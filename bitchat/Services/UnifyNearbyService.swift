@@ -455,8 +455,13 @@ final class UnifyNearbyService: NSObject, ObservableObject {
 
     private func startScanIfReady() {
         guard wantScanning, let central, central.state == .poweredOn else { return }
+        // Scan WITHOUT a service-UUID filter and match the service in code
+        // (`didDiscover`). A filtered scan suppresses the scan-response local
+        // name on iOS, so Unify receivers showed up nameless ("Unify user");
+        // the unfiltered scan delivers the advertised display name. Gated to
+        // while the radar is visible, so the broader scan is short-lived.
         central.scanForPeripherals(
-            withServices: [UnifyNearbyContract.serviceUUID],
+            withServices: nil,
             options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]
         )
     }
@@ -555,8 +560,11 @@ extension UnifyNearbyService: CBCentralManagerDelegate {
         advertisementData: [String: Any],
         rssi RSSI: NSNumber
     ) {
+        // Unfiltered scan → only keep advertisers carrying the Unify service.
+        let services = advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID] ?? []
+        guard services.contains(UnifyNearbyContract.serviceUUID) else { return }
         let id = peripheral.identifier.uuidString
-        let name = Self.advertisedName(advertisementData)
+        let name = Self.advertisedName(advertisementData, peripheralName: peripheral.name)
         let rssi = RSSI.intValue
         Task { @MainActor in
             self.recordDiscovery(id: id, name: name, rssi: rssi, peripheral: peripheral)
@@ -597,11 +605,12 @@ extension UnifyNearbyService: CBCentralManagerDelegate {
     /// manufacturer-specific data under company id 0xFFFF; iOS receivers carry
     /// it in the BLE local name. We read manufacturer data first, then local
     /// name, then fall back to the default prefix.
-    nonisolated static func advertisedName(_ adv: [String: Any]) -> String {
-        // Prefer the iOS receiver's local name, then the Android manufacturer
-        // 0xFFFF name, then the default. (Both go through the contract's
-        // sanitize/trim + 20-byte cap so they look identical to the receiver's
-        // own advertised value.)
+    nonisolated static func advertisedName(_ adv: [String: Any], peripheralName: String?) -> String {
+        // Prefer the iOS receiver's advertised local name, then the Android
+        // manufacturer 0xFFFF name, then the GAP peripheral name (populated by
+        // CoreBluetooth from the scan response / after connect), then the
+        // default. All go through the contract's sanitize/trim + 20-byte cap so
+        // they look identical to the receiver's own advertised value.
         if let local = adv[CBAdvertisementDataLocalNameKey] as? String,
            let clean = UnifyNearbyContract.sanitizeAdvertisedName(local) {
             return clean
@@ -609,6 +618,9 @@ extension UnifyNearbyService: CBCentralManagerDelegate {
         if let mfg = adv[CBAdvertisementDataManufacturerDataKey] as? Data,
            let name = nameFromManufacturerData(mfg) {
             return name
+        }
+        if let clean = UnifyNearbyContract.sanitizeAdvertisedName(peripheralName) {
+            return clean
         }
         return UnifyNearbyContract.advertisedNamePrefix
     }

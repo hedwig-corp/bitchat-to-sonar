@@ -87,6 +87,13 @@ final class UnifyReceiverService: NSObject, ObservableObject {
     /// The display name currently being advertised.
     private var cachedName: String?
 
+    /// NOTIFY push state: the framed payload split into MTU-sized chunks for the
+    /// current subscriber, and the index of the next chunk to send. Unify's
+    /// payer subscribes and consumes these notifications (its Reassembler
+    /// concatenates them back into the framed blob).
+    private var outgoingChunks: [Data] = []
+    private var sendCursor = 0
+
     /// nonisolated so it can be a default-argument value in the @MainActor
     /// SonarAppStore designated init (no main-actor work here).
     nonisolated override init() {
@@ -123,6 +130,8 @@ final class UnifyReceiverService: NSObject, ObservableObject {
         framedPayload = nil
         cachedOffer = nil
         cachedName = nil
+        outgoingChunks = []
+        sendCursor = 0
     }
 
     // MARK: - Building + advertising
@@ -170,15 +179,16 @@ final class UnifyReceiverService: NSObject, ObservableObject {
         }
     }
 
-    /// Build + add the GATT service exactly once. The characteristic is READ
-    /// only (the payer reads the framed offer); the value is served per-request
-    /// in `didReceiveRead` to handle CoreBluetooth long reads by offset.
+    /// Build + add the GATT service exactly once. The characteristic is
+    /// NOTIFY + READ: Unify's payer SUBSCRIBES (setNotifyValue) and we push the
+    /// framed offer in MTU-sized chunks on `didSubscribeTo` (the primary path);
+    /// READ is a fallback served per-request in `didReceiveRead`.
     private func ensureServiceAdded() {
         guard let manager, !serviceAdded else { return }
         let characteristic = CBMutableCharacteristic(
             type: UnifyNearbyContract.payloadCharacteristicUUID,
-            properties: [.read],
-            value: nil,                 // dynamic value → served via didReceiveRead
+            properties: [.read, .notify],
+            value: nil,                 // dynamic value → served via notify/read
             permissions: [.readable]
         )
         let service = CBMutableService(type: UnifyNearbyContract.serviceUUID, primary: true)
@@ -186,6 +196,31 @@ final class UnifyReceiverService: NSObject, ObservableObject {
         payloadCharacteristic = characteristic
         manager.add(service)
         serviceAdded = true
+    }
+
+    /// Push the framed payload to a subscribed central in MTU-sized chunks via
+    /// NOTIFY, exactly like Unify's receiver. Chunk size is fixed to the
+    /// subscriber's MTU at the START of a transfer (re-chunking mid-stream would
+    /// desync `sendCursor`). `updateValue` returning false means the transmit
+    /// queue is full — we stop and resume from `peripheralManagerIsReady`.
+    private func pumpChunks(to central: CBCentral) {
+        guard let manager, let characteristic = payloadCharacteristic else { return }
+        if sendCursor == 0, let framed = framedPayload {
+            // Unify DEFAULT_MAX_CHUNK_SIZE (180), capped to the subscriber MTU.
+            let chunkSize = max(20, min(central.maximumUpdateValueLength, 180))
+            outgoingChunks = stride(from: 0, to: framed.count, by: chunkSize).map {
+                framed.subdata(in: $0..<min($0 + chunkSize, framed.count))
+            }
+        }
+        while sendCursor < outgoingChunks.count {
+            let ok = manager.updateValue(
+                outgoingChunks[sendCursor],
+                for: characteristic,
+                onSubscribedCentrals: [central]
+            )
+            if !ok { return } // queue full — resume in peripheralManagerIsReady
+            sendCursor += 1
+        }
     }
 }
 
@@ -222,6 +257,26 @@ extension UnifyReceiverService: CBPeripheralManagerDelegate {
             }
             request.value = framed.subdata(in: request.offset..<framed.count)
             peripheral.respond(to: request, withResult: .success)
+        }
+    }
+
+    /// Unify's payer subscribes (NOTIFY); push the framed payload in chunks.
+    nonisolated func peripheralManager(_ peripheral: CBPeripheralManager,
+                                       central: CBCentral,
+                                       didSubscribeTo characteristic: CBCharacteristic) {
+        Task { @MainActor in
+            self.sendCursor = 0
+            self.pumpChunks(to: central)
+        }
+    }
+
+    /// Transmit queue drained — resume pushing to the (single) subscriber.
+    nonisolated func peripheralManagerIsReady(toUpdateSubscribers peripheral: CBPeripheralManager) {
+        Task { @MainActor in
+            if let characteristic = self.payloadCharacteristic,
+               let subscriber = characteristic.subscribedCentrals?.first {
+                self.pumpChunks(to: subscriber)
+            }
         }
     }
 }

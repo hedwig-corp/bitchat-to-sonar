@@ -177,19 +177,24 @@ final class UnifyReceiverTests: XCTestCase {
             CBAdvertisementDataLocalNameKey: "LocalNick",
             CBAdvertisementDataManufacturerDataKey: mfgData(companyLE: [0xFF, 0xFF], name: "MfgNick")
         ]
-        XCTAssertEqual(UnifyNearbyService.advertisedName(adv), "LocalNick")
+        XCTAssertEqual(UnifyNearbyService.advertisedName(adv, peripheralName: "DeviceName"), "LocalNick")
     }
 
     func testAdvertisedNameFallsBackToManufacturer() {
         let adv: [String: Any] = [
             CBAdvertisementDataManufacturerDataKey: mfgData(companyLE: [0xFF, 0xFF], name: "MfgNick")
         ]
-        XCTAssertEqual(UnifyNearbyService.advertisedName(adv), "MfgNick")
+        XCTAssertEqual(UnifyNearbyService.advertisedName(adv, peripheralName: "DeviceName"), "MfgNick")
+    }
+
+    func testAdvertisedNameFallsBackToPeripheralName() {
+        // No local name, no manufacturer name → use the GAP peripheral name.
+        XCTAssertEqual(UnifyNearbyService.advertisedName([:], peripheralName: "Vince iPhone"), "Vince iPhone")
     }
 
     func testAdvertisedNameDefaultWhenNothing() {
         XCTAssertEqual(
-            UnifyNearbyService.advertisedName([:]),
+            UnifyNearbyService.advertisedName([:], peripheralName: nil),
             UnifyNearbyContract.advertisedNamePrefix
         )
     }
