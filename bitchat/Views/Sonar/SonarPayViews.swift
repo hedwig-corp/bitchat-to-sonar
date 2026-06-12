@@ -349,3 +349,186 @@ struct SNWalletSetupSheetContent: View {
         }
     }
 }
+
+// MARK: - Unify nearby-payments sheet (direct Lightning send, payments-only)
+
+/// The "Send sats" sheet for a Unify Wallet user discovered over Bluetooth.
+/// Unlike the ⚡PAY sealed-coin chat flow, this is a direct Lightning send to
+/// the receiver's served BOLT12/BOLT11 destination. The sheet walks the phases
+/// the store drives: fetching → (amount keypad | direct pay) → sent / failed.
+struct UnifyPaySheetView: View {
+    let peerName: String
+    let phase: SonarAppStore.UnifyPayPhase
+    let balance: Int64
+    let fiatText: (Int64) -> String?
+    let onConfirmAmount: (_ destination: String, _ sats: Int64) -> Void
+    let onClose: () -> Void
+
+    var body: some View {
+        switch phase {
+        case .fetching:
+            status(icon: .bolt, tint: SonarTheme.goldDeep,
+                   title: "Reading \(peerName)\u{2019}s payment\u{2026}",
+                   desc: "Connecting over Bluetooth to fetch their Lightning request.",
+                   busy: true)
+        case .amount(let destination):
+            UnifyAmountKeypad(
+                peerName: peerName,
+                balance: balance,
+                fiatText: fiatText,
+                onSend: { sats in onConfirmAmount(destination, sats) }
+            )
+        case .paying(_, let sats):
+            status(icon: .bolt, tint: SonarTheme.goldDeep,
+                   title: "Sending \(snPayFmt(sats)) sats\u{2026}",
+                   desc: "Paying \(peerName) over the Lightning network.",
+                   busy: true)
+        case .sent(let sats):
+            status(icon: .check, tint: SonarTheme.green,
+                   title: "Sent \(snPayFmt(sats)) sats",
+                   desc: "\(peerName) has been paid over Lightning.",
+                   busy: false, done: true)
+        case .failed(let message):
+            status(icon: .x, tint: SonarTheme.danger,
+                   title: "Couldn\u{2019}t send",
+                   desc: message,
+                   busy: false, done: true)
+        }
+    }
+
+    private func status(icon: SNIconName, tint: Color, title: String, desc: String,
+                        busy: Bool, done: Bool = false) -> some View {
+        VStack(spacing: 0) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .fill(SonarTheme.goldSoft)
+                    .frame(width: 56, height: 56)
+                if busy {
+                    ProgressView().tint(tint)
+                } else {
+                    SNIcon(name: icon, size: 26).foregroundColor(tint)
+                }
+            }
+            .padding(.top, 8)
+            Text(verbatim: title)
+                .font(SonarTheme.uiFont(size: 16, weight: .bold))
+                .foregroundColor(SonarTheme.text)
+                .padding(.top, 10)
+            Text(verbatim: desc)
+                .font(SonarTheme.uiFont(size: 13.5))
+                .lineSpacing(13.5 * 0.3)
+                .foregroundColor(SonarTheme.text2)
+                .multilineTextAlignment(.center)
+                .padding(EdgeInsets(top: 6, leading: 14, bottom: 2, trailing: 14))
+            if done {
+                VStack(spacing: 6) { SNGhostButton(label: "Done", action: onClose) }
+                    .padding(EdgeInsets(top: 12, leading: 8, bottom: 0, trailing: 8))
+            }
+        }
+    }
+}
+
+/// Amount keypad for an amountless Unify offer (mirrors SNPaySheet's pad, but
+/// always sends "over Lightning" — Unify payments are never mesh ecash).
+private struct UnifyAmountKeypad: View {
+    let peerName: String
+    let balance: Int64
+    let fiatText: (Int64) -> String?
+    let onSend: (Int64) -> Void
+
+    @State private var v = ""
+
+    private var sats: Int64 { Int64(v) ?? 0 }
+    private var over: Bool { sats > balance }
+    private var can: Bool { sats > 0 && !over }
+
+    private func tap(_ k: String) {
+        if k == "del" { v = String(v.dropLast()); return }
+        var nv = v + k
+        while nv.count > 1 && nv.hasPrefix("0") { nv.removeFirst() }
+        if nv.count <= 7 { v = nv }
+    }
+
+    private let keys = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "00", "0", "del"]
+    private let chips: [Int64] = [1000, 10000, 21000]
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 6) {
+                SNIcon(name: .coin, size: 13, weight: 2)
+                Text(verbatim: "Balance \u{00B7} \(snPayFmt(balance)) sats")
+            }
+            .font(SonarTheme.uiFont(size: 12.5))
+            .foregroundColor(SonarTheme.text3)
+            .padding(EdgeInsets(top: 2, leading: 0, bottom: 4, trailing: 0))
+
+            VStack(spacing: 0) {
+                HStack(alignment: .firstTextBaseline, spacing: 7) {
+                    Text(verbatim: v.isEmpty ? "0" : snPayFmt(sats))
+                        .font(SonarTheme.uiFont(size: 42, weight: .heavy))
+                        .kerning(-42 * 0.02)
+                        .foregroundColor(over ? SonarTheme.danger : SonarTheme.text)
+                    Text("sats")
+                        .font(SonarTheme.uiFont(size: 15, weight: .bold))
+                        .foregroundColor(SonarTheme.text3)
+                }
+                Text(verbatim: over ? "Not enough sats" : (fiatText(sats) ?? ""))
+                    .font(SonarTheme.uiFont(size: 13.5))
+                    .foregroundColor(SonarTheme.text3)
+                    .padding(.top, 3)
+                    .frame(minHeight: 20)
+            }
+            .padding(EdgeInsets(top: 8, leading: 0, bottom: 2, trailing: 0))
+
+            HStack(spacing: 8) {
+                ForEach(chips, id: \.self) { c in
+                    Button { v = String(c) } label: {
+                        Text(verbatim: snPayFmt(c))
+                            .font(SonarTheme.uiFont(size: 13, weight: .bold))
+                            .foregroundColor(SonarTheme.goldDeep)
+                            .padding(.vertical, 7)
+                            .padding(.horizontal, 14)
+                            .background(Capsule().fill(SonarTheme.goldSoft))
+                    }
+                    .buttonStyle(SNScaleStyle(scale: 0.95))
+                }
+            }
+            .padding(EdgeInsets(top: 10, leading: 0, bottom: 2, trailing: 0))
+
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 4), count: 3), spacing: 4) {
+                ForEach(keys, id: \.self) { k in
+                    Button { tap(k) } label: {
+                        Group {
+                            if k == "del" {
+                                SNIcon(name: .back, size: 18, weight: 2.2)
+                            } else {
+                                Text(verbatim: k).font(SonarTheme.uiFont(size: 21, weight: .semibold))
+                            }
+                        }
+                        .foregroundColor(SonarTheme.text)
+                        .frame(maxWidth: .infinity)
+                        .padding(12)
+                        .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    }
+                    .buttonStyle(SNRowPressStyle(cornerRadius: 12))
+                    .accessibilityLabel(k == "del" ? "Delete" : k)
+                }
+            }
+            .padding(EdgeInsets(top: 8, leading: 18, bottom: 2, trailing: 18))
+
+            VStack(spacing: 6) {
+                SNPrimaryButton(label: "Send over Lightning", net: true, disabled: !can) {
+                    guard can else { return }
+                    onSend(sats)
+                }
+                Text(verbatim: "Instant over the Lightning network, straight to \(peerName)\u{2019}s wallet.")
+                    .font(SonarTheme.uiFont(size: 12))
+                    .lineSpacing(12 * 0.5)
+                    .foregroundColor(SonarTheme.text3)
+                    .multilineTextAlignment(.center)
+                    .padding(EdgeInsets(top: 2, leading: 14, bottom: 0, trailing: 14))
+            }
+            .padding(EdgeInsets(top: 6, leading: 8, bottom: 0, trailing: 8))
+        }
+    }
+}

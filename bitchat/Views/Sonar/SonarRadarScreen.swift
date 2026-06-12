@@ -52,6 +52,28 @@ struct SonarRadarScreen: View {
         }
         .animation(reduceMotion ? nil : .timingCurve(0.25, 0.9, 0.3, 1, duration: 0.25), value: psel?.id)
         .background(SonarTheme.bg.ignoresSafeArea())
+        .onAppear { store.nearbyAppeared() }
+        .onDisappear { store.nearbyDisappeared() }
+        .snSheet(
+            isPresented: Binding(
+                get: { store.unifyPay != nil },
+                set: { if !$0 { store.dismissUnifyPay() } }
+            ),
+            title: "Send sats"
+        ) {
+            if let pay = store.unifyPay {
+                UnifyPaySheetView(
+                    peerName: store.peerItem(pay.peerId).name,
+                    phase: pay.phase,
+                    balance: store.balanceSats ?? 0,
+                    fiatText: { store.fiatText($0) },
+                    onConfirmAmount: { dest, sats in
+                        store.confirmUnifyAmount(pay.peerId, destination: dest, sats: sats)
+                    },
+                    onClose: { store.dismissUnifyPay() }
+                )
+            }
+        }
     }
 
     // sn-peercard: quick actions for the tapped node. "Send sats" only for
@@ -63,18 +85,25 @@ struct SonarRadarScreen: View {
                 Text(verbatim: p.name)
                     .font(SonarTheme.uiFont(size: 15.5, weight: .bold))
                     .foregroundColor(SonarTheme.text)
-                Text(verbatim: p.inRange ? "\(p.hint) · over Bluetooth" : "Out of range · over the internet")
+                Text(verbatim: peerCardSub(p))
                     .font(SonarTheme.uiFont(size: 12))
                     .foregroundColor(SonarTheme.text2)
                     .lineLimit(1)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            SNSmallButton(label: "Message", expand: false) {
-                openMeshDM(p.id)
-            }
-            if store.paymentCapable(p.id) {
+            if p.unify {
+                // Unify Wallet user: payments only, no DM.
                 SNSmallButton(label: "Send sats", primary: true, expand: false) {
-                    store.quickPay(p.id)
+                    store.sendSatsToUnify(p.id)
+                }
+            } else {
+                SNSmallButton(label: "Message", expand: false) {
+                    openMeshDM(p.id)
+                }
+                if store.paymentCapable(p.id) {
+                    SNSmallButton(label: "Send sats", primary: true, expand: false) {
+                        store.quickPay(p.id)
+                    }
                 }
             }
         }
@@ -121,6 +150,11 @@ struct SonarRadarScreen: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+    }
+
+    private func peerCardSub(_ p: SNPeerItem) -> String {
+        if p.unify { return "Unify user \u{00B7} pay only" }
+        return p.inRange ? "\(p.hint) \u{00B7} over Bluetooth" : "Out of range \u{00B7} over the internet"
     }
 
     /// Radar node tap selects the peer card (screens.jsx setPsel).
@@ -186,14 +220,14 @@ struct SonarRadarScreen: View {
                         ForEach(Array(inRange.enumerated()), id: \.element.id) { i, p in
                             SNConvRow(
                                 title: p.name,
-                                verified: store.isVerified(p.id),
+                                verified: p.unify ? false : store.isVerified(p.id),
                                 divider: i < inRange.count - 1,
-                                action: { openMeshDM(p.id) },
+                                action: { p.unify ? store.sendSatsToUnify(p.id) : openMeshDM(p.id) },
                                 avatar: { sonarBadged(p) { SonarAvatar(name: p.name, size: 44, presence: true) } },
                                 sub: {
                                     HStack(spacing: 6) {
                                         SNBars(n: p.bars)
-                                        Text(verbatim: "\(p.hint) · \(p.detail)")
+                                        Text(verbatim: p.unify ? p.detail : "\(p.hint) · \(p.detail)")
                                             .font(SonarTheme.uiFont(size: 13.5))
                                             .foregroundColor(SonarTheme.text2)
                                     }
@@ -241,11 +275,24 @@ struct SonarRadarScreen: View {
             .padding(EdgeInsets(top: 4, leading: 18, bottom: 10, trailing: 18))
     }
 
-    /// Small indigo dot (net-color language) marking peers that announced a
-    /// Sonar discovery profile.
+    /// Small badge dot: indigo (net-color) for Sonar peers, gold (payment-color)
+    /// for Unify Wallet users (payments-only).
     @ViewBuilder
     private func sonarBadged<Avatar: View>(_ p: SNPeerItem, @ViewBuilder avatar: () -> Avatar) -> some View {
-        if p.sonar {
+        if p.unify {
+            ZStack(alignment: .bottomTrailing) {
+                avatar()
+                Circle()
+                    .fill(SonarTheme.goldFill)
+                    .frame(width: 16, height: 16)
+                    .overlay(
+                        SNIcon(name: .coin, size: 9, weight: 2.4)
+                            .foregroundColor(SonarTheme.bg)
+                    )
+                    .overlay(Circle().strokeBorder(SonarTheme.bg, lineWidth: 2))
+                    .offset(x: 3, y: 3)
+            }
+        } else if p.sonar {
             ZStack(alignment: .bottomTrailing) {
                 avatar()
                 Circle()
@@ -337,7 +384,17 @@ private struct SNRadarField: View {
                     radarNodeLabel(label: p.name) {
                         ZStack(alignment: .bottomTrailing) {
                             SonarAvatar(name: p.name, size: 44, presence: true)
-                            if p.sonar {
+                            if p.unify {
+                                Circle()
+                                    .fill(SonarTheme.goldFill)
+                                    .frame(width: 16, height: 16)
+                                    .overlay(
+                                        SNIcon(name: .coin, size: 9, weight: 2.4)
+                                            .foregroundColor(SonarTheme.bg)
+                                    )
+                                    .overlay(Circle().strokeBorder(SonarTheme.bg, lineWidth: 2))
+                                    .offset(x: 3, y: 3)
+                            } else if p.sonar {
                                 Circle()
                                     .fill(SonarTheme.net)
                                     .frame(width: 13, height: 13)

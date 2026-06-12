@@ -90,6 +90,9 @@ struct SNPeerItem: Identifiable {
     let angle: Double       // deterministic radar angle (degrees)
     let r: Double           // radar ring radius
     var sonar: Bool = false // announced a Sonar discovery profile (npub)
+    /// A Unify Wallet user discovered over Bluetooth (payments-only, no chat).
+    /// `id` is the Unify peripheral identifier; tapping offers only "Send sats".
+    var unify: Bool = false
 }
 
 /// A peer's Sonar discovery profile (verified announce, type 0x53):
@@ -137,10 +140,16 @@ final class SonarAppStore: ObservableObject {
     }
 
     static let marmotIDPrefix = "marmot:"
+    /// SNPeerItem id prefix for a Unify Wallet peer discovered over Bluetooth.
+    /// The remainder is the Unify peripheral identifier (UnifyPeer.id).
+    static let unifyIDPrefix = "unify:"
 
     let chatViewModel: ChatViewModel
     let marmot: MarmotChatModel
     let idBridge: NostrIdentityBridge
+    /// Ad-hoc Bluetooth discovery of Unify Wallet users (payments-only). Owns
+    /// its own CBCentralManager, separate from the mesh BLEService.
+    let unify: UnifyNearbyService
     /// Lightning wallet behind the payments UI; UnconfiguredWallet until the
     /// real bridge (Services/WalletBridgeService) is injected.
     let wallet: SonarWalletProviding
@@ -202,7 +211,8 @@ final class SonarAppStore: ObservableObject {
         keychain: KeychainManagerProtocol,
         idBridge: NostrIdentityBridge,
         wallet: SonarWalletProviding = UnconfiguredWallet(),
-        payLedger: SonarPayLedger = SonarPayLedger()
+        payLedger: SonarPayLedger = SonarPayLedger(),
+        unify: UnifyNearbyService = UnifyNearbyService()
     ) {
         self.chatViewModel = chatViewModel
         self.marmot = marmot
@@ -210,6 +220,7 @@ final class SonarAppStore: ObservableObject {
         self.idBridge = idBridge
         self.wallet = wallet
         self.payLedger = payLedger
+        self.unify = unify
         walletState = wallet.state
         onboarded = UserDefaults.standard.bool(forKey: Keys.onboarded)
         mode = UserDefaults.standard.string(forKey: Keys.mode) ?? "dark"
@@ -225,6 +236,8 @@ final class SonarAppStore: ObservableObject {
         republish(marmot.objectWillChange)
         republish(locationManager.objectWillChange)
         republish(relayManager.objectWillChange)
+        // Unify nearby payments: republish discovered-peer changes into the radar.
+        republish(unify.objectWillChange)
 
         // Sonar discovery: collect verified peer profiles announced over the
         // mesh, and start announcing ours once the Marmot npub is known.
@@ -283,6 +296,9 @@ final class SonarAppStore: ObservableObject {
             if locationManager.permissionState == .authorized {
                 locationManager.refreshChannels()
             }
+            // Unify scanning is started on demand while the radar is visible
+            // (see nearbyAppeared/Disappeared) to avoid a continuous high-power
+            // BLE scan on top of the mesh.
         }
 
         #if DEBUG
@@ -331,6 +347,12 @@ final class SonarAppStore: ObservableObject {
         path = []
         marmot.connectIfNeeded()
     }
+
+    /// Start Unify scanning while the Nearby/radar screen is visible; stop it
+    /// when it goes away. Keeps the extra BLE scan off except when the user is
+    /// actually looking for someone nearby to pay.
+    func nearbyAppeared() { unify.start() }
+    func nearbyDisappeared() { unify.stop() }
 
     /// Marmot (White Noise) npub once the secure-chat service connected.
     var npub: String? { marmot.npub }
@@ -630,7 +652,31 @@ final class SonarAppStore: ObservableObject {
                 ))
             }
         }
+        // Unify Wallet users discovered over Bluetooth (payments-only). They
+        // are NOT mesh peers, so they sit on the outer ring with a plain-
+        // language "pay only" label and a distinct badge. Tapping one offers
+        // only "Send sats" — never a DM.
+        for peer in unify.peers {
+            let id = Self.unifyIDPrefix + peer.id
+            let h = snHash(peer.id)
+            let angle = Double(h % 360)
+            let jitter = Double((h >> 9) % 11) - 5
+            items.append(SNPeerItem(
+                id: id, name: peer.name, inRange: true, bars: unifyBars(peer.rssi),
+                hint: "Unify", detail: "Unify \u{00B7} pay only",
+                angle: angle, r: 150 + jitter, unify: true
+            ))
+        }
         return items
+    }
+
+    /// Map a Unify peer RSSI (dBm) onto the 0–3 radar signal bars.
+    private func unifyBars(_ rssi: Int) -> Int {
+        switch rssi {
+        case (-60)...: return 3
+        case (-75)..<(-60): return 2
+        default: return 1
+        }
     }
 
     func peerItem(_ id: String) -> SNPeerItem {
@@ -645,6 +691,15 @@ final class SonarAppStore: ObservableObject {
             )
         }
         if let item = nearbyPeers.first(where: { $0.id == id }) { return item }
+        if let unifyId = unifyPeerId(id) {
+            let name = unify.peers.first { $0.id == unifyId }?.name
+                ?? UnifyNearbyContract.advertisedNamePrefix
+            return SNPeerItem(
+                id: id, name: name, inRange: true, bars: 1,
+                hint: "Unify", detail: "Unify \u{00B7} pay only",
+                angle: 0, r: 0, unify: true
+            )
+        }
         let peerID = PeerID(str: id)
         return SNPeerItem(
             id: id,
@@ -1101,6 +1156,89 @@ final class SonarAppStore: ObservableObject {
         return true
     }
 
+    // MARK: Unify nearby payments (payments-only, no chat)
+
+    /// True if `id` is a Unify peer id (prefix `unify:`).
+    func isUnify(_ id: String) -> Bool { id.hasPrefix(Self.unifyIDPrefix) }
+
+    /// The Unify peripheral identifier behind a `unify:` SNPeerItem id.
+    func unifyPeerId(_ id: String) -> String? {
+        id.hasPrefix(Self.unifyIDPrefix) ? String(id.dropFirst(Self.unifyIDPrefix.count)) : nil
+    }
+
+    /// Drives the "Send sats" sheet for a tapped Unify peer.
+    enum UnifyPayPhase: Equatable {
+        /// Fetching the served BIP321 URI over Bluetooth.
+        case fetching
+        /// Offer fetched; show the amount keypad (URI carried no amount).
+        case amount(destination: String)
+        /// Paying `sats` to `destination` over Lightning.
+        case paying(destination: String, sats: Int64)
+        /// Done.
+        case sent(sats: Int64)
+        /// Failed with a human message.
+        case failed(String)
+    }
+
+    /// Sheet state for the Unify "Send sats" flow (nil = no sheet). The peer
+    /// id stays alongside so the sheet can label itself.
+    @Published var unifyPay: (peerId: String, phase: UnifyPayPhase)?
+
+    /// Radar/list tap on a Unify peer chose "Send sats". Fetch the served
+    /// BIP321 URI, parse the Lightning destination, then either pay directly
+    /// (URI carried an amount) or prompt for an amount.
+    func sendSatsToUnify(_ id: String) {
+        guard let unifyId = unifyPeerId(id) else { return }
+        // Honest gate: a Unify peer still shows, but paying needs a wallet.
+        guard case .ready = walletState else {
+            unifyPay = (id, .failed("Set up your Bitcoin wallet first to send sats."))
+            return
+        }
+        unifyPay = (id, .fetching)
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let uri = try await self.unify.fetchPaymentURI(unifyId)
+                guard let parsed = UnifyBIP321.parse(uri) else {
+                    self.unifyPay = (id, .failed(UnifyNearbyError.noPayment.localizedDescription))
+                    return
+                }
+                if let sats = parsed.amountSats {
+                    self.payUnify(id, destination: parsed.lightning, sats: sats)
+                } else {
+                    self.unifyPay = (id, .amount(destination: parsed.lightning))
+                }
+            } catch {
+                let msg = (error as? UnifyNearbyError)?.errorDescription ?? error.localizedDescription
+                self.unifyPay = (id, .failed(msg))
+            }
+        }
+    }
+
+    /// User entered an amount on the Unify pay keypad.
+    func confirmUnifyAmount(_ id: String, destination: String, sats: Int64) {
+        guard sats > 0 else { return }
+        payUnify(id, destination: destination, sats: sats)
+    }
+
+    /// Direct Lightning send to the Unify receiver's served offer/invoice. This
+    /// is NOT the ⚡PAY sealed-coin chat path — Unify peers don't chat.
+    private func payUnify(_ id: String, destination: String, sats: Int64) {
+        unifyPay = (id, .paying(destination: destination, sats: sats))
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await self.wallet.send(destination: destination, amountSats: sats, note: "Unify nearby payment")
+                self.unifyPay = (id, .sent(sats: sats))
+            } catch {
+                self.unifyPay = (id, .failed(error.localizedDescription))
+            }
+        }
+    }
+
+    /// Dismiss the Unify pay sheet.
+    func dismissUnifyPay() { unifyPay = nil }
+
     // MARK: Verification (real fingerprints)
 
     func verifyInfo(for id: String) -> SNVerifyInfo {
@@ -1221,6 +1359,9 @@ final class SonarAppStore: ObservableObject {
         // Stop Sonar discovery announces and forget discovered profiles.
         (chatViewModel.meshService as? BLEService)?.sonarProfileProvider = nil
         sonarProfiles = [:]
+        // Stop scanning for Unify peers and clear the discovered list (no
+        // secrets are stored, but the list must not survive a panic wipe).
+        unify.stop()
         pendingMarmotSends = [:]
         // Forget every ⚡PAY coin and the Lightning wallet seed (separate
         // keychain service owned by SonarWalletKit).
