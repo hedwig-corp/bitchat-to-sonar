@@ -1,7 +1,16 @@
-# Unify nearby-payments interop (Sonar as payer)
+# Unify nearby-payments interop (bidirectional)
 
-Ad-hoc detection of **Unify Wallet** users over Bluetooth, payments-only (no
-chat). After this feature, Sonar's radar shows three kinds of nearby people:
+Ad-hoc **Unify Wallet** payments over Bluetooth, payments-only (no chat).
+Sonar plays BOTH Unify roles, so payments flow in both directions with no
+changes on Unify's side:
+
+- **Payer** (GATT central) — Sonar scans for Unify receivers and pays them.
+  See "Payer flow" below.
+- **Receiver** (GATT peripheral) — Sonar advertises the Unify service and
+  serves a framed BIP321 offer so a **Unify user can pay a Sonar user**. See
+  "Receiver flow" below.
+
+After this feature, Sonar's radar shows three kinds of nearby people:
 
 - **bitchat** — chat only, no badge.
 - **Sonar** — chat + payments, indigo Sonar badge.
@@ -31,9 +40,8 @@ Unify models the person **getting paid** as the GATT **peripheral** (the
 payload characteristic. The **payer** is the GATT **central**: it scans, connects,
 reads the chunked payload, reassembles the URI, and pays it.
 
-**Sonar is always the PAYER.** We never advertise (no receiver role) and never
-chat with Unify peers. We scan, badge, and on "Send sats" we read the offer and
-pay it directly over Lightning.
+Sonar plays BOTH roles (two separate, isolated services — see "Receiver flow"),
+and never chats with Unify peers in either direction.
 
 ## UUIDs and sizes (UnifyNearbyContract)
 
@@ -55,8 +63,15 @@ v2 receivers advertise a human display name in the scan response:
 - **Android receiver:** in manufacturer-specific data under company id `0xFFFF`
   (2-byte little-endian company id followed by the UTF-8 name bytes).
 
-Our payer reads **manufacturer data first, then local name**, then falls back to
-the default "Unify user". Names are truncated by the receiver to 20 UTF-8 bytes.
+Our payer resolves the name in this precedence: **local name, then manufacturer
+0xFFFF data, then the default "Unify user"** (`UnifyNearbyService.advertisedName`).
+Both candidates pass through `UnifyNearbyContract.sanitizeAdvertisedName`
+(replace control chars with spaces, collapse whitespace, trim, truncate to 20
+UTF-8 bytes on a codepoint boundary) so they look identical to the value the
+receiver put on the air.
+
+When Sonar is the **receiver**, it advertises its name in the BLE local name
+(`CBAdvertisementDataLocalNameKey`), like any iOS receiver — see below.
 
 ## Framing (UnifyNearbyFraming — mirror of NearbyPaymentFraming.kt)
 
@@ -131,6 +146,60 @@ This is a **direct Lightning send** to the receiver's served offer — NOT the
 ⚡PAY sealed-coin / Marmot chat path (that is chat-bound and Unify peers don't
 chat).
 
+## Receiver flow (UnifyReceiverService) — a Unify user pays a Sonar user
+
+`UnifyReceiverService` is the mirror of `UnifyNearbyService`: a `@MainActor
+ObservableObject`, **no singleton** (constructed by `SonarAppStore`), owning its
+**own `CBPeripheralManager`** on a dedicated queue — isolated from the mesh
+`BLEService` AND from the payer's central.
+
+- **GATT service:** it builds service `b1f7e2a0…` with a single READ
+  characteristic `b1f7e2a1…` (`CBMutableCharacteristic`, `.read`, permission
+  `.readable`, dynamic value). The service is added exactly once, after the
+  peripheral manager powers on.
+- **Served value:** `frame("bitcoin:?lno=<offer>")` — the exact inverse of the
+  payer's `Reassembler` (4-byte big-endian length + UTF-8 body). The offer is
+  **amountless** (`bitcoin:?lno=<offer>` with no `amount=`); the Unify payer
+  enters the sats. The framed blob is cached and rebuilt only when the offer
+  changes.
+- **Long reads:** `peripheralManager(_:didReceiveRead:)` returns
+  `framedPayload.subdata(in: request.offset..<count)` with `.success`.
+  CoreBluetooth chunks the response by the negotiated ATT MTU and calls us once
+  per chunk with an increasing `request.offset`; the payer's central
+  concatenates the slices back into the full framed blob. An offset past the end
+  returns `.invalidOffset`.
+- **Offer source:** injected `offerProvider: () async -> String?` →
+  `SonarWalletProviding.createOffer()` (the iOS Breez wallet behind
+  `WalletBridgeService`). The offer is fetched lazily when advertising starts
+  (it can be slow/async); if no offer is available yet (wallet not ready) we do
+  not advertise.
+- **Advertised name:** injected `nameProvider: () -> String?` →
+  `ChatViewModel.nickname`, sanitized + 20-byte-capped, fallback **"Sonar
+  user"**. Carried in `CBAdvertisementDataLocalNameKey`.
+- **Lifecycle (always payable, foreground-only):** `SonarAppStore` starts the
+  receiver iff the wallet is `.ready` AND the app is foreground, and stops it
+  otherwise (`updateReceiverAdvertising()`), driven by the wallet state sink and
+  `setForeground(_:)` from `BitchatApp`'s `scenePhase` (`.active` → resume,
+  `.background` → stop). It also stops on panic wipe.
+
+### iOS background-advertising caveat
+
+iOS **strips the BLE local name and restricts service-UUID advertising while the
+app is backgrounded** (service UUIDs move to a special "overflow" area only
+discoverable by another iOS device explicitly scanning for them, and the local
+name is dropped entirely). A Unify payer scanning by service UUID would not see
+our name (and on Android may not see us at all). So receiver advertising is
+**foreground-only by design** — it stops on `.background` and resumes on
+`.active`. This is an accepted limitation for the demo (brainstorm 2026-06-12).
+
+## Avatar distinctness (multiple Unify peers)
+
+`SonarAvatar` gained an optional `seed:` parameter (defaults to the display
+name). Unify `SNPeerItem`s set `avatarSeed` to the stable Unify peripheral id,
+so two Unify users that share a display name (both "Unify user") still get a
+distinct hue + identicon grid. The gold Unify badge and "Send sats"-only
+behavior are unchanged.
+
 ## Platform note
 
 CoreBluetooth central scanning is available on both iOS and macOS, so the real
@@ -140,6 +209,8 @@ no-op stub is provided for any future platform without CoreBluetooth.
 
 ## Panic wipe
 
-`SonarAppStore.wipe()` calls `unify.stop()`, which stops scanning and clears the
-discovered-peer list. No secrets are stored by this service, but the list must
-not survive a wipe.
+`SonarAppStore.wipe()` calls `unify.stop()` (stops scanning + clears the
+discovered-peer list) and `unifyReceiver.stop()` (stops advertising + drops the
+cached framed offer). No secrets are stored by either service, but the
+discovered list must not survive a wipe and the served offer is derived from the
+wallet seed being wiped.
