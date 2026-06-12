@@ -15,7 +15,11 @@ final class BLEService: NSObject {
     
     // MARK: - Constants
     
-    #if DEBUG
+    // Sonar (2026-06-12): always join the PRODUCTION bitchat mesh so dev builds
+    // interop with the App Store app (upstream put Debug builds on a separate
+    // "testnet" UUID, which made store clients invisible during development).
+    // Opt back into the isolated test mesh with -DBITCHAT_TESTNET_MESH.
+    #if BITCHAT_TESTNET_MESH
     static let serviceUUID = CBUUID(string: "F47B5E2D-4A9E-4C5A-9B3F-8E1D2C3A4B5A") // testnet
     #else
     static let serviceUUID = CBUUID(string: "F47B5E2D-4A9E-4C5A-9B3F-8E1D2C3A4B5C") // mainnet
@@ -102,6 +106,14 @@ final class BLEService: NSObject {
     // Simple announce throttling
     private var lastAnnounceSent = Date.distantPast
     private let announceMinInterval: TimeInterval = TransportConfig.bleAnnounceMinInterval
+
+    // Sonar discovery (additive, see docs/SONAR-DISCOVERY.md):
+    // injected provider for the local Sonar profile (Marmot npub + optional
+    // BIP-353 address). Set by the app layer once the Marmot identity is
+    // known; while nil, no Sonar announce (type 0x53) is sent. The closure is
+    // invoked from the message queue, so it must be thread-safe and must not
+    // touch main-actor state.
+    var sonarProfileProvider: (() -> SonarLocalProfile?)?
     
     // Application state tracking (thread-safe)
     #if os(iOS)
@@ -465,7 +477,7 @@ final class BLEService: NSObject {
     
     weak var delegate: BitchatDelegate?
     weak var peerEventsDelegate: TransportPeerEventsDelegate?
-    
+
     // MARK: Peer snapshots publisher (non-UI convenience)
     
     private let peerSnapshotSubject = PassthroughSubject<[TransportPeerSnapshot], Never>()
@@ -1573,6 +1585,52 @@ final class BLEService: NSObject {
         }
         // Ensure our own announce is included in sync state
         gossipSyncManager?.onPublicPacketSeen(signedPacket)
+
+        // Sonar discovery rides along with every bitchat announce (no-op
+        // unless the app layer injected a profile).
+        sendSonarAnnounce()
+    }
+
+    /// Broadcast the Sonar discovery announce (raw type 0x53) after a bitchat
+    /// announce. Signed with the same Ed25519 signing key as the announce, so
+    /// receivers verify it against the identity they already verified.
+    /// Stock bitchat clients ignore the unknown type by design.
+    private func sendSonarAnnounce() {
+        guard let profile = sonarProfileProvider?() else { return }
+
+        let announce = SonarAnnouncePacket(
+            npub: profile.npub,
+            bip353: profile.bip353,
+            capabilities: profile.capabilities
+        )
+        guard let payload = announce.encode() else {
+            SecureLogger.error("❌ Failed to encode Sonar announce packet", category: .session)
+            return
+        }
+
+        let packet = BitchatPacket(
+            type: SonarAnnouncePacket.packetType,
+            senderID: myPeerIDData,
+            recipientID: nil,
+            timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+            payload: payload,
+            signature: nil, // Will be set by signPacket below
+            ttl: messageTTL
+        )
+
+        guard let signedPacket = noiseService.signPacket(packet) else {
+            SecureLogger.error("❌ Failed to sign Sonar announce packet", category: .security)
+            return
+        }
+
+        // Call directly if on messageQueue, otherwise dispatch
+        if DispatchQueue.getSpecific(key: messageQueueKey) != nil {
+            broadcastPacket(signedPacket)
+        } else {
+            messageQueue.async { [weak self] in
+                self?.broadcastPacket(signedPacket)
+            }
+        }
     }
 
     // MARK: QR Verification over Noise
@@ -1724,8 +1782,6 @@ extension BLEService: CBCentralManagerDelegate {
                 withServices: [BLEService.serviceUUID],
             options: [CBCentralManagerScanOptionAllowDuplicatesKey: allowDuplicates]
         )
-        
-        // Started BLE scanning
     }
     
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String: Any], rssi RSSI: NSNumber) {
@@ -1733,7 +1789,6 @@ extension BLEService: CBCentralManagerDelegate {
         let advertisedName = advertisementData[CBAdvertisementDataLocalNameKey] as? String ?? (peripheralID.prefix(6) + "…")
         let isConnectable = (advertisementData[CBAdvertisementDataIsConnectable] as? NSNumber)?.boolValue ?? true
         let rssiValue = RSSI.intValue
-        
         // Skip if peripheral is not connectable (per advertisement data)
         guard isConnectable else { return }
 
@@ -3759,7 +3814,16 @@ extension BLEService {
             self.recentPacketTimestamps.removeAll { $0 < cutoff }
         }
 
-        
+
+        // Sonar discovery announce (raw type 0x53) — handled before the
+        // bitchat dispatch so the MessageType enum and its exhaustive
+        // switches stay untouched. Falls through to the relay logic below so
+        // Sonar nodes flood it exactly like stock bitchat nodes do for
+        // unknown types.
+        if packet.type == SonarAnnouncePacket.packetType {
+            handleSonarAnnounce(packet, from: senderID)
+        }
+
         // Process by type
         switch MessageType(rawValue: packet.type) {
         case .announce:
@@ -3787,7 +3851,9 @@ extension BLEService {
             handleLeave(packet, from: senderID)
             
         case .none:
-            SecureLogger.warning("⚠️ Unknown message type: \(packet.type)", category: .session)
+            if packet.type != SonarAnnouncePacket.packetType {
+                SecureLogger.warning("⚠️ Unknown message type: \(packet.type)", category: .session)
+            }
             break
         }
         
@@ -4012,6 +4078,52 @@ extension BLEService {
                 self?.sendAnnounce(forceSend: true)
             }
         }
+    }
+
+    /// Handle a Sonar discovery announce (raw type 0x53, see
+    /// docs/SONAR-DISCOVERY.md). The sender must already be known from a
+    /// VERIFIED bitchat announce: the packet is signed with the same Ed25519
+    /// signing key, so we verify it against the peer's stored signing key and
+    /// drop it otherwise. On success the decoded profile is published via
+    /// NotificationCenter; peer/transport state is not touched.
+    private func handleSonarAnnounce(_ packet: BitchatPacket, from peerID: PeerID) {
+        // Ignore our own announces echoed back by the mesh
+        if peerID == myPeerID { return }
+
+        // Reject stale Sonar announces (same 15-minute window as announces)
+        let maxAnnounceAgeSeconds: TimeInterval = 900
+        let nowMs = UInt64(Date().timeIntervalSince1970 * 1000)
+        let ageThresholdMs = UInt64(maxAnnounceAgeSeconds * 1000)
+        if nowMs >= ageThresholdMs, packet.timestamp < nowMs - ageThresholdMs {
+            return
+        }
+
+        // The peer must exist from a verified bitchat announce (peers[] is
+        // only populated by verified announces); else drop.
+        guard let signingKey = collectionsQueue.sync(execute: { peers[peerID]?.signingPublicKey }) else {
+            SecureLogger.debug("Ignoring Sonar announce from unknown peer \(peerID.id.prefix(8))…", category: .security)
+            return
+        }
+
+        // Same signature scheme as the bitchat announce, bound to the same identity
+        guard packet.signature != nil, noiseService.verifyPacketSignature(packet, publicKey: signingKey) else {
+            SecureLogger.warning("⚠️ Ignoring unverified Sonar announce from \(peerID.id.prefix(8))…", category: .security)
+            return
+        }
+
+        guard let announce = SonarAnnouncePacket.decode(from: packet.payload) else {
+            SecureLogger.warning("⚠️ Failed to decode Sonar announce from \(peerID.id.prefix(8))…", category: .session)
+            return
+        }
+
+        NotificationCenter.default.post(
+            name: .sonarPeerProfileUpdated,
+            object: nil,
+            userInfo: [
+                SonarDiscoveryUserInfoKey.peerID: peerID.id,
+                SonarDiscoveryUserInfoKey.profile: announce
+            ]
+        )
     }
 
     // Handle REQUEST_SYNC: decode payload and respond with missing packets via sync manager

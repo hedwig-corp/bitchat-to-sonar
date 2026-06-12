@@ -367,175 +367,175 @@
         "ar" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "bitchat"
+            "value" : "Sonar"
           }
         },
         "bn" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "bitchat"
+            "value" : "Sonar"
           }
         },
         "de" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "bitchat"
+            "value" : "Sonar"
           }
         },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "bitchat"
+            "value" : "Sonar"
           }
         },
         "es" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "bitchat"
+            "value" : "Sonar"
           }
         },
         "fil" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "bitchat"
+            "value" : "Sonar"
           }
         },
         "fr" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "bitchat"
+            "value" : "Sonar"
           }
         },
         "he" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "bitchat"
+            "value" : "Sonar"
           }
         },
         "hi" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "bitchat"
+            "value" : "Sonar"
           }
         },
         "id" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "bitchat"
+            "value" : "Sonar"
           }
         },
         "it" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "bitchat"
+            "value" : "Sonar"
           }
         },
         "ja" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "bitchat"
+            "value" : "Sonar"
           }
         },
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "bitchat"
+            "value" : "Sonar"
           }
         },
         "ms" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "bitchat"
+            "value" : "Sonar"
           }
         },
         "ne" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "bitchat"
+            "value" : "Sonar"
           }
         },
         "nl" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "bitchat"
+            "value" : "Sonar"
           }
         },
         "pl" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "bitchat"
+            "value" : "Sonar"
           }
         },
         "pt" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "bitchat"
+            "value" : "Sonar"
           }
         },
         "pt-BR" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "bitchat"
+            "value" : "Sonar"
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "bitchat"
+            "value" : "Sonar"
           }
         },
         "sv" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "bitchat"
+            "value" : "Sonar"
           }
         },
         "ta" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "bitchat"
+            "value" : "Sonar"
           }
         },
         "th" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "bitchat"
+            "value" : "Sonar"
           }
         },
         "tr" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "bitchat"
+            "value" : "Sonar"
           }
         },
         "uk" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "bitchat"
+            "value" : "Sonar"
           }
         },
         "ur" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "bitchat"
+            "value" : "Sonar"
           }
         },
         "vi" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "bitchat"
+            "value" : "Sonar"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "bitchat"
+            "value" : "Sonar"
           }
         },
         "zh-Hant" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "bitchat"
+            "value" : "Sonar"
           }
         }
       }
@@ -5755,7 +5755,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "sidegroupchat"
+            "value" : "sense who’s nearby before you see them"
           }
         },
         "es" : {
@@ -12404,7 +12404,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "bluetooth is turned off. please turn on bluetooth in settings to use bitchat."
+            "value" : "bluetooth is turned off. please turn on bluetooth in settings to use Sonar."
           }
         },
         "es" : {
@@ -12583,7 +12583,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "bitchat needs bluetooth permission to connect with nearby devices. please enable bluetooth access in settings."
+            "value" : "Sonar needs bluetooth permission to sense people nearby. please enable bluetooth access in settings."
           }
         },
         "es" : {
@@ -13120,7 +13120,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "this device does not support bluetooth. bitchat requires bluetooth to function."
+            "value" : "this device does not support bluetooth. Sonar requires bluetooth to function."
           }
         },
         "es" : {

@@ -12,7 +12,14 @@ import SwiftUI
 
 /// Manages all private chat functionality
 final class PrivateChatManager: ObservableObject {
-    @Published var privateChats: [PeerID: [BitchatMessage]] = [:]
+    /// Encrypted on-disk store backing the in-memory transcripts: hydrated on
+    /// launch, written through on every change so chats survive a restart.
+    /// Mesh DMs stay LOCAL-ONLY — this store is private to the device.
+    private let store: MessageStore
+
+    @Published var privateChats: [PeerID: [BitchatMessage]] = [:] {
+        didSet { persistChanges(old: oldValue, new: privateChats) }
+    }
     @Published var selectedPeer: PeerID? = nil
     @Published var unreadMessages: Set<PeerID> = []
 
@@ -25,12 +32,42 @@ final class PrivateChatManager: ObservableObject {
     // Peer service for looking up peer info during consolidation
     weak var unifiedPeerService: UnifiedPeerService?
 
-    init(meshService: Transport? = nil) {
+    /// Set while we are hydrating from disk on launch, so the write-through
+    /// `didSet` doesn't echo the loaded data straight back to disk.
+    private var isHydrating = false
+
+    init(meshService: Transport? = nil, store: MessageStore = .shared) {
         self.meshService = meshService
+        self.store = store
+        hydrateFromStore()
     }
 
     // Cap for messages stored per private chat
     private let privateChatCap = TransportConfig.privateChatCap
+
+    // MARK: - Persistence (write-through to MessageStore)
+
+    /// Load persisted transcripts on launch so private chats survive a restart.
+    private func hydrateFromStore() {
+        let persisted = store.loadAllPrivate()
+        guard !persisted.isEmpty else { return }
+        isHydrating = true
+        privateChats = persisted
+        isHydrating = false
+    }
+
+    /// Write through only the peers whose transcript actually changed.
+    private func persistChanges(old: [PeerID: [BitchatMessage]], new: [PeerID: [BitchatMessage]]) {
+        guard !isHydrating else { return }
+        // Peers added or modified: re-save their (deduped, capped) transcript.
+        for (peerID, messages) in new where old[peerID] != messages {
+            store.savePrivate(peerID: peerID, messages: messages)
+        }
+        // Peers removed (e.g. consolidation merged them away): drop their file.
+        for peerID in old.keys where new[peerID] == nil {
+            store.savePrivate(peerID: peerID, messages: [])
+        }
+    }
 
     // MARK: - Message Consolidation
 

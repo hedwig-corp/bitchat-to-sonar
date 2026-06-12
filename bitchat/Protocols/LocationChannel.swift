@@ -109,6 +109,16 @@ enum ChannelID: Equatable, Codable {
         }
     }
 
+    /// Stable id used as the MessageStore channel key ("mesh" / "geo:<gh>").
+    /// Matches the Sonar UI channel ids (NB: "mesh" is itself a valid geohash,
+    /// hence the "geo:" prefix).
+    var storeID: String {
+        switch self {
+        case .mesh: return "mesh"
+        case .location(let ch): return "geo:" + ch.geohash
+        }
+    }
+
     /// Nostr tag value for scoping (geohash), if applicable.
     var nostrGeohashTag: String? {
         switch self {
