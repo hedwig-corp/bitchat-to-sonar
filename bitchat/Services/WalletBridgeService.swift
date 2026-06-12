@@ -253,13 +253,16 @@ final class WalletBridgeService: ObservableObject {
     /// (if supported, else EUR). Never overrides a later user choice.
     private func applyFirstRunMoneyDefaults() {
         guard !UserDefaults.standard.bool(forKey: Self.moneyDefaultedKey) else { return }
-        UserDefaults.standard.set(true, forKey: Self.moneyDefaultedKey)
         let supported = Set(supportedCurrencies().map(\.code))
         let locale = Locale.current.currency?.identifier ?? "EUR"
         let currency = supported.contains(locale) ? locale : (supported.contains("EUR") ? "EUR" : (supported.first ?? "USD"))
         Task {
             await self.setDisplayCurrency(currency)
             await self.setDisplayMode("fiat")
+            // Mark first-run done only after both persist — if the app dies
+            // mid-Task the flag stays unset and we retry on next launch,
+            // instead of stranding the user in the SDK's bitcoin default.
+            UserDefaults.standard.set(true, forKey: Self.moneyDefaultedKey)
         }
     }
 
