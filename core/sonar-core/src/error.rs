@@ -1,0 +1,32 @@
+use nostr::PublicKey;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum Error {
+    #[error("invalid key: {0}")]
+    InvalidKey(String),
+
+    #[error("nostr key error: {0}")]
+    NostrKey(#[from] nostr::key::Error),
+
+    #[error("mdk error: {0}")]
+    Mdk(#[from] mdk_core::Error),
+
+    #[error("storage error: {0}")]
+    Storage(String),
+
+    #[error("event builder error: {0}")]
+    EventBuilder(#[from] nostr::event::builder::Error),
+
+    #[error("event error: {0}")]
+    NostrEvent(#[from] nostr::event::Error),
+
+    #[error("nip59 gift wrap error: {0}")]
+    Nip59(#[from] nostr::nips::nip59::Error),
+
+    #[error("nostr client error: {0}")]
+    NostrClient(#[from] nostr_sdk::client::Error),
+
+    #[error("no key package found on relays for {0}")]
+    KeyPackageNotFound(PublicKey),
+}

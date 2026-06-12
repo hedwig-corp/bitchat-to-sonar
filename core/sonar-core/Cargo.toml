@@ -1,0 +1,30 @@
+[package]
+name = "sonar-core"
+description = "Headless core for Sonar: Nostr identity + Marmot (MLS over Nostr) messaging"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mdk-core.workspace = true
+mdk-storage-traits.workspace = true
+mdk-memory-storage.workspace = true
+# Persistent storage: mdk-sqlite-storage wraps rusqlite with the (hardcoded)
+# `bundled-sqlcipher` feature. On Apple host→Apple target builds the libsqlite3-sys
+# build.rs compiles SQLCipher against CommonCrypto (-DSQLCIPHER_CRYPTO_CC, links
+# Security + CoreFoundation), so NO OpenSSL is needed for iOS cross-builds —
+# provided OPENSSL_DIR / OPENSSL_LIB_DIR / OPENSSL_INCLUDE_DIR are NOT set.
+mdk-sqlite-storage.workspace = true
+nostr.workspace = true
+nostr-sdk.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+tracing.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+nostr-relay-builder.workspace = true
+tracing-subscriber.workspace = true
+tempfile.workspace = true
