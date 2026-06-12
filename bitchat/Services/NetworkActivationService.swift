@@ -11,11 +11,14 @@ final class NetworkActivationService: ObservableObject {
     static let shared = NetworkActivationService()
 
     @Published private(set) var activationAllowed: Bool = false
-    @Published private(set) var userTorEnabled: Bool = true
+    // Sonar decision (2026-06-13): Tor is opt-in and OFF by default for now —
+    // public channels / Nostr go direct. The v2 key ignores any previously
+    // stored "true" from older builds where Tor defaulted on.
+    @Published private(set) var userTorEnabled: Bool = false
 
     private var cancellables = Set<AnyCancellable>()
     private var started = false
-    private let torPreferenceKey = "networkActivationService.userTorEnabled"
+    private let torPreferenceKey = "networkActivationService.userTorEnabled.v2"
     private var torAutoStartDesired: Bool = false
 
     private init() {}
@@ -27,7 +30,7 @@ final class NetworkActivationService: ObservableObject {
         if let stored = UserDefaults.standard.object(forKey: torPreferenceKey) as? Bool {
             userTorEnabled = stored
         } else {
-            userTorEnabled = true
+            userTorEnabled = false
         }
 
         // Initial compute
