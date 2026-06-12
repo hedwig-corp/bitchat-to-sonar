@@ -11,6 +11,11 @@
 //
 
 import SwiftUI
+#if os(iOS)
+import UIKit
+#else
+import AppKit
+#endif
 
 // MARK: - bcHash (FNV-1a, identical to components.jsx)
 
@@ -481,9 +486,48 @@ struct SNMsgBubble: View {
     /// Tap another participant's name/bubble to open a private DM (channels).
     var onTapAuthor: ((SNMessage) -> Void)? = nil
 
+    @Environment(\.openURL) private var openURL
+
     private var mine: Bool { m.mine }
-    /// Only other participants' bubbles in a channel context are tappable.
+    /// Only other participants' names in a channel context are tappable.
     private var tappable: Bool { onTapAuthor != nil && !mine }
+
+    private static let linkDetector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
+
+    /// Message text with detected URLs turned into tappable, underlined links.
+    private var linkified: AttributedString {
+        var result = AttributedString(m.text)
+        result.foregroundColor = bubbleText
+        let ns = m.text as NSString
+        guard ns.length > 0, let detector = Self.linkDetector else { return result }
+        let matches = detector.matches(in: m.text, options: [], range: NSRange(location: 0, length: ns.length))
+        for match in matches {
+            guard let r = Range(match.range, in: m.text),
+                  let ar = Range(r, in: result),
+                  let url = match.url else { continue }
+            result[ar].link = url
+            result[ar].underlineStyle = .single
+            if !mine { result[ar].foregroundColor = SonarTheme.accentDeep }
+        }
+        return result
+    }
+
+    /// The first URL in the message, if any (drives the "Open link" action).
+    private var firstURL: URL? {
+        let ns = m.text as NSString
+        guard ns.length > 0, let detector = Self.linkDetector else { return nil }
+        return detector.firstMatch(in: m.text, options: [], range: NSRange(location: 0, length: ns.length))?.url
+    }
+
+    static func copyToClipboard(_ text: String) {
+        #if os(iOS)
+        UIPasteboard.general.string = text
+        #else
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(text, forType: .string)
+        #endif
+    }
     private var bubbleFill: Color {
         guard mine else { return SonarTheme.bubbleOther }
         return m.via == .internet ? SonarTheme.netFill : SonarTheme.accentFill
@@ -521,10 +565,11 @@ struct SNMsgBubble: View {
                     .onTapGesture { if tappable { onTapAuthor?(m) } }
             }
             HStack(alignment: .bottom, spacing: 8) {
-                Text(verbatim: m.text)
+                Text(linkified)
                     .font(SonarTheme.uiFont(size: 16))
                     .lineSpacing(16 * 0.2)
                     .foregroundColor(bubbleText)
+                    .tint(mine ? bubbleText : SonarTheme.accentDeep)
                 HStack(spacing: 3) {
                     Text(verbatim: m.time)
                         .font(SonarTheme.uiFont(size: 10.5))
@@ -541,8 +586,20 @@ struct SNMsgBubble: View {
                     .fill(bubbleFill)
                     .shadow(color: mine ? .clear : Color(sonarHex: 0x0A232D, opacity: 0.07), radius: 0.75, y: 1)
             )
-            .contentShape(bubbleShape)
-            .onTapGesture { if tappable { onTapAuthor?(m) } }
+            .contextMenu {
+                Button {
+                    SNMsgBubble.copyToClipboard(m.text)
+                } label: {
+                    Label("Copy", systemImage: "doc.on.doc")
+                }
+                if let url = firstURL {
+                    Button {
+                        openURL(url)
+                    } label: {
+                        Label("Open link", systemImage: "safari")
+                    }
+                }
+            }
             if showState, let stateText = m.state {
                 HStack(spacing: 3) {
                     SNIcon(name: .check, size: 11, weight: 2.6)
