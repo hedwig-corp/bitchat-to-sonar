@@ -18,6 +18,8 @@ struct SonarChannelScreen: View {
     let chId: String
 
     @State private var sheet = false
+    @State private var authorSheet: SonarAppStore.SNChannelAuthor?
+    @State private var toast: String?
 
     private var ch: SNChannelItem { store.channelItem(chId) }
 
@@ -62,7 +64,16 @@ struct SonarChannelScreen: View {
                         : "Nobody has said anything yet. Say hi."
                 )
             } else {
-                SNMsgList(msgs: msgs, showAuthors: true)
+                SNMsgList(msgs: msgs, showAuthors: true, onTapAuthor: { m in
+                    guard !m.mine else { return }
+                    if let author = store.channelAuthor(forMessage: m.id) {
+                        authorSheet = author
+                    } else {
+                        // Their per-location identity has left the channel, so
+                        // we can't open a DM right now (honest "offline" signal).
+                        showToast("\(m.author ?? "Questa persona") non \u{00E8} pi\u{00F9} nel canale")
+                    }
+                })
             }
 
             SNComposer(
@@ -76,6 +87,8 @@ struct SonarChannelScreen: View {
             )
         }
         .background(SonarTheme.bg.ignoresSafeArea())
+        .overlay(alignment: .bottom) { toastView }
+        .animation(.easeOut(duration: 0.2), value: toast)
         .onAppear { store.ensureChannelSelected(chId) }
         .snSheet(isPresented: $sheet, title: "Add to your message") {
             VStack(spacing: 0) {
@@ -84,6 +97,65 @@ struct SonarChannelScreen: View {
                     store.push(.nearby)
                 }
             }
+        }
+        .snSheet(
+            isPresented: Binding(
+                get: { authorSheet != nil },
+                set: { if !$0 { authorSheet = nil } }
+            ),
+            title: authorSheet.map { "Message \($0.name)" } ?? ""
+        ) {
+            if let author = authorSheet {
+                VStack(spacing: 0) {
+                    SNActionRow(
+                        icon: .lock, label: "Open private chat",
+                        desc: "End-to-end encrypted, over the internet"
+                    ) {
+                        authorSheet = nil
+                        store.openChannelDM(author)
+                    }
+                    SNActionRow(
+                        icon: .trash, label: "Block \(author.name)",
+                        desc: "You won\u{2019}t see their messages anymore"
+                    ) {
+                        let name = author.name
+                        authorSheet = nil
+                        store.blockChannelAuthor(author)
+                        showToast("\(name) blocked")
+                    }
+                }
+            }
+        }
+    }
+
+    // sn-toast: transient bottom snackbar in the app style (auto-dismisses).
+    @ViewBuilder
+    private var toastView: some View {
+        if let toast {
+            Text(verbatim: toast)
+                .font(SonarTheme.uiFont(size: 13.5, weight: .medium))
+                .foregroundColor(SonarTheme.text)
+                .multilineTextAlignment(.center)
+                .padding(EdgeInsets(top: 11, leading: 16, bottom: 11, trailing: 16))
+                .background(
+                    RoundedRectangle(cornerRadius: 13, style: .continuous)
+                        .fill(SonarTheme.surface2)
+                        .shadow(color: Color.black.opacity(0.18), radius: 12, y: 6)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 13, style: .continuous)
+                        .strokeBorder(SonarTheme.hairline, lineWidth: 1)
+                )
+                .padding(.horizontal, 24)
+                .padding(.bottom, 88)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+        }
+    }
+
+    private func showToast(_ text: String) {
+        toast = text
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.6) {
+            if toast == text { toast = nil }
         }
     }
 }

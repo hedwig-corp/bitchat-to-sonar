@@ -478,8 +478,12 @@ struct SNMsgBubble: View {
     var cont: Bool = false
     var showState: Bool = false
     let maxBubbleWidth: CGFloat
+    /// Tap another participant's name/bubble to open a private DM (channels).
+    var onTapAuthor: ((SNMessage) -> Void)? = nil
 
     private var mine: Bool { m.mine }
+    /// Only other participants' bubbles in a channel context are tappable.
+    private var tappable: Bool { onTapAuthor != nil && !mine }
     private var bubbleFill: Color {
         guard mine else { return SonarTheme.bubbleOther }
         return m.via == .internet ? SonarTheme.netFill : SonarTheme.accentFill
@@ -513,6 +517,8 @@ struct SNMsgBubble: View {
                     .foregroundColor(SonarTheme.authorColor(author))
                     .padding(.leading, 12)
                     .padding(.bottom, 3)
+                    .contentShape(Rectangle())
+                    .onTapGesture { if tappable { onTapAuthor?(m) } }
             }
             HStack(alignment: .bottom, spacing: 8) {
                 Text(verbatim: m.text)
@@ -535,6 +541,8 @@ struct SNMsgBubble: View {
                     .fill(bubbleFill)
                     .shadow(color: mine ? .clear : Color(sonarHex: 0x0A232D, opacity: 0.07), radius: 0.75, y: 1)
             )
+            .contentShape(bubbleShape)
+            .onTapGesture { if tappable { onTapAuthor?(m) } }
             if showState, let stateText = m.state {
                 HStack(spacing: 3) {
                     SNIcon(name: .check, size: 11, weight: 2.6)
@@ -562,6 +570,8 @@ struct SNMsgList: View {
     var fiatText: (Int64) -> String? = { _ in nil }
     /// Tap-to-claim on a sealed incoming payment (uuid).
     var onClaim: ((String) -> Void)? = nil
+    /// Tap on another participant's bubble/name (geohash channels) to DM them.
+    var onTapAuthor: ((SNMessage) -> Void)? = nil
 
     var body: some View {
         GeometryReader { geo in
@@ -598,7 +608,8 @@ struct SNMsgList: View {
                                     showAuthor: showAuthors && !m.mine && !cont,
                                     cont: cont,
                                     showState: m.mine && i == msgs.count - 1,
-                                    maxBubbleWidth: geo.size.width * 0.78
+                                    maxBubbleWidth: geo.size.width * 0.78,
+                                    onTapAuthor: onTapAuthor
                                 )
                             }
                         }

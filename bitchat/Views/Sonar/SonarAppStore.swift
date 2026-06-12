@@ -675,6 +675,51 @@ final class SonarAppStore: ObservableObject {
         )
     }
 
+    // MARK: Geohash channel → private DM (tap an author in the transcript)
+
+    /// A geohash-channel participant resolved to a DM-able identity.
+    struct SNChannelAuthor: Identifiable, Equatable {
+        /// The DM route id ("nostr_<16hex>") passed to `.dm(...)`.
+        let routeId: String
+        /// The participant's full 64-char Nostr pubkey hex (needed for block).
+        let pubkeyHex: String
+        /// Display name, e.g. "alice#c3d4" (or "anon#7f21" when anonymous).
+        let name: String
+        var id: String { routeId }
+    }
+
+    /// Resolve the author of a geohash-channel message to a private-DM target.
+    /// Returns nil when the message is ours, isn't a geohash message, or the
+    /// author is no longer an active participant — in which case we can't
+    /// recover their full pubkey (their per-location identity has left the
+    /// channel), and the UI surfaces an "no longer here" toast instead.
+    func channelAuthor(forMessage messageId: String) -> SNChannelAuthor? {
+        guard let m = chatViewModel.messages.first(where: { $0.id == messageId }),
+              let spid = m.senderPeerID, spid.isGeoChat,
+              !chatViewModel.isSelfMessage(m) else { return nil }
+        // The public message carries only the short id (first 8 hex chars);
+        // recover the full pubkey from the live participant roster.
+        let short = spid.bare.lowercased()
+        guard let person = chatViewModel.visibleGeohashPeople()
+            .first(where: { $0.id.lowercased().hasPrefix(short) }) else { return nil }
+        let convKey = PeerID(nostr_: person.id)
+        return SNChannelAuthor(routeId: convKey.id, pubkeyHex: person.id.lowercased(), name: person.displayName)
+    }
+
+    /// Open a private DM with a resolved geohash participant. Registers the
+    /// recipient mapping (`startGeohashDM` — required before `sendGeohashDM`
+    /// can resolve the recipient) and navigates to the DM screen.
+    func openChannelDM(_ author: SNChannelAuthor) {
+        chatViewModel.startGeohashDM(withPubkeyHex: author.pubkeyHex)
+        push(.dm(author.routeId))
+    }
+
+    /// Block a geohash participant (persists across launches; their messages
+    /// disappear from the channel).
+    func blockChannelAuthor(_ author: SNChannelAuthor) {
+        chatViewModel.blockGeohashUser(pubkeyHexLowercased: author.pubkeyHex, displayName: author.name)
+    }
+
     // MARK: People (radar / compose)
 
     /// Real peers: connected (inner ring), mesh-relayed (middle ring) and
