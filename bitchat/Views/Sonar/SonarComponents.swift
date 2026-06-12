@@ -503,9 +503,9 @@ struct SNMsgBubble: View {
         let matches = detector.matches(in: m.text, options: [], range: NSRange(location: 0, length: ns.length))
         for match in matches {
             guard let r = Range(match.range, in: m.text),
-                  let ar = Range(r, in: result),
-                  let url = match.url else { continue }
-            result[ar].link = url
+                  let ar = Range(r, in: result) else { continue }
+            // Style only (underline + accent color); the tap is handled by the
+            // bubble's onTapGesture so opening is deterministic.
             result[ar].underlineStyle = .single
             if !mine { result[ar].foregroundColor = SonarTheme.accentDeep }
         }
@@ -586,6 +586,11 @@ struct SNMsgBubble: View {
                     .fill(bubbleFill)
                     .shadow(color: mine ? .clear : Color(sonarHex: 0x0A232D, opacity: 0.07), radius: 0.75, y: 1)
             )
+            .contentShape(bubbleShape)
+            // Tap a bubble that contains a link → open it in the browser.
+            // (Deterministic: we don't rely on SwiftUI's inline link tap, which
+            // is flaky next to the context menu.)
+            .onTapGesture { if let url = firstURL { openURL(url) } }
             .contextMenu {
                 Button {
                     SNMsgBubble.copyToClipboard(m.text)
