@@ -70,6 +70,12 @@ final class WalletBridgeService: ObservableObject {
     private var balanceTask: Task<Void, Never>?
     private var setupTask: Task<Void, Error>?
 
+    /// Supplies 64-hex (32-byte) entropy to derive the wallet deterministically
+    /// on first run, or nil when the source identity is not ready yet. When
+    /// nil-returning (or unset) and no wallet exists, setup defers. Set by the
+    /// host so the wallet is reconstructable from the chat identity (nsec).
+    var entropyProvider: (() -> String?)?
+
     /// - Parameter mainnet: pass false to point the node at testnet.
     init(mainnet: Bool = true) {
         self.wallet = SonarWallet()
@@ -116,8 +122,21 @@ final class WalletBridgeService: ObservableObject {
         do {
             try wallet.configure(apiKey: apiKey, mainnet: mainnet)
             if try await !wallet.hasWallet() {
-                // KeyManager generates + persists the mnemonic in Keychain.
-                try await wallet.createWallet()
+                if let entropyHex = entropyProvider?() {
+                    // Deterministic: wallet is reconstructable from the chat
+                    // identity (one identity = one wallet).
+                    try await wallet.createWalletFromEntropy(entropyHex: entropyHex)
+                } else if entropyProvider != nil {
+                    // Identity not ready yet — defer; setupIfNeeded retries
+                    // once the identity exists (so we never create a random,
+                    // non-derivable wallet for a derived-wallet host).
+                    state = .notConfigured
+                    throw WalletBridgeError.core("identity not ready for wallet derivation")
+                } else {
+                    // No derivation source configured: random wallet (the
+                    // standalone/back-compat path).
+                    try await wallet.createWallet()
+                }
             }
             try await wallet.startNode()
         } catch let error as SonarWallet.WalletError {

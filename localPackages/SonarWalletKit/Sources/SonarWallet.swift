@@ -105,6 +105,23 @@ public final class SonarWallet {
         }
     }
 
+    /// Create the wallet DETERMINISTICALLY from caller-supplied 32-byte
+    /// entropy (`entropyHex` = 64 hex chars) → a 24-word BIP39 mnemonic.
+    /// Lets the host derive one-wallet-per-identity (e.g. from a Nostr key).
+    /// Does NOT start the node — call `startNode()` afterward. Throws if a
+    /// wallet already exists or the entropy is malformed.
+    @discardableResult
+    public func createWalletFromEntropy(entropyHex: String) async throws -> String {
+        try ensureConfigured()
+        return try await withCheckedThrowingContinuation { continuation in
+            bridge.createWalletFromEntropy(
+                entropyHex: entropyHex,
+                onSuccess: { continuation.resume(returning: $0) },
+                onError: { continuation.resume(throwing: WalletError.core($0)) }
+            )
+        }
+    }
+
     /// The stored mnemonic, or nil when no wallet exists.
     public func loadWallet() async throws -> String? {
         try ensureConfigured()

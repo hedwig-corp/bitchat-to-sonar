@@ -142,10 +142,16 @@ struct SonarLocalProfile {
     let npub: Data
     /// Optional BIP-353 payment address ("user@domain", no leading ₿).
     let bip353: String?
+    /// Whether this device can actually RECEIVE payments (wallet configured).
+    /// We only advertise the ⚡PAY capability when true, so peers never show
+    /// "Send sats" toward someone who can't receive.
+    let paymentsEnabled: Bool
 
     var capabilities: UInt8 {
-        // This build speaks Marmot DMs and the ⚡PAY payment convention.
-        SonarCapability.marmotDM | SonarCapability.payments
+        // Always speaks Marmot DMs; ⚡PAY only when the wallet is configured.
+        var caps = SonarCapability.marmotDM
+        if paymentsEnabled { caps |= SonarCapability.payments }
+        return caps
     }
 }
 

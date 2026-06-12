@@ -130,6 +130,9 @@ final class SonarAppStore: ObservableObject {
         static let mode = "sonar.appearance.mode"
         static let marmotVerified = "sonar.verified.marmot"
         static let bip353 = "sonar.bip353"
+        /// Thread-safe flag read by the BLE announce provider to gate the
+        /// ⚡PAY capability on a configured, receive-capable wallet.
+        static let walletConfigured = "sonar.wallet.configured"
         static let legacyDemoState = "sn_proto_v1" // removed prototype persistence
     }
 
@@ -231,7 +234,14 @@ final class SonarAppStore: ObservableObject {
             .store(in: &cancellables)
         marmot.$npub
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] npub in self?.wireSonarProfileProvider(npub) }
+            .sink { [weak self] npub in
+                self?.wireSonarProfileProvider(npub)
+                // The wallet derives from the same identity (nsec); once the
+                // Marmot identity exists, (re)attempt the deferred wallet setup.
+                #if os(iOS)
+                if npub != nil { (self?.wallet as? BridgedWallet)?.retrySetup() }
+                #endif
+            }
             .store(in: &cancellables)
         // Messages typed to an out-of-range Sonar peer before their White
         // Noise group exists are queued; flush once the group appears.
@@ -245,8 +255,20 @@ final class SonarAppStore: ObservableObject {
         republish(payLedger.objectWillChange)
         wallet.statePublisher
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] state in self?.walletState = state }
+            .sink { [weak self] state in
+                self?.walletState = state
+                // Gate the advertised ⚡PAY capability on a receive-capable wallet.
+                let configured: Bool
+                if case .ready = state { configured = true } else { configured = false }
+                UserDefaults.standard.set(configured, forKey: Keys.walletConfigured)
+            }
             .store(in: &cancellables)
+        // Seed the flag from the current state so the first announce is correct.
+        if case .ready = wallet.state {
+            UserDefaults.standard.set(true, forKey: Keys.walletConfigured)
+        } else {
+            UserDefaults.standard.set(false, forKey: Keys.walletConfigured)
+        }
         chatViewModel.objectWillChange
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.processIncomingPayLines() }
@@ -429,12 +451,15 @@ final class SonarAppStore: ObservableObject {
         }
         let npubRaw = decoded.data
         let bip353Key = Keys.bip353
+        let walletConfiguredKey = Keys.walletConfigured
         ble.sonarProfileProvider = {
             let stored = UserDefaults.standard.string(forKey: bip353Key)?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             return SonarLocalProfile(
                 npub: npubRaw,
-                bip353: (stored?.isEmpty == false) ? stored : nil
+                bip353: (stored?.isEmpty == false) ? stored : nil,
+                // Advertise ⚡PAY only when our wallet can actually receive.
+                paymentsEnabled: UserDefaults.standard.bool(forKey: walletConfiguredKey)
             )
         }
     }
