@@ -59,13 +59,14 @@ struct SonarRadarScreen: View {
                 get: { store.unifyPay != nil },
                 set: { if !$0 { store.dismissUnifyPay() } }
             ),
-            title: "Send sats"
+            title: "Send money"
         ) {
             if let pay = store.unifyPay {
                 UnifyPaySheetView(
                     peerName: store.peerItem(pay.peerId).name,
                     phase: pay.phase,
                     balance: store.balanceSats ?? 0,
+                    money: { store.money($0) },
                     fiatText: { store.fiatText($0) },
                     onConfirmAmount: { dest, sats in
                         store.confirmUnifyAmount(pay.peerId, destination: dest, sats: sats)
@@ -93,7 +94,7 @@ struct SonarRadarScreen: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             if p.unify {
                 // Unify Wallet user: payments only, no DM.
-                SNSmallButton(label: "Send sats", primary: true, expand: false) {
+                SNSmallButton(label: "Send money", primary: true, expand: false) {
                     store.sendSatsToUnify(p.id)
                 }
             } else {
@@ -101,7 +102,7 @@ struct SonarRadarScreen: View {
                     openMeshDM(p.id)
                 }
                 if store.paymentCapable(p.id) {
-                    SNSmallButton(label: "Send sats", primary: true, expand: false) {
+                    SNSmallButton(label: "Send money", primary: true, expand: false) {
                         store.quickPay(p.id)
                     }
                 }

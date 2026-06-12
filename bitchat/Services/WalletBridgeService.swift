@@ -70,6 +70,16 @@ final class WalletBridgeService: ObservableObject {
     private var balanceTask: Task<Void, Never>?
     private var setupTask: Task<Void, Error>?
 
+    // MARK: - Money display
+
+    /// True only after a live-rate fetch returned the selected currency. The UI
+    /// shows fiat ONLY when this is true; otherwise sats (never a bundled rate).
+    @Published private(set) var hasLiveRate = false
+    /// Fires when display mode, currency, or rate availability changes.
+    let moneyDisplay = PassthroughSubject<Void, Never>()
+    private var ratesTask: Task<Void, Never>?
+    private static let moneyDefaultedKey = "sonar.money.defaulted"
+
     /// Supplies 64-hex (32-byte) entropy to derive the wallet deterministically
     /// on first run, or nil when the source identity is not ready yet. When
     /// nil-returning (or unset) and no wallet exists, setup defers. Set by the
@@ -144,12 +154,18 @@ final class WalletBridgeService: ObservableObject {
         }
         startObservingBalance()
         state = .ready(balanceSats: 0)
+        // Money display: apply first-run defaults (fiat + locale currency) then
+        // fetch live rates and keep them fresh while ready.
+        applyFirstRunMoneyDefaults()
+        startRefreshingRates()
     }
 
     /// Stop the Breez node (e.g. on scene teardown). Setup can run again.
     func shutdown() async {
         balanceTask?.cancel()
         balanceTask = nil
+        ratesTask?.cancel()
+        ratesTask = nil
         setupTask = nil
         try? await wallet.stopNode()
         state = .notConfigured
@@ -194,6 +210,79 @@ final class WalletBridgeService: ObservableObject {
     /// history). The stream ends when the consuming task is cancelled.
     func incomingPayments() -> AsyncStream<Payment> {
         wallet.incomingPaymentsStream()
+    }
+
+    // MARK: - Money display (forwarded to the SDK)
+
+    var displayMode: String { wallet.displayMode() }
+    var displayCurrency: String { wallet.displayCurrency() }
+
+    func supportedCurrencies() -> [SonarCurrency] {
+        wallet.supportedCurrencies().map {
+            SonarCurrency(code: $0.code, symbol: $0.symbol, decimals: $0.decimals)
+        }
+    }
+
+    func setDisplayMode(_ mode: String) async {
+        _ = await wallet.setDisplayMode(mode)
+        moneyDisplay.send()
+    }
+
+    func setDisplayCurrency(_ code: String) async {
+        _ = await wallet.setDisplayCurrency(code)
+        // A new currency needs a rate for it; refresh + recompute hasLiveRate.
+        await refreshRates()
+        moneyDisplay.send()
+    }
+
+    /// Effective money string: fiat (SDK) only when mode==fiat AND a live rate
+    /// exists; otherwise grouped sats (never the SDK's bundled fallback fiat).
+    func formatMoney(sats: Int64) -> String {
+        if displayMode == "fiat" && hasLiveRate {
+            return wallet.formatAmount(sats: sats)
+        }
+        return sonarFormatSats(sats)
+    }
+
+    /// Fiat text → sats at the live rate (callers gate on `hasLiveRate`).
+    func parseFiatInput(_ text: String) -> Int64 {
+        wallet.parseFiatInput(text, currencyCode: displayCurrency)
+    }
+
+    /// First run only: default to fiat display in the device-locale currency
+    /// (if supported, else EUR). Never overrides a later user choice.
+    private func applyFirstRunMoneyDefaults() {
+        guard !UserDefaults.standard.bool(forKey: Self.moneyDefaultedKey) else { return }
+        UserDefaults.standard.set(true, forKey: Self.moneyDefaultedKey)
+        let supported = Set(supportedCurrencies().map(\.code))
+        let locale = Locale.current.currency?.identifier ?? "EUR"
+        let currency = supported.contains(locale) ? locale : (supported.contains("EUR") ? "EUR" : (supported.first ?? "USD"))
+        Task {
+            await self.setDisplayCurrency(currency)
+            await self.setDisplayMode("fiat")
+        }
+    }
+
+    /// Fetch live rates now and recompute `hasLiveRate` for the selected
+    /// currency. Empty result (offline/error) → hasLiveRate=false → sats.
+    private func refreshRates() async {
+        let rates = await wallet.fetchExchangeRates()
+        let live = rates.contains { $0.currencyCode == displayCurrency }
+        if live != hasLiveRate { hasLiveRate = live; moneyDisplay.send() }
+    }
+
+    /// Refresh rates on ready and every few minutes while the node runs.
+    private func startRefreshingRates() {
+        ratesTask?.cancel()
+        ratesTask = Task { [weak self] in
+            while !Task.isCancelled {
+                // Stop the loop if the service is gone, so a missed shutdown()
+                // can't leave a bare 5-minute timer spinning forever.
+                guard let self else { return }
+                await self.refreshRates()
+                try? await Task.sleep(nanoseconds: 5 * 60 * 1_000_000_000)
+            }
+        }
     }
 
     // MARK: - Internals

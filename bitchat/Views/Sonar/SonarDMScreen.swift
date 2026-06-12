@@ -63,7 +63,8 @@ struct SonarDMScreen: View {
                     msgs: msgs,
                     showAuthors: false,
                     peerName: peer.name,
-                    fiatText: { store.fiatText($0) },
+                    money: { store.money($0) },
+                    fiatText: { store.moneySatsLine($0) },
                     onClaim: { payId in
                         if walletReady {
                             store.claimPay(peerId, payId: payId)
@@ -101,8 +102,8 @@ struct SonarDMScreen: View {
             VStack(spacing: 0) {
                 if store.paymentCapable(peerId) {
                     SNActionRow(
-                        icon: .coin, gold: true, label: "Send bitcoin",
-                        desc: peer.inRange ? "Travels over Bluetooth as ecash" : "Instant over Lightning"
+                        icon: .coin, gold: true, label: "Send money",
+                        desc: peer.inRange ? "Hand to hand over Bluetooth" : "Instant over the internet"
                     ) {
                         sheet = false
                         if walletReady {
@@ -121,17 +122,18 @@ struct SonarDMScreen: View {
         .snSheet(isPresented: $verifySheet, title: "Verify \(peer.name)") {
             verifyContent
         }
-        .snSheet(isPresented: $paySheet, title: "Send bitcoin · \(peer.name)") {
+        .snSheet(isPresented: $paySheet, title: "Send money · \(peer.name)") {
             SNPaySheet(
                 peerName: peer.name,
                 balance: store.balanceSats ?? 0,
                 transport: transport,
+                money: { store.money($0) },
                 fiatText: { store.fiatText($0) },
                 onClose: { paySheet = false },
                 onSend: { sats in store.sendPay(peerId, sats: sats) }
             )
         }
-        .snSheet(isPresented: $walletSheet, title: "Bitcoin wallet") {
+        .snSheet(isPresented: $walletSheet, title: "Your wallet") {
             SNWalletSetupSheetContent(
                 settingUp: store.walletState == .settingUp,
                 onClose: { walletSheet = false }

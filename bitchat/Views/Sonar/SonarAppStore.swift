@@ -263,6 +263,9 @@ final class SonarAppStore: ObservableObject {
         republish(relayManager.objectWillChange)
         // Unify nearby payments: republish discovered-peer changes into the radar.
         republish(unify.objectWillChange)
+        // Money display: re-render every amount when the mode/currency/rate
+        // changes (fiat<->bitcoin toggle, currency picker, live-rate arrival).
+        republish(wallet.moneyDisplayChanged)
 
         // Sonar discovery: collect verified peer profiles announced over the
         // mesh, and start announcing ours once the Marmot npub is known.
@@ -1067,9 +1070,41 @@ final class SonarAppStore: ObservableObject {
         return nil
     }
 
-    /// Live fiat line for an amount; nil = no live rate (line not rendered).
+    // MARK: Money display
+
+    /// The EFFECTIVE money string for an amount (fiat when the user picked fiat
+    /// AND a live rate exists, otherwise grouped sats). The single rendering
+    /// path for every amount in the UI.
+    func money(_ sats: Int64) -> String { wallet.format(sats: sats) }
+
+    /// Secondary "≈ N sats" detail, shown only when the primary line is fiat
+    /// (so the user can still see the bitcoin amount). nil otherwise.
+    func moneySatsLine(_ sats: Int64) -> String? {
+        wallet.effectiveShowsFiat ? sonarFormatSats(sats) : nil
+    }
+
+    /// Live fiat line for an amount; nil unless fiat is effectively shown.
+    /// (Kept for call sites that want an optional secondary fiat line.)
     func fiatText(_ sats: Int64) -> String? {
-        wallet.fiatText(forSats: sats)
+        wallet.effectiveShowsFiat ? wallet.format(sats: sats) : nil
+    }
+
+    var displayMode: String { wallet.displayMode }
+    var displayCurrency: String { wallet.displayCurrency }
+    var canEnterFiat: Bool { wallet.hasLiveRate }
+    func supportedCurrencies() -> [SonarCurrency] { wallet.supportedCurrencies() }
+
+    /// Symbol for the selected currency (falls back to the code).
+    var currencySymbol: String {
+        supportedCurrencies().first { $0.code == displayCurrency }?.symbol ?? displayCurrency
+    }
+
+    func setDisplayMode(_ mode: String) { Task { await wallet.setDisplayMode(mode) } }
+    func setDisplayCurrency(_ code: String) { Task { await wallet.setDisplayCurrency(code) } }
+
+    /// Typed fiat text → sats at the live rate (only call when canEnterFiat).
+    func parseFiat(_ text: String) -> Int64 {
+        wallet.parseFiatInput(text, currencyCode: displayCurrency)
     }
 
     /// ⚡PAY lines may only travel to counterparts that speak them: Marmot
@@ -1248,7 +1283,7 @@ final class SonarAppStore: ObservableObject {
         guard let unifyId = unifyPeerId(id) else { return }
         // Honest gate: a Unify peer still shows, but paying needs a wallet.
         guard case .ready = walletState else {
-            unifyPay = (id, .failed("Set up your Bitcoin wallet first to send sats."))
+            unifyPay = (id, .failed("Set up your wallet first to send money."))
             return
         }
         unifyPay = (id, .fetching)

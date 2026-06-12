@@ -28,7 +28,10 @@ func snPayFmt(_ sats: Int64) -> String {
 struct SNPayBubble: View {
     let m: SNMessage           // m.pay != nil
     let peerName: String
-    /// Live fiat line for an amount; nil = no live rate, line not rendered.
+    /// Primary money string (fiat or sats, unit included).
+    let money: (Int64) -> String
+    /// Secondary detail line (the sats amount when the primary is fiat); nil
+    /// when the primary is already sats.
     let fiatText: (Int64) -> String?
     let maxBubbleWidth: CGFloat
     let onClaim: ((String) -> Void)?
@@ -69,7 +72,7 @@ struct SNPayBubble: View {
     private var mineStateText: String {
         switch pay.state {
         case .sealed, .claiming: return "Sealed — waiting for \(peerName) to claim"
-        case .settling: return "Claim received — paying over Lightning"
+        case .settling: return "Claim received — paying over the internet"
         case .claimed: return "Claimed by \(peerName)"
         }
     }
@@ -80,16 +83,11 @@ struct SNPayBubble: View {
             coin(pulse: !m.mine && sealed)
             VStack(alignment: .leading, spacing: 1) {
                 if showAmount {
-                    HStack(alignment: .firstTextBaseline, spacing: 2) {
-                        Text(verbatim: snPayFmt(pay.sats))
-                            .font(SonarTheme.uiFont(size: 19, weight: .heavy))
-                            .kerning(-19 * 0.01)
-                        Text("sats")
-                            .font(SonarTheme.uiFont(size: 12, weight: .bold))
-                            .opacity(0.7)
-                    }
-                    if let fiat = fiatText(pay.sats) {
-                        Text(verbatim: fiat)
+                    Text(verbatim: money(pay.sats))
+                        .font(SonarTheme.uiFont(size: 19, weight: .heavy))
+                        .kerning(-19 * 0.01)
+                    if let detail = fiatText(pay.sats) {
+                        Text(verbatim: detail)
                             .font(SonarTheme.uiFont(size: 11.5, weight: .semibold))
                             .opacity(0.72)
                     }
@@ -193,6 +191,8 @@ struct SNPaySheet: View {
     let peerName: String
     let balance: Int64
     let transport: SNVia
+    /// Primary money string for the balance (fiat or sats, unit included).
+    let money: (Int64) -> String
     /// Live fiat line; nil = no live rate, the € line simply doesn't render.
     let fiatText: (Int64) -> String?
     let onClose: () -> Void
@@ -227,7 +227,7 @@ struct SNPaySheet: View {
             // .pay-balance
             HStack(spacing: 6) {
                 SNIcon(name: .coin, size: 13, weight: 2)
-                Text(verbatim: "Balance · \(snPayFmt(balance)) sats")
+                Text(verbatim: "Balance · \(money(balance))")
             }
             .font(SonarTheme.uiFont(size: 12.5))
             .foregroundColor(SonarTheme.text3)
@@ -299,14 +299,14 @@ struct SNPaySheet: View {
             // .bc-sheetactions
             VStack(spacing: 6) {
                 SNPrimaryButton(
-                    label: mesh ? "Send over Bluetooth" : "Send over Lightning",
+                    label: mesh ? "Send over Bluetooth" : "Send over the internet",
                     net: !mesh,
                     disabled: !can,
                     action: send
                 )
                 Text(verbatim: mesh
                     ? "Travels phone-to-phone as ecash — works offline. Sealed until \(peerName) claims it."
-                    : "Instant over the Lightning network. Sealed until \(peerName) claims it.")
+                    : "Instant over the internet. Sealed until \(peerName) claims it.")
                     .font(SonarTheme.uiFont(size: 12))
                     .lineSpacing(12 * 0.5)
                     .foregroundColor(SonarTheme.text3)
@@ -336,7 +336,7 @@ struct SNWalletSetupSheetContent: View {
                 .padding(.top, 8)
             Text(settingUp
                 ? "Your wallet is being set up. Sats you receive will land here, and payments you send will settle from it — try again in a moment."
-                : "Payments in Sonar need a Lightning wallet on this phone. Yours isn\u{2019}t set up yet — once it is, sats you receive land here and payments you send settle from it.")
+                : "Payments in Sonar need a wallet on this phone. Yours isn\u{2019}t set up yet — once it is, money you receive lands here and payments you send come from it.")
                 .font(SonarTheme.uiFont(size: 13.5))
                 .lineSpacing(13.5 * 0.3)
                 .foregroundColor(SonarTheme.text2)
@@ -360,6 +360,8 @@ struct UnifyPaySheetView: View {
     let peerName: String
     let phase: SonarAppStore.UnifyPayPhase
     let balance: Int64
+    /// Primary money string for the balance (fiat or sats, unit included).
+    let money: (Int64) -> String
     let fiatText: (Int64) -> String?
     let onConfirmAmount: (_ destination: String, _ sats: Int64) -> Void
     let onClose: () -> Void
@@ -369,24 +371,25 @@ struct UnifyPaySheetView: View {
         case .fetching:
             status(icon: .bolt, tint: SonarTheme.goldDeep,
                    title: "Reading \(peerName)\u{2019}s payment\u{2026}",
-                   desc: "Connecting over Bluetooth to fetch their Lightning request.",
+                   desc: "Connecting over Bluetooth to fetch their payment request.",
                    busy: true)
         case .amount(let destination):
             UnifyAmountKeypad(
                 peerName: peerName,
                 balance: balance,
+                money: money,
                 fiatText: fiatText,
                 onSend: { sats in onConfirmAmount(destination, sats) }
             )
         case .paying(_, let sats):
             status(icon: .bolt, tint: SonarTheme.goldDeep,
-                   title: "Sending \(snPayFmt(sats)) sats\u{2026}",
-                   desc: "Paying \(peerName) over the Lightning network.",
+                   title: "Sending \(money(sats))\u{2026}",
+                   desc: "Paying \(peerName) over the internet.",
                    busy: true)
         case .sent(let sats):
             status(icon: .check, tint: SonarTheme.green,
-                   title: "Sent \(snPayFmt(sats)) sats",
-                   desc: "\(peerName) has been paid over Lightning.",
+                   title: "Sent \(money(sats))",
+                   desc: "\(peerName) has been paid over the internet.",
                    busy: false, done: true)
         case .failed(let message):
             status(icon: .x, tint: SonarTheme.danger,
@@ -433,6 +436,7 @@ struct UnifyPaySheetView: View {
 private struct UnifyAmountKeypad: View {
     let peerName: String
     let balance: Int64
+    let money: (Int64) -> String
     let fiatText: (Int64) -> String?
     let onSend: (Int64) -> Void
 
@@ -456,7 +460,7 @@ private struct UnifyAmountKeypad: View {
         VStack(spacing: 0) {
             HStack(spacing: 6) {
                 SNIcon(name: .coin, size: 13, weight: 2)
-                Text(verbatim: "Balance \u{00B7} \(snPayFmt(balance)) sats")
+                Text(verbatim: "Balance \u{00B7} \(money(balance))")
             }
             .font(SonarTheme.uiFont(size: 12.5))
             .foregroundColor(SonarTheme.text3)
@@ -517,11 +521,11 @@ private struct UnifyAmountKeypad: View {
             .padding(EdgeInsets(top: 8, leading: 18, bottom: 2, trailing: 18))
 
             VStack(spacing: 6) {
-                SNPrimaryButton(label: "Send over Lightning", net: true, disabled: !can) {
+                SNPrimaryButton(label: "Send over the internet", net: true, disabled: !can) {
                     guard can else { return }
                     onSend(sats)
                 }
-                Text(verbatim: "Instant over the Lightning network, straight to \(peerName)\u{2019}s wallet.")
+                Text(verbatim: "Instant over the internet, straight to \(peerName)\u{2019}s wallet.")
                     .font(SonarTheme.uiFont(size: 12))
                     .lineSpacing(12 * 0.5)
                     .foregroundColor(SonarTheme.text3)

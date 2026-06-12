@@ -20,6 +20,7 @@ struct SonarSettingsScreen: View {
     @State private var connSheet = false
     @State private var wipeAsk = false
     @State private var walletSheet = false
+    @State private var currencySheet = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -56,14 +57,30 @@ struct SonarSettingsScreen: View {
                     SNSectionLabel("Wallet")
                     SNSettingsCard {
                         SNSettingsRow(
-                            icon: .coin, tone: .gold, label: "Bitcoin",
-                            sub: "Pays like you message — Bluetooth or Lightning",
+                            icon: .coin, tone: .gold, label: "Balance",
+                            sub: "Pays like you message — tap to pay nearby or over the internet",
                             value: walletValue,
-                            divider: false
+                            divider: true
                         ) {
                             // Real balance is just informational; anything
                             // less than ready explains the setup state.
                             if store.balanceSats == nil { walletSheet = true }
+                        }
+                        // Show balance in fiat (default) or bitcoin (sats).
+                        SNSettingsRow(
+                            icon: .coin, tone: .gold, label: "Show balance in",
+                            value: store.displayMode == "fiat" ? "Money" : "Bitcoin",
+                            divider: true
+                        ) {
+                            store.setDisplayMode(store.displayMode == "fiat" ? "bitcoin" : "fiat")
+                        }
+                        // Currency for the fiat display.
+                        SNSettingsRow(
+                            icon: .coin, tone: .gold, label: "Currency",
+                            value: store.displayCurrency,
+                            divider: false
+                        ) {
+                            currencySheet = true
                         }
                     }
 
@@ -108,18 +125,30 @@ struct SonarSettingsScreen: View {
                 onClose: { wipeAsk = false }
             )
         }
-        .snSheet(isPresented: $walletSheet, title: "Bitcoin wallet") {
+        .snSheet(isPresented: $walletSheet, title: "Your wallet") {
             SNWalletSetupSheetContent(
                 settingUp: store.walletState == .settingUp,
                 onClose: { walletSheet = false }
             )
         }
+        .snSheet(isPresented: $currencySheet, title: "Currency") {
+            SNCurrencyPickerContent(
+                currencies: store.supportedCurrencies(),
+                selected: store.displayCurrency,
+                onPick: { code in
+                    store.setDisplayCurrency(code)
+                    currencySheet = false
+                },
+                onClose: { currencySheet = false }
+            )
+        }
     }
 
-    /// Real balance when the wallet is ready; honest affordance otherwise.
+    /// Real balance when the wallet is ready, in the chosen display unit;
+    /// honest affordance otherwise.
     private var walletValue: String {
         switch store.walletState {
-        case .ready(let balance): return snPayFmt(balance) + " sats"
+        case .ready(let balance): return store.money(balance)
         case .settingUp: return "Setting up\u{2026}"
         case .notConfigured: return "Set up"
         }

@@ -169,7 +169,7 @@ struct SonarProfileScreen: View {
                         }
                         .padding(EdgeInsets(top: 12, leading: 14, bottom: 12, trailing: 14))
                     }
-                    Text("People nearby can send you bitcoin at this address. It's shared with your Sonar announce — leave it empty to share nothing.")
+                    Text("People nearby can send you money at this address. It's shared with your Sonar announce — leave it empty to share nothing.")
                         .font(SonarTheme.uiFont(size: 12))
                         .lineSpacing(12 * 0.3)
                         .foregroundColor(SonarTheme.text3)

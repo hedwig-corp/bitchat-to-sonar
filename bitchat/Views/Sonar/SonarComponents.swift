@@ -556,7 +556,9 @@ struct SNMsgList: View {
     let showAuthors: Bool
     /// Counterpart name, used by pay bubbles ("Payment from X", "Claimed by X").
     var peerName: String = ""
-    /// Live fiat line for pay bubbles; nil result = line not rendered.
+    /// Primary money string for pay bubbles (fiat or sats, unit included).
+    var money: (Int64) -> String = { sonarFormatSats($0) }
+    /// Secondary detail line for pay bubbles; nil result = line not rendered.
     var fiatText: (Int64) -> String? = { _ in nil }
     /// Tap-to-claim on a sealed incoming payment (uuid).
     var onClaim: ((String) -> Void)? = nil
@@ -575,6 +577,7 @@ struct SNMsgList: View {
                                 SNPayBubble(
                                     m: m,
                                     peerName: peerName,
+                                    money: money,
                                     fiatText: fiatText,
                                     maxBubbleWidth: geo.size.width * 0.78,
                                     onClaim: onClaim
@@ -1083,6 +1086,43 @@ struct SNEmptyState: View {
 }
 
 // MARK: - Wipe confirmation sheet content (shared by Home + Settings)
+
+/// Currency picker for the money-display setting. Lists the supported fiat
+/// currencies; tap to select (persisted by the SDK).
+struct SNCurrencyPickerContent: View {
+    let currencies: [SonarCurrency]
+    let selected: String
+    let onPick: (String) -> Void
+    let onClose: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if currencies.isEmpty {
+                Text("Set up your wallet to choose a currency.")
+                    .font(SonarTheme.uiFont(size: 13.5))
+                    .foregroundColor(SonarTheme.text2)
+                    .multilineTextAlignment(.center)
+                    .padding(14)
+            } else {
+                SNSettingsCard {
+                    ForEach(Array(currencies.enumerated()), id: \.element.id) { idx, c in
+                        SNSettingsRow(
+                            icon: .coin, tone: .gold,
+                            label: "\(c.code) \u{00B7} \(c.symbol)",
+                            value: c.code == selected ? "Selected" : nil,
+                            trail: c.code == selected ? .none : .chevron,
+                            divider: idx < currencies.count - 1
+                        ) {
+                            onPick(c.code)
+                        }
+                    }
+                }
+            }
+            SNGhostButton(label: "Done", action: onClose)
+                .padding(EdgeInsets(top: 6, leading: 8, bottom: 0, trailing: 8))
+        }
+    }
+}
 
 struct SNWipeSheetContent: View {
     let onWipe: () -> Void

@@ -86,6 +86,9 @@ final class BridgedWallet: SonarWalletProviding {
         // With no BREEZ_API_KEY this settles to .notConfigured immediately.
         let bridge = self.bridge
         Task { try? await bridge.setupIfNeeded() }
+        // NOTE: incoming-payment observation must NOT be started here — calling
+        // it before the wallet is configured crashes the Kotlin side. The
+        // receive flow (subscribe after .ready) is tracked in issue #3.
     }
 
     /// Re-attempt setup once the chat identity exists (the entropy provider
@@ -119,9 +122,30 @@ final class BridgedWallet: SonarWalletProviding {
         try await bridge.createOffer()
     }
 
-    /// Live rates land with the exchange-rate wiring (Breez fetchFiatRates);
-    /// until then the fiat line is honestly omitted.
-    func fiatText(forSats sats: Int64) -> String? { nil }
+    // MARK: Money display — forwarded to the SDK via WalletBridgeService
+
+    var displayMode: String { bridge.displayMode }
+    func setDisplayMode(_ mode: String) async { await bridge.setDisplayMode(mode) }
+
+    var displayCurrency: String { bridge.displayCurrency }
+    func setDisplayCurrency(_ code: String) async { await bridge.setDisplayCurrency(code) }
+
+    func supportedCurrencies() -> [SonarCurrency] { bridge.supportedCurrencies() }
+
+    var hasLiveRate: Bool { bridge.hasLiveRate }
+
+    func format(sats: Int64) -> String { bridge.formatMoney(sats: sats) }
+
+    func parseFiatInput(_ text: String, currencyCode: String) -> Int64 {
+        bridge.parseFiatInput(text)
+    }
+
+    var moneyDisplayChanged: AnyPublisher<Void, Never> {
+        // Re-render amounts when the persisted mode/currency or rate changes.
+        bridge.moneyDisplay
+            .merge(with: bridge.$hasLiveRate.map { _ in () })
+            .eraseToAnyPublisher()
+    }
 
     /// Emergency wipe: forget the wallet seed along with everything else.
     /// (The keychain service is owned by SonarWalletKit's storage.) The seed
