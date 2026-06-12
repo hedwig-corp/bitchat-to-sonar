@@ -93,6 +93,10 @@ struct SNPeerItem: Identifiable {
     /// A Unify Wallet user discovered over Bluetooth (payments-only, no chat).
     /// `id` is the Unify peripheral identifier; tapping offers only "Send sats".
     var unify: Bool = false
+    /// Deterministic avatar seed: nil = seed by name. Set to a stable per-peer
+    /// id (the Unify peripheral id) so two Unify peers that share a display
+    /// name (both "Unify user") still get distinct hue + identicon.
+    var avatarSeed: String? = nil
 }
 
 /// A peer's Sonar discovery profile (verified announce, type 0x53):
@@ -150,6 +154,14 @@ final class SonarAppStore: ObservableObject {
     /// Ad-hoc Bluetooth discovery of Unify Wallet users (payments-only). Owns
     /// its own CBCentralManager, separate from the mesh BLEService.
     let unify: UnifyNearbyService
+    /// The mirror RECEIVER role: advertises Sonar as a Unify payment receiver
+    /// (so a Unify user can pay us). Owns its own CBPeripheralManager, separate
+    /// from the mesh BLEService and from `unify`'s central. Advertises only
+    /// while the wallet is ready AND the app is foreground.
+    let unifyReceiver: UnifyReceiverService
+    /// Whether the app is in the foreground (set by BitchatApp scenePhase).
+    /// Receiver advertising is gated on this AND a ready wallet.
+    private var isForeground = true
     /// Lightning wallet behind the payments UI; UnconfiguredWallet until the
     /// real bridge (Services/WalletBridgeService) is injected.
     let wallet: SonarWalletProviding
@@ -212,7 +224,8 @@ final class SonarAppStore: ObservableObject {
         idBridge: NostrIdentityBridge,
         wallet: SonarWalletProviding = UnconfiguredWallet(),
         payLedger: SonarPayLedger = SonarPayLedger(),
-        unify: UnifyNearbyService = UnifyNearbyService()
+        unify: UnifyNearbyService = UnifyNearbyService(),
+        unifyReceiver: UnifyReceiverService = UnifyReceiverService()
     ) {
         self.chatViewModel = chatViewModel
         self.marmot = marmot
@@ -221,7 +234,19 @@ final class SonarAppStore: ObservableObject {
         self.wallet = wallet
         self.payLedger = payLedger
         self.unify = unify
+        self.unifyReceiver = unifyReceiver
         walletState = wallet.state
+
+        // Unify receiver (mirror role): serve an AMOUNTLESS BOLT12 offer behind
+        // the user's nickname so a Unify user can pay us. The offer is fetched
+        // lazily when advertising starts; the wallet façade is the only source.
+        let walletRef = wallet
+        unifyReceiver.offerProvider = { try? await walletRef.createOffer() }
+        let chatRef = chatViewModel
+        unifyReceiver.nameProvider = { [weak chatRef] in
+            let nick = chatRef?.nickname.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return nick.isEmpty ? nil : nick
+        }
         onboarded = UserDefaults.standard.bool(forKey: Keys.onboarded)
         mode = UserDefaults.standard.string(forKey: Keys.mode) ?? "dark"
         marmotVerified = (UserDefaults.standard.dictionary(forKey: Keys.marmotVerified) as? [String: Bool]) ?? [:]
@@ -269,11 +294,14 @@ final class SonarAppStore: ObservableObject {
         wallet.statePublisher
             .receive(on: DispatchQueue.main)
             .sink { [weak self] state in
-                self?.walletState = state
+                guard let self else { return }
+                self.walletState = state
                 // Gate the advertised ⚡PAY capability on a receive-capable wallet.
                 let configured: Bool
                 if case .ready = state { configured = true } else { configured = false }
                 UserDefaults.standard.set(configured, forKey: Keys.walletConfigured)
+                // Start/stop the Unify receiver as the wallet becomes (un)ready.
+                self.updateReceiverAdvertising()
             }
             .store(in: &cancellables)
         // Seed the flag from the current state so the first announce is correct.
@@ -282,6 +310,8 @@ final class SonarAppStore: ObservableObject {
         } else {
             UserDefaults.standard.set(false, forKey: Keys.walletConfigured)
         }
+        // Seed receiver advertising from the current state (foreground at launch).
+        updateReceiverAdvertising()
         chatViewModel.objectWillChange
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.processIncomingPayLines() }
@@ -353,6 +383,30 @@ final class SonarAppStore: ObservableObject {
     /// actually looking for someone nearby to pay.
     func nearbyAppeared() { unify.start() }
     func nearbyDisappeared() { unify.stop() }
+
+    // MARK: Unify receiver (mirror role: a Unify user can pay us)
+
+    /// Foreground/background transitions from BitchatApp's scenePhase. iOS
+    /// strips the BLE local name and restricts service-UUID advertising in the
+    /// background, so we advertise the receiver only while foreground.
+    func setForeground(_ foreground: Bool) {
+        guard isForeground != foreground else { return }
+        isForeground = foreground
+        updateReceiverAdvertising()
+    }
+
+    /// Start advertising as a Unify receiver iff the wallet is ready AND the
+    /// app is foreground; stop otherwise. Idempotent — the receiver itself
+    /// coalesces repeat starts and only advertises once an offer is fetched.
+    private func updateReceiverAdvertising() {
+        let ready: Bool
+        if case .ready = walletState { ready = true } else { ready = false }
+        if ready && isForeground {
+            unifyReceiver.start()
+        } else {
+            unifyReceiver.stop()
+        }
+    }
 
     /// Marmot (White Noise) npub once the secure-chat service connected.
     var npub: String? { marmot.npub }
@@ -664,7 +718,10 @@ final class SonarAppStore: ObservableObject {
             items.append(SNPeerItem(
                 id: id, name: peer.name, inRange: true, bars: unifyBars(peer.rssi),
                 hint: "Unify", detail: "Unify \u{00B7} pay only",
-                angle: angle, r: 150 + jitter, unify: true
+                angle: angle, r: 150 + jitter, unify: true,
+                // Seed the avatar by the stable peripheral id so two Unify users
+                // are visually distinct even with the same "Unify user" name.
+                avatarSeed: peer.id
             ))
         }
         return items
@@ -697,7 +754,7 @@ final class SonarAppStore: ObservableObject {
             return SNPeerItem(
                 id: id, name: name, inRange: true, bars: 1,
                 hint: "Unify", detail: "Unify \u{00B7} pay only",
-                angle: 0, r: 0, unify: true
+                angle: 0, r: 0, unify: true, avatarSeed: unifyId
             )
         }
         let peerID = PeerID(str: id)
@@ -1362,6 +1419,9 @@ final class SonarAppStore: ObservableObject {
         // Stop scanning for Unify peers and clear the discovered list (no
         // secrets are stored, but the list must not survive a panic wipe).
         unify.stop()
+        // Stop advertising as a Unify receiver (the served offer is derived
+        // from the wallet seed being wiped below).
+        unifyReceiver.stop()
         pendingMarmotSends = [:]
         // Forget every ⚡PAY coin and the Lightning wallet seed (separate
         // keychain service owned by SonarWalletKit).

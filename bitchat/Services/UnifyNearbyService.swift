@@ -62,11 +62,49 @@ enum UnifyNearbyContract {
     /// SIG-reserved "no registered company" id; an Android Unify receiver puts
     /// its display name in manufacturer-specific data under this id.
     static let nameManufacturerID = 0xFFFF
+    /// Max UTF-8 byte length of an advertised display name (Unify
+    /// MAX_ADVERTISED_NAME_BYTES). Names are truncated on a codepoint boundary
+    /// so a multi-byte character is never split.
+    static let maxAdvertisedNameBytes = 20
 
     #if canImport(CoreBluetooth)
     static let serviceUUID = CBUUID(string: serviceUUIDString)
     static let payloadCharacteristicUUID = CBUUID(string: payloadCharacteristicUUIDString)
     #endif
+
+    /// Normalize a user-entered display name for advertising, mirroring Unify's
+    /// `NearbyPaymentContract.sanitizeAdvertisedName`: replace control characters
+    /// with spaces, collapse whitespace runs, trim, and truncate to
+    /// `maxAdvertisedNameBytes` UTF-8 bytes on a codepoint boundary.
+    ///
+    /// - Returns: the cleaned name, or `nil` if blank after cleaning (signals
+    ///   "advertise no custom name / fall back to the default").
+    static func sanitizeAdvertisedName(_ name: String?) -> String? {
+        guard let name else { return nil }
+        // Replace control characters (Unicode category Cc: C0 0x00–0x1F and
+        // C1 0x7F–0x9F, matching Kotlin's Char.isISOControl) with a space.
+        let scalars = name.unicodeScalars.map { scalar -> Unicode.Scalar in
+            scalar.properties.generalCategory == .control ? " " : scalar
+        }
+        let replaced = String(String.UnicodeScalarView(scalars))
+        // Collapse runs of whitespace to a single space, then trim.
+        let collapsed = replaced.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        let cleaned = collapsed.trimmingCharacters(in: .whitespacesAndNewlines)
+        if cleaned.isEmpty { return nil }
+        return truncateToUTF8Bytes(cleaned, maxBytes: maxAdvertisedNameBytes)
+    }
+
+    /// Truncate `value` to at most `maxBytes` UTF-8 bytes without splitting a
+    /// multi-byte codepoint (back off any trailing continuation byte).
+    static func truncateToUTF8Bytes(_ value: String, maxBytes: Int) -> String {
+        let bytes = Array(value.utf8)
+        if bytes.count <= maxBytes { return value }
+        var end = maxBytes
+        // 0b10xxxxxx is a UTF-8 continuation byte; back off until we land on a
+        // lead byte (or the start) so we cut on a codepoint boundary.
+        while end > 0 && (bytes[end] & 0xC0) == 0x80 { end -= 1 }
+        return String(decoding: bytes[0..<end], as: UTF8.self)
+    }
 }
 
 // MARK: - Framing (mirror of NearbyPaymentFraming.kt — pure, unit-tested)
@@ -518,7 +556,7 @@ extension UnifyNearbyService: CBCentralManagerDelegate {
         rssi RSSI: NSNumber
     ) {
         let id = peripheral.identifier.uuidString
-        let name = Self.advertisedName(advertisementData, peripheral: peripheral)
+        let name = Self.advertisedName(advertisementData)
         let rssi = RSSI.intValue
         Task { @MainActor in
             self.recordDiscovery(id: id, name: name, rssi: rssi, peripheral: peripheral)
@@ -559,29 +597,32 @@ extension UnifyNearbyService: CBCentralManagerDelegate {
     /// manufacturer-specific data under company id 0xFFFF; iOS receivers carry
     /// it in the BLE local name. We read manufacturer data first, then local
     /// name, then fall back to the default prefix.
-    nonisolated private static func advertisedName(_ adv: [String: Any], peripheral: CBPeripheral) -> String {
+    nonisolated static func advertisedName(_ adv: [String: Any]) -> String {
+        // Prefer the iOS receiver's local name, then the Android manufacturer
+        // 0xFFFF name, then the default. (Both go through the contract's
+        // sanitize/trim + 20-byte cap so they look identical to the receiver's
+        // own advertised value.)
+        if let local = adv[CBAdvertisementDataLocalNameKey] as? String,
+           let clean = UnifyNearbyContract.sanitizeAdvertisedName(local) {
+            return clean
+        }
         if let mfg = adv[CBAdvertisementDataManufacturerDataKey] as? Data,
            let name = nameFromManufacturerData(mfg) {
             return name
-        }
-        if let local = (adv[CBAdvertisementDataLocalNameKey] as? String)?
-            .trimmingCharacters(in: .whitespacesAndNewlines), !local.isEmpty {
-            return local
         }
         return UnifyNearbyContract.advertisedNamePrefix
     }
 
     /// Manufacturer data layout: 2-byte little-endian company id followed by
     /// the UTF-8 name bytes (Unify uses 0xFFFF + the sanitized name). Returns
-    /// `nil` if the company id doesn't match or the name is empty.
-    nonisolated private static func nameFromManufacturerData(_ data: Data) -> String? {
+    /// `nil` if the company id doesn't match or the name is empty after the
+    /// same sanitize/trim + 20-byte cap the receiver applies.
+    nonisolated static func nameFromManufacturerData(_ data: Data) -> String? {
         guard data.count > 2 else { return nil }
         let company = Int(data[data.startIndex]) | (Int(data[data.startIndex + 1]) << 8)
         guard company == UnifyNearbyContract.nameManufacturerID else { return nil }
         let nameBytes = data.subdata(in: (data.startIndex + 2)..<data.endIndex)
-        let name = String(decoding: nameBytes, as: UTF8.self)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return name.isEmpty ? nil : name
+        return UnifyNearbyContract.sanitizeAdvertisedName(String(decoding: nameBytes, as: UTF8.self))
     }
 }
 

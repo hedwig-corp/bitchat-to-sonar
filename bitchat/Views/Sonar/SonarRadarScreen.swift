@@ -80,7 +80,7 @@ struct SonarRadarScreen: View {
     // counterparts that speak ⚡PAY (Sonar payments capability).
     private func peerCard(_ p: SNPeerItem) -> some View {
         HStack(spacing: 12) {
-            SonarAvatar(name: p.name, size: 44, presence: p.inRange)
+            SonarAvatar(name: p.name, size: 44, presence: p.inRange, seed: p.avatarSeed)
             VStack(alignment: .leading, spacing: 1) {
                 Text(verbatim: p.name)
                     .font(SonarTheme.uiFont(size: 15.5, weight: .bold))
@@ -223,7 +223,7 @@ struct SonarRadarScreen: View {
                                 verified: p.unify ? false : store.isVerified(p.id),
                                 divider: i < inRange.count - 1,
                                 action: { p.unify ? store.sendSatsToUnify(p.id) : openMeshDM(p.id) },
-                                avatar: { sonarBadged(p) { SonarAvatar(name: p.name, size: 44, presence: true) } },
+                                avatar: { sonarBadged(p) { SonarAvatar(name: p.name, size: 44, presence: true, seed: p.avatarSeed) } },
                                 sub: {
                                     HStack(spacing: 6) {
                                         SNBars(n: p.bars)
@@ -245,7 +245,7 @@ struct SonarRadarScreen: View {
                                 title: p.name,
                                 divider: i < far.count - 1,
                                 action: { openMeshDM(p.id) },
-                                avatar: { sonarBadged(p) { SonarAvatar(name: p.name, size: 44) } },
+                                avatar: { sonarBadged(p) { SonarAvatar(name: p.name, size: 44, seed: p.avatarSeed) } },
                                 sub: {
                                     HStack(spacing: 6) {
                                         SNIcon(name: .globe, size: 12, weight: 2.2)
@@ -383,7 +383,7 @@ private struct SNRadarField: View {
                 Button(action: { onTapPeer(p) }) {
                     radarNodeLabel(label: p.name) {
                         ZStack(alignment: .bottomTrailing) {
-                            SonarAvatar(name: p.name, size: 44, presence: true)
+                            SonarAvatar(name: p.name, size: 44, presence: true, seed: p.avatarSeed)
                             if p.unify {
                                 Circle()
                                     .fill(SonarTheme.goldFill)
@@ -411,7 +411,7 @@ private struct SNRadarField: View {
                 Button(action: { onTapPeer(p) }) {
                     radarNodeLabel(label: p.name) {
                         ZStack(alignment: .bottomTrailing) {
-                            SonarAvatar(name: p.name, size: 34)
+                            SonarAvatar(name: p.name, size: 34, seed: p.avatarSeed)
                             Circle()
                                 .fill(SonarTheme.net)
                                 .frame(width: 16, height: 16)

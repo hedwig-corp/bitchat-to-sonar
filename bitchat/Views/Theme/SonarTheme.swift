@@ -204,6 +204,10 @@ struct SonarAvatar: View {
     let name: String
     var size: CGFloat = 44
     var presence: Bool = false
+    /// Optional deterministic seed for the hue + identicon grid. Defaults to
+    /// `name`; pass a stable per-peer id (e.g. a Unify peripheral id) so two
+    /// peers that share a display name (both "Sonar user") still look distinct.
+    var seed: String? = nil
 
     private static func hash(_ s: String) -> UInt32 {
         var h: UInt32 = 2166136261
@@ -215,7 +219,8 @@ struct SonarAvatar: View {
     }
 
     var body: some View {
-        let h = Self.hash(name.isEmpty ? "?" : name)
+        let key = seed ?? name
+        let h = Self.hash(key.isEmpty ? "?" : key)
         let hue = Double(h % 360)
         ZStack(alignment: .bottomTrailing) {
             Canvas { context, canvasSize in

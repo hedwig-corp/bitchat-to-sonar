@@ -73,6 +73,10 @@ struct BitchatApp: App {
                     switch newPhase {
                     case .background:
                         // Keep BLE mesh running in background; BLEService adapts scanning automatically
+                        // Stop advertising as a Unify receiver: iOS strips the BLE
+                        // local name and restricts service-UUID advertising in the
+                        // background, so receiving payments is foreground-only.
+                        sonarStore.setForeground(false)
                         // Always send Tor to dormant on background for a clean restart later.
                         TorManager.shared.setAppForeground(false)
                         TorManager.shared.goDormantOnBackground()
@@ -86,6 +90,9 @@ struct BitchatApp: App {
                     case .active:
                         // Restart services when becoming active
                         chatViewModel.meshService.startServices()
+                        // Resume Unify receiver advertising (gated internally on a
+                        // ready wallet) now that we're foreground again.
+                        sonarStore.setForeground(true)
                         TorManager.shared.setAppForeground(true)
                         // On initial cold launch, Tor was just started in onAppear.
                         // Skip the deterministic restart the first time we become active.
