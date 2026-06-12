@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sonar — sense who's nearby</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700;800&amp;family=IBM+Plex+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #060809;
+    --panel: #0C1013;
+    --card: #12171B;
+    --text: #EFF3F4;
+    --text2: #9AA6AB;
+    --text3: #65717A;
+    --hairline: rgba(255, 255, 255, 0.08);
+    --cyan: #22D3EE;
+    --cyan-deep: #67E2F4;
+    --cyan-fill: #1FC0DE;
+    --on-cyan: #04222B;
+    --cyan-soft: rgba(34, 211, 238, 0.12);
+    --indigo: #7B79F7;
+    --indigo-fill: #5E5CE6;
+    --indigo-soft: rgba(123, 121, 247, 0.14);
+    --green: #41BC76;
+    --mono: 'IBM Plex Mono', ui-monospace, monospace;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Figtree', system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    line-height: 1.5;
+  }
+  .wrap { max-width: 1060px; margin: 0 auto; padding: 0 28px; }
+
+  /* nav */
+  nav { position: sticky; top: 0; z-index: 20; background: rgba(6, 8, 9, 0.8); backdrop-filter: blur(12px); border-bottom: 1px solid var(--hairline); }
+  .navin { display: flex; align-items: center; justify-content: space-between; padding: 16px 28px; max-width: 1060px; margin: 0 auto; }
+  .wordmark { display: flex; align-items: center; gap: 9px; font-size: 20px; font-weight: 800; letter-spacing: -0.02em; color: var(--text); text-decoration: none; }
+  .wordmark svg { color: var(--cyan); }
+  .navlinks { display: flex; align-items: center; gap: 10px; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 11px 20px; border-radius: 999px; border: none;
+    font-family: inherit; font-size: 15px; font-weight: 700;
+    text-decoration: none; cursor: pointer; transition: transform 0.12s, background 0.15s;
+  }
+  .btn:active { transform: scale(0.97); }
+  .btn.primary { background: var(--cyan-fill); color: var(--on-cyan); }
+  .btn.primary:hover { background: var(--cyan); }
+  .btn.ghost { background: transparent; color: var(--text2); box-shadow: inset 0 0 0 1px var(--hairline); }
+  .btn.ghost:hover { color: var(--text); }
+  .btn.small { padding: 9px 16px; font-size: 13.5px; }
+
+  /* hero */
+  .hero { display: grid; grid-template-columns: 1.05fr 0.95fr; gap: 48px; align-items: center; padding: 84px 0 72px; }
+  .kicker {
+    display: inline-flex; align-items: center; gap: 8px;
+    font-size: 13px; font-weight: 700; color: var(--cyan-deep);
+    background: var(--cyan-soft); border-radius: 999px; padding: 6px 13px;
+    margin-bottom: 22px;
+  }
+  .kicker .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); }
+  h1 {
+    font-size: clamp(40px, 5.4vw, 62px);
+    font-weight: 800; letter-spacing: -0.03em; line-height: 1.04;
+    margin: 0 0 20px;
+  }
+  h1 em { font-style: normal; color: var(--cyan); }
+  .sub { font-size: 18.5px; color: var(--text2); max-width: 46ch; margin: 0 0 30px; text-wrap: pretty; }
+  .ctas { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+  .heronote { margin-top: 18px; font-size: 13px; color: var(--text3); }
+  .heronote code { font-family: var(--mono); font-size: 12px; }
+
+  /* radar */
+  .radarbox { display: flex; justify-content: center; }
+  .radar { position: relative; width: 420px; height: 420px; max-width: 100%; }
+  .radar svg.grid { position: absolute; inset: 0; width: 100%; height: 100%; }
+  .sweep {
+    position: absolute; inset: 0; border-radius: 50%;
+    background: conic-gradient(from 0deg, transparent 0deg 285deg, rgba(34, 211, 238, 0.04) 330deg, rgba(34, 211, 238, 0.28) 358deg, transparent 360deg);
+    animation: spin 5s linear infinite;
+  }
+  .pulse {
+    position: absolute; left: 50%; top: 50%;
+    width: 84px; height: 84px; margin: -42px 0 0 -42px;
+    border-radius: 50%; border: 2px solid var(--cyan); opacity: 0.5;
+    animation: pulse 2.8s ease-out infinite; pointer-events: none;
+  }
+  .pulse.d2 { animation-delay: 1.4s; }
+  .node {
+    position: absolute; transform: translate(-50%, -50%);
+    display: flex; flex-direction: column; align-items: center; gap: 5px;
+  }
+  .node .name {
+    font-size: 12px; font-weight: 600; color: var(--text2);
+    background: var(--bg); padding: 1px 8px; border-radius: 8px; white-space: nowrap;
+  }
+  .node.ghost { opacity: 0.55; }
+  .avwrap { position: relative; display: inline-block; }
+  .avwrap svg { display: block; border-radius: 50%; }
+  .presence {
+    position: absolute; right: 0; bottom: 0;
+    width: 13px; height: 13px; border-radius: 50%;
+    background: var(--green); border: 2.5px solid var(--bg);
+  }
+  .netbadge {
+    position: absolute; right: -3px; bottom: -3px;
+    width: 17px; height: 17px; border-radius: 50%;
+    background: var(--indigo-fill); color: #F2F2FF;
+    display: flex; align-items: center; justify-content: center;
+    border: 2px solid var(--bg);
+  }
+
+  /* sections */
+  section { padding: 76px 0; }
+  section.alt { background: var(--panel); border-top: 1px solid var(--hairline); border-bottom: 1px solid var(--hairline); }
+  .label {
+    font-size: 12.5px; font-weight: 700; letter-spacing: 0.08em;
+    text-transform: uppercase; color: var(--cyan-deep); margin: 0 0 12px;
+  }
+  h2 { font-size: clamp(28px, 3.4vw, 40px); font-weight: 800; letter-spacing: -0.02em; line-height: 1.12; margin: 0 0 14px; }
+  .lede { font-size: 17px; color: var(--text2); max-width: 56ch; margin: 0; text-wrap: pretty; }
+
+  /* transport demo */
+  .twocol { display: grid; grid-template-columns: 1fr 1fr; gap: 56px; align-items: center; }
+  .chatcard {
+    background: var(--card); border: 1px solid var(--hairline); border-radius: 24px;
+    padding: 22px 20px; display: flex; flex-direction: column; gap: 10px;
+    max-width: 420px; margin: 0 auto; width: 100%;
+  }
+  .bub { max-width: 78%; padding: 10px 14px; border-radius: 18px; font-size: 15.5px; line-height: 1.4; }
+  .bub .meta { display: inline-flex; align-items: center; gap: 4px; font-size: 10.5px; opacity: 0.72; margin-left: 8px; white-space: nowrap; }
+  .bub.them { align-self: flex-start; background: #1F2529; border-bottom-left-radius: 6px; }
+  .bub.ble { align-self: flex-end; background: var(--cyan-fill); color: var(--on-cyan); border-bottom-right-radius: 6px; }
+  .bub.net { align-self: flex-end; background: var(--indigo-fill); color: #F2F2FF; border-bottom-right-radius: 6px; }
+  .chatdivider { align-self: center; font-size: 11px; font-weight: 600; color: var(--text3); padding: 2px 0; }
+  .legend { display: flex; gap: 20px; margin-top: 22px; font-size: 14px; color: var(--text2); flex-wrap: wrap; }
+  .legend span { display: flex; align-items: center; gap: 8px; }
+  .ldot { width: 10px; height: 10px; border-radius: 50%; }
+  .ldot.c { background: var(--cyan); }
+  .ldot.i { background: var(--indigo); }
+
+  /* features */
+  .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; margin-top: 44px; }
+  .feat {
+    background: var(--card); border: 1px solid var(--hairline); border-radius: 20px;
+    padding: 26px 24px;
+  }
+  .feat .icon {
+    width: 44px; height: 44px; border-radius: 13px;
+    background: var(--cyan-soft); color: var(--cyan-deep);
+    display: flex; align-items: center; justify-content: center;
+    margin-bottom: 18px;
+  }
+  .feat h3 { font-size: 18px; font-weight: 750; margin: 0 0 7px; letter-spacing: -0.01em; }
+  .feat p { font-size: 14.5px; color: var(--text2); margin: 0; text-wrap: pretty; }
+
+  /* channels */
+  .chanrow {
+    display: flex; align-items: center; gap: 13px;
+    padding: 13px 14px; border-radius: 16px; background: var(--card);
+    border: 1px solid var(--hairline);
+  }
+  .chanrows { display: flex; flex-direction: column; gap: 10px; max-width: 420px; margin: 0 auto; width: 100%; }
+  .pintile {
+    width: 46px; height: 46px; border-radius: 14px; flex: none;
+    background: var(--cyan-soft); color: var(--cyan-deep);
+    display: flex; align-items: center; justify-content: center;
+  }
+  .chanrow .t { font-size: 16px; font-weight: 700; }
+  .chanrow .d { font-size: 13px; color: var(--text2); margin-top: 1px; }
+  .chanrow .geo { margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--text3); }
+
+  /* privacy strip */
+  .mono-card {
+    font-family: var(--mono); font-size: 13px; letter-spacing: 0.05em;
+    background: var(--card); border: 1px solid var(--hairline); border-radius: 12px;
+    padding: 10px 14px; color: var(--text2); display: inline-block; margin-top: 14px;
+  }
+
+  /* cta band */
+  .band { text-align: center; padding: 88px 0; }
+  .band h2 { margin-bottom: 10px; }
+  .band .lede { margin: 0 auto 30px; }
+  .band .ctas { justify-content: center; }
+
+  footer { border-top: 1px solid var(--hairline); padding: 30px 0 44px; }
+  .footin { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+  .footin .fine { font-size: 13px; color: var(--text3); }
+  .footin .fine code { font-family: var(--mono); font-size: 11.5px; }
+
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes pulse { from { transform: scale(0.7); opacity: 0.5; } to { transform: scale(2.6); opacity: 0; } }
+  @media (prefers-reduced-motion: reduce) {
+    .sweep, .pulse { animation: none; }
+    .pulse { display: none; }
+  }
+  @media (max-width: 860px) {
+    .hero { grid-template-columns: 1fr; padding: 56px 0 48px; }
+    .twocol { grid-template-columns: 1fr; gap: 36px; }
+    .grid3 { grid-template-columns: 1fr; }
+    .radar { width: 340px; height: 340px; }
+  }
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="navin">
+    <a class="wordmark" href="#">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="2" fill="currentColor" stroke="none"></circle><circle cx="12" cy="12" r="5.8"></circle><circle cx="12" cy="12" r="9.4"></circle></svg>
+      sonar
+    </a>
+    <div class="navlinks">
+      <a class="btn ghost small" href="Sonar Prototype.html">Open the prototype</a>
+      <a class="btn primary small" href="#download">Get the app</a>
+    </div>
+  </div>
+</nav>
+
+<header class="wrap hero">
+  <div>
+    <span class="kicker"><span class="dot"></span>No phone number · no account · no servers</span>
+    <h1>Sense who&rsquo;s nearby <em>before you see them.</em></h1>
+    <p class="sub">Sonar is a private messenger that works two ways at once: Bluetooth finds the people around you — even with no internet — and the open Nostr network reaches everyone else. Your phone is the only account you need.</p>
+    <div class="ctas">
+      <a class="btn primary" href="#download">Download for iPhone</a>
+      <a class="btn ghost" href="Sonar Prototype.html">Try the interactive demo</a>
+    </div>
+    <p class="heronote">End-to-end encrypted · your key never leaves the phone · <code>a3f9 2c41 770e 5b2d</code></p>
+  </div>
+
+  <div class="radarbox">
+    <div class="radar" aria-hidden="true">
+      <svg class="grid" viewBox="0 0 420 420" id="radarGrid">
+        <circle cx="210" cy="210" r="80" fill="none" stroke="rgba(34,211,238,0.22)"></circle>
+        <circle cx="210" cy="210" r="138" fill="none" stroke="rgba(34,211,238,0.22)"></circle>
+        <circle cx="210" cy="210" r="196" fill="none" stroke="rgba(34,211,238,0.22)"></circle>
+      </svg>
+      <div class="sweep"></div>
+      <div class="pulse"></div>
+      <div class="pulse d2"></div>
+
+      <div class="node" style="left: 210px; top: 210px;">
+        <span class="avwrap">
+          <svg width="58" height="58" viewBox="0 0 66 66"><rect width="66" height="66" fill="hsl(192 40% 36%)"></rect><rect x="8" y="8" width="10" height="10" fill="hsl(192 70% 76%)"></rect><rect x="48" y="8" width="10" height="10" fill="hsl(192 70% 76%)"></rect><rect x="28" y="18" width="10" height="10" fill="hsl(192 64% 68%)"></rect><rect x="18" y="28" width="10" height="10" fill="hsl(192 70% 76%)"></rect><rect x="38" y="28" width="10" height="10" fill="hsl(192 70% 76%)"></rect><rect x="28" y="38" width="10" height="10" fill="hsl(192 64% 68%)"></rect><rect x="8" y="48" width="10" height="10" fill="hsl(192 64% 68%)"></rect><rect x="48" y="48" width="10" height="10" fill="hsl(192 64% 68%)"></rect></svg>
+        </span>
+        <span class="name">you</span>
+      </div>
+
+      <div class="node" style="left: 138px; top: 168px;">
+        <span class="avwrap">
+          <svg width="48" height="48" viewBox="0 0 66 66"><rect width="66" height="66" fill="hsl(330 40% 38%)"></rect><rect x="18" y="8" width="10" height="10" fill="hsl(330 70% 78%)"></rect><rect x="38" y="8" width="10" height="10" fill="hsl(330 70% 78%)"></rect><rect x="8" y="28" width="10" height="10" fill="hsl(330 64% 70%)"></rect><rect x="48" y="28" width="10" height="10" fill="hsl(330 64% 70%)"></rect><rect x="28" y="28" width="10" height="10" fill="hsl(330 70% 78%)"></rect><rect x="18" y="48" width="10" height="10" fill="hsl(330 64% 70%)"></rect><rect x="38" y="48" width="10" height="10" fill="hsl(330 64% 70%)"></rect></svg>
+          <span class="presence"></span>
+        </span>
+        <span class="name">Maya</span>
+      </div>
+
+      <div class="node" style="left: 300px; top: 130px;">
+        <span class="avwrap">
+          <svg width="44" height="44" viewBox="0 0 66 66"><rect width="66" height="66" fill="hsl(150 40% 34%)"></rect><rect x="8" y="8" width="10" height="10" fill="hsl(150 64% 68%)"></rect><rect x="48" y="8" width="10" height="10" fill="hsl(150 64% 68%)"></rect><rect x="28" y="18" width="10" height="10" fill="hsl(150 70% 78%)"></rect><rect x="8" y="38" width="10" height="10" fill="hsl(150 70% 78%)"></rect><rect x="48" y="38" width="10" height="10" fill="hsl(150 70% 78%)"></rect><rect x="28" y="48" width="10" height="10" fill="hsl(150 64% 68%)"></rect></svg>
+          <span class="presence"></span>
+        </span>
+        <span class="name">Luca</span>
+      </div>
+
+      <div class="node" style="left: 256px; top: 318px;">
+        <span class="avwrap">
+          <svg width="44" height="44" viewBox="0 0 66 66"><rect width="66" height="66" fill="hsl(48 42% 36%)"></rect><rect x="18" y="18" width="10" height="10" fill="hsl(48 70% 74%)"></rect><rect x="38" y="18" width="10" height="10" fill="hsl(48 70% 74%)"></rect><rect x="8" y="38" width="10" height="10" fill="hsl(48 64% 66%)"></rect><rect x="48" y="38" width="10" height="10" fill="hsl(48 64% 66%)"></rect><rect x="28" y="38" width="10" height="10" fill="hsl(48 70% 74%)"></rect></svg>
+          <span class="presence"></span>
+        </span>
+        <span class="name">nettle</span>
+      </div>
+
+      <div class="node ghost" style="left: 84px; top: 320px;">
+        <span class="avwrap">
+          <svg width="38" height="38" viewBox="0 0 66 66"><rect width="66" height="66" fill="hsl(265 38% 40%)"></rect><rect x="28" y="8" width="10" height="10" fill="hsl(265 66% 78%)"></rect><rect x="8" y="28" width="10" height="10" fill="hsl(265 66% 78%)"></rect><rect x="48" y="28" width="10" height="10" fill="hsl(265 66% 78%)"></rect><rect x="28" y="48" width="10" height="10" fill="hsl(265 60% 70%)"></rect></svg>
+          <span class="netbadge"><svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6"><circle cx="12" cy="12" r="8.2"></circle><path d="M3.8 12h16.4M12 3.8c-2.7 2.5-4.1 5.2-4.1 8.2s1.4 5.7 4.1 8.2c2.7-2.5 4.1-5.2 4.1-8.2S14.7 6.3 12 3.8z"></path></svg></span>
+        </span>
+        <span class="name">Sofia</span>
+      </div>
+    </div>
+  </div>
+</header>
+
+<section class="alt">
+  <div class="wrap twocol">
+    <div>
+      <p class="label">Two networks, one chat</p>
+      <h2>You always know how a message traveled.</h2>
+      <p class="lede">Sonar routes every message automatically: Bluetooth when your friend is in range, the encrypted open internet when they are not. The bubble color tells you which — like iMessage, but for distance instead of platform.</p>
+      <div class="legend">
+        <span><i class="ldot c"></i>nearby · over Bluetooth</span>
+        <span><i class="ldot i"></i>far · over the internet</span>
+      </div>
+    </div>
+    <div class="chatcard">
+      <div class="bub them">did you make it to the meetup?<span class="meta">18:02</span></div>
+      <div class="bub ble">just got here — it&rsquo;s packed<span class="meta">18:04 · bluetooth</span></div>
+      <div class="chatdivider">later, from across town</div>
+      <div class="bub net">home safe! same time next week?<span class="meta">22:31 · internet</span></div>
+      <div class="bub them">wouldn&rsquo;t miss it<span class="meta">22:33</span></div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="label">Why Sonar</p>
+    <h2>A messenger that treats the network as a feature.</h2>
+    <div class="grid3">
+      <div class="feat">
+        <span class="icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="1.7" fill="currentColor" stroke="none"></circle><path d="M8.7 8.7a4.7 4.7 0 0 0 0 6.6M15.3 8.7a4.7 4.7 0 0 1 0 6.6M6.2 6.2a8.2 8.2 0 0 0 0 11.6M17.8 6.2a8.2 8.2 0 0 1 0 11.6"></path></svg></span>
+        <h3>Works without internet</h3>
+        <p>Bluetooth mesh relays messages phone-to-phone. Festivals, flights, blackouts, protests — if people are around, Sonar works.</p>
+      </div>
+      <div class="feat">
+        <span class="icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="8.2"></circle><path d="M3.8 12h16.4M12 3.8c-2.7 2.5-4.1 5.2-4.1 8.2s1.4 5.7 4.1 8.2c2.7-2.5 4.1-5.2 4.1-8.2S14.7 6.3 12 3.8z"></path></svg></span>
+        <h3>Reaches anyone, anywhere</h3>
+        <p>Out of range? Messages travel over Nostr — an open relay network nobody owns. No company server sits between you and your friends.</p>
+      </div>
+      <div class="feat">
+        <span class="icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><rect x="5.5" y="10.5" width="13" height="9.5" rx="2.6"></rect><path d="M8.5 10.5V8a3.5 3.5 0 0 1 7 0v2.5"></path></svg></span>
+        <h3>Private by design</h3>
+        <p>Direct messages are end-to-end encrypted, always. Your identity is a key created on your phone — verify friends in person with a safety number.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap twocol">
+    <div class="chanrows">
+      <div class="chanrow">
+        <span class="pintile"><svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 20.8s-6.3-5.3-6.3-10.2a6.3 6.3 0 0 1 12.6 0c0 4.9-6.3 10.2-6.3 10.2z"></path><circle cx="12" cy="10.4" r="2.2"></circle></svg></span>
+        <span><span class="t">Lugano · Centro</span><br><span class="d">Public · 12 here now</span></span>
+        <span class="geo">block</span>
+      </div>
+      <div class="chanrow">
+        <span class="pintile"><svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 20.8s-6.3-5.3-6.3-10.2a6.3 6.3 0 0 1 12.6 0c0 4.9-6.3 10.2-6.3 10.2z"></path><circle cx="12" cy="10.4" r="2.2"></circle></svg></span>
+        <span><span class="t">Lugano</span><br><span class="d">Public · 48 in range today</span></span>
+        <span class="geo">city</span>
+      </div>
+    </div>
+    <div>
+      <p class="label">Location channels</p>
+      <h2>Places, not coordinates.</h2>
+      <p class="lede">Every neighborhood has an open channel anyone nearby can join. Sonar shows real place names — never raw geohashes — and you pick exactly how precise to be: block, neighborhood, city, or region.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="label">Quiet, dependable privacy</p>
+    <h2>Nothing to leak, nothing to subpoena.</h2>
+    <p class="lede">There is no signup, no contact upload, no cloud backup of your conversations. And if you ever need it: triple-tap to wipe everything — key, chats, nickname — instantly.</p>
+    <span class="mono-card">$ accounts found: 0 &nbsp;·&nbsp; servers contacted: 0</span>
+  </div>
+</section>
+
+<section class="alt band" id="download">
+  <div class="wrap">
+    <h2>Hear the room before you enter it.</h2>
+    <p class="lede">Free, open source, end-to-end encrypted. iPhone first — Android next.</p>
+    <div class="ctas">
+      <a class="btn primary" href="#download">Download for iPhone</a>
+      <a class="btn ghost" href="Sonar Prototype.html">Try the interactive demo</a>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap footin">
+    <a class="wordmark" href="#" style="font-size: 17px;">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="2" fill="currentColor" stroke="none"></circle><circle cx="12" cy="12" r="5.8"></circle><circle cx="12" cy="12" r="9.4"></circle></svg>
+      sonar
+    </a>
+    <span class="fine">Open protocols — Bluetooth mesh + Nostr · <code>npub1w4j8mc7&hellip;q4k9dj</code></span>
+  </div>
+</footer>
+
+<script>
+  // dotted texture rings for the hero radar
+  (function () {
+    var svg = document.getElementById('radarGrid');
+    var NS = 'http://www.w3.org/2000/svg';
+    [52, 109, 167, 206].forEach(function (r) {
+      var n = Math.floor((2 * Math.PI * r) / 19);
+      for (var i = 0; i < n; i++) {
+        var a = (i / n) * 2 * Math.PI;
+        var c = document.createElementNS(NS, 'circle');
+        c.setAttribute('cx', (210 + r * Math.cos(a)).toFixed(1));
+        c.setAttribute('cy', (210 + r * Math.sin(a)).toFixed(1));
+        c.setAttribute('r', '1.3');
+        c.setAttribute('fill', 'rgba(140,210,230,0.15)');
+        svg.appendChild(c);
+      }
+    });
+  })();
+</script>
+
+</body>
+</html>

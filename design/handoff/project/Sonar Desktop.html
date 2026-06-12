@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sonar Desktop — interactive prototype</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700;800&amp;family=Nunito+Sans:opsz,wght@6..12,400;6..12,600;6..12,700;6..12,800&amp;family=IBM+Plex+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="sonar/theme.css">
+<link rel="stylesheet" href="sonar/desktop.css">
+<style>
+  body {
+    margin: 0;
+    background: #131517;
+    font-family: 'Figtree', system-ui, sans-serif;
+    transition: background 0.25s;
+  }
+  body[data-mode="light"] { background: #DDE3E6; }
+  .page {
+    display: flex; gap: 36px;
+    align-items: flex-start; justify-content: center;
+    padding: 32px 28px 48px;
+    min-height: 100vh; box-sizing: border-box;
+  }
+  aside.notes {
+    width: 300px; flex: none;
+    position: sticky; top: 32px;
+    display: flex; flex-direction: column; gap: 12px;
+    color: #C7CCCF; font-size: 13.5px; line-height: 1.55;
+  }
+  body[data-mode="light"] aside.notes { color: #394246; }
+  .notes h1 { font-size: 18px; font-weight: 800; margin: 0; letter-spacing: -0.01em; }
+  .notes .tagline { font-size: 12.5px; color: #7E898E; margin: -8px 0 2px; }
+  .notes .card { background: rgba(255, 255, 255, 0.055); border-radius: 14px; padding: 13px 16px; }
+  body[data-mode="light"] .notes .card { background: rgba(255, 255, 255, 0.72); }
+  .notes h2 {
+    font-size: 11px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.07em; color: #7E898E; margin: 0 0 7px;
+  }
+  .notes ul { margin: 0; padding-left: 17px; display: flex; flex-direction: column; gap: 5px; }
+  .notes code {
+    font-family: 'IBM Plex Mono', monospace; font-size: 11.5px;
+    background: rgba(255, 255, 255, 0.1); border-radius: 4px; padding: 1px 4px;
+  }
+  body[data-mode="light"] .notes code { background: rgba(0, 0, 0, 0.06); }
+  #root { flex: none; }
+  @media (max-width: 1080px) {
+    .page { flex-direction: column; align-items: center; }
+    aside.notes { position: static; width: auto; max-width: 640px; }
+  }
+</style>
+</head>
+<body data-mode="dark">
+  <div class="page">
+    <aside class="notes">
+      <h1>Sonar Desktop</h1>
+      <p class="tagline">macOS / iPadOS split view · same design system as mobile</p>
+      <div class="card">
+        <h2>Layout</h2>
+        <ul>
+          <li><strong>Sidebar</strong> — status chip, channels &amp; messages, you + settings at the bottom.</li>
+          <li><strong>Main pane</strong> — chat with the same transport-colored bubbles (cyan = Bluetooth, indigo = internet).</li>
+          <li><strong>Detail rail</strong> — safety number &amp; verify for DMs; place + precision for channels. Toggle with the ⓘ button.</li>
+          <li><strong>Radar</strong> gets a full pane with the peer list beside it.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h2>Try</h2>
+        <ul>
+          <li>Click <strong>Sonar</strong> at the top of the sidebar → radar pane; click a peer to chat.</li>
+          <li>Maya (cyan) vs Sofia (indigo) — watch the composer send button change too.</li>
+          <li>ⓘ in the chat header → verify Maya's safety number in the rail.</li>
+          <li>Open a channel → rail shows the <strong>place precision</strong> picker.</li>
+          <li>Bottom-left gear-ish button → <strong>Settings modal</strong> (rename yourself, wipe, toggles).</li>
+          <li>Tweaks: window width simulates iPad (~1080px) vs full desktop.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h2>iPad note</h2>
+        <ul>
+          <li>This three-pane layout maps 1:1 to iPadOS: sidebar = primary column, rail = inspector; at iPad width the rail overlays instead.</li>
+        </ul>
+      </div>
+    </aside>
+    <div id="root"></div>
+  </div>
+
+  <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+  <script src="sonar/data.js"></script>
+  <script type="text/babel" src="macos-window.jsx"></script>
+  <script type="text/babel" src="tweaks-panel.jsx"></script>
+  <script type="text/babel" src="sonar/icons.jsx"></script>
+  <script type="text/babel" src="sonar/components.jsx"></script>
+  <script type="text/babel" src="sonar/settings.jsx"></script>
+  <script type="text/babel" src="sonar/desktop.jsx"></script>
+  <script type="text/babel" src="sonar/desktop-app.jsx"></script>
+</body>
+</html>

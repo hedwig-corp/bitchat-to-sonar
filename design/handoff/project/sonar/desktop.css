@@ -1,0 +1,198 @@
+/* ── Sonar Desktop — split-view layout on top of sonar/theme.css tokens ── */
+
+.dk-window {
+  display: flex; position: relative; overflow: hidden;
+  border-radius: 16px;
+  background: var(--bg); color: var(--text);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.4), 0 28px 70px rgba(0, 0, 0, 0.5);
+  font-family: var(--ui-font, 'Figtree', system-ui, sans-serif);
+  -webkit-font-smoothing: antialiased;
+}
+.dk-window * { box-sizing: border-box; }
+.dk-window ::-webkit-scrollbar { width: 0; height: 0; }
+
+/* ── sidebar ── */
+.dk-side {
+  width: 300px; flex: none;
+  display: flex; flex-direction: column;
+  border-right: 1px solid var(--hairline);
+  background: rgba(255, 255, 255, 0.015);
+}
+.dk-titlebar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 14px 14px 6px;
+}
+.dk-brand {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 16px 4px;
+  font-size: 19px; font-weight: 800; letter-spacing: -0.02em;
+}
+.dk-brand svg { color: var(--accent); }
+.dk-search {
+  display: flex; align-items: center; gap: 8px;
+  margin: 8px 14px 6px; padding: 8px 12px;
+  border-radius: 10px; background: var(--surface2);
+  color: var(--text3); font-size: 13.5px;
+}
+.dk-search .kbd {
+  margin-left: auto; font-family: var(--mono); font-size: 10.5px;
+  background: var(--surface); border-radius: 5px; padding: 2px 6px;
+  box-shadow: inset 0 0 0 1px var(--hairline);
+}
+.dk-list { flex: 1; overflow-y: auto; padding-bottom: 8px; }
+.dk-row {
+  display: flex; align-items: center; gap: 11px;
+  width: calc(100% - 16px); margin: 1px 8px;
+  padding: var(--row-py) 10px;
+  border: none; border-radius: 12px; background: none;
+  font-family: inherit; color: inherit; text-align: left; cursor: pointer;
+}
+.dk-row:hover { background: var(--press); }
+.dk-row.sel { background: var(--accent-soft); }
+.dk-rowmain { flex: 1; min-width: 0; }
+.dk-rowtitle {
+  font-size: 14.5px; font-weight: 650; letter-spacing: -0.01em;
+  display: flex; align-items: center; gap: 5px;
+}
+.dk-rowsub {
+  font-size: 12.5px; color: var(--text2); margin-top: 1px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  display: flex; align-items: center; gap: 4px;
+}
+.dk-rowend { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; flex: none; }
+.dk-time { font-size: 11px; color: var(--text3); }
+.dk-side .bc-sect { padding: 14px 18px 5px; font-size: 11.5px; }
+.dk-discover {
+  display: flex; align-items: center; gap: 11px;
+  width: calc(100% - 16px); margin: 4px 8px 2px;
+  padding: 9px 10px; border: none; border-radius: 12px;
+  background: none; font-family: inherit; color: inherit;
+  text-align: left; cursor: pointer;
+}
+.dk-discover:hover { background: var(--press); }
+.dk-discover.sel { background: var(--accent-soft); }
+.dk-discover .tile {
+  width: 34px; height: 34px; border-radius: 10px; flex: none;
+  background: var(--accent-soft); color: var(--accent-deep);
+  display: flex; align-items: center; justify-content: center;
+}
+.dk-me {
+  display: flex; align-items: center; gap: 10px;
+  padding: 12px 14px; border-top: 1px solid var(--hairline);
+}
+.dk-memain { flex: 1; min-width: 0; }
+.dk-mename { font-size: 14px; font-weight: 700; }
+.dk-mekey { font-family: var(--mono); font-size: 10.5px; color: var(--text3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* sidebar status chip tweaks */
+.dk-side .bc-chipbanner { margin: 4px 14px 4px; width: calc(100% - 28px); }
+.dk-side .bc-chiprow { padding: 2px 14px 6px; }
+
+/* ── main pane ── */
+.dk-main { flex: 1; min-width: 0; display: flex; flex-direction: column; position: relative; }
+.dk-chathead {
+  display: flex; align-items: center; gap: 12px;
+  padding: 13px 18px; flex: none;
+  border-bottom: 1px solid var(--hairline);
+}
+.dk-chathead .titles { flex: 1; min-width: 0; }
+.dk-chathead .bc-hname { font-size: 16px; }
+.dk-chathead .bc-hsub { font-size: 12px; }
+.dk-main .bc-banner { margin: 10px 18px 0; }
+.dk-main .bc-msgs { padding: 14px 22px; }
+.dk-main .bc-msg { max-width: 62%; }
+.dk-main .bc-composer { padding: 10px 16px 16px; }
+.dk-main .bc-cmdstrip { padding: 8px 16px 2px; }
+.dk-main .bc-empty { padding: 0 80px; }
+
+/* ── radar pane ── */
+.dk-radarpane {
+  flex: 1; min-height: 0;
+  display: flex; align-items: center; justify-content: center;
+  gap: 44px; padding: 24px 36px;
+}
+.dk-radarside { display: flex; flex-direction: column; align-items: center; }
+.dk-radarlist { width: 330px; max-height: 100%; overflow-y: auto; }
+.dk-radarlist .bc-sect { padding: 12px 10px 6px; }
+.dk-radarlist .dk-row { width: 100%; margin: 1px 0; }
+
+/* ── detail rail ── */
+.dk-rail {
+  width: 286px; flex: none;
+  border-left: 1px solid var(--hairline);
+  overflow-y: auto;
+  display: flex; flex-direction: column; align-items: center;
+  gap: 8px; padding: 26px 20px;
+  text-align: center;
+}
+.dk-railname { font-size: 19px; font-weight: 800; display: flex; align-items: center; gap: 6px; justify-content: center; }
+.dk-railsub { font-size: 12.5px; color: var(--text2); display: flex; align-items: center; gap: 5px; }
+.dk-rail .bc-fpcard { width: 100%; text-align: left; margin-top: 14px; }
+.dk-rail .bc-safety { margin: 10px 0 2px; width: 100%; font-size: 12.5px; line-height: 1.9; }
+.dk-rail .bc-pubkey { padding: 4px 2px; }
+.dk-rail .bc-primary { font-size: 14.5px; padding: 12px; border-radius: 13px; margin-top: 10px; }
+.dk-rail .bc-ghost { font-size: 13.5px; padding: 8px; }
+.dk-railnote { font-size: 12px; color: var(--text3); line-height: 1.5; margin-top: 4px; }
+.dk-verifiedpill {
+  display: inline-flex; align-items: center; gap: 7px;
+  background: var(--green-soft); color: var(--green-deep);
+  border-radius: 999px; padding: 7px 14px;
+  font-size: 13px; font-weight: 700; margin-top: 10px;
+}
+.dk-precision { display: flex; gap: 4px; width: 100%; margin-top: 14px; }
+.dk-precision button {
+  flex: 1; padding: 7px 4px; border: none; border-radius: 9px;
+  background: var(--surface2); color: var(--text2);
+  font-family: inherit; font-size: 11.5px; font-weight: 600; cursor: pointer;
+}
+.dk-precision button.on { background: var(--accent-soft); color: var(--accent-deep); }
+
+/* ── icon buttons ── */
+.dk-iconbtn {
+  width: 34px; height: 34px; flex: none;
+  border: none; border-radius: 9px; background: transparent;
+  color: var(--text2); cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  transition: background 0.15s;
+}
+.dk-iconbtn:hover { background: var(--press); }
+.dk-iconbtn.on { background: var(--accent-soft); color: var(--accent-deep); }
+
+/* ── settings modal ── */
+.dk-scrim {
+  position: absolute; inset: 0; z-index: 60;
+  background: var(--scrim);
+  display: flex; align-items: center; justify-content: center;
+  animation: bcFade 0.18s;
+}
+.dk-modal {
+  width: 440px; max-height: 88%;
+  overflow-y: auto;
+  background: var(--bg); border-radius: 20px;
+  box-shadow: 0 0 0 1px var(--hairline), 0 24px 60px rgba(0, 0, 0, 0.45);
+  padding-bottom: 16px;
+  animation: dkPop 0.22s cubic-bezier(0.25, 0.9, 0.3, 1);
+}
+.dk-modalhead {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 16px 18px 8px;
+  position: sticky; top: 0; background: var(--bg); z-index: 2;
+}
+.dk-modalhead h3 { margin: 0; font-size: 17px; font-weight: 800; letter-spacing: -0.01em; }
+.dk-profhead { display: flex; flex-direction: column; align-items: center; gap: 7px; padding: 6px 0 4px; }
+.dk-profhead .pf-name { font-size: 20px; }
+@keyframes dkPop { from { transform: scale(0.96) translateY(8px); } }
+
+/* composer "+" popover (desktop) */
+.dk-pop {
+  position: absolute; left: 16px; bottom: 66px; z-index: 30;
+  width: 290px; padding: 6px;
+  background: var(--surface); border-radius: 14px;
+  box-shadow: 0 0 0 1px var(--hairline), 0 12px 36px rgba(0, 0, 0, 0.35);
+  animation: dkPop 0.18s cubic-bezier(0.25, 0.9, 0.3, 1);
+}
+
+/* density mapping for desktop rows */
+.dk-window[data-density="compact"] { --row-py: 6px; }
+.dk-window[data-density="regular"] { --row-py: 9px; }
+.dk-window[data-density="cozy"]    { --row-py: 13px; }

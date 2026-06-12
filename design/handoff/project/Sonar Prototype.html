@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sonar — interactive prototype</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700;800&amp;family=Nunito+Sans:opsz,wght@6..12,400;6..12,600;6..12,700;6..12,800&amp;family=IBM+Plex+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="sonar/theme.css">
+<style>
+  body {
+    margin: 0;
+    background: #131517;
+    font-family: 'Figtree', system-ui, sans-serif;
+    transition: background 0.25s;
+  }
+  body[data-mode="light"] { background: #E4E8EA; }
+  .page {
+    display: flex; gap: 44px;
+    align-items: flex-start; justify-content: center;
+    padding: 32px 28px 48px;
+    min-height: 100vh; box-sizing: border-box;
+  }
+  aside.notes {
+    max-width: 320px;
+    position: sticky; top: 32px;
+    display: flex; flex-direction: column; gap: 12px;
+    color: #C7CCCF; font-size: 13.5px; line-height: 1.55;
+  }
+  body[data-mode="light"] aside.notes { color: #394246; }
+  .notes h1 { font-size: 18px; font-weight: 800; margin: 0; letter-spacing: -0.01em; }
+  .notes .tagline { font-size: 12.5px; color: #7E898E; margin: -8px 0 2px; }
+  .notes .card {
+    background: rgba(255, 255, 255, 0.055);
+    border-radius: 14px; padding: 13px 16px;
+  }
+  body[data-mode="light"] .notes .card { background: rgba(255, 255, 255, 0.72); }
+  .notes h2 {
+    font-size: 11px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.07em; color: #7E898E; margin: 0 0 7px;
+  }
+  .notes ul { margin: 0; padding-left: 17px; display: flex; flex-direction: column; gap: 5px; }
+  .notes code {
+    font-family: 'IBM Plex Mono', monospace; font-size: 11.5px;
+    background: rgba(255, 255, 255, 0.1); border-radius: 4px; padding: 1px 4px;
+  }
+  body[data-mode="light"] .notes code { background: rgba(0, 0, 0, 0.06); }
+  .notes .swatch { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 3px; }
+  #root { flex: none; }
+  @media (max-width: 880px) {
+    .page { flex-direction: column; align-items: center; }
+    aside.notes { position: static; max-width: 402px; }
+  }
+</style>
+</head>
+<body data-mode="dark">
+  <div class="page">
+    <aside class="notes">
+      <h1>Sonar — interactive prototype</h1>
+      <p class="tagline">v2 · dark-first · radar discovery · transport-colored chats</p>
+      <div class="card">
+        <h2>What changed from bitchat v1</h2>
+        <ul>
+          <li>Rebranded to <strong>Sonar</strong> — cyan on cool neutrals, dark-first.</li>
+          <li><strong>Radar discovery</strong>: people placed by Bluetooth proximity, sweep + pulse, list one tap away. Out-of-range friends appear as faded edge ghosts.</li>
+          <li><strong>iMessage-style transport colors</strong>: your bubbles are <span class="swatch" style="background:#22D3EE;"></span>cyan when delivered nearby over Bluetooth, <span class="swatch" style="background:#7B79F7;"></span>indigo when they travel over the internet (Nostr). Routing is automatic.</li>
+          <li><strong>XChat-inspired</strong>: bigger round avatars, unread dot, floating search + discover bar, Settings with profile card + grouped sections.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h2>Try</h2>
+        <ul>
+          <li>Tap the compose/rings button (or top-right) → the <strong>radar</strong>; toggle Radar ↔ List.</li>
+          <li>DM <strong>Maya</strong> (in range → cyan) vs <strong>Sofia</strong> (out of range → indigo).</li>
+          <li>Tap the status chip to go Offline, then message Sofia — it queues: \u201cWaiting to send\u201d.</li>
+          <li>Your avatar (top-left) → <strong>Settings</strong>: identity, network, emergency wipe.</li>
+          <li>Triple-tap the <strong>sonar</strong> title for emergency wipe.</li>
+          <li><code>/</code> in any composer still reveals the command layer.</li>
+          <li><strong>Bitcoin:</strong> claim Maya’s sealed coin; “+” in a DM → Send bitcoin (keypad); radar → tap a peer → “Send sats”. Gold = money; rails follow the transport (ecash over Bluetooth / Lightning).</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h2>Next steps</h2>
+        <ul>
+          <li>Place picker — precision as place names + map</li>
+          <li>Live radar motion (peers drifting as signal changes)</li>
+          <li>Message requests / blocked list in Settings</li>
+          <li>Component spec sheet for handoff</li>
+        </ul>
+      </div>
+    </aside>
+    <div id="root"></div>
+  </div>
+
+  <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+  <script src="sonar/data.js"></script>
+  <script type="text/babel" src="ios-frame.jsx"></script>
+  <script type="text/babel" src="tweaks-panel.jsx"></script>
+  <script type="text/babel" src="sonar/icons.jsx"></script>
+  <script type="text/babel" src="sonar/components.jsx"></script>
+  <script type="text/babel" src="sonar/pay.jsx"></script>
+  <script type="text/babel" src="sonar/screens.jsx"></script>
+  <script type="text/babel" src="sonar/settings.jsx"></script>
+  <script type="text/babel" src="sonar/app.jsx"></script>
+</body>
+</html>
