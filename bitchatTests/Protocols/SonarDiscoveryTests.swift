@@ -156,14 +156,18 @@ final class SonarDiscoveryTests: XCTestCase {
     // MARK: - Local profile capabilities
 
     func testLocalProfileCapabilities() {
-        // This build always speaks Marmot DMs + the ⚡PAY convention,
-        // regardless of whether a BIP-353 address is advertised.
+        // Marmot DMs are always advertised; ⚡PAY is gated on a configured wallet.
         XCTAssertEqual(
-            SonarLocalProfile(npub: npub, bip353: nil).capabilities,
-            SonarCapability.marmotDM | SonarCapability.payments
+            SonarLocalProfile(npub: npub, bip353: nil, paymentsEnabled: false).capabilities,
+            SonarCapability.marmotDM
         )
         XCTAssertEqual(
-            SonarLocalProfile(npub: npub, bip353: "satoshi@example.org").capabilities,
+            SonarLocalProfile(npub: npub, bip353: nil, paymentsEnabled: true).capabilities,
+            SonarCapability.marmotDM | SonarCapability.payments
+        )
+        // BIP-353 presence does not change capabilities; the wallet flag does.
+        XCTAssertEqual(
+            SonarLocalProfile(npub: npub, bip353: "satoshi@example.org", paymentsEnabled: true).capabilities,
             SonarCapability.marmotDM | SonarCapability.payments
         )
     }
