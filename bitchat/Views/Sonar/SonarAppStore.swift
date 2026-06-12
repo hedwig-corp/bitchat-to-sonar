@@ -657,10 +657,13 @@ final class SonarAppStore: ObservableObject {
         if m.sender == "system" || m.content.hasPrefix("* ") {
             return SNMessage(id: m.id, action: true, text: m.content, time: time)
         }
-        let nick = chatViewModel.nickname
-        let mine = m.senderPeerID == chatViewModel.meshService.myPeerID
-            || m.sender == nick
-            || (!nick.isEmpty && m.sender.hasPrefix(nick + "#"))
+        // Identity-based self-detection (NOT nickname): for geohash channels
+        // this compares senderPeerID against our per-geohash derived Nostr
+        // identity (HMAC of the device seed), so own messages stay "mine"
+        // after a nickname change. The old nick-equality check broke exactly
+        // there — rename from "Vincenzo" to "Jimmy" and past messages stopped
+        // being recognized as ours.
+        let mine = chatViewModel.isSelfMessage(m)
         return SNMessage(
             id: m.id,
             mine: mine,
