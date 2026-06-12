@@ -1,13 +1,108 @@
 package chat.bitchat.sonar
 
+import android.content.Context
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import uniffi.sonar_ffi.SonarIdentity
+import uniffi.sonar_ffi.SonarNode
+import java.io.File
+import java.security.SecureRandom
 
 /**
- * Android `actual`: call the Rust core through the UniFFI Kotlin bindings
- * (JNA over libsonar_ffi.so in src/androidMain/jniLibs).
+ * Android `actual`: drive the Rust core (Marmot/White Noise) through the
+ * UniFFI Kotlin/JNA bindings. The FFI is blocking (owns a tokio runtime), so
+ * every call hops to [Dispatchers.IO]. Identity + DB key persist in prefs
+ * (NOTE: plain SharedPreferences for this test build — production must use the
+ * Android Keystore / EncryptedSharedPreferences).
  */
 actual object SonarCore {
-    actual fun generateNpub(): String {
-        return SonarIdentity.generate().npub()
+
+    // Must match the iOS MarmotService relays so the two interop.
+    private val relayUrls = listOf(
+        "wss://relay.damus.io",
+        "wss://nos.lol",
+        "wss://relay.primal.net",
+    )
+
+    private val lock = Mutex()
+    private var node: SonarNode? = null
+    @Volatile private var npub: String = ""
+
+    private val ctx: Context get() = AppContextHolder.ctx
+    private fun prefs() = ctx.getSharedPreferences("sonar", Context.MODE_PRIVATE)
+
+    actual suspend fun start(): String = withContext(Dispatchers.IO) {
+        lock.withLock {
+            if (node == null) {
+                val identity = loadOrCreateIdentity()
+                npub = identity.npub()
+
+                val dir = File(ctx.filesDir, "sonar-marmot").apply { mkdirs() }
+                val dbPath = File(dir, "marmot.sqlite").absolutePath
+                val dbKeyHex = loadOrCreateDbKey()
+
+                val n = SonarNode.connect(identity, relayUrls, dbPath, dbKeyHex)
+                runCatching { n.publishKeyPackage() }
+                node = n
+            }
+            npub
+        }
+    }
+
+    actual fun myNpub(): String = npub
+
+    actual suspend fun chats(): List<SonarChat> = withContext(Dispatchers.IO) {
+        val n = node ?: return@withContext emptyList()
+        n.groups().map { SonarChat(id = it.idHex, name = it.name, members = it.memberNpubs) }
+    }
+
+    actual suspend fun startChat(peer: String): String = withContext(Dispatchers.IO) {
+        val n = requireNode()
+        n.startDm(peer.trim(), "")
+    }
+
+    actual suspend fun send(chatId: String, text: String) = withContext(Dispatchers.IO) {
+        requireNode().sendText(chatId, text)
+    }
+
+    actual suspend fun messages(chatId: String): List<SonarMsg> = withContext(Dispatchers.IO) {
+        val n = node ?: return@withContext emptyList()
+        n.messages(chatId).map {
+            SonarMsg(
+                id = it.idHex,
+                senderNpub = it.senderNpub,
+                content = it.content,
+                mine = it.mine,
+                tsSecs = it.createdAtSecs.toLong(),
+            )
+        }
+    }
+
+    actual suspend fun sync() = withContext(Dispatchers.IO) {
+        runCatching { node?.syncOnce() }
+        Unit
+    }
+
+    private fun requireNode(): SonarNode =
+        node ?: error("SonarCore not started — call start() first")
+
+    private fun loadOrCreateIdentity(): SonarIdentity {
+        val saved = prefs().getString("nsec", null)
+        if (saved != null) {
+            runCatching { return SonarIdentity.import(saved) }
+        }
+        val id = SonarIdentity.generate()
+        prefs().edit().putString("nsec", id.nsec()).apply()
+        return id
+    }
+
+    private fun loadOrCreateDbKey(): String {
+        prefs().getString("dbKeyHex", null)?.let { return it }
+        val bytes = ByteArray(32).also { SecureRandom().nextBytes(it) }
+        val hex = bytes.joinToString("") { b -> "%02x".format(b) }
+        prefs().edit().putString("dbKeyHex", hex).apply()
+        return hex
     }
 }

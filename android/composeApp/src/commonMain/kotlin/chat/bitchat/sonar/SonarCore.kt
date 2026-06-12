@@ -1,15 +1,52 @@
 package chat.bitchat.sonar
 
+/** A White Noise (Marmot) 1:1 chat, as the UI sees it. */
+data class SonarChat(
+    val id: String,        // MLS group id hex
+    val name: String,
+    val members: List<String>,
+)
+
+/** A decrypted message in a chat. */
+data class SonarMsg(
+    val id: String,
+    val senderNpub: String,
+    val content: String,
+    val mine: Boolean,
+    val tsSecs: Long,
+)
+
 /**
- * The shared boundary to the headless Rust core (`sonar-core`). UI in
- * `commonMain` calls this; each platform provides the `actual` binding:
- *  - androidMain → UniFFI Kotlin/JNA over the `.so` (issue #6 step 1),
- *  - iosMain (later) → Kotlin/Native call path (revisit at the iOS shift).
+ * Shared boundary to the headless Rust core (`sonar-core`). UI in `commonMain`
+ * calls these; each platform provides the `actual`:
+ *  - androidMain → UniFFI Kotlin/JNA over libsonar_ffi.so (blocking calls
+ *    dispatched to a background thread),
+ *  - iosMain (later) → Kotlin/Native call path.
  *
- * This first version only exposes the smoke test; the real surface (identity,
- * Marmot, etc.) grows here as the app gains features.
+ * v1 surface = White Noise (Marmot) encrypted DMs over Nostr relays — the
+ * cross-platform-testable slice that interops with the iOS app via the same
+ * protocol + relays. BLE mesh / geohash come later (issue #6).
  */
 expect object SonarCore {
-    /** Generate a fresh Nostr identity in the Rust core and return its npub. */
-    fun generateNpub(): String
+    /** Ensure an identity exists, connect to relays, publish our KeyPackage.
+     *  Returns our npub. Safe to call repeatedly. */
+    suspend fun start(): String
+
+    /** Our npub (empty until [start]). */
+    fun myNpub(): String
+
+    /** All 1:1 chats we belong to. */
+    suspend fun chats(): List<SonarChat>
+
+    /** Start (or fetch) a 1:1 chat with a peer (npub or hex). Returns chat id. */
+    suspend fun startChat(peer: String): String
+
+    /** Send an encrypted text message to a chat. */
+    suspend fun send(chatId: String, text: String)
+
+    /** Decrypted message history for a chat, oldest first. */
+    suspend fun messages(chatId: String): List<SonarMsg>
+
+    /** Poll the relays once (welcomes + group messages). */
+    suspend fun sync()
 }

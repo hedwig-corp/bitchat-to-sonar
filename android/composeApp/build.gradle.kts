@@ -20,9 +20,11 @@ kotlin {
             implementation(compose.foundation)
             implementation(compose.material3)
             implementation(compose.ui)
+            implementation(libs.coroutines.core)
         }
         androidMain.dependencies {
             implementation(libs.androidx.activity.compose)
+            implementation(libs.coroutines.android)
             // UniFFI Kotlin bindings for the Rust core use JNA at runtime.
             // MUST be the @aar variant on Android — it ships libjnidispatch.so
             // as proper jniLibs (the plain jar hides it as a classpath resource
