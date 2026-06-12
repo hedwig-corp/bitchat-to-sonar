@@ -4,10 +4,11 @@
 #
 # Mirror of build-ios.sh for the Android side of issue #6 (1:1 Android app).
 #
-# Outputs (under core/android-out/, ready to drop into an Android module's
-# src/main):
-#   jniLibs/<abi>/libsonar_ffi.so   for arm64-v8a, armeabi-v7a, x86_64
-#   kotlin/uniffi/sonar_ffi/sonar_ffi.kt   UniFFI Kotlin bindings (uniffi 0.31)
+# Outputs (straight into the CMP app's androidMain source set):
+#   android/composeApp/src/androidMain/jniLibs/<abi>/libsonar_ffi.so
+#       for arm64-v8a, armeabi-v7a, x86_64
+#   android/composeApp/src/androidMain/kotlin/uniffi/sonar_ffi/sonar_ffi.kt
+#       UniFFI Kotlin bindings (uniffi 0.31)
 #
 # The generated Kotlin uses JNA — the consuming Gradle module must depend on
 #   net.java.dev.jna:jna:<ver>@aar
@@ -19,6 +20,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$SCRIPT_DIR"
 
 # --- NDK discovery -----------------------------------------------------------
@@ -37,7 +39,9 @@ echo "Using NDK: $ANDROID_NDK_HOME"
 
 CRATE="sonar-ffi"
 LIB="libsonar_ffi.so"
-OUT="$SCRIPT_DIR/android-out"
+# Write straight into the CMP app's androidMain (the canonical consumer), the
+# way build-ios.sh assembles localPackages/SonarCore. Override OUT to retarget.
+OUT="${OUT:-$REPO_ROOT/android/composeApp/src/androidMain}"
 JNILIBS="$OUT/jniLibs"
 KOTLIN_DIR="$OUT/kotlin"
 
@@ -52,7 +56,10 @@ for t in "${RUST_TARGETS[@]}"; do rustup target add "$t" >/dev/null 2>&1 || true
 unset OPENSSL_DIR OPENSSL_LIB_DIR OPENSSL_INCLUDE_DIR OPENSSL_NO_VENDOR \
       OPENSSL_STATIC LIBSQLITE3_SYS_USE_PKG_CONFIG 2>/dev/null || true
 
-rm -rf "$JNILIBS" "$KOTLIN_DIR"
+# Only wipe the generated artifacts — KOTLIN_DIR is the androidMain source root
+# and also holds hand-written Kotlin (MainActivity, actuals), so scope the
+# delete to the generated uniffi package.
+rm -rf "$JNILIBS" "$KOTLIN_DIR/uniffi"
 mkdir -p "$JNILIBS" "$KOTLIN_DIR"
 
 # --- Build the 3 ABIs (cargo-ndk copies each .so into jniLibs/<abi>/) ---------
