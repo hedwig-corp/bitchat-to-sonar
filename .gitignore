@@ -79,3 +79,6 @@ build.log
 
 # Local configs
 Local.xcconfig
+
+# Android Rust core build outputs (regenerate with core/build-android.sh)
+core/android-out/

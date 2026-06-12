@@ -24,6 +24,16 @@ hex.workspace = true
 tracing.workspace = true
 serde.workspace = true
 
+# SQLCipher needs a crypto backend. Apple targets compile it against
+# CommonCrypto (no OpenSSL — see the mdk-sqlite-storage note above). Android
+# has no CommonCrypto, so vendor OpenSSL for the SQLCipher build: the
+# `bundled-sqlcipher-vendored-openssl` feature makes libsqlite3-sys compile
+# OpenSSL from source (openssl-sys/openssl-src, via cargo-ndk's cross
+# toolchain) and feeds DEP_OPENSSL_INCLUDE into the SQLCipher cc build.
+# Target-scoped so iOS keeps the CommonCrypto path untouched.
+[target.'cfg(target_os = "android")'.dependencies]
+libsqlite3-sys = { version = "0.35", features = ["bundled-sqlcipher-vendored-openssl"] }
+
 [dev-dependencies]
 nostr-relay-builder.workspace = true
 tracing-subscriber.workspace = true

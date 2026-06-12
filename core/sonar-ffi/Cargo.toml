@@ -8,8 +8,9 @@ rust-version.workspace = true
 
 [lib]
 name = "sonar_ffi"
-# staticlib for the iOS/macOS xcframework, lib so `cargo test` works.
-crate-type = ["staticlib", "lib"]
+# staticlib for the iOS/macOS xcframework, cdylib (.so) for Android JNI
+# loading, lib so `cargo test` works.
+crate-type = ["staticlib", "cdylib", "lib"]
 
 [[bin]]
 name = "uniffi-bindgen"
