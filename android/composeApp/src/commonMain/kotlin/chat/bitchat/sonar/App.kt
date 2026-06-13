@@ -196,12 +196,28 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             }
         }
 
-        LazyColumn(
-            Modifier.weight(1f).fillMaxWidth(),
-            state = listState,
-            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
-        ) {
-            items(state.messages, key = { it.id }) { m -> MessageBubble(m) }
+        chat.bitchat.sonar.ui.SNBanner(
+            icon = SNIconName.Lock, tone = chat.bitchat.sonar.ui.SNBannerTone.Enc,
+            bold = "End-to-end encrypted",
+            rest = " — only you and ${screen.name} can read this"
+        )
+
+        if (state.messages.isEmpty()) {
+            Box(Modifier.weight(1f).fillMaxWidth()) {
+                chat.bitchat.sonar.ui.SNEmptyState(
+                    icon = SNIconName.Lock,
+                    title = "Say hi to ${screen.name}",
+                    desc = "Messages here are end-to-end encrypted. Only the two of you can read them."
+                )
+            }
+        } else {
+            LazyColumn(
+                Modifier.weight(1f).fillMaxWidth(),
+                state = listState,
+                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
+            ) {
+                items(state.messages, key = { it.id }) { m -> MessageBubble(m) }
+            }
         }
 
         Row(Modifier.fillMaxWidth().padding(10.dp), verticalAlignment = Alignment.CenterVertically) {

@@ -184,6 +184,58 @@ fun SNDot(color: Color, size: Dp = 7.dp) {
     Box(Modifier.size(size).clip(CircleShape).background(color))
 }
 
+enum class SNBannerTone { Enc, Net, Neutral, Public }
+
+/** bc-banner: tinted strip with an icon + bold + rest text. */
+@Composable
+fun SNBanner(icon: SNIconName, tone: SNBannerTone, bold: String, rest: String) {
+    val s = sonar
+    val (bg, fg) = when (tone) {
+        SNBannerTone.Enc -> s.greenSoft to s.green
+        SNBannerTone.Net -> s.netSoft to s.net
+        SNBannerTone.Public -> s.accentSoft to s.accentDeep
+        SNBannerTone.Neutral -> s.surface2 to s.text2
+    }
+    Row(
+        Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 6.dp)
+            .clip(RoundedCornerShape(12.dp)).background(bg)
+            .padding(horizontal = 12.dp, vertical = 9.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        SNIcon(icon, 15.dp, fg, weight = 2.2f)
+        Spacer(Modifier.width(8.dp))
+        Text(
+            buildAnnotatedSimple(bold, rest),
+            color = s.text2, fontSize = 13.sp, lineHeight = 17.sp
+        )
+    }
+}
+
+@Composable
+private fun buildAnnotatedSimple(bold: String, rest: String) =
+    androidx.compose.ui.text.buildAnnotatedString {
+        pushStyle(androidx.compose.ui.text.SpanStyle(fontWeight = FontWeight.Bold, color = sonar.text))
+        append(bold)
+        pop()
+        append(rest)
+    }
+
+/** An empty-state block: icon + title + description, centered. */
+@Composable
+fun SNEmptyState(icon: SNIconName, title: String, desc: String, iconSize: Dp = 24.dp) {
+    val s = sonar
+    Column(
+        Modifier.fillMaxWidth().padding(top = 80.dp, start = 24.dp, end = 24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        SNIcon(icon, iconSize, s.text3)
+        Spacer(Modifier.height(10.dp))
+        Text(title, color = s.text2, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.height(4.dp))
+        Text(desc, color = s.text3, fontSize = 13.sp, lineHeight = 18.sp, textAlign = TextAlign.Center)
+    }
+}
+
 /** bc-header with a back button + bold title (Settings/Profile/sub screens). */
 @Composable
 fun SNNavHeader(title: String, hairline: Boolean = true, onBack: () -> Unit) {
