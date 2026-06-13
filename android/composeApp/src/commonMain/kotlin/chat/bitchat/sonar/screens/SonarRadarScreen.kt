@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -67,7 +68,7 @@ fun SonarRadarScreen(state: SonarAppState) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     SNDot(s.green, 6.dp)
                     Spacer(Modifier.width(5.dp))
-                    Text("0 in range · scanning", color = s.text2, fontSize = 12.sp)
+                    Text("${state.meshPeers.size} in range · scanning", color = s.text2, fontSize = 12.sp)
                 }
             }
         }
@@ -86,9 +87,9 @@ fun SonarRadarScreen(state: SonarAppState) {
         } else {
             Column(Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally) {
                 Spacer(Modifier.weight(1f))
-                RadarField(state.nick.ifBlank { "you" })
+                RadarField(state.nick.ifBlank { "you" }, state.meshPeers)
                 Text(
-                    "Looking for people around you…",
+                    if (state.meshPeers.isEmpty()) "Looking for people around you…" else "Tap someone to chat",
                     color = s.text3, fontSize = 12.5.sp, modifier = Modifier.padding(top = 4.dp)
                 )
                 Row(Modifier.padding(top = 12.dp), horizontalArrangement = Arrangement.spacedBy(18.dp)) {
@@ -145,7 +146,7 @@ private fun ListEmpty() {
 }
 
 @Composable
-private fun RadarField(nick: String) {
+private fun RadarField(nick: String, peers: List<chat.bitchat.sonar.MeshPeer>) {
     val s = sonar
     val transition = rememberInfiniteTransition(label = "radar")
     val sweep by transition.animateFloat(
@@ -197,6 +198,23 @@ private fun RadarField(nick: String) {
                     radius = 35f * k * scale, center = Offset(c, c),
                     style = androidx.compose.ui.graphics.drawscope.Stroke(width = 2f)
                 )
+            }
+        }
+        // mesh peer nodes, placed on the inner ring by a deterministic angle
+        peers.forEachIndexed { i, p ->
+            val ang = (chat.bitchat.sonar.ui.snHash(p.id) % 360).toDouble() * PI / 180.0
+            val radius = 84f + (i % 2) * 34f
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                modifier = Modifier.align(Alignment.Center).offset(
+                    x = (radius * cos(ang)).dp, y = (radius * sin(ang)).dp
+                )
+            ) {
+                SonarAvatar(p.name, 40.dp, presence = true)
+                Spacer(Modifier.height(3.dp))
+                Box(Modifier.clip(RoundedCornerShape(8.dp)).background(s.bg).padding(horizontal = 6.dp, vertical = 1.dp)) {
+                    Text(p.name, color = s.text2, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+                }
             }
         }
         // you, center

@@ -53,7 +53,15 @@ class SonarAppState(private val scope: CoroutineScope) {
         private set
     var channelMsgs by mutableStateOf<List<SonarChannelMsg>>(emptyList())
         private set
+    var meshPeers by mutableStateOf<List<MeshPeer>>(emptyList())
+        private set
     var toast by mutableStateOf<String?>(null)
+
+    /** Start the BLE mesh radio (call once permissions are granted). */
+    fun startMesh() {
+        MeshRadio.start()
+        meshPeers = MeshRadio.peers()
+    }
 
     fun joinChannel(geohash: String) {
         val g = geohash.trim().lowercase()
@@ -168,6 +176,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 refreshChats()
                 (screen as? Screen.Chat)?.let { messages = SonarCore.messages(it.id) }
                 (screen as? Screen.Channel)?.let { channelMsgs = SonarCore.channelMessages(it.geohash) }
+                meshPeers = MeshRadio.peers()
             }
         }
     }
