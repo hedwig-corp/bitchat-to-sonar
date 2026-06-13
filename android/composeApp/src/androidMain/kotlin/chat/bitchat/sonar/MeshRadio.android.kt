@@ -75,6 +75,7 @@ actual object MeshRadio {
                 .addServiceUuid(ParcelUuid(SERVICE_UUID))
                 .build()
             advertiser?.startAdvertising(advSettings, advData, advCallback)
+            MeshGatt.startServer()
         } catch (_: SecurityException) {
             scanning = false
         } catch (_: Throwable) {
@@ -86,6 +87,7 @@ actual object MeshRadio {
         scanning = false
         try { scanner?.stopScan(scanCallback) } catch (_: Throwable) {}
         try { advertiser?.stopAdvertising(advCallback) } catch (_: Throwable) {}
+        MeshGatt.stop()
         seen.clear(); lastSeen.clear()
     }
 
@@ -100,8 +102,15 @@ actual object MeshRadio {
             val id = result.device.address
             val name = runCatching { result.scanRecord?.deviceName }.getOrNull()
                 ?: ("mesh·" + id.takeLast(5).replace(":", ""))
+            val isNew = !seen.containsKey(id)
             seen[id] = MeshPeer(id = id, name = name, rssi = result.rssi)
             lastSeen[id] = System.currentTimeMillis()
+            // Auto-link over GATT to newly-discovered peers (Noise XX). To avoid
+            // dual-connect races, only the lexicographically-higher address dials.
+            if (isNew) {
+                val mine = runCatching { adapter()?.address }.getOrNull() ?: ""
+                if (mine.isBlank() || mine > id) MeshGatt.connect(result.device)
+            }
         }
     }
 
