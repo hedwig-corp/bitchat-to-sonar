@@ -8,11 +8,12 @@
 //!   plain synchronous functions.
 //! - GroupId crosses the boundary as lowercase hex of `GroupId::as_slice()`.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use nostr::prelude::*;
 use sonar_core::client::SonarClient;
 use sonar_core::identity::Identity;
+use sonar_core::noise::{NoiseHandshake, NoiseKeypair, NoiseSession};
 use sonar_core::GroupId;
 
 uniffi::setup_scaffolding!();
@@ -291,6 +292,118 @@ impl SonarNode {
             .runtime
             .block_on(self.client.fetch_geo_dm(&geohash, &peer_hex))?;
         Ok(msgs.into_iter().map(geo_message_info).collect())
+    }
+}
+
+// ── Noise XX session for the BLE mesh (the tested core crypto, on Android) ──
+
+/// A freshly generated Noise static keypair (hex-encoded X25519).
+#[derive(uniffi::Record)]
+pub struct NoiseKeypairHex {
+    pub private_hex: String,
+    pub public_hex: String,
+}
+
+#[uniffi::export]
+pub fn noise_generate_keypair() -> FfiResult<NoiseKeypairHex> {
+    let kp = NoiseKeypair::generate()?;
+    Ok(NoiseKeypairHex {
+        private_hex: hex::encode(kp.private),
+        public_hex: hex::encode(kp.public),
+    })
+}
+
+enum NoisePhase {
+    Handshake(NoiseHandshake),
+    Session(NoiseSession),
+    Spent,
+}
+
+/// A Noise XX session driver for one mesh link. Feed handshake messages until
+/// `is_finished`, capture `remote_static_hex` (the peer's authenticated key →
+/// bitchat fingerprint), call `finalize`, then `encrypt`/`decrypt`.
+#[derive(uniffi::Object)]
+pub struct SonarNoise {
+    phase: Mutex<NoisePhase>,
+}
+
+#[uniffi::export]
+impl SonarNoise {
+    #[uniffi::constructor]
+    pub fn initiator(private_hex: String) -> FfiResult<Arc<Self>> {
+        let sk = hex::decode(&private_hex).map_err(invalid("noise private key"))?;
+        Ok(Arc::new(Self {
+            phase: Mutex::new(NoisePhase::Handshake(NoiseHandshake::initiator(&sk)?)),
+        }))
+    }
+
+    #[uniffi::constructor]
+    pub fn responder(private_hex: String) -> FfiResult<Arc<Self>> {
+        let sk = hex::decode(&private_hex).map_err(invalid("noise private key"))?;
+        Ok(Arc::new(Self {
+            phase: Mutex::new(NoisePhase::Handshake(NoiseHandshake::responder(&sk)?)),
+        }))
+    }
+
+    /// Next handshake message to send to the peer.
+    pub fn write_message(&self) -> FfiResult<Vec<u8>> {
+        match &mut *self.phase.lock().unwrap() {
+            NoisePhase::Handshake(hs) => Ok(hs.write_message()?),
+            _ => Err(SonarFfiError::Core("noise: not in handshake".into())),
+        }
+    }
+
+    /// Consume a handshake message received from the peer.
+    pub fn read_message(&self, msg: Vec<u8>) -> FfiResult<()> {
+        match &mut *self.phase.lock().unwrap() {
+            NoisePhase::Handshake(hs) => Ok(hs.read_message(&msg)?),
+            _ => Err(SonarFfiError::Core("noise: not in handshake".into())),
+        }
+    }
+
+    pub fn is_finished(&self) -> bool {
+        match &*self.phase.lock().unwrap() {
+            NoisePhase::Handshake(hs) => hs.is_finished(),
+            NoisePhase::Session(_) => true,
+            NoisePhase::Spent => false,
+        }
+    }
+
+    /// The peer's authenticated static key (hex), available after the handshake.
+    pub fn remote_static_hex(&self) -> Option<String> {
+        match &*self.phase.lock().unwrap() {
+            NoisePhase::Handshake(hs) => hs.remote_static().map(hex::encode),
+            _ => None,
+        }
+    }
+
+    /// Transition from handshake to the encrypted transport phase.
+    pub fn finalize(&self) -> FfiResult<()> {
+        let mut g = self.phase.lock().unwrap();
+        match std::mem::replace(&mut *g, NoisePhase::Spent) {
+            NoisePhase::Handshake(hs) => {
+                *g = NoisePhase::Session(hs.into_session()?);
+                Ok(())
+            }
+            other => {
+                *g = other;
+                Err(SonarFfiError::Core("noise: handshake not finished".into()))
+            }
+        }
+    }
+
+    pub fn encrypt(&self, data: Vec<u8>) -> FfiResult<Vec<u8>> {
+        match &mut *self.phase.lock().unwrap() {
+            NoisePhase::Session(s) => Ok(s.encrypt(&data)?),
+            _ => Err(SonarFfiError::Core("noise: no session".into())),
+        }
+    }
+
+    pub fn decrypt(&self, data: Vec<u8>) -> FfiResult<Vec<u8>> {
+        match &mut *self.phase.lock().unwrap() {
+            NoisePhase::Session(s) => Ok(s.decrypt(&data)?),
+            _ => Err(SonarFfiError::Core("noise: no session".into())),
+        }
     }
 }
 
