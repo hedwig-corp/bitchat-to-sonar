@@ -1,0 +1,5 @@
+/.build/
+/.swiftpm/
+# 392M of generated static libs; rebuild with core/build-ios.sh.
+# Decide before first commit whether to LFS/ignore or commit like Arti does.
+/Frameworks/

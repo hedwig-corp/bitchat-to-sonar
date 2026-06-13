@@ -1,0 +1,30 @@
+[package]
+name = "sonar-ffi"
+description = "UniFFI bindings for sonar-core (Swift/Kotlin shells)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "sonar_ffi"
+# staticlib for the iOS/macOS xcframework, cdylib (.so) for Android JNI
+# loading, lib so `cargo test` works.
+crate-type = ["staticlib", "cdylib", "lib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["cli"]
+
+[features]
+# Host-only helper used by core/build-ios.sh; never enabled for device builds.
+cli = ["uniffi/cli"]
+
+[dependencies]
+sonar-core = { path = "../sonar-core" }
+uniffi = "0.31"
+nostr.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+hex.workspace = true

@@ -60,12 +60,12 @@ public final class TorManager: ObservableObject {
     private var restarting: Bool = false
 
     // Whether the app must enforce Tor for all connections (fail-closed).
+    // Sonar decision (2026-06-13): Tor is DISABLED for now — public channels
+    // and Nostr traffic go over direct connections. Fail-closed enforcement
+    // blocked geohash/relay traffic behind Tor bootstrap; revisit with an
+    // alternative (or opt-in Tor) later.
     public var torEnforced: Bool {
-        #if BITCHAT_DEV_ALLOW_CLEARNET
         return false
-        #else
-        return true
-        #endif
     }
 
     // Returns true only when Tor is actually up (or dev fallback is compiled).

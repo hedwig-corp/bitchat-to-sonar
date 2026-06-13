@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>bitchat — interactive prototype</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700;800&amp;family=Nunito+Sans:opsz,wght@6..12,400;6..12,600;6..12,700;6..12,800&amp;family=IBM+Plex+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="bitchat/theme.css">
+<style>
+  body {
+    margin: 0;
+    background: #E8E6E0;
+    font-family: 'Figtree', system-ui, sans-serif;
+    transition: background 0.25s;
+  }
+  body[data-mode="dark"] { background: #131315; }
+  .page {
+    display: flex; gap: 44px;
+    align-items: flex-start; justify-content: center;
+    padding: 32px 28px 48px;
+    min-height: 100vh; box-sizing: border-box;
+  }
+  aside.notes {
+    max-width: 320px;
+    position: sticky; top: 32px;
+    display: flex; flex-direction: column; gap: 12px;
+    color: #3C382F; font-size: 13.5px; line-height: 1.55;
+  }
+  body[data-mode="dark"] aside.notes { color: #C9C7C1; }
+  .notes h1 { font-size: 18px; font-weight: 800; margin: 0; letter-spacing: -0.01em; }
+  .notes .tagline { font-size: 12.5px; color: #8B8678; margin: -8px 0 2px; }
+  .notes .card {
+    background: rgba(255, 255, 255, 0.72);
+    border-radius: 14px; padding: 13px 16px;
+  }
+  body[data-mode="dark"] .notes .card { background: rgba(255, 255, 255, 0.055); }
+  .notes h2 {
+    font-size: 11px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.07em; color: #8B8678; margin: 0 0 7px;
+  }
+  .notes ul { margin: 0; padding-left: 17px; display: flex; flex-direction: column; gap: 5px; }
+  .notes code {
+    font-family: 'IBM Plex Mono', monospace; font-size: 11.5px;
+    background: rgba(0, 0, 0, 0.06); border-radius: 4px; padding: 1px 4px;
+  }
+  body[data-mode="dark"] .notes code { background: rgba(255, 255, 255, 0.1); }
+  #root { flex: none; }
+  @media (max-width: 880px) {
+    .page { flex-direction: column; align-items: center; }
+    aside.notes { position: static; max-width: 402px; }
+  }
+</style>
+</head>
+<body>
+  <div class="page">
+    <aside class="notes">
+      <h1>bitchat — interactive prototype</h1>
+      <p class="tagline">v1 · core flow · light &amp; dark · tweakable</p>
+      <div class="card">
+        <h2>Design assumptions</h2>
+        <ul>
+          <li>Familiar Signal/Telegram patterns: conversation list, bubbles, a real composer — zero terminal idioms required.</li>
+          <li>Amber <code>#D97706</code> accent on warm-neutral surfaces; true-neutral dark mode.</li>
+          <li>Figtree for UI; IBM Plex Mono <em>only</em> for fingerprints and keys.</li>
+          <li>Network state is simulated for the demo.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h2>Try</h2>
+        <ul>
+          <li>Tap the <strong>status chip</strong> to flip Online ↔ Offline (mesh) — then send a message and check its delivery tag.</li>
+          <li>Open <strong>Lugano · Centro</strong> — public banner, colored authors, mesh/internet tags per message.</li>
+          <li>DM <strong>Maya</strong> → Verify → compare safety numbers → mark verified.</li>
+          <li>Type <code>/</code> in any composer for the power-user command layer.</li>
+          <li>People icon (top right) → mesh peers in plain language.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h2>3 directions — open Tweaks</h2>
+        <ul>
+          <li><strong>quiet</strong> — iOS-classic, hairline lists</li>
+          <li><strong>warm</strong> — grouped cards on warm canvas</li>
+          <li><strong>soft</strong> — airy, no separators</li>
+        </ul>
+        <p style="margin: 7px 0 0;">Plus chip/bubble variants, radius, density, and typefaces.</p>
+      </div>
+      <div class="card">
+        <h2>Next steps</h2>
+        <ul>
+          <li>Place picker — precision as place names + map</li>
+          <li>Command palette sheet</li>
+          <li>Settings: identity, safety number, emergency wipe</li>
+          <li>Component spec sheet for handoff</li>
+        </ul>
+      </div>
+    </aside>
+    <div id="root"></div>
+  </div>
+
+  <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+  <script src="bitchat/data.js"></script>
+  <script type="text/babel" src="ios-frame.jsx"></script>
+  <script type="text/babel" src="tweaks-panel.jsx"></script>
+  <script type="text/babel" src="bitchat/icons.jsx"></script>
+  <script type="text/babel" src="bitchat/components.jsx"></script>
+  <script type="text/babel" src="bitchat/screens.jsx"></script>
+  <script type="text/babel" src="bitchat/app.jsx"></script>
+</body>
+</html>

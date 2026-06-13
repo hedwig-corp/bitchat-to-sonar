@@ -14,8 +14,12 @@ import UserNotifications
 struct BitchatApp: App {
     static let bundleID = Bundle.main.bundleIdentifier ?? "chat.bitchat"
     static let groupID = "group.\(bundleID)"
-    
-    @StateObject private var chatViewModel: ChatViewModel
+
+    // The Sonar UI is the app root. The store owns the real backends
+    // (ChatViewModel: mesh + Nostr + geohash channels, MarmotChatModel:
+    // White Noise secure chats) and maps them to the screens.
+    @StateObject private var sonarStore = SonarAppStore()
+
     #if os(iOS)
     @Environment(\.scenePhase) var scenePhase
     @UIApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
@@ -25,35 +29,26 @@ struct BitchatApp: App {
     #elseif os(macOS)
     @NSApplicationDelegateAdaptor(MacAppDelegate.self) var appDelegate
     #endif
-    
-    private let idBridge = NostrIdentityBridge()
-    
+
     init() {
-        let keychain = KeychainManager()
-        let idBridge = self.idBridge
-        _chatViewModel = StateObject(
-            wrappedValue: ChatViewModel(
-                keychain: keychain,
-                idBridge: idBridge,
-                identityManager: SecureIdentityStateManager(keychain)
-            )
-        )
-        
         UNUserNotificationCenter.current().delegate = NotificationDelegate.shared
         // Warm up georelay directory and refresh if stale (once/day)
         GeoRelayDirectory.shared.prefetchIfNeeded()
     }
-    
+
+    private var chatViewModel: ChatViewModel { sonarStore.chatViewModel }
+
     var body: some Scene {
         WindowGroup {
-            ContentView()
-                .environmentObject(chatViewModel)
+            SonarRootView()
+                .environmentObject(sonarStore)
                 .onAppear {
                     NotificationDelegate.shared.chatViewModel = chatViewModel
                     // Inject live Noise service into VerificationService to avoid creating new BLE instances
                     VerificationService.shared.configure(with: chatViewModel.meshService.getNoiseService())
                     // Prewarm Nostr identity and QR to make first VERIFY sheet fast
                     let nickname = chatViewModel.nickname
+                    let idBridge = sonarStore.idBridge
                     DispatchQueue.global(qos: .utility).async {
                         let npub = try? idBridge.getCurrentNostrIdentity()?.npub
                         _ = VerificationService.shared.buildMyQRString(nickname: nickname, npub: npub)
@@ -63,7 +58,7 @@ struct BitchatApp: App {
 
                     // Initialize network activation policy; will start Tor/Nostr only when allowed
                     NetworkActivationService.shared.start()
-                    
+
                     // Start presence service (will wait for Tor readiness)
                     GeohashPresenceService.shared.start()
 
@@ -78,6 +73,10 @@ struct BitchatApp: App {
                     switch newPhase {
                     case .background:
                         // Keep BLE mesh running in background; BLEService adapts scanning automatically
+                        // Stop advertising as a Unify receiver: iOS strips the BLE
+                        // local name and restricts service-UUID advertising in the
+                        // background, so receiving payments is foreground-only.
+                        sonarStore.setForeground(false)
                         // Always send Tor to dormant on background for a clean restart later.
                         TorManager.shared.setAppForeground(false)
                         TorManager.shared.goDormantOnBackground()
@@ -91,9 +90,13 @@ struct BitchatApp: App {
                     case .active:
                         // Restart services when becoming active
                         chatViewModel.meshService.startServices()
+                        // Resume Unify receiver advertising (gated internally on a
+                        // ready wallet) now that we're foreground again.
+                        sonarStore.setForeground(true)
                         TorManager.shared.setAppForeground(true)
                         // On initial cold launch, Tor was just started in onAppear.
                         // Skip the deterministic restart the first time we become active.
+                        let wasBackgrounded = didEnterBackground
                         if didHandleInitialActive && didEnterBackground {
                             if TorManager.shared.isAutoStartAllowed() && !TorManager.shared.isReady {
                                 TorManager.shared.ensureRunningOnForeground()
@@ -112,6 +115,10 @@ struct BitchatApp: App {
                                     NostrRelayManager.shared.resetAllConnections()
                                 }
                             }
+                        } else if wasBackgrounded {
+                            // Tor disabled: backgrounding disconnected Nostr above, so
+                            // reconnect directly on foreground (no Tor readiness to await).
+                            NostrRelayManager.shared.resetAllConnections()
                         }
                         checkForSharedContent()
                     case .inactive:
@@ -135,35 +142,35 @@ struct BitchatApp: App {
         .windowResizability(.contentSize)
         #endif
     }
-    
+
     private func handleURL(_ url: URL) {
         if url.scheme == "bitchat" && url.host == "share" {
             // Handle shared content
             checkForSharedContent()
         }
     }
-    
+
     private func checkForSharedContent() {
         // Check app group for shared content from extension
         guard let userDefaults = UserDefaults(suiteName: BitchatApp.groupID) else {
             return
         }
-        
+
         guard let sharedContent = userDefaults.string(forKey: "sharedContent"),
               let sharedDate = userDefaults.object(forKey: "sharedContentDate") as? Date else {
             return
         }
-        
+
         // Only process if shared within configured window
         if Date().timeIntervalSince(sharedDate) < TransportConfig.uiShareAcceptWindowSeconds {
             let contentType = userDefaults.string(forKey: "sharedContentType") ?? "text"
-            
+
             // Clear the shared content
             userDefaults.removeObject(forKey: "sharedContent")
             userDefaults.removeObject(forKey: "sharedContentType")
             userDefaults.removeObject(forKey: "sharedContentDate")
             // No need to force synchronize here
-            
+
             // Send the shared content immediately on the main queue
             DispatchQueue.main.async {
                 if contentType == "url" {
@@ -188,11 +195,11 @@ struct BitchatApp: App {
 #if os(iOS)
 final class AppDelegate: NSObject, UIApplicationDelegate {
     weak var chatViewModel: ChatViewModel?
-    
+
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey : Any]? = nil) -> Bool {
         return true
     }
-    
+
     func applicationWillTerminate(_ application: UIApplication) {
         chatViewModel?.applicationWillTerminate()
     }
@@ -204,11 +211,11 @@ import AppKit
 
 final class MacAppDelegate: NSObject, NSApplicationDelegate {
     weak var chatViewModel: ChatViewModel?
-    
+
     func applicationWillTerminate(_ notification: Notification) {
         chatViewModel?.applicationWillTerminate()
     }
-    
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         return true
     }
@@ -218,11 +225,11 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate {
 final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
     static let shared = NotificationDelegate()
     weak var chatViewModel: ChatViewModel?
-    
+
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse, withCompletionHandler completionHandler: @escaping () -> Void) {
         let identifier = response.notification.request.identifier
         let userInfo = response.notification.request.content.userInfo
-        
+
         // Check if this is a private message notification
         if identifier.hasPrefix("private-") {
             // Get peer ID from userInfo
@@ -240,14 +247,14 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
             DispatchQueue.main.async { NSWorkspace.shared.open(url) }
             #endif
         }
-        
+
         completionHandler()
     }
-    
+
     func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
         let identifier = notification.request.identifier
         let userInfo = notification.request.content.userInfo
-        
+
         // Check if this is a private message notification
         if identifier.hasPrefix("private-") {
             // Get peer ID from userInfo
@@ -273,9 +280,8 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
                 return
             }
         }
-        
+
         // Show notification in all other cases
         completionHandler([.banner, .sound])
     }
 }
-

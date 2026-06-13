@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Dark-first launch theme so the cold-start window matches the app
+         (no white splash flash before Compose draws). -->
+    <style name="Theme.Sonar" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/sonar_bg</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>

@@ -12,8 +12,11 @@ import UniformTypeIdentifiers
 /// Modern share extension using UIKit + UTTypes.
 /// Avoids deprecated Social framework and SLComposeServiceViewController.
 final class ShareViewController: UIViewController {
-    // Bundle.main.bundleIdentifier would get the extension's bundleID
-    private static let groupID = "group.chat.bitchat"
+    // Bundle.main.bundleIdentifier would get the extension's bundleID.
+    // The app group is injected at build time (APP_GROUP_ID → Info.plist) so
+    // local dev builds can use a team-registrable group id.
+    private static let groupID =
+        Bundle.main.object(forInfoDictionaryKey: "AppGroupID") as? String ?? "group.chat.bitchat"
 
     private enum Strings {
         static let nothingToShare = String(localized: "share.status.nothing_to_share", comment: "Shown when the share extension receives no content")

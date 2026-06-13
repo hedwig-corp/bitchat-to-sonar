@@ -500,10 +500,9 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
                 String(localized: "system.tor.starting", comment: "System message when Tor is starting")
             )
         } else if !TorManager.shared.torEnforced && !torStatusAnnounced {
+            // Sonar: direct (no-Tor) networking is the intended default for now;
+            // no system message needed (the old "dev bypass" warning is misleading).
             torStatusAnnounced = true
-            addGeohashOnlySystemMessage(
-                String(localized: "system.tor.dev_bypass", comment: "System message when Tor bypass is enabled in development")
-            )
         }
 
         // Initialize Nostr relay manager regardless of Tor readiness; connection is controlled elsewhere
@@ -1900,9 +1899,14 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
         
         // Clear all messages
         messages.removeAll()
+        timelineStore.clear(channel: .mesh)
         privateChatManager.privateChats.removeAll()
         privateChatManager.unreadMessages.removeAll()
-        
+
+        // Erase the on-disk message store: persisted mesh DMs and channel
+        // transcripts MUST be wiped on panic (they are local-only on-device).
+        MessageStore.shared.wipeAll()
+
         // Delete all keychain data (including Noise and Nostr keys)
         _ = keychain.deleteAllKeychainData()
         
@@ -2595,6 +2599,24 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
     func refreshVisibleMessages(from channel: ChannelID? = nil) {
         let target = channel ?? activeChannel
         messages = timelineStore.messages(for: target)
+        // Write-through: persist the visible channel transcript so public /
+        // geohash history survives an app restart. Local-only on-device store.
+        MessageStore.shared.saveChannel(target.storeID, messages: messages)
+    }
+
+    /// Merge a channel's persisted transcript (from MessageStore) back into the
+    /// in-memory timeline on channel-select, so history survives a relaunch.
+    /// Existing messages are deduped by id inside the timeline store.
+    @MainActor
+    func hydrateChannelFromStore(_ channel: ChannelID) {
+        let stored = MessageStore.shared.loadChannel(channel.storeID)
+        guard !stored.isEmpty else { return }
+        switch channel {
+        case .mesh:
+            for message in stored { timelineStore.append(message, to: .mesh) }
+        case .location(let ch):
+            for message in stored { _ = timelineStore.appendIfAbsent(message, toGeohash: ch.geohash) }
+        }
     }
 
     @MainActor

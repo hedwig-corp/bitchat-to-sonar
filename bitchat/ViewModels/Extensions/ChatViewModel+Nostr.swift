@@ -188,6 +188,10 @@ extension ChatViewModel {
         
         // Reset deduplication set and optionally hydrate timeline for mesh
         deduplicationService.clearNostrCaches()
+        // Hydrate this channel's persisted transcript from disk so history
+        // survives an app restart (write-through happens in
+        // refreshVisibleMessages). No-op when nothing was stored.
+        hydrateChannelFromStore(channel)
         switch channel {
         case .mesh:
             refreshVisibleMessages(from: .mesh)

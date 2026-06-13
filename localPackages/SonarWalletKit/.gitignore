@@ -1,0 +1,7 @@
+/.build/
+/.swiftpm/
+# ~440M generated KMP static framework; rebuild from the unify-wallet repo
+# (branch sonar-wallet-kit) with
+#   ./gradlew :shared:wallet-kit:assembleSonarWalletKitReleaseXCFramework
+# and copy build/XCFrameworks/release/SonarWalletKit.xcframework here.
+/Frameworks/

@@ -53,6 +53,9 @@ struct ContentView: View {
     @State private var autocompleteDebounceTimer: Timer?
     @State private var showLocationChannelsSheet = false
     @State private var showVerifySheet = false
+    @State private var showNearbySonar = false
+    @State private var showMarmotChats = false
+    @AppStorage("sonar.onboarding.complete") private var hasCompletedOnboarding = false
     @State private var expandedMessageIDs: Set<String> = []
     @State private var showLocationNotes = false
     @State private var notesGeohash: String? = nil
@@ -81,15 +84,15 @@ struct ContentView: View {
     // MARK: - Computed Properties
     
     private var backgroundColor: Color {
-        colorScheme == .dark ? Color.black : Color.white
+        SonarTheme.bg
     }
 
     private var textColor: Color {
-        colorScheme == .dark ? Color.green : Color(red: 0, green: 0.5, blue: 0)
+        SonarTheme.text
     }
 
     private var secondaryTextColor: Color {
-        colorScheme == .dark ? Color.green.opacity(0.8) : Color(red: 0, green: 0.5, blue: 0).opacity(0.8)
+        SonarTheme.text2
     }
 
     private var headerLineLimit: Int? {
@@ -144,6 +147,16 @@ struct ContentView: View {
                 .onChange(of: colorScheme) { newValue in
                     viewModel.currentColorScheme = newValue
                 }
+
+            // Network status, in plain language (Sonar status chip)
+            HStack {
+                Spacer()
+                SonarStatusChip()
+                Spacer()
+            }
+            .padding(.top, 2)
+            .padding(.bottom, 8)
+            .background(backgroundColor)
 
             Divider()
 
@@ -341,8 +354,21 @@ struct ContentView: View {
             scrollThrottleTimer?.invalidate()
             autocompleteDebounceTimer?.invalidate()
         }
+        .overlay(
+            Group {
+                if !hasCompletedOnboarding {
+                    SonarOnboardingView(onDone: {
+                        withAnimation(.easeOut(duration: 0.25)) {
+                            hasCompletedOnboarding = true
+                        }
+                    })
+                    .environmentObject(viewModel)
+                    .transition(.opacity)
+                }
+            }
+        )
     }
-    
+
     // MARK: - Message List View
     
     private func messagesView(privatePeer: PeerID?, isAtBottom: Binding<Bool>) -> some View {
@@ -381,7 +407,7 @@ struct ContentView: View {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     ForEach(messageItems) { item in
                         let message = item.message
-                        messageRow(for: message)
+                        messageRow(for: message, privatePeer: privatePeer)
                             .onAppear {
                                 if message.id == windowedMessages.last?.id {
                                     isAtBottom.wrappedValue = true
@@ -595,13 +621,13 @@ struct ContentView: View {
                             .frame(maxWidth: .infinity, alignment: .leading)
                         }
                         .buttonStyle(.plain)
-                        .background(Color.gray.opacity(0.1))
+                        .background(SonarTheme.surface2)
                     }
                 }
-                .background(backgroundColor)
+                .background(SonarTheme.surface)
                 .overlay(
-                    RoundedRectangle(cornerRadius: 4)
-                        .stroke(secondaryTextColor.opacity(0.3), lineWidth: 1)
+                    RoundedRectangle(cornerRadius: 10)
+                        .stroke(SonarTheme.hairline, lineWidth: 1)
                 )
                 .padding(.horizontal, 12)
             }
@@ -637,11 +663,11 @@ struct ContentView: View {
 #endif
                 .submitLabel(.send)
                 .onSubmit { sendMessage() }
-                .padding(.vertical, 4)
-                .padding(.horizontal, 6)
+                .padding(.vertical, 7)
+                .padding(.horizontal, 12)
                 .background(
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .fill(colorScheme == .dark ? Color.black.opacity(0.35) : Color.white.opacity(0.7))
+                    RoundedRectangle(cornerRadius: SonarTheme.bubbleRadius, style: .continuous)
+                        .fill(SonarTheme.surface2)
                 )
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .onChange(of: messageText) { newValue in
@@ -898,9 +924,9 @@ struct ContentView: View {
                     let subtitleColor: Color = {
                         switch locationManager.selectedChannel {
                         case .mesh:
-                            return Color.blue
+                            return SonarTheme.accent
                         case .location:
-                            return Color.green
+                            return SonarTheme.net
                         }
                     }()
                     HStack(spacing: 6) {
@@ -1184,16 +1210,14 @@ struct ContentView: View {
         switch locationManager.selectedChannel {
         case .location:
             let n = viewModel.geohashPeople.count
-            let standardGreen = (colorScheme == .dark) ? Color.green : Color(red: 0, green: 0.5, blue: 0)
-            return (n, n > 0 ? standardGreen : Color.secondary)
+            return (n, n > 0 ? SonarTheme.net : SonarTheme.text3)
         case .mesh:
             let counts = viewModel.allPeers.reduce(into: (others: 0, mesh: 0)) { counts, peer in
                 guard peer.peerID != viewModel.meshService.myPeerID else { return }
                 if peer.isConnected { counts.mesh += 1; counts.others += 1 }
                 else if peer.isReachable { counts.others += 1 }
             }
-            let meshBlue = Color(hue: 0.60, saturation: 0.85, brightness: 0.82)
-            let color: Color = counts.mesh > 0 ? meshBlue : Color.secondary
+            let color: Color = counts.mesh > 0 ? SonarTheme.accent : SonarTheme.text3
             return (counts.others, color)
         }
     }
@@ -1201,8 +1225,8 @@ struct ContentView: View {
     
     private var mainHeaderView: some View {
         HStack(spacing: 0) {
-            Text(verbatim: "bitchat/")
-                .font(.bitchatSystem(size: 18, weight: .medium, design: .monospaced))
+            Text(verbatim: "sonar")
+                .font(SonarTheme.uiFont(size: 20, weight: .heavy))
                 .foregroundColor(textColor)
                 .onTapGesture(count: 3) {
                     // PANIC: Triple-tap to clear all data
@@ -1217,6 +1241,7 @@ struct ContentView: View {
                 Text(verbatim: "@")
                     .font(.bitchatSystem(size: 14, design: .monospaced))
                     .foregroundColor(secondaryTextColor)
+                    .padding(.leading, 8)
                 
                 TextField("content.input.nickname_placeholder", text: $viewModel.nickname)
                     .textFieldStyle(.plain)
@@ -1253,14 +1278,32 @@ struct ContentView: View {
             }()
 
             HStack(spacing: 10) {
+                // Sonar radar: discover who's nearby before you see them
+                Button(action: { showNearbySonar = true }) {
+                    Image(systemName: "circle.circle")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundColor(SonarTheme.accent)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("People nearby radar")
+
+                // Marmot secure chats (MLS over Nostr — White Noise interop)
+                Button(action: { showMarmotChats = true }) {
+                    Image(systemName: "lock.shield")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundColor(SonarTheme.net)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Secure internet chats")
+
                 // Unread icon immediately to the left of the channel badge (independent from channel button)
-                
+
                 // Unread indicator (now shown on iOS and macOS)
                 if viewModel.hasAnyUnreadMessages {
                     Button(action: { viewModel.openMostRelevantPrivateChat() }) {
                         Image(systemName: "envelope.fill")
                             .font(.bitchatSystem(size: 12))
-                            .foregroundColor(Color.orange)
+                            .foregroundColor(SonarTheme.accent)
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel(
@@ -1280,7 +1323,7 @@ struct ContentView: View {
                         HStack(alignment: .center, spacing: 4) {
                             Image(systemName: "note.text")
                                 .font(.bitchatSystem(size: 12))
-                                .foregroundColor(Color.orange.opacity(0.8))
+                                .foregroundColor(SonarTheme.accent.opacity(0.8))
                                 .padding(.top, 1)
                         }
                         .fixedSize(horizontal: true, vertical: false)
@@ -1318,9 +1361,9 @@ struct ContentView: View {
                     let badgeColor: Color = {
                         switch locationManager.selectedChannel {
                         case .mesh:
-                            return Color(hue: 0.60, saturation: 0.85, brightness: 0.82)
+                            return SonarTheme.accent
                         case .location:
-                            return (colorScheme == .dark) ? Color.green : Color(red: 0, green: 0.5, blue: 0)
+                            return SonarTheme.net
                         }
                     }()
                     Text(badgeText)
@@ -1372,6 +1415,13 @@ struct ContentView: View {
         }
         .frame(height: headerHeight)
         .padding(.horizontal, 12)
+        .sheet(isPresented: $showNearbySonar) {
+            SonarNearbyView()
+                .environmentObject(viewModel)
+        }
+        .sheet(isPresented: $showMarmotChats) {
+            MarmotChatsView()
+        }
         .sheet(isPresented: $showLocationChannelsSheet) {
             LocationChannelsSheet(isPresented: $showLocationChannelsSheet)
                 .environmentObject(viewModel)
@@ -1546,13 +1596,35 @@ private extension ContentView {
     }
 
     @ViewBuilder
-    private func messageRow(for message: BitchatMessage) -> some View {
+    private func messageRow(for message: BitchatMessage, privatePeer: PeerID?) -> some View {
         if message.sender == "system" {
             systemMessageRow(message)
         } else if let media = mediaAttachment(for: message) {
             mediaMessageRow(message: message, media: media)
         } else {
-            TextMessageView(message: message, expandedMessageIDs: $expandedMessageIDs)
+            SonarMessageBubbleView(
+                message: message,
+                transport: transport(privatePeer: privatePeer),
+                showAuthor: privatePeer == nil,
+                expandedMessageIDs: $expandedMessageIDs
+            )
+        }
+    }
+
+    /// How a message travels in this conversation context: BLE mesh vs Nostr.
+    /// Mesh channel and mesh-reachable DMs go over Bluetooth; geohash channels
+    /// and out-of-range DMs go over Nostr/the internet.
+    private func transport(privatePeer: PeerID?) -> SonarTransport {
+        if let peer = privatePeer {
+            if peer.isGeoDM { return .internet }
+            if viewModel.meshService.isPeerConnected(peer) || viewModel.meshService.isPeerReachable(peer) {
+                return .mesh
+            }
+            return .internet
+        }
+        switch locationManager.selectedChannel {
+        case .mesh: return .mesh
+        case .location: return .internet
         }
     }
 
@@ -1702,7 +1774,9 @@ private extension ContentView {
     }
 
     private var composerAccentColor: Color {
-        viewModel.selectedPrivateChatPeer != nil ? Color.orange : textColor
+        // Transport-colored composer: cyan when the message will travel over
+        // the Bluetooth mesh, indigo when it goes over Nostr/the internet.
+        transport(privatePeer: viewModel.selectedPrivateChatPeer).tint
     }
 
     var attachmentButton: some View {
@@ -1779,7 +1853,7 @@ private extension ContentView {
         return Button(action: sendMessage) {
             Image(systemName: "arrow.up.circle.fill")
                 .font(.bitchatSystem(size: 24))
-                .foregroundColor(enabled ? activeColor : Color.gray)
+                .foregroundColor(enabled ? activeColor : SonarTheme.text3)
                 .frame(width: 36, height: 36)
         }
         .buttonStyle(.plain)

@@ -14,6 +14,9 @@
 		A6E3E5722E7703760032EA8A /* BitLogger in Frameworks */ = {isa = PBXBuildFile; productRef = A6E3E5712E7703760032EA8A /* BitLogger */; };
 		A6E3EA7F2E7706720032EA8A /* Tor in Frameworks */ = {isa = PBXBuildFile; productRef = A6E3EA7E2E7706720032EA8A /* Tor */; };
 		A6E3EA812E7706A80032EA8A /* Tor in Frameworks */ = {isa = PBXBuildFile; productRef = A6E3EA802E7706A80032EA8A /* Tor */; };
+		A15C0DE000000000000000A4 /* SonarCore in Frameworks */ = {isa = PBXBuildFile; productRef = A15C0DE000000000000000A2 /* SonarCore */; };
+		A15C0DE000000000000000A5 /* SonarCore in Frameworks */ = {isa = PBXBuildFile; productRef = A15C0DE000000000000000A3 /* SonarCore */; };
+		A15C0DE100000000000000B4 /* WalletKit in Frameworks */ = {isa = PBXBuildFile; productRef = A15C0DE100000000000000B2 /* WalletKit */; };
 		E0A1B2C3D4E5F6012345678D /* relays/online_relays_gps.csv in Resources */ = {isa = PBXBuildFile; fileRef = E0A1B2C3D4E5F6012345678A /* relays/online_relays_gps.csv */; };
 		E0A1B2C3D4E5F6012345678E /* relays/online_relays_gps.csv in Resources */ = {isa = PBXBuildFile; fileRef = E0A1B2C3D4E5F6012345678A /* relays/online_relays_gps.csv */; };
 /* End PBXBuildFile section */
@@ -156,6 +159,7 @@
 				A6E3E5722E7703760032EA8A /* BitLogger in Frameworks */,
 				3EE336D150427F736F32B56C /* P256K in Frameworks */,
 				A6E3EA812E7706A80032EA8A /* Tor in Frameworks */,
+				A15C0DE000000000000000A5 /* SonarCore in Frameworks */,
 			);
 		};
 		B5A5CC493FFB3D8966548140 /* Frameworks */ = {
@@ -164,6 +168,8 @@
 				A6E3E5702E77036A0032EA8A /* BitLogger in Frameworks */,
 				885BBED78092484A5B069461 /* P256K in Frameworks */,
 				A6E3EA7F2E7706720032EA8A /* Tor in Frameworks */,
+				A15C0DE000000000000000A4 /* SonarCore in Frameworks */,
+				A15C0DE100000000000000B4 /* WalletKit in Frameworks */,
 			);
 		};
 /* End PBXFrameworksBuildPhase section */
@@ -223,6 +229,7 @@
 				B1D9136AA0083366353BFA2F /* P256K */,
 				A6E3E5712E7703760032EA8A /* BitLogger */,
 				A6E3EA802E7706A80032EA8A /* Tor */,
+				A15C0DE000000000000000A3 /* SonarCore */,
 			);
 			productName = bitchat_macOS;
 			productReference = 8F3A7C058C2C8E1A06C8CF8B /* bitchat.app */;
@@ -303,6 +310,8 @@
 				4EB6BA1B8464F1EA38F4E286 /* P256K */,
 				A6E3E56F2E77036A0032EA8A /* BitLogger */,
 				A6E3EA7E2E7706720032EA8A /* Tor */,
+				A15C0DE000000000000000A2 /* SonarCore */,
+				A15C0DE100000000000000B2 /* WalletKit */,
 			);
 			productName = bitchat_iOS;
 			productReference = 96D0D41CA19EE5A772AA8434 /* bitchat.app */;
@@ -344,6 +353,8 @@
 				B8C407587481BBB190741C93 /* XCRemoteSwiftPackageReference "swift-secp256k1" */,
 				A6E3E56E2E77036A0032EA8A /* XCLocalSwiftPackageReference "localPackages/BitLogger" */,
 				A6E3EA7D2E7706720032EA8A /* XCLocalSwiftPackageReference "localPackages/Arti" */,
+				A15C0DE000000000000000A1 /* XCLocalSwiftPackageReference "localPackages/SonarCore" */,
+				A15C0DE100000000000000B1 /* XCLocalSwiftPackageReference "localPackages/SonarWalletKit" */,
 			);
 			preferredProjectObjectVersion = 90;
 			projectDirPath = "";
@@ -915,6 +926,14 @@
 			isa = XCLocalSwiftPackageReference;
 			relativePath = localPackages/Arti;
 		};
+		A15C0DE000000000000000A1 /* XCLocalSwiftPackageReference "localPackages/SonarCore" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = localPackages/SonarCore;
+		};
+		A15C0DE100000000000000B1 /* XCLocalSwiftPackageReference "localPackages/SonarWalletKit" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = localPackages/SonarWalletKit;
+		};
 /* End XCLocalSwiftPackageReference section */
 
 /* Begin XCRemoteSwiftPackageReference section */
@@ -949,6 +968,18 @@
 		A6E3EA802E7706A80032EA8A /* Tor */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = Tor;
+		};
+		A15C0DE000000000000000A2 /* SonarCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = SonarCore;
+		};
+		A15C0DE000000000000000A3 /* SonarCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = SonarCore;
+		};
+		A15C0DE100000000000000B2 /* WalletKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = WalletKit;
 		};
 		B1D9136AA0083366353BFA2F /* P256K */ = {
 			isa = XCSwiftPackageProductDependency;

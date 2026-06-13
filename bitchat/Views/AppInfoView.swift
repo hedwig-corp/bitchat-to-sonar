@@ -5,15 +5,15 @@ struct AppInfoView: View {
     @Environment(\.colorScheme) var colorScheme
     
     private var backgroundColor: Color {
-        colorScheme == .dark ? Color.black : Color.white
+        SonarTheme.bg
     }
-    
+
     private var textColor: Color {
-        colorScheme == .dark ? Color.green : Color(red: 0, green: 0.5, blue: 0)
+        SonarTheme.text
     }
-    
+
     private var secondaryTextColor: Color {
-        colorScheme == .dark ? Color.green.opacity(0.8) : Color(red: 0, green: 0.5, blue: 0).opacity(0.8)
+        SonarTheme.text2
     }
     
     // MARK: - Constants
@@ -134,62 +134,83 @@ struct AppInfoView: View {
     
     @ViewBuilder
     private var infoContent: some View {
-        VStack(alignment: .leading, spacing: 24) {
-            // Header
-            VStack(alignment: .center, spacing: 8) {
+        VStack(alignment: .leading, spacing: 8) {
+            // Header: Sonar mark + name + tagline
+            VStack(alignment: .center, spacing: 12) {
+                RoundedRectangle(cornerRadius: 23, style: .continuous)
+                    .fill(SonarTheme.accentFill)
+                    .frame(width: 74, height: 74)
+                    .overlay(
+                        Image(systemName: "circle.circle")
+                            .font(.system(size: 38, weight: .light))
+                            .foregroundColor(SonarTheme.onAccent)
+                    )
+
                 Text(Strings.appName)
-                    .font(.bitchatSystem(size: 32, weight: .bold, design: .monospaced))
+                    .font(SonarTheme.uiFont(size: 30, weight: .heavy))
                     .foregroundColor(textColor)
-                
+
                 Text(Strings.tagline)
-                    .font(.bitchatSystem(size: 16, design: .monospaced))
+                    .font(SonarTheme.uiFont(size: 15))
                     .foregroundColor(secondaryTextColor)
+                    .multilineTextAlignment(.center)
             }
             .frame(maxWidth: .infinity)
             .padding(.vertical)
-            
-            // How to Use
-            VStack(alignment: .leading, spacing: 16) {
-                SectionHeader(Strings.HowToUse.title)
 
-                VStack(alignment: .leading, spacing: 8) {
+            // How to Use
+            SectionHeader(Strings.HowToUse.title)
+            AppInfoCard {
+                VStack(alignment: .leading, spacing: 10) {
                     ForEach(Array(Strings.HowToUse.instructions.enumerated()), id: \.offset) { _, instruction in
                         Text(instruction)
                     }
                 }
-                .font(.bitchatSystem(size: 14, design: .monospaced))
+                .font(SonarTheme.uiFont(size: 14))
                 .foregroundColor(textColor)
+                .padding(14)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
 
             // Features
-            VStack(alignment: .leading, spacing: 16) {
-                SectionHeader(Strings.Features.title)
-
-                FeatureRow(info: Strings.Features.offlineComm)
-
-                FeatureRow(info: Strings.Features.encryption)
-
-                FeatureRow(info: Strings.Features.extendedRange)
-
-                FeatureRow(info: Strings.Features.favorites)
-
-                FeatureRow(info: Strings.Features.geohash)
-
-                FeatureRow(info: Strings.Features.mentions)
+            SectionHeader(Strings.Features.title)
+            AppInfoCard {
+                VStack(alignment: .leading, spacing: 0) {
+                    FeatureRow(info: Strings.Features.offlineComm)
+                    FeatureRow(info: Strings.Features.encryption)
+                    FeatureRow(info: Strings.Features.extendedRange)
+                    FeatureRow(info: Strings.Features.favorites)
+                    FeatureRow(info: Strings.Features.geohash)
+                    FeatureRow(info: Strings.Features.mentions, isLast: true)
+                }
             }
 
             // Privacy
-            VStack(alignment: .leading, spacing: 16) {
-                SectionHeader(Strings.Privacy.title)
-
-                FeatureRow(info: Strings.Privacy.noTracking)
-
-                FeatureRow(info: Strings.Privacy.ephemeral)
-
-                FeatureRow(info: Strings.Privacy.panic)
+            SectionHeader(Strings.Privacy.title)
+            AppInfoCard {
+                VStack(alignment: .leading, spacing: 0) {
+                    FeatureRow(info: Strings.Privacy.noTracking)
+                    FeatureRow(info: Strings.Privacy.ephemeral)
+                    FeatureRow(info: Strings.Privacy.panic, isLast: true)
+                }
             }
         }
-        .padding()
+        .padding(14)
+    }
+}
+
+/// Grouped settings card (st-card pattern from the Sonar prototype).
+struct AppInfoCard<Content: View>: View {
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        content
+            .background(
+                RoundedRectangle(cornerRadius: SonarTheme.cardRadius, style: .continuous)
+                    .fill(SonarTheme.surface)
+                    .shadow(color: Color.black.opacity(0.04), radius: 1, y: 1)
+            )
+            .padding(.bottom, 8)
     }
 }
 
@@ -201,55 +222,60 @@ struct AppInfoFeatureInfo {
 
 struct SectionHeader: View {
     let title: LocalizedStringKey
-    @Environment(\.colorScheme) var colorScheme
-    
-    private var textColor: Color {
-        colorScheme == .dark ? Color.green : Color(red: 0, green: 0.5, blue: 0)
-    }
-    
+
     init(_ title: LocalizedStringKey) {
         self.title = title
     }
-    
+
     var body: some View {
         Text(title)
-            .font(.bitchatSystem(size: 16, weight: .bold, design: .monospaced))
-            .foregroundColor(textColor)
+            .font(SonarTheme.uiFont(size: 12.5, weight: .bold))
+            .foregroundColor(SonarTheme.text3)
+            .textCase(.uppercase)
+            .kerning(0.6)
             .padding(.top, 8)
+            .padding(.horizontal, 4)
+            .padding(.bottom, 2)
     }
 }
 
 struct FeatureRow: View {
     let info: AppInfoFeatureInfo
-    @Environment(\.colorScheme) var colorScheme
-    
-    private var textColor: Color {
-        colorScheme == .dark ? Color.green : Color(red: 0, green: 0.5, blue: 0)
-    }
-    
-    private var secondaryTextColor: Color {
-        colorScheme == .dark ? Color.green.opacity(0.8) : Color(red: 0, green: 0.5, blue: 0).opacity(0.8)
-    }
-    
+    var isLast: Bool = false
+
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
-            Image(systemName: info.icon)
-                .font(.bitchatSystem(size: 20))
-                .foregroundColor(textColor)
-                .frame(width: 30)
-            
-            VStack(alignment: .leading, spacing: 4) {
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(SonarTheme.accentSoft)
+                .frame(width: 30, height: 30)
+                .overlay(
+                    Image(systemName: info.icon)
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundColor(SonarTheme.accentDeep)
+                )
+
+            VStack(alignment: .leading, spacing: 2) {
                 Text(info.title)
-                    .font(.bitchatSystem(size: 14, weight: .semibold, design: .monospaced))
-                    .foregroundColor(textColor)
-                
+                    .font(SonarTheme.uiFont(size: 15, weight: .semibold))
+                    .foregroundColor(SonarTheme.text)
+
                 Text(info.description)
-                    .font(.bitchatSystem(size: 12, design: .monospaced))
-                    .foregroundColor(secondaryTextColor)
+                    .font(SonarTheme.uiFont(size: 12.5))
+                    .foregroundColor(SonarTheme.text2)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            
+
             Spacer()
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .overlay(alignment: .bottom) {
+            if !isLast {
+                Rectangle()
+                    .fill(SonarTheme.hairline)
+                    .frame(height: 1)
+                    .padding(.leading, 56)
+            }
         }
     }
 }

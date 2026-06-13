@@ -1,0 +1,43 @@
+[package]
+name = "sonar-core"
+description = "Headless core for Sonar: Nostr identity + Marmot (MLS over Nostr) messaging"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mdk-core.workspace = true
+mdk-storage-traits.workspace = true
+mdk-memory-storage.workspace = true
+# Persistent storage: mdk-sqlite-storage wraps rusqlite with the (hardcoded)
+# `bundled-sqlcipher` feature. On Apple host→Apple target builds the libsqlite3-sys
+# build.rs compiles SQLCipher against CommonCrypto (-DSQLCIPHER_CRYPTO_CC, links
+# Security + CoreFoundation), so NO OpenSSL is needed for iOS cross-builds —
+# provided OPENSSL_DIR / OPENSSL_LIB_DIR / OPENSSL_INCLUDE_DIR are NOT set.
+mdk-sqlite-storage.workspace = true
+nostr.workspace = true
+nostr-sdk.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+tracing.workspace = true
+serde.workspace = true
+# Noise XX session crypto for the BLE mesh transport (bitchat uses
+# Noise_XX_25519_ChaChaPoly_SHA256). `snow` is a vetted pure-Rust Noise impl.
+snow = "0.9"
+
+# SQLCipher needs a crypto backend. Apple targets compile it against
+# CommonCrypto (no OpenSSL — see the mdk-sqlite-storage note above). Android
+# has no CommonCrypto, so vendor OpenSSL for the SQLCipher build: the
+# `bundled-sqlcipher-vendored-openssl` feature makes libsqlite3-sys compile
+# OpenSSL from source (openssl-sys/openssl-src, via cargo-ndk's cross
+# toolchain) and feeds DEP_OPENSSL_INCLUDE into the SQLCipher cc build.
+# Target-scoped so iOS keeps the CommonCrypto path untouched.
+[target.'cfg(target_os = "android")'.dependencies]
+libsqlite3-sys = { version = "0.35", features = ["bundled-sqlcipher-vendored-openssl"] }
+
+[dev-dependencies]
+nostr-relay-builder.workspace = true
+tracing-subscriber.workspace = true
+tempfile.workspace = true
