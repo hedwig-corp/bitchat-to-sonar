@@ -11,6 +11,7 @@ sealed interface Screen {
     data object Home : Screen
     data object Settings : Screen
     data object Profile : Screen
+    data object Nearby : Screen
     data class Chat(val id: String, val name: String) : Screen
 }
 

@@ -69,6 +69,7 @@ fun App() {
                         is Screen.Chat -> ChatScreen(state, sc)
                         is Screen.Settings -> chat.bitchat.sonar.screens.SonarSettingsScreen(state)
                         is Screen.Profile -> chat.bitchat.sonar.screens.SonarProfileScreen(state)
+                        is Screen.Nearby -> chat.bitchat.sonar.screens.SonarRadarScreen(state)
                     }
                 }
             }
@@ -99,6 +100,8 @@ private fun HomeScreen(state: SonarAppState) {
                     )
                 }
             }
+            SNIconButton(SNIconName.Rings, size = 22.dp, weight = 2f, tint = s.text2) { state.push(Screen.Nearby) }
+            Spacer(Modifier.width(2.dp))
             Box(Modifier.clickable { state.push(Screen.Settings) }) {
                 SonarAvatar(state.nick.ifBlank { "you" }, 34.dp)
             }
