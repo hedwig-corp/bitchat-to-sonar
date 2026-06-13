@@ -247,6 +247,10 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
 @Composable
 private fun MessageBubble(m: SonarMsg) {
     val s = sonar
+    val linkColor = if (m.mine) s.onNet else s.accent
+    val annotated = remember(m.content, m.mine) { linkify(m.content, linkColor) }
+    val firstUrl = remember(m.content) { firstUrl(m.content) }
+    val uriHandler = androidx.compose.ui.platform.LocalUriHandler.current
     Column(
         Modifier.fillMaxWidth().padding(vertical = 3.dp),
         horizontalAlignment = if (m.mine) Alignment.End else Alignment.Start
@@ -254,12 +258,43 @@ private fun MessageBubble(m: SonarMsg) {
         Box(
             Modifier.clip(RoundedCornerShape(18.dp))
                 .background(if (m.mine) s.netFill else s.bubbleOther)
+                .then(if (firstUrl != null) Modifier.clickable { uriHandler.openUri(firstUrl) } else Modifier)
                 .padding(horizontal = 12.dp, vertical = 8.dp)
         ) {
-            Text(m.content, color = if (m.mine) s.onNet else s.text, fontSize = 16.sp)
+            // Selectable (long-press → Copy); tap opens a link if present —
+            // mirrors the iOS deterministic copy + tappable-link behavior.
+            androidx.compose.foundation.text.selection.SelectionContainer {
+                Text(annotated, color = if (m.mine) s.onNet else s.text, fontSize = 16.sp)
+            }
         }
     }
 }
+
+private val URL_REGEX = Regex("""(https?://|www\.)\S+""")
+
+private fun firstUrl(text: String): String? {
+    val m = URL_REGEX.find(text) ?: return null
+    val raw = m.value
+    return if (raw.startsWith("www.")) "https://$raw" else raw
+}
+
+private fun linkify(text: String, linkColor: androidx.compose.ui.graphics.Color) =
+    androidx.compose.ui.text.buildAnnotatedString {
+        var last = 0
+        for (match in URL_REGEX.findAll(text)) {
+            append(text.substring(last, match.range.first))
+            pushStyle(
+                androidx.compose.ui.text.SpanStyle(
+                    color = linkColor,
+                    textDecoration = androidx.compose.ui.text.style.TextDecoration.Underline
+                )
+            )
+            append(match.value)
+            pop()
+            last = match.range.last + 1
+        }
+        append(text.substring(last))
+    }
 
 @Composable
 private fun NewChatSheet(onStart: (String) -> Unit, onDismiss: () -> Unit) {
