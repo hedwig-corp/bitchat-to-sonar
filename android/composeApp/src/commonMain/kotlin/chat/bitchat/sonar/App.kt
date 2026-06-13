@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -209,6 +210,7 @@ private fun ChatRow(chat: SonarChat, onClick: () -> Unit) {
 private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     val s = sonar
     var draft by remember { mutableStateOf("") }
+    var paySheet by remember { mutableStateOf(false) }
     val listState = rememberLazyListState()
     LaunchedEffect(state.messages.size) {
         if (state.messages.isNotEmpty()) listState.animateScrollToItem(state.messages.size - 1)
@@ -216,13 +218,13 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
 
     Column(Modifier.fillMaxSize()) {
         Row(
-            Modifier.fillMaxWidth().padding(start = 6.dp, end = 16.dp, top = 12.dp, bottom = 8.dp),
+            Modifier.fillMaxWidth().padding(start = 6.dp, end = 12.dp, top = 12.dp, bottom = 8.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             SNIconButton(SNIconName.Back, onClick = { state.back() })
             SonarAvatar(screen.name, 36.dp, presence = false)
             Spacer(Modifier.width(10.dp))
-            Column {
+            Column(Modifier.weight(1f)) {
                 Text(
                     screen.name.ifBlank { "secure chat" },
                     color = s.text, fontSize = 16.sp, fontWeight = FontWeight.Bold,
@@ -234,6 +236,10 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                     Text("Sonar · end-to-end encrypted", color = s.text3, fontSize = 11.5.sp)
                 }
             }
+            Box(
+                Modifier.size(38.dp).clip(CircleShape).clickable { paySheet = true },
+                contentAlignment = Alignment.Center
+            ) { SNIcon(SNIconName.Coin, 21.dp, s.goldDeep, weight = 2f) }
         }
 
         chat.bitchat.sonar.ui.SNBanner(
@@ -251,12 +257,19 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                 )
             }
         } else {
+            val visible = state.messages.filter {
+                val p = PayLine.decode(it.content); p == null || p is PayLine.Pay
+            }
             LazyColumn(
                 Modifier.weight(1f).fillMaxWidth(),
                 state = listState,
                 contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
             ) {
-                items(state.messages, key = { it.id }) { m -> MessageBubble(m) }
+                items(visible, key = { it.id }) { m ->
+                    val pay = PayLine.decode(m.content) as? PayLine.Pay
+                    if (pay != null) PayBubble(m, pay) { state.toast = "Set up a wallet to claim payments." }
+                    else MessageBubble(m)
+                }
             }
         }
 
@@ -281,7 +294,94 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             ) { Text("↑", color = s.onNet, fontSize = 20.sp, fontWeight = FontWeight.Bold) }
         }
     }
+    if (paySheet) SendMoneySheet(
+        peerName = screen.name,
+        onSend = { sats ->
+            paySheet = false
+            state.send(screen.id, PayLine.Pay(randomPayId(), sats).encoded())
+        },
+        onDismiss = { paySheet = false }
+    )
     state.toast?.let { ToastBar(it) { state.toast = null } }
+}
+
+private fun randomPayId(): String =
+    (0 until 16).map { "0123456789abcdef".random() }.joinToString("")
+
+internal fun fmtSats(sats: Long): String {
+    val s = sats.toString().reversed().chunked(3).joinToString(",").reversed()
+    return "$s sats"
+}
+
+@Composable
+private fun PayBubble(m: SonarMsg, pay: PayLine.Pay, onClaim: () -> Unit) {
+    val s = sonar
+    Column(
+        Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        horizontalAlignment = if (m.mine) Alignment.End else Alignment.Start
+    ) {
+        Column(
+            Modifier.widthIn(max = 260.dp).clip(RoundedCornerShape(18.dp)).background(s.goldSoft)
+                .padding(14.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            SNIcon(SNIconName.Bolt, 22.dp, s.goldDeep)
+            Spacer(Modifier.height(6.dp))
+            Text(fmtSats(pay.sats), color = s.text, fontSize = 22.sp, fontWeight = FontWeight.Black)
+            Spacer(Modifier.height(2.dp))
+            Text(
+                if (m.mine) "You sent a payment" else "Payment for you",
+                color = s.text2, fontSize = 12.5.sp
+            )
+            if (!m.mine) {
+                Spacer(Modifier.height(10.dp))
+                Box(
+                    Modifier.clip(RoundedCornerShape(12.dp)).background(s.goldFill)
+                        .clickable(onClick = onClaim).padding(horizontal = 22.dp, vertical = 10.dp)
+                ) { Text("Claim", color = s.onGold, fontSize = 14.sp, fontWeight = FontWeight.Bold) }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SendMoneySheet(peerName: String, onSend: (Long) -> Unit, onDismiss: () -> Unit) {
+    val s = sonar
+    var amount by remember { mutableStateOf("") }
+    val sats = amount.toLongOrNull() ?: 0L
+    Box(
+        Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onDismiss),
+        contentAlignment = Alignment.BottomCenter
+    ) {
+        Surface(color = s.surface, shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)) {
+            Column(Modifier.fillMaxWidth().padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                Text("Send money to $peerName", color = s.text, fontSize = 17.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(14.dp))
+                Box(
+                    Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(s.surface2)
+                        .padding(horizontal = 14.dp, vertical = 16.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    if (amount.isEmpty()) Text("0 sats", color = s.text3, fontSize = 22.sp, fontWeight = FontWeight.Black)
+                    BasicTextField(
+                        value = amount, onValueChange = { v -> amount = v.filter { it.isDigit() }.take(8) },
+                        singleLine = true,
+                        textStyle = TextStyle(color = s.text, fontSize = 22.sp, fontWeight = FontWeight.Black, textAlign = androidx.compose.ui.text.style.TextAlign.Center),
+                        cursorBrush = SolidColor(s.goldDeep),
+                        keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.Number),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+                Spacer(Modifier.height(14.dp))
+                SNPrimaryButton(if (sats > 0) "Send ${fmtSats(sats)}" else "Send", disabled = sats <= 0) { onSend(sats) }
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "Travels as a sealed coin inside your encrypted chat. The wallet to settle it lands in a later build.",
+                    color = s.text3, fontSize = 12.sp, textAlign = androidx.compose.ui.text.style.TextAlign.Center, lineHeight = 16.sp
+                )
+            }
+        }
+    }
 }
 
 @Composable
