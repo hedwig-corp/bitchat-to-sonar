@@ -94,6 +94,10 @@ expect object SonarCore {
     fun isDark(): Boolean
     fun setDark(value: Boolean)
 
+    /** Generic persisted key/value blobs (⚡PAY ledger, BIP-353 address, …). */
+    fun loadBlob(key: String): String
+    fun saveBlob(key: String, value: String)
+
     /** Wipe all on-device data (identity, chats, prefs). */
     suspend fun wipe()
 }

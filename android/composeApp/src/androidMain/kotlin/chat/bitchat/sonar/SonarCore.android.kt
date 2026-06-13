@@ -172,6 +172,12 @@ actual object SonarCore {
         prefs().edit().putBoolean("appearance.dark", value).apply()
     }
 
+    actual fun loadBlob(key: String): String = prefs().getString("blob.$key", "") ?: ""
+
+    actual fun saveBlob(key: String, value: String) {
+        prefs().edit().putString("blob.$key", value).apply()
+    }
+
     actual suspend fun wipe() = withContext(Dispatchers.IO) {
         lock.withLock {
             node = null
