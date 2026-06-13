@@ -110,6 +110,22 @@ actual object SonarCore {
         prefs().edit().putBoolean("onboarding.complete", value).apply()
     }
 
+    actual fun isDark(): Boolean = prefs().getBoolean("appearance.dark", true)
+
+    actual fun setDark(value: Boolean) {
+        prefs().edit().putBoolean("appearance.dark", value).apply()
+    }
+
+    actual suspend fun wipe() = withContext(Dispatchers.IO) {
+        lock.withLock {
+            node = null
+            npub = ""; pubkeyHex = ""
+            // Drop the encrypted Marmot DB + all prefs.
+            File(ctx.filesDir, "sonar-marmot").deleteRecursively()
+            prefs().edit().clear().apply()
+        }
+    }
+
     private fun requireNode(): SonarNode =
         node ?: error("SonarCore not started — call start() first")
 

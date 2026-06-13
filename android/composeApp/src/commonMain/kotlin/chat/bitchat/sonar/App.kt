@@ -67,6 +67,8 @@ fun App() {
                     when (val sc = state.screen) {
                         is Screen.Home -> HomeScreen(state)
                         is Screen.Chat -> ChatScreen(state, sc)
+                        is Screen.Settings -> chat.bitchat.sonar.screens.SonarSettingsScreen(state)
+                        is Screen.Profile -> chat.bitchat.sonar.screens.SonarProfileScreen(state)
                     }
                 }
             }
@@ -97,6 +99,10 @@ private fun HomeScreen(state: SonarAppState) {
                     )
                 }
             }
+            Box(Modifier.clickable { state.push(Screen.Settings) }) {
+                SonarAvatar(state.nick.ifBlank { "you" }, 34.dp)
+            }
+            Spacer(Modifier.width(6.dp))
             SNIconButton(SNIconName.Plus, size = 22.dp, weight = 2.4f, tint = s.accent) { showNew = true }
         }
 

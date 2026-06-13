@@ -62,4 +62,11 @@ expect object SonarCore {
     /** Onboarding gate. */
     fun onboardingComplete(): Boolean
     fun setOnboardingComplete(value: Boolean)
+
+    /** Appearance: dark (default) or light. */
+    fun isDark(): Boolean
+    fun setDark(value: Boolean)
+
+    /** Wipe all on-device data (identity, chats, prefs). */
+    suspend fun wipe()
 }

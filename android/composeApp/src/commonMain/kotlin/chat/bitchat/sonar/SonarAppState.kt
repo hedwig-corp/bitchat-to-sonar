@@ -9,6 +9,8 @@ import kotlinx.coroutines.launch
 
 sealed interface Screen {
     data object Home : Screen
+    data object Settings : Screen
+    data object Profile : Screen
     data class Chat(val id: String, val name: String) : Screen
 }
 
@@ -26,8 +28,23 @@ class SonarAppState(private val scope: CoroutineScope) {
         private set
     var chats by mutableStateOf<List<SonarChat>>(emptyList())
         private set
-    var screen by mutableStateOf<Screen>(Screen.Home)
+    private var stack by mutableStateOf<List<Screen>>(listOf(Screen.Home))
+    val screen: Screen get() = stack.last()
+
+    var dark by mutableStateOf(SonarCore.isDark())
         private set
+
+    fun push(s: Screen) { stack = stack + s }
+    fun toggleDark() { dark = !dark; SonarCore.setDark(dark) }
+
+    fun wipe() {
+        scope.launch {
+            SonarCore.wipe()
+            stack = listOf(Screen.Home)
+            chats = emptyList(); messages = emptyList()
+            onboarded = false; nick = ""; npub = ""; started = false
+        }
+    }
     var messages by mutableStateOf<List<SonarMsg>>(emptyList())
         private set
     var toast by mutableStateOf<String?>(null)
@@ -69,12 +86,12 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     fun openChat(chat: SonarChat) {
-        screen = Screen.Chat(chat.id, chat.name)
+        push(Screen.Chat(chat.id, chat.name))
         scope.launch { messages = SonarCore.messages(chat.id) }
     }
 
     fun back() {
-        screen = Screen.Home
+        if (stack.size > 1) stack = stack.dropLast(1)
         messages = emptyList()
         scope.launch { refreshChats() }
     }
