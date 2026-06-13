@@ -22,6 +22,9 @@ kotlin {
             implementation(compose.ui)
             implementation(libs.coroutines.core)
         }
+        commonTest.dependencies {
+            implementation(kotlin("test"))
+        }
         androidMain.dependencies {
             implementation(libs.androidx.activity.compose)
             implementation(libs.coroutines.android)
