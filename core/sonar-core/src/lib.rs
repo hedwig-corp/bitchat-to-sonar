@@ -9,6 +9,7 @@ pub mod error;
 pub mod geohash;
 pub mod identity;
 pub mod marmot;
+pub mod noise;
 
 pub use error::Error;
 

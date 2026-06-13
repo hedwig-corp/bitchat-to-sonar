@@ -23,6 +23,9 @@ thiserror.workspace = true
 hex.workspace = true
 tracing.workspace = true
 serde.workspace = true
+# Noise XX session crypto for the BLE mesh transport (bitchat uses
+# Noise_XX_25519_ChaChaPoly_SHA256). `snow` is a vetted pure-Rust Noise impl.
+snow = "0.9"
 
 # SQLCipher needs a crypto backend. Apple targets compile it against
 # CommonCrypto (no OpenSSL — see the mdk-sqlite-storage note above). Android
