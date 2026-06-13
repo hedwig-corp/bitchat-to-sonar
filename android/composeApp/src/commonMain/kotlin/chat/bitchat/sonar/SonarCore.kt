@@ -16,6 +16,15 @@ data class SonarMsg(
     val tsSecs: Long,
 )
 
+/** A public message in a geohash channel. */
+data class SonarChannelMsg(
+    val id: String,
+    val author: String,
+    val content: String,
+    val mine: Boolean,
+    val tsSecs: Long,
+)
+
 /**
  * Shared boundary to the headless Rust core (`sonar-core`). UI in `commonMain`
  * calls these; each platform provides the `actual`:
@@ -49,6 +58,19 @@ expect object SonarCore {
 
     /** Poll the relays once (welcomes + group messages). */
     suspend fun sync()
+
+    // ── Geohash public channels ──
+
+    /** Geohash channels the user has joined (persisted). */
+    fun joinedChannels(): List<String>
+    fun joinChannel(geohash: String)
+    fun leaveChannel(geohash: String)
+
+    /** Recent public messages in a geohash channel, oldest first. */
+    suspend fun channelMessages(geohash: String): List<SonarChannelMsg>
+
+    /** Publish a public message to a geohash channel. */
+    suspend fun sendChannel(geohash: String, text: String)
 
     // ── Identity / profile (persisted on-device) ──
 

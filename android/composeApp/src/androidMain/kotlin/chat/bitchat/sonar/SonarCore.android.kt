@@ -87,6 +87,42 @@ actual object SonarCore {
         Unit
     }
 
+    actual fun joinedChannels(): List<String> =
+        prefs().getString("channels", "")?.split(",")?.filter { it.isNotBlank() } ?: emptyList()
+
+    actual fun joinChannel(geohash: String) {
+        val g = geohash.trim().lowercase()
+        if (g.isEmpty()) return
+        val set = joinedChannels().toMutableList()
+        if (!set.contains(g)) { set.add(g); prefs().edit().putString("channels", set.joinToString(",")).apply() }
+    }
+
+    actual fun leaveChannel(geohash: String) {
+        val set = joinedChannels().toMutableList()
+        set.remove(geohash.trim().lowercase())
+        prefs().edit().putString("channels", set.joinToString(",")).apply()
+    }
+
+    actual suspend fun channelMessages(geohash: String): List<SonarChannelMsg> = withContext(Dispatchers.IO) {
+        val n = node ?: return@withContext emptyList()
+        runCatching {
+            n.geohashMessages(geohash, 200u).map {
+                SonarChannelMsg(
+                    id = it.idHex,
+                    author = it.nickname.ifBlank { it.senderPubkeyHex.take(8) },
+                    content = it.content,
+                    mine = it.mine,
+                    tsSecs = it.createdAtSecs.toLong(),
+                )
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    actual suspend fun sendChannel(geohash: String, text: String) = withContext(Dispatchers.IO) {
+        val nick = nickname().ifBlank { "anon" }
+        requireNode().sendGeohash(geohash, text, nick)
+    }
+
     actual fun nickname(): String = prefs().getString("nickname", "") ?: ""
 
     actual fun setNickname(value: String) {

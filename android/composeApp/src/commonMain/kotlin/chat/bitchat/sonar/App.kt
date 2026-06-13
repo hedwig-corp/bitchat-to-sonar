@@ -70,6 +70,7 @@ fun App() {
                         is Screen.Settings -> chat.bitchat.sonar.screens.SonarSettingsScreen(state)
                         is Screen.Profile -> chat.bitchat.sonar.screens.SonarProfileScreen(state)
                         is Screen.Nearby -> chat.bitchat.sonar.screens.SonarRadarScreen(state)
+                        is Screen.Channel -> chat.bitchat.sonar.screens.SonarChannelScreen(state, sc)
                     }
                 }
             }
@@ -110,6 +111,12 @@ private fun HomeScreen(state: SonarAppState) {
         }
 
         LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 40.dp)) {
+            item { SNSectionLabel("Nearby channels") }
+            if (state.channels.isEmpty()) {
+                item { ChannelHint() }
+            } else {
+                items(state.channels, key = { it }) { gh -> ChannelRow(gh) { state.openChannel(gh) } }
+            }
             item { SNSectionLabel("Messages") }
             if (state.chats.isEmpty()) {
                 item { EmptyMessages() }
@@ -119,7 +126,11 @@ private fun HomeScreen(state: SonarAppState) {
         }
     }
 
-    if (showNew) NewChatSheet(onStart = { showNew = false; state.startChat(it) }, onDismiss = { showNew = false })
+    if (showNew) NewChatSheet(
+        onStart = { showNew = false; state.startChat(it) },
+        onJoin = { showNew = false; state.joinChannel(it) },
+        onDismiss = { showNew = false }
+    )
     state.toast?.let { ToastBar(it) { state.toast = null } }
 }
 
@@ -138,6 +149,35 @@ private fun EmptyMessages() {
             "Tap + and paste someone’s npub to start an end-to-end encrypted chat over the internet.",
             color = s.text3, fontSize = 13.sp, lineHeight = 18.sp
         )
+    }
+}
+
+@Composable
+private fun ChannelHint() {
+    val s = sonar
+    Text(
+        "Join a channel from + to chat publicly with people in an area.",
+        color = s.text3, fontSize = 13.sp, lineHeight = 18.sp,
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 4.dp)
+    )
+}
+
+@Composable
+private fun ChannelRow(geohash: String, onClick: () -> Unit) {
+    val s = sonar
+    Row(
+        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 11.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(
+            Modifier.size(46.dp).clip(androidx.compose.foundation.shape.RoundedCornerShape(14.dp)).background(s.accentSoft),
+            contentAlignment = Alignment.Center
+        ) { SNIcon(SNIconName.Pin, 22.dp, s.accentDeep) }
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+            Text("#$geohash", color = s.text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+            Text("Public channel · over the internet", color = s.text3, fontSize = 12.sp)
+        }
     }
 }
 
@@ -297,9 +337,10 @@ private fun linkify(text: String, linkColor: androidx.compose.ui.graphics.Color)
     }
 
 @Composable
-private fun NewChatSheet(onStart: (String) -> Unit, onDismiss: () -> Unit) {
+private fun NewChatSheet(onStart: (String) -> Unit, onJoin: (String) -> Unit, onDismiss: () -> Unit) {
     val s = sonar
     var peer by remember { mutableStateOf("") }
+    var channel by remember { mutableStateOf("") }
     Box(
         Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onDismiss),
         contentAlignment = Alignment.BottomCenter
@@ -309,24 +350,39 @@ private fun NewChatSheet(onStart: (String) -> Unit, onDismiss: () -> Unit) {
                 Text("New secure chat", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(4.dp))
                 Text("Paste their npub. They need to have opened Sonar at least once.", color = s.text3, fontSize = 12.5.sp)
-                Spacer(Modifier.height(14.dp))
-                Box(
-                    Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(s.surface2)
-                        .padding(horizontal = 14.dp, vertical = 14.dp)
-                ) {
-                    if (peer.isEmpty()) Text("npub1…", color = s.text3, fontSize = 15.sp)
-                    BasicTextField(
-                        value = peer, onValueChange = { peer = it }, singleLine = true,
-                        textStyle = TextStyle(color = s.text, fontSize = 15.sp),
-                        cursorBrush = SolidColor(s.accent),
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                }
-                Spacer(Modifier.height(14.dp))
+                Spacer(Modifier.height(12.dp))
+                SheetField(peer, "npub1…") { peer = it }
+                Spacer(Modifier.height(12.dp))
                 SNPrimaryButton("Start chat") { onStart(peer) }
+
+                Spacer(Modifier.height(22.dp))
+                Text("Join a channel", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(4.dp))
+                Text("Enter an area code (geohash) to chat publicly with people there.", color = s.text3, fontSize = 12.5.sp)
+                Spacer(Modifier.height(12.dp))
+                SheetField(channel, "e.g. u0nd or sr2y…") { channel = it }
+                Spacer(Modifier.height(12.dp))
+                SNPrimaryButton("Join channel", net = true) { onJoin(channel) }
                 Spacer(Modifier.height(8.dp))
             }
         }
+    }
+}
+
+@Composable
+private fun SheetField(value: String, placeholder: String, onChange: (String) -> Unit) {
+    val s = sonar
+    Box(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(s.surface2)
+            .padding(horizontal = 14.dp, vertical = 14.dp)
+    ) {
+        if (value.isEmpty()) Text(placeholder, color = s.text3, fontSize = 15.sp)
+        BasicTextField(
+            value = value, onValueChange = onChange, singleLine = true,
+            textStyle = TextStyle(color = s.text, fontSize = 15.sp),
+            cursorBrush = SolidColor(s.accent),
+            modifier = Modifier.fillMaxWidth()
+        )
     }
 }
 

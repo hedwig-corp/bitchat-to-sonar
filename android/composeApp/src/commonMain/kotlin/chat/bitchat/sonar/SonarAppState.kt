@@ -13,6 +13,7 @@ sealed interface Screen {
     data object Profile : Screen
     data object Nearby : Screen
     data class Chat(val id: String, val name: String) : Screen
+    data class Channel(val geohash: String) : Screen
 }
 
 /**
@@ -48,7 +49,38 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
     var messages by mutableStateOf<List<SonarMsg>>(emptyList())
         private set
+    var channels by mutableStateOf(SonarCore.joinedChannels())
+        private set
+    var channelMsgs by mutableStateOf<List<SonarChannelMsg>>(emptyList())
+        private set
     var toast by mutableStateOf<String?>(null)
+
+    fun joinChannel(geohash: String) {
+        val g = geohash.trim().lowercase()
+        if (g.isEmpty()) return
+        SonarCore.joinChannel(g)
+        channels = SonarCore.joinedChannels()
+        openChannel(g)
+    }
+
+    fun openChannel(geohash: String) {
+        push(Screen.Channel(geohash))
+        channelMsgs = emptyList()
+        scope.launch { channelMsgs = SonarCore.channelMessages(geohash) }
+    }
+
+    fun sendChannelMsg(geohash: String, text: String) {
+        val t = text.trim()
+        if (t.isEmpty()) return
+        scope.launch {
+            try {
+                SonarCore.sendChannel(geohash, t)
+                channelMsgs = SonarCore.channelMessages(geohash)
+            } catch (e: Throwable) {
+                toast = "send failed: ${e.message}"
+            }
+        }
+    }
 
     var onboarded by mutableStateOf(SonarCore.onboardingComplete())
         private set
@@ -135,6 +167,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 SonarCore.sync()
                 refreshChats()
                 (screen as? Screen.Chat)?.let { messages = SonarCore.messages(it.id) }
+                (screen as? Screen.Channel)?.let { channelMsgs = SonarCore.channelMessages(it.geohash) }
             }
         }
     }

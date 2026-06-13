@@ -6,6 +6,7 @@
 
 pub mod client;
 pub mod error;
+pub mod geohash;
 pub mod identity;
 pub mod marmot;
 

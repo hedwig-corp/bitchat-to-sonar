@@ -70,3 +70,49 @@ async fn two_instances_exchange_dms_through_a_relay() {
     let members = bob.groups().unwrap()[0].clone();
     assert_eq!(members.mls_group_id, *bob_group);
 }
+
+/// Two instances in the same geohash channel exchange public messages, with
+/// correct nickname tags, mine-detection, and channel isolation.
+#[tokio::test]
+async fn two_instances_exchange_geohash_channel_messages() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url.clone()])
+        .await
+        .expect("alice connects");
+    let bob = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url.clone()])
+        .await
+        .expect("bob connects");
+
+    let geohash = "u0nd";
+    // Geohash messages are ephemeral — both must subscribe before anyone posts,
+    // and delivery is live (no relay storage), so allow brief propagation.
+    alice.subscribe_geohash(geohash).await.expect("alice joins");
+    bob.subscribe_geohash(geohash).await.expect("bob joins");
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+    alice
+        .send_geohash(geohash, "hello from alice", "alice")
+        .await
+        .expect("alice posts");
+    bob.send_geohash(geohash, "hi from bob", "bob")
+        .await
+        .expect("bob posts");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let view = bob.fetch_geohash(geohash, 100).await.expect("bob fetches");
+    assert_eq!(view.len(), 2, "both public messages visible");
+
+    let from_alice = view.iter().find(|m| m.content == "hello from alice").unwrap();
+    assert_eq!(from_alice.nickname, "alice");
+    assert!(!from_alice.mine, "alice's message is not bob's");
+
+    let from_bob = view.iter().find(|m| m.content == "hi from bob").unwrap();
+    assert_eq!(from_bob.nickname, "bob");
+    assert!(from_bob.mine, "bob's own message detected as mine");
+
+    // A different geohash is an isolated channel.
+    let other = bob.fetch_geohash("9q5c", 100).await.expect("other fetch");
+    assert!(other.is_empty(), "different geohash sees nothing");
+}

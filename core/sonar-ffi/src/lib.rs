@@ -126,6 +126,17 @@ pub struct MessageInfo {
     pub mine: bool,
 }
 
+/// FFI-friendly geohash channel message (public, plaintext).
+#[derive(uniffi::Record)]
+pub struct GeoMessageInfo {
+    pub id_hex: String,
+    pub sender_pubkey_hex: String,
+    pub nickname: String,
+    pub content: String,
+    pub created_at_secs: u64,
+    pub mine: bool,
+}
+
 /// A relay-connected Sonar node. Owns its own tokio runtime; every method is
 /// blocking — call from a background queue in Swift, never the main thread.
 #[derive(uniffi::Object)]
@@ -239,6 +250,35 @@ impl SonarNode {
                 sender_npub: m.sender.to_bech32().expect("npub encoding cannot fail"),
                 content: m.content,
                 created_at_secs: m.created_at.as_secs(),
+                mine: m.mine,
+            })
+            .collect())
+    }
+
+    /// Publish a public message to a geohash channel (kind-20000 over Nostr).
+    pub fn send_geohash(&self, geohash: String, text: String, nickname: String) -> FfiResult<()> {
+        self.runtime
+            .block_on(self.client.send_geohash(&geohash, &text, &nickname))?;
+        Ok(())
+    }
+
+    /// Fetch recent messages for a geohash channel, oldest first.
+    pub fn geohash_messages(
+        &self,
+        geohash: String,
+        limit: u32,
+    ) -> FfiResult<Vec<GeoMessageInfo>> {
+        let msgs = self
+            .runtime
+            .block_on(self.client.fetch_geohash(&geohash, limit as usize))?;
+        Ok(msgs
+            .into_iter()
+            .map(|m| GeoMessageInfo {
+                id_hex: m.id,
+                sender_pubkey_hex: m.sender_pubkey,
+                nickname: m.nickname,
+                content: m.content,
+                created_at_secs: m.created_at,
                 mine: m.mine,
             })
             .collect())
