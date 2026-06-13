@@ -32,6 +32,25 @@ class SonarAppState(private val scope: CoroutineScope) {
         private set
     var toast by mutableStateOf<String?>(null)
 
+    var onboarded by mutableStateOf(SonarCore.onboardingComplete())
+        private set
+    var nick by mutableStateOf(SonarCore.nickname())
+        private set
+
+    fun fingerprint(): String = SonarCore.fingerprint()
+
+    fun completeOnboarding(nickname: String) {
+        SonarCore.setNickname(nickname)
+        SonarCore.setOnboardingComplete(true)
+        nick = nickname
+        onboarded = true
+    }
+
+    fun updateNickname(value: String) {
+        SonarCore.setNickname(value)
+        nick = value
+    }
+
     fun boot() {
         if (started || connecting) return
         connecting = true

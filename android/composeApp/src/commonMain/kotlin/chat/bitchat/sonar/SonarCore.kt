@@ -49,4 +49,17 @@ expect object SonarCore {
 
     /** Poll the relays once (welcomes + group messages). */
     suspend fun sync()
+
+    // ── Identity / profile (persisted on-device) ──
+
+    /** Display nickname (what people see). Empty until set. */
+    fun nickname(): String
+    fun setNickname(value: String)
+
+    /** Grouped key-fingerprint string for the verify/profile surfaces. */
+    fun fingerprint(): String
+
+    /** Onboarding gate. */
+    fun onboardingComplete(): Boolean
+    fun setOnboardingComplete(value: Boolean)
 }

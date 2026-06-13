@@ -29,6 +29,7 @@ actual object SonarCore {
     private val lock = Mutex()
     private var node: SonarNode? = null
     @Volatile private var npub: String = ""
+    @Volatile private var pubkeyHex: String = ""
 
     private val ctx: Context get() = AppContextHolder.ctx
     private fun prefs() = ctx.getSharedPreferences("sonar", Context.MODE_PRIVATE)
@@ -38,6 +39,7 @@ actual object SonarCore {
             if (node == null) {
                 val identity = loadOrCreateIdentity()
                 npub = identity.npub()
+                pubkeyHex = identity.pubkeyHex()
 
                 val dir = File(ctx.filesDir, "sonar-marmot").apply { mkdirs() }
                 val dbPath = File(dir, "marmot.sqlite").absolutePath
@@ -83,6 +85,29 @@ actual object SonarCore {
     actual suspend fun sync() = withContext(Dispatchers.IO) {
         runCatching { node?.syncOnce() }
         Unit
+    }
+
+    actual fun nickname(): String = prefs().getString("nickname", "") ?: ""
+
+    actual fun setNickname(value: String) {
+        prefs().edit().putString("nickname", value.trim()).apply()
+    }
+
+    actual fun fingerprint(): String {
+        var hex = pubkeyHex
+        if (hex.isEmpty()) {
+            val saved = prefs().getString("nsec", null)
+            if (saved != null) hex = runCatching { SonarIdentity.import(saved).pubkeyHex() }.getOrDefault("")
+        }
+        if (hex.isEmpty()) return ""
+        // First 32 hex chars grouped in 4s, uppercase — a stable key fingerprint.
+        return hex.take(32).uppercase().chunked(4).joinToString(" ")
+    }
+
+    actual fun onboardingComplete(): Boolean = prefs().getBoolean("onboarding.complete", false)
+
+    actual fun setOnboardingComplete(value: Boolean) {
+        prefs().edit().putBoolean("onboarding.complete", value).apply()
     }
 
     private fun requireNode(): SonarNode =
