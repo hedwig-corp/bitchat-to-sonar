@@ -116,3 +116,60 @@ async fn two_instances_exchange_geohash_channel_messages() {
     let other = bob.fetch_geohash("9q5c", 100).await.expect("other fetch");
     assert!(other.is_empty(), "different geohash sees nothing");
 }
+
+/// Two channel participants exchange a 1:1 encrypted geohash DM (NIP-17 over
+/// their per-geohash keys), learning each other's keys from the public channel.
+#[tokio::test]
+async fn geohash_dm_between_channel_participants() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let url = relay.url().await;
+    let alice = SonarClient::connect_in_memory(Identity::generate(), vec![url.clone()])
+        .await
+        .expect("alice connects");
+    let bob = SonarClient::connect_in_memory(Identity::generate(), vec![url.clone()])
+        .await
+        .expect("bob connects");
+
+    let gh = "u0nd";
+    alice.subscribe_geohash(gh).await.expect("alice joins");
+    bob.subscribe_geohash(gh).await.expect("bob joins");
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+    // Both post publicly so each learns the other's per-geohash pubkey.
+    alice.send_geohash(gh, "hi from alice", "alice").await.unwrap();
+    bob.send_geohash(gh, "hi from bob", "bob").await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+
+    let alice_pk = bob
+        .fetch_geohash(gh, 50)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|m| m.content == "hi from alice")
+        .expect("bob sees alice in channel")
+        .sender_pubkey;
+    let bob_pk = alice
+        .fetch_geohash(gh, 50)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|m| m.content == "hi from bob")
+        .expect("alice sees bob in channel")
+        .sender_pubkey;
+
+    // Alice DMs bob privately.
+    alice
+        .send_geo_dm(gh, &bob_pk, "hey bob, privately")
+        .await
+        .expect("alice dms bob");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let bob_inbox = bob.fetch_geo_dm(gh, &alice_pk).await.expect("bob reads dm");
+    assert_eq!(bob_inbox.len(), 1, "bob received the private DM");
+    assert_eq!(bob_inbox[0].content, "hey bob, privately");
+    assert!(!bob_inbox[0].mine, "the DM is from alice");
+
+    let alice_thread = alice.fetch_geo_dm(gh, &bob_pk).await.expect("alice reads thread");
+    assert_eq!(alice_thread.len(), 1);
+    assert!(alice_thread[0].mine, "alice's own sent DM is mine");
+}

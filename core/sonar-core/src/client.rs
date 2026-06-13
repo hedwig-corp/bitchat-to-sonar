@@ -31,12 +31,25 @@ struct RawGeo {
     ts: u64,
 }
 
+/// One received geohash 1:1 DM (NIP-17 over the per-geohash identity).
+struct RawGeoDm {
+    id: String,
+    sender: PublicKey,
+    content: String,
+    ts: u64,
+    mine: bool,
+}
+
+type GeoDmBuf = Arc<Mutex<HashMap<(String, String), Vec<RawGeoDm>>>>;
+
 pub struct SonarClient {
     engine: MarmotEngine,
     nostr: Client,
     relays: Vec<RelayUrl>,
     geo: Arc<Mutex<HashMap<String, Vec<RawGeo>>>>,
+    geo_dm: GeoDmBuf,
     geo_subscribed: Arc<Mutex<HashSet<String>>>,
+    identity_secret: [u8; 32],
 }
 
 impl SonarClient {
@@ -75,32 +88,73 @@ impl SonarClient {
         }
         nostr.connect().await;
 
-        // Background collector for geohash channel events (ephemeral, not
-        // stored by relays — only delivered live to active subscriptions).
+        // Background collector for geohash channel events (kind-20000, public,
+        // ephemeral) and geohash 1:1 DMs (kind-1059 NIP-17 gift wraps). Both are
+        // delivered live to active subscriptions; relays don't store them.
         let geo: Arc<Mutex<HashMap<String, Vec<RawGeo>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let geo_dm: GeoDmBuf = Arc::new(Mutex::new(HashMap::new()));
+        let geo_subscribed: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let identity_secret = identity.keys().secret_key().to_secret_bytes();
+
         let handler_geo = geo.clone();
+        let handler_dm = geo_dm.clone();
+        let handler_subs = geo_subscribed.clone();
         let mut notifications = nostr.notifications();
         tokio::spawn(async move {
             while let Ok(notification) = notifications.recv().await {
-                if let RelayPoolNotification::Event { event, .. } = notification {
-                    if event.kind.as_u16() != 20000 {
-                        continue;
+                let RelayPoolNotification::Event { event, .. } = notification else {
+                    continue;
+                };
+                match event.kind.as_u16() {
+                    20000 => {
+                        let Some(geohash) = tag_value(&event, Alphabet::G) else { continue };
+                        let nickname = tag_value(&event, Alphabet::N).unwrap_or_default();
+                        let id = event.id.to_hex();
+                        let mut map = handler_geo.lock().unwrap();
+                        let bucket = map.entry(geohash).or_default();
+                        if !bucket.iter().any(|r| r.id == id) {
+                            bucket.push(RawGeo {
+                                id,
+                                pubkey: event.pubkey,
+                                nickname,
+                                content: event.content.clone(),
+                                ts: event.created_at.as_u64(),
+                            });
+                        }
                     }
-                    let geohash = tag_value(&event, Alphabet::G);
-                    let Some(geohash) = geohash else { continue };
-                    let nickname = tag_value(&event, Alphabet::N).unwrap_or_default();
-                    let id = event.id.to_hex();
-                    let mut map = handler_geo.lock().unwrap();
-                    let bucket = map.entry(geohash).or_default();
-                    if !bucket.iter().any(|r| r.id == id) {
-                        bucket.push(RawGeo {
-                            id,
-                            pubkey: event.pubkey,
-                            nickname,
-                            content: event.content.clone(),
-                            ts: event.created_at.as_u64(),
-                        });
+                    1059 => {
+                        // Gift wrap: the `p` tag names our per-geohash recipient
+                        // key. Find which active channel it targets, unwrap with
+                        // that key, and record the kind-14 DM.
+                        let Some(p_hex) = tag_value(&event, Alphabet::P) else { continue };
+                        let subs: Vec<String> = handler_subs.lock().unwrap().iter().cloned().collect();
+                        for geohash in subs {
+                            let Ok(keys) = crate::geohash::derive_geohash_keys(&identity_secret, &geohash) else { continue };
+                            if keys.public_key().to_hex() != p_hex {
+                                continue;
+                            }
+                            if let Ok(unwrapped) = UnwrappedGift::from_gift_wrap(&keys, &event).await {
+                                if unwrapped.rumor.kind.as_u16() != 14 {
+                                    break;
+                                }
+                                let peer_hex = unwrapped.sender.to_hex();
+                                let id = unwrapped.rumor.id.map(|i| i.to_hex()).unwrap_or_else(|| event.id.to_hex());
+                                let mut map = handler_dm.lock().unwrap();
+                                let bucket = map.entry((geohash.clone(), peer_hex)).or_default();
+                                if !bucket.iter().any(|r| r.id == id) {
+                                    bucket.push(RawGeoDm {
+                                        id,
+                                        sender: unwrapped.sender,
+                                        content: unwrapped.rumor.content.clone(),
+                                        ts: unwrapped.rumor.created_at.as_u64(),
+                                        mine: false,
+                                    });
+                                }
+                            }
+                            break;
+                        }
                     }
+                    _ => {}
                 }
             }
         });
@@ -110,7 +164,9 @@ impl SonarClient {
             nostr,
             relays,
             geo,
-            geo_subscribed: Arc::new(Mutex::new(HashSet::new())),
+            geo_dm,
+            geo_subscribed,
+            identity_secret,
         })
     }
 
@@ -212,11 +268,71 @@ impl SonarClient {
                 return Ok(());
             }
         }
-        let filter = Filter::new()
+        // Public channel messages (kind-20000) tagged with this geohash.
+        let channel = Filter::new()
             .kind(Kind::Custom(20000))
             .custom_tag(SingleLetterTag::lowercase(Alphabet::G), geohash);
-        self.nostr.subscribe(filter, None).await?;
+        self.nostr.subscribe(channel, None).await?;
+
+        // 1:1 DMs (NIP-17 gift wraps) addressed to our per-geohash key.
+        let geo_pk = crate::geohash::derive_geohash_keys(&self.identity_secret, geohash)?.public_key();
+        let dms = Filter::new().kind(Kind::GiftWrap).pubkey(geo_pk);
+        self.nostr.subscribe(dms, None).await?;
         Ok(())
+    }
+
+    /// Send a 1:1 encrypted DM to a participant in a geohash channel (NIP-17
+    /// gift wrap from our per-geohash key to theirs).
+    pub async fn send_geo_dm(&self, geohash: &str, recipient_hex: &str, text: &str) -> Result<()> {
+        self.subscribe_geohash(geohash).await?;
+        let keys = crate::geohash::derive_geohash_keys(&self.identity_secret, geohash)?;
+        let recipient = PublicKey::from_hex(recipient_hex)?;
+        let rumor = EventBuilder::new(Kind::Custom(14), text)
+            .tags([Tag::public_key(recipient)])
+            .build(keys.public_key());
+        let ts = rumor.created_at.as_u64();
+        let gift = EventBuilder::gift_wrap(&keys, &recipient, rumor, []).await?;
+        self.nostr.send_event(&gift).await?;
+        // Record locally (relays don't echo to the sender).
+        let id = gift.id.to_hex();
+        let mut map = self.geo_dm.lock().unwrap();
+        let bucket = map.entry((geohash.to_string(), recipient_hex.to_string())).or_default();
+        bucket.push(RawGeoDm {
+            id,
+            sender: keys.public_key(),
+            content: text.to_string(),
+            ts,
+            mine: true,
+        });
+        Ok(())
+    }
+
+    /// The 1:1 geohash DM conversation with `peer_hex`, oldest first.
+    pub async fn fetch_geo_dm(
+        &self,
+        geohash: &str,
+        peer_hex: &str,
+    ) -> Result<Vec<crate::geohash::GeoMessage>> {
+        self.subscribe_geohash(geohash).await?;
+        let map = self.geo_dm.lock().unwrap();
+        let mut out: Vec<crate::geohash::GeoMessage> = map
+            .get(&(geohash.to_string(), peer_hex.to_string()))
+            .map(|bucket| {
+                bucket
+                    .iter()
+                    .map(|r| crate::geohash::GeoMessage {
+                        id: r.id.clone(),
+                        sender_pubkey: r.sender.to_hex(),
+                        nickname: String::new(),
+                        content: r.content.clone(),
+                        created_at: r.ts,
+                        mine: r.mine,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.sort_by_key(|m| m.created_at);
+        Ok(out)
     }
 
     /// Publish a public message to a geohash channel, signed with this

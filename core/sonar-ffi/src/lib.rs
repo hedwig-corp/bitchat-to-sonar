@@ -271,17 +271,37 @@ impl SonarNode {
         let msgs = self
             .runtime
             .block_on(self.client.fetch_geohash(&geohash, limit as usize))?;
-        Ok(msgs
-            .into_iter()
-            .map(|m| GeoMessageInfo {
-                id_hex: m.id,
-                sender_pubkey_hex: m.sender_pubkey,
-                nickname: m.nickname,
-                content: m.content,
-                created_at_secs: m.created_at,
-                mine: m.mine,
-            })
-            .collect())
+        Ok(msgs.into_iter().map(geo_message_info).collect())
+    }
+
+    /// Send a 1:1 encrypted DM to a geohash channel participant (NIP-17).
+    pub fn send_geo_dm(&self, geohash: String, recipient_hex: String, text: String) -> FfiResult<()> {
+        self.runtime
+            .block_on(self.client.send_geo_dm(&geohash, &recipient_hex, &text))?;
+        Ok(())
+    }
+
+    /// The 1:1 geohash DM conversation with a participant, oldest first.
+    pub fn geo_dm_messages(
+        &self,
+        geohash: String,
+        peer_hex: String,
+    ) -> FfiResult<Vec<GeoMessageInfo>> {
+        let msgs = self
+            .runtime
+            .block_on(self.client.fetch_geo_dm(&geohash, &peer_hex))?;
+        Ok(msgs.into_iter().map(geo_message_info).collect())
+    }
+}
+
+fn geo_message_info(m: sonar_core::geohash::GeoMessage) -> GeoMessageInfo {
+    GeoMessageInfo {
+        id_hex: m.id,
+        sender_pubkey_hex: m.sender_pubkey,
+        nickname: m.nickname,
+        content: m.content,
+        created_at_secs: m.created_at,
+        mine: m.mine,
     }
 }
 

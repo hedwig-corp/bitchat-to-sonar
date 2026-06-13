@@ -96,7 +96,11 @@ fun SonarChannelScreen(state: SonarAppState, screen: Screen.Channel) {
                 state = listState,
                 contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
             ) {
-                items(state.channelMsgs, key = { it.id }) { m -> ChannelBubble(m) }
+                items(state.channelMsgs, key = { it.id }) { m ->
+                    ChannelBubble(m) {
+                        if (!m.mine) state.openGeoDm(screen.geohash, m.senderPubkey, m.author)
+                    }
+                }
             }
         }
 
@@ -125,7 +129,7 @@ fun SonarChannelScreen(state: SonarAppState, screen: Screen.Channel) {
 }
 
 @Composable
-private fun ChannelBubble(m: SonarChannelMsg) {
+private fun ChannelBubble(m: SonarChannelMsg, onTapAuthor: () -> Unit) {
     val s = sonar
     Column(
         Modifier.fillMaxWidth().padding(vertical = 3.dp),
@@ -135,7 +139,7 @@ private fun ChannelBubble(m: SonarChannelMsg) {
             Text(
                 m.author, color = authorColor(m.author, s.isDark),
                 fontSize = 12.sp, fontWeight = FontWeight.Bold,
-                modifier = Modifier.padding(start = 12.dp, bottom = 3.dp)
+                modifier = Modifier.padding(start = 12.dp, bottom = 3.dp).clickable(onClick = onTapAuthor)
             )
         }
         Box(

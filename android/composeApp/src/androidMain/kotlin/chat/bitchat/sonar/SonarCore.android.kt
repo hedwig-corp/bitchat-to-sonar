@@ -110,6 +110,7 @@ actual object SonarCore {
                 SonarChannelMsg(
                     id = it.idHex,
                     author = it.nickname.ifBlank { it.senderPubkeyHex.take(8) },
+                    senderPubkey = it.senderPubkeyHex,
                     content = it.content,
                     mine = it.mine,
                     tsSecs = it.createdAtSecs.toLong(),
@@ -121,6 +122,25 @@ actual object SonarCore {
     actual suspend fun sendChannel(geohash: String, text: String) = withContext(Dispatchers.IO) {
         val nick = nickname().ifBlank { "anon" }
         requireNode().sendGeohash(geohash, text, nick)
+    }
+
+    actual suspend fun geoDmMessages(geohash: String, peerHex: String): List<SonarMsg> = withContext(Dispatchers.IO) {
+        val n = node ?: return@withContext emptyList()
+        runCatching {
+            n.geoDmMessages(geohash, peerHex).map {
+                SonarMsg(
+                    id = it.idHex,
+                    senderNpub = it.senderPubkeyHex,
+                    content = it.content,
+                    mine = it.mine,
+                    tsSecs = it.createdAtSecs.toLong(),
+                )
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    actual suspend fun sendGeoDm(geohash: String, peerHex: String, text: String) = withContext(Dispatchers.IO) {
+        requireNode().sendGeoDm(geohash, peerHex, text)
     }
 
     actual fun nickname(): String = prefs().getString("nickname", "") ?: ""

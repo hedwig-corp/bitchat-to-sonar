@@ -20,6 +20,7 @@ data class SonarMsg(
 data class SonarChannelMsg(
     val id: String,
     val author: String,
+    val senderPubkey: String,
     val content: String,
     val mine: Boolean,
     val tsSecs: Long,
@@ -71,6 +72,10 @@ expect object SonarCore {
 
     /** Publish a public message to a geohash channel. */
     suspend fun sendChannel(geohash: String, text: String)
+
+    /** 1:1 encrypted DM conversation with a channel participant (NIP-17). */
+    suspend fun geoDmMessages(geohash: String, peerHex: String): List<SonarMsg>
+    suspend fun sendGeoDm(geohash: String, peerHex: String, text: String)
 
     // ── Identity / profile (persisted on-device) ──
 

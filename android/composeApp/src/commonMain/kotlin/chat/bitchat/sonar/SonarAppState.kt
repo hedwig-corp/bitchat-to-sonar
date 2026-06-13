@@ -14,6 +14,7 @@ sealed interface Screen {
     data object Nearby : Screen
     data class Chat(val id: String, val name: String) : Screen
     data class Channel(val geohash: String) : Screen
+    data class GeoDm(val geohash: String, val peerHex: String, val name: String) : Screen
 }
 
 /**
@@ -84,6 +85,26 @@ class SonarAppState(private val scope: CoroutineScope) {
             try {
                 SonarCore.sendChannel(geohash, t)
                 channelMsgs = SonarCore.channelMessages(geohash)
+            } catch (e: Throwable) {
+                toast = "send failed: ${e.message}"
+            }
+        }
+    }
+
+    fun openGeoDm(geohash: String, peerHex: String, name: String) {
+        if (peerHex.isBlank()) return
+        push(Screen.GeoDm(geohash, peerHex, name))
+        messages = emptyList()
+        scope.launch { messages = SonarCore.geoDmMessages(geohash, peerHex) }
+    }
+
+    fun sendGeoDmMsg(geohash: String, peerHex: String, text: String) {
+        val t = text.trim()
+        if (t.isEmpty()) return
+        scope.launch {
+            try {
+                SonarCore.sendGeoDm(geohash, peerHex, t)
+                messages = SonarCore.geoDmMessages(geohash, peerHex)
             } catch (e: Throwable) {
                 toast = "send failed: ${e.message}"
             }
@@ -176,6 +197,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 refreshChats()
                 (screen as? Screen.Chat)?.let { messages = SonarCore.messages(it.id) }
                 (screen as? Screen.Channel)?.let { channelMsgs = SonarCore.channelMessages(it.geohash) }
+                (screen as? Screen.GeoDm)?.let { messages = SonarCore.geoDmMessages(it.geohash, it.peerHex) }
                 meshPeers = MeshRadio.peers()
             }
         }
