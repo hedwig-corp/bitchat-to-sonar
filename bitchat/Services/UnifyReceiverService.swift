@@ -171,8 +171,13 @@ final class UnifyReceiverService: NSObject, ObservableObject {
         if name != cachedName || !isAdvertising {
             cachedName = name
             manager.stopAdvertising()
+            // Advertise the Unify service + the 16-bit "I am Sonar" marker so
+            // peer Sonar apps recognize us and don't list us as a Unify user.
             manager.startAdvertising([
-                CBAdvertisementDataServiceUUIDsKey: [UnifyNearbyContract.serviceUUID],
+                CBAdvertisementDataServiceUUIDsKey: [
+                    UnifyNearbyContract.serviceUUID,
+                    UnifyNearbyContract.sonarMarkerUUID,
+                ],
                 CBAdvertisementDataLocalNameKey: name
             ])
             isAdvertising = true

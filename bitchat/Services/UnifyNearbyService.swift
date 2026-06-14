@@ -67,9 +67,19 @@ enum UnifyNearbyContract {
     /// so a multi-byte character is never split.
     static let maxAdvertisedNameBytes = 20
 
+    /// 16-bit "I am Sonar" marker advertised ALONGSIDE the Unify service by a
+    /// Sonar app's receiver. Other Sonar apps skip these — a Sonar peer is
+    /// shown via the mesh, never as a generic "Unify user"; the real Unify
+    /// Wallet has no marker and still lists. A service UUID (not manufacturer
+    /// data) is used because iOS CoreBluetooth can only advertise service UUIDs
+    /// + local name, and a 16-bit UUID is tiny enough to fit beside the 128-bit
+    /// Unify UUID in the primary advert (so Android sees it too).
+    static let sonarMarkerUUIDString = "53A0"
+
     #if canImport(CoreBluetooth)
     static let serviceUUID = CBUUID(string: serviceUUIDString)
     static let payloadCharacteristicUUID = CBUUID(string: payloadCharacteristicUUIDString)
+    static let sonarMarkerUUID = CBUUID(string: sonarMarkerUUIDString)
     #endif
 
     /// Normalize a user-entered display name for advertising, mirroring Unify's
@@ -563,6 +573,9 @@ extension UnifyNearbyService: CBCentralManagerDelegate {
         // Unfiltered scan → only keep advertisers carrying the Unify service.
         let services = advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID] ?? []
         guard services.contains(UnifyNearbyContract.serviceUUID) else { return }
+        // Skip Sonar apps advertising the Unify receiver — they're shown as Sonar
+        // peers via the mesh, not as generic "Unify users".
+        if services.contains(UnifyNearbyContract.sonarMarkerUUID) { return }
         let id = peripheral.identifier.uuidString
         let name = Self.advertisedName(advertisementData, peripheralName: peripheral.name)
         let rssi = RSSI.intValue
