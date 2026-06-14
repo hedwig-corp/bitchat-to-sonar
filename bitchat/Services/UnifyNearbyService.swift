@@ -502,6 +502,13 @@ final class UnifyNearbyService: NSObject, ObservableObject {
         }
     }
 
+    /// Remove a peer revealed to be a Sonar app (carries the 0x53A0 marker) so a
+    /// pre-marker discovery can't linger as a zombie. No-op unless mid-fetch.
+    private func retractDiscovery(id: String) {
+        peers.removeAll { $0.id == id }
+        if id != fetch?.peerId { peripherals.removeValue(forKey: id) }
+    }
+
     private func pruneStale() {
         let cutoff = Date().addingTimeInterval(-staleAfter)
         let live = peers.filter { $0.lastSeen >= cutoff }
@@ -585,8 +592,16 @@ extension UnifyNearbyService: CBCentralManagerDelegate {
         let services = advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID] ?? []
         guard services.contains(UnifyNearbyContract.serviceUUID) else { return }
         // Skip Sonar apps advertising the Unify receiver — they're shown as Sonar
-        // peers via the mesh, not as generic "Unify users".
-        if services.contains(UnifyNearbyContract.sonarMarkerUUID) { return }
+        // peers via the mesh, not as generic "Unify users". Also RETRACT any peer
+        // already recorded for this id: a Sonar advertiser whose marker arrives in
+        // a later packet (e.g. an Android build that split it into the scan
+        // response) would otherwise have been listed once before the marker was
+        // seen, leaving a permanent "Unify user" zombie that re-refreshes forever.
+        if services.contains(UnifyNearbyContract.sonarMarkerUUID) {
+            let markedId = peripheral.identifier.uuidString
+            Task { @MainActor in self.retractDiscovery(id: markedId) }
+            return
+        }
         let id = peripheral.identifier.uuidString
         let name = Self.advertisedName(advertisementData, peripheralName: peripheral.name)
         let rssi = RSSI.intValue
