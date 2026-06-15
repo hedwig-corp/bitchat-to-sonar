@@ -53,6 +53,30 @@ actual object MessageStore {
         Unit
     }
 
+    // BLE-mesh private transcripts live in their own subdir so loadAll can
+    // enumerate just them (channel/geo-DM files share root() but the key can't be
+    // recovered from their hashed names). Each mesh file carries a peerKey
+    // envelope (MessageCodec.encodeMeshEnvelope) so the map is re-keyed on load.
+    private fun meshDir(): File = File(root(), "mesh").apply { mkdirs() }
+
+    private fun meshFile(peerKey: String): File {
+        val name = Sha256.hash("mesh:$peerKey".encodeToByteArray())
+            .joinToString("") { ((it.toInt() and 0xFF) + 0x100).toString(16).substring(1) }
+        return File(meshDir(), "$name.txt")
+    }
+
+    actual suspend fun loadAllMeshDms(): Map<String, List<SonarMsg>> = withContext(Dispatchers.IO) {
+        val files = meshDir().listFiles() ?: return@withContext emptyMap()
+        files.mapNotNull { f ->
+            runCatching { MessageCodec.decodeMeshEnvelope(f.readText()) }.getOrNull()
+        }.toMap()
+    }
+
+    actual suspend fun saveMeshDm(peerKey: String, msgs: List<SonarMsg>): Unit = withContext(Dispatchers.IO) {
+        runCatching { meshFile(peerKey).writeText(MessageCodec.encodeMeshEnvelope(peerKey, msgs)) }
+        Unit
+    }
+
     actual suspend fun wipe(): Unit = withContext(Dispatchers.IO) {
         runCatching { root().deleteRecursively() }
         Unit

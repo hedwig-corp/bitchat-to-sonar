@@ -335,6 +335,16 @@ final class SonarAppStore: ObservableObject {
         }
 
         #if DEBUG
+        // Init probe (only when a debug launch arg is present): pull
+        // <AppSupport>/sonar-debug.txt to confirm the store init ran and that the
+        // launch args reached UserDefaults. NB: pass app args after a `--` so
+        // devicectl doesn't swallow `-sonar.debug.*` as its own options, e.g.
+        // `devicectl … process launch --terminate-existing --device <id> -- \
+        //   <bundle> -sonar.debug.sendMarmot "<npub>|<text>"`.
+        if ["sonar.debug.sendMarmot", "sonar.debug.sendMeshDM", "sonar.debug.route"]
+            .contains(where: { defaults.string(forKey: $0) != nil }) {
+            writeDebugReport("init onboarded=\(onboarded) sendMarmot=\(defaults.string(forKey: "sonar.debug.sendMarmot") ?? "nil") sendMeshDM=\(defaults.string(forKey: "sonar.debug.sendMeshDM") ?? "nil")")
+        }
         // Smoke-test hook: `simctl launch <sim> <bundle> -sonar.debug.route
         // settings` lands in the argument domain (volatile, this launch
         // only) and deep-opens a screen for screenshot verification.
@@ -353,8 +363,81 @@ final class SonarAppStore: ObservableObject {
         if onboarded, let text = defaults.string(forKey: "sonar.debug.sendMeshDM"), !text.isEmpty {
             scheduleDebugMeshDM(text)
         }
+        // `-sonar.debug.sendMarmot "<text>"`: force the White Noise (Marmot) path
+        // to the first discovered Sonar peer ~25s after launch (after 0x53
+        // discovery has populated its npub). This exercises the BLE→White Noise
+        // fallback transport directly, independent of BLE reachability.
+        if onboarded, let raw = defaults.string(forKey: "sonar.debug.sendMarmot"), !raw.isEmpty {
+            // Single launch arg (two devicectl `-key value` pairs parse
+            // unreliably). Format "<npub1…>|<text>" → DIRECT White Noise send to
+            // that npub (bypasses BLE 0x53 discovery, verifies the Marmot/relay
+            // transport device-to-device). Plain "<text>" → send to the first
+            // discovered Sonar peer.
+            if raw.hasPrefix("npub1"), let sep = raw.firstIndex(of: "|") {
+                let npub = String(raw[raw.startIndex..<sep])
+                let text = String(raw[raw.index(after: sep)...])
+                scheduleDebugMarmotDirect(text, npub: npub)
+            } else {
+                scheduleDebugMarmot(raw)
+            }
+        }
         #endif
     }
+
+    #if DEBUG
+    /// Append a line to <AppSupport>/sonar-debug.txt — reliably pullable with
+    /// `devicectl device copy from` when os_log streaming is unavailable.
+    private func writeDebugReport(_ line: String) {
+        guard let base = try? FileManager.default.url(
+            for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true
+        ) else { return }
+        let url = base.appendingPathComponent("sonar-debug.txt")
+        let stamped = line + "\n"
+        guard let data = stamped.data(using: .utf8) else { return }
+        if let h = try? FileHandle(forWritingTo: url) {
+            h.seekToEndOfFile(); h.write(data); try? h.close()
+        } else {
+            try? data.write(to: url)
+        }
+    }
+
+    /// Direct White Noise send to an explicit npub (bypasses BLE 0x53 discovery).
+    /// Retries the send and writes the Marmot connect/group state to a file each
+    /// attempt so the relay round-trip can be diagnosed without iOS log streaming.
+    private func scheduleDebugMarmotDirect(_ text: String, npub: String, attempt: Int = 0, sent: Bool = false) {
+        let delay: Double = attempt == 0 ? 14 : 8
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            let grp = self.marmotGroup(forNpub: npub)
+            let connected = self.marmot.npub != nil
+            self.writeDebugReport("marmotDirect attempt=\(attempt) connected=\(connected) err=\(self.marmot.errorText ?? "nil") groups=\(self.marmot.groups.count) groupForNpub=\(grp?.id ?? "none") sent=\(sent)")
+            var didSend = sent
+            if !sent && connected {
+                self.sendOverMarmot(text, npub: npub)
+                didSend = true
+            }
+            if attempt < 6 { self.scheduleDebugMarmotDirect(text, npub: npub, attempt: attempt + 1, sent: didSend) }
+        }
+    }
+
+    private func scheduleDebugMarmot(_ text: String, attempt: Int = 0) {
+        // Retry until 0x53 discovery has populated a Sonar peer's npub (after a
+        // --terminate-existing relaunch the mesh re-handshake + announce can take
+        // longer than a single fixed delay), then force the White Noise path.
+        let delay: Double = attempt == 0 ? 18 : 5
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            if let (peerID, profile) = self.sonarProfiles.first {
+                SecureLogger.warning("🧪 debug.sendMarmot: White Noise send '\(text)' to npub \(profile.npub) (peer \(peerID))", category: .session)
+                self.sendOverMarmot(text, npub: profile.npub)
+            } else if attempt < 10 {
+                self.scheduleDebugMarmot(text, attempt: attempt + 1)
+            } else {
+                SecureLogger.warning("🧪 debug.sendMarmot: gave up — no Sonar peer discovered (no npub)", category: .session)
+            }
+        }
+    }
+    #endif
 
     #if DEBUG
     private func scheduleDebugMeshDM(_ text: String) {

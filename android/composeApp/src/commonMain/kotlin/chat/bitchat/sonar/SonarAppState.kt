@@ -82,6 +82,9 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  don't live in the Rust core (that's Marmot/Nostr) — they ride the Noise
      *  link, so the app holds them. Chat id on the nav stack is "mesh:<peerId>". */
     private var meshChats = mutableMapOf<String, List<SonarMsg>>()
+    // Observability for the White Noise (Marmot) fallback (logged in poll()).
+    private var lastWnGroups = -1
+    private var lastWnMsgs = -1
     /** Mesh DM conversations shown in the home "Messages" list (observable so the
      *  list updates when a DM arrives from a peer we haven't opened yet). */
     var meshDmRows by mutableStateOf<List<MeshDmRow>>(emptyList())
@@ -531,7 +534,13 @@ class SonarAppState(private val scope: CoroutineScope) {
         scope.launch {
             try {
                 npub = SonarCore.start()
+                android.util.Log.i("SonarNpub", "my npub=$npub")
                 started = true
+                // Hydrate BLE-mesh transcripts from disk so private mesh chats
+                // survive a restart (parity with the iOS MessageStore). Precedes
+                // refreshMeshDmRows so the Messages list is populated at launch.
+                meshChats.putAll(MessageStore.loadAllMeshDms())
+                refreshMeshDmRows()
                 setupWallet()
                 refreshLocationChannels()
                 refreshChats()
@@ -640,8 +649,17 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (!ok) { toast = "Not connected over Bluetooth yet — stay close and try again"; return }
         val msg = SonarMsg(randomMeshId(), npub, text, mine = true, MeshRadio.nowSecs())
         meshChats[peerId] = meshChats[peerId].orEmpty() + msg
+        persistMesh(peerId)
         scope.launch { refreshOpenDm(peerId) }
         refreshMeshDmRows()
+    }
+
+    /** Write-through a peer's BLE-mesh transcript so it survives an app restart
+     *  (parity with the iOS MessageStore). Marmot/White Noise legs are NOT written
+     *  here — they already persist in the encrypted SQLCipher DB. */
+    private fun persistMesh(peerId: String) {
+        val msgs = meshChats[peerId].orEmpty()
+        scope.launch { MessageStore.saveMeshDm(peerId, msgs) }
     }
 
     /** Texts queued for a Sonar peer (keyed by npub hex) while their White Noise
@@ -731,14 +749,17 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (incoming.isEmpty()) return
         val openChatId = (screen as? Screen.Chat)?.id
         val notifsOn = prefBool("notifs", true)
+        val touched = mutableSetOf<String>()
         for (m in incoming) {
             val msg = SonarMsg(randomMeshId(), m.peerId, m.text, mine = false, m.tsSecs)
             meshChats[m.peerId] = meshChats[m.peerId].orEmpty() + msg
+            touched += m.peerId
             val chatId = meshChatId(m.peerId)
             if (notifsOn && !foreground && chatId != openChatId) {
                 Notifier.notify(chatId.hashCode(), meshPeerName(m.peerId), notifPreview(m.text))
             }
         }
+        touched.forEach { persistMesh(it) } // write-through so received DMs survive restart
         refreshMeshDmRows()
         // Refresh the open conversation (merged mesh + White Noise) if it's one we
         // just appended to.
@@ -799,6 +820,15 @@ class SonarAppState(private val scope: CoroutineScope) {
                 tick++
                 SonarCore.sync()
                 refreshChats()
+                // Observability for the BLE→White Noise fallback: a new Marmot
+                // group (a Welcome received over relays) or a grown transcript is
+                // the signal that White Noise delivery reached us. Logged only on
+                // change so a cross-device round trip shows up in logcat.
+                val wnMsgs = chats.sumOf { runCatching { SonarCore.messages(it.id).size }.getOrDefault(0) }
+                if (chats.size != lastWnGroups || wnMsgs != lastWnMsgs) {
+                    android.util.Log.i("SonarWN", "White Noise: ${chats.size} group(s), $wnMsgs message(s)")
+                    lastWnGroups = chats.size; lastWnMsgs = wnMsgs
+                }
                 flushPendingMarmot() // a queued out-of-range send whose group just landed
                 maybeNotify()
                 // Marmot/Nostr chats refresh from the core; mesh chats are local

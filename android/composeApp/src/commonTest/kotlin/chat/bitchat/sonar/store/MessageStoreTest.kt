@@ -30,6 +30,31 @@ class MessageCodecTest {
         assertTrue(MessageCodec.decodeChannel("").isEmpty())
         assertTrue(MessageCodec.decodeDm("").isEmpty())
     }
+
+    @Test fun meshEnvelopeRoundTripPreservesKeyAndMessages() {
+        val peerKey = "7a60f087831cb56d0011223344556677" // stable fingerprint
+        val msgs = listOf(
+            SonarMsg("m1", "", "Ciao da BLE", mine = false, tsSecs = 10),
+            SonarMsg("m2", "", "reply\twith\ntabs|and ⚡PAY|1|x|5", mine = true, tsSecs = 20),
+        )
+        val (key, decoded) = MessageCodec.decodeMeshEnvelope(
+            MessageCodec.encodeMeshEnvelope(peerKey, msgs)
+        )!!
+        assertEquals(peerKey, key)
+        assertEquals(msgs, decoded)
+    }
+
+    @Test fun meshEnvelopeWithNoMessagesKeepsKey() {
+        val (key, decoded) = MessageCodec.decodeMeshEnvelope(
+            MessageCodec.encodeMeshEnvelope("abcd", emptyList())
+        )!!
+        assertEquals("abcd", key)
+        assertTrue(decoded.isEmpty())
+    }
+
+    @Test fun meshEnvelopeRejectsGarbage() {
+        assertEquals(null, MessageCodec.decodeMeshEnvelope(""))
+    }
 }
 
 class MessageMergeTest {
