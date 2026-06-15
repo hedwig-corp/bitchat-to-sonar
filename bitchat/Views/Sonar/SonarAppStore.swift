@@ -20,6 +20,9 @@ import BitLogger
 import Combine
 import Foundation
 import SwiftUI
+#if canImport(UIKit)
+import UIKit
+#endif
 
 // MARK: - Routes (stack entries below home)
 
@@ -77,6 +80,9 @@ struct SNMediaItem: Equatable {
     let mime: String
     let filename: String
     let groupId: String
+    /// For BLE-mesh media (bitchat file transfer): the local file path on disk.
+    /// When set, the bytes are loaded locally instead of downloaded from Blossom.
+    var localPath: String? = nil
     var isImage: Bool { mime.hasPrefix("image/") }
 }
 
@@ -394,6 +400,13 @@ final class SonarAppStore: ObservableObject {
         if onboarded, let text = defaults.string(forKey: "sonar.debug.sendMeshDM"), !text.isEmpty {
             scheduleDebugMeshDM(text)
         }
+        // `-sonar.debug.sendMeshImage 1`: send a generated test JPEG to the first
+        // connected/reachable mesh peer ~12s after launch over the bitchat file
+        // transfer path (type 0x22). Verifies Sonar→stock-bitchat BLE media interop
+        // without UI automation (the phone must be unlocked + Sonar foreground).
+        if onboarded, let flag = defaults.string(forKey: "sonar.debug.sendMeshImage"), !flag.isEmpty {
+            scheduleDebugMeshImage()
+        }
         // `-sonar.debug.sendMarmot "<text>"`: force the White Noise (Marmot) path
         // to the first discovered Sonar peer ~25s after launch (after 0x53
         // discovery has populated its npub). This exercises the BLE→White Noise
@@ -486,6 +499,56 @@ final class SonarAppStore: ObservableObject {
             self.chatViewModel.startPrivateChat(with: peer.peerID)
             self.chatViewModel.sendPrivateMessage(text, to: peer.peerID)
         }
+    }
+
+    private func scheduleDebugMeshImage(attempt: Int = 0) {
+        let delay: Double = attempt == 0 ? 12 : 6
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            let my = self.chatViewModel.meshService.myPeerID
+            let target = self.chatViewModel.allPeers.first {
+                $0.peerID != my && ($0.isConnected || $0.isReachable)
+            }
+            guard let peer = target else {
+                if attempt < 8 {
+                    self.scheduleDebugMeshImage(attempt: attempt + 1)
+                } else {
+                    SecureLogger.warning("🧪 debug.sendMeshImage: no connected peer to send to", category: .session)
+                    self.writeDebugReport("sendMeshImage gave up — no connected/reachable peer")
+                }
+                return
+            }
+            guard let jpeg = Self.debugTestJPEG() else {
+                self.writeDebugReport("sendMeshImage: failed to render test JPEG")
+                return
+            }
+            SecureLogger.warning("🧪 debug.sendMeshImage: sending \(jpeg.count)B JPEG to peer \(peer.peerID.id) (\(peer.displayName))", category: .session)
+            self.writeDebugReport("sendMeshImage: \(jpeg.count)B → \(peer.peerID.id) (\(peer.displayName))")
+            self.sendImageOverMesh(peer.peerID, data: jpeg)
+        }
+    }
+
+    /// A small, valid JPEG generated in-process (cyan field + label) for the
+    /// mesh-image smoke test. Returns nil on platforms without UIKit.
+    private static func debugTestJPEG() -> Data? {
+        #if canImport(UIKit)
+        let size = CGSize(width: 240, height: 240)
+        let renderer = UIGraphicsImageRenderer(size: size)
+        let image = renderer.image { ctx in
+            UIColor(red: 0.12, green: 0.74, blue: 0.89, alpha: 1).setFill()
+            ctx.fill(CGRect(origin: .zero, size: size))
+            let text = "SONAR → bitchat"
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: UIFont.boldSystemFont(ofSize: 20),
+                .foregroundColor: UIColor.white,
+            ]
+            let s = text.size(withAttributes: attrs)
+            text.draw(at: CGPoint(x: (size.width - s.width) / 2, y: (size.height - s.height) / 2), withAttributes: attrs)
+        }
+        return image.jpegData(compressionQuality: 0.8)
+        #else
+        return nil
+        #endif
     }
     #endif
 
@@ -1179,14 +1242,18 @@ final class SonarAppStore: ObservableObject {
                     time: Self.clock(m.timestamp), via: payVia, pay: pay
                 ))
             case .notPay:
+                // BLE-mesh media (bitchat file transfer) arrives as an
+                // "[image] <name>" marker with the file already on disk.
+                let mediaItem = meshMediaItem(m.content)
                 return (m.timestamp, SNMessage(
                     id: m.id,
                     mine: mine,
                     author: m.sender,
-                    text: m.content,
+                    text: mediaItem != nil ? "" : m.content,
                     time: Self.clock(m.timestamp),
                     via: via,
-                    state: mine ? Self.stateText(m.deliveryStatus) : nil
+                    state: mine ? Self.stateText(m.deliveryStatus) : nil,
+                    media: mediaItem.map { [$0] } ?? []
                 ))
             }
         }
@@ -1277,17 +1344,32 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
-    /// True if `id` is a chat that can carry media (an existing Marmot group, or
-    /// a Sonar peer whose White Noise group exists). Gates the "Send photo" UI.
+    /// True if `id` is a chat that can carry media: an existing Marmot group, a
+    /// Sonar peer whose White Noise group exists, OR a bitchat/mesh peer
+    /// reachable over Bluetooth right now (sent as a bitchat file transfer).
     func canSendMedia(_ id: String) -> Bool {
         if marmotGroupId(id) != nil { return true }
-        if let profile = resolvedSonarProfile(id) { return marmotGroup(forNpub: profile.npub) != nil }
-        return false
+        if let profile = resolvedSonarProfile(id), marmotGroup(forNpub: profile.npub) != nil { return true }
+        return meshReachable(id)
     }
 
-    /// Send an image to a Sonar/White Noise chat: encrypt + Blossom upload +
-    /// publish over Marmot. No-op if no Marmot group backs the chat.
+    /// True for a non-geo private peer reachable over the BLE mesh right now.
+    private func meshReachable(_ id: String) -> Bool {
+        guard marmotGroupId(id) == nil else { return false }
+        let peerID = PeerID(str: id)
+        guard !peerID.isGeoDM else { return false }
+        let mesh = chatViewModel.meshService
+        return mesh.isPeerConnected(peerID) || mesh.isPeerReachable(peerID)
+    }
+
+    /// Send an image. Over the BLE mesh (bitchat file transfer, type 0x22) when
+    /// the peer is reachable over Bluetooth — interops with stock bitchat;
+    /// otherwise encrypt + Blossom-upload + publish over White Noise (Marmot).
     func sendImage(_ id: String, data: Data, filename: String, mime: String) {
+        if meshReachable(id) {
+            sendImageOverMesh(PeerID(str: id), data: data)
+            return
+        }
         let groupId: String?
         if let gid = marmotGroupId(id) {
             groupId = gid
@@ -1300,9 +1382,47 @@ final class SonarAppStore: ObservableObject {
         marmot.sendMedia(groupId: gid, data: data, filename: filename, mime: mime)
     }
 
-    /// Download + decrypt a media attachment, returning the raw bytes (cached by
-    /// URL). The view decodes platform images from this.
+    /// Send an image over the BLE mesh by reusing ChatViewModel's bitchat file
+    /// path (saves outgoing, echoes "[image] <name>", sends `sendFilePrivate`).
+    private func sendImageOverMesh(_ peerID: PeerID, data: Data) {
+        chatViewModel.selectedPrivateChatPeer = peerID // target + enable media context
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("sonar-\(UUID().uuidString).jpg")
+        guard (try? data.write(to: tmp)) != nil else { return }
+        chatViewModel.sendImage(from: tmp) { try? FileManager.default.removeItem(at: tmp) }
+    }
+
+    /// Resolve a bitchat file marker ("[image]/[file]/[voice] <name>") to a media
+    /// item with the local on-disk path, if the file exists.
+    private func meshMediaItem(_ content: String) -> SNMediaItem? {
+        let kinds: [(prefix: String, mime: String, dirs: [String])] = [
+            ("[image] ", "image/jpeg", ["images/incoming", "images/outgoing"]),
+            ("[voice] ", "audio/mp4", ["voicenotes/incoming", "voicenotes/outgoing"]),
+            ("[file] ", "application/octet-stream", ["files/incoming", "files/outgoing"]),
+        ]
+        guard let k = kinds.first(where: { content.hasPrefix($0.prefix) }) else { return nil }
+        let name = String(content.dropFirst(k.prefix.count)).trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty,
+              let base = try? FileManager.default.url(
+                  for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false)
+        else { return nil }
+        let safe = (name as NSString).lastPathComponent
+        let filesDir = base.appendingPathComponent("files", isDirectory: true)
+        for dir in k.dirs {
+            let path = filesDir.appendingPathComponent(dir).appendingPathComponent(safe).path
+            if FileManager.default.fileExists(atPath: path) {
+                return SNMediaItem(url: "", mime: k.mime, filename: safe, groupId: "", localPath: path)
+            }
+        }
+        return nil
+    }
+
+    /// Bytes for a media attachment: a local file (BLE-mesh) or download+decrypt
+    /// from Blossom (Marmot), cached by URL.
     func mediaData(_ item: SNMediaItem) async -> Data? {
+        if let path = item.localPath {
+            return try? Data(contentsOf: URL(fileURLWithPath: path))
+        }
         if let cached = mediaImageCache[item.url] { return cached }
         guard let data = await marmot.fetchMedia(groupId: item.groupId, url: item.url) else {
             return nil
