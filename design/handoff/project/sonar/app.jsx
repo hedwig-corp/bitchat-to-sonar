@@ -32,7 +32,7 @@ function bcFreshState() {
     read: {},
     stack: [{ s: 'home' }],
     nav: '',
-    prefs: { appLock: false, readReceipts: true, preview: true, names: true, notifs: true, icon: 'cyan', requests: 1 },
+    prefs: { appLock: false, readReceipts: true, preview: true, names: true, notifs: true, icon: 'cyan', requests: 1, btcMode: false, currency: 'EUR' },
     chMsgs: { centro: BC_DATA.chMsgs.slice(), city: [] },
     dmMsgs: { maya: BC_DATA.dmMsgs.slice(), sofia: BC_DATA.dmMsgsSofia.slice() },
   };
@@ -141,6 +141,43 @@ function SonarApp() {
     return { ...a, balance: (a.balance || 0) + m.amount, dmMsgs: { ...a.dmMsgs, [peerId]: list } };
   });
 
+  // Media rides the same rails as messages (Bluetooth in range, internet otherwise)
+  const sendMediaCh = (chId, type) => setApp((a) => ({
+    ...a,
+    chMsgs: { ...a.chMsgs, [chId]: [...(a.chMsgs[chId] || []), {
+      mine: true, author: a.nick || 'you', media: bcSampleMedia(type), time: bcNow(),
+      via: a.network === 'online' ? 'internet' : 'mesh', state: 'Delivered',
+    }] },
+  }));
+  const sendMediaDm = (peerId, type) => setApp((a) => {
+    const peer = BC_DATA.peers.find((p) => p.id === peerId);
+    const via = peer && peer.inRange ? 'mesh' : 'internet';
+    return {
+      ...a,
+      dmMsgs: { ...a.dmMsgs, [peerId]: [...(a.dmMsgs[peerId] || []), {
+        mine: true, media: bcSampleMedia(type), time: bcNow(), via, state: 'Delivered',
+      }] },
+    };
+  });
+
+  const sendVoiceCh = (chId, sec) => setApp((a) => ({
+    ...a,
+    chMsgs: { ...a.chMsgs, [chId]: [...(a.chMsgs[chId] || []), {
+      mine: true, author: a.nick || 'you', media: bcVoiceMedia(sec), time: bcNow(),
+      via: a.network === 'online' ? 'internet' : 'mesh', state: 'Delivered',
+    }] },
+  }));
+  const sendVoiceDm = (peerId, sec) => setApp((a) => {
+    const peer = BC_DATA.peers.find((p) => p.id === peerId);
+    const via = peer && peer.inRange ? 'mesh' : 'internet';
+    return {
+      ...a,
+      dmMsgs: { ...a.dmMsgs, [peerId]: [...(a.dmMsgs[peerId] || []), {
+        mine: true, media: bcVoiceMedia(sec), time: bcNow(), via, state: 'Delivered',
+      }] },
+    };
+  });
+
   const onCommand = (ctx, cmd) => {
     if (cmd === 'who' || cmd === 'msg') { push('nearby'); return; }
     if (cmd === 'slap') {
@@ -155,9 +192,9 @@ function SonarApp() {
   if (top.s === 'home') {
     screen = <HomeScreen key={screenKey} app={app} t={t} nav={app.nav} push={push} toggleNetwork={toggleNetwork} onWipe={wipe} />;
   } else if (top.s === 'channel') {
-    screen = <ChannelScreen key={screenKey} app={app} nav={app.nav} pop={pop} push={push} chId={top.id} onSend={sendCh} onCommand={onCommand} />;
+    screen = <ChannelScreen key={screenKey} app={app} nav={app.nav} pop={pop} push={push} chId={top.id} onSend={sendCh} onCommand={onCommand} onMedia={sendMediaCh} onVoice={sendVoiceCh} />;
   } else if (top.s === 'dm') {
-    screen = <DMScreen key={screenKey} app={app} nav={app.nav} pop={pop} push={push} peerId={top.id} onSend={sendDm} onCommand={onCommand} onVerify={(pid) => setApp((a) => ({ ...a, verified: { ...a.verified, [pid]: true } }))} onPay={(sats) => sendPay(top.id, sats)} onClaimPay={claimPay} openPay={!!top.pay} />;
+    screen = <DMScreen key={screenKey} app={app} nav={app.nav} pop={pop} push={push} peerId={top.id} onSend={sendDm} onCommand={onCommand} onVerify={(pid) => setApp((a) => ({ ...a, verified: { ...a.verified, [pid]: true } }))} onPay={(sats) => sendPay(top.id, sats)} onClaimPay={claimPay} openPay={!!top.pay} onMedia={sendMediaDm} onVoice={sendVoiceDm} />;
   } else if (top.s === 'nearby') {
     screen = <SonarScreen key={screenKey} app={app} nav={app.nav} pop={pop} push={push} />;
   } else if (top.s === 'settings') {

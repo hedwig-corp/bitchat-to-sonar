@@ -25,6 +25,9 @@
     --indigo-fill: #5E5CE6;
     --indigo-soft: rgba(123, 121, 247, 0.14);
     --green: #41BC76;
+    --gold-fill: #F0B03A;
+    --on-gold: #241500;
+    --gold-soft: rgba(240, 176, 58, 0.16);
     --mono: 'IBM Plex Mono', ui-monospace, monospace;
   }
   * { box-sizing: border-box; }
@@ -46,7 +49,7 @@
   .wordmark svg { color: var(--cyan); }
   .navlinks { display: flex; align-items: center; gap: 10px; }
   .btn {
-    display: inline-flex; align-items: center; gap: 8px;
+    display: inline-flex; align-items: center; gap: 8px; white-space: nowrap;
     padding: 11px 20px; border-radius: 999px; border: none;
     font-family: inherit; font-size: 15px; font-weight: 700;
     text-decoration: none; cursor: pointer; transition: transform 0.12s, background 0.15s;
@@ -185,6 +188,57 @@
     padding: 10px 14px; color: var(--text2); display: inline-block; margin-top: 14px;
   }
 
+  /* payments */
+  .paycard {
+    display: flex; align-items: center; gap: 13px; align-self: flex-end;
+    background: var(--gold-fill); color: var(--on-gold);
+    border-radius: 18px; border-bottom-right-radius: 6px;
+    padding: 12px 16px 12px 12px; min-width: 188px;
+  }
+  .paycoin {
+    width: 40px; height: 40px; flex: none; border-radius: 50%;
+    background: rgba(0, 0, 0, 0.16);
+    box-shadow: inset 0 1.5px 0 rgba(255, 255, 255, 0.35), inset 0 -1.5px 0 rgba(0, 0, 0, 0.18);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 20px; font-weight: 800;
+  }
+  .payamt { font-size: 19px; font-weight: 800; letter-spacing: -0.01em; }
+  .paystate { align-self: flex-end; font-size: 11.5px; color: var(--text3); margin: 2px 4px 0; display: flex; align-items: center; gap: 5px; }
+  .modechip {
+    display: flex; align-items: center; gap: 11px; margin-top: 24px;
+    padding: 12px 15px; border-radius: 13px;
+    background: var(--card); border: 1px solid var(--hairline);
+    font-size: 13.5px; color: var(--text2); line-height: 1.45; max-width: 44ch;
+  }
+  .modechip b { color: var(--text); font-weight: 700; }
+  .modeswitch { width: 40px; height: 23px; flex: none; border-radius: 12px; background: #2A3036; position: relative; box-shadow: inset 0 0 0 1px var(--hairline); }
+  .modeswitch::after { content: ''; position: absolute; top: 2px; left: 2px; width: 19px; height: 19px; border-radius: 50%; background: #E7ECEE; }
+
+  /* devices */
+  .devstage { display: flex; gap: 36px; align-items: center; justify-content: center; flex-wrap: wrap; margin-top: 52px; }
+  .win { width: 470px; max-width: 100%; border-radius: 14px; overflow: hidden; background: var(--bg); box-shadow: 0 0 0 1px var(--hairline), 0 40px 90px rgba(0, 0, 0, 0.55); text-align: left; }
+  .wintop { display: flex; align-items: center; gap: 7px; padding: 11px 14px; border-bottom: 1px solid var(--hairline); }
+  .tl { width: 11px; height: 11px; border-radius: 50%; flex: none; }
+  .winmark { margin-left: 8px; display: flex; align-items: center; gap: 6px; font-weight: 800; font-size: 13px; color: var(--text2); }
+  .win-body { display: flex; height: 266px; }
+  .win-side { width: 156px; flex: none; border-right: 1px solid var(--hairline); padding: 12px 10px; display: flex; flex-direction: column; gap: 8px; }
+  .statuspill { display: flex; align-items: center; gap: 7px; background: var(--card); border: 1px solid var(--hairline); border-radius: 999px; padding: 7px 11px; font-size: 11px; color: var(--text2); }
+  .siderow { display: flex; align-items: center; gap: 9px; padding: 6px; border-radius: 10px; }
+  .siderow.sel { background: var(--cyan-soft); }
+  .dot-av { width: 26px; height: 26px; border-radius: 50%; flex: none; }
+  .bars { flex: 1; display: flex; flex-direction: column; gap: 5px; }
+  .barline { height: 6px; border-radius: 4px; background: var(--card); }
+  .win-main { flex: 1; padding: 16px; display: flex; flex-direction: column; gap: 8px; justify-content: flex-end; }
+  .phone-sm { width: 190px; height: 384px; flex: none; border-radius: 34px; background: #07090B; box-shadow: 0 0 0 8px #14191C, 0 40px 90px rgba(0, 0, 0, 0.55); position: relative; overflow: hidden; }
+  .phone-notch { position: absolute; top: 10px; left: 50%; transform: translateX(-50%); width: 66px; height: 18px; border-radius: 12px; background: #000; z-index: 3; }
+  .psm-head { text-align: center; padding: 34px 0 0; font-weight: 800; font-size: 15px; }
+  .psm-radar { position: relative; width: 166px; height: 166px; margin: 26px auto 0; }
+  .ring { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); border: 1px solid rgba(34, 211, 238, 0.25); border-radius: 50%; }
+  .ring.r1 { width: 58px; height: 58px; } .ring.r2 { width: 110px; height: 110px; } .ring.r3 { width: 162px; height: 162px; }
+  .psm-sweep { position: absolute; inset: 0; border-radius: 50%; background: conic-gradient(from 0deg, transparent 0deg 285deg, rgba(34, 211, 238, 0.04) 330deg, rgba(34, 211, 238, 0.28) 358deg, transparent 360deg); animation: spin 5s linear infinite; }
+  .pdot { position: absolute; width: 22px; height: 22px; border-radius: 50%; transform: translate(-50%, -50%); box-shadow: 0 0 0 3px var(--bg); }
+  .psm-cap { text-align: center; font-size: 11.5px; color: var(--text3); margin-top: 18px; }
+
   /* cta band */
   .band { text-align: center; padding: 88px 0; }
   .band h2 { margin-bottom: 10px; }
@@ -199,7 +253,7 @@
   @keyframes spin { to { transform: rotate(360deg); } }
   @keyframes pulse { from { transform: scale(0.7); opacity: 0.5; } to { transform: scale(2.6); opacity: 0; } }
   @media (prefers-reduced-motion: reduce) {
-    .sweep, .pulse { animation: none; }
+    .sweep, .pulse, .psm-sweep { animation: none; }
     .pulse { display: none; }
   }
   @media (max-width: 860px) {
@@ -207,6 +261,7 @@
     .twocol { grid-template-columns: 1fr; gap: 36px; }
     .grid3 { grid-template-columns: 1fr; }
     .radar { width: 340px; height: 340px; }
+    .win { width: 100%; }
   }
 </style>
 </head>
@@ -337,6 +392,28 @@
 
 <section class="alt">
   <div class="wrap twocol">
+    <div>
+      <p class="label">Pay a friend</p>
+      <h2>Send money as easily as a message.</h2>
+      <p class="lede">Settle a dinner across the table or send cash across the world. The payment takes the same path your message would — phone-to-phone over Bluetooth when they’re near, over the internet when they’re not. It arrives sealed; they tap to open.</p>
+      <div class="modechip">
+        <span class="modeswitch"></span>
+        <span><b>Bitcoin mode is off by default.</b> You see amounts in your own currency. Flip it on for sats, Lightning and ecash — your call.</span>
+      </div>
+    </div>
+    <div class="chatcard">
+      <div class="bub them">that’s dinner sorted — you got me next time<span class="meta">20:14</span></div>
+      <div class="paycard">
+        <span class="paycoin">€</span>
+        <span class="payamt">€18.00</span>
+      </div>
+      <div class="paystate"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="12" cy="12" r="1.7" fill="currentColor" stroke="none"></circle><path d="M8.7 8.7a4.7 4.7 0 0 0 0 6.6M15.3 8.7a4.7 4.7 0 0 1 0 6.6"></path></svg>Sealed · Maya taps to open · over Bluetooth</div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap twocol">
     <div class="chanrows">
       <div class="chanrow">
         <span class="pintile"><svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 20.8s-6.3-5.3-6.3-10.2a6.3 6.3 0 0 1 12.6 0c0 4.9-6.3 10.2-6.3 10.2z"></path><circle cx="12" cy="10.4" r="2.2"></circle></svg></span>
@@ -352,7 +429,52 @@
     <div>
       <p class="label">Location channels</p>
       <h2>Places, not coordinates.</h2>
-      <p class="lede">Every neighborhood has an open channel anyone nearby can join. Sonar shows real place names — never raw geohashes — and you pick exactly how precise to be: block, neighborhood, city, or region.</p>
+      <p class="lede">Wherever you stand, Sonar shows one “Around you” place — zoom from your block to the whole region with a single tap. Real place names, never raw coordinates, and never an endless list of empty rooms.</p>
+    </div>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap" style="text-align: center;">
+    <p class="label" style="color: var(--cyan-deep);">Everywhere you are</p>
+    <h2>One private network, on every screen.</h2>
+    <p class="lede" style="margin: 0 auto;">Built for iPhone, iPad and Mac. The same nearby radar, the same encrypted chats, the same key in your pocket — your conversations follow you, and nothing lives on a server.</p>
+    <div class="devstage">
+      <div class="win" aria-hidden="true">
+        <div class="wintop">
+          <span class="tl" style="background: #FF5F57;"></span>
+          <span class="tl" style="background: #FEBC2E;"></span>
+          <span class="tl" style="background: #28C840;"></span>
+          <span class="winmark"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--cyan)" stroke-width="1.8"><circle cx="12" cy="12" r="2" fill="var(--cyan)" stroke="none"></circle><circle cx="12" cy="12" r="5.8"></circle><circle cx="12" cy="12" r="9.4"></circle></svg>sonar</span>
+        </div>
+        <div class="win-body">
+          <div class="win-side">
+            <span class="statuspill"><span style="width: 7px; height: 7px; border-radius: 50%; background: var(--green);"></span>Online · reaches anyone</span>
+            <div class="siderow"><span class="dot-av" style="background: hsl(330 40% 45%);"></span><span class="bars"><span class="barline" style="width: 68%;"></span><span class="barline" style="width: 46%; background: #1A2024;"></span></span></div>
+            <div class="siderow sel"><span class="dot-av" style="background: hsl(150 40% 42%);"></span><span class="bars"><span class="barline" style="width: 60%;"></span><span class="barline" style="width: 50%; background: #1A2024;"></span></span></div>
+            <div class="siderow"><span class="dot-av" style="background: hsl(265 38% 48%);"></span><span class="bars"><span class="barline" style="width: 72%;"></span><span class="barline" style="width: 40%; background: #1A2024;"></span></span></div>
+          </div>
+          <div class="win-main">
+            <div class="bub them" style="font-size: 13px; max-width: none; white-space: nowrap;">see you at the lake?</div>
+            <div class="bub ble" style="font-size: 13px; max-width: none; white-space: nowrap; align-self: flex-end;">on my way</div>
+            <div class="paycard" style="min-width: 0; padding: 8px 13px 8px 8px; border-radius: 15px; border-bottom-right-radius: 6px;"><span class="paycoin" style="width: 30px; height: 30px; font-size: 15px;">€</span><span class="payamt" style="font-size: 15px;">€12.00</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="phone-sm" aria-hidden="true">
+        <div class="phone-notch"></div>
+        <div class="psm-head">sonar</div>
+        <div class="psm-radar">
+          <span class="ring r3"></span><span class="ring r2"></span><span class="ring r1"></span>
+          <span class="psm-sweep"></span>
+          <span class="pdot" style="left: 50%; top: 50%; width: 30px; height: 30px; background: hsl(192 50% 52%);"></span>
+          <span class="pdot" style="left: 31%; top: 37%; background: hsl(330 55% 62%);"></span>
+          <span class="pdot" style="left: 71%; top: 43%; background: hsl(150 50% 50%);"></span>
+          <span class="pdot" style="left: 60%; top: 73%; background: hsl(48 60% 56%);"></span>
+        </div>
+        <div class="psm-cap">4 people nearby</div>
+      </div>
     </div>
   </div>
 </section>
