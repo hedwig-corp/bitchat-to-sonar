@@ -22,6 +22,7 @@ import uniffi.sonar_ffi.NoiseKeypairHex
 import uniffi.sonar_ffi.SonarNoise
 import uniffi.sonar_ffi.meshBuildAnnounce
 import uniffi.sonar_ffi.meshBuildPacket
+import uniffi.sonar_ffi.meshBuildSignedPacket
 import uniffi.sonar_ffi.meshBuildPublicMessage
 import uniffi.sonar_ffi.meshDecodePacket
 import uniffi.sonar_ffi.meshDecodePrivateMessage
@@ -111,28 +112,42 @@ object MeshGatt {
     private var characteristic: BluetoothGattCharacteristic? = null
     private val handler = android.os.Handler(android.os.Looper.getMainLooper())
 
-    /** Per-link Noise state (DMs only), keyed by remote BLE address. */
-    private class Link(val noise: SonarNoise, var established: Boolean = false)
+    /** Per-link Noise state (DMs only), keyed by remote BLE address. [startedMs]
+     *  is when the current handshake attempt began, so a half-open handshake (m1
+     *  sent but m2/m3 lost to an intermittent BLE link) can be retried instead of
+     *  blocking forever. */
+    private class Link(val noise: SonarNoise, var established: Boolean = false, var startedMs: Long = 0L)
     private val serverLinks = ConcurrentHashMap<String, Link>()
     private val serverDevices = ConcurrentHashMap<String, BluetoothDevice>()
     private val clientLinks = ConcurrentHashMap<String, Link>()
-    /** The peer's announced bitchat peerID, keyed by BLE address. */
+    /** The peer's announced bitchat peerID (ROTATES ~2 min), keyed by BLE address.
+     *  Used only to address packets on the wire to the peer's CURRENT id. */
     private val peerIdByAddr = ConcurrentHashMap<String, String>()
+    /** The peer's STABLE identity = fingerprint SHA256(noise static pubkey), keyed
+     *  by BLE address. This is what the app keys conversations/radar by, so a peer
+     *  stays one identity across peerID + MAC rotation (issue #12). */
+    private val fingerprintByAddr = ConcurrentHashMap<String, String>()
 
-    // Listeners (fired from BLE callback threads → concurrent lists).
+    // Listeners (fired from BLE callback threads → concurrent lists). The String
+    // identity passed to onText/onSonar/onLink is the stable FINGERPRINT.
     private val onText = java.util.concurrent.CopyOnWriteArrayList<(String, String) -> Unit>()
     private val onSonar = java.util.concurrent.CopyOnWriteArrayList<(String, ByteArray) -> Unit>()
-    private val onAnnounce = java.util.concurrent.CopyOnWriteArrayList<(String, MeshAnnounceInfo) -> Unit>()
+    private val onAnnounce = java.util.concurrent.CopyOnWriteArrayList<(String, MeshAnnounceInfo, String) -> Unit>()
     private val onLink = java.util.concurrent.CopyOnWriteArrayList<(String) -> Unit>()
     private val onBroadcast = java.util.concurrent.CopyOnWriteArrayList<(MeshPublicMessage) -> Unit>()
     /** Dedup public broadcasts by message id (we receive from multiple links). */
     private val seenBroadcastIds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
-    fun addMessageListener(cb: (peerId: String, text: String) -> Unit) { onText.add(cb) }
-    fun addSonarListener(cb: (peerId: String, payload: ByteArray) -> Unit) { onSonar.add(cb) }
-    /** Fired when a peer's signed announce is received + verified. */
-    fun addAnnounceListener(cb: (bleAddr: String, info: MeshAnnounceInfo) -> Unit) { onAnnounce.add(cb) }
-    fun addLinkListener(cb: (peerId: String) -> Unit) { onLink.add(cb) }
+    fun addMessageListener(cb: (fingerprint: String, text: String) -> Unit) { onText.add(cb) }
+    fun addSonarListener(cb: (fingerprint: String, payload: ByteArray) -> Unit) { onSonar.add(cb) }
+    /** Fired when a peer's signed announce is received + verified. The third arg
+     *  is the peer's stable fingerprint (SHA256 of its noise static pubkey). */
+    fun addAnnounceListener(cb: (bleAddr: String, info: MeshAnnounceInfo, fingerprint: String) -> Unit) { onAnnounce.add(cb) }
+    fun addLinkListener(cb: (fingerprint: String) -> Unit) { onLink.add(cb) }
+
+    /** Stable fingerprint for a peer = SHA256(noise static pubkey), full hex. */
+    private fun fingerprintOf(noisePublicKeyHex: String): String =
+        runCatching { Sha256.hash(noisePublicKeyHex.hexToBytes()).toHex() }.getOrDefault("")
     /** Fired for an incoming public broadcast (Mesh channel) message. */
     fun addBroadcastListener(cb: (MeshPublicMessage) -> Unit) { onBroadcast.add(cb) }
 
@@ -171,7 +186,13 @@ object MeshGatt {
 
     private fun sonarBytes(): ByteArray? = sonarPayload?.let { p ->
         runCatching {
-            meshBuildPacket(TYPE_SONAR_0X53, myPeerIdHex, "", DEFAULT_TTL, System.currentTimeMillis().toULong(), p)
+            // The 0x53 MUST be signed with the same Ed25519 key as the announce —
+            // iOS `handleSonarAnnounce` rejects an unsigned/invalid one as
+            // "unverified", so an unsigned 0x53 broke the npub exchange entirely.
+            meshBuildSignedPacket(
+                ed25519SeedHex, TYPE_SONAR_0X53, myPeerIdHex, "",
+                DEFAULT_TTL, System.currentTimeMillis().toULong(), p,
+            )
         }.getOrNull()
     }
 
@@ -204,7 +225,7 @@ object MeshGatt {
         server = null; characteristic = null
         clientGatt.values.forEach { runCatching { it.disconnect(); it.close() } }
         clientGatt.clear(); clientChar.clear(); clientLinks.clear(); clientPending.clear(); clientConnected.clear()
-        serverLinks.clear(); serverDevices.clear(); peerIdByAddr.clear(); recentDials.clear()
+        serverLinks.clear(); serverDevices.clear(); peerIdByAddr.clear(); fingerprintByAddr.clear(); recentDials.clear()
         pendingSends.clear()
     }
 
@@ -214,7 +235,7 @@ object MeshGatt {
                 serverDevices[device.address] = device
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 serverLinks.remove(device.address); serverDevices.remove(device.address)
-                peerIdByAddr.remove(device.address)
+                peerIdByAddr.remove(device.address); fingerprintByAddr.remove(device.address)
                 serverNotifyQueue.remove(device.address); serverNotifying.remove(device.address)
             }
         }
@@ -271,6 +292,9 @@ object MeshGatt {
     /** Once CONNECTED, time to wait for the peer's announce before giving up. */
     private const val ANNOUNCE_TIMEOUT_MS = 6_000L
     private const val REDIAL_BACKOFF_MS = 30_000L
+    /** Retry a half-open Noise handshake (m1 sent, m2/m3 never arrived) no sooner
+     *  than this — driven by the peer's ~15s announce cadence. */
+    private const val HANDSHAKE_RETRY_MS = 8_000L
 
     /** Addresses that have reached CONNECTED — they get the longer announce
      *  window; un-established dials are dropped at CONNECT_ESTABLISH_MS. */
@@ -399,7 +423,7 @@ object MeshGatt {
     }
 
     private fun cleanupClient(addr: String) {
-        clientLinks.remove(addr); clientChar.remove(addr); peerIdByAddr.remove(addr)
+        clientLinks.remove(addr); clientChar.remove(addr); peerIdByAddr.remove(addr); fingerprintByAddr.remove(addr)
         clientPending.remove(addr); clientConnected.remove(addr)
         clientWriteQueue.remove(addr); clientWriting.remove(addr)
         clientGatt.remove(addr)?.let { runCatching { it.disconnect(); it.close() } }
@@ -421,17 +445,27 @@ object MeshGatt {
             TYPE_ANNOUNCE -> {
                 val ann = runCatching { meshParseAnnounce(value) }.getOrNull()
                 if (ann == null) { android.util.Log.w(TAG, "announce verify FAILED from $addr"); return }
-                android.util.Log.i(TAG, "ANNOUNCE from $addr → '${ann.nickname}' peerId=${ann.senderIdHex}")
+                val fp = fingerprintOf(ann.noisePublicKeyHex)
+                android.util.Log.i(TAG, "ANNOUNCE from $addr → '${ann.nickname}' peerId=${ann.senderIdHex} fp=${fp.take(8)}…")
                 peerIdByAddr[addr] = ann.senderIdHex
+                if (fp.isNotEmpty()) fingerprintByAddr[addr] = fp
                 clientPending.remove(addr) // a real peer answered — keep this link
-                onAnnounce.forEach { it(addr, ann) }
+                onAnnounce.forEach { it(addr, ann, fp) }
                 // Central: now that we know the peer's peerID, open a Noise link
                 // for DMs (initiator). Peripheral waits for the peer's 0x10.
-                if (!fromServer && gatt != null && clientLinks[addr] == null) {
-                    android.util.Log.i(TAG, "starting Noise handshake (initiator) → $addr")
+                // Re-handshake if there is no link OR the current one is still
+                // half-open after HANDSHAKE_RETRY_MS — an m1 whose m2/m3 was lost
+                // to a flaky BLE link must not block re-handshaking forever (that
+                // left `hasMeshLink` false even with the peer right there, so DMs
+                // silently fell back to "internet" / never sent).
+                val existing = clientLinks[addr]
+                val stale = existing != null && !existing.established &&
+                    System.currentTimeMillis() - existing.startedMs > HANDSHAKE_RETRY_MS
+                if (!fromServer && gatt != null && (existing == null || stale)) {
+                    android.util.Log.i(TAG, "starting Noise handshake (initiator) → $addr${if (stale) " [retry]" else ""}")
                     startHandshake(gatt, addr, ann.senderIdHex)
                 } else {
-                    android.util.Log.i(TAG, "no handshake: fromServer=$fromServer gatt=${gatt != null} link=${clientLinks[addr] != null}")
+                    android.util.Log.i(TAG, "no handshake: fromServer=$fromServer gatt=${gatt != null} established=${existing?.established}")
                 }
             }
             TYPE_MESSAGE -> {
@@ -451,11 +485,11 @@ object MeshGatt {
             TYPE_NOISE_HANDSHAKE -> handleHandshake(addr, info.payload, fromServer, device, gatt)
             TYPE_NOISE_ENCRYPTED -> handleEncrypted(addr, info.payload, fromServer)
             TYPE_SONAR_0X53 -> {
-                // Tag the 0x53 with the peer's stable bitchat peerID (learned
-                // from its 0x01 announce, which precedes the 0x53) so it can be
-                // correlated to the mesh peer despite BLE address rotation.
-                val peerId = peerIdByAddr[addr] ?: return
-                onSonar.forEach { it(peerId, info.payload) }
+                // Tag the 0x53 with the peer's STABLE fingerprint (from its 0x01
+                // announce, which precedes the 0x53) so its Sonar profile/npub
+                // stays correlated to the peer across peerID + BLE rotation.
+                val fp = fingerprintByAddr[addr] ?: return
+                onSonar.forEach { it(fp, info.payload) }
             }
             else -> android.util.Log.i(TAG, "ignoring mesh packet type=${info.packetType} from $addr")
         }
@@ -467,7 +501,7 @@ object MeshGatt {
         val ch = clientChar[addr] ?: run {
             android.util.Log.w(TAG, "startHandshake $addr: no clientChar"); return
         }
-        val link = Link(SonarNoise.initiator(keypair.privateHex))
+        val link = Link(SonarNoise.initiator(keypair.privateHex), startedMs = System.currentTimeMillis())
         clientLinks[addr] = link
         runCatching {
             val m1 = link.noise.writeMessage()
@@ -507,14 +541,40 @@ object MeshGatt {
         }
     }
 
+    /** The established Noise session for a peer identity, across connections.
+     *  bitchat keeps ONE Noise session per peer and uses it over either BLE
+     *  connection (each device connects to the other → two GATT links). Android
+     *  keys sessions by BLE address, so a packet arriving on the OTHER connection
+     *  than the handshake had no session → dropped (iOS delivery acks + iOS→Android
+     *  DMs were silently lost). Resolve the session by fingerprint: prefer the
+     *  client link (we were initiator), else any established link for that fp. */
+    private fun establishedLinkForFp(fp: String): Link? {
+        for ((a, f) in fingerprintByAddr) {
+            if (f != fp) continue
+            clientLinks[a]?.takeIf { it.established }?.let { return it }
+            serverLinks[a]?.takeIf { it.established }?.let { return it }
+        }
+        return null
+    }
+
     private fun handleEncrypted(addr: String, ciphertext: ByteArray, fromServer: Boolean) {
-        val link = (if (fromServer) serverLinks[addr] else clientLinks[addr])?.takeIf { it.established } ?: return
+        val fp = fingerprintByAddr[addr]
+        // Prefer this connection's own session; fall back to the peer's session on
+        // its OTHER connection (snow does not advance the nonce on a failed decrypt,
+        // so this fallback can't desync a healthy session).
+        val link = (if (fromServer) serverLinks[addr] else clientLinks[addr])?.takeIf { it.established }
+            ?: fp?.let { establishedLinkForFp(it) }
+            ?: return
         runCatching {
             val plain = link.noise.decrypt(ciphertext)
-            // Surface the STABLE peerID (not the rotating BLE address) so the app
-            // can key the conversation by peer across MAC rotation.
-            val peerId = peerIdByAddr[addr] ?: addr
-            meshDecodePrivateMessage(plain)?.let { pm -> onText.forEach { it(peerId, pm.content) } }
+            // inner NoisePayloadType: 0x01 privateMessage, 0x02 readReceipt,
+            // 0x03 delivered ack. We currently surface only 0x01; the others are
+            // logged (a 0x03 confirms the peer received + stored our DM).
+            android.util.Log.i(TAG, "rx 0x11 inner type=0x${(plain.firstOrNull()?.toInt()?.and(0xFF) ?: -1).toString(16)} (${plain.size}B) from $addr")
+            // Surface the STABLE fingerprint so the app keys the conversation by
+            // peer identity across peerID + BLE-address rotation (issue #12).
+            val idFp = fp ?: peerIdByAddr[addr] ?: addr
+            meshDecodePrivateMessage(plain)?.let { pm -> onText.forEach { it(idFp, pm.content) } }
         }
     }
 
@@ -522,12 +582,12 @@ object MeshGatt {
         meshBuildPacket(TYPE_NOISE_HANDSHAKE, myPeerIdHex, peerIdHex, DEFAULT_TTL, System.currentTimeMillis().toULong(), noiseMsg)
 
     private fun linkEstablished(addr: String) {
-        // NB: callers pass the BLE address; resolve the stable peerID so listeners
-        // (and the pending-send flush) key by peerID, not the rotating address.
-        val pid = peerIdByAddr[addr] ?: addr
-        android.util.Log.i(TAG, "✅ Noise link ESTABLISHED with $addr (peerId=$pid)")
-        onLink.forEach { it(pid) }
-        flushPending(pid)
+        // Resolve the stable fingerprint so listeners + the pending-send flush key
+        // by peer identity, not the rotating peerID/address (issue #12).
+        val fp = fingerprintByAddr[addr] ?: peerIdByAddr[addr] ?: addr
+        android.util.Log.i(TAG, "✅ Noise link ESTABLISHED with $addr (peerId=${peerIdByAddr[addr]} fp=${fp.take(8)}…)")
+        onLink.forEach { it(fp) }
+        flushPending(fp)
     }
 
     /** Send an encrypted DM to an established peer (private message TLV inside). */
@@ -552,37 +612,40 @@ object MeshGatt {
      *  queue the message instead of failing, and deliver it on (re)connect. */
     private val pendingSends = ConcurrentHashMap<String, java.util.concurrent.ConcurrentLinkedQueue<Pair<String, String>>>()
 
-    private fun establishedAddrFor(peerId: String): String? =
-        peerIdByAddr.entries.firstOrNull { (a, pid) ->
-            pid == peerId &&
+    /** The BLE address with an established Noise link to the peer identified by
+     *  [fingerprint]. Resolves the CURRENT address even after the peer rotated its
+     *  peerID/MAC — `sendText` then addresses that address's current peerID. */
+    private fun establishedAddrFor(fingerprint: String): String? =
+        fingerprintByAddr.entries.firstOrNull { (a, fp) ->
+            fp == fingerprint &&
                 ((clientLinks[a]?.established == true) || (serverLinks[a]?.established == true))
         }?.key
 
-    /** Send a DM addressed by the peer's stable bitchat peerID (the radar/UI key).
+    /** Send a DM addressed by the peer's stable fingerprint (the radar/UI key).
      *  Sends immediately over a live Noise link, else QUEUES it to deliver when a
      *  link (re)establishes. Always returns true — the message is accepted (the
      *  UI echoes it optimistically); "false" used to surface a scary "not
      *  connected" toast even though the peer was right there. */
-    fun sendTextToPeer(peerId: String, messageId: String, text: String): Boolean {
-        val addr = establishedAddrFor(peerId)
+    fun sendTextToPeer(fingerprint: String, messageId: String, text: String): Boolean {
+        val addr = establishedAddrFor(fingerprint)
         if (addr != null) return sendText(addr, messageId, text)
-        pendingSends.getOrPut(peerId) { java.util.concurrent.ConcurrentLinkedQueue() }.add(messageId to text)
+        pendingSends.getOrPut(fingerprint) { java.util.concurrent.ConcurrentLinkedQueue() }.add(messageId to text)
         return true
     }
 
-    /** Flush any queued DMs to [peerId] now that an encrypted link is up. */
-    private fun flushPending(peerId: String) {
-        val q = pendingSends[peerId] ?: return
-        val addr = establishedAddrFor(peerId) ?: return
+    /** Flush any queued DMs to [fingerprint] now that an encrypted link is up. */
+    private fun flushPending(fingerprint: String) {
+        val q = pendingSends[fingerprint] ?: return
+        val addr = establishedAddrFor(fingerprint) ?: return
         while (true) {
             val (mid, txt) = q.poll() ?: break
             sendText(addr, mid, txt)
         }
     }
 
-    /** True iff there is an established encrypted link to [peerId] right now. */
-    fun hasLink(peerId: String): Boolean = peerIdByAddr.entries.any { (a, pid) ->
-        pid == peerId && ((clientLinks[a]?.established == true) || (serverLinks[a]?.established == true))
+    /** True iff there is an established encrypted link to [fingerprint] right now. */
+    fun hasLink(fingerprint: String): Boolean = fingerprintByAddr.entries.any { (a, fp) ->
+        fp == fingerprint && ((clientLinks[a]?.established == true) || (serverLinks[a]?.established == true))
     }
 
     /** True iff [addr] is currently linked (dialed, dialing, or accepted as a

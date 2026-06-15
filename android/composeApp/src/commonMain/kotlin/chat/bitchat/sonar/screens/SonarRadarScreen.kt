@@ -143,8 +143,8 @@ fun SonarRadarScreen(state: SonarAppState) {
         val pid = p.id.removePrefix("mesh:")
         PeerCard(
             p,
-            onMessage = { card = null; state.openMeshChat(pid, p.name) },
-            onSendSats = { card = null; state.openMeshChat(pid, p.name, pay = true) },
+            onMessage = { card = null; state.openDm(pid, p.name) },
+            onSendSats = { card = null; state.openDm(pid, p.name, pay = true) },
             onClose = { card = null },
         )
     }

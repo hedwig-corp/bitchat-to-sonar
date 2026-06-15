@@ -174,7 +174,7 @@ private fun HomeScreen(state: SonarAppState) {
                     ConvRow(
                         avatar = { SonarAvatar(row.name, 52.dp, presence = true) },
                         title = row.name, sub = row.preview, lock = false,
-                    ) { state.openMeshChat(row.peerId, row.name) }
+                    ) { state.openDm(row.peerId, row.name) }
                 }
                 items(state.chats, key = { it.id }) { chat ->
                     ConvRow(
@@ -420,10 +420,17 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             ?.let { shortNpub(it) } ?: "secure chat"
     }
     val verified = run { state.payVersion; state.isVerified(screen.id) }
-    // BLE-mesh DMs are cyan/"Bluetooth"; Marmot DMs indigo/"internet" (the
-    // design's signature transport-colored bubbles).
-    val mesh = screen.id.startsWith("mesh:")
-    val transport = if (mesh) "Bluetooth" else "internet"
+    // A radar-peer DM is a "mesh:" route that auto-picks transport: BLE mesh
+    // (cyan/"Bluetooth") while in range, White Noise (indigo/"internet") when out
+    // of range. A pure Marmot chat (non-mesh route) is always internet. Per-message
+    // bubbles colour by the leg they travelled (`m.viaInternet`).
+    val isMeshRoute = screen.id.startsWith("mesh:")
+    val peerId = screen.id.removePrefix("mesh:")
+    val inRange = run { state.payVersion; isMeshRoute && state.dmInRange(peerId) }
+    val isSonarPeer = isMeshRoute && state.isSonarPeer(peerId)
+    // Transport the NEXT message will take (drives header + composer + send button).
+    val sendOverMesh = isMeshRoute && inRange
+    val transport = if (sendOverMesh) "Bluetooth" else "internet"
 
     Column(Modifier.fillMaxSize()) {
         // bc-header (DM): avatar + name + verified shield + lock·"Via internet"
@@ -453,7 +460,19 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             }
         }
 
-        if (verified) {
+        if (isMeshRoute && !inRange) {
+            if (isSonarPeer) {
+                chat.bitchat.sonar.ui.SNBanner(
+                    icon = SNIconName.Globe, tone = chat.bitchat.sonar.ui.SNBannerTone.Net,
+                    bold = "Out of range", rest = " — continuing over White Noise"
+                )
+            } else {
+                chat.bitchat.sonar.ui.SNBanner(
+                    icon = SNIconName.Mesh, tone = chat.bitchat.sonar.ui.SNBannerTone.Neutral,
+                    bold = "Out of range", rest = " — messages will wait until you meet again"
+                )
+            }
+        } else if (verified) {
             chat.bitchat.sonar.ui.SNBanner(
                 icon = SNIconName.ShieldCheck, tone = chat.bitchat.sonar.ui.SNBannerTone.Enc,
                 bold = "Verified", rest = " — you confirmed $peerName’s safety number"
@@ -484,13 +503,16 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                 contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
             ) {
                 items(visible, key = { it.id }) { m ->
+                    // Colour each bubble by the leg it travelled: mesh route + this
+                    // message went over mesh ⇒ cyan; otherwise indigo (internet).
+                    val msgMesh = isMeshRoute && !m.viaInternet
                     val pay = PayLine.decode(m.content) as? PayLine.Pay
                     if (pay != null) {
                         val status = run { state.payVersion; state.payStatus(pay.uuid) }
-                        PayBubble(m, pay, status, peerName, mesh = mesh, fiatOf = { state.fiatOrNull(it) }) {
+                        PayBubble(m, pay, status, peerName, mesh = msgMesh, fiatOf = { state.fiatOrNull(it) }) {
                             state.claimPay(screen.id, pay.uuid)
                         }
-                    } else MessageBubble(m, mesh)
+                    } else MessageBubble(m, msgMesh)
                 }
             }
         }
@@ -517,7 +539,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             }
             Spacer(Modifier.width(8.dp))
             Box(
-                Modifier.size(46.dp).clip(CircleShape).background(if (mesh) s.accentFill else s.netFill)
+                Modifier.size(46.dp).clip(CircleShape).background(if (sendOverMesh) s.accentFill else s.netFill)
                     .clickable {
                         val d = draft; draft = ""
                         if (!state.handleCommand(d, peerName, channelGeohash = null, chatId = screen.id)) {
@@ -525,7 +547,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                         }
                     },
                 contentAlignment = Alignment.Center
-            ) { Text("↑", color = if (mesh) s.onAccent else s.onNet, fontSize = 20.sp, fontWeight = FontWeight.Bold) }
+            ) { Text("↑", color = if (sendOverMesh) s.onAccent else s.onNet, fontSize = 20.sp, fontWeight = FontWeight.Bold) }
         }
     }
     if (addSheet) AddToMessageSheet(

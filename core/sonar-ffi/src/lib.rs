@@ -599,6 +599,43 @@ pub fn mesh_build_packet(
         .ok_or_else(|| SonarFfiError::Core("packet encode failed".into()))
 }
 
+/// Build a packet SIGNED with the Ed25519 announce key (`seed_hex`), the same way
+/// `mesh_build_announce` signs — for packet types that bitchat verifies against
+/// the peer's signing key. Required for the Sonar Discovery announce (0x53):
+/// iOS `handleSonarAnnounce` drops it unless `packet.signature` verifies against
+/// the signing key from the peer's bitchat announce. Plain `mesh_build_packet`
+/// leaves it unsigned, so the 0x53 was silently rejected (no npub exchange).
+#[uniffi::export]
+pub fn mesh_build_signed_packet(
+    seed_hex: String,
+    packet_type: u8,
+    sender_id_hex: String,
+    recipient_id_hex: String,
+    ttl: u8,
+    timestamp_ms: u64,
+    payload: Vec<u8>,
+) -> FfiResult<Vec<u8>> {
+    let seed = hex::decode(&seed_hex).map_err(invalid("mesh seed"))?;
+    if seed.len() != 32 {
+        return Err(SonarFfiError::InvalidInput("mesh seed must be 32 bytes".into()));
+    }
+    let mut s = [0u8; 32];
+    s.copy_from_slice(&seed);
+    let signer = mesh::MeshSigner::from_seed(&s);
+    let sender = parse_id8(&sender_id_hex, "sender id")?;
+    let mut packet = mesh::Packet::new(packet_type, ttl, timestamp_ms, sender);
+    if !recipient_id_hex.is_empty() {
+        packet.recipient_id = Some(parse_id8(&recipient_id_hex, "recipient id")?);
+    }
+    packet.payload = payload;
+    if !mesh::sign_packet(&mut packet, &signer) {
+        return Err(SonarFfiError::Core("signed packet sign failed".into()));
+    }
+    packet
+        .encode()
+        .ok_or_else(|| SonarFfiError::Core("signed packet encode failed".into()))
+}
+
 /// The inner noiseEncrypted plaintext for a private message: `[0x01][TLV]`.
 #[uniffi::export]
 pub fn mesh_encode_private_message(message_id: String, content: String) -> FfiResult<Vec<u8>> {

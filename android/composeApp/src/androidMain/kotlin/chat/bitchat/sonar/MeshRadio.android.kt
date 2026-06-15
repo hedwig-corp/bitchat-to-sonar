@@ -84,26 +84,31 @@ actual object MeshRadio {
     private val meshBroadcastInbox = java.util.concurrent.ConcurrentLinkedQueue<MeshBroadcastIn>()
 
     init {
+        // The String identity from MeshGatt is the peer's STABLE fingerprint
+        // (SHA256 of its noise static key), so a peer stays ONE radar node + ONE
+        // conversation across peerID + BLE-address rotation (issue #12).
         // Buffer incoming Noise DMs (the listener fires on a BLE callback thread).
-        MeshGatt.addMessageListener { peerId, text ->
-            meshDmInbox.add(MeshDmIn(peerId, text, System.currentTimeMillis() / 1000))
+        MeshGatt.addMessageListener { fingerprint, text ->
+            meshDmInbox.add(MeshDmIn(fingerprint, text, System.currentTimeMillis() / 1000))
         }
         // Buffer incoming public broadcasts (the BLE "Mesh" channel).
         MeshGatt.addBroadcastListener { pm ->
             meshBroadcastInbox.add(MeshBroadcastIn(pm.senderIdHex, pm.content, (pm.timestampMs / 1000u).toLong()))
         }
-        // Stash peers' 0x53 payloads + register named, verified announce peers.
-        MeshGatt.addSonarListener { peerId, payload -> sonarProfiles[peerId] = payload }
-        MeshGatt.addAnnounceListener { _, info ->
-            announcedPeers[info.senderIdHex] = MeshPeer(
-                id = "mesh:" + info.senderIdHex,
+        // Stash peers' 0x53 payloads + register named, verified announce peers,
+        // keyed by stable fingerprint.
+        MeshGatt.addSonarListener { fingerprint, payload -> sonarProfiles[fingerprint] = payload }
+        MeshGatt.addAnnounceListener { _, info, fingerprint ->
+            if (fingerprint.isEmpty()) return@addAnnounceListener
+            announcedPeers[fingerprint] = MeshPeer(
+                id = "mesh:" + fingerprint,
                 name = info.nickname,
                 rssi = -50, // connected ⇒ close; no per-packet RSSI on the GATT path
             )
-            announcedSeen[info.senderIdHex] = System.currentTimeMillis()
+            announcedSeen[fingerprint] = System.currentTimeMillis()
         }
         // Keep a peer fresh while its encrypted link is (re)established.
-        MeshGatt.addLinkListener { peerId -> announcedSeen[peerId] = System.currentTimeMillis() }
+        MeshGatt.addLinkListener { fingerprint -> announcedSeen[fingerprint] = System.currentTimeMillis() }
     }
 
     private val ctx: Context get() = AppContextHolder.ctx

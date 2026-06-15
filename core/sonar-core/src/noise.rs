@@ -97,16 +97,39 @@ pub struct NoiseSession {
 }
 
 impl NoiseSession {
+    /// Encrypt a transport message in **bitchat's wire format**:
+    /// `[4-byte BE nonce counter][ChaChaPoly ciphertext+tag]`.
+    ///
+    /// bitchat's `NoiseCipherState` (iOS) splits transport ciphers with
+    /// `useExtractedNonce: true` (`NoiseSession.swift:106`), which PREPENDS the
+    /// 4-byte big-endian message counter to the ciphertext. The ChaChaPoly nonce
+    /// itself is the standard Noise nonce (`00000000 || counter_le64`), identical
+    /// to snow's — so only the explicit prefix differs. Plain snow output (no
+    /// prefix) made the handshake interop but every transport message fail to
+    /// decrypt cross-platform, which is why Android↔iOS mesh DMs silently never
+    /// arrived (Android↔Android worked because both used snow's bare format).
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        let nonce = self.state.sending_nonce(); // counter snow will use for this msg
         let mut buf = vec![0u8; plaintext.len() + 16];
         let len = self.state.write_message(plaintext, &mut buf)?;
         buf.truncate(len);
-        Ok(buf)
+        let mut out = Vec::with_capacity(4 + buf.len());
+        out.extend_from_slice(&(nonce as u32).to_be_bytes());
+        out.extend_from_slice(&buf);
+        Ok(out)
     }
 
+    /// Decrypt a bitchat transport message: strip the 4-byte BE nonce prefix,
+    /// align snow's receiving counter to it, then decrypt the ChaChaPoly body.
     pub fn decrypt(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>> {
-        let mut buf = vec![0u8; ciphertext.len()];
-        let len = self.state.read_message(ciphertext, &mut buf)?;
+        if ciphertext.len() < 4 + 16 {
+            return Err(Error::Storage("noise: transport message too short".into()));
+        }
+        let nonce = u32::from_be_bytes([ciphertext[0], ciphertext[1], ciphertext[2], ciphertext[3]]);
+        let body = &ciphertext[4..];
+        self.state.set_receiving_nonce(nonce as u64);
+        let mut buf = vec![0u8; body.len()];
+        let len = self.state.read_message(body, &mut buf)?;
         buf.truncate(len);
         Ok(buf)
     }

@@ -1,12 +1,16 @@
 package chat.bitchat.sonar
 
-/** A peer discovered over the BLE mesh radio. `sonar` = it emitted a rich Sonar
- *  Discovery (0x53) announce, so it's a full Sonar user (chat + pay), not a
- *  plain bitchat peer (chat only). */
+/** A peer discovered over the BLE mesh radio. [id] is `"mesh:<fingerprint>"`,
+ *  where the fingerprint = SHA256(peer's noise static pubkey) — a STABLE identity
+ *  that survives the peer's peerID + BLE-address rotation (issue #12), so the same
+ *  person is always one radar node. `sonar` = it emitted a rich Sonar Discovery
+ *  (0x53) announce, so it's a full Sonar user (chat + pay), not a plain bitchat
+ *  peer (chat only). */
 data class MeshPeer(val id: String, val name: String, val rssi: Int, val sonar: Boolean = false)
 
-/** An incoming mesh DM (decrypted Noise text), keyed by the sender's bitchat
- *  peerID, drained by the app into the mesh-chat store. */
+/** An incoming mesh DM (decrypted Noise text). [peerId] is the sender's STABLE
+ *  fingerprint (not the rotating bitchat peerID), so messages stay in one
+ *  conversation across rotation. Drained by the app into the mesh-chat store. */
 data class MeshDmIn(val peerId: String, val text: String, val tsSecs: Long)
 
 /** An incoming PUBLIC broadcast (the BLE "Mesh" channel) from another peer. The
@@ -45,10 +49,12 @@ expect object MeshRadio {
      *  Decoded with [SonarAnnounce.decode] in shared code. */
     fun sonarPeers(): Map<String, ByteArray>
 
-    /** Send an encrypted DM over the BLE mesh to [peerId] (bitchat peerID).
-     *  Returns false if no live Noise link to that peer exists yet. */
+    /** Send an encrypted DM over the BLE mesh to the peer with stable [peerId]
+     *  (fingerprint). Resolves the peer's CURRENT address/peerID at send time, so
+     *  delivery survives rotation. Returns false only if it could not be queued. */
     fun sendMeshDm(peerId: String, messageId: String, text: String): Boolean
-    /** True iff an encrypted Noise link to [peerId] is established right now. */
+    /** True iff an encrypted Noise link to the peer with stable [peerId]
+     *  (fingerprint) is established right now. */
     fun hasMeshLink(peerId: String): Boolean
     /** Pull (and clear) all mesh DMs received since the last call. */
     fun drainMeshDm(): List<MeshDmIn>

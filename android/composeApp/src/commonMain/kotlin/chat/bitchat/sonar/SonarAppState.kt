@@ -552,13 +552,17 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
-    /** Open the BLE-mesh DM with a radar peer (Noise link). [pay] auto-opens the
-     *  payment sheet (radar "Send sats"). */
-    fun openMeshChat(peerId: String, name: String, pay: Boolean = false) {
+    /** Open the 1:1 DM with a radar peer. The conversation auto-picks transport:
+     *  BLE mesh (Noise) while in Bluetooth range, White Noise (Marmot) when out of
+     *  range for a Sonar peer — both legs merged into one thread. [pay] auto-opens
+     *  the payment sheet (radar "Send sats"). */
+    fun openDm(peerId: String, name: String, pay: Boolean = false) {
         val id = meshChatId(peerId)
+        if (name.isNotBlank()) meshChatNames[peerId] = name
         push(Screen.Chat(id, name, pay))
-        messages = meshChats[peerId].orEmpty()
+        messages = meshChats[peerId].orEmpty() // immediate mesh view; Marmot leg merges in async
         processPayLines(id, messages)
+        scope.launch { refreshChats(); refreshOpenDm(peerId) }
     }
 
     private fun meshChatId(peerId: String) = "mesh:$peerId"
@@ -608,7 +612,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun send(chatId: String, text: String) {
         val t = text.trim()
         if (t.isEmpty()) return
-        if (isMeshChat(chatId)) { sendMesh(meshPeerId(chatId), t); return }
+        if (isMeshChat(chatId)) { sendDmAuto(meshPeerId(chatId), t); return }
         scope.launch {
             try {
                 SonarCore.send(chatId, t)
@@ -620,19 +624,105 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
+    /** Auto-pick the transport for a radar-peer DM (mirrors iOS `sendDm`): a live
+     *  Noise link ⇒ BLE mesh; otherwise White Noise (Marmot) for a Sonar peer. A
+     *  plain bitchat peer out of range waits (Step 2 adds favorite → NIP-17). */
+    private fun sendDmAuto(peerId: String, text: String) {
+        if (MeshRadio.hasMeshLink(peerId)) { sendMesh(peerId, text); return }
+        val prof = sonarProfile(peerId)
+        if (prof != null) { sendOverMarmot(peerId, prof.npub, text); return }
+        toast = "Out of range — your message will wait until you’re close again."
+    }
+
     /** Send a BLE-mesh DM over the Noise link + optimistically echo it. */
     private fun sendMesh(peerId: String, text: String) {
         val ok = MeshRadio.sendMeshDm(peerId, randomMeshId(), text)
         if (!ok) { toast = "Not connected over Bluetooth yet — stay close and try again"; return }
         val msg = SonarMsg(randomMeshId(), npub, text, mine = true, MeshRadio.nowSecs())
         meshChats[peerId] = meshChats[peerId].orEmpty() + msg
-        messages = meshChats[peerId].orEmpty()
-        processPayLines(meshChatId(peerId), messages)
+        scope.launch { refreshOpenDm(peerId) }
         refreshMeshDmRows()
     }
 
+    /** Texts queued for a Sonar peer (keyed by npub hex) while their White Noise
+     *  group is created on the first out-of-range send. Flushed by
+     *  [flushPendingMarmot] once the group appears in [chats]. */
+    private val pendingMarmotSends = mutableMapOf<String, MutableList<String>>()
+
+    /** Continue a Sonar-peer conversation over White Noise (Marmot) when out of
+     *  Bluetooth range, creating the 1:1 group on first send (mirrors iOS
+     *  `sendOverMarmot`). */
+    private fun sendOverMarmot(peerId: String, npubRaw: ByteArray, text: String) {
+        val group = marmotGroupForNpub(npubRaw)
+        if (group != null) {
+            scope.launch {
+                try { SonarCore.send(group.id, text); refreshOpenDm(peerId) }
+                catch (e: Throwable) { toast = "send failed: ${e.message}" }
+            }
+            return
+        }
+        pendingMarmotSends.getOrPut(npubRaw.toHexLower()) { mutableListOf() }.add(text)
+        toast = "Out of range — continuing over White Noise…"
+        scope.launch {
+            try {
+                SonarCore.startChat(npubRaw.toHexLower()) // start_dm accepts a hex pubkey
+                refreshChats(); flushPendingMarmot(); refreshOpenDm(peerId)
+            } catch (e: Throwable) { toast = "couldn’t start secure chat: ${e.message}" }
+        }
+    }
+
+    /** Flush texts queued for Sonar peers whose White Noise group now exists. */
+    private fun flushPendingMarmot() {
+        if (pendingMarmotSends.isEmpty()) return
+        for ((npubHex, texts) in pendingMarmotSends.toMap()) {
+            val group = marmotGroupForNpub(npubHex.hexToBytesOrEmpty()) ?: continue
+            pendingMarmotSends.remove(npubHex)
+            scope.launch { for (tx in texts) runCatching { SonarCore.send(group.id, tx) } }
+        }
+    }
+
+    /** The White Noise (Marmot) 1:1 group whose member list contains [npubRaw].
+     *  Member npubs are bech32, so decode each and compare the raw 32 bytes. */
+    private fun marmotGroupForNpub(npubRaw: ByteArray): SonarChat? {
+        if (npubRaw.isEmpty()) return null
+        return chats.firstOrNull { c ->
+            c.members.any { m ->
+                chat.bitchat.sonar.crypto.Bech32.decode(m)
+                    ?.takeIf { it.hrp == "npub" }?.data?.contentEquals(npubRaw) == true
+            }
+        }
+    }
+
+    /** Rebuild the open Sonar-peer DM transcript: the mesh leg plus, for a Sonar
+     *  peer with a Marmot group, the White Noise leg merged chronologically. The
+     *  White Noise leg renders as internet (indigo). No-op if that DM isn't open. */
+    private suspend fun refreshOpenDm(peerId: String) {
+        if ((screen as? Screen.Chat)?.id != meshChatId(peerId)) return
+        val mesh = meshChats[peerId].orEmpty()
+        val group = sonarProfile(peerId)?.let { marmotGroupForNpub(it.npub) }
+        val merged = if (group != null) {
+            val wn = SonarCore.messages(group.id).map { it.copy(viaInternet = true) }
+            (mesh + wn).sortedBy { it.tsSecs }
+        } else mesh
+        messages = merged
+        processPayLines(meshChatId(peerId), merged)
+    }
+
+    /** True while a live Noise link to [peerId] exists (peer is in Bluetooth range). */
+    fun dmInRange(peerId: String): Boolean = MeshRadio.hasMeshLink(peerId)
+
+    /** True if [peerId] is a full Sonar peer (sent a 0x53 announce with an npub). */
+    fun isSonarPeer(peerId: String): Boolean = sonarProfile(peerId) != null
+
     private fun randomMeshId(): String =
         (0 until 16).joinToString("") { "0123456789abcdef"[kotlin.random.Random.nextInt(16)].toString() }
+
+    private fun ByteArray.toHexLower(): String =
+        joinToString("") { (it.toInt() and 0xFF).toString(16).padStart(2, '0') }
+
+    private fun String.hexToBytesOrEmpty(): ByteArray =
+        if (length % 2 != 0) ByteArray(0)
+        else runCatching { chunked(2).map { it.toInt(16).toByte() }.toByteArray() }.getOrDefault(ByteArray(0))
 
     /** Drain mesh DMs received since last poll into the per-peer transcripts,
      *  surface them as Messages rows, and notify for ones we're not looking at. */
@@ -650,14 +740,12 @@ class SonarAppState(private val scope: CoroutineScope) {
             }
         }
         refreshMeshDmRows()
-        // Refresh the open mesh conversation if it's one we just appended to.
+        // Refresh the open conversation (merged mesh + White Noise) if it's one we
+        // just appended to.
         (screen as? Screen.Chat)?.let { sc ->
             if (isMeshChat(sc.id)) {
                 val pid = meshPeerId(sc.id)
-                if (incoming.any { it.peerId == pid }) {
-                    messages = meshChats[pid].orEmpty()
-                    processPayLines(sc.id, messages)
-                }
+                if (incoming.any { it.peerId == pid }) scope.launch { refreshOpenDm(pid) }
             }
         }
     }
@@ -711,11 +799,14 @@ class SonarAppState(private val scope: CoroutineScope) {
                 tick++
                 SonarCore.sync()
                 refreshChats()
+                flushPendingMarmot() // a queued out-of-range send whose group just landed
                 maybeNotify()
                 // Marmot/Nostr chats refresh from the core; mesh chats are local
-                // and refreshed by drainMeshDms() below.
+                // and refreshed by drainMeshDms() below. A mesh-route DM merges
+                // both legs (mesh + White Noise) via refreshOpenDm.
                 (screen as? Screen.Chat)?.let {
-                    if (!isMeshChat(it.id)) { messages = SonarCore.messages(it.id); processPayLines(it.id, messages) }
+                    if (isMeshChat(it.id)) refreshOpenDm(meshPeerId(it.id))
+                    else { messages = SonarCore.messages(it.id); processPayLines(it.id, messages) }
                 }
                 (screen as? Screen.Channel)?.let { refreshChannel(it.geohash) }
                 (screen as? Screen.GeoDm)?.let { refreshGeoDm(it.geohash, it.peerHex) }

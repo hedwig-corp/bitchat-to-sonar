@@ -7,13 +7,16 @@ data class SonarChat(
     val members: List<String>,
 )
 
-/** A decrypted message in a chat. */
+/** A decrypted message in a chat. [viaInternet] marks the transport for the
+ *  per-message bubble colour: false = BLE mesh (cyan), true = White Noise /
+ *  Nostr internet (indigo). A Sonar-peer DM merges both legs into one thread. */
 data class SonarMsg(
     val id: String,
     val senderNpub: String,
     val content: String,
     val mine: Boolean,
     val tsSecs: Long,
+    val viaInternet: Boolean = false,
 )
 
 /** A public message in a geohash channel. */
