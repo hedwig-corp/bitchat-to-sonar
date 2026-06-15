@@ -3,10 +3,10 @@
 # Build sonar-ffi for iOS/macOS and assemble the SonarCore Swift package bits.
 #
 # Outputs:
-#   localPackages/SonarCore/Frameworks/sonarffi.xcframework
+#   ios/localPackages/SonarCore/Frameworks/sonarffi.xcframework
 #       static libsonar_ffi.a per slice (ios-arm64, ios-arm64-simulator,
 #       macos-arm64), each with Headers/{sonar_ffiFFI.h, module.modulemap}
-#   localPackages/SonarCore/Sources/SonarFFI.swift
+#   ios/localPackages/SonarCore/Sources/SonarFFI.swift
 #       UniFFI-generated Swift bindings (uniffi 0.31, proc-macro mode,
 #       library-mode bindgen run against the host (macOS) staticlib)
 #
@@ -35,7 +35,7 @@ unset OPENSSL_DIR OPENSSL_LIB_DIR OPENSSL_INCLUDE_DIR OPENSSL_NO_VENDOR \
 CRATE="sonar-ffi"
 LIB_NAME="libsonar_ffi.a"
 FFI_MODULE="sonar_ffiFFI" # uniffi: <crate_name>FFI
-PKG_DIR="$REPO_ROOT/localPackages/SonarCore"
+PKG_DIR="$REPO_ROOT/ios/localPackages/SonarCore"
 XCFRAMEWORK="$PKG_DIR/Frameworks/sonarffi.xcframework"
 GEN_DIR="$SCRIPT_DIR/target/uniffi-swift"
 

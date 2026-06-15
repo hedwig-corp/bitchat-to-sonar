@@ -89,12 +89,20 @@ Private messages use **intelligent transport selection**:
 
 For detailed protocol documentation, see the [Technical Whitepaper](WHITEPAPER.md).
 
+## Repository layout
+
+Two apps over one shared Rust core (`core/`):
+
+- **`ios/`** — the native SwiftUI **reference implementation** (iOS/macOS): `bitchat/`, `bitchat.xcodeproj`, its SPM `localPackages/`, and `Configs/`.
+- **`apps/`** — **Compose Multiplatform** apps (umbrella for current + future Compose apps); today `apps/sonar/` (Android).
+- `design/` (handoff bundle) and `docs/` (incl. `docs/brainstorms/`) stay at the top level, shared across apps.
+
 ## Setup
 
 ### Option 1: Using Xcode
 
    ```bash
-   cd bitchat
+   cd ios
    open bitchat.xcodeproj
    ```
 
@@ -116,7 +124,7 @@ Run `just clean` afterwards to restore things to original state for mobile app b
 
 ## Localization
 
-- Base app resources live under `bitchat/Localization/Base.lproj/`. Add new copy to `Localizable.strings` and plural rules to `Localizable.stringsdict`.
-- Share extension strings are separate in `bitchatShareExtension/Localization/Base.lproj/Localizable.strings`.
+- Base app resources live under `ios/bitchat/Localization/Base.lproj/`. Add new copy to `Localizable.strings` and plural rules to `Localizable.stringsdict`.
+- Share extension strings are separate in `ios/bitchatShareExtension/Localization/Base.lproj/Localizable.strings`.
 - Prefer keys that describe intent (`app_info.features.offline.title`) and reuse existing ones where possible.
-- Run `xcodebuild -project bitchat.xcodeproj -scheme "bitchat (macOS)" -configuration Debug CODE_SIGNING_ALLOWED=NO build` to compile-check any localization updates.
+- Run `xcodebuild -project ios/bitchat.xcodeproj -scheme "bitchat (macOS)" -configuration Debug CODE_SIGNING_ALLOWED=NO build` to compile-check any localization updates.
