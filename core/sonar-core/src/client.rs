@@ -98,6 +98,14 @@ const SYNC_OVERLAP_SECS: u64 = 60;
 const SUB_MARMOT_WELCOMES: &str = "sonar-marmot-welcomes";
 const SUB_MARMOT_GROUPS: &str = "sonar-marmot-groups";
 
+/// Hard cap on the live Marmot event buffer. The handler pushes here while the
+/// host drains via `drain_pending_marmot`; if a host has not wired draining yet
+/// (e.g. a platform still on the poll path), this bounds memory — dropped live
+/// events are recovered by the watermarked `sync()` safety net, so capping never
+/// loses a message permanently. When full, the oldest half is dropped (amortizes
+/// the shift cost vs dropping one-at-a-time).
+const MARMOT_BUFFER_CAP: usize = 1024;
+
 /// One received geohash channel event (ephemeral kind-20000), buffered from the
 /// live subscription. Geohash channels are public ephemeral events — relays do
 /// NOT store them, so we accumulate them in memory as the subscription delivers.
@@ -318,7 +326,13 @@ impl SonarClient {
                         // Buffer it (do NOT touch the MLS engine here) and wake
                         // the host to drain + process it on its engine thread.
                         if p_hex == my_pubkey_hex {
-                            handler_pending.lock().unwrap().push((*event).clone());
+                            {
+                                let mut buf = handler_pending.lock().unwrap();
+                                if buf.len() >= MARMOT_BUFFER_CAP {
+                                    buf.drain(0..MARMOT_BUFFER_CAP / 2);
+                                }
+                                buf.push((*event).clone());
+                            }
                             handler_notify.notify_one();
                             continue;
                         }
@@ -368,7 +382,13 @@ impl SonarClient {
                         // (the relay only sends 445s matching our `#h` filter).
                         // Buffer + wake; processing happens on the host's engine
                         // thread via drain_pending_marmot.
-                        handler_pending.lock().unwrap().push((*event).clone());
+                        {
+                            let mut buf = handler_pending.lock().unwrap();
+                            if buf.len() >= MARMOT_BUFFER_CAP {
+                                buf.drain(0..MARMOT_BUFFER_CAP / 2);
+                            }
+                            buf.push((*event).clone());
+                        }
                         handler_notify.notify_one();
                     }
                     _ => {}
