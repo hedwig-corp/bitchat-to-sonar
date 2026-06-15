@@ -1,7 +1,10 @@
 package chat.bitchat.sonar
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -14,8 +17,10 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -38,11 +43,19 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import chat.bitchat.sonar.screens.SonarOnboardingScreen
 import chat.bitchat.sonar.ui.SNDot
+import chat.bitchat.sonar.ui.SNSettingsRow
+import chat.bitchat.sonar.ui.SNTone
+import chat.bitchat.sonar.ui.SNTrail
 import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconButton
 import chat.bitchat.sonar.ui.SNIconName
@@ -52,25 +65,35 @@ import chat.bitchat.sonar.ui.SonarAvatar
 import chat.bitchat.sonar.ui.SonarTheme
 import chat.bitchat.sonar.ui.sonar
 
+/** Bridges Android activity foreground state into the commonMain UI without
+ *  pulling Android lifecycle APIs into commonMain. */
+object SonarLifecycle {
+    @Volatile var onForeground: ((Boolean) -> Unit)? = null
+}
+
 @Composable
 fun App() {
-    SonarTheme(dark = true) {
+    val scope = rememberCoroutineScope()
+    val state = remember { SonarAppState(scope) }
+    LaunchedEffect(state) { SonarLifecycle.onForeground = { state.setForeground(it) } }
+    LaunchedEffect(Unit) { state.boot() }
+    SonarTheme(dark = state.dark) {
         val s = sonar
-        val scope = rememberCoroutineScope()
-        val state = remember { SonarAppState(scope) }
-        LaunchedEffect(Unit) { state.boot() }
 
         Surface(Modifier.fillMaxSize(), color = s.bg) {
-            if (!state.onboarded) {
-                Box(Modifier.statusBarsPadding()) { SonarOnboardingScreen(state) }
+            if (state.locked) {
+                LockScreen(onUnlock = { state.unlock() })
+            } else if (!state.onboarded) {
+                Box(Modifier.statusBarsPadding().imePadding()) { SonarOnboardingScreen(state) }
             } else {
-                Box(Modifier.statusBarsPadding()) {
+                Box(Modifier.statusBarsPadding().imePadding()) {
                     when (val sc = state.screen) {
                         is Screen.Home -> HomeScreen(state)
                         is Screen.Chat -> ChatScreen(state, sc)
                         is Screen.Settings -> chat.bitchat.sonar.screens.SonarSettingsScreen(state)
                         is Screen.Profile -> chat.bitchat.sonar.screens.SonarProfileScreen(state)
                         is Screen.Nearby -> chat.bitchat.sonar.screens.SonarRadarScreen(state)
+                        is Screen.Search -> chat.bitchat.sonar.screens.SonarSearchScreen(state)
                         is Screen.Channel -> chat.bitchat.sonar.screens.SonarChannelScreen(state, sc)
                         is Screen.GeoDm -> GeoDmScreen(state, sc)
                     }
@@ -83,57 +106,320 @@ fun App() {
 @Composable
 private fun HomeScreen(state: SonarAppState) {
     val s = sonar
-    var showNew by remember { mutableStateOf(false) }
+    var composeSheet by remember { mutableStateOf(false) }
+    var connSheet by remember { mutableStateOf(false) }
+    var wipeAsk by remember { mutableStateOf(false) }
+    var titleTaps by remember { mutableStateOf(0) }
+    var pendingDelete by remember { mutableStateOf<DeleteTarget?>(null) }
+    val meshCount = state.meshPeers.size
+    // Triple-tap the title within 1.2s → emergency wipe (1:1 with iOS).
+    LaunchedEffect(titleTaps) { if (titleTaps in 1..2) { kotlinx.coroutines.delay(1200); titleTaps = 0 } }
 
-    Column(Modifier.fillMaxSize()) {
-        // bc-header
-        Row(
-            Modifier.fillMaxWidth().padding(start = 18.dp, end = 12.dp, top = 14.dp, bottom = 8.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Column(Modifier.weight(1f)) {
-                Text("Sonar", color = s.text, fontSize = 27.sp, fontWeight = FontWeight.Black)
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    SNDot(if (state.started) s.green else s.text3, 7.dp)
-                    Spacer(Modifier.width(5.dp))
-                    Text(
-                        if (state.started) "Online · reaches anyone"
-                        else if (state.connecting) "connecting…" else "Offline",
-                        color = s.text2, fontSize = 12.sp
-                    )
+    Box(Modifier.fillMaxSize()) {
+        Column(Modifier.fillMaxSize()) {
+            // bc-header: avatar (→settings) · "sonar" centered (triple-tap) · rings (→nearby)
+            Row(
+                Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, top = 6.dp, bottom = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Box(
+                    Modifier.size(38.dp).clip(CircleShape).clickable { state.push(Screen.Settings) },
+                    contentAlignment = Alignment.Center
+                ) { SonarAvatar(state.nick.ifBlank { "you" }, 32.dp) }
+                Text(
+                    "sonar", color = s.text, fontSize = 27.sp, fontWeight = FontWeight.Black,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.weight(1f).clickable(
+                        indication = null, interactionSource = remember { MutableInteractionSource() }
+                    ) { titleTaps++; if (titleTaps >= 3) { titleTaps = 0; wipeAsk = true } }
+                )
+                SNIconButton(SNIconName.Rings, size = 22.dp, weight = 2f, tint = s.text2) { state.push(Screen.Nearby) }
+            }
+
+            // status chip — centered pill
+            Box(Modifier.fillMaxWidth().padding(bottom = 10.dp), contentAlignment = Alignment.Center) {
+                StatusChipPill(state.started, state.connecting, meshCount) { connSheet = true }
+            }
+
+            LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 110.dp)) {
+                item { SNSectionLabel("Nearby channels") }
+                // Mesh channel is always first (BLE broadcast).
+                item {
+                    ConvRow(
+                        avatar = { MeshTile(52.dp) },
+                        title = "Mesh",
+                        sub = "${meshCount} ${if (meshCount == 1) "person" else "people"} in Bluetooth range",
+                    ) { state.openChannel("mesh") }
+                }
+                // GPS-derived location channels (Ottaviano … Italy).
+                items(state.locationChannels, key = { it.geohash + it.level.name }) { c ->
+                    val here = state.presence(c.geohash)
+                    ConvRow(
+                        avatar = { PlaceTile(52.dp) },
+                        title = c.name,
+                        sub = if (here > 0) "$here here now · ${c.level.label}" else c.level.label,
+                    ) { state.openChannel(c.geohash) }
+                }
+                // Any manually-joined channels not already shown.
+                items(
+                    state.channels.filter { gh -> state.locationChannels.none { it.geohash == gh } && gh != "mesh" },
+                    key = { it }
+                ) { gh ->
+                    ConvRow(avatar = { PlaceTile(52.dp) }, title = channelName(gh), sub = "joined channel") {
+                        state.openChannel(gh)
+                    }
+                }
+                if (state.locationChannels.isEmpty()) item { LocationHint() }
+                item { SNSectionLabel("Messages") }
+                if (state.chats.isEmpty() && state.meshDmRows.isEmpty()) item { EmptyMessages() }
+                // BLE-mesh DMs (incl. ones started by a peer messaging us) — over
+                // Bluetooth, so a cyan dot instead of the internet lock.
+                items(state.meshDmRows, key = { "mesh:" + it.peerId }) { row ->
+                    ConvRow(
+                        avatar = { SonarAvatar(row.name, 52.dp, presence = true) },
+                        title = row.name, sub = row.preview, lock = false,
+                        onLongClick = { pendingDelete = DeleteTarget(row.peerId, row.name, isMesh = true) },
+                    ) { state.openDm(row.peerId, row.name) }
+                }
+                items(state.chats, key = { it.id }) { chat ->
+                    val chatTitle = state.chatTitle(chat)
+                    ConvRow(
+                        avatar = { SonarAvatar(chatTitle, 52.dp, presence = false) },
+                        title = chatTitle, sub = "Tap to open", lock = true,
+                        verified = state.isVerified(chat.id),
+                        onLongClick = { pendingDelete = DeleteTarget(chat.id, chatTitle, isMesh = false) },
+                    ) { state.openChat(chat) }
                 }
             }
-            SNIconButton(SNIconName.Rings, size = 22.dp, weight = 2f, tint = s.text2) { state.push(Screen.Nearby) }
-            Spacer(Modifier.width(2.dp))
-            Box(Modifier.clickable { state.push(Screen.Settings) }) {
-                SonarAvatar(state.nick.ifBlank { "you" }, 34.dp)
-            }
-            Spacer(Modifier.width(6.dp))
-            SNIconButton(SNIconName.Plus, size = 22.dp, weight = 2.4f, tint = s.accent) { showNew = true }
         }
 
-        LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 40.dp)) {
-            item { SNSectionLabel("Nearby channels") }
-            if (state.channels.isEmpty()) {
-                item { ChannelHint() }
-            } else {
-                items(state.channels, key = { it }) { gh -> ChannelRow(gh) { state.openChannel(gh) } }
+        // sn-fab: Search pill + compose rings
+        Row(
+            Modifier.align(Alignment.BottomCenter).fillMaxWidth()
+                .padding(start = 14.dp, end = 14.dp, bottom = 28.dp),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Row(
+                Modifier.weight(1f).clip(RoundedCornerShape(999.dp)).background(s.surface)
+                    .clickable { state.push(Screen.Search) }.padding(horizontal = 16.dp, vertical = 13.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                SNIcon(SNIconName.Search, 17.dp, s.text3, weight = 2f)
+                Spacer(Modifier.width(9.dp))
+                Text("Search", color = s.text3, fontSize = 15.sp)
             }
-            item { SNSectionLabel("Messages") }
-            if (state.chats.isEmpty()) {
-                item { EmptyMessages() }
-            } else {
-                items(state.chats, key = { it.id }) { chat -> ChatRow(chat) { state.openChat(chat) } }
-            }
+            // sn-compose → "Start a chat" sheet (1:1 with iOS SonarHomeScreen).
+            Box(
+                Modifier.size(48.dp).clip(CircleShape).background(s.accentFill)
+                    .clickable { composeSheet = true },
+                contentAlignment = Alignment.Center
+            ) { SNIcon(SNIconName.Rings, 23.dp, s.onAccent, weight = 1.9f) }
         }
     }
 
-    if (showNew) NewChatSheet(
-        onStart = { showNew = false; state.startChat(it) },
-        onJoin = { showNew = false; state.joinChannel(it) },
-        onDismiss = { showNew = false }
-    )
+    if (composeSheet) ComposeSheet(state) { composeSheet = false }
+    if (connSheet) ConnectivitySheet(online = state.started, meshCount = meshCount) { connSheet = false }
+    if (wipeAsk) WipeConfirmSheet(onWipe = { wipeAsk = false; state.wipe() }, onClose = { wipeAsk = false })
+    pendingDelete?.let { t ->
+        DeleteChatSheet(
+            name = t.name,
+            onDelete = {
+                if (t.isMesh) state.deleteMeshDm(t.id) else state.deleteMarmotChat(t.id)
+                pendingDelete = null
+            },
+            onClose = { pendingDelete = null }
+        )
+    }
     state.toast?.let { ToastBar(it) { state.toast = null } }
+}
+
+private fun channelName(geohash: String): String =
+    if (geohash.equals("mesh", true)) "Bluetooth mesh" else "#$geohash"
+
+/** bc-chip — centered status pill: dot + "<b>Online</b> · reaches anyone". */
+@Composable
+private fun StatusChipPill(online: Boolean, connecting: Boolean, meshCount: Int, onClick: () -> Unit) {
+    val s = sonar
+    Row(
+        Modifier.clip(RoundedCornerShape(999.dp)).background(s.surface)
+            .clickable(onClick = onClick).padding(horizontal = 14.dp, vertical = 7.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        SNDot(if (online) s.green else s.accent, 9.dp)
+        Spacer(Modifier.width(8.dp))
+        val label = if (online) "Online" else "Offline"
+        val desc = when {
+            online -> "reaches anyone"
+            connecting -> "connecting…"
+            else -> "$meshCount nearby on Bluetooth"
+        }
+        Text(
+            buildAnnotatedString {
+                withStyle(SpanStyle(color = s.text, fontWeight = FontWeight.Bold)) { append(label) }
+                withStyle(SpanStyle(color = s.text2)) { append(" · $desc") }
+            },
+            fontSize = 13.sp
+        )
+    }
+}
+
+/** bc-placetile — accent-soft rounded square with a pin glyph (channel avatar). */
+@Composable
+private fun PlaceTile(size: Dp) {
+    val s = sonar
+    Box(
+        Modifier.size(size).clip(RoundedCornerShape(size * 0.31f)).background(s.accentSoft),
+        contentAlignment = Alignment.Center
+    ) { SNIcon(SNIconName.Pin, size * 0.46f, s.accentDeep) }
+}
+
+/** Mesh channel avatar — accent-soft tile with the mesh (signal) glyph. */
+@Composable
+private fun MeshTile(size: Dp) {
+    val s = sonar
+    Box(
+        Modifier.size(size).clip(RoundedCornerShape(size * 0.31f)).background(s.accentSoft),
+        contentAlignment = Alignment.Center
+    ) { SNIcon(SNIconName.Mesh, size * 0.5f, s.accentDeep, weight = 2f) }
+}
+
+@Composable
+private fun LocationHint() {
+    val s = sonar
+    Text(
+        "Turn on location to see public channels for your area (neighborhood → country).",
+        color = s.text3, fontSize = 13.sp, lineHeight = 18.sp,
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 4.dp)
+    )
+}
+
+/** bc-row — avatar · (title [+verified]) / (lock? + sub) · time/unread. */
+@Composable
+@OptIn(ExperimentalFoundationApi::class)
+private fun ConvRow(
+    avatar: @Composable () -> Unit,
+    title: String,
+    sub: String,
+    time: String? = null,
+    lock: Boolean = false,
+    verified: Boolean = false,
+    unread: Boolean = false,
+    onLongClick: (() -> Unit)? = null,
+    onClick: () -> Unit,
+) {
+    val s = sonar
+    Row(
+        Modifier.fillMaxWidth()
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick)
+            .padding(horizontal = 16.dp, vertical = 9.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        avatar()
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(title, color = s.text, fontSize = 16.5.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                if (verified) { Spacer(Modifier.width(5.dp)); SNIcon(SNIconName.ShieldCheck, 14.dp, s.green, weight = 2.1f) }
+            }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (lock) { SNIcon(SNIconName.Lock, 12.dp, s.text3, weight = 2.2f); Spacer(Modifier.width(4.dp)) }
+                Text(sub, color = s.text2, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+        }
+        Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(5.dp)) {
+            if (time != null) Text(time, color = s.text3, fontSize = 12.sp)
+            if (unread) Box(Modifier.size(11.dp).clip(CircleShape).background(s.accent))
+        }
+    }
+}
+
+@Composable
+private fun WipeConfirmSheet(onWipe: () -> Unit, onClose: () -> Unit) {
+    val s = sonar
+    Box(
+        Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
+        contentAlignment = Alignment.BottomCenter
+    ) {
+        Surface(color = s.surface, shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)) {
+            Column(Modifier.fillMaxWidth().padding(20.dp)) {
+                Text("Emergency wipe", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    "This deletes your identity, wallet, all chats and your nickname from this phone. It can’t be undone.",
+                    color = s.text2, fontSize = 13.5.sp, lineHeight = 18.sp
+                )
+                Spacer(Modifier.height(16.dp))
+                SNPrimaryButton("Wipe everything", net = false) { onWipe() }
+                Spacer(Modifier.height(8.dp))
+                Box(Modifier.fillMaxWidth().height(44.dp).clickable(onClick = onClose), contentAlignment = Alignment.Center) {
+                    Text("Cancel", color = s.text2, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                }
+            }
+        }
+    }
+}
+
+/** A chat the user long-pressed to delete (mesh DM peer id, or Marmot group id). */
+private data class DeleteTarget(val id: String, val name: String, val isMesh: Boolean)
+
+@Composable
+private fun DeleteChatSheet(name: String, onDelete: () -> Unit, onClose: () -> Unit) {
+    val s = sonar
+    Box(
+        Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
+        contentAlignment = Alignment.BottomCenter
+    ) {
+        Surface(color = s.surface, shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)) {
+            Column(Modifier.fillMaxWidth().padding(20.dp)) {
+                Text("Delete this chat?", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    "Removes “$name” from this device only. The other person isn’t notified, and you can start the chat again later.",
+                    color = s.text2, fontSize = 13.5.sp, lineHeight = 18.sp
+                )
+                Spacer(Modifier.height(16.dp))
+                SNPrimaryButton("Delete chat", net = false) { onDelete() }
+                Spacer(Modifier.height(8.dp))
+                Box(Modifier.fillMaxWidth().height(44.dp).clickable(onClick = onClose), contentAlignment = Alignment.Center) {
+                    Text("Cancel", color = s.text2, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ConnectivitySheet(online: Boolean, meshCount: Int, onClose: () -> Unit) {
+    val s = sonar
+    Box(
+        Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
+        contentAlignment = Alignment.BottomCenter
+    ) {
+        Surface(color = s.surface, shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)) {
+            Column(Modifier.fillMaxWidth().padding(vertical = 16.dp)) {
+                Text(
+                    "Connections", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp)
+                )
+                Spacer(Modifier.height(6.dp))
+                chat.bitchat.sonar.ui.SNSettingsRow(
+                    icon = SNIconName.Globe, tone = if (online) SNTone.Cyan else SNTone.Default,
+                    label = "Internet",
+                    sub = if (online) "Connected · Nostr relays" else "Offline — messages wait or travel over Bluetooth",
+                    value = if (online) "Online" else "Offline", trail = SNTrail.None,
+                )
+                chat.bitchat.sonar.ui.SNSettingsRow(
+                    icon = SNIconName.Mesh, tone = SNTone.Cyan, label = "Bluetooth mesh",
+                    sub = "$meshCount people in range", trail = SNTrail.None, divider = false,
+                )
+                Spacer(Modifier.height(10.dp))
+                Box(Modifier.fillMaxWidth().height(44.dp).clickable(onClick = onClose), contentAlignment = Alignment.Center) {
+                    Text("Done", color = s.text2, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                }
+            }
+        }
+    }
 }
 
 @Composable
@@ -148,7 +434,7 @@ private fun EmptyMessages() {
         Text("No secure chats yet", color = s.text2, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
         Spacer(Modifier.height(4.dp))
         Text(
-            "Tap + and paste someone’s npub to start an end-to-end encrypted chat over the internet.",
+            "Tap Search and paste someone’s npub to start an end-to-end encrypted chat over the internet.",
             color = s.text3, fontSize = 13.sp, lineHeight = 18.sp
         )
     }
@@ -158,53 +444,10 @@ private fun EmptyMessages() {
 private fun ChannelHint() {
     val s = sonar
     Text(
-        "Join a channel from + to chat publicly with people in an area.",
+        "Tap Search to join a channel and chat publicly with people in an area.",
         color = s.text3, fontSize = 13.sp, lineHeight = 18.sp,
         modifier = Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 4.dp)
     )
-}
-
-@Composable
-private fun ChannelRow(geohash: String, onClick: () -> Unit) {
-    val s = sonar
-    Row(
-        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 11.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Box(
-            Modifier.size(46.dp).clip(androidx.compose.foundation.shape.RoundedCornerShape(14.dp)).background(s.accentSoft),
-            contentAlignment = Alignment.Center
-        ) { SNIcon(SNIconName.Pin, 22.dp, s.accentDeep) }
-        Spacer(Modifier.width(12.dp))
-        Column(Modifier.weight(1f)) {
-            Text("#$geohash", color = s.text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
-            Text("Public channel · over the internet", color = s.text3, fontSize = 12.sp)
-        }
-    }
-}
-
-@Composable
-private fun ChatRow(chat: SonarChat, onClick: () -> Unit) {
-    val s = sonar
-    Row(
-        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 11.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        SonarAvatar(chat.name.ifBlank { chat.members.firstOrNull() ?: "?" }, 46.dp, presence = false)
-        Spacer(Modifier.width(12.dp))
-        Column(Modifier.weight(1f)) {
-            Text(
-                chat.name.ifBlank { shortNpub(chat.members.firstOrNull() ?: "secure chat") },
-                color = s.text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold,
-                maxLines = 1, overflow = TextOverflow.Ellipsis
-            )
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                SNIcon(SNIconName.Globe, 11.dp, s.net, weight = 2f)
-                Spacer(Modifier.width(4.dp))
-                Text("Sonar · end-to-end encrypted", color = s.text3, fontSize = 12.sp)
-            }
-        }
-    }
 }
 
 @Composable
@@ -212,48 +455,94 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     val s = sonar
     var draft by remember { mutableStateOf("") }
     var paySheet by remember { mutableStateOf(false) }
+    var verifySheet by remember { mutableStateOf(false) }
+    var addSheet by remember { mutableStateOf(false) }
+    val pickPhoto = rememberPhotoPicker { bytes, name, mime ->
+        state.sendImage(screen.id, bytes, name, mime)
+    }
+    // Radar "Send sats" opens the chat with pay=true → jump straight to the sheet.
+    LaunchedEffect(screen.id) { if (screen.pay) paySheet = true }
     val listState = rememberLazyListState()
     LaunchedEffect(state.messages.size) {
         if (state.messages.isNotEmpty()) listState.animateScrollToItem(state.messages.size - 1)
     }
+    // Resolve a human name for the peer (Marmot groups often have a blank name).
+    val peerName = screen.name.ifBlank {
+        state.chats.firstOrNull { it.id == screen.id }
+            ?.members?.firstOrNull { it != state.npub && it.isNotBlank() }
+            ?.let { shortNpub(it) } ?: "secure chat"
+    }
+    val verified = run { state.payVersion; state.isVerified(screen.id) }
+    // A radar-peer DM is a "mesh:" route that auto-picks transport: BLE mesh
+    // (cyan/"Bluetooth") while in range, White Noise (indigo/"internet") when out
+    // of range. A pure Marmot chat (non-mesh route) is always internet. Per-message
+    // bubbles colour by the leg they travelled (`m.viaInternet`).
+    val isMeshRoute = screen.id.startsWith("mesh:")
+    val peerId = screen.id.removePrefix("mesh:")
+    val inRange = run { state.payVersion; isMeshRoute && state.dmInRange(peerId) }
+    val isSonarPeer = isMeshRoute && state.isSonarPeer(peerId)
+    // Transport the NEXT message will take (drives header + composer + send button).
+    val sendOverMesh = isMeshRoute && inRange
+    val transport = if (sendOverMesh) "Bluetooth" else "internet"
 
     Column(Modifier.fillMaxSize()) {
+        // bc-header (DM): avatar + name + verified shield + lock·"Via internet"
         Row(
             Modifier.fillMaxWidth().padding(start = 6.dp, end = 12.dp, top = 12.dp, bottom = 8.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             SNIconButton(SNIconName.Back, onClick = { state.back() })
-            SonarAvatar(screen.name, 36.dp, presence = false)
+            SonarAvatar(peerName, 36.dp, presence = false)
             Spacer(Modifier.width(10.dp))
-            Column(Modifier.weight(1f)) {
-                Text(
-                    screen.name.ifBlank { "secure chat" },
-                    color = s.text, fontSize = 16.sp, fontWeight = FontWeight.Bold,
-                    maxLines = 1, overflow = TextOverflow.Ellipsis
-                )
+            Column(Modifier.weight(1f).clip(RoundedCornerShape(8.dp)).clickable { verifySheet = true }) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        peerName, color = s.text, fontSize = 16.sp, fontWeight = FontWeight.Bold,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis
+                    )
+                    if (verified) { Spacer(Modifier.width(5.dp)); SNIcon(SNIconName.ShieldCheck, 14.dp, s.green, weight = 2.1f) }
+                }
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     SNIcon(SNIconName.Lock, 11.dp, s.text2, weight = 2.4f)
                     Spacer(Modifier.width(4.dp))
-                    Text("Sonar · end-to-end encrypted", color = s.text3, fontSize = 11.5.sp)
+                    Text(
+                        (if (verified) "Verified · " else "") + "Via $transport",
+                        color = s.text3, fontSize = 11.5.sp
+                    )
                 }
             }
-            Box(
-                Modifier.size(38.dp).clip(CircleShape).clickable { paySheet = true },
-                contentAlignment = Alignment.Center
-            ) { SNIcon(SNIconName.Coin, 21.dp, s.goldDeep, weight = 2f) }
         }
 
-        chat.bitchat.sonar.ui.SNBanner(
-            icon = SNIconName.Lock, tone = chat.bitchat.sonar.ui.SNBannerTone.Enc,
-            bold = "End-to-end encrypted",
-            rest = " — only you and ${screen.name} can read this"
-        )
+        if (isMeshRoute && !inRange) {
+            if (isSonarPeer) {
+                chat.bitchat.sonar.ui.SNBanner(
+                    icon = SNIconName.Globe, tone = chat.bitchat.sonar.ui.SNBannerTone.Net,
+                    bold = "Out of range", rest = " — continuing over White Noise"
+                )
+            } else {
+                chat.bitchat.sonar.ui.SNBanner(
+                    icon = SNIconName.Mesh, tone = chat.bitchat.sonar.ui.SNBannerTone.Neutral,
+                    bold = "Out of range", rest = " — messages will wait until you meet again"
+                )
+            }
+        } else if (verified) {
+            chat.bitchat.sonar.ui.SNBanner(
+                icon = SNIconName.ShieldCheck, tone = chat.bitchat.sonar.ui.SNBannerTone.Enc,
+                bold = "Verified", rest = " — you confirmed $peerName’s safety number"
+            )
+        } else {
+            chat.bitchat.sonar.ui.SNBanner(
+                icon = SNIconName.Lock, tone = chat.bitchat.sonar.ui.SNBannerTone.Enc,
+                bold = "End-to-end encrypted", rest = " — only you and $peerName can read this",
+                actionLabel = "Verify", onAction = { verifySheet = true }
+            )
+        }
 
         if (state.messages.isEmpty()) {
             Box(Modifier.weight(1f).fillMaxWidth()) {
                 chat.bitchat.sonar.ui.SNEmptyState(
                     icon = SNIconName.Lock,
-                    title = "Say hi to ${screen.name}",
+                    title = "Say hi to $peerName",
                     desc = "Messages here are end-to-end encrypted. Only the two of you can read them."
                 )
             }
@@ -267,19 +556,35 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                 contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
             ) {
                 items(visible, key = { it.id }) { m ->
+                    // Colour each bubble by the leg it travelled: mesh route + this
+                    // message went over mesh ⇒ cyan; otherwise indigo (internet).
+                    val msgMesh = isMeshRoute && !m.viaInternet
                     val pay = PayLine.decode(m.content) as? PayLine.Pay
-                    if (pay != null) PayBubble(m, pay) { state.toast = "Set up a wallet to claim payments." }
-                    else MessageBubble(m)
+                    if (pay != null) {
+                        val status = run { state.payVersion; state.payStatus(pay.uuid) }
+                        PayBubble(m, pay, status, peerName, mesh = msgMesh, fiatOf = { state.fiatOrNull(it) }) {
+                            state.claimPay(screen.id, pay.uuid)
+                        }
+                    } else if (m.media.isNotEmpty()) {
+                        MediaBubble(m, state, screen.id)
+                    } else MessageBubble(m, msgMesh)
                 }
             }
         }
 
+        if (draft.startsWith("/")) SlashHints(draft) { draft = it }
         Row(Modifier.fillMaxWidth().padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
+            // bc-plus: "Add to your message" sheet (bitcoin / location / verify / reactions)
+            Box(
+                Modifier.size(40.dp).clip(CircleShape).background(s.surface2).clickable { addSheet = true },
+                contentAlignment = Alignment.Center
+            ) { SNIcon(SNIconName.Plus, 20.dp, s.text2, weight = 2.4f) }
+            Spacer(Modifier.width(8.dp))
             Box(
                 Modifier.weight(1f).clip(RoundedCornerShape(22.dp)).background(s.surface2)
                     .padding(horizontal = 16.dp, vertical = 12.dp)
             ) {
-                if (draft.isEmpty()) Text("Message", color = s.text3, fontSize = 16.sp)
+                if (draft.isEmpty()) Text("Message $peerName · via $transport", color = s.text3, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 BasicTextField(
                     value = draft, onValueChange = { draft = it },
                     textStyle = TextStyle(color = s.text, fontSize = 16.sp),
@@ -289,101 +594,197 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             }
             Spacer(Modifier.width(8.dp))
             Box(
-                Modifier.size(46.dp).clip(CircleShape).background(s.netFill)
-                    .clickable { state.send(screen.id, draft); draft = "" },
+                Modifier.size(46.dp).clip(CircleShape).background(if (sendOverMesh) s.accentFill else s.netFill)
+                    .clickable {
+                        val d = draft; draft = ""
+                        if (!state.handleCommand(d, peerName, channelGeohash = null, chatId = screen.id)) {
+                            state.send(screen.id, d)
+                        }
+                    },
                 contentAlignment = Alignment.Center
-            ) { Text("↑", color = s.onNet, fontSize = 20.sp, fontWeight = FontWeight.Bold) }
+            ) { Text("↑", color = if (sendOverMesh) s.onAccent else s.onNet, fontSize = 20.sp, fontWeight = FontWeight.Bold) }
         }
     }
-    if (paySheet) SendMoneySheet(
-        peerName = screen.name,
-        onSend = { sats ->
-            paySheet = false
-            state.send(screen.id, PayLine.Pay(randomPayId(), sats).encoded())
-        },
-        onDismiss = { paySheet = false }
+    if (addSheet) AddToMessageSheet(
+        peerName = peerName,
+        onBitcoin = { addSheet = false; paySheet = true },
+        onLocation = { addSheet = false; state.toast = "Location sharing is coming soon." },
+        onVerify = { addSheet = false; verifySheet = true },
+        onReactions = { addSheet = false; state.toast = "Reactions are coming soon." },
+        onClose = { addSheet = false },
+        canSendPhoto = state.canSendMedia(screen.id),
+        onPhoto = { addSheet = false; pickPhoto() }
+    )
+    if (paySheet) PaySheet(
+        peerName = peerName,
+        balanceSats = state.walletBalanceSats(),
+        // Mesh DMs carry ecash over Bluetooth; Marmot DMs ride the internet.
+        mesh = screen.id.startsWith("mesh:"),
+        fiatOf = { state.fiatOrNull(it) },
+        onSend = { sats -> state.send(screen.id, PayLine.Pay(randomPayId(), sats).encoded()) },
+        onClose = { paySheet = false }
+    )
+    if (verifySheet) VerifySheet(
+        peerName = peerName,
+        info = state.verifyInfo(screen.id),
+        myName = state.nick.ifBlank { "you" },
+        onVerify = { state.markVerified(screen.id); verifySheet = false },
+        onDismiss = { verifySheet = false }
     )
     state.toast?.let { ToastBar(it) { state.toast = null } }
 }
 
-private fun randomPayId(): String =
-    (0 until 16).map { "0123456789abcdef".random() }.joinToString("")
-
-internal fun fmtSats(sats: Long): String {
-    val s = sats.toString().reversed().chunked(3).joinToString(",").reversed()
-    return "$s sats"
+/** "Add to your message" sheet — 1:1 with the iOS/prototype DM "+" sheet. */
+@Composable
+private fun AddToMessageSheet(
+    peerName: String,
+    onBitcoin: () -> Unit,
+    onLocation: () -> Unit,
+    onVerify: () -> Unit,
+    onReactions: () -> Unit,
+    onClose: () -> Unit,
+    canSendPhoto: Boolean = false,
+    onPhoto: () -> Unit = {},
+) {
+    val s = sonar
+    Box(
+        Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
+        contentAlignment = Alignment.BottomCenter
+    ) {
+        Surface(color = s.surface, shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)) {
+            Column(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 18.dp, bottom = 20.dp)) {
+                Text("Add to your message", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(8.dp))
+                if (canSendPhoto) {
+                    ActionRow(SNIconName.Lock, "Send photo", "Encrypted end-to-end over White Noise", onPhoto)
+                }
+                ActionRow(SNIconName.Coin, "Send bitcoin", "Instant over Lightning", onBitcoin)
+                ActionRow(SNIconName.NavArrow, "Share location", "Only $peerName will see it", onLocation)
+                ActionRow(SNIconName.Shield, "Verify safety number", "Confirm this chat is secure", onVerify)
+                ActionRow(SNIconName.People, "Reactions", "A little fun, no noise", onReactions)
+            }
+        }
+    }
 }
 
+/** Full-screen lock gate; auto-prompts the device credential on appear. */
 @Composable
-private fun PayBubble(m: SonarMsg, pay: PayLine.Pay, onClaim: () -> Unit) {
+private fun LockScreen(onUnlock: () -> Unit) {
     val s = sonar
-    Column(
-        Modifier.fillMaxWidth().padding(vertical = 4.dp),
-        horizontalAlignment = if (m.mine) Alignment.End else Alignment.Start
-    ) {
-        Column(
-            Modifier.widthIn(max = 260.dp).clip(RoundedCornerShape(18.dp)).background(s.goldSoft)
-                .padding(14.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            SNIcon(SNIconName.Bolt, 22.dp, s.goldDeep)
+    LaunchedEffect(Unit) { onUnlock() }
+    Box(Modifier.fillMaxSize().background(s.bg), contentAlignment = Alignment.Center) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            SNIcon(SNIconName.Lock, 40.dp, s.accent, weight = 2f)
+            Spacer(Modifier.height(16.dp))
+            Text("Sonar is locked", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(6.dp))
-            Text(fmtSats(pay.sats), color = s.text, fontSize = 22.sp, fontWeight = FontWeight.Black)
-            Spacer(Modifier.height(2.dp))
-            Text(
-                if (m.mine) "You sent a payment" else "Payment for you",
-                color = s.text2, fontSize = 12.5.sp
-            )
-            if (!m.mine) {
-                Spacer(Modifier.height(10.dp))
-                Box(
-                    Modifier.clip(RoundedCornerShape(12.dp)).background(s.goldFill)
-                        .clickable(onClick = onClaim).padding(horizontal = 22.dp, vertical = 10.dp)
-                ) { Text("Claim", color = s.onGold, fontSize = 14.sp, fontWeight = FontWeight.Bold) }
+            Text("Unlock with your device PIN or biometrics.", color = s.text2, fontSize = 13.5.sp)
+            Spacer(Modifier.height(22.dp))
+            Box(
+                Modifier.clip(RoundedCornerShape(14.dp)).background(s.accentFill)
+                    .clickable(onClick = onUnlock).padding(horizontal = 28.dp, vertical = 12.dp)
+            ) { Text("Unlock", color = s.onAccent, fontSize = 15.sp, fontWeight = FontWeight.Bold) }
+        }
+    }
+}
+
+/** Slash-command suggestions (1:1 with iOS snCommands). */
+@Composable
+private fun SlashHints(draft: String, onPick: (String) -> Unit) {
+    val s = sonar
+    val commands = listOf("who" to "See who's nearby", "msg" to "Message someone", "slap" to "Classic IRC slap")
+    val typed = draft.drop(1).lowercase()
+    val matches = commands.filter { it.first.startsWith(typed) }
+    if (matches.isEmpty()) return
+    Column(Modifier.fillMaxWidth().padding(horizontal = 10.dp)) {
+        matches.forEach { (cmd, desc) ->
+            Row(
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))
+                    .clickable { onPick("/$cmd") }.padding(horizontal = 12.dp, vertical = 9.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("/$cmd", color = s.accent, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.width(10.dp))
+                Text(desc, color = s.text3, fontSize = 13.sp)
             }
         }
     }
 }
 
 @Composable
-private fun SendMoneySheet(peerName: String, onSend: (Long) -> Unit, onDismiss: () -> Unit) {
+private fun VerifySheet(
+    peerName: String,
+    info: SonarVerify,
+    myName: String,
+    onVerify: () -> Unit,
+    onDismiss: () -> Unit,
+) {
     val s = sonar
-    var amount by remember { mutableStateOf("") }
-    val sats = amount.toLongOrNull() ?: 0L
     Box(
         Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onDismiss),
         contentAlignment = Alignment.BottomCenter
     ) {
         Surface(color = s.surface, shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)) {
-            Column(Modifier.fillMaxWidth().padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                Text("Send money to $peerName", color = s.text, fontSize = 17.sp, fontWeight = FontWeight.Bold)
+            Column(
+                Modifier.fillMaxWidth().padding(20.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Text("Verify safety numbers", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(14.dp))
-                Box(
-                    Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(s.surface2)
-                        .padding(horizontal = 14.dp, vertical = 16.dp),
-                    contentAlignment = Alignment.Center
-                ) {
-                    if (amount.isEmpty()) Text("0 sats", color = s.text3, fontSize = 22.sp, fontWeight = FontWeight.Black)
-                    BasicTextField(
-                        value = amount, onValueChange = { v -> amount = v.filter { it.isDigit() }.take(8) },
-                        singleLine = true,
-                        textStyle = TextStyle(color = s.text, fontSize = 22.sp, fontWeight = FontWeight.Black, textAlign = androidx.compose.ui.text.style.TextAlign.Center),
-                        cursorBrush = SolidColor(s.goldDeep),
-                        keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.Number),
-                        modifier = Modifier.fillMaxWidth()
-                    )
+                Row(horizontalArrangement = Arrangement.spacedBy(28.dp)) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        SonarAvatar(myName, 48.dp, presence = false)
+                        Spacer(Modifier.height(4.dp)); Text(myName, color = s.text2, fontSize = 12.sp)
+                    }
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        SonarAvatar(peerName, 48.dp, presence = false)
+                        Spacer(Modifier.height(4.dp)); Text(peerName, color = s.text2, fontSize = 12.sp)
+                    }
                 }
-                Spacer(Modifier.height(14.dp))
-                SNPrimaryButton(if (sats > 0) "Send ${fmtSats(sats)}" else "Send", disabled = sats <= 0) { onSend(sats) }
+                Spacer(Modifier.height(16.dp))
+                if (info.safety.isEmpty()) {
+                    Text(
+                        info.note ?: "Safety numbers aren't available yet.",
+                        color = s.text2, fontSize = 13.5.sp, textAlign = TextAlign.Center
+                    )
+                } else {
+                    Text(
+                        "Compare these numbers with $peerName in person or on a call. If they match, this chat is end-to-end encrypted and nobody is in the middle.",
+                        color = s.text2, fontSize = 13.5.sp, lineHeight = 18.sp, textAlign = TextAlign.Center
+                    )
+                    Spacer(Modifier.height(14.dp))
+                    // 3 rows × 4 groups, monospace.
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        listOf(0, 4, 8).forEach { row ->
+                            Text(
+                                info.safety.subList(row, row + 4).joinToString(" "),
+                                color = s.text, style = chat.bitchat.sonar.ui.SonarType.mono(15.0),
+                                modifier = Modifier.padding(vertical = 3.dp)
+                            )
+                        }
+                    }
+                    Spacer(Modifier.height(18.dp))
+                    if (info.verified) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            SNIcon(SNIconName.ShieldCheck, 16.dp, s.green)
+                            Spacer(Modifier.width(6.dp))
+                            Text("Verified", color = s.green, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                        }
+                    } else {
+                        SNPrimaryButton("They match — mark as verified") { onVerify() }
+                    }
+                }
                 Spacer(Modifier.height(8.dp))
-                Text(
-                    "Travels as a sealed coin inside your encrypted chat. The wallet to settle it lands in a later build.",
-                    color = s.text3, fontSize = 12.sp, textAlign = androidx.compose.ui.text.style.TextAlign.Center, lineHeight = 16.sp
-                )
+                Box(Modifier.fillMaxWidth().height(44.dp).clickable(onClick = onDismiss), contentAlignment = Alignment.Center) {
+                    Text("Close", color = s.text2, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                }
             }
         }
     }
 }
+
+private fun randomPayId(): String =
+    (0 until 16).map { "0123456789abcdef".random() }.joinToString("")
 
 @Composable
 private fun GeoDmScreen(state: SonarAppState, screen: Screen.GeoDm) {
@@ -451,10 +852,14 @@ private fun GeoDmScreen(state: SonarAppState, screen: Screen.GeoDm) {
 }
 
 @Composable
-private fun MessageBubble(m: SonarMsg) {
+private fun MessageBubble(m: SonarMsg, mesh: Boolean = false) {
     val s = sonar
-    val linkColor = if (m.mine) s.onNet else s.accent
-    val annotated = remember(m.content, m.mine) { linkify(m.content, linkColor) }
+    // Own bubble is cyan over BLE mesh, indigo over Nostr/internet (the design's
+    // transport-colored bubbles); the other party's bubble is always the surface.
+    val mineBg = if (mesh) s.accentFill else s.netFill
+    val onMine = if (mesh) s.onAccent else s.onNet
+    val linkColor = if (m.mine) onMine else s.accent
+    val annotated = remember(m.content, m.mine, mesh) { linkify(m.content, linkColor) }
     val firstUrl = remember(m.content) { firstUrl(m.content) }
     val uriHandler = androidx.compose.ui.platform.LocalUriHandler.current
     Column(
@@ -463,15 +868,74 @@ private fun MessageBubble(m: SonarMsg) {
     ) {
         Box(
             Modifier.clip(RoundedCornerShape(18.dp))
-                .background(if (m.mine) s.netFill else s.bubbleOther)
+                .background(if (m.mine) mineBg else s.bubbleOther)
                 .then(if (firstUrl != null) Modifier.clickable { uriHandler.openUri(firstUrl) } else Modifier)
                 .padding(horizontal = 12.dp, vertical = 8.dp)
         ) {
             // Selectable (long-press → Copy); tap opens a link if present —
             // mirrors the iOS deterministic copy + tappable-link behavior.
             androidx.compose.foundation.text.selection.SelectionContainer {
-                Text(annotated, color = if (m.mine) s.onNet else s.text, fontSize = 16.sp)
+                Text(annotated, color = if (m.mine) onMine else s.text, fontSize = 16.sp)
             }
+        }
+    }
+}
+
+/**
+ * A media message bubble (Marmot MIP-04). No 1:1 design handoff exists for media,
+ * so this is the deliberate, tasteful extension matching Sonar tokens: an inline
+ * image (downloaded + decrypted on appear, cached by the store) or a file chip,
+ * plus an optional caption.
+ */
+@Composable
+private fun MediaBubble(m: SonarMsg, state: SonarAppState, chatId: String) {
+    val s = sonar
+    val media = m.media.first()
+    Column(
+        Modifier.fillMaxWidth().padding(vertical = 3.dp),
+        horizontalAlignment = if (m.mine) Alignment.End else Alignment.Start
+    ) {
+        if (media.isImage) {
+            val img by androidx.compose.runtime.produceState<androidx.compose.ui.graphics.ImageBitmap?>(
+                null, media.url
+            ) {
+                value = state.mediaData(chatId, media)?.let { decodeImageBitmap(it) }
+            }
+            Box(
+                Modifier.widthIn(max = 240.dp).clip(RoundedCornerShape(18.dp)).background(s.surface2),
+                contentAlignment = Alignment.Center
+            ) {
+                val bmp = img
+                if (bmp != null) {
+                    androidx.compose.foundation.Image(
+                        bitmap = bmp,
+                        contentDescription = media.filename,
+                        contentScale = androidx.compose.ui.layout.ContentScale.Fit,
+                        modifier = Modifier.widthIn(max = 240.dp).heightIn(max = 300.dp)
+                    )
+                } else {
+                    Box(
+                        Modifier.size(width = 180.dp, height = 130.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        androidx.compose.material3.CircularProgressIndicator(
+                            color = s.text3, strokeWidth = 2.dp
+                        )
+                    }
+                }
+            }
+        } else {
+            Row(
+                Modifier.clip(RoundedCornerShape(14.dp)).background(s.surface2)
+                    .padding(horizontal = 12.dp, vertical = 9.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(media.filename, color = s.text, fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold)
+            }
+        }
+        if (m.content.isNotEmpty()) {
+            Spacer(Modifier.height(3.dp))
+            Text(m.content, color = s.text, fontSize = 14.5.sp)
         }
     }
 }
@@ -502,36 +966,88 @@ private fun linkify(text: String, linkColor: androidx.compose.ui.graphics.Color)
         append(text.substring(last))
     }
 
+/**
+ * "Start a chat" sheet — 1:1 with the iOS SonarHomeScreen compose sheet:
+ * nearby Bluetooth peers, a "People nearby" radar entry, and an expandable
+ * "Secure chat via npub" field. This is the home compose (cyan) button's action.
+ */
 @Composable
-private fun NewChatSheet(onStart: (String) -> Unit, onJoin: (String) -> Unit, onDismiss: () -> Unit) {
+private fun ComposeSheet(state: SonarAppState, onClose: () -> Unit) {
     val s = sonar
-    var peer by remember { mutableStateOf("") }
-    var channel by remember { mutableStateOf("") }
+    var npubEntry by remember { mutableStateOf(false) }
+    var npubDraft by remember { mutableStateOf("") }
+    val inRange = state.meshPeers
     Box(
-        Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onDismiss),
+        Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
         contentAlignment = Alignment.BottomCenter
     ) {
         Surface(color = s.surface, shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)) {
-            Column(Modifier.fillMaxWidth().padding(20.dp)) {
-                Text("New secure chat", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
-                Spacer(Modifier.height(4.dp))
-                Text("Paste their npub. They need to have opened Sonar at least once.", color = s.text3, fontSize = 12.5.sp)
-                Spacer(Modifier.height(12.dp))
-                SheetField(peer, "npub1…") { peer = it }
-                Spacer(Modifier.height(12.dp))
-                SNPrimaryButton("Start chat") { onStart(peer) }
-
-                Spacer(Modifier.height(22.dp))
-                Text("Join a channel", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
-                Spacer(Modifier.height(4.dp))
-                Text("Enter an area code (geohash) to chat publicly with people there.", color = s.text3, fontSize = 12.5.sp)
-                Spacer(Modifier.height(12.dp))
-                SheetField(channel, "e.g. u0nd or sr2y…") { channel = it }
-                Spacer(Modifier.height(12.dp))
-                SNPrimaryButton("Join channel", net = true) { onJoin(channel) }
-                Spacer(Modifier.height(8.dp))
+            Column(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 18.dp, bottom = 22.dp)) {
+                Text("Start a chat", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(10.dp))
+                if (inRange.isEmpty()) {
+                    Text(
+                        "Nobody in Bluetooth range right now.", color = s.text2, fontSize = 13.5.sp,
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 10.dp)
+                    )
+                } else {
+                    inRange.take(4).forEach { p ->
+                        Row(
+                            Modifier.fillMaxWidth().clickable {
+                                state.toast = "Bluetooth chats arrive with the live mesh link."
+                            }.padding(vertical = 9.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            SonarAvatar(p.name, 44.dp, presence = true)
+                            Spacer(Modifier.width(12.dp))
+                            Column {
+                                Text(p.name, color = s.text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+                                Text(
+                                    "${chat.bitchat.sonar.screens.rssiLabel(p.rssi)} · Bluetooth",
+                                    color = s.text2, fontSize = 13.sp
+                                )
+                            }
+                        }
+                    }
+                }
+                ActionRow(SNIconName.Rings, "People nearby", "Open the radar to see everyone in range") {
+                    onClose(); state.push(Screen.Nearby)
+                }
+                ActionRow(SNIconName.Key, "Secure chat via npub", "Encrypted chat over the internet — reaches anywhere") {
+                    npubEntry = true
+                }
+                if (npubEntry) {
+                    Spacer(Modifier.height(8.dp))
+                    SheetField(npubDraft, "npub1…") { npubDraft = it }
+                    Spacer(Modifier.height(10.dp))
+                    SNPrimaryButton(
+                        "Start secure chat",
+                        disabled = !npubDraft.trim().startsWith("npub1")
+                    ) { state.startChat(npubDraft.trim()); onClose() }
+                }
             }
         }
+    }
+}
+
+/** st-action-row: tinted icon tile + label/desc, used in the compose sheet. */
+@Composable
+private fun ActionRow(icon: SNIconName, label: String, desc: String, onClick: () -> Unit) {
+    val s = sonar
+    Row(
+        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(
+            Modifier.size(38.dp).clip(RoundedCornerShape(11.dp)).background(s.accentSoft),
+            contentAlignment = Alignment.Center
+        ) { SNIcon(icon, 18.dp, s.accentDeep) }
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+            Text(label, color = s.text, fontSize = 15.5.sp, fontWeight = FontWeight.SemiBold)
+            Text(desc, color = s.text3, fontSize = 12.5.sp, lineHeight = 16.sp)
+        }
+        SNIcon(SNIconName.Chevron, 14.dp, s.text3, weight = 2.2f)
     }
 }
 
@@ -553,7 +1069,7 @@ private fun SheetField(value: String, placeholder: String, onChange: (String) ->
 }
 
 @Composable
-private fun ToastBar(text: String, onDone: () -> Unit) {
+internal fun ToastBar(text: String, onDone: () -> Unit) {
     val s = sonar
     LaunchedEffect(text) { kotlinx.coroutines.delay(2600); onDone() }
     Box(Modifier.fillMaxSize().padding(bottom = 90.dp), contentAlignment = Alignment.BottomCenter) {

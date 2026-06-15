@@ -69,6 +69,20 @@ actual object SonarCore {
         requireNode().sendText(chatId, text)
     }
 
+    actual suspend fun sendMedia(
+        chatId: String,
+        data: ByteArray,
+        filename: String,
+        mime: String,
+        caption: String,
+        serverUrl: String,
+    ) = withContext(Dispatchers.IO) {
+        requireNode().sendMedia(chatId, data, filename, mime, caption, serverUrl)
+    }
+
+    actual suspend fun fetchMedia(chatId: String, url: String): ByteArray =
+        withContext(Dispatchers.IO) { requireNode().fetchMedia(chatId, url) }
+
     actual suspend fun messages(chatId: String): List<SonarMsg> = withContext(Dispatchers.IO) {
         val n = node ?: return@withContext emptyList()
         n.messages(chatId).map {
@@ -78,8 +92,32 @@ actual object SonarCore {
                 content = it.content,
                 mine = it.mine,
                 tsSecs = it.createdAtSecs.toLong(),
+                media = it.media.map { m ->
+                    SonarMedia(
+                        url = m.url,
+                        mimeType = m.mimeType,
+                        filename = m.filename,
+                        width = m.width?.toInt(),
+                        height = m.height?.toInt(),
+                        durationMs = m.durationMs?.toLong(),
+                    )
+                },
             )
         }
+    }
+
+    actual suspend fun publishProfile(name: String, about: String?, picture: String?) = withContext(Dispatchers.IO) {
+        runCatching { node?.publishProfile(name, about, picture) }
+        Unit
+    }
+
+    actual suspend fun fetchProfile(npub: String): SonarProfile? = withContext(Dispatchers.IO) {
+        val n = node ?: return@withContext null
+        runCatching {
+            n.fetchProfile(npub)?.let {
+                SonarProfile(it.name, it.displayName, it.about, it.picture, it.nip05)
+            }
+        }.getOrNull()
     }
 
     actual suspend fun sync() = withContext(Dispatchers.IO) {
@@ -124,6 +162,16 @@ actual object SonarCore {
         requireNode().sendGeohash(geohash, text, nick)
     }
 
+    actual suspend fun sendChannelPresence(geohash: String) = withContext(Dispatchers.IO) {
+        runCatching { node?.sendGeohashPresence(geohash) }
+        Unit
+    }
+
+    actual suspend fun channelPresenceCount(geohash: String): Int = withContext(Dispatchers.IO) {
+        val n = node ?: return@withContext 0
+        runCatching { n.geohashPresenceCount(geohash).toInt() }.getOrDefault(0)
+    }
+
     actual suspend fun geoDmMessages(geohash: String, peerHex: String): List<SonarMsg> = withContext(Dispatchers.IO) {
         val n = node ?: return@withContext emptyList()
         runCatching {
@@ -160,6 +208,8 @@ actual object SonarCore {
         return hex.take(32).uppercase().chunked(4).joinToString(" ")
     }
 
+    actual fun identityNsec(): String = prefs().getString("nsec", "") ?: ""
+
     actual fun onboardingComplete(): Boolean = prefs().getBoolean("onboarding.complete", false)
 
     actual fun setOnboardingComplete(value: Boolean) {
@@ -186,6 +236,26 @@ actual object SonarCore {
             File(ctx.filesDir, "sonar-marmot").deleteRecursively()
             prefs().edit().clear().apply()
         }
+    }
+
+    actual suspend fun eraseChats() {
+        withContext(Dispatchers.IO) {
+            lock.withLock {
+                node = null
+                // Delete ONLY the encrypted Marmot DB — keep nsec, the DB key,
+                // nickname and every pref. start() (below) reopens a fresh empty
+                // DB with the SAME identity + key.
+                File(ctx.filesDir, "sonar-marmot").deleteRecursively()
+            }
+        }
+        // Reconnect with the same identity and republish our KeyPackage so peers
+        // can still start new secure chats with us.
+        start()
+    }
+
+    actual suspend fun deleteChat(chatId: String): Unit = withContext(Dispatchers.IO) {
+        runCatching { node?.deleteGroup(chatId) }
+        Unit
     }
 
     private fun requireNode(): SonarNode =

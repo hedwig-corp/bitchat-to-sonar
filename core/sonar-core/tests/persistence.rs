@@ -78,6 +78,16 @@ async fn group_and_message_survive_reopen() {
     assert_eq!(messages[0].content, "persisted hello");
     assert_eq!(messages[0].sender, alice_pubkey);
     assert!(messages[0].mine);
+
+    // The sync watermark RESUMES from the persisted history (at or after the
+    // stored message's timestamp — `latest_message_secs` also counts non-chat
+    // membership/commit events) instead of resetting to 0, so a relaunch syncs
+    // incrementally rather than re-fetching the whole history from scratch.
+    assert!(
+        alice2.latest_message_secs() >= messages[0].created_at.as_u64(),
+        "watermark resumes at/after the newest stored message after reopen"
+    );
+    assert!(alice2.latest_message_secs() > 0);
 }
 
 #[tokio::test]
@@ -96,6 +106,40 @@ async fn wrong_key_cannot_open_existing_db() {
     let wrong_key = [0x13; 32];
     let result = MarmotEngine::persistent(Identity::generate(), &db_path, wrong_key);
     assert!(result.is_err(), "wrong SQLCipher key must be rejected");
+}
+
+#[tokio::test]
+async fn self_heals_an_unencrypted_legacy_database() {
+    // Reproduces the field bug: an older build left a PLAINTEXT marmot.sqlite on
+    // disk; the current code opens it WITH a SQLCipher key and SQLCipher refuses
+    // ("Cannot open unencrypted database with encryption: database was created
+    // without encryption"), failing on every launch. `persistent` must self-heal
+    // by discarding the unusable file and recreating an encrypted store.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+
+    // Fabricate a plaintext SQLite database at the path (no PRAGMA key → SQLCipher
+    // writes a standard, unencrypted file).
+    {
+        let conn = rusqlite::Connection::open(&db_path).expect("open plaintext db");
+        conn.execute_batch("CREATE TABLE legacy (x INTEGER); INSERT INTO legacy VALUES (1);")
+            .expect("write plaintext db");
+    }
+    assert!(db_path.exists(), "plaintext db exists before reopen");
+
+    // Opening with a key must NOT error — it should wipe + recreate encrypted.
+    let alice = MarmotEngine::persistent(Identity::generate(), &db_path, DB_KEY)
+        .expect("self-heal recreates the database instead of failing");
+
+    // The recreated database is a working encrypted store.
+    let _ = alice.key_package_event(relays()).expect("usable after self-heal");
+    assert_eq!(alice.groups().expect("groups").len(), 0, "fresh store starts empty");
+    drop(alice);
+
+    // And it now reopens cleanly with the same key (it is genuinely encrypted).
+    let alice2 = MarmotEngine::persistent(Identity::generate(), &db_path, DB_KEY)
+        .expect("recreated db reopens with the key");
+    assert_eq!(alice2.groups().expect("groups").len(), 0);
 }
 
 #[tokio::test]

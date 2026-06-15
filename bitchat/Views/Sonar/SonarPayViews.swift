@@ -268,6 +268,21 @@ struct SNPaySheet: View {
                     }
                     .buttonStyle(SNScaleStyle(scale: 0.95))
                 }
+                // "Max" = the entire spendable balance (to drain the wallet to
+                // this recipient). Filled gold to stand out from the presets.
+                if balance > 0 {
+                    Button {
+                        v = String(balance)
+                    } label: {
+                        Text(verbatim: "Max")
+                            .font(SonarTheme.uiFont(size: 13, weight: .bold))
+                            .foregroundColor(SonarTheme.onGold)
+                            .padding(.vertical, 7)
+                            .padding(.horizontal, 16)
+                            .background(Capsule().fill(SonarTheme.goldFill))
+                    }
+                    .buttonStyle(SNScaleStyle(scale: 0.95))
+                }
             }
             .padding(EdgeInsets(top: 10, leading: 0, bottom: 2, trailing: 0))
 
@@ -493,6 +508,19 @@ private struct UnifyAmountKeypad: View {
                             .padding(.vertical, 7)
                             .padding(.horizontal, 14)
                             .background(Capsule().fill(SonarTheme.goldSoft))
+                    }
+                    .buttonStyle(SNScaleStyle(scale: 0.95))
+                }
+                // "Max" = the entire spendable balance — drains the wallet to
+                // this recipient (the Unify nearby-wallet send).
+                if balance > 0 {
+                    Button { v = String(balance) } label: {
+                        Text(verbatim: "Max")
+                            .font(SonarTheme.uiFont(size: 13, weight: .bold))
+                            .foregroundColor(SonarTheme.onGold)
+                            .padding(.vertical, 7)
+                            .padding(.horizontal, 16)
+                            .background(Capsule().fill(SonarTheme.goldFill))
                     }
                     .buttonStyle(SNScaleStyle(scale: 0.95))
                 }

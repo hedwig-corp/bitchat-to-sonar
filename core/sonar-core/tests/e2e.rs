@@ -9,6 +9,42 @@ use sonar_core::client::SonarClient;
 use sonar_core::identity::Identity;
 
 #[tokio::test]
+async fn profile_publish_and_fetch_through_a_relay() {
+    // A Marmot member's identity is a Nostr pubkey (MIP-00); their display name
+    // is resolved via a standard kind-0 profile. Bob publishes his profile; Alice
+    // fetches it to show a human name instead of a raw npub.
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url.clone()])
+        .await
+        .expect("alice connects");
+    let bob = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url.clone()])
+        .await
+        .expect("bob connects");
+
+    // Before Bob publishes, Alice finds no profile.
+    let none = alice
+        .fetch_profile(bob.identity().public_key())
+        .await
+        .expect("fetch ok");
+    assert!(none.is_none(), "no profile before Bob publishes");
+
+    bob.publish_profile("Bob the Marmot", Some("hello there"), None)
+        .await
+        .expect("bob publishes profile");
+
+    let profile = alice
+        .fetch_profile(bob.identity().public_key())
+        .await
+        .expect("fetch ok")
+        .expect("Bob's profile is found");
+    assert_eq!(profile.best_name(), Some("Bob the Marmot"));
+    assert_eq!(profile.name.as_deref(), Some("Bob the Marmot"));
+    assert_eq!(profile.about.as_deref(), Some("hello there"));
+}
+
+#[tokio::test]
 async fn two_instances_exchange_dms_through_a_relay() {
     let relay = MockRelay::run().await.expect("mock relay starts");
     let relay_url = relay.url().await;
@@ -71,6 +107,55 @@ async fn two_instances_exchange_dms_through_a_relay() {
     assert_eq!(members.mls_group_id, *bob_group);
 }
 
+/// Per-chat delete: deleting a group locally removes ONLY that chat's state on
+/// the deleter's device; the peer is unaffected (local-only, no MLS/Nostr
+/// publish). Backs the "erase a single chat at a time" feature.
+#[tokio::test]
+async fn delete_group_removes_a_single_chat_locally() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url.clone()])
+        .await
+        .expect("alice connects");
+    let bob = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url.clone()])
+        .await
+        .expect("bob connects");
+    bob.publish_key_package().await.expect("bob publishes kp");
+
+    let alice_group = alice
+        .start_dm(bob.identity().public_key(), "alice & bob")
+        .await
+        .expect("alice starts dm");
+    alice
+        .send_text(&alice_group, "Hi Bob!")
+        .await
+        .expect("alice sends");
+    bob.sync().await.expect("bob syncs");
+
+    assert_eq!(alice.groups().unwrap().len(), 1);
+    assert_eq!(bob.groups().unwrap().len(), 1);
+    let bob_group = bob.groups().unwrap()[0].mls_group_id.clone();
+
+    // Alice deletes the chat from HER device only.
+    alice
+        .delete_group(&alice_group)
+        .await
+        .expect("alice deletes the chat");
+    assert_eq!(alice.groups().unwrap().len(), 0, "chat is gone for alice");
+    assert!(alice.messages(&alice_group).unwrap_or_default().is_empty());
+
+    // Bob is untouched — local-only delete publishes no MLS proposal / Nostr event.
+    assert_eq!(bob.groups().unwrap().len(), 1, "bob still has the chat");
+    assert_eq!(bob.messages(&bob_group).unwrap().len(), 1);
+
+    // Deleting again is a harmless no-op (idempotent).
+    alice
+        .delete_group(&alice_group)
+        .await
+        .expect("idempotent re-delete");
+}
+
 /// Two instances in the same geohash channel exchange public messages, with
 /// correct nickname tags, mine-detection, and channel isolation.
 #[tokio::test]
@@ -115,6 +200,65 @@ async fn two_instances_exchange_geohash_channel_messages() {
     // A different geohash is an isolated channel.
     let other = bob.fetch_geohash("9q5c", 100).await.expect("other fetch");
     assert!(other.is_empty(), "different geohash sees nothing");
+}
+
+/// Presence heartbeats (kind-20001) drive the "N here now" count: each
+/// participant who announces is counted once, distinct geohashes are isolated,
+/// and re-announcing does not double-count.
+#[tokio::test]
+async fn geohash_presence_counts_participants() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let url = relay.url().await;
+    let alice = SonarClient::connect_in_memory(Identity::generate(), vec![url.clone()])
+        .await
+        .expect("alice connects");
+    let bob = SonarClient::connect_in_memory(Identity::generate(), vec![url.clone()])
+        .await
+        .expect("bob connects");
+
+    let gh = "u0nd";
+    alice.subscribe_geohash(gh).await.expect("alice joins");
+    bob.subscribe_geohash(gh).await.expect("bob joins");
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+    // Only alice has announced so far — she counts herself locally.
+    alice.send_geohash_presence(gh).await.expect("alice announces");
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert_eq!(
+        bob.geohash_presence_count(gh).await.unwrap(),
+        1,
+        "bob sees alice present"
+    );
+
+    // Bob announces too; both sides now count two distinct participants.
+    bob.send_geohash_presence(gh).await.expect("bob announces");
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert_eq!(
+        alice.geohash_presence_count(gh).await.unwrap(),
+        2,
+        "alice sees both present"
+    );
+    assert_eq!(
+        bob.geohash_presence_count(gh).await.unwrap(),
+        2,
+        "bob sees both present"
+    );
+
+    // Re-announcing refreshes the heartbeat, it does not double-count.
+    alice.send_geohash_presence(gh).await.expect("alice re-announces");
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert_eq!(
+        bob.geohash_presence_count(gh).await.unwrap(),
+        2,
+        "still two distinct participants"
+    );
+
+    // A different geohash has nobody present.
+    assert_eq!(
+        bob.geohash_presence_count("9q5c").await.unwrap(),
+        0,
+        "isolated channel has no presence"
+    );
 }
 
 /// Two channel participants exchange a 1:1 encrypted geohash DM (NIP-17 over

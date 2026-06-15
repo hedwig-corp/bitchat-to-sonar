@@ -31,7 +31,7 @@ import kotlin.math.sqrt
 enum class SNIconName {
     Back, Chevron, Lock, Plus, Pin, People, Mesh, Globe, Check, Shield,
     ShieldCheck, X, NavArrow, Dice, Rings, Moon, Trash, Info, Coin, Bolt,
-    Pencil, Key,
+    Pencil, Key, Search,
 }
 
 private sealed interface Shape {
@@ -63,6 +63,7 @@ private val ICONS: Map<SNIconName, List<Shape>> = mapOf(
     SNIconName.Bolt to listOf(Shape.P("M13 3 6 13.5h4.5L11 21l7-10.5h-4.5z")),
     SNIconName.Pencil to listOf(Shape.P("M16.8 4.6l2.6 2.6L8.6 18l-3.4.8.8-3.4z")),
     SNIconName.Key to listOf(Shape.C(8.5f, 12f, 3.4f), Shape.P("M11.9 12h8M17 12v2.8M19.9 12v2")),
+    SNIconName.Search to listOf(Shape.C(10.5f, 10.5f, 5.5f), Shape.P("M14.5 14.5L20 20")),
 )
 
 @Composable

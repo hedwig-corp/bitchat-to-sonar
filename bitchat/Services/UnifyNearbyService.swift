@@ -730,6 +730,25 @@ extension UnifyNearbyService: CBPeripheralDelegate {
                 self.failFetch(.readFailed("empty payload")); return
             }
             do {
+                // We subscribe to NOTIFY *and* issue a READ, so `didUpdateValueFor`
+                // fires for both — and a GATT long READ returns the WHOLE framed
+                // blob in one shot (CoreBluetooth coalesces offset reads) while
+                // NOTIFY may deliver chunks. Feeding both into one reassembler
+                // overran it ("received N expected M"). If `value` is itself a
+                // complete, self-contained frame (header + exactly the declared
+                // body), decode it directly — that's the READ path, and it must
+                // not be appended to a partial NOTIFY buffer. `finishFetch` clears
+                // `fetch`, so the redundant second delivery is then ignored.
+                if value.count >= UnifyNearbyFraming.headerSize {
+                    let declared = UnifyNearbyFraming.readBigEndianInt(value, at: 0)
+                    if declared >= 0, declared <= UnifyNearbyContract.maxPayloadBytes,
+                       value.count == UnifyNearbyFraming.headerSize + declared,
+                       let str = String(data: value.subdata(in: UnifyNearbyFraming.headerSize..<value.count),
+                                        encoding: .utf8) {
+                        self.finishFetch(success: str)
+                        return
+                    }
+                }
                 if let payload = try ctx.reassembler.offer(value) {
                     self.finishFetch(success: payload)
                 }

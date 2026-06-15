@@ -7,6 +7,7 @@
 //
 
 import SwiftUI
+import BitLogger
 
 /// UI state for Marmot (MLS-over-Nostr) secure chats — the White Noise
 /// interop path. Owns a `MarmotService` and persists the generated Nostr
@@ -20,10 +21,15 @@ final class MarmotChatModel: ObservableObject {
     @Published var messagesByGroup: [String: [MarmotService.MarmotMessage]] = [:]
     @Published var busy = false
     @Published var errorText: String?
+    /// Resolved kind-0 profiles, keyed by npub — fills in human names/avatars
+    /// for Marmot members instead of raw npubs.
+    @Published var profilesByNpub: [String: MarmotService.Profile] = [:]
 
     private let service: MarmotService
     private let keychain: KeychainManagerProtocol
     private var syncTask: Task<Void, Never>?
+    /// npubs whose profile fetch is in flight or done, to fetch each once.
+    private var profileFetches: Set<String> = []
     /// Optimistically-echoed outgoing messages per group, kept visible until
     /// the relay round-trip brings the real copy back (then reconciled away).
     private var pendingOptimistic: [String: [MarmotService.MarmotMessage]] = [:]
@@ -39,32 +45,100 @@ final class MarmotChatModel: ObservableObject {
 
     /// Connect on first appearance: reuse the keychain identity if present,
     /// otherwise generate one and persist it. Publishes our KeyPackage so
-    /// White Noise users can start chats with us.
+    /// White Noise users can start chats with us. Lazy + idempotent: no-op once
+    /// connected (npub set) or while a connect is already in flight (busy).
     func connectIfNeeded() {
         guard npub == nil, !busy else { return }
         busy = true
         Task {
             defer { busy = false }
-            do {
-                let storedNsec = keychain.getIdentityKey(forKey: Self.nsecKeychainKey)
-                    .flatMap { String(data: $0, encoding: .utf8) }
-                let npub = try await service.connect(nsec: storedNsec)
-                if storedNsec == nil, let fresh = await service.exportNsec() {
-                    _ = keychain.saveIdentityKey(Data(fresh.utf8), forKey: Self.nsecKeychainKey)
-                }
-                try await service.publishKeyPackage()
-                self.npub = npub
-                self.errorText = nil
-                await refresh()
-            } catch {
-                self.errorText = Self.describe(error)
-            }
+            await performConnect()
         }
     }
 
-    func refresh() async {
+    /// The actual connect sequence (awaitable, NOT guarded). Reuse the keychain
+    /// identity, open the encrypted DB, load local chats, publish our KeyPackage.
+    /// Used by the lazy `connectIfNeeded()` and the erase-and-reconnect path —
+    /// the latter must NOT be blocked by the `busy`/`npub` guard, which would
+    /// silently leave the node disconnected ("not connected yet" until restart).
+    private func performConnect() async {
+        // Read the persisted nsec SAFELY: only a genuine .itemNotFound means
+        // "no identity yet" (→ generate). On a transient read failure (e.g.
+        // device LOCKED during a background BLE wake) do NOT generate — that
+        // would overwrite the existing nsec and orphan its derived wallet +
+        // chat DB forever. Defer instead; setup retries once accessible (#13).
+        let storedNsec: String?
+        switch keychain.getIdentityKeyWithResult(forKey: Self.nsecKeychainKey) {
+        case .success(let data):
+            storedNsec = String(data: data, encoding: .utf8)
+            // Migration: re-save to upgrade a legacy WhenUnlocked item to
+            // AfterFirstUnlockThisDeviceOnly (this read just succeeded).
+            if let s = storedNsec { _ = keychain.saveIdentityKey(Data(s.utf8), forKey: Self.nsecKeychainKey) }
+        case .itemNotFound:
+            storedNsec = nil
+        case .accessDenied, .deviceLocked, .authenticationFailed, .otherError:
+            SecureLogger.warning("⚠️ marmot-nsec not readable yet (device locked?) — deferring identity", category: .session)
+            return
+        }
+        // 1) Publish our npub IMMEDIATELY — the identity pubkey is offline-
+        //    derivable, so Sonar discovery (0x53) can advertise it without
+        //    waiting on (or being blocked by) the relay connect. Persist a
+        //    freshly-generated nsec so `connect` below reuses the same identity.
+        if let np = try? await service.loadIdentityNpub(nsec: storedNsec) {
+            if storedNsec == nil, let fresh = await service.exportNsec() {
+                _ = keychain.saveIdentityKey(Data(fresh.utf8), forKey: Self.nsecKeychainKey)
+            }
+            self.npub = np
+        }
+        // 2) Connect (opens the encrypted DB) → load the LOCAL chats right away
+        //    (they don't need the relays) → then publish our KeyPackage. A relay
+        //    publish failure must NOT hide already-persisted chats — that was
+        //    the "chats vanish on restart, reappear on the next launch" bug.
         do {
-            try await service.syncOnce()
+            _ = try await service.connect(nsec: storedNsec)
+            // Paint persisted chats from the encrypted DB IMMEDIATELY — they do
+            // not need the relays. The relay drain (syncOnce) + KeyPackage
+            // publish must NOT gate first paint, or the UI freezes on
+            // "Connecting…" for the entire relay round-trip even though every
+            // chat is already on disk (the user's "sync on launch is slow"
+            // report). Run them detached.
+            await loadLocal()
+            self.errorText = nil
+            Task { [weak self] in
+                guard let self else { return }
+                await self.refresh()
+                try? await self.service.publishKeyPackage()
+            }
+            // Run the live subscription loop for as long as we're connected, so
+            // welcomes + messages arrive in real time globally (not only while a
+            // specific chat is open).
+            startPolling()
+        } catch {
+            let desc = Self.describe(error)
+            SecureLogger.warning("⚠️ Marmot connect failed: \(desc)", category: .session)
+            self.errorText = desc
+        }
+    }
+
+    /// Await until the Marmot node is connected (or a short timeout), kicking
+    /// off a connect if none is in flight. Lets start/send wait through the
+    /// reconnect window (e.g. right after "erase all chats" or a cold launch)
+    /// instead of immediately surfacing "not connected yet".
+    func ensureConnected(timeoutSeconds: Double = 10) async -> Bool {
+        if await service.isConnected() { return true }
+        if !busy { connectIfNeeded() }
+        let start = Date()
+        while Date().timeIntervalSince(start) < timeoutSeconds {
+            if await service.isConnected() { return true }
+            try? await Task.sleep(nanoseconds: 250_000_000)
+        }
+        return await service.isConnected()
+    }
+
+    /// Load groups + messages from the LOCAL encrypted DB only (no relay I/O),
+    /// so the chat list paints instantly on launch regardless of relay health.
+    func loadLocal() async {
+        do {
             let groups = try await service.groups()
             var byGroup: [String: [MarmotService.MarmotMessage]] = [:]
             for group in groups {
@@ -72,10 +146,59 @@ final class MarmotChatModel: ObservableObject {
             }
             self.groups = groups
             self.messagesByGroup = reconcileOptimistic(into: byGroup)
+            // Resolve a human name for every counterpart (once each).
+            for group in groups {
+                for member in group.memberNpubs where member != npub {
+                    ensureProfile(member)
+                }
+            }
+        } catch {
+            self.errorText = Self.describe(error)
+        }
+    }
+
+    /// Poll the relays once, then reflect the (possibly updated) local state.
+    /// Local chats are loaded even when the relay sync fails, so a relay outage
+    /// never hides already-persisted conversations.
+    func refresh() async {
+        do {
+            try await service.syncOnce()
             self.errorText = nil
         } catch {
             self.errorText = Self.describe(error)
         }
+        await loadLocal()
+    }
+
+    /// Publish our own kind-0 profile so peers see our nickname, not our npub.
+    func publishProfile(name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        Task { try? await service.publishProfile(name: trimmed) }
+    }
+
+    /// Fetch + cache a peer's kind-0 profile, so their name/avatar replaces the
+    /// raw npub in the chat list, header, and avatar. Retries (via the periodic
+    /// `refresh()`) until the peer has published a profile.
+    func ensureProfile(_ npubToFetch: String) {
+        guard !npubToFetch.isEmpty, npubToFetch != npub else { return }
+        guard profilesByNpub[npubToFetch] == nil else { return } // already resolved
+        guard profileFetches.insert(npubToFetch).inserted else { return } // in flight
+        Task {
+            let profile = try? await service.fetchProfile(npub: npubToFetch)
+            await MainActor.run {
+                if let profile, profile.bestName != nil {
+                    self.profilesByNpub[npubToFetch] = profile
+                } else {
+                    self.profileFetches.remove(npubToFetch) // not published yet — allow retry
+                }
+            }
+        }
+    }
+
+    /// Best display name for a member npub, if we've resolved their profile.
+    func displayName(forNpub member: String) -> String? {
+        profilesByNpub[member]?.bestName
     }
 
     /// Merge still-pending optimistic echoes into the freshly-synced
@@ -105,10 +228,14 @@ final class MarmotChatModel: ObservableObject {
 
     func startChat(with peer: String) {
         let trimmed = peer.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, !busy else { return }
-        busy = true
+        guard !trimmed.isEmpty else { return }
         Task {
-            defer { busy = false }
+            // Wait through the connect/reconnect window (post-erase or cold
+            // launch) so a fresh chat doesn't fail with "not connected yet".
+            guard await ensureConnected() else {
+                self.errorText = "Not connected yet — try again in a moment."
+                return
+            }
             do {
                 _ = try await service.startDirectMessage(with: trimmed, name: "")
                 await refresh()
@@ -129,12 +256,18 @@ final class MarmotChatModel: ObservableObject {
             senderNpub: npub ?? "",
             content: trimmed,
             createdAt: Date(),
-            isMine: true
+            isMine: true,
+            media: []
         )
         pendingOptimistic[groupId, default: []].append(echo)
         messagesByGroup[groupId, default: []].append(echo)
         Task {
             do {
+                // Wait through the connect/reconnect window so a send right after
+                // erase / cold launch doesn't fail with "not connected yet".
+                guard await ensureConnected() else {
+                    throw MarmotService.ServiceError.notConnected
+                }
                 try await service.sendText(groupId: groupId, text: trimmed)
                 await refresh()
             } catch {
@@ -147,13 +280,49 @@ final class MarmotChatModel: ObservableObject {
         }
     }
 
-    /// Poll while a Marmot screen is visible (core has no live subscription yet).
+    /// Send a media attachment (encrypt with the group key, upload the ciphertext
+    /// to Blossom, publish the kind-445 with the imeta tag). Refreshes on success.
+    func sendMedia(groupId: String, data: Data, filename: String, mime: String, caption: String = "") {
+        Task {
+            do {
+                try await service.sendMedia(
+                    groupId: groupId, data: data, filename: filename, mime: mime, caption: caption
+                )
+                await refresh()
+            } catch {
+                self.errorText = Self.describe(error)
+            }
+        }
+    }
+
+    /// Download + decrypt a media blob. The store caches the decoded image.
+    func fetchMedia(groupId: String, url: String) async -> Data? {
+        do {
+            return try await service.fetchMedia(groupId: groupId, url: url)
+        } catch {
+            self.errorText = Self.describe(error)
+            return nil
+        }
+    }
+
+    /// Drive LIVE updates off the core's relay subscriptions: park on
+    /// `waitForMarmotEvent` and, the instant a welcome/message is pushed, drain +
+    /// process it and reload the UI from the local DB. On the idle timeout (no
+    /// push), run one `refresh()` as a safety reconciliation that also catches any
+    /// subscription event the relay dropped/lagged. Replaces the old 5s poll.
     func startPolling() {
         guard syncTask == nil else { return }
         syncTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 5_000_000_000)
-                await self?.refresh()
+                guard let self else { return }
+                let woke = await self.service.waitForMarmotEvent(timeoutSeconds: 25)
+                if Task.isCancelled { return }
+                if woke {
+                    let drained = (try? await self.service.drainPending()) ?? false
+                    if drained { await self.loadLocal() }
+                } else {
+                    await self.refresh() // idle safety reconciliation
+                }
             }
         }
     }
@@ -161,6 +330,16 @@ final class MarmotChatModel: ObservableObject {
     func stopPolling() {
         syncTask?.cancel()
         syncTask = nil
+    }
+
+    /// Delete ONE White Noise / Marmot chat locally (messages + MLS keys), then
+    /// drop it from the in-memory state. Local-only — the peer is not notified.
+    func deleteGroup(_ groupId: String) async {
+        try? await service.deleteGroup(groupId: groupId)
+        groups.removeAll { $0.id == groupId }
+        messagesByGroup[groupId] = nil
+        pendingOptimistic[groupId] = nil
+        profileFetches = []
     }
 
     /// Panic-wipe the encrypted Marmot database + its Keychain key and reset
@@ -175,11 +354,40 @@ final class MarmotChatModel: ObservableObject {
         pendingOptimistic = [:]
     }
 
+    /// Erase every White Noise / Marmot chat but KEEP the identity: wipe the
+    /// encrypted DB (which preserves `marmot-nsec`, deleting only the DB and
+    /// its SQLCipher key), then reconnect with the same nsec so a fresh, empty
+    /// store is opened and our KeyPackage is republished — new secure chats
+    /// keep working. Used by "erase all chats" (not the full panic wipe).
+    func eraseChatsKeepIdentity() async {
+        let wasPolling = syncTask != nil
+        stopPolling()
+        await service.wipeDatabase()
+        npub = nil
+        groups = []
+        messagesByGroup = [:]
+        pendingOptimistic = [:]
+        profilesByNpub = [:]
+        profileFetches = []
+        errorText = nil
+        // Reopen a fresh DB with the SAME identity and republish our KeyPackage.
+        // Await a FORCED reconnect (not `connectIfNeeded()`, whose busy/npub
+        // guard could silently skip it and leave the node "not connected yet").
+        busy = true
+        await performConnect()
+        busy = false
+        if wasPolling { startPolling() }
+    }
+
     /// Short label for a 1:1 group: the other member's npub prefix.
     func title(for group: MarmotService.MarmotGroup) -> String {
         if !group.name.isEmpty { return group.name }
-        let other = group.memberNpubs.first { $0 != npub }
-        return other.map { String($0.prefix(12)) + "…" } ?? "Secure chat"
+        guard let other = group.memberNpubs.first(where: { $0 != npub }) else { return "Secure chat" }
+        // Prefer the counterpart's resolved kind-0 profile name; fetch it if we
+        // haven't yet; fall back to a short npub until it lands.
+        if let name = displayName(forNpub: other) { return name }
+        ensureProfile(other)
+        return String(other.prefix(12)) + "…"
     }
 
     private static func describe(_ error: Error) -> String {

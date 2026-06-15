@@ -18,8 +18,12 @@
 
 import BitLogger
 import Combine
+import CryptoKit
 import Foundation
 import SwiftUI
+#if canImport(UIKit)
+import UIKit
+#endif
 
 // MARK: - Routes (stack entries below home)
 
@@ -65,6 +69,22 @@ struct SNMessage: Identifiable, Equatable {
     var state: String?
     /// Non-nil = render as a PayBubble instead of a text bubble.
     var pay: SNPayInfo?
+    /// Encrypted media attachments (White Noise / Marmot MIP-04). Non-empty ⇒
+    /// render a media bubble (image inline, else a file chip).
+    var media: [SNMediaItem] = []
+}
+
+/// A media attachment on a Sonar message. `url` is the Blossom URL of the
+/// CIPHERTEXT; `groupId` is the Marmot group needed to download + decrypt it.
+struct SNMediaItem: Equatable {
+    let url: String
+    let mime: String
+    let filename: String
+    let groupId: String
+    /// For BLE-mesh media (bitchat file transfer): the local file path on disk.
+    /// When set, the bytes are loaded locally instead of downloaded from Blossom.
+    var localPath: String? = nil
+    var isImage: Bool { mime.hasPrefix("image/") }
 }
 
 /// A public channel row: the `#mesh` channel or one geohash level around the
@@ -101,7 +121,7 @@ struct SNPeerItem: Identifiable {
 
 /// A peer's Sonar discovery profile (verified announce, type 0x53):
 /// their White Noise / Marmot identity plus optional payment address.
-struct SonarPeerProfile: Equatable {
+struct SonarPeerProfile: Equatable, Codable {
     let npub: String        // bech32 npub1…
     let bip353: String?     // payment address (user@domain)
     let capabilities: UInt8
@@ -141,6 +161,9 @@ final class SonarAppStore: ObservableObject {
         /// ⚡PAY capability on a configured, receive-capable wallet.
         static let walletConfigured = "sonar.wallet.configured"
         static let legacyDemoState = "sn_proto_v1" // removed prototype persistence
+        /// Persisted Sonar profiles ([fingerprint: SonarPeerProfile] JSON) so a
+        /// peer's npub↔identity link survives restarts (one folded conversation).
+        static let sonarProfiles = "sonar.peerProfiles.v1"
     }
 
     static let marmotIDPrefix = "marmot:"
@@ -178,7 +201,14 @@ final class SonarAppStore: ObservableObject {
     @Published private(set) var mode: String
     @Published private(set) var marmotVerified: [String: Bool]
     /// Sonar discovery profiles received from nearby peers, keyed by PeerID.id.
+    /// LIVE only (the short PeerID rotates) — see `sonarProfilesByFingerprint`
+    /// for the persisted, restart-surviving copy.
     @Published private(set) var sonarProfiles: [String: SonarPeerProfile] = [:]
+    /// Persisted Sonar profiles keyed by the peer's STABLE Noise fingerprint, so
+    /// the npub↔peer link survives a restart / BLE-down. This keeps a Sonar
+    /// peer's mesh (Noise) and White Noise (Marmot) legs folded into ONE
+    /// conversation even when the live 0x53 announce isn't currently arriving.
+    private var sonarProfilesByFingerprint: [String: SonarPeerProfile] = [:]
     /// Our optional BIP-353 payment address ("" = unset, TLV omitted).
     @Published private(set) var bip353: String
     /// Mirrors wallet.state for the UI (balance row, PaySheet, claims).
@@ -276,11 +306,15 @@ final class SonarAppStore: ObservableObject {
         marmot.$npub
             .receive(on: DispatchQueue.main)
             .sink { [weak self] npub in
-                self?.wireSonarProfileProvider(npub)
+                guard let self else { return }
+                self.wireSonarProfileProvider(npub)
+                // Publish our kind-0 profile (NIP-01) so peers resolve our
+                // nickname instead of our npub. MIP-00 identity == Nostr pubkey.
+                if npub != nil { self.marmot.publishProfile(name: self.chatViewModel.nickname) }
                 // The wallet derives from the same identity (nsec); once the
                 // Marmot identity exists, (re)attempt the deferred wallet setup.
                 #if os(iOS)
-                if npub != nil { (self?.wallet as? BridgedWallet)?.retrySetup() }
+                if npub != nil { (self.wallet as? BridgedWallet)?.retrySetup() }
                 #endif
             }
             .store(in: &cancellables)
@@ -324,6 +358,10 @@ final class SonarAppStore: ObservableObject {
             .sink { [weak self] _ in self?.processIncomingPayLines() }
             .store(in: &cancellables)
 
+        // Restore persisted Sonar profiles so a peer's mesh + White Noise legs
+        // stay folded into one conversation across restarts (before dmRows runs).
+        hydrateSonarProfiles()
+
         if onboarded {
             marmot.connectIfNeeded()
             if locationManager.permissionState == .authorized {
@@ -335,6 +373,16 @@ final class SonarAppStore: ObservableObject {
         }
 
         #if DEBUG
+        // Init probe (only when a debug launch arg is present): pull
+        // <AppSupport>/sonar-debug.txt to confirm the store init ran and that the
+        // launch args reached UserDefaults. NB: pass app args after a `--` so
+        // devicectl doesn't swallow `-sonar.debug.*` as its own options, e.g.
+        // `devicectl … process launch --terminate-existing --device <id> -- \
+        //   <bundle> -sonar.debug.sendMarmot "<npub>|<text>"`.
+        if ["sonar.debug.sendMarmot", "sonar.debug.sendMeshDM", "sonar.debug.route"]
+            .contains(where: { defaults.string(forKey: $0) != nil }) {
+            writeDebugReport("init onboarded=\(onboarded) sendMarmot=\(defaults.string(forKey: "sonar.debug.sendMarmot") ?? "nil") sendMeshDM=\(defaults.string(forKey: "sonar.debug.sendMeshDM") ?? "nil")")
+        }
         // Smoke-test hook: `simctl launch <sim> <bundle> -sonar.debug.route
         // settings` lands in the argument domain (volatile, this launch
         // only) and deep-opens a screen for screenshot verification.
@@ -345,8 +393,165 @@ final class SonarAppStore: ObservableObject {
             default: break
             }
         }
+        // Smoke-test hook (on-device, USB): launch with
+        // `-sonar.debug.sendMeshDM "<text>"` to send a private mesh DM to the
+        // first connected/reachable peer ~12s after launch (once BLE has had
+        // time to connect + handshake). Logs the target peerID + text so the
+        // send/receive can be confirmed from device logs without UI automation.
+        if onboarded, let text = defaults.string(forKey: "sonar.debug.sendMeshDM"), !text.isEmpty {
+            scheduleDebugMeshDM(text)
+        }
+        // `-sonar.debug.sendMeshImage 1`: send a generated test JPEG to the first
+        // connected/reachable mesh peer ~12s after launch over the bitchat file
+        // transfer path (type 0x22). Verifies Sonar→stock-bitchat BLE media interop
+        // without UI automation (the phone must be unlocked + Sonar foreground).
+        if onboarded, let flag = defaults.string(forKey: "sonar.debug.sendMeshImage"), !flag.isEmpty {
+            scheduleDebugMeshImage()
+        }
+        // `-sonar.debug.sendMarmot "<text>"`: force the White Noise (Marmot) path
+        // to the first discovered Sonar peer ~25s after launch (after 0x53
+        // discovery has populated its npub). This exercises the BLE→White Noise
+        // fallback transport directly, independent of BLE reachability.
+        if onboarded, let raw = defaults.string(forKey: "sonar.debug.sendMarmot"), !raw.isEmpty {
+            // Single launch arg (two devicectl `-key value` pairs parse
+            // unreliably). Format "<npub1…>|<text>" → DIRECT White Noise send to
+            // that npub (bypasses BLE 0x53 discovery, verifies the Marmot/relay
+            // transport device-to-device). Plain "<text>" → send to the first
+            // discovered Sonar peer.
+            if raw.hasPrefix("npub1"), let sep = raw.firstIndex(of: "|") {
+                let npub = String(raw[raw.startIndex..<sep])
+                let text = String(raw[raw.index(after: sep)...])
+                scheduleDebugMarmotDirect(text, npub: npub)
+            } else {
+                scheduleDebugMarmot(raw)
+            }
+        }
         #endif
     }
+
+    #if DEBUG
+    /// Append a line to <AppSupport>/sonar-debug.txt — reliably pullable with
+    /// `devicectl device copy from` when os_log streaming is unavailable.
+    private func writeDebugReport(_ line: String) {
+        guard let base = try? FileManager.default.url(
+            for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true
+        ) else { return }
+        let url = base.appendingPathComponent("sonar-debug.txt")
+        let stamped = line + "\n"
+        guard let data = stamped.data(using: .utf8) else { return }
+        if let h = try? FileHandle(forWritingTo: url) {
+            h.seekToEndOfFile(); h.write(data); try? h.close()
+        } else {
+            try? data.write(to: url)
+        }
+    }
+
+    /// Direct White Noise send to an explicit npub (bypasses BLE 0x53 discovery).
+    /// Retries the send and writes the Marmot connect/group state to a file each
+    /// attempt so the relay round-trip can be diagnosed without iOS log streaming.
+    private func scheduleDebugMarmotDirect(_ text: String, npub: String, attempt: Int = 0, sent: Bool = false) {
+        let delay: Double = attempt == 0 ? 14 : 8
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            let grp = self.marmotGroup(forNpub: npub)
+            let connected = self.marmot.npub != nil
+            self.writeDebugReport("marmotDirect attempt=\(attempt) connected=\(connected) err=\(self.marmot.errorText ?? "nil") groups=\(self.marmot.groups.count) groupForNpub=\(grp?.id ?? "none") sent=\(sent)")
+            var didSend = sent
+            if !sent && connected {
+                self.sendOverMarmot(text, npub: npub)
+                didSend = true
+            }
+            if attempt < 6 { self.scheduleDebugMarmotDirect(text, npub: npub, attempt: attempt + 1, sent: didSend) }
+        }
+    }
+
+    private func scheduleDebugMarmot(_ text: String, attempt: Int = 0) {
+        // Retry until 0x53 discovery has populated a Sonar peer's npub (after a
+        // --terminate-existing relaunch the mesh re-handshake + announce can take
+        // longer than a single fixed delay), then force the White Noise path.
+        let delay: Double = attempt == 0 ? 18 : 5
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            if let (peerID, profile) = self.sonarProfiles.first {
+                SecureLogger.warning("🧪 debug.sendMarmot: White Noise send '\(text)' to npub \(profile.npub) (peer \(peerID))", category: .session)
+                self.sendOverMarmot(text, npub: profile.npub)
+            } else if attempt < 10 {
+                self.scheduleDebugMarmot(text, attempt: attempt + 1)
+            } else {
+                SecureLogger.warning("🧪 debug.sendMarmot: gave up — no Sonar peer discovered (no npub)", category: .session)
+            }
+        }
+    }
+    #endif
+
+    #if DEBUG
+    private func scheduleDebugMeshDM(_ text: String) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 12) { [weak self] in
+            guard let self else { return }
+            let my = self.chatViewModel.meshService.myPeerID
+            let target = self.chatViewModel.allPeers.first {
+                $0.peerID != my && ($0.isConnected || $0.isReachable)
+            }
+            guard let peer = target else {
+                SecureLogger.warning("🧪 debug.sendMeshDM: no connected peer to send to", category: .session)
+                return
+            }
+            SecureLogger.warning("🧪 debug.sendMeshDM: sending '\(text)' to peer \(peer.peerID.id) (\(peer.displayName))", category: .session)
+            self.chatViewModel.startPrivateChat(with: peer.peerID)
+            self.chatViewModel.sendPrivateMessage(text, to: peer.peerID)
+        }
+    }
+
+    private func scheduleDebugMeshImage(attempt: Int = 0) {
+        let delay: Double = attempt == 0 ? 12 : 6
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            let my = self.chatViewModel.meshService.myPeerID
+            let target = self.chatViewModel.allPeers.first {
+                $0.peerID != my && ($0.isConnected || $0.isReachable)
+            }
+            guard let peer = target else {
+                if attempt < 8 {
+                    self.scheduleDebugMeshImage(attempt: attempt + 1)
+                } else {
+                    SecureLogger.warning("🧪 debug.sendMeshImage: no connected peer to send to", category: .session)
+                    self.writeDebugReport("sendMeshImage gave up — no connected/reachable peer")
+                }
+                return
+            }
+            guard let jpeg = Self.debugTestJPEG() else {
+                self.writeDebugReport("sendMeshImage: failed to render test JPEG")
+                return
+            }
+            SecureLogger.warning("🧪 debug.sendMeshImage: sending \(jpeg.count)B JPEG to peer \(peer.peerID.id) (\(peer.displayName))", category: .session)
+            self.writeDebugReport("sendMeshImage: \(jpeg.count)B → \(peer.peerID.id) (\(peer.displayName))")
+            self.sendImageOverMesh(peer.peerID, data: jpeg)
+        }
+    }
+
+    /// A small, valid JPEG generated in-process (cyan field + label) for the
+    /// mesh-image smoke test. Returns nil on platforms without UIKit.
+    private static func debugTestJPEG() -> Data? {
+        #if canImport(UIKit)
+        let size = CGSize(width: 240, height: 240)
+        let renderer = UIGraphicsImageRenderer(size: size)
+        let image = renderer.image { ctx in
+            UIColor(red: 0.12, green: 0.74, blue: 0.89, alpha: 1).setFill()
+            ctx.fill(CGRect(origin: .zero, size: size))
+            let text = "SONAR → bitchat"
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: UIFont.boldSystemFont(ofSize: 20),
+                .foregroundColor: UIColor.white,
+            ]
+            let s = text.size(withAttributes: attrs)
+            text.draw(at: CGPoint(x: (size.width - s.width) / 2, y: (size.height - s.height) / 2), withAttributes: attrs)
+        }
+        return image.jpegData(compressionQuality: 0.8)
+        #else
+        return nil
+        #endif
+    }
+    #endif
 
     private func republish<P: Publisher>(_ publisher: P) where P.Output == Void, P.Failure == Never {
         publisher
@@ -371,6 +576,8 @@ final class SonarAppStore: ObservableObject {
     func rename(_ nick: String) {
         chatViewModel.nickname = nick
         chatViewModel.validateAndSaveNickname()
+        // Re-publish our kind-0 profile so peers see the new name.
+        if marmot.npub != nil { marmot.publishProfile(name: chatViewModel.nickname) }
     }
 
     func completeOnboarding(nick: String) {
@@ -514,6 +721,44 @@ final class SonarAppStore: ObservableObject {
         if sonarProfiles[peerID] != profile {
             sonarProfiles[peerID] = profile
         }
+        // Persist the npub↔peer link keyed by the STABLE Noise fingerprint, so the
+        // mesh + White Noise legs stay one conversation across restarts / BLE-down.
+        let fp = chatViewModel.getFingerprint(for: PeerID(str: peerID)) ?? peerID
+        if sonarProfilesByFingerprint[fp] != profile {
+            sonarProfilesByFingerprint[fp] = profile
+            persistSonarProfiles()
+        }
+    }
+
+    private func persistSonarProfiles() {
+        guard let data = try? JSONEncoder().encode(sonarProfilesByFingerprint) else { return }
+        defaults.set(data, forKey: Keys.sonarProfiles)
+    }
+
+    private func hydrateSonarProfiles() {
+        guard let data = defaults.data(forKey: Keys.sonarProfiles),
+              let map = try? JSONDecoder().decode([String: SonarPeerProfile].self, from: data)
+        else { return }
+        sonarProfilesByFingerprint = map
+    }
+
+    /// The Sonar profile for a peer id, preferring the live 0x53 announce and
+    /// falling back to the persisted (by-fingerprint) copy — so a Sonar peer's
+    /// White Noise leg is still recognized when it isn't currently advertising.
+    func resolvedSonarProfile(_ id: String) -> SonarPeerProfile? {
+        if let live = sonarProfiles[id] { return live }
+        let fp = chatViewModel.getFingerprint(for: PeerID(str: id)) ?? id
+        return sonarProfilesByFingerprint[fp]
+    }
+
+    /// The peer key (stable fingerprint) of a persisted/live Sonar peer whose
+    /// npub matches `npub`, if any — used to fold a Marmot group into that peer's
+    /// mesh conversation even with no live announce.
+    func sonarPeerKey(forNpub npub: String) -> String? {
+        if let live = sonarProfiles.first(where: { $0.value.npub == npub })?.key {
+            return chatViewModel.getFingerprint(for: PeerID(str: live)) ?? live
+        }
+        return sonarProfilesByFingerprint.first(where: { $0.value.npub == npub })?.key
     }
 
     /// Inject our Sonar profile into BLEService once the Marmot identity is
@@ -858,38 +1103,47 @@ final class SonarAppStore: ObservableObject {
         for group in marmot.groups {
             let msgs = marmot.messagesByGroup[group.id] ?? []
             let last = msgs.last
-            if let otherNpub = group.memberNpubs.first(where: { $0 != marmot.npub }),
-               let sonarPeerId = sonarProfiles.first(where: { $0.value.npub == otherNpub })?.key {
-                let peerID = PeerID(str: sonarPeerId)
-                let key = chatViewModel.getFingerprint(for: peerID) ?? sonarPeerId
-                if let existing = byKey[key] {
-                    if let last, last.createdAt > (existing.lastDate ?? .distantPast) {
-                        byKey[key] = SNDMRow(
-                            id: existing.id,
-                            title: existing.title,
-                            preview: Self.previewText(last.content),
-                            time: Self.listTime(last.createdAt),
-                            unread: existing.unread,
-                            presence: existing.presence,
-                            verified: existing.verified,
-                            isMarmot: false,
-                            lastDate: last.createdAt
-                        )
-                    }
-                } else {
-                    let mesh = chatViewModel.meshService
-                    byKey[key] = SNDMRow(
-                        id: sonarPeerId,
-                        title: chatViewModel.nicknameForPeer(peerID),
-                        preview: last.map { Self.previewText($0.content) } ?? networkLabel(forPeer: sonarPeerId),
-                        time: last.map { Self.listTime($0.createdAt) } ?? "",
-                        unread: false,
-                        presence: mesh.isPeerConnected(peerID) || mesh.isPeerReachable(peerID),
-                        verified: isVerified(sonarPeerId),
+            let otherNpub = group.memberNpubs.first(where: { $0 != marmot.npub })
+            // Live peer id (only when currently discovered over 0x53) lets us build
+            // a fresh row; the persisted fingerprint still folds into an EXISTING
+            // mesh row when the peer isn't advertising (BLE down / after restart).
+            let liveSonarPeerId = otherNpub.flatMap { np in
+                sonarProfiles.first(where: { $0.value.npub == np })?.key
+            }
+            let foldKey = otherNpub.flatMap { sonarPeerKey(forNpub: $0) }
+            if let foldKey, let existing = byKey[foldKey] {
+                // Same person as a mesh/bitchat chat → merge the White Noise leg
+                // into that one row instead of showing a duplicate conversation.
+                if let last, last.createdAt > (existing.lastDate ?? .distantPast) {
+                    byKey[foldKey] = SNDMRow(
+                        id: existing.id,
+                        title: existing.title,
+                        preview: Self.previewText(last.content),
+                        time: Self.listTime(last.createdAt),
+                        unread: existing.unread,
+                        presence: existing.presence,
+                        verified: existing.verified,
                         isMarmot: false,
-                        lastDate: last?.createdAt
+                        lastDate: last.createdAt
                     )
                 }
+                continue
+            }
+            if let liveSonarPeerId, let foldKey {
+                // Discovered Sonar peer with no mesh transcript yet → one row.
+                let peerID = PeerID(str: liveSonarPeerId)
+                let mesh = chatViewModel.meshService
+                byKey[foldKey] = SNDMRow(
+                    id: liveSonarPeerId,
+                    title: chatViewModel.nicknameForPeer(peerID),
+                    preview: last.map { Self.previewText($0.content) } ?? networkLabel(forPeer: liveSonarPeerId),
+                    time: last.map { Self.listTime($0.createdAt) } ?? "",
+                    unread: false,
+                    presence: mesh.isPeerConnected(peerID) || mesh.isPeerReachable(peerID),
+                    verified: isVerified(liveSonarPeerId),
+                    isMarmot: false,
+                    lastDate: last?.createdAt
+                )
                 continue
             }
             marmotRows.append(SNDMRow(
@@ -969,7 +1223,8 @@ final class SonarAppStore: ObservableObject {
                         author: String(m.senderNpub.prefix(12)),
                         text: m.content,
                         time: Self.clock(m.createdAt),
-                        via: .internet
+                        via: .internet,
+                        media: Self.mediaItems(m, groupId: groupId)
                     )
                 }
             }
@@ -988,14 +1243,18 @@ final class SonarAppStore: ObservableObject {
                     time: Self.clock(m.timestamp), via: payVia, pay: pay
                 ))
             case .notPay:
+                // BLE-mesh media (bitchat file transfer) arrives as an
+                // "[image] <name>" marker with the file already on disk.
+                let mediaItem = meshMediaItem(m.content)
                 return (m.timestamp, SNMessage(
                     id: m.id,
                     mine: mine,
                     author: m.sender,
-                    text: m.content,
+                    text: mediaItem != nil ? "" : m.content,
                     time: Self.clock(m.timestamp),
                     via: via,
-                    state: mine ? Self.stateText(m.deliveryStatus) : nil
+                    state: mine ? Self.stateText(m.deliveryStatus) : nil,
+                    media: mediaItem.map { [$0] } ?? []
                 ))
             }
         }
@@ -1003,7 +1262,7 @@ final class SonarAppStore: ObservableObject {
         // of Bluetooth range. v1 keeps the two transcripts in separate
         // stores but RENDERS them as one, merged chronologically; the
         // White Noise leg always renders as internet (indigo).
-        if let profile = sonarProfiles[id], let group = marmotGroup(forNpub: profile.npub) {
+        if let profile = resolvedSonarProfile(id), let group = marmotGroup(forNpub: profile.npub) {
             dated += (marmot.messagesByGroup[group.id] ?? []).compactMap { m in
                 switch payMapping(m.content, fallbackVia: .internet) {
                 case .hidden:
@@ -1020,7 +1279,8 @@ final class SonarAppStore: ObservableObject {
                         author: m.isMine ? nil : chatViewModel.nicknameForPeer(peerID),
                         text: m.content,
                         time: Self.clock(m.createdAt),
-                        via: .internet
+                        via: .internet,
+                        media: Self.mediaItems(m, groupId: group.id)
                     ))
                 }
             }
@@ -1046,7 +1306,7 @@ final class SonarAppStore: ObservableObject {
         }
         // Sonar peer out of Bluetooth range: continue over White Noise,
         // creating the Marmot group on first send if it doesn't exist yet.
-        if let profile = sonarProfiles[id], dmTransport(id) == .internet {
+        if let profile = resolvedSonarProfile(id), dmTransport(id) == .internet {
             sendOverMarmot(text, npub: profile.npub)
             return
         }
@@ -1072,6 +1332,138 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
+    // MARK: Media (White Noise / Marmot MIP-04)
+
+    /// In-memory decrypted-media cache (raw bytes), keyed by the ciphertext's
+    /// Blossom URL. Cleared by `wipe()` and `eraseAllChats()`.
+    private var mediaImageCache: [String: Data] = [:]
+
+    /// Map a Marmot message's attachments into UI items carrying the group id.
+    static func mediaItems(_ m: MarmotService.MarmotMessage, groupId: String) -> [SNMediaItem] {
+        m.media.map {
+            SNMediaItem(url: $0.url, mime: $0.mimeType, filename: $0.filename, groupId: groupId)
+        }
+    }
+
+    /// True if `id` is a chat that can carry media: an existing Marmot group, a
+    /// Sonar peer whose White Noise group exists, OR a bitchat/mesh peer
+    /// reachable over Bluetooth right now (sent as a bitchat file transfer).
+    func canSendMedia(_ id: String) -> Bool {
+        if marmotGroupId(id) != nil { return true }
+        if let profile = resolvedSonarProfile(id), marmotGroup(forNpub: profile.npub) != nil { return true }
+        return meshReachable(id)
+    }
+
+    /// True for a non-geo private peer reachable over the BLE mesh right now.
+    private func meshReachable(_ id: String) -> Bool {
+        guard marmotGroupId(id) == nil else { return false }
+        let peerID = PeerID(str: id)
+        guard !peerID.isGeoDM else { return false }
+        let mesh = chatViewModel.meshService
+        return mesh.isPeerConnected(peerID) || mesh.isPeerReachable(peerID)
+    }
+
+    /// Send an image. Over the BLE mesh (bitchat file transfer, type 0x22) when
+    /// the peer is reachable over Bluetooth — interops with stock bitchat;
+    /// otherwise encrypt + Blossom-upload + publish over White Noise (Marmot).
+    func sendImage(_ id: String, data: Data, filename: String, mime: String) {
+        if meshReachable(id) {
+            sendImageOverMesh(PeerID(str: id), data: data)
+            return
+        }
+        let groupId: String?
+        if let gid = marmotGroupId(id) {
+            groupId = gid
+        } else if let profile = resolvedSonarProfile(id) {
+            groupId = marmotGroup(forNpub: profile.npub)?.id
+        } else {
+            groupId = nil
+        }
+        guard let gid = groupId else { return }
+        marmot.sendMedia(groupId: gid, data: data, filename: filename, mime: mime)
+    }
+
+    /// Send an image over the BLE mesh by reusing ChatViewModel's bitchat file
+    /// path (saves outgoing, echoes "[image] <name>", sends `sendFilePrivate`).
+    private func sendImageOverMesh(_ peerID: PeerID, data: Data) {
+        chatViewModel.selectedPrivateChatPeer = peerID // target + enable media context
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("sonar-\(UUID().uuidString).jpg")
+        guard (try? data.write(to: tmp)) != nil else { return }
+        chatViewModel.sendImage(from: tmp) { try? FileManager.default.removeItem(at: tmp) }
+    }
+
+    /// Resolve a bitchat file marker ("[image]/[file]/[voice] <name>") to a media
+    /// item with the local on-disk path, if the file exists.
+    private func meshMediaItem(_ content: String) -> SNMediaItem? {
+        let kinds: [(prefix: String, mime: String, dirs: [String])] = [
+            ("[image] ", "image/jpeg", ["images/incoming", "images/outgoing"]),
+            ("[voice] ", "audio/mp4", ["voicenotes/incoming", "voicenotes/outgoing"]),
+            ("[file] ", "application/octet-stream", ["files/incoming", "files/outgoing"]),
+        ]
+        guard let k = kinds.first(where: { content.hasPrefix($0.prefix) }) else { return nil }
+        let name = String(content.dropFirst(k.prefix.count)).trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty,
+              let base = try? FileManager.default.url(
+                  for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false)
+        else { return nil }
+        let safe = (name as NSString).lastPathComponent
+        let filesDir = base.appendingPathComponent("files", isDirectory: true)
+        for dir in k.dirs {
+            let path = filesDir.appendingPathComponent(dir).appendingPathComponent(safe).path
+            if FileManager.default.fileExists(atPath: path) {
+                return SNMediaItem(url: "", mime: k.mime, filename: safe, groupId: "", localPath: path)
+            }
+        }
+        return nil
+    }
+
+    /// Bytes for a media attachment: a local file (BLE-mesh) or download+decrypt
+    /// from Blossom (Marmot), cached by URL.
+    func mediaData(_ item: SNMediaItem) async -> Data? {
+        if let path = item.localPath {
+            return try? Data(contentsOf: URL(fileURLWithPath: path))
+        }
+        if let cached = mediaImageCache[item.url] { return cached }
+        // Persistent on-disk cache: a decrypted blob survives relaunch and, on a
+        // hit, returns WITHOUT touching the serialized Marmot FFI queue — so it
+        // can never queue behind an in-flight sync (the cause of slow media).
+        if let disk = Self.mediaCacheURL(for: item.url),
+           let data = try? Data(contentsOf: disk) {
+            mediaImageCache[item.url] = data
+            return data
+        }
+        guard let data = await marmot.fetchMedia(groupId: item.groupId, url: item.url) else {
+            return nil
+        }
+        mediaImageCache[item.url] = data
+        // Write-through to disk, protected at rest like MessageStore plaintext.
+        if let disk = Self.mediaCacheURL(for: item.url) {
+            try? data.write(to: disk, options: [.atomic, .completeFileProtection])
+        }
+        return data
+    }
+
+    /// `<AppSupport>/media-cache/<sha256(url)>` — content-addressed by the
+    /// ciphertext's Blossom URL (a stable per-blob key). Creates the dir lazily.
+    private static func mediaCacheURL(for url: String) -> URL? {
+        guard !url.isEmpty, let base = try? FileManager.default.url(
+            for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+        else { return nil }
+        let dir = base.appendingPathComponent("media-cache", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let name = SHA256.hash(data: Data(url.utf8)).map { String(format: "%02x", $0) }.joined()
+        return dir.appendingPathComponent(name)
+    }
+
+    /// Erase the on-disk media cache. Called by both wipe paths.
+    private func clearMediaDiskCache() {
+        guard let base = try? FileManager.default.url(
+            for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false)
+        else { return }
+        try? FileManager.default.removeItem(at: base.appendingPathComponent("media-cache", isDirectory: true))
+    }
+
     func openedDM(_ id: String) {
         if marmotGroupId(id) != nil {
             marmot.startPolling()
@@ -1079,8 +1471,9 @@ final class SonarAppStore: ObservableObject {
         } else {
             chatViewModel.startPrivateChat(with: PeerID(str: id))
             // Sonar peers may carry a White Noise leg of the conversation:
-            // keep that transcript fresh while the screen is open.
-            if sonarProfiles[id] != nil {
+            // keep that transcript fresh while the screen is open (resolved =
+            // live OR persisted, so it works even when not currently in range).
+            if resolvedSonarProfile(id) != nil {
                 marmot.connectIfNeeded()
                 marmot.startPolling()
                 if marmot.npub != nil {
@@ -1091,12 +1484,11 @@ final class SonarAppStore: ObservableObject {
     }
 
     func closedDM(_ id: String) {
-        if marmotGroupId(id) != nil {
-            marmot.stopPolling()
-        } else {
-            if sonarProfiles[id] != nil {
-                marmot.stopPolling()
-            }
+        // NB: do NOT stop the Marmot subscription loop here — it now runs for as
+        // long as we're connected (started in performConnect) so welcomes +
+        // messages keep arriving live in the background list, not only while a
+        // chat is open. It is stopped only on wipe / erase.
+        if marmotGroupId(id) == nil {
             if chatViewModel.selectedPrivateChatPeer == PeerID(str: id) {
                 chatViewModel.endPrivateChat()
             }
@@ -1475,6 +1867,58 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
+    // MARK: Delete a single chat (per-row)
+
+    /// Delete ONE conversation from this device. Handles all three Messages-row
+    /// kinds: a pure White Noise/Marmot group (`marmot:<id>`), a mesh/bitchat
+    /// peer, or a Sonar peer whose conversation spans BOTH a mesh leg and a White
+    /// Noise leg (delete both). Local-only — the other party is not notified.
+    func deleteChat(_ id: String) {
+        if let groupId = marmotGroupId(id) {
+            Task { await marmot.deleteGroup(groupId) }
+        } else {
+            // Mesh / Sonar peer: delete the mesh transcript...
+            chatViewModel.deleteConversation(with: PeerID(str: id))
+            // ...and the folded White Noise leg, if this peer has one.
+            if let profile = resolvedSonarProfile(id), let g = marmotGroup(forNpub: profile.npub) {
+                Task { await marmot.deleteGroup(g.id) }
+            }
+        }
+        // If we're currently viewing this chat, return to the Messages list.
+        path.removeAll { route in
+            if case .dm(let rid) = route { return rid == id }
+            return false
+        }
+        objectWillChange.send()
+    }
+
+    // MARK: Erase all chats (keep identity)
+
+    /// Delete every conversation — mesh DMs, public/channel transcripts and
+    /// White Noise (Marmot) secure chats — WITHOUT logging the user out. The
+    /// Noise/Nostr/Marmot identities, nickname, favorites, onboarding and the
+    /// Lightning wallet are preserved; only message history is erased. Use this
+    /// to start fresh (e.g. to drop a broken Marmot group) without re-running
+    /// onboarding. Contrast with `wipe()`, which destroys everything.
+    func eraseAllChats() {
+        path = []
+        // Mesh DMs + public/channel transcripts (in-memory + on-disk store).
+        chatViewModel.clearAllConversations()
+        // White Noise / Marmot groups: wipe the encrypted DB then reconnect
+        // with the SAME identity so new secure chats still work.
+        Task { await marmot.eraseChatsKeepIdentity() }
+        // Drop queued sends + pay-scan state that referenced the erased chats.
+        pendingMarmotSends = [:]
+        scannedPayMessageIDs = []
+        pendingPayPeer = nil
+        // ⚡PAY coins live inside the erased chats — clear the ledger too. The
+        // Lightning wallet seed/balance is separate and is NOT touched.
+        payLedger.wipe()
+        mediaImageCache = [:]
+        clearMediaDiskCache()
+        objectWillChange.send()
+    }
+
     // MARK: Emergency wipe (the real panic path)
 
     func wipe() {
@@ -1496,9 +1940,12 @@ final class SonarAppStore: ObservableObject {
         marmot.messagesByGroup = [:]
         marmotVerified = [:]
         defaults.removeObject(forKey: Keys.marmotVerified)
-        // Stop Sonar discovery announces and forget discovered profiles.
+        // Stop Sonar discovery announces and forget discovered profiles (live +
+        // the persisted npub↔peer link).
         (chatViewModel.meshService as? BLEService)?.sonarProfileProvider = nil
         sonarProfiles = [:]
+        sonarProfilesByFingerprint = [:]
+        defaults.removeObject(forKey: Keys.sonarProfiles)
         // Stop scanning for Unify peers and clear the discovered list (no
         // secrets are stored, but the list must not survive a panic wipe).
         unify.stop()
@@ -1512,6 +1959,8 @@ final class SonarAppStore: ObservableObject {
         BridgedWallet.wipeWalletStorage()
         #endif
         payLedger.wipe()
+        mediaImageCache = [:]
+        clearMediaDiskCache()
         scannedPayMessageIDs = []
         pendingPayPeer = nil
         bip353 = ""

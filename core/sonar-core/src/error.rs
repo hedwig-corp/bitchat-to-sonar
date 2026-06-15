@@ -24,9 +24,21 @@ pub enum Error {
     #[error("nip59 gift wrap error: {0}")]
     Nip59(#[from] nostr::nips::nip59::Error),
 
+    #[error("nip44 encryption error: {0}")]
+    Nip44(#[from] nostr::nips::nip44::Error),
+
     #[error("nostr client error: {0}")]
     NostrClient(#[from] nostr_sdk::client::Error),
 
     #[error("no key package found on relays for {0}")]
     KeyPackageNotFound(PublicKey),
+
+    #[error("encrypted media error: {0}")]
+    Media(String),
+
+    #[error("blossom storage error: {0}")]
+    Blossom(String),
+
+    #[error("http error: {0}")]
+    Http(String),
 }

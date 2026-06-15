@@ -194,6 +194,15 @@ final class MessageStore {
         }
     }
 
+    /// Delete one peer's private transcript file (used by per-chat delete). The
+    /// raw key never hits the FS, so we remove the hashed file for this PeerID.
+    func deletePrivate(peerID: PeerID) {
+        io.async { [weak self] in
+            guard let self else { return }
+            try? FileManager.default.removeItem(at: self.privateFileURL(for: peerID))
+        }
+    }
+
     // MARK: - File helpers
 
     /// One file per peer. Keyed by a filesystem-safe hash of the PeerID so the

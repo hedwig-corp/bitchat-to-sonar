@@ -25,6 +25,31 @@ pub fn derive_geohash_keys(identity_secret: &[u8; 32], geohash: &str) -> Result<
     Ok(Keys::new(sk))
 }
 
+/// Decode a geohash to the centre (latitude, longitude) of its cell — matches
+/// bitchat's `Geohash.decodeCenter`, used to route a channel to the relays
+/// nearest its location. Returns `None` on an invalid character.
+pub fn decode_center(geohash: &str) -> Option<(f64, f64)> {
+    const BASE32: &[u8] = b"0123456789bcdefghjkmnpqrstuvwxyz";
+    let (mut lat0, mut lat1) = (-90.0_f64, 90.0_f64);
+    let (mut lon0, mut lon1) = (-180.0_f64, 180.0_f64);
+    let mut is_lon = true; // the first bit of a geohash refines longitude
+    for ch in geohash.bytes() {
+        let val = BASE32.iter().position(|&b| b == ch.to_ascii_lowercase())?;
+        for i in (0..5).rev() {
+            let bit = (val >> i) & 1;
+            if is_lon {
+                let mid = (lon0 + lon1) / 2.0;
+                if bit == 1 { lon0 = mid } else { lon1 = mid }
+            } else {
+                let mid = (lat0 + lat1) / 2.0;
+                if bit == 1 { lat0 = mid } else { lat1 = mid }
+            }
+            is_lon = !is_lon;
+        }
+    }
+    Some(((lat0 + lat1) / 2.0, (lon0 + lon1) / 2.0))
+}
+
 /// A decrypted (well, plaintext — geohash channels are public) channel message.
 #[derive(Debug, Clone)]
 pub struct GeoMessage {

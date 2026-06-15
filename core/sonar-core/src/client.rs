@@ -7,18 +7,104 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use mdk_core::prelude::*;
 use nostr::prelude::*;
+use nostr_blossom::prelude::*;
 use nostr_sdk::{Client, RelayPoolNotification};
 
 use crate::identity::Identity;
 use crate::marmot::{ChatMessage, MarmotEngine, KEY_PACKAGE_KIND};
 use crate::{Error, Result};
 
+/// Blossom user-server-list event kind (BUD-03): the user's preferred blob
+/// servers, newest first.
+const BLOSSOM_SERVER_LIST_KIND: u16 = 10063;
+
+/// Fallback Blossom server when the user has published no kind-10063 list.
+pub const DEFAULT_BLOSSOM_SERVER: &str = "https://blossom.primal.net";
+
+/// Hard ceiling on a single downloaded media blob. The URL comes from the
+/// SENDER (untrusted), so this bounds memory use against a malicious/huge blob.
+/// Comfortably above any real image while well under MDK's 100 MB MIP-04 limit.
+const MAX_MEDIA_DOWNLOAD_BYTES: usize = 25 * 1024 * 1024;
+
+/// Shared HTTP client for Blossom media downloads. Built once so every blob
+/// reuses keep-alive connections + the TLS session cache instead of paying a
+/// fresh connect + handshake per download (the White Noise reference client
+/// keeps a single static client for exactly this reason).
+static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(60))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+});
+
+/// Download raw bytes for an encrypted media blob by its full imeta URL.
+///
+/// Hardening (the URL is attacker-controllable — it is whatever the message
+/// sender put in the imeta tag): require **https** (no SSRF to plaintext/local
+/// schemes) and stream with a hard size cap (no memory-DoS from a server that
+/// lies about / omits Content-Length). Integrity is still verified afterwards by
+/// `decrypt_from_download` (AEAD + original-hash check).
+async fn http_get(url: &str) -> Result<Vec<u8>> {
+    if !url.starts_with("https://") {
+        return Err(Error::Http(format!("refusing non-https media url: {url}")));
+    }
+    let mut resp = HTTP_CLIENT
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| Error::Http(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Err(Error::Http(format!("GET {url} -> HTTP {}", resp.status())));
+    }
+    if let Some(len) = resp.content_length() {
+        if len as usize > MAX_MEDIA_DOWNLOAD_BYTES {
+            return Err(Error::Http(format!(
+                "media too large: {len} bytes (cap {MAX_MEDIA_DOWNLOAD_BYTES})"
+            )));
+        }
+    }
+    let mut out: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| Error::Http(e.to_string()))? {
+        if out.len() + chunk.len() > MAX_MEDIA_DOWNLOAD_BYTES {
+            return Err(Error::Http("media exceeds size cap".into()));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
+}
+
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Extra lookback applied ONLY to the gift-wrap (welcome) `.since` filter.
+/// NIP-59 deliberately backdates a gift wrap's `created_at` (up to ~2 days, we
+/// use a comfortable margin) to defeat timing analysis, so a tight watermark
+/// would silently miss a just-received welcome. Mirrors White Noise's
+/// `GIFTWRAP_LOOKBACK_BUFFER`.
+const GIFTWRAP_LOOKBACK_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Safety overlap subtracted from the watermark on every incremental fetch, to
+/// cover clock skew and events that landed on a relay mid-sync. Already-seen
+/// events are tolerated (MDK dedups on processing), so a small overlap is free.
+const SYNC_OVERLAP_SECS: u64 = 60;
+
+/// Stable subscription ids for the live Marmot tail (so re-subscribing the
+/// group filter REPLACES it rather than stacking new subscriptions).
+const SUB_MARMOT_WELCOMES: &str = "sonar-marmot-welcomes";
+const SUB_MARMOT_GROUPS: &str = "sonar-marmot-groups";
+
+/// Hard cap on the live Marmot event buffer. The handler pushes here while the
+/// host drains via `drain_pending_marmot`; if a host has not wired draining yet
+/// (e.g. a platform still on the poll path), this bounds memory — dropped live
+/// events are recovered by the watermarked `sync()` safety net, so capping never
+/// loses a message permanently. When full, the oldest half is dropped (amortizes
+/// the shift cost vs dropping one-at-a-time).
+const MARMOT_BUFFER_CAP: usize = 1024;
 
 /// One received geohash channel event (ephemeral kind-20000), buffered from the
 /// live subscription. Geohash channels are public ephemeral events — relays do
@@ -42,14 +128,65 @@ struct RawGeoDm {
 
 type GeoDmBuf = Arc<Mutex<HashMap<(String, String), Vec<RawGeoDm>>>>;
 
+/// Live presence (kind-20001) per geohash channel: participant pubkey hex →
+/// last-seen unix seconds. Presence events are ephemeral heartbeats, so we keep
+/// only the most recent timestamp per participant and count those still within
+/// the TTL when reporting "N here now".
+type GeoPresenceBuf = Arc<Mutex<HashMap<String, HashMap<String, u64>>>>;
+
+/// How long a presence heartbeat keeps a participant counted as "here now".
+/// iOS re-broadcasts kind-20001 every 40-80s, well within this window.
+const PRESENCE_TTL_SECS: u64 = 300;
+
+/// A user's public Nostr profile (kind-0 metadata, NIP-01). Marmot identity IS
+/// a Nostr pubkey (MIP-00), and MIP-00 leaves display names out of scope, so the
+/// standard Nostr profile mechanism resolves a member's human-readable name and
+/// avatar. All fields are optional (a peer may not have published a profile).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Profile {
+    pub name: Option<String>,
+    pub display_name: Option<String>,
+    pub about: Option<String>,
+    pub picture: Option<String>,
+    pub nip05: Option<String>,
+}
+
+impl Profile {
+    /// The best human-readable label: display_name, else name, else None.
+    pub fn best_name(&self) -> Option<&str> {
+        self.display_name
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| self.name.as_deref().filter(|s| !s.trim().is_empty()))
+    }
+}
+
 pub struct SonarClient {
     engine: MarmotEngine,
     nostr: Client,
     relays: Vec<RelayUrl>,
     geo: Arc<Mutex<HashMap<String, Vec<RawGeo>>>>,
     geo_dm: GeoDmBuf,
+    geo_presence: GeoPresenceBuf,
     geo_subscribed: Arc<Mutex<HashSet<String>>>,
     identity_secret: [u8; 32],
+    /// Unix-seconds watermark of the last successful [`SonarClient::sync`].
+    /// Scopes each poll's `.since(...)` so we fetch only NEW welcomes/messages
+    /// instead of re-downloading + re-processing all history every 5s. 0 until
+    /// the first sync completes (an unbounded backfill, like White Noise's
+    /// `since = None` on a fresh account).
+    last_sync: Arc<Mutex<u64>>,
+    /// Live Marmot events (welcomes 1059→us + group 445s) pushed by the
+    /// notification handler. Drained + MLS-processed on the host's serialized
+    /// engine thread via `drain_pending_marmot` — the handler NEVER touches the
+    /// engine, so MLS state mutation stays single-threaded (the MLS invariant).
+    pending_marmot: Arc<Mutex<Vec<Event>>>,
+    /// Fired whenever a live Marmot event is buffered, so `wait_for_marmot_event`
+    /// wakes the host to drain in real time (push) instead of polling.
+    marmot_notify: Arc<tokio::sync::Notify>,
+    /// Whether to join geohash-nearest relays on subscribe (real sessions); off
+    /// for in-memory/test sessions so they stay network-free against a MockRelay.
+    allow_geo_relays: bool,
 }
 
 impl SonarClient {
@@ -67,20 +204,21 @@ impl SonarClient {
         db_key: [u8; 32],
     ) -> Result<Self> {
         let engine = MarmotEngine::persistent(identity.clone(), db_path, db_key)?;
-        Self::with_engine(identity, relays, engine).await
+        Self::with_engine(identity, relays, engine, true).await
     }
 
     /// Connect with a volatile in-memory store. State is lost when the client is
     /// dropped. Intended for tests and ephemeral/anonymous sessions.
     pub async fn connect_in_memory(identity: Identity, relays: Vec<RelayUrl>) -> Result<Self> {
         let engine = MarmotEngine::in_memory(identity.clone());
-        Self::with_engine(identity, relays, engine).await
+        Self::with_engine(identity, relays, engine, false).await
     }
 
     async fn with_engine(
         identity: Identity,
         relays: Vec<RelayUrl>,
         engine: MarmotEngine,
+        allow_geo_relays: bool,
     ) -> Result<Self> {
         let nostr = Client::new(identity.keys().clone());
         for relay in &relays {
@@ -93,23 +231,66 @@ impl SonarClient {
         // delivered live to active subscriptions; relays don't store them.
         let geo: Arc<Mutex<HashMap<String, Vec<RawGeo>>>> = Arc::new(Mutex::new(HashMap::new()));
         let geo_dm: GeoDmBuf = Arc::new(Mutex::new(HashMap::new()));
+        let geo_presence: GeoPresenceBuf = Arc::new(Mutex::new(HashMap::new()));
         let geo_subscribed: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let identity_secret = identity.keys().secret_key().to_secret_bytes();
 
+        let pending_marmot: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
+        let marmot_notify = Arc::new(tokio::sync::Notify::new());
+
         let handler_geo = geo.clone();
         let handler_dm = geo_dm.clone();
+        let handler_presence = geo_presence.clone();
         let handler_subs = geo_subscribed.clone();
+        let handler_pending = pending_marmot.clone();
+        let handler_notify = marmot_notify.clone();
+        // Our MAIN identity pubkey hex: a kind-1059 with this `p` tag is a Marmot
+        // welcome (vs a geohash DM, whose `p` is a per-geohash ephemeral key).
+        let my_pubkey_hex = identity.keys().public_key().to_hex();
         let mut notifications = nostr.notifications();
         tokio::spawn(async move {
-            while let Ok(notification) = notifications.recv().await {
+            loop {
+                let notification = match notifications.recv().await {
+                    Ok(n) => n,
+                    // The notification stream is a BOUNDED tokio broadcast. A busy
+                    // channel (e.g. a whole-country region geohash with many
+                    // people broadcasting presence + messages) can make us fall
+                    // behind: `Lagged` means some events were dropped — keep
+                    // going, do NOT exit. The old `while let Ok` killed the
+                    // collector permanently on the first lag, so Android stopped
+                    // seeing ANY participants/messages while iOS (no such loop)
+                    // kept working.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
                 let RelayPoolNotification::Event { event, .. } = notification else {
                     continue;
                 };
                 match event.kind.as_u16() {
                     20000 => {
-                        let Some(geohash) = tag_value(&event, Alphabet::G) else { continue };
+                        let Some(geohash) = tag_value(&event, Alphabet::G) else {
+                            continue;
+                        };
                         let nickname = tag_value(&event, Alphabet::N).unwrap_or_default();
                         let id = event.id.to_hex();
+                        let ts = event.created_at.as_u64();
+                        // Count a message AUTHOR as an active participant too —
+                        // iOS's GeohashParticipantTracker counts both message
+                        // authors and presence broadcasters within the activity
+                        // window, so a busy channel shows e.g. "5 here now" even
+                        // if those people aren't sending presence heartbeats.
+                        // Counting only presence (the old behaviour) showed "1".
+                        {
+                            let mut pmap = handler_presence.lock().unwrap();
+                            let slot = pmap
+                                .entry(geohash.clone())
+                                .or_default()
+                                .entry(event.pubkey.to_hex())
+                                .or_insert(0);
+                            if ts > *slot {
+                                *slot = ts;
+                            }
+                        }
                         let mut map = handler_geo.lock().unwrap();
                         let bucket = map.entry(geohash).or_default();
                         if !bucket.iter().any(|r| r.id == id) {
@@ -118,27 +299,69 @@ impl SonarClient {
                                 pubkey: event.pubkey,
                                 nickname,
                                 content: event.content.clone(),
-                                ts: event.created_at.as_u64(),
+                                ts,
                             });
                         }
                     }
+                    20001 => {
+                        // Presence heartbeat: record the freshest timestamp per
+                        // participant so "N here now" counts live participants.
+                        let Some(geohash) = tag_value(&event, Alphabet::G) else {
+                            continue;
+                        };
+                        let mut map = handler_presence.lock().unwrap();
+                        let bucket = map.entry(geohash).or_default();
+                        let ts = event.created_at.as_u64();
+                        let slot = bucket.entry(event.pubkey.to_hex()).or_insert(0);
+                        if ts > *slot {
+                            *slot = ts;
+                        }
+                    }
                     1059 => {
-                        // Gift wrap: the `p` tag names our per-geohash recipient
-                        // key. Find which active channel it targets, unwrap with
-                        // that key, and record the kind-14 DM.
-                        let Some(p_hex) = tag_value(&event, Alphabet::P) else { continue };
-                        let subs: Vec<String> = handler_subs.lock().unwrap().iter().cloned().collect();
+                        // Gift wrap: the `p` tag names the recipient key.
+                        let Some(p_hex) = tag_value(&event, Alphabet::P) else {
+                            continue;
+                        };
+                        // Addressed to our MAIN identity → a Marmot welcome.
+                        // Buffer it (do NOT touch the MLS engine here) and wake
+                        // the host to drain + process it on its engine thread.
+                        if p_hex == my_pubkey_hex {
+                            {
+                                let mut buf = handler_pending.lock().unwrap();
+                                if buf.len() >= MARMOT_BUFFER_CAP {
+                                    buf.drain(0..MARMOT_BUFFER_CAP / 2);
+                                }
+                                buf.push((*event).clone());
+                            }
+                            handler_notify.notify_one();
+                            continue;
+                        }
+                        // Otherwise the `p` tag names a per-geohash recipient key:
+                        // find which active channel it targets, unwrap with that
+                        // key, and record the kind-14 DM.
+                        let subs: Vec<String> =
+                            handler_subs.lock().unwrap().iter().cloned().collect();
                         for geohash in subs {
-                            let Ok(keys) = crate::geohash::derive_geohash_keys(&identity_secret, &geohash) else { continue };
+                            let Ok(keys) =
+                                crate::geohash::derive_geohash_keys(&identity_secret, &geohash)
+                            else {
+                                continue;
+                            };
                             if keys.public_key().to_hex() != p_hex {
                                 continue;
                             }
-                            if let Ok(unwrapped) = UnwrappedGift::from_gift_wrap(&keys, &event).await {
+                            if let Ok(unwrapped) =
+                                UnwrappedGift::from_gift_wrap(&keys, &event).await
+                            {
                                 if unwrapped.rumor.kind.as_u16() != 14 {
                                     break;
                                 }
                                 let peer_hex = unwrapped.sender.to_hex();
-                                let id = unwrapped.rumor.id.map(|i| i.to_hex()).unwrap_or_else(|| event.id.to_hex());
+                                let id = unwrapped
+                                    .rumor
+                                    .id
+                                    .map(|i| i.to_hex())
+                                    .unwrap_or_else(|| event.id.to_hex());
                                 let mut map = handler_dm.lock().unwrap();
                                 let bucket = map.entry((geohash.clone(), peer_hex)).or_default();
                                 if !bucket.iter().any(|r| r.id == id) {
@@ -154,24 +377,64 @@ impl SonarClient {
                             break;
                         }
                     }
+                    445 => {
+                        // Live MLS group message for one of our subscribed groups
+                        // (the relay only sends 445s matching our `#h` filter).
+                        // Buffer + wake; processing happens on the host's engine
+                        // thread via drain_pending_marmot.
+                        {
+                            let mut buf = handler_pending.lock().unwrap();
+                            if buf.len() >= MARMOT_BUFFER_CAP {
+                                buf.drain(0..MARMOT_BUFFER_CAP / 2);
+                            }
+                            buf.push((*event).clone());
+                        }
+                        handler_notify.notify_one();
+                    }
                     _ => {}
                 }
             }
         });
 
-        Ok(Self {
+        // Resume incremental sync across restarts: start the watermark at the
+        // newest event already in the store (see `latest_message_secs`), so a
+        // relaunch fetches only what is new instead of re-downloading the entire
+        // White Noise history every time. The gift-wrap fetch still applies its
+        // 7-day NIP-59 lookback on top of this.
+        let resume_watermark = engine.latest_message_secs();
+        let client = Self {
             engine,
             nostr,
             relays,
             geo,
             geo_dm,
+            geo_presence,
             geo_subscribed,
             identity_secret,
-        })
+            last_sync: Arc::new(Mutex::new(resume_watermark)),
+            pending_marmot,
+            marmot_notify,
+            allow_geo_relays,
+        };
+        // Open the live Marmot subscriptions for real sessions. In-memory test
+        // sessions (allow_geo_relays=false) stay on the explicit `sync()` path so
+        // the e2e tests remain deterministic and network-shaped.
+        if allow_geo_relays {
+            if let Err(err) = client.subscribe_marmot().await {
+                tracing::debug!(%err, "marmot live subscribe failed (sync() still covers it)");
+            }
+        }
+        Ok(client)
     }
 
     pub fn identity(&self) -> &Identity {
         self.engine.identity()
+    }
+
+    /// Access the transport-free Marmot engine. Primarily for tests that exercise
+    /// the media crypto path (encrypt/imeta/decrypt) without a Blossom server.
+    pub fn engine(&self) -> &MarmotEngine {
+        &self.engine
     }
 
     /// Publish our kind-30443 KeyPackage so others can start groups with us.
@@ -179,6 +442,42 @@ impl SonarClient {
         let event = self.engine.key_package_event(self.relays.clone())?;
         self.nostr.send_event(&event).await?;
         Ok(())
+    }
+
+    /// Fetch ALL of `author`'s KeyPackage events from the relays (a peer may have
+    /// several under different `d` tags — e.g. multiple devices, or a stale slot
+    /// from an old install). Newest first.
+    pub async fn fetch_all_key_packages(&self, author: PublicKey) -> Result<Vec<Event>> {
+        let filter = Filter::new()
+            .kind(Kind::Custom(KEY_PACKAGE_KIND))
+            .author(author);
+        let mut events: Vec<Event> = self
+            .nostr
+            .fetch_events(filter, FETCH_TIMEOUT)
+            .await?
+            .into_iter()
+            .collect();
+        events.sort_by_key(|e| std::cmp::Reverse(e.created_at));
+        Ok(events)
+    }
+
+    /// Create a 1:1 group inviting the holder of a SPECIFIC KeyPackage event and
+    /// deliver the welcome. Used to invite via a chosen KeyPackage when a peer has
+    /// several (the newest may be a stale slot the peer no longer holds the key
+    /// material for, which the recipient rejects as "unknown key package").
+    pub async fn start_dm_with_key_package(
+        &self,
+        key_package: Event,
+        name: &str,
+    ) -> Result<GroupId> {
+        let creation = self
+            .engine
+            .create_group(name, vec![key_package], self.relays.clone())?;
+        for (member, rumor) in creation.welcomes {
+            let wrapped = self.engine.gift_wrap_welcome(&member, rumor).await?;
+            self.nostr.send_event(&wrapped).await?;
+        }
+        Ok(creation.group.mls_group_id)
     }
 
     /// Fetch the freshest KeyPackage event for `author` from the relays.
@@ -192,6 +491,43 @@ impl SonarClient {
             .into_iter()
             .next()
             .ok_or(Error::KeyPackageNotFound(author))
+    }
+
+    /// Publish our kind-0 profile (NIP-01 metadata) so peers can resolve our
+    /// display name + avatar. `name` is used for both `name` and `display_name`;
+    /// `about`/`picture` are optional (a bad picture URL is dropped, not fatal).
+    pub async fn publish_profile(
+        &self,
+        name: &str,
+        about: Option<&str>,
+        picture: Option<&str>,
+    ) -> Result<()> {
+        let mut metadata = Metadata::new().name(name).display_name(name);
+        if let Some(about) = about.filter(|s| !s.is_empty()) {
+            metadata = metadata.about(about);
+        }
+        if let Some(url) = picture
+            .filter(|s| !s.is_empty())
+            .and_then(|p| Url::parse(p).ok())
+        {
+            metadata = metadata.picture(url);
+        }
+        self.nostr.set_metadata(&metadata).await?;
+        Ok(())
+    }
+
+    /// Fetch a peer's kind-0 profile from the relays. Returns `None` if they have
+    /// not published one. Used to show a human name/avatar for a Marmot member
+    /// instead of a raw npub.
+    pub async fn fetch_profile(&self, author: PublicKey) -> Result<Option<Profile>> {
+        let metadata = self.nostr.fetch_metadata(author, FETCH_TIMEOUT).await?;
+        Ok(metadata.map(|m| Profile {
+            name: m.name,
+            display_name: m.display_name,
+            about: m.about,
+            picture: m.picture,
+            nip05: m.nip05,
+        }))
     }
 
     /// Start a DM/group with `peer`: fetch their KeyPackage, create the MLS
@@ -216,33 +552,292 @@ impl SonarClient {
         Ok(())
     }
 
-    /// Poll the relays once: first gift-wrapped welcomes addressed to us
-    /// (which may add groups), then kind-445 messages for every known group.
-    /// Duplicate/already-processed events are tolerated by design.
+    // ── Encrypted media (Marmot MIP-04 + Blossom) ─────────────────────────
+
+    /// Send a media attachment to `group_id`: encrypt with the group key
+    /// (MIP-04), upload the ciphertext to a Blossom server, then publish a
+    /// kind-445 message carrying the `imeta` tag and optional `caption`. The
+    /// message is only published AFTER a successful upload, so a failed upload
+    /// never leaves a dangling reference. `server_url` empty →
+    /// [`DEFAULT_BLOSSOM_SERVER`].
+    pub async fn send_media(
+        &self,
+        group_id: &GroupId,
+        data: Vec<u8>,
+        filename: &str,
+        mime: &str,
+        caption: &str,
+        server_url: &str,
+    ) -> Result<()> {
+        let upload = self.engine.encrypt_media(group_id, &data, mime, filename)?;
+        let url = self
+            .blossom_upload(server_url, upload.encrypted_data.clone(), &upload.mime_type)
+            .await?;
+        let event = self
+            .engine
+            .create_media_event(group_id, &upload, &url, caption)?;
+        self.nostr.send_event(&event).await?;
+        self.engine.process_incoming(&event).await?;
+        Ok(())
+    }
+
+    /// Download the encrypted blob at `url` and decrypt it with the group media
+    /// key (resolved from the message's imeta tag). Returns plaintext bytes.
+    pub async fn fetch_media(&self, group_id: &GroupId, url: &str) -> Result<Vec<u8>> {
+        let ciphertext = http_get(url).await?;
+        self.engine.decrypt_media_by_url(group_id, url, &ciphertext)
+    }
+
+    /// Upload an encrypted blob to a Blossom server (BUD-02), authed with our
+    /// Nostr key, returning the URL where it can be fetched.
+    async fn blossom_upload(&self, server_url: &str, data: Vec<u8>, mime: &str) -> Result<String> {
+        let server = if server_url.is_empty() {
+            DEFAULT_BLOSSOM_SERVER
+        } else {
+            server_url
+        };
+        let base = Url::parse(server)
+            .map_err(|e| Error::Blossom(format!("bad server url {server}: {e}")))?;
+        let descriptor = BlossomClient::new(base)
+            .upload_blob(
+                data,
+                Some(mime.to_string()),
+                None,
+                Some(self.identity().keys()),
+            )
+            .await
+            .map_err(|e| Error::Blossom(e.to_string()))?;
+        Ok(descriptor.url.to_string())
+    }
+
+    /// The user's Blossom server list (kind-10063 / BUD-03). Empty if unset.
+    pub async fn blossom_servers(&self) -> Result<Vec<String>> {
+        let filter = Filter::new()
+            .kind(Kind::Custom(BLOSSOM_SERVER_LIST_KIND))
+            .author(self.identity().public_key())
+            .limit(1);
+        let mut servers = Vec::new();
+        for event in self.nostr.fetch_events(filter, FETCH_TIMEOUT).await? {
+            for tag in event.tags.iter() {
+                if tag.kind() == TagKind::Custom("server".into()) {
+                    if let Some(url) = tag.content() {
+                        servers.push(url.to_string());
+                    }
+                }
+            }
+        }
+        Ok(servers)
+    }
+
+    /// Publish our Blossom server list (kind-10063) so peers and our other
+    /// devices know where our blobs live.
+    pub async fn publish_blossom_servers(&self, servers: Vec<String>) -> Result<()> {
+        let tags = servers
+            .into_iter()
+            .map(|s| Tag::custom(TagKind::Custom("server".into()), [s]));
+        let builder = EventBuilder::new(Kind::Custom(BLOSSOM_SERVER_LIST_KIND), "").tags(tags);
+        self.nostr.send_event_builder(builder).await?;
+        Ok(())
+    }
+
+    /// Poll the relays once for anything NEW since the last sync: gift-wrapped
+    /// welcomes addressed to us (which may add groups), then kind-445 messages
+    /// for every known group.
+    ///
+    /// A monotonic per-session watermark scopes each fetch with `.since(...)`,
+    /// so a repeat poll only pulls events newer than the last one instead of
+    /// re-downloading + re-processing the entire history every time (the naive
+    /// version made every 5s poll a full backfill, which also starved media
+    /// downloads queued behind it on the host). All group messages are fetched
+    /// in ONE request batched on the `#h` tag, not one fetch per group. This is
+    /// the same `last_synced_at` + batched-subscription pattern the White Noise
+    /// reference client uses. Duplicate/already-processed events are tolerated.
     pub async fn sync(&self) -> Result<()> {
-        let wraps = Filter::new()
+        // Watermark from the previous successful sync (0 on the first poll of a
+        // session → an unbounded backfill, bounded only by the `#p`/`#h` scope).
+        let since_secs = *self.last_sync.lock().unwrap();
+        // Capture the start time as the next watermark BEFORE fetching, so any
+        // event that lands mid-sync is re-covered by the overlap next poll.
+        let started = Timestamp::now().as_u64();
+
+        let mut wraps = Filter::new()
             .kind(Kind::GiftWrap)
             .pubkey(self.identity().public_key());
-        for event in self.nostr.fetch_events(wraps, FETCH_TIMEOUT).await? {
+        if since_secs > 0 {
+            // Gift wraps are backdated (NIP-59) → extra lookback so we don't
+            // skip a just-received welcome whose wrapper timestamp is in the past.
+            wraps = wraps.since(Timestamp::from_secs(
+                since_secs.saturating_sub(GIFTWRAP_LOOKBACK_SECS),
+            ));
+        }
+        // Scope to OUR Marmot relays, not the whole pool: `subscribe_geohash`
+        // adds up to a dozen geohash-nearest relays per opened channel, none of
+        // which carry our 1059/445 events — fetching from them only makes the
+        // sync wait on their EOSE. The MLS group + KeyPackage relay lists are
+        // built from `self.relays`, so conformant peers publish welcomes there.
+        for event in self
+            .nostr
+            .fetch_events_from(self.relays.clone(), wraps, FETCH_TIMEOUT)
+            .await?
+        {
             if let Err(err) = self.engine.process_incoming(&event).await {
                 tracing::debug!(%err, "skipping gift wrap (likely duplicate)");
             }
         }
 
-        for group in self.engine.groups()? {
-            let filter = Filter::new()
+        // Fetch kind-445 for ALL known groups in one request (batched `#h`),
+        // including any group a welcome just added above.
+        let group_ids: Vec<String> = self
+            .engine
+            .groups()?
+            .into_iter()
+            .map(|g| hex::encode(g.nostr_group_id))
+            .collect();
+        if !group_ids.is_empty() {
+            let mut filter = Filter::new()
                 .kind(Kind::MlsGroupMessage)
-                .custom_tag(
-                    SingleLetterTag::lowercase(Alphabet::H),
-                    hex::encode(group.nostr_group_id),
-                );
-            for event in self.nostr.fetch_events(filter, FETCH_TIMEOUT).await? {
+                .custom_tags(SingleLetterTag::lowercase(Alphabet::H), group_ids);
+            if since_secs > 0 {
+                filter = filter.since(Timestamp::from_secs(
+                    since_secs.saturating_sub(SYNC_OVERLAP_SECS),
+                ));
+            }
+            for event in self
+                .nostr
+                .fetch_events_from(self.relays.clone(), filter, FETCH_TIMEOUT)
+                .await?
+            {
                 if let Err(err) = self.engine.process_incoming(&event).await {
                     tracing::debug!(%err, "skipping group message (likely duplicate)");
                 }
             }
         }
+
+        // Advance the watermark only after a fully successful poll: a fetch
+        // error returns `?` above and leaves the old watermark, so the next
+        // poll re-tries the same window rather than skipping events.
+        *self.last_sync.lock().unwrap() = started;
         Ok(())
+    }
+
+    /// Open the persistent LIVE Marmot subscriptions: welcomes (1059 → us) and
+    /// group messages (445 on our groups' `#h`). The relay pushes new events to
+    /// the notification handler → buffer → `drain_pending_marmot`. Both subs are
+    /// a since-now LIVE TAIL; pre-session history stays with `sync()` (watermark)
+    /// and a freshly-joined group's history is backfilled explicitly in
+    /// `drain_pending_marmot` (its messages predate the watermark).
+    pub async fn subscribe_marmot(&self) -> Result<()> {
+        let wraps = Filter::new()
+            .kind(Kind::GiftWrap)
+            .pubkey(self.identity().public_key())
+            .since(Timestamp::now());
+        self.nostr
+            .subscribe_with_id(SubscriptionId::new(SUB_MARMOT_WELCOMES), wraps, None)
+            .await?;
+        self.subscribe_group_messages().await
+    }
+
+    /// (Re)subscribe the kind-445 live tail (`since = now`) to the CURRENT group
+    /// set. Re-running with the same id REPLACES the filter, so calling this
+    /// after a welcome adds a group widens the live subscription. History for a
+    /// newly-added group is fetched separately by `backfill_group`.
+    async fn subscribe_group_messages(&self) -> Result<()> {
+        let group_ids: Vec<String> = self
+            .engine
+            .groups()?
+            .into_iter()
+            .map(|g| hex::encode(g.nostr_group_id))
+            .collect();
+        if group_ids.is_empty() {
+            return Ok(());
+        }
+        let filter = Filter::new()
+            .kind(Kind::MlsGroupMessage)
+            .custom_tags(SingleLetterTag::lowercase(Alphabet::H), group_ids)
+            .since(Timestamp::now());
+        self.nostr
+            .subscribe_with_id(SubscriptionId::new(SUB_MARMOT_GROUPS), filter, None)
+            .await?;
+        Ok(())
+    }
+
+    /// One-off fetch of a single group's full kind-445 history (no `since`),
+    /// processed through the engine. Used when a welcome adds a group whose
+    /// messages predate the sync watermark, so they'd be missed by both the
+    /// watermarked `sync()` and the since-now live subscription.
+    async fn backfill_group(&self, group_id_hex: &str) -> Result<()> {
+        let filter = Filter::new()
+            .kind(Kind::MlsGroupMessage)
+            .custom_tag(SingleLetterTag::lowercase(Alphabet::H), group_id_hex);
+        for event in self
+            .nostr
+            .fetch_events_from(self.relays.clone(), filter, FETCH_TIMEOUT)
+            .await?
+        {
+            if let Err(err) = self.engine.process_incoming(&event).await {
+                tracing::debug!(%err, "skipping backfilled group message (likely duplicate)");
+            }
+        }
+        Ok(())
+    }
+
+    /// Park until a live Marmot event is buffered (or `timeout_secs` elapses).
+    /// Returns true if there is something to drain. This is the host's "wait for
+    /// push" primitive — it touches NO engine state, so it is the one Marmot call
+    /// the host may run OFF its serialized engine queue.
+    pub async fn wait_for_marmot_event(&self, timeout_secs: u64) -> bool {
+        if !self.pending_marmot.lock().unwrap().is_empty() {
+            return true;
+        }
+        tokio::time::timeout(
+            Duration::from_secs(timeout_secs.max(1)),
+            self.marmot_notify.notified(),
+        )
+        .await
+        .is_ok()
+    }
+
+    /// Process every buffered live Marmot event through the MLS engine, then
+    /// widen the group subscription if a welcome just added a group. Returns true
+    /// if anything was drained. MUST run on the host's serialized engine thread
+    /// (it mutates MLS state); the notification handler only ever BUFFERS.
+    pub async fn drain_pending_marmot(&self) -> Result<bool> {
+        let events: Vec<Event> = {
+            let mut buf = self.pending_marmot.lock().unwrap();
+            if buf.is_empty() {
+                return Ok(false);
+            }
+            std::mem::take(&mut *buf)
+        };
+        let ids_before: HashSet<String> = self
+            .engine
+            .groups()?
+            .into_iter()
+            .map(|g| hex::encode(g.nostr_group_id))
+            .collect();
+        for event in &events {
+            if let Err(err) = self.engine.process_incoming(event).await {
+                tracing::debug!(%err, "skipping live marmot event (likely duplicate)");
+            }
+        }
+        // A welcome may have joined new group(s): backfill each one's history
+        // (predates the watermark + the since-now sub) and widen the live sub.
+        let new_ids: Vec<String> = self
+            .engine
+            .groups()?
+            .into_iter()
+            .map(|g| hex::encode(g.nostr_group_id))
+            .filter(|id| !ids_before.contains(id))
+            .collect();
+        if !new_ids.is_empty() {
+            for id in &new_ids {
+                if let Err(err) = self.backfill_group(id).await {
+                    tracing::debug!(%err, "group backfill failed (sync will retry)");
+                }
+            }
+            let _ = self.subscribe_group_messages().await;
+        }
+        Ok(true)
     }
 
     pub fn groups(&self) -> Result<Vec<group_types::Group>> {
@@ -257,7 +852,38 @@ impl SonarClient {
         self.engine.members(group_id)
     }
 
+    /// Delete a single Marmot chat's local state (see
+    /// [`MarmotEngine::delete_group`]) and narrow the live 445 subscription so we
+    /// stop receiving its messages. Local-only; the peer is not notified.
+    pub async fn delete_group(&self, group_id: &GroupId) -> Result<()> {
+        self.engine.delete_group(group_id)?;
+        if self.allow_geo_relays {
+            let _ = self.subscribe_group_messages().await;
+        }
+        Ok(())
+    }
+
     // ── Geohash public channels (kind-20000 over Nostr) ──
+
+    /// Add + connect the Nostr relays geographically nearest [geohash] — the SAME
+    /// set bitchat's `GeoRelayDirectory` uses for that geohash. Without this our
+    /// channel events land on different relays than a bitchat client subscribes
+    /// to, so neither side sees the other. Best-effort per relay.
+    async fn ensure_geohash_relays(&self, geohash: &str) {
+        if !self.allow_geo_relays {
+            return; // in-memory/test session: stay network-free
+        }
+        // bitchat picks the 5 nearest relays from ITS relay directory. A peer's
+        // directory can differ (or be a stale bundle when its fetch fails — seen
+        // on bitchat-android), so its top pick may rank lower in ours. Join a
+        // WIDER set (12) than bitchat's 5 so the two overlap on at least one
+        // relay even when the directories don't perfectly agree.
+        for url in crate::relay_directory::closest_relays_for_geohash(geohash, 12) {
+            if self.nostr.add_relay(&url).await.is_ok() {
+                let _ = self.nostr.connect_relay(&url).await;
+            }
+        }
+    }
 
     /// Subscribe to a geohash channel so the relay delivers its live
     /// (ephemeral) messages into our buffer. Idempotent.
@@ -268,14 +894,24 @@ impl SonarClient {
                 return Ok(());
             }
         }
+        // Join the geohash's nearest relays (bitchat's set) BEFORE subscribing,
+        // so the subscription covers them and our publishes reach bitchat.
+        self.ensure_geohash_relays(geohash).await;
         // Public channel messages (kind-20000) tagged with this geohash.
         let channel = Filter::new()
             .kind(Kind::Custom(20000))
             .custom_tag(SingleLetterTag::lowercase(Alphabet::G), geohash);
         self.nostr.subscribe(channel, None).await?;
 
+        // Presence heartbeats (kind-20001) tagged with this geohash.
+        let presence = Filter::new()
+            .kind(Kind::Custom(20001))
+            .custom_tag(SingleLetterTag::lowercase(Alphabet::G), geohash);
+        self.nostr.subscribe(presence, None).await?;
+
         // 1:1 DMs (NIP-17 gift wraps) addressed to our per-geohash key.
-        let geo_pk = crate::geohash::derive_geohash_keys(&self.identity_secret, geohash)?.public_key();
+        let geo_pk =
+            crate::geohash::derive_geohash_keys(&self.identity_secret, geohash)?.public_key();
         let dms = Filter::new().kind(Kind::GiftWrap).pubkey(geo_pk);
         self.nostr.subscribe(dms, None).await?;
         Ok(())
@@ -292,17 +928,25 @@ impl SonarClient {
             .build(keys.public_key());
         let ts = rumor.created_at.as_u64();
         let gift = EventBuilder::gift_wrap(&keys, &recipient, rumor, []).await?;
-        self.nostr.send_event(&gift).await?;
-        // Record locally (relays don't echo to the sender).
+        // Record locally first, then publish in the background so the UI shows
+        // the message instantly (relays don't echo to the sender anyway).
         let id = gift.id.to_hex();
-        let mut map = self.geo_dm.lock().unwrap();
-        let bucket = map.entry((geohash.to_string(), recipient_hex.to_string())).or_default();
-        bucket.push(RawGeoDm {
-            id,
-            sender: keys.public_key(),
-            content: text.to_string(),
-            ts,
-            mine: true,
+        {
+            let mut map = self.geo_dm.lock().unwrap();
+            let bucket = map
+                .entry((geohash.to_string(), recipient_hex.to_string()))
+                .or_default();
+            bucket.push(RawGeoDm {
+                id,
+                sender: keys.public_key(),
+                content: text.to_string(),
+                ts,
+                mine: true,
+            });
+        }
+        let nostr = self.nostr.clone();
+        tokio::spawn(async move {
+            let _ = nostr.send_event(&gift).await;
         });
         Ok(())
     }
@@ -355,22 +999,88 @@ impl SonarClient {
         let event = EventBuilder::new(Kind::Custom(20000), text)
             .tags(tags)
             .sign_with_keys(&geo)?;
-        self.nostr.send_event(&event).await?;
-        // Relays don't echo an event back to its sender, so record our own
-        // message locally (deduped by id in case a relay does echo).
+        // Record locally + count ourselves FIRST so the UI shows the message
+        // INSTANTLY, then publish in the BACKGROUND. send_event() awaits a relay
+        // round-trip across EVERY connected relay (a dozen for a geohash); doing
+        // that before recording made the user wait seconds for their own message
+        // to appear. Relays don't echo to the sender, so the local copy is what
+        // the UI renders either way.
         let id = event.id.to_hex();
-        let mut map = self.geo.lock().unwrap();
-        let bucket = map.entry(geohash.to_string()).or_default();
-        if !bucket.iter().any(|r| r.id == id) {
-            bucket.push(RawGeo {
-                id,
-                pubkey: event.pubkey,
-                nickname: nickname.to_string(),
-                content: text.to_string(),
-                ts: event.created_at.as_u64(),
-            });
+        let ts = event.created_at.as_u64();
+        self.geo_presence
+            .lock()
+            .unwrap()
+            .entry(geohash.to_string())
+            .or_default()
+            .insert(event.pubkey.to_hex(), ts);
+        {
+            let mut map = self.geo.lock().unwrap();
+            let bucket = map.entry(geohash.to_string()).or_default();
+            if !bucket.iter().any(|r| r.id == id) {
+                bucket.push(RawGeo {
+                    id,
+                    pubkey: event.pubkey,
+                    nickname: nickname.to_string(),
+                    content: text.to_string(),
+                    ts,
+                });
+            }
         }
+        let nostr = self.nostr.clone();
+        tokio::spawn(async move {
+            let _ = nostr.send_event(&event).await;
+        });
         Ok(())
+    }
+
+    /// Broadcast a presence heartbeat (kind-20001) for a geohash channel, so
+    /// other participants count this device in "N here now". Empty content, a
+    /// single `g`=geohash tag, signed with the stable per-geohash ephemeral key
+    /// (the same key used for messages, so presence and authorship line up).
+    /// Wire-compatible with the iOS `createGeohashPresenceEvent`. Call this on
+    /// channel open and re-call on a ~60s heartbeat while the channel is active.
+    pub async fn send_geohash_presence(&self, geohash: &str) -> Result<()> {
+        self.subscribe_geohash(geohash).await?;
+        let secret = self.identity().keys().secret_key().to_secret_bytes();
+        let geo = crate::geohash::derive_geohash_keys(&secret, geohash)?;
+        let event = EventBuilder::new(Kind::Custom(20001), "")
+            .tags([Tag::custom(
+                TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::G)),
+                [geohash.to_string()],
+            )])
+            .sign_with_keys(&geo)?;
+        // Count ourselves locally first, then publish in the background — the
+        // heartbeat fires for several channels each tick and must not block the
+        // poll on relay round-trips.
+        {
+            let mut map = self.geo_presence.lock().unwrap();
+            let bucket = map.entry(geohash.to_string()).or_default();
+            bucket.insert(event.pubkey.to_hex(), event.created_at.as_u64());
+        }
+        let nostr = self.nostr.clone();
+        tokio::spawn(async move {
+            let _ = nostr.send_event(&event).await;
+        });
+        Ok(())
+    }
+
+    /// Number of participants currently "here now" in a geohash channel: the
+    /// count of distinct presence heartbeats (kind-20001) seen within the TTL.
+    /// Subscribes on first access. Includes this device once it has announced.
+    pub async fn geohash_presence_count(&self, geohash: &str) -> Result<u32> {
+        self.subscribe_geohash(geohash).await?;
+        let cutoff = Timestamp::now().as_u64().saturating_sub(PRESENCE_TTL_SECS);
+        let mut map = self.geo_presence.lock().unwrap();
+        let count = match map.get_mut(geohash) {
+            Some(bucket) => {
+                // Evict stale heartbeats while we're here so the map can't grow
+                // unbounded over a long session in a busy channel.
+                bucket.retain(|_, &mut ts| ts >= cutoff);
+                bucket.len()
+            }
+            None => 0,
+        };
+        Ok(count as u32)
     }
 
     /// Recent messages for a geohash channel from the live buffer, oldest

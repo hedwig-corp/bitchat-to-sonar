@@ -69,6 +69,14 @@ struct PublicTimelineStore {
         }
     }
 
+    /// Erase every timeline (mesh + all geohash channels). Used by the
+    /// "erase all chats" action, which clears conversations but keeps identity.
+    mutating func clearAll() {
+        meshTimeline.removeAll()
+        geohashTimelines.removeAll()
+        pendingGeohashSystemMessages.removeAll()
+    }
+
     @discardableResult
     mutating func removeMessage(withID id: String) -> BitchatMessage? {
         if let index = meshTimeline.firstIndex(where: { $0.id == id }) {

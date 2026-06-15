@@ -11,27 +11,59 @@ import androidx.activity.result.contract.ActivityResultContracts
 
 class MainActivity : ComponentActivity() {
 
-    private val blePermissions: Array<String> =
+    /** Every runtime permission the app needs, requested together so Android
+     *  shows them in one sequence (firing three separate launchers in onCreate
+     *  raced and some grants were silently dropped). */
+    private val requiredPermissions: Array<String> = buildList {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            arrayOf(
-                Manifest.permission.BLUETOOTH_SCAN,
-                Manifest.permission.BLUETOOTH_ADVERTISE,
-                Manifest.permission.BLUETOOTH_CONNECT,
-            )
-        } else {
-            arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+            add(Manifest.permission.BLUETOOTH_SCAN)
+            add(Manifest.permission.BLUETOOTH_ADVERTISE)
+            add(Manifest.permission.BLUETOOTH_CONNECT)
         }
+        add(Manifest.permission.ACCESS_FINE_LOCATION)
+        add(Manifest.permission.ACCESS_COARSE_LOCATION)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }.toTypedArray()
 
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+            // Whatever the user granted, (re)try starting the mesh radio.
             MeshRadio.start()
         }
+
+    /** Request any not-yet-granted permission in a single dialog sequence. */
+    private fun requestAllPermissions() {
+        val missing = requiredPermissions.filter {
+            checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED
+        }
+        if (missing.isEmpty()) MeshRadio.start() else permissionLauncher.launch(missing.toTypedArray())
+    }
+
+    private var unlockCb: ((Boolean) -> Unit)? = null
+    private val unlockLauncher =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { res ->
+            unlockCb?.invoke(res.resultCode == RESULT_OK)
+            unlockCb = null
+        }
+
+    /** Launch the device-credential (PIN/pattern/biometric) confirm screen. */
+    private fun confirmDeviceCredential(onResult: (Boolean) -> Unit) {
+        val km = getSystemService(android.app.KeyguardManager::class.java)
+        @Suppress("DEPRECATION")
+        val intent = km?.createConfirmDeviceCredentialIntent("Unlock Sonar", "Confirm it's you to continue")
+        if (intent == null) { onResult(true); return } // no secure lock → nothing to confirm
+        unlockCb = onResult
+        unlockLauncher.launch(intent)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
+        ActivityBridge.requestUnlock = { cb -> confirmDeviceCredential(cb) }
         meshNoiseSmokeTest()
-        requestMeshPermissions()
+        requestAllPermissions()
         setContent {
             App()
         }
@@ -52,7 +84,7 @@ class MainActivity : ComponentActivity() {
             ini.readMessage(res.writeMessage())    // m2
             res.readMessage(ini.writeMessage())    // m3
             val peerOk = ini.remoteStaticHex() == b.publicHex && res.remoteStaticHex() == a.publicHex
-            ini.finalize(); res.finalize()
+            ini.intoSession(); res.intoSession()
             val ct = ini.encrypt("mesh hello".encodeToByteArray())
             val pt = res.decrypt(ct).decodeToString()
             android.util.Log.i("MeshNoiseSmoke", "ok=${pt == "mesh hello" && peerOk} decrypted=$pt")
@@ -61,11 +93,14 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun requestMeshPermissions() {
-        val granted = blePermissions.all {
-            checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED
-        }
-        if (granted) MeshRadio.start() else permissionLauncher.launch(blePermissions)
+    override fun onResume() {
+        super.onResume()
+        SonarLifecycle.onForeground?.invoke(true)
+    }
+
+    override fun onPause() {
+        super.onPause()
+        SonarLifecycle.onForeground?.invoke(false)
     }
 
     override fun onDestroy() {
