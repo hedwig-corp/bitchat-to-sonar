@@ -29,12 +29,39 @@ actual object MeshRadio {
     // bitchat mainnet service + payload characteristic (from iOS BLEService).
     private val SERVICE_UUID: UUID = UUID.fromString("F47B5E2D-4A9E-4C5A-9B3F-8E1D2C3A4B5C")
     private const val STALE_MS = 20_000L
+    /** Manufacturer-data company id under which we advertise our 8-byte mesh
+     *  node id (for Sonar-Android dialer election). Distinct from Unify's
+     *  0xFFFF; iOS / stock bitchat ignore it. */
+    private const val NODE_ID_COMPANY = 0xFFFE
 
     private val seen = ConcurrentHashMap<String, MeshPeer>()
     private val lastSeen = ConcurrentHashMap<String, Long>()
     @Volatile private var scanning = false
     private var scanner: BluetoothLeScanner? = null
     private var advertiser: BluetoothLeAdvertiser? = null
+
+    // ── Scan watchdog ──
+    // On some controllers (seen on Pixel 10 Pro) a `connectGatt` dial starves the
+    // LE scanner: after the first dial it stops delivering results entirely and
+    // never auto-resumes, so the designated dialer can never re-discover (let
+    // alone re-dial) its peer → mutual-discovery deadlock. A watchdog restarts
+    // the scan whenever it has gone quiet, reviving the starved scanner. Restarts
+    // are spaced ≥ WATCHDOG_GAP_MS apart to stay under Android's "5 scan starts /
+    // 30 s" throttle (which would otherwise silently stop the scan for 30 s).
+    private val handler = android.os.Handler(android.os.Looper.getMainLooper())
+    // Track the last NEW (distinct-address) discovery, not just any scan result:
+    // the Pixel 10 Pro's scanner goes "tunnel-blind" after a dial — it keeps
+    // re-reporting the ONE address it locked onto (so any-result staleness never
+    // trips) while missing every other advertiser, including the peer we need.
+    @Volatile private var lastNewDiscoveryMs = 0L
+    @Volatile private var lastScanStartMs = 0L
+    @Volatile private var scanResultCount = 0L
+    private const val WATCHDOG_TICK_MS = 4_000L
+    private const val WATCHDOG_STALE_MS = 7_000L
+    private const val WATCHDOG_GAP_MS = 8_000L
+    /** Head start the SMALLER node id gets before the larger node also dials, in
+     *  the soft election (see [scanCallback]). */
+    private const val FALLBACK_DIAL_MS = 5_000L
 
     // ── Sonar Discovery (0x53) + bitchat announce over the mesh ──
     private val sonarProfiles = ConcurrentHashMap<String, ByteArray>()
@@ -89,17 +116,9 @@ actual object MeshRadio {
         scanning = true
         try {
             scanner = a.bluetoothLeScanner
-            val filters = listOf(ScanFilter.Builder().setServiceUuid(ParcelUuid(SERVICE_UUID)).build())
-            val settings = ScanSettings.Builder()
-                .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-                // Aggressive matching reports even weak/intermittent advertisers,
-                // and ALL_MATCHES keeps reporting them so they don't time out.
-                .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
-                .setMatchMode(ScanSettings.MATCH_MODE_AGGRESSIVE)
-                .setNumOfMatches(ScanSettings.MATCH_NUM_MAX_ADVERTISEMENT)
-                .setReportDelay(0)
-                .build()
-            scanner?.startScan(filters, settings, scanCallback)
+            startScanInternal()
+            lastNewDiscoveryMs = System.currentTimeMillis()
+            handler.postDelayed(scanWatchdog, WATCHDOG_TICK_MS)
 
             advertiser = a.bluetoothLeAdvertiser
             val advSettings = AdvertiseSettings.Builder()
@@ -110,9 +129,13 @@ actual object MeshRadio {
             val advData = AdvertiseData.Builder()
                 .addServiceUuid(ParcelUuid(SERVICE_UUID))
                 .build()
-            // Device name rides the scan response (a second 31-byte packet) so it
-            // can't overflow the primary advert that carries the 128-bit UUID.
-            val scanResponse = AdvertiseData.Builder().setIncludeDeviceName(true).build()
+            // Scan response carries our 8-byte node id (== peerID) in manufacturer
+            // data, so a peer Sonar-Android can elect a single dialer (the actual
+            // display name comes from the signed announce, not the advert). iOS /
+            // stock bitchat ignore this manufacturer data.
+            val scanResponse = AdvertiseData.Builder()
+                .addManufacturerData(NODE_ID_COMPANY, MeshGatt.nodeId())
+                .build()
             advertiser?.startAdvertising(advSettings, advData, scanResponse, advCallback)
             MeshGatt.startServer()
             android.util.Log.i(TAG, "scanning + advertising $SERVICE_UUID (advertiser=${advertiser != null})")
@@ -127,10 +150,46 @@ actual object MeshRadio {
 
     actual fun stop() {
         scanning = false
+        handler.removeCallbacks(scanWatchdog)
         try { scanner?.stopScan(scanCallback) } catch (_: Throwable) {}
         try { advertiser?.stopAdvertising(advCallback) } catch (_: Throwable) {}
         MeshGatt.stop()
         seen.clear(); lastSeen.clear(); announcedPeers.clear(); announcedSeen.clear()
+    }
+
+    /** (Re)start the LE scan with the mesh filters/settings. */
+    private fun startScanInternal() {
+        val filters = listOf(ScanFilter.Builder().setServiceUuid(ParcelUuid(SERVICE_UUID)).build())
+        val settings = ScanSettings.Builder()
+            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            // Aggressive matching reports even weak/intermittent advertisers,
+            // and ALL_MATCHES keeps reporting them so they don't time out.
+            .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
+            .setMatchMode(ScanSettings.MATCH_MODE_AGGRESSIVE)
+            .setNumOfMatches(ScanSettings.MATCH_NUM_MAX_ADVERTISEMENT)
+            .setReportDelay(0)
+            .build()
+        scanner?.startScan(filters, settings, scanCallback)
+        lastScanStartMs = System.currentTimeMillis()
+    }
+
+    /** Revive a scanner that a `connectGatt` dial has starved (no results for a
+     *  while), spacing restarts to stay under Android's scan-start throttle. */
+    private val scanWatchdog = object : Runnable {
+        override fun run() {
+            if (!scanning) return
+            val now = System.currentTimeMillis()
+            if (now - lastNewDiscoveryMs > WATCHDOG_STALE_MS && now - lastScanStartMs > WATCHDOG_GAP_MS) {
+                android.util.Log.i(
+                    TAG,
+                    "scan tunnel-blind (${now - lastNewDiscoveryMs}ms no new peer, $scanResultCount results) — restarting",
+                )
+                runCatching { scanner?.stopScan(scanCallback) }
+                runCatching { startScanInternal() }
+                lastNewDiscoveryMs = now // give the fresh scan a grace period
+            }
+            handler.postDelayed(this, WATCHDOG_TICK_MS)
+        }
     }
 
     actual fun peers(): List<MeshPeer> {
@@ -157,6 +216,7 @@ actual object MeshRadio {
 
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
+            scanResultCount++
             val id = result.device.address
             val name = runCatching { result.scanRecord?.deviceName }.getOrNull()
                 ?: ("mesh·" + id.takeLast(5).replace(":", ""))
@@ -164,12 +224,30 @@ actual object MeshRadio {
             seen[id] = MeshPeer(id = id, name = name, rssi = result.rssi)
             lastSeen[id] = System.currentTimeMillis()
             if (isNew) {
-                android.util.Log.i(TAG, "discovered peer $name [$id] rssi=${result.rssi}")
-                // Dial each peer ONCE to exchange signed announces (the discovery
-                // handshake). MeshGatt.connect is idempotent per address and uses
-                // TRANSPORT_LE (the earlier status-133 churn was the missing LE
-                // transport + dialing on every advert, both fixed).
-                runCatching { MeshGatt.connect(result.device) }
+                lastNewDiscoveryMs = System.currentTimeMillis()
+                // SOFT dialer election. Two Sonar-Android phones dialing each
+                // other at once race the controller (status 19), so the SMALLER
+                // node id dials immediately and the larger holds back — BUT only
+                // as a head start, not a veto: the larger ALSO dials after a short
+                // fallback delay. A strict "larger never dials" deadlocks whenever
+                // the smaller node's scanner is the weak one (e.g. Pixel 10 Pro,
+                // whose mesh scan goes tunnel-blind after a dial) — it never
+                // re-discovers the peer to dial it, and nobody else does either.
+                // The larger node's healthy scanner then carries the link; the
+                // peer's GATT server accepts inbound dials regardless of its own
+                // scanner. connect()'s dedup + cap + backoff bound the churn, and
+                // status 19 is cleaned up + retried like 133. A peer with NO node
+                // id (iOS / stock bitchat) is dialed immediately (iPhone compat).
+                val peerNodeId = runCatching {
+                    result.scanRecord?.getManufacturerSpecificData(NODE_ID_COMPANY)
+                }.getOrNull()
+                val dialNow = peerNodeId == null || MeshGatt.shouldDial(peerNodeId)
+                android.util.Log.i(TAG, "discovered $id rssi=${result.rssi} nodeId=${peerNodeId != null} dialNow=$dialNow")
+                if (dialNow) {
+                    runCatching { MeshGatt.connect(result.device) }
+                } else {
+                    handler.postDelayed({ runCatching { MeshGatt.connect(result.device) } }, FALLBACK_DIAL_MS)
+                }
             }
         }
 

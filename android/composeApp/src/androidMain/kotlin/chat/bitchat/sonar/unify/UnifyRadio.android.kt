@@ -47,11 +47,15 @@ actual object UnifyRadio {
     private const val FETCH_TIMEOUT_MS = 15_000L
     /** BLE manufacturer-data company id carrying the display name (== iOS). */
     private const val NAME_COMPANY_ID = 0xFFFF
-    /** A private marker (in our scan response) that says "this Unify advertiser
-     *  is actually a Sonar app". Other Sonar scanners skip it — a Sonar peer is
-     *  shown via the mesh, not as a generic "Unify user". The real Unify Wallet
-     *  has no marker, so it still lists correctly. */
-    private const val SONAR_MARKER_COMPANY = 0x53A0
+    /** 16-bit "I am Sonar" marker service UUID (0x53A0), advertised ALONGSIDE the
+     *  Unify service so peer Sonar apps skip us — a Sonar peer is shown via the
+     *  mesh, not as a generic "Unify user". The real Unify Wallet has no marker
+     *  and still lists. A SERVICE UUID (not manufacturer data) is used to match
+     *  iOS: CoreBluetooth can only advertise service UUIDs, and a 16-bit UUID in
+     *  the Bluetooth base range advertises as 2 bytes — visible to both platforms
+     *  (must equal iOS `UnifyNearbyContract.sonarMarkerUUIDString = "53A0"`). */
+    private val SONAR_MARKER_UUID: ParcelUuid =
+        ParcelUuid(UUID.fromString("000053A0-0000-1000-8000-00805F9B34FB"))
 
     private val ctx: Context get() = AppContextHolder.ctx
 
@@ -97,10 +101,17 @@ actual object UnifyRadio {
         try {
             scanner = a.bluetoothLeScanner
             val filters = listOf(ScanFilter.Builder().setServiceUuid(ParcelUuid(SERVICE)).build())
+            // BALANCED, not LOW_LATENCY+AGGRESSIVE: the mesh radio runs its own
+            // concurrent scan in the same app, and on some controllers (Pixel 10
+            // Pro) a flat-out Unify scan monopolises the radio and STARVES the
+            // mesh scan (it delivered only one result then went silent). Payment
+            // discovery tolerates the slightly slower cadence; the mesh link is
+            // the priority. Still ALL_MATCHES so a receiver isn't dropped on a
+            // first-match timeout.
             val settings = ScanSettings.Builder()
-                .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                .setScanMode(ScanSettings.SCAN_MODE_BALANCED)
                 .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
-                .setMatchMode(ScanSettings.MATCH_MODE_AGGRESSIVE)
+                .setMatchMode(ScanSettings.MATCH_MODE_STICKY)
                 .setNumOfMatches(ScanSettings.MATCH_NUM_MAX_ADVERTISEMENT)
                 .setReportDelay(0)
                 .build()
@@ -115,7 +126,7 @@ actual object UnifyRadio {
     actual fun stopScanning() {
         scanning = false
         try { scanner?.stopScan(scanCallback) } catch (_: Throwable) {}
-        seen.clear(); lastSeen.clear()
+        seen.clear(); lastSeen.clear(); loggedAddrs.clear()
     }
 
     actual fun peers(): List<UnifyPeer> {
@@ -129,14 +140,32 @@ actual object UnifyRadio {
             .sortedByDescending { it.rssi }
     }
 
+    /** Addresses already logged once, so the per-advert callback (fires ~10×/s)
+     *  doesn't flood logcat and rotate other tags' lines out of the ring buffer. */
+    private val loggedAddrs = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
+            val addr = result.device.address
             // Skip Sonar apps advertising the Unify receiver — they're shown as
-            // Sonar peers via the mesh, not as generic "Unify users".
-            if (result.scanRecord?.getManufacturerSpecificData(SONAR_MARKER_COMPANY) != null) return
-            val id = result.device.address
-            seen[id] = UnifyPeer(id = id, name = advertisedName(result), rssi = result.rssi)
-            lastSeen[id] = System.currentTimeMillis()
+            // Sonar peers via the mesh, not as generic "Unify users". Both iOS
+            // and Android Sonar carry the 0x53A0 marker service UUID (primary or
+            // scan-response; getServiceUuids merges both).
+            if (result.scanRecord?.serviceUuids?.contains(SONAR_MARKER_UUID) == true) {
+                if (loggedAddrs.add("skip:$addr"))
+                    android.util.Log.i(TAG, "skip Sonar-marked Unify advertiser $addr")
+                return
+            }
+            val rec = result.scanRecord
+            val nm = advertisedName(result)
+            if (loggedAddrs.add("peer:$addr")) {
+                android.util.Log.i(
+                    TAG,
+                    "Unify peer $addr name='$nm' localName=${rec?.deviceName} mfg0xFFFF=${rec?.getManufacturerSpecificData(NAME_COMPANY_ID)?.size}B rssi=${result.rssi}",
+                )
+            }
+            seen[addr] = UnifyPeer(id = addr, name = nm, rssi = result.rssi)
+            lastSeen[addr] = System.currentTimeMillis()
         }
         override fun onScanFailed(errorCode: Int) {
             android.util.Log.e(TAG, "Unify scan failed: $errorCode")
@@ -240,14 +269,26 @@ actual object UnifyRadio {
                 .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
                 .setConnectable(true)
                 .build()
+            // Primary advert: the 128-bit Unify service UUID + the 16-bit "I am
+            // Sonar" marker, IN THE SAME PACKET. Budget: 3 (flags) + 18 (128-bit
+            // UUID) + 4 (16-bit UUID) = 25B ≤ 31B. The marker MUST ride the
+            // primary advert, not the scan response: iOS scans unfiltered with
+            // allowDuplicates and records a peer the instant a packet carries the
+            // Unify UUID, skipping it only if the SAME packet also carries the
+            // marker. A marker in the scan response arrives in a later callback —
+            // too late — so the peer was already (permanently) listed as a "Unify
+            // user" zombie, multiplied by every rotating-MAC the iPhone can't
+            // resolve. Keeping both UUIDs together fixes that. The name overflows
+            // the primary (ADVERTISE_FAILED_DATA_TOO_LARGE), so it stays in the
+            // scan response.
             val data = AdvertiseData.Builder()
                 .addServiceUuid(ParcelUuid(SERVICE))
-                .addManufacturerData(NAME_COMPANY_ID, sanitizeName(name).encodeToByteArray())
+                .addServiceUuid(SONAR_MARKER_UUID)
                 .build()
-            // Scan response carries the "I am Sonar" marker so peer Sonar apps
-            // don't double-list us as a generic Unify user.
+            // Scan response: the display name only (Unify reads it from
+            // manufacturer 0xFFFF). The marker is already in the primary advert.
             val scanResponse = AdvertiseData.Builder()
-                .addManufacturerData(SONAR_MARKER_COMPANY, byteArrayOf(0x01))
+                .addManufacturerData(NAME_COMPANY_ID, sanitizeName(name).encodeToByteArray())
                 .build()
             advertiser?.startAdvertising(settings, data, scanResponse, advCallback)
             advertising = true
