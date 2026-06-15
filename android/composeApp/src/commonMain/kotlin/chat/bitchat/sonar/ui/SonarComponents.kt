@@ -1,6 +1,9 @@
 package chat.bitchat.sonar.ui
 
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.offset
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Box
@@ -46,44 +49,59 @@ fun authorColor(name: String, dark: Boolean): Color {
 }
 
 @Composable
-fun SonarAvatar(name: String, size: Dp, presence: Boolean? = null) {
+fun SonarAvatar(name: String, size: Dp, presence: Boolean? = null, seed: String? = null) {
     val s = sonar
-    val seed = name.ifBlank { "?" }
-    val hue = (snHash(seed) % 360).toFloat()
-    val c1 = Color.hsl(hue, 0.52f, if (s.isDark) 0.55f else 0.5f)
-    val c2 = Color.hsl((hue + 26f) % 360f, 0.5f, if (s.isDark) 0.42f else 0.62f)
+    val key = (seed ?: name).ifBlank { "?" }
+    val h = avatarHash(key)
+    val hue = (h % 360L).toFloat()
+    // Identicon palette — exact CSS values from the prototype Avatar (components.jsx).
+    val bg = Color.hsl(hue, 0.40f, 0.36f)
+    val lite = Color.hsl(hue, 0.64f, 0.70f)
+    val liter = Color.hsl(hue, 0.72f, 0.82f)
     Box(contentAlignment = Alignment.Center) {
-        Box(
-            Modifier.size(size).clip(CircleShape)
-                .background(Brush.linearGradient(listOf(c1, c2)))
-        ) {
-            Text(
-                initials(seed),
-                color = Color.White,
-                fontSize = (size.value * 0.38f).sp,
-                fontWeight = FontWeight.Bold,
-                modifier = Modifier.align(Alignment.Center)
+        Canvas(Modifier.size(size).clip(CircleShape)) {
+            drawRect(bg)
+            val unit = this.size.width / 66f
+            var any = false
+            for (r in 0 until 5) {
+                for (c in 0 until 3) {
+                    if ((h shr (r * 3 + c)) and 1L == 1L) {
+                        any = true
+                        val fill = if ((h shr (r + c + 4)) and 1L == 1L) lite else liter
+                        fun cell(col: Int) = drawRect(
+                            fill,
+                            topLeft = Offset((8 + col * 10) * unit, (8 + r * 10) * unit),
+                            size = androidx.compose.ui.geometry.Size(10 * unit, 10 * unit),
+                        )
+                        cell(c)
+                        if (c < 2) cell(4 - c) // mirror to the right half
+                    }
+                }
+            }
+            if (!any) drawRect(
+                lite,
+                topLeft = Offset(28 * unit, 8 * unit),
+                size = androidx.compose.ui.geometry.Size(10 * unit, 50 * unit),
             )
         }
-        if (presence != null) {
+        // bc-presence: green dot with a bg-colored ring, only when present.
+        if (presence == true) {
             Box(
-                Modifier.align(Alignment.BottomEnd)
-                    .size(size * 0.30f).clip(CircleShape).background(s.bg)
-                    .padding(2.dp)
+                Modifier.align(Alignment.BottomEnd).offset(x = 1.dp, y = 1.dp)
+                    .size(size * 0.30f).clip(CircleShape).background(s.bg),
+                contentAlignment = Alignment.Center
             ) {
-                Box(
-                    Modifier.size(size * 0.30f).clip(CircleShape)
-                        .background(if (presence) s.green else s.text3)
-                )
+                Box(Modifier.size(size * 0.30f - 4.dp).clip(CircleShape).background(s.green))
             }
         }
     }
 }
 
-private fun initials(s: String): String {
-    val cleaned = s.trim()
-    if (cleaned.isEmpty() || cleaned == "?") return "?"
-    return cleaned.take(1).uppercase()
+/** FNV-1a 32-bit (matches the iOS SonarAvatar hash). */
+private fun avatarHash(str: String): Long {
+    var h = 2166136261L
+    for (ch in str) { h = h xor ch.code.toLong(); h = (h * 16777619L) and 0xFFFFFFFFL }
+    return h
 }
 
 @Composable
@@ -186,9 +204,16 @@ fun SNDot(color: Color, size: Dp = 7.dp) {
 
 enum class SNBannerTone { Enc, Net, Neutral, Public }
 
-/** bc-banner: tinted strip with an icon + bold + rest text. */
+/** bc-banner: tinted strip with an icon + bold + rest text + optional action. */
 @Composable
-fun SNBanner(icon: SNIconName, tone: SNBannerTone, bold: String, rest: String) {
+fun SNBanner(
+    icon: SNIconName,
+    tone: SNBannerTone,
+    bold: String,
+    rest: String,
+    actionLabel: String? = null,
+    onAction: (() -> Unit)? = null,
+) {
     val s = sonar
     val (bg, fg) = when (tone) {
         SNBannerTone.Enc -> s.greenSoft to s.green
@@ -206,8 +231,16 @@ fun SNBanner(icon: SNIconName, tone: SNBannerTone, bold: String, rest: String) {
         Spacer(Modifier.width(8.dp))
         Text(
             buildAnnotatedSimple(bold, rest),
-            color = s.text2, fontSize = 13.sp, lineHeight = 17.sp
+            color = s.text2, fontSize = 13.sp, lineHeight = 17.sp,
+            modifier = Modifier.weight(1f)
         )
+        if (actionLabel != null && onAction != null) {
+            Spacer(Modifier.width(8.dp))
+            Box(
+                Modifier.clip(RoundedCornerShape(9.dp)).background(s.surface)
+                    .clickable(onClick = onAction).padding(horizontal = 12.dp, vertical = 6.dp)
+            ) { Text(actionLabel, color = fg, fontSize = 12.5.sp, fontWeight = FontWeight.Bold) }
+        }
     }
 }
 

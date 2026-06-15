@@ -16,9 +16,12 @@ import chat.bitchat.sonar.AppContextHolder
 import chat.bitchat.sonar.BuildConfig
 import chat.bitchat.sonar.crypto.Bech32
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 
 /**
@@ -51,18 +54,28 @@ actual object WalletBridge {
             val secretHex = Bech32.nsecToSecretHex(nsec)
             if (secretHex == null) { current = WalletState.Failed("no identity"); return@withContext }
             current = WalletState.SettingUp
-            try {
-                val seed = WalletSeed.seed64(WalletSeed.hexToBytes(secretHex))
-                val config = defaultConfig(LiquidNetwork.MAINNET, key).apply {
-                    val dir = File(ctx.filesDir, "sonar-wallet/mainnet").apply { mkdirs() }
-                    workingDir = dir.absolutePath
+            // The Breez connect()/getInfo() are blocking native calls — a plain
+            // withTimeoutOrNull can't preempt them (cancellation is cooperative).
+            // Run them in a child coroutine and bound the await: on timeout the UI
+            // gets Failed instead of hanging on SettingUp forever (the abandoned
+            // call finishes on its IO thread but its result is discarded).
+            val outcome = coroutineScope {
+                val work = async(Dispatchers.IO) {
+                    val seed = WalletSeed.seed64(WalletSeed.hexToBytes(secretHex))
+                    val config = defaultConfig(LiquidNetwork.MAINNET, key).apply {
+                        val dir = File(ctx.filesDir, "sonar-wallet/mainnet").apply { mkdirs() }
+                        workingDir = dir.absolutePath
+                    }
+                    val node = connect(ConnectRequest(config, null, null, seed.map { it.toUByte() }))
+                    node to node.getInfo().walletInfo.balanceSat.toLong()
                 }
-                val node = connect(ConnectRequest(config, null, null, seed.map { it.toUByte() }))
-                sdk = node
-                val bal = node.getInfo().walletInfo.balanceSat.toLong()
-                current = WalletState.Ready(bal)
-            } catch (t: Throwable) {
-                current = WalletState.Failed(t.message ?: "wallet setup failed")
+                runCatching { withTimeoutOrNull(20_000) { work.await() } }
+                    .also { if (it.getOrNull() == null) work.cancel() }
+            }
+            current = when {
+                outcome.isFailure -> WalletState.Failed(outcome.exceptionOrNull()?.message ?: "wallet setup failed")
+                outcome.getOrNull() == null -> WalletState.Failed("wallet setup timed out")
+                else -> outcome.getOrThrow()!!.let { (node, bal) -> sdk = node; WalletState.Ready(bal) }
             }
         }
     }
@@ -88,7 +101,9 @@ actual object WalletBridge {
     actual suspend fun send(destination: String, amountSats: Long, note: String): Boolean =
         withContext(Dispatchers.IO) {
             val node = sdk ?: return@withContext false
+            if (amountSats < 0) return@withContext false // never let a bad amount slip through
             try {
+                // amountSats == 0 ⇒ amountless (the invoice/offer carries the amount).
                 val amount: PayAmount? =
                     if (amountSats > 0) PayAmount.Bitcoin(amountSats.toULong()) else null
                 val prepared = node.prepareSendPayment(PrepareSendRequest(destination.trim(), amount))

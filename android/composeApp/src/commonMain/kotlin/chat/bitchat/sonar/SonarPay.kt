@@ -27,7 +27,9 @@ sealed interface PayLine {
             val parts = content.split("|")
             if (parts.size < 3 || parts[1] != "1") return null
             return when (parts[0]) {
-                "⚡PAY" -> parts.getOrNull(3)?.toLongOrNull()?.let { Pay(parts[2], it) }
+                // Reject non-positive sats — a peer-controlled line must not seed
+                // a zero/negative coin into the ledger.
+                "⚡PAY" -> parts.getOrNull(3)?.toLongOrNull()?.takeIf { it > 0 }?.let { Pay(parts[2], it) }
                 "⚡PAYCLAIM" -> parts.getOrNull(3)?.let { Claim(parts[2], it) }
                 "⚡PAYDONE" -> Done(parts[2])
                 else -> null

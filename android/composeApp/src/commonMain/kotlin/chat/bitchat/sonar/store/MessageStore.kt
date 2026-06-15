@@ -17,11 +17,13 @@ import chat.bitchat.sonar.SonarMsg
  * Encryption keeps encrypted at rest (analogous to iOS NSFileProtectionComplete).
  */
 expect object MessageStore {
-    fun loadChannel(geohash: String): List<SonarChannelMsg>
-    fun saveChannel(geohash: String, msgs: List<SonarChannelMsg>)
-    fun loadGeoDm(geohash: String, peerHex: String): List<SonarMsg>
-    fun saveGeoDm(geohash: String, peerHex: String, msgs: List<SonarMsg>)
-    fun wipe()
+    // suspend so the file I/O runs off the main thread (the Android actual
+    // dispatches to Dispatchers.IO) — avoids an ANR on a cold/large store.
+    suspend fun loadChannel(geohash: String): List<SonarChannelMsg>
+    suspend fun saveChannel(geohash: String, msgs: List<SonarChannelMsg>)
+    suspend fun loadGeoDm(geohash: String, peerHex: String): List<SonarMsg>
+    suspend fun saveGeoDm(geohash: String, peerHex: String, msgs: List<SonarMsg>)
+    suspend fun wipe()
 }
 
 /** Cap kept on disk per conversation (matches the in-memory timeline). */

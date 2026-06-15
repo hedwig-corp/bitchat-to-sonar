@@ -332,6 +332,11 @@ impl SonarNoise {
     #[uniffi::constructor]
     pub fn initiator(private_hex: String) -> FfiResult<Arc<Self>> {
         let sk = hex::decode(&private_hex).map_err(invalid("noise private key"))?;
+        if sk.len() != 32 {
+            return Err(SonarFfiError::InvalidInput(
+                "noise private key must be exactly 32 bytes (64 hex chars)".into(),
+            ));
+        }
         Ok(Arc::new(Self {
             phase: Mutex::new(NoisePhase::Handshake(NoiseHandshake::initiator(&sk)?)),
         }))
@@ -340,6 +345,11 @@ impl SonarNoise {
     #[uniffi::constructor]
     pub fn responder(private_hex: String) -> FfiResult<Arc<Self>> {
         let sk = hex::decode(&private_hex).map_err(invalid("noise private key"))?;
+        if sk.len() != 32 {
+            return Err(SonarFfiError::InvalidInput(
+                "noise private key must be exactly 32 bytes (64 hex chars)".into(),
+            ));
+        }
         Ok(Arc::new(Self {
             phase: Mutex::new(NoisePhase::Handshake(NoiseHandshake::responder(&sk)?)),
         }))

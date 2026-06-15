@@ -19,6 +19,7 @@ sealed interface Screen {
     data object Settings : Screen
     data object Profile : Screen
     data object Nearby : Screen
+    data object Search : Screen
     data class Chat(val id: String, val name: String) : Screen
     data class Channel(val geohash: String) : Screen
     data class GeoDm(val geohash: String, val peerHex: String, val name: String) : Screen
@@ -200,8 +201,11 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun openChannel(geohash: String) {
         push(Screen.Channel(geohash))
-        channelMsgs = MessageStore.loadChannel(geohash) // instant, survives restart
-        scope.launch { refreshChannel(geohash) }
+        channelMsgs = emptyList()
+        scope.launch {
+            channelMsgs = MessageStore.loadChannel(geohash) // disk hydrate (off-main), survives restart
+            refreshChannel(geohash)
+        }
     }
 
     /** Fetch the channel from the core, merge with what's on disk, persist. */
@@ -228,8 +232,11 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun openGeoDm(geohash: String, peerHex: String, name: String) {
         if (peerHex.isBlank()) return
         push(Screen.GeoDm(geohash, peerHex, name))
-        messages = MessageStore.loadGeoDm(geohash, peerHex)
-        scope.launch { refreshGeoDm(geohash, peerHex) }
+        messages = emptyList()
+        scope.launch {
+            messages = MessageStore.loadGeoDm(geohash, peerHex) // disk hydrate (off-main)
+            refreshGeoDm(geohash, peerHex)
+        }
     }
 
     private suspend fun refreshGeoDm(geohash: String, peerHex: String) {
@@ -330,7 +337,12 @@ class SonarAppState(private val scope: CoroutineScope) {
         appLockOn = AppLock.isEnabled()
     }
 
+    // The credential prompt backgrounds us; the foreground return it triggers
+    // must NOT re-lock — otherwise a successful unlock immediately re-locks.
+    private var bypassRelock = false
+
     fun unlock() {
+        bypassRelock = true
         AppLock.authenticate { ok -> if (ok) locked = false }
     }
 
@@ -364,7 +376,10 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun setForeground(value: Boolean) {
         val cameToForeground = value && !foreground
         foreground = value
-        if (cameToForeground && AppLock.isEnabled()) locked = true
+        if (cameToForeground) {
+            if (bypassRelock) bypassRelock = false        // return from our own unlock prompt
+            else if (AppLock.isEnabled()) locked = true   // genuine app-switch → re-lock
+        }
     }
 
     private fun notifPreview(content: String): String =

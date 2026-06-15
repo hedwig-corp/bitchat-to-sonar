@@ -4,6 +4,8 @@ import chat.bitchat.sonar.AppContextHolder
 import chat.bitchat.sonar.SonarChannelMsg
 import chat.bitchat.sonar.SonarMsg
 import chat.bitchat.sonar.crypto.Sha256
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.io.File
 
 /**
@@ -21,35 +23,38 @@ actual object MessageStore {
         return File(root(), "$name.txt")
     }
 
-    actual fun loadChannel(geohash: String): List<SonarChannelMsg> {
+    actual suspend fun loadChannel(geohash: String): List<SonarChannelMsg> = withContext(Dispatchers.IO) {
         val f = file("ch", geohash.lowercase())
-        if (!f.exists()) return emptyList()
-        return runCatching { MessageCodec.decodeChannel(f.readText()) }.getOrDefault(emptyList())
+        if (!f.exists()) return@withContext emptyList()
+        runCatching { MessageCodec.decodeChannel(f.readText()) }.getOrDefault(emptyList())
     }
 
-    actual fun saveChannel(geohash: String, msgs: List<SonarChannelMsg>) {
+    actual suspend fun saveChannel(geohash: String, msgs: List<SonarChannelMsg>): Unit = withContext(Dispatchers.IO) {
         runCatching {
             file("ch", geohash.lowercase()).writeText(
                 MessageCodec.encodeChannel(msgs.takeLast(MESSAGE_STORE_CAP))
             )
         }
+        Unit
     }
 
-    actual fun loadGeoDm(geohash: String, peerHex: String): List<SonarMsg> {
+    actual suspend fun loadGeoDm(geohash: String, peerHex: String): List<SonarMsg> = withContext(Dispatchers.IO) {
         val f = file("dm", "${geohash.lowercase()}:${peerHex.lowercase()}")
-        if (!f.exists()) return emptyList()
-        return runCatching { MessageCodec.decodeDm(f.readText()) }.getOrDefault(emptyList())
+        if (!f.exists()) return@withContext emptyList()
+        runCatching { MessageCodec.decodeDm(f.readText()) }.getOrDefault(emptyList())
     }
 
-    actual fun saveGeoDm(geohash: String, peerHex: String, msgs: List<SonarMsg>) {
+    actual suspend fun saveGeoDm(geohash: String, peerHex: String, msgs: List<SonarMsg>): Unit = withContext(Dispatchers.IO) {
         runCatching {
             file("dm", "${geohash.lowercase()}:${peerHex.lowercase()}").writeText(
                 MessageCodec.encodeDm(msgs.takeLast(MESSAGE_STORE_CAP))
             )
         }
+        Unit
     }
 
-    actual fun wipe() {
+    actual suspend fun wipe(): Unit = withContext(Dispatchers.IO) {
         runCatching { root().deleteRecursively() }
+        Unit
     }
 }

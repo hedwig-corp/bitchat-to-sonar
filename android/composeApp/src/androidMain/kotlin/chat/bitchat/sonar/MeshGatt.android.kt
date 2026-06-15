@@ -55,7 +55,9 @@ object MeshGatt {
     private class Link(val noise: SonarNoise, var established: Boolean = false)
     private val serverLinks = ConcurrentHashMap<String, Link>()
     private val clientLinks = ConcurrentHashMap<String, Link>()
-    private val onText: MutableList<(String, String) -> Unit> = mutableListOf()
+    // Iterated from BLE callback threads, mutated from the main thread → must be
+    // a concurrent collection to avoid ConcurrentModificationException.
+    private val onText = java.util.concurrent.CopyOnWriteArrayList<(String, String) -> Unit>()
 
     fun addMessageListener(cb: (peerId: String, text: String) -> Unit) { onText.add(cb) }
 
