@@ -551,6 +551,147 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
 
 
 /**
+ * Reassembles incoming 0x20 fragment payloads into the original bytes. Keyed by
+ * (sender, fragmentID); `add` returns the full bytes once the last piece lands.
+ */
+public protocol MeshReassemblerProtocol: AnyObject, Sendable {
+    
+    /**
+     * Feed one 0x20 fragment payload (with the carrying packet's sender id hex).
+     * Returns the reassembled original bytes when complete, else nil.
+     */
+    func add(senderIdHex: String, fragmentPayload: Data) throws  -> Data?
+    
+}
+/**
+ * Reassembles incoming 0x20 fragment payloads into the original bytes. Keyed by
+ * (sender, fragmentID); `add` returns the full bytes once the last piece lands.
+ */
+open class MeshReassembler: MeshReassemblerProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_sonar_ffi_fn_clone_meshreassembler(self.handle, $0) }
+    }
+public convenience init() {
+    let handle =
+        try! rustCall() {
+    uniffi_sonar_ffi_fn_constructor_meshreassembler_new($0
+    )
+}
+    self.init(unsafeFromHandle: handle)
+}
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_sonar_ffi_fn_free_meshreassembler(handle, $0) }
+    }
+
+    
+
+    
+    /**
+     * Feed one 0x20 fragment payload (with the carrying packet's sender id hex).
+     * Returns the reassembled original bytes when complete, else nil.
+     */
+open func add(senderIdHex: String, fragmentPayload: Data)throws  -> Data?  {
+    return try  FfiConverterOptionData.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_meshreassembler_add(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(senderIdHex),
+        FfiConverterData.lower(fragmentPayload),$0
+    )
+})
+}
+    
+
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMeshReassembler: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = MeshReassembler
+
+    public static func lift(_ handle: UInt64) throws -> MeshReassembler {
+        return MeshReassembler(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: MeshReassembler) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MeshReassembler {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: MeshReassembler, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMeshReassembler_lift(_ handle: UInt64) throws -> MeshReassembler {
+    return try FfiConverterTypeMeshReassembler.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMeshReassembler_lower(_ value: MeshReassembler) -> UInt64 {
+    return FfiConverterTypeMeshReassembler.lower(value)
+}
+
+
+
+
+
+
+/**
  * A Nostr identity (secp256k1 keypair). Wraps `sonar_core::identity::Identity`.
  */
 public protocol SonarIdentityProtocol: AnyObject, Sendable {
@@ -1701,6 +1842,72 @@ public func FfiConverterTypeMeshAnnounceInfo_lower(_ value: MeshAnnounceInfo) ->
 
 
 /**
+ * A decoded mesh file transfer (`BitchatFilePacket`, type 0x22). `content` is
+ * the raw file bytes (already decrypted for a private transfer).
+ */
+public struct MeshFileInfo: Equatable, Hashable {
+    public var fileName: String?
+    public var fileSize: UInt64?
+    public var mimeType: String?
+    public var content: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(fileName: String?, fileSize: UInt64?, mimeType: String?, content: Data) {
+        self.fileName = fileName
+        self.fileSize = fileSize
+        self.mimeType = mimeType
+        self.content = content
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension MeshFileInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMeshFileInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MeshFileInfo {
+        return
+            try MeshFileInfo(
+                fileName: FfiConverterOptionString.read(from: &buf), 
+                fileSize: FfiConverterOptionUInt64.read(from: &buf), 
+                mimeType: FfiConverterOptionString.read(from: &buf), 
+                content: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MeshFileInfo, into buf: inout [UInt8]) {
+        FfiConverterOptionString.write(value.fileName, into: &buf)
+        FfiConverterOptionUInt64.write(value.fileSize, into: &buf)
+        FfiConverterOptionString.write(value.mimeType, into: &buf)
+        FfiConverterData.write(value.content, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMeshFileInfo_lift(_ buf: RustBuffer) throws -> MeshFileInfo {
+    return try FfiConverterTypeMeshFileInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMeshFileInfo_lower(_ value: MeshFileInfo) -> RustBuffer {
+    return FfiConverterTypeMeshFileInfo.lower(value)
+}
+
+
+/**
  * The outer fields of a decoded mesh packet.
  */
 public struct MeshPacketInfo: Equatable, Hashable {
@@ -2277,6 +2484,30 @@ fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionData: FfiConverterRustBuffer {
+    typealias SwiftType = Data?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterData.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterData.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeMeshAnnounceInfo: FfiConverterRustBuffer {
     typealias SwiftType = MeshAnnounceInfo?
 
@@ -2293,6 +2524,30 @@ fileprivate struct FfiConverterOptionTypeMeshAnnounceInfo: FfiConverterRustBuffe
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeMeshAnnounceInfo.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeMeshFileInfo: FfiConverterRustBuffer {
+    typealias SwiftType = MeshFileInfo?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeMeshFileInfo.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeMeshFileInfo.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -2414,6 +2669,31 @@ fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterString.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceData: FfiConverterRustBuffer {
+    typealias SwiftType = [Data]
+
+    public static func write(_ value: [Data], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterData.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [Data] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [Data]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterData.read(from: &buf))
         }
         return seq
     }
@@ -2587,6 +2867,16 @@ public func meshBuildSignedPacket(seedHex: String, packetType: UInt8, senderIdHe
 })
 }
 /**
+ * Decode a `BitchatFilePacket` TLV (already reassembled + decrypted).
+ */
+public func meshDecodeFilePacket(bytes: Data) -> MeshFileInfo?  {
+    return try!  FfiConverterOptionTypeMeshFileInfo.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_func_mesh_decode_file_packet(
+        FfiConverterData.lower(bytes),$0
+    )
+})
+}
+/**
  * Decode the outer fields of any mesh packet.
  */
 public func meshDecodePacket(packetBytes: Data) -> MeshPacketInfo?  {
@@ -2608,6 +2898,20 @@ public func meshDecodePrivateMessage(plaintext: Data) -> MeshPrivateMessage?  {
 })
 }
 /**
+ * Encode a `BitchatFilePacket` TLV (bitchat-compatible). The result is the
+ * payload of a 0x22 packet (private = Noise-encrypt it first, then fragment).
+ */
+public func meshEncodeFilePacket(fileName: String?, fileSize: UInt64?, mimeType: String?, content: Data)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_func_mesh_encode_file_packet(
+        FfiConverterOptionString.lower(fileName),
+        FfiConverterOptionUInt64.lower(fileSize),
+        FfiConverterOptionString.lower(mimeType),
+        FfiConverterData.lower(content),$0
+    )
+})
+}
+/**
  * The inner noiseEncrypted plaintext for a private message: `[0x01][TLV]`.
  */
 public func meshEncodePrivateMessage(messageId: String, content: String)throws  -> Data  {
@@ -2615,6 +2919,20 @@ public func meshEncodePrivateMessage(messageId: String, content: String)throws  
     uniffi_sonar_ffi_fn_func_mesh_encode_private_message(
         FfiConverterString.lower(messageId),
         FfiConverterString.lower(content),$0
+    )
+})
+}
+/**
+ * Split `data` into bitchat-compatible 0x20 fragment payloads (each carries
+ * `original_type`). Wrap each returned payload in a 0x20 packet to send.
+ */
+public func meshFragment(data: Data, fragmentIdHex: String, originalType: UInt8, chunkSize: UInt32)throws  -> [Data]  {
+    return try  FfiConverterSequenceData.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_func_mesh_fragment(
+        FfiConverterData.lower(data),
+        FfiConverterString.lower(fragmentIdHex),
+        FfiConverterUInt8.lower(originalType),
+        FfiConverterUInt32.lower(chunkSize),$0
     )
 })
 }
@@ -2699,13 +3017,22 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_func_mesh_build_signed_packet() != 53546) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_func_mesh_decode_file_packet() != 36326) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_func_mesh_decode_packet() != 8405) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_func_mesh_decode_private_message() != 53773) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_func_mesh_encode_file_packet() != 32345) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_func_mesh_encode_private_message() != 50193) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_mesh_fragment() != 41072) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_func_mesh_parse_announce() != 60089) {
@@ -2721,6 +3048,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_func_wipe_marmot_database() != 5401) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_meshreassembler_add() != 11739) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonaridentity_npub() != 62373) {
@@ -2805,6 +3135,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnoise_write_message() != 7081) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_constructor_meshreassembler_new() != 63788) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_constructor_sonaridentity_generate() != 7736) {
