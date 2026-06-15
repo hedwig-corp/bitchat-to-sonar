@@ -35,6 +35,13 @@ const BC_ICONS = {
   compose: <><path d="M12 5.2H7.2A2.4 2.4 0 0 0 4.8 7.6v9a2.4 2.4 0 0 0 2.4 2.4h9a2.4 2.4 0 0 0 2.4-2.4V12" /><path d="M17.7 4.5l1.8 1.8-6.6 6.6-2.5.7.7-2.5z" /></>,
   coin: <><circle cx="12" cy="12" r="8.4" /><path d="M9.9 8.2h3a1.9 1.9 0 0 1 0 3.8h-3zM9.9 12h3.5a1.9 1.9 0 0 1 0 3.8H9.9zM9.9 8.2V16M11.4 6.6v1.6M11.4 16v1.6" /></>,
   bolt: <path d="M13 3 6 13.5h4.5L11 21l7-10.5h-4.5z" />,
+  photo: <><rect x="4" y="5" width="16" height="14" rx="3" /><circle cx="9" cy="10" r="1.6" /><path d="M5 17.5 9.5 13l2.5 2.5 3-3 4 4" /></>,
+  camera: <><path d="M4.5 8.5a2 2 0 0 1 2-2h1.2l1-1.6h6.6l1 1.6h1.2a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z" /><circle cx="12" cy="12.5" r="3.2" /></>,
+  videocam: <><rect x="3.5" y="7" width="12" height="10" rx="2.5" /><path d="M15.5 11l5-2.6v7.2l-5-2.6z" /></>,
+  mic: <><rect x="9.2" y="3.4" width="5.6" height="11" rx="2.8" /><path d="M5.8 11.5a6.2 6.2 0 0 0 12.4 0M12 17.7V20.4M9 20.6h6" /></>,
+  play: <path d="M7.5 5.5v13l11-6.5z" fill="currentColor" stroke="none" />,
+  doc: <><path d="M6.5 3.5h7l5 5v12a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1v-16a1 1 0 0 1 1-1z" /><path d="M13.5 3.5V8.5h5" /></>,
+  download: <><path d="M12 4v11M7.5 10.5 12 15l4.5-4.5" /><path d="M5 19.5h14" /></>,
 };
 
 function BCIcon({ name, size = 20, weight = 1.8, style, className }) {

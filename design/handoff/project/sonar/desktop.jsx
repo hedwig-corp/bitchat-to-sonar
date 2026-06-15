@@ -1,6 +1,38 @@
 // Sonar Desktop — sidebar, chat pane, radar pane, detail rail, settings modal
 // Depends on: icons.jsx, components.jsx, settings.jsx (StRow/StSwitch/ShareCode), BC_DATA.
 
+/* ── "Around you": same collapsed precision ladder as mobile, sidebar-tuned ── */
+function DkHereRow({ sel, onSelect }) {
+  const ladder = BC_DATA.here || [];
+  const def = (() => {
+    for (let i = 0; i < ladder.length; i++) if (ladder[i].count > 0) return i;
+    return Math.max(0, ladder.length - 1);
+  })();
+  const [idx, setIdx] = React.useState(def);
+  const lv = ladder[idx];
+  if (!lv) return null;
+  const active = sel.type === 'channel' && ladder.some((l) => l.id === sel.id);
+  return (
+    <div className={'here-card' + (active ? ' sel' : '')}>
+      <button className="here-main" onClick={() => onSelect('channel', lv.id)}>
+        <PlaceTile size={40} />
+        <span className="here-text">
+          <span className="here-name">{lv.name}</span>
+          <span className="here-sub">{lv.tier} · {lv.count} here now</span>
+        </span>
+        <BCIcon name="chevron" size={14} weight={2.2} style={{ color: 'var(--text3)', flex: 'none' }} />
+      </button>
+      <div className="here-scale" role="group" aria-label="Precision">
+        {ladder.map((l, i) => (
+          <button key={l.id} className={'here-tick' + (i === idx ? ' on' : '')} onClick={() => setIdx(i)}>
+            {l.short}{l.count > 0 ? <i className="here-live"></i> : null}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 /* ── Sidebar ── */
 function DkSidebar({ app, sel, onSelect, toggleNetwork, onSettings }) {
   const meshCount = BC_DATA.peers.filter((p) => p.inRange).length;
@@ -36,7 +68,13 @@ function DkSidebar({ app, sel, onSelect, toggleNetwork, onSettings }) {
             <span className="dk-rowsub">{meshCount} people in range</span>
           </span>
         </button>
-        <SectionLabel>Nearby channels</SectionLabel>
+        <SectionLabel>Around you</SectionLabel>
+        <DkHereRow sel={sel} onSelect={onSelect} />
+        <button className="dk-morebtn" onClick={() => onSelect('radar')}>
+          <BCIcon name="pin" size={15} weight={2} />
+          More places nearby
+        </button>
+        <SectionLabel>Saved channels</SectionLabel>
         {BC_DATA.channels.map((ch) => (
           <button key={ch.id} className={'dk-row' + (isSel('channel', ch.id) ? ' sel' : '')} onClick={() => onSelect('channel', ch.id)}>
             <PlaceTile size={40} />
@@ -94,10 +132,12 @@ function DkSidebar({ app, sel, onSelect, toggleNetwork, onSettings }) {
 }
 
 /* ── Chat pane (channel or DM) ── */
-function DkChatPane({ app, sel, railOpen, onToggleRail, onSendCh, onSendDm, onCommand, onSelect }) {
+function DkChatPane({ app, sel, railOpen, onToggleRail, onSendCh, onSendDm, onCommand, onSelect, onPay, onClaimPay, openPay, onMedia, onVoice }) {
   const [pop, setPop] = React.useState(false);
+  const [pay, setPay] = React.useState(false);
+  React.useEffect(() => { setPay(!!openPay); }, [openPay, sel.id]);
   const isCh = sel.type === 'channel';
-  const ch = isCh ? (BC_DATA.channels.find((c) => c.id === sel.id) || BC_DATA.channels[0]) : null;
+  const ch = isCh ? (BC_DATA.channels.find((c) => c.id === sel.id) || (BC_DATA.here || []).find((c) => c.id === sel.id) || BC_DATA.channels[0]) : null;
   const peer = !isCh ? (BC_DATA.peers.find((p) => p.id === sel.id) || BC_DATA.peers[0]) : null;
   const msgs = isCh ? (app.chMsgs[ch.id] || []) : (app.dmMsgs[peer.id] || []);
   const verified = !isCh && !!app.verified[peer.id];
@@ -109,6 +149,8 @@ function DkChatPane({ app, sel, railOpen, onToggleRail, onSendCh, onSendDm, onCo
     : (verified ? 'Verified · ' : '') + (peer.inRange
         ? 'Nearby · Bluetooth'
         : (app.network === 'online' ? 'Via internet' : 'Offline — will send later'));
+  const btc = !!(app.prefs && app.prefs.btcMode);
+  const pp = payPrefs(app);
   return (
     <div className="dk-main" data-screen-label={isCh ? 'Channel: ' + ch.name : 'DM: ' + peer.name}>
       <div className="dk-chathead">
@@ -152,11 +194,15 @@ function DkChatPane({ app, sel, railOpen, onToggleRail, onSendCh, onSendDm, onCo
           </div>
         )
       ) : (
-        <MsgList msgs={msgs} showAuthors={isCh} />
+        <MsgList msgs={msgs} showAuthors={isCh} peerName={isCh ? undefined : peer.name} onClaim={isCh ? undefined : (i) => onClaimPay(peer.id, i)} pay={pp} />
       )}
       <div style={{ position: 'relative' }}>
         {pop && (
           <div className="dk-pop">
+            <AttachActions transport={transport} onPick={(t) => { setPop(false); onMedia(isCh ? ch.id : peer.id, t); }} />
+            {!isCh && (
+              <ActionRow icon="coin" label={btc ? 'Send bitcoin' : 'Send money'} desc={btc ? (peer.inRange ? 'Travels over Bluetooth as ecash' : 'Instant over Lightning') : (peer.inRange ? 'Privately, phone-to-phone over Bluetooth' : 'Privately over the internet')} onClick={() => { setPop(false); setPay(true); }} />
+            )}
             <ActionRow icon="navArrow" label="Share location" desc={isCh ? 'Drop a pin in this channel' : 'Only ' + peer.name + ' will see it'} onClick={() => setPop(false)} />
             <ActionRow icon="people" label="People nearby" desc="Open the radar" onClick={() => { setPop(false); onSelect('radar'); }} />
             <ActionRow icon="smile" label="Reactions" desc="A little fun, no noise" onClick={() => setPop(false)} />
@@ -167,15 +213,23 @@ function DkChatPane({ app, sel, railOpen, onToggleRail, onSendCh, onSendDm, onCo
           transport={transport}
           onSend={(tx) => isCh ? onSendCh(ch.id, tx) : onSendDm(peer.id, tx)}
           onPlus={() => setPop(!pop)}
+          onVoice={(sec) => onVoice(isCh ? ch.id : peer.id, sec)}
           onCommand={(c) => onCommand({ type: isCh ? 'ch' : 'dm', id: isCh ? ch.id : peer.id, target: isCh ? 'Luca' : peer.name }, c)}
         />
       </div>
+      {pay && !isCh && (
+        <PaySheet
+          peer={peer} balance={app.balance || 0} transport={transport} pay={pp}
+          onClose={() => setPay(false)} onSend={(sats) => onPay(peer.id, sats)}
+        />
+      )}
     </div>
   );
 }
 
 /* ── Radar pane ── */
 function DkRadarPane({ app, onSelect }) {
+  const [psel, setPsel] = React.useState(null);
   const inRange = BC_DATA.peers.filter((p) => p.inRange);
   const far = BC_DATA.peers.filter((p) => !p.inRange);
   const C = 174;
@@ -219,13 +273,13 @@ function DkRadarPane({ app, onSelect }) {
               <span className="sn-nodename">you</span>
             </div>
             {inRange.map((p) => (
-              <button key={p.id} className="sn-node" style={pos(p)} onClick={() => onSelect('dm', p.id)}>
+              <button key={p.id} className="sn-node" style={pos(p)} onClick={() => setPsel(p)}>
                 <Avatar name={p.name} size={44} presence />
                 <span className="sn-nodename">{p.name}</span>
               </button>
             ))}
             {far.map((p) => (
-              <button key={p.id} className="sn-node ghost" style={pos(p)} onClick={() => onSelect('dm', p.id)}>
+              <button key={p.id} className="sn-node ghost" style={pos(p)} onClick={() => setPsel(p)}>
                 <span style={{ position: 'relative', display: 'inline-block' }}>
                   <Avatar name={p.name} size={34} />
                   <span className="sn-ghostbadge"><BCIcon name="globe" size={9} weight={2.4} /></span>
@@ -234,11 +288,22 @@ function DkRadarPane({ app, onSelect }) {
               </button>
             ))}
           </div>
-          <div className="sn-caption">Click someone to chat</div>
+          <div className="sn-caption">{psel ? 'Choose what to do' : 'Click someone to chat or pay'}</div>
           <div className="sn-legend">
             <span><i className="sn-ldot ble"></i>nearby · Bluetooth</span>
             <span><i className="sn-ldot net"></i>far · internet</span>
           </div>
+          {psel && (
+            <div className="sn-peercard" style={{ position: 'static', margin: '16px 0 0', width: 330, maxWidth: '100%' }}>
+              <Avatar name={psel.name} size={44} presence={psel.inRange} />
+              <span className="pcmain">
+                <div className="pcname">{psel.name}</div>
+                <div className="pchint">{psel.inRange ? psel.hint + ' · over Bluetooth' : 'Out of range · over the internet'}</div>
+              </span>
+              <button className="pf-smallbtn" onClick={() => onSelect('dm', psel.id)}>Message</button>
+              <button className="pf-smallbtn primary" onClick={() => onSelect('dm', psel.id, { pay: 1 })}>Send sats</button>
+            </div>
+          )}
         </div>
         <div className="dk-radarlist">
           <SectionLabel>In range · Bluetooth</SectionLabel>
@@ -275,7 +340,7 @@ function DkRail({ app, sel, onVerify }) {
   const [showKey, setShowKey] = React.useState(false);
   const [precision, setPrecision] = React.useState('block');
   if (sel.type === 'channel') {
-    const ch = BC_DATA.channels.find((c) => c.id === sel.id) || BC_DATA.channels[0];
+    const ch = BC_DATA.channels.find((c) => c.id === sel.id) || (BC_DATA.here || []).find((c) => c.id === sel.id) || BC_DATA.channels[0];
     return (
       <div className="dk-rail" data-screen-label="Channel details">
         <PlaceTile size={64} />
@@ -330,6 +395,7 @@ function DkSettingsModal({ app, mode, onToggleMode, toggleNetwork, onPref, onRen
   const [editing, setEditing] = React.useState(false);
   const [draft, setDraft] = React.useState(app.nick || '');
   const [wipeAsk, setWipeAsk] = React.useState(false);
+  const [curOpen, setCurOpen] = React.useState(false);
   const prefs = app.prefs || {};
   const shortKey = BC_DATA.pubkey.slice(0, 14) + '\u2026' + BC_DATA.pubkey.slice(-6);
   const save = () => {
@@ -383,6 +449,25 @@ function DkSettingsModal({ app, mode, onToggleMode, toggleNetwork, onPref, onRen
             onClick={toggleNetwork}
           />
         </div>
+
+        <SectionLabel>Wallet</SectionLabel>
+        <div className="st-card">
+          <StRow icon="coin" tone="gold" label="Bitcoin" sub="Pays like you message — Bluetooth or Lightning" value={payFmt(app.balance || 0) + ' sats'} onClick={() => {}} />
+        </div>
+
+        <SectionLabel>Wallet</SectionLabel>
+        <div className="st-card">
+          <StRow icon="coin" tone="gold" label="Balance" value={walletStr(app)} trail={null} onClick={() => {}} />
+          <StRow icon="globe" label="Currency" value={(prefs.currency || 'EUR')} onClick={() => setCurOpen(!curOpen)} />
+          <StRow icon="bolt" label="Bitcoin mode" sub="Show sats and bitcoin networks" onClick={() => onPref('btcMode', !prefs.btcMode)} toggle={!!prefs.btcMode} />
+        </div>
+        {curOpen && (
+          <div className="pf-reqbtns" style={{ padding: '0 16px 6px', flexWrap: 'wrap' }}>
+            {PAY_CURRENCIES.map((c) => (
+              <button key={c} className={'pay-chip' + ((prefs.currency || 'EUR') === c ? ' on' : '')} onClick={() => { onPref('currency', c); setCurOpen(false); }}>{c}</button>
+            ))}
+          </div>
+        )}
 
         <SectionLabel>Privacy &amp; safety</SectionLabel>
         <div className="st-card">

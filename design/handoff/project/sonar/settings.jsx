@@ -178,6 +178,7 @@ function SettingsScreen({ app, nav, pop, push, mode, onToggleMode, toggleNetwork
   const [requests, setRequests] = React.useState(false);
   const [appicon, setAppicon] = React.useState(false);
   const [wipeAsk, setWipeAsk] = React.useState(false);
+  const [curSheet, setCurSheet] = React.useState(false);
   const prefs = app.prefs || {};
   const verifiedCount = Object.keys(app.verified).length;
   const shortKey = BC_DATA.pubkey.slice(0, 14) + '\u2026' + BC_DATA.pubkey.slice(-6);
@@ -215,8 +216,11 @@ function SettingsScreen({ app, nav, pop, push, mode, onToggleMode, toggleNetwork
 
         <SectionLabel>Wallet</SectionLabel>
         <div className="st-card">
-          <StRow icon="coin" tone="gold" label="Bitcoin" sub="Pays like you message — Bluetooth or Lightning" value={payFmt(app.balance || 0) + ' sats'} onClick={() => {}} />
+          <StRow icon="coin" tone="gold" label="Balance" value={walletStr(app)} chevron={false} onClick={() => {}} />
+          <StRow icon="globe" label="Currency" value={(prefs.currency || 'EUR')} onClick={() => setCurSheet(true)} />
+          <StRow icon="bolt" label="Bitcoin mode" sub="Show sats and bitcoin networks" onClick={() => onPref('btcMode', !prefs.btcMode)} toggle={!!prefs.btcMode} />
         </div>
+        <p className="st-note">Off by default — amounts show in your currency. Turn on to see sats, Lightning and ecash.</p>
 
         <SectionLabel>Privacy &amp; safety</SectionLabel>
         <div className="st-card">
@@ -245,6 +249,14 @@ function SettingsScreen({ app, nav, pop, push, mode, onToggleMode, toggleNetwork
       {notif && <NotifSheet onClose={() => setNotif(false)} prefs={prefs} onPref={onPref} />}
       {requests && <RequestsSheet onClose={() => setRequests(false)} onResolve={() => onPref('requests', 0)} />}
       {appicon && <AppIconSheet onClose={() => setAppicon(false)} current={prefs.icon || 'cyan'} onPick={(id) => onPref('icon', id)} />}
+      {curSheet && (
+        <Sheet onClose={() => setCurSheet(false)} title="Currency">
+          {PAY_CURRENCIES.map((c) => (
+            <StRow key={c} icon="globe" label={c} sub={PAY_NAMES[c]} value={PAY_SYM[c].trim()} trail={(prefs.currency || 'EUR') === c ? 'check' : null} onClick={() => { onPref('currency', c); setCurSheet(false); }} />
+          ))}
+          <div className="bc-sheetactions"><button className="bc-ghost" onClick={() => setCurSheet(false)}>Done</button></div>
+        </Sheet>
+      )}
       {wipeAsk && <WipeSheet onClose={() => setWipeAsk(false)} onWipe={onWipe} />}
     </div>
   );

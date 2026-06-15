@@ -76,6 +76,23 @@
   background: var(--accent-soft); color: var(--accent-deep);
   display: flex; align-items: center; justify-content: center;
 }
+/* "Around you" collapsed precision card — desktop sidebar variant */
+.dk-side .here-card { margin: 2px 8px 6px; border-radius: 14px; }
+.dk-side .here-main { padding: 9px 10px 8px; gap: 11px; }
+.dk-side .here-name { font-size: 14.5px; }
+.dk-side .here-sub { font-size: 12px; margin-top: 1px; }
+.dk-side .here-card.sel { box-shadow: inset 0 0 0 1px var(--accent); }
+.dk-side .here-scale { padding: 0 9px 9px; gap: 5px; }
+.dk-side .here-tick { padding: 5px 9px; font-size: 11.5px; }
+.dk-morebtn {
+  display: flex; align-items: center; gap: 8px;
+  width: calc(100% - 16px); margin: 0 8px 4px;
+  padding: 8px 10px; border: none; border-radius: 10px;
+  background: none; color: var(--text2);
+  font-family: inherit; font-size: 13px; font-weight: 600; cursor: pointer;
+}
+.dk-morebtn:hover { background: var(--press); color: var(--text); }
+
 .dk-me {
   display: flex; align-items: center; gap: 10px;
   padding: 12px 14px; border-top: 1px solid var(--hairline);

@@ -115,6 +115,37 @@ function WipeSheet({ onClose, onWipe }) {
   );
 }
 
+/* ── "Around you": collapses the whole precision ladder into ONE row ── */
+function HereCard({ onEnter }) {
+  const ladder = BC_DATA.here || [];
+  const def = (() => {
+    for (let i = 0; i < ladder.length; i++) if (ladder[i].count > 0) return i;
+    return Math.max(0, ladder.length - 1);
+  })();
+  const [idx, setIdx] = React.useState(def);
+  const lv = ladder[idx];
+  if (!lv) return null;
+  return (
+    <div className="here-card">
+      <button className="here-main" onClick={() => onEnter(lv)}>
+        <PlaceTile size={52} />
+        <span className="here-text">
+          <span className="here-name">{lv.name}</span>
+          <span className="here-sub">{lv.tier} · {lv.count} here now</span>
+        </span>
+        <BCIcon name="chevron" size={15} weight={2.2} style={{ color: 'var(--text3)', flex: 'none' }} />
+      </button>
+      <div className="here-scale" role="group" aria-label="Precision">
+        {ladder.map((l, i) => (
+          <button key={l.id} className={'here-tick' + (i === idx ? ' on' : '')} onClick={() => setIdx(i)}>
+            {l.short}{l.count > 0 ? <i className="here-live"></i> : null}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 /* ── Home ── */
 function HomeScreen({ app, t, nav, push, toggleNetwork, onWipe }) {
   const meshCount = BC_DATA.peers.filter((p) => p.inRange).length;
@@ -139,7 +170,9 @@ function HomeScreen({ app, t, nav, push, toggleNetwork, onWipe }) {
       </div>
       <StatusChip network={app.network} meshCount={meshCount} variant={t.chip} onToggle={toggleNetwork} />
       <div className="bc-scroll" style={{ paddingBottom: 120 }}>
-        <SectionLabel>Nearby channels</SectionLabel>
+        <SectionLabel>Around you</SectionLabel>
+        <HereCard onEnter={(lv) => push('channel', { id: lv.id })} />
+        <SectionLabel>Saved channels</SectionLabel>
         <div className="bc-list">
           {BC_DATA.channels.map((ch) => (
             <ConvRow
@@ -192,8 +225,8 @@ function HomeScreen({ app, t, nav, push, toggleNetwork, onWipe }) {
 }
 
 /* ── Location channel (public) ── */
-function ChannelScreen({ app, nav, pop, push, chId, onSend, onCommand }) {
-  const ch = BC_DATA.channels.find((c) => c.id === chId) || BC_DATA.channels[0];
+function ChannelScreen({ app, nav, pop, push, chId, onSend, onCommand, onMedia, onVoice }) {
+  const ch = BC_DATA.channels.find((c) => c.id === chId) || (BC_DATA.here || []).find((c) => c.id === chId) || BC_DATA.channels[0];
   const msgs = app.chMsgs[ch.id] || [];
   const [sheet, setSheet] = React.useState(false);
   const transport = app.network === 'online' ? 'internet' : 'mesh';
@@ -230,10 +263,12 @@ function ChannelScreen({ app, nav, pop, push, chId, onSend, onCommand }) {
         transport={transport}
         onSend={(tx) => onSend(ch.id, tx)}
         onPlus={() => setSheet(true)}
+        onVoice={(sec) => onVoice(ch.id, sec)}
         onCommand={(c) => onCommand({ type: 'ch', id: ch.id, target: 'Luca' }, c)}
       />
       {sheet && (
         <Sheet onClose={() => setSheet(false)} title="Add to your message">
+          <AttachActions transport={transport} onPick={(t) => { setSheet(false); onMedia(ch.id, t); }} />
           <ActionRow icon="navArrow" label="Share location" desc="Drop a pin for people in this channel" onClick={() => setSheet(false)} />
           <ActionRow icon="people" label="People nearby" desc="See who can hear you over Bluetooth" onClick={() => { setSheet(false); push('nearby'); }} />
           <ActionRow icon="smile" label="Reactions" desc="A little fun, no noise" onClick={() => setSheet(false)} />
@@ -244,7 +279,7 @@ function ChannelScreen({ app, nav, pop, push, chId, onSend, onCommand }) {
 }
 
 /* ── Direct message (encrypted, transport-aware) ── */
-function DMScreen({ app, nav, pop, push, peerId, onSend, onCommand, onVerify, onPay, onClaimPay, openPay }) {
+function DMScreen({ app, nav, pop, push, peerId, onSend, onCommand, onVerify, onPay, onClaimPay, openPay, onMedia, onVoice }) {
   const peer = BC_DATA.peers.find((p) => p.id === peerId) || BC_DATA.peers[0];
   const msgs = app.dmMsgs[peer.id] || [];
   const [sheet, setSheet] = React.useState(false);
@@ -253,6 +288,8 @@ function DMScreen({ app, nav, pop, push, peerId, onSend, onCommand, onVerify, on
   const [pay, setPay] = React.useState(!!openPay);
   const verified = !!app.verified[peer.id];
   const transport = peer.inRange ? 'mesh' : 'internet';
+  const btc = !!(app.prefs && app.prefs.btcMode);
+  const pp = payPrefs(app);
   const offlineFar = !peer.inRange && app.network !== 'online';
   const sub = verified ? 'Verified · ' : '';
   const subTransport = peer.inRange
@@ -301,18 +338,20 @@ function DMScreen({ app, nav, pop, push, peerId, onSend, onCommand, onVerify, on
           <div className="bc-emptydesc">Messages here are end-to-end encrypted. Only the two of you can read them.</div>
         </div>
       ) : (
-        <MsgList msgs={msgs} showAuthors={false} peerName={peer.name} onClaim={(i) => onClaimPay(peer.id, i)} />
+        <MsgList msgs={msgs} showAuthors={false} peerName={peer.name} onClaim={(i) => onClaimPay(peer.id, i)} pay={pp} />
       )}
       <Composer
         placeholder={'Message ' + peer.name + (peer.inRange ? '' : ' · via internet')}
         transport={transport}
         onSend={(tx) => onSend(peer.id, tx)}
         onPlus={() => setSheet(true)}
+        onVoice={(sec) => onVoice(peer.id, sec)}
         onCommand={(c) => onCommand({ type: 'dm', id: peer.id, target: peer.name }, c)}
       />
       {sheet && (
         <Sheet onClose={() => setSheet(false)} title="Add to your message">
-          <ActionRow icon="coin" label="Send bitcoin" desc={peer.inRange ? 'Travels over Bluetooth as ecash' : 'Instant over Lightning'} onClick={() => { setSheet(false); setPay(true); }} />
+          <AttachActions transport={transport} onPick={(t) => { setSheet(false); onMedia(peer.id, t); }} />
+          <ActionRow icon="coin" label={btc ? 'Send bitcoin' : 'Send money'} desc={btc ? (peer.inRange ? 'Travels over Bluetooth as ecash' : 'Instant over Lightning') : (peer.inRange ? 'Privately, phone-to-phone over Bluetooth' : 'Privately over the internet')} onClick={() => { setSheet(false); setPay(true); }} />
           <ActionRow icon="navArrow" label="Share location" desc={'Only ' + peer.name + ' will see it'} onClick={() => setSheet(false)} />
           <ActionRow icon="shield" label="Verify safety number" desc="Confirm this chat is secure" onClick={() => { setSheet(false); setVerify(true); }} />
           <ActionRow icon="smile" label="Reactions" desc="A little fun, no noise" onClick={() => setSheet(false)} />
@@ -348,7 +387,7 @@ function DMScreen({ app, nav, pop, push, peerId, onSend, onCommand, onVerify, on
       )}
       {pay && (
         <PaySheet
-          peer={peer} balance={app.balance || 0} transport={transport}
+          peer={peer} balance={app.balance || 0} transport={transport} pay={pp}
           onClose={() => setPay(false)} onSend={(sats) => onPay(sats)}
         />
       )}
