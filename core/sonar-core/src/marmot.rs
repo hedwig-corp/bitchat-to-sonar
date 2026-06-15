@@ -460,6 +460,35 @@ impl MarmotEngine {
             .collect())
     }
 
+    /// Unix-seconds timestamp of the NEWEST event stored across all groups (any
+    /// kind — membership/commit/chat). Used to RESUME incremental relay sync
+    /// across restarts: a relaunch fetches only what arrived after this instead
+    /// of re-downloading the whole history (the reference White Noise client
+    /// persists a `last_synced_at` column for the same purpose; deriving it from
+    /// the store keeps it ALWAYS consistent with what is actually persisted — a
+    /// fresh or wiped DB has nothing → 0 → a full backfill). 0 if empty/on error.
+    pub fn latest_message_secs(&self) -> u64 {
+        let groups = match self.groups() {
+            Ok(g) => g,
+            Err(_) => return 0,
+        };
+        let mut newest = 0u64;
+        for g in groups {
+            let msgs = match dispatch!(&self.storage, |mdk| mdk.get_messages(&g.mls_group_id, None))
+            {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            for m in msgs {
+                let t = m.created_at.as_u64();
+                if t > newest {
+                    newest = t;
+                }
+            }
+        }
+        newest
+    }
+
     /// Delete ALL local state for a group: messages, processed-message records,
     /// MLS tree state, epoch secrets, key material, relay links, proposals, and
     /// snapshots. Local-only — no MLS proposal or Nostr event is published, so

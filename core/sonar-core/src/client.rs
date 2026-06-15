@@ -396,6 +396,12 @@ impl SonarClient {
             }
         });
 
+        // Resume incremental sync across restarts: start the watermark at the
+        // newest event already in the store (see `latest_message_secs`), so a
+        // relaunch fetches only what is new instead of re-downloading the entire
+        // White Noise history every time. The gift-wrap fetch still applies its
+        // 7-day NIP-59 lookback on top of this.
+        let resume_watermark = engine.latest_message_secs();
         let client = Self {
             engine,
             nostr,
@@ -405,7 +411,7 @@ impl SonarClient {
             geo_presence,
             geo_subscribed,
             identity_secret,
-            last_sync: Arc::new(Mutex::new(0)),
+            last_sync: Arc::new(Mutex::new(resume_watermark)),
             pending_marmot,
             marmot_notify,
             allow_geo_relays,

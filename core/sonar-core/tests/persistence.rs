@@ -78,6 +78,16 @@ async fn group_and_message_survive_reopen() {
     assert_eq!(messages[0].content, "persisted hello");
     assert_eq!(messages[0].sender, alice_pubkey);
     assert!(messages[0].mine);
+
+    // The sync watermark RESUMES from the persisted history (at or after the
+    // stored message's timestamp — `latest_message_secs` also counts non-chat
+    // membership/commit events) instead of resetting to 0, so a relaunch syncs
+    // incrementally rather than re-fetching the whole history from scratch.
+    assert!(
+        alice2.latest_message_secs() >= messages[0].created_at.as_u64(),
+        "watermark resumes at/after the newest stored message after reopen"
+    );
+    assert!(alice2.latest_message_secs() > 0);
 }
 
 #[tokio::test]
