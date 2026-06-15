@@ -26,20 +26,43 @@ const BLOSSOM_SERVER_LIST_KIND: u16 = 10063;
 /// Fallback Blossom server when the user has published no kind-10063 list.
 pub const DEFAULT_BLOSSOM_SERVER: &str = "https://blossom.primal.net";
 
-/// Download raw bytes over HTTPS (rustls). Used to fetch an encrypted media blob
-/// by its full imeta URL (Blossom GET is unauthenticated for public blobs).
+/// Hard ceiling on a single downloaded media blob. The URL comes from the
+/// SENDER (untrusted), so this bounds memory use against a malicious/huge blob.
+/// Comfortably above any real image while well under MDK's 100 MB MIP-04 limit.
+const MAX_MEDIA_DOWNLOAD_BYTES: usize = 25 * 1024 * 1024;
+
+/// Download raw bytes for an encrypted media blob by its full imeta URL.
+///
+/// Hardening (the URL is attacker-controllable — it is whatever the message
+/// sender put in the imeta tag): require **https** (no SSRF to plaintext/local
+/// schemes) and stream with a hard size cap (no memory-DoS from a server that
+/// lies about / omits Content-Length). Integrity is still verified afterwards by
+/// `decrypt_from_download` (AEAD + original-hash check).
 async fn http_get(url: &str) -> Result<Vec<u8>> {
-    let resp = reqwest::get(url)
+    if !url.starts_with("https://") {
+        return Err(Error::Http(format!("refusing non-https media url: {url}")));
+    }
+    let mut resp = reqwest::get(url)
         .await
         .map_err(|e| Error::Http(e.to_string()))?;
     if !resp.status().is_success() {
         return Err(Error::Http(format!("GET {url} -> HTTP {}", resp.status())));
     }
-    Ok(resp
-        .bytes()
-        .await
-        .map_err(|e| Error::Http(e.to_string()))?
-        .to_vec())
+    if let Some(len) = resp.content_length() {
+        if len as usize > MAX_MEDIA_DOWNLOAD_BYTES {
+            return Err(Error::Http(format!(
+                "media too large: {len} bytes (cap {MAX_MEDIA_DOWNLOAD_BYTES})"
+            )));
+        }
+    }
+    let mut out: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| Error::Http(e.to_string()))? {
+        if out.len() + chunk.len() > MAX_MEDIA_DOWNLOAD_BYTES {
+            return Err(Error::Http("media exceeds size cap".into()));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
 }
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
