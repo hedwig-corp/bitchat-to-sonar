@@ -26,6 +26,10 @@ serde.workspace = true
 # Noise XX session crypto for the BLE mesh transport (bitchat uses
 # Noise_XX_25519_ChaChaPoly_SHA256). `snow` is a vetted pure-Rust Noise impl.
 snow = "0.9"
+# Ed25519 (RFC 8032) for the bitchat mesh identity-announce signature —
+# wire-interoperable with Apple's Curve25519.Signing on iOS.
+ed25519-dalek = "2"
+getrandom = "0.2"
 
 # SQLCipher needs a crypto backend. Apple targets compile it against
 # CommonCrypto (no OpenSSL — see the mdk-sqlite-storage note above). Android

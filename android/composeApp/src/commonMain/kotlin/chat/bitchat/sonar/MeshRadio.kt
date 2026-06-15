@@ -24,6 +24,8 @@ expect object MeshRadio {
     /** Our encoded Sonar Discovery (0x53) announce to send to peers as Noise
      *  links come up. Null clears it (e.g. before an identity exists). */
     fun setLocalSonarAnnounce(payload: ByteArray?)
+    /** Display nickname carried in our signed bitchat mesh announce. */
+    fun setMeshNickname(nick: String)
     /** Raw 0x53 payloads received from peers, keyed by peer id (BLE address).
      *  Decoded with [SonarAnnounce.decode] in shared code. */
     fun sonarPeers(): Map<String, ByteArray>

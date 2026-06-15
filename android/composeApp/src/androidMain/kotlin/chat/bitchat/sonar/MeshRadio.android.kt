@@ -36,22 +36,15 @@ actual object MeshRadio {
     private var scanner: BluetoothLeScanner? = null
     private var advertiser: BluetoothLeAdvertiser? = null
 
-    // ── Sonar Discovery (0x53) over the established mesh links ──
-    @Volatile private var localSonarAnnounce: ByteArray? = null
+    // ── Sonar Discovery (0x53) + bitchat announce over the mesh ──
     private val sonarProfiles = ConcurrentHashMap<String, ByteArray>()
-    private val handler = android.os.Handler(android.os.Looper.getMainLooper())
+    /** Peer nicknames learned from their signed bitchat announce, by BLE addr. */
+    private val announcedNames = ConcurrentHashMap<String, String>()
 
     init {
-        // When a Noise link comes up, send our announce; stash peers' announces.
-        // The send is deferred ~150ms: on the initiator side the link finishes
-        // the instant handshake m3 is written, and GATT serializes writes — the
-        // delay lets m3 drain before the 0x53 write rides the same characteristic.
-        MeshGatt.addLinkListener { peerId ->
-            localSonarAnnounce?.let { payload ->
-                handler.postDelayed({ MeshGatt.sendSonar(peerId, payload) }, 150)
-            }
-        }
+        // Stash peers' 0x53 payloads + the names from their verified announces.
         MeshGatt.addSonarListener { peerId, payload -> sonarProfiles[peerId] = payload }
+        MeshGatt.addAnnounceListener { addr, info -> announcedNames[addr] = info.nickname }
     }
 
     private val ctx: Context get() = AppContextHolder.ctx
@@ -124,16 +117,22 @@ actual object MeshRadio {
         try { scanner?.stopScan(scanCallback) } catch (_: Throwable) {}
         try { advertiser?.stopAdvertising(advCallback) } catch (_: Throwable) {}
         MeshGatt.stop()
-        seen.clear(); lastSeen.clear()
+        seen.clear(); lastSeen.clear(); announcedNames.clear()
     }
 
     actual fun peers(): List<MeshPeer> {
         val now = System.currentTimeMillis()
         for ((id, t) in lastSeen) if (now - t > STALE_MS) { seen.remove(id); lastSeen.remove(id) }
-        return seen.values.sortedByDescending { it.rssi }
+        // Prefer the nickname from the peer's signed announce over the BLE name.
+        return seen.values
+            .map { p -> announcedNames[p.id]?.let { p.copy(name = it) } ?: p }
+            .sortedByDescending { it.rssi }
     }
 
-    actual fun setLocalSonarAnnounce(payload: ByteArray?) { localSonarAnnounce = payload }
+    actual fun setLocalSonarAnnounce(payload: ByteArray?) { MeshGatt.sonarPayload = payload }
+
+    /** Push the display nickname carried in our bitchat announce. */
+    actual fun setMeshNickname(nick: String) { if (nick.isNotBlank()) MeshGatt.nickname = nick }
 
     actual fun sonarPeers(): Map<String, ByteArray> = HashMap(sonarProfiles)
 
@@ -147,11 +146,12 @@ actual object MeshRadio {
             lastSeen[id] = System.currentTimeMillis()
             if (isNew) {
                 android.util.Log.i(TAG, "discovered peer $name [$id] rssi=${result.rssi}")
+                // Dial each peer ONCE to exchange signed announces (the discovery
+                // handshake). MeshGatt.connect is idempotent per address and uses
+                // TRANSPORT_LE (the earlier status-133 churn was the missing LE
+                // transport + dialing on every advert, both fixed).
+                runCatching { MeshGatt.connect(result.device) }
             }
-            // NB: we no longer auto-dial GATT on every discovery — the failing
-            // connects (status 133) churned the BLE controller and could starve
-            // the scan, hiding real peers. The Noise link is established on demand
-            // when the user opens a mesh DM (MeshGatt.connect), not during scan.
         }
 
         override fun onScanFailed(errorCode: Int) {

@@ -583,6 +583,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // Sonar Discovery (0x53): keep our announce current for outgoing
                 // links and decode any peers' announces received over the mesh.
                 MeshRadio.setLocalSonarAnnounce(localSonarAnnounce()?.encode())
+                MeshRadio.setMeshNickname(nick)
                 sonarPeerProfiles = MeshRadio.sonarPeers()
                     .mapNotNull { (id, raw) -> SonarAnnounce.decode(raw)?.let { id to it } }
                     .toMap()

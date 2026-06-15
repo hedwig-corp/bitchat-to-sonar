@@ -436,6 +436,182 @@ impl SonarNoise {
     }
 }
 
+// ── bitchat mesh wire (interop with the iOS BLEService) ──
+//
+// Stateless helpers over `sonar_core::mesh` (the byte-exact, unit-tested wire
+// stack). The Android `MeshGatt` builds/parses these to speak the real bitchat
+// protocol; the Noise crypto stays in `SonarNoise`.
+
+use sonar_core::mesh;
+
+/// A verified identity announce decoded off the mesh.
+#[derive(uniffi::Record)]
+pub struct MeshAnnounceInfo {
+    pub nickname: String,
+    pub noise_public_key_hex: String,
+    pub signing_public_key_hex: String,
+    pub sender_id_hex: String,
+}
+
+/// The outer fields of a decoded mesh packet.
+#[derive(uniffi::Record)]
+pub struct MeshPacketInfo {
+    pub packet_type: u8,
+    pub ttl: u8,
+    pub sender_id_hex: String,
+    /// Empty when the packet has no recipient (broadcast/undirected).
+    pub recipient_id_hex: String,
+    pub payload: Vec<u8>,
+    pub has_signature: bool,
+}
+
+/// A decoded private chat message (the inner noiseEncrypted payload).
+#[derive(uniffi::Record)]
+pub struct MeshPrivateMessage {
+    pub message_id: String,
+    pub content: String,
+}
+
+fn parse_id8(hex_str: &str, what: &'static str) -> Result<[u8; 8], SonarFfiError> {
+    let bytes = hex::decode(hex_str).map_err(invalid(what))?;
+    if bytes.len() != 8 {
+        return Err(SonarFfiError::InvalidInput(format!("{what} must be 8 bytes")));
+    }
+    let mut id = [0u8; 8];
+    id.copy_from_slice(&bytes);
+    Ok(id)
+}
+
+/// Ed25519 mesh signing public key (hex) for a 32-byte seed (hex).
+#[uniffi::export]
+pub fn mesh_signing_public_key(seed_hex: String) -> FfiResult<String> {
+    let seed = hex::decode(&seed_hex).map_err(invalid("mesh seed"))?;
+    if seed.len() != 32 {
+        return Err(SonarFfiError::InvalidInput("mesh seed must be 32 bytes".into()));
+    }
+    let mut s = [0u8; 32];
+    s.copy_from_slice(&seed);
+    Ok(hex::encode(mesh::MeshSigner::from_seed(&s).public_key()))
+}
+
+/// Build a signed identity announce as wire bytes (padded 0x01 packet).
+#[uniffi::export]
+pub fn mesh_build_announce(
+    seed_hex: String,
+    sender_id_hex: String,
+    nickname: String,
+    noise_public_key_hex: String,
+    ttl: u8,
+    timestamp_ms: u64,
+) -> FfiResult<Vec<u8>> {
+    let seed = hex::decode(&seed_hex).map_err(invalid("mesh seed"))?;
+    if seed.len() != 32 {
+        return Err(SonarFfiError::InvalidInput("mesh seed must be 32 bytes".into()));
+    }
+    let mut s = [0u8; 32];
+    s.copy_from_slice(&seed);
+    let signer = mesh::MeshSigner::from_seed(&s);
+    let sender = parse_id8(&sender_id_hex, "sender id")?;
+    let noise_pub = hex::decode(&noise_public_key_hex).map_err(invalid("noise public key"))?;
+
+    let announce = mesh::Announce {
+        nickname,
+        noise_public_key: noise_pub,
+        signing_public_key: signer.public_key().to_vec(),
+        direct_neighbors: None,
+    };
+    let mut packet = mesh::Packet::new(mesh::msg_type::ANNOUNCE, ttl, timestamp_ms, sender);
+    packet.payload = announce
+        .encode()
+        .ok_or_else(|| SonarFfiError::Core("announce encode failed".into()))?;
+    if !mesh::sign_packet(&mut packet, &signer) {
+        return Err(SonarFfiError::Core("announce sign failed".into()));
+    }
+    packet
+        .encode()
+        .ok_or_else(|| SonarFfiError::Core("announce packet encode failed".into()))
+}
+
+/// Decode + verify an incoming announce packet. Returns the peer info only if
+/// the Ed25519 signature checks against the signing key carried in the announce
+/// (== iOS `verifyPacketSignature`). Returns None for non-announce/invalid.
+#[uniffi::export]
+pub fn mesh_parse_announce(packet_bytes: Vec<u8>) -> Option<MeshAnnounceInfo> {
+    let packet = mesh::Packet::decode(&packet_bytes)?;
+    if packet.type_ != mesh::msg_type::ANNOUNCE {
+        return None;
+    }
+    let announce = mesh::Announce::decode(&packet.payload)?;
+    if !mesh::verify_packet(&packet, &announce.signing_public_key) {
+        return None;
+    }
+    Some(MeshAnnounceInfo {
+        nickname: announce.nickname,
+        noise_public_key_hex: hex::encode(&announce.noise_public_key),
+        signing_public_key_hex: hex::encode(&announce.signing_public_key),
+        sender_id_hex: hex::encode(packet.sender_id),
+    })
+}
+
+/// Decode the outer fields of any mesh packet.
+#[uniffi::export]
+pub fn mesh_decode_packet(packet_bytes: Vec<u8>) -> Option<MeshPacketInfo> {
+    let p = mesh::Packet::decode(&packet_bytes)?;
+    Some(MeshPacketInfo {
+        packet_type: p.type_,
+        ttl: p.ttl,
+        sender_id_hex: hex::encode(p.sender_id),
+        recipient_id_hex: p.recipient_id.map(hex::encode).unwrap_or_default(),
+        payload: p.payload,
+        has_signature: p.signature.is_some(),
+    })
+}
+
+/// Build a directed packet of `packet_type` (e.g. 0x10 handshake / 0x11
+/// encrypted). An empty `recipient_id_hex` makes it undirected.
+#[uniffi::export]
+pub fn mesh_build_packet(
+    packet_type: u8,
+    sender_id_hex: String,
+    recipient_id_hex: String,
+    ttl: u8,
+    timestamp_ms: u64,
+    payload: Vec<u8>,
+) -> FfiResult<Vec<u8>> {
+    let sender = parse_id8(&sender_id_hex, "sender id")?;
+    let mut packet = mesh::Packet::new(packet_type, ttl, timestamp_ms, sender);
+    if !recipient_id_hex.is_empty() {
+        packet.recipient_id = Some(parse_id8(&recipient_id_hex, "recipient id")?);
+    }
+    packet.payload = payload;
+    packet
+        .encode()
+        .ok_or_else(|| SonarFfiError::Core("packet encode failed".into()))
+}
+
+/// The inner noiseEncrypted plaintext for a private message: `[0x01][TLV]`.
+#[uniffi::export]
+pub fn mesh_encode_private_message(message_id: String, content: String) -> FfiResult<Vec<u8>> {
+    let pm = mesh::PrivateMessage { message_id, content };
+    mesh::encode_private_message_plaintext(&pm)
+        .ok_or_else(|| SonarFfiError::Core("private message encode failed".into()))
+}
+
+/// Parse a decrypted noiseEncrypted plaintext as a private message. Returns None
+/// unless the leading type byte is privateMessage (0x01) and the TLV is valid.
+#[uniffi::export]
+pub fn mesh_decode_private_message(plaintext: Vec<u8>) -> Option<MeshPrivateMessage> {
+    let (t, rest) = mesh::split_noise_plaintext(&plaintext)?;
+    if t != mesh::noise_payload::PRIVATE_MESSAGE {
+        return None;
+    }
+    let pm = mesh::PrivateMessage::decode(rest)?;
+    Some(MeshPrivateMessage {
+        message_id: pm.message_id,
+        content: pm.content,
+    })
+}
+
 fn geo_message_info(m: sonar_core::geohash::GeoMessage) -> GeoMessageInfo {
     GeoMessageInfo {
         id_hex: m.id,
