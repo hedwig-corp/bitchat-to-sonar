@@ -321,7 +321,7 @@ enum NoisePhase {
 
 /// A Noise XX session driver for one mesh link. Feed handshake messages until
 /// `is_finished`, capture `remote_static_hex` (the peer's authenticated key →
-/// bitchat fingerprint), call `finalize`, then `encrypt`/`decrypt`.
+/// bitchat fingerprint), call `into_session`, then `encrypt`/`decrypt`.
 #[derive(uniffi::Object)]
 pub struct SonarNoise {
     phase: Mutex<NoisePhase>,
@@ -378,7 +378,10 @@ impl SonarNoise {
     }
 
     /// Transition from handshake to the encrypted transport phase.
-    pub fn finalize(&self) -> FfiResult<()> {
+    /// NB: NOT named `finalize` — that collides with Java's `Object.finalize()`
+    /// in the generated Kotlin binding (the GC then re-invokes it on a spent
+    /// object and throws).
+    pub fn into_session(&self) -> FfiResult<()> {
         let mut g = self.phase.lock().unwrap();
         match std::mem::replace(&mut *g, NoisePhase::Spent) {
             NoisePhase::Handshake(hs) => {

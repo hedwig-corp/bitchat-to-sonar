@@ -22,6 +22,8 @@ dependencyResolutionManagement {
             }
         }
         mavenCentral()
+        // Breez SDK Liquid (on-device Lightning wallet for ⚡PAY).
+        maven("https://mvn.breez.technology/releases")
     }
 }
 

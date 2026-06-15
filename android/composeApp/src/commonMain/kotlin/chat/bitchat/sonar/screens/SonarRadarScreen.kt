@@ -21,6 +21,9 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -49,10 +52,26 @@ import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.sin
 
+/** RSSI → 1..4 signal strength (BLE: ~-40 close, ~-95 far). */
+internal fun rssiBars(rssi: Int): Int = when {
+    rssi >= -55 -> 4
+    rssi >= -70 -> 3
+    rssi >= -85 -> 2
+    else -> 1
+}
+
+internal fun rssiLabel(rssi: Int): String = when (rssiBars(rssi)) {
+    4 -> "Very close"
+    3 -> "Nearby"
+    2 -> "In range"
+    else -> "Far"
+}
+
 @Composable
 fun SonarRadarScreen(state: SonarAppState) {
     val s = sonar
     var listMode by remember { mutableStateOf(false) }
+    var card by remember { mutableStateOf<chat.bitchat.sonar.MeshPeer?>(null) }
 
     Column(Modifier.fillMaxSize().background(s.bg)) {
         // header (back + title + status)
@@ -83,7 +102,10 @@ fun SonarRadarScreen(state: SonarAppState) {
         }
 
         if (listMode) {
-            ListEmpty()
+            if (state.meshPeers.isEmpty()) ListEmpty()
+            else LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(vertical = 8.dp)) {
+                items(state.meshPeers, key = { it.id }) { p -> PeerRow(p) { card = p } }
+            }
         } else {
             Column(Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally) {
                 Spacer(Modifier.weight(1f))
@@ -97,6 +119,77 @@ fun SonarRadarScreen(state: SonarAppState) {
                     Legend(s.net, "far · internet")
                 }
                 Spacer(Modifier.weight(1f))
+            }
+        }
+    }
+
+    card?.let { PeerCard(it, onClose = { card = null }) }
+}
+
+@Composable
+private fun PeerRow(p: chat.bitchat.sonar.MeshPeer, onClick: () -> Unit) {
+    val s = sonar
+    Row(
+        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        SonarAvatar(p.name, 44.dp, presence = true)
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+            Text(p.name, color = s.text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                SNDot(s.accent, 6.dp)
+                Spacer(Modifier.width(5.dp))
+                Text("Bluetooth · ${rssiLabel(p.rssi)}", color = s.text3, fontSize = 12.5.sp)
+            }
+        }
+        SignalBars(rssiBars(p.rssi), s.accent)
+    }
+}
+
+/** 4 stepped bars, [filled] of them in [color], the rest faint. */
+@Composable
+private fun SignalBars(filled: Int, color: Color) {
+    val s = sonar
+    Row(verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+        for (i in 1..4) {
+            Box(
+                Modifier.width(3.dp).height((4 + i * 3).dp).clip(RoundedCornerShape(1.dp))
+                    .background(if (i <= filled) color else s.surface2)
+            )
+        }
+    }
+}
+
+@Composable
+private fun PeerCard(p: chat.bitchat.sonar.MeshPeer, onClose: () -> Unit) {
+    val s = sonar
+    Box(
+        Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
+        contentAlignment = Alignment.BottomCenter
+    ) {
+        androidx.compose.material3.Surface(color = s.surface, shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)) {
+            Column(Modifier.fillMaxWidth().padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                SonarAvatar(p.name, 64.dp, presence = true)
+                Spacer(Modifier.height(10.dp))
+                Text(p.name, color = s.text, fontSize = 19.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(4.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    SignalBars(rssiBars(p.rssi), s.accent)
+                    Spacer(Modifier.width(8.dp))
+                    Text("Bluetooth · ${rssiLabel(p.rssi)}", color = s.text2, fontSize = 13.sp)
+                }
+                Spacer(Modifier.height(18.dp))
+                // Mesh DM goes live with the BLE link (Phase 8); honest until then.
+                Box(
+                    Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(s.surface2)
+                        .padding(vertical = 13.dp),
+                    contentAlignment = Alignment.Center
+                ) { Text("Reachable over Bluetooth mesh", color = s.text2, fontSize = 14.sp, fontWeight = FontWeight.SemiBold) }
+                Spacer(Modifier.height(8.dp))
+                Box(Modifier.fillMaxWidth().height(44.dp).clickable(onClick = onClose), contentAlignment = Alignment.Center) {
+                    Text("Close", color = s.text2, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                }
             }
         }
     }

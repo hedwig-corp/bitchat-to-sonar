@@ -1,4 +1,5 @@
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import java.util.Properties
 
 plugins {
     alias(libs.plugins.multiplatform)
@@ -28,6 +29,8 @@ kotlin {
         androidMain.dependencies {
             implementation(libs.androidx.activity.compose)
             implementation(libs.coroutines.android)
+            // On-device Lightning wallet (Breez SDK Liquid) for ⚡PAY.
+            implementation(libs.breez.sdk.liquid)
             // UniFFI Kotlin bindings for the Rust core use JNA at runtime.
             // MUST be the @aar variant on Android — it ships libjnidispatch.so
             // as proper jniLibs (the plain jar hides it as a classpath resource
@@ -35,6 +38,17 @@ kotlin {
             implementation("net.java.dev.jna:jna:5.14.0@aar")
         }
     }
+}
+
+// Breez API key from a gitignored secret — NEVER hardcode or commit it.
+// Resolution order: local.properties `breez.apiKey`, else env `BREEZ_API_KEY`,
+// else empty (wallet UI then shows "unavailable", like iOS with no key).
+val breezApiKey: String = run {
+    val lp = rootProject.file("local.properties")
+    val fromFile = if (lp.exists()) {
+        Properties().apply { lp.inputStream().use { load(it) } }.getProperty("breez.apiKey")
+    } else null
+    (fromFile ?: System.getenv("BREEZ_API_KEY") ?: "").trim()
 }
 
 android {
@@ -47,6 +61,11 @@ android {
         targetSdk = libs.versions.android.targetSdk.get().toInt()
         versionCode = 1
         versionName = "0.1"
+        buildConfigField("String", "BREEZ_API_KEY", "\"$breezApiKey\"")
+    }
+
+    buildFeatures {
+        buildConfig = true
     }
 
     // The Rust core .so per ABI lives in src/androidMain/jniLibs (produced by
@@ -61,6 +80,13 @@ android {
     buildTypes {
         getByName("release") {
             isMinifyEnabled = false
+        }
+        getByName("debug") {
+            // Debug builds only run on the local dev device. Both the Apple-
+            // Silicon emulator and the Pixel 8 are arm64-v8a, so ship just that
+            // ABI — keeps the debug APK small (the full multi-ABI build bundles
+            // the Rust + Breez .so for every ABI and overflows small partitions).
+            ndk { abiFilters += "arm64-v8a" }
         }
     }
 }

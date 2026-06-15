@@ -27,11 +27,30 @@ class MainActivity : ComponentActivity() {
             MeshRadio.start()
         }
 
+    private var unlockCb: ((Boolean) -> Unit)? = null
+    private val unlockLauncher =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { res ->
+            unlockCb?.invoke(res.resultCode == RESULT_OK)
+            unlockCb = null
+        }
+
+    /** Launch the device-credential (PIN/pattern/biometric) confirm screen. */
+    private fun confirmDeviceCredential(onResult: (Boolean) -> Unit) {
+        val km = getSystemService(android.app.KeyguardManager::class.java)
+        @Suppress("DEPRECATION")
+        val intent = km?.createConfirmDeviceCredentialIntent("Unlock Sonar", "Confirm it's you to continue")
+        if (intent == null) { onResult(true); return } // no secure lock → nothing to confirm
+        unlockCb = onResult
+        unlockLauncher.launch(intent)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
+        ActivityBridge.requestUnlock = { cb -> confirmDeviceCredential(cb) }
         meshNoiseSmokeTest()
         requestMeshPermissions()
+        requestNotificationPermission()
         setContent {
             App()
         }
@@ -52,7 +71,7 @@ class MainActivity : ComponentActivity() {
             ini.readMessage(res.writeMessage())    // m2
             res.readMessage(ini.writeMessage())    // m3
             val peerOk = ini.remoteStaticHex() == b.publicHex && res.remoteStaticHex() == a.publicHex
-            ini.finalize(); res.finalize()
+            ini.intoSession(); res.intoSession()
             val ct = ini.encrypt("mesh hello".encodeToByteArray())
             val pt = res.decrypt(ct).decodeToString()
             android.util.Log.i("MeshNoiseSmoke", "ok=${pt == "mesh hello" && peerOk} decrypted=$pt")
@@ -66,6 +85,28 @@ class MainActivity : ComponentActivity() {
             checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED
         }
         if (granted) MeshRadio.start() else permissionLauncher.launch(blePermissions)
+    }
+
+    private val notifPermLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+
+    /** Ask for POST_NOTIFICATIONS on Android 13+ (no-op below). */
+    private fun requestNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            notifPermLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        SonarLifecycle.onForeground?.invoke(true)
+    }
+
+    override fun onPause() {
+        super.onPause()
+        SonarLifecycle.onForeground?.invoke(false)
     }
 
     override fun onDestroy() {

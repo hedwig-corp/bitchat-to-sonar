@@ -278,6 +278,7 @@ fun SNSettingsRow(
     trail: SNTrail = SNTrail.Chevron,
     danger: Boolean = false,
     divider: Boolean = true,
+    toggle: Boolean? = null,
     onClick: () -> Unit = {},
 ) {
     val s = sonar
@@ -307,9 +308,26 @@ fun SNSettingsRow(
                 else Text(value, color = s.text2, fontSize = 14.sp)
                 Spacer(Modifier.width(6.dp))
             }
-            if (trail == SNTrail.Chevron) SNIcon(SNIconName.Chevron, 14.dp, s.text3, weight = 2.2f)
+            when {
+                toggle != null -> SNSwitch(toggle)
+                trail == SNTrail.Chevron -> SNIcon(SNIconName.Chevron, 14.dp, s.text3, weight = 2.2f)
+                else -> {}
+            }
         }
         if (divider) Box(Modifier.fillMaxWidth().padding(start = 60.dp).height(1.dp).background(s.hairline))
+    }
+}
+
+/** iOS-style toggle (st-switch): cyan track when on, neutral when off. */
+@Composable
+fun SNSwitch(on: Boolean) {
+    val s = sonar
+    Box(
+        Modifier.size(width = 44.dp, height = 26.dp).clip(RoundedCornerShape(13.dp))
+            .background(if (on) s.accentFill else s.surface2),
+        contentAlignment = if (on) Alignment.CenterEnd else Alignment.CenterStart
+    ) {
+        Box(Modifier.padding(horizontal = 3.dp).size(20.dp).clip(RoundedCornerShape(10.dp)).background(Color.White))
     }
 }
 

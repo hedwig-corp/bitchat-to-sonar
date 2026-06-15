@@ -160,6 +160,8 @@ actual object SonarCore {
         return hex.take(32).uppercase().chunked(4).joinToString(" ")
     }
 
+    actual fun identityNsec(): String = prefs().getString("nsec", "") ?: ""
+
     actual fun onboardingComplete(): Boolean = prefs().getBoolean("onboarding.complete", false)
 
     actual fun setOnboardingComplete(value: Boolean) {

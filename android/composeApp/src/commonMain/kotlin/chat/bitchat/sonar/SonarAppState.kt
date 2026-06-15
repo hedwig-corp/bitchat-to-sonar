@@ -3,6 +3,13 @@ package chat.bitchat.sonar
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import chat.bitchat.sonar.store.MessageMerge
+import chat.bitchat.sonar.store.MessageStore
+import chat.bitchat.sonar.wallet.ExchangeRate
+import chat.bitchat.sonar.wallet.FiatCurrency
+import chat.bitchat.sonar.wallet.Money
+import chat.bitchat.sonar.wallet.WalletBridge
+import chat.bitchat.sonar.wallet.WalletState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -16,6 +23,9 @@ sealed interface Screen {
     data class Channel(val geohash: String) : Screen
     data class GeoDm(val geohash: String, val peerHex: String, val name: String) : Screen
 }
+
+/** Verify-sheet model: the safety groups (empty ⇒ show [note]) + verified flag. */
+data class SonarVerify(val safety: List<String>, val verified: Boolean, val note: String?)
 
 /**
  * Shared (commonMain) UI state for the Sonar app. Drives White Noise (Marmot)
@@ -42,10 +52,14 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun wipe() {
         scope.launch {
+            WalletBridge.shutdown()
+            MessageStore.wipe()
             SonarCore.wipe()
             stack = listOf(Screen.Home)
             chats = emptyList(); messages = emptyList()
             onboarded = false; nick = ""; npub = ""; started = false
+            walletState = WalletState.NotConfigured
+            payLedger = SonarPayLedger(); scannedPay.clear(); payVersion++
         }
     }
     var messages by mutableStateOf<List<SonarMsg>>(emptyList())
@@ -57,6 +71,111 @@ class SonarAppState(private val scope: CoroutineScope) {
     var meshPeers by mutableStateOf<List<MeshPeer>>(emptyList())
         private set
     var toast by mutableStateOf<String?>(null)
+
+    // ── Lightning wallet ──
+    val walletAvailable: Boolean = WalletBridge.isAvailable()
+    var walletState by mutableStateOf<WalletState>(WalletBridge.state())
+        private set
+    var showFiat by mutableStateOf(WalletBridge.showFiat())
+        private set
+    var currency by mutableStateOf(WalletBridge.currency())
+        private set
+    private var rate: ExchangeRate? = WalletBridge.cachedRate(currency)
+
+    /** Money label honoring the fiat/sats preference + live rate (iOS rule). */
+    fun money(sats: Long): String = Money.format(sats, showFiat, currency, rate)
+
+    /** Spendable balance in sats (0 unless the wallet is Ready). */
+    fun walletBalanceSats(): Long = (walletState as? WalletState.Ready)?.balanceSats ?: 0L
+
+    /** Live-rate fiat string for [sats], or null when no rate is available. */
+    fun fiatOrNull(sats: Long): String? = Money.formatFiat(sats, currency, rate)
+
+    fun toggleShowFiat() {
+        showFiat = !showFiat
+        WalletBridge.setShowFiat(showFiat)
+    }
+
+    fun selectCurrency(c: FiatCurrency) {
+        currency = c
+        WalletBridge.setCurrency(c)
+        rate = WalletBridge.cachedRate(c)
+    }
+
+    private fun setupWallet() {
+        if (!walletAvailable) return
+        scope.launch {
+            WalletBridge.setupIfNeeded(SonarCore.identityNsec())
+            walletState = WalletBridge.state()
+            WalletBridge.fetchRates()
+            rate = WalletBridge.cachedRate(currency)
+        }
+    }
+
+    // ── ⚡PAY ledger (sealed-coin auto-claim, 1:1 with iOS) ──
+    private var payLedger = SonarPayLedger(SonarCore.loadBlob("pay.ledger"))
+    private val scannedPay = HashSet<String>()
+    /** Bumped whenever the ledger changes, so pay bubbles recompose. */
+    var payVersion by mutableStateOf(0)
+        private set
+
+    fun payStatus(uuid: String): PayStatus? = payLedger.get(uuid)?.status
+
+    private fun persistPay() { SonarCore.saveBlob("pay.ledger", payLedger.serialize()) }
+
+    /** Scan a chat's transcript for ⚡PAY control lines and drive the state machine. */
+    fun processPayLines(chatId: String, msgs: List<SonarMsg>) {
+        var changed = false
+        for (m in msgs) {
+            when (val line = PayLine.decode(m.content)) {
+                is PayLine.Pay -> if (payLedger.recordSealed(line.uuid, line.sats, m.mine)) changed = true
+                is PayLine.Claim -> if (scannedPay.add("claim:${line.uuid}")) {
+                    val e = payLedger.get(line.uuid)
+                    // Only the original sender settles a coin they sealed.
+                    if (e != null && e.mine && e.status == PayStatus.Sealed) {
+                        if (payLedger.markSettling(line.uuid)) changed = true
+                        settle(chatId, line.uuid, line.offer, e.sats)
+                    }
+                }
+                is PayLine.Done -> if (payLedger.markClaimed(line.uuid)) changed = true
+                null -> {}
+            }
+        }
+        if (changed) { persistPay(); payVersion++ }
+    }
+
+    /** Sender side: pay the claimant's BOLT12 offer, then confirm with ⚡PAYDONE. */
+    private fun settle(chatId: String, uuid: String, offer: String, sats: Long) {
+        scope.launch {
+            val ok = walletAvailable && WalletBridge.send(offer, sats, "Sonar coin")
+            if (ok) {
+                payLedger.markClaimed(uuid)
+                runCatching { SonarCore.send(chatId, PayLine.Done(uuid).encoded()) }
+                walletState = WalletBridge.state()
+            } else {
+                payLedger.fail(uuid)
+            }
+            persistPay(); payVersion++
+        }
+    }
+
+    /** Receiver side: create a fresh BOLT12 offer and return it via ⚡PAYCLAIM. */
+    fun claimPay(chatId: String, uuid: String) {
+        if (!walletAvailable || walletState !is WalletState.Ready) {
+            toast = "Set up a wallet to claim payments."
+            return
+        }
+        scope.launch {
+            try {
+                val offer = WalletBridge.createOffer()
+                payLedger.markClaiming(uuid)
+                SonarCore.send(chatId, PayLine.Claim(uuid, offer).encoded())
+                persistPay(); payVersion++
+            } catch (e: Throwable) {
+                toast = "claim failed: ${e.message}"
+            }
+        }
+    }
 
     /** Start the BLE mesh radio (call once permissions are granted). */
     fun startMesh() {
@@ -74,8 +193,16 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun openChannel(geohash: String) {
         push(Screen.Channel(geohash))
-        channelMsgs = emptyList()
-        scope.launch { channelMsgs = SonarCore.channelMessages(geohash) }
+        channelMsgs = MessageStore.loadChannel(geohash) // instant, survives restart
+        scope.launch { refreshChannel(geohash) }
+    }
+
+    /** Fetch the channel from the core, merge with what's on disk, persist. */
+    private suspend fun refreshChannel(geohash: String) {
+        val fresh = SonarCore.channelMessages(geohash)
+        val merged = MessageMerge.channels(MessageStore.loadChannel(geohash), fresh)
+        MessageStore.saveChannel(geohash, merged)
+        channelMsgs = merged
     }
 
     fun sendChannelMsg(geohash: String, text: String) {
@@ -84,7 +211,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         scope.launch {
             try {
                 SonarCore.sendChannel(geohash, t)
-                channelMsgs = SonarCore.channelMessages(geohash)
+                refreshChannel(geohash)
             } catch (e: Throwable) {
                 toast = "send failed: ${e.message}"
             }
@@ -94,8 +221,15 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun openGeoDm(geohash: String, peerHex: String, name: String) {
         if (peerHex.isBlank()) return
         push(Screen.GeoDm(geohash, peerHex, name))
-        messages = emptyList()
-        scope.launch { messages = SonarCore.geoDmMessages(geohash, peerHex) }
+        messages = MessageStore.loadGeoDm(geohash, peerHex)
+        scope.launch { refreshGeoDm(geohash, peerHex) }
+    }
+
+    private suspend fun refreshGeoDm(geohash: String, peerHex: String) {
+        val fresh = SonarCore.geoDmMessages(geohash, peerHex)
+        val merged = MessageMerge.dms(MessageStore.loadGeoDm(geohash, peerHex), fresh)
+        MessageStore.saveGeoDm(geohash, peerHex, merged)
+        messages = merged
     }
 
     fun sendGeoDmMsg(geohash: String, peerHex: String, text: String) {
@@ -104,7 +238,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         scope.launch {
             try {
                 SonarCore.sendGeoDm(geohash, peerHex, t)
-                messages = SonarCore.geoDmMessages(geohash, peerHex)
+                refreshGeoDm(geohash, peerHex)
             } catch (e: Throwable) {
                 toast = "send failed: ${e.message}"
             }
@@ -118,6 +252,48 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun fingerprint(): String = SonarCore.fingerprint()
 
+    // ── Sonar Discovery profile (BIP-353 payment address) ──
+    var bip353 by mutableStateOf(SonarCore.loadBlob("bip353"))
+        private set
+
+    fun updateBip353(value: String) {
+        val t = value.trim()
+        SonarCore.saveBlob("bip353", t)
+        bip353 = t
+    }
+
+    /** Capabilities this node advertises in its Sonar announce (0x53). */
+    private fun capabilities(): Int =
+        SonarAnnounce.CAP_MARMOT or (if (walletAvailable) SonarAnnounce.CAP_PAY else 0)
+
+    /** Build our local Sonar Discovery announce from the current identity. */
+    fun localSonarAnnounce(): SonarAnnounce? {
+        val raw = chat.bitchat.sonar.crypto.Bech32.decode(npub)?.takeIf { it.hrp == "npub" }?.data
+            ?: return null
+        if (raw.size != 32) return null
+        return SonarAnnounce(1, raw, bip353.ifBlank { null }, capabilities())
+    }
+
+    // ── Verify safety numbers (1:1 with iOS) ──
+    fun isVerified(chatId: String): Boolean = SonarCore.loadBlob("verified.$chatId") == "1"
+
+    fun markVerified(chatId: String) {
+        SonarCore.saveBlob("verified.$chatId", "1")
+        payVersion++ // recompose verify-dependent UI
+        toast = "Marked as verified"
+    }
+
+    /** Verify info for a Marmot chat: the 12 safety groups, or an honest note. */
+    fun verifyInfo(chatId: String): SonarVerify {
+        val peer = chats.firstOrNull { it.id == chatId }
+            ?.members?.firstOrNull { it != npub && it.isNotBlank() }
+        return if (peer.isNullOrBlank() || npub.isBlank()) {
+            SonarVerify(emptyList(), isVerified(chatId), "Connecting to the secure chat service — try again in a moment.")
+        } else {
+            SonarVerify(SafetyNumber.of(npub, peer), isVerified(chatId), null)
+        }
+    }
+
     fun completeOnboarding(nickname: String) {
         SonarCore.setNickname(nickname)
         SonarCore.setOnboardingComplete(true)
@@ -130,13 +306,95 @@ class SonarAppState(private val scope: CoroutineScope) {
         nick = value
     }
 
+    // ── Local notifications (fire on new incoming message while backgrounded) ──
+    private var foreground = true
+    private val lastSeenTs = HashMap<String, Long>()
+    private var seededSeen = false
+
+    // ── App lock ──
+    val appLockAvailable: Boolean = AppLock.isAvailable()
+    var appLockOn by mutableStateOf(AppLock.isEnabled())
+        private set
+    var locked by mutableStateOf(AppLock.isEnabled())
+        private set
+
+    fun setAppLock(value: Boolean) {
+        AppLock.setEnabled(value)
+        appLockOn = AppLock.isEnabled()
+    }
+
+    fun unlock() {
+        AppLock.authenticate { ok -> if (ok) locked = false }
+    }
+
+    // ── Generic persisted preferences (Settings toggles + choices) ──
+    var prefsVersion by mutableStateOf(0)
+        private set
+
+    fun prefBool(key: String, default: Boolean = false): Boolean {
+        val v = SonarCore.loadBlob("pref.$key")
+        return if (v.isEmpty()) default else v == "1"
+    }
+
+    fun setPref(key: String, on: Boolean) {
+        SonarCore.saveBlob("pref.$key", if (on) "1" else "0")
+        prefsVersion++
+    }
+
+    fun togglePref(key: String, default: Boolean = false) = setPref(key, !prefBool(key, default))
+
+    fun prefStr(key: String, default: String): String =
+        SonarCore.loadBlob("pref.$key").ifEmpty { default }
+
+    fun setPrefStr(key: String, value: String) {
+        SonarCore.saveBlob("pref.$key", value)
+        prefsVersion++
+    }
+
+    /** Count of chats the user has marked verified (for the Settings row). */
+    fun verifiedCount(): Int = chats.count { isVerified(it.id) }
+
+    fun setForeground(value: Boolean) {
+        val cameToForeground = value && !foreground
+        foreground = value
+        if (cameToForeground && AppLock.isEnabled()) locked = true
+    }
+
+    private fun notifPreview(content: String): String =
+        if (PayLine.decode(content) != null) "₿ Payment"
+        else content.replace("\n", " ").let { if (it.length > 80) it.take(80) + "…" else it }
+
+    /** Notify for any chat whose newest incoming message is newer than last seen. */
+    private suspend fun maybeNotify() {
+        val enabled = prefBool("notifs", true) // master switch (Settings → Notifications)
+        val showNames = prefBool("notifNames", true)
+        val showPreview = prefBool("notifPreview", true)
+        val openChatId = (screen as? Screen.Chat)?.id
+        for (c in chats) {
+            val msgs = SonarCore.messages(c.id)
+            val newestIncoming = msgs.lastOrNull { !it.mine }
+            val prev = lastSeenTs[c.id]
+            if (enabled && seededSeen && prev != null && newestIncoming != null &&
+                newestIncoming.tsSecs > prev && !foreground && c.id != openChatId
+            ) {
+                val title = if (showNames) c.name.ifBlank { "Secure chat" } else "New message"
+                val body = if (showPreview) notifPreview(newestIncoming.content) else "Tap to open"
+                Notifier.notify(c.id.hashCode(), title, body)
+            }
+            lastSeenTs[c.id] = msgs.lastOrNull()?.tsSecs ?: (prev ?: 0L)
+        }
+        seededSeen = true
+    }
+
     fun boot() {
         if (started || connecting) return
         connecting = true
+        Notifier.ensureChannel()
         scope.launch {
             try {
                 npub = SonarCore.start()
                 started = true
+                setupWallet()
                 refreshChats()
                 poll()
             } catch (t: Throwable) {
@@ -149,7 +407,10 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun openChat(chat: SonarChat) {
         push(Screen.Chat(chat.id, chat.name))
-        scope.launch { messages = SonarCore.messages(chat.id) }
+        scope.launch {
+            messages = SonarCore.messages(chat.id)
+            processPayLines(chat.id, messages)
+        }
     }
 
     fun back() {
@@ -172,6 +433,26 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
+    /**
+     * Handle a slash command (1:1 with iOS snCommands). Returns true if [text]
+     * was a recognized command and consumed; false ⇒ send as normal text.
+     * `target` is the channel/peer display name for the /slap action.
+     */
+    fun handleCommand(text: String, target: String, channelGeohash: String?, chatId: String?): Boolean {
+        if (!text.startsWith("/")) return false
+        return when (text.drop(1).trim().substringBefore(' ').lowercase()) {
+            "who", "msg" -> { push(Screen.Nearby); true }
+            "slap" -> {
+                val who = nick.ifBlank { "you" }
+                val line = "* $who slaps $target around a bit with a large trout"
+                if (channelGeohash != null) sendChannelMsg(channelGeohash, line)
+                else if (chatId != null) send(chatId, line)
+                true
+            }
+            else -> false
+        }
+    }
+
     fun send(chatId: String, text: String) {
         val t = text.trim()
         if (t.isEmpty()) return
@@ -179,6 +460,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             try {
                 SonarCore.send(chatId, t)
                 messages = SonarCore.messages(chatId)
+                processPayLines(chatId, messages)
             } catch (e: Throwable) {
                 toast = "send failed: ${e.message}"
             }
@@ -195,10 +477,15 @@ class SonarAppState(private val scope: CoroutineScope) {
                 delay(4000)
                 SonarCore.sync()
                 refreshChats()
-                (screen as? Screen.Chat)?.let { messages = SonarCore.messages(it.id) }
-                (screen as? Screen.Channel)?.let { channelMsgs = SonarCore.channelMessages(it.geohash) }
-                (screen as? Screen.GeoDm)?.let { messages = SonarCore.geoDmMessages(it.geohash, it.peerHex) }
+                maybeNotify()
+                (screen as? Screen.Chat)?.let { messages = SonarCore.messages(it.id); processPayLines(it.id, messages) }
+                (screen as? Screen.Channel)?.let { refreshChannel(it.geohash) }
+                (screen as? Screen.GeoDm)?.let { refreshGeoDm(it.geohash, it.peerHex) }
                 meshPeers = MeshRadio.peers()
+                if (walletAvailable && walletState is WalletState.Ready) {
+                    WalletBridge.refreshBalance()
+                    walletState = WalletBridge.state()
+                }
             }
         }
     }

@@ -65,4 +65,47 @@ class SonarPayLedgerTest {
         assertFalse(l.markClaimed("nope"))
         assertFalse(l.fail("nope"))
     }
+
+    @Test
+    fun payLineCodecRoundTrips() {
+        assertEquals("⚡PAY|1|u1|2100", PayLine.Pay("u1", 2100).encoded())
+        assertEquals("⚡PAYCLAIM|1|u1|lno1xxx", PayLine.Claim("u1", "lno1xxx").encoded())
+        assertEquals("⚡PAYDONE|1|u1", PayLine.Done("u1").encoded())
+
+        assertEquals(PayLine.Pay("u1", 2100), PayLine.decode("⚡PAY|1|u1|2100"))
+        assertEquals(PayLine.Claim("u1", "lno1xxx"), PayLine.decode("⚡PAYCLAIM|1|u1|lno1xxx"))
+        assertEquals(PayLine.Done("u1"), PayLine.decode("⚡PAYDONE|1|u1"))
+        assertNull(PayLine.decode("hello world"))
+        assertNull(PayLine.decode("⚡PAY|2|u1|2100"), "unknown version → plain text")
+    }
+
+    /**
+     * The full auto-claim handshake, modelled as the sender + receiver ledgers
+     * each consume the shared transcript. End state: Claimed on both sides.
+     */
+    @Test
+    fun twoPartyAutoClaimConverges() {
+        val sender = SonarPayLedger()   // sealed the coin (mine=true)
+        val receiver = SonarPayLedger() // gets the coin (mine=false)
+
+        // 1) Sender posts ⚡PAY. Both ledgers record it (idempotent).
+        val pay = PayLine.decode("⚡PAY|1|c1|5000") as PayLine.Pay
+        sender.recordSealed(pay.uuid, pay.sats, mine = true)
+        receiver.recordSealed(pay.uuid, pay.sats, mine = false)
+
+        // 2) Receiver claims → creates an offer → markClaiming + posts ⚡PAYCLAIM.
+        assertTrue(receiver.markClaiming("c1"))
+        val claim = PayLine.decode("⚡PAYCLAIM|1|c1|lno1offer") as PayLine.Claim
+
+        // 3) Sender sees the CLAIM for a coin it sealed → settle → markClaimed + ⚡PAYDONE.
+        assertTrue(sender.markSettling(claim.uuid))
+        assertTrue(sender.markClaimed(claim.uuid))
+        val done = PayLine.decode("⚡PAYDONE|1|c1") as PayLine.Done
+
+        // 4) Receiver sees DONE → markClaimed.
+        assertTrue(receiver.markClaimed(done.uuid))
+
+        assertEquals(PayStatus.Claimed, sender.get("c1")!!.status)
+        assertEquals(PayStatus.Claimed, receiver.get("c1")!!.status)
+    }
 }

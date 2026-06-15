@@ -53,6 +53,7 @@ fun SonarProfileScreen(state: SonarAppState) {
     var editing by remember { mutableStateOf(false) }
     var draft by remember { mutableStateOf(state.nick) }
     var showKey by remember { mutableStateOf(false) }
+    var payDraft by remember { mutableStateOf(state.bip353) }
     val displayNick = state.nick.ifBlank { "you" }
 
     Column(Modifier.fillMaxSize().background(s.bg)) {
@@ -130,6 +131,33 @@ fun SonarProfileScreen(state: SonarAppState) {
                     textAlign = TextAlign.Center,
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 10.dp)
                 )
+            }
+            SNSectionLabel("Payments")
+            Column(
+                Modifier.fillMaxWidth().padding(horizontal = 14.dp)
+                    .clip(RoundedCornerShape(18.dp)).background(s.surface).padding(14.dp)
+            ) {
+                Text("Payment address (BIP-353)", color = s.text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "Shared with Sonar peers nearby so they can pay you. Optional.",
+                    color = s.text3, fontSize = 12.5.sp, lineHeight = 16.sp
+                )
+                Spacer(Modifier.height(10.dp))
+                Box(
+                    Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(s.surface2)
+                        .padding(horizontal = 12.dp, vertical = 11.dp)
+                ) {
+                    if (payDraft.isEmpty()) Text("you@example.com", color = s.text3, fontSize = 14.sp)
+                    BasicTextField(
+                        value = payDraft,
+                        onValueChange = { payDraft = it; state.updateBip353(it) },
+                        singleLine = true,
+                        textStyle = TextStyle(color = s.text, fontSize = 14.sp),
+                        cursorBrush = SolidColor(s.goldDeep),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
             }
             Spacer(Modifier.height(40.dp))
         }

@@ -86,6 +86,10 @@ expect object SonarCore {
     /** Grouped key-fingerprint string for the verify/profile surfaces. */
     fun fingerprint(): String
 
+    /** Our Nostr secret key (`nsec1…`), empty until an identity exists. The
+     *  Lightning wallet derives its deterministic seed from this. */
+    fun identityNsec(): String
+
     /** Onboarding gate. */
     fun onboardingComplete(): Boolean
     fun setOnboardingComplete(value: Boolean)

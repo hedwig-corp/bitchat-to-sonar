@@ -24,6 +24,8 @@ import java.util.concurrent.ConcurrentHashMap
  */
 actual object MeshRadio {
 
+    private const val TAG = "MeshRadio"
+
     // bitchat mainnet service + payload characteristic (from iOS BLEService).
     private val SERVICE_UUID: UUID = UUID.fromString("F47B5E2D-4A9E-4C5A-9B3F-8E1D2C3A4B5C")
     private const val STALE_MS = 20_000L
@@ -55,7 +57,10 @@ actual object MeshRadio {
     }
 
     actual fun start() {
-        if (scanning || !available()) return
+        if (scanning || !available()) {
+            android.util.Log.i(TAG, "start skipped: scanning=$scanning available=${available()}")
+            return
+        }
         val a = adapter() ?: return
         scanning = true
         try {
@@ -76,10 +81,13 @@ actual object MeshRadio {
                 .build()
             advertiser?.startAdvertising(advSettings, advData, advCallback)
             MeshGatt.startServer()
-        } catch (_: SecurityException) {
+            android.util.Log.i(TAG, "scanning + advertising $SERVICE_UUID (advertiser=${advertiser != null})")
+        } catch (e: SecurityException) {
             scanning = false
-        } catch (_: Throwable) {
+            android.util.Log.e(TAG, "start failed (permission)", e)
+        } catch (e: Throwable) {
             scanning = false
+            android.util.Log.e(TAG, "start failed", e)
         }
     }
 
@@ -105,14 +113,27 @@ actual object MeshRadio {
             val isNew = !seen.containsKey(id)
             seen[id] = MeshPeer(id = id, name = name, rssi = result.rssi)
             lastSeen[id] = System.currentTimeMillis()
-            // Auto-link over GATT to newly-discovered peers (Noise XX). To avoid
-            // dual-connect races, only the lexicographically-higher address dials.
             if (isNew) {
-                val mine = runCatching { adapter()?.address }.getOrNull() ?: ""
-                if (mine.isBlank() || mine > id) MeshGatt.connect(result.device)
+                android.util.Log.i(TAG, "discovered peer $name [$id] rssi=${result.rssi} → dialing")
+                // Auto-link over GATT to newly-discovered peers (Noise XX). NB:
+                // BluetoothAdapter.getAddress() is the fixed 02:00:00:00:00:00 on
+                // API 12+, so a local-address tie-break can't work; both sides
+                // dial and MeshGatt dedups the resulting link by peer address.
+                MeshGatt.connect(result.device)
             }
+        }
+
+        override fun onScanFailed(errorCode: Int) {
+            android.util.Log.e(TAG, "scan failed: $errorCode")
         }
     }
 
-    private val advCallback = object : android.bluetooth.le.AdvertiseCallback() {}
+    private val advCallback = object : android.bluetooth.le.AdvertiseCallback() {
+        override fun onStartSuccess(settingsInEffect: android.bluetooth.le.AdvertiseSettings?) {
+            android.util.Log.i(TAG, "advertising started")
+        }
+        override fun onStartFailure(errorCode: Int) {
+            android.util.Log.e(TAG, "advertise failed: $errorCode")
+        }
+    }
 }

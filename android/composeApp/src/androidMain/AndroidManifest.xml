@@ -3,6 +3,8 @@
     xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Local notifications for incoming messages (Android 13+ runtime grant). -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <!-- BLE mesh transport (peer discovery + GATT). Android 12+ uses the
          neverForLocation scan/advertise/connect runtime permissions; older

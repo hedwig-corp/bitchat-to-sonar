@@ -165,11 +165,11 @@ object MeshGatt {
             if (!link.established) {
                 link.noise.readMessage(record) // m2
                 if (link.noise.isFinished()) {
-                    link.noise.finalize()
+                    link.noise.intoSession()
                     link.established = true
                 } else {
                     writeRecord(gatt, ch, link.noise.writeMessage()) // m3
-                    if (link.noise.isFinished()) { link.noise.finalize(); link.established = true }
+                    if (link.noise.isFinished()) { link.noise.intoSession(); link.established = true }
                 }
             } else {
                 val packet = BitchatPacket.decode(link.noise.decrypt(record)) ?: return
@@ -203,7 +203,7 @@ object MeshGatt {
                 if (!link.established) {
                     link.noise.readMessage(record) // m1 (then m3)
                     if (link.noise.isFinished()) {
-                        link.noise.finalize(); link.established = true
+                        link.noise.intoSession(); link.established = true
                     } else {
                         notify(device, link.noise.writeMessage()) // m2
                     }

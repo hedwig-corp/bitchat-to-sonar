@@ -6,6 +6,7 @@ androidx-activityCompose = "1.9.3"
 androidx-lifecycle = "2.8.4"
 coroutines = "1.9.0"
 jna = "5.14.0"
+breez-sdk-liquid = "0.11.13"
 android-minSdk = "26"
 android-targetSdk = "35"
 android-compileSdk = "35"
@@ -16,6 +17,7 @@ androidx-lifecycle-viewmodel-compose = { module = "org.jetbrains.androidx.lifecy
 coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "coroutines" }
 coroutines-android = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-android", version.ref = "coroutines" }
 jna = { module = "net.java.dev.jna:jna", version.ref = "jna" }
+breez-sdk-liquid = { module = "technology.breez.liquid:breez-sdk-liquid-kmp", version.ref = "breez-sdk-liquid" }
 
 [plugins]
 multiplatform = { id = "org.jetbrains.kotlin.multiplatform", version.ref = "kotlin" }
