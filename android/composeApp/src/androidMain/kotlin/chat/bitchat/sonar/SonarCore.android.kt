@@ -124,6 +124,16 @@ actual object SonarCore {
         requireNode().sendGeohash(geohash, text, nick)
     }
 
+    actual suspend fun sendChannelPresence(geohash: String) = withContext(Dispatchers.IO) {
+        runCatching { node?.sendGeohashPresence(geohash) }
+        Unit
+    }
+
+    actual suspend fun channelPresenceCount(geohash: String): Int = withContext(Dispatchers.IO) {
+        val n = node ?: return@withContext 0
+        runCatching { n.geohashPresenceCount(geohash).toInt() }.getOrDefault(0)
+    }
+
     actual suspend fun geoDmMessages(geohash: String, peerHex: String): List<SonarMsg> = withContext(Dispatchers.IO) {
         val n = node ?: return@withContext emptyList()
         runCatching {

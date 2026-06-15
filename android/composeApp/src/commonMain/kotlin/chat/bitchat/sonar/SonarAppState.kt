@@ -5,6 +5,9 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import chat.bitchat.sonar.store.MessageMerge
 import chat.bitchat.sonar.store.MessageStore
+import chat.bitchat.sonar.unify.UnifyBIP321
+import chat.bitchat.sonar.unify.UnifyPeer
+import chat.bitchat.sonar.unify.UnifyRadio
 import chat.bitchat.sonar.wallet.ExchangeRate
 import chat.bitchat.sonar.wallet.FiatCurrency
 import chat.bitchat.sonar.wallet.Money
@@ -54,12 +57,17 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun wipe() {
         scope.launch {
             WalletBridge.shutdown()
+            UnifyRadio.stopScanning()
+            UnifyRadio.stopAdvertising()
+            unifyOffer = null; unifyPeers = emptyList()
+            MeshRadio.setLocalSonarAnnounce(null); sonarPeerProfiles = emptyMap()
             MessageStore.wipe()
             SonarCore.wipe()
             stack = listOf(Screen.Home)
             chats = emptyList(); messages = emptyList()
             onboarded = false; nick = ""; npub = ""; started = false
             walletState = WalletState.NotConfigured
+            presenceByGeohash = emptyMap()
             payLedger = SonarPayLedger(); scannedPay.clear(); payVersion++
         }
     }
@@ -71,10 +79,25 @@ class SonarAppState(private val scope: CoroutineScope) {
         private set
     var meshPeers by mutableStateOf<List<MeshPeer>>(emptyList())
         private set
+    /** Nearby Unify Wallet users (payments-only, gold badge on the radar). */
+    var unifyPeers by mutableStateOf<List<UnifyPeer>>(emptyList())
+        private set
+    /** Sonar Discovery profiles received over mesh links, keyed by peer id. */
+    var sonarPeerProfiles by mutableStateOf<Map<String, SonarAnnounce>>(emptyMap())
+        private set
+
+    /** The Sonar Discovery profile for a mesh peer (its BLE id), if any. */
+    fun sonarProfile(peerId: String): SonarAnnounce? = sonarPeerProfiles[peerId]
     /** GPS-derived location channels (Mesh + Ottaviano…Italy), like iOS. */
     var locationChannels by mutableStateOf<List<GeoChannel>>(emptyList())
         private set
+    /** Live "here now" counts per geohash (kind-20001 presence), like iOS. */
+    var presenceByGeohash by mutableStateOf<Map<String, Int>>(emptyMap())
+        private set
     var toast by mutableStateOf<String?>(null)
+
+    /** "N here now" for a geohash channel (0 ⇒ unknown / nobody). */
+    fun presence(geohash: String): Int = presenceByGeohash[geohash] ?: 0
 
     fun refreshLocationChannels() {
         scope.launch { runCatching { locationChannels = LocationChannels.current() } }
@@ -191,6 +214,50 @@ class SonarAppState(private val scope: CoroutineScope) {
         meshPeers = MeshRadio.peers()
     }
 
+    // ── Unify nearby payments (separate BLE service; payments-only) ──
+    /** Cached amountless BOLT12 offer we advertise as the Unify receiver. */
+    private var unifyOffer: String? = null
+
+    /** Start scanning for Unify peers (payer role). Idempotent; no-op until
+     *  onboarded or while BLE permissions are missing. */
+    private fun startUnify() {
+        if (!onboarded) return
+        UnifyRadio.startScanning()
+    }
+
+    /** Advertise our receivable BOLT12 offer iff the wallet is ready AND we are
+     *  in the foreground — mirrors the iOS receiver policy (foreground-only). */
+    private suspend fun updateUnifyReceiver() {
+        val shouldServe = walletAvailable && onboarded && foreground &&
+            walletState is WalletState.Ready
+        if (shouldServe) {
+            if (unifyOffer == null) unifyOffer = runCatching { WalletBridge.createOffer() }.getOrNull()
+            val offer = unifyOffer
+            if (offer != null && !UnifyRadio.isAdvertising()) {
+                UnifyRadio.startAdvertising(offer, nick.ifBlank { "Sonar user" })
+            }
+        } else if (UnifyRadio.isAdvertising()) {
+            UnifyRadio.stopAdvertising()
+        }
+    }
+
+    /** Pay a nearby Unify user [amountSats] over Lightning: read their offer,
+     *  parse the BIP321 destination, and send. Surfaces the outcome via toast. */
+    fun sendSatsToUnify(peerId: String, amountSats: Long) {
+        if (!walletAvailable || walletState !is WalletState.Ready) {
+            toast = "Set up the wallet first"; return
+        }
+        if (amountSats <= 0) return
+        scope.launch {
+            val raw = UnifyRadio.fetchOffer(peerId)
+            val dest = raw?.let { UnifyBIP321.parse(it) }?.lightning
+            if (dest == null) { toast = "Couldn't read that user's payment request"; return@launch }
+            val ok = WalletBridge.send(dest, amountSats, "Sonar nearby")
+            walletState = WalletBridge.state()
+            toast = if (ok) "Sent ${amountSats} sats" else "Payment failed"
+        }
+    }
+
     fun joinChannel(geohash: String) {
         val g = geohash.trim().lowercase()
         if (g.isEmpty()) return
@@ -205,6 +272,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         scope.launch {
             channelMsgs = MessageStore.loadChannel(geohash) // disk hydrate (off-main), survives restart
             refreshChannel(geohash)
+            // Announce our presence right away and pull the current count so the
+            // header shows "N here now" without waiting for the next poll tick.
+            beatPresence(geohash)
+            refreshPresenceCounts()
         }
     }
 
@@ -380,6 +451,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (bypassRelock) bypassRelock = false        // return from our own unlock prompt
             else if (AppLock.isEnabled()) locked = true   // genuine app-switch → re-lock
         }
+        // Unify receiver is foreground-only (matches iOS) — react immediately.
+        scope.launch { updateUnifyReceiver() }
     }
 
     private fun notifPreview(content: String): String =
@@ -496,8 +569,10 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private fun poll() {
         scope.launch {
+            var tick = 0
             while (true) {
                 delay(4000)
+                tick++
                 SonarCore.sync()
                 refreshChats()
                 maybeNotify()
@@ -505,12 +580,47 @@ class SonarAppState(private val scope: CoroutineScope) {
                 (screen as? Screen.Channel)?.let { refreshChannel(it.geohash) }
                 (screen as? Screen.GeoDm)?.let { refreshGeoDm(it.geohash, it.peerHex) }
                 meshPeers = MeshRadio.peers()
+                // Sonar Discovery (0x53): keep our announce current for outgoing
+                // links and decode any peers' announces received over the mesh.
+                MeshRadio.setLocalSonarAnnounce(localSonarAnnounce()?.encode())
+                sonarPeerProfiles = MeshRadio.sonarPeers()
+                    .mapNotNull { (id, raw) -> SonarAnnounce.decode(raw)?.let { id to it } }
+                    .toMap()
+                // Unify nearby: keep the payer scan alive and refresh peers +
+                // the receiver advertising (wallet/foreground gated).
+                startUnify()
+                unifyPeers = UnifyRadio.peers()
+                updateUnifyReceiver()
                 if (locationChannels.isEmpty()) refreshLocationChannels()
+                // Presence: announce ourselves in the open channel on a ~60s
+                // heartbeat, then refresh "here now" counts (cheap in-memory read).
+                (screen as? Screen.Channel)?.let { if (tick % 15 == 1) beatPresence(it.geohash) }
+                refreshPresenceCounts()
                 if (walletAvailable && walletState is WalletState.Ready) {
                     WalletBridge.refreshBalance()
                     walletState = WalletBridge.state()
                 }
             }
         }
+    }
+
+    /** Broadcast our presence heartbeat (kind-20001) in [geohash]. Skips "mesh"
+     *  (the Bluetooth channel has no Nostr presence) and throttles to once per
+     *  beat so we don't spam the relays. */
+    private suspend fun beatPresence(geohash: String) {
+        if (geohash.isBlank() || geohash == "mesh") return
+        runCatching { SonarCore.sendChannelPresence(geohash) }
+    }
+
+    /** Refresh "N here now" counts for the open channel + the location channels
+     *  shown on Home, so people see live participation without opening each. */
+    private suspend fun refreshPresenceCounts() {
+        val targets = LinkedHashSet<String>()
+        (screen as? Screen.Channel)?.let { if (it.geohash != "mesh") targets.add(it.geohash) }
+        locationChannels.forEach { if (it.geohash != "mesh") targets.add(it.geohash) }
+        if (targets.isEmpty()) return
+        val next = presenceByGeohash.toMutableMap()
+        for (gh in targets) next[gh] = SonarCore.channelPresenceCount(gh)
+        presenceByGeohash = next
     }
 }

@@ -20,4 +20,11 @@ expect object MeshRadio {
     fun stop()
     /** Currently-visible mesh peers (pruned of stale entries). */
     fun peers(): List<MeshPeer>
+
+    /** Our encoded Sonar Discovery (0x53) announce to send to peers as Noise
+     *  links come up. Null clears it (e.g. before an identity exists). */
+    fun setLocalSonarAnnounce(payload: ByteArray?)
+    /** Raw 0x53 payloads received from peers, keyed by peer id (BLE address).
+     *  Decoded with [SonarAnnounce.decode] in shared code. */
+    fun sonarPeers(): Map<String, ByteArray>
 }

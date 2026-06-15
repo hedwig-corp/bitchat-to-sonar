@@ -36,6 +36,24 @@ actual object MeshRadio {
     private var scanner: BluetoothLeScanner? = null
     private var advertiser: BluetoothLeAdvertiser? = null
 
+    // ── Sonar Discovery (0x53) over the established mesh links ──
+    @Volatile private var localSonarAnnounce: ByteArray? = null
+    private val sonarProfiles = ConcurrentHashMap<String, ByteArray>()
+    private val handler = android.os.Handler(android.os.Looper.getMainLooper())
+
+    init {
+        // When a Noise link comes up, send our announce; stash peers' announces.
+        // The send is deferred ~150ms: on the initiator side the link finishes
+        // the instant handshake m3 is written, and GATT serializes writes — the
+        // delay lets m3 drain before the 0x53 write rides the same characteristic.
+        MeshGatt.addLinkListener { peerId ->
+            localSonarAnnounce?.let { payload ->
+                handler.postDelayed({ MeshGatt.sendSonar(peerId, payload) }, 150)
+            }
+        }
+        MeshGatt.addSonarListener { peerId, payload -> sonarProfiles[peerId] = payload }
+    }
+
     private val ctx: Context get() = AppContextHolder.ctx
 
     private fun hasPerm(p: String) =
@@ -114,6 +132,10 @@ actual object MeshRadio {
         for ((id, t) in lastSeen) if (now - t > STALE_MS) { seen.remove(id); lastSeen.remove(id) }
         return seen.values.sortedByDescending { it.rssi }
     }
+
+    actual fun setLocalSonarAnnounce(payload: ByteArray?) { localSonarAnnounce = payload }
+
+    actual fun sonarPeers(): Map<String, ByteArray> = HashMap(sonarProfiles)
 
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {

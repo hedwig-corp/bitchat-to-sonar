@@ -149,9 +149,11 @@ private fun HomeScreen(state: SonarAppState) {
                 }
                 // GPS-derived location channels (Ottaviano … Italy).
                 items(state.locationChannels, key = { it.geohash + it.level.name }) { c ->
+                    val here = state.presence(c.geohash)
                     ConvRow(
                         avatar = { PlaceTile(52.dp) },
-                        title = c.name, sub = c.level.label,
+                        title = c.name,
+                        sub = if (here > 0) "$here here now · ${c.level.label}" else c.level.label,
                     ) { state.openChannel(c.geohash) }
                 }
                 // Any manually-joined channels not already shown.

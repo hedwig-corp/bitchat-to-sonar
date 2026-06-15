@@ -42,12 +42,23 @@ struct RawGeoDm {
 
 type GeoDmBuf = Arc<Mutex<HashMap<(String, String), Vec<RawGeoDm>>>>;
 
+/// Live presence (kind-20001) per geohash channel: participant pubkey hex →
+/// last-seen unix seconds. Presence events are ephemeral heartbeats, so we keep
+/// only the most recent timestamp per participant and count those still within
+/// the TTL when reporting "N here now".
+type GeoPresenceBuf = Arc<Mutex<HashMap<String, HashMap<String, u64>>>>;
+
+/// How long a presence heartbeat keeps a participant counted as "here now".
+/// iOS re-broadcasts kind-20001 every 40-80s, well within this window.
+const PRESENCE_TTL_SECS: u64 = 300;
+
 pub struct SonarClient {
     engine: MarmotEngine,
     nostr: Client,
     relays: Vec<RelayUrl>,
     geo: Arc<Mutex<HashMap<String, Vec<RawGeo>>>>,
     geo_dm: GeoDmBuf,
+    geo_presence: GeoPresenceBuf,
     geo_subscribed: Arc<Mutex<HashSet<String>>>,
     identity_secret: [u8; 32],
 }
@@ -93,11 +104,13 @@ impl SonarClient {
         // delivered live to active subscriptions; relays don't store them.
         let geo: Arc<Mutex<HashMap<String, Vec<RawGeo>>>> = Arc::new(Mutex::new(HashMap::new()));
         let geo_dm: GeoDmBuf = Arc::new(Mutex::new(HashMap::new()));
+        let geo_presence: GeoPresenceBuf = Arc::new(Mutex::new(HashMap::new()));
         let geo_subscribed: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let identity_secret = identity.keys().secret_key().to_secret_bytes();
 
         let handler_geo = geo.clone();
         let handler_dm = geo_dm.clone();
+        let handler_presence = geo_presence.clone();
         let handler_subs = geo_subscribed.clone();
         let mut notifications = nostr.notifications();
         tokio::spawn(async move {
@@ -120,6 +133,18 @@ impl SonarClient {
                                 content: event.content.clone(),
                                 ts: event.created_at.as_u64(),
                             });
+                        }
+                    }
+                    20001 => {
+                        // Presence heartbeat: record the freshest timestamp per
+                        // participant so "N here now" counts live participants.
+                        let Some(geohash) = tag_value(&event, Alphabet::G) else { continue };
+                        let mut map = handler_presence.lock().unwrap();
+                        let bucket = map.entry(geohash).or_default();
+                        let ts = event.created_at.as_u64();
+                        let slot = bucket.entry(event.pubkey.to_hex()).or_insert(0);
+                        if ts > *slot {
+                            *slot = ts;
                         }
                     }
                     1059 => {
@@ -165,6 +190,7 @@ impl SonarClient {
             relays,
             geo,
             geo_dm,
+            geo_presence,
             geo_subscribed,
             identity_secret,
         })
@@ -274,6 +300,12 @@ impl SonarClient {
             .custom_tag(SingleLetterTag::lowercase(Alphabet::G), geohash);
         self.nostr.subscribe(channel, None).await?;
 
+        // Presence heartbeats (kind-20001) tagged with this geohash.
+        let presence = Filter::new()
+            .kind(Kind::Custom(20001))
+            .custom_tag(SingleLetterTag::lowercase(Alphabet::G), geohash);
+        self.nostr.subscribe(presence, None).await?;
+
         // 1:1 DMs (NIP-17 gift wraps) addressed to our per-geohash key.
         let geo_pk = crate::geohash::derive_geohash_keys(&self.identity_secret, geohash)?.public_key();
         let dms = Filter::new().kind(Kind::GiftWrap).pubkey(geo_pk);
@@ -371,6 +403,50 @@ impl SonarClient {
             });
         }
         Ok(())
+    }
+
+    /// Broadcast a presence heartbeat (kind-20001) for a geohash channel, so
+    /// other participants count this device in "N here now". Empty content, a
+    /// single `g`=geohash tag, signed with the stable per-geohash ephemeral key
+    /// (the same key used for messages, so presence and authorship line up).
+    /// Wire-compatible with the iOS `createGeohashPresenceEvent`. Call this on
+    /// channel open and re-call on a ~60s heartbeat while the channel is active.
+    pub async fn send_geohash_presence(&self, geohash: &str) -> Result<()> {
+        self.subscribe_geohash(geohash).await?;
+        let secret = self.identity().keys().secret_key().to_secret_bytes();
+        let geo = crate::geohash::derive_geohash_keys(&secret, geohash)?;
+        let event = EventBuilder::new(Kind::Custom(20001), "")
+            .tags([Tag::custom(
+                TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::G)),
+                [geohash.to_string()],
+            )])
+            .sign_with_keys(&geo)?;
+        self.nostr.send_event(&event).await?;
+        // Relays don't echo to the sender; count ourselves locally so a solo
+        // user still sees "1 here now".
+        let mut map = self.geo_presence.lock().unwrap();
+        let bucket = map.entry(geohash.to_string()).or_default();
+        bucket.insert(event.pubkey.to_hex(), event.created_at.as_u64());
+        Ok(())
+    }
+
+    /// Number of participants currently "here now" in a geohash channel: the
+    /// count of distinct presence heartbeats (kind-20001) seen within the TTL.
+    /// Subscribes on first access. Includes this device once it has announced.
+    pub async fn geohash_presence_count(&self, geohash: &str) -> Result<u32> {
+        self.subscribe_geohash(geohash).await?;
+        let cutoff = Timestamp::now().as_u64().saturating_sub(PRESENCE_TTL_SECS);
+        let mut map = self.geo_presence.lock().unwrap();
+        let count = match map.get_mut(geohash) {
+            Some(bucket) => {
+                // Evict stale heartbeats while we're here so the map can't grow
+                // unbounded over a long session in a busy channel.
+                bucket.retain(|_, &mut ts| ts >= cutoff);
+                bucket.len()
+            }
+            None => 0,
+        };
+        Ok(count as u32)
     }
 
     /// Recent messages for a geohash channel from the live buffer, oldest

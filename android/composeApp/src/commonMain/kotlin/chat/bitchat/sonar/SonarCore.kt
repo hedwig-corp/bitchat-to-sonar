@@ -73,6 +73,14 @@ expect object SonarCore {
     /** Publish a public message to a geohash channel. */
     suspend fun sendChannel(geohash: String, text: String)
 
+    /** Broadcast a presence heartbeat (kind-20001) for a geohash channel.
+     *  Call on channel open and on a ~60s heartbeat while it stays open. */
+    suspend fun sendChannelPresence(geohash: String)
+
+    /** Count of participants currently "here now" in a geohash channel
+     *  (distinct kind-20001 heartbeats within the presence TTL). */
+    suspend fun channelPresenceCount(geohash: String): Int
+
     /** 1:1 encrypted DM conversation with a channel participant (NIP-17). */
     suspend fun geoDmMessages(geohash: String, peerHex: String): List<SonarMsg>
     suspend fun sendGeoDm(geohash: String, peerHex: String, text: String)

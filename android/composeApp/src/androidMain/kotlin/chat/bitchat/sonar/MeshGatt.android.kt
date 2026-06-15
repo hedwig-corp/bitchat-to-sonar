@@ -54,12 +54,39 @@ object MeshGatt {
     /** Per-link state keyed by remote device address. */
     private class Link(val noise: SonarNoise, var established: Boolean = false)
     private val serverLinks = ConcurrentHashMap<String, Link>()
+    private val serverDevices = ConcurrentHashMap<String, BluetoothDevice>()
     private val clientLinks = ConcurrentHashMap<String, Link>()
     // Iterated from BLE callback threads, mutated from the main thread → must be
-    // a concurrent collection to avoid ConcurrentModificationException.
+    // concurrent collections to avoid ConcurrentModificationException.
     private val onText = java.util.concurrent.CopyOnWriteArrayList<(String, String) -> Unit>()
+    private val onSonar = java.util.concurrent.CopyOnWriteArrayList<(String, ByteArray) -> Unit>()
+    private val onLink = java.util.concurrent.CopyOnWriteArrayList<(String) -> Unit>()
+
+    /** bitchat mesh packet types we route over an established Noise link. */
+    private const val TYPE_MESSAGE = 1
 
     fun addMessageListener(cb: (peerId: String, text: String) -> Unit) { onText.add(cb) }
+    /** Listen for raw Sonar Discovery (0x53) payloads decoded off the link. */
+    fun addSonarListener(cb: (peerId: String, payload: ByteArray) -> Unit) { onSonar.add(cb) }
+    /** Notified (with the peer's address) the moment a Noise link establishes,
+     *  on either role — the cue to send our own Sonar Discovery announce. */
+    fun addLinkListener(cb: (peerId: String) -> Unit) { onLink.add(cb) }
+
+    private fun linkEstablished(peerId: String) { onLink.forEach { it(peerId) } }
+
+    /**
+     * Route a decoded packet by its [BitchatPacket.type] instead of assuming
+     * everything is chat text. Unknown types are ignored (forward-compatible,
+     * like stock bitchat). This is the single dispatch point for both the
+     * central and peripheral receive paths.
+     */
+    private fun dispatch(peerId: String, packet: BitchatPacket) {
+        when (packet.type) {
+            TYPE_MESSAGE -> onText.forEach { it(peerId, packet.payload.decodeToString()) }
+            SonarAnnounce.PACKET_TYPE -> onSonar.forEach { it(peerId, packet.payload) }
+            else -> android.util.Log.i(TAG, "ignoring mesh packet type=${packet.type} from $peerId")
+        }
+    }
 
     /** Start the peripheral GATT server so peers can link to us. */
     fun startServer() {
@@ -82,7 +109,7 @@ object MeshGatt {
     fun stop() {
         try { server?.close() } catch (_: Throwable) {}
         server = null; characteristic = null
-        serverLinks.clear(); clientLinks.clear()
+        serverLinks.clear(); serverDevices.clear(); clientLinks.clear()
     }
 
     // ── Central: initiate a link to a discovered peer ──
@@ -106,7 +133,7 @@ object MeshGatt {
         if (!link.established) return false
         return runCatching {
             val packet = BitchatPacket(
-                type = 1, ttl = 7, timestampMs = 0L,
+                type = TYPE_MESSAGE, ttl = 7, timestampMs = 0L,
                 senderId = keypair.publicHex.hexToBytes().copyOf(8),
                 recipientId = BitchatPacket.BROADCAST,
                 payload = text.encodeToByteArray(), signature = null,
@@ -120,6 +147,31 @@ object MeshGatt {
             } ?: false
         }.getOrDefault(false)
     }
+
+    /**
+     * Send our Sonar Discovery announce (a 0x53 TLV [payload]) to an established
+     * peer, over whichever Noise role links us to it. The 0x53 rides the
+     * already-authenticated Noise session (the peer's static key is verified by
+     * the handshake), so the npub it carries is bound to that authenticated
+     * peer — the Android analogue of iOS verifying 0x53 against the peer's
+     * Ed25519 announce key.
+     */
+    fun sendSonar(peerId: String, payload: ByteArray): Boolean = runCatching {
+        val packet = BitchatPacket(
+            type = SonarAnnounce.PACKET_TYPE, ttl = 1, timestampMs = 0L,
+            senderId = keypair.publicHex.hexToBytes().copyOf(8),
+            recipientId = BitchatPacket.BROADCAST,
+            payload = payload, signature = null,
+        ).encode()
+        clientLinks[peerId]?.takeIf { it.established }?.let { link ->
+            val gatt = clientGatt[peerId]; val ch = clientChar[peerId]
+            if (gatt != null && ch != null) { writeRecord(gatt, ch, link.noise.encrypt(packet)); return@runCatching true }
+        }
+        serverLinks[peerId]?.takeIf { it.established }?.let { link ->
+            serverDevices[peerId]?.let { device -> notify(device, link.noise.encrypt(packet)); return@runCatching true }
+        }
+        false
+    }.getOrDefault(false)
 
     // ── GATT plumbing ──
     private val clientGatt = ConcurrentHashMap<String, BluetoothGatt>()
@@ -180,17 +232,19 @@ object MeshGatt {
                     link.noise.intoSession()
                     link.established = true
                     android.util.Log.i(TAG, "client link ESTABLISHED with $addr peer=$peer")
+                    linkEstablished(addr)
                 } else {
                     writeRecord(gatt, ch, link.noise.writeMessage()) // m3
                     if (link.noise.isFinished()) {
                         val peer = link.noise.remoteStaticHex()
                         link.noise.intoSession(); link.established = true
                         android.util.Log.i(TAG, "client link ESTABLISHED with $addr peer=$peer")
+                        linkEstablished(addr)
                     }
                 }
             } else {
                 val packet = BitchatPacket.decode(link.noise.decrypt(record)) ?: return
-                onText.forEach { it(addr, packet.payload.decodeToString()) }
+                dispatch(addr, packet)
             }
         } catch (_: Throwable) { cleanupClient(addr) }
     }
@@ -204,8 +258,10 @@ object MeshGatt {
         override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 serverLinks[device.address] = Link(SonarNoise.responder(keypair.privateHex))
+                serverDevices[device.address] = device
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 serverLinks.remove(device.address)
+                serverDevices.remove(device.address)
             }
         }
 
@@ -221,12 +277,13 @@ object MeshGatt {
                     link.noise.readMessage(record) // m1 (then m3)
                     if (link.noise.isFinished()) {
                         link.noise.intoSession(); link.established = true
+                        linkEstablished(device.address)
                     } else {
                         notify(device, link.noise.writeMessage()) // m2
                     }
                 } else {
                     val packet = BitchatPacket.decode(link.noise.decrypt(record)) ?: return
-                    onText.forEach { it(device.address, packet.payload.decodeToString()) }
+                    dispatch(device.address, packet)
                 }
             } catch (_: Throwable) { serverLinks.remove(device.address) }
         }

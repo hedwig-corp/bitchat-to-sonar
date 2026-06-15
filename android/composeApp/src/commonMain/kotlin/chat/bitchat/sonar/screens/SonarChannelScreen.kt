@@ -72,7 +72,10 @@ fun SonarChannelScreen(state: SonarAppState, screen: Screen.Channel) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     SNDot(s.green, 6.dp)
                     Spacer(Modifier.width(5.dp))
-                    Text("public channel · over the internet", color = s.text2, fontSize = 11.5.sp)
+                    val here = state.presence(screen.geohash)
+                    val sub = if (here > 0) "$here here now · over the internet"
+                              else "public channel · over the internet"
+                    Text(sub, color = s.text2, fontSize = 11.5.sp)
                 }
             }
         }

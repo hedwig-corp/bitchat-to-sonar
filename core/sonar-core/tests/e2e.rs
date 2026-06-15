@@ -117,6 +117,65 @@ async fn two_instances_exchange_geohash_channel_messages() {
     assert!(other.is_empty(), "different geohash sees nothing");
 }
 
+/// Presence heartbeats (kind-20001) drive the "N here now" count: each
+/// participant who announces is counted once, distinct geohashes are isolated,
+/// and re-announcing does not double-count.
+#[tokio::test]
+async fn geohash_presence_counts_participants() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let url = relay.url().await;
+    let alice = SonarClient::connect_in_memory(Identity::generate(), vec![url.clone()])
+        .await
+        .expect("alice connects");
+    let bob = SonarClient::connect_in_memory(Identity::generate(), vec![url.clone()])
+        .await
+        .expect("bob connects");
+
+    let gh = "u0nd";
+    alice.subscribe_geohash(gh).await.expect("alice joins");
+    bob.subscribe_geohash(gh).await.expect("bob joins");
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+    // Only alice has announced so far — she counts herself locally.
+    alice.send_geohash_presence(gh).await.expect("alice announces");
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert_eq!(
+        bob.geohash_presence_count(gh).await.unwrap(),
+        1,
+        "bob sees alice present"
+    );
+
+    // Bob announces too; both sides now count two distinct participants.
+    bob.send_geohash_presence(gh).await.expect("bob announces");
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert_eq!(
+        alice.geohash_presence_count(gh).await.unwrap(),
+        2,
+        "alice sees both present"
+    );
+    assert_eq!(
+        bob.geohash_presence_count(gh).await.unwrap(),
+        2,
+        "bob sees both present"
+    );
+
+    // Re-announcing refreshes the heartbeat, it does not double-count.
+    alice.send_geohash_presence(gh).await.expect("alice re-announces");
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert_eq!(
+        bob.geohash_presence_count(gh).await.unwrap(),
+        2,
+        "still two distinct participants"
+    );
+
+    // A different geohash has nobody present.
+    assert_eq!(
+        bob.geohash_presence_count("9q5c").await.unwrap(),
+        0,
+        "isolated channel has no presence"
+    );
+}
+
 /// Two channel participants exchange a 1:1 encrypted geohash DM (NIP-17 over
 /// their per-geohash keys), learning each other's keys from the public channel.
 #[tokio::test]

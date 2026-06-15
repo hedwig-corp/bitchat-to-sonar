@@ -275,6 +275,22 @@ impl SonarNode {
         Ok(msgs.into_iter().map(geo_message_info).collect())
     }
 
+    /// Broadcast a presence heartbeat (kind-20001) for a geohash channel.
+    /// Call on channel open and on a ~60s heartbeat while it is active.
+    pub fn send_geohash_presence(&self, geohash: String) -> FfiResult<()> {
+        self.runtime
+            .block_on(self.client.send_geohash_presence(&geohash))?;
+        Ok(())
+    }
+
+    /// Count of participants currently "here now" in a geohash channel
+    /// (distinct kind-20001 heartbeats within the presence TTL).
+    pub fn geohash_presence_count(&self, geohash: String) -> FfiResult<u32> {
+        Ok(self
+            .runtime
+            .block_on(self.client.geohash_presence_count(&geohash))?)
+    }
+
     /// Send a 1:1 encrypted DM to a geohash channel participant (NIP-17).
     pub fn send_geo_dm(&self, geohash: String, recipient_hex: String, text: String) -> FfiResult<()> {
         self.runtime
