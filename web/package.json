@@ -2,7 +2,7 @@
   "name": "sonar-landing",
   "version": "1.0.0",
   "description": "Sonar landing page — sense who's nearby before you see them.",
-  "license": "MIT",
+  "license": "Unlicense",
   "private": true,
   "type": "module",
   "scripts": {
