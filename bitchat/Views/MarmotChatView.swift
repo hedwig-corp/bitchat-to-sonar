@@ -7,6 +7,7 @@
 //
 
 import SwiftUI
+import BitLogger
 
 /// UI state for Marmot (MLS-over-Nostr) secure chats — the White Noise
 /// interop path. Owns a `MarmotService` and persists the generated Nostr
@@ -45,19 +46,29 @@ final class MarmotChatModel: ObservableObject {
         busy = true
         Task {
             defer { busy = false }
-            do {
-                let storedNsec = keychain.getIdentityKey(forKey: Self.nsecKeychainKey)
-                    .flatMap { String(data: $0, encoding: .utf8) }
-                let npub = try await service.connect(nsec: storedNsec)
+            let storedNsec = keychain.getIdentityKey(forKey: Self.nsecKeychainKey)
+                .flatMap { String(data: $0, encoding: .utf8) }
+            // 1) Publish our npub IMMEDIATELY — the identity pubkey is offline-
+            //    derivable, so Sonar discovery (0x53) can advertise it without
+            //    waiting on (or being blocked by) the relay connect. Persist a
+            //    freshly-generated nsec so `connect` below reuses the same identity.
+            if let np = try? await service.loadIdentityNpub(nsec: storedNsec) {
                 if storedNsec == nil, let fresh = await service.exportNsec() {
                     _ = keychain.saveIdentityKey(Data(fresh.utf8), forKey: Self.nsecKeychainKey)
                 }
+                self.npub = np
+            }
+            // 2) Connect to relays + publish our KeyPackage — required for actual
+            //    White Noise message delivery (not for advertising the npub).
+            do {
+                _ = try await service.connect(nsec: storedNsec)
                 try await service.publishKeyPackage()
-                self.npub = npub
                 self.errorText = nil
                 await refresh()
             } catch {
-                self.errorText = Self.describe(error)
+                let desc = Self.describe(error)
+                SecureLogger.warning("⚠️ Marmot connect/publish failed: \(desc)", category: .session)
+                self.errorText = desc
             }
         }
     }

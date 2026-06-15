@@ -122,6 +122,14 @@ fun PaySheet(
                                 .clickable { v = c.toString() }.padding(horizontal = 14.dp, vertical = 7.dp)
                         ) { Text(payFmt(c), color = s.goldDeep, fontSize = 13.sp, fontWeight = FontWeight.Bold) }
                     }
+                    // "Max" = the entire spendable balance (to drain the wallet to
+                    // this recipient). Filled gold to stand out from the presets.
+                    if (balanceSats > 0) {
+                        Box(
+                            Modifier.clip(RoundedCornerShape(999.dp)).background(s.goldFill)
+                                .clickable { v = balanceSats.toString() }.padding(horizontal = 16.dp, vertical = 7.dp)
+                        ) { Text("Max", color = s.onGold, fontSize = 13.sp, fontWeight = FontWeight.Bold) }
+                    }
                 }
 
                 // pay-pad (4 rows × 3 cols)

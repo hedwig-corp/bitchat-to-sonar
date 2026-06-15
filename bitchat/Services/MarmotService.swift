@@ -104,6 +104,26 @@ final class MarmotService: @unchecked Sendable {
         }
     }
 
+    /// Load (or generate + persist into `service.identity`) the identity and
+    /// return its `npub1...` WITHOUT connecting to relays. The npub is just the
+    /// identity pubkey — available offline — so Sonar discovery (0x53) can
+    /// advertise our npub even when the Marmot relay connect is slow or failing.
+    /// A subsequent `connect(nsec: nil)` reuses this same `service.identity`.
+    func loadIdentityNpub(nsec: String? = nil) async throws -> String {
+        try await run { service in
+            let identity: SonarIdentity
+            if let nsec {
+                identity = try SonarIdentity.import(nsec: nsec)
+            } else if let existing = service.identity {
+                identity = existing
+            } else {
+                identity = SonarIdentity.generate()
+            }
+            service.identity = identity
+            return identity.npub()
+        }
+    }
+
     /// `npub1...` of the connected identity (nil before `connect`).
     func currentNpub() async -> String? {
         await runNonThrowing { $0.identity?.npub() }
