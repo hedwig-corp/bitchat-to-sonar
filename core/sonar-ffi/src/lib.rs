@@ -890,12 +890,11 @@ pub fn mesh_fragment(
     if chunk_size == 0 {
         return Err(SonarFfiError::InvalidInput("chunk_size must be > 0".into()));
     }
-    Ok(
-        mesh::file_packet::fragment(&data, id, original_type, chunk_size as usize)
-            .iter()
-            .map(|f| f.encode_payload())
-            .collect(),
-    )
+    let frags = mesh::file_packet::fragment(&data, id, original_type, chunk_size as usize)
+        .ok_or_else(|| {
+            SonarFfiError::InvalidInput("data too large to fragment (exceeds max fragments)".into())
+        })?;
+    Ok(frags.iter().map(|f| f.encode_payload()).collect())
 }
 
 /// Reassembles incoming 0x20 fragment payloads into the original bytes. Keyed by

@@ -633,6 +633,15 @@ pub mod fragment {
 
     use std::collections::HashMap;
 
+    /// Upper bound on a message's fragment count. The fragments arrive from
+    /// UNTRUSTED BLE peers, so a malicious `total` (up to 65535) would otherwise
+    /// pre-allocate a large slot vec from a single tiny packet. 8192 fragments
+    /// comfortably covers the 1 MiB file cap at any realistic chunk size.
+    pub const MAX_FRAGMENTS: u16 = 8192;
+    /// Max concurrent in-flight reassembly streams. Bounds memory against an
+    /// attacker opening many never-completed streams with distinct fragment ids.
+    pub const MAX_BUCKETS: usize = 256;
+
     /// Reassembles fragments keyed by (sender, fragmentID). `add` returns the
     /// concatenated original bytes once every index 0..total has arrived.
     #[derive(Default)]
@@ -646,12 +655,18 @@ pub mod fragment {
         }
 
         /// Feed one fragment (with the carrying packet's `sender`). Returns the
-        /// reassembled original packet bytes when complete.
+        /// reassembled original packet bytes when complete. Hardened against
+        /// untrusted input: rejects an oversized `total` and caps the number of
+        /// concurrent streams (a new stream is dropped once at capacity rather
+        /// than growing memory unbounded).
         pub fn add(&mut self, sender: [u8; 8], frag: &Fragment) -> Option<Vec<u8>> {
-            if frag.total == 0 || frag.index >= frag.total {
+            if frag.total == 0 || frag.index >= frag.total || frag.total > MAX_FRAGMENTS {
                 return None;
             }
             let key = (sender, frag.fragment_id);
+            if !self.buckets.contains_key(&key) && self.buckets.len() >= MAX_BUCKETS {
+                return None; // at capacity: drop fragments for new streams
+            }
             let slots = self
                 .buckets
                 .entry(key)
@@ -827,24 +842,36 @@ pub mod file_packet {
     /// each carries `original_type` (0x22 for a file packet) and is sent as a
     /// 0x20 packet. `chunk_size` is the per-fragment chunk (≤ BLE write size).
     /// The receiver feeds these to [`super::fragment::Reassembler`].
+    ///
+    /// Returns `None` if the data cannot be represented in bitchat's wire format:
+    /// `chunk_size == 0`, or it would need more than `MAX_FRAGMENTS` fragments
+    /// (bitchat's `total` is a u16). Never panics.
     pub fn fragment(
         data: &[u8],
         fragment_id: [u8; 8],
         original_type: u8,
         chunk_size: usize,
-    ) -> Vec<Fragment> {
-        assert!(chunk_size > 0, "chunk_size must be > 0");
-        let total = data.len().div_ceil(chunk_size).max(1) as u16;
-        data.chunks(chunk_size)
-            .enumerate()
-            .map(|(i, chunk)| Fragment {
-                fragment_id,
-                index: i as u16,
-                total,
-                original_type,
-                chunk: chunk.to_vec(),
-            })
-            .collect()
+    ) -> Option<Vec<Fragment>> {
+        if chunk_size == 0 {
+            return None;
+        }
+        let count = data.len().div_ceil(chunk_size).max(1);
+        if count > super::fragment::MAX_FRAGMENTS as usize {
+            return None;
+        }
+        let total = count as u16;
+        Some(
+            data.chunks(chunk_size)
+                .enumerate()
+                .map(|(i, chunk)| Fragment {
+                    fragment_id,
+                    index: i as u16,
+                    total,
+                    original_type,
+                    chunk: chunk.to_vec(),
+                })
+                .collect(),
+        )
     }
 }
 

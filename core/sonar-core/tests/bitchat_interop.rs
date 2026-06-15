@@ -101,7 +101,7 @@ fn large_file_packet_fragments_and_reassembles() {
     let encoded = packet.encode().expect("encode"); // > 65535 → must fragment
     assert!(encoded.len() > u16::MAX as usize);
 
-    let frags: Vec<Fragment> = fragment(&encoded, [7u8; 8], msg_type::FILE_TRANSFER, 400);
+    let frags: Vec<Fragment> = fragment(&encoded, [7u8; 8], msg_type::FILE_TRANSFER, 400).expect("fragment");
     assert!(frags.len() > 1);
     assert!(frags.iter().all(|f| f.original_type == msg_type::FILE_TRANSFER));
 
@@ -118,6 +118,36 @@ fn large_file_packet_fragments_and_reassembles() {
     let whole = whole.expect("reassembled");
     assert_eq!(whole, encoded);
     assert_eq!(FilePacket::decode(&whole).unwrap(), packet);
+}
+
+/// Hardening: the reassembler rejects an oversized `total` (a malicious BLE peer
+/// could otherwise force a large pre-allocation from one tiny packet), and
+/// `fragment()` refuses input that can't fit bitchat's u16 fragment count — no
+/// panic.
+#[test]
+fn reassembler_and_fragment_reject_abusive_inputs() {
+    use sonar_core::mesh::fragment::MAX_FRAGMENTS;
+
+    // A single fragment claiming total > MAX_FRAGMENTS is dropped, not allocated.
+    let mut reasm = Reassembler::new();
+    let evil = Fragment {
+        fragment_id: [0xAB; 8],
+        index: 0,
+        total: u16::MAX,
+        original_type: msg_type::FILE_TRANSFER,
+        chunk: vec![0u8; 4],
+    };
+    assert!(reasm.add([1u8; 8], &evil).is_none());
+
+    // fragment() never panics: chunk_size 0 and too-many-fragments both → None.
+    assert!(fragment(b"data", [1u8; 8], msg_type::FILE_TRANSFER, 0).is_none());
+    let huge = vec![0u8; (MAX_FRAGMENTS as usize + 1) * 2];
+    assert!(fragment(&huge, [1u8; 8], msg_type::FILE_TRANSFER, 1).is_none());
+
+    // A valid (total == MAX_FRAGMENTS) stream still works.
+    let ok = fragment(&vec![7u8; MAX_FRAGMENTS as usize], [2u8; 8], msg_type::FILE_TRANSFER, 1)
+        .expect("at-limit fragmentation is allowed");
+    assert_eq!(ok.len(), MAX_FRAGMENTS as usize);
 }
 
 /// Full mesh path: a file packet survives a Noise XX link + fragmentation +
@@ -145,7 +175,7 @@ fn file_survives_noise_and_fragmentation_over_the_mesh() {
     let plain = packet.encode().unwrap();
     let ciphertext = sender.encrypt(&plain).unwrap();
 
-    let frags = fragment(&ciphertext, [9u8; 8], msg_type::FILE_TRANSFER, 350);
+    let frags = fragment(&ciphertext, [9u8; 8], msg_type::FILE_TRANSFER, 350).expect("fragment");
     let mut reasm = Reassembler::new();
     let mut got = None;
     for f in frags.iter().rev() {
