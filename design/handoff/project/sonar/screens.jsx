@@ -115,6 +115,37 @@ function WipeSheet({ onClose, onWipe }) {
   );
 }
 
+/* ── "Around you": collapses the whole precision ladder into ONE row ── */
+function HereCard({ onEnter }) {
+  const ladder = BC_DATA.here || [];
+  const def = (() => {
+    for (let i = 0; i < ladder.length; i++) if (ladder[i].count > 0) return i;
+    return Math.max(0, ladder.length - 1);
+  })();
+  const [idx, setIdx] = React.useState(def);
+  const lv = ladder[idx];
+  if (!lv) return null;
+  return (
+    <div className="here-card">
+      <button className="here-main" onClick={() => onEnter(lv)}>
+        <PlaceTile size={52} />
+        <span className="here-text">
+          <span className="here-name">{lv.name}</span>
+          <span className="here-sub">{lv.tier} · {lv.count} here now</span>
+        </span>
+        <BCIcon name="chevron" size={15} weight={2.2} style={{ color: 'var(--text3)', flex: 'none' }} />
+      </button>
+      <div className="here-scale" role="group" aria-label="Precision">
+        {ladder.map((l, i) => (
+          <button key={l.id} className={'here-tick' + (i === idx ? ' on' : '')} onClick={() => setIdx(i)}>
+            {l.short}{l.count > 0 ? <i className="here-live"></i> : null}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 /* ── Home ── */
 function HomeScreen({ app, t, nav, push, toggleNetwork, onWipe }) {
   const meshCount = BC_DATA.peers.filter((p) => p.inRange).length;
@@ -139,7 +170,9 @@ function HomeScreen({ app, t, nav, push, toggleNetwork, onWipe }) {
       </div>
       <StatusChip network={app.network} meshCount={meshCount} variant={t.chip} onToggle={toggleNetwork} />
       <div className="bc-scroll" style={{ paddingBottom: 120 }}>
-        <SectionLabel>Nearby channels</SectionLabel>
+        <SectionLabel>Around you</SectionLabel>
+        <HereCard onEnter={(lv) => push('channel', { id: lv.id })} />
+        <SectionLabel>Saved channels</SectionLabel>
         <div className="bc-list">
           {BC_DATA.channels.map((ch) => (
             <ConvRow
@@ -193,7 +226,7 @@ function HomeScreen({ app, t, nav, push, toggleNetwork, onWipe }) {
 
 /* ── Location channel (public) ── */
 function ChannelScreen({ app, nav, pop, push, chId, onSend, onCommand }) {
-  const ch = BC_DATA.channels.find((c) => c.id === chId) || BC_DATA.channels[0];
+  const ch = BC_DATA.channels.find((c) => c.id === chId) || (BC_DATA.here || []).find((c) => c.id === chId) || BC_DATA.channels[0];
   const msgs = app.chMsgs[ch.id] || [];
   const [sheet, setSheet] = React.useState(false);
   const transport = app.network === 'online' ? 'internet' : 'mesh';

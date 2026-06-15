@@ -70,11 +70,22 @@ actual object MeshRadio {
      *  announce carries a stable peerID — keying by address loses the name). */
     private val announcedPeers = ConcurrentHashMap<String, MeshPeer>()
     private val announcedSeen = ConcurrentHashMap<String, Long>()
-    /** Identified peers stay listed longer than raw scan blips (they re-announce
-     *  over a live link, but tolerate gaps). */
-    private const val ANNOUNCE_STALE_MS = 60_000L
+    /** How long a verified peer stays listed after we last heard from it WITHOUT
+     *  a live link. A peer announces only once per Noise connection (not on a
+     *  heartbeat), and connections re-form only every few minutes as BLE private
+     *  addresses rotate — so a short window made the radar flicker empty between
+     *  announces. A peer with a CURRENTLY established link never ages out (see
+     *  peers()); this grace just bridges the gap after a link drops. */
+    private const val ANNOUNCE_STALE_MS = 300_000L
+
+    /** Incoming decrypted mesh DMs, buffered until the app drains them. */
+    private val meshDmInbox = java.util.concurrent.ConcurrentLinkedQueue<MeshDmIn>()
 
     init {
+        // Buffer incoming Noise DMs (the listener fires on a BLE callback thread).
+        MeshGatt.addMessageListener { peerId, text ->
+            meshDmInbox.add(MeshDmIn(peerId, text, System.currentTimeMillis() / 1000))
+        }
         // Stash peers' 0x53 payloads + register named, verified announce peers.
         MeshGatt.addSonarListener { peerId, payload -> sonarProfiles[peerId] = payload }
         MeshGatt.addAnnounceListener { _, info ->
@@ -85,6 +96,8 @@ actual object MeshRadio {
             )
             announcedSeen[info.senderIdHex] = System.currentTimeMillis()
         }
+        // Keep a peer fresh while its encrypted link is (re)established.
+        MeshGatt.addLinkListener { peerId -> announcedSeen[peerId] = System.currentTimeMillis() }
     }
 
     private val ctx: Context get() = AppContextHolder.ctx
@@ -199,7 +212,13 @@ actual object MeshRadio {
         // exposing those produced "zombie" peers. Only VERIFIED announce peers
         // (stable bitchat peerID + signed nickname) are real users, like iOS.
         for ((id, t) in lastSeen) if (now - t > STALE_MS) { seen.remove(id); lastSeen.remove(id) }
-        for ((id, t) in announcedSeen) if (now - t > ANNOUNCE_STALE_MS) { announcedPeers.remove(id); announcedSeen.remove(id) }
+        // Keep a peer while it has a live Noise link (definitely present), or
+        // within the grace window after we last heard from it.
+        for ((id, t) in announcedSeen) {
+            if (!MeshGatt.hasLink(id) && now - t > ANNOUNCE_STALE_MS) {
+                announcedPeers.remove(id); announcedSeen.remove(id)
+            }
+        }
         // Classify by richest protocol: a peer that also sent a 0x53 Sonar
         // announce is a full Sonar user, else a plain bitchat peer.
         return announcedPeers.entries
@@ -213,6 +232,19 @@ actual object MeshRadio {
     actual fun setMeshNickname(nick: String) { if (nick.isNotBlank()) MeshGatt.nickname = nick }
 
     actual fun sonarPeers(): Map<String, ByteArray> = HashMap(sonarProfiles)
+
+    actual fun sendMeshDm(peerId: String, messageId: String, text: String): Boolean =
+        MeshGatt.sendTextToPeer(peerId, messageId, text)
+
+    actual fun hasMeshLink(peerId: String): Boolean = MeshGatt.hasLink(peerId)
+
+    actual fun drainMeshDm(): List<MeshDmIn> {
+        val out = ArrayList<MeshDmIn>()
+        while (true) { out.add(meshDmInbox.poll() ?: break) }
+        return out
+    }
+
+    actual fun nowSecs(): Long = System.currentTimeMillis() / 1000
 
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {

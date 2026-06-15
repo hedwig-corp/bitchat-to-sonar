@@ -399,6 +399,8 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     var paySheet by remember { mutableStateOf(false) }
     var verifySheet by remember { mutableStateOf(false) }
     var addSheet by remember { mutableStateOf(false) }
+    // Radar "Send sats" opens the chat with pay=true → jump straight to the sheet.
+    LaunchedEffect(screen.id) { if (screen.pay) paySheet = true }
     val listState = rememberLazyListState()
     LaunchedEffect(state.messages.size) {
         if (state.messages.isNotEmpty()) listState.animateScrollToItem(state.messages.size - 1)
@@ -410,6 +412,10 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             ?.let { shortNpub(it) } ?: "secure chat"
     }
     val verified = run { state.payVersion; state.isVerified(screen.id) }
+    // BLE-mesh DMs are cyan/"Bluetooth"; Marmot DMs indigo/"internet" (the
+    // design's signature transport-colored bubbles).
+    val mesh = screen.id.startsWith("mesh:")
+    val transport = if (mesh) "Bluetooth" else "internet"
 
     Column(Modifier.fillMaxSize()) {
         // bc-header (DM): avatar + name + verified shield + lock·"Via internet"
@@ -432,7 +438,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                     SNIcon(SNIconName.Lock, 11.dp, s.text2, weight = 2.4f)
                     Spacer(Modifier.width(4.dp))
                     Text(
-                        (if (verified) "Verified · " else "") + "Via internet",
+                        (if (verified) "Verified · " else "") + "Via $transport",
                         color = s.text3, fontSize = 11.5.sp
                     )
                 }
@@ -473,10 +479,10 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                     val pay = PayLine.decode(m.content) as? PayLine.Pay
                     if (pay != null) {
                         val status = run { state.payVersion; state.payStatus(pay.uuid) }
-                        PayBubble(m, pay, status, peerName, mesh = false, fiatOf = { state.fiatOrNull(it) }) {
+                        PayBubble(m, pay, status, peerName, mesh = mesh, fiatOf = { state.fiatOrNull(it) }) {
                             state.claimPay(screen.id, pay.uuid)
                         }
-                    } else MessageBubble(m)
+                    } else MessageBubble(m, mesh)
                 }
             }
         }
@@ -493,7 +499,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                 Modifier.weight(1f).clip(RoundedCornerShape(22.dp)).background(s.surface2)
                     .padding(horizontal = 16.dp, vertical = 12.dp)
             ) {
-                if (draft.isEmpty()) Text("Message $peerName · via internet", color = s.text3, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                if (draft.isEmpty()) Text("Message $peerName · via $transport", color = s.text3, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 BasicTextField(
                     value = draft, onValueChange = { draft = it },
                     textStyle = TextStyle(color = s.text, fontSize = 16.sp),
@@ -503,7 +509,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             }
             Spacer(Modifier.width(8.dp))
             Box(
-                Modifier.size(46.dp).clip(CircleShape).background(s.netFill)
+                Modifier.size(46.dp).clip(CircleShape).background(if (mesh) s.accentFill else s.netFill)
                     .clickable {
                         val d = draft; draft = ""
                         if (!state.handleCommand(d, peerName, channelGeohash = null, chatId = screen.id)) {
@@ -511,7 +517,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                         }
                     },
                 contentAlignment = Alignment.Center
-            ) { Text("↑", color = s.onNet, fontSize = 20.sp, fontWeight = FontWeight.Bold) }
+            ) { Text("↑", color = if (mesh) s.onAccent else s.onNet, fontSize = 20.sp, fontWeight = FontWeight.Bold) }
         }
     }
     if (addSheet) AddToMessageSheet(
@@ -525,7 +531,8 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     if (paySheet) PaySheet(
         peerName = peerName,
         balanceSats = state.walletBalanceSats(),
-        mesh = false, // Marmot/White Noise DMs ride the internet (Lightning)
+        // Mesh DMs carry ecash over Bluetooth; Marmot DMs ride the internet.
+        mesh = screen.id.startsWith("mesh:"),
         fiatOf = { state.fiatOrNull(it) },
         onSend = { sats -> state.send(screen.id, PayLine.Pay(randomPayId(), sats).encoded()) },
         onClose = { paySheet = false }
@@ -753,10 +760,14 @@ private fun GeoDmScreen(state: SonarAppState, screen: Screen.GeoDm) {
 }
 
 @Composable
-private fun MessageBubble(m: SonarMsg) {
+private fun MessageBubble(m: SonarMsg, mesh: Boolean = false) {
     val s = sonar
-    val linkColor = if (m.mine) s.onNet else s.accent
-    val annotated = remember(m.content, m.mine) { linkify(m.content, linkColor) }
+    // Own bubble is cyan over BLE mesh, indigo over Nostr/internet (the design's
+    // transport-colored bubbles); the other party's bubble is always the surface.
+    val mineBg = if (mesh) s.accentFill else s.netFill
+    val onMine = if (mesh) s.onAccent else s.onNet
+    val linkColor = if (m.mine) onMine else s.accent
+    val annotated = remember(m.content, m.mine, mesh) { linkify(m.content, linkColor) }
     val firstUrl = remember(m.content) { firstUrl(m.content) }
     val uriHandler = androidx.compose.ui.platform.LocalUriHandler.current
     Column(
@@ -765,14 +776,14 @@ private fun MessageBubble(m: SonarMsg) {
     ) {
         Box(
             Modifier.clip(RoundedCornerShape(18.dp))
-                .background(if (m.mine) s.netFill else s.bubbleOther)
+                .background(if (m.mine) mineBg else s.bubbleOther)
                 .then(if (firstUrl != null) Modifier.clickable { uriHandler.openUri(firstUrl) } else Modifier)
                 .padding(horizontal = 12.dp, vertical = 8.dp)
         ) {
             // Selectable (long-press → Copy); tap opens a link if present —
             // mirrors the iOS deterministic copy + tappable-link behavior.
             androidx.compose.foundation.text.selection.SelectionContainer {
-                Text(annotated, color = if (m.mine) s.onNet else s.text, fontSize = 16.sp)
+                Text(annotated, color = if (m.mine) onMine else s.text, fontSize = 16.sp)
             }
         }
     }

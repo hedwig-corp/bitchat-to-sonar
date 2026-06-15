@@ -54,6 +54,14 @@ fun SonarChannelScreen(state: SonarAppState, screen: Screen.Channel) {
     LaunchedEffect(state.channelMsgs.size) {
         if (state.channelMsgs.isNotEmpty()) listState.animateScrollToItem(state.channelMsgs.size - 1)
     }
+    // Humanize the channel: the design NEVER shows a raw geohash as a label — use
+    // the location channel's name + tier + live "N here now" count (state.presence).
+    val gc = state.locationChannels.firstOrNull { it.geohash == screen.geohash }
+    val isMesh = screen.geohash == "mesh"
+    val name = gc?.name ?: if (isMesh) "Mesh" else "#${screen.geohash}"
+    val here = state.presence(screen.geohash)
+    val tier = gc?.level?.label ?: if (isMesh) "Bluetooth range" else "channel"
+    val headerSub = if (here > 0) "Public · $here here now" else "Public · $tier"
 
     Column(Modifier.fillMaxSize().background(s.bg)) {
         // header: place tile + name + status
@@ -67,30 +75,30 @@ fun SonarChannelScreen(state: SonarAppState, screen: Screen.Channel) {
                 contentAlignment = Alignment.Center
             ) { SNIcon(SNIconName.Pin, 18.dp, s.accentDeep) }
             Spacer(Modifier.width(10.dp))
-            Column {
-                Text("#${screen.geohash}", color = s.text, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+            Column(Modifier.weight(1f)) {
+                Text(name, color = s.text, fontSize = 16.sp, fontWeight = FontWeight.Bold, maxLines = 1)
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     SNDot(s.green, 6.dp)
                     Spacer(Modifier.width(5.dp))
-                    val here = state.presence(screen.geohash)
-                    val sub = if (here > 0) "$here here now · over the internet"
-                              else "public channel · over the internet"
-                    Text(sub, color = s.text2, fontSize = 11.5.sp)
+                    Text(headerSub, color = s.text2, fontSize = 11.5.sp)
                 }
             }
+            // Trailing: people-nearby (radar), per the design's NavHeader trailing.
+            SNIconButton(SNIconName.Rings, onClick = { state.push(Screen.Nearby) })
         }
 
         SNBanner(
             icon = SNIconName.People, tone = SNBannerTone.Public,
-            bold = "Public channel", rest = " — anyone in this area can read"
+            bold = "Public channel", rest = " — anyone nearby can read"
         )
 
         if (state.channelMsgs.isEmpty()) {
             Box(Modifier.weight(1f).fillMaxWidth()) {
                 SNEmptyState(
                     icon = SNIconName.Pin, iconSize = 26.dp,
-                    title = "Quiet here right now",
-                    desc = "Say something — people in this channel will see it over the internet."
+                    title = "Quiet in $name right now",
+                    desc = if (here > 0) "$here ${if (here == 1) "person is" else "people are"} in range of this channel today. Say hi."
+                           else "Be the first to say something in $name."
                 )
             }
         } else {
@@ -113,7 +121,7 @@ fun SonarChannelScreen(state: SonarAppState, screen: Screen.Channel) {
                 Modifier.weight(1f).clip(RoundedCornerShape(22.dp)).background(s.surface2)
                     .padding(horizontal = 16.dp, vertical = 12.dp)
             ) {
-                if (draft.isEmpty()) Text("Message #${screen.geohash}", color = s.text3, fontSize = 16.sp)
+                if (draft.isEmpty()) Text("Message $name", color = s.text3, fontSize = 16.sp)
                 BasicTextField(
                     value = draft, onValueChange = { draft = it },
                     textStyle = TextStyle(color = s.text, fontSize = 16.sp),

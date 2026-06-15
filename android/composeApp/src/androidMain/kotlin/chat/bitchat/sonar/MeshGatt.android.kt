@@ -487,7 +487,10 @@ object MeshGatt {
         val link = (if (fromServer) serverLinks[addr] else clientLinks[addr])?.takeIf { it.established } ?: return
         runCatching {
             val plain = link.noise.decrypt(ciphertext)
-            meshDecodePrivateMessage(plain)?.let { pm -> onText.forEach { it(addr, pm.content) } }
+            // Surface the STABLE peerID (not the rotating BLE address) so the app
+            // can key the conversation by peer across MAC rotation.
+            val peerId = peerIdByAddr[addr] ?: addr
+            meshDecodePrivateMessage(plain)?.let { pm -> onText.forEach { it(peerId, pm.content) } }
         }
     }
 
@@ -514,6 +517,23 @@ object MeshGatt {
             serverDevices[peerAddress]?.let { notify(it, packet); true } ?: false
         }
     }.getOrDefault(false)
+
+    /** Send a DM addressed by the peer's stable bitchat peerID (the radar/UI key).
+     *  Resolves it to whichever BLE address currently holds an established Noise
+     *  link to that peer (links are keyed by the rotating BLE address). Returns
+     *  false if no live encrypted link exists yet — the caller surfaces that. */
+    fun sendTextToPeer(peerId: String, messageId: String, text: String): Boolean {
+        val addr = peerIdByAddr.entries.firstOrNull { (a, pid) ->
+            pid == peerId &&
+                ((clientLinks[a]?.established == true) || (serverLinks[a]?.established == true))
+        }?.key ?: return false
+        return sendText(addr, messageId, text)
+    }
+
+    /** True iff there is an established encrypted link to [peerId] right now. */
+    fun hasLink(peerId: String): Boolean = peerIdByAddr.entries.any { (a, pid) ->
+        pid == peerId && ((clientLinks[a]?.established == true) || (serverLinks[a]?.established == true))
+    }
 
     /** Broadcast our Sonar Discovery (0x53) payload to an established peer. */
     fun sendSonar(peerId: String, payload: ByteArray): Boolean = runCatching {

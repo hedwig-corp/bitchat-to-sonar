@@ -23,7 +23,9 @@ sealed interface Screen {
     data object Profile : Screen
     data object Nearby : Screen
     data object Search : Screen
-    data class Chat(val id: String, val name: String) : Screen
+    // id "mesh:<peerId>" = a BLE-mesh DM (Noise link); otherwise a Marmot group.
+    // pay=true auto-opens the payment sheet (radar "Send sats").
+    data class Chat(val id: String, val name: String, val pay: Boolean = false) : Screen
     data class Channel(val geohash: String) : Screen
     data class GeoDm(val geohash: String, val peerHex: String, val name: String) : Screen
 }
@@ -73,6 +75,10 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
     var messages by mutableStateOf<List<SonarMsg>>(emptyList())
         private set
+    /** In-memory BLE-mesh DM transcripts, keyed by bitchat peerID. Mesh chats
+     *  don't live in the Rust core (that's Marmot/Nostr) — they ride the Noise
+     *  link, so the app holds them. Chat id on the nav stack is "mesh:<peerId>". */
+    private var meshChats = mutableMapOf<String, List<SonarMsg>>()
     var channels by mutableStateOf(SonarCore.joinedChannels())
         private set
     var channelMsgs by mutableStateOf<List<SonarChannelMsg>>(emptyList())
@@ -512,6 +518,19 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
+    /** Open the BLE-mesh DM with a radar peer (Noise link). [pay] auto-opens the
+     *  payment sheet (radar "Send sats"). */
+    fun openMeshChat(peerId: String, name: String, pay: Boolean = false) {
+        val id = meshChatId(peerId)
+        push(Screen.Chat(id, name, pay))
+        messages = meshChats[peerId].orEmpty()
+        processPayLines(id, messages)
+    }
+
+    private fun meshChatId(peerId: String) = "mesh:$peerId"
+    private fun meshPeerId(chatId: String) = chatId.removePrefix("mesh:")
+    private fun isMeshChat(chatId: String) = chatId.startsWith("mesh:")
+
     fun back() {
         if (stack.size > 1) stack = stack.dropLast(1)
         messages = emptyList()
@@ -555,6 +574,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun send(chatId: String, text: String) {
         val t = text.trim()
         if (t.isEmpty()) return
+        if (isMeshChat(chatId)) { sendMesh(meshPeerId(chatId), t); return }
         scope.launch {
             try {
                 SonarCore.send(chatId, t)
@@ -562,6 +582,39 @@ class SonarAppState(private val scope: CoroutineScope) {
                 processPayLines(chatId, messages)
             } catch (e: Throwable) {
                 toast = "send failed: ${e.message}"
+            }
+        }
+    }
+
+    /** Send a BLE-mesh DM over the Noise link + optimistically echo it. */
+    private fun sendMesh(peerId: String, text: String) {
+        val ok = MeshRadio.sendMeshDm(peerId, randomMeshId(), text)
+        if (!ok) { toast = "Not connected over Bluetooth yet — stay close and try again"; return }
+        val msg = SonarMsg(randomMeshId(), npub, text, mine = true, MeshRadio.nowSecs())
+        meshChats[peerId] = meshChats[peerId].orEmpty() + msg
+        messages = meshChats[peerId].orEmpty()
+        processPayLines(meshChatId(peerId), messages)
+    }
+
+    private fun randomMeshId(): String =
+        (0 until 16).joinToString("") { "0123456789abcdef"[kotlin.random.Random.nextInt(16)].toString() }
+
+    /** Drain mesh DMs received since last poll into the per-peer transcripts. */
+    private fun drainMeshDms() {
+        val incoming = MeshRadio.drainMeshDm()
+        if (incoming.isEmpty()) return
+        for (m in incoming) {
+            val msg = SonarMsg(randomMeshId(), m.peerId, m.text, mine = false, m.tsSecs)
+            meshChats[m.peerId] = meshChats[m.peerId].orEmpty() + msg
+        }
+        // Refresh the open mesh conversation if it's one we just appended to.
+        (screen as? Screen.Chat)?.let { sc ->
+            if (isMeshChat(sc.id)) {
+                val pid = meshPeerId(sc.id)
+                if (incoming.any { it.peerId == pid }) {
+                    messages = meshChats[pid].orEmpty()
+                    processPayLines(sc.id, messages)
+                }
             }
         }
     }
@@ -579,9 +632,14 @@ class SonarAppState(private val scope: CoroutineScope) {
                 SonarCore.sync()
                 refreshChats()
                 maybeNotify()
-                (screen as? Screen.Chat)?.let { messages = SonarCore.messages(it.id); processPayLines(it.id, messages) }
+                // Marmot/Nostr chats refresh from the core; mesh chats are local
+                // and refreshed by drainMeshDms() below.
+                (screen as? Screen.Chat)?.let {
+                    if (!isMeshChat(it.id)) { messages = SonarCore.messages(it.id); processPayLines(it.id, messages) }
+                }
                 (screen as? Screen.Channel)?.let { refreshChannel(it.geohash) }
                 (screen as? Screen.GeoDm)?.let { refreshGeoDm(it.geohash, it.peerHex) }
+                drainMeshDms()
                 meshPeers = MeshRadio.peers()
                 // Sonar Discovery (0x53): keep our announce current for outgoing
                 // links and decode any peers' announces received over the mesh.
@@ -596,9 +654,10 @@ class SonarAppState(private val scope: CoroutineScope) {
                 unifyPeers = UnifyRadio.peers()
                 updateUnifyReceiver()
                 if (locationChannels.isEmpty()) refreshLocationChannels()
-                // Presence: announce ourselves in the open channel on a ~60s
-                // heartbeat, then refresh "here now" counts (cheap in-memory read).
-                (screen as? Screen.Channel)?.let { if (tick % 15 == 1) beatPresence(it.geohash) }
+                // Presence: like iOS GeohashPresenceService, broadcast to the
+                // low-precision channels (region/province/city) on a ~60s
+                // heartbeat so others count us; then refresh "here now" counts.
+                if (tick % 15 == 1) beatGlobalPresence()
                 refreshPresenceCounts()
                 if (walletAvailable && walletState is WalletState.Ready) {
                     WalletBridge.refreshBalance()
@@ -614,6 +673,17 @@ class SonarAppState(private val scope: CoroutineScope) {
     private suspend fun beatPresence(geohash: String) {
         if (geohash.isBlank() || geohash == "mesh") return
         runCatching { SonarCore.sendChannelPresence(geohash) }
+    }
+
+    /** Broadcast presence to the low-precision location channels, mirroring iOS
+     *  `GeohashPresenceService`: region(2)/province(4)/city(5) ONLY — never
+     *  neighborhood/block/building (privacy). This is what makes other apps
+     *  (iOS/bitchat) count this device in "N here now" for those channels. */
+    private suspend fun beatGlobalPresence() {
+        val coarse = setOf(GeoLevel.Region, GeoLevel.Province, GeoLevel.City)
+        locationChannels
+            .filter { it.level in coarse && it.geohash != "mesh" }
+            .forEach { beatPresence(it.geohash) }
     }
 
     /** Refresh "N here now" counts for the open channel + the location channels

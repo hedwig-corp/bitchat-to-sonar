@@ -8,7 +8,9 @@ import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -34,6 +36,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.drawscope.rotate as drawRotate
 import androidx.compose.ui.graphics.Brush
@@ -118,7 +121,10 @@ fun SonarRadarScreen(state: SonarAppState) {
         } else {
             Column(Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally) {
                 Spacer(Modifier.weight(1f))
-                RadarField(state.nick.ifBlank { "you" }, state.meshPeers, unify) { unifyCard = it }
+                RadarField(
+                    state.nick.ifBlank { "you" }, state.meshPeers, unify,
+                    onMeshTap = { card = it }, onUnifyTap = { unifyCard = it },
+                )
                 Text(
                     if (state.meshPeers.isEmpty() && unify.isEmpty()) "Looking for people around you…" else "Tap someone to chat",
                     color = s.text3, fontSize = 12.5.sp, modifier = Modifier.padding(top = 4.dp)
@@ -133,7 +139,15 @@ fun SonarRadarScreen(state: SonarAppState) {
         }
     }
 
-    card?.let { PeerCard(it, onClose = { card = null }) }
+    card?.let { p ->
+        val pid = p.id.removePrefix("mesh:")
+        PeerCard(
+            p,
+            onMessage = { card = null; state.openMeshChat(pid, p.name) },
+            onSendSats = { card = null; state.openMeshChat(pid, p.name, pay = true) },
+            onClose = { card = null },
+        )
+    }
     unifyCard?.let { p ->
         UnifyPeerCard(p, onClose = { unifyCard = null }, onSend = { unifyCard = null; paySheet = p })
     }
@@ -187,37 +201,73 @@ private fun SignalBars(filled: Int, color: Color) {
     }
 }
 
+/** The design's `.sn-peercard` — a compact card that floats over the bottom of
+ *  the radar when you tap a peer: avatar · name · hint · Message [· Send sats].
+ *  Tapping outside dismisses it; the radar stays visible (no scrim). */
 @Composable
-private fun PeerCard(p: chat.bitchat.sonar.MeshPeer, onClose: () -> Unit) {
+private fun PeerCard(
+    p: chat.bitchat.sonar.MeshPeer,
+    onMessage: () -> Unit,
+    onSendSats: () -> Unit,
+    onClose: () -> Unit,
+) {
     val s = sonar
     Box(
-        Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
-        contentAlignment = Alignment.BottomCenter
+        Modifier.fillMaxSize().clickable(
+            interactionSource = remember { MutableInteractionSource() }, indication = null,
+            onClick = onClose,
+        ),
+        contentAlignment = Alignment.BottomCenter,
     ) {
-        androidx.compose.material3.Surface(color = s.surface, shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)) {
-            Column(Modifier.fillMaxWidth().padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                SonarAvatar(p.name, 64.dp, presence = true)
-                Spacer(Modifier.height(10.dp))
-                Text(p.name, color = s.text, fontSize = 19.sp, fontWeight = FontWeight.Bold)
-                Spacer(Modifier.height(4.dp))
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    SignalBars(rssiBars(p.rssi), s.accent)
-                    Spacer(Modifier.width(8.dp))
-                    Text("Bluetooth · ${rssiLabel(p.rssi)}", color = s.text2, fontSize = 13.sp)
-                }
-                Spacer(Modifier.height(18.dp))
-                // Mesh DM goes live with the BLE link (Phase 8); honest until then.
-                Box(
-                    Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(s.surface2)
-                        .padding(vertical = 13.dp),
-                    contentAlignment = Alignment.Center
-                ) { Text("Reachable over Bluetooth mesh", color = s.text2, fontSize = 14.sp, fontWeight = FontWeight.SemiBold) }
-                Spacer(Modifier.height(8.dp))
-                Box(Modifier.fillMaxWidth().height(44.dp).clickable(onClick = onClose), contentAlignment = Alignment.Center) {
-                    Text("Close", color = s.text2, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
-                }
+        Row(
+            Modifier.fillMaxWidth().padding(start = 14.dp, end = 14.dp, bottom = 38.dp)
+                .shadow(14.dp, RoundedCornerShape(18.dp))
+                .clip(RoundedCornerShape(18.dp))
+                .background(s.surface)
+                .border(1.dp, s.hairline, RoundedCornerShape(18.dp))
+                .clickable(  // swallow taps on the card itself
+                    interactionSource = remember { MutableInteractionSource() }, indication = null,
+                    onClick = {},
+                )
+                .padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            SonarAvatar(p.name, 44.dp, presence = true)
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text(p.name, color = s.text, fontSize = 15.5.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+                Text(
+                    "${rssiLabel(p.rssi)} · over Bluetooth",
+                    color = s.text2, fontSize = 12.sp, maxLines = 1,
+                    modifier = Modifier.padding(top = 1.dp),
+                )
+            }
+            Spacer(Modifier.width(12.dp))
+            SNPill("Message", primary = false, onClick = onMessage)
+            // "Send sats" only for full Sonar peers (they advertise pay capability).
+            if (p.sonar) {
+                Spacer(Modifier.width(8.dp))
+                SNPill("Send sats", primary = true, onClick = onSendSats)
             }
         }
+    }
+}
+
+/** Pill button matching the design `.pf-smallbtn` (and iOS `SNSmallButton`). */
+@Composable
+private fun SNPill(label: String, primary: Boolean, onClick: () -> Unit) {
+    val s = sonar
+    Box(
+        Modifier.clip(RoundedCornerShape(999.dp))
+            .background(if (primary) s.accentFill else s.surface2)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 14.dp, vertical = 11.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            label, color = if (primary) s.onAccent else s.text,
+            fontSize = 14.sp, fontWeight = FontWeight.Bold,
+        )
     }
 }
 
@@ -327,6 +377,7 @@ private fun RadarField(
     nick: String,
     peers: List<chat.bitchat.sonar.MeshPeer>,
     unify: List<chat.bitchat.sonar.unify.UnifyPeer> = emptyList(),
+    onMeshTap: (chat.bitchat.sonar.MeshPeer) -> Unit = {},
     onUnifyTap: (chat.bitchat.sonar.unify.UnifyPeer) -> Unit = {},
 ) {
     val s = sonar
@@ -390,7 +441,9 @@ private fun RadarField(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 modifier = Modifier.align(Alignment.Center).offset(
                     x = (radius * cos(ang)).dp, y = (radius * sin(ang)).dp
-                )
+                ).clickable(
+                    interactionSource = remember { MutableInteractionSource() }, indication = null,
+                ) { onMeshTap(p) }
             ) {
                 SonarAvatar(p.name, 40.dp, presence = true)
                 Spacer(Modifier.height(3.dp))

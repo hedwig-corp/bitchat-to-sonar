@@ -11,6 +11,7 @@ pub mod identity;
 pub mod marmot;
 pub mod mesh;
 pub mod noise;
+pub mod relay_directory;
 
 pub use error::Error;
 

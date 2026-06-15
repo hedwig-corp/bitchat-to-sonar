@@ -61,6 +61,9 @@ pub struct SonarClient {
     geo_presence: GeoPresenceBuf,
     geo_subscribed: Arc<Mutex<HashSet<String>>>,
     identity_secret: [u8; 32],
+    /// Whether to join geohash-nearest relays on subscribe (real sessions); off
+    /// for in-memory/test sessions so they stay network-free against a MockRelay.
+    allow_geo_relays: bool,
 }
 
 impl SonarClient {
@@ -78,20 +81,21 @@ impl SonarClient {
         db_key: [u8; 32],
     ) -> Result<Self> {
         let engine = MarmotEngine::persistent(identity.clone(), db_path, db_key)?;
-        Self::with_engine(identity, relays, engine).await
+        Self::with_engine(identity, relays, engine, true).await
     }
 
     /// Connect with a volatile in-memory store. State is lost when the client is
     /// dropped. Intended for tests and ephemeral/anonymous sessions.
     pub async fn connect_in_memory(identity: Identity, relays: Vec<RelayUrl>) -> Result<Self> {
         let engine = MarmotEngine::in_memory(identity.clone());
-        Self::with_engine(identity, relays, engine).await
+        Self::with_engine(identity, relays, engine, false).await
     }
 
     async fn with_engine(
         identity: Identity,
         relays: Vec<RelayUrl>,
         engine: MarmotEngine,
+        allow_geo_relays: bool,
     ) -> Result<Self> {
         let nostr = Client::new(identity.keys().clone());
         for relay in &relays {
@@ -114,7 +118,20 @@ impl SonarClient {
         let handler_subs = geo_subscribed.clone();
         let mut notifications = nostr.notifications();
         tokio::spawn(async move {
-            while let Ok(notification) = notifications.recv().await {
+            loop {
+                let notification = match notifications.recv().await {
+                    Ok(n) => n,
+                    // The notification stream is a BOUNDED tokio broadcast. A busy
+                    // channel (e.g. a whole-country region geohash with many
+                    // people broadcasting presence + messages) can make us fall
+                    // behind: `Lagged` means some events were dropped — keep
+                    // going, do NOT exit. The old `while let Ok` killed the
+                    // collector permanently on the first lag, so Android stopped
+                    // seeing ANY participants/messages while iOS (no such loop)
+                    // kept working.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
                 let RelayPoolNotification::Event { event, .. } = notification else {
                     continue;
                 };
@@ -123,6 +140,24 @@ impl SonarClient {
                         let Some(geohash) = tag_value(&event, Alphabet::G) else { continue };
                         let nickname = tag_value(&event, Alphabet::N).unwrap_or_default();
                         let id = event.id.to_hex();
+                        let ts = event.created_at.as_u64();
+                        // Count a message AUTHOR as an active participant too —
+                        // iOS's GeohashParticipantTracker counts both message
+                        // authors and presence broadcasters within the activity
+                        // window, so a busy channel shows e.g. "5 here now" even
+                        // if those people aren't sending presence heartbeats.
+                        // Counting only presence (the old behaviour) showed "1".
+                        {
+                            let mut pmap = handler_presence.lock().unwrap();
+                            let slot = pmap
+                                .entry(geohash.clone())
+                                .or_default()
+                                .entry(event.pubkey.to_hex())
+                                .or_insert(0);
+                            if ts > *slot {
+                                *slot = ts;
+                            }
+                        }
                         let mut map = handler_geo.lock().unwrap();
                         let bucket = map.entry(geohash).or_default();
                         if !bucket.iter().any(|r| r.id == id) {
@@ -131,7 +166,7 @@ impl SonarClient {
                                 pubkey: event.pubkey,
                                 nickname,
                                 content: event.content.clone(),
-                                ts: event.created_at.as_u64(),
+                                ts,
                             });
                         }
                     }
@@ -193,6 +228,7 @@ impl SonarClient {
             geo_presence,
             geo_subscribed,
             identity_secret,
+            allow_geo_relays,
         })
     }
 
@@ -285,6 +321,26 @@ impl SonarClient {
 
     // ── Geohash public channels (kind-20000 over Nostr) ──
 
+    /// Add + connect the Nostr relays geographically nearest [geohash] — the SAME
+    /// set bitchat's `GeoRelayDirectory` uses for that geohash. Without this our
+    /// channel events land on different relays than a bitchat client subscribes
+    /// to, so neither side sees the other. Best-effort per relay.
+    async fn ensure_geohash_relays(&self, geohash: &str) {
+        if !self.allow_geo_relays {
+            return; // in-memory/test session: stay network-free
+        }
+        // bitchat picks the 5 nearest relays from ITS relay directory. A peer's
+        // directory can differ (or be a stale bundle when its fetch fails — seen
+        // on bitchat-android), so its top pick may rank lower in ours. Join a
+        // WIDER set (12) than bitchat's 5 so the two overlap on at least one
+        // relay even when the directories don't perfectly agree.
+        for url in crate::relay_directory::closest_relays_for_geohash(geohash, 12) {
+            if self.nostr.add_relay(&url).await.is_ok() {
+                let _ = self.nostr.connect_relay(&url).await;
+            }
+        }
+    }
+
     /// Subscribe to a geohash channel so the relay delivers its live
     /// (ephemeral) messages into our buffer. Idempotent.
     pub async fn subscribe_geohash(&self, geohash: &str) -> Result<()> {
@@ -294,6 +350,9 @@ impl SonarClient {
                 return Ok(());
             }
         }
+        // Join the geohash's nearest relays (bitchat's set) BEFORE subscribing,
+        // so the subscription covers them and our publishes reach bitchat.
+        self.ensure_geohash_relays(geohash).await;
         // Public channel messages (kind-20000) tagged with this geohash.
         let channel = Filter::new()
             .kind(Kind::Custom(20000))
@@ -324,17 +383,25 @@ impl SonarClient {
             .build(keys.public_key());
         let ts = rumor.created_at.as_u64();
         let gift = EventBuilder::gift_wrap(&keys, &recipient, rumor, []).await?;
-        self.nostr.send_event(&gift).await?;
-        // Record locally (relays don't echo to the sender).
+        // Record locally first, then publish in the background so the UI shows
+        // the message instantly (relays don't echo to the sender anyway).
         let id = gift.id.to_hex();
-        let mut map = self.geo_dm.lock().unwrap();
-        let bucket = map.entry((geohash.to_string(), recipient_hex.to_string())).or_default();
-        bucket.push(RawGeoDm {
-            id,
-            sender: keys.public_key(),
-            content: text.to_string(),
-            ts,
-            mine: true,
+        {
+            let mut map = self.geo_dm.lock().unwrap();
+            let bucket = map
+                .entry((geohash.to_string(), recipient_hex.to_string()))
+                .or_default();
+            bucket.push(RawGeoDm {
+                id,
+                sender: keys.public_key(),
+                content: text.to_string(),
+                ts,
+                mine: true,
+            });
+        }
+        let nostr = self.nostr.clone();
+        tokio::spawn(async move {
+            let _ = nostr.send_event(&gift).await;
         });
         Ok(())
     }
@@ -387,21 +454,37 @@ impl SonarClient {
         let event = EventBuilder::new(Kind::Custom(20000), text)
             .tags(tags)
             .sign_with_keys(&geo)?;
-        self.nostr.send_event(&event).await?;
-        // Relays don't echo an event back to its sender, so record our own
-        // message locally (deduped by id in case a relay does echo).
+        // Record locally + count ourselves FIRST so the UI shows the message
+        // INSTANTLY, then publish in the BACKGROUND. send_event() awaits a relay
+        // round-trip across EVERY connected relay (a dozen for a geohash); doing
+        // that before recording made the user wait seconds for their own message
+        // to appear. Relays don't echo to the sender, so the local copy is what
+        // the UI renders either way.
         let id = event.id.to_hex();
-        let mut map = self.geo.lock().unwrap();
-        let bucket = map.entry(geohash.to_string()).or_default();
-        if !bucket.iter().any(|r| r.id == id) {
-            bucket.push(RawGeo {
-                id,
-                pubkey: event.pubkey,
-                nickname: nickname.to_string(),
-                content: text.to_string(),
-                ts: event.created_at.as_u64(),
-            });
+        let ts = event.created_at.as_u64();
+        self.geo_presence
+            .lock()
+            .unwrap()
+            .entry(geohash.to_string())
+            .or_default()
+            .insert(event.pubkey.to_hex(), ts);
+        {
+            let mut map = self.geo.lock().unwrap();
+            let bucket = map.entry(geohash.to_string()).or_default();
+            if !bucket.iter().any(|r| r.id == id) {
+                bucket.push(RawGeo {
+                    id,
+                    pubkey: event.pubkey,
+                    nickname: nickname.to_string(),
+                    content: text.to_string(),
+                    ts,
+                });
+            }
         }
+        let nostr = self.nostr.clone();
+        tokio::spawn(async move {
+            let _ = nostr.send_event(&event).await;
+        });
         Ok(())
     }
 
@@ -421,12 +504,18 @@ impl SonarClient {
                 [geohash.to_string()],
             )])
             .sign_with_keys(&geo)?;
-        self.nostr.send_event(&event).await?;
-        // Relays don't echo to the sender; count ourselves locally so a solo
-        // user still sees "1 here now".
-        let mut map = self.geo_presence.lock().unwrap();
-        let bucket = map.entry(geohash.to_string()).or_default();
-        bucket.insert(event.pubkey.to_hex(), event.created_at.as_u64());
+        // Count ourselves locally first, then publish in the background — the
+        // heartbeat fires for several channels each tick and must not block the
+        // poll on relay round-trips.
+        {
+            let mut map = self.geo_presence.lock().unwrap();
+            let bucket = map.entry(geohash.to_string()).or_default();
+            bucket.insert(event.pubkey.to_hex(), event.created_at.as_u64());
+        }
+        let nostr = self.nostr.clone();
+        tokio::spawn(async move {
+            let _ = nostr.send_event(&event).await;
+        });
         Ok(())
     }
 

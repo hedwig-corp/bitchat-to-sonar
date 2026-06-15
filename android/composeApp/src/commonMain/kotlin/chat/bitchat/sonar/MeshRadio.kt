@@ -5,6 +5,10 @@ package chat.bitchat.sonar
  *  plain bitchat peer (chat only). */
 data class MeshPeer(val id: String, val name: String, val rssi: Int, val sonar: Boolean = false)
 
+/** An incoming mesh DM (decrypted Noise text), keyed by the sender's bitchat
+ *  peerID, drained by the app into the mesh-chat store. */
+data class MeshDmIn(val peerId: String, val text: String, val tsSecs: Long)
+
 /**
  * The BLE mesh radio: scans for and advertises the bitchat mesh service so
  * nearby Sonar/bitchat phones discover each other over Bluetooth. This is the
@@ -31,4 +35,14 @@ expect object MeshRadio {
     /** Raw 0x53 payloads received from peers, keyed by peer id (BLE address).
      *  Decoded with [SonarAnnounce.decode] in shared code. */
     fun sonarPeers(): Map<String, ByteArray>
+
+    /** Send an encrypted DM over the BLE mesh to [peerId] (bitchat peerID).
+     *  Returns false if no live Noise link to that peer exists yet. */
+    fun sendMeshDm(peerId: String, messageId: String, text: String): Boolean
+    /** True iff an encrypted Noise link to [peerId] is established right now. */
+    fun hasMeshLink(peerId: String): Boolean
+    /** Pull (and clear) all mesh DMs received since the last call. */
+    fun drainMeshDm(): List<MeshDmIn>
+    /** Wall-clock seconds (platform clock) — for mesh message timestamps. */
+    fun nowSecs(): Long
 }

@@ -435,3 +435,80 @@ All verified — the full payment flow works end to end: claiming Maya's sealed 
 
 Natural next steps whenever you want them: **request sats** (invoices as sealed bubbles pointing the other way), **split with nearby** in channels, or bringing payments to **Sonar Desktop**.
 
+## User
+
+The nearby channels looks like that are not limited to a list of stuff, so the phone is listing a lot of channels that are making the ui difficult to ready, see the image attached. Give us some guideline on how to manage these cases
+
+## Assistant
+
+_[tool: list_files]_
+
+_[tool: view_image]_
+
+_[tool: view_image]_
+
+_[tool: read_file]_
+
+This is a great catch — and the screenshot shows the real problem precisely. Let me read it carefully.
+
+The issue isn't "too many channels" in general — it's that **one physical spot is being exploded into six rows**, one per geohash precision level (building → block → neighborhood → city → province → region). Most are empty ("0 here now"), two have identical names ("Stazione di Allerona" twice), and the stack shoves your actual Messages off-screen.
+
+Let me give you concrete guidelines, then build a reference fix into the prototype.
+
+_[tool: read_file]_
+
+_[tool: grep]_
+
+A `HereCard` with a precision ladder already exists — let me read the full current state so I build on it rather than duplicate.
+
+_[tool: read_file]_
+
+_[tool: grep]_
+
+The prototype already has a `HereCard` that collapses the ladder — but the screenshot shows the failure mode in full, so let me see the complete data model and make the reference implementation airtight, then write up the guidelines.
+
+_[tool: show_html]_
+
+_[tool: eval_js]_
+
+The foundation is already here: `here` is the full precision ladder, `channels` is now only *explicitly saved* channels, and `HereCard` collapses the ladder into one row. Let me see how it renders live, then tighten it and write up the guidelines.
+
+_[tool: show_html]_
+
+The prototype already demonstrates the fix live — that **"Around you"** card is the whole answer in one component. Here's the diagnosis and the guidelines behind it.
+
+## What's actually going wrong in your screenshot
+
+It's not "too many channels" — it's **one place rendered six times**. Sonar derives a geohash channel at every precision (building → block → neighborhood → city → province → region), and the list shows all of them as equal, full-height rows. So:
+
+- **Duplicate names** — "Stazione di Allerona" appears twice (block + neighborhood), indistinguishable.
+- **Dead rows dominate** — four of six say "0 here now" but take the same space as live ones.
+- **Your real conversations get buried** — Messages is pushed below the fold by ambient places you never chose.
+
+The mental model is wrong: those six rows aren't six places. They're **one location at six zoom levels**.
+
+## Guidelines for managing location channels
+
+**1. Collapse the precision ladder into ONE control — never N rows.**
+You're standing in a single spot. Show one "Around you" row with a **zoom scale** (block · area · city · region) underneath. Tapping a level re-aims the *same* row — name and count update in place. This is the single most important fix, and it's what the prototype's `HereCard` now does.
+
+**2. Auto-pick the tightest level that has life.**
+Default the scale to the narrowest precision with people present (here it lands on *Block · 2 here*), not "building" (empty) and not "region" (410 — too broad to matter). Put a small live dot on every level that has people so zooming feels rewarded.
+
+**3. Separate "here" from "saved."**
+Three distinct buckets, in priority order: **Around you** (the one ambient place) → **Saved channels** (only ones you explicitly joined) → **Messages**. Passing through a place must never auto-add a permanent row. Ambient ≠ subscribed.
+
+**4. Rank by people, hide the empties.**
+Sort by who's present now, not by geography. A channel with "0 here now" should never get a bright full row on home — drop it, or tuck it behind a "Quiet places nearby" expander. Empty rooms are the noise.
+
+**5. Cap the home list; browse the rest on a dedicated screen.**
+Home shows at most ~2–3 location entries. Everything else lives behind "More places nearby" → a picker/map screen. Home is for what's active *now*; discovery is a separate intent.
+
+**6. Disambiguate names with the tier, never repeat a bare name.**
+If two levels resolve to the same place name, the precision label *is* the differentiator ("Allerona · city" vs "Allerona · neighborhood") — but better still, the collapsed card removes the duplication entirely.
+
+**7. Keep Messages always reachable.**
+Your actual chats are the reason people open the app. Location channels are ambient context — they should occupy a fixed, bounded slice at the top, not an unbounded list that shoves conversations off-screen.
+
+You can see all seven applied in the running prototype: the six-row pile-up is now a single **"Around you · Quartiere Maghetti · Block · 2 here now"** card with the zoom scale, then just your saved channels and messages. Want me to also build the **"More places nearby"** browser screen (the overflow destination for guideline #5), so the pattern is complete end-to-end?
+

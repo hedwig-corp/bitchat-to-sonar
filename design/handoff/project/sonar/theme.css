@@ -562,6 +562,37 @@
 .sn-ldot.ble { background: var(--accent); }
 .sn-ldot.net { background: var(--net); }
 
+/* ── "Around you" collapsed precision card ── */
+.here-card {
+  margin: 2px 14px 6px; border-radius: 20px; overflow: hidden;
+  background: var(--surface);
+  box-shadow: 0 1px 2px rgba(8, 30, 40, 0.05), inset 0 0 0 1px var(--hairline);
+}
+.here-main {
+  display: flex; align-items: center; gap: 12px;
+  width: 100%; padding: 12px 14px 10px;
+  border: none; background: none; font-family: inherit;
+  color: inherit; text-align: left; cursor: pointer;
+}
+.here-main:active { background: var(--press); }
+.here-text { flex: 1; min-width: 0; }
+.here-name { font-size: 16.5px; font-weight: 700; letter-spacing: -0.01em; display: block; }
+.here-sub { font-size: 13.5px; color: var(--text2); margin-top: 2px; display: block; }
+.here-scale {
+  display: flex; gap: 6px; padding: 0 12px 12px;
+  overflow-x: auto; scrollbar-width: none;
+}
+.here-scale::-webkit-scrollbar { display: none; }
+.here-tick {
+  flex: none; display: inline-flex; align-items: center; gap: 5px;
+  padding: 6px 11px; border: none; border-radius: 999px;
+  background: var(--surface2); color: var(--text2);
+  font-family: inherit; font-size: 12.5px; font-weight: 600; cursor: pointer;
+  transition: background 0.14s, color 0.14s;
+}
+.here-tick.on { background: var(--accent-soft); color: var(--accent-deep); }
+.here-live { width: 6px; height: 6px; border-radius: 50%; background: var(--green); flex: none; }
+
 /* ── floating home bar (search + compose) ── */
 .sn-fab {
   position: absolute; left: 14px; right: 14px; bottom: 28px;

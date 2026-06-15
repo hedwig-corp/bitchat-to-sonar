@@ -37,7 +37,10 @@ enum class GeoLevel(val label: String, val length: Int) {
     Neighborhood("neighborhood", 6),
     City("city", 5),
     Province("province", 4),
-    Region("region", 3),
+    // Region precision is 2, NOT 3 — must match bitchat's GeohashChannelLevel
+    // (region=2) or Sonar's "Italy" channel is a different geohash (sr8 vs sr)
+    // than bitchat's, so presence counts + messages never line up across apps.
+    Region("region", 2),
 }
 
 /** A discovered location channel for the home list. */

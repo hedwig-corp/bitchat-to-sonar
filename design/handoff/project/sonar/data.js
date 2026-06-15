@@ -1,8 +1,19 @@
 // Sonar prototype — sample data
 window.BC_DATA = {
+  // Explicitly joined/saved channels only — NOT every place you pass through
   channels: [
     { id: 'centro', name: 'Lugano · Centro', sub: 'Public · 12 here now', preview: 'Maya: in. I\u2019ll bring the speaker', time: '17:51', unread: 3, count: 12 },
-    { id: 'city', name: 'Lugano', sub: 'Public · 48 in range today', preview: 'City-wide · quieter', time: '', unread: 0, count: 48 },
+    { id: 'city', name: 'Milano · Navigli', sub: 'Public · joined Apr 3', preview: 'Saved — quiet right now', time: '', unread: 0, count: 30 },
+  ],
+  // The single place you're standing in, at every precision level (narrow → wide).
+  // The UI collapses this whole ladder into ONE row with a precision scale.
+  here: [
+    { id: 'h-bld', tier: 'building', short: 'Building', name: 'Via Nassa 5', sub: 'Public · building', count: 0 },
+    { id: 'h-blk', tier: 'block', short: 'Block', name: 'Quartiere Maghetti', sub: 'Public · block', count: 2 },
+    { id: 'h-hood', tier: 'neighborhood', short: 'Area', name: 'Lugano · Centro', sub: 'Public · neighborhood', count: 12 },
+    { id: 'h-city', tier: 'city', short: 'City', name: 'Lugano', sub: 'Public · city', count: 48 },
+    { id: 'h-prov', tier: 'province', short: 'Province', name: 'Ticino', sub: 'Public · province', count: 130 },
+    { id: 'h-reg', tier: 'region', short: 'Region', name: 'Svizzera italiana', sub: 'Public · region', count: 410 },
   ],
   // inRange = reachable over Bluetooth right now; angle/r place them on the radar
   peers: [
