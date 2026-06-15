@@ -12,6 +12,7 @@
 //
 
 import SwiftUI
+import PhotosUI
 
 struct SonarDMScreen: View {
     @EnvironmentObject private var store: SonarAppStore
@@ -22,6 +23,8 @@ struct SonarDMScreen: View {
     @State private var showKey = false
     @State private var paySheet = false
     @State private var walletSheet = false
+    @State private var pickPhoto = false
+    @State private var photoItem: PhotosPickerItem?
 
     private var peer: SNPeerItem { store.peerItem(peerId) }
     private var isMarmot: Bool { store.marmotGroupId(peerId) != nil }
@@ -71,7 +74,8 @@ struct SonarDMScreen: View {
                         } else {
                             walletSheet = true
                         }
-                    }
+                    },
+                    loadMedia: { await store.mediaData($0) }
                 )
             }
 
@@ -113,9 +117,33 @@ struct SonarDMScreen: View {
                         }
                     }
                 }
+                if store.canSendMedia(peerId) {
+                    SNActionRow(icon: .lock, label: "Send photo", desc: "Encrypted end-to-end over White Noise") {
+                        sheet = false
+                        pickPhoto = true
+                    }
+                }
                 SNActionRow(icon: .shield, label: "Verify safety number", desc: "Confirm this chat is secure") {
                     sheet = false
                     verifySheet = true
+                }
+            }
+        }
+        .photosPicker(isPresented: $pickPhoto, selection: $photoItem, matching: .images)
+        .onChange(of: photoItem) { item in
+            guard let item else { return }
+            Task {
+                guard let data = try? await item.loadTransferable(type: Data.self) else { return }
+                // Normalize to JPEG: guarantees a format the core's image encoder
+                // handles (HEIC/etc. aren't) and keeps the upload small.
+                #if os(iOS)
+                let bytes = UIImage(data: data)?.jpegData(compressionQuality: 0.85) ?? data
+                #else
+                let bytes = data
+                #endif
+                await MainActor.run {
+                    store.sendImage(peerId, data: bytes, filename: "photo.jpg", mime: "image/jpeg")
+                    photoItem = nil
                 }
             }
         }

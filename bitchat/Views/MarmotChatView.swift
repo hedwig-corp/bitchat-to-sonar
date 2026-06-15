@@ -253,6 +253,31 @@ final class MarmotChatModel: ObservableObject {
         }
     }
 
+    /// Send a media attachment (encrypt with the group key, upload the ciphertext
+    /// to Blossom, publish the kind-445 with the imeta tag). Refreshes on success.
+    func sendMedia(groupId: String, data: Data, filename: String, mime: String, caption: String = "") {
+        Task {
+            do {
+                try await service.sendMedia(
+                    groupId: groupId, data: data, filename: filename, mime: mime, caption: caption
+                )
+                await refresh()
+            } catch {
+                self.errorText = Self.describe(error)
+            }
+        }
+    }
+
+    /// Download + decrypt a media blob. The store caches the decoded image.
+    func fetchMedia(groupId: String, url: String) async -> Data? {
+        do {
+            return try await service.fetchMedia(groupId: groupId, url: url)
+        } catch {
+            self.errorText = Self.describe(error)
+            return nil
+        }
+    }
+
     /// Poll while a Marmot screen is visible (core has no live subscription yet).
     func startPolling() {
         guard syncTask == nil else { return }

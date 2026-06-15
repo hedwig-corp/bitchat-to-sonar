@@ -634,6 +634,8 @@ struct SNMsgList: View {
     var onClaim: ((String) -> Void)? = nil
     /// Tap on another participant's bubble/name (geohash channels) to DM them.
     var onTapAuthor: ((SNMessage) -> Void)? = nil
+    /// Download + decrypt a media attachment to raw bytes (cached by the store).
+    var loadMedia: ((SNMediaItem) async -> Data?)? = nil
 
     var body: some View {
         GeometryReader { geo in
@@ -653,6 +655,12 @@ struct SNMsgList: View {
                                     fiatText: fiatText,
                                     maxBubbleWidth: geo.size.width * 0.78,
                                     onClaim: onClaim
+                                )
+                            } else if !m.media.isEmpty {
+                                SNMediaBubble(
+                                    m: m,
+                                    maxBubbleWidth: geo.size.width * 0.72,
+                                    load: loadMedia
                                 )
                             } else if m.action {
                                 Text(verbatim: m.text)
@@ -695,6 +703,102 @@ let snCommands: [(String, String)] = [
     ("msg", "Message someone"),
     ("slap", "Classic IRC slap"),
 ]
+
+/// Decode a platform image (UIImage on iOS, NSImage on macOS) from raw bytes.
+func snPlatformImage(_ data: Data) -> Image? {
+    #if canImport(UIKit)
+    return UIImage(data: data).map { Image(uiImage: $0) }
+    #elseif canImport(AppKit)
+    return NSImage(data: data).map { Image(nsImage: $0) }
+    #else
+    return nil
+    #endif
+}
+
+/// A media message bubble. No 1:1 design handoff exists for media, so this is
+/// the deliberate, tasteful extension noted in the brainstorm: an inline image
+/// (downloaded + decrypted on appear, Sonar radius 18, surface placeholder while
+/// loading) or a file chip, with an optional caption and the timestamp.
+struct SNMediaBubble: View {
+    let m: SNMessage
+    let maxBubbleWidth: CGFloat
+    var load: ((SNMediaItem) async -> Data?)? = nil
+
+    @State private var bytes: Data?
+    @State private var failed = false
+
+    private var item: SNMediaItem? { m.media.first }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            if m.mine { Spacer(minLength: 40) }
+            VStack(alignment: m.mine ? .trailing : .leading, spacing: 4) {
+                content
+                if !m.text.isEmpty {
+                    Text(verbatim: m.text)
+                        .font(SonarTheme.uiFont(size: 14.5))
+                        .foregroundColor(SonarTheme.text)
+                        .frame(maxWidth: maxBubbleWidth, alignment: m.mine ? .trailing : .leading)
+                }
+                Text(verbatim: m.time)
+                    .font(SonarTheme.uiFont(size: 10.5))
+                    .foregroundColor(SonarTheme.text3)
+            }
+            if !m.mine { Spacer(minLength: 40) }
+        }
+        .padding(.horizontal, 2)
+        .padding(.top, 7)
+        .task(id: item?.url) {
+            guard let item, bytes == nil, let load else { return }
+            if let d = await load(item) { bytes = d } else { failed = true }
+        }
+    }
+
+    @ViewBuilder private var content: some View {
+        if let item, item.isImage {
+            if let bytes, let image = snPlatformImage(bytes) {
+                image
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(maxWidth: maxBubbleWidth, maxHeight: 300)
+                    .clipShape(RoundedRectangle(cornerRadius: 18))
+            } else {
+                RoundedRectangle(cornerRadius: 18)
+                    .fill(SonarTheme.surface2)
+                    .frame(width: maxBubbleWidth * 0.62, height: 150)
+                    .overlay {
+                        if failed {
+                            Text(verbatim: "Couldn't load image")
+                                .font(SonarTheme.uiFont(size: 12))
+                                .foregroundColor(SonarTheme.text3)
+                        } else {
+                            ProgressView()
+                        }
+                    }
+            }
+        } else if let item {
+            HStack(spacing: 10) {
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(SonarTheme.accent.opacity(0.18))
+                    .frame(width: 34, height: 34)
+                    .overlay(Text(verbatim: "·").font(SonarTheme.uiFont(size: 18, weight: .bold)).foregroundColor(SonarTheme.accent))
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(verbatim: item.filename)
+                        .font(SonarTheme.uiFont(size: 13.5, weight: .semibold))
+                        .foregroundColor(SonarTheme.text)
+                        .lineLimit(1)
+                    Text(verbatim: item.mime)
+                        .font(SonarTheme.uiFont(size: 11))
+                        .foregroundColor(SonarTheme.text3)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            .frame(maxWidth: maxBubbleWidth, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 14).fill(SonarTheme.surface2))
+        }
+    }
+}
 
 struct SNComposer: View {
     let placeholder: String

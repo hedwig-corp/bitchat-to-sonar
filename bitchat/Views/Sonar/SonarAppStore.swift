@@ -65,6 +65,19 @@ struct SNMessage: Identifiable, Equatable {
     var state: String?
     /// Non-nil = render as a PayBubble instead of a text bubble.
     var pay: SNPayInfo?
+    /// Encrypted media attachments (White Noise / Marmot MIP-04). Non-empty ⇒
+    /// render a media bubble (image inline, else a file chip).
+    var media: [SNMediaItem] = []
+}
+
+/// A media attachment on a Sonar message. `url` is the Blossom URL of the
+/// CIPHERTEXT; `groupId` is the Marmot group needed to download + decrypt it.
+struct SNMediaItem: Equatable {
+    let url: String
+    let mime: String
+    let filename: String
+    let groupId: String
+    var isImage: Bool { mime.hasPrefix("image/") }
 }
 
 /// A public channel row: the `#mesh` channel or one geohash level around the
@@ -1146,7 +1159,8 @@ final class SonarAppStore: ObservableObject {
                         author: String(m.senderNpub.prefix(12)),
                         text: m.content,
                         time: Self.clock(m.createdAt),
-                        via: .internet
+                        via: .internet,
+                        media: Self.mediaItems(m, groupId: groupId)
                     )
                 }
             }
@@ -1197,7 +1211,8 @@ final class SonarAppStore: ObservableObject {
                         author: m.isMine ? nil : chatViewModel.nicknameForPeer(peerID),
                         text: m.content,
                         time: Self.clock(m.createdAt),
-                        via: .internet
+                        via: .internet,
+                        media: Self.mediaItems(m, groupId: group.id)
                     ))
                 }
             }
@@ -1247,6 +1262,53 @@ final class SonarAppStore: ObservableObject {
             pendingMarmotSends[npub] = nil
             for text in texts { marmot.send(text, to: group.id) }
         }
+    }
+
+    // MARK: Media (White Noise / Marmot MIP-04)
+
+    /// In-memory decrypted-media cache (raw bytes), keyed by the ciphertext's
+    /// Blossom URL. Cleared by `wipe()` and `eraseAllChats()`.
+    private var mediaImageCache: [String: Data] = [:]
+
+    /// Map a Marmot message's attachments into UI items carrying the group id.
+    static func mediaItems(_ m: MarmotService.MarmotMessage, groupId: String) -> [SNMediaItem] {
+        m.media.map {
+            SNMediaItem(url: $0.url, mime: $0.mimeType, filename: $0.filename, groupId: groupId)
+        }
+    }
+
+    /// True if `id` is a chat that can carry media (an existing Marmot group, or
+    /// a Sonar peer whose White Noise group exists). Gates the "Send photo" UI.
+    func canSendMedia(_ id: String) -> Bool {
+        if marmotGroupId(id) != nil { return true }
+        if let profile = resolvedSonarProfile(id) { return marmotGroup(forNpub: profile.npub) != nil }
+        return false
+    }
+
+    /// Send an image to a Sonar/White Noise chat: encrypt + Blossom upload +
+    /// publish over Marmot. No-op if no Marmot group backs the chat.
+    func sendImage(_ id: String, data: Data, filename: String, mime: String) {
+        let groupId: String?
+        if let gid = marmotGroupId(id) {
+            groupId = gid
+        } else if let profile = resolvedSonarProfile(id) {
+            groupId = marmotGroup(forNpub: profile.npub)?.id
+        } else {
+            groupId = nil
+        }
+        guard let gid = groupId else { return }
+        marmot.sendMedia(groupId: gid, data: data, filename: filename, mime: mime)
+    }
+
+    /// Download + decrypt a media attachment, returning the raw bytes (cached by
+    /// URL). The view decodes platform images from this.
+    func mediaData(_ item: SNMediaItem) async -> Data? {
+        if let cached = mediaImageCache[item.url] { return cached }
+        guard let data = await marmot.fetchMedia(groupId: item.groupId, url: item.url) else {
+            return nil
+        }
+        mediaImageCache[item.url] = data
+        return data
     }
 
     func openedDM(_ id: String) {
@@ -1675,6 +1737,7 @@ final class SonarAppStore: ObservableObject {
         // ⚡PAY coins live inside the erased chats — clear the ledger too. The
         // Lightning wallet seed/balance is separate and is NOT touched.
         payLedger.wipe()
+        mediaImageCache = [:]
         objectWillChange.send()
     }
 
@@ -1718,6 +1781,7 @@ final class SonarAppStore: ObservableObject {
         BridgedWallet.wipeWalletStorage()
         #endif
         payLedger.wipe()
+        mediaImageCache = [:]
         scannedPayMessageIDs = []
         pendingPayPeer = nil
         bip353 = ""
