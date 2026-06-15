@@ -18,6 +18,7 @@
 
 import BitLogger
 import Combine
+import CryptoKit
 import Foundation
 import SwiftUI
 #if canImport(UIKit)
@@ -1424,11 +1425,43 @@ final class SonarAppStore: ObservableObject {
             return try? Data(contentsOf: URL(fileURLWithPath: path))
         }
         if let cached = mediaImageCache[item.url] { return cached }
+        // Persistent on-disk cache: a decrypted blob survives relaunch and, on a
+        // hit, returns WITHOUT touching the serialized Marmot FFI queue — so it
+        // can never queue behind an in-flight sync (the cause of slow media).
+        if let disk = Self.mediaCacheURL(for: item.url),
+           let data = try? Data(contentsOf: disk) {
+            mediaImageCache[item.url] = data
+            return data
+        }
         guard let data = await marmot.fetchMedia(groupId: item.groupId, url: item.url) else {
             return nil
         }
         mediaImageCache[item.url] = data
+        // Write-through to disk, protected at rest like MessageStore plaintext.
+        if let disk = Self.mediaCacheURL(for: item.url) {
+            try? data.write(to: disk, options: [.atomic, .completeFileProtection])
+        }
         return data
+    }
+
+    /// `<AppSupport>/media-cache/<sha256(url)>` — content-addressed by the
+    /// ciphertext's Blossom URL (a stable per-blob key). Creates the dir lazily.
+    private static func mediaCacheURL(for url: String) -> URL? {
+        guard !url.isEmpty, let base = try? FileManager.default.url(
+            for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+        else { return nil }
+        let dir = base.appendingPathComponent("media-cache", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let name = SHA256.hash(data: Data(url.utf8)).map { String(format: "%02x", $0) }.joined()
+        return dir.appendingPathComponent(name)
+    }
+
+    /// Erase the on-disk media cache. Called by both wipe paths.
+    private func clearMediaDiskCache() {
+        guard let base = try? FileManager.default.url(
+            for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false)
+        else { return }
+        try? FileManager.default.removeItem(at: base.appendingPathComponent("media-cache", isDirectory: true))
     }
 
     func openedDM(_ id: String) {
@@ -1858,6 +1891,7 @@ final class SonarAppStore: ObservableObject {
         // Lightning wallet seed/balance is separate and is NOT touched.
         payLedger.wipe()
         mediaImageCache = [:]
+        clearMediaDiskCache()
         objectWillChange.send()
     }
 
@@ -1902,6 +1936,7 @@ final class SonarAppStore: ObservableObject {
         #endif
         payLedger.wipe()
         mediaImageCache = [:]
+        clearMediaDiskCache()
         scannedPayMessageIDs = []
         pendingPayPeer = nil
         bip353 = ""

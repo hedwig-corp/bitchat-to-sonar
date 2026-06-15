@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use mdk_core::prelude::*;
@@ -31,6 +31,18 @@ pub const DEFAULT_BLOSSOM_SERVER: &str = "https://blossom.primal.net";
 /// Comfortably above any real image while well under MDK's 100 MB MIP-04 limit.
 const MAX_MEDIA_DOWNLOAD_BYTES: usize = 25 * 1024 * 1024;
 
+/// Shared HTTP client for Blossom media downloads. Built once so every blob
+/// reuses keep-alive connections + the TLS session cache instead of paying a
+/// fresh connect + handshake per download (the White Noise reference client
+/// keeps a single static client for exactly this reason).
+static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(60))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+});
+
 /// Download raw bytes for an encrypted media blob by its full imeta URL.
 ///
 /// Hardening (the URL is attacker-controllable — it is whatever the message
@@ -42,7 +54,9 @@ async fn http_get(url: &str) -> Result<Vec<u8>> {
     if !url.starts_with("https://") {
         return Err(Error::Http(format!("refusing non-https media url: {url}")));
     }
-    let mut resp = reqwest::get(url)
+    let mut resp = HTTP_CLIENT
+        .get(url)
+        .send()
         .await
         .map_err(|e| Error::Http(e.to_string()))?;
     if !resp.status().is_success() {
@@ -66,6 +80,18 @@ async fn http_get(url: &str) -> Result<Vec<u8>> {
 }
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Extra lookback applied ONLY to the gift-wrap (welcome) `.since` filter.
+/// NIP-59 deliberately backdates a gift wrap's `created_at` (up to ~2 days, we
+/// use a comfortable margin) to defeat timing analysis, so a tight watermark
+/// would silently miss a just-received welcome. Mirrors White Noise's
+/// `GIFTWRAP_LOOKBACK_BUFFER`.
+const GIFTWRAP_LOOKBACK_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Safety overlap subtracted from the watermark on every incremental fetch, to
+/// cover clock skew and events that landed on a relay mid-sync. Already-seen
+/// events are tolerated (MDK dedups on processing), so a small overlap is free.
+const SYNC_OVERLAP_SECS: u64 = 60;
 
 /// One received geohash channel event (ephemeral kind-20000), buffered from the
 /// live subscription. Geohash channels are public ephemeral events — relays do
@@ -131,6 +157,12 @@ pub struct SonarClient {
     geo_presence: GeoPresenceBuf,
     geo_subscribed: Arc<Mutex<HashSet<String>>>,
     identity_secret: [u8; 32],
+    /// Unix-seconds watermark of the last successful [`SonarClient::sync`].
+    /// Scopes each poll's `.since(...)` so we fetch only NEW welcomes/messages
+    /// instead of re-downloading + re-processing all history every 5s. 0 until
+    /// the first sync completes (an unbounded backfill, like White Noise's
+    /// `since = None` on a fresh account).
+    last_sync: Arc<Mutex<u64>>,
     /// Whether to join geohash-nearest relays on subscribe (real sessions); off
     /// for in-memory/test sessions so they stay network-free against a MockRelay.
     allow_geo_relays: bool,
@@ -315,6 +347,7 @@ impl SonarClient {
             geo_presence,
             geo_subscribed,
             identity_secret,
+            last_sync: Arc::new(Mutex::new(0)),
             allow_geo_relays,
         })
     }
@@ -532,30 +565,70 @@ impl SonarClient {
         Ok(())
     }
 
-    /// Poll the relays once: first gift-wrapped welcomes addressed to us
-    /// (which may add groups), then kind-445 messages for every known group.
-    /// Duplicate/already-processed events are tolerated by design.
+    /// Poll the relays once for anything NEW since the last sync: gift-wrapped
+    /// welcomes addressed to us (which may add groups), then kind-445 messages
+    /// for every known group.
+    ///
+    /// A monotonic per-session watermark scopes each fetch with `.since(...)`,
+    /// so a repeat poll only pulls events newer than the last one instead of
+    /// re-downloading + re-processing the entire history every time (the naive
+    /// version made every 5s poll a full backfill, which also starved media
+    /// downloads queued behind it on the host). All group messages are fetched
+    /// in ONE request batched on the `#h` tag, not one fetch per group. This is
+    /// the same `last_synced_at` + batched-subscription pattern the White Noise
+    /// reference client uses. Duplicate/already-processed events are tolerated.
     pub async fn sync(&self) -> Result<()> {
-        let wraps = Filter::new()
+        // Watermark from the previous successful sync (0 on the first poll of a
+        // session → an unbounded backfill, bounded only by the `#p`/`#h` scope).
+        let since_secs = *self.last_sync.lock().unwrap();
+        // Capture the start time as the next watermark BEFORE fetching, so any
+        // event that lands mid-sync is re-covered by the overlap next poll.
+        let started = Timestamp::now().as_u64();
+
+        let mut wraps = Filter::new()
             .kind(Kind::GiftWrap)
             .pubkey(self.identity().public_key());
+        if since_secs > 0 {
+            // Gift wraps are backdated (NIP-59) → extra lookback so we don't
+            // skip a just-received welcome whose wrapper timestamp is in the past.
+            wraps = wraps.since(Timestamp::from_secs(
+                since_secs.saturating_sub(GIFTWRAP_LOOKBACK_SECS),
+            ));
+        }
         for event in self.nostr.fetch_events(wraps, FETCH_TIMEOUT).await? {
             if let Err(err) = self.engine.process_incoming(&event).await {
                 tracing::debug!(%err, "skipping gift wrap (likely duplicate)");
             }
         }
 
-        for group in self.engine.groups()? {
-            let filter = Filter::new().kind(Kind::MlsGroupMessage).custom_tag(
-                SingleLetterTag::lowercase(Alphabet::H),
-                hex::encode(group.nostr_group_id),
-            );
+        // Fetch kind-445 for ALL known groups in one request (batched `#h`),
+        // including any group a welcome just added above.
+        let group_ids: Vec<String> = self
+            .engine
+            .groups()?
+            .into_iter()
+            .map(|g| hex::encode(g.nostr_group_id))
+            .collect();
+        if !group_ids.is_empty() {
+            let mut filter = Filter::new()
+                .kind(Kind::MlsGroupMessage)
+                .custom_tags(SingleLetterTag::lowercase(Alphabet::H), group_ids);
+            if since_secs > 0 {
+                filter = filter.since(Timestamp::from_secs(
+                    since_secs.saturating_sub(SYNC_OVERLAP_SECS),
+                ));
+            }
             for event in self.nostr.fetch_events(filter, FETCH_TIMEOUT).await? {
                 if let Err(err) = self.engine.process_incoming(&event).await {
                     tracing::debug!(%err, "skipping group message (likely duplicate)");
                 }
             }
         }
+
+        // Advance the watermark only after a fully successful poll: a fetch
+        // error returns `?` above and leaves the old watermark, so the next
+        // poll re-tries the same window rather than skipping events.
+        *self.last_sync.lock().unwrap() = started;
         Ok(())
     }
 
