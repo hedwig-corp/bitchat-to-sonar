@@ -5,9 +5,9 @@
 # Mirror of build-ios.sh for the Android side of issue #6 (1:1 Android app).
 #
 # Outputs (straight into the CMP app's androidMain source set):
-#   android/composeApp/src/androidMain/jniLibs/<abi>/libsonar_ffi.so
+#   apps/sonar/composeApp/src/androidMain/jniLibs/<abi>/libsonar_ffi.so
 #       for arm64-v8a, armeabi-v7a, x86_64
-#   android/composeApp/src/androidMain/kotlin/uniffi/sonar_ffi/sonar_ffi.kt
+#   apps/sonar/composeApp/src/androidMain/kotlin/uniffi/sonar_ffi/sonar_ffi.kt
 #       UniFFI Kotlin bindings (uniffi 0.31)
 #
 # The generated Kotlin uses JNA — the consuming Gradle module must depend on
@@ -40,8 +40,8 @@ echo "Using NDK: $ANDROID_NDK_HOME"
 CRATE="sonar-ffi"
 LIB="libsonar_ffi.so"
 # Write straight into the CMP app's androidMain (the canonical consumer), the
-# way build-ios.sh assembles localPackages/SonarCore. Override OUT to retarget.
-OUT="${OUT:-$REPO_ROOT/android/composeApp/src/androidMain}"
+# way build-ios.sh assembles ios/localPackages/SonarCore. Override OUT to retarget.
+OUT="${OUT:-$REPO_ROOT/apps/sonar/composeApp/src/androidMain}"
 JNILIBS="$OUT/jniLibs"
 KOTLIN_DIR="$OUT/kotlin"
 
