@@ -229,7 +229,8 @@ final class MarmotChatModel: ObservableObject {
             senderNpub: npub ?? "",
             content: trimmed,
             createdAt: Date(),
-            isMine: true
+            isMine: true,
+            media: []
         )
         pendingOptimistic[groupId, default: []].append(echo)
         messagesByGroup[groupId, default: []].append(echo)

@@ -39,6 +39,22 @@ final class MarmotService: @unchecked Sendable {
         let createdAt: Date
         /// True when the local identity sent it.
         let isMine: Bool
+        /// Encrypted media attachments (Marmot MIP-04), empty for plain text.
+        let media: [MarmotMedia]
+    }
+
+    /// A reference to an encrypted media attachment. `url` is the Blossom URL of
+    /// the CIPHERTEXT; call `fetchMedia(groupId:url:)` to download + decrypt.
+    struct MarmotMedia: Sendable, Equatable {
+        let url: String
+        let mimeType: String
+        let filename: String
+        let width: UInt32?
+        let height: UInt32?
+        let durationMs: UInt64?
+        var isImage: Bool { mimeType.hasPrefix("image/") }
+        var isVideo: Bool { mimeType.hasPrefix("video/") }
+        var isAudio: Bool { mimeType.hasPrefix("audio/") }
     }
 
     /// A peer's Nostr profile (kind-0 metadata, NIP-01). A Marmot member's
@@ -191,6 +207,43 @@ final class MarmotService: @unchecked Sendable {
         try await run { try $0.requireNode().sendText(groupIdHex: groupId, text: text) }
     }
 
+    /// Encrypt `data`, upload the ciphertext to a Blossom server, and publish a
+    /// media message to the group. `serverUrl` empty → the core default.
+    func sendMedia(
+        groupId: String,
+        data: Data,
+        filename: String,
+        mime: String,
+        caption: String,
+        serverUrl: String = ""
+    ) async throws {
+        try await run {
+            try $0.requireNode().sendMedia(
+                groupIdHex: groupId,
+                data: data,
+                filename: filename,
+                mime: mime,
+                caption: caption,
+                serverUrl: serverUrl
+            )
+        }
+    }
+
+    /// Download + decrypt the media blob at `url` for the group. Returns plaintext.
+    func fetchMedia(groupId: String, url: String) async throws -> Data {
+        try await run { try $0.requireNode().fetchMedia(groupIdHex: groupId, url: url) }
+    }
+
+    /// The user's Blossom server list (kind-10063). Empty if unset.
+    func blossomServers() async throws -> [String] {
+        try await run { try $0.requireNode().blossomServers() }
+    }
+
+    /// Publish the user's Blossom server list (kind-10063).
+    func publishBlossomServers(_ servers: [String]) async throws {
+        try await run { try $0.requireNode().publishBlossomServers(servers: servers) }
+    }
+
     /// Poll the relays once for welcomes addressed to us and new group
     /// messages. Call periodically (or after sending) until live
     /// subscriptions land in the core.
@@ -216,7 +269,17 @@ final class MarmotService: @unchecked Sendable {
                     senderNpub: $0.senderNpub,
                     content: $0.content,
                     createdAt: Date(timeIntervalSince1970: TimeInterval($0.createdAtSecs)),
-                    isMine: $0.mine
+                    isMine: $0.mine,
+                    media: $0.media.map {
+                        MarmotMedia(
+                            url: $0.url,
+                            mimeType: $0.mimeType,
+                            filename: $0.filename,
+                            width: $0.width,
+                            height: $0.height,
+                            durationMs: $0.durationMs
+                        )
+                    }
                 )
             }
         }
