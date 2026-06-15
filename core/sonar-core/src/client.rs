@@ -595,7 +595,16 @@ impl SonarClient {
                 since_secs.saturating_sub(GIFTWRAP_LOOKBACK_SECS),
             ));
         }
-        for event in self.nostr.fetch_events(wraps, FETCH_TIMEOUT).await? {
+        // Scope to OUR Marmot relays, not the whole pool: `subscribe_geohash`
+        // adds up to a dozen geohash-nearest relays per opened channel, none of
+        // which carry our 1059/445 events — fetching from them only makes the
+        // sync wait on their EOSE. The MLS group + KeyPackage relay lists are
+        // built from `self.relays`, so conformant peers publish welcomes there.
+        for event in self
+            .nostr
+            .fetch_events_from(self.relays.clone(), wraps, FETCH_TIMEOUT)
+            .await?
+        {
             if let Err(err) = self.engine.process_incoming(&event).await {
                 tracing::debug!(%err, "skipping gift wrap (likely duplicate)");
             }
@@ -618,7 +627,11 @@ impl SonarClient {
                     since_secs.saturating_sub(SYNC_OVERLAP_SECS),
                 ));
             }
-            for event in self.nostr.fetch_events(filter, FETCH_TIMEOUT).await? {
+            for event in self
+                .nostr
+                .fetch_events_from(self.relays.clone(), filter, FETCH_TIMEOUT)
+                .await?
+            {
                 if let Err(err) = self.engine.process_incoming(&event).await {
                     tracing::debug!(%err, "skipping group message (likely duplicate)");
                 }

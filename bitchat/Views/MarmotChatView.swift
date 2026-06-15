@@ -96,12 +96,22 @@ final class MarmotChatModel: ObservableObject {
         //    the "chats vanish on restart, reappear on the next launch" bug.
         do {
             _ = try await service.connect(nsec: storedNsec)
-            await refresh()
+            // Paint persisted chats from the encrypted DB IMMEDIATELY — they do
+            // not need the relays. The relay drain (syncOnce) + KeyPackage
+            // publish must NOT gate first paint, or the UI freezes on
+            // "Connecting…" for the entire relay round-trip even though every
+            // chat is already on disk (the user's "sync on launch is slow"
+            // report). Run them detached.
+            await loadLocal()
             self.errorText = nil
-            try await service.publishKeyPackage()
+            Task { [weak self] in
+                guard let self else { return }
+                await self.refresh()
+                try? await self.service.publishKeyPackage()
+            }
         } catch {
             let desc = Self.describe(error)
-            SecureLogger.warning("⚠️ Marmot connect/publish failed: \(desc)", category: .session)
+            SecureLogger.warning("⚠️ Marmot connect failed: \(desc)", category: .session)
             self.errorText = desc
         }
     }
@@ -121,9 +131,10 @@ final class MarmotChatModel: ObservableObject {
         return await service.isConnected()
     }
 
-    func refresh() async {
+    /// Load groups + messages from the LOCAL encrypted DB only (no relay I/O),
+    /// so the chat list paints instantly on launch regardless of relay health.
+    func loadLocal() async {
         do {
-            try await service.syncOnce()
             let groups = try await service.groups()
             var byGroup: [String: [MarmotService.MarmotMessage]] = [:]
             for group in groups {
@@ -131,7 +142,6 @@ final class MarmotChatModel: ObservableObject {
             }
             self.groups = groups
             self.messagesByGroup = reconcileOptimistic(into: byGroup)
-            self.errorText = nil
             // Resolve a human name for every counterpart (once each).
             for group in groups {
                 for member in group.memberNpubs where member != npub {
@@ -141,6 +151,19 @@ final class MarmotChatModel: ObservableObject {
         } catch {
             self.errorText = Self.describe(error)
         }
+    }
+
+    /// Poll the relays once, then reflect the (possibly updated) local state.
+    /// Local chats are loaded even when the relay sync fails, so a relay outage
+    /// never hides already-persisted conversations.
+    func refresh() async {
+        do {
+            try await service.syncOnce()
+            self.errorText = nil
+        } catch {
+            self.errorText = Self.describe(error)
+        }
+        await loadLocal()
     }
 
     /// Publish our own kind-0 profile so peers see our nickname, not our npub.
