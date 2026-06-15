@@ -109,6 +109,10 @@ final class MarmotChatModel: ObservableObject {
                 await self.refresh()
                 try? await self.service.publishKeyPackage()
             }
+            // Run the live subscription loop for as long as we're connected, so
+            // welcomes + messages arrive in real time globally (not only while a
+            // specific chat is open).
+            startPolling()
         } catch {
             let desc = Self.describe(error)
             SecureLogger.warning("⚠️ Marmot connect failed: \(desc)", category: .session)
@@ -301,13 +305,24 @@ final class MarmotChatModel: ObservableObject {
         }
     }
 
-    /// Poll while a Marmot screen is visible (core has no live subscription yet).
+    /// Drive LIVE updates off the core's relay subscriptions: park on
+    /// `waitForMarmotEvent` and, the instant a welcome/message is pushed, drain +
+    /// process it and reload the UI from the local DB. On the idle timeout (no
+    /// push), run one `refresh()` as a safety reconciliation that also catches any
+    /// subscription event the relay dropped/lagged. Replaces the old 5s poll.
     func startPolling() {
         guard syncTask == nil else { return }
         syncTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 5_000_000_000)
-                await self?.refresh()
+                guard let self else { return }
+                let woke = await self.service.waitForMarmotEvent(timeoutSeconds: 25)
+                if Task.isCancelled { return }
+                if woke {
+                    let drained = (try? await self.service.drainPending()) ?? false
+                    if drained { await self.loadLocal() }
+                } else {
+                    await self.refresh() // idle safety reconciliation
+                }
             }
         }
     }

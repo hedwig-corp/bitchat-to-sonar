@@ -274,6 +274,21 @@ impl SonarNode {
         Ok(())
     }
 
+    /// Block until a live Marmot event (welcome or group message) has been pushed
+    /// by the relay subscriptions, or `timeout_secs` elapses. Returns true if
+    /// there is something to drain. Touches NO MLS state, so the host may call it
+    /// OFF its serialized engine queue (a parked "wait for push", not a poll).
+    pub fn wait_for_marmot_event(&self, timeout_secs: u64) -> bool {
+        self.runtime
+            .block_on(self.client.wait_for_marmot_event(timeout_secs))
+    }
+
+    /// Process buffered live Marmot events through the MLS engine. Returns true if
+    /// anything was drained. MUST run on the host's serialized engine queue.
+    pub fn drain_pending_marmot(&self) -> FfiResult<bool> {
+        Ok(self.runtime.block_on(self.client.drain_pending_marmot())?)
+    }
+
     /// All groups this identity belongs to.
     pub fn groups(&self) -> FfiResult<Vec<GroupInfo>> {
         let groups = self.client.groups()?;

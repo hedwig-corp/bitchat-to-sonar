@@ -99,6 +99,11 @@ final class MarmotService: @unchecked Sendable {
     /// cooperative pool.
     private let workQueue = DispatchQueue(label: "chat.bitchat.marmot-service", qos: .userInitiated)
 
+    /// Separate queue for the parked `waitForMarmotEvent` call ONLY. It blocks
+    /// for up to its timeout, so it must NOT share the serial engine queue (that
+    /// would stall syncs/sends). The wait touches no MLS state, so this is safe.
+    private let waitQueue = DispatchQueue(label: "chat.bitchat.marmot-wait", qos: .utility)
+
     // Guarded by `workQueue`.
     private var identity: SonarIdentity?
     private var node: SonarNode?
@@ -249,6 +254,32 @@ final class MarmotService: @unchecked Sendable {
     /// subscriptions land in the core.
     func syncOnce() async throws {
         try await run { try $0.requireNode().syncOnce() }
+    }
+
+    /// Park until the relay subscriptions push a live Marmot event (welcome or
+    /// group message), or `timeoutSeconds` elapses. Returns true if there is
+    /// something to drain. Runs OFF the serial engine queue, so a long park does
+    /// not block syncs/sends; `SonarNode` is internally Send+Sync, so calling it
+    /// from `waitQueue` with a reference grabbed race-free on `workQueue` is safe.
+    func waitForMarmotEvent(timeoutSeconds: UInt64) async -> Bool {
+        guard let node = await runNonThrowing({ $0.node }) else {
+            // Not connected yet: wait out the timeout so the caller's loop does
+            // not busy-spin until a node exists.
+            try? await Task.sleep(nanoseconds: timeoutSeconds * 1_000_000_000)
+            return false
+        }
+        return await withCheckedContinuation { continuation in
+            waitQueue.async {
+                continuation.resume(returning: node.waitForMarmotEvent(timeoutSecs: timeoutSeconds))
+            }
+        }
+    }
+
+    /// Process buffered live Marmot events through the MLS engine on the serial
+    /// engine queue. Returns true if anything was drained (→ reload the UI).
+    @discardableResult
+    func drainPending() async throws -> Bool {
+        try await run { try $0.requireNode().drainPendingMarmot() }
     }
 
     /// All Marmot groups the identity belongs to.

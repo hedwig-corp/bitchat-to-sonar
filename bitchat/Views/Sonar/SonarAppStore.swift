@@ -1484,12 +1484,11 @@ final class SonarAppStore: ObservableObject {
     }
 
     func closedDM(_ id: String) {
-        if marmotGroupId(id) != nil {
-            marmot.stopPolling()
-        } else {
-            if resolvedSonarProfile(id) != nil {
-                marmot.stopPolling()
-            }
+        // NB: do NOT stop the Marmot subscription loop here — it now runs for as
+        // long as we're connected (started in performConnect) so welcomes +
+        // messages keep arriving live in the background list, not only while a
+        // chat is open. It is stopped only on wipe / erase.
+        if marmotGroupId(id) == nil {
             if chatViewModel.selectedPrivateChatPeer == PeerID(str: id) {
                 chatViewModel.endPrivateChat()
             }

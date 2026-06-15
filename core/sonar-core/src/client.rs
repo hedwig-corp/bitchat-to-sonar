@@ -93,6 +93,11 @@ const GIFTWRAP_LOOKBACK_SECS: u64 = 7 * 24 * 60 * 60;
 /// events are tolerated (MDK dedups on processing), so a small overlap is free.
 const SYNC_OVERLAP_SECS: u64 = 60;
 
+/// Stable subscription ids for the live Marmot tail (so re-subscribing the
+/// group filter REPLACES it rather than stacking new subscriptions).
+const SUB_MARMOT_WELCOMES: &str = "sonar-marmot-welcomes";
+const SUB_MARMOT_GROUPS: &str = "sonar-marmot-groups";
+
 /// One received geohash channel event (ephemeral kind-20000), buffered from the
 /// live subscription. Geohash channels are public ephemeral events — relays do
 /// NOT store them, so we accumulate them in memory as the subscription delivers.
@@ -163,6 +168,14 @@ pub struct SonarClient {
     /// the first sync completes (an unbounded backfill, like White Noise's
     /// `since = None` on a fresh account).
     last_sync: Arc<Mutex<u64>>,
+    /// Live Marmot events (welcomes 1059→us + group 445s) pushed by the
+    /// notification handler. Drained + MLS-processed on the host's serialized
+    /// engine thread via `drain_pending_marmot` — the handler NEVER touches the
+    /// engine, so MLS state mutation stays single-threaded (the MLS invariant).
+    pending_marmot: Arc<Mutex<Vec<Event>>>,
+    /// Fired whenever a live Marmot event is buffered, so `wait_for_marmot_event`
+    /// wakes the host to drain in real time (push) instead of polling.
+    marmot_notify: Arc<tokio::sync::Notify>,
     /// Whether to join geohash-nearest relays on subscribe (real sessions); off
     /// for in-memory/test sessions so they stay network-free against a MockRelay.
     allow_geo_relays: bool,
@@ -214,10 +227,18 @@ impl SonarClient {
         let geo_subscribed: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let identity_secret = identity.keys().secret_key().to_secret_bytes();
 
+        let pending_marmot: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
+        let marmot_notify = Arc::new(tokio::sync::Notify::new());
+
         let handler_geo = geo.clone();
         let handler_dm = geo_dm.clone();
         let handler_presence = geo_presence.clone();
         let handler_subs = geo_subscribed.clone();
+        let handler_pending = pending_marmot.clone();
+        let handler_notify = marmot_notify.clone();
+        // Our MAIN identity pubkey hex: a kind-1059 with this `p` tag is a Marmot
+        // welcome (vs a geohash DM, whose `p` is a per-geohash ephemeral key).
+        let my_pubkey_hex = identity.keys().public_key().to_hex();
         let mut notifications = nostr.notifications();
         tokio::spawn(async move {
             loop {
@@ -289,12 +310,21 @@ impl SonarClient {
                         }
                     }
                     1059 => {
-                        // Gift wrap: the `p` tag names our per-geohash recipient
-                        // key. Find which active channel it targets, unwrap with
-                        // that key, and record the kind-14 DM.
+                        // Gift wrap: the `p` tag names the recipient key.
                         let Some(p_hex) = tag_value(&event, Alphabet::P) else {
                             continue;
                         };
+                        // Addressed to our MAIN identity → a Marmot welcome.
+                        // Buffer it (do NOT touch the MLS engine here) and wake
+                        // the host to drain + process it on its engine thread.
+                        if p_hex == my_pubkey_hex {
+                            handler_pending.lock().unwrap().push((*event).clone());
+                            handler_notify.notify_one();
+                            continue;
+                        }
+                        // Otherwise the `p` tag names a per-geohash recipient key:
+                        // find which active channel it targets, unwrap with that
+                        // key, and record the kind-14 DM.
                         let subs: Vec<String> =
                             handler_subs.lock().unwrap().iter().cloned().collect();
                         for geohash in subs {
@@ -333,12 +363,20 @@ impl SonarClient {
                             break;
                         }
                     }
+                    445 => {
+                        // Live MLS group message for one of our subscribed groups
+                        // (the relay only sends 445s matching our `#h` filter).
+                        // Buffer + wake; processing happens on the host's engine
+                        // thread via drain_pending_marmot.
+                        handler_pending.lock().unwrap().push((*event).clone());
+                        handler_notify.notify_one();
+                    }
                     _ => {}
                 }
             }
         });
 
-        Ok(Self {
+        let client = Self {
             engine,
             nostr,
             relays,
@@ -348,8 +386,19 @@ impl SonarClient {
             geo_subscribed,
             identity_secret,
             last_sync: Arc::new(Mutex::new(0)),
+            pending_marmot,
+            marmot_notify,
             allow_geo_relays,
-        })
+        };
+        // Open the live Marmot subscriptions for real sessions. In-memory test
+        // sessions (allow_geo_relays=false) stay on the explicit `sync()` path so
+        // the e2e tests remain deterministic and network-shaped.
+        if allow_geo_relays {
+            if let Err(err) = client.subscribe_marmot().await {
+                tracing::debug!(%err, "marmot live subscribe failed (sync() still covers it)");
+            }
+        }
+        Ok(client)
     }
 
     pub fn identity(&self) -> &Identity {
@@ -643,6 +692,126 @@ impl SonarClient {
         // poll re-tries the same window rather than skipping events.
         *self.last_sync.lock().unwrap() = started;
         Ok(())
+    }
+
+    /// Open the persistent LIVE Marmot subscriptions: welcomes (1059 → us) and
+    /// group messages (445 on our groups' `#h`). The relay pushes new events to
+    /// the notification handler → buffer → `drain_pending_marmot`. Both subs are
+    /// a since-now LIVE TAIL; pre-session history stays with `sync()` (watermark)
+    /// and a freshly-joined group's history is backfilled explicitly in
+    /// `drain_pending_marmot` (its messages predate the watermark).
+    pub async fn subscribe_marmot(&self) -> Result<()> {
+        let wraps = Filter::new()
+            .kind(Kind::GiftWrap)
+            .pubkey(self.identity().public_key())
+            .since(Timestamp::now());
+        self.nostr
+            .subscribe_with_id(SubscriptionId::new(SUB_MARMOT_WELCOMES), wraps, None)
+            .await?;
+        self.subscribe_group_messages().await
+    }
+
+    /// (Re)subscribe the kind-445 live tail (`since = now`) to the CURRENT group
+    /// set. Re-running with the same id REPLACES the filter, so calling this
+    /// after a welcome adds a group widens the live subscription. History for a
+    /// newly-added group is fetched separately by `backfill_group`.
+    async fn subscribe_group_messages(&self) -> Result<()> {
+        let group_ids: Vec<String> = self
+            .engine
+            .groups()?
+            .into_iter()
+            .map(|g| hex::encode(g.nostr_group_id))
+            .collect();
+        if group_ids.is_empty() {
+            return Ok(());
+        }
+        let filter = Filter::new()
+            .kind(Kind::MlsGroupMessage)
+            .custom_tags(SingleLetterTag::lowercase(Alphabet::H), group_ids)
+            .since(Timestamp::now());
+        self.nostr
+            .subscribe_with_id(SubscriptionId::new(SUB_MARMOT_GROUPS), filter, None)
+            .await?;
+        Ok(())
+    }
+
+    /// One-off fetch of a single group's full kind-445 history (no `since`),
+    /// processed through the engine. Used when a welcome adds a group whose
+    /// messages predate the sync watermark, so they'd be missed by both the
+    /// watermarked `sync()` and the since-now live subscription.
+    async fn backfill_group(&self, group_id_hex: &str) -> Result<()> {
+        let filter = Filter::new()
+            .kind(Kind::MlsGroupMessage)
+            .custom_tag(SingleLetterTag::lowercase(Alphabet::H), group_id_hex);
+        for event in self
+            .nostr
+            .fetch_events_from(self.relays.clone(), filter, FETCH_TIMEOUT)
+            .await?
+        {
+            if let Err(err) = self.engine.process_incoming(&event).await {
+                tracing::debug!(%err, "skipping backfilled group message (likely duplicate)");
+            }
+        }
+        Ok(())
+    }
+
+    /// Park until a live Marmot event is buffered (or `timeout_secs` elapses).
+    /// Returns true if there is something to drain. This is the host's "wait for
+    /// push" primitive — it touches NO engine state, so it is the one Marmot call
+    /// the host may run OFF its serialized engine queue.
+    pub async fn wait_for_marmot_event(&self, timeout_secs: u64) -> bool {
+        if !self.pending_marmot.lock().unwrap().is_empty() {
+            return true;
+        }
+        tokio::time::timeout(
+            Duration::from_secs(timeout_secs.max(1)),
+            self.marmot_notify.notified(),
+        )
+        .await
+        .is_ok()
+    }
+
+    /// Process every buffered live Marmot event through the MLS engine, then
+    /// widen the group subscription if a welcome just added a group. Returns true
+    /// if anything was drained. MUST run on the host's serialized engine thread
+    /// (it mutates MLS state); the notification handler only ever BUFFERS.
+    pub async fn drain_pending_marmot(&self) -> Result<bool> {
+        let events: Vec<Event> = {
+            let mut buf = self.pending_marmot.lock().unwrap();
+            if buf.is_empty() {
+                return Ok(false);
+            }
+            std::mem::take(&mut *buf)
+        };
+        let ids_before: HashSet<String> = self
+            .engine
+            .groups()?
+            .into_iter()
+            .map(|g| hex::encode(g.nostr_group_id))
+            .collect();
+        for event in &events {
+            if let Err(err) = self.engine.process_incoming(event).await {
+                tracing::debug!(%err, "skipping live marmot event (likely duplicate)");
+            }
+        }
+        // A welcome may have joined new group(s): backfill each one's history
+        // (predates the watermark + the since-now sub) and widen the live sub.
+        let new_ids: Vec<String> = self
+            .engine
+            .groups()?
+            .into_iter()
+            .map(|g| hex::encode(g.nostr_group_id))
+            .filter(|id| !ids_before.contains(id))
+            .collect();
+        if !new_ids.is_empty() {
+            for id in &new_ids {
+                if let Err(err) = self.backfill_group(id).await {
+                    tracing::debug!(%err, "group backfill failed (sync will retry)");
+                }
+            }
+            let _ = self.subscribe_group_messages().await;
+        }
+        Ok(true)
     }
 
     pub fn groups(&self) -> Result<Vec<group_types::Group>> {

@@ -884,6 +884,12 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func blossomServers() throws  -> [String]
     
     /**
+     * Process buffered live Marmot events through the MLS engine. Returns true if
+     * anything was drained. MUST run on the host's serialized engine queue.
+     */
+    func drainPendingMarmot() throws  -> Bool
+    
+    /**
      * Download + decrypt the media blob at `url` for `group_id`. Returns plaintext.
      */
     func fetchMedia(groupIdHex: String, url: String) throws  -> Data
@@ -975,6 +981,14 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      */
     func syncOnce() throws 
     
+    /**
+     * Block until a live Marmot event (welcome or group message) has been pushed
+     * by the relay subscriptions, or `timeout_secs` elapses. Returns true if
+     * there is something to drain. Touches NO MLS state, so the host may call it
+     * OFF its serialized engine queue (a parked "wait for push", not a poll).
+     */
+    func waitForMarmotEvent(timeoutSecs: UInt64)  -> Bool
+    
 }
 /**
  * A relay-connected Sonar node. Owns its own tokio runtime; every method is
@@ -1061,6 +1075,18 @@ public static func connect(identity: SonarIdentity, relayUrls: [String], dbPath:
 open func blossomServers()throws  -> [String]  {
     return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_blossom_servers(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Process buffered live Marmot events through the MLS engine. Returns true if
+     * anything was drained. MUST run on the host's serialized engine queue.
+     */
+open func drainPendingMarmot()throws  -> Bool  {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_drain_pending_marmot(
             self.uniffiCloneHandle(),$0
     )
 })
@@ -1279,6 +1305,21 @@ open func syncOnce()throws   {try rustCallWithError(FfiConverterTypeSonarFfiErro
             self.uniffiCloneHandle(),$0
     )
 }
+}
+    
+    /**
+     * Block until a live Marmot event (welcome or group message) has been pushed
+     * by the relay subscriptions, or `timeout_secs` elapses. Returns true if
+     * there is something to drain. Touches NO MLS state, so the host may call it
+     * OFF its serialized engine queue (a parked "wait for push", not a poll).
+     */
+open func waitForMarmotEvent(timeoutSecs: UInt64) -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_sonarnode_wait_for_marmot_event(
+            self.uniffiCloneHandle(),
+        FfiConverterUInt64.lower(timeoutSecs),$0
+    )
+})
 }
     
 
@@ -3065,6 +3106,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_blossom_servers() != 8214) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_drain_pending_marmot() != 32220) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_fetch_media() != 440) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3114,6 +3158,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_sync_once() != 45718) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_wait_for_marmot_event() != 64873) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnoise_decrypt() != 61202) {
