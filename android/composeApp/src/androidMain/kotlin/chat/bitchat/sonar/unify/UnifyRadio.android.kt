@@ -47,6 +47,11 @@ actual object UnifyRadio {
     private const val FETCH_TIMEOUT_MS = 15_000L
     /** BLE manufacturer-data company id carrying the display name (== iOS). */
     private const val NAME_COMPANY_ID = 0xFFFF
+    /** A private marker (in our scan response) that says "this Unify advertiser
+     *  is actually a Sonar app". Other Sonar scanners skip it — a Sonar peer is
+     *  shown via the mesh, not as a generic "Unify user". The real Unify Wallet
+     *  has no marker, so it still lists correctly. */
+    private const val SONAR_MARKER_COMPANY = 0x53A0
 
     private val ctx: Context get() = AppContextHolder.ctx
 
@@ -116,11 +121,19 @@ actual object UnifyRadio {
     actual fun peers(): List<UnifyPeer> {
         val now = System.currentTimeMillis()
         for ((id, t) in lastSeen) if (now - t > STALE_MS) { seen.remove(id); lastSeen.remove(id) }
-        return seen.values.sortedByDescending { it.rssi }
+        // Dedupe rotating-MAC "zombies": one real device advertises under many
+        // addresses, so collapse by display name, keeping the strongest signal.
+        return seen.values
+            .groupBy { it.name }
+            .map { (_, dupes) -> dupes.maxByOrNull { it.rssi }!! }
+            .sortedByDescending { it.rssi }
     }
 
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
+            // Skip Sonar apps advertising the Unify receiver — they're shown as
+            // Sonar peers via the mesh, not as generic "Unify users".
+            if (result.scanRecord?.getManufacturerSpecificData(SONAR_MARKER_COMPANY) != null) return
             val id = result.device.address
             seen[id] = UnifyPeer(id = id, name = advertisedName(result), rssi = result.rssi)
             lastSeen[id] = System.currentTimeMillis()
@@ -231,7 +244,12 @@ actual object UnifyRadio {
                 .addServiceUuid(ParcelUuid(SERVICE))
                 .addManufacturerData(NAME_COMPANY_ID, sanitizeName(name).encodeToByteArray())
                 .build()
-            advertiser?.startAdvertising(settings, data, advCallback)
+            // Scan response carries the "I am Sonar" marker so peer Sonar apps
+            // don't double-list us as a generic Unify user.
+            val scanResponse = AdvertiseData.Builder()
+                .addManufacturerData(SONAR_MARKER_COMPANY, byteArrayOf(0x01))
+                .build()
+            advertiser?.startAdvertising(settings, data, scanResponse, advCallback)
             advertising = true
             android.util.Log.i(TAG, "advertising Unify offer as '${sanitizeName(name)}'")
         } catch (e: Throwable) {

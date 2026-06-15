@@ -1,7 +1,9 @@
 package chat.bitchat.sonar
 
-/** A peer discovered over the BLE mesh radio. */
-data class MeshPeer(val id: String, val name: String, val rssi: Int)
+/** A peer discovered over the BLE mesh radio. `sonar` = it emitted a rich Sonar
+ *  Discovery (0x53) announce, so it's a full Sonar user (chat + pay), not a
+ *  plain bitchat peer (chat only). */
+data class MeshPeer(val id: String, val name: String, val rssi: Int, val sonar: Boolean = false)
 
 /**
  * The BLE mesh radio: scans for and advertises the bitchat mesh service so

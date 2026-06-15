@@ -41,4 +41,16 @@ class SonarDiscoveryTest {
         val withUnknown = a.encode() + byteArrayOf(0x09, 0x02, 0x41, 0x42)
         assertEquals(a, SonarAnnounce.decode(withUnknown))
     }
+
+    @Test fun roundTripWithLargeBolt12Offer() {
+        // A realistic BOLT12 offer exceeds 255 bytes → exercises the 2-byte
+        // length TLV (0x05) path.
+        val offer = "lno1" + "qp".repeat(200) // ~404 chars
+        assertTrue(offer.length > 255)
+        val a = SonarAnnounce(1, npub, "vince@sonar.app", SonarAnnounce.CAP_PAY, offer)
+        val decoded = SonarAnnounce.decode(a.encode())!!
+        assertEquals(a, decoded)
+        assertEquals(offer, decoded.bolt12Offer)
+        assertEquals("vince@sonar.app", decoded.bip353)
+    }
 }

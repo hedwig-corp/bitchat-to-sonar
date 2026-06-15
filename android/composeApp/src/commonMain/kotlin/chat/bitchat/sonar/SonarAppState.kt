@@ -351,12 +351,15 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun capabilities(): Int =
         SonarAnnounce.CAP_MARMOT or (if (walletAvailable) SonarAnnounce.CAP_PAY else 0)
 
-    /** Build our local Sonar Discovery announce from the current identity. */
+    /** Build our local Sonar Discovery announce from the current identity. The
+     *  rich Sonar identity: npub + capabilities + (when set) BIP-353 payment
+     *  address + the BOLT12 offer, so a peer Sonar can pay us without a
+     *  round-trip. */
     fun localSonarAnnounce(): SonarAnnounce? {
         val raw = chat.bitchat.sonar.crypto.Bech32.decode(npub)?.takeIf { it.hrp == "npub" }?.data
             ?: return null
         if (raw.size != 32) return null
-        return SonarAnnounce(1, raw, bip353.ifBlank { null }, capabilities())
+        return SonarAnnounce(1, raw, bip353.ifBlank { null }, capabilities(), unifyOffer)
     }
 
     // ── Verify safety numbers (1:1 with iOS) ──

@@ -140,7 +140,9 @@ object MeshGatt {
     fun stop() {
         try { server?.close() } catch (_: Throwable) {}
         server = null; characteristic = null
-        serverLinks.clear(); serverDevices.clear(); clientLinks.clear(); peerIdByAddr.clear()
+        clientGatt.values.forEach { runCatching { it.disconnect(); it.close() } }
+        clientGatt.clear(); clientChar.clear(); clientLinks.clear(); clientPending.clear()
+        serverLinks.clear(); serverDevices.clear(); peerIdByAddr.clear(); recentDials.clear()
     }
 
     private val serverCallback = object : BluetoothGattServerCallback() {
@@ -178,15 +180,45 @@ object MeshGatt {
 
     private val clientGatt = ConcurrentHashMap<String, BluetoothGatt>()
     private val clientChar = ConcurrentHashMap<String, BluetoothGattCharacteristic>()
+    /** Dials that haven't produced an announce yet (still "probing"). */
+    private val clientPending = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    /** Last dial time per address, to avoid re-dialing the same one in a storm. */
+    private val recentDials = ConcurrentHashMap<String, Long>()
 
-    /** Connect to a discovered peer to exchange announces (and enable DMs). */
+    /** Cap concurrent outgoing links: BLE MAC rotation means a single nearby
+     *  device appears as a stream of fresh addresses, and dialing each one
+     *  floods the controller (status 133) and drains battery. */
+    private const val MAX_CLIENTS = 4
+    private const val CONNECT_TIMEOUT_MS = 12_000L
+    private const val REDIAL_BACKOFF_MS = 30_000L
+
+    /** Connect to a discovered peer to exchange announces (and enable DMs).
+     *  Bounded + timed-out so a rotating-MAC advertiser can't churn the radio. */
     fun connect(device: BluetoothDevice) {
-        if (clientGatt.containsKey(device.address)) return
-        android.util.Log.i(TAG, "dialing ${device.address} (TRANSPORT_LE)")
+        val addr = device.address
+        if (clientGatt.containsKey(addr)) return
+        val now = System.currentTimeMillis()
+        recentDials[addr]?.let { if (now - it < REDIAL_BACKOFF_MS) return }
+        if (clientGatt.size >= MAX_CLIENTS) return // at capacity — let some drain first
+        recentDials[addr] = now
+        // Prune stale backoff entries so the map can't grow unbounded.
+        if (recentDials.size > 256) recentDials.entries.removeAll { now - it.value > REDIAL_BACKOFF_MS }
+        android.util.Log.i(TAG, "dialing $addr (TRANSPORT_LE) [${clientGatt.size + 1}/$MAX_CLIENTS]")
         try {
-            device.connectGatt(ctx, false, clientCallback, BluetoothDevice.TRANSPORT_LE)
+            val gatt = device.connectGatt(ctx, false, clientCallback, BluetoothDevice.TRANSPORT_LE)
+            if (gatt == null) return
+            clientGatt[addr] = gatt
+            clientPending.add(addr)
+            // Drop the link if it hasn't yielded an announce in time — frees the slot.
+            handler.postDelayed({
+                if (clientPending.contains(addr)) {
+                    android.util.Log.i(TAG, "dial $addr timed out (no announce) — closing")
+                    cleanupClient(addr)
+                }
+            }, CONNECT_TIMEOUT_MS)
         } catch (t: Throwable) {
-            android.util.Log.e(TAG, "connectGatt failed for ${device.address}", t)
+            android.util.Log.e(TAG, "connectGatt failed for $addr", t)
+            cleanupClient(addr)
         }
     }
 
@@ -233,7 +265,8 @@ object MeshGatt {
 
     private fun cleanupClient(addr: String) {
         clientLinks.remove(addr); clientChar.remove(addr); peerIdByAddr.remove(addr)
-        clientGatt.remove(addr)?.let { runCatching { it.close() } }
+        clientPending.remove(addr)
+        clientGatt.remove(addr)?.let { runCatching { it.disconnect(); it.close() } }
     }
 
     // ── Receive: route every characteristic value (one padded packet) by type ──
@@ -242,11 +275,19 @@ object MeshGatt {
         addr: String, value: ByteArray, fromServer: Boolean,
         device: BluetoothDevice? = null, gatt: BluetoothGatt? = null,
     ) {
-        val info = runCatching { meshDecodePacket(value) }.getOrNull() ?: return
+        val info = runCatching { meshDecodePacket(value) }.getOrNull()
+        if (info == null) {
+            android.util.Log.i(TAG, "rx undecodable value (${value.size}B) from $addr")
+            return
+        }
+        android.util.Log.i(TAG, "rx type=0x${info.packetType.toString(16)} (${value.size}B) from $addr server=$fromServer")
         when (info.packetType) {
             TYPE_ANNOUNCE -> {
-                val ann = runCatching { meshParseAnnounce(value) }.getOrNull() ?: return
+                val ann = runCatching { meshParseAnnounce(value) }.getOrNull()
+                if (ann == null) { android.util.Log.w(TAG, "announce verify FAILED from $addr"); return }
+                android.util.Log.i(TAG, "ANNOUNCE from $addr → '${ann.nickname}' peerId=${ann.senderIdHex}")
                 peerIdByAddr[addr] = ann.senderIdHex
+                clientPending.remove(addr) // a real peer answered — keep this link
                 onAnnounce.forEach { it(addr, ann) }
                 // Central: now that we know the peer's peerID, open a Noise link
                 // for DMs (initiator). Peripheral waits for the peer's 0x10.
@@ -256,7 +297,13 @@ object MeshGatt {
             }
             TYPE_NOISE_HANDSHAKE -> handleHandshake(addr, info.payload, fromServer, device, gatt)
             TYPE_NOISE_ENCRYPTED -> handleEncrypted(addr, info.payload, fromServer)
-            TYPE_SONAR_0X53 -> onSonar.forEach { it(addr, info.payload) }
+            TYPE_SONAR_0X53 -> {
+                // Tag the 0x53 with the peer's stable bitchat peerID (learned
+                // from its 0x01 announce, which precedes the 0x53) so it can be
+                // correlated to the mesh peer despite BLE address rotation.
+                val peerId = peerIdByAddr[addr] ?: return
+                onSonar.forEach { it(peerId, info.payload) }
+            }
             else -> android.util.Log.i(TAG, "ignoring mesh packet type=${info.packetType} from $addr")
         }
     }

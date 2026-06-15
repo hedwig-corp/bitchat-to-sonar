@@ -11,21 +11,35 @@ import androidx.activity.result.contract.ActivityResultContracts
 
 class MainActivity : ComponentActivity() {
 
-    private val blePermissions: Array<String> =
+    /** Every runtime permission the app needs, requested together so Android
+     *  shows them in one sequence (firing three separate launchers in onCreate
+     *  raced and some grants were silently dropped). */
+    private val requiredPermissions: Array<String> = buildList {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            arrayOf(
-                Manifest.permission.BLUETOOTH_SCAN,
-                Manifest.permission.BLUETOOTH_ADVERTISE,
-                Manifest.permission.BLUETOOTH_CONNECT,
-            )
-        } else {
-            arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+            add(Manifest.permission.BLUETOOTH_SCAN)
+            add(Manifest.permission.BLUETOOTH_ADVERTISE)
+            add(Manifest.permission.BLUETOOTH_CONNECT)
         }
+        add(Manifest.permission.ACCESS_FINE_LOCATION)
+        add(Manifest.permission.ACCESS_COARSE_LOCATION)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }.toTypedArray()
 
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+            // Whatever the user granted, (re)try starting the mesh radio.
             MeshRadio.start()
         }
+
+    /** Request any not-yet-granted permission in a single dialog sequence. */
+    private fun requestAllPermissions() {
+        val missing = requiredPermissions.filter {
+            checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED
+        }
+        if (missing.isEmpty()) MeshRadio.start() else permissionLauncher.launch(missing.toTypedArray())
+    }
 
     private var unlockCb: ((Boolean) -> Unit)? = null
     private val unlockLauncher =
@@ -49,9 +63,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         ActivityBridge.requestUnlock = { cb -> confirmDeviceCredential(cb) }
         meshNoiseSmokeTest()
-        requestMeshPermissions()
-        requestNotificationPermission()
-        requestLocationPermission()
+        requestAllPermissions()
         setContent {
             App()
         }
@@ -78,39 +90,6 @@ class MainActivity : ComponentActivity() {
             android.util.Log.i("MeshNoiseSmoke", "ok=${pt == "mesh hello" && peerOk} decrypted=$pt")
         } catch (t: Throwable) {
             android.util.Log.e("MeshNoiseSmoke", "noise FFI failed", t)
-        }
-    }
-
-    private fun requestMeshPermissions() {
-        val granted = blePermissions.all {
-            checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED
-        }
-        if (granted) MeshRadio.start() else permissionLauncher.launch(blePermissions)
-    }
-
-    private val notifPermLauncher =
-        registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
-
-    private val locationPermLauncher =
-        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { }
-
-    /** Ask for location so the home can show nearby geohash channels. */
-    private fun requestLocationPermission() {
-        val fine = Manifest.permission.ACCESS_FINE_LOCATION
-        val coarse = Manifest.permission.ACCESS_COARSE_LOCATION
-        if (checkSelfPermission(fine) != PackageManager.PERMISSION_GRANTED &&
-            checkSelfPermission(coarse) != PackageManager.PERMISSION_GRANTED
-        ) {
-            locationPermLauncher.launch(arrayOf(fine, coarse))
-        }
-    }
-
-    /** Ask for POST_NOTIFICATIONS on Android 13+ (no-op below). */
-    private fun requestNotificationPermission() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-        ) {
-            notifPermLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
     }
 

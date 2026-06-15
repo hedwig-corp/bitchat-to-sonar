@@ -108,7 +108,7 @@ fun SonarRadarScreen(state: SonarAppState) {
             if (state.meshPeers.isEmpty() && unify.isEmpty()) ListEmpty()
             else LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(vertical = 8.dp)) {
                 items(state.meshPeers, key = { it.id }) { p ->
-                    PeerRow(p, state.sonarProfile(p.id) != null) { card = p }
+                    PeerRow(p, p.sonar) { card = p }
                 }
                 if (unify.isNotEmpty()) {
                     item { chat.bitchat.sonar.ui.SNSectionLabel("Unify users nearby") }
@@ -164,8 +164,7 @@ private fun PeerRow(p: chat.bitchat.sonar.MeshPeer, isSonar: Boolean, onClick: (
                 SNDot(s.accent, 6.dp)
                 Spacer(Modifier.width(5.dp))
                 Text(
-                    if (isSonar) "Sonar · Bluetooth · ${rssiLabel(p.rssi)}"
-                    else "Bluetooth · ${rssiLabel(p.rssi)}",
+                    (if (isSonar) "Sonar" else "bitchat") + " · ${rssiLabel(p.rssi)}",
                     color = s.text3, fontSize = 12.5.sp,
                 )
             }

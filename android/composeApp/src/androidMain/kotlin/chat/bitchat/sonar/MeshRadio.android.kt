@@ -38,13 +38,26 @@ actual object MeshRadio {
 
     // ── Sonar Discovery (0x53) + bitchat announce over the mesh ──
     private val sonarProfiles = ConcurrentHashMap<String, ByteArray>()
-    /** Peer nicknames learned from their signed bitchat announce, by BLE addr. */
-    private val announcedNames = ConcurrentHashMap<String, String>()
+    /** Verified mesh peers keyed by their bitchat peerID (NOT the BLE address:
+     *  a device advertises under a rotating Resolvable Private Address but its
+     *  announce carries a stable peerID — keying by address loses the name). */
+    private val announcedPeers = ConcurrentHashMap<String, MeshPeer>()
+    private val announcedSeen = ConcurrentHashMap<String, Long>()
+    /** Identified peers stay listed longer than raw scan blips (they re-announce
+     *  over a live link, but tolerate gaps). */
+    private const val ANNOUNCE_STALE_MS = 60_000L
 
     init {
-        // Stash peers' 0x53 payloads + the names from their verified announces.
+        // Stash peers' 0x53 payloads + register named, verified announce peers.
         MeshGatt.addSonarListener { peerId, payload -> sonarProfiles[peerId] = payload }
-        MeshGatt.addAnnounceListener { addr, info -> announcedNames[addr] = info.nickname }
+        MeshGatt.addAnnounceListener { _, info ->
+            announcedPeers[info.senderIdHex] = MeshPeer(
+                id = "mesh:" + info.senderIdHex,
+                name = info.nickname,
+                rssi = -50, // connected ⇒ close; no per-packet RSSI on the GATT path
+            )
+            announcedSeen[info.senderIdHex] = System.currentTimeMillis()
+        }
     }
 
     private val ctx: Context get() = AppContextHolder.ctx
@@ -117,15 +130,21 @@ actual object MeshRadio {
         try { scanner?.stopScan(scanCallback) } catch (_: Throwable) {}
         try { advertiser?.stopAdvertising(advCallback) } catch (_: Throwable) {}
         MeshGatt.stop()
-        seen.clear(); lastSeen.clear(); announcedNames.clear()
+        seen.clear(); lastSeen.clear(); announcedPeers.clear(); announcedSeen.clear()
     }
 
     actual fun peers(): List<MeshPeer> {
         val now = System.currentTimeMillis()
+        // `seen` (raw scan results) is kept only to drive auto-dial — it is NOT
+        // shown. BLE MAC rotation turns one device into a stream of addresses;
+        // exposing those produced "zombie" peers. Only VERIFIED announce peers
+        // (stable bitchat peerID + signed nickname) are real users, like iOS.
         for ((id, t) in lastSeen) if (now - t > STALE_MS) { seen.remove(id); lastSeen.remove(id) }
-        // Prefer the nickname from the peer's signed announce over the BLE name.
-        return seen.values
-            .map { p -> announcedNames[p.id]?.let { p.copy(name = it) } ?: p }
+        for ((id, t) in announcedSeen) if (now - t > ANNOUNCE_STALE_MS) { announcedPeers.remove(id); announcedSeen.remove(id) }
+        // Classify by richest protocol: a peer that also sent a 0x53 Sonar
+        // announce is a full Sonar user, else a plain bitchat peer.
+        return announcedPeers.entries
+            .map { (peerId, p) -> p.copy(sonar = sonarProfiles.containsKey(peerId)) }
             .sortedByDescending { it.rssi }
     }
 
