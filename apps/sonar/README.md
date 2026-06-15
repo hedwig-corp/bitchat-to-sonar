@@ -17,20 +17,28 @@ composeApp/src/
 
 ## Platform support matrix
 
-| Capability                         | Android | Desktop |
-|------------------------------------|:-------:|:-------:|
-| White Noise (Marmot) secure DMs    |   ✅    |   ✅    |
-| Geohash public channels + presence |   ✅    |   ✅    |
-| Encrypted media (MIP-04)           |   ✅    |   ✅    |
-| Profiles / verify safety numbers   |   ✅    |   ✅    |
-| BLE mesh (nearby radar, mesh DMs)  |   ✅    |   ⚪️ unavailable (no desktop BLE) |
-| Unify nearby payments (BLE)        |   ✅    |   ⚪️ unavailable |
-| Lightning wallet (⚡PAY)           |   ✅ (Breez) | ⚪️ unavailable (no desktop Breez build yet) |
+| Capability                          | Android | Desktop |
+|-------------------------------------|:-------:|:-------:|
+| White Noise (Marmot) secure DMs     |   ✅    |   ✅    |
+| Geohash public channels + presence  |   ✅    |   ✅    |
+| Encrypted media (MIP-04)            |   ✅    |   ✅    |
+| Profiles / verify safety numbers    |   ✅    |   ✅    |
+| Location channels ("Around you")    |   ✅ GPS | ⚪️ opt-in IP geolocation (Settings) |
+| BLE mesh (nearby radar, mesh DMs)   |   ✅    |   ⚪️ unavailable (no desktop BLE) |
+| Unify nearby payments (BLE)         |   ✅    |   ⚪️ unavailable |
+| Lightning wallet (⚡PAY)            |   ✅ (Breez) | ⚪️ unavailable (no desktop Breez build yet) |
 
 Desktop covers the entire **internet-backed** surface — exactly the slice that
-interops cross-platform over the same Nostr relays. BLE is phone hardware; the
-Lightning wallet is a documented follow-up (a JVM Breez build, or an LDK/CLN/LND
-bridge).
+interops cross-platform over the same Nostr relays.
+
+- **Location channels**: a desktop has no GPS, so "Around you" is empty by
+  default. Enable **Settings → Approximate location** to resolve coarse
+  city/region/country geohash channels from your IP (opt-in; sends your IP to a
+  geolocation service). Or just join any geohash channel via Search.
+- **BLE** is phone hardware — the bitchat mesh needs the BLE *peripheral* role,
+  which isn't available portably from a desktop JVM. Not a Compose limitation.
+- The **Lightning wallet** is a documented follow-up (a JVM Breez build, or an
+  LDK/CLN/LND bridge).
 
 ## Build & run — Desktop
 

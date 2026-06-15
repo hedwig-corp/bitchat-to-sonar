@@ -24,6 +24,10 @@ actual object LocationChannels {
         ctx.checkSelfPermission(android.Manifest.permission.ACCESS_COARSE_LOCATION) ==
             PackageManager.PERMISSION_GRANTED
 
+    // Mobile resolves location from GPS — no IP opt-in needed, so the desktop
+    // Settings toggle is hidden here.
+    actual fun configurable(): Boolean = false
+
     actual suspend fun current(): List<GeoChannel> = withContext(Dispatchers.IO) {
         if (!hasLocationPerm()) return@withContext emptyList()
         val loc = lastKnown() ?: return@withContext emptyList()
