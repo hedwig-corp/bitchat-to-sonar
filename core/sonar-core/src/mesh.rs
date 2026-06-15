@@ -22,6 +22,10 @@ pub mod msg_type {
     pub const NOISE_HANDSHAKE: u8 = 0x10;
     pub const NOISE_ENCRYPTED: u8 = 0x11;
     pub const FRAGMENT: u8 = 0x20;
+    /// Binary file/audio/image payloads (bitchat `MessageType.fileTransfer`).
+    /// Payload is a [`super::file_packet::FilePacket`] TLV; large files ride as
+    /// 0x20 fragments with `original_type = 0x22`.
+    pub const FILE_TRANSFER: u8 = 0x22;
 }
 
 const V1_HEADER_SIZE: usize = 14;
@@ -667,6 +671,180 @@ pub mod fragment {
                 None
             }
         }
+    }
+}
+
+/// Mesh file transfer (`MessageType.fileTransfer` = 0x22), byte-for-byte
+/// compatible with bitchat's `BitchatFilePacket` so Sonar and stock bitchat can
+/// exchange images / voice notes / files over Bluetooth.
+pub mod file_packet {
+    use super::fragment::Fragment;
+
+    /// Max content size (bitchat `FileTransferLimits.maxPayloadBytes` = 1 MiB).
+    pub const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
+
+    // Canonical TLV tags (must match bitchat exactly).
+    const T_FILE_NAME: u8 = 0x01;
+    const T_FILE_SIZE: u8 = 0x02;
+    const T_MIME_TYPE: u8 = 0x03;
+    const T_CONTENT: u8 = 0x04;
+
+    /// A decoded file transfer payload.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct FilePacket {
+        pub file_name: Option<String>,
+        pub file_size: Option<u64>,
+        pub mime_type: Option<String>,
+        pub content: Vec<u8>,
+    }
+
+    impl FilePacket {
+        /// Encode using v2 canonical TLVs (4-byte fileSize, u32 content length).
+        /// Returns `None` when fields exceed protocol limits. Byte-identical to
+        /// `BitchatFilePacket.encode()`.
+        pub fn encode(&self) -> Option<Vec<u8>> {
+            let resolved = self.file_size.unwrap_or(self.content.len() as u64);
+            if resolved > u32::MAX as u64 || resolved > MAX_PAYLOAD_BYTES as u64 {
+                return None;
+            }
+            if self.content.len() > u32::MAX as usize || self.content.len() > MAX_PAYLOAD_BYTES {
+                return None;
+            }
+            let mut out = Vec::new();
+            if let Some(name) = &self.file_name {
+                let nb = name.as_bytes();
+                if nb.len() <= u16::MAX as usize {
+                    out.push(T_FILE_NAME);
+                    out.extend_from_slice(&(nb.len() as u16).to_be_bytes());
+                    out.extend_from_slice(nb);
+                }
+            }
+            out.push(T_FILE_SIZE);
+            out.extend_from_slice(&4u16.to_be_bytes());
+            out.extend_from_slice(&(resolved as u32).to_be_bytes());
+            if let Some(mime) = &self.mime_type {
+                let mb = mime.as_bytes();
+                if mb.len() <= u16::MAX as usize {
+                    out.push(T_MIME_TYPE);
+                    out.extend_from_slice(&(mb.len() as u16).to_be_bytes());
+                    out.extend_from_slice(mb);
+                }
+            }
+            out.push(T_CONTENT);
+            out.extend_from_slice(&(self.content.len() as u32).to_be_bytes());
+            out.extend_from_slice(&self.content);
+            Some(out)
+        }
+
+        /// Decode, tolerating legacy encodings (8-byte fileSize, 2-byte content
+        /// length) exactly like `BitchatFilePacket.decode()`.
+        pub fn decode(data: &[u8]) -> Option<FilePacket> {
+            let end = data.len();
+            let mut cur = 0usize;
+            let mut file_name = None;
+            let mut file_size: Option<u64> = None;
+            let mut mime_type = None;
+            let mut content: Vec<u8> = Vec::new();
+
+            // Read a big-endian length of `bytes` width, advancing `cur`.
+            fn read_be(data: &[u8], cur: &mut usize, bytes: usize) -> Option<usize> {
+                if data.len() - *cur < bytes {
+                    return None;
+                }
+                let mut r: u64 = 0;
+                for _ in 0..bytes {
+                    r = (r << 8) | data[*cur] as u64;
+                    *cur += 1;
+                }
+                if r > usize::MAX as u64 {
+                    return None;
+                }
+                Some(r as usize)
+            }
+
+            while cur < end {
+                let type_raw = data[cur];
+                cur += 1;
+
+                let length = if type_raw == T_CONTENT {
+                    let snap = cur;
+                    match read_be(data, &mut cur, 4) {
+                        Some(c) if c <= end - cur => Some(c),
+                        _ => {
+                            cur = snap;
+                            read_be(data, &mut cur, 2)
+                        }
+                    }
+                } else {
+                    read_be(data, &mut cur, 2)
+                };
+
+                let len = length?;
+                if end - cur < len {
+                    return None;
+                }
+                let value = &data[cur..cur + len];
+                cur += len;
+
+                match type_raw {
+                    T_FILE_NAME => file_name = String::from_utf8(value.to_vec()).ok(),
+                    T_FILE_SIZE => {
+                        if len == 4 || len == 8 {
+                            let mut size: u64 = 0;
+                            for &b in value {
+                                size = (size << 8) | b as u64;
+                            }
+                            if size > MAX_PAYLOAD_BYTES as u64 {
+                                return None;
+                            }
+                            file_size = Some(size);
+                        }
+                    }
+                    T_MIME_TYPE => mime_type = String::from_utf8(value.to_vec()).ok(),
+                    T_CONTENT => {
+                        if content.len() + value.len() > MAX_PAYLOAD_BYTES {
+                            return None;
+                        }
+                        content.extend_from_slice(value);
+                    }
+                    _ => continue, // unknown tag: skip (tolerant, like bitchat)
+                }
+            }
+
+            if content.is_empty() || content.len() > MAX_PAYLOAD_BYTES {
+                return None;
+            }
+            Some(FilePacket {
+                file_name,
+                file_size: Some(file_size.unwrap_or(content.len() as u64)),
+                mime_type,
+                content,
+            })
+        }
+    }
+
+    /// Split a (possibly large) byte blob into bitchat-compatible fragments —
+    /// each carries `original_type` (0x22 for a file packet) and is sent as a
+    /// 0x20 packet. `chunk_size` is the per-fragment chunk (≤ BLE write size).
+    /// The receiver feeds these to [`super::fragment::Reassembler`].
+    pub fn fragment(
+        data: &[u8],
+        fragment_id: [u8; 8],
+        original_type: u8,
+        chunk_size: usize,
+    ) -> Vec<Fragment> {
+        assert!(chunk_size > 0, "chunk_size must be > 0");
+        let total = data.len().div_ceil(chunk_size).max(1) as u16;
+        data.chunks(chunk_size)
+            .enumerate()
+            .map(|(i, chunk)| Fragment {
+                fragment_id,
+                index: i as u16,
+                total,
+                original_type,
+                chunk: chunk.to_vec(),
+            })
+            .collect()
     }
 }
 

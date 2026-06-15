@@ -584,6 +584,16 @@ pub struct MeshPrivateMessage {
     pub content: String,
 }
 
+/// A decoded mesh file transfer (`BitchatFilePacket`, type 0x22). `content` is
+/// the raw file bytes (already decrypted for a private transfer).
+#[derive(uniffi::Record)]
+pub struct MeshFileInfo {
+    pub file_name: Option<String>,
+    pub file_size: Option<u64>,
+    pub mime_type: Option<String>,
+    pub content: Vec<u8>,
+}
+
 /// A decoded public broadcast (BLE "Mesh" channel) message. The wire payload is
 /// just the UTF-8 content (matching bitchat); the sender id + timestamp come from
 /// the packet, and the display nickname is resolved from the sender's announce.
@@ -829,6 +839,94 @@ pub fn mesh_parse_public_message(packet_bytes: Vec<u8>) -> Option<MeshPublicMess
         sender_id_hex: hex::encode(packet.sender_id),
         timestamp_ms: packet.timestamp,
     })
+}
+
+// ── Mesh file transfer (BitchatFilePacket, type 0x22) ─────────────────────
+
+/// Encode a `BitchatFilePacket` TLV (bitchat-compatible). The result is the
+/// payload of a 0x22 packet (private = Noise-encrypt it first, then fragment).
+#[uniffi::export]
+pub fn mesh_encode_file_packet(
+    file_name: Option<String>,
+    file_size: Option<u64>,
+    mime_type: Option<String>,
+    content: Vec<u8>,
+) -> FfiResult<Vec<u8>> {
+    mesh::file_packet::FilePacket {
+        file_name,
+        file_size,
+        mime_type,
+        content,
+    }
+    .encode()
+    .ok_or_else(|| SonarFfiError::InvalidInput("file packet exceeds protocol limits".into()))
+}
+
+/// Decode a `BitchatFilePacket` TLV (already reassembled + decrypted).
+#[uniffi::export]
+pub fn mesh_decode_file_packet(bytes: Vec<u8>) -> Option<MeshFileInfo> {
+    let p = mesh::file_packet::FilePacket::decode(&bytes)?;
+    Some(MeshFileInfo {
+        file_name: p.file_name,
+        file_size: p.file_size,
+        mime_type: p.mime_type,
+        content: p.content,
+    })
+}
+
+/// Split `data` into bitchat-compatible 0x20 fragment payloads (each carries
+/// `original_type`). Wrap each returned payload in a 0x20 packet to send.
+#[uniffi::export]
+pub fn mesh_fragment(
+    data: Vec<u8>,
+    fragment_id_hex: String,
+    original_type: u8,
+    chunk_size: u32,
+) -> FfiResult<Vec<Vec<u8>>> {
+    let id_bytes = hex::decode(&fragment_id_hex).map_err(invalid("fragment id"))?;
+    let id: [u8; 8] = id_bytes
+        .try_into()
+        .map_err(|_| SonarFfiError::InvalidInput("fragment id must be 8 bytes".into()))?;
+    if chunk_size == 0 {
+        return Err(SonarFfiError::InvalidInput("chunk_size must be > 0".into()));
+    }
+    Ok(
+        mesh::file_packet::fragment(&data, id, original_type, chunk_size as usize)
+            .iter()
+            .map(|f| f.encode_payload())
+            .collect(),
+    )
+}
+
+/// Reassembles incoming 0x20 fragment payloads into the original bytes. Keyed by
+/// (sender, fragmentID); `add` returns the full bytes once the last piece lands.
+#[derive(uniffi::Object)]
+pub struct MeshReassembler {
+    inner: Mutex<mesh::fragment::Reassembler>,
+}
+
+#[uniffi::export]
+impl MeshReassembler {
+    #[uniffi::constructor]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(mesh::fragment::Reassembler::new()),
+        })
+    }
+
+    /// Feed one 0x20 fragment payload (with the carrying packet's sender id hex).
+    /// Returns the reassembled original bytes when complete, else nil.
+    pub fn add(&self, sender_id_hex: String, fragment_payload: Vec<u8>) -> FfiResult<Option<Vec<u8>>> {
+        let sender_bytes = hex::decode(&sender_id_hex).map_err(invalid("sender id"))?;
+        let sender: [u8; 8] = sender_bytes
+            .try_into()
+            .map_err(|_| SonarFfiError::InvalidInput("sender id must be 8 bytes".into()))?;
+        let frag = match mesh::fragment::Fragment::decode_payload(&fragment_payload) {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        Ok(self.inner.lock().unwrap().add(sender, &frag))
+    }
 }
 
 fn geo_message_info(m: sonar_core::geohash::GeoMessage) -> GeoMessageInfo {
