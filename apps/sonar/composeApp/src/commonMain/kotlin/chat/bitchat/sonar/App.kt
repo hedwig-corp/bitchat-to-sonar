@@ -1,6 +1,14 @@
 package chat.bitchat.sonar
 
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
@@ -12,6 +20,7 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -37,10 +46,14 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.SpanStyle
@@ -63,7 +76,11 @@ import chat.bitchat.sonar.ui.SNPrimaryButton
 import chat.bitchat.sonar.ui.SNSectionLabel
 import chat.bitchat.sonar.ui.SonarAvatar
 import chat.bitchat.sonar.ui.SonarTheme
+import chat.bitchat.sonar.ui.SonarType
 import chat.bitchat.sonar.ui.sonar
+import kotlinx.coroutines.launch
+import kotlin.math.abs
+import kotlin.math.sin
 
 /** Bridges Android activity foreground state into the commonMain UI without
  *  pulling Android lifecycle APIs into commonMain. */
@@ -142,23 +159,19 @@ private fun HomeScreen(state: SonarAppState) {
             }
 
             LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 110.dp)) {
-                item { SNSectionLabel("Nearby channels") }
-                // Mesh channel is always first (BLE broadcast).
+                item { SNSectionLabel("Around you") }
+                // "Around you" collapses the geohash precision ladder (+ Mesh) into one
+                // card with a tier picker (design: HereCard) instead of a flat list.
                 item {
-                    ConvRow(
-                        avatar = { MeshTile(52.dp) },
-                        title = "Mesh",
-                        sub = "${meshCount} ${if (meshCount == 1) "person" else "people"} in Bluetooth range",
-                    ) { state.openChannel("mesh") }
-                }
-                // GPS-derived location channels (Ottaviano … Italy).
-                items(state.locationChannels, key = { it.geohash + it.level.name }) { c ->
-                    val here = state.presence(c.geohash)
-                    ConvRow(
-                        avatar = { PlaceTile(52.dp) },
-                        title = c.name,
-                        sub = if (here > 0) "$here here now · ${c.level.label}" else c.level.label,
-                    ) { state.openChannel(c.geohash) }
+                    val hereItems = remember(state.locationChannels, meshCount, state.presenceByGeohash) {
+                        buildList {
+                            add(HereItem("mesh", "Mesh", "Mesh", meshCount))
+                            state.locationChannels.forEach { c ->
+                                add(HereItem(c.geohash, c.name, c.level.label, state.presence(c.geohash)))
+                            }
+                        }
+                    }
+                    HereCard(hereItems) { state.openChannel(it) }
                 }
                 // Any manually-joined channels not already shown.
                 items(
@@ -460,6 +473,19 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     val pickPhoto = rememberPhotoPicker { bytes, name, mime ->
         state.sendImage(screen.id, bytes, name, mime)
     }
+    // Voice-note recorder (hold the mic to record; drag left to cancel).
+    val recorder = remember { VoiceRecorder() }
+    var recording by remember { mutableStateOf(false) }
+    var recElapsed by remember { mutableStateOf(0) }
+    var recLevel by remember { mutableStateOf(0f) }
+    var recDragX by remember { mutableStateOf(0f) }
+    val recScope = rememberCoroutineScope()
+    LaunchedEffect(recording) {
+        while (recording) {
+            recElapsed = recorder.elapsed(); recLevel = recorder.level()
+            kotlinx.coroutines.delay(80)
+        }
+    }
     // Radar "Send sats" opens the chat with pay=true → jump straight to the sheet.
     LaunchedEffect(screen.id) { if (screen.pay) paySheet = true }
     val listState = rememberLazyListState()
@@ -566,43 +592,86 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                             state.claimPay(screen.id, pay.uuid)
                         }
                     } else if (m.media.isNotEmpty()) {
-                        MediaBubble(m, state, screen.id)
+                        MediaBubble(m, state, screen.id, mesh = msgMesh)
                     } else MessageBubble(m, msgMesh)
                 }
             }
         }
 
         if (draft.startsWith("/")) SlashHints(draft) { draft = it }
-        Row(Modifier.fillMaxWidth().padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
-            // bc-plus: "Add to your message" sheet (bitcoin / location / verify / reactions)
-            Box(
-                Modifier.size(40.dp).clip(CircleShape).background(s.surface2).clickable { addSheet = true },
-                contentAlignment = Alignment.Center
-            ) { SNIcon(SNIconName.Plus, 20.dp, s.text2, weight = 2.4f) }
-            Spacer(Modifier.width(8.dp))
-            Box(
-                Modifier.weight(1f).clip(RoundedCornerShape(22.dp)).background(s.surface2)
-                    .padding(horizontal = 16.dp, vertical = 12.dp)
-            ) {
-                if (draft.isEmpty()) Text("Message $peerName · via $transport", color = s.text3, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                BasicTextField(
-                    value = draft, onValueChange = { draft = it },
-                    textStyle = TextStyle(color = s.text, fontSize = 16.sp),
-                    cursorBrush = SolidColor(s.accent),
-                    modifier = Modifier.fillMaxWidth()
-                )
+        if (recording) {
+            VoiceRecBar(
+                elapsed = recElapsed, level = recLevel, dragX = recDragX,
+                net = transport == "internet",
+                onTrash = { recorder.cancel(); recording = false; recDragX = 0f }
+            )
+        } else {
+            Row(Modifier.fillMaxWidth().padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                // bc-plus: "Add to your message" sheet (bitcoin / location / verify / reactions)
+                Box(
+                    Modifier.size(40.dp).clip(CircleShape).background(s.surface2).clickable { addSheet = true },
+                    contentAlignment = Alignment.Center
+                ) { SNIcon(SNIconName.Plus, 20.dp, s.text2, weight = 2.4f) }
+                Spacer(Modifier.width(8.dp))
+                Box(
+                    Modifier.weight(1f).clip(RoundedCornerShape(22.dp)).background(s.surface2)
+                        .padding(horizontal = 16.dp, vertical = 12.dp)
+                ) {
+                    if (draft.isEmpty()) Text("Message $peerName · via $transport", color = s.text3, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    BasicTextField(
+                        value = draft, onValueChange = { draft = it },
+                        textStyle = TextStyle(color = s.text, fontSize = 16.sp),
+                        cursorBrush = SolidColor(s.accent),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+                Spacer(Modifier.width(8.dp))
+                if (draft.isEmpty() && state.canSendMedia(screen.id)) {
+                    // Hold-to-record mic (design: bc-sendbtn mic). Drag left to cancel.
+                    Box(
+                        Modifier.size(46.dp).clip(CircleShape).background(s.surface2)
+                            .pointerInput(screen.id) {
+                                // The pointer scope is @RestrictsSuspension, so the recorder
+                                // lifecycle runs in recScope: launch start() at down, join it on
+                                // release so finish()/cancel() can never race ahead of start().
+                                awaitEachGesture {
+                                    val down = awaitFirstDown(requireUnconsumed = false)
+                                    recDragX = 0f; recElapsed = 0; recording = true
+                                    var startedOk = false
+                                    val startJob = recScope.launch { startedOk = recorder.start() }
+                                    var dx = 0f
+                                    var pressed = true
+                                    while (pressed) {
+                                        val ev = awaitPointerEvent()
+                                        val ch = ev.changes.firstOrNull { it.id == down.id } ?: ev.changes.first()
+                                        dx += ch.positionChange().x; recDragX = dx
+                                        if (!ch.pressed) pressed = false
+                                    }
+                                    val cancel = dx < -240f
+                                    recScope.launch {
+                                        startJob.join()
+                                        if (!startedOk) state.toast = "Allow microphone access to record voice notes."
+                                        else if (cancel) recorder.cancel()
+                                        else { val b = recorder.finish(); if (b != null) state.sendVoiceNote(screen.id, b) }
+                                        recording = false; recDragX = 0f
+                                    }
+                                }
+                            },
+                        contentAlignment = Alignment.Center
+                    ) { SNIcon(SNIconName.Mic, 20.dp, s.text2, weight = 2f) }
+                } else {
+                    Box(
+                        Modifier.size(46.dp).clip(CircleShape).background(if (sendOverMesh) s.accentFill else s.netFill)
+                            .clickable {
+                                val d = draft; draft = ""
+                                if (!state.handleCommand(d, peerName, channelGeohash = null, chatId = screen.id)) {
+                                    state.send(screen.id, d)
+                                }
+                            },
+                        contentAlignment = Alignment.Center
+                    ) { Text("↑", color = if (sendOverMesh) s.onAccent else s.onNet, fontSize = 20.sp, fontWeight = FontWeight.Bold) }
+                }
             }
-            Spacer(Modifier.width(8.dp))
-            Box(
-                Modifier.size(46.dp).clip(CircleShape).background(if (sendOverMesh) s.accentFill else s.netFill)
-                    .clickable {
-                        val d = draft; draft = ""
-                        if (!state.handleCommand(d, peerName, channelGeohash = null, chatId = screen.id)) {
-                            state.send(screen.id, d)
-                        }
-                    },
-                contentAlignment = Alignment.Center
-            ) { Text("↑", color = if (sendOverMesh) s.onAccent else s.onNet, fontSize = 20.sp, fontWeight = FontWeight.Bold) }
         }
     }
     if (addSheet) AddToMessageSheet(
@@ -888,7 +957,7 @@ private fun MessageBubble(m: SonarMsg, mesh: Boolean = false) {
  * plus an optional caption.
  */
 @Composable
-private fun MediaBubble(m: SonarMsg, state: SonarAppState, chatId: String) {
+private fun MediaBubble(m: SonarMsg, state: SonarAppState, chatId: String, mesh: Boolean) {
     val s = sonar
     val media = m.media.first()
     Column(
@@ -924,6 +993,8 @@ private fun MediaBubble(m: SonarMsg, state: SonarAppState, chatId: String) {
                     }
                 }
             }
+        } else if (media.mimeType.startsWith("audio/")) {
+            AudioBubble(m, state, chatId, media, mesh = mesh)
         } else {
             Row(
                 Modifier.clip(RoundedCornerShape(14.dp)).background(s.surface2)
@@ -939,6 +1010,216 @@ private fun MediaBubble(m: SonarMsg, state: SonarAppState, chatId: String) {
         }
     }
 }
+
+/**
+ * Audio / voice-note bubble (design: MediaBubble `media-audio` — play button +
+ * `MediaWave` + duration). Downloads + decrypts the note on appear, then plays it
+ * via [AudioNotePlayer]. Mirrors iOS `SNAudioBubble`. No duration metadata travels
+ * with the note, so the static waveform is a deterministic hash of the filename.
+ */
+@Composable
+private fun AudioBubble(m: SonarMsg, state: SonarAppState, chatId: String, media: SonarMedia, mesh: Boolean) {
+    val s = sonar
+    val net = !mesh
+    val tint = if (net) s.netFill else s.accentFill
+    val bytes by androidx.compose.runtime.produceState<ByteArray?>(null, media.url) {
+        value = state.mediaData(chatId, media)
+    }
+    var playing by remember { mutableStateOf(false) }
+    // Stop playback if the bubble leaves composition.
+    androidx.compose.runtime.DisposableEffect(media.url) {
+        onDispose { if (playing) AudioNotePlayer.stop() }
+    }
+    val durText = remember(media.durationMs) {
+        media.durationMs?.let { fmtDur((it / 1000).toInt()) } ?: ""
+    }
+    Row(
+        Modifier.clip(RoundedCornerShape(18.dp))
+            .background(if (m.mine) tint.copy(alpha = 0.15f) else s.surface2)
+            .padding(horizontal = 12.dp, vertical = 9.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(
+            Modifier.size(34.dp).clip(CircleShape)
+                .background(if (m.mine) tint else s.surface)
+                .clickable(enabled = bytes != null) {
+                    val b = bytes ?: return@clickable
+                    // onComplete resets `playing` when the note ends, is stopped, or
+                    // another note steals the shared player.
+                    if (playing) AudioNotePlayer.stop()
+                    else { playing = true; AudioNotePlayer.play(b) { playing = false } }
+                },
+            contentAlignment = Alignment.Center
+        ) {
+            SNIcon(
+                if (playing) SNIconName.Pause else SNIconName.Play, 14.dp,
+                if (m.mine) (if (net) s.onNet else s.onAccent) else s.accent,
+                weight = 2.2f
+            )
+        }
+        Spacer(Modifier.width(11.dp))
+        MediaWaveStatic(media.filename, Modifier.width(124.dp).height(22.dp))
+        if (durText.isNotEmpty()) {
+            Spacer(Modifier.width(8.dp))
+            Text(durText, style = SonarType.mono(11.5), color = s.text3)
+        }
+    }
+}
+
+/** Static waveform (design: `MediaWave`) — deterministic hash bars from a seed. */
+@Composable
+private fun MediaWaveStatic(seed: String, modifier: Modifier = Modifier) {
+    val s = sonar
+    val bars = remember(seed) {
+        var h = 2166136261u
+        for (b in seed.encodeToByteArray()) { h = (h xor (b.toInt() and 0xFF).toUInt()) * 16777619u }
+        (0 until 34).map { i ->
+            val v = (h shr (i % 28)) xor (h * (i + 3).toUInt())
+            0.22f + (v and 15u).toInt() / 15f * 0.78f
+        }
+    }
+    Row(modifier, verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+        bars.forEach { v ->
+            Box(Modifier.width(2.dp).fillMaxHeight(v).clip(CircleShape).background(s.text2.copy(alpha = 0.5f)))
+        }
+    }
+}
+
+/**
+ * The Telegram/Signal-style recording bar (design: VoiceRecorder) shown while the
+ * mic is held: trash, rec dot, timer, live waveform, and a slide-to-cancel hint
+ * that arms when [dragX] passes the cancel threshold. Mirrors iOS `recordingBar`.
+ */
+@Composable
+private fun VoiceRecBar(elapsed: Int, level: Float, dragX: Float, net: Boolean, onTrash: () -> Unit) {
+    val s = sonar
+    val armed = dragX < -240f
+    Row(
+        Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Box(
+            Modifier.size(40.dp).clip(CircleShape).clickable(onClick = onTrash),
+            contentAlignment = Alignment.Center
+        ) { SNIcon(SNIconName.Trash, 19.dp, s.danger, weight = 2f) }
+        Row(
+            Modifier.weight(1f).heightIn(min = 36.dp).clip(RoundedCornerShape(19.dp)).background(s.surface2)
+                .padding(horizontal = 12.dp, vertical = 7.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(9.dp)
+        ) {
+            Box(Modifier.size(9.dp).clip(CircleShape).background(s.danger))
+            Text(fmtDur(elapsed), style = SonarType.mono(13.0, FontWeight.Medium), color = s.text, modifier = Modifier.width(38.dp))
+            LiveWave(level, Modifier.weight(1f))
+            Row(
+                Modifier.alpha((1f + dragX / 110f).coerceIn(0f, 1f)),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(3.dp)
+            ) {
+                SNIcon(SNIconName.Back, 12.dp, if (armed) s.danger else s.text3, weight = 2.4f)
+                Text(
+                    if (armed) "release to cancel" else "slide to cancel",
+                    color = if (armed) s.danger else s.text3, fontSize = 12.sp, maxLines = 1
+                )
+            }
+        }
+        Box(
+            Modifier.size(34.dp).clip(CircleShape).background(if (net) s.netFill else s.accentFill),
+            contentAlignment = Alignment.Center
+        ) { SNIcon(SNIconName.Mic, 18.dp, if (net) s.onNet else s.onAccent, weight = 2f) }
+    }
+}
+
+/** Live recording waveform (design: VoiceLive) — bars driven off the mic [level]. */
+@Composable
+private fun LiveWave(level: Float, modifier: Modifier = Modifier) {
+    val s = sonar
+    val transition = rememberInfiniteTransition(label = "wave")
+    val phase by transition.animateFloat(
+        initialValue = 0f, targetValue = 6.2832f,
+        animationSpec = infiniteRepeatable(tween(900, easing = LinearEasing)),
+        label = "phase"
+    )
+    Row(modifier.height(20.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+        for (i in 0 until 22) {
+            val p = phase * 6 + i * 0.5f
+            val v = (sin(p * 0.7f) + sin(p * 1.9f + i)) * 0.5f
+            val h = 4f + abs(v) * 14f * maxOf(0.25f, level)
+            Box(Modifier.width(2.dp).height(h.dp).clip(CircleShape).background(s.text2.copy(alpha = 0.55f)))
+        }
+    }
+}
+
+/** m:ss like the design's fmtDur. */
+private fun fmtDur(sec: Int): String = "${sec / 60}:${(sec % 60).toString().padStart(2, '0')}"
+
+/**
+ * "Around you" card (design: screens.jsx HereCard) — collapses the geohash
+ * precision ladder (+ Mesh) into ONE row plus a tier picker. The main row enters
+ * the selected channel; the ladder ticks pick precision (live green dot when
+ * someone's there). Mirrors iOS `SNHereCard`. [items] is mesh-first, then the
+ * geohash levels coarsening outward. Returns the chosen channel's geohash.
+ */
+@Composable
+private fun HereCard(items: List<HereItem>, onEnter: (String) -> Unit) {
+    val s = sonar
+    if (items.isEmpty()) {
+        chat.bitchat.sonar.ui.SNEmptyState(
+            icon = SNIconName.Pin, iconSize = 22.dp,
+            title = "Nothing around you yet",
+            desc = "Turn on location to see public channels nearby, or use the radar to find people over Bluetooth."
+        )
+        return
+    }
+    val defaultIdx = items.indexOfFirst { it.count > 0 }.let { if (it >= 0) it else items.lastIndex }
+    var idx by remember(items.size) { mutableStateOf(defaultIdx) }
+    val sel = items[idx.coerceIn(0, items.lastIndex)]
+    Column(Modifier.fillMaxWidth()) {
+        Row(
+            Modifier.fillMaxWidth().clickable { onEnter(sel.geohash) }.padding(horizontal = 16.dp, vertical = 9.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            if (sel.geohash == "mesh") MeshTile(52.dp) else PlaceTile(52.dp)
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text(sel.name, color = s.text, fontSize = 16.5.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(
+                    if (sel.count > 0) "${sel.tier} · ${sel.count} here now" else sel.tier,
+                    color = s.text2, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis
+                )
+            }
+            SNIcon(SNIconName.Chevron, 15.dp, s.text3, weight = 2.2f)
+        }
+        Row(
+            Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
+                .padding(start = 14.dp, end = 14.dp, bottom = 6.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            items.forEachIndexed { i, ch ->
+                Row(
+                    Modifier.clip(CircleShape)
+                        .background(if (i == idx) s.surface2 else androidx.compose.ui.graphics.Color.Transparent)
+                        .clickable { idx = i }
+                        .padding(horizontal = 11.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Text(
+                        ch.tier.ifBlank { ch.name }, fontSize = 12.5.sp,
+                        fontWeight = if (i == idx) FontWeight.SemiBold else FontWeight.Normal,
+                        color = if (i == idx) s.text else s.text3
+                    )
+                    if (ch.count > 0) Box(Modifier.size(5.dp).clip(CircleShape).background(s.green))
+                }
+            }
+        }
+    }
+}
+
+/** One precision tick on the "Around you" ladder. */
+data class HereItem(val geohash: String, val name: String, val tier: String, val count: Int)
 
 private val URL_REGEX = Regex("""(https?://|www\.)\S+""")
 

@@ -754,6 +754,24 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
+    /** Send a recorded voice note (AAC .m4a bytes) to a White Noise chat — same
+     *  media path as a photo, audio mime. (Android has no BLE file transfer yet,
+     *  so voice notes ride White Noise / Marmot only.) */
+    fun sendVoiceNote(chatId: String, bytes: ByteArray) {
+        scope.launch {
+            val groupId = resolveMarmotGroupId(chatId)
+            if (groupId == null) { toast = "Start the secure chat first to send a voice note."; return@launch }
+            try {
+                SonarCore.sendMedia(groupId, bytes, "vn-${(1000..99999).random()}.m4a", "audio/mp4", "")
+                (screen as? Screen.Chat)?.let { sc ->
+                    if (sc.id == chatId) { messages = SonarCore.messages(groupId); processPayLines(chatId, messages) }
+                }
+            } catch (e: Throwable) {
+                toast = "couldn't send voice note: ${e.message}"
+            }
+        }
+    }
+
     /** Download + decrypt a media attachment, cached by URL. */
     suspend fun mediaData(chatId: String, media: SonarMedia): ByteArray? {
         mediaCache[media.url]?.let { return it }
