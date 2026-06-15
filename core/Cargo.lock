@@ -2889,6 +2889,7 @@ dependencies = [
  "nostr",
  "nostr-relay-builder",
  "nostr-sdk",
+ "rusqlite",
  "serde",
  "snow",
  "tempfile",

@@ -45,3 +45,7 @@ libsqlite3-sys = { version = "0.35", features = ["bundled-sqlcipher-vendored-ope
 nostr-relay-builder.workspace = true
 tracing-subscriber.workspace = true
 tempfile.workspace = true
+# Match the libsqlite3-sys (0.35) that mdk-sqlite-storage pulls in, so the
+# self-heal test can fabricate a PLAINTEXT SQLite file with the same SQLCipher
+# build that the engine then opens with a key.
+rusqlite = { version = "0.37", features = ["bundled-sqlcipher"] }

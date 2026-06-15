@@ -114,8 +114,33 @@ impl MarmotEngine {
     /// on iOS. The parent directory of `db_path` must already exist; the host is
     /// expected to place it in a Data-Protection-Complete directory.
     pub fn persistent(identity: Identity, db_path: impl AsRef<Path>, key: [u8; 32]) -> Result<Self> {
-        let storage = MdkSqliteStorage::new_with_key(db_path, EncryptionConfig::new(key))
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        let path = db_path.as_ref();
+        let storage = match MdkSqliteStorage::new_with_key(path, EncryptionConfig::new(key)) {
+            Ok(storage) => storage,
+            Err(e) if is_unusable_db_error(&e.to_string()) => {
+                // The file on disk cannot be opened as our encrypted store: it is
+                // either plaintext (created by an older build that didn't encrypt),
+                // encrypted under a different/lost key, or corrupt. In every case
+                // the contents are UNRECOVERABLE with the current key, and the file
+                // blocks the app on every launch ("database was created without
+                // encryption" / "file is not a database"). Self-heal by erasing it
+                // and recreating a fresh encrypted database, so the app stays usable
+                // (the keychain key is now stable, so the new DB persists). This is
+                // destructive but only ever discards already-inaccessible data.
+                let detail = e.to_string();
+                Self::wipe(path)?;
+                let storage = MdkSqliteStorage::new_with_key(path, EncryptionConfig::new(key))
+                    .map_err(|e2| Error::Storage(format!(
+                        "recreate after unusable DB failed: {e2} (original: {detail})"
+                    )))?;
+                tracing::warn!(
+                    "marmot: discarded an unusable on-disk database and recreated it \
+                     encrypted (original open error: {detail})"
+                );
+                storage
+            }
+            Err(e) => return Err(Error::Storage(e.to_string())),
+        };
         Ok(Self {
             storage: Storage::Sqlite(Box::new(MDK::new(storage))),
             identity,
@@ -293,6 +318,25 @@ impl MarmotEngine {
 }
 
 /// The database file plus the SQLite sidecar files that may exist alongside it.
+/// True only when an open error means the on-disk file is a PLAINTEXT SQLite
+/// database being opened with an encryption key — an unambiguous, permanent
+/// mismatch (an older build created the store unencrypted; the file can never
+/// be opened with a key). Recreating it is the only way forward and discards
+/// only already-inaccessible data.
+///
+/// Deliberately conservative: a WRONG/lost key on a genuinely-encrypted file
+/// surfaces as "file is not a database", which is indistinguishable from a
+/// transient host key-plumbing bug — we do NOT self-heal on that, so a correct
+/// encrypted database is never erased because the host momentarily passed a bad
+/// key. Likewise disk-full / permission / locked errors are not matched.
+fn is_unusable_db_error(message: &str) -> bool {
+    let m = message.to_lowercase();
+    // SQLCipher when a key is set but the file has no encryption header:
+    // "Cannot open unencrypted database with encryption: database was created
+    //  without encryption".
+    m.contains("without encryption") || m.contains("unencrypted database")
+}
+
 fn sidecar_paths(base: &Path) -> Vec<std::path::PathBuf> {
     let name = base.file_name().and_then(|n| n.to_str()).unwrap_or_default();
     ["", "-wal", "-shm", "-journal"]

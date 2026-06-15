@@ -128,7 +128,16 @@ final class KeychainManager: KeychainManagerProtocol {
             kSecAttrAccount as String: key,
             kSecValueData as String: data,
             kSecAttrService as String: service,
-            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlocked,
+            // AfterFirstUnlock (not WhenUnlocked): the app is woken in the
+            // BACKGROUND with the screen LOCKED via BLE state restoration
+            // (CBCentralManagerOptionRestoreIdentifierKey). A WhenUnlocked item is
+            // unreadable then, so NoiseEncryptionService fell back to an EPHEMERAL
+            // key → the static Noise key / signing key / marmot-nsec regenerated on
+            // every locked wake (peerID + npub churn, and the derived wallet became
+            // unreachable). AfterFirstUnlockThisDeviceOnly stays readable in the
+            // background after the first unlock since boot — matching the wallet
+            // keychain (KeychainWalletStorage). Fixes #13.
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
             kSecAttrLabel as String: "bitchat-\(key)"
         ]
         #if os(macOS)
@@ -293,7 +302,16 @@ final class KeychainManager: KeychainManagerProtocol {
             kSecAttrAccount as String: key,
             kSecValueData as String: data,
             kSecAttrService as String: service,
-            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlocked,
+            // AfterFirstUnlock (not WhenUnlocked): the app is woken in the
+            // BACKGROUND with the screen LOCKED via BLE state restoration
+            // (CBCentralManagerOptionRestoreIdentifierKey). A WhenUnlocked item is
+            // unreadable then, so NoiseEncryptionService fell back to an EPHEMERAL
+            // key → the static Noise key / signing key / marmot-nsec regenerated on
+            // every locked wake (peerID + npub churn, and the derived wallet became
+            // unreachable). AfterFirstUnlockThisDeviceOnly stays readable in the
+            // background after the first unlock since boot — matching the wallet
+            // keychain (KeychainWalletStorage). Fixes #13.
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
             kSecAttrLabel as String: "bitchat-\(key)"
         ]
         #if os(macOS)

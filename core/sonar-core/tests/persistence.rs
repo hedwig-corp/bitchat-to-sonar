@@ -99,6 +99,40 @@ async fn wrong_key_cannot_open_existing_db() {
 }
 
 #[tokio::test]
+async fn self_heals_an_unencrypted_legacy_database() {
+    // Reproduces the field bug: an older build left a PLAINTEXT marmot.sqlite on
+    // disk; the current code opens it WITH a SQLCipher key and SQLCipher refuses
+    // ("Cannot open unencrypted database with encryption: database was created
+    // without encryption"), failing on every launch. `persistent` must self-heal
+    // by discarding the unusable file and recreating an encrypted store.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+
+    // Fabricate a plaintext SQLite database at the path (no PRAGMA key → SQLCipher
+    // writes a standard, unencrypted file).
+    {
+        let conn = rusqlite::Connection::open(&db_path).expect("open plaintext db");
+        conn.execute_batch("CREATE TABLE legacy (x INTEGER); INSERT INTO legacy VALUES (1);")
+            .expect("write plaintext db");
+    }
+    assert!(db_path.exists(), "plaintext db exists before reopen");
+
+    // Opening with a key must NOT error — it should wipe + recreate encrypted.
+    let alice = MarmotEngine::persistent(Identity::generate(), &db_path, DB_KEY)
+        .expect("self-heal recreates the database instead of failing");
+
+    // The recreated database is a working encrypted store.
+    let _ = alice.key_package_event(relays()).expect("usable after self-heal");
+    assert_eq!(alice.groups().expect("groups").len(), 0, "fresh store starts empty");
+    drop(alice);
+
+    // And it now reopens cleanly with the same key (it is genuinely encrypted).
+    let alice2 = MarmotEngine::persistent(Identity::generate(), &db_path, DB_KEY)
+        .expect("recreated db reopens with the key");
+    assert_eq!(alice2.groups().expect("groups").len(), 0);
+}
+
+#[tokio::test]
 async fn wipe_removes_the_database() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("marmot.sqlite");

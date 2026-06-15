@@ -46,8 +46,24 @@ final class MarmotChatModel: ObservableObject {
         busy = true
         Task {
             defer { busy = false }
-            let storedNsec = keychain.getIdentityKey(forKey: Self.nsecKeychainKey)
-                .flatMap { String(data: $0, encoding: .utf8) }
+            // Read the persisted nsec SAFELY: only a genuine .itemNotFound means
+            // "no identity yet" (→ generate). On a transient read failure (e.g.
+            // device LOCKED during a background BLE wake) do NOT generate — that
+            // would overwrite the existing nsec and orphan its derived wallet +
+            // chat DB forever. Defer instead; setup retries once accessible (#13).
+            let storedNsec: String?
+            switch keychain.getIdentityKeyWithResult(forKey: Self.nsecKeychainKey) {
+            case .success(let data):
+                storedNsec = String(data: data, encoding: .utf8)
+                // Migration: re-save to upgrade a legacy WhenUnlocked item to
+                // AfterFirstUnlockThisDeviceOnly (this read just succeeded).
+                if let s = storedNsec { _ = keychain.saveIdentityKey(Data(s.utf8), forKey: Self.nsecKeychainKey) }
+            case .itemNotFound:
+                storedNsec = nil
+            case .accessDenied, .deviceLocked, .authenticationFailed, .otherError:
+                SecureLogger.warning("⚠️ marmot-nsec not readable yet (device locked?) — deferring identity", category: .session)
+                return
+            }
             // 1) Publish our npub IMMEDIATELY — the identity pubkey is offline-
             //    derivable, so Sonar discovery (0x53) can advertise it without
             //    waiting on (or being blocked by) the relay connect. Persist a
@@ -58,13 +74,15 @@ final class MarmotChatModel: ObservableObject {
                 }
                 self.npub = np
             }
-            // 2) Connect to relays + publish our KeyPackage — required for actual
-            //    White Noise message delivery (not for advertising the npub).
+            // 2) Connect (opens the encrypted DB) → load the LOCAL chats right away
+            //    (they don't need the relays) → then publish our KeyPackage. A relay
+            //    publish failure must NOT hide already-persisted chats — that was
+            //    the "chats vanish on restart, reappear on the next launch" bug.
             do {
                 _ = try await service.connect(nsec: storedNsec)
-                try await service.publishKeyPackage()
-                self.errorText = nil
                 await refresh()
+                self.errorText = nil
+                try await service.publishKeyPackage()
             } catch {
                 let desc = Self.describe(error)
                 SecureLogger.warning("⚠️ Marmot connect/publish failed: \(desc)", category: .session)

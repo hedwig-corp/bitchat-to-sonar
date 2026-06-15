@@ -216,10 +216,25 @@ final class MarmotService: @unchecked Sendable {
         let url = try databaseURL()
         let keychain = KeychainManager()
         let keyHex: String
-        if let existing = keychain.getIdentityKey(forKey: dbKeychainKey)
-            .flatMap({ String(data: $0, encoding: .utf8) }), existing.count == 64 {
+        // Distinguish "no key yet" (safe to generate) from "key not readable
+        // right now" (e.g. device locked during a background wake). Generating a
+        // new key on a TRANSIENT read failure would overwrite the existing one and
+        // make the encrypted DB unreadable FOREVER (all chat history lost) — so we
+        // only generate on .itemNotFound, and fail otherwise so setup retries once
+        // the keychain is accessible (#13 / chat-state-loss on locked wakes).
+        switch keychain.getIdentityKeyWithResult(forKey: dbKeychainKey) {
+        case .success(let data):
+            guard let existing = String(data: data, encoding: .utf8), existing.count == 64 else {
+                // Present but malformed: the DB is encrypted with *something*;
+                // refuse to overwrite (that would orphan it).
+                throw ServiceError.core("database key malformed — refusing to overwrite (would lose history)")
+            }
             keyHex = existing
-        } else {
+            // Migration (#13): re-save to upgrade a legacy WhenUnlocked item to
+            // AfterFirstUnlockThisDeviceOnly, so it stays readable on background/
+            // locked wakes (this read just succeeded → keychain is accessible).
+            _ = keychain.saveIdentityKey(Data(keyHex.utf8), forKey: dbKeychainKey)
+        case .itemNotFound:
             var bytes = [UInt8](repeating: 0, count: 32)
             guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else {
                 // Never fall back to a weak/zero key for an encrypted DB.
@@ -227,10 +242,11 @@ final class MarmotService: @unchecked Sendable {
             }
             keyHex = bytes.map { String(format: "%02x", $0) }.joined()
             guard keychain.saveIdentityKey(Data(keyHex.utf8), forKey: dbKeychainKey) else {
-                // If we can't persist the key, the DB would be unreadable next
-                // launch — fail now rather than silently lose history later.
                 throw ServiceError.core("failed to persist database encryption key")
             }
+        case .accessDenied, .deviceLocked, .authenticationFailed, .otherError:
+            // The key likely EXISTS but isn't readable now. Do NOT regenerate.
+            throw ServiceError.core("database key not readable yet (device locked?) — deferring")
         }
         return (url.path, keyHex)
     }

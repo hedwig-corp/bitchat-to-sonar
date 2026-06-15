@@ -419,6 +419,38 @@ fileprivate final class UniffiHandleMap<T>: @unchecked Sendable {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterUInt8: FfiConverterPrimitive {
+    typealias FfiType = UInt8
+    typealias SwiftType = UInt8
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt8 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: UInt8, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterUInt32: FfiConverterPrimitive {
+    typealias FfiType = UInt32
+    typealias SwiftType = UInt32
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt32 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterUInt64: FfiConverterPrimitive {
     typealias FfiType = UInt64
     typealias SwiftType = UInt64
@@ -494,6 +526,24 @@ fileprivate struct FfiConverterString: FfiConverter {
         let len = Int32(value.utf8.count)
         writeInt(&buf, len)
         writeBytes(&buf, value.utf8)
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterData: FfiConverterRustBuffer {
+    typealias SwiftType = Data
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Data {
+        let len: Int32 = try readInt(&buf)
+        return Data(try readBytes(&buf, count: Int(len)))
+    }
+
+    public static func write(_ value: Data, into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        writeBytes(&buf, value)
     }
 }
 
@@ -688,6 +738,22 @@ public func FfiConverterTypeSonarIdentity_lower(_ value: SonarIdentity) -> UInt6
 public protocol SonarNodeProtocol: AnyObject, Sendable {
     
     /**
+     * The 1:1 geohash DM conversation with a participant, oldest first.
+     */
+    func geoDmMessages(geohash: String, peerHex: String) throws  -> [GeoMessageInfo]
+    
+    /**
+     * Fetch recent messages for a geohash channel, oldest first.
+     */
+    func geohashMessages(geohash: String, limit: UInt32) throws  -> [GeoMessageInfo]
+    
+    /**
+     * Count of participants currently "here now" in a geohash channel
+     * (distinct kind-20001 heartbeats within the presence TTL).
+     */
+    func geohashPresenceCount(geohash: String) throws  -> UInt32
+    
+    /**
      * All groups this identity belongs to.
      */
     func groups() throws  -> [GroupInfo]
@@ -701,6 +767,22 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * Publish our kind-30443 KeyPackage so others can start groups with us.
      */
     func publishKeyPackage() throws 
+    
+    /**
+     * Send a 1:1 encrypted DM to a geohash channel participant (NIP-17).
+     */
+    func sendGeoDm(geohash: String, recipientHex: String, text: String) throws 
+    
+    /**
+     * Publish a public message to a geohash channel (kind-20000 over Nostr).
+     */
+    func sendGeohash(geohash: String, text: String, nickname: String) throws 
+    
+    /**
+     * Broadcast a presence heartbeat (kind-20001) for a geohash channel.
+     * Call on channel open and on a ~60s heartbeat while it is active.
+     */
+    func sendGeohashPresence(geohash: String) throws 
     
     /**
      * Encrypt + publish a text message to the group.
@@ -800,6 +882,45 @@ public static func connect(identity: SonarIdentity, relayUrls: [String], dbPath:
 
     
     /**
+     * The 1:1 geohash DM conversation with a participant, oldest first.
+     */
+open func geoDmMessages(geohash: String, peerHex: String)throws  -> [GeoMessageInfo]  {
+    return try  FfiConverterSequenceTypeGeoMessageInfo.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_geo_dm_messages(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(geohash),
+        FfiConverterString.lower(peerHex),$0
+    )
+})
+}
+    
+    /**
+     * Fetch recent messages for a geohash channel, oldest first.
+     */
+open func geohashMessages(geohash: String, limit: UInt32)throws  -> [GeoMessageInfo]  {
+    return try  FfiConverterSequenceTypeGeoMessageInfo.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_geohash_messages(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(geohash),
+        FfiConverterUInt32.lower(limit),$0
+    )
+})
+}
+    
+    /**
+     * Count of participants currently "here now" in a geohash channel
+     * (distinct kind-20001 heartbeats within the presence TTL).
+     */
+open func geohashPresenceCount(geohash: String)throws  -> UInt32  {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_geohash_presence_count(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(geohash),$0
+    )
+})
+}
+    
+    /**
      * All groups this identity belongs to.
      */
 open func groups()throws  -> [GroupInfo]  {
@@ -828,6 +949,44 @@ open func messages(groupIdHex: String)throws  -> [MessageInfo]  {
 open func publishKeyPackage()throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_publish_key_package(
             self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
+     * Send a 1:1 encrypted DM to a geohash channel participant (NIP-17).
+     */
+open func sendGeoDm(geohash: String, recipientHex: String, text: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_send_geo_dm(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(geohash),
+        FfiConverterString.lower(recipientHex),
+        FfiConverterString.lower(text),$0
+    )
+}
+}
+    
+    /**
+     * Publish a public message to a geohash channel (kind-20000 over Nostr).
+     */
+open func sendGeohash(geohash: String, text: String, nickname: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_send_geohash(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(geohash),
+        FfiConverterString.lower(text),
+        FfiConverterString.lower(nickname),$0
+    )
+}
+}
+    
+    /**
+     * Broadcast a presence heartbeat (kind-20001) for a geohash channel.
+     * Call on channel open and on a ~60s heartbeat while it is active.
+     */
+open func sendGeohashPresence(geohash: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_send_geohash_presence(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(geohash),$0
     )
 }
 }
@@ -917,6 +1076,312 @@ public func FfiConverterTypeSonarNode_lower(_ value: SonarNode) -> UInt64 {
 
 
 
+
+
+/**
+ * A Noise XX session driver for one mesh link. Feed handshake messages until
+ * `is_finished`, capture `remote_static_hex` (the peer's authenticated key →
+ * bitchat fingerprint), call `into_session`, then `encrypt`/`decrypt`.
+ */
+public protocol SonarNoiseProtocol: AnyObject, Sendable {
+    
+    func decrypt(data: Data) throws  -> Data
+    
+    func encrypt(data: Data) throws  -> Data
+    
+    /**
+     * Transition from handshake to the encrypted transport phase.
+     * NB: NOT named `finalize` — that collides with Java's `Object.finalize()`
+     * in the generated Kotlin binding (the GC then re-invokes it on a spent
+     * object and throws).
+     */
+    func intoSession() throws 
+    
+    func isFinished()  -> Bool
+    
+    /**
+     * Consume a handshake message received from the peer.
+     */
+    func readMessage(msg: Data) throws 
+    
+    /**
+     * The peer's authenticated static key (hex), available after the handshake.
+     */
+    func remoteStaticHex()  -> String?
+    
+    /**
+     * Next handshake message to send to the peer.
+     */
+    func writeMessage() throws  -> Data
+    
+}
+/**
+ * A Noise XX session driver for one mesh link. Feed handshake messages until
+ * `is_finished`, capture `remote_static_hex` (the peer's authenticated key →
+ * bitchat fingerprint), call `into_session`, then `encrypt`/`decrypt`.
+ */
+open class SonarNoise: SonarNoiseProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_sonar_ffi_fn_clone_sonarnoise(self.handle, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_sonar_ffi_fn_free_sonarnoise(handle, $0) }
+    }
+
+    
+public static func initiator(privateHex: String)throws  -> SonarNoise  {
+    return try  FfiConverterTypeSonarNoise_lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_constructor_sonarnoise_initiator(
+        FfiConverterString.lower(privateHex),$0
+    )
+})
+}
+    
+public static func responder(privateHex: String)throws  -> SonarNoise  {
+    return try  FfiConverterTypeSonarNoise_lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_constructor_sonarnoise_responder(
+        FfiConverterString.lower(privateHex),$0
+    )
+})
+}
+    
+
+    
+open func decrypt(data: Data)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnoise_decrypt(
+            self.uniffiCloneHandle(),
+        FfiConverterData.lower(data),$0
+    )
+})
+}
+    
+open func encrypt(data: Data)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnoise_encrypt(
+            self.uniffiCloneHandle(),
+        FfiConverterData.lower(data),$0
+    )
+})
+}
+    
+    /**
+     * Transition from handshake to the encrypted transport phase.
+     * NB: NOT named `finalize` — that collides with Java's `Object.finalize()`
+     * in the generated Kotlin binding (the GC then re-invokes it on a spent
+     * object and throws).
+     */
+open func intoSession()throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnoise_into_session(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+open func isFinished() -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_sonarnoise_is_finished(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Consume a handshake message received from the peer.
+     */
+open func readMessage(msg: Data)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnoise_read_message(
+            self.uniffiCloneHandle(),
+        FfiConverterData.lower(msg),$0
+    )
+}
+}
+    
+    /**
+     * The peer's authenticated static key (hex), available after the handshake.
+     */
+open func remoteStaticHex() -> String?  {
+    return try!  FfiConverterOptionString.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_sonarnoise_remote_static_hex(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Next handshake message to send to the peer.
+     */
+open func writeMessage()throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnoise_write_message(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSonarNoise: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = SonarNoise
+
+    public static func lift(_ handle: UInt64) throws -> SonarNoise {
+        return SonarNoise(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: SonarNoise) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SonarNoise {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: SonarNoise, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSonarNoise_lift(_ handle: UInt64) throws -> SonarNoise {
+    return try FfiConverterTypeSonarNoise.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSonarNoise_lower(_ value: SonarNoise) -> UInt64 {
+    return FfiConverterTypeSonarNoise.lower(value)
+}
+
+
+
+
+/**
+ * FFI-friendly geohash channel message (public, plaintext).
+ */
+public struct GeoMessageInfo: Equatable, Hashable {
+    public var idHex: String
+    public var senderPubkeyHex: String
+    public var nickname: String
+    public var content: String
+    public var createdAtSecs: UInt64
+    public var mine: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(idHex: String, senderPubkeyHex: String, nickname: String, content: String, createdAtSecs: UInt64, mine: Bool) {
+        self.idHex = idHex
+        self.senderPubkeyHex = senderPubkeyHex
+        self.nickname = nickname
+        self.content = content
+        self.createdAtSecs = createdAtSecs
+        self.mine = mine
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension GeoMessageInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeGeoMessageInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> GeoMessageInfo {
+        return
+            try GeoMessageInfo(
+                idHex: FfiConverterString.read(from: &buf), 
+                senderPubkeyHex: FfiConverterString.read(from: &buf), 
+                nickname: FfiConverterString.read(from: &buf), 
+                content: FfiConverterString.read(from: &buf), 
+                createdAtSecs: FfiConverterUInt64.read(from: &buf), 
+                mine: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: GeoMessageInfo, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.idHex, into: &buf)
+        FfiConverterString.write(value.senderPubkeyHex, into: &buf)
+        FfiConverterString.write(value.nickname, into: &buf)
+        FfiConverterString.write(value.content, into: &buf)
+        FfiConverterUInt64.write(value.createdAtSecs, into: &buf)
+        FfiConverterBool.write(value.mine, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGeoMessageInfo_lift(_ buf: RustBuffer) throws -> GeoMessageInfo {
+    return try FfiConverterTypeGeoMessageInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGeoMessageInfo_lower(_ value: GeoMessageInfo) -> RustBuffer {
+    return FfiConverterTypeGeoMessageInfo.lower(value)
+}
+
+
 /**
  * FFI-friendly group summary.
  */
@@ -981,6 +1446,270 @@ public func FfiConverterTypeGroupInfo_lift(_ buf: RustBuffer) throws -> GroupInf
 #endif
 public func FfiConverterTypeGroupInfo_lower(_ value: GroupInfo) -> RustBuffer {
     return FfiConverterTypeGroupInfo.lower(value)
+}
+
+
+/**
+ * A verified identity announce decoded off the mesh.
+ */
+public struct MeshAnnounceInfo: Equatable, Hashable {
+    public var nickname: String
+    public var noisePublicKeyHex: String
+    public var signingPublicKeyHex: String
+    public var senderIdHex: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(nickname: String, noisePublicKeyHex: String, signingPublicKeyHex: String, senderIdHex: String) {
+        self.nickname = nickname
+        self.noisePublicKeyHex = noisePublicKeyHex
+        self.signingPublicKeyHex = signingPublicKeyHex
+        self.senderIdHex = senderIdHex
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension MeshAnnounceInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMeshAnnounceInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MeshAnnounceInfo {
+        return
+            try MeshAnnounceInfo(
+                nickname: FfiConverterString.read(from: &buf), 
+                noisePublicKeyHex: FfiConverterString.read(from: &buf), 
+                signingPublicKeyHex: FfiConverterString.read(from: &buf), 
+                senderIdHex: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MeshAnnounceInfo, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.nickname, into: &buf)
+        FfiConverterString.write(value.noisePublicKeyHex, into: &buf)
+        FfiConverterString.write(value.signingPublicKeyHex, into: &buf)
+        FfiConverterString.write(value.senderIdHex, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMeshAnnounceInfo_lift(_ buf: RustBuffer) throws -> MeshAnnounceInfo {
+    return try FfiConverterTypeMeshAnnounceInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMeshAnnounceInfo_lower(_ value: MeshAnnounceInfo) -> RustBuffer {
+    return FfiConverterTypeMeshAnnounceInfo.lower(value)
+}
+
+
+/**
+ * The outer fields of a decoded mesh packet.
+ */
+public struct MeshPacketInfo: Equatable, Hashable {
+    public var packetType: UInt8
+    public var ttl: UInt8
+    public var senderIdHex: String
+    /**
+     * Empty when the packet has no recipient (broadcast/undirected).
+     */
+    public var recipientIdHex: String
+    public var payload: Data
+    public var hasSignature: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(packetType: UInt8, ttl: UInt8, senderIdHex: String, 
+        /**
+         * Empty when the packet has no recipient (broadcast/undirected).
+         */recipientIdHex: String, payload: Data, hasSignature: Bool) {
+        self.packetType = packetType
+        self.ttl = ttl
+        self.senderIdHex = senderIdHex
+        self.recipientIdHex = recipientIdHex
+        self.payload = payload
+        self.hasSignature = hasSignature
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension MeshPacketInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMeshPacketInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MeshPacketInfo {
+        return
+            try MeshPacketInfo(
+                packetType: FfiConverterUInt8.read(from: &buf), 
+                ttl: FfiConverterUInt8.read(from: &buf), 
+                senderIdHex: FfiConverterString.read(from: &buf), 
+                recipientIdHex: FfiConverterString.read(from: &buf), 
+                payload: FfiConverterData.read(from: &buf), 
+                hasSignature: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MeshPacketInfo, into buf: inout [UInt8]) {
+        FfiConverterUInt8.write(value.packetType, into: &buf)
+        FfiConverterUInt8.write(value.ttl, into: &buf)
+        FfiConverterString.write(value.senderIdHex, into: &buf)
+        FfiConverterString.write(value.recipientIdHex, into: &buf)
+        FfiConverterData.write(value.payload, into: &buf)
+        FfiConverterBool.write(value.hasSignature, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMeshPacketInfo_lift(_ buf: RustBuffer) throws -> MeshPacketInfo {
+    return try FfiConverterTypeMeshPacketInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMeshPacketInfo_lower(_ value: MeshPacketInfo) -> RustBuffer {
+    return FfiConverterTypeMeshPacketInfo.lower(value)
+}
+
+
+/**
+ * A decoded private chat message (the inner noiseEncrypted payload).
+ */
+public struct MeshPrivateMessage: Equatable, Hashable {
+    public var messageId: String
+    public var content: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(messageId: String, content: String) {
+        self.messageId = messageId
+        self.content = content
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension MeshPrivateMessage: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMeshPrivateMessage: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MeshPrivateMessage {
+        return
+            try MeshPrivateMessage(
+                messageId: FfiConverterString.read(from: &buf), 
+                content: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MeshPrivateMessage, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.messageId, into: &buf)
+        FfiConverterString.write(value.content, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMeshPrivateMessage_lift(_ buf: RustBuffer) throws -> MeshPrivateMessage {
+    return try FfiConverterTypeMeshPrivateMessage.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMeshPrivateMessage_lower(_ value: MeshPrivateMessage) -> RustBuffer {
+    return FfiConverterTypeMeshPrivateMessage.lower(value)
+}
+
+
+/**
+ * A decoded public broadcast (BLE "Mesh" channel) message. The wire payload is
+ * just the UTF-8 content (matching bitchat); the sender id + timestamp come from
+ * the packet, and the display nickname is resolved from the sender's announce.
+ */
+public struct MeshPublicMessage: Equatable, Hashable {
+    public var content: String
+    public var senderIdHex: String
+    public var timestampMs: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(content: String, senderIdHex: String, timestampMs: UInt64) {
+        self.content = content
+        self.senderIdHex = senderIdHex
+        self.timestampMs = timestampMs
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension MeshPublicMessage: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMeshPublicMessage: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MeshPublicMessage {
+        return
+            try MeshPublicMessage(
+                content: FfiConverterString.read(from: &buf), 
+                senderIdHex: FfiConverterString.read(from: &buf), 
+                timestampMs: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MeshPublicMessage, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.content, into: &buf)
+        FfiConverterString.write(value.senderIdHex, into: &buf)
+        FfiConverterUInt64.write(value.timestampMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMeshPublicMessage_lift(_ buf: RustBuffer) throws -> MeshPublicMessage {
+    return try FfiConverterTypeMeshPublicMessage.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMeshPublicMessage_lower(_ value: MeshPublicMessage) -> RustBuffer {
+    return FfiConverterTypeMeshPublicMessage.lower(value)
 }
 
 
@@ -1056,6 +1785,63 @@ public func FfiConverterTypeMessageInfo_lift(_ buf: RustBuffer) throws -> Messag
 #endif
 public func FfiConverterTypeMessageInfo_lower(_ value: MessageInfo) -> RustBuffer {
     return FfiConverterTypeMessageInfo.lower(value)
+}
+
+
+/**
+ * A freshly generated Noise static keypair (hex-encoded X25519).
+ */
+public struct NoiseKeypairHex: Equatable, Hashable {
+    public var privateHex: String
+    public var publicHex: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(privateHex: String, publicHex: String) {
+        self.privateHex = privateHex
+        self.publicHex = publicHex
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension NoiseKeypairHex: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeNoiseKeypairHex: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> NoiseKeypairHex {
+        return
+            try NoiseKeypairHex(
+                privateHex: FfiConverterString.read(from: &buf), 
+                publicHex: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: NoiseKeypairHex, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.privateHex, into: &buf)
+        FfiConverterString.write(value.publicHex, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNoiseKeypairHex_lift(_ buf: RustBuffer) throws -> NoiseKeypairHex {
+    return try FfiConverterTypeNoiseKeypairHex.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNoiseKeypairHex_lower(_ value: NoiseKeypairHex) -> RustBuffer {
+    return FfiConverterTypeNoiseKeypairHex.lower(value)
 }
 
 
@@ -1153,6 +1939,126 @@ public func FfiConverterTypeSonarFfiError_lower(_ value: SonarFfiError) -> RustB
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
+    typealias SwiftType = String?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterString.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterString.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeMeshAnnounceInfo: FfiConverterRustBuffer {
+    typealias SwiftType = MeshAnnounceInfo?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeMeshAnnounceInfo.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeMeshAnnounceInfo.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeMeshPacketInfo: FfiConverterRustBuffer {
+    typealias SwiftType = MeshPacketInfo?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeMeshPacketInfo.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeMeshPacketInfo.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeMeshPrivateMessage: FfiConverterRustBuffer {
+    typealias SwiftType = MeshPrivateMessage?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeMeshPrivateMessage.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeMeshPrivateMessage.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeMeshPublicMessage: FfiConverterRustBuffer {
+    typealias SwiftType = MeshPublicMessage?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeMeshPublicMessage.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeMeshPublicMessage.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
     typealias SwiftType = [String]
 
@@ -1170,6 +2076,31 @@ fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterString.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeGeoMessageInfo: FfiConverterRustBuffer {
+    typealias SwiftType = [GeoMessageInfo]
+
+    public static func write(_ value: [GeoMessageInfo], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeGeoMessageInfo.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [GeoMessageInfo] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [GeoMessageInfo]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeGeoMessageInfo.read(from: &buf))
         }
         return seq
     }
@@ -1225,6 +2156,145 @@ fileprivate struct FfiConverterSequenceTypeMessageInfo: FfiConverterRustBuffer {
     }
 }
 /**
+ * Build a signed identity announce as wire bytes (padded 0x01 packet).
+ */
+public func meshBuildAnnounce(seedHex: String, senderIdHex: String, nickname: String, noisePublicKeyHex: String, ttl: UInt8, timestampMs: UInt64)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_func_mesh_build_announce(
+        FfiConverterString.lower(seedHex),
+        FfiConverterString.lower(senderIdHex),
+        FfiConverterString.lower(nickname),
+        FfiConverterString.lower(noisePublicKeyHex),
+        FfiConverterUInt8.lower(ttl),
+        FfiConverterUInt64.lower(timestampMs),$0
+    )
+})
+}
+/**
+ * Build a directed packet of `packet_type` (e.g. 0x10 handshake / 0x11
+ * encrypted). An empty `recipient_id_hex` makes it undirected.
+ */
+public func meshBuildPacket(packetType: UInt8, senderIdHex: String, recipientIdHex: String, ttl: UInt8, timestampMs: UInt64, payload: Data)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_func_mesh_build_packet(
+        FfiConverterUInt8.lower(packetType),
+        FfiConverterString.lower(senderIdHex),
+        FfiConverterString.lower(recipientIdHex),
+        FfiConverterUInt8.lower(ttl),
+        FfiConverterUInt64.lower(timestampMs),
+        FfiConverterData.lower(payload),$0
+    )
+})
+}
+/**
+ * Build a SIGNED public broadcast message packet (type 0x02, recipient
+ * 0xFF*8) carrying a `BitchatMessage` payload — the BLE "Mesh" channel.
+ * Wire-compatible with iOS public messages.
+ */
+public func meshBuildPublicMessage(seedHex: String, senderIdHex: String, content: String, ttl: UInt8, timestampMs: UInt64)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_func_mesh_build_public_message(
+        FfiConverterString.lower(seedHex),
+        FfiConverterString.lower(senderIdHex),
+        FfiConverterString.lower(content),
+        FfiConverterUInt8.lower(ttl),
+        FfiConverterUInt64.lower(timestampMs),$0
+    )
+})
+}
+/**
+ * Build a packet SIGNED with the Ed25519 announce key (`seed_hex`), the same way
+ * `mesh_build_announce` signs — for packet types that bitchat verifies against
+ * the peer's signing key. Required for the Sonar Discovery announce (0x53):
+ * iOS `handleSonarAnnounce` drops it unless `packet.signature` verifies against
+ * the signing key from the peer's bitchat announce. Plain `mesh_build_packet`
+ * leaves it unsigned, so the 0x53 was silently rejected (no npub exchange).
+ */
+public func meshBuildSignedPacket(seedHex: String, packetType: UInt8, senderIdHex: String, recipientIdHex: String, ttl: UInt8, timestampMs: UInt64, payload: Data)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_func_mesh_build_signed_packet(
+        FfiConverterString.lower(seedHex),
+        FfiConverterUInt8.lower(packetType),
+        FfiConverterString.lower(senderIdHex),
+        FfiConverterString.lower(recipientIdHex),
+        FfiConverterUInt8.lower(ttl),
+        FfiConverterUInt64.lower(timestampMs),
+        FfiConverterData.lower(payload),$0
+    )
+})
+}
+/**
+ * Decode the outer fields of any mesh packet.
+ */
+public func meshDecodePacket(packetBytes: Data) -> MeshPacketInfo?  {
+    return try!  FfiConverterOptionTypeMeshPacketInfo.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_func_mesh_decode_packet(
+        FfiConverterData.lower(packetBytes),$0
+    )
+})
+}
+/**
+ * Parse a decrypted noiseEncrypted plaintext as a private message. Returns None
+ * unless the leading type byte is privateMessage (0x01) and the TLV is valid.
+ */
+public func meshDecodePrivateMessage(plaintext: Data) -> MeshPrivateMessage?  {
+    return try!  FfiConverterOptionTypeMeshPrivateMessage.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_func_mesh_decode_private_message(
+        FfiConverterData.lower(plaintext),$0
+    )
+})
+}
+/**
+ * The inner noiseEncrypted plaintext for a private message: `[0x01][TLV]`.
+ */
+public func meshEncodePrivateMessage(messageId: String, content: String)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_func_mesh_encode_private_message(
+        FfiConverterString.lower(messageId),
+        FfiConverterString.lower(content),$0
+    )
+})
+}
+/**
+ * Decode + verify an incoming announce packet. Returns the peer info only if
+ * the Ed25519 signature checks against the signing key carried in the announce
+ * (== iOS `verifyPacketSignature`). Returns None for non-announce/invalid.
+ */
+public func meshParseAnnounce(packetBytes: Data) -> MeshAnnounceInfo?  {
+    return try!  FfiConverterOptionTypeMeshAnnounceInfo.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_func_mesh_parse_announce(
+        FfiConverterData.lower(packetBytes),$0
+    )
+})
+}
+/**
+ * Parse an incoming type-0x02 packet as a public broadcast message — payload is
+ * the raw UTF-8 content. Returns None for other types / non-UTF-8 input.
+ */
+public func meshParsePublicMessage(packetBytes: Data) -> MeshPublicMessage?  {
+    return try!  FfiConverterOptionTypeMeshPublicMessage.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_func_mesh_parse_public_message(
+        FfiConverterData.lower(packetBytes),$0
+    )
+})
+}
+/**
+ * Ed25519 mesh signing public key (hex) for a 32-byte seed (hex).
+ */
+public func meshSigningPublicKey(seedHex: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_func_mesh_signing_public_key(
+        FfiConverterString.lower(seedHex),$0
+    )
+})
+}
+public func noiseGenerateKeypair()throws  -> NoiseKeypairHex  {
+    return try  FfiConverterTypeNoiseKeypairHex_lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_func_noise_generate_keypair($0
+    )
+})
+}
+/**
  * Erase the persistent Marmot database at `db_path` (and its SQLite sidecars:
  * `-wal`, `-shm`, `-journal`).
  *
@@ -1254,6 +2324,39 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
+    if (uniffi_sonar_ffi_checksum_func_mesh_build_announce() != 52908) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_mesh_build_packet() != 50052) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_mesh_build_public_message() != 29507) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_mesh_build_signed_packet() != 53546) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_mesh_decode_packet() != 8405) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_mesh_decode_private_message() != 53773) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_mesh_encode_private_message() != 50193) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_mesh_parse_announce() != 60089) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_mesh_parse_public_message() != 41596) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_mesh_signing_public_key() != 29933) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_noise_generate_keypair() != 35056) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_func_wipe_marmot_database() != 5401) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -1266,6 +2369,15 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonaridentity_pubkey_hex() != 4949) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_geo_dm_messages() != 48140) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_geohash_messages() != 43956) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_geohash_presence_count() != 20097) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_groups() != 48990) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -1273,6 +2385,15 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_key_package() != 48211) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_send_geo_dm() != 38953) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_send_geohash() != 25070) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_send_geohash_presence() != 60076) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_send_text() != 23173) {
@@ -1284,6 +2405,27 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_sync_once() != 45718) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnoise_decrypt() != 61202) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnoise_encrypt() != 30878) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnoise_into_session() != 4047) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnoise_is_finished() != 47294) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnoise_read_message() != 11342) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnoise_remote_static_hex() != 34199) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnoise_write_message() != 7081) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_constructor_sonaridentity_generate() != 7736) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -1291,6 +2433,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_constructor_sonarnode_connect() != 2559) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_constructor_sonarnoise_initiator() != 18155) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_constructor_sonarnoise_responder() != 10813) {
         return InitializationResult.apiChecksumMismatch
     }
 

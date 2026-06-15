@@ -345,8 +345,35 @@ final class SonarAppStore: ObservableObject {
             default: break
             }
         }
+        // Smoke-test hook (on-device, USB): launch with
+        // `-sonar.debug.sendMeshDM "<text>"` to send a private mesh DM to the
+        // first connected/reachable peer ~12s after launch (once BLE has had
+        // time to connect + handshake). Logs the target peerID + text so the
+        // send/receive can be confirmed from device logs without UI automation.
+        if onboarded, let text = defaults.string(forKey: "sonar.debug.sendMeshDM"), !text.isEmpty {
+            scheduleDebugMeshDM(text)
+        }
         #endif
     }
+
+    #if DEBUG
+    private func scheduleDebugMeshDM(_ text: String) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 12) { [weak self] in
+            guard let self else { return }
+            let my = self.chatViewModel.meshService.myPeerID
+            let target = self.chatViewModel.allPeers.first {
+                $0.peerID != my && ($0.isConnected || $0.isReachable)
+            }
+            guard let peer = target else {
+                SecureLogger.warning("🧪 debug.sendMeshDM: no connected peer to send to", category: .session)
+                return
+            }
+            SecureLogger.warning("🧪 debug.sendMeshDM: sending '\(text)' to peer \(peer.peerID.id) (\(peer.displayName))", category: .session)
+            self.chatViewModel.startPrivateChat(with: peer.peerID)
+            self.chatViewModel.sendPrivateMessage(text, to: peer.peerID)
+        }
+    }
+    #endif
 
     private func republish<P: Publisher>(_ publisher: P) where P.Output == Void, P.Failure == Never {
         publisher

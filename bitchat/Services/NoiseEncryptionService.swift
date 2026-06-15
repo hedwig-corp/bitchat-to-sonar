@@ -211,6 +211,10 @@ final class NoiseEncryptionService {
             if let key = try? Curve25519.KeyAgreement.PrivateKey(rawRepresentation: identityData) {
                 loadedKey = key
                 SecureLogger.logKeyOperation(.load, keyType: "noiseStaticKey", success: true)
+                // Migration (#13): re-save to upgrade a legacy WhenUnlocked item to
+                // AfterFirstUnlockThisDeviceOnly so it survives locked/background
+                // wakes (this read just succeeded, so the keychain is accessible).
+                _ = keychain.saveIdentityKey(identityData, forKey: "noiseStaticKey")
             } else {
                 // Data corrupted, regenerate
                 SecureLogger.warning("Noise static key data corrupted, regenerating", category: .keychain)
@@ -253,6 +257,9 @@ final class NoiseEncryptionService {
             if let key = try? Curve25519.Signing.PrivateKey(rawRepresentation: signingData) {
                 loadedSigningKey = key
                 SecureLogger.logKeyOperation(.load, keyType: "ed25519SigningKey", success: true)
+                // Migration (#13): upgrade a legacy WhenUnlocked item to
+                // AfterFirstUnlockThisDeviceOnly (see the noiseStaticKey case).
+                _ = keychain.saveIdentityKey(signingData, forKey: "ed25519SigningKey")
             } else {
                 // Data corrupted, regenerate
                 SecureLogger.warning("Ed25519 signing key data corrupted, regenerating", category: .keychain)
