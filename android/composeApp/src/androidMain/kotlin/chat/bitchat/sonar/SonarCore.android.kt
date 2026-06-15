@@ -82,6 +82,20 @@ actual object SonarCore {
         }
     }
 
+    actual suspend fun publishProfile(name: String, about: String?, picture: String?) = withContext(Dispatchers.IO) {
+        runCatching { node?.publishProfile(name, about, picture) }
+        Unit
+    }
+
+    actual suspend fun fetchProfile(npub: String): SonarProfile? = withContext(Dispatchers.IO) {
+        val n = node ?: return@withContext null
+        runCatching {
+            n.fetchProfile(npub)?.let {
+                SonarProfile(it.name, it.displayName, it.about, it.picture, it.nip05)
+            }
+        }.getOrNull()
+    }
+
     actual suspend fun sync() = withContext(Dispatchers.IO) {
         runCatching { node?.syncOnce() }
         Unit

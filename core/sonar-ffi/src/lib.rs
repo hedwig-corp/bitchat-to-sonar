@@ -127,6 +127,17 @@ pub struct MessageInfo {
     pub mine: bool,
 }
 
+/// FFI-friendly Nostr profile (kind-0 metadata, NIP-01). A Marmot member's
+/// identity is a Nostr pubkey, so this resolves their human name + avatar.
+#[derive(uniffi::Record)]
+pub struct ProfileInfo {
+    pub name: Option<String>,
+    pub display_name: Option<String>,
+    pub about: Option<String>,
+    pub picture: Option<String>,
+    pub nip05: Option<String>,
+}
+
 /// FFI-friendly geohash channel message (public, plaintext).
 #[derive(uniffi::Record)]
 pub struct GeoMessageInfo {
@@ -193,6 +204,36 @@ impl SonarNode {
     pub fn publish_key_package(&self) -> FfiResult<()> {
         self.runtime.block_on(self.client.publish_key_package())?;
         Ok(())
+    }
+
+    /// Publish our kind-0 profile (NIP-01 metadata) so peers can show our name +
+    /// avatar instead of a raw npub. `name` is used for both name + display_name.
+    pub fn publish_profile(
+        &self,
+        name: String,
+        about: Option<String>,
+        picture: Option<String>,
+    ) -> FfiResult<()> {
+        self.runtime.block_on(self.client.publish_profile(
+            &name,
+            about.as_deref(),
+            picture.as_deref(),
+        ))?;
+        Ok(())
+    }
+
+    /// Fetch a peer's kind-0 profile (npub or hex pubkey). `None` if they have
+    /// not published one. Used to resolve a Marmot member's display name.
+    pub fn fetch_profile(&self, npub: String) -> FfiResult<Option<ProfileInfo>> {
+        let pubkey = PublicKey::parse(&npub).map_err(invalid("profile pubkey"))?;
+        let profile = self.runtime.block_on(self.client.fetch_profile(pubkey))?;
+        Ok(profile.map(|p| ProfileInfo {
+            name: p.name,
+            display_name: p.display_name,
+            about: p.about,
+            picture: p.picture,
+            nip05: p.nip05,
+        }))
     }
 
     /// Start a 1:1 DM group with `peer` (npub or hex pubkey). Fetches their

@@ -50,6 +50,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         private set
     var chats by mutableStateOf<List<SonarChat>>(emptyList())
         private set
+    /** Resolved kind-0 profiles by npub — fills human names for Marmot members. */
+    var profilesByNpub by mutableStateOf<Map<String, SonarProfile>>(emptyMap())
+        private set
+    private val profileFetches = mutableSetOf<String>()
     private var stack by mutableStateOf<List<Screen>>(listOf(Screen.Home))
     val screen: Screen get() = stack.last()
 
@@ -435,6 +439,8 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun updateNickname(value: String) {
         SonarCore.setNickname(value)
         nick = value
+        // Re-publish our kind-0 profile so peers see the new name.
+        if (started) scope.launch { runCatching { SonarCore.publishProfile(value) } }
     }
 
     // ── Local notifications (fire on new incoming message while backgrounded) ──
@@ -518,7 +524,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (enabled && seededSeen && prev != null && newestIncoming != null &&
                 newestIncoming.tsSecs > prev && !foreground && c.id != openChatId
             ) {
-                val title = if (showNames) c.name.ifBlank { "Secure chat" } else "New message"
+                val title = if (showNames) chatTitle(c) else "New message"
                 val body = if (showPreview) notifPreview(newestIncoming.content) else "Tap to open"
                 Notifier.notify(c.id.hashCode(), title, body)
             }
@@ -536,6 +542,8 @@ class SonarAppState(private val scope: CoroutineScope) {
                 npub = SonarCore.start()
                 android.util.Log.i("SonarNpub", "my npub=$npub")
                 started = true
+                // Publish our kind-0 profile so peers see our nickname, not npub.
+                launch { runCatching { SonarCore.publishProfile(nick) } }
                 // Hydrate BLE-mesh transcripts from disk so private mesh chats
                 // survive a restart (parity with the iOS MessageStore). Precedes
                 // refreshMeshDmRows so the Messages list is populated at launch.
@@ -553,8 +561,38 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
+    /** Display title for a White Noise (Marmot) chat. A 1:1 group's stored name
+     *  is blank, so fall back to the counterpart's short npub — never an empty
+     *  title. Mirrors iOS `MarmotChatModel.title(for:)`. */
+    fun chatTitle(chat: SonarChat): String {
+        if (chat.name.isNotBlank()) return chat.name
+        val other = chat.members.firstOrNull { it != npub && it.isNotBlank() } ?: return "Secure chat"
+        // Prefer the counterpart's resolved kind-0 profile name; fetch it once if
+        // not cached; fall back to a short npub until it lands.
+        profilesByNpub[other]?.bestName?.let { return it }
+        ensureProfile(other)
+        return if (other.length > 16) other.take(10) + "…" + other.takeLast(4) else other
+    }
+
+    /** Fetch + cache a peer's kind-0 profile once, so their name replaces the
+     *  raw npub in the chat list/header. */
+    fun ensureProfile(otherNpub: String) {
+        if (otherNpub.isBlank() || otherNpub == npub) return
+        if (profilesByNpub.containsKey(otherNpub)) return // already resolved
+        if (!profileFetches.add(otherNpub)) return        // fetch already in flight
+        scope.launch {
+            val p = SonarCore.fetchProfile(otherNpub)
+            if (p?.bestName != null) {
+                profilesByNpub = profilesByNpub + (otherNpub to p)
+            } else {
+                // Not published yet — allow a later retry (driven by poll()).
+                profileFetches.remove(otherNpub)
+            }
+        }
+    }
+
     fun openChat(chat: SonarChat) {
-        push(Screen.Chat(chat.id, chat.name))
+        push(Screen.Chat(chat.id, chatTitle(chat)))
         scope.launch {
             messages = SonarCore.messages(chat.id)
             processPayLines(chat.id, messages)
@@ -829,6 +867,9 @@ class SonarAppState(private val scope: CoroutineScope) {
                     android.util.Log.i("SonarWN", "White Noise: ${chats.size} group(s), $wnMsgs message(s)")
                     lastWnGroups = chats.size; lastWnMsgs = wnMsgs
                 }
+                // Resolve each counterpart's kind-0 profile (retries until they
+                // publish one) so chats show a human name, not a raw npub.
+                for (c in chats) c.members.forEach { if (it != npub) ensureProfile(it) }
                 flushPendingMarmot() // a queued out-of-range send whose group just landed
                 maybeNotify()
                 // Marmot/Nostr chats refresh from the core; mesh chats are local

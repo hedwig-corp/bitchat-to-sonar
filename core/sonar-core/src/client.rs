@@ -52,6 +52,29 @@ type GeoPresenceBuf = Arc<Mutex<HashMap<String, HashMap<String, u64>>>>;
 /// iOS re-broadcasts kind-20001 every 40-80s, well within this window.
 const PRESENCE_TTL_SECS: u64 = 300;
 
+/// A user's public Nostr profile (kind-0 metadata, NIP-01). Marmot identity IS
+/// a Nostr pubkey (MIP-00), and MIP-00 leaves display names out of scope, so the
+/// standard Nostr profile mechanism resolves a member's human-readable name and
+/// avatar. All fields are optional (a peer may not have published a profile).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Profile {
+    pub name: Option<String>,
+    pub display_name: Option<String>,
+    pub about: Option<String>,
+    pub picture: Option<String>,
+    pub nip05: Option<String>,
+}
+
+impl Profile {
+    /// The best human-readable label: display_name, else name, else None.
+    pub fn best_name(&self) -> Option<&str> {
+        self.display_name
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| self.name.as_deref().filter(|s| !s.trim().is_empty()))
+    }
+}
+
 pub struct SonarClient {
     engine: MarmotEngine,
     nostr: Client,
@@ -254,6 +277,43 @@ impl SonarClient {
             .into_iter()
             .next()
             .ok_or(Error::KeyPackageNotFound(author))
+    }
+
+    /// Publish our kind-0 profile (NIP-01 metadata) so peers can resolve our
+    /// display name + avatar. `name` is used for both `name` and `display_name`;
+    /// `about`/`picture` are optional (a bad picture URL is dropped, not fatal).
+    pub async fn publish_profile(
+        &self,
+        name: &str,
+        about: Option<&str>,
+        picture: Option<&str>,
+    ) -> Result<()> {
+        let mut metadata = Metadata::new().name(name).display_name(name);
+        if let Some(about) = about.filter(|s| !s.is_empty()) {
+            metadata = metadata.about(about);
+        }
+        if let Some(url) = picture
+            .filter(|s| !s.is_empty())
+            .and_then(|p| Url::parse(p).ok())
+        {
+            metadata = metadata.picture(url);
+        }
+        self.nostr.set_metadata(&metadata).await?;
+        Ok(())
+    }
+
+    /// Fetch a peer's kind-0 profile from the relays. Returns `None` if they have
+    /// not published one. Used to show a human name/avatar for a Marmot member
+    /// instead of a raw npub.
+    pub async fn fetch_profile(&self, author: PublicKey) -> Result<Option<Profile>> {
+        let metadata = self.nostr.fetch_metadata(author, FETCH_TIMEOUT).await?;
+        Ok(metadata.map(|m| Profile {
+            name: m.name,
+            display_name: m.display_name,
+            about: m.about,
+            picture: m.picture,
+            nip05: m.nip05,
+        }))
     }
 
     /// Start a DM/group with `peer`: fetch their KeyPackage, create the MLS

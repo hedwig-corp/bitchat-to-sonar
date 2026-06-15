@@ -201,11 +201,12 @@ impl MarmotEngine {
         let config = NostrGroupConfigData::new(
             name.to_owned(),
             String::new(),
-            None,
-            None,
-            None,
+            None, // image_hash
+            None, // image_key
+            None, // image_nonce
             relays,
             admins,
+            None, // disappearing_message_secs (no ephemeral messages in v1 DMs)
         );
         let result = dispatch!(&self.storage, |mdk| mdk.create_group(
             &self.identity.public_key(),
@@ -231,8 +232,29 @@ impl MarmotEngine {
         receiver: &PublicKey,
         rumor: UnsignedEvent,
     ) -> Result<Event> {
-        let wrapped =
-            EventBuilder::gift_wrap(self.identity.keys(), receiver, rumor, []).await?;
+        // Build the NIP-59 gift wrap manually so the OUTER (kind-1059) event uses a
+        // CURRENT timestamp instead of NIP-59's randomized up-to-2-days-in-the-past
+        // tweak. White Noise subscribes for incoming welcomes with
+        // `since = last_synced_at - 10s`, so a far-past gift-wrap timestamp falls
+        // outside its window and the welcome is NEVER fetched — Sonar->White Noise
+        // group invites silently failed. A recent timestamp keeps them in the window.
+        // (We don't filter by `since`, which is why White Noise->Sonar worked.)
+        let keys = self.identity.keys();
+        let seal: Event = EventBuilder::seal(keys, receiver, rumor)
+            .await?
+            .sign(keys)
+            .await?;
+        let ephemeral = Keys::generate();
+        let content = nip44::encrypt(
+            ephemeral.secret_key(),
+            receiver,
+            seal.as_json(),
+            nip44::Version::default(),
+        )?;
+        let wrapped = EventBuilder::new(Kind::GiftWrap, content)
+            .tags([Tag::public_key(*receiver)])
+            .custom_created_at(Timestamp::now())
+            .sign_with_keys(&ephemeral)?;
         Ok(wrapped)
     }
 

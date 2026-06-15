@@ -19,6 +19,20 @@ data class SonarMsg(
     val viaInternet: Boolean = false,
 )
 
+/** A peer's Nostr profile (kind-0 metadata, NIP-01). A Marmot member's identity
+ *  is a Nostr pubkey, so this resolves their human name + avatar (vs a raw npub). */
+data class SonarProfile(
+    val name: String?,
+    val displayName: String?,
+    val about: String?,
+    val picture: String?,
+    val nip05: String?,
+) {
+    /** Best human label: display name, else name, else null. */
+    val bestName: String? get() =
+        displayName?.takeIf { it.isNotBlank() } ?: name?.takeIf { it.isNotBlank() }
+}
+
 /** A public message in a geohash channel. */
 data class SonarChannelMsg(
     val id: String,
@@ -62,6 +76,12 @@ expect object SonarCore {
 
     /** Poll the relays once (welcomes + group messages). */
     suspend fun sync()
+
+    /** Publish our kind-0 profile (NIP-01) so peers see our nickname, not npub. */
+    suspend fun publishProfile(name: String, about: String? = null, picture: String? = null)
+
+    /** Fetch a peer's kind-0 profile (npub or hex). null if they have none. */
+    suspend fun fetchProfile(npub: String): SonarProfile?
 
     // ── Geohash public channels ──
 

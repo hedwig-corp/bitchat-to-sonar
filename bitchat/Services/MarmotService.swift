@@ -41,6 +41,23 @@ final class MarmotService: @unchecked Sendable {
         let isMine: Bool
     }
 
+    /// A peer's Nostr profile (kind-0 metadata, NIP-01). A Marmot member's
+    /// identity is a Nostr pubkey, so this resolves a human name + avatar
+    /// instead of a raw npub.
+    struct Profile: Sendable, Equatable {
+        let name: String?
+        let displayName: String?
+        let about: String?
+        let picture: String?
+        let nip05: String?
+        /// Best human label: display name, else name, else nil.
+        var bestName: String? {
+            if let d = displayName, !d.trimmingCharacters(in: .whitespaces).isEmpty { return d }
+            if let n = name, !n.trimmingCharacters(in: .whitespaces).isEmpty { return n }
+            return nil
+        }
+    }
+
     enum ServiceError: Error, Equatable {
         /// `connect()` has not completed successfully yet.
         case notConnected
@@ -140,6 +157,21 @@ final class MarmotService: @unchecked Sendable {
     /// Publish our MLS KeyPackage (kind 30443) so peers can invite us.
     func publishKeyPackage() async throws {
         try await run { try $0.requireNode().publishKeyPackage() }
+    }
+
+    /// Publish our kind-0 Nostr profile (NIP-01) so peers can show our name
+    /// instead of a raw npub. `name` becomes both name + display_name.
+    func publishProfile(name: String, about: String? = nil, picture: String? = nil) async throws {
+        try await run { try $0.requireNode().publishProfile(name: name, about: about, picture: picture) }
+    }
+
+    /// Fetch a peer's kind-0 profile (npub or hex). nil if they have none.
+    func fetchProfile(npub: String) async throws -> Profile? {
+        try await run {
+            try $0.requireNode().fetchProfile(npub: npub).map {
+                Profile(name: $0.name, displayName: $0.displayName, about: $0.about, picture: $0.picture, nip05: $0.nip05)
+            }
+        }
     }
 
     /// Start a 1:1 DM group with `peer` (`npub1...` or hex pubkey). The peer

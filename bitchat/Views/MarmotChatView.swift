@@ -21,10 +21,15 @@ final class MarmotChatModel: ObservableObject {
     @Published var messagesByGroup: [String: [MarmotService.MarmotMessage]] = [:]
     @Published var busy = false
     @Published var errorText: String?
+    /// Resolved kind-0 profiles, keyed by npub — fills in human names/avatars
+    /// for Marmot members instead of raw npubs.
+    @Published var profilesByNpub: [String: MarmotService.Profile] = [:]
 
     private let service: MarmotService
     private let keychain: KeychainManagerProtocol
     private var syncTask: Task<Void, Never>?
+    /// npubs whose profile fetch is in flight or done, to fetch each once.
+    private var profileFetches: Set<String> = []
     /// Optimistically-echoed outgoing messages per group, kept visible until
     /// the relay round-trip brings the real copy back (then reconciled away).
     private var pendingOptimistic: [String: [MarmotService.MarmotMessage]] = [:]
@@ -102,9 +107,46 @@ final class MarmotChatModel: ObservableObject {
             self.groups = groups
             self.messagesByGroup = reconcileOptimistic(into: byGroup)
             self.errorText = nil
+            // Resolve a human name for every counterpart (once each).
+            for group in groups {
+                for member in group.memberNpubs where member != npub {
+                    ensureProfile(member)
+                }
+            }
         } catch {
             self.errorText = Self.describe(error)
         }
+    }
+
+    /// Publish our own kind-0 profile so peers see our nickname, not our npub.
+    func publishProfile(name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        Task { try? await service.publishProfile(name: trimmed) }
+    }
+
+    /// Fetch + cache a peer's kind-0 profile, so their name/avatar replaces the
+    /// raw npub in the chat list, header, and avatar. Retries (via the periodic
+    /// `refresh()`) until the peer has published a profile.
+    func ensureProfile(_ npubToFetch: String) {
+        guard !npubToFetch.isEmpty, npubToFetch != npub else { return }
+        guard profilesByNpub[npubToFetch] == nil else { return } // already resolved
+        guard profileFetches.insert(npubToFetch).inserted else { return } // in flight
+        Task {
+            let profile = try? await service.fetchProfile(npub: npubToFetch)
+            await MainActor.run {
+                if let profile, profile.bestName != nil {
+                    self.profilesByNpub[npubToFetch] = profile
+                } else {
+                    self.profileFetches.remove(npubToFetch) // not published yet — allow retry
+                }
+            }
+        }
+    }
+
+    /// Best display name for a member npub, if we've resolved their profile.
+    func displayName(forNpub member: String) -> String? {
+        profilesByNpub[member]?.bestName
     }
 
     /// Merge still-pending optimistic echoes into the freshly-synced
@@ -207,8 +249,12 @@ final class MarmotChatModel: ObservableObject {
     /// Short label for a 1:1 group: the other member's npub prefix.
     func title(for group: MarmotService.MarmotGroup) -> String {
         if !group.name.isEmpty { return group.name }
-        let other = group.memberNpubs.first { $0 != npub }
-        return other.map { String($0.prefix(12)) + "…" } ?? "Secure chat"
+        guard let other = group.memberNpubs.first(where: { $0 != npub }) else { return "Secure chat" }
+        // Prefer the counterpart's resolved kind-0 profile name; fetch it if we
+        // haven't yet; fall back to a short npub until it lands.
+        if let name = displayName(forNpub: other) { return name }
+        ensureProfile(other)
+        return String(other.prefix(12)) + "…"
     }
 
     private static func describe(_ error: Error) -> String {

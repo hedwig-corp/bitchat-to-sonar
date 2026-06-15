@@ -738,6 +738,12 @@ public func FfiConverterTypeSonarIdentity_lower(_ value: SonarIdentity) -> UInt6
 public protocol SonarNodeProtocol: AnyObject, Sendable {
     
     /**
+     * Fetch a peer's kind-0 profile (npub or hex pubkey). `None` if they have
+     * not published one. Used to resolve a Marmot member's display name.
+     */
+    func fetchProfile(npub: String) throws  -> ProfileInfo?
+    
+    /**
      * The 1:1 geohash DM conversation with a participant, oldest first.
      */
     func geoDmMessages(geohash: String, peerHex: String) throws  -> [GeoMessageInfo]
@@ -767,6 +773,12 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * Publish our kind-30443 KeyPackage so others can start groups with us.
      */
     func publishKeyPackage() throws 
+    
+    /**
+     * Publish our kind-0 profile (NIP-01 metadata) so peers can show our name +
+     * avatar instead of a raw npub. `name` is used for both name + display_name.
+     */
+    func publishProfile(name: String, about: String?, picture: String?) throws 
     
     /**
      * Send a 1:1 encrypted DM to a geohash channel participant (NIP-17).
@@ -882,6 +894,19 @@ public static func connect(identity: SonarIdentity, relayUrls: [String], dbPath:
 
     
     /**
+     * Fetch a peer's kind-0 profile (npub or hex pubkey). `None` if they have
+     * not published one. Used to resolve a Marmot member's display name.
+     */
+open func fetchProfile(npub: String)throws  -> ProfileInfo?  {
+    return try  FfiConverterOptionTypeProfileInfo.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_fetch_profile(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(npub),$0
+    )
+})
+}
+    
+    /**
      * The 1:1 geohash DM conversation with a participant, oldest first.
      */
 open func geoDmMessages(geohash: String, peerHex: String)throws  -> [GeoMessageInfo]  {
@@ -949,6 +974,20 @@ open func messages(groupIdHex: String)throws  -> [MessageInfo]  {
 open func publishKeyPackage()throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_publish_key_package(
             self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
+     * Publish our kind-0 profile (NIP-01 metadata) so peers can show our name +
+     * avatar instead of a raw npub. `name` is used for both name + display_name.
+     */
+open func publishProfile(name: String, about: String?, picture: String?)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_publish_profile(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(name),
+        FfiConverterOptionString.lower(about),
+        FfiConverterOptionString.lower(picture),$0
     )
 }
 }
@@ -1846,6 +1885,76 @@ public func FfiConverterTypeNoiseKeypairHex_lower(_ value: NoiseKeypairHex) -> R
 
 
 /**
+ * FFI-friendly Nostr profile (kind-0 metadata, NIP-01). A Marmot member's
+ * identity is a Nostr pubkey, so this resolves their human name + avatar.
+ */
+public struct ProfileInfo: Equatable, Hashable {
+    public var name: String?
+    public var displayName: String?
+    public var about: String?
+    public var picture: String?
+    public var nip05: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(name: String?, displayName: String?, about: String?, picture: String?, nip05: String?) {
+        self.name = name
+        self.displayName = displayName
+        self.about = about
+        self.picture = picture
+        self.nip05 = nip05
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension ProfileInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeProfileInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ProfileInfo {
+        return
+            try ProfileInfo(
+                name: FfiConverterOptionString.read(from: &buf), 
+                displayName: FfiConverterOptionString.read(from: &buf), 
+                about: FfiConverterOptionString.read(from: &buf), 
+                picture: FfiConverterOptionString.read(from: &buf), 
+                nip05: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ProfileInfo, into buf: inout [UInt8]) {
+        FfiConverterOptionString.write(value.name, into: &buf)
+        FfiConverterOptionString.write(value.displayName, into: &buf)
+        FfiConverterOptionString.write(value.about, into: &buf)
+        FfiConverterOptionString.write(value.picture, into: &buf)
+        FfiConverterOptionString.write(value.nip05, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeProfileInfo_lift(_ buf: RustBuffer) throws -> ProfileInfo {
+    return try FfiConverterTypeProfileInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeProfileInfo_lower(_ value: ProfileInfo) -> RustBuffer {
+    return FfiConverterTypeProfileInfo.lower(value)
+}
+
+
+/**
  * Flat error: only the rendered message crosses the FFI boundary
  * (`SonarFfiError.InvalidInput(message:)` / `.Core(message:)` in Swift).
  */
@@ -2051,6 +2160,30 @@ fileprivate struct FfiConverterOptionTypeMeshPublicMessage: FfiConverterRustBuff
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeMeshPublicMessage.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeProfileInfo: FfiConverterRustBuffer {
+    typealias SwiftType = ProfileInfo?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeProfileInfo.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeProfileInfo.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -2369,6 +2502,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonaridentity_pubkey_hex() != 4949) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_fetch_profile() != 10147) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_geo_dm_messages() != 48140) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -2385,6 +2521,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_key_package() != 48211) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_profile() != 42572) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_send_geo_dm() != 38953) {

@@ -24,6 +24,9 @@ pub enum Error {
     #[error("nip59 gift wrap error: {0}")]
     Nip59(#[from] nostr::nips::nip59::Error),
 
+    #[error("nip44 encryption error: {0}")]
+    Nip44(#[from] nostr::nips::nip44::Error),
+
     #[error("nostr client error: {0}")]
     NostrClient(#[from] nostr_sdk::client::Error),
 

@@ -17,10 +17,16 @@ lto = "thin"
 codegen-units = 1
 
 [workspace.dependencies]
-mdk-core = "0.8.0"
-mdk-storage-traits = "0.8.0"
-mdk-memory-storage = "0.8.0"
-mdk-sqlite-storage = "0.8.0"
+# Pinned to the SAME MDK git rev White Noise (whitenoise-rs) uses, so the MLS
+# group/welcome/message wire format matches byte-for-byte and White Noise <->
+# Sonar interop works in BOTH directions. The published crates.io 0.8.0 is
+# behind this rev (which adds the v3 Nostr-group-data extension / disappearing
+# messages); our old 0.8.0 could not read White Noise's newer messages. Keep
+# this rev in lockstep with whitenoise-rs's Cargo.toml.
+mdk-core = { git = "https://github.com/marmot-protocol/mdk", rev = "e8cd584878be908cb95aad260bb7bca65e017de1" }
+mdk-storage-traits = { git = "https://github.com/marmot-protocol/mdk", rev = "e8cd584878be908cb95aad260bb7bca65e017de1" }
+mdk-memory-storage = { git = "https://github.com/marmot-protocol/mdk", rev = "e8cd584878be908cb95aad260bb7bca65e017de1" }
+mdk-sqlite-storage = { git = "https://github.com/marmot-protocol/mdk", rev = "e8cd584878be908cb95aad260bb7bca65e017de1" }
 nostr = { version = "0.44", features = ["std", "nip44", "nip59"] }
 nostr-sdk = "0.44"
 nostr-relay-builder = "0.44"

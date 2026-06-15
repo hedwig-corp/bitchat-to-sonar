@@ -101,7 +101,7 @@ struct SNPeerItem: Identifiable {
 
 /// A peer's Sonar discovery profile (verified announce, type 0x53):
 /// their White Noise / Marmot identity plus optional payment address.
-struct SonarPeerProfile: Equatable {
+struct SonarPeerProfile: Equatable, Codable {
     let npub: String        // bech32 npub1…
     let bip353: String?     // payment address (user@domain)
     let capabilities: UInt8
@@ -141,6 +141,9 @@ final class SonarAppStore: ObservableObject {
         /// ⚡PAY capability on a configured, receive-capable wallet.
         static let walletConfigured = "sonar.wallet.configured"
         static let legacyDemoState = "sn_proto_v1" // removed prototype persistence
+        /// Persisted Sonar profiles ([fingerprint: SonarPeerProfile] JSON) so a
+        /// peer's npub↔identity link survives restarts (one folded conversation).
+        static let sonarProfiles = "sonar.peerProfiles.v1"
     }
 
     static let marmotIDPrefix = "marmot:"
@@ -178,7 +181,14 @@ final class SonarAppStore: ObservableObject {
     @Published private(set) var mode: String
     @Published private(set) var marmotVerified: [String: Bool]
     /// Sonar discovery profiles received from nearby peers, keyed by PeerID.id.
+    /// LIVE only (the short PeerID rotates) — see `sonarProfilesByFingerprint`
+    /// for the persisted, restart-surviving copy.
     @Published private(set) var sonarProfiles: [String: SonarPeerProfile] = [:]
+    /// Persisted Sonar profiles keyed by the peer's STABLE Noise fingerprint, so
+    /// the npub↔peer link survives a restart / BLE-down. This keeps a Sonar
+    /// peer's mesh (Noise) and White Noise (Marmot) legs folded into ONE
+    /// conversation even when the live 0x53 announce isn't currently arriving.
+    private var sonarProfilesByFingerprint: [String: SonarPeerProfile] = [:]
     /// Our optional BIP-353 payment address ("" = unset, TLV omitted).
     @Published private(set) var bip353: String
     /// Mirrors wallet.state for the UI (balance row, PaySheet, claims).
@@ -276,11 +286,15 @@ final class SonarAppStore: ObservableObject {
         marmot.$npub
             .receive(on: DispatchQueue.main)
             .sink { [weak self] npub in
-                self?.wireSonarProfileProvider(npub)
+                guard let self else { return }
+                self.wireSonarProfileProvider(npub)
+                // Publish our kind-0 profile (NIP-01) so peers resolve our
+                // nickname instead of our npub. MIP-00 identity == Nostr pubkey.
+                if npub != nil { self.marmot.publishProfile(name: self.chatViewModel.nickname) }
                 // The wallet derives from the same identity (nsec); once the
                 // Marmot identity exists, (re)attempt the deferred wallet setup.
                 #if os(iOS)
-                if npub != nil { (self?.wallet as? BridgedWallet)?.retrySetup() }
+                if npub != nil { (self.wallet as? BridgedWallet)?.retrySetup() }
                 #endif
             }
             .store(in: &cancellables)
@@ -323,6 +337,10 @@ final class SonarAppStore: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.processIncomingPayLines() }
             .store(in: &cancellables)
+
+        // Restore persisted Sonar profiles so a peer's mesh + White Noise legs
+        // stay folded into one conversation across restarts (before dmRows runs).
+        hydrateSonarProfiles()
 
         if onboarded {
             marmot.connectIfNeeded()
@@ -481,6 +499,8 @@ final class SonarAppStore: ObservableObject {
     func rename(_ nick: String) {
         chatViewModel.nickname = nick
         chatViewModel.validateAndSaveNickname()
+        // Re-publish our kind-0 profile so peers see the new name.
+        if marmot.npub != nil { marmot.publishProfile(name: chatViewModel.nickname) }
     }
 
     func completeOnboarding(nick: String) {
@@ -624,6 +644,44 @@ final class SonarAppStore: ObservableObject {
         if sonarProfiles[peerID] != profile {
             sonarProfiles[peerID] = profile
         }
+        // Persist the npub↔peer link keyed by the STABLE Noise fingerprint, so the
+        // mesh + White Noise legs stay one conversation across restarts / BLE-down.
+        let fp = chatViewModel.getFingerprint(for: PeerID(str: peerID)) ?? peerID
+        if sonarProfilesByFingerprint[fp] != profile {
+            sonarProfilesByFingerprint[fp] = profile
+            persistSonarProfiles()
+        }
+    }
+
+    private func persistSonarProfiles() {
+        guard let data = try? JSONEncoder().encode(sonarProfilesByFingerprint) else { return }
+        defaults.set(data, forKey: Keys.sonarProfiles)
+    }
+
+    private func hydrateSonarProfiles() {
+        guard let data = defaults.data(forKey: Keys.sonarProfiles),
+              let map = try? JSONDecoder().decode([String: SonarPeerProfile].self, from: data)
+        else { return }
+        sonarProfilesByFingerprint = map
+    }
+
+    /// The Sonar profile for a peer id, preferring the live 0x53 announce and
+    /// falling back to the persisted (by-fingerprint) copy — so a Sonar peer's
+    /// White Noise leg is still recognized when it isn't currently advertising.
+    func resolvedSonarProfile(_ id: String) -> SonarPeerProfile? {
+        if let live = sonarProfiles[id] { return live }
+        let fp = chatViewModel.getFingerprint(for: PeerID(str: id)) ?? id
+        return sonarProfilesByFingerprint[fp]
+    }
+
+    /// The peer key (stable fingerprint) of a persisted/live Sonar peer whose
+    /// npub matches `npub`, if any — used to fold a Marmot group into that peer's
+    /// mesh conversation even with no live announce.
+    func sonarPeerKey(forNpub npub: String) -> String? {
+        if let live = sonarProfiles.first(where: { $0.value.npub == npub })?.key {
+            return chatViewModel.getFingerprint(for: PeerID(str: live)) ?? live
+        }
+        return sonarProfilesByFingerprint.first(where: { $0.value.npub == npub })?.key
     }
 
     /// Inject our Sonar profile into BLEService once the Marmot identity is
@@ -968,38 +1026,47 @@ final class SonarAppStore: ObservableObject {
         for group in marmot.groups {
             let msgs = marmot.messagesByGroup[group.id] ?? []
             let last = msgs.last
-            if let otherNpub = group.memberNpubs.first(where: { $0 != marmot.npub }),
-               let sonarPeerId = sonarProfiles.first(where: { $0.value.npub == otherNpub })?.key {
-                let peerID = PeerID(str: sonarPeerId)
-                let key = chatViewModel.getFingerprint(for: peerID) ?? sonarPeerId
-                if let existing = byKey[key] {
-                    if let last, last.createdAt > (existing.lastDate ?? .distantPast) {
-                        byKey[key] = SNDMRow(
-                            id: existing.id,
-                            title: existing.title,
-                            preview: Self.previewText(last.content),
-                            time: Self.listTime(last.createdAt),
-                            unread: existing.unread,
-                            presence: existing.presence,
-                            verified: existing.verified,
-                            isMarmot: false,
-                            lastDate: last.createdAt
-                        )
-                    }
-                } else {
-                    let mesh = chatViewModel.meshService
-                    byKey[key] = SNDMRow(
-                        id: sonarPeerId,
-                        title: chatViewModel.nicknameForPeer(peerID),
-                        preview: last.map { Self.previewText($0.content) } ?? networkLabel(forPeer: sonarPeerId),
-                        time: last.map { Self.listTime($0.createdAt) } ?? "",
-                        unread: false,
-                        presence: mesh.isPeerConnected(peerID) || mesh.isPeerReachable(peerID),
-                        verified: isVerified(sonarPeerId),
+            let otherNpub = group.memberNpubs.first(where: { $0 != marmot.npub })
+            // Live peer id (only when currently discovered over 0x53) lets us build
+            // a fresh row; the persisted fingerprint still folds into an EXISTING
+            // mesh row when the peer isn't advertising (BLE down / after restart).
+            let liveSonarPeerId = otherNpub.flatMap { np in
+                sonarProfiles.first(where: { $0.value.npub == np })?.key
+            }
+            let foldKey = otherNpub.flatMap { sonarPeerKey(forNpub: $0) }
+            if let foldKey, let existing = byKey[foldKey] {
+                // Same person as a mesh/bitchat chat → merge the White Noise leg
+                // into that one row instead of showing a duplicate conversation.
+                if let last, last.createdAt > (existing.lastDate ?? .distantPast) {
+                    byKey[foldKey] = SNDMRow(
+                        id: existing.id,
+                        title: existing.title,
+                        preview: Self.previewText(last.content),
+                        time: Self.listTime(last.createdAt),
+                        unread: existing.unread,
+                        presence: existing.presence,
+                        verified: existing.verified,
                         isMarmot: false,
-                        lastDate: last?.createdAt
+                        lastDate: last.createdAt
                     )
                 }
+                continue
+            }
+            if let liveSonarPeerId, let foldKey {
+                // Discovered Sonar peer with no mesh transcript yet → one row.
+                let peerID = PeerID(str: liveSonarPeerId)
+                let mesh = chatViewModel.meshService
+                byKey[foldKey] = SNDMRow(
+                    id: liveSonarPeerId,
+                    title: chatViewModel.nicknameForPeer(peerID),
+                    preview: last.map { Self.previewText($0.content) } ?? networkLabel(forPeer: liveSonarPeerId),
+                    time: last.map { Self.listTime($0.createdAt) } ?? "",
+                    unread: false,
+                    presence: mesh.isPeerConnected(peerID) || mesh.isPeerReachable(peerID),
+                    verified: isVerified(liveSonarPeerId),
+                    isMarmot: false,
+                    lastDate: last?.createdAt
+                )
                 continue
             }
             marmotRows.append(SNDMRow(
@@ -1113,7 +1180,7 @@ final class SonarAppStore: ObservableObject {
         // of Bluetooth range. v1 keeps the two transcripts in separate
         // stores but RENDERS them as one, merged chronologically; the
         // White Noise leg always renders as internet (indigo).
-        if let profile = sonarProfiles[id], let group = marmotGroup(forNpub: profile.npub) {
+        if let profile = resolvedSonarProfile(id), let group = marmotGroup(forNpub: profile.npub) {
             dated += (marmot.messagesByGroup[group.id] ?? []).compactMap { m in
                 switch payMapping(m.content, fallbackVia: .internet) {
                 case .hidden:
@@ -1156,7 +1223,7 @@ final class SonarAppStore: ObservableObject {
         }
         // Sonar peer out of Bluetooth range: continue over White Noise,
         // creating the Marmot group on first send if it doesn't exist yet.
-        if let profile = sonarProfiles[id], dmTransport(id) == .internet {
+        if let profile = resolvedSonarProfile(id), dmTransport(id) == .internet {
             sendOverMarmot(text, npub: profile.npub)
             return
         }
@@ -1189,8 +1256,9 @@ final class SonarAppStore: ObservableObject {
         } else {
             chatViewModel.startPrivateChat(with: PeerID(str: id))
             // Sonar peers may carry a White Noise leg of the conversation:
-            // keep that transcript fresh while the screen is open.
-            if sonarProfiles[id] != nil {
+            // keep that transcript fresh while the screen is open (resolved =
+            // live OR persisted, so it works even when not currently in range).
+            if resolvedSonarProfile(id) != nil {
                 marmot.connectIfNeeded()
                 marmot.startPolling()
                 if marmot.npub != nil {
@@ -1204,7 +1272,7 @@ final class SonarAppStore: ObservableObject {
         if marmotGroupId(id) != nil {
             marmot.stopPolling()
         } else {
-            if sonarProfiles[id] != nil {
+            if resolvedSonarProfile(id) != nil {
                 marmot.stopPolling()
             }
             if chatViewModel.selectedPrivateChatPeer == PeerID(str: id) {
@@ -1606,9 +1674,12 @@ final class SonarAppStore: ObservableObject {
         marmot.messagesByGroup = [:]
         marmotVerified = [:]
         defaults.removeObject(forKey: Keys.marmotVerified)
-        // Stop Sonar discovery announces and forget discovered profiles.
+        // Stop Sonar discovery announces and forget discovered profiles (live +
+        // the persisted npub↔peer link).
         (chatViewModel.meshService as? BLEService)?.sonarProfileProvider = nil
         sonarProfiles = [:]
+        sonarProfilesByFingerprint = [:]
+        defaults.removeObject(forKey: Keys.sonarProfiles)
         // Stop scanning for Unify peers and clear the discovered list (no
         // secrets are stored, but the list must not survive a panic wipe).
         unify.stop()

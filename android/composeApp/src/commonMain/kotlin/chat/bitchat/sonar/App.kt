@@ -177,9 +177,10 @@ private fun HomeScreen(state: SonarAppState) {
                     ) { state.openDm(row.peerId, row.name) }
                 }
                 items(state.chats, key = { it.id }) { chat ->
+                    val chatTitle = state.chatTitle(chat)
                     ConvRow(
-                        avatar = { SonarAvatar(chat.name, 52.dp, presence = false) },
-                        title = chat.name, sub = "Tap to open", lock = true,
+                        avatar = { SonarAvatar(chatTitle, 52.dp, presence = false) },
+                        title = chatTitle, sub = "Tap to open", lock = true,
                         verified = state.isVerified(chat.id),
                     ) { state.openChat(chat) }
                 }

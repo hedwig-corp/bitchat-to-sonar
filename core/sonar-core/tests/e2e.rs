@@ -9,6 +9,42 @@ use sonar_core::client::SonarClient;
 use sonar_core::identity::Identity;
 
 #[tokio::test]
+async fn profile_publish_and_fetch_through_a_relay() {
+    // A Marmot member's identity is a Nostr pubkey (MIP-00); their display name
+    // is resolved via a standard kind-0 profile. Bob publishes his profile; Alice
+    // fetches it to show a human name instead of a raw npub.
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url.clone()])
+        .await
+        .expect("alice connects");
+    let bob = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url.clone()])
+        .await
+        .expect("bob connects");
+
+    // Before Bob publishes, Alice finds no profile.
+    let none = alice
+        .fetch_profile(bob.identity().public_key())
+        .await
+        .expect("fetch ok");
+    assert!(none.is_none(), "no profile before Bob publishes");
+
+    bob.publish_profile("Bob the Marmot", Some("hello there"), None)
+        .await
+        .expect("bob publishes profile");
+
+    let profile = alice
+        .fetch_profile(bob.identity().public_key())
+        .await
+        .expect("fetch ok")
+        .expect("Bob's profile is found");
+    assert_eq!(profile.best_name(), Some("Bob the Marmot"));
+    assert_eq!(profile.name.as_deref(), Some("Bob the Marmot"));
+    assert_eq!(profile.about.as_deref(), Some("hello there"));
+}
+
+#[tokio::test]
 async fn two_instances_exchange_dms_through_a_relay() {
     let relay = MockRelay::run().await.expect("mock relay starts");
     let relay_url = relay.url().await;

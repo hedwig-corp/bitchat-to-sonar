@@ -1644,8 +1644,7 @@ checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
 [[package]]
 name = "mdk-core"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bce37d3705644198b5d4d0ba171fa5cb803f7cc7b486c38ff2b86010414d98ef"
+source = "git+https://github.com/marmot-protocol/mdk?rev=e8cd584878be908cb95aad260bb7bca65e017de1#e8cd584878be908cb95aad260bb7bca65e017de1"
 dependencies = [
  "base64",
  "blurhash",
@@ -1673,14 +1672,12 @@ dependencies = [
 [[package]]
 name = "mdk-macros"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16d1dc36bd628c20e171926e03034d2bee55a210c7f0bf006180bb33229aa98b"
+source = "git+https://github.com/marmot-protocol/mdk?rev=e8cd584878be908cb95aad260bb7bca65e017de1#e8cd584878be908cb95aad260bb7bca65e017de1"
 
 [[package]]
 name = "mdk-memory-storage"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "66cf685d2eefc45e37b2fd739beb0419fcc58a229a53c096090010f86bc66c12"
+source = "git+https://github.com/marmot-protocol/mdk?rev=e8cd584878be908cb95aad260bb7bca65e017de1#e8cd584878be908cb95aad260bb7bca65e017de1"
 dependencies = [
  "lru",
  "mdk-storage-traits",
@@ -1696,8 +1693,7 @@ dependencies = [
 [[package]]
 name = "mdk-sqlite-storage"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "865eeb78d12a90d53aaabd8f2b1dba97893e82b67f13bd6d8a2693092813528d"
+source = "git+https://github.com/marmot-protocol/mdk?rev=e8cd584878be908cb95aad260bb7bca65e017de1#e8cd584878be908cb95aad260bb7bca65e017de1"
 dependencies = [
  "base64",
  "getrandom 0.4.2",
@@ -1719,8 +1715,7 @@ dependencies = [
 [[package]]
 name = "mdk-storage-traits"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "99e1d9ab3deeabe388d49c32cc9c275707ca646aa3d0e694d55f2a659b8b42d9"
+source = "git+https://github.com/marmot-protocol/mdk?rev=e8cd584878be908cb95aad260bb7bca65e017de1#e8cd584878be908cb95aad260bb7bca65e017de1"
 dependencies = [
  "nostr",
  "openmls",
@@ -1950,8 +1945,7 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 [[package]]
 name = "openmls"
 version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dcb512bfe6a55777518853ea535c6241f069cb0e8984678c117151d2a1e7e903"
+source = "git+https://github.com/openmls/openmls?rev=04c50d7fb12d52f4f9aee26de5f5234f3df29fa8#04c50d7fb12d52f4f9aee26de5f5234f3df29fa8"
 dependencies = [
  "log",
  "openmls_traits",
@@ -1966,8 +1960,7 @@ dependencies = [
 [[package]]
 name = "openmls_basic_credential"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "983e8be1457dd6f316f409292cec334af3b57b49a19deadc925c83c3c35e15b6"
+source = "git+https://github.com/openmls/openmls?rev=04c50d7fb12d52f4f9aee26de5f5234f3df29fa8#04c50d7fb12d52f4f9aee26de5f5234f3df29fa8"
 dependencies = [
  "ed25519-dalek",
  "openmls_traits",
@@ -1980,8 +1973,7 @@ dependencies = [
 [[package]]
 name = "openmls_memory_storage"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a52c927ddb9940acb96d51aebd54b8b9c601c7119e6609622fb3f2cbe16abe3"
+source = "git+https://github.com/openmls/openmls?rev=04c50d7fb12d52f4f9aee26de5f5234f3df29fa8#04c50d7fb12d52f4f9aee26de5f5234f3df29fa8"
 dependencies = [
  "log",
  "openmls_traits",
@@ -1993,8 +1985,7 @@ dependencies = [
 [[package]]
 name = "openmls_rust_crypto"
 version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fafcc8a3552b10fbb3ab757cccaf1a34081e826ca819f49aa7e6645b1d95c00f"
+source = "git+https://github.com/openmls/openmls?rev=04c50d7fb12d52f4f9aee26de5f5234f3df29fa8#04c50d7fb12d52f4f9aee26de5f5234f3df29fa8"
 dependencies = [
  "aes-gcm",
  "chacha20poly1305",
@@ -2018,8 +2009,7 @@ dependencies = [
 [[package]]
 name = "openmls_traits"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f88ccdd53448dfdbfa5b8da8ba4e527c418fdb966418172bace2e3b41eedd56"
+source = "git+https://github.com/openmls/openmls?rev=04c50d7fb12d52f4f9aee26de5f5234f3df29fa8#04c50d7fb12d52f4f9aee26de5f5234f3df29fa8"
 dependencies = [
  "serde",
  "tls_codec",
