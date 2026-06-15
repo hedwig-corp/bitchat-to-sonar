@@ -9,6 +9,15 @@ data class MeshPeer(val id: String, val name: String, val rssi: Int, val sonar: 
  *  peerID, drained by the app into the mesh-chat store. */
 data class MeshDmIn(val peerId: String, val text: String, val tsSecs: Long)
 
+/** An incoming PUBLIC broadcast (the BLE "Mesh" channel) from another peer. The
+ *  wire carries only content + sender peerID + timestamp; the display nickname is
+ *  resolved from the sender's announce by the app. */
+data class MeshBroadcastIn(
+    val senderId: String,
+    val content: String,
+    val tsSecs: Long,
+)
+
 /**
  * The BLE mesh radio: scans for and advertises the bitchat mesh service so
  * nearby Sonar/bitchat phones discover each other over Bluetooth. This is the
@@ -45,4 +54,12 @@ expect object MeshRadio {
     fun drainMeshDm(): List<MeshDmIn>
     /** Wall-clock seconds (platform clock) — for mesh message timestamps. */
     fun nowSecs(): Long
+
+    /** Broadcast a PUBLIC message to all connected mesh peers (the "Mesh"
+     *  channel). Returns false if no peer is currently connected. */
+    fun sendMeshBroadcast(text: String): Boolean
+    /** Pull (and clear) public Mesh-channel broadcasts received since last call. */
+    fun drainMeshBroadcast(): List<MeshBroadcastIn>
+    /** Mesh peers we can currently reach with a broadcast (for "N in range"). */
+    fun connectedMeshPeerCount(): Int
 }

@@ -80,11 +80,17 @@ actual object MeshRadio {
 
     /** Incoming decrypted mesh DMs, buffered until the app drains them. */
     private val meshDmInbox = java.util.concurrent.ConcurrentLinkedQueue<MeshDmIn>()
+    /** Incoming public Mesh-channel broadcasts, buffered until drained. */
+    private val meshBroadcastInbox = java.util.concurrent.ConcurrentLinkedQueue<MeshBroadcastIn>()
 
     init {
         // Buffer incoming Noise DMs (the listener fires on a BLE callback thread).
         MeshGatt.addMessageListener { peerId, text ->
             meshDmInbox.add(MeshDmIn(peerId, text, System.currentTimeMillis() / 1000))
+        }
+        // Buffer incoming public broadcasts (the BLE "Mesh" channel).
+        MeshGatt.addBroadcastListener { pm ->
+            meshBroadcastInbox.add(MeshBroadcastIn(pm.senderIdHex, pm.content, (pm.timestampMs / 1000u).toLong()))
         }
         // Stash peers' 0x53 payloads + register named, verified announce peers.
         MeshGatt.addSonarListener { peerId, payload -> sonarProfiles[peerId] = payload }
@@ -246,6 +252,16 @@ actual object MeshRadio {
 
     actual fun nowSecs(): Long = System.currentTimeMillis() / 1000
 
+    actual fun sendMeshBroadcast(text: String): Boolean = MeshGatt.broadcastPublic(text)
+
+    actual fun drainMeshBroadcast(): List<MeshBroadcastIn> {
+        val out = ArrayList<MeshBroadcastIn>()
+        while (true) { out.add(meshBroadcastInbox.poll() ?: break) }
+        return out
+    }
+
+    actual fun connectedMeshPeerCount(): Int = MeshGatt.connectedPeerCount()
+
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             scanResultCount++
@@ -255,6 +271,9 @@ actual object MeshRadio {
             val isNew = !seen.containsKey(id)
             seen[id] = MeshPeer(id = id, name = name, rssi = result.rssi)
             lastSeen[id] = System.currentTimeMillis()
+            val peerNodeId = runCatching {
+                result.scanRecord?.getManufacturerSpecificData(NODE_ID_COMPANY)
+            }.getOrNull()
             if (isNew) {
                 lastNewDiscoveryMs = System.currentTimeMillis()
                 // SOFT dialer election. Two Sonar-Android phones dialing each
@@ -270,9 +289,6 @@ actual object MeshRadio {
                 // scanner. connect()'s dedup + cap + backoff bound the churn, and
                 // status 19 is cleaned up + retried like 133. A peer with NO node
                 // id (iOS / stock bitchat) is dialed immediately (iPhone compat).
-                val peerNodeId = runCatching {
-                    result.scanRecord?.getManufacturerSpecificData(NODE_ID_COMPANY)
-                }.getOrNull()
                 val dialNow = peerNodeId == null || MeshGatt.shouldDial(peerNodeId)
                 android.util.Log.i(TAG, "discovered $id rssi=${result.rssi} nodeId=${peerNodeId != null} dialNow=$dialNow")
                 if (dialNow) {
@@ -280,6 +296,15 @@ actual object MeshRadio {
                 } else {
                     handler.postDelayed({ runCatching { MeshGatt.connect(result.device) } }, FALLBACK_DIAL_MS)
                 }
+            } else if (!MeshGatt.isLinkedAddr(id)) {
+                // RE-DIAL a known peer we have NO live link to. The first dial can
+                // fail (rotated RPA, status 133, iOS not yet ready), and on the
+                // Pixel 10 the scanner never re-fires `isNew` for that address —
+                // so without this branch a failed dial is never retried and the
+                // mesh link with iOS / a peer never recovers. connect()'s 30s
+                // backoff (recentDials) + MAX_CLIENTS cap throttle this; we just
+                // un-gate the *attempt* so re-sightings can drive recovery.
+                runCatching { MeshGatt.connect(result.device) }
             }
         }
 

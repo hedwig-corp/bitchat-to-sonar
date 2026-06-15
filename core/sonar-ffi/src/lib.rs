@@ -472,6 +472,16 @@ pub struct MeshPrivateMessage {
     pub content: String,
 }
 
+/// A decoded public broadcast (BLE "Mesh" channel) message. The wire payload is
+/// just the UTF-8 content (matching bitchat); the sender id + timestamp come from
+/// the packet, and the display nickname is resolved from the sender's announce.
+#[derive(uniffi::Record)]
+pub struct MeshPublicMessage {
+    pub content: String,
+    pub sender_id_hex: String,
+    pub timestamp_ms: u64,
+}
+
 fn parse_id8(hex_str: &str, what: &'static str) -> Result<[u8; 8], SonarFfiError> {
     let bytes = hex::decode(hex_str).map_err(invalid(what))?;
     if bytes.len() != 8 {
@@ -609,6 +619,53 @@ pub fn mesh_decode_private_message(plaintext: Vec<u8>) -> Option<MeshPrivateMess
     Some(MeshPrivateMessage {
         message_id: pm.message_id,
         content: pm.content,
+    })
+}
+
+/// Build a SIGNED public broadcast message packet (type 0x02, recipient
+/// 0xFF*8) carrying a `BitchatMessage` payload — the BLE "Mesh" channel.
+/// Wire-compatible with iOS public messages.
+#[uniffi::export]
+pub fn mesh_build_public_message(
+    seed_hex: String,
+    sender_id_hex: String,
+    content: String,
+    ttl: u8,
+    timestamp_ms: u64,
+) -> FfiResult<Vec<u8>> {
+    let seed = hex::decode(&seed_hex).map_err(invalid("mesh seed"))?;
+    if seed.len() != 32 {
+        return Err(SonarFfiError::InvalidInput("mesh seed must be 32 bytes".into()));
+    }
+    let mut s = [0u8; 32];
+    s.copy_from_slice(&seed);
+    let signer = mesh::MeshSigner::from_seed(&s);
+    let sender = parse_id8(&sender_id_hex, "sender id")?;
+    // bitchat public message: payload IS the raw UTF-8 content; recipientID = nil;
+    // signed. Sender + timestamp live in the packet header.
+    let mut packet = mesh::Packet::new(mesh::msg_type::MESSAGE, ttl, timestamp_ms, sender);
+    packet.payload = content.into_bytes();
+    if !mesh::sign_packet(&mut packet, &signer) {
+        return Err(SonarFfiError::Core("public message sign failed".into()));
+    }
+    packet
+        .encode()
+        .ok_or_else(|| SonarFfiError::Core("public message packet encode failed".into()))
+}
+
+/// Parse an incoming type-0x02 packet as a public broadcast message — payload is
+/// the raw UTF-8 content. Returns None for other types / non-UTF-8 input.
+#[uniffi::export]
+pub fn mesh_parse_public_message(packet_bytes: Vec<u8>) -> Option<MeshPublicMessage> {
+    let packet = mesh::Packet::decode(&packet_bytes)?;
+    if packet.type_ != mesh::msg_type::MESSAGE {
+        return None;
+    }
+    let content = String::from_utf8(packet.payload).ok()?;
+    Some(MeshPublicMessage {
+        content,
+        sender_id_hex: hex::encode(packet.sender_id),
+        timestamp_ms: packet.timestamp,
     })
 }
 

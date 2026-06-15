@@ -167,8 +167,16 @@ private fun HomeScreen(state: SonarAppState) {
                 }
                 if (state.locationChannels.isEmpty()) item { LocationHint() }
                 item { SNSectionLabel("Messages") }
-                if (state.chats.isEmpty()) item { EmptyMessages() }
-                else items(state.chats, key = { it.id }) { chat ->
+                if (state.chats.isEmpty() && state.meshDmRows.isEmpty()) item { EmptyMessages() }
+                // BLE-mesh DMs (incl. ones started by a peer messaging us) — over
+                // Bluetooth, so a cyan dot instead of the internet lock.
+                items(state.meshDmRows, key = { "mesh:" + it.peerId }) { row ->
+                    ConvRow(
+                        avatar = { SonarAvatar(row.name, 52.dp, presence = true) },
+                        title = row.name, sub = row.preview, lock = false,
+                    ) { state.openMeshChat(row.peerId, row.name) }
+                }
+                items(state.chats, key = { it.id }) { chat ->
                     ConvRow(
                         avatar = { SonarAvatar(chat.name, 52.dp, presence = false) },
                         title = chat.name, sub = "Tap to open", lock = true,

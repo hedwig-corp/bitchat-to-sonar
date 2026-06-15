@@ -551,6 +551,13 @@ pub fn split_noise_plaintext(plain: &[u8]) -> Option<(u8, &[u8])> {
     plain.split_first().map(|(t, rest)| (*t, rest))
 }
 
+// The BLE "Mesh" channel public broadcast is a type-0x02 packet whose payload is
+// the raw UTF-8 content (recipientID = nil), signed — exactly like bitchat's
+// `BLEService` public send (`payload: Data(content.utf8)`). There is no
+// application-layer TLV on the public wire; sender id + timestamp come from the
+// packet header. (The `BitchatMessage.toBinaryPayload` TLV is used only inside
+// encrypted private payloads and will be ported for M3 with real test vectors.)
+
 /// Wrap a raw Noise handshake message in a directed 0x10 packet.
 pub fn handshake_packet(sender: [u8; 8], recipient: [u8; 8], ttl: u8, timestamp: u64, noise_msg: Vec<u8>) -> Packet {
     let mut p = Packet::new(msg_type::NOISE_HANDSHAKE, ttl, timestamp, sender);

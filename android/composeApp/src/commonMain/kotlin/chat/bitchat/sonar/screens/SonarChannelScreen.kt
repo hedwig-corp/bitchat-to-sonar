@@ -94,12 +94,20 @@ fun SonarChannelScreen(state: SonarAppState, screen: Screen.Channel) {
 
         if (state.channelMsgs.isEmpty()) {
             Box(Modifier.weight(1f).fillMaxWidth()) {
-                SNEmptyState(
-                    icon = SNIconName.Pin, iconSize = 26.dp,
-                    title = "Quiet in $name right now",
-                    desc = if (here > 0) "$here ${if (here == 1) "person is" else "people are"} in range of this channel today. Say hi."
-                           else "Be the first to say something in $name."
-                )
+                if (isMesh) {
+                    SNEmptyState(
+                        icon = SNIconName.Mesh, iconSize = 26.dp,
+                        title = "Bluetooth mesh",
+                        desc = "Messages here reach everyone in Bluetooth range — no internet needed. Say hi."
+                    )
+                } else {
+                    SNEmptyState(
+                        icon = SNIconName.Pin, iconSize = 26.dp,
+                        title = "Quiet in $name right now",
+                        desc = if (here > 0) "$here ${if (here == 1) "person is" else "people are"} in range of this channel today. Say hi."
+                               else "Be the first to say something in $name."
+                    )
+                }
             }
         } else {
             LazyColumn(

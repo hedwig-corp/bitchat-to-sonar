@@ -17,14 +17,17 @@ import java.security.SecureRandom
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import uniffi.sonar_ffi.MeshAnnounceInfo
+import uniffi.sonar_ffi.MeshPublicMessage
 import uniffi.sonar_ffi.NoiseKeypairHex
 import uniffi.sonar_ffi.SonarNoise
 import uniffi.sonar_ffi.meshBuildAnnounce
 import uniffi.sonar_ffi.meshBuildPacket
+import uniffi.sonar_ffi.meshBuildPublicMessage
 import uniffi.sonar_ffi.meshDecodePacket
 import uniffi.sonar_ffi.meshDecodePrivateMessage
 import uniffi.sonar_ffi.meshEncodePrivateMessage
 import uniffi.sonar_ffi.meshParseAnnounce
+import uniffi.sonar_ffi.meshParsePublicMessage
 import uniffi.sonar_ffi.noiseGenerateKeypair
 
 /**
@@ -58,6 +61,7 @@ object MeshGatt {
 
     // bitchat packet types (subset; full set in sonar_core::mesh::msg_type).
     private const val TYPE_ANNOUNCE: UByte = 0x01u
+    private const val TYPE_MESSAGE: UByte = 0x02u // public broadcast (Mesh channel)
     private const val TYPE_NOISE_HANDSHAKE: UByte = 0x10u
     private const val TYPE_NOISE_ENCRYPTED: UByte = 0x11u
     private const val TYPE_SONAR_0X53: UByte = 0x53u
@@ -120,12 +124,17 @@ object MeshGatt {
     private val onSonar = java.util.concurrent.CopyOnWriteArrayList<(String, ByteArray) -> Unit>()
     private val onAnnounce = java.util.concurrent.CopyOnWriteArrayList<(String, MeshAnnounceInfo) -> Unit>()
     private val onLink = java.util.concurrent.CopyOnWriteArrayList<(String) -> Unit>()
+    private val onBroadcast = java.util.concurrent.CopyOnWriteArrayList<(MeshPublicMessage) -> Unit>()
+    /** Dedup public broadcasts by message id (we receive from multiple links). */
+    private val seenBroadcastIds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
     fun addMessageListener(cb: (peerId: String, text: String) -> Unit) { onText.add(cb) }
     fun addSonarListener(cb: (peerId: String, payload: ByteArray) -> Unit) { onSonar.add(cb) }
     /** Fired when a peer's signed announce is received + verified. */
     fun addAnnounceListener(cb: (bleAddr: String, info: MeshAnnounceInfo) -> Unit) { onAnnounce.add(cb) }
     fun addLinkListener(cb: (peerId: String) -> Unit) { onLink.add(cb) }
+    /** Fired for an incoming public broadcast (Mesh channel) message. */
+    fun addBroadcastListener(cb: (MeshPublicMessage) -> Unit) { onBroadcast.add(cb) }
 
     /** This device's 8-byte mesh node id (== bitchat peerID). MeshRadio puts it
      *  in the advert so two Sonar-Android peers can elect a single dialer. */
@@ -196,6 +205,7 @@ object MeshGatt {
         clientGatt.values.forEach { runCatching { it.disconnect(); it.close() } }
         clientGatt.clear(); clientChar.clear(); clientLinks.clear(); clientPending.clear(); clientConnected.clear()
         serverLinks.clear(); serverDevices.clear(); peerIdByAddr.clear(); recentDials.clear()
+        pendingSends.clear()
     }
 
     private val serverCallback = object : BluetoothGattServerCallback() {
@@ -424,6 +434,20 @@ object MeshGatt {
                     android.util.Log.i(TAG, "no handshake: fromServer=$fromServer gatt=${gatt != null} link=${clientLinks[addr] != null}")
                 }
             }
+            TYPE_MESSAGE -> {
+                // Public broadcast (Mesh channel). Parse the whole packet; dedup
+                // by message id since we may hear it on several links.
+                val pm = runCatching { meshParsePublicMessage(value) }.getOrNull() ?: return
+                if (seenBroadcastIds.add("${pm.senderIdHex}-${pm.timestampMs}")) {
+                    if (seenBroadcastIds.size > 1024) seenBroadcastIds.clear()
+                    android.util.Log.i(TAG, "rx broadcast from ${pm.senderIdHex}: ${pm.content.take(40)}")
+                    onBroadcast.forEach { it(pm) }
+                    // Multi-hop: flood the packet onward so the mesh extends past
+                    // our direct neighbours (this is how a message crosses A↔relay↔B
+                    // when A and B aren't directly connected).
+                    relayPacket(value, addr)
+                }
+            }
             TYPE_NOISE_HANDSHAKE -> handleHandshake(addr, info.payload, fromServer, device, gatt)
             TYPE_NOISE_ENCRYPTED -> handleEncrypted(addr, info.payload, fromServer)
             TYPE_SONAR_0X53 -> {
@@ -497,9 +521,13 @@ object MeshGatt {
     private fun handshakePacket(peerIdHex: String, noiseMsg: ByteArray): ByteArray =
         meshBuildPacket(TYPE_NOISE_HANDSHAKE, myPeerIdHex, peerIdHex, DEFAULT_TTL, System.currentTimeMillis().toULong(), noiseMsg)
 
-    private fun linkEstablished(peerId: String) {
-        android.util.Log.i(TAG, "✅ Noise link ESTABLISHED with $peerId (peerId=${peerIdByAddr[peerId]})")
-        onLink.forEach { it(peerId) }
+    private fun linkEstablished(addr: String) {
+        // NB: callers pass the BLE address; resolve the stable peerID so listeners
+        // (and the pending-send flush) key by peerID, not the rotating address.
+        val pid = peerIdByAddr[addr] ?: addr
+        android.util.Log.i(TAG, "✅ Noise link ESTABLISHED with $addr (peerId=$pid)")
+        onLink.forEach { it(pid) }
+        flushPending(pid)
     }
 
     /** Send an encrypted DM to an established peer (private message TLV inside). */
@@ -518,21 +546,89 @@ object MeshGatt {
         }
     }.getOrDefault(false)
 
-    /** Send a DM addressed by the peer's stable bitchat peerID (the radar/UI key).
-     *  Resolves it to whichever BLE address currently holds an established Noise
-     *  link to that peer (links are keyed by the rotating BLE address). Returns
-     *  false if no live encrypted link exists yet — the caller surfaces that. */
-    fun sendTextToPeer(peerId: String, messageId: String, text: String): Boolean {
-        val addr = peerIdByAddr.entries.firstOrNull { (a, pid) ->
+    /** DMs queued for a peer that has no live link yet, flushed when one forms.
+     *  Mesh links are intermittent (BLE MAC rotation + scanner stalls), so a peer
+     *  can be visible on the radar without a live encrypted link this instant —
+     *  queue the message instead of failing, and deliver it on (re)connect. */
+    private val pendingSends = ConcurrentHashMap<String, java.util.concurrent.ConcurrentLinkedQueue<Pair<String, String>>>()
+
+    private fun establishedAddrFor(peerId: String): String? =
+        peerIdByAddr.entries.firstOrNull { (a, pid) ->
             pid == peerId &&
                 ((clientLinks[a]?.established == true) || (serverLinks[a]?.established == true))
-        }?.key ?: return false
-        return sendText(addr, messageId, text)
+        }?.key
+
+    /** Send a DM addressed by the peer's stable bitchat peerID (the radar/UI key).
+     *  Sends immediately over a live Noise link, else QUEUES it to deliver when a
+     *  link (re)establishes. Always returns true — the message is accepted (the
+     *  UI echoes it optimistically); "false" used to surface a scary "not
+     *  connected" toast even though the peer was right there. */
+    fun sendTextToPeer(peerId: String, messageId: String, text: String): Boolean {
+        val addr = establishedAddrFor(peerId)
+        if (addr != null) return sendText(addr, messageId, text)
+        pendingSends.getOrPut(peerId) { java.util.concurrent.ConcurrentLinkedQueue() }.add(messageId to text)
+        return true
+    }
+
+    /** Flush any queued DMs to [peerId] now that an encrypted link is up. */
+    private fun flushPending(peerId: String) {
+        val q = pendingSends[peerId] ?: return
+        val addr = establishedAddrFor(peerId) ?: return
+        while (true) {
+            val (mid, txt) = q.poll() ?: break
+            sendText(addr, mid, txt)
+        }
     }
 
     /** True iff there is an established encrypted link to [peerId] right now. */
     fun hasLink(peerId: String): Boolean = peerIdByAddr.entries.any { (a, pid) ->
         pid == peerId && ((clientLinks[a]?.established == true) || (serverLinks[a]?.established == true))
+    }
+
+    /** True iff [addr] is currently linked (dialed, dialing, or accepted as a
+     *  server) — used by the scanner to decide whether a re-sighting should
+     *  trigger a recovery re-dial. Covers a live client GATT, an in-flight dial,
+     *  and an inbound server connection so we don't pile redundant links on a
+     *  peer we already reach. */
+    fun isLinkedAddr(addr: String): Boolean =
+        clientGatt.containsKey(addr) || clientPending.contains(addr) || serverDevices.containsKey(addr)
+
+    /** Broadcast a PUBLIC message (the BLE "Mesh" channel) to every connected mesh
+     *  peer — raw UTF-8 content + Ed25519-signed (type 0x02, no recipient), exactly
+     *  like a bitchat public message (BLEService payload = Data(content.utf8)).
+     *  Returns false if no peer is connected. */
+    fun broadcastPublic(text: String): Boolean = runCatching {
+        val ts = System.currentTimeMillis().toULong()
+        val packet = meshBuildPublicMessage(ed25519SeedHex, myPeerIdHex, text, DEFAULT_TTL, ts)
+        seenBroadcastIds.add("$myPeerIdHex-$ts") // skip our own echo if it loops back
+        var peers = 0
+        clientGatt.forEach { (addr, gatt) ->
+            clientChar[addr]?.let { ch -> writePacket(gatt, ch, packet); peers++ }
+        }
+        serverDevices.forEach { (_, device) -> notify(device, packet); peers++ }
+        android.util.Log.i(TAG, "broadcast '${text.take(40)}' to $peers peer(s)")
+        peers > 0
+    }.getOrDefault(false)
+
+    /** Number of mesh peers we can currently reach with a broadcast. */
+    fun connectedPeerCount(): Int = (clientChar.keys + serverDevices.keys).size
+
+    /** Flood a received broadcast packet onward (TTL gossip), so messages cross
+     *  the mesh past our direct neighbours. TTL lives at header byte 2 and is NOT
+     *  part of the signature (it's signed as 0), so decrementing it is safe.
+     *  [fromAddr] is excluded so we don't echo it straight back. */
+    private fun relayPacket(packet: ByteArray, fromAddr: String) {
+        if (packet.size < 3) return
+        val ttl = packet[2].toInt() and 0xFF
+        if (ttl <= 1) return // would reach 0 — drop
+        val relayed = packet.copyOf()
+        relayed[2] = (ttl - 1).toByte()
+        clientGatt.forEach { (addr, gatt) ->
+            if (addr != fromAddr) clientChar[addr]?.let { ch -> writePacket(gatt, ch, relayed) }
+        }
+        serverDevices.forEach { (addr, device) ->
+            if (addr != fromAddr) notify(device, relayed)
+        }
     }
 
     /** Broadcast our Sonar Discovery (0x53) payload to an established peer. */

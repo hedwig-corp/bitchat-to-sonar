@@ -30,6 +30,9 @@ sealed interface Screen {
     data class GeoDm(val geohash: String, val peerHex: String, val name: String) : Screen
 }
 
+/** A BLE-mesh DM conversation row for the home Messages list. */
+data class MeshDmRow(val peerId: String, val name: String, val preview: String, val tsSecs: Long)
+
 /** Verify-sheet model: the safety groups (empty ⇒ show [note]) + verified flag. */
 data class SonarVerify(val safety: List<String>, val verified: Boolean, val note: String?)
 
@@ -79,6 +82,15 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  don't live in the Rust core (that's Marmot/Nostr) — they ride the Noise
      *  link, so the app holds them. Chat id on the nav stack is "mesh:<peerId>". */
     private var meshChats = mutableMapOf<String, List<SonarMsg>>()
+    /** Mesh DM conversations shown in the home "Messages" list (observable so the
+     *  list updates when a DM arrives from a peer we haven't opened yet). */
+    var meshDmRows by mutableStateOf<List<MeshDmRow>>(emptyList())
+        private set
+    /** Remembered display names for mesh peers we've chatted with (they can leave
+     *  range, so we can't always re-derive the name from the live radar list). */
+    private val meshChatNames = mutableMapOf<String, String>()
+    /** Public BLE "Mesh" channel transcript (broadcast messages, not Nostr). */
+    private var meshBroadcast = listOf<SonarChannelMsg>()
     var channels by mutableStateOf(SonarCore.joinedChannels())
         private set
     var channelMsgs by mutableStateOf<List<SonarChannelMsg>>(emptyList())
@@ -272,11 +284,21 @@ class SonarAppState(private val scope: CoroutineScope) {
         openChannel(g)
     }
 
+    /** True iff [geohash] is the channel currently on screen. Guards async loads
+     *  so a stale refresh for a channel the user already left can't overwrite the
+     *  visible list (that made different channels look "mixed"). */
+    private fun isOpenChannel(geohash: String) = (screen as? Screen.Channel)?.geohash == geohash
+
     fun openChannel(geohash: String) {
         push(Screen.Channel(geohash))
         channelMsgs = emptyList()
+        // The "mesh" channel is the BLE Bluetooth mesh — NO geohash, NEVER Nostr
+        // (bitchat's .mesh geohash is nil). It's driven by BLE broadcasts, so just
+        // show what we have; new messages arrive via drainMeshBroadcasts().
+        if (geohash == "mesh") { channelMsgs = meshBroadcast; return }
         scope.launch {
-            channelMsgs = MessageStore.loadChannel(geohash) // disk hydrate (off-main), survives restart
+            val disk = MessageStore.loadChannel(geohash) // disk hydrate (off-main), survives restart
+            if (isOpenChannel(geohash)) channelMsgs = disk
             refreshChannel(geohash)
             // Announce our presence right away and pull the current count so the
             // header shows "N here now" without waiting for the next poll tick.
@@ -287,15 +309,27 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /** Fetch the channel from the core, merge with what's on disk, persist. */
     private suspend fun refreshChannel(geohash: String) {
+        if (geohash == "mesh") return // BLE mesh — not a Nostr channel
         val fresh = SonarCore.channelMessages(geohash)
         val merged = MessageMerge.channels(MessageStore.loadChannel(geohash), fresh)
         MessageStore.saveChannel(geohash, merged)
-        channelMsgs = merged
+        // Only touch the visible list if THIS channel is still open.
+        if (isOpenChannel(geohash)) channelMsgs = merged
     }
 
     fun sendChannelMsg(geohash: String, text: String) {
         val t = text.trim()
         if (t.isEmpty()) return
+        // The Bluetooth mesh channel is a BLE broadcast (NOT Nostr): send it to
+        // every connected mesh peer + echo locally. No relay round-trip.
+        if (geohash == "mesh") {
+            val reached = MeshRadio.sendMeshBroadcast(t)
+            val msg = SonarChannelMsg(randomMeshId(), nick.ifBlank { "you" }, "", t, mine = true, MeshRadio.nowSecs())
+            meshBroadcast = (meshBroadcast + msg).takeLast(200)
+            channelMsgs = meshBroadcast
+            if (!reached) toast = "No one in Bluetooth range yet — your message will reach people as they connect."
+            return
+        }
         scope.launch {
             try {
                 SonarCore.sendChannel(geohash, t)
@@ -594,19 +628,28 @@ class SonarAppState(private val scope: CoroutineScope) {
         meshChats[peerId] = meshChats[peerId].orEmpty() + msg
         messages = meshChats[peerId].orEmpty()
         processPayLines(meshChatId(peerId), messages)
+        refreshMeshDmRows()
     }
 
     private fun randomMeshId(): String =
         (0 until 16).joinToString("") { "0123456789abcdef"[kotlin.random.Random.nextInt(16)].toString() }
 
-    /** Drain mesh DMs received since last poll into the per-peer transcripts. */
+    /** Drain mesh DMs received since last poll into the per-peer transcripts,
+     *  surface them as Messages rows, and notify for ones we're not looking at. */
     private fun drainMeshDms() {
         val incoming = MeshRadio.drainMeshDm()
         if (incoming.isEmpty()) return
+        val openChatId = (screen as? Screen.Chat)?.id
+        val notifsOn = prefBool("notifs", true)
         for (m in incoming) {
             val msg = SonarMsg(randomMeshId(), m.peerId, m.text, mine = false, m.tsSecs)
             meshChats[m.peerId] = meshChats[m.peerId].orEmpty() + msg
+            val chatId = meshChatId(m.peerId)
+            if (notifsOn && !foreground && chatId != openChatId) {
+                Notifier.notify(chatId.hashCode(), meshPeerName(m.peerId), notifPreview(m.text))
+            }
         }
+        refreshMeshDmRows()
         // Refresh the open mesh conversation if it's one we just appended to.
         (screen as? Screen.Chat)?.let { sc ->
             if (isMeshChat(sc.id)) {
@@ -617,6 +660,43 @@ class SonarAppState(private val scope: CoroutineScope) {
                 }
             }
         }
+    }
+
+    /** Drain incoming public Mesh-channel broadcasts into the mesh transcript.
+     *  The wire carries sender peerID + content; resolve the display nickname. */
+    private fun drainMeshBroadcasts() {
+        val incoming = MeshRadio.drainMeshBroadcast()
+        if (incoming.isEmpty()) return
+        val seen = meshBroadcast.mapTo(HashSet()) { it.id }
+        val add = incoming
+            .map {
+                val id = "${it.senderId}-${it.tsSecs}"
+                SonarChannelMsg(id, meshPeerName(it.senderId), it.senderId, it.content, mine = false, it.tsSecs)
+            }
+            .filter { it.id !in seen }
+        if (add.isEmpty()) return
+        meshBroadcast = (meshBroadcast + add).sortedBy { it.tsSecs }.takeLast(200)
+        if ((screen as? Screen.Channel)?.geohash == "mesh") channelMsgs = meshBroadcast
+    }
+
+    /** Display name for a mesh peer: prefer the live radar name, else a remembered
+     *  one, else a short id. Remembers whatever it resolves. */
+    private fun meshPeerName(peerId: String): String {
+        val live = meshPeers.firstOrNull { it.id == "mesh:$peerId" }?.name
+        val name = live ?: meshChatNames[peerId] ?: ("mesh·" + peerId.take(6))
+        meshChatNames[peerId] = name
+        return name
+    }
+
+    /** Recompute the observable mesh DM rows (newest conversation first). */
+    private fun refreshMeshDmRows() {
+        meshDmRows = meshChats.entries
+            .filter { it.value.isNotEmpty() }
+            .map { (pid, msgs) ->
+                val last = msgs.last()
+                MeshDmRow(pid, meshPeerName(pid), last.content, last.tsSecs)
+            }
+            .sortedByDescending { it.tsSecs }
     }
 
     private suspend fun refreshChats() {
@@ -640,6 +720,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 (screen as? Screen.Channel)?.let { refreshChannel(it.geohash) }
                 (screen as? Screen.GeoDm)?.let { refreshGeoDm(it.geohash, it.peerHex) }
                 drainMeshDms()
+                drainMeshBroadcasts()
                 meshPeers = MeshRadio.peers()
                 // Sonar Discovery (0x53): keep our announce current for outgoing
                 // links and decode any peers' announces received over the mesh.
