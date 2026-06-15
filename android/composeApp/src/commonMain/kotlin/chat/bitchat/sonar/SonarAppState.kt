@@ -80,6 +80,31 @@ class SonarAppState(private val scope: CoroutineScope) {
             payLedger = SonarPayLedger(); scannedPay.clear(); payVersion++
         }
     }
+    /** Erase every conversation — BLE-mesh DMs, public/channel transcripts and
+     *  White Noise (Marmot) secure chats — WITHOUT logging the user out. The
+     *  identity (npub/nsec), nickname, onboarding and wallet are preserved; only
+     *  message history is removed. Use this to start fresh (e.g. drop a broken
+     *  Marmot group) without re-running onboarding. Mirrors iOS `eraseAllChats`. */
+    fun eraseAllChats() {
+        scope.launch {
+            // Local transcripts on disk (mesh DMs, channels, geo DMs).
+            MessageStore.wipe()
+            // In-memory conversation state.
+            meshChats.clear(); meshChatNames.clear(); pendingMarmotSends.clear()
+            meshBroadcast = emptyList(); meshDmRows = emptyList()
+            messages = emptyList(); channelMsgs = emptyList(); chats = emptyList()
+            lastWnGroups = -1; lastWnMsgs = -1
+            // ⚡PAY coins live inside the erased chats — reset the ledger. The
+            // Lightning wallet seed/balance is separate and is NOT touched.
+            payLedger = SonarPayLedger(); persistPay(); scannedPay.clear(); payVersion++
+            // White Noise / Marmot DB: wipe + reconnect with the SAME identity.
+            runCatching { SonarCore.eraseChats() }
+            refreshChats()
+            stack = listOf(Screen.Home)
+            toast = "All chats erased"
+        }
+    }
+
     var messages by mutableStateOf<List<SonarMsg>>(emptyList())
         private set
     /** In-memory BLE-mesh DM transcripts, keyed by bitchat peerID. Mesh chats
@@ -540,7 +565,6 @@ class SonarAppState(private val scope: CoroutineScope) {
         scope.launch {
             try {
                 npub = SonarCore.start()
-                android.util.Log.i("SonarNpub", "my npub=$npub")
                 started = true
                 // Publish our kind-0 profile so peers see our nickname, not npub.
                 launch { runCatching { SonarCore.publishProfile(nick) } }

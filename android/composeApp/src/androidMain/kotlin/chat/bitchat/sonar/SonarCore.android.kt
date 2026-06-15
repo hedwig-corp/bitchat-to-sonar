@@ -214,6 +214,21 @@ actual object SonarCore {
         }
     }
 
+    actual suspend fun eraseChats() {
+        withContext(Dispatchers.IO) {
+            lock.withLock {
+                node = null
+                // Delete ONLY the encrypted Marmot DB — keep nsec, the DB key,
+                // nickname and every pref. start() (below) reopens a fresh empty
+                // DB with the SAME identity + key.
+                File(ctx.filesDir, "sonar-marmot").deleteRecursively()
+            }
+        }
+        // Reconnect with the same identity and republish our KeyPackage so peers
+        // can still start new secure chats with us.
+        start()
+    }
+
     private fun requireNode(): SonarNode =
         node ?: error("SonarCore not started — call start() first")
 

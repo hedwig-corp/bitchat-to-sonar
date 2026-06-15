@@ -317,7 +317,15 @@ impl MarmotEngine {
     /// Decrypted message history for a group (storage-backed).
     pub fn messages(&self, group_id: &GroupId) -> Result<Vec<ChatMessage>> {
         let msgs = dispatch!(&self.storage, |mdk| mdk.get_messages(group_id, None))?;
-        Ok(msgs.into_iter().map(|m| self.to_chat_message(m)).collect())
+        Ok(msgs
+            .into_iter()
+            // Only surface real chat messages (kind-9). MDK's store ALSO keeps
+            // non-chat entries (group-membership / commit / proposal / reaction
+            // kinds) which carry no chat text — without this filter they render
+            // as empty message bubbles in the UI.
+            .filter(|m| m.kind.as_u16() == CHAT_RUMOR_KIND)
+            .map(|m| self.to_chat_message(m))
+            .collect())
     }
 
     /// Members of a group.

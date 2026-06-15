@@ -1891,7 +1891,24 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
     
     
     // MARK: - Emergency Functions
-    
+
+    /// Erase every conversation — mesh DMs, public/channel timelines, and the
+    /// on-disk MessageStore — WITHOUT touching identity, keys, favorites or the
+    /// nickname. The user stays logged in with the same peer ID; only the
+    /// message history is gone. (Contrast with panicClearAllData(), which also
+    /// destroys the identity.)
+    @MainActor
+    func clearAllConversations() {
+        messages.removeAll()
+        timelineStore.clearAll()
+        privateChatManager.privateChats.removeAll()
+        privateChatManager.unreadMessages.removeAll()
+        // Erase the on-disk message store: persisted mesh DMs and channel
+        // transcripts are local-only on-device, so they must go too.
+        MessageStore.shared.wipeAll()
+        objectWillChange.send()
+    }
+
     // PANIC: Emergency data clearing for activist safety
     @MainActor
     func panicClearAllData() {

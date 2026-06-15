@@ -266,6 +266,42 @@ impl SonarClient {
         Ok(())
     }
 
+    /// Fetch ALL of `author`'s KeyPackage events from the relays (a peer may have
+    /// several under different `d` tags — e.g. multiple devices, or a stale slot
+    /// from an old install). Newest first.
+    pub async fn fetch_all_key_packages(&self, author: PublicKey) -> Result<Vec<Event>> {
+        let filter = Filter::new()
+            .kind(Kind::Custom(KEY_PACKAGE_KIND))
+            .author(author);
+        let mut events: Vec<Event> = self
+            .nostr
+            .fetch_events(filter, FETCH_TIMEOUT)
+            .await?
+            .into_iter()
+            .collect();
+        events.sort_by_key(|e| std::cmp::Reverse(e.created_at));
+        Ok(events)
+    }
+
+    /// Create a 1:1 group inviting the holder of a SPECIFIC KeyPackage event and
+    /// deliver the welcome. Used to invite via a chosen KeyPackage when a peer has
+    /// several (the newest may be a stale slot the peer no longer holds the key
+    /// material for, which the recipient rejects as "unknown key package").
+    pub async fn start_dm_with_key_package(
+        &self,
+        key_package: Event,
+        name: &str,
+    ) -> Result<GroupId> {
+        let creation = self
+            .engine
+            .create_group(name, vec![key_package], self.relays.clone())?;
+        for (member, rumor) in creation.welcomes {
+            let wrapped = self.engine.gift_wrap_welcome(&member, rumor).await?;
+            self.nostr.send_event(&wrapped).await?;
+        }
+        Ok(creation.group.mls_group_id)
+    }
+
     /// Fetch the freshest KeyPackage event for `author` from the relays.
     pub async fn fetch_key_package(&self, author: PublicKey) -> Result<Event> {
         let filter = Filter::new()

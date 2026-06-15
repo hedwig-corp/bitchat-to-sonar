@@ -45,55 +45,80 @@ final class MarmotChatModel: ObservableObject {
 
     /// Connect on first appearance: reuse the keychain identity if present,
     /// otherwise generate one and persist it. Publishes our KeyPackage so
-    /// White Noise users can start chats with us.
+    /// White Noise users can start chats with us. Lazy + idempotent: no-op once
+    /// connected (npub set) or while a connect is already in flight (busy).
     func connectIfNeeded() {
         guard npub == nil, !busy else { return }
         busy = true
         Task {
             defer { busy = false }
-            // Read the persisted nsec SAFELY: only a genuine .itemNotFound means
-            // "no identity yet" (→ generate). On a transient read failure (e.g.
-            // device LOCKED during a background BLE wake) do NOT generate — that
-            // would overwrite the existing nsec and orphan its derived wallet +
-            // chat DB forever. Defer instead; setup retries once accessible (#13).
-            let storedNsec: String?
-            switch keychain.getIdentityKeyWithResult(forKey: Self.nsecKeychainKey) {
-            case .success(let data):
-                storedNsec = String(data: data, encoding: .utf8)
-                // Migration: re-save to upgrade a legacy WhenUnlocked item to
-                // AfterFirstUnlockThisDeviceOnly (this read just succeeded).
-                if let s = storedNsec { _ = keychain.saveIdentityKey(Data(s.utf8), forKey: Self.nsecKeychainKey) }
-            case .itemNotFound:
-                storedNsec = nil
-            case .accessDenied, .deviceLocked, .authenticationFailed, .otherError:
-                SecureLogger.warning("⚠️ marmot-nsec not readable yet (device locked?) — deferring identity", category: .session)
-                return
-            }
-            // 1) Publish our npub IMMEDIATELY — the identity pubkey is offline-
-            //    derivable, so Sonar discovery (0x53) can advertise it without
-            //    waiting on (or being blocked by) the relay connect. Persist a
-            //    freshly-generated nsec so `connect` below reuses the same identity.
-            if let np = try? await service.loadIdentityNpub(nsec: storedNsec) {
-                if storedNsec == nil, let fresh = await service.exportNsec() {
-                    _ = keychain.saveIdentityKey(Data(fresh.utf8), forKey: Self.nsecKeychainKey)
-                }
-                self.npub = np
-            }
-            // 2) Connect (opens the encrypted DB) → load the LOCAL chats right away
-            //    (they don't need the relays) → then publish our KeyPackage. A relay
-            //    publish failure must NOT hide already-persisted chats — that was
-            //    the "chats vanish on restart, reappear on the next launch" bug.
-            do {
-                _ = try await service.connect(nsec: storedNsec)
-                await refresh()
-                self.errorText = nil
-                try await service.publishKeyPackage()
-            } catch {
-                let desc = Self.describe(error)
-                SecureLogger.warning("⚠️ Marmot connect/publish failed: \(desc)", category: .session)
-                self.errorText = desc
-            }
+            await performConnect()
         }
+    }
+
+    /// The actual connect sequence (awaitable, NOT guarded). Reuse the keychain
+    /// identity, open the encrypted DB, load local chats, publish our KeyPackage.
+    /// Used by the lazy `connectIfNeeded()` and the erase-and-reconnect path —
+    /// the latter must NOT be blocked by the `busy`/`npub` guard, which would
+    /// silently leave the node disconnected ("not connected yet" until restart).
+    private func performConnect() async {
+        // Read the persisted nsec SAFELY: only a genuine .itemNotFound means
+        // "no identity yet" (→ generate). On a transient read failure (e.g.
+        // device LOCKED during a background BLE wake) do NOT generate — that
+        // would overwrite the existing nsec and orphan its derived wallet +
+        // chat DB forever. Defer instead; setup retries once accessible (#13).
+        let storedNsec: String?
+        switch keychain.getIdentityKeyWithResult(forKey: Self.nsecKeychainKey) {
+        case .success(let data):
+            storedNsec = String(data: data, encoding: .utf8)
+            // Migration: re-save to upgrade a legacy WhenUnlocked item to
+            // AfterFirstUnlockThisDeviceOnly (this read just succeeded).
+            if let s = storedNsec { _ = keychain.saveIdentityKey(Data(s.utf8), forKey: Self.nsecKeychainKey) }
+        case .itemNotFound:
+            storedNsec = nil
+        case .accessDenied, .deviceLocked, .authenticationFailed, .otherError:
+            SecureLogger.warning("⚠️ marmot-nsec not readable yet (device locked?) — deferring identity", category: .session)
+            return
+        }
+        // 1) Publish our npub IMMEDIATELY — the identity pubkey is offline-
+        //    derivable, so Sonar discovery (0x53) can advertise it without
+        //    waiting on (or being blocked by) the relay connect. Persist a
+        //    freshly-generated nsec so `connect` below reuses the same identity.
+        if let np = try? await service.loadIdentityNpub(nsec: storedNsec) {
+            if storedNsec == nil, let fresh = await service.exportNsec() {
+                _ = keychain.saveIdentityKey(Data(fresh.utf8), forKey: Self.nsecKeychainKey)
+            }
+            self.npub = np
+        }
+        // 2) Connect (opens the encrypted DB) → load the LOCAL chats right away
+        //    (they don't need the relays) → then publish our KeyPackage. A relay
+        //    publish failure must NOT hide already-persisted chats — that was
+        //    the "chats vanish on restart, reappear on the next launch" bug.
+        do {
+            _ = try await service.connect(nsec: storedNsec)
+            await refresh()
+            self.errorText = nil
+            try await service.publishKeyPackage()
+        } catch {
+            let desc = Self.describe(error)
+            SecureLogger.warning("⚠️ Marmot connect/publish failed: \(desc)", category: .session)
+            self.errorText = desc
+        }
+    }
+
+    /// Await until the Marmot node is connected (or a short timeout), kicking
+    /// off a connect if none is in flight. Lets start/send wait through the
+    /// reconnect window (e.g. right after "erase all chats" or a cold launch)
+    /// instead of immediately surfacing "not connected yet".
+    func ensureConnected(timeoutSeconds: Double = 10) async -> Bool {
+        if await service.isConnected() { return true }
+        if !busy { connectIfNeeded() }
+        let start = Date()
+        while Date().timeIntervalSince(start) < timeoutSeconds {
+            if await service.isConnected() { return true }
+            try? await Task.sleep(nanoseconds: 250_000_000)
+        }
+        return await service.isConnected()
     }
 
     func refresh() async {
@@ -176,10 +201,14 @@ final class MarmotChatModel: ObservableObject {
 
     func startChat(with peer: String) {
         let trimmed = peer.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, !busy else { return }
-        busy = true
+        guard !trimmed.isEmpty else { return }
         Task {
-            defer { busy = false }
+            // Wait through the connect/reconnect window (post-erase or cold
+            // launch) so a fresh chat doesn't fail with "not connected yet".
+            guard await ensureConnected() else {
+                self.errorText = "Not connected yet — try again in a moment."
+                return
+            }
             do {
                 _ = try await service.startDirectMessage(with: trimmed, name: "")
                 await refresh()
@@ -206,6 +235,11 @@ final class MarmotChatModel: ObservableObject {
         messagesByGroup[groupId, default: []].append(echo)
         Task {
             do {
+                // Wait through the connect/reconnect window so a send right after
+                // erase / cold launch doesn't fail with "not connected yet".
+                guard await ensureConnected() else {
+                    throw MarmotService.ServiceError.notConnected
+                }
                 try await service.sendText(groupId: groupId, text: trimmed)
                 await refresh()
             } catch {
@@ -244,6 +278,31 @@ final class MarmotChatModel: ObservableObject {
         groups = []
         messagesByGroup = [:]
         pendingOptimistic = [:]
+    }
+
+    /// Erase every White Noise / Marmot chat but KEEP the identity: wipe the
+    /// encrypted DB (which preserves `marmot-nsec`, deleting only the DB and
+    /// its SQLCipher key), then reconnect with the same nsec so a fresh, empty
+    /// store is opened and our KeyPackage is republished — new secure chats
+    /// keep working. Used by "erase all chats" (not the full panic wipe).
+    func eraseChatsKeepIdentity() async {
+        let wasPolling = syncTask != nil
+        stopPolling()
+        await service.wipeDatabase()
+        npub = nil
+        groups = []
+        messagesByGroup = [:]
+        pendingOptimistic = [:]
+        profilesByNpub = [:]
+        profileFetches = []
+        errorText = nil
+        // Reopen a fresh DB with the SAME identity and republish our KeyPackage.
+        // Await a FORCED reconnect (not `connectIfNeeded()`, whose busy/npub
+        // guard could silently skip it and leave the node "not connected yet").
+        busy = true
+        await performConnect()
+        busy = false
+        if wasPolling { startPolling() }
     }
 
     /// Short label for a 1:1 group: the other member's npub prefix.

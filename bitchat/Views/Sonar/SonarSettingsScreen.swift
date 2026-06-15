@@ -19,6 +19,7 @@ struct SonarSettingsScreen: View {
 
     @State private var connSheet = false
     @State private var wipeAsk = false
+    @State private var eraseAsk = false
     @State private var walletSheet = false
     @State private var currencySheet = false
 
@@ -90,6 +91,12 @@ struct SonarSettingsScreen: View {
                             store.push(.nearby)
                         }
                         SNSettingsRow(
+                            icon: .trash, tone: .cyan, label: "Erase all chats",
+                            sub: "Clears conversations — keeps your identity"
+                        ) {
+                            eraseAsk = true
+                        }
+                        SNSettingsRow(
                             icon: .trash, tone: .red, label: "Emergency wipe",
                             sub: "Deletes your key, chats and nickname",
                             danger: true, divider: false
@@ -115,6 +122,15 @@ struct SonarSettingsScreen: View {
         .background(SonarTheme.bg.ignoresSafeArea())
         .snSheet(isPresented: $connSheet, title: "Connection") {
             SNConnectivitySheetContent(onClose: { connSheet = false })
+        }
+        .snSheet(isPresented: $eraseAsk, title: "Erase all chats") {
+            SNEraseChatsSheetContent(
+                onErase: {
+                    eraseAsk = false
+                    store.eraseAllChats()
+                },
+                onClose: { eraseAsk = false }
+            )
         }
         .snSheet(isPresented: $wipeAsk, title: "Emergency wipe") {
             SNWipeSheetContent(

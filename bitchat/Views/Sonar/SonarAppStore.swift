@@ -1653,6 +1653,31 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
+    // MARK: Erase all chats (keep identity)
+
+    /// Delete every conversation — mesh DMs, public/channel transcripts and
+    /// White Noise (Marmot) secure chats — WITHOUT logging the user out. The
+    /// Noise/Nostr/Marmot identities, nickname, favorites, onboarding and the
+    /// Lightning wallet are preserved; only message history is erased. Use this
+    /// to start fresh (e.g. to drop a broken Marmot group) without re-running
+    /// onboarding. Contrast with `wipe()`, which destroys everything.
+    func eraseAllChats() {
+        path = []
+        // Mesh DMs + public/channel transcripts (in-memory + on-disk store).
+        chatViewModel.clearAllConversations()
+        // White Noise / Marmot groups: wipe the encrypted DB then reconnect
+        // with the SAME identity so new secure chats still work.
+        Task { await marmot.eraseChatsKeepIdentity() }
+        // Drop queued sends + pay-scan state that referenced the erased chats.
+        pendingMarmotSends = [:]
+        scannedPayMessageIDs = []
+        pendingPayPeer = nil
+        // ⚡PAY coins live inside the erased chats — clear the ledger too. The
+        // Lightning wallet seed/balance is separate and is NOT touched.
+        payLedger.wipe()
+        objectWillChange.send()
+    }
+
     // MARK: Emergency wipe (the real panic path)
 
     func wipe() {

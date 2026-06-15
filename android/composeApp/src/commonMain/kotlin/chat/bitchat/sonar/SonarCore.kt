@@ -135,4 +135,10 @@ expect object SonarCore {
 
     /** Wipe all on-device data (identity, chats, prefs). */
     suspend fun wipe()
+
+    /** Erase the White Noise (Marmot) chats but KEEP the identity: delete the
+     *  encrypted SQLCipher DB only (nsec, DB key, nickname and prefs survive),
+     *  then reconnect with the same identity so new secure chats still work and
+     *  our KeyPackage is republished. Used by "erase all chats" (not full wipe). */
+    suspend fun eraseChats()
 }

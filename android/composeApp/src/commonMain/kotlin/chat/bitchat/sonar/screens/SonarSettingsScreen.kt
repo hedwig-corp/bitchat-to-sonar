@@ -57,6 +57,7 @@ import chat.bitchat.sonar.ui.sonar
 fun SonarSettingsScreen(state: SonarAppState) {
     val s = sonar
     var wipeAsk by remember { mutableStateOf(false) }
+    var eraseAsk by remember { mutableStateOf(false) }
     var currencyPick by remember { mutableStateOf(false) }
     var notif by remember { mutableStateOf(false) }
     var appicon by remember { mutableStateOf(false) }
@@ -155,6 +156,10 @@ fun SonarSettingsScreen(state: SonarAppState) {
                     value = state.verifiedCount().toString(),
                 ) { state.push(Screen.Nearby) }
                 SNSettingsRow(
+                    icon = SNIconName.Trash, tone = SNTone.Cyan, label = "Erase all chats",
+                    sub = "Clears conversations — keeps your identity",
+                ) { eraseAsk = true }
+                SNSettingsRow(
                     icon = SNIconName.Trash, tone = SNTone.Red, label = "Emergency wipe",
                     sub = "Deletes your key, chats and nickname",
                     danger = true, trail = SNTrail.None, divider = false,
@@ -190,6 +195,7 @@ fun SonarSettingsScreen(state: SonarAppState) {
     }
 
     if (wipeAsk) WipeSheet(onWipe = { wipeAsk = false; state.wipe() }, onClose = { wipeAsk = false })
+    if (eraseAsk) EraseChatsSheet(onErase = { eraseAsk = false; state.eraseAllChats() }, onClose = { eraseAsk = false })
     if (currencyPick) CurrencySheet(
         selected = state.currency,
         onPick = { state.selectCurrency(it); currencyPick = false },
@@ -289,6 +295,32 @@ private fun Sheet(title: String, onClose: () -> Unit, content: @Composable () ->
                 Spacer(Modifier.height(10.dp))
                 Box(Modifier.fillMaxWidth().height(44.dp).clickable(onClick = onClose), contentAlignment = Alignment.Center) {
                     Text("Done", color = s.text2, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun EraseChatsSheet(onErase: () -> Unit, onClose: () -> Unit) {
+    val s = sonar
+    Box(
+        Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
+        contentAlignment = Alignment.BottomCenter
+    ) {
+        androidx.compose.material3.Surface(color = s.surface, shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)) {
+            Column(Modifier.fillMaxWidth().padding(20.dp)) {
+                Text("Erase all chats", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    "This deletes every conversation from this phone — Bluetooth chats and White Noise secure chats. Your identity, nickname and wallet stay, so you can start fresh without setting up again.",
+                    color = s.text2, fontSize = 13.5.sp, lineHeight = 18.sp
+                )
+                Spacer(Modifier.height(16.dp))
+                SNPrimaryButton("Erase all chats", net = false) { onErase() }
+                Spacer(Modifier.height(8.dp))
+                Box(Modifier.fillMaxWidth().height(44.dp).clickable(onClick = onClose), contentAlignment = Alignment.Center) {
+                    Text("Cancel", color = s.text2, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
                 }
             }
         }

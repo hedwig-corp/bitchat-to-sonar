@@ -1197,6 +1197,29 @@ struct SNCurrencyPickerContent: View {
     }
 }
 
+/// Confirmation for "Erase all chats" — clears conversations but keeps the
+/// identity (unlike the full Emergency wipe).
+struct SNEraseChatsSheetContent: View {
+    let onErase: () -> Void
+    let onClose: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Text("This deletes every conversation from this phone — Bluetooth chats and White Noise secure chats. Your identity, nickname and wallet stay, so you can start fresh without setting up again.")
+                .font(SonarTheme.uiFont(size: 13.5))
+                .lineSpacing(13.5 * 0.3)
+                .foregroundColor(SonarTheme.text2)
+                .multilineTextAlignment(.center)
+                .padding(EdgeInsets(top: 8, leading: 14, bottom: 2, trailing: 14))
+            VStack(spacing: 6) {
+                SNPrimaryButton(label: "Erase all chats", danger: true, action: onErase)
+                SNGhostButton(label: "Cancel", action: onClose)
+            }
+            .padding(EdgeInsets(top: 6, leading: 8, bottom: 0, trailing: 8))
+        }
+    }
+}
+
 struct SNWipeSheetContent: View {
     let onWipe: () -> Void
     let onClose: () -> Void

@@ -146,6 +146,12 @@ final class MarmotService: @unchecked Sendable {
         await runNonThrowing { $0.identity?.npub() }
     }
 
+    /// True once `connect` has opened the node (relays + encrypted DB). False
+    /// before the first connect and during a reconnect (e.g. after erase).
+    func isConnected() async -> Bool {
+        await runNonThrowing { $0.node != nil }
+    }
+
     /// `nsec1...` backup export of the connected identity (nil before `connect`).
     /// Handle with care; intended for user-driven backup only.
     func exportNsec() async -> String? {
