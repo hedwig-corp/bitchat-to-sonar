@@ -1383,6 +1383,30 @@ final class SonarAppStore: ObservableObject {
         marmot.sendMedia(groupId: gid, data: data, filename: filename, mime: mime)
     }
 
+    /// Send a recorded voice note (AAC .m4a at `url`). Over the BLE mesh it rides
+    /// bitchat's file transfer as a `[voice]` note (interops with stock bitchat);
+    /// otherwise it's encrypted + uploaded over White Noise (Marmot) like any
+    /// media. Same routing as `sendImage`, audio mime. Cleans up the temp file.
+    func sendVoiceNote(_ id: String, url: URL) {
+        defer { try? FileManager.default.removeItem(at: url) }
+        if meshReachable(id) {
+            chatViewModel.selectedPrivateChatPeer = PeerID(str: id)
+            chatViewModel.sendVoiceNote(at: url)
+            return
+        }
+        guard let data = try? Data(contentsOf: url) else { return }
+        let groupId: String?
+        if let gid = marmotGroupId(id) {
+            groupId = gid
+        } else if let profile = resolvedSonarProfile(id) {
+            groupId = marmotGroup(forNpub: profile.npub)?.id
+        } else {
+            groupId = nil
+        }
+        guard let gid = groupId else { return }
+        marmot.sendMedia(groupId: gid, data: data, filename: url.lastPathComponent, mime: "audio/mp4")
+    }
+
     /// Send an image over the BLE mesh by reusing ChatViewModel's bitchat file
     /// path (saves outgoing, echoes "[image] <name>", sends `sendFilePrivate`).
     private func sendImageOverMesh(_ peerID: PeerID, data: Data) {

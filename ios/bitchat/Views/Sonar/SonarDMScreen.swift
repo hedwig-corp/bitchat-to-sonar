@@ -86,7 +86,8 @@ struct SonarDMScreen: View {
                 onPlus: { sheet = true },
                 onCommand: { cmd in
                     store.onCommand(.init(type: .dm, id: peerId, target: peer.name), cmd)
-                }
+                },
+                onVoice: { store.sendVoiceNote(peerId, url: $0) }
             )
         }
         .background(SonarTheme.bg.ignoresSafeArea())

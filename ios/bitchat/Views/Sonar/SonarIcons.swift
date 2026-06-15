@@ -19,7 +19,7 @@ enum SNIconName: String {
     case back, chevron, lock, plus, send, search, pin, people, mesh, globe
     case check, shield, shieldCheck, x, smile, navArrow, dice, slash, rings
     case pencil, key, inbox, arrowOut, faceid, drive, data, list, moon, bell
-    case trash, info, compose, coin, bolt
+    case trash, info, compose, coin, bolt, mic
 }
 
 private enum SNIconElement {
@@ -111,6 +111,11 @@ private let snIconTable: [SNIconName: [SNIconElement]] = [
     .trash: [
         .path("M5 7h14M10 7V5.6A1.6 1.6 0 0 1 11.6 4h.8A1.6 1.6 0 0 1 14 5.6V7"),
         .path("M7 7l.8 12a1.8 1.8 0 0 0 1.8 1.7h4.8a1.8 1.8 0 0 0 1.8-1.7L17 7"),
+    ],
+    // design icons.jsx `mic`: a rounded mic body + the stand/arc.
+    .mic: [
+        .rect(9.2, 3.4, 5.6, 11, 2.8),
+        .path("M5.8 11.5a6.2 6.2 0 0 0 12.4 0M12 17.7V20.4M9 20.6h6"),
     ],
     .info: [
         .circle(12, 12, 8.2, filled: false),

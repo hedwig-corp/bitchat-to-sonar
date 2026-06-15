@@ -13,6 +13,7 @@
 import SwiftUI
 #if os(iOS)
 import UIKit
+import AVFoundation
 #else
 import AppKit
 #endif
@@ -776,6 +777,8 @@ struct SNMediaBubble: View {
                         }
                     }
             }
+        } else if let item, item.mime.hasPrefix("audio/") {
+            SNAudioBubble(bytes: bytes, seed: item.filename, mine: m.mine, via: m.via ?? .mesh)
         } else if let item {
             HStack(spacing: 10) {
                 RoundedRectangle(cornerRadius: 8)
@@ -800,14 +803,130 @@ struct SNMediaBubble: View {
     }
 }
 
+/// Audio / voice-note bubble (design: MediaBubble `media-audio` — play button +
+/// `MediaWave` + duration). Plays the decrypted bytes via AVAudioPlayer.
+/// Deviation: the flat play triangle uses an SF Symbol (`play.fill`/`pause.fill`),
+/// the platform idiom for a media transport control.
+struct SNAudioBubble: View {
+    let bytes: Data?
+    let seed: String
+    let mine: Bool
+    var via: SNVia = .mesh
+
+    #if os(iOS)
+    @StateObject private var player = SNAudioPlayer()
+    #endif
+
+    private var tint: Color { via == .internet ? SonarTheme.netFill : SonarTheme.accentFill }
+
+    var body: some View {
+        HStack(spacing: 11) {
+            Button {
+                #if os(iOS)
+                player.toggle(bytes)
+                #endif
+            } label: {
+                Circle().fill(mine ? tint : SonarTheme.surface)
+                    .frame(width: 34, height: 34)
+                    .overlay(
+                        Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+                            .font(.system(size: 13, weight: .bold))
+                            .foregroundColor(mine ? (via == .internet ? SonarTheme.onNet : SonarTheme.onAccent) : SonarTheme.accent)
+                    )
+            }
+            .buttonStyle(SNScaleStyle(scale: 0.92))
+            SNMediaWave(seed: seed).frame(width: 124, height: 22)
+            Text(verbatim: durationText)
+                .font(SonarTheme.monoFont(size: 11.5))
+                .foregroundColor(SonarTheme.text3)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .background(RoundedRectangle(cornerRadius: 18).fill(mine ? tint.opacity(0.15) : SonarTheme.surface2))
+    }
+
+    private var isPlaying: Bool {
+        #if os(iOS)
+        return player.playing
+        #else
+        return false
+        #endif
+    }
+    private var durationText: String {
+        #if os(iOS)
+        return snFmtDur(Int(player.duration.rounded()))
+        #else
+        return "0:00"
+        #endif
+    }
+}
+
+/// Static waveform (design: `MediaWave` — deterministic hash bars).
+struct SNMediaWave: View {
+    let seed: String
+    private func bars() -> [CGFloat] {
+        var h: UInt32 = 2166136261
+        for b in seed.utf8 { h = (h ^ UInt32(b)) &* 16777619 }
+        return (0..<34).map { i in
+            let v = (h >> UInt32(i % 28)) ^ (h &* UInt32(i + 3))
+            return 0.22 + CGFloat(v & 15) / 15 * 0.78
+        }
+    }
+    var body: some View {
+        GeometryReader { geo in
+            HStack(spacing: 2) {
+                ForEach(Array(bars().enumerated()), id: \.offset) { _, v in
+                    Capsule().fill(SonarTheme.text2.opacity(0.5)).frame(width: 2, height: geo.size.height * v)
+                }
+            }
+            .frame(maxHeight: .infinity, alignment: .center)
+        }
+    }
+}
+
+#if os(iOS)
+/// Minimal AVAudioPlayer wrapper for the audio bubble.
+@MainActor
+final class SNAudioPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
+    @Published private(set) var playing = false
+    @Published private(set) var duration: TimeInterval = 0
+    private var player: AVAudioPlayer?
+
+    func toggle(_ bytes: Data?) {
+        if playing { player?.pause(); playing = false; return }
+        if player == nil, let bytes {
+            try? AVAudioSession.sharedInstance().setCategory(.playback)
+            try? AVAudioSession.sharedInstance().setActive(true)
+            player = try? AVAudioPlayer(data: bytes)
+            player?.delegate = self
+            duration = player?.duration ?? 0
+        }
+        player?.play()
+        playing = true
+    }
+
+    nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+        Task { @MainActor in self.playing = false }
+    }
+}
+#endif
+
 struct SNComposer: View {
     let placeholder: String
     let transport: SNVia
     let onSend: (String) -> Void
     let onPlus: () -> Void
     let onCommand: (String) -> Void
+    /// Hold-to-record produced a voice note at this file URL (audio/mp4 .m4a).
+    var onVoice: (URL) -> Void = { _ in }
 
     @State private var text = ""
+    #if os(iOS)
+    @StateObject private var voice = VoiceNoteRecorder()
+    @State private var recording = false
+    @State private var dragX: CGFloat = 0
+    private var cancelArmed: Bool { dragX < -100 }
+    #endif
 
     private var slash: Bool { text.hasPrefix("/") }
     private var hasText: Bool { !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
@@ -851,46 +970,154 @@ struct SNComposer: View {
                     .padding(EdgeInsets(top: 8, leading: 12, bottom: 2, trailing: 12))
                 }
             }
-            HStack(alignment: .bottom, spacing: 8) {
-                Button(action: onPlus) {
-                    Circle()
-                        .fill(SonarTheme.surface2)
-                        .frame(width: 36, height: 36)
-                        .overlay(
-                            SNIcon(name: .plus, size: 19, weight: 2.1)
-                                .foregroundColor(SonarTheme.text2)
-                        )
-                }
-                .buttonStyle(SNScaleStyle(scale: 0.92))
-
-                HStack {
-                    TextField("", text: $text, prompt: Text(verbatim: placeholder).foregroundColor(SonarTheme.text3))
-                        .textFieldStyle(.plain)
-                        .font(SonarTheme.uiFont(size: 16))
-                        .foregroundColor(SonarTheme.text)
-                        .onSubmit(send)
-                }
-                .padding(.vertical, 7)
-                .padding(.horizontal, 14)
-                .frame(minHeight: 36)
-                .background(RoundedRectangle(cornerRadius: 19, style: .continuous).fill(SonarTheme.surface2))
-
-                Button(action: send) {
-                    Circle()
-                        .fill(hasText ? (transport == .internet ? SonarTheme.netFill : SonarTheme.accentFill) : SonarTheme.surface2)
-                        .frame(width: 34, height: 34)
-                        .overlay(
-                            SNIcon(name: .send, size: 17, weight: 2.3)
-                                .foregroundColor(hasText ? (transport == .internet ? SonarTheme.onNet : SonarTheme.onAccent) : SonarTheme.text3)
-                        )
-                        .padding(.bottom, 1)
-                }
-                .buttonStyle(SNScaleStyle(scale: 0.92))
-            }
-            .padding(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12))
+            #if os(iOS)
+            if recording { recordingBar } else { inputRow }
+            #else
+            inputRow
+            #endif
         }
         .background(SonarTheme.bg)
     }
+
+    private var inputRow: some View {
+        HStack(alignment: .bottom, spacing: 8) {
+            Button(action: onPlus) {
+                Circle()
+                    .fill(SonarTheme.surface2)
+                    .frame(width: 36, height: 36)
+                    .overlay(
+                        SNIcon(name: .plus, size: 19, weight: 2.1)
+                            .foregroundColor(SonarTheme.text2)
+                    )
+            }
+            .buttonStyle(SNScaleStyle(scale: 0.92))
+
+            HStack {
+                TextField("", text: $text, prompt: Text(verbatim: placeholder).foregroundColor(SonarTheme.text3))
+                    .textFieldStyle(.plain)
+                    .font(SonarTheme.uiFont(size: 16))
+                    .foregroundColor(SonarTheme.text)
+                    .onSubmit(send)
+            }
+            .padding(.vertical, 7)
+            .padding(.horizontal, 14)
+            .frame(minHeight: 36)
+            .background(RoundedRectangle(cornerRadius: 19, style: .continuous).fill(SonarTheme.surface2))
+
+            #if os(iOS)
+            if hasText { sendButton } else { micButton }
+            #else
+            sendButton
+            #endif
+        }
+        .padding(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12))
+    }
+
+    private var sendButton: some View {
+        Button(action: send) {
+            Circle()
+                .fill(hasText ? (transport == .internet ? SonarTheme.netFill : SonarTheme.accentFill) : SonarTheme.surface2)
+                .frame(width: 34, height: 34)
+                .overlay(
+                    SNIcon(name: .send, size: 17, weight: 2.3)
+                        .foregroundColor(hasText ? (transport == .internet ? SonarTheme.onNet : SonarTheme.onAccent) : SonarTheme.text3)
+                )
+                .padding(.bottom, 1)
+        }
+        .buttonStyle(SNScaleStyle(scale: 0.92))
+    }
+
+    #if os(iOS)
+    /// Hold-to-record mic (design: bc-sendbtn mic). Press starts recording; drag
+    /// left past the threshold cancels; release sends the note.
+    private var micButton: some View {
+        Circle()
+            .fill(SonarTheme.surface2)
+            .frame(width: 34, height: 34)
+            .overlay(SNIcon(name: .mic, size: 18, weight: 2).foregroundColor(SonarTheme.text2))
+            .padding(.bottom, 1)
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { g in
+                        if !recording {
+                            recording = true
+                            dragX = 0
+                            Task { await voice.start() }
+                        } else {
+                            dragX = min(0, g.translation.width)
+                        }
+                    }
+                    .onEnded { _ in
+                        let cancel = cancelArmed
+                        recording = false
+                        dragX = 0
+                        if cancel { voice.cancel() } else if let url = voice.finish() { onVoice(url) }
+                    }
+            )
+    }
+
+    /// The Telegram/Signal-style recording bar (design: VoiceRecorder): trash,
+    /// rec dot, timer, live waveform, slide-to-cancel hint, send.
+    private var recordingBar: some View {
+        let net = transport == .internet
+        return HStack(alignment: .center, spacing: 8) {
+            Button { recording = false; dragX = 0; voice.cancel() } label: {
+                SNIcon(name: .trash, size: 19, weight: 2).foregroundColor(SonarTheme.danger)
+            }
+            HStack(spacing: 9) {
+                Circle().fill(SonarTheme.danger).frame(width: 9, height: 9)
+                Text(verbatim: snFmtDur(voice.elapsed))
+                    .font(SonarTheme.monoFont(size: 13, weight: .medium))
+                    .foregroundColor(SonarTheme.text)
+                    .frame(width: 38, alignment: .leading)
+                SNLiveWave(level: voice.level)
+                    .frame(maxWidth: .infinity)
+                Spacer(minLength: 0)
+                HStack(spacing: 3) {
+                    SNIcon(name: .chevron, size: 12, weight: 2.4).foregroundColor(SonarTheme.text3)
+                        .rotationEffect(.degrees(180))
+                    Text(verbatim: cancelArmed ? "release to cancel" : "slide to cancel")
+                        .font(SonarTheme.uiFont(size: 12))
+                        .foregroundColor(cancelArmed ? SonarTheme.danger : SonarTheme.text3)
+                }
+                .opacity(1 + dragX / 110)
+            }
+            .padding(.vertical, 7)
+            .padding(.horizontal, 12)
+            .frame(minHeight: 36)
+            .background(RoundedRectangle(cornerRadius: 19, style: .continuous).fill(SonarTheme.surface2))
+            Circle()
+                .fill(net ? SonarTheme.netFill : SonarTheme.accentFill)
+                .frame(width: 34, height: 34)
+                .overlay(SNIcon(name: .mic, size: 18, weight: 2).foregroundColor(net ? SonarTheme.onNet : SonarTheme.onAccent))
+        }
+        .padding(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12))
+    }
+    #endif
+}
+
+/// Live recording waveform (design: VoiceLive) — bars driven off the mic level.
+struct SNLiveWave: View {
+    let level: CGFloat
+    var body: some View {
+        TimelineView(.animation) { ctx in
+            let t = ctx.date.timeIntervalSinceReferenceDate
+            HStack(spacing: 2) {
+                ForEach(0..<22, id: \.self) { i in
+                    let phase = t * 6 + Double(i) * 0.5
+                    let v = (sin(phase * 0.7) + sin(phase * 1.9 + Double(i))) * 0.5
+                    let h = 4 + abs(CGFloat(v)) * 14 * max(0.25, level)
+                    Capsule().fill(SonarTheme.text2.opacity(0.55)).frame(width: 2, height: h)
+                }
+            }
+            .frame(height: 20)
+        }
+    }
+}
+
+/// m:ss like the design's fmtDur.
+func snFmtDur(_ sec: Int) -> String {
+    String(format: "%d:%02d", sec / 60, sec % 60)
 }
 
 // MARK: - Bottom sheet (bc-scrim / bc-sheet)

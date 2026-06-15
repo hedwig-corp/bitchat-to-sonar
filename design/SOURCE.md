@@ -3,10 +3,15 @@
 The complete design handoff bundle lives in `design/handoff/`. It is **vendored**
 (checked in) so agents read it from disk instead of re-fetching every time.
 
-- **Source share:** https://api.anthropic.com/v1/design/h/H5tEQgWekwCuHihJuEYcxw (Claude Design / claude.ai/design)
-- **Last synced:** 2026-06-14 (this refresh updated `project/sonar/{screens,data,theme}.*` and
-  added `project/uploads/Screenshot 2026-06-14 at 02.04.36.png` — the design was revised since the
-  prior 2026-06-12 vendoring, which is why the radar peer-tap UI changed).
+- **Source share:** https://api.anthropic.com/v1/design/h/A6e-y7WFkbHYzGBYedgCxw (Claude Design / claude.ai/design)
+  - prior shares: `H5tEQgWekwCuHihJuEYcxw` (2026-06-14), earlier 2026-06-12.
+- **Last synced:** 2026-06-16 (re-fetched the new share; the bundle is **byte-identical** to the
+  2026-06-14 vendoring — `diff -rq` is empty. So the design has NOT changed; the home "around me"
+  radar, chat media, and the **send-audio / voice-note** affordances (`AttachActions` Audio note +
+  the `bc-sendbtn mic` hold-to-record button + `bcVoiceMedia` waveform notes in
+  `project/sonar/components.jsx`) are already in the design but NOT yet implemented in the apps —
+  voice/video were deferred during the media Phase-1 (images-only) work. This refresh implements
+  those design aspects in both apps.)
 
 ## What's the source of truth
 
