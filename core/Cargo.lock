@@ -3132,6 +3132,7 @@ dependencies = [
  "reqwest",
  "rusqlite",
  "serde",
+ "sha2",
  "snow",
  "tempfile",
  "thiserror 2.0.18",
