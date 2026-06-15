@@ -23,7 +23,9 @@ codegen-units = 1
 # behind this rev (which adds the v3 Nostr-group-data extension / disappearing
 # messages); our old 0.8.0 could not read White Noise's newer messages. Keep
 # this rev in lockstep with whitenoise-rs's Cargo.toml.
-mdk-core = { git = "https://github.com/marmot-protocol/mdk", rev = "e8cd584878be908cb95aad260bb7bca65e017de1" }
+# `mip04` enables the Encrypted Media module (EncryptedMediaManager) — the
+# Marmot media spec White Noise uses; required for image/file/voice sharing.
+mdk-core = { git = "https://github.com/marmot-protocol/mdk", rev = "e8cd584878be908cb95aad260bb7bca65e017de1", features = ["mip04"] }
 mdk-storage-traits = { git = "https://github.com/marmot-protocol/mdk", rev = "e8cd584878be908cb95aad260bb7bca65e017de1" }
 mdk-memory-storage = { git = "https://github.com/marmot-protocol/mdk", rev = "e8cd584878be908cb95aad260bb7bca65e017de1" }
 mdk-sqlite-storage = { git = "https://github.com/marmot-protocol/mdk", rev = "e8cd584878be908cb95aad260bb7bca65e017de1" }

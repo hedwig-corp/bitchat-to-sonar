@@ -32,4 +32,13 @@ pub enum Error {
 
     #[error("no key package found on relays for {0}")]
     KeyPackageNotFound(PublicKey),
+
+    #[error("encrypted media error: {0}")]
+    Media(String),
+
+    #[error("blossom storage error: {0}")]
+    Blossom(String),
+
+    #[error("http error: {0}")]
+    Http(String),
 }

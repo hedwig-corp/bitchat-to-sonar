@@ -87,7 +87,8 @@ impl SonarIdentity {
     /// Import from an `nsec1...` bech32 string or 64-char hex secret key.
     #[uniffi::constructor]
     pub fn import(nsec: String) -> FfiResult<Arc<Self>> {
-        let inner = Identity::import(&nsec).map_err(|e| SonarFfiError::InvalidInput(e.to_string()))?;
+        let inner =
+            Identity::import(&nsec).map_err(|e| SonarFfiError::InvalidInput(e.to_string()))?;
         Ok(Arc::new(Self { inner }))
     }
 
@@ -125,6 +126,20 @@ pub struct MessageInfo {
     pub created_at_secs: u64,
     /// True when the local identity sent it.
     pub mine: bool,
+    /// Encrypted media attachments (Marmot MIP-04), empty for a plain text message.
+    pub media: Vec<MediaInfo>,
+}
+
+/// FFI-friendly reference to an encrypted media attachment. `url` is the Blossom
+/// URL of the CIPHERTEXT; call `fetch_media(groupId, url)` to download + decrypt.
+#[derive(uniffi::Record)]
+pub struct MediaInfo {
+    pub url: String,
+    pub mime_type: String,
+    pub filename: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub duration_ms: Option<u64>,
 }
 
 /// FFI-friendly Nostr profile (kind-0 metadata, NIP-01). A Marmot member's
@@ -293,8 +308,63 @@ impl SonarNode {
                 content: m.content,
                 created_at_secs: m.created_at.as_secs(),
                 mine: m.mine,
+                media: m
+                    .media
+                    .into_iter()
+                    .map(|r| MediaInfo {
+                        url: r.url,
+                        mime_type: r.mime_type,
+                        filename: r.filename,
+                        width: r.width,
+                        height: r.height,
+                        duration_ms: r.duration_ms,
+                    })
+                    .collect(),
             })
             .collect())
+    }
+
+    /// Encrypt + upload `data` to a Blossom server, then publish a media message
+    /// to the group. `server_url` empty → the core default. Blocks on the upload.
+    pub fn send_media(
+        &self,
+        group_id_hex: String,
+        data: Vec<u8>,
+        filename: String,
+        mime: String,
+        caption: String,
+        server_url: String,
+    ) -> FfiResult<()> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        self.runtime.block_on(self.client.send_media(
+            &group_id,
+            data,
+            &filename,
+            &mime,
+            &caption,
+            &server_url,
+        ))?;
+        Ok(())
+    }
+
+    /// Download + decrypt the media blob at `url` for `group_id`. Returns plaintext.
+    pub fn fetch_media(&self, group_id_hex: String, url: String) -> FfiResult<Vec<u8>> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        Ok(self
+            .runtime
+            .block_on(self.client.fetch_media(&group_id, &url))?)
+    }
+
+    /// The user's Blossom server list (kind-10063). Empty if unset.
+    pub fn blossom_servers(&self) -> FfiResult<Vec<String>> {
+        Ok(self.runtime.block_on(self.client.blossom_servers())?)
+    }
+
+    /// Publish the user's Blossom server list (kind-10063).
+    pub fn publish_blossom_servers(&self, servers: Vec<String>) -> FfiResult<()> {
+        self.runtime
+            .block_on(self.client.publish_blossom_servers(servers))?;
+        Ok(())
     }
 
     /// Publish a public message to a geohash channel (kind-20000 over Nostr).
@@ -305,11 +375,7 @@ impl SonarNode {
     }
 
     /// Fetch recent messages for a geohash channel, oldest first.
-    pub fn geohash_messages(
-        &self,
-        geohash: String,
-        limit: u32,
-    ) -> FfiResult<Vec<GeoMessageInfo>> {
+    pub fn geohash_messages(&self, geohash: String, limit: u32) -> FfiResult<Vec<GeoMessageInfo>> {
         let msgs = self
             .runtime
             .block_on(self.client.fetch_geohash(&geohash, limit as usize))?;
@@ -333,7 +399,12 @@ impl SonarNode {
     }
 
     /// Send a 1:1 encrypted DM to a geohash channel participant (NIP-17).
-    pub fn send_geo_dm(&self, geohash: String, recipient_hex: String, text: String) -> FfiResult<()> {
+    pub fn send_geo_dm(
+        &self,
+        geohash: String,
+        recipient_hex: String,
+        text: String,
+    ) -> FfiResult<()> {
         self.runtime
             .block_on(self.client.send_geo_dm(&geohash, &recipient_hex, &text))?;
         Ok(())
@@ -526,7 +597,9 @@ pub struct MeshPublicMessage {
 fn parse_id8(hex_str: &str, what: &'static str) -> Result<[u8; 8], SonarFfiError> {
     let bytes = hex::decode(hex_str).map_err(invalid(what))?;
     if bytes.len() != 8 {
-        return Err(SonarFfiError::InvalidInput(format!("{what} must be 8 bytes")));
+        return Err(SonarFfiError::InvalidInput(format!(
+            "{what} must be 8 bytes"
+        )));
     }
     let mut id = [0u8; 8];
     id.copy_from_slice(&bytes);
@@ -538,7 +611,9 @@ fn parse_id8(hex_str: &str, what: &'static str) -> Result<[u8; 8], SonarFfiError
 pub fn mesh_signing_public_key(seed_hex: String) -> FfiResult<String> {
     let seed = hex::decode(&seed_hex).map_err(invalid("mesh seed"))?;
     if seed.len() != 32 {
-        return Err(SonarFfiError::InvalidInput("mesh seed must be 32 bytes".into()));
+        return Err(SonarFfiError::InvalidInput(
+            "mesh seed must be 32 bytes".into(),
+        ));
     }
     let mut s = [0u8; 32];
     s.copy_from_slice(&seed);
@@ -557,7 +632,9 @@ pub fn mesh_build_announce(
 ) -> FfiResult<Vec<u8>> {
     let seed = hex::decode(&seed_hex).map_err(invalid("mesh seed"))?;
     if seed.len() != 32 {
-        return Err(SonarFfiError::InvalidInput("mesh seed must be 32 bytes".into()));
+        return Err(SonarFfiError::InvalidInput(
+            "mesh seed must be 32 bytes".into(),
+        ));
     }
     let mut s = [0u8; 32];
     s.copy_from_slice(&seed);
@@ -658,7 +735,9 @@ pub fn mesh_build_signed_packet(
 ) -> FfiResult<Vec<u8>> {
     let seed = hex::decode(&seed_hex).map_err(invalid("mesh seed"))?;
     if seed.len() != 32 {
-        return Err(SonarFfiError::InvalidInput("mesh seed must be 32 bytes".into()));
+        return Err(SonarFfiError::InvalidInput(
+            "mesh seed must be 32 bytes".into(),
+        ));
     }
     let mut s = [0u8; 32];
     s.copy_from_slice(&seed);
@@ -680,7 +759,10 @@ pub fn mesh_build_signed_packet(
 /// The inner noiseEncrypted plaintext for a private message: `[0x01][TLV]`.
 #[uniffi::export]
 pub fn mesh_encode_private_message(message_id: String, content: String) -> FfiResult<Vec<u8>> {
-    let pm = mesh::PrivateMessage { message_id, content };
+    let pm = mesh::PrivateMessage {
+        message_id,
+        content,
+    };
     mesh::encode_private_message_plaintext(&pm)
         .ok_or_else(|| SonarFfiError::Core("private message encode failed".into()))
 }
@@ -713,7 +795,9 @@ pub fn mesh_build_public_message(
 ) -> FfiResult<Vec<u8>> {
     let seed = hex::decode(&seed_hex).map_err(invalid("mesh seed"))?;
     if seed.len() != 32 {
-        return Err(SonarFfiError::InvalidInput("mesh seed must be 32 bytes".into()));
+        return Err(SonarFfiError::InvalidInput(
+            "mesh seed must be 32 bytes".into(),
+        ));
     }
     let mut s = [0u8; 32];
     s.copy_from_slice(&seed);
@@ -794,7 +878,12 @@ mod tests {
         ));
         // bad relay url
         assert!(matches!(
-            SonarNode::connect(id.clone(), vec!["not-a-url".into()], db.clone(), key.clone()),
+            SonarNode::connect(
+                id.clone(),
+                vec!["not-a-url".into()],
+                db.clone(),
+                key.clone()
+            ),
             Err(SonarFfiError::InvalidInput(_))
         ));
         // bad db key (wrong length)

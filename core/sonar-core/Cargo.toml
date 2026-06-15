@@ -18,6 +18,15 @@ mdk-memory-storage.workspace = true
 mdk-sqlite-storage.workspace = true
 nostr.workspace = true
 nostr-sdk.workspace = true
+# Blossom blob storage (BUD-01/02) for encrypted media (Marmot MIP-04). Uses
+# reqwest with rustls-tls only (NO OpenSSL) — keeps the iOS cross-build clean.
+nostr-blossom = "0.44"
+# Direct HTTP to download a media blob by its full imeta URL. Same rustls-tls
+# feature set as nostr-blossom so cargo unifies ONE reqwest build (no
+# native-tls/OpenSSL → iOS/Android cross-compile stays OpenSSL-free).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# Map a filename extension → MIME type for outgoing media.
+mime_guess = "2"
 tokio.workspace = true
 thiserror.workspace = true
 hex.workspace = true

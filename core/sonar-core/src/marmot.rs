@@ -15,6 +15,7 @@
 
 use std::path::Path;
 
+use mdk_core::encrypted_media::{EncryptedMediaUpload, MediaReference};
 use mdk_core::prelude::*;
 use mdk_memory_storage::MdkMemoryStorage;
 use mdk_sqlite_storage::{EncryptionConfig, MdkSqliteStorage};
@@ -39,16 +40,51 @@ pub struct GroupCreation {
     pub welcomes: Vec<(PublicKey, UnsignedEvent)>,
 }
 
+/// A reference to an encrypted media blob (Marmot MIP-04) attached to a chat
+/// message — enough for the UI to render a placeholder and trigger a download.
+/// The decryption material (nonce, hashes, scheme) stays inside MDK;
+/// `decrypt_media_by_url` re-derives it from the message's `imeta` tag by URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaRef {
+    /// Blossom URL of the ENCRYPTED blob.
+    pub url: String,
+    pub mime_type: String,
+    pub filename: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub duration_ms: Option<u64>,
+}
+
+impl From<&MediaReference> for MediaRef {
+    fn from(r: &MediaReference) -> Self {
+        let (width, height) = match r.dimensions {
+            Some((w, h)) => (Some(w), Some(h)),
+            None => (None, None),
+        };
+        Self {
+            url: r.url.clone(),
+            mime_type: r.mime_type.clone(),
+            filename: r.filename.clone(),
+            width,
+            height,
+            duration_ms: r.duration_ms,
+        }
+    }
+}
+
 /// A decrypted application message, mapped to a small FFI-friendly shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatMessage {
     pub id: EventId,
     pub group_id: GroupId,
     pub sender: PublicKey,
+    /// Caption / text body (may be empty for a pure media message).
     pub content: String,
     pub created_at: Timestamp,
     /// True when `sender` is the local identity.
     pub mine: bool,
+    /// Encrypted media attachments (MIP-04 `imeta` tags), if any.
+    pub media: Vec<MediaRef>,
 }
 
 /// What came out of processing an incoming event.
@@ -113,7 +149,11 @@ impl MarmotEngine {
     /// path is bypassed because OS keyrings are unreliable from a Rust static lib
     /// on iOS. The parent directory of `db_path` must already exist; the host is
     /// expected to place it in a Data-Protection-Complete directory.
-    pub fn persistent(identity: Identity, db_path: impl AsRef<Path>, key: [u8; 32]) -> Result<Self> {
+    pub fn persistent(
+        identity: Identity,
+        db_path: impl AsRef<Path>,
+        key: [u8; 32],
+    ) -> Result<Self> {
         let path = db_path.as_ref();
         let storage = match MdkSqliteStorage::new_with_key(path, EncryptionConfig::new(key)) {
             Ok(storage) => storage,
@@ -130,9 +170,11 @@ impl MarmotEngine {
                 let detail = e.to_string();
                 Self::wipe(path)?;
                 let storage = MdkSqliteStorage::new_with_key(path, EncryptionConfig::new(key))
-                    .map_err(|e2| Error::Storage(format!(
-                        "recreate after unusable DB failed: {e2} (original: {detail})"
-                    )))?;
+                    .map_err(|e2| {
+                        Error::Storage(format!(
+                            "recreate after unusable DB failed: {e2} (original: {detail})"
+                        ))
+                    })?;
                 tracing::warn!(
                     "marmot: discarded an unusable on-disk database and recreated it \
                      encrypted (original open error: {detail})"
@@ -195,8 +237,7 @@ impl MarmotEngine {
     ) -> Result<GroupCreation> {
         let mut admins: Vec<PublicKey> = member_key_packages.iter().map(|e| e.pubkey).collect();
         admins.push(self.identity.public_key());
-        let member_pubkeys: Vec<PublicKey> =
-            member_key_packages.iter().map(|e| e.pubkey).collect();
+        let member_pubkeys: Vec<PublicKey> = member_key_packages.iter().map(|e| e.pubkey).collect();
 
         let config = NostrGroupConfigData::new(
             name.to_owned(),
@@ -264,8 +305,91 @@ impl MarmotEngine {
     pub fn create_text_message(&self, group_id: &GroupId, text: &str) -> Result<Event> {
         let rumor = EventBuilder::new(Kind::Custom(CHAT_RUMOR_KIND), text)
             .build(self.identity.public_key());
-        let event = dispatch!(&self.storage, |mdk| mdk.create_message(group_id, rumor, None))?;
+        let event = dispatch!(&self.storage, |mdk| mdk
+            .create_message(group_id, rumor, None))?;
         Ok(event)
+    }
+
+    // ── Encrypted media (Marmot MIP-04) ───────────────────────────────────
+    //
+    // MDK does the crypto (key from the group exporter secret) and the `imeta`
+    // tag; the caller ([`crate::client`]) does the Blossom upload/download. This
+    // engine layer stays transport-free.
+
+    /// Encrypt `data` for `group_id` into a ciphertext + metadata blob ready to
+    /// upload to a Blossom server. Pure crypto, no I/O. `mime` like `image/jpeg`.
+    pub fn encrypt_media(
+        &self,
+        group_id: &GroupId,
+        data: &[u8],
+        mime: &str,
+        filename: &str,
+    ) -> Result<EncryptedMediaUpload> {
+        dispatch!(&self.storage, |mdk| mdk
+            .media_manager(group_id.clone())
+            .encrypt_for_upload(data, mime, filename)
+            .map_err(|e| Error::Media(e.to_string())))
+    }
+
+    /// Build a signed kind-445 media message: a kind-9 rumor carrying `caption`
+    /// (may be empty) plus the `imeta` tag pointing at the uploaded ciphertext
+    /// `url`. The imeta rides INSIDE the encrypted rumor, so it is E2E-protected.
+    pub fn create_media_event(
+        &self,
+        group_id: &GroupId,
+        upload: &EncryptedMediaUpload,
+        url: &str,
+        caption: &str,
+    ) -> Result<Event> {
+        let event = dispatch!(&self.storage, |mdk| {
+            let imeta = mdk
+                .media_manager(group_id.clone())
+                .create_imeta_tag(upload, url);
+            let rumor = EventBuilder::new(Kind::Custom(CHAT_RUMOR_KIND), caption)
+                .tags([imeta])
+                .build(self.identity.public_key());
+            mdk.create_message(group_id, rumor, None)
+        })?;
+        Ok(event)
+    }
+
+    /// Find the `MediaReference` for `url` among `group_id`'s stored messages and
+    /// decrypt the downloaded `ciphertext` with it. Verifies the original hash.
+    pub fn decrypt_media_by_url(
+        &self,
+        group_id: &GroupId,
+        url: &str,
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>> {
+        dispatch!(&self.storage, |mdk| {
+            let mgr = mdk.media_manager(group_id.clone());
+            for m in mdk.get_messages(group_id, None)? {
+                for tag in m.tags.iter() {
+                    if tag.kind() == TagKind::Custom("imeta".into()) {
+                        if let Ok(r) = mgr.parse_imeta_tag(tag) {
+                            if r.url == url {
+                                return mgr
+                                    .decrypt_from_download(ciphertext, &r)
+                                    .map_err(|e| Error::Media(e.to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+            Err(Error::Media(format!("no media reference for url {url}")))
+        })
+    }
+
+    /// Parse the `imeta` tags on a message into display-ready [`MediaRef`]s.
+    fn parse_media_refs(&self, group_id: &GroupId, tags: &Tags) -> Vec<MediaRef> {
+        dispatch!(&self.storage, |mdk| {
+            let mgr = mdk.media_manager(group_id.clone());
+            tags.iter()
+                .filter(|t| t.kind() == TagKind::Custom("imeta".into()))
+                .filter_map(|t| mgr.parse_imeta_tag(t).ok())
+                .map(|r| MediaRef::from(&r))
+                .collect()
+        })
     }
 
     /// Process any incoming Marmot-relevant event:
@@ -275,36 +399,37 @@ impl MarmotEngine {
     pub async fn process_incoming(&self, event: &Event) -> Result<Incoming> {
         match event.kind {
             Kind::GiftWrap => {
-                let unwrapped =
-                    UnwrappedGift::from_gift_wrap(self.identity.keys(), event).await?;
+                let unwrapped = UnwrappedGift::from_gift_wrap(self.identity.keys(), event).await?;
                 if unwrapped.rumor.kind != Kind::MlsWelcome {
                     return Ok(Incoming::None);
                 }
-                let welcome =
-                    dispatch!(&self.storage, |mdk| mdk.process_welcome(&event.id, &unwrapped.rumor))?;
+                let welcome = dispatch!(&self.storage, |mdk| mdk
+                    .process_welcome(&event.id, &unwrapped.rumor))?;
                 dispatch!(&self.storage, |mdk| mdk.accept_welcome(&welcome))?;
                 Ok(Incoming::GroupUpdated(welcome.mls_group_id))
             }
-            Kind::MlsGroupMessage => match dispatch!(&self.storage, |mdk| mdk.process_message(event))? {
-                MessageProcessingResult::ApplicationMessage(msg) => {
-                    Ok(Incoming::Message(self.to_chat_message(msg)))
+            Kind::MlsGroupMessage => {
+                match dispatch!(&self.storage, |mdk| mdk.process_message(event))? {
+                    MessageProcessingResult::ApplicationMessage(msg) => {
+                        Ok(Incoming::Message(self.to_chat_message(msg)))
+                    }
+                    MessageProcessingResult::Commit { mls_group_id }
+                    | MessageProcessingResult::PendingProposal { mls_group_id } => {
+                        Ok(Incoming::GroupUpdated(mls_group_id))
+                    }
+                    MessageProcessingResult::Proposal(update) => {
+                        // Auto-committed proposal (e.g. a member leaving): the
+                        // caller must publish `evolution_event`; surfacing it is
+                        // M1-deferred — log and report the group as updated.
+                        tracing::warn!(
+                            group = ?update.mls_group_id,
+                            "auto-committed proposal; evolution event publication not yet wired"
+                        );
+                        Ok(Incoming::GroupUpdated(update.mls_group_id))
+                    }
+                    _ => Ok(Incoming::None),
                 }
-                MessageProcessingResult::Commit { mls_group_id }
-                | MessageProcessingResult::PendingProposal { mls_group_id } => {
-                    Ok(Incoming::GroupUpdated(mls_group_id))
-                }
-                MessageProcessingResult::Proposal(update) => {
-                    // Auto-committed proposal (e.g. a member leaving): the
-                    // caller must publish `evolution_event`; surfacing it is
-                    // M1-deferred — log and report the group as updated.
-                    tracing::warn!(
-                        group = ?update.mls_group_id,
-                        "auto-committed proposal; evolution event publication not yet wired"
-                    );
-                    Ok(Incoming::GroupUpdated(update.mls_group_id))
-                }
-                _ => Ok(Incoming::None),
-            },
+            }
             _ => Ok(Incoming::None),
         }
     }
@@ -336,6 +461,7 @@ impl MarmotEngine {
     }
 
     fn to_chat_message(&self, m: message_types::Message) -> ChatMessage {
+        let media = self.parse_media_refs(&m.mls_group_id, &m.tags);
         ChatMessage {
             id: m.id,
             group_id: m.mls_group_id.clone(),
@@ -343,6 +469,7 @@ impl MarmotEngine {
             content: m.content.clone(),
             created_at: m.created_at,
             mine: m.pubkey == self.identity.public_key(),
+            media,
         }
     }
 }
@@ -368,7 +495,10 @@ fn is_unusable_db_error(message: &str) -> bool {
 }
 
 fn sidecar_paths(base: &Path) -> Vec<std::path::PathBuf> {
-    let name = base.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    let name = base
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
     ["", "-wal", "-shm", "-journal"]
         .iter()
         .map(|suffix| base.with_file_name(format!("{name}{suffix}")))

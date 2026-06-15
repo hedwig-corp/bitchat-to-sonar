@@ -12,11 +12,35 @@ use std::time::Duration;
 
 use mdk_core::prelude::*;
 use nostr::prelude::*;
+use nostr_blossom::prelude::*;
 use nostr_sdk::{Client, RelayPoolNotification};
 
 use crate::identity::Identity;
 use crate::marmot::{ChatMessage, MarmotEngine, KEY_PACKAGE_KIND};
 use crate::{Error, Result};
+
+/// Blossom user-server-list event kind (BUD-03): the user's preferred blob
+/// servers, newest first.
+const BLOSSOM_SERVER_LIST_KIND: u16 = 10063;
+
+/// Fallback Blossom server when the user has published no kind-10063 list.
+pub const DEFAULT_BLOSSOM_SERVER: &str = "https://blossom.primal.net";
+
+/// Download raw bytes over HTTPS (rustls). Used to fetch an encrypted media blob
+/// by its full imeta URL (Blossom GET is unauthenticated for public blobs).
+async fn http_get(url: &str) -> Result<Vec<u8>> {
+    let resp = reqwest::get(url)
+        .await
+        .map_err(|e| Error::Http(e.to_string()))?;
+    if !resp.status().is_success() {
+        return Err(Error::Http(format!("GET {url} -> HTTP {}", resp.status())));
+    }
+    Ok(resp
+        .bytes()
+        .await
+        .map_err(|e| Error::Http(e.to_string()))?
+        .to_vec())
+}
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -160,7 +184,9 @@ impl SonarClient {
                 };
                 match event.kind.as_u16() {
                     20000 => {
-                        let Some(geohash) = tag_value(&event, Alphabet::G) else { continue };
+                        let Some(geohash) = tag_value(&event, Alphabet::G) else {
+                            continue;
+                        };
                         let nickname = tag_value(&event, Alphabet::N).unwrap_or_default();
                         let id = event.id.to_hex();
                         let ts = event.created_at.as_u64();
@@ -196,7 +222,9 @@ impl SonarClient {
                     20001 => {
                         // Presence heartbeat: record the freshest timestamp per
                         // participant so "N here now" counts live participants.
-                        let Some(geohash) = tag_value(&event, Alphabet::G) else { continue };
+                        let Some(geohash) = tag_value(&event, Alphabet::G) else {
+                            continue;
+                        };
                         let mut map = handler_presence.lock().unwrap();
                         let bucket = map.entry(geohash).or_default();
                         let ts = event.created_at.as_u64();
@@ -209,19 +237,32 @@ impl SonarClient {
                         // Gift wrap: the `p` tag names our per-geohash recipient
                         // key. Find which active channel it targets, unwrap with
                         // that key, and record the kind-14 DM.
-                        let Some(p_hex) = tag_value(&event, Alphabet::P) else { continue };
-                        let subs: Vec<String> = handler_subs.lock().unwrap().iter().cloned().collect();
+                        let Some(p_hex) = tag_value(&event, Alphabet::P) else {
+                            continue;
+                        };
+                        let subs: Vec<String> =
+                            handler_subs.lock().unwrap().iter().cloned().collect();
                         for geohash in subs {
-                            let Ok(keys) = crate::geohash::derive_geohash_keys(&identity_secret, &geohash) else { continue };
+                            let Ok(keys) =
+                                crate::geohash::derive_geohash_keys(&identity_secret, &geohash)
+                            else {
+                                continue;
+                            };
                             if keys.public_key().to_hex() != p_hex {
                                 continue;
                             }
-                            if let Ok(unwrapped) = UnwrappedGift::from_gift_wrap(&keys, &event).await {
+                            if let Ok(unwrapped) =
+                                UnwrappedGift::from_gift_wrap(&keys, &event).await
+                            {
                                 if unwrapped.rumor.kind.as_u16() != 14 {
                                     break;
                                 }
                                 let peer_hex = unwrapped.sender.to_hex();
-                                let id = unwrapped.rumor.id.map(|i| i.to_hex()).unwrap_or_else(|| event.id.to_hex());
+                                let id = unwrapped
+                                    .rumor
+                                    .id
+                                    .map(|i| i.to_hex())
+                                    .unwrap_or_else(|| event.id.to_hex());
                                 let mut map = handler_dm.lock().unwrap();
                                 let bucket = map.entry((geohash.clone(), peer_hex)).or_default();
                                 if !bucket.iter().any(|r| r.id == id) {
@@ -257,6 +298,12 @@ impl SonarClient {
 
     pub fn identity(&self) -> &Identity {
         self.engine.identity()
+    }
+
+    /// Access the transport-free Marmot engine. Primarily for tests that exercise
+    /// the media crypto path (encrypt/imeta/decrypt) without a Blossom server.
+    pub fn engine(&self) -> &MarmotEngine {
+        &self.engine
     }
 
     /// Publish our kind-30443 KeyPackage so others can start groups with us.
@@ -374,6 +421,94 @@ impl SonarClient {
         Ok(())
     }
 
+    // ── Encrypted media (Marmot MIP-04 + Blossom) ─────────────────────────
+
+    /// Send a media attachment to `group_id`: encrypt with the group key
+    /// (MIP-04), upload the ciphertext to a Blossom server, then publish a
+    /// kind-445 message carrying the `imeta` tag and optional `caption`. The
+    /// message is only published AFTER a successful upload, so a failed upload
+    /// never leaves a dangling reference. `server_url` empty →
+    /// [`DEFAULT_BLOSSOM_SERVER`].
+    pub async fn send_media(
+        &self,
+        group_id: &GroupId,
+        data: Vec<u8>,
+        filename: &str,
+        mime: &str,
+        caption: &str,
+        server_url: &str,
+    ) -> Result<()> {
+        let upload = self.engine.encrypt_media(group_id, &data, mime, filename)?;
+        let url = self
+            .blossom_upload(server_url, upload.encrypted_data.clone(), &upload.mime_type)
+            .await?;
+        let event = self
+            .engine
+            .create_media_event(group_id, &upload, &url, caption)?;
+        self.nostr.send_event(&event).await?;
+        self.engine.process_incoming(&event).await?;
+        Ok(())
+    }
+
+    /// Download the encrypted blob at `url` and decrypt it with the group media
+    /// key (resolved from the message's imeta tag). Returns plaintext bytes.
+    pub async fn fetch_media(&self, group_id: &GroupId, url: &str) -> Result<Vec<u8>> {
+        let ciphertext = http_get(url).await?;
+        self.engine.decrypt_media_by_url(group_id, url, &ciphertext)
+    }
+
+    /// Upload an encrypted blob to a Blossom server (BUD-02), authed with our
+    /// Nostr key, returning the URL where it can be fetched.
+    async fn blossom_upload(&self, server_url: &str, data: Vec<u8>, mime: &str) -> Result<String> {
+        let server = if server_url.is_empty() {
+            DEFAULT_BLOSSOM_SERVER
+        } else {
+            server_url
+        };
+        let base = Url::parse(server)
+            .map_err(|e| Error::Blossom(format!("bad server url {server}: {e}")))?;
+        let descriptor = BlossomClient::new(base)
+            .upload_blob(
+                data,
+                Some(mime.to_string()),
+                None,
+                Some(self.identity().keys()),
+            )
+            .await
+            .map_err(|e| Error::Blossom(e.to_string()))?;
+        Ok(descriptor.url.to_string())
+    }
+
+    /// The user's Blossom server list (kind-10063 / BUD-03). Empty if unset.
+    pub async fn blossom_servers(&self) -> Result<Vec<String>> {
+        let filter = Filter::new()
+            .kind(Kind::Custom(BLOSSOM_SERVER_LIST_KIND))
+            .author(self.identity().public_key())
+            .limit(1);
+        let mut servers = Vec::new();
+        for event in self.nostr.fetch_events(filter, FETCH_TIMEOUT).await? {
+            for tag in event.tags.iter() {
+                if tag.kind() == TagKind::Custom("server".into()) {
+                    if let Some(url) = tag.content() {
+                        servers.push(url.to_string());
+                    }
+                }
+            }
+        }
+        Ok(servers)
+    }
+
+    /// Publish our Blossom server list (kind-10063) so peers and our other
+    /// devices know where our blobs live.
+    pub async fn publish_blossom_servers(&self, servers: Vec<String>) -> Result<()> {
+        let tags = servers
+            .into_iter()
+            .map(|s| Tag::custom(TagKind::Custom("server".into()), [s]));
+        let builder = EventBuilder::new(Kind::Custom(BLOSSOM_SERVER_LIST_KIND), "").tags(tags);
+        self.nostr.send_event_builder(builder).await?;
+        Ok(())
+    }
+
     /// Poll the relays once: first gift-wrapped welcomes addressed to us
     /// (which may add groups), then kind-445 messages for every known group.
     /// Duplicate/already-processed events are tolerated by design.
@@ -388,12 +523,10 @@ impl SonarClient {
         }
 
         for group in self.engine.groups()? {
-            let filter = Filter::new()
-                .kind(Kind::MlsGroupMessage)
-                .custom_tag(
-                    SingleLetterTag::lowercase(Alphabet::H),
-                    hex::encode(group.nostr_group_id),
-                );
+            let filter = Filter::new().kind(Kind::MlsGroupMessage).custom_tag(
+                SingleLetterTag::lowercase(Alphabet::H),
+                hex::encode(group.nostr_group_id),
+            );
             for event in self.nostr.fetch_events(filter, FETCH_TIMEOUT).await? {
                 if let Err(err) = self.engine.process_incoming(&event).await {
                     tracing::debug!(%err, "skipping group message (likely duplicate)");
@@ -462,7 +595,8 @@ impl SonarClient {
         self.nostr.subscribe(presence, None).await?;
 
         // 1:1 DMs (NIP-17 gift wraps) addressed to our per-geohash key.
-        let geo_pk = crate::geohash::derive_geohash_keys(&self.identity_secret, geohash)?.public_key();
+        let geo_pk =
+            crate::geohash::derive_geohash_keys(&self.identity_secret, geohash)?.public_key();
         let dms = Filter::new().kind(Kind::GiftWrap).pubkey(geo_pk);
         self.nostr.subscribe(dms, None).await?;
         Ok(())
