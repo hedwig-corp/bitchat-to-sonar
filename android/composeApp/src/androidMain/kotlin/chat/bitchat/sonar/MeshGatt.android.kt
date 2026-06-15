@@ -37,6 +37,7 @@ import uniffi.sonar_ffi.noiseGenerateKeypair
 @SuppressLint("MissingPermission")
 object MeshGatt {
 
+    private const val TAG = "MeshGatt"
     private val SERVICE: UUID = UUID.fromString("F47B5E2D-4A9E-4C5A-9B3F-8E1D2C3A4B5C")
     private val CHAR: UUID = UUID.fromString("A1B2C3D4-E5F6-4A5B-8C9D-0E1F2A3B4C5D")
     private val CCC: UUID = UUID.fromString("00002902-0000-1000-0000-00805f9b34fb")
@@ -86,7 +87,13 @@ object MeshGatt {
     fun connect(device: BluetoothDevice) {
         if (clientLinks.containsKey(device.address)) return
         clientLinks[device.address] = Link(SonarNoise.initiator(keypair.privateHex))
-        try { device.connectGatt(ctx, false, clientCallback) } catch (_: Throwable) {
+        android.util.Log.i(TAG, "dialing ${device.address} (TRANSPORT_LE)")
+        try {
+            // MUST pass TRANSPORT_LE: the default TRANSPORT_AUTO often picks
+            // BR/EDR and fails the BLE connect with status=133.
+            device.connectGatt(ctx, false, clientCallback, BluetoothDevice.TRANSPORT_LE)
+        } catch (t: Throwable) {
+            android.util.Log.e(TAG, "connectGatt failed for ${device.address}", t)
             clientLinks.remove(device.address)
         }
     }
@@ -118,10 +125,12 @@ object MeshGatt {
 
     private val clientCallback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+            android.util.Log.i(TAG, "client ${gatt.device.address}: state=$newState status=$status")
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 clientGatt[gatt.device.address] = gatt
                 gatt.requestMtu(517)
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                if (status != 0) gatt.close() // failed connect: release the client
                 cleanupClient(gatt.device.address)
             }
         }
@@ -165,11 +174,17 @@ object MeshGatt {
             if (!link.established) {
                 link.noise.readMessage(record) // m2
                 if (link.noise.isFinished()) {
+                    val peer = link.noise.remoteStaticHex()
                     link.noise.intoSession()
                     link.established = true
+                    android.util.Log.i(TAG, "client link ESTABLISHED with $addr peer=$peer")
                 } else {
                     writeRecord(gatt, ch, link.noise.writeMessage()) // m3
-                    if (link.noise.isFinished()) { link.noise.intoSession(); link.established = true }
+                    if (link.noise.isFinished()) {
+                        val peer = link.noise.remoteStaticHex()
+                        link.noise.intoSession(); link.established = true
+                        android.util.Log.i(TAG, "client link ESTABLISHED with $addr peer=$peer")
+                    }
                 }
             } else {
                 val packet = BitchatPacket.decode(link.noise.decrypt(record)) ?: return

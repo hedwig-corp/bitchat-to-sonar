@@ -68,18 +68,28 @@ actual object MeshRadio {
             val filters = listOf(ScanFilter.Builder().setServiceUuid(ParcelUuid(SERVICE_UUID)).build())
             val settings = ScanSettings.Builder()
                 .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                // Aggressive matching reports even weak/intermittent advertisers,
+                // and ALL_MATCHES keeps reporting them so they don't time out.
+                .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
+                .setMatchMode(ScanSettings.MATCH_MODE_AGGRESSIVE)
+                .setNumOfMatches(ScanSettings.MATCH_NUM_MAX_ADVERTISEMENT)
+                .setReportDelay(0)
                 .build()
             scanner?.startScan(filters, settings, scanCallback)
 
             advertiser = a.bluetoothLeAdvertiser
             val advSettings = AdvertiseSettings.Builder()
                 .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
+                .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
                 .setConnectable(true)
                 .build()
             val advData = AdvertiseData.Builder()
                 .addServiceUuid(ParcelUuid(SERVICE_UUID))
                 .build()
-            advertiser?.startAdvertising(advSettings, advData, advCallback)
+            // Device name rides the scan response (a second 31-byte packet) so it
+            // can't overflow the primary advert that carries the 128-bit UUID.
+            val scanResponse = AdvertiseData.Builder().setIncludeDeviceName(true).build()
+            advertiser?.startAdvertising(advSettings, advData, scanResponse, advCallback)
             MeshGatt.startServer()
             android.util.Log.i(TAG, "scanning + advertising $SERVICE_UUID (advertiser=${advertiser != null})")
         } catch (e: SecurityException) {
@@ -114,13 +124,12 @@ actual object MeshRadio {
             seen[id] = MeshPeer(id = id, name = name, rssi = result.rssi)
             lastSeen[id] = System.currentTimeMillis()
             if (isNew) {
-                android.util.Log.i(TAG, "discovered peer $name [$id] rssi=${result.rssi} → dialing")
-                // Auto-link over GATT to newly-discovered peers (Noise XX). NB:
-                // BluetoothAdapter.getAddress() is the fixed 02:00:00:00:00:00 on
-                // API 12+, so a local-address tie-break can't work; both sides
-                // dial and MeshGatt dedups the resulting link by peer address.
-                MeshGatt.connect(result.device)
+                android.util.Log.i(TAG, "discovered peer $name [$id] rssi=${result.rssi}")
             }
+            // NB: we no longer auto-dial GATT on every discovery — the failing
+            // connects (status 133) churned the BLE controller and could starve
+            // the scan, hiding real peers. The Noise link is established on demand
+            // when the user opens a mesh DM (MeshGatt.connect), not during scan.
         }
 
         override fun onScanFailed(errorCode: Int) {

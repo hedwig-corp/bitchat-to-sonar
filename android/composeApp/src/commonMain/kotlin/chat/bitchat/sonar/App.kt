@@ -39,7 +39,11 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -105,56 +109,92 @@ private fun HomeScreen(state: SonarAppState) {
     // Triple-tap the title within 1.2s → emergency wipe (1:1 with iOS).
     LaunchedEffect(titleTaps) { if (titleTaps in 1..2) { kotlinx.coroutines.delay(1200); titleTaps = 0 } }
 
-    Column(Modifier.fillMaxSize()) {
-        // bc-header
-        Row(
-            Modifier.fillMaxWidth().padding(start = 18.dp, end = 12.dp, top = 14.dp, bottom = 8.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Column(Modifier.weight(1f)) {
+    Box(Modifier.fillMaxSize()) {
+        Column(Modifier.fillMaxSize()) {
+            // bc-header: avatar (→settings) · "sonar" centered (triple-tap) · rings (→nearby)
+            Row(
+                Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, top = 6.dp, bottom = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Box(
+                    Modifier.size(38.dp).clip(CircleShape).clickable { state.push(Screen.Settings) },
+                    contentAlignment = Alignment.Center
+                ) { SonarAvatar(state.nick.ifBlank { "you" }, 32.dp) }
                 Text(
-                    "Sonar", color = s.text, fontSize = 27.sp, fontWeight = FontWeight.Black,
-                    modifier = Modifier.clickable(
-                        indication = null,
-                        interactionSource = remember { MutableInteractionSource() }
+                    "sonar", color = s.text, fontSize = 27.sp, fontWeight = FontWeight.Black,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.weight(1f).clickable(
+                        indication = null, interactionSource = remember { MutableInteractionSource() }
                     ) { titleTaps++; if (titleTaps >= 3) { titleTaps = 0; wipeAsk = true } }
                 )
-                Row(
-                    Modifier.clip(RoundedCornerShape(8.dp)).clickable { connSheet = true },
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    SNDot(if (state.started) s.green else s.text3, 7.dp)
-                    Spacer(Modifier.width(5.dp))
-                    Text(
-                        if (state.started) "Online · reaches anyone"
-                        else if (state.connecting) "connecting…"
-                        else "Offline · $meshCount nearby on Bluetooth",
-                        color = s.text2, fontSize = 12.sp
-                    )
+                SNIconButton(SNIconName.Rings, size = 22.dp, weight = 2f, tint = s.text2) { state.push(Screen.Nearby) }
+            }
+
+            // status chip — centered pill
+            Box(Modifier.fillMaxWidth().padding(bottom = 10.dp), contentAlignment = Alignment.Center) {
+                StatusChipPill(state.started, state.connecting, meshCount) { connSheet = true }
+            }
+
+            LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 110.dp)) {
+                item { SNSectionLabel("Nearby channels") }
+                // Mesh channel is always first (BLE broadcast).
+                item {
+                    ConvRow(
+                        avatar = { MeshTile(52.dp) },
+                        title = "Mesh",
+                        sub = "${meshCount} ${if (meshCount == 1) "person" else "people"} in Bluetooth range",
+                    ) { state.openChannel("mesh") }
+                }
+                // GPS-derived location channels (Ottaviano … Italy).
+                items(state.locationChannels, key = { it.geohash + it.level.name }) { c ->
+                    ConvRow(
+                        avatar = { PlaceTile(52.dp) },
+                        title = c.name, sub = c.level.label,
+                    ) { state.openChannel(c.geohash) }
+                }
+                // Any manually-joined channels not already shown.
+                items(
+                    state.channels.filter { gh -> state.locationChannels.none { it.geohash == gh } && gh != "mesh" },
+                    key = { it }
+                ) { gh ->
+                    ConvRow(avatar = { PlaceTile(52.dp) }, title = channelName(gh), sub = "joined channel") {
+                        state.openChannel(gh)
+                    }
+                }
+                if (state.locationChannels.isEmpty()) item { LocationHint() }
+                item { SNSectionLabel("Messages") }
+                if (state.chats.isEmpty()) item { EmptyMessages() }
+                else items(state.chats, key = { it.id }) { chat ->
+                    ConvRow(
+                        avatar = { SonarAvatar(chat.name, 52.dp, presence = false) },
+                        title = chat.name, sub = "Tap to open", lock = true,
+                        verified = state.isVerified(chat.id),
+                    ) { state.openChat(chat) }
                 }
             }
-            SNIconButton(SNIconName.Rings, size = 22.dp, weight = 2f, tint = s.text2) { state.push(Screen.Nearby) }
-            Spacer(Modifier.width(2.dp))
-            Box(Modifier.clickable { state.push(Screen.Settings) }) {
-                SonarAvatar(state.nick.ifBlank { "you" }, 34.dp)
-            }
-            Spacer(Modifier.width(6.dp))
-            SNIconButton(SNIconName.Plus, size = 22.dp, weight = 2.4f, tint = s.accent) { showNew = true }
         }
 
-        LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 40.dp)) {
-            item { SNSectionLabel("Nearby channels") }
-            if (state.channels.isEmpty()) {
-                item { ChannelHint() }
-            } else {
-                items(state.channels, key = { it }) { gh -> ChannelRow(gh) { state.openChannel(gh) } }
+        // sn-fab: Search pill + compose rings
+        Row(
+            Modifier.align(Alignment.BottomCenter).fillMaxWidth()
+                .padding(start = 14.dp, end = 14.dp, bottom = 28.dp),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Row(
+                Modifier.weight(1f).clip(RoundedCornerShape(999.dp)).background(s.surface)
+                    .clickable { showNew = true }.padding(horizontal = 16.dp, vertical = 13.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                SNIcon(SNIconName.Search, 17.dp, s.text3, weight = 2f)
+                Spacer(Modifier.width(9.dp))
+                Text("Search", color = s.text3, fontSize = 15.sp)
             }
-            item { SNSectionLabel("Messages") }
-            if (state.chats.isEmpty()) {
-                item { EmptyMessages() }
-            } else {
-                items(state.chats, key = { it.id }) { chat -> ChatRow(chat) { state.openChat(chat) } }
-            }
+            Box(
+                Modifier.size(48.dp).clip(CircleShape).background(s.accentFill)
+                    .clickable { state.push(Screen.Nearby) },
+                contentAlignment = Alignment.Center
+            ) { SNIcon(SNIconName.Rings, 23.dp, s.onAccent, weight = 1.9f) }
         }
     }
 
@@ -166,6 +206,102 @@ private fun HomeScreen(state: SonarAppState) {
     if (connSheet) ConnectivitySheet(online = state.started, meshCount = meshCount) { connSheet = false }
     if (wipeAsk) WipeConfirmSheet(onWipe = { wipeAsk = false; state.wipe() }, onClose = { wipeAsk = false })
     state.toast?.let { ToastBar(it) { state.toast = null } }
+}
+
+private fun channelName(geohash: String): String =
+    if (geohash.equals("mesh", true)) "Bluetooth mesh" else "#$geohash"
+
+/** bc-chip — centered status pill: dot + "<b>Online</b> · reaches anyone". */
+@Composable
+private fun StatusChipPill(online: Boolean, connecting: Boolean, meshCount: Int, onClick: () -> Unit) {
+    val s = sonar
+    Row(
+        Modifier.clip(RoundedCornerShape(999.dp)).background(s.surface)
+            .clickable(onClick = onClick).padding(horizontal = 14.dp, vertical = 7.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        SNDot(if (online) s.green else s.accent, 9.dp)
+        Spacer(Modifier.width(8.dp))
+        val label = if (online) "Online" else "Offline"
+        val desc = when {
+            online -> "reaches anyone"
+            connecting -> "connecting…"
+            else -> "$meshCount nearby on Bluetooth"
+        }
+        Text(
+            buildAnnotatedString {
+                withStyle(SpanStyle(color = s.text, fontWeight = FontWeight.Bold)) { append(label) }
+                withStyle(SpanStyle(color = s.text2)) { append(" · $desc") }
+            },
+            fontSize = 13.sp
+        )
+    }
+}
+
+/** bc-placetile — accent-soft rounded square with a pin glyph (channel avatar). */
+@Composable
+private fun PlaceTile(size: Dp) {
+    val s = sonar
+    Box(
+        Modifier.size(size).clip(RoundedCornerShape(size * 0.31f)).background(s.accentSoft),
+        contentAlignment = Alignment.Center
+    ) { SNIcon(SNIconName.Pin, size * 0.46f, s.accentDeep) }
+}
+
+/** Mesh channel avatar — accent-soft tile with the mesh (signal) glyph. */
+@Composable
+private fun MeshTile(size: Dp) {
+    val s = sonar
+    Box(
+        Modifier.size(size).clip(RoundedCornerShape(size * 0.31f)).background(s.accentSoft),
+        contentAlignment = Alignment.Center
+    ) { SNIcon(SNIconName.Mesh, size * 0.5f, s.accentDeep, weight = 2f) }
+}
+
+@Composable
+private fun LocationHint() {
+    val s = sonar
+    Text(
+        "Turn on location to see public channels for your area (neighborhood → country).",
+        color = s.text3, fontSize = 13.sp, lineHeight = 18.sp,
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 4.dp)
+    )
+}
+
+/** bc-row — avatar · (title [+verified]) / (lock? + sub) · time/unread. */
+@Composable
+private fun ConvRow(
+    avatar: @Composable () -> Unit,
+    title: String,
+    sub: String,
+    time: String? = null,
+    lock: Boolean = false,
+    verified: Boolean = false,
+    unread: Boolean = false,
+    onClick: () -> Unit,
+) {
+    val s = sonar
+    Row(
+        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 9.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        avatar()
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(title, color = s.text, fontSize = 16.5.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                if (verified) { Spacer(Modifier.width(5.dp)); SNIcon(SNIconName.ShieldCheck, 14.dp, s.green, weight = 2.1f) }
+            }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (lock) { SNIcon(SNIconName.Lock, 12.dp, s.text3, weight = 2.2f); Spacer(Modifier.width(4.dp)) }
+                Text(sub, color = s.text2, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+        }
+        Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(5.dp)) {
+            if (time != null) Text(time, color = s.text3, fontSize = 12.sp)
+            if (unread) Box(Modifier.size(11.dp).clip(CircleShape).background(s.accent))
+        }
+    }
 }
 
 @Composable
@@ -239,7 +375,7 @@ private fun EmptyMessages() {
         Text("No secure chats yet", color = s.text2, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
         Spacer(Modifier.height(4.dp))
         Text(
-            "Tap + and paste someone’s npub to start an end-to-end encrypted chat over the internet.",
+            "Tap Search and paste someone’s npub to start an end-to-end encrypted chat over the internet.",
             color = s.text3, fontSize = 13.sp, lineHeight = 18.sp
         )
     }
@@ -249,53 +385,10 @@ private fun EmptyMessages() {
 private fun ChannelHint() {
     val s = sonar
     Text(
-        "Join a channel from + to chat publicly with people in an area.",
+        "Tap Search to join a channel and chat publicly with people in an area.",
         color = s.text3, fontSize = 13.sp, lineHeight = 18.sp,
         modifier = Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 4.dp)
     )
-}
-
-@Composable
-private fun ChannelRow(geohash: String, onClick: () -> Unit) {
-    val s = sonar
-    Row(
-        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 11.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Box(
-            Modifier.size(46.dp).clip(androidx.compose.foundation.shape.RoundedCornerShape(14.dp)).background(s.accentSoft),
-            contentAlignment = Alignment.Center
-        ) { SNIcon(SNIconName.Pin, 22.dp, s.accentDeep) }
-        Spacer(Modifier.width(12.dp))
-        Column(Modifier.weight(1f)) {
-            Text("#$geohash", color = s.text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
-            Text("Public channel · over the internet", color = s.text3, fontSize = 12.sp)
-        }
-    }
-}
-
-@Composable
-private fun ChatRow(chat: SonarChat, onClick: () -> Unit) {
-    val s = sonar
-    Row(
-        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 11.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        SonarAvatar(chat.name.ifBlank { chat.members.firstOrNull() ?: "?" }, 46.dp, presence = false)
-        Spacer(Modifier.width(12.dp))
-        Column(Modifier.weight(1f)) {
-            Text(
-                chat.name.ifBlank { shortNpub(chat.members.firstOrNull() ?: "secure chat") },
-                color = s.text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold,
-                maxLines = 1, overflow = TextOverflow.Ellipsis
-            )
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                SNIcon(SNIconName.Globe, 11.dp, s.net, weight = 2f)
-                Spacer(Modifier.width(4.dp))
-                Text("Sonar · end-to-end encrypted", color = s.text3, fontSize = 12.sp)
-            }
-        }
-    }
 }
 
 @Composable

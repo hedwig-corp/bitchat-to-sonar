@@ -70,7 +70,14 @@ class SonarAppState(private val scope: CoroutineScope) {
         private set
     var meshPeers by mutableStateOf<List<MeshPeer>>(emptyList())
         private set
+    /** GPS-derived location channels (Mesh + Ottaviano…Italy), like iOS. */
+    var locationChannels by mutableStateOf<List<GeoChannel>>(emptyList())
+        private set
     var toast by mutableStateOf<String?>(null)
+
+    fun refreshLocationChannels() {
+        scope.launch { runCatching { locationChannels = LocationChannels.current() } }
+    }
 
     // ── Lightning wallet ──
     val walletAvailable: Boolean = WalletBridge.isAvailable()
@@ -395,6 +402,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 npub = SonarCore.start()
                 started = true
                 setupWallet()
+                refreshLocationChannels()
                 refreshChats()
                 poll()
             } catch (t: Throwable) {
@@ -482,6 +490,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 (screen as? Screen.Channel)?.let { refreshChannel(it.geohash) }
                 (screen as? Screen.GeoDm)?.let { refreshGeoDm(it.geohash, it.peerHex) }
                 meshPeers = MeshRadio.peers()
+                if (locationChannels.isEmpty()) refreshLocationChannels()
                 if (walletAvailable && walletState is WalletState.Ready) {
                     WalletBridge.refreshBalance()
                     walletState = WalletBridge.state()

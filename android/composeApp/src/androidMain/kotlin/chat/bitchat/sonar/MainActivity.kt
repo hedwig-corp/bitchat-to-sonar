@@ -51,6 +51,7 @@ class MainActivity : ComponentActivity() {
         meshNoiseSmokeTest()
         requestMeshPermissions()
         requestNotificationPermission()
+        requestLocationPermission()
         setContent {
             App()
         }
@@ -89,6 +90,20 @@ class MainActivity : ComponentActivity() {
 
     private val notifPermLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+
+    private val locationPermLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { }
+
+    /** Ask for location so the home can show nearby geohash channels. */
+    private fun requestLocationPermission() {
+        val fine = Manifest.permission.ACCESS_FINE_LOCATION
+        val coarse = Manifest.permission.ACCESS_COARSE_LOCATION
+        if (checkSelfPermission(fine) != PackageManager.PERMISSION_GRANTED &&
+            checkSelfPermission(coarse) != PackageManager.PERMISSION_GRANTED
+        ) {
+            locationPermLauncher.launch(arrayOf(fine, coarse))
+        }
+    }
 
     /** Ask for POST_NOTIFICATIONS on Android 13+ (no-op below). */
     private fun requestNotificationPermission() {
