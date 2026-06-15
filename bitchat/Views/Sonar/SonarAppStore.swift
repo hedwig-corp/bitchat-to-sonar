@@ -1867,6 +1867,31 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
+    // MARK: Delete a single chat (per-row)
+
+    /// Delete ONE conversation from this device. Handles all three Messages-row
+    /// kinds: a pure White Noise/Marmot group (`marmot:<id>`), a mesh/bitchat
+    /// peer, or a Sonar peer whose conversation spans BOTH a mesh leg and a White
+    /// Noise leg (delete both). Local-only — the other party is not notified.
+    func deleteChat(_ id: String) {
+        if let groupId = marmotGroupId(id) {
+            Task { await marmot.deleteGroup(groupId) }
+        } else {
+            // Mesh / Sonar peer: delete the mesh transcript...
+            chatViewModel.deleteConversation(with: PeerID(str: id))
+            // ...and the folded White Noise leg, if this peer has one.
+            if let profile = resolvedSonarProfile(id), let g = marmotGroup(forNpub: profile.npub) {
+                Task { await marmot.deleteGroup(g.id) }
+            }
+        }
+        // If we're currently viewing this chat, return to the Messages list.
+        path.removeAll { route in
+            if case .dm(let rid) = route { return rid == id }
+            return false
+        }
+        objectWillChange.send()
+    }
+
     // MARK: Erase all chats (keep identity)
 
     /// Delete every conversation — mesh DMs, public/channel transcripts and

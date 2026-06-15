@@ -332,6 +332,16 @@ final class MarmotChatModel: ObservableObject {
         syncTask = nil
     }
 
+    /// Delete ONE White Noise / Marmot chat locally (messages + MLS keys), then
+    /// drop it from the in-memory state. Local-only — the peer is not notified.
+    func deleteGroup(_ groupId: String) async {
+        try? await service.deleteGroup(groupId: groupId)
+        groups.removeAll { $0.id == groupId }
+        messagesByGroup[groupId] = nil
+        pendingOptimistic[groupId] = nil
+        profileFetches = []
+    }
+
     /// Panic-wipe the encrypted Marmot database + its Keychain key and reset
     /// in-memory state. Called from the emergency-wipe path.
     func wipeDatabase() {

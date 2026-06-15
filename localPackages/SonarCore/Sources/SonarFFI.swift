@@ -884,6 +884,13 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func blossomServers() throws  -> [String]
     
     /**
+     * Delete a single chat's local Marmot state (messages + MLS keys). Local-
+     * only — the peer is NOT notified. Idempotent (deleting an unknown group is
+     * a no-op). Used by per-chat "delete this conversation".
+     */
+    func deleteGroup(groupIdHex: String) throws 
+    
+    /**
      * Process buffered live Marmot events through the MLS engine. Returns true if
      * anything was drained. MUST run on the host's serialized engine queue.
      */
@@ -1078,6 +1085,19 @@ open func blossomServers()throws  -> [String]  {
             self.uniffiCloneHandle(),$0
     )
 })
+}
+    
+    /**
+     * Delete a single chat's local Marmot state (messages + MLS keys). Local-
+     * only — the peer is NOT notified. Idempotent (deleting an unknown group is
+     * a no-op). Used by per-chat "delete this conversation".
+     */
+open func deleteGroup(groupIdHex: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_delete_group(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(groupIdHex),$0
+    )
+}
 }
     
     /**
@@ -3104,6 +3124,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_blossom_servers() != 8214) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_delete_group() != 40442) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_drain_pending_marmot() != 32220) {

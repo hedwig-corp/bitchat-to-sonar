@@ -1909,6 +1909,29 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
         objectWillChange.send()
     }
 
+    /// Delete ONE mesh/bitchat private conversation locally. The same contact
+    /// can appear under several peer-id representations (a short mesh id and a
+    /// stable Noise-key hex) — fold them by fingerprint and drop every one,
+    /// clearing unread flags and the on-disk transcript. Local-only; the peer is
+    /// not notified (like deleting a conversation in Signal/iMessage).
+    func deleteConversation(with peerID: PeerID) {
+        let targetFP = getFingerprint(for: peerID)
+        let matches = privateChatManager.privateChats.keys.filter { key in
+            if let targetFP, let fp = getFingerprint(for: key) { return fp == targetFP }
+            return key == peerID
+        }
+        let toRemove = matches.isEmpty ? [peerID] : Array(matches)
+        for key in toRemove {
+            privateChatManager.privateChats.removeValue(forKey: key)
+            privateChatManager.unreadMessages.remove(key)
+            MessageStore.shared.deletePrivate(peerID: key)
+        }
+        if let sel = selectedPrivateChatPeer, toRemove.contains(sel) {
+            endPrivateChat()
+        }
+        objectWillChange.send()
+    }
+
     // PANIC: Emergency data clearing for activist safety
     @MainActor
     func panicClearAllData() {

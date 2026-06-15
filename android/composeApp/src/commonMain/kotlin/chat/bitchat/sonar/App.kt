@@ -2,7 +2,9 @@ package chat.bitchat.sonar
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -108,6 +110,7 @@ private fun HomeScreen(state: SonarAppState) {
     var connSheet by remember { mutableStateOf(false) }
     var wipeAsk by remember { mutableStateOf(false) }
     var titleTaps by remember { mutableStateOf(0) }
+    var pendingDelete by remember { mutableStateOf<DeleteTarget?>(null) }
     val meshCount = state.meshPeers.size
     // Triple-tap the title within 1.2s → emergency wipe (1:1 with iOS).
     LaunchedEffect(titleTaps) { if (titleTaps in 1..2) { kotlinx.coroutines.delay(1200); titleTaps = 0 } }
@@ -175,6 +178,7 @@ private fun HomeScreen(state: SonarAppState) {
                     ConvRow(
                         avatar = { SonarAvatar(row.name, 52.dp, presence = true) },
                         title = row.name, sub = row.preview, lock = false,
+                        onLongClick = { pendingDelete = DeleteTarget(row.peerId, row.name, isMesh = true) },
                     ) { state.openDm(row.peerId, row.name) }
                 }
                 items(state.chats, key = { it.id }) { chat ->
@@ -183,6 +187,7 @@ private fun HomeScreen(state: SonarAppState) {
                         avatar = { SonarAvatar(chatTitle, 52.dp, presence = false) },
                         title = chatTitle, sub = "Tap to open", lock = true,
                         verified = state.isVerified(chat.id),
+                        onLongClick = { pendingDelete = DeleteTarget(chat.id, chatTitle, isMesh = false) },
                     ) { state.openChat(chat) }
                 }
             }
@@ -216,6 +221,16 @@ private fun HomeScreen(state: SonarAppState) {
     if (composeSheet) ComposeSheet(state) { composeSheet = false }
     if (connSheet) ConnectivitySheet(online = state.started, meshCount = meshCount) { connSheet = false }
     if (wipeAsk) WipeConfirmSheet(onWipe = { wipeAsk = false; state.wipe() }, onClose = { wipeAsk = false })
+    pendingDelete?.let { t ->
+        DeleteChatSheet(
+            name = t.name,
+            onDelete = {
+                if (t.isMesh) state.deleteMeshDm(t.id) else state.deleteMarmotChat(t.id)
+                pendingDelete = null
+            },
+            onClose = { pendingDelete = null }
+        )
+    }
     state.toast?.let { ToastBar(it) { state.toast = null } }
 }
 
@@ -281,6 +296,7 @@ private fun LocationHint() {
 
 /** bc-row — avatar · (title [+verified]) / (lock? + sub) · time/unread. */
 @Composable
+@OptIn(ExperimentalFoundationApi::class)
 private fun ConvRow(
     avatar: @Composable () -> Unit,
     title: String,
@@ -289,11 +305,14 @@ private fun ConvRow(
     lock: Boolean = false,
     verified: Boolean = false,
     unread: Boolean = false,
+    onLongClick: (() -> Unit)? = null,
     onClick: () -> Unit,
 ) {
     val s = sonar
     Row(
-        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 9.dp),
+        Modifier.fillMaxWidth()
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick)
+            .padding(horizontal = 16.dp, vertical = 9.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         avatar()
@@ -332,6 +351,35 @@ private fun WipeConfirmSheet(onWipe: () -> Unit, onClose: () -> Unit) {
                 )
                 Spacer(Modifier.height(16.dp))
                 SNPrimaryButton("Wipe everything", net = false) { onWipe() }
+                Spacer(Modifier.height(8.dp))
+                Box(Modifier.fillMaxWidth().height(44.dp).clickable(onClick = onClose), contentAlignment = Alignment.Center) {
+                    Text("Cancel", color = s.text2, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                }
+            }
+        }
+    }
+}
+
+/** A chat the user long-pressed to delete (mesh DM peer id, or Marmot group id). */
+private data class DeleteTarget(val id: String, val name: String, val isMesh: Boolean)
+
+@Composable
+private fun DeleteChatSheet(name: String, onDelete: () -> Unit, onClose: () -> Unit) {
+    val s = sonar
+    Box(
+        Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
+        contentAlignment = Alignment.BottomCenter
+    ) {
+        Surface(color = s.surface, shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)) {
+            Column(Modifier.fillMaxWidth().padding(20.dp)) {
+                Text("Delete this chat?", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    "Removes “$name” from this device only. The other person isn’t notified, and you can start the chat again later.",
+                    color = s.text2, fontSize = 13.5.sp, lineHeight = 18.sp
+                )
+                Spacer(Modifier.height(16.dp))
+                SNPrimaryButton("Delete chat", net = false) { onDelete() }
                 Spacer(Modifier.height(8.dp))
                 Box(Modifier.fillMaxWidth().height(44.dp).clickable(onClick = onClose), contentAlignment = Alignment.Center) {
                     Text("Cancel", color = s.text2, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)

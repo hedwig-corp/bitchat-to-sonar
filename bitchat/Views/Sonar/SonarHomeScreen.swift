@@ -17,6 +17,7 @@ struct SonarHomeScreen: View {
     @EnvironmentObject private var store: SonarAppStore
 
     @State private var wipeAsk = false
+    @State private var pendingDelete: SNDMRow?
     @State private var connSheet = false
     @State private var composeSheet = false
     @State private var npubEntry = false
@@ -160,8 +161,24 @@ struct SonarHomeScreen: View {
                         avatar: { SonarAvatar(name: d.title, size: 52, presence: d.presence) },
                         sub: { SNLockedPreview(preview: d.preview) }
                     )
+                    .contextMenu {
+                        Button(role: .destructive) { pendingDelete = d } label: {
+                            Label("Delete chat", systemImage: "trash")
+                        }
+                    }
                 }
             }
+        }
+        .confirmationDialog(
+            "Delete this chat?",
+            isPresented: Binding(get: { pendingDelete != nil }, set: { if !$0 { pendingDelete = nil } }),
+            titleVisibility: .visible,
+            presenting: pendingDelete
+        ) { row in
+            Button("Delete \(row.title)", role: .destructive) { store.deleteChat(row.id) }
+            Button("Cancel", role: .cancel) {}
+        } message: { _ in
+            Text("This removes the conversation from this device only. The other person isn't notified.")
         }
     }
 

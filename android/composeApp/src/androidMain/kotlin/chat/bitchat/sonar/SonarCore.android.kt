@@ -253,6 +253,11 @@ actual object SonarCore {
         start()
     }
 
+    actual suspend fun deleteChat(chatId: String): Unit = withContext(Dispatchers.IO) {
+        runCatching { node?.deleteGroup(chatId) }
+        Unit
+    }
+
     private fun requireNode(): SonarNode =
         node ?: error("SonarCore not started — call start() first")
 

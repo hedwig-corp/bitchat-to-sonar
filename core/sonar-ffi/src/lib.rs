@@ -268,6 +268,15 @@ impl SonarNode {
         Ok(())
     }
 
+    /// Delete a single chat's local Marmot state (messages + MLS keys). Local-
+    /// only — the peer is NOT notified. Idempotent (deleting an unknown group is
+    /// a no-op). Used by per-chat "delete this conversation".
+    pub fn delete_group(&self, group_id_hex: String) -> FfiResult<()> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        self.runtime.block_on(self.client.delete_group(&group_id))?;
+        Ok(())
+    }
+
     /// Poll the relays once: welcomes addressed to us, then group messages.
     pub fn sync_once(&self) -> FfiResult<()> {
         self.runtime.block_on(self.client.sync())?;

@@ -170,4 +170,9 @@ expect object SonarCore {
      *  then reconnect with the same identity so new secure chats still work and
      *  our KeyPackage is republished. Used by "erase all chats" (not full wipe). */
     suspend fun eraseChats()
+
+    /** Delete ONE White Noise (Marmot) chat's local state (messages + MLS keys)
+     *  by its group id. Local-only — the peer is NOT notified. Idempotent. Backs
+     *  per-chat "delete this conversation". */
+    suspend fun deleteChat(chatId: String)
 }

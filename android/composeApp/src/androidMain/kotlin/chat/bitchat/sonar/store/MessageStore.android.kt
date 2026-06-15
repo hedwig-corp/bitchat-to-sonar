@@ -77,6 +77,11 @@ actual object MessageStore {
         Unit
     }
 
+    actual suspend fun deleteMeshDm(peerKey: String): Unit = withContext(Dispatchers.IO) {
+        runCatching { meshFile(peerKey).delete() }
+        Unit
+    }
+
     actual suspend fun wipe(): Unit = withContext(Dispatchers.IO) {
         runCatching { root().deleteRecursively() }
         Unit

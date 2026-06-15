@@ -256,6 +256,12 @@ final class MarmotService: @unchecked Sendable {
         try await run { try $0.requireNode().syncOnce() }
     }
 
+    /// Delete a single Marmot chat's local state (messages + MLS keys). Local-
+    /// only; the peer is not notified. Idempotent.
+    func deleteGroup(groupId: String) async throws {
+        try await run { try $0.requireNode().deleteGroup(groupIdHex: groupId) }
+    }
+
     /// Park until the relay subscriptions push a live Marmot event (welcome or
     /// group message), or `timeoutSeconds` elapses. Returns true if there is
     /// something to drain. Runs OFF the serial engine queue, so a long park does

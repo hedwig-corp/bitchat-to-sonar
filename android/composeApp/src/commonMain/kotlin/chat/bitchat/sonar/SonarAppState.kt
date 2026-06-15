@@ -648,6 +648,28 @@ class SonarAppState(private val scope: CoroutineScope) {
         scope.launch { refreshChats() }
     }
 
+    /** Delete ONE White Noise (Marmot) chat locally (messages + MLS keys) and
+     *  drop it from the list. Local-only — the peer is not notified. */
+    fun deleteMarmotChat(chatId: String) {
+        val wasOpen = (stack.lastOrNull() as? Screen.Chat)?.id == chatId
+        chats = chats.filterNot { it.id == chatId }
+        if (wasOpen && stack.size > 1) stack = stack.dropLast(1) // pop WITHOUT refresh
+        scope.launch {
+            SonarCore.deleteChat(chatId)
+            refreshChats()
+        }
+    }
+
+    /** Delete ONE BLE-mesh private conversation locally (in-memory + on-disk). */
+    fun deleteMeshDm(peerId: String) {
+        val wasOpen = (stack.lastOrNull() as? Screen.Chat)?.id == peerId
+        meshChats.remove(peerId)
+        meshChatNames.remove(peerId)
+        meshDmRows = meshDmRows.filterNot { it.peerId == peerId }
+        if (wasOpen && stack.size > 1) stack = stack.dropLast(1)
+        scope.launch { MessageStore.deleteMeshDm(peerId) }
+    }
+
     fun startChat(peer: String) {
         val p = peer.trim()
         if (p.isEmpty()) return

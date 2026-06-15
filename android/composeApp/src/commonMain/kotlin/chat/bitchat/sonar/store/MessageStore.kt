@@ -31,6 +31,8 @@ expect object MessageStore {
     suspend fun loadAllMeshDms(): Map<String, List<SonarMsg>>
     /** Write-through a single peer's BLE-mesh transcript (called on every append). */
     suspend fun saveMeshDm(peerKey: String, msgs: List<SonarMsg>)
+    /** Delete a single peer's BLE-mesh transcript file (per-chat delete). */
+    suspend fun deleteMeshDm(peerKey: String)
     suspend fun wipe()
 }
 

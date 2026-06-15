@@ -846,6 +846,17 @@ impl SonarClient {
         self.engine.members(group_id)
     }
 
+    /// Delete a single Marmot chat's local state (see
+    /// [`MarmotEngine::delete_group`]) and narrow the live 445 subscription so we
+    /// stop receiving its messages. Local-only; the peer is not notified.
+    pub async fn delete_group(&self, group_id: &GroupId) -> Result<()> {
+        self.engine.delete_group(group_id)?;
+        if self.allow_geo_relays {
+            let _ = self.subscribe_group_messages().await;
+        }
+        Ok(())
+    }
+
     // ── Geohash public channels (kind-20000 over Nostr) ──
 
     /// Add + connect the Nostr relays geographically nearest [geohash] — the SAME

@@ -460,6 +460,15 @@ impl MarmotEngine {
             .collect())
     }
 
+    /// Delete ALL local state for a group: messages, processed-message records,
+    /// MLS tree state, epoch secrets, key material, relay links, proposals, and
+    /// snapshots. Local-only — no MLS proposal or Nostr event is published, so
+    /// the peer is NOT notified (this is "delete this chat from my device", like
+    /// deleting a conversation in Signal/iMessage). Idempotent.
+    pub fn delete_group(&self, group_id: &GroupId) -> Result<()> {
+        Ok(dispatch!(&self.storage, |mdk| mdk.delete_group(group_id))?)
+    }
+
     fn to_chat_message(&self, m: message_types::Message) -> ChatMessage {
         let media = self.parse_media_refs(&m.mls_group_id, &m.tags);
         ChatMessage {
