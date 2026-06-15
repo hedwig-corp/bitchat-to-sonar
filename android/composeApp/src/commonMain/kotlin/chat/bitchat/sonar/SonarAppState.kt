@@ -78,6 +78,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             walletState = WalletState.NotConfigured
             presenceByGeohash = emptyMap()
             payLedger = SonarPayLedger(); scannedPay.clear(); payVersion++
+            mediaCache.clear()
         }
     }
     /** Erase every conversation — BLE-mesh DMs, public/channel transcripts and
@@ -97,6 +98,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             // ⚡PAY coins live inside the erased chats — reset the ledger. The
             // Lightning wallet seed/balance is separate and is NOT touched.
             payLedger = SonarPayLedger(); persistPay(); scannedPay.clear(); payVersion++
+            mediaCache.clear()
             // White Noise / Marmot DB: wipe + reconnect with the SAME identity.
             runCatching { SonarCore.eraseChats() }
             refreshChats()
@@ -692,6 +694,54 @@ class SonarAppState(private val scope: CoroutineScope) {
             } catch (e: Throwable) {
                 toast = "send failed: ${e.message}"
             }
+        }
+    }
+
+    // ── Media (White Noise / Marmot MIP-04) ──
+    /** Decrypted-media cache (raw bytes), keyed by the ciphertext's Blossom URL. */
+    private val mediaCache = mutableMapOf<String, ByteArray>()
+
+    /** The Marmot group id backing [chatId]: the chat id itself for a White Noise
+     *  chat, or the Sonar peer's group for a mesh-routed DM. null ⇒ no group yet. */
+    private fun resolveMarmotGroupId(chatId: String): String? {
+        if (!isMeshChat(chatId)) return chatId
+        val prof = sonarProfile(meshPeerId(chatId)) ?: return null
+        return marmotGroupForNpub(prof.npub)?.id
+    }
+
+    /** True if [chatId] can carry media (an existing Marmot group backs it). */
+    fun canSendMedia(chatId: String): Boolean = resolveMarmotGroupId(chatId) != null
+
+    /** Send an image to a White Noise chat: encrypt + Blossom upload + publish. */
+    fun sendImage(chatId: String, data: ByteArray, filename: String, mime: String) {
+        scope.launch {
+            val groupId = resolveMarmotGroupId(chatId)
+            if (groupId == null) { toast = "Start the secure chat first, then send a photo."; return@launch }
+            try {
+                SonarCore.sendMedia(groupId, data, filename, mime, "")
+                // Refresh the open conversation so the sent image shows.
+                (screen as? Screen.Chat)?.let { sc ->
+                    if (sc.id == chatId) {
+                        if (isMeshChat(chatId)) refreshOpenDm(meshPeerId(chatId))
+                        else { messages = SonarCore.messages(groupId); processPayLines(chatId, messages) }
+                    }
+                }
+            } catch (e: Throwable) {
+                toast = "couldn't send photo: ${e.message}"
+            }
+        }
+    }
+
+    /** Download + decrypt a media attachment, cached by URL. */
+    suspend fun mediaData(chatId: String, media: SonarMedia): ByteArray? {
+        mediaCache[media.url]?.let { return it }
+        val groupId = resolveMarmotGroupId(chatId) ?: return null
+        return try {
+            val bytes = SonarCore.fetchMedia(groupId, media.url)
+            mediaCache[media.url] = bytes
+            bytes
+        } catch (e: Throwable) {
+            null
         }
     }
 

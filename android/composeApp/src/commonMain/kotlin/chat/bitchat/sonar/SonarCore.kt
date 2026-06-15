@@ -17,7 +17,22 @@ data class SonarMsg(
     val mine: Boolean,
     val tsSecs: Long,
     val viaInternet: Boolean = false,
+    /// Encrypted media attachments (Marmot MIP-04), empty for plain text.
+    val media: List<SonarMedia> = emptyList(),
 )
+
+/** A reference to an encrypted media attachment. [url] is the Blossom URL of the
+ *  CIPHERTEXT; call [SonarCore.fetchMedia] to download + decrypt. */
+data class SonarMedia(
+    val url: String,
+    val mimeType: String,
+    val filename: String,
+    val width: Int?,
+    val height: Int?,
+    val durationMs: Long?,
+) {
+    val isImage: Boolean get() = mimeType.startsWith("image/")
+}
 
 /** A peer's Nostr profile (kind-0 metadata, NIP-01). A Marmot member's identity
  *  is a Nostr pubkey, so this resolves their human name + avatar (vs a raw npub). */
@@ -70,6 +85,20 @@ expect object SonarCore {
 
     /** Send an encrypted text message to a chat. */
     suspend fun send(chatId: String, text: String)
+
+    /** Encrypt + upload [data] to a Blossom server, then publish a media message
+     *  to the chat. [serverUrl] empty → the core default. */
+    suspend fun sendMedia(
+        chatId: String,
+        data: ByteArray,
+        filename: String,
+        mime: String,
+        caption: String,
+        serverUrl: String = "",
+    )
+
+    /** Download + decrypt the media blob at [url] for the chat. Returns plaintext. */
+    suspend fun fetchMedia(chatId: String, url: String): ByteArray
 
     /** Decrypted message history for a chat, oldest first. */
     suspend fun messages(chatId: String): List<SonarMsg>

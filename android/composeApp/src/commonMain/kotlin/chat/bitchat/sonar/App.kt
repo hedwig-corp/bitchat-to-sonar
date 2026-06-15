@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -408,6 +409,9 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     var paySheet by remember { mutableStateOf(false) }
     var verifySheet by remember { mutableStateOf(false) }
     var addSheet by remember { mutableStateOf(false) }
+    val pickPhoto = rememberPhotoPicker { bytes, name, mime ->
+        state.sendImage(screen.id, bytes, name, mime)
+    }
     // Radar "Send sats" opens the chat with pay=true → jump straight to the sheet.
     LaunchedEffect(screen.id) { if (screen.pay) paySheet = true }
     val listState = rememberLazyListState()
@@ -513,6 +517,8 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                         PayBubble(m, pay, status, peerName, mesh = msgMesh, fiatOf = { state.fiatOrNull(it) }) {
                             state.claimPay(screen.id, pay.uuid)
                         }
+                    } else if (m.media.isNotEmpty()) {
+                        MediaBubble(m, state, screen.id)
                     } else MessageBubble(m, msgMesh)
                 }
             }
@@ -557,7 +563,9 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         onLocation = { addSheet = false; state.toast = "Location sharing is coming soon." },
         onVerify = { addSheet = false; verifySheet = true },
         onReactions = { addSheet = false; state.toast = "Reactions are coming soon." },
-        onClose = { addSheet = false }
+        onClose = { addSheet = false },
+        canSendPhoto = state.canSendMedia(screen.id),
+        onPhoto = { addSheet = false; pickPhoto() }
     )
     if (paySheet) PaySheet(
         peerName = peerName,
@@ -587,6 +595,8 @@ private fun AddToMessageSheet(
     onVerify: () -> Unit,
     onReactions: () -> Unit,
     onClose: () -> Unit,
+    canSendPhoto: Boolean = false,
+    onPhoto: () -> Unit = {},
 ) {
     val s = sonar
     Box(
@@ -597,6 +607,9 @@ private fun AddToMessageSheet(
             Column(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 18.dp, bottom = 20.dp)) {
                 Text("Add to your message", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(8.dp))
+                if (canSendPhoto) {
+                    ActionRow(SNIconName.Lock, "Send photo", "Encrypted end-to-end over White Noise", onPhoto)
+                }
                 ActionRow(SNIconName.Coin, "Send bitcoin", "Instant over Lightning", onBitcoin)
                 ActionRow(SNIconName.NavArrow, "Share location", "Only $peerName will see it", onLocation)
                 ActionRow(SNIconName.Shield, "Verify safety number", "Confirm this chat is secure", onVerify)
@@ -816,6 +829,65 @@ private fun MessageBubble(m: SonarMsg, mesh: Boolean = false) {
             androidx.compose.foundation.text.selection.SelectionContainer {
                 Text(annotated, color = if (m.mine) onMine else s.text, fontSize = 16.sp)
             }
+        }
+    }
+}
+
+/**
+ * A media message bubble (Marmot MIP-04). No 1:1 design handoff exists for media,
+ * so this is the deliberate, tasteful extension matching Sonar tokens: an inline
+ * image (downloaded + decrypted on appear, cached by the store) or a file chip,
+ * plus an optional caption.
+ */
+@Composable
+private fun MediaBubble(m: SonarMsg, state: SonarAppState, chatId: String) {
+    val s = sonar
+    val media = m.media.first()
+    Column(
+        Modifier.fillMaxWidth().padding(vertical = 3.dp),
+        horizontalAlignment = if (m.mine) Alignment.End else Alignment.Start
+    ) {
+        if (media.isImage) {
+            val img by androidx.compose.runtime.produceState<androidx.compose.ui.graphics.ImageBitmap?>(
+                null, media.url
+            ) {
+                value = state.mediaData(chatId, media)?.let { decodeImageBitmap(it) }
+            }
+            Box(
+                Modifier.widthIn(max = 240.dp).clip(RoundedCornerShape(18.dp)).background(s.surface2),
+                contentAlignment = Alignment.Center
+            ) {
+                val bmp = img
+                if (bmp != null) {
+                    androidx.compose.foundation.Image(
+                        bitmap = bmp,
+                        contentDescription = media.filename,
+                        contentScale = androidx.compose.ui.layout.ContentScale.Fit,
+                        modifier = Modifier.widthIn(max = 240.dp).heightIn(max = 300.dp)
+                    )
+                } else {
+                    Box(
+                        Modifier.size(width = 180.dp, height = 130.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        androidx.compose.material3.CircularProgressIndicator(
+                            color = s.text3, strokeWidth = 2.dp
+                        )
+                    }
+                }
+            }
+        } else {
+            Row(
+                Modifier.clip(RoundedCornerShape(14.dp)).background(s.surface2)
+                    .padding(horizontal = 12.dp, vertical = 9.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(media.filename, color = s.text, fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold)
+            }
+        }
+        if (m.content.isNotEmpty()) {
+            Spacer(Modifier.height(3.dp))
+            Text(m.content, color = s.text, fontSize = 14.5.sp)
         }
     }
 }

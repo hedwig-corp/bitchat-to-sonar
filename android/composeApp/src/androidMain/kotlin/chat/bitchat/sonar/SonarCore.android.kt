@@ -69,6 +69,20 @@ actual object SonarCore {
         requireNode().sendText(chatId, text)
     }
 
+    actual suspend fun sendMedia(
+        chatId: String,
+        data: ByteArray,
+        filename: String,
+        mime: String,
+        caption: String,
+        serverUrl: String,
+    ) = withContext(Dispatchers.IO) {
+        requireNode().sendMedia(chatId, data, filename, mime, caption, serverUrl)
+    }
+
+    actual suspend fun fetchMedia(chatId: String, url: String): ByteArray =
+        withContext(Dispatchers.IO) { requireNode().fetchMedia(chatId, url) }
+
     actual suspend fun messages(chatId: String): List<SonarMsg> = withContext(Dispatchers.IO) {
         val n = node ?: return@withContext emptyList()
         n.messages(chatId).map {
@@ -78,6 +92,16 @@ actual object SonarCore {
                 content = it.content,
                 mine = it.mine,
                 tsSecs = it.createdAtSecs.toLong(),
+                media = it.media.map { m ->
+                    SonarMedia(
+                        url = m.url,
+                        mimeType = m.mimeType,
+                        filename = m.filename,
+                        width = m.width?.toInt(),
+                        height = m.height?.toInt(),
+                        durationMs = m.durationMs?.toLong(),
+                    )
+                },
             )
         }
     }
