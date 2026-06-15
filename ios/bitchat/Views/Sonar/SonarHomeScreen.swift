@@ -44,7 +44,7 @@ struct SonarHomeScreen: View {
                 }
                 ScrollView {
                     VStack(spacing: 0) {
-                        SNSectionLabel("Nearby channels")
+                        SNSectionLabel("Around you")
                         channelList
                         SNSectionLabel("Messages")
                         dmList
@@ -102,21 +102,10 @@ struct SonarHomeScreen: View {
     }
 
     private var channelList: some View {
-        let channels = store.channels
         return VStack(spacing: 0) {
-            ForEach(Array(channels.enumerated()), id: \.element.id) { i, ch in
-                SNConvRow(
-                    title: ch.name,
-                    divider: i < channels.count - 1 || !store.locationReady,
-                    action: { store.openChannel(ch) },
-                    avatar: { SNPlaceTile(size: 52, icon: ch.id == "mesh" ? .mesh : .pin) },
-                    sub: {
-                        Text(verbatim: ch.preview)
-                            .font(SonarTheme.uiFont(size: 14))
-                            .foregroundColor(SonarTheme.text2)
-                    }
-                )
-            }
+            // "Around you" collapses the geohash precision ladder (+ Mesh) into one
+            // card with a tier picker (design: HereCard) instead of a flat list.
+            SNHereCard(channels: store.channels) { store.openChannel($0) }
             if !store.locationReady {
                 SNConvRow(
                     title: "Channels around you",

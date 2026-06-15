@@ -803,6 +803,73 @@ struct SNMediaBubble: View {
     }
 }
 
+/// "Around you" card (design: screens.jsx HereCard) — collapses the geohash
+/// precision ladder (+ Mesh) into ONE row plus a tier picker. The main row enters
+/// the selected channel; the ladder ticks pick precision (live green dot when
+/// someone's there). Deviation: Mesh is included as the first tick (a real
+/// "around you" channel on this platform; the web ladder is geohash-only).
+struct SNHereCard: View {
+    let channels: [SNChannelItem]
+    let onEnter: (SNChannelItem) -> Void
+    @State private var idx: Int = 0
+
+    private var defaultIdx: Int {
+        channels.firstIndex(where: { $0.count > 0 }) ?? max(0, channels.count - 1)
+    }
+
+    var body: some View {
+        if channels.isEmpty {
+            SNEmptyState(icon: .pin, iconSize: 22,
+                         title: "Nothing around you yet",
+                         desc: "Grant location to see public channels nearby, or use the radar to find people over Bluetooth.")
+                .padding(.vertical, 18)
+        } else {
+            let sel = channels[min(idx, channels.count - 1)]
+            VStack(spacing: 0) {
+                Button { onEnter(sel) } label: {
+                    HStack(spacing: 12) {
+                        SNPlaceTile(size: 52, icon: sel.id == "mesh" ? .mesh : .pin)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(verbatim: sel.name)
+                                .font(SonarTheme.uiFont(size: 16.5, weight: .semibold))
+                                .foregroundColor(SonarTheme.text).lineLimit(1)
+                            Text(verbatim: "\(sel.tier) · \(sel.count) here now")
+                                .font(SonarTheme.uiFont(size: 14))
+                                .foregroundColor(SonarTheme.text2).lineLimit(1)
+                        }
+                        Spacer(minLength: 0)
+                        SNIcon(name: .chevron, size: 15, weight: 2.2).foregroundColor(SonarTheme.text3)
+                    }
+                    .padding(.horizontal, 16).padding(.vertical, 9)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(SNScaleStyle(scale: 0.99))
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(Array(channels.enumerated()), id: \.element.id) { i, ch in
+                            Button { idx = i } label: {
+                                HStack(spacing: 4) {
+                                    Text(verbatim: ch.tier.isEmpty ? ch.name : ch.tier)
+                                        .font(SonarTheme.uiFont(size: 12.5, weight: i == idx ? .semibold : .regular))
+                                        .foregroundColor(i == idx ? SonarTheme.text : SonarTheme.text3)
+                                    if ch.count > 0 {
+                                        Circle().fill(SonarTheme.green).frame(width: 5, height: 5)
+                                    }
+                                }
+                                .padding(.horizontal, 11).padding(.vertical, 6)
+                                .background(Capsule().fill(i == idx ? SonarTheme.surface2 : Color.clear))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.horizontal, 14).padding(.bottom, 6)
+                }
+            }
+            .onAppear { idx = defaultIdx }
+        }
+    }
+}
+
 /// Audio / voice-note bubble (design: MediaBubble `media-audio` — play button +
 /// `MediaWave` + duration). Plays the decrypted bytes via AVAudioPlayer.
 /// Deviation: the flat play triangle uses an SF Symbol (`play.fill`/`pause.fill`),

@@ -96,6 +96,9 @@ struct SNChannelItem: Identifiable {
     let preview: String     // home row second line
     let count: Int
     let channel: ChannelID
+    /// Short precision-tier label for the "Around you" ladder (design HereCard
+    /// `here-scale`): "Mesh" or the geohash level (Block / Area / City / …).
+    var tier: String = ""
 }
 
 /// A person: a mesh peer (direct / relayed / unreachable mutual favorite)
@@ -840,7 +843,8 @@ final class SonarAppStore: ObservableObject {
             sub: "Public · \(n) in range",
             preview: n > 0 ? "\(n) people in Bluetooth range" : "Bluetooth · works without internet",
             count: n,
-            channel: .mesh
+            channel: .mesh,
+            tier: "Mesh"
         )
     }
 
@@ -853,7 +857,8 @@ final class SonarAppStore: ObservableObject {
             sub: "Public · \(count) here now",
             preview: "\(ch.level.displayName) · \(count) here now",
             count: count,
-            channel: .location(ch)
+            channel: .location(ch),
+            tier: ch.level.displayName
         )
     }
 
