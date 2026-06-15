@@ -3,10 +3,12 @@
 The complete design handoff bundle lives in `design/handoff/`. It is **vendored**
 (checked in) so agents read it from disk instead of re-fetching every time.
 
-- **Source share:** https://api.anthropic.com/v1/design/h/H5tEQgWekwCuHihJuEYcxw (Claude Design / claude.ai/design)
-- **Last synced:** 2026-06-14 (this refresh updated `project/sonar/{screens,data,theme}.*` and
-  added `project/uploads/Screenshot 2026-06-14 at 02.04.36.png` — the design was revised since the
-  prior 2026-06-12 vendoring, which is why the radar peer-tap UI changed).
+- **Source share:** https://api.anthropic.com/v1/design/h/LiZ0wCa-wc3TUfTpZosL3w?open_file=Sonar+Desktop.html (Claude Design / claude.ai/design)
+- **Last synced:** 2026-06-16 (re-fetched for the **Sonar Desktop** implementation. The user opened
+  `Sonar Desktop.html` when triggering this handoff; the project files matched the prior vendoring
+  byte-for-byte — only the bundle README changed — so no design content shifted. The desktop split
+  view was implemented in the Compose Multiplatform app this refresh; see `apps/sonar`.)
+- **Prior source share:** https://api.anthropic.com/v1/design/h/H5tEQgWekwCuHihJuEYcxw (synced 2026-06-14).
 
 ## What's the source of truth
 

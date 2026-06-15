@@ -87,19 +87,30 @@ fun App() {
                 Box(Modifier.statusBarsPadding().imePadding()) { SonarOnboardingScreen(state) }
             } else {
                 Box(Modifier.statusBarsPadding().imePadding()) {
-                    when (val sc = state.screen) {
-                        is Screen.Home -> HomeScreen(state)
-                        is Screen.Chat -> ChatScreen(state, sc)
-                        is Screen.Settings -> chat.bitchat.sonar.screens.SonarSettingsScreen(state)
-                        is Screen.Profile -> chat.bitchat.sonar.screens.SonarProfileScreen(state)
-                        is Screen.Nearby -> chat.bitchat.sonar.screens.SonarRadarScreen(state)
-                        is Screen.Search -> chat.bitchat.sonar.screens.SonarSearchScreen(state)
-                        is Screen.Channel -> chat.bitchat.sonar.screens.SonarChannelScreen(state, sc)
-                        is Screen.GeoDm -> GeoDmScreen(state, sc)
-                    }
+                    SonarScreenHost(state)
                 }
             }
         }
+    }
+}
+
+/**
+ * Renders the screen on top of [SonarAppState]'s navigation stack. Extracted from
+ * [App] so the desktop three-pane shell can reuse the exact same feature-complete
+ * screens (chat, channel, radar, settings, profile, search, geo-DM) inside its
+ * content pane — one UI codebase across phone and desktop.
+ */
+@Composable
+internal fun SonarScreenHost(state: SonarAppState) {
+    when (val sc = state.screen) {
+        is Screen.Home -> HomeScreen(state)
+        is Screen.Chat -> ChatScreen(state, sc)
+        is Screen.Settings -> chat.bitchat.sonar.screens.SonarSettingsScreen(state)
+        is Screen.Profile -> chat.bitchat.sonar.screens.SonarProfileScreen(state)
+        is Screen.Nearby -> chat.bitchat.sonar.screens.SonarRadarScreen(state)
+        is Screen.Search -> chat.bitchat.sonar.screens.SonarSearchScreen(state)
+        is Screen.Channel -> chat.bitchat.sonar.screens.SonarChannelScreen(state, sc)
+        is Screen.GeoDm -> GeoDmScreen(state, sc)
     }
 }
 

@@ -648,6 +648,17 @@ class SonarAppState(private val scope: CoroutineScope) {
         scope.launch { refreshChats() }
     }
 
+    /** Desktop master-detail helper: collapse the nav stack to [Screen.Home] so
+     *  the content pane shows the welcome placeholder. Called before selecting a
+     *  sidebar item so the stack never grows unbounded and a screen's Back button
+     *  deselects (returns to the welcome pane) instead of walking history. */
+    fun resetToHome() {
+        if (stack.size > 1) { stack = listOf(Screen.Home); messages = emptyList() }
+    }
+
+    /** True when the desktop content pane should show the welcome placeholder. */
+    val isHome: Boolean get() = stack.size == 1
+
     /** Delete ONE White Noise (Marmot) chat locally (messages + MLS keys) and
      *  drop it from the list. Local-only — the peer is not notified. */
     fun deleteMarmotChat(chatId: String) {
@@ -960,7 +971,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // change so a cross-device round trip shows up in logcat.
                 val wnMsgs = chats.sumOf { runCatching { SonarCore.messages(it.id).size }.getOrDefault(0) }
                 if (chats.size != lastWnGroups || wnMsgs != lastWnMsgs) {
-                    android.util.Log.i("SonarWN", "White Noise: ${chats.size} group(s), $wnMsgs message(s)")
+                    sonarLog("SonarWN", "White Noise: ${chats.size} group(s), $wnMsgs message(s)")
                     lastWnGroups = chats.size; lastWnMsgs = wnMsgs
                 }
                 // Resolve each counterpart's kind-0 profile (retries until they
