@@ -23,10 +23,6 @@ struct SonarCallScreen: View {
     let peerId: String
     let video: Bool
 
-    private enum Phase { case ringing, connected }
-
-    @State private var phase: Phase = .ringing
-    @State private var secs: Int = 0
     @State private var muted = false
     @State private var speaker: Bool
     @State private var camOn = true
@@ -38,17 +34,23 @@ struct SonarCallScreen: View {
         _speaker = State(initialValue: video)
     }
 
-    // MARK: Derived
+    // MARK: Derived (driven by the real call engine via store.activeCall)
 
-    private var peerName: String { store.peerItem(peerId).name }
+    private var call: SNActiveCall? { store.activeCall }
+    private var incoming: Bool { call?.incoming == true }
+    private var connected: Bool { call?.phase == .connected }
+    private var ringing: Bool { call?.phase == .ringing || call?.phase == .connecting }
+    private var secs: Int { call?.connectedSecs ?? 0 }
+    private var peerName: String { call?.peerName ?? store.peerItem(peerId).name }
     private var mesh: Bool { store.dmTransport(peerId) == .mesh }
     private var encLine: String { mesh ? "Bluetooth" : "internet" }
     private var hue: Double { Double(snHash(peerName) % 360) }
 
     private var status: String {
-        phase == .ringing
-            ? (video ? "Ringing\u{2026}" : "Calling\u{2026}")
-            : SonarAppStore.fmtCall(secs)
+        if connected { return SonarAppStore.fmtCall(secs) }
+        if call?.phase == .connecting { return "Connecting\u{2026}" }
+        if incoming { return video ? "Incoming video call" : "Incoming call" }
+        return video ? "Ringing\u{2026}" : "Calling\u{2026}"
     }
 
     // MARK: Body
@@ -73,7 +75,7 @@ struct SonarCallScreen: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-            if video && phase == .connected && camOn {
+            if video && connected && camOn {
                 pip
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
                     .padding(.trailing, 16)
@@ -83,20 +85,6 @@ struct SonarCallScreen: View {
         .background(Color.black.ignoresSafeArea())
         .ignoresSafeArea()
         .environment(\.colorScheme, .dark)
-        .task { await runCallTimers() }
-    }
-
-    // MARK: Timing (call.jsx useEffects — ringing→connected@2s, +1s tick)
-
-    private func runCallTimers() async {
-        try? await Task.sleep(nanoseconds: 2_000_000_000)
-        guard !Task.isCancelled else { return }
-        await MainActor.run { phase = .connected }
-        while !Task.isCancelled {
-            try? await Task.sleep(nanoseconds: 1_000_000_000)
-            if Task.isCancelled { break }
-            await MainActor.run { secs += 1 }
-        }
     }
 
     // MARK: Backgrounds
@@ -121,7 +109,7 @@ struct SonarCallScreen: View {
 
     private var remoteFeed: some View {
         ZStack {
-            if phase == .connected && camOn {
+            if connected && camOn {
                 SNCallFeed(hue: hue, animate: !reduceMotion)
             } else {
                 LinearGradient(
@@ -183,7 +171,7 @@ struct SonarCallScreen: View {
 
     private var voiceCenter: some View {
         VStack(spacing: 0) {
-            SNRingingAvatar(name: peerName, ringing: phase == .ringing, reduceMotion: reduceMotion)
+            SNRingingAvatar(name: peerName, ringing: ringing, reduceMotion: reduceMotion)
             Text(verbatim: peerName)
                 .font(SonarTheme.uiFont(size: 30, weight: .heavy))
                 .kerning(-30 * 0.02)
@@ -232,28 +220,32 @@ struct SonarCallScreen: View {
 
     private var controls: some View {
         HStack(alignment: .top, spacing: 14) {
-            SNCallButton(
-                icon: muted ? .micOff : .mic,
-                label: muted ? "Unmute" : "Mute",
-                active: muted
-            ) { muted.toggle() }
-
-            if video {
-                SNCallButton(
-                    icon: camOn ? .videocam : .videoOff,
-                    label: camOn ? "Stop video" : "Start video",
-                    active: !camOn
-                ) { camOn.toggle() }
-                // Flip camera — no-op in the mock.
-                SNCallButton(icon: .cameraFlip, label: "Flip") {}
+            if incoming && !connected {
+                // Incoming call: Decline (red) + Accept (green).
+                SNCallButton(icon: .phoneDown, label: "Decline", end: true) { store.declineCall() }
+                SNCallButton(icon: .phone, label: "Accept", accept: true) { store.acceptCall() }
             } else {
-                SNCallButton(icon: .speaker, label: "Speaker", active: speaker) { speaker.toggle() }
-                // Upgrade to video — no-op in the mock (call.jsx).
-                SNCallButton(icon: .videocam, label: "Video") {}
-            }
+                SNCallButton(
+                    icon: muted ? .micOff : .mic,
+                    label: muted ? "Unmute" : "Mute",
+                    active: muted
+                ) { muted.toggle() }
 
-            SNCallButton(icon: .phoneDown, label: "End", end: true) {
-                store.endCall(peerId, video: video, seconds: phase == .connected ? secs : 0)
+                if video {
+                    SNCallButton(
+                        icon: camOn ? .videocam : .videoOff,
+                        label: camOn ? "Stop video" : "Start video",
+                        active: !camOn
+                    ) { camOn.toggle() }
+                    // Flip camera — cosmetic (no camera control yet).
+                    SNCallButton(icon: .cameraFlip, label: "Flip") {}
+                } else {
+                    SNCallButton(icon: .speaker, label: "Speaker", active: speaker) { speaker.toggle() }
+                    // Upgrade to video — cosmetic (call.jsx).
+                    SNCallButton(icon: .videocam, label: "Video") {}
+                }
+
+                SNCallButton(icon: .phoneDown, label: "End", end: true) { store.hangupCall() }
             }
         }
         .padding(EdgeInsets(top: 22, leading: 18, bottom: 46, trailing: 18))
@@ -278,6 +270,7 @@ private struct SNCallButton: View {
     let label: String
     var active: Bool = false
     var end: Bool = false
+    var accept: Bool = false
     let action: () -> Void
 
     var body: some View {
@@ -297,12 +290,13 @@ private struct SNCallButton: View {
     }
 
     private var circleColor: Color {
+        if accept { return Color(sonarHex: 0x41BC76) }    // var(--green)
         if end { return Color(sonarHex: 0xF16A6A) }       // var(--danger), dark
         return active ? .white : Color.white.opacity(0.12)
     }
 
     private var iconColor: Color {
-        if end { return .white }
+        if accept || end { return .white }
         return active ? Color(sonarHex: 0x0B1418) : .white  // .call-btn.active color
     }
 }

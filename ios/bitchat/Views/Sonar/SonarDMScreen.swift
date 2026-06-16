@@ -53,10 +53,10 @@ struct SonarDMScreen: View {
                 // Calls are Sonar-only: shown only when the peer advertised the
                 // calls capability over its 0x53 Sonar profile.
                 if store.canCall(peerId) {
-                    SNIconButton(action: { store.push(.call(peerId, video: false)) }) {
+                    SNIconButton(action: { store.placeCall(peerId, video: false) }) {
                         SNIcon(name: .phone, size: 20)
                     }
-                    SNIconButton(action: { store.push(.call(peerId, video: true)) }) {
+                    SNIconButton(action: { store.placeCall(peerId, video: true) }) {
                         SNIcon(name: .videocam, size: 21)
                     }
                 }

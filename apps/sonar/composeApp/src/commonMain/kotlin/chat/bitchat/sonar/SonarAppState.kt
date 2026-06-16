@@ -109,7 +109,17 @@ class SonarAppState(private val scope: CoroutineScope) {
             payLedger = SonarPayLedger(); scannedPay.clear(); payVersion++
             mediaCache.clear()
             callLogs.clear(); callVersion++
+            resetCallState()
         }
+    }
+
+    /** Tear down call state on wipe so calling rebinds cleanly after re-onboarding
+     *  (the node is recreated, so the iroh endpoint must be re-bound). */
+    private fun resetCallState() {
+        callTicker?.cancel(); callTicker = null
+        activeCall = null
+        callStarted = false
+        scannedCall.clear()
     }
     /** Erase every conversation — BLE-mesh DMs, public/channel transcripts and
      *  White Noise (Marmot) secure chats — WITHOUT logging the user out. The
@@ -132,6 +142,9 @@ class SonarAppState(private val scope: CoroutineScope) {
             callLogs.clear(); callVersion++
             // White Noise / Marmot DB: wipe + reconnect with the SAME identity.
             runCatching { SonarCore.eraseChats() }
+            // The node is recreated → re-bind the iroh call endpoint on next use.
+            resetCallState()
+            ensureCallStarted()
             refreshChats()
             stack = listOf(Screen.Home)
             toast = "All chats erased"

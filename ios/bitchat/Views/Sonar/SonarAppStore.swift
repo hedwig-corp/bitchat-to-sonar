@@ -20,6 +20,7 @@ import BitLogger
 import Combine
 import CryptoKit
 import Foundation
+import SonarCore
 import SwiftUI
 #if canImport(UIKit)
 import UIKit
@@ -83,6 +84,19 @@ struct SNCallRecord: Identifiable, Equatable {
     let id: String
     let date: Date
     let message: SNMessage
+}
+
+/// The in-flight P2P call the call screen renders. `incoming` ⇒ we are the callee
+/// (show Accept/Decline); `phase` tracks the engine state machine.
+struct SNActiveCall: Equatable {
+    let callId: String
+    /// The conversation id the ☎CALL signaling rides (DM peer id or Marmot conv).
+    let convId: String
+    let peerName: String
+    let video: Bool
+    let incoming: Bool
+    var phase: CallStateInfo
+    var connectedSecs: Int = 0
 }
 
 struct SNMessage: Identifiable, Equatable {
@@ -252,6 +266,15 @@ final class SonarAppStore: ObservableObject {
     /// signalling; nothing here is persisted or written to MessageStore/Marmot.
     @Published private(set) var callLogs: [String: [SNCallRecord]] = [:]
 
+    /// The in-flight P2P call the [SonarCallScreen] renders, or nil. Driven by the
+    /// real iroh/opus engine via `callWaitEvent`.
+    @Published private(set) var activeCall: SNActiveCall?
+    private var callStarted = false
+    private var callLoopTask: Task<Void, Never>?
+    private var callTickerTask: Task<Void, Never>?
+    /// Ids of ☎CALL control messages already routed to the engine (dedup).
+    private var scannedCallMessageIDs = Set<String>()
+
     private var cancellables = Set<AnyCancellable>()
     /// Texts queued for a Sonar peer (keyed by npub) while their White
     /// Noise group is being created on first out-of-range send.
@@ -347,6 +370,9 @@ final class SonarAppStore: ObservableObject {
                 // Publish our kind-0 profile (NIP-01) so peers resolve our
                 // nickname instead of our npub. MIP-00 identity == Nostr pubkey.
                 if npub != nil { self.marmot.publishProfile(name: self.chatViewModel.nickname) }
+                // Bind the iroh call endpoint + start the event loop once we're
+                // connected, so an incoming call rings without placing one first.
+                if npub != nil { self.ensureCallStarted() }
                 // The wallet derives from the same identity (nsec); once the
                 // Marmot identity exists, (re)attempt the deferred wallet setup.
                 #if os(iOS)
@@ -387,11 +413,11 @@ final class SonarAppStore: ObservableObject {
         updateReceiverAdvertising()
         chatViewModel.objectWillChange
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in self?.processIncomingPayLines() }
+            .sink { [weak self] _ in self?.processIncomingPayLines(); self?.processIncomingCallLines() }
             .store(in: &cancellables)
         marmot.$messagesByGroup
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in self?.processIncomingPayLines() }
+            .sink { [weak self] _ in self?.processIncomingPayLines(); self?.processIncomingCallLines() }
             .store(in: &cancellables)
 
         // Restore persisted Sonar profiles so a peer's mesh + White Noise legs
@@ -1263,6 +1289,8 @@ final class SonarAppStore: ObservableObject {
     }
 
     private func payMapping(_ content: String, fallbackVia: SNVia) -> PayMapping {
+        // ☎CALL signaling lines ride the chat like ⚡PAY but are never shown.
+        if callParseControl(content: content) != nil { return .hidden }
         guard let line = SonarPayMessage.decode(content) else { return .notPay }
         guard case .pay(let pid, let sats) = line else { return .hidden }
         let entry = payLedger.entry(for: pid)
@@ -1963,17 +1991,143 @@ final class SonarAppStore: ObservableObject {
         "\(sec / 60):" + String(format: "%02d", sec % 60)
     }
 
-    /// End a MOCKED call: append a CallLog record to the peer's DM transcript
-    /// (in-memory only) and pop the call screen — mirrors app.jsx `endCall`.
-    /// `seconds == 0` ⇒ the call never connected (a missed call).
-    func endCall(_ peerId: String, video: Bool, seconds: Int) {
+    // MARK: - Real P2P voice calls (iroh transport; ☎CALL over the chat)
+
+    /// Bind the iroh endpoint once + start the call event loop (idempotent).
+    func ensureCallStarted() {
+        guard !callStarted else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await self.marmot.callStart()
+                await MainActor.run { self.callStarted = true; self.startCallLoop() }
+            } catch {
+                SecureLogger.error("call start failed: \(error)", category: .session)
+            }
+        }
+    }
+
+    /// Place an outgoing call from `convId`: register it, push the call screen,
+    /// and send the ☎CALL OFFER (with our dialable address) over the chat.
+    func placeCall(_ convId: String, video: Bool) {
+        guard activeCall == nil else { return }
+        let callId = UUID().uuidString
+        let name = peerItem(convId).name
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await self.marmot.callStart()
+                await MainActor.run { self.callStarted = true; self.startCallLoop() }
+                let addr = try await self.marmot.callLocalAddress()
+                try await self.marmot.callPlace(callId: callId, video: video)
+                let line = callEncodeOffer(callId: callId, video: video, nodeAddrB64: addr, unixSecs: UInt64(Date().timeIntervalSince1970))
+                await MainActor.run {
+                    self.activeCall = SNActiveCall(callId: callId, convId: convId, peerName: name, video: video, incoming: false, phase: .ringing)
+                    self.push(.call(convId, video: video))
+                    self.sendDm(convId, line)
+                }
+            } catch {
+                SecureLogger.error("call place failed: \(error)", category: .session)
+                await MainActor.run { self.activeCall = nil }
+            }
+        }
+    }
+
+    /// Accept the incoming call: send ANSWER|accept (with our address), then dial.
+    func acceptCall() {
+        guard let c = activeCall else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let addr = try await self.marmot.callLocalAddress()
+                let line = callEncodeAnswer(callId: c.callId, answer: .accept, nodeAddrB64: addr)
+                await MainActor.run { self.sendDm(c.convId, line) }
+                try await self.marmot.callAccept(callId: c.callId)
+            } catch {
+                SecureLogger.error("call accept failed: \(error)", category: .session)
+            }
+        }
+    }
+
+    /// Decline the incoming call: send ANSWER|decline + tear down the local slot.
+    func declineCall() {
+        guard let c = activeCall else { return }
+        let line = callEncodeAnswer(callId: c.callId, answer: .decline, nodeAddrB64: "")
+        sendDm(c.convId, line)
+        Task { [weak self] in try? await self?.marmot.callHangup(callId: c.callId) }
+    }
+
+    /// Hang up an outgoing/connected call: tear down media + signal END. The
+    /// engine's Ended event records the call-log entry and pops the screen.
+    func hangupCall() {
+        guard let c = activeCall else { return }
+        let line = callEncodeEnd(callId: c.callId, reason: "hangup")
+        sendDm(c.convId, line)
+        Task { [weak self] in try? await self?.marmot.callHangup(callId: c.callId) }
+    }
+
+    private func startCallLoop() {
+        guard callLoopTask == nil else { return }
+        callLoopTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                let ev = await self.marmot.callWaitEvent(timeoutSeconds: 20)
+                if Task.isCancelled { return }
+                if let ev { await MainActor.run { self.onCallEvent(ev) } }
+            }
+        }
+    }
+
+    private func onCallEvent(_ ev: CallEventInfo) {
+        guard var c = activeCall, ev.callId == c.callId else { return }
+        switch ev.state {
+        case .ringing: break
+        case .connecting: c.phase = .connecting; activeCall = c
+        case .connected: c.phase = .connected; c.connectedSecs = 0; activeCall = c; startCallTicker()
+        case .ended, .failed, .declined, .busy, .missed: finalizeCall(c, ev)
+        }
+    }
+
+    private func startCallTicker() {
+        callTickerTask?.cancel()
+        callTickerTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard let self else { return }
+                await MainActor.run {
+                    if var c = self.activeCall { c.connectedSecs += 1; self.activeCall = c }
+                }
+            }
+        }
+    }
+
+    /// Record the call-log entry, clear state, and pop the call screen.
+    private func finalizeCall(_ c: SNActiveCall, _ ev: CallEventInfo) {
+        callTickerTask?.cancel(); callTickerTask = nil
+        let secs = Int(ev.durationSecs)
+        recordCall(convId: c.convId, video: c.video, mine: !c.incoming, seconds: secs)
+        activeCall = nil
+        if case .call? = path.last { pop() }
+    }
+
+    /// Tear down call state on wipe/erase so calling rebinds cleanly after the
+    /// node is recreated (the iroh endpoint must be re-bound).
+    private func resetCallState() {
+        callTickerTask?.cancel(); callTickerTask = nil
+        callLoopTask?.cancel(); callLoopTask = nil
+        activeCall = nil
+        callStarted = false
+        scannedCallMessageIDs = []
+    }
+
+    private func recordCall(convId: String, video: Bool, mine: Bool, seconds: Int) {
         let connected = seconds > 0
         let now = Date()
         let record = SNCallRecord(
             id: UUID().uuidString,
             date: now,
             message: SNMessage(
-                mine: true,
+                mine: mine,
                 text: "",
                 time: Self.clock(now),
                 call: SNCallInfo(
@@ -1983,8 +2137,68 @@ final class SonarAppStore: ObservableObject {
                 )
             )
         )
-        callLogs[peerId, default: []].append(record)
-        pop()
+        callLogs[convId, default: []].append(record)
+    }
+
+    /// Scan inbound mesh + Marmot messages for ☎CALL control lines (deduped) and
+    /// route them to the engine — never rendered as chat. Mirrors the ⚡PAY scan.
+    private func processIncomingCallLines() {
+        let my = chatViewModel.meshService.myPeerID
+        for (peerID, msgs) in chatViewModel.privateChats {
+            for m in msgs where m.senderPeerID != my {
+                guard !scannedCallMessageIDs.contains(m.id) else { continue }
+                scannedCallMessageIDs.insert(m.id)
+                if let ctrl = callParseControl(content: m.content) {
+                    handleCallControl(ctrl, convId: peerID.id)
+                }
+            }
+        }
+        for (groupId, msgs) in marmot.messagesByGroup {
+            for m in msgs where !m.isMine {
+                guard !scannedCallMessageIDs.contains(m.id) else { continue }
+                scannedCallMessageIDs.insert(m.id)
+                if let ctrl = callParseControl(content: m.content) {
+                    handleCallControl(ctrl, convId: marmotConvId(forGroup: groupId))
+                }
+            }
+        }
+    }
+
+    private func handleCallControl(_ ctrl: CallControlInfo, convId: String) {
+        switch ctrl {
+        case let .offer(callId, video, nodeAddrB64, unixSecs):
+            if activeCall != nil { // busy: auto-decline
+                sendDm(convId, callEncodeAnswer(callId: callId, answer: .busy, nodeAddrB64: ""))
+                return
+            }
+            let stale = Date().timeIntervalSince1970 - Double(unixSecs) > 60
+            let name = peerItem(convId).name
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    try await self.marmot.callStart()
+                    await MainActor.run { self.callStarted = true; self.startCallLoop() }
+                    try await self.marmot.callIncomingOffer(callId: callId, addrB64: nodeAddrB64, video: video)
+                    if stale {
+                        try? await self.marmot.callHangup(callId: callId)
+                        await MainActor.run { self.recordCall(convId: convId, video: video, mine: false, seconds: 0) }
+                        return
+                    }
+                    await MainActor.run {
+                        self.activeCall = SNActiveCall(callId: callId, convId: convId, peerName: name, video: video, incoming: true, phase: .ringing)
+                        self.push(.call(convId, video: video))
+                    }
+                } catch {
+                    SecureLogger.error("incoming offer failed: \(error)", category: .session)
+                }
+            }
+        case let .answer(callId, answer, nodeAddrB64):
+            Task { [weak self] in try? await self?.marmot.callAnswer(callId: callId, answer: answer, addrB64: nodeAddrB64) }
+        case let .cancel(callId):
+            if activeCall?.callId == callId { Task { [weak self] in try? await self?.marmot.callHangup(callId: callId) } }
+        case let .end(callId, _):
+            if activeCall?.callId == callId { Task { [weak self] in try? await self?.marmot.callHangup(callId: callId) } }
+        }
     }
 
     // MARK: Commands (composer "/" layer)
@@ -2058,6 +2272,9 @@ final class SonarAppStore: ObservableObject {
         scannedPayMessageIDs = []
         pendingPayPeer = nil
         callLogs = [:]
+        // The node is recreated by eraseChatsKeepIdentity → reset call state so
+        // the iroh endpoint rebinds (the marmot.$npub sink calls ensureCallStarted).
+        resetCallState()
         // ⚡PAY coins live inside the erased chats — clear the ledger too. The
         // Lightning wallet seed/balance is separate and is NOT touched.
         payLedger.wipe()
@@ -2111,6 +2328,7 @@ final class SonarAppStore: ObservableObject {
         scannedPayMessageIDs = []
         pendingPayPeer = nil
         callLogs = [:]
+        resetCallState()
         bip353 = ""
         defaults.removeObject(forKey: Keys.bip353)
         onboarded = false

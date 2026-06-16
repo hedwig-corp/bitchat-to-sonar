@@ -39,6 +39,10 @@ let package = Package(
                 .linkedFramework("AudioToolbox"),
                 .linkedFramework("CoreAudio"),
                 .linkedFramework("AVFoundation"),
+                // iroh's network-interface/DNS discovery (netdev, hickory-resolver,
+                // system_configuration crates) calls SystemConfiguration. Same
+                // static-lib gotcha — the framework link isn't propagated.
+                .linkedFramework("SystemConfiguration"),
             ]
         ),
         // Binary framework containing the Rust static library + C headers.
