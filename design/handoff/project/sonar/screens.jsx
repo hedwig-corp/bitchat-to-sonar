@@ -297,7 +297,19 @@ function DMScreen({ app, nav, pop, push, peerId, onSend, onCommand, onVerify, on
     : (offlineFar ? 'Offline — will send later' : 'Via internet');
   return (
     <div className="bc-screen" data-nav={nav} data-screen-label={'DM: ' + peer.name}>
-      <NavHeader onBack={pop}>
+      <NavHeader
+        onBack={pop}
+        trailing={
+          <React.Fragment>
+            <button className="bc-iconbtn" onClick={() => push('call', { id: peer.id, kind: 'voice' })} aria-label="Voice call">
+              <BCIcon name="phone" size={20} />
+            </button>
+            <button className="bc-iconbtn" onClick={() => push('call', { id: peer.id, kind: 'video' })} aria-label="Video call">
+              <BCIcon name="videocam" size={21} />
+            </button>
+          </React.Fragment>
+        }
+      >
         <Avatar name={peer.name} size={36} presence={peer.inRange} />
         <div style={{ minWidth: 0 }}>
           <div className="bc-hname">

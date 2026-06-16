@@ -132,7 +132,7 @@ function DkSidebar({ app, sel, onSelect, toggleNetwork, onSettings }) {
 }
 
 /* ── Chat pane (channel or DM) ── */
-function DkChatPane({ app, sel, railOpen, onToggleRail, onSendCh, onSendDm, onCommand, onSelect, onPay, onClaimPay, openPay, onMedia, onVoice }) {
+function DkChatPane({ app, sel, railOpen, onToggleRail, onSendCh, onSendDm, onCommand, onSelect, onPay, onClaimPay, openPay, onMedia, onVoice, onCall }) {
   const [pop, setPop] = React.useState(false);
   const [pay, setPay] = React.useState(false);
   React.useEffect(() => { setPay(!!openPay); }, [openPay, sel.id]);
@@ -168,6 +168,16 @@ function DkChatPane({ app, sel, railOpen, onToggleRail, onSendCh, onSendDm, onCo
         <button className="dk-iconbtn" onClick={() => onSelect('radar')} title="People nearby">
           <BCIcon name="rings" size={18} />
         </button>
+        {!isCh && (
+          <React.Fragment>
+            <button className="dk-iconbtn" onClick={() => onCall(peer.id, 'voice')} title="Voice call">
+              <BCIcon name="phone" size={18} />
+            </button>
+            <button className="dk-iconbtn" onClick={() => onCall(peer.id, 'video')} title="Video call">
+              <BCIcon name="videocam" size={19} />
+            </button>
+          </React.Fragment>
+        )}
         <button className={'dk-iconbtn' + (railOpen ? ' on' : '')} onClick={onToggleRail} title="Details">
           <BCIcon name="info" size={18} />
         </button>
