@@ -927,7 +927,13 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     /**
      * Park up to `timeout_secs` for the next call state change. The host loops
      * this on a dedicated thread (like `wait_for_marmot_event`); it touches no
-     * MLS state. `None` on timeout (or if the engine is not started).
+     * MLS state. `None` on timeout.
+     *
+     * If the engine is not bound yet (`call_start` hasn't run, or it failed),
+     * we STILL park for the timeout instead of returning instantly — otherwise
+     * the host's `while { waitEvent(20) }` loop busy-spins (on iOS that loop is
+     * MainActor-isolated → the UI freezes). Mirrors `wait_for_marmot_event`,
+     * which also blocks the timeout when there is nothing yet to wait on.
      */
     func callWaitEvent(timeoutSecs: UInt64)  -> CallEventInfo?
     
@@ -1225,7 +1231,13 @@ open func callStart()throws   {try rustCallWithError(FfiConverterTypeSonarFfiErr
     /**
      * Park up to `timeout_secs` for the next call state change. The host loops
      * this on a dedicated thread (like `wait_for_marmot_event`); it touches no
-     * MLS state. `None` on timeout (or if the engine is not started).
+     * MLS state. `None` on timeout.
+     *
+     * If the engine is not bound yet (`call_start` hasn't run, or it failed),
+     * we STILL park for the timeout instead of returning instantly — otherwise
+     * the host's `while { waitEvent(20) }` loop busy-spins (on iOS that loop is
+     * MainActor-isolated → the UI freezes). Mirrors `wait_for_marmot_event`,
+     * which also blocks the timeout when there is nothing yet to wait on.
      */
 open func callWaitEvent(timeoutSecs: UInt64) -> CallEventInfo?  {
     return try!  FfiConverterOptionTypeCallEventInfo.lift(try! rustCall() {
@@ -3785,7 +3797,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_call_start() != 21488) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_call_wait_event() != 59679) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_call_wait_event() != 8621) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_delete_group() != 40442) {
