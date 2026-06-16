@@ -73,7 +73,7 @@ mkdir -p "$JNILIBS" "$KOTLIN_DIR"
 # --- Build the 3 ABIs (cargo-ndk copies each .so into jniLibs/<abi>/) ---------
 echo "Building $CRATE for arm64-v8a, armeabi-v7a, x86_64 ${SONAR_FEATURES:+($SONAR_FEATURES)}..."
 cargo ndk -o "$JNILIBS" \
-  -t arm64-v8a -t armeabi-v7a -t x86_64 \
+  ${SONAR_ABIS:--t arm64-v8a -t armeabi-v7a -t x86_64} \
   build -p "$CRATE" --lib --release ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
 
 # --- Ship libc++_shared.so (oboe links the shared C++ runtime) ----------------
