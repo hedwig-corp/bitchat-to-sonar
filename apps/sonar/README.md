@@ -56,20 +56,41 @@ interops cross-platform over the same Nostr relays — plus **BLE discovery**.
 ## Build & run — Desktop
 
 ```bash
-# 1. Build the Rust core for the host (one time, or after core changes).
-#    Produces jvmMain/resources/<jna-prefix>/libsonar_ffi.<ext> + UniFFI bindings.
+# 1. Build the Rust core + BLE bridge for the host (one time, or after a change).
+#    Produces jvmMain/resources/<jna-prefix>/{libsonar_ffi,libsonar_ble}.<ext>
+#    + the UniFFI Kotlin bindings.
 core/build-desktop.sh
 
-# 2. Run the app.
+# 2a. Quick run (no BLE — see the permission note below).
 cd apps/sonar
 ./gradlew :composeApp:run
 
-# Package a native installer (.dmg / .msi / .deb):
-./gradlew :composeApp:packageDistributionForCurrentOS
+# 2b. Build the installable app — REQUIRED for Bluetooth to work.
+#     The .app carries NSBluetoothAlwaysUsageDescription + the Bluetooth
+#     entitlement, so macOS grants BLE. Output: build/compose/binaries/main/app/Sonar.app
+./gradlew :composeApp:createDistributable          # the .app
+./gradlew :composeApp:packageDistributionForCurrentOS   # a .dmg/.msi/.deb
+cp -R composeApp/build/compose/binaries/main/app/Sonar.app /Applications/
+open /Applications/Sonar.app
 ```
 
 Desktop data (identity, encrypted Marmot DB, transcripts, prefs) lives under the
 OS app-data dir, e.g. `~/Library/Application Support/Sonar` on macOS.
+
+### Seeing mesh peers on the radar
+
+The desktop discovers nearby bitchat-mesh phones over BLE. Two conditions:
+
+1. **Run the packaged `.app`** (not `gradle run`) so macOS grants Bluetooth — the
+   raw `java` process from `gradle run` has no `.app` bundle, so macOS can't grant
+   it. On first launch, approve the Bluetooth prompt (or System Settings → Privacy
+   & Security → Bluetooth → Sonar).
+2. **Keep the phone's Sonar/bitchat app in the foreground** — iOS stops BLE mesh
+   advertising when the app is backgrounded, so a backgrounded phone is invisible.
+
+Then click **Sonar** in the sidebar → the phone appears as a node on the radar
+(and the sidebar shows "N people in range"). Set `SONAR_BLE_DEBUG=1` to trace the
+scan to `/tmp/sonar-ble.log`.
 
 ## Build & run — Android
 

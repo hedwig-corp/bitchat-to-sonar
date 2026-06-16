@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- JVM under hardened runtime needs JIT + unsigned exec memory; the app loads
+       the Rust core/BLE dylibs extracted at runtime, so library validation is off. -->
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+  <!-- Required so the desktop BLE radio (sonar-ble / CoreBluetooth) can scan +
+       advertise under the hardened runtime. Without it, macOS blocks Bluetooth
+       before even showing the permission prompt. -->
+  <key>com.apple.security.device.bluetooth</key>
+  <true/>
+</dict>
+</plist>

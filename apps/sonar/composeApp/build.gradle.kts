@@ -83,6 +83,12 @@ compose.desktop {
                         <string>Sonar uses Bluetooth to find people nearby and relay messages over the mesh.</string>
                     """.trimIndent()
                 }
+                // Under the hardened runtime, Bluetooth needs an entitlement (on
+                // top of the Info.plist string) or macOS blocks it before prompting.
+                // The file also carries the JVM's JIT + library-validation
+                // entitlements (the app loads the Rust core/BLE dylibs at runtime).
+                entitlementsFile.set(project.file("macos-entitlements.plist"))
+                runtimeEntitlementsFile.set(project.file("macos-entitlements.plist"))
             }
         }
     }

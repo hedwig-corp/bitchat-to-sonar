@@ -31,8 +31,30 @@ use uuid::Uuid;
 
 /// bitchat mesh GATT service — must match the iOS/Android apps for real interop.
 const BITCHAT_SERVICE: Uuid = Uuid::from_u128(0xF47B5E2D_4A9E_4C5A_9B3F_8E1D2C3A4B5C);
-/// Drop a peer from the radar this long after its last advertisement.
-const PEER_TTL: Duration = Duration::from_secs(12);
+/// Drop a peer from the radar this long after its last advertisement. Generous
+/// because CoreBluetooth coalesces duplicate adverts (it reports a peripheral
+/// once per scan), so refreshes only arrive on each periodic re-scan below.
+const PEER_TTL: Duration = Duration::from_secs(30);
+/// Restart the scan this often so CoreBluetooth re-delivers current advertisers
+/// (refreshing their last-seen) — without this, a device is reported once and
+/// then ages out even though it's still nearby.
+const RESCAN_EVERY: Duration = Duration::from_secs(6);
+
+/// Diagnostic log (only when SONAR_BLE_DEBUG is set) — appends to a file so it's
+/// readable regardless of how the app is launched (a jpackage app has no stdout).
+fn dbg_log(msg: &str) {
+    if std::env::var_os("SONAR_BLE_DEBUG").is_none() {
+        return;
+    }
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/sonar-ble.log")
+    {
+        let _ = writeln!(f, "{msg}");
+    }
+}
 
 #[derive(Clone)]
 struct Seen {
@@ -114,22 +136,40 @@ pub unsafe extern "C" fn sonar_ble_free(ptr: *mut c_char) {
 }
 
 async fn scan_loop() {
+    dbg_log("scan_loop: init");
     let Some(central) = init_central().await else {
+        dbg_log("scan_loop: NO ADAPTER");
         RUNNING.store(false, Ordering::SeqCst);
         return;
     };
+    dbg_log(&format!(
+        "scan_loop: adapter = {}",
+        central.adapter_info().await.unwrap_or_default()
+    ));
     let Ok(mut events) = central.events().await else {
+        dbg_log("scan_loop: events() FAILED");
         RUNNING.store(false, Ordering::SeqCst);
         return;
     };
-    let _ = central.start_scan(ScanFilter::default()).await;
+    match central.start_scan(ScanFilter::default()).await {
+        Ok(_) => dbg_log("scan_loop: scan started"),
+        Err(e) => dbg_log(&format!("scan_loop: start_scan ERR {e}")),
+    }
 
+    let mut last_rescan = Instant::now();
     while RUNNING.load(Ordering::SeqCst) {
         // 1s timeout so a stop() is noticed even when no advertisements arrive.
         match tokio::time::timeout(Duration::from_secs(1), events.next()).await {
             Ok(Some(ev)) => handle_event(&central, ev).await,
             Ok(None) => break, // stream ended
             Err(_) => {}       // tick — re-check RUNNING
+        }
+        // Periodic re-scan: CoreBluetooth coalesces duplicate advertisements, so
+        // without restarting the scan a still-present device is never re-reported.
+        if last_rescan.elapsed() >= RESCAN_EVERY {
+            let _ = central.stop_scan().await;
+            let _ = central.start_scan(ScanFilter::default()).await;
+            last_rescan = Instant::now();
         }
     }
     let _ = central.stop_scan().await;
@@ -155,6 +195,9 @@ async fn handle_event(central: &btleplug::platform::Adapter, ev: CentralEvent) {
     let rssi = props.as_ref().and_then(|pr| pr.rssi).unwrap_or(0);
     let services = props.as_ref().map(|pr| pr.services.clone()).unwrap_or_default();
     let bitchat = services.contains(&BITCHAT_SERVICE);
+    if bitchat {
+        dbg_log(&format!("discovered BITCHAT peer {id} rssi={rssi}"));
+    }
     if let Ok(mut d) = DEVICES.lock() {
         d.insert(
             id.to_string(),
