@@ -31,7 +31,7 @@ import kotlin.math.sqrt
 enum class SNIconName {
     Back, Chevron, Lock, Plus, Pin, People, Mesh, Globe, Check, Shield,
     ShieldCheck, X, NavArrow, Dice, Rings, Moon, Trash, Info, Coin, Bolt,
-    Pencil, Key, Search, Mic, Play, Pause,
+    Pencil, Key, Search, Mic, Play, Pause, Bookmark, BookmarkFill,
 }
 
 private sealed interface Shape {
@@ -48,6 +48,9 @@ private val ICONS: Map<SNIconName, List<Shape>> = mapOf(
     SNIconName.Play to listOf(Shape.P("M7.5 5.5v13l11-6.5z", fill = true)),
     // Two filled bars — the playing-state toggle for the audio bubble.
     SNIconName.Pause to listOf(Shape.P("M8.5 5.5h2.4v13H8.5zM13.1 5.5h2.4v13h-2.4z", fill = true)),
+    // Bookmark — the "save channel" toggle (outline = not saved, fill = saved).
+    SNIconName.Bookmark to listOf(Shape.P("M6.8 4.8h10.4a.6.6 0 0 1 .6.6v14.3l-5.8-3.4-5.8 3.4V5.4a.6.6 0 0 1 .6-.6z")),
+    SNIconName.BookmarkFill to listOf(Shape.P("M6.8 4.8h10.4a.6.6 0 0 1 .6.6v14.3l-5.8-3.4-5.8 3.4V5.4a.6.6 0 0 1 .6-.6z", fill = true)),
     SNIconName.Lock to listOf(Shape.R(5.5f, 10.5f, 13f, 9.5f, 2.6f), Shape.P("M8.5 10.5V8a3.5 3.5 0 0 1 7 0v2.5")),
     SNIconName.Plus to listOf(Shape.P("M12 5.5v13M5.5 12h13")),
     SNIconName.Pin to listOf(Shape.P("M12 20.8s-6.3-5.3-6.3-10.2a6.3 6.3 0 0 1 12.6 0c0 4.9-6.3 10.2-6.3 10.2z"), Shape.C(12f, 10.4f, 2.2f)),

@@ -835,6 +835,38 @@ final class SonarAppStore: ObservableObject {
         return item(for: ch)
     }
 
+    /// Explicitly saved/bookmarked geohash channels (design home "Saved
+    /// channels"), one row each. Raw geohashes from GeohashBookmarksStore become
+    /// humanized SNChannelItems with a live "N here now" count; the friendly
+    /// place name resolves asynchronously (until then, the precision-tier label
+    /// — NEVER the raw geohash, per the design rule). Mesh is always present so
+    /// it is never bookmarked.
+    var savedChannels: [SNChannelItem] {
+        locationManager.bookmarks.map { gh in
+            let count = chatViewModel.geohashParticipantCount(for: gh)
+            let level = Self.level(forLength: gh.count)
+            let name = locationManager.bookmarkNames[gh] ?? level.displayName
+            return SNChannelItem(
+                id: "geo:" + gh,
+                name: name,
+                sub: "Public · \(count) here now",
+                preview: count > 0 ? "\(count) here now" : "Saved channel",
+                count: count,
+                channel: .location(GeohashChannel(level: level, geohash: gh)),
+                tier: level.displayName
+            )
+        }
+    }
+
+    /// Kick off friendly place-name resolution for all saved channels (the
+    /// design shows place names, never raw geohashes). Idempotent — safe to call
+    /// on appear; mirrors LocationChannelsSheet's per-row `resolveBookmarkNameIfNeeded`.
+    func resolveSavedChannelNames() {
+        for gh in locationManager.bookmarks {
+            locationManager.resolveBookmarkNameIfNeeded(for: gh)
+        }
+    }
+
     private func meshChannelItem() -> SNChannelItem {
         let n = meshCount
         return SNChannelItem(

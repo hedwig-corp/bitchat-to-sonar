@@ -83,7 +83,16 @@ fun SonarChannelScreen(state: SonarAppState, screen: Screen.Channel) {
                     Text(headerSub, color = s.text2, fontSize = 11.5.sp)
                 }
             }
-            // Trailing: people-nearby (radar), per the design's NavHeader trailing.
+            // Trailing: pin/save this channel to home (geohash channels only — Mesh
+            // is always present), then people-nearby (radar) per the design.
+            if (!isMesh) {
+                val saved = state.isSaved(screen.geohash)
+                SNIconButton(
+                    if (saved) SNIconName.BookmarkFill else SNIconName.Bookmark,
+                    tint = if (saved) s.accent else s.text2,
+                    onClick = { state.toggleSaved(screen.geohash) }
+                )
+            }
             SNIconButton(SNIconName.Rings, onClick = { state.push(Screen.Nearby) })
         }
 

@@ -318,6 +318,27 @@ class SonarAppState(private val scope: CoroutineScope) {
         openChannel(g)
     }
 
+    /** Explicitly saved/joined channels (design: home "Saved channels"), minus the
+     *  always-present Mesh. These get a permanent one-tap row on the home. */
+    val savedChannels: List<String> get() = channels.filter { it != "mesh" }
+
+    /** True iff [geohash] is pinned to the home "Saved channels" list. */
+    fun isSaved(geohash: String): Boolean {
+        val g = geohash.trim().lowercase()
+        return g != "mesh" && channels.contains(g)
+    }
+
+    /** Pin/unpin a channel to the home "Saved channels" list WITHOUT navigating
+     *  (the channel header bookmark + the home long-press use this). Mesh is always
+     *  present, so it is never savable. */
+    fun toggleSaved(geohash: String) {
+        val g = geohash.trim().lowercase()
+        if (g.isEmpty() || g == "mesh") return
+        if (channels.contains(g)) { SonarCore.leaveChannel(g); toast = "Removed from saved channels" }
+        else { SonarCore.joinChannel(g); toast = "Channel saved" }
+        channels = SonarCore.joinedChannels()
+    }
+
     /** True iff [geohash] is the channel currently on screen. Guards async loads
      *  so a stale refresh for a channel the user already left can't overwrite the
      *  visible list (that made different channels look "mixed"). */

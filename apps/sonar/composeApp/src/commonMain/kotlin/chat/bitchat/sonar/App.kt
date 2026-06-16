@@ -173,16 +173,28 @@ private fun HomeScreen(state: SonarAppState) {
                     }
                     HereCard(hereItems) { state.openChannel(it) }
                 }
-                // Any manually-joined channels not already shown.
-                items(
-                    state.channels.filter { gh -> state.locationChannels.none { it.geohash == gh } && gh != "mesh" },
-                    key = { it }
-                ) { gh ->
-                    ConvRow(avatar = { PlaceTile(52.dp) }, title = channelName(gh), sub = "joined channel") {
-                        state.openChannel(gh)
+                if (state.locationChannels.isEmpty()) item { LocationHint() }
+                // "Saved channels" (design): channels you explicitly pinned (the
+                // bookmark in a channel header), each a one-tap row with its live
+                // "N here now" count. This is the pin/favorite the HereCard lacks.
+                // Exclude channels already shown in the "Around you" ladder so a
+                // pinned current-location channel doesn't appear twice (design:
+                // Saved = "NOT every place you pass through"); it reappears here
+                // once you move out of its area.
+                val saved = state.savedChannels.filter { gh -> state.locationChannels.none { it.geohash == gh } }
+                if (saved.isNotEmpty()) {
+                    item { SNSectionLabel("Saved channels") }
+                    items(saved, key = { "saved:" + it }) { gh ->
+                        val here = state.presence(gh)
+                        val gc = state.locationChannels.firstOrNull { it.geohash == gh }
+                        ConvRow(
+                            avatar = { PlaceTile(52.dp) },
+                            title = gc?.name ?: channelName(gh),
+                            sub = if (here > 0) "$here here now" else "Saved channel",
+                            onLongClick = { state.toggleSaved(gh) }, // long-press to unpin
+                        ) { state.openChannel(gh) }
                     }
                 }
-                if (state.locationChannels.isEmpty()) item { LocationHint() }
                 item { SNSectionLabel("Messages") }
                 if (state.chats.isEmpty() && state.meshDmRows.isEmpty()) item { EmptyMessages() }
                 // BLE-mesh DMs (incl. ones started by a peer messaging us) — over
@@ -599,14 +611,21 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         }
 
         if (draft.startsWith("/")) SlashHints(draft) { draft = it }
-        if (recording) {
-            VoiceRecBar(
-                elapsed = recElapsed, level = recLevel, dragX = recDragX,
-                net = transport == "internet",
-                onTrash = { recorder.cancel(); recording = false; recDragX = 0f }
-            )
-        } else {
-            Row(Modifier.fillMaxWidth().padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
+        // ONE composer row in BOTH states. Only the left (plus↔trash) and middle
+        // (text field↔recording pill) swap; the mic Box on the right MUST stay
+        // mounted while recording, or Compose cancels its hold-to-record gesture
+        // (the @RestrictsSuspension pointer coroutine dies with its layout node)
+        // and the finger-release is never seen — the note never sends.
+        Row(Modifier.fillMaxWidth().padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
+            if (recording) {
+                // Slide-left-far OR tap the trash to discard.
+                Box(
+                    Modifier.size(40.dp).clip(CircleShape).clickable { recorder.cancel(); recording = false; recDragX = 0f },
+                    contentAlignment = Alignment.Center
+                ) { SNIcon(SNIconName.Trash, 19.dp, s.danger, weight = 2f) }
+                Spacer(Modifier.width(8.dp))
+                RecordingPill(recElapsed, recLevel, recDragX, Modifier.weight(1f))
+            } else {
                 // bc-plus: "Add to your message" sheet (bitcoin / location / verify / reactions)
                 Box(
                     Modifier.size(40.dp).clip(CircleShape).background(s.surface2).clickable { addSheet = true },
@@ -625,52 +644,57 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                         modifier = Modifier.fillMaxWidth()
                     )
                 }
-                Spacer(Modifier.width(8.dp))
-                if (draft.isEmpty() && state.canSendMedia(screen.id)) {
-                    // Hold-to-record mic (design: bc-sendbtn mic). Drag left to cancel.
-                    Box(
-                        Modifier.size(46.dp).clip(CircleShape).background(s.surface2)
-                            .pointerInput(screen.id) {
-                                // The pointer scope is @RestrictsSuspension, so the recorder
-                                // lifecycle runs in recScope: launch start() at down, join it on
-                                // release so finish()/cancel() can never race ahead of start().
-                                awaitEachGesture {
-                                    val down = awaitFirstDown(requireUnconsumed = false)
-                                    recDragX = 0f; recElapsed = 0; recording = true
-                                    var startedOk = false
-                                    val startJob = recScope.launch { startedOk = recorder.start() }
-                                    var dx = 0f
-                                    var pressed = true
-                                    while (pressed) {
-                                        val ev = awaitPointerEvent()
-                                        val ch = ev.changes.firstOrNull { it.id == down.id } ?: ev.changes.first()
-                                        dx += ch.positionChange().x; recDragX = dx
-                                        if (!ch.pressed) pressed = false
-                                    }
-                                    val cancel = dx < -240f
-                                    recScope.launch {
-                                        startJob.join()
-                                        if (!startedOk) state.toast = "Allow microphone access to record voice notes."
-                                        else if (cancel) recorder.cancel()
-                                        else { val b = recorder.finish(); if (b != null) state.sendVoiceNote(screen.id, b) }
-                                        recording = false; recDragX = 0f
-                                    }
+            }
+            Spacer(Modifier.width(8.dp))
+            if (draft.isEmpty() && state.canSendMedia(screen.id)) {
+                // Hold-to-record mic (design: bc-sendbtn mic). Drag left past the
+                // threshold to cancel; release to send. STAYS mounted across the
+                // recording toggle (draft is empty + canSendMedia is unchanged), so
+                // the gesture coroutine below survives — this is load-bearing.
+                val micBg = if (recording) (if (transport == "internet") s.netFill else s.accentFill) else s.surface2
+                val micFg = if (recording) (if (transport == "internet") s.onNet else s.onAccent) else s.text2
+                Box(
+                    Modifier.size(46.dp).clip(CircleShape).background(micBg)
+                        .pointerInput(screen.id) {
+                            // The pointer scope is @RestrictsSuspension, so the recorder
+                            // lifecycle runs in recScope: launch start() at down, join it on
+                            // release so finish()/cancel() can never race ahead of start().
+                            awaitEachGesture {
+                                val down = awaitFirstDown(requireUnconsumed = false)
+                                recDragX = 0f; recElapsed = 0; recording = true
+                                var startedOk = false
+                                val startJob = recScope.launch { startedOk = recorder.start() }
+                                var dx = 0f
+                                var pressed = true
+                                while (pressed) {
+                                    val ev = awaitPointerEvent()
+                                    val ch = ev.changes.firstOrNull { it.id == down.id } ?: ev.changes.first()
+                                    dx += ch.positionChange().x; recDragX = dx
+                                    if (!ch.pressed) pressed = false
                                 }
-                            },
-                        contentAlignment = Alignment.Center
-                    ) { SNIcon(SNIconName.Mic, 20.dp, s.text2, weight = 2f) }
-                } else {
-                    Box(
-                        Modifier.size(46.dp).clip(CircleShape).background(if (sendOverMesh) s.accentFill else s.netFill)
-                            .clickable {
-                                val d = draft; draft = ""
-                                if (!state.handleCommand(d, peerName, channelGeohash = null, chatId = screen.id)) {
-                                    state.send(screen.id, d)
+                                val cancel = dx < -240f
+                                recScope.launch {
+                                    startJob.join()
+                                    if (!startedOk) state.toast = "Allow microphone access to record voice notes."
+                                    else if (cancel) recorder.cancel()
+                                    else { val b = recorder.finish(); if (b != null) state.sendVoiceNote(screen.id, b) }
+                                    recording = false; recDragX = 0f
                                 }
-                            },
-                        contentAlignment = Alignment.Center
-                    ) { Text("↑", color = if (sendOverMesh) s.onAccent else s.onNet, fontSize = 20.sp, fontWeight = FontWeight.Bold) }
-                }
+                            }
+                        },
+                    contentAlignment = Alignment.Center
+                ) { SNIcon(SNIconName.Mic, 20.dp, micFg, weight = 2f) }
+            } else {
+                Box(
+                    Modifier.size(46.dp).clip(CircleShape).background(if (sendOverMesh) s.accentFill else s.netFill)
+                        .clickable {
+                            val d = draft; draft = ""
+                            if (!state.handleCommand(d, peerName, channelGeohash = null, chatId = screen.id)) {
+                                state.send(screen.id, d)
+                            }
+                        },
+                    contentAlignment = Alignment.Center
+                ) { Text("↑", color = if (sendOverMesh) s.onAccent else s.onNet, fontSize = 20.sp, fontWeight = FontWeight.Bold) }
             }
         }
     }
@@ -1086,48 +1110,35 @@ private fun MediaWaveStatic(seed: String, modifier: Modifier = Modifier) {
 }
 
 /**
- * The Telegram/Signal-style recording bar (design: VoiceRecorder) shown while the
- * mic is held: trash, rec dot, timer, live waveform, and a slide-to-cancel hint
- * that arms when [dragX] passes the cancel threshold. Mirrors iOS `recordingBar`.
+ * The recording pill (design: VoiceRecorder) shown while the mic is held: rec dot,
+ * timer, live waveform, and a slide-to-cancel hint that arms when [dragX] passes
+ * the cancel threshold. The trash + mic buttons live in the composer row so the
+ * mic (the gesture host) stays mounted across the recording toggle.
  */
 @Composable
-private fun VoiceRecBar(elapsed: Int, level: Float, dragX: Float, net: Boolean, onTrash: () -> Unit) {
+private fun RecordingPill(elapsed: Int, level: Float, dragX: Float, modifier: Modifier = Modifier) {
     val s = sonar
     val armed = dragX < -240f
     Row(
-        Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 8.dp),
+        modifier.heightIn(min = 46.dp).clip(RoundedCornerShape(22.dp)).background(s.surface2)
+            .padding(horizontal = 14.dp, vertical = 7.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp)
+        horizontalArrangement = Arrangement.spacedBy(9.dp)
     ) {
-        Box(
-            Modifier.size(40.dp).clip(CircleShape).clickable(onClick = onTrash),
-            contentAlignment = Alignment.Center
-        ) { SNIcon(SNIconName.Trash, 19.dp, s.danger, weight = 2f) }
+        Box(Modifier.size(9.dp).clip(CircleShape).background(s.danger))
+        Text(fmtDur(elapsed), style = SonarType.mono(13.0, FontWeight.Medium), color = s.text, modifier = Modifier.width(38.dp))
+        LiveWave(level, Modifier.weight(1f))
         Row(
-            Modifier.weight(1f).heightIn(min = 36.dp).clip(RoundedCornerShape(19.dp)).background(s.surface2)
-                .padding(horizontal = 12.dp, vertical = 7.dp),
+            Modifier.alpha((1f + dragX / 110f).coerceIn(0f, 1f)),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(9.dp)
+            horizontalArrangement = Arrangement.spacedBy(3.dp)
         ) {
-            Box(Modifier.size(9.dp).clip(CircleShape).background(s.danger))
-            Text(fmtDur(elapsed), style = SonarType.mono(13.0, FontWeight.Medium), color = s.text, modifier = Modifier.width(38.dp))
-            LiveWave(level, Modifier.weight(1f))
-            Row(
-                Modifier.alpha((1f + dragX / 110f).coerceIn(0f, 1f)),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(3.dp)
-            ) {
-                SNIcon(SNIconName.Back, 12.dp, if (armed) s.danger else s.text3, weight = 2.4f)
-                Text(
-                    if (armed) "release to cancel" else "slide to cancel",
-                    color = if (armed) s.danger else s.text3, fontSize = 12.sp, maxLines = 1
-                )
-            }
+            SNIcon(SNIconName.Back, 12.dp, if (armed) s.danger else s.text3, weight = 2.4f)
+            Text(
+                if (armed) "release to cancel" else "slide to cancel",
+                color = if (armed) s.danger else s.text3, fontSize = 12.sp, maxLines = 1
+            )
         }
-        Box(
-            Modifier.size(34.dp).clip(CircleShape).background(if (net) s.netFill else s.accentFill),
-            contentAlignment = Alignment.Center
-        ) { SNIcon(SNIconName.Mic, 18.dp, if (net) s.onNet else s.onAccent, weight = 2f) }
     }
 }
 
