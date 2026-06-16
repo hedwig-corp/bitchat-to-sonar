@@ -33,3 +33,12 @@ nostr.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 hex.workspace = true
+
+# Android-only: the JNI shim in src/android_jni.rs publishes the JavaVM +
+# Application Context to `ndk_context` so the crates that reach Android system
+# services via JNI (hickory-resolver during iroh Endpoint::bind, cpal/oboe for
+# AAudio) work when this .so is dlopen'd by UniFFI's JNA bindings. Both are
+# already in the dependency tree (pulled by iroh/cpal) — reused, default features.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+ndk-context = "0.1.1"

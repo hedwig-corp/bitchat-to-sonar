@@ -179,7 +179,8 @@ class SonarAppState(private val scope: CoroutineScope) {
     private suspend fun ensureCallStarted() {
         if (callStarted) return
         runCatching { SonarCore.callStart() }
-            .onSuccess { callStarted = true; startCallLoop() }
+            .onSuccess { callStarted = true; startCallLoop(); android.util.Log.i("SonarCall", "call endpoint bound") }
+            .onFailure { android.util.Log.e("SonarCall", "callStart FAILED: ${it.message}", it) }
     }
 
     /** Place an outgoing call from [chatId]: register it, push the call screen,
@@ -281,9 +282,12 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun processCallLines(chatId: String, msgs: List<SonarMsg>) {
         for (m in msgs) {
             if (m.id in scannedCall) continue
-            val ctrl = SonarCore.callParseControl(m.content) ?: continue
             scannedCall.add(m.id)
             if (m.mine) continue // our own control line — we already drive our side
+            // Cheap prefilter (mirrors Rust CallControl::is_control): skip the FFI
+            // for every non-☎CALL message so we don't re-marshal all chat each poll.
+            if (!m.content.trimStart().startsWith("☎CALL")) continue
+            val ctrl = SonarCore.callParseControl(m.content) ?: continue
             scope.launch { onCallControl(chatId, m, ctrl) }
         }
     }

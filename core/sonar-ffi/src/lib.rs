@@ -18,6 +18,12 @@ use sonar_core::GroupId;
 
 uniffi::setup_scaffolding!();
 
+// Android-only JNI shim that initializes `ndk_context` (JavaVM + app Context) so
+// iroh's DNS read on `Endpoint::bind()` and cpal/oboe audio work when this `.so`
+// is loaded by UniFFI's JNA bindings (no JNI_OnLoad fires under JNA).
+#[cfg(target_os = "android")]
+mod android_jni;
+
 /// Flat error: only the rendered message crosses the FFI boundary
 /// (`SonarFfiError.InvalidInput(message:)` / `.Core(message:)` in Swift).
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -652,9 +658,29 @@ impl SonarNode {
 
     /// Park up to `timeout_secs` for the next call state change. The host loops
     /// this on a dedicated thread (like `wait_for_marmot_event`); it touches no
-    /// MLS state. `None` on timeout (or if the engine is not started).
+    /// MLS state. `None` on timeout.
+    ///
+    /// If the engine is not bound yet (`call_start` hasn't run, or it failed),
+    /// we STILL park for the timeout instead of returning instantly — otherwise
+    /// the host's `while { waitEvent(20) }` loop busy-spins (on iOS that loop is
+    /// MainActor-isolated → the UI freezes). Mirrors `wait_for_marmot_event`,
+    /// which also blocks the timeout when there is nothing yet to wait on.
     pub fn call_wait_event(&self, timeout_secs: u64) -> Option<CallEventInfo> {
-        let engine = self.call.lock().unwrap().clone()?;
+        // Snapshot the engine under a SHORT lock: bind it to a `let` so the
+        // guard drops at the `;`, never held across the block_on park below
+        // (so a long wait can't block `call_hangup`/`call_start`).
+        let engine = self.call.lock().unwrap().clone();
+        let Some(engine) = engine else {
+            // No engine: park the node's runtime for the (capped) timeout, then
+            // report "nothing happened". `.max(1)` floors a 0 timeout so we can
+            // never spin; capping at 30s bounds a bogus/hostile huge value.
+            let secs = timeout_secs.clamp(1, 30);
+            self.runtime
+                .block_on(tokio::time::sleep(std::time::Duration::from_secs(secs)));
+            return None;
+        };
+        // Engine present: `next_event` already honors the timeout internally
+        // (tokio::time::timeout over an mpsc recv → None on elapse).
         let ev = self.runtime.block_on(engine.next_event(timeout_secs))?;
         Some(CallEventInfo {
             call_id: ev.call_id,

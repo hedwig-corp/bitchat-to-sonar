@@ -507,8 +507,11 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     // call-log records, merged chronologically.
     val visible = state.messages.filter {
         val p = PayLine.decode(it.content)
-        // Hide ⚡PAY control lines (Claim/Done) and ☎CALL signaling lines.
-        (p == null || p is PayLine.Pay) && SonarCore.callParseControl(it.content) == null
+        // Hide ⚡PAY control lines (Claim/Done) and ☎CALL signaling lines. The
+        // cheap ☎CALL prefix check avoids an FFI call for ordinary chat.
+        val isCall = it.content.trimStart().startsWith("☎CALL") &&
+            SonarCore.callParseControl(it.content) != null
+        (p == null || p is PayLine.Pay) && !isCall
     }
     val calls = run { state.callVersion; state.callRecords(screen.id) }
     val feed: List<Any> = (visible + calls).sortedBy { if (it is CallRecord) it.tsSecs else (it as SonarMsg).tsSecs }

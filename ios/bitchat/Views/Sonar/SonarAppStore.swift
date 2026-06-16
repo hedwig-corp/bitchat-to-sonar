@@ -1289,8 +1289,11 @@ final class SonarAppStore: ObservableObject {
     }
 
     private func payMapping(_ content: String, fallbackVia: SNVia) -> PayMapping {
-        // ☎CALL signaling lines ride the chat like ⚡PAY but are never shown.
-        if callParseControl(content: content) != nil { return .hidden }
+        // ☎CALL signaling lines ride the chat like ⚡PAY but are never shown. The
+        // cheap prefix prefilter avoids an FFI call for ordinary chat messages.
+        if Self.looksLikeCallControl(content), callParseControl(content: content) != nil {
+            return .hidden
+        }
         guard let line = SonarPayMessage.decode(content) else { return .notPay }
         guard case .pay(let pid, let sats) = line else { return .hidden }
         let entry = payLedger.entry(for: pid)
@@ -2068,7 +2071,11 @@ final class SonarAppStore: ObservableObject {
 
     private func startCallLoop() {
         guard callLoopTask == nil else { return }
-        callLoopTask = Task { [weak self] in
+        // Detached: the parking loop must NOT be MainActor-isolated. The blocking
+        // wait already parks off-main (MarmotService.callWaitQueue); keeping the
+        // loop body off the main actor too means even a degenerate fast-return
+        // can't starve the UI. State mutation hops back via MainActor.run below.
+        callLoopTask = Task.detached(priority: .utility) { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
                 let ev = await self.marmot.callWaitEvent(timeoutSeconds: 20)
@@ -2142,12 +2149,26 @@ final class SonarAppStore: ObservableObject {
 
     /// Scan inbound mesh + Marmot messages for ☎CALL control lines (deduped) and
     /// route them to the engine — never rendered as chat. Mirrors the ⚡PAY scan.
+    /// Wire prefix of a ☎CALL control line (mirrors Rust `CALL_PREFIX`). Used as a
+    /// pure-Swift prefilter so plain chat never crosses the FFI boundary.
+    private static let callPrefix = "☎CALL"
+
+    /// Cheap allocation-light check matching Rust `CallControl::is_control`
+    /// (`content.trim_start().starts_with(CALL_PREFIX)`). No FFI.
+    private static func looksLikeCallControl(_ content: String) -> Bool {
+        content.drop(while: { $0.isWhitespace }).hasPrefix(callPrefix)
+    }
+
     private func processIncomingCallLines() {
         let my = chatViewModel.meshService.myPeerID
         for (peerID, msgs) in chatViewModel.privateChats {
             for m in msgs where m.senderPeerID != my {
                 guard !scannedCallMessageIDs.contains(m.id) else { continue }
                 scannedCallMessageIDs.insert(m.id)
+                // Pure-Swift prefilter: skip the FFI for every non-☎CALL message
+                // (i.e. essentially all chat) so this main-queue sink never
+                // marshals ordinary messages into the core just to get back nil.
+                guard Self.looksLikeCallControl(m.content) else { continue }
                 if let ctrl = callParseControl(content: m.content) {
                     handleCallControl(ctrl, convId: peerID.id)
                 }
@@ -2157,6 +2178,7 @@ final class SonarAppStore: ObservableObject {
             for m in msgs where !m.isMine {
                 guard !scannedCallMessageIDs.contains(m.id) else { continue }
                 scannedCallMessageIDs.insert(m.id)
+                guard Self.looksLikeCallControl(m.content) else { continue }
                 if let ctrl = callParseControl(content: m.content) {
                     handleCallControl(ctrl, convId: marmotConvId(forGroup: groupId))
                 }

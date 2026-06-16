@@ -5286,6 +5286,8 @@ name = "sonar-ffi"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "jni 0.21.1",
+ "ndk-context",
  "nostr",
  "sonar-core",
  "thiserror 2.0.18",
