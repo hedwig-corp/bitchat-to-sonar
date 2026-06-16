@@ -2219,11 +2219,17 @@ final class SonarAppStore: ObservableObject {
             }
             let stale = Date().timeIntervalSince1970 - Double(unixSecs) > 60
             let name = peerItem(convId).name
+            let alreadyStarted = callStarted
             Task { [weak self] in
                 guard let self else { return }
                 do {
-                    try await self.marmot.callStart()
-                    await MainActor.run { self.callStarted = true; self.startCallLoop() }
+                    // The endpoint is already bound at boot — do NOT call callStart()
+                    // again (a second bind blocks, so the incoming OFFER would never
+                    // ring). Only bind if boot's ensureCallStarted actually failed.
+                    if !alreadyStarted {
+                        try await self.marmot.callStart()
+                        await MainActor.run { self.callStarted = true; self.startCallLoop() }
+                    }
                     try await self.marmot.callIncomingOffer(callId: callId, addrB64: nodeAddrB64, video: video)
                     if stale {
                         try? await self.marmot.callHangup(callId: callId)

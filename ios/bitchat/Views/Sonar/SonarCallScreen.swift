@@ -2,13 +2,18 @@
 // SonarCallScreen.swift
 // bitchat
 //
-// MOCKED voice/video call screen — a 1:1 reproduction of CallView in
+// Voice/video call screen — a 1:1 reproduction of CallView in
 // design/handoff/project/sonar/call.jsx + the .call* styles in theme.css.
-// There is NO real microphone/camera/audio/video/WebRTC here: the call merely
-// transitions ringing → connected after 2s, ticks a seconds counter, and on
-// "End" appends an in-memory CallLog record to the DM transcript (the next
-// step swaps this mock for real P2P signalling). The screen is always dark,
-// matching the design's `.call` surface, regardless of app appearance.
+// The phase (ringing/connecting/connected + the seconds timer) is driven by the
+// REAL call engine via `store.activeCall` (iroh transport + Opus audio). "End"
+// is real (store.hangupCall()).
+//
+// HONEST v1 LIMITATIONS (still "fake" parts of this view):
+//   - Mute / Speaker / Video / Flip buttons are COSMETIC — they toggle only the
+//     button appearance, not the engine (no set_muted / audio routing / camera).
+//   - VIDEO is NOT implemented: the media is audio-only; the "video" feed is a
+//     placeholder gradient. A video call is an audio call behind a video UI.
+// The screen is always dark, matching the design's `.call` surface.
 //
 // This is free and unencumbered software released into the public domain.
 // For more information, see <https://unlicense.org>
