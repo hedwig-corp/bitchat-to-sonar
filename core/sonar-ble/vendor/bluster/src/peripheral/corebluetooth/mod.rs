@@ -1,0 +1,69 @@
+mod characteristic_flags;
+mod constants;
+mod error;
+mod events;
+mod ffi;
+mod into_bool;
+mod into_cbuuid;
+mod peripheral_manager;
+
+use uuid::Uuid;
+
+use self::peripheral_manager::PeripheralManager;
+use crate::{gatt::service::Service, Error};
+
+pub struct Peripheral {
+    peripheral_manager: PeripheralManager,
+}
+
+impl Peripheral {
+    #[allow(clippy::new_ret_no_self)]
+    pub async fn new() -> Result<Self, Error> {
+        Ok(Peripheral {
+            peripheral_manager: PeripheralManager::new(),
+        })
+    }
+
+    pub async fn is_powered(&self) -> Result<bool, Error> {
+        Ok(self.peripheral_manager.is_powered())
+    }
+
+    pub async fn register_gatt(&self) -> Result<(), Error> {
+        Ok(())
+    }
+
+    pub async fn unregister_gatt(&self) -> Result<(), Error> {
+        Ok(())
+    }
+
+    pub async fn start_advertising(self: &Self, name: &str, uuids: &[Uuid]) -> Result<(), Error> {
+        self.peripheral_manager.start_advertising(name, uuids);
+        Ok(())
+    }
+
+    pub async fn stop_advertising(&self) -> Result<(), Error> {
+        self.peripheral_manager.stop_advertising();
+        Ok(())
+    }
+
+    pub async fn is_advertising(&self) -> Result<bool, Error> {
+        Ok(self.peripheral_manager.is_advertising())
+    }
+
+    pub fn add_service(&self, service: &Service) -> Result<(), Error> {
+        self.peripheral_manager.add_service(service);
+        Ok(())
+    }
+
+    /// PATCH (Sonar): notify subscribed centrals with `data` on the registered
+    /// notify characteristic. Returns false when there's no characteristic yet or
+    /// CoreBluetooth's transmit queue is full.
+    pub fn notify(&self, data: &[u8]) -> bool {
+        self.peripheral_manager.notify(data)
+    }
+
+    /// PATCH (Sonar): drain bytes written to our characteristic by centrals.
+    pub fn take_writes(&self) -> Vec<Vec<u8>> {
+        self.peripheral_manager.take_writes()
+    }
+}

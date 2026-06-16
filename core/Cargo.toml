@@ -1,10 +1,13 @@
 [workspace]
 resolver = "2"
 members = ["sonar-core", "sonar-ffi"]
-# Vendored, iroh-1.0-ported fork of iroh-roq (the RTP-over-QUIC media layer);
-# a `calls`-feature path dependency of sonar-core, NOT a workspace member, so the
-# default build never touches it. See sonar-core/Cargo.toml for why it's vendored.
-exclude = ["vendor/iroh-roq"]
+# Excluded sub-trees, each its own build island so the default `cargo test
+# --workspace` (CI) never touches them:
+#  - vendor/iroh-roq: vendored, iroh-1.0-ported RTP-over-QUIC media layer, a
+#    `calls`-feature path dep of sonar-core (see sonar-core/Cargo.toml).
+#  - sonar-ble: the desktop BLE bridge (own [workspace]) so its
+#    btleplug/CoreBluetooth deps stay out of this workspace.
+exclude = ["vendor/iroh-roq", "sonar-ble"]
 
 [workspace.package]
 version = "0.1.0"

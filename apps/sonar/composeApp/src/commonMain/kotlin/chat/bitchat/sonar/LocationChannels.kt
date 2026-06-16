@@ -7,6 +7,13 @@ package chat.bitchat.sonar
  * the Mesh channel).
  */
 expect object LocationChannels {
-    /** Geohash channels for the current GPS position, building → region. */
+    /** Geohash channels for the current position, fine → coarse. Empty when no
+     *  location is available (permission denied on mobile, or — on desktop — the
+     *  optional IP-location preference is off). */
     suspend fun current(): List<GeoChannel>
+
+    /** True on platforms where the user can opt into IP-based approximate
+     *  location (desktop, which has no GPS). The Settings toggle is hidden when
+     *  false — mobile resolves location from GPS, no opt-in needed. */
+    fun configurable(): Boolean
 }

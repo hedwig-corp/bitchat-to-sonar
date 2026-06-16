@@ -1,1 +1,3 @@
 /target/
+# sonar-ble is a detached workspace with its own target dir.
+/sonar-ble/target/
