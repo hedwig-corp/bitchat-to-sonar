@@ -20,6 +20,8 @@ enum SNIconName: String {
     case check, shield, shieldCheck, x, smile, navArrow, dice, slash, rings
     case pencil, key, inbox, arrowOut, faceid, drive, data, list, moon, bell
     case trash, info, compose, coin, bolt, mic
+    // Calls (call.jsx): phone/videocam start a call; the in-call controls.
+    case phone, videocam, phoneDown, micOff, videoOff, speaker, cameraFlip
 }
 
 private enum SNIconElement {
@@ -131,6 +133,30 @@ private let snIconTable: [SNIconName: [SNIconElement]] = [
         .path("M9.9 8.2h3a1.9 1.9 0 0 1 0 3.8h-3zM9.9 12h3.5a1.9 1.9 0 0 1 0 3.8H9.9zM9.9 8.2V16M11.4 6.6v1.6M11.4 16v1.6"),
     ],
     .bolt: [.path("M13 3 6 13.5h4.5L11 21l7-10.5h-4.5z")],
+    .phone: [.path("M6.5 4.5c-1 0-2 .9-2 2 0 7 6 13 13 13 1.1 0 2-1 2-2v-2.6c0-.5-.4-.9-.9-1l-3-.6c-.4-.1-.9.1-1.1.5l-1 1.6a11 11 0 0 1-5-5l1.6-1c.4-.2.6-.7.5-1.1l-.6-3c-.1-.5-.5-.9-1-.9z")],
+    .videocam: [
+        .rect(3.5, 7, 12, 10, 2.5),
+        .path("M15.5 11l5-2.6v7.2l-5-2.6z"),
+    ],
+    .phoneDown: [.path("M3.5 13.5c4.7-4 12.3-4 17 0l-2.2 2.6c-.4.5-1.1.5-1.6.2l-1.9-1.2a1.1 1.1 0 0 1-.5-1.2l.3-1.4a11 11 0 0 0-5.7 0l.3 1.4c.1.5-.1 1-.5 1.2l-1.9 1.2c-.5.3-1.2.3-1.6-.2z")],
+    .micOff: [
+        .path("M9.2 5.4a2.8 2.8 0 0 1 5.6.8v4M14.8 12.8a2.8 2.8 0 0 1-5.6-1.2V9.2M5.8 11.5a6.2 6.2 0 0 0 9.5 5.3M18.2 11.5a6.2 6.2 0 0 1-.4 2.2M12 17.7V20.4M9 20.6h6"),
+        .path("M4.5 4.5l15 15"),
+    ],
+    .videoOff: [
+        .path("M3.5 7h9a2.5 2.5 0 0 1 2.5 2.5v.5l5-2.6v7.2l-5-2.6"),
+        .path("M4.5 4.5l15 15"),
+    ],
+    .speaker: [
+        .path("M5 9.5v5h3l4 3.5v-12L8 9.5z"),
+        .path("M15.5 9a4 4 0 0 1 0 6M17.8 6.8a7 7 0 0 1 0 10.4"),
+    ],
+    .cameraFlip: [
+        .rect(3.5, 6.5, 17, 13, 3),
+        .path("M8.5 13a3.5 3.5 0 0 1 6-2.4M15.5 13a3.5 3.5 0 0 1-6 2.4"),
+        .path("M14.2 8.2 14.6 10.4 12.4 10.2M9.8 17.8 9.4 15.6 11.6 15.8"),
+        .path("M8 6.5l1-2h6l1 2"),
+    ],
 ]
 
 // MARK: - SVG path-data parser (M/L/H/V/C/S/A/Z + lowercase)

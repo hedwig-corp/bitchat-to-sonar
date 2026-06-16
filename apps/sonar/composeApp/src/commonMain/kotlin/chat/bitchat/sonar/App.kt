@@ -33,6 +33,7 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -113,6 +114,7 @@ fun App() {
                         is Screen.Search -> chat.bitchat.sonar.screens.SonarSearchScreen(state)
                         is Screen.Channel -> chat.bitchat.sonar.screens.SonarChannelScreen(state, sc)
                         is Screen.GeoDm -> GeoDmScreen(state, sc)
+                        is Screen.Call -> CallScreen(state, sc)
                     }
                 }
             }
@@ -501,8 +503,15 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     // Radar "Send sats" opens the chat with pay=true → jump straight to the sheet.
     LaunchedEffect(screen.id) { if (screen.pay) paySheet = true }
     val listState = rememberLazyListState()
-    LaunchedEffect(state.messages.size) {
-        if (state.messages.isNotEmpty()) listState.animateScrollToItem(state.messages.size - 1)
+    // Transcript feed = chat messages (pay control lines collapsed) + mocked
+    // call-log records, merged chronologically.
+    val visible = state.messages.filter {
+        val p = PayLine.decode(it.content); p == null || p is PayLine.Pay
+    }
+    val calls = run { state.callVersion; state.callRecords(screen.id) }
+    val feed: List<Any> = (visible + calls).sortedBy { if (it is CallRecord) it.tsSecs else (it as SonarMsg).tsSecs }
+    LaunchedEffect(feed.size) {
+        if (feed.isNotEmpty()) listState.animateScrollToItem(feed.size - 1)
     }
     // Resolve a human name for the peer (Marmot groups often have a blank name).
     val peerName = screen.name.ifBlank {
@@ -549,6 +558,13 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                     )
                 }
             }
+            // Voice + video call buttons (design: DMScreen trailing → push call).
+            SNIconButton(SNIconName.Phone, size = 20.dp, weight = 2f, tint = s.text2) {
+                state.push(Screen.Call(screen.id, peerName, video = false))
+            }
+            SNIconButton(SNIconName.Videocam, size = 21.dp, weight = 2f, tint = s.text2) {
+                state.push(Screen.Call(screen.id, peerName, video = true))
+            }
         }
 
         if (isMeshRoute && !inRange) {
@@ -576,7 +592,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             )
         }
 
-        if (state.messages.isEmpty()) {
+        if (feed.isEmpty()) {
             Box(Modifier.weight(1f).fillMaxWidth()) {
                 chat.bitchat.sonar.ui.SNEmptyState(
                     icon = SNIconName.Lock,
@@ -585,27 +601,34 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                 )
             }
         } else {
-            val visible = state.messages.filter {
-                val p = PayLine.decode(it.content); p == null || p is PayLine.Pay
-            }
             LazyColumn(
                 Modifier.weight(1f).fillMaxWidth(),
                 state = listState,
                 contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
             ) {
-                items(visible, key = { it.id }) { m ->
-                    // Colour each bubble by the leg it travelled: mesh route + this
-                    // message went over mesh ⇒ cyan; otherwise indigo (internet).
-                    val msgMesh = isMeshRoute && !m.viaInternet
-                    val pay = PayLine.decode(m.content) as? PayLine.Pay
-                    if (pay != null) {
-                        val status = run { state.payVersion; state.payStatus(pay.uuid) }
-                        PayBubble(m, pay, status, peerName, mesh = msgMesh, fiatOf = { state.fiatOrNull(it) }) {
-                            state.claimPay(screen.id, pay.uuid)
-                        }
-                    } else if (m.media.isNotEmpty()) {
-                        MediaBubble(m, state, screen.id, mesh = msgMesh)
-                    } else MessageBubble(m, msgMesh)
+                itemsIndexed(
+                    feed,
+                    // Index-keyed call records avoid duplicate keys when two calls end
+                    // in the same second (identical ts/dur/kind would otherwise collide).
+                    key = { i, it -> if (it is CallRecord) "c:$i" else "m:${(it as SonarMsg).id}" }
+                ) { _, item ->
+                    if (item is CallRecord) {
+                        CallLogRow(item)
+                    } else {
+                        val m = item as SonarMsg
+                        // Colour each bubble by the leg it travelled: mesh route + this
+                        // message went over mesh ⇒ cyan; otherwise indigo (internet).
+                        val msgMesh = isMeshRoute && !m.viaInternet
+                        val pay = PayLine.decode(m.content) as? PayLine.Pay
+                        if (pay != null) {
+                            val status = run { state.payVersion; state.payStatus(pay.uuid) }
+                            PayBubble(m, pay, status, peerName, mesh = msgMesh, fiatOf = { state.fiatOrNull(it) }) {
+                                state.claimPay(screen.id, pay.uuid)
+                            }
+                        } else if (m.media.isNotEmpty()) {
+                            MediaBubble(m, state, screen.id, mesh = msgMesh)
+                        } else MessageBubble(m, msgMesh)
+                    }
                 }
             }
         }

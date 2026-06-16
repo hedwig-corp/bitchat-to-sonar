@@ -33,6 +33,8 @@ enum SonarRoute: Hashable {
     case nearby
     case settings
     case profile
+    /// MOCKED voice/video call (call.jsx). Carries the DM peer id + kind.
+    case call(String, video: Bool)
 }
 
 // MARK: - View models consumed by the screens
@@ -58,6 +60,31 @@ struct SNPayInfo: Equatable {
     let state: SonarPayEntry.State
 }
 
+/// A call kind (call.jsx `kind`). Drives icons + labels everywhere.
+enum SNCallKind: String, Equatable {
+    case voice
+    case video
+}
+
+/// The descriptor of a finished call, rendered as a CallLog row inside the DM
+/// transcript (call.jsx `CallLog`). MOCK-ONLY and in-memory — see
+/// `SonarAppStore.callLogs`.
+struct SNCallInfo: Equatable {
+    let kind: SNCallKind
+    /// The call never connected (secs == 0) ⇒ shown as a missed call (red).
+    let missed: Bool
+    /// `fmtCall(secs)` when the call connected, else nil.
+    let dur: String?
+}
+
+/// A stored MOCK call record: its timeline `date` (used to merge it
+/// chronologically into the transcript) plus the prebuilt CallLog message.
+struct SNCallRecord: Identifiable, Equatable {
+    let id: String
+    let date: Date
+    let message: SNMessage
+}
+
 struct SNMessage: Identifiable, Equatable {
     var id: String = UUID().uuidString
     var mine: Bool = false
@@ -69,6 +96,8 @@ struct SNMessage: Identifiable, Equatable {
     var state: String?
     /// Non-nil = render as a PayBubble instead of a text bubble.
     var pay: SNPayInfo?
+    /// Non-nil = render a compact CallLog row instead of a bubble (call.jsx).
+    var call: SNCallInfo?
     /// Encrypted media attachments (White Noise / Marmot MIP-04). Non-empty ⇒
     /// render a media bubble (image inline, else a file chip).
     var media: [SNMediaItem] = []
@@ -218,6 +247,10 @@ final class SonarAppStore: ObservableObject {
     @Published private(set) var walletState: SonarWalletState
     /// Radar "Send sats" quick-pay: the DM screen opens with the PaySheet up.
     private var pendingPayPeer: String?
+    /// MOCK-ONLY in-memory call records, keyed by DM peer id (the same id the
+    /// call route + dmMsgs use). The next step replaces this with real P2P
+    /// signalling; nothing here is persisted or written to MessageStore/Marmot.
+    @Published private(set) var callLogs: [String: [SNCallRecord]] = [:]
 
     private var cancellables = Set<AnyCancellable>()
     /// Texts queued for a Sonar peer (keyed by npub) while their White
@@ -1244,17 +1277,17 @@ final class SonarAppStore: ObservableObject {
 
     func dmMsgs(_ id: String) -> [SNMessage] {
         if let groupId = marmotGroupId(id) {
-            return (marmot.messagesByGroup[groupId] ?? []).compactMap { m in
+            let dated: [(Date, SNMessage)] = (marmot.messagesByGroup[groupId] ?? []).compactMap { m in
                 switch payMapping(m.content, fallbackVia: .internet) {
                 case .hidden:
                     return nil
                 case .bubble(let pay, let payVia):
-                    return SNMessage(
+                    return (m.createdAt, SNMessage(
                         id: m.id, mine: m.isMine, text: m.content,
                         time: Self.clock(m.createdAt), via: payVia, pay: pay
-                    )
+                    ))
                 case .notPay:
-                    return SNMessage(
+                    return (m.createdAt, SNMessage(
                         id: m.id,
                         mine: m.isMine,
                         author: String(m.senderNpub.prefix(12)),
@@ -1262,9 +1295,10 @@ final class SonarAppStore: ObservableObject {
                         time: Self.clock(m.createdAt),
                         via: .internet,
                         media: Self.mediaItems(m, groupId: groupId)
-                    )
+                    ))
                 }
             }
+            return mergeCallLogs(into: dated, id: id)
         }
         let peerID = PeerID(str: id)
         let via = dmTransport(id)
@@ -1323,7 +1357,19 @@ final class SonarAppStore: ObservableObject {
             }
             dated.sort { $0.0 < $1.0 }
         }
-        return dated.map(\.1)
+        return mergeCallLogs(into: dated, id: id)
+    }
+
+    /// Fold the MOCK in-memory call records for `id` into the transcript,
+    /// chronologically (stable sort keeps same-instant messages in place). A
+    /// no-op when this peer has no recorded calls.
+    private func mergeCallLogs(into dated: [(Date, SNMessage)], id: String) -> [SNMessage] {
+        let calls = callLogs[id] ?? []
+        guard !calls.isEmpty else { return dated.map(\.1) }
+        var combined = dated
+        for c in calls { combined.append((c.date, c.message)) }
+        combined.sort { $0.0 < $1.0 }
+        return combined.map(\.1)
     }
 
     /// DM routing mirrors MessageRouter: Bluetooth when the peer is reachable
@@ -1902,6 +1948,37 @@ final class SonarAppStore: ObservableObject {
         if !path.isEmpty { path.removeLast() }
     }
 
+    // MARK: Calls (MOCK — call.jsx)
+
+    /// mm:ss formatter (call.jsx `fmtCall`): minutes unpadded, seconds padded.
+    static func fmtCall(_ sec: Int) -> String {
+        "\(sec / 60):" + String(format: "%02d", sec % 60)
+    }
+
+    /// End a MOCKED call: append a CallLog record to the peer's DM transcript
+    /// (in-memory only) and pop the call screen — mirrors app.jsx `endCall`.
+    /// `seconds == 0` ⇒ the call never connected (a missed call).
+    func endCall(_ peerId: String, video: Bool, seconds: Int) {
+        let connected = seconds > 0
+        let now = Date()
+        let record = SNCallRecord(
+            id: UUID().uuidString,
+            date: now,
+            message: SNMessage(
+                mine: true,
+                text: "",
+                time: Self.clock(now),
+                call: SNCallInfo(
+                    kind: video ? .video : .voice,
+                    missed: !connected,
+                    dur: connected ? Self.fmtCall(seconds) : nil
+                )
+            )
+        )
+        callLogs[peerId, default: []].append(record)
+        pop()
+    }
+
     // MARK: Commands (composer "/" layer)
 
     struct CommandContext {
@@ -1972,6 +2049,7 @@ final class SonarAppStore: ObservableObject {
         pendingMarmotSends = [:]
         scannedPayMessageIDs = []
         pendingPayPeer = nil
+        callLogs = [:]
         // ⚡PAY coins live inside the erased chats — clear the ledger too. The
         // Lightning wallet seed/balance is separate and is NOT touched.
         payLedger.wipe()
@@ -2024,6 +2102,7 @@ final class SonarAppStore: ObservableObject {
         clearMediaDiskCache()
         scannedPayMessageIDs = []
         pendingPayPeer = nil
+        callLogs = [:]
         bip353 = ""
         defaults.removeObject(forKey: Keys.bip353)
         onboarded = false

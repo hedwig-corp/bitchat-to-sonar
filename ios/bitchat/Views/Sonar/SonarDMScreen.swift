@@ -43,13 +43,20 @@ struct SonarDMScreen: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            SNNavHeader(onBack: { store.pop() }) {
+            SNNavHeader(onBack: { store.pop() }, content: {
                 SonarAvatar(name: peer.name, size: 36, presence: peer.inRange)
                 SNHeaderTitle(name: peer.name, verified: verified) {
                     SNIcon(name: .lock, size: 11, weight: 2.4)
                     Text(verbatim: (verified ? "Verified · " : "") + subTransport)
                 }
-            }
+            }, trailing: {
+                SNIconButton(action: { store.push(.call(peerId, video: false)) }) {
+                    SNIcon(name: .phone, size: 20)
+                }
+                SNIconButton(action: { store.push(.call(peerId, video: true)) }) {
+                    SNIcon(name: .videocam, size: 21)
+                }
+            })
 
             banner
 

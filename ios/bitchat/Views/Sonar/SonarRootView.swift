@@ -50,6 +50,8 @@ struct SonarRootView: View {
             SonarSettingsScreen()
         case .profile:
             SonarProfileScreen()
+        case .call(let id, let video):
+            SonarCallScreen(peerId: id, video: video)
         }
     }
 }

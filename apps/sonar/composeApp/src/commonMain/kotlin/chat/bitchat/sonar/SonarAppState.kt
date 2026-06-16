@@ -28,10 +28,27 @@ sealed interface Screen {
     data class Chat(val id: String, val name: String, val pay: Boolean = false) : Screen
     data class Channel(val geohash: String) : Screen
     data class GeoDm(val geohash: String, val peerHex: String, val name: String) : Screen
+    // Full-screen voice/video call (MOCK — no real audio/video). [peerId] is the
+    // backing chat id (e.g. "mesh:<id>" or a Marmot group id) so the call log
+    // appends to the right conversation; [video] picks voice vs video layout.
+    data class Call(val peerId: String, val name: String, val video: Boolean) : Screen
 }
 
 /** A BLE-mesh DM conversation row for the home Messages list. */
 data class MeshDmRow(val peerId: String, val name: String, val preview: String, val tsSecs: Long)
+
+/** A MOCKED call-log record appended to a DM transcript when a call ends. Lives
+ *  in memory only (no MessageStore/SonarCore/Marmot write) — the next step
+ *  replaces the mock with real P2P. [durSecs] == 0 ⇒ the call never connected
+ *  (rendered as "Missed"); otherwise it's the connected duration. */
+data class CallRecord(
+    val video: Boolean,
+    val mine: Boolean,
+    val durSecs: Int,
+    val tsSecs: Long,
+) {
+    val missed: Boolean get() = durSecs == 0
+}
 
 /** Verify-sheet model: the safety groups (empty ⇒ show [note]) + verified flag. */
 data class SonarVerify(val safety: List<String>, val verified: Boolean, val note: String?)
@@ -79,6 +96,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             presenceByGeohash = emptyMap()
             payLedger = SonarPayLedger(); scannedPay.clear(); payVersion++
             mediaCache.clear()
+            callLogs.clear(); callVersion++
         }
     }
     /** Erase every conversation — BLE-mesh DMs, public/channel transcripts and
@@ -99,6 +117,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             // Lightning wallet seed/balance is separate and is NOT touched.
             payLedger = SonarPayLedger(); persistPay(); scannedPay.clear(); payVersion++
             mediaCache.clear()
+            callLogs.clear(); callVersion++
             // White Noise / Marmot DB: wipe + reconnect with the SAME identity.
             runCatching { SonarCore.eraseChats() }
             refreshChats()
@@ -109,6 +128,28 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     var messages by mutableStateOf<List<SonarMsg>>(emptyList())
         private set
+
+    // ── Mocked voice/video call log (in-memory only) ──
+    /** Call records per chat id, merged into that DM's transcript by timestamp. */
+    private val callLogs = mutableMapOf<String, MutableList<CallRecord>>()
+    /** Bumped on every call-log change so the open chat recomposes. */
+    var callVersion by mutableStateOf(0)
+        private set
+
+    /** Call-log records for [chatId] (oldest first). */
+    fun callRecords(chatId: String): List<CallRecord> = callLogs[chatId].orEmpty()
+
+    /** End a mocked call: append a call-log record to [chatId]'s transcript and
+     *  pop the call screen back to the DM (mirrors app.jsx `endCall`). [secs] is
+     *  the connected duration, or 0 if it never connected (⇒ "Missed"). The open
+     *  chat's `messages` is left intact (the poll loop skips while the call screen
+     *  is on top), so the DM repaints with the new record merged in. */
+    fun endCall(chatId: String, video: Boolean, secs: Int) {
+        callLogs.getOrPut(chatId) { mutableListOf() }
+            .add(CallRecord(video = video, mine = true, durSecs = secs, tsSecs = SonarClock.nowSecs()))
+        callVersion++
+        if (stack.size > 1) stack = stack.dropLast(1) // pop the call; keep messages
+    }
     /** In-memory BLE-mesh DM transcripts, keyed by bitchat peerID. Mesh chats
      *  don't live in the Rust core (that's Marmot/Nostr) — they ride the Noise
      *  link, so the app holds them. Chat id on the nav stack is "mesh:<peerId>". */

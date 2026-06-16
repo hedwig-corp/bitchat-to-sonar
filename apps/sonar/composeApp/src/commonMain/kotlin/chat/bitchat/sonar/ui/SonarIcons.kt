@@ -32,6 +32,8 @@ enum class SNIconName {
     Back, Chevron, Lock, Plus, Pin, People, Mesh, Globe, Check, Shield,
     ShieldCheck, X, NavArrow, Dice, Rings, Moon, Trash, Info, Coin, Bolt,
     Pencil, Key, Search, Mic, Play, Pause, Bookmark, BookmarkFill,
+    // Call glyphs (design icons.jsx): voice/video buttons + in-call controls.
+    Phone, Videocam, PhoneDown, MicOff, VideoOff, Speaker, CameraFlip,
 }
 
 private sealed interface Shape {
@@ -72,6 +74,14 @@ private val ICONS: Map<SNIconName, List<Shape>> = mapOf(
     SNIconName.Pencil to listOf(Shape.P("M16.8 4.6l2.6 2.6L8.6 18l-3.4.8.8-3.4z")),
     SNIconName.Key to listOf(Shape.C(8.5f, 12f, 3.4f), Shape.P("M11.9 12h8M17 12v2.8M19.9 12v2")),
     SNIconName.Search to listOf(Shape.C(10.5f, 10.5f, 5.5f), Shape.P("M14.5 14.5L20 20")),
+    // ── call glyphs (verbatim from design icons.jsx) ──
+    SNIconName.Phone to listOf(Shape.P("M6.5 4.5c-1 0-2 .9-2 2 0 7 6 13 13 13 1.1 0 2-1 2-2v-2.6c0-.5-.4-.9-.9-1l-3-.6c-.4-.1-.9.1-1.1.5l-1 1.6a11 11 0 0 1-5-5l1.6-1c.4-.2.6-.7.5-1.1l-.6-3c-.1-.5-.5-.9-1-.9z")),
+    SNIconName.Videocam to listOf(Shape.R(3.5f, 7f, 12f, 10f, 2.5f), Shape.P("M15.5 11l5-2.6v7.2l-5-2.6z")),
+    SNIconName.PhoneDown to listOf(Shape.P("M3.5 13.5c4.7-4 12.3-4 17 0l-2.2 2.6c-.4.5-1.1.5-1.6.2l-1.9-1.2a1.1 1.1 0 0 1-.5-1.2l.3-1.4a11 11 0 0 0-5.7 0l.3 1.4c.1.5-.1 1-.5 1.2l-1.9 1.2c-.5.3-1.2.3-1.6-.2z")),
+    SNIconName.MicOff to listOf(Shape.P("M9.2 5.4a2.8 2.8 0 0 1 5.6.8v4M14.8 12.8a2.8 2.8 0 0 1-5.6-1.2V9.2M5.8 11.5a6.2 6.2 0 0 0 9.5 5.3M18.2 11.5a6.2 6.2 0 0 1-.4 2.2M12 17.7V20.4M9 20.6h6"), Shape.P("M4.5 4.5l15 15")),
+    SNIconName.VideoOff to listOf(Shape.P("M3.5 7h9a2.5 2.5 0 0 1 2.5 2.5v.5l5-2.6v7.2l-5-2.6"), Shape.P("M4.5 4.5l15 15")),
+    SNIconName.Speaker to listOf(Shape.P("M5 9.5v5h3l4 3.5v-12L8 9.5z"), Shape.P("M15.5 9a4 4 0 0 1 0 6M17.8 6.8a7 7 0 0 1 0 10.4")),
+    SNIconName.CameraFlip to listOf(Shape.R(3.5f, 6.5f, 17f, 13f, 3f), Shape.P("M8.5 13a3.5 3.5 0 0 1 6-2.4M15.5 13a3.5 3.5 0 0 1-6 2.4"), Shape.P("M14.2 8.2 14.6 10.4 12.4 10.2M9.8 17.8 9.4 15.6 11.6 15.8"), Shape.P("M8 6.5l1-2h6l1 2")),
 )
 
 @Composable

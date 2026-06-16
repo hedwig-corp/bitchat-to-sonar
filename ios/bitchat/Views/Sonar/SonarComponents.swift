@@ -648,7 +648,9 @@ struct SNMsgList: View {
                             .foregroundColor(SonarTheme.text3)
                             .padding(EdgeInsets(top: 5, leading: 10, bottom: 5, trailing: 10))
                         ForEach(Array(msgs.enumerated()), id: \.element.id) { i, m in
-                            if m.pay != nil {
+                            if let call = m.call {
+                                SNCallLogRow(call: call, mine: m.mine, time: m.time)
+                            } else if m.pay != nil {
                                 SNPayBubble(
                                     m: m,
                                     peerName: peerName,
@@ -694,6 +696,50 @@ struct SNMsgList: View {
                 }
             }
         }
+    }
+}
+
+// MARK: - Call log row (call.jsx CallLog / theme.css .call-log)
+
+/// Compact, centered surface2 pill shown inline after a call ends. Green
+/// phone/videocam glyph (red when missed), label, optional ` · {dur}`, and the
+/// time on the right — a 1:1 reproduction of the prototype's CallLog.
+struct SNCallLogRow: View {
+    let call: SNCallInfo
+    let mine: Bool
+    let time: String
+
+    private var icon: SNIconName { call.kind == .video ? .videocam : .phone }
+
+    private var label: String {
+        if call.missed {
+            return call.kind == .video ? "Missed video call" : "Missed call"
+        }
+        return (mine ? "Outgoing " : "Incoming ") + (call.kind == .video ? "video call" : "call")
+    }
+
+    var body: some View {
+        HStack(spacing: 9) {
+            SNIcon(name: icon, size: 15, weight: 2)
+                .foregroundColor(call.missed ? SonarTheme.danger : SonarTheme.green)
+            HStack(spacing: 0) {
+                Text(verbatim: label)
+                    .font(SonarTheme.uiFont(size: 13, weight: .semibold))
+                    .foregroundColor(SonarTheme.text)
+                if !call.missed, let dur = call.dur {
+                    Text(verbatim: " · \(dur)")
+                        .font(SonarTheme.uiFont(size: 13))
+                        .foregroundColor(SonarTheme.text2)
+                }
+            }
+            Text(verbatim: time)
+                .font(SonarTheme.uiFont(size: 11.5))
+                .foregroundColor(SonarTheme.text3)
+        }
+        .padding(EdgeInsets(top: 8, leading: 14, bottom: 8, trailing: 14))
+        .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(SonarTheme.surface2))
+        .frame(maxWidth: .infinity, alignment: .center)
+        .padding(.top, 10)
     }
 }
 
