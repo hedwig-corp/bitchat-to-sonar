@@ -559,11 +559,15 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                 }
             }
             // Voice + video call buttons (design: DMScreen trailing → push call).
-            SNIconButton(SNIconName.Phone, size = 20.dp, weight = 2f, tint = s.text2) {
-                state.push(Screen.Call(screen.id, peerName, video = false))
-            }
-            SNIconButton(SNIconName.Videocam, size = 21.dp, weight = 2f, tint = s.text2) {
-                state.push(Screen.Call(screen.id, peerName, video = true))
+            // Calls are a Sonar-only feature: only shown for a call-capable Sonar
+            // peer (advertised CAP_CALLS over its 0x53 announce).
+            if (state.canCall(screen.id)) {
+                SNIconButton(SNIconName.Phone, size = 20.dp, weight = 2f, tint = s.text2) {
+                    state.push(Screen.Call(screen.id, peerName, video = false))
+                }
+                SNIconButton(SNIconName.Videocam, size = 21.dp, weight = 2f, tint = s.text2) {
+                    state.push(Screen.Call(screen.id, peerName, video = true))
+                }
             }
         }
 

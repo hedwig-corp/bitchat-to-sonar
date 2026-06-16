@@ -50,11 +50,15 @@ struct SonarDMScreen: View {
                     Text(verbatim: (verified ? "Verified · " : "") + subTransport)
                 }
             }, trailing: {
-                SNIconButton(action: { store.push(.call(peerId, video: false)) }) {
-                    SNIcon(name: .phone, size: 20)
-                }
-                SNIconButton(action: { store.push(.call(peerId, video: true)) }) {
-                    SNIcon(name: .videocam, size: 21)
+                // Calls are Sonar-only: shown only when the peer advertised the
+                // calls capability over its 0x53 Sonar profile.
+                if store.canCall(peerId) {
+                    SNIconButton(action: { store.push(.call(peerId, video: false)) }) {
+                        SNIcon(name: .phone, size: 20)
+                    }
+                    SNIconButton(action: { store.push(.call(peerId, video: true)) }) {
+                        SNIcon(name: .videocam, size: 21)
+                    }
                 }
             })
 

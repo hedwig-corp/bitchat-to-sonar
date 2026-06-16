@@ -1665,6 +1665,14 @@ final class SonarAppStore: ObservableObject {
         return false
     }
 
+    /// Voice/video calls are a Sonar-only feature: only a peer that announced
+    /// the calls capability (discovery bit 2) over its 0x53 Sonar profile can
+    /// be called. White Noise / plain bitchat peers cannot.
+    func canCall(_ id: String) -> Bool {
+        guard let profile = sonarProfiles[id] else { return false }
+        return profile.capabilities & SonarCapability.calls != 0
+    }
+
     /// Sends a sealed coin over the conversation's current rail. The balance
     /// is NOT deducted here — real sats only move at claim time, when the
     /// wallet pays the receiver's offer (honest deviation from the demo).

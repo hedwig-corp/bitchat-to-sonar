@@ -483,9 +483,11 @@ class SonarAppState(private val scope: CoroutineScope) {
         bip353 = t
     }
 
-    /** Capabilities this node advertises in its Sonar announce (0x53). */
+    /** Capabilities this node advertises in its Sonar announce (0x53). This build
+     *  speaks Sonar voice/video calls, so it always advertises CAP_CALLS. */
     private fun capabilities(): Int =
-        SonarAnnounce.CAP_MARMOT or (if (walletAvailable) SonarAnnounce.CAP_PAY else 0)
+        SonarAnnounce.CAP_MARMOT or SonarAnnounce.CAP_CALLS or
+            (if (walletAvailable) SonarAnnounce.CAP_PAY else 0)
 
     /** Build our local Sonar Discovery announce from the current identity. The
      *  rich Sonar identity: npub + capabilities + (when set) BIP-353 payment
@@ -945,6 +947,12 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /** True if [peerId] is a full Sonar peer (sent a 0x53 announce with an npub). */
     fun isSonarPeer(peerId: String): Boolean = sonarProfile(peerId) != null
+
+    /** True if [chatId]'s peer can be voice/video called: calls are a Sonar-only
+     *  feature, so the peer must be a mesh-routed Sonar peer whose 0x53 profile
+     *  advertised CAP_CALLS. A White Noise / non-Sonar chat cannot be called. */
+    fun canCall(chatId: String): Boolean =
+        isMeshChat(chatId) && sonarProfile(meshPeerId(chatId))?.speaksCalls == true
 
     private fun randomMeshId(): String =
         (0 until 16).joinToString("") { "0123456789abcdef"[kotlin.random.Random.nextInt(16)].toString() }

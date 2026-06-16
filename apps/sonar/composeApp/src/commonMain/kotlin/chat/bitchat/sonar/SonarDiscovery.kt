@@ -15,7 +15,7 @@ package chat.bitchat.sonar
  *   0x01 version   u8 (= 1)
  *   0x02 npub      32 raw bytes (Nostr x-only pubkey)
  *   0x03 bip353    UTF-8, ≤255 bytes (optional payment address, email-like)
- *   0x04 caps      u8 bitfield — bit0 marmot-dm, bit1 ⚡PAY payments
+ *   0x04 caps      u8 bitfield — bit0 marmot-dm, bit1 ⚡PAY payments, bit2 calls
  *   0x05 bolt12    UTF-8 BOLT12 offer, **2-byte big-endian length** (offers
  *                  routinely exceed 255 bytes, so this field is length-extended)
  *
@@ -33,6 +33,7 @@ data class SonarAnnounce(
 ) {
     val speaksMarmot: Boolean get() = capabilities and CAP_MARMOT != 0
     val speaksPay: Boolean get() = capabilities and CAP_PAY != 0
+    val speaksCalls: Boolean get() = capabilities and CAP_CALLS != 0
 
     fun encode(): ByteArray {
         val out = ArrayList<Byte>()
@@ -68,6 +69,7 @@ data class SonarAnnounce(
         const val PACKET_TYPE = 0x53
         const val CAP_MARMOT = 0x01
         const val CAP_PAY = 0x02
+        const val CAP_CALLS = 0x04   // bit2: speaks Sonar voice/video calls
 
         /** Decode a TLV payload. Returns null if malformed or no npub present.
          *  Type 0x05 (BOLT12 offer) uses a 2-byte length; all others 1 byte. */
