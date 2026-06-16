@@ -506,7 +506,9 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     // Transcript feed = chat messages (pay control lines collapsed) + mocked
     // call-log records, merged chronologically.
     val visible = state.messages.filter {
-        val p = PayLine.decode(it.content); p == null || p is PayLine.Pay
+        val p = PayLine.decode(it.content)
+        // Hide ⚡PAY control lines (Claim/Done) and ☎CALL signaling lines.
+        (p == null || p is PayLine.Pay) && SonarCore.callParseControl(it.content) == null
     }
     val calls = run { state.callVersion; state.callRecords(screen.id) }
     val feed: List<Any> = (visible + calls).sortedBy { if (it is CallRecord) it.tsSecs else (it as SonarMsg).tsSecs }
@@ -563,10 +565,10 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             // peer (advertised CAP_CALLS over its 0x53 announce).
             if (state.canCall(screen.id)) {
                 SNIconButton(SNIconName.Phone, size = 20.dp, weight = 2f, tint = s.text2) {
-                    state.push(Screen.Call(screen.id, peerName, video = false))
+                    state.placeCall(screen.id, peerName, video = false)
                 }
                 SNIconButton(SNIconName.Videocam, size = 21.dp, weight = 2f, tint = s.text2) {
-                    state.push(Screen.Call(screen.id, peerName, video = true))
+                    state.placeCall(screen.id, peerName, video = true)
                 }
             }
         }

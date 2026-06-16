@@ -50,6 +50,18 @@ data class CallRecord(
     val missed: Boolean get() = durSecs == 0
 }
 
+/** The in-flight P2P call the [CallScreen] renders. [incoming] true ⇒ we are the
+ *  callee (show Accept/Decline); [phase] tracks the engine state machine. */
+data class ActiveCall(
+    val callId: String,
+    val chatId: String,
+    val peerName: String,
+    val video: Boolean,
+    val incoming: Boolean,
+    val phase: SonarCallState,
+    val connectedSecs: Int = 0,
+)
+
 /** Verify-sheet model: the safety groups (empty ⇒ show [note]) + verified flag. */
 data class SonarVerify(val safety: List<String>, val verified: Boolean, val note: String?)
 
@@ -139,17 +151,164 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Call-log records for [chatId] (oldest first). */
     fun callRecords(chatId: String): List<CallRecord> = callLogs[chatId].orEmpty()
 
-    /** End a mocked call: append a call-log record to [chatId]'s transcript and
-     *  pop the call screen back to the DM (mirrors app.jsx `endCall`). [secs] is
-     *  the connected duration, or 0 if it never connected (⇒ "Missed"). The open
-     *  chat's `messages` is left intact (the poll loop skips while the call screen
-     *  is on top), so the DM repaints with the new record merged in. */
-    fun endCall(chatId: String, video: Boolean, secs: Int) {
-        callLogs.getOrPut(chatId) { mutableListOf() }
-            .add(CallRecord(video = video, mine = true, durSecs = secs, tsSecs = SonarClock.nowSecs()))
-        callVersion++
-        if (stack.size > 1) stack = stack.dropLast(1) // pop the call; keep messages
+    // ── Real P2P voice calls (iroh transport; ☎CALL over the chat) ──
+    /** The in-flight call the [CallScreen] renders, or null. [phase] tracks the
+     *  engine state; [connectedSecs] is the live duration once Connected. */
+    var activeCall by mutableStateOf<ActiveCall?>(null)
+        private set
+    private var callStarted = false
+    private var callLoopRunning = false
+    private var callTicker: kotlinx.coroutines.Job? = null
+    /** Ids of ☎CALL control messages already routed to the engine (dedup). */
+    private val scannedCall = mutableSetOf<String>()
+
+    /** Bind the iroh endpoint once + start the event loop (idempotent). */
+    private suspend fun ensureCallStarted() {
+        if (callStarted) return
+        runCatching { SonarCore.callStart() }
+            .onSuccess { callStarted = true; startCallLoop() }
     }
+
+    /** Place an outgoing call from [chatId]: register it, push the call screen,
+     *  and send the ☎CALL OFFER (with our dialable address) over the chat. */
+    fun placeCall(chatId: String, peerName: String, video: Boolean) {
+        if (activeCall != null) { toast = "Already in a call"; return }
+        scope.launch {
+            ensureCallStarted()
+            if (!callStarted) { toast = "Calling isn’t available right now"; return@launch }
+            val callId = randomMeshId()
+            try {
+                val addr = SonarCore.callLocalAddress()
+                SonarCore.callPlace(callId, video)
+                activeCall = ActiveCall(callId, chatId, peerName, video, incoming = false, phase = SonarCallState.Ringing)
+                push(Screen.Call(chatId, peerName, video))
+                send(chatId, SonarCore.callEncodeOffer(callId, video, addr, SonarClock.nowSecs()))
+            } catch (e: Throwable) {
+                toast = "call failed: ${e.message}"; activeCall = null
+            }
+        }
+    }
+
+    /** Accept the incoming call: send ANSWER|accept (with our address), then dial. */
+    fun acceptCall() {
+        val c = activeCall ?: return
+        scope.launch {
+            try {
+                val addr = SonarCore.callLocalAddress()
+                send(c.chatId, SonarCore.callEncodeAnswer(c.callId, SonarAnswer.Accept, addr))
+                SonarCore.callAccept(c.callId)
+            } catch (e: Throwable) { toast = "couldn’t accept: ${e.message}" }
+        }
+    }
+
+    /** Decline the incoming call: send ANSWER|decline + tear down the local slot. */
+    fun declineCall() {
+        val c = activeCall ?: return
+        scope.launch {
+            runCatching { send(c.chatId, SonarCore.callEncodeAnswer(c.callId, SonarAnswer.Decline, "")) }
+            runCatching { SonarCore.callHangup(c.callId) } // engine Ended event finalizes
+        }
+    }
+
+    /** Hang up an outgoing/connected call: tear down media + signal END. The
+     *  engine's Ended event records the call-log entry and pops the screen. */
+    fun hangupCall() {
+        val c = activeCall ?: return
+        scope.launch {
+            runCatching { SonarCore.callHangup(c.callId) }
+            runCatching { send(c.chatId, SonarCore.callEncodeEnd(c.callId, "hangup")) }
+        }
+    }
+
+    private fun startCallLoop() {
+        if (callLoopRunning) return
+        callLoopRunning = true
+        scope.launch {
+            while (true) {
+                val ev = try { SonarCore.callWaitEvent(20) } catch (e: Throwable) { delay(1000); null }
+                if (ev != null) onCallEvent(ev)
+            }
+        }
+    }
+
+    private fun onCallEvent(ev: SonarCallEvent) {
+        val c = activeCall ?: return
+        if (ev.callId != c.callId) return
+        when (ev.state) {
+            SonarCallState.Ringing -> {}
+            SonarCallState.Connecting -> activeCall = c.copy(phase = SonarCallState.Connecting)
+            SonarCallState.Connected -> { activeCall = c.copy(phase = SonarCallState.Connected, connectedSecs = 0); startCallTicker() }
+            SonarCallState.Ended, SonarCallState.Failed, SonarCallState.Declined,
+            SonarCallState.Busy, SonarCallState.Missed -> finalizeCall(c, ev)
+        }
+    }
+
+    private fun startCallTicker() {
+        callTicker?.cancel()
+        callTicker = scope.launch {
+            while (true) { delay(1000); activeCall?.let { activeCall = it.copy(connectedSecs = it.connectedSecs + 1) } }
+        }
+    }
+
+    /** Record the call-log entry, clear state, and pop the call screen. */
+    private fun finalizeCall(c: ActiveCall, ev: SonarCallEvent) {
+        callTicker?.cancel(); callTicker = null
+        val connected = ev.durationSecs > 0
+        callLogs.getOrPut(c.chatId) { mutableListOf() }.add(
+            CallRecord(video = c.video, mine = !c.incoming, durSecs = ev.durationSecs.toInt(), tsSecs = SonarClock.nowSecs())
+        )
+        callVersion++
+        activeCall = null
+        if (screen is Screen.Call && stack.size > 1) stack = stack.dropLast(1)
+    }
+
+    /** Scan [msgs] for ☎CALL control lines (deduped by message id) and route them
+     *  to the engine. Called wherever new chat messages arrive (open chat, the
+     *  global poll, mesh DMs) so a call rings even when the chat isn't open. */
+    private fun processCallLines(chatId: String, msgs: List<SonarMsg>) {
+        for (m in msgs) {
+            if (m.id in scannedCall) continue
+            val ctrl = SonarCore.callParseControl(m.content) ?: continue
+            scannedCall.add(m.id)
+            if (m.mine) continue // our own control line — we already drive our side
+            scope.launch { onCallControl(chatId, m, ctrl) }
+        }
+    }
+
+    private suspend fun onCallControl(chatId: String, m: SonarMsg, ctrl: SonarCallControl) {
+        ensureCallStarted()
+        when (ctrl) {
+            is SonarCallControl.Offer -> {
+                if (activeCall != null) { // busy: auto-decline
+                    runCatching { send(chatId, SonarCore.callEncodeAnswer(ctrl.callId, SonarAnswer.Busy, "")) }
+                    return
+                }
+                runCatching { SonarCore.callIncomingOffer(ctrl.callId, ctrl.addrB64, ctrl.video) }
+                // A stale offer (peer rang while we were offline) is a missed call.
+                if (SonarClock.nowSecs() - ctrl.unixSecs > 60) {
+                    runCatching { SonarCore.callHangup(ctrl.callId) }
+                    callLogs.getOrPut(chatId) { mutableListOf() }
+                        .add(CallRecord(video = ctrl.video, mine = false, durSecs = 0, tsSecs = SonarClock.nowSecs()))
+                    callVersion++
+                    return
+                }
+                val name = callPeerName(chatId)
+                activeCall = ActiveCall(ctrl.callId, chatId, name, ctrl.video, incoming = true, phase = SonarCallState.Ringing)
+                push(Screen.Call(chatId, name, ctrl.video))
+            }
+            is SonarCallControl.Answer ->
+                runCatching { SonarCore.callAnswer(ctrl.callId, ctrl.answer, ctrl.addrB64) }
+            is SonarCallControl.Cancel, is SonarCallControl.End ->
+                if (activeCall?.callId == ctrl.callId) runCatching { SonarCore.callHangup(ctrl.callId) }
+        }
+    }
+
+    /** A human name for the chat the incoming call arrived on. */
+    private fun callPeerName(chatId: String): String =
+        if (isMeshChat(chatId)) meshPeerName(meshPeerId(chatId))
+        else chats.firstOrNull { it.id == chatId }
+            ?.members?.firstOrNull { it != npub && it.isNotBlank() }
+            ?.let { profilesByNpub[it]?.bestName ?: (it.take(10) + "…") } ?: "secure chat"
     /** In-memory BLE-mesh DM transcripts, keyed by bitchat peerID. Mesh chats
      *  don't live in the Rust core (that's Marmot/Nostr) — they ride the Noise
      *  link, so the app holds them. Chat id on the nav stack is "mesh:<peerId>". */
@@ -642,6 +801,9 @@ class SonarAppState(private val scope: CoroutineScope) {
                 setupWallet()
                 refreshLocationChannels()
                 refreshChats()
+                // Bind the iroh call endpoint + start the call event loop early so
+                // an incoming call rings without us having to place one first.
+                launch { ensureCallStarted() }
                 poll()
             } catch (t: Throwable) {
                 toast = "connect failed: ${t.message}"
@@ -777,6 +939,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 SonarCore.send(chatId, t)
                 messages = SonarCore.messages(chatId)
                 processPayLines(chatId, messages)
+                processCallLines(chatId, messages)
             } catch (e: Throwable) {
                 toast = "send failed: ${e.message}"
             }
@@ -974,9 +1137,15 @@ class SonarAppState(private val scope: CoroutineScope) {
         val touched = mutableSetOf<String>()
         for (m in incoming) {
             val msg = SonarMsg(randomMeshId(), m.peerId, m.text, mine = false, m.tsSecs)
+            val chatId = meshChatId(m.peerId)
+            // A ☎CALL control line arriving over the mesh link: route it to the
+            // engine, never store/show it as a chat message.
+            if (SonarCore.callParseControl(m.text) != null) {
+                processCallLines(chatId, listOf(msg))
+                continue
+            }
             meshChats[m.peerId] = meshChats[m.peerId].orEmpty() + msg
             touched += m.peerId
-            val chatId = meshChatId(m.peerId)
             if (notifsOn && !foreground && chatId != openChatId) {
                 Notifier.notify(chatId.hashCode(), meshPeerName(m.peerId), notifPreview(m.text))
             }
@@ -1046,7 +1215,15 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // group (a Welcome received over relays) or a grown transcript is
                 // the signal that White Noise delivery reached us. Logged only on
                 // change so a cross-device round trip shows up in logcat.
-                val wnMsgs = chats.sumOf { runCatching { SonarCore.messages(it.id).size }.getOrDefault(0) }
+                // Fetch each chat's messages once: sum sizes (observability) AND
+                // scan for inbound ☎CALL lines so a call rings even when the chat
+                // isn't open (the offer arrives over White Noise/Marmot).
+                var wnMsgs = 0
+                for (c in chats) {
+                    val ms = runCatching { SonarCore.messages(c.id) }.getOrDefault(emptyList())
+                    wnMsgs += ms.size
+                    processCallLines(c.id, ms)
+                }
                 if (chats.size != lastWnGroups || wnMsgs != lastWnMsgs) {
                     android.util.Log.i("SonarWN", "White Noise: ${chats.size} group(s), $wnMsgs message(s)")
                     lastWnGroups = chats.size; lastWnMsgs = wnMsgs
