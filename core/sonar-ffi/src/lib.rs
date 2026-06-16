@@ -590,6 +590,13 @@ impl SonarNode {
     /// the host passes nothing and never reimplements the derivation; the NodeId
     /// is stable across launches. Idempotent-ish: a second call rebinds.
     pub fn call_start(&self) -> FfiResult<()> {
+        // Idempotent: bind the iroh endpoint ONCE per session. A second
+        // CallEngine::start binds a fresh endpoint (presets::N0 → a network
+        // round-trip that can block) AND drops the active engine — which made a
+        // call placed after boot's ensureCallStarted "take forever".
+        if self.call.lock().unwrap().is_some() {
+            return Ok(());
+        }
         let nostr_secret = self.client.identity().keys().secret_key().to_secret_bytes();
         let iroh_secret = sonar_core::call::identity::derive_iroh_secret(&nostr_secret);
         let engine = self

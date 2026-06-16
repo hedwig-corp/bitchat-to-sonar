@@ -2021,22 +2021,34 @@ final class SonarAppStore: ObservableObject {
         guard activeCall == nil else { return }
         let callId = UUID().uuidString
         let name = peerItem(convId).name
+        // Show the ringing screen IMMEDIATELY so the tap is responsive — the iroh
+        // setup (bind/offer) runs in the background. The endpoint is already bound
+        // at boot via ensureCallStarted(), so we must NOT call callStart() again
+        // here (a second bind blocks — which made the tap "take forever").
+        activeCall = SNActiveCall(callId: callId, convId: convId, peerName: name, video: video, incoming: false, phase: .ringing)
+        push(.call(convId, video: video))
+        let alreadyStarted = callStarted
         Task { [weak self] in
             guard let self else { return }
             do {
-                try await self.marmot.callStart()
-                await MainActor.run { self.callStarted = true; self.startCallLoop() }
+                if !alreadyStarted {
+                    try await self.marmot.callStart()
+                    await MainActor.run { self.callStarted = true; self.startCallLoop() }
+                }
                 let addr = try await self.marmot.callLocalAddress()
                 try await self.marmot.callPlace(callId: callId, video: video)
                 let line = callEncodeOffer(callId: callId, video: video, nodeAddrB64: addr, unixSecs: UInt64(Date().timeIntervalSince1970))
                 await MainActor.run {
-                    self.activeCall = SNActiveCall(callId: callId, convId: convId, peerName: name, video: video, incoming: false, phase: .ringing)
-                    self.push(.call(convId, video: video))
+                    guard self.activeCall?.callId == callId else { return } // user already ended
                     self.sendDm(convId, line)
                 }
             } catch {
                 SecureLogger.error("call place failed: \(error)", category: .session)
-                await MainActor.run { self.activeCall = nil }
+                await MainActor.run {
+                    guard self.activeCall?.callId == callId else { return }
+                    self.activeCall = nil
+                    self.pop()
+                }
             }
         }
     }
@@ -2044,9 +2056,16 @@ final class SonarAppStore: ObservableObject {
     /// Accept the incoming call: send ANSWER|accept (with our address), then dial.
     func acceptCall() {
         guard let c = activeCall else { return }
+        let alreadyStarted = callStarted
         Task { [weak self] in
             guard let self else { return }
             do {
+                // The endpoint is normally bound at boot; ensure it before dialing
+                // in case ensureCallStarted() failed (e.g. no network at launch).
+                if !alreadyStarted {
+                    try await self.marmot.callStart()
+                    await MainActor.run { self.callStarted = true; self.startCallLoop() }
+                }
                 let addr = try await self.marmot.callLocalAddress()
                 let line = callEncodeAnswer(callId: c.callId, answer: .accept, nodeAddrB64: addr)
                 await MainActor.run { self.sendDm(c.convId, line) }
