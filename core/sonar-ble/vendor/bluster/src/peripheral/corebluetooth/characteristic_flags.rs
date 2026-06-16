@@ -23,6 +23,13 @@ pub fn get_properties_and_permissions(characteristic: &Characteristic) -> (u16, 
         match write {
             Write::WithResponse(secure) => {
                 properties |= CBCharacteristicProperties::CBCharacteristicPropertyWrite as u16;
+                // PATCH (Sonar): also advertise write-WITHOUT-response. A real
+                // bitchat peripheral exposes both (Android: PROPERTY_WRITE |
+                // PROPERTY_WRITE_NO_RESPONSE); iOS clients write without response,
+                // so without this the iPhone can't write to us. Both land in
+                // didReceiveWriteRequests, which we capture.
+                properties |=
+                    CBCharacteristicProperties::CBCharacteristicPropertyWriteWithoutResponse as u16;
                 match secure {
                     Secure::Secure(_) => {
                         permissions |=
