@@ -25,3 +25,7 @@ pub mod transport;
 /// The opus audio codec. Gated behind `calls-audio`.
 #[cfg(feature = "calls-audio")]
 pub mod codec;
+
+/// The call media path: opus over iroh-roq RTP flows. Gated behind `calls-audio`.
+#[cfg(feature = "calls-audio")]
+pub mod media;
