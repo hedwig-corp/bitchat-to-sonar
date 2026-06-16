@@ -10,13 +10,17 @@
 //
 
 import SwiftUI
+#if canImport(UIKit)
+import UIKit
+#elseif canImport(AppKit)
+import AppKit
+#endif
 
 struct SonarProfileScreen: View {
     @EnvironmentObject private var store: SonarAppStore
 
     @State private var editing = false
     @State private var draft = ""
-    @State private var showKey = false
     @State private var bip353Draft = ""
     @FocusState private var draftFocused: Bool
 
@@ -94,47 +98,30 @@ struct SonarProfileScreen: View {
                     }
                     .padding(EdgeInsets(top: 14, leading: 28, bottom: 4, trailing: 28))
 
-                    // pf-codecard
-                    VStack(spacing: 12) {
-                        SNShareCode(seed: store.npub ?? store.myFingerprintDisplay, size: 164)
-                        Text("Show this code to someone nearby to start an encrypted chat.")
-                            .font(SonarTheme.uiFont(size: 12.5))
-                            .lineSpacing(12.5 * 0.25)
-                            .foregroundColor(SonarTheme.text2)
-                            .multilineTextAlignment(.center)
-                            .frame(maxWidth: 240)
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(EdgeInsets(top: 20, leading: 18, bottom: 16, trailing: 18))
-                    .background(
-                        RoundedRectangle(cornerRadius: 20, style: .continuous)
-                            .fill(SonarTheme.surface)
-                            .shadow(color: Color(sonarHex: 0x081E28, opacity: 0.04), radius: 1, y: 1)
-                    )
-                    .padding(14)
-
-                    SNSectionLabel("Keys")
+                    // Your key — KeyShareCard (QR + copy/share + expand)
+                    SNSectionLabel("Your key")
                     SNSettingsCard {
-                        SNSettingsRow(
-                            icon: .key, tone: .cyan, label: "Key fingerprint",
-                            value: store.myFingerprintDisplay, valueMono: true,
-                            trail: .none
-                        ) {}
-                        SNSettingsRow(
-                            icon: .lock, label: "Public key",
-                            sub: showKey ? nil : "Tap to reveal",
-                            divider: false
-                        ) {
-                            showKey.toggle()
+                        if let npub = store.npub {
+                            SNKeyShareCard(key: npub)
+                        } else {
+                            Text(verbatim: "Your key isn't ready yet — connecting to the secure chat service.")
+                                .font(SonarTheme.uiFont(size: 12.5))
+                                .lineSpacing(12.5 * 0.45)
+                                .foregroundColor(SonarTheme.text2)
+                                .multilineTextAlignment(.center)
+                                .frame(maxWidth: .infinity)
+                                .padding(EdgeInsets(top: 22, leading: 18, bottom: 22, trailing: 18))
                         }
                     }
-                    if showKey {
-                        Text(verbatim: store.npub ?? "npub not available yet — connecting to the secure chat service.")
-                            .font(SonarTheme.monoFont(size: 11))
-                            .lineSpacing(11 * 0.6)
-                            .foregroundColor(SonarTheme.text3)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(EdgeInsets(top: 2, leading: 26, bottom: 8, trailing: 26))
+
+                    SNSectionLabel("Safety")
+                    SNSettingsCard {
+                        SNSettingsRow(
+                            icon: .key, tone: .cyan, label: "Fingerprint",
+                            sub: "Read this aloud to verify in person",
+                            value: store.myFingerprintDisplay, valueMono: true,
+                            trail: .none, divider: false
+                        ) {}
                     }
                     Text("Your nickname is just what people see — your key never leaves this phone.")
                         .font(SonarTheme.uiFont(size: 12))
@@ -228,5 +215,116 @@ struct SNShareCode: View {
         }
         .frame(width: size, height: size)
         .accessibilityHidden(true)
+    }
+}
+
+// MARK: - Key sharing card (QR + copy/share + expand), ported from KeyShareCard in settings.jsx
+
+struct SNKeyShareCard: View {
+    let key: String
+    var compact: Bool = false
+
+    @State private var full = false
+    @State private var copied = false
+
+    /// First 18 + "…" + last 8, matching the prototype's shortKey.
+    private var shortKey: String {
+        guard key.count > 18 + 8 + 1 else { return key }
+        return String(key.prefix(18)) + "\u{2026}" + String(key.suffix(8))
+    }
+
+    private func copyKey() {
+        #if canImport(UIKit)
+        UIPasteboard.general.string = key
+        #elseif canImport(AppKit)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(key, forType: .string)
+        #endif
+        withAnimation(.easeOut(duration: 0.15)) { copied = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.7) {
+            withAnimation(.easeOut(duration: 0.15)) { copied = false }
+        }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // keyshare-qr — dark cells on a white rounded plate
+            SNShareCode(seed: key, size: compact ? 150 : 184)
+                .padding(16)
+                .background(
+                    RoundedRectangle(cornerRadius: 20, style: .continuous)
+                        .fill(Color.white)
+                        .shadow(color: Color(sonarHex: 0x081E28, opacity: 0.12), radius: 5, y: 2)
+                )
+
+            Text("Let someone scan this to add you — keys are exchanged directly, never through a server.")
+                .font(SonarTheme.uiFont(size: 12.5))
+                .lineSpacing(12.5 * 0.45)
+                .foregroundColor(SonarTheme.text2)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 260)
+                .padding(.top, 14)
+
+            // keyshare-keyrow — tap to expand to the full key
+            Button { full.toggle() } label: {
+                Text(verbatim: full ? key : shortKey)
+                    .font(SonarTheme.monoFont(size: full ? 11.5 : 12.5))
+                    .tracking(0.25)
+                    .lineSpacing(full ? 11.5 * 0.6 : 0)
+                    .foregroundColor(full ? SonarTheme.text : SonarTheme.text2)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity)
+                    .padding(EdgeInsets(top: 11, leading: 14, bottom: 11, trailing: 14))
+                    .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(SonarTheme.surface2))
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(SNScaleStyle(scale: 0.99))
+            .accessibilityLabel(full ? "Hide full key" : "Show full key")
+            .padding(.top, 12)
+
+            // keyshare-btns — copy + native share
+            HStack(spacing: 10) {
+                Button(action: copyKey) {
+                    keyShareButtonLabel(
+                        icon: copied ? .check : .copy,
+                        iconWeight: 2.2,
+                        text: copied ? "Copied" : "Copy key",
+                        fg: SonarTheme.onAccent,
+                        bg: copied ? SonarTheme.green : SonarTheme.accentFill
+                    )
+                }
+                .buttonStyle(SNScaleStyle(scale: 0.97))
+
+                ShareLink(item: key) {
+                    keyShareButtonLabel(
+                        icon: .share,
+                        iconWeight: 2,
+                        text: "Share",
+                        fg: SonarTheme.text,
+                        bg: SonarTheme.surface2
+                    )
+                }
+                .buttonStyle(SNScaleStyle(scale: 0.97))
+            }
+            .padding(.top, 10)
+        }
+        .padding(EdgeInsets(
+            top: compact ? 8 : 14,
+            leading: compact ? 8 : 16,
+            bottom: compact ? 6 : 8,
+            trailing: compact ? 8 : 16
+        ))
+    }
+
+    private func keyShareButtonLabel(icon: SNIconName, iconWeight: CGFloat, text: String, fg: Color, bg: Color) -> some View {
+        HStack(spacing: 7) {
+            SNIcon(name: icon, size: 17, weight: iconWeight)
+            Text(verbatim: text)
+                .font(SonarTheme.uiFont(size: 14.5, weight: .bold))
+        }
+        .foregroundColor(fg)
+        .frame(maxWidth: .infinity)
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 13, style: .continuous).fill(bg))
     }
 }
