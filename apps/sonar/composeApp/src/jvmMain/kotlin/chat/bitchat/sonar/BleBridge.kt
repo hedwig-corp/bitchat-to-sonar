@@ -11,6 +11,9 @@ private interface BleLib : Library {
     fun sonar_ble_stop()
     fun sonar_ble_peers_json(): Pointer?
     fun sonar_ble_free(ptr: Pointer?)
+    fun sonar_ble_set_announce(data: ByteArray?, len: Long)
+    fun sonar_ble_start_advertising()
+    fun sonar_ble_stop_advertising()
 }
 
 /**
@@ -45,6 +48,11 @@ object BleBridge {
 
     fun start() { lib?.sonar_ble_start() }
     fun stop() { lib?.sonar_ble_stop() }
+
+    /** Peripheral role: set the signed announce served on subscribe, then advertise. */
+    fun setAnnounce(bytes: ByteArray) { lib?.sonar_ble_set_announce(bytes, bytes.size.toLong()) }
+    fun startAdvertising() { lib?.sonar_ble_start_advertising() }
+    fun stopAdvertising() { lib?.sonar_ble_stop_advertising() }
 
     /** Fresh bitchat-mesh peers discovered by the background scan. */
     fun peers(): List<Dev> {

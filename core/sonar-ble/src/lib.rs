@@ -20,17 +20,30 @@
 
 use btleplug::api::{Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter};
 use btleplug::platform::Manager;
+use bluster::gatt::characteristic::{Characteristic, Properties, Read, Secure, Write};
+use bluster::gatt::event::{Event, Response};
+use bluster::gatt::service::Service;
+use bluster::Peripheral;
 use futures::StreamExt;
 use once_cell::sync::Lazy;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, CString};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+use uuid08::Uuid as Uuid08; // bluster's UUID version
 
-/// bitchat mesh GATT service — must match the iOS/Android apps for real interop.
-const BITCHAT_SERVICE: Uuid = Uuid::from_u128(0xF47B5E2D_4A9E_4C5A_9B3F_8E1D2C3A4B5C);
+/// bitchat mesh GATT service + characteristic — must match the iOS/Android apps.
+const BITCHAT_SERVICE_U128: u128 = 0xF47B5E2D_4A9E_4C5A_9B3F_8E1D2C3A4B5C;
+const BITCHAT_CHAR_U128: u128 = 0xA1B2C3D4_E5F6_4A5B_8C9D_0E1F2A3B4C5D;
+const BITCHAT_SERVICE: Uuid = Uuid::from_u128(BITCHAT_SERVICE_U128);
+
+/// The signed bitchat ANNOUNCE packet (built by the Rust core via the JVM and
+/// pushed down) that the GATT server sends when a central subscribes — that's
+/// what makes a phone show this desktop as a named mesh peer.
+static ANNOUNCE: Lazy<Mutex<Option<Vec<u8>>>> = Lazy::new(|| Mutex::new(None));
+static ADVERTISING: AtomicBool = AtomicBool::new(false);
 /// Drop a peer from the radar this long after its last advertisement. Generous
 /// because CoreBluetooth coalesces duplicate adverts (it reports a peripheral
 /// once per scan), so refreshes only arrive on each periodic re-scan below.
@@ -204,4 +217,119 @@ async fn handle_event(central: &btleplug::platform::Adapter, ev: CentralEvent) {
             Seen { name, rssi, bitchat, at: Instant::now() },
         );
     }
+}
+
+// ── Peripheral role: advertise the bitchat service + serve the announce ──
+
+/// Set/replace the signed ANNOUNCE the GATT server sends to subscribers. Built by
+/// the Rust core (meshBuildAnnounce) on the JVM side and pushed down as bytes.
+///
+/// # Safety
+/// `ptr` must point to `len` readable bytes, or be null (which clears it).
+#[no_mangle]
+pub unsafe extern "C" fn sonar_ble_set_announce(ptr: *const u8, len: usize) {
+    let next = if ptr.is_null() || len == 0 {
+        None
+    } else {
+        Some(std::slice::from_raw_parts(ptr, len).to_vec())
+    };
+    dbg_log(&format!("set_announce: {} bytes", next.as_ref().map(|v| v.len()).unwrap_or(0)));
+    if let Ok(mut a) = ANNOUNCE.lock() {
+        *a = next;
+    }
+}
+
+/// Begin advertising the bitchat service (peripheral role) so phones discover
+/// this desktop and, on subscribe, receive the announce. Idempotent.
+#[no_mangle]
+pub extern "C" fn sonar_ble_start_advertising() {
+    if ADVERTISING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::Builder::new()
+        .name("sonar-ble-adv".into())
+        .spawn(|| {
+            let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(_) => {
+                    ADVERTISING.store(false, Ordering::SeqCst);
+                    return;
+                }
+            };
+            rt.block_on(async {
+                if let Err(e) = run_peripheral().await {
+                    dbg_log(&format!("advertise: ERR {e}"));
+                }
+                ADVERTISING.store(false, Ordering::SeqCst);
+            });
+        })
+        .ok();
+}
+
+#[no_mangle]
+pub extern "C" fn sonar_ble_stop_advertising() {
+    ADVERTISING.store(false, Ordering::SeqCst);
+}
+
+async fn run_peripheral() -> Result<(), Box<dyn std::error::Error>> {
+    let svc = Uuid08::from_u128(BITCHAT_SERVICE_U128);
+    let chr = Uuid08::from_u128(BITCHAT_CHAR_U128);
+
+    let peripheral = Peripheral::new().await?;
+    let (tx, mut rx) = futures::channel::mpsc::channel(32);
+    let characteristic = Characteristic::new(
+        chr,
+        Properties::new(
+            Some(Read(Secure::Insecure(tx.clone()))),
+            Some(Write::WithResponse(Secure::Insecure(tx.clone()))),
+            Some(tx.clone()),
+            None,
+        ),
+        None,
+        HashSet::new(),
+    );
+    let mut chars = HashSet::new();
+    chars.insert(characteristic);
+    peripheral.add_service(&Service::new(svc, true, chars))?;
+    peripheral.register_gatt().await?;
+
+    let mut tries = 0;
+    while !peripheral.is_powered().await? {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        tries += 1;
+        if tries > 50 {
+            return Err("peripheral never powered on".into());
+        }
+    }
+    peripheral.start_advertising("Sonar", &[svc]).await?;
+    dbg_log("advertise: started (bitchat service)");
+
+    fn announce() -> Vec<u8> {
+        ANNOUNCE.lock().ok().and_then(|a| a.clone()).unwrap_or_default()
+    }
+
+    while ADVERTISING.load(Ordering::SeqCst) {
+        match tokio::time::timeout(Duration::from_secs(1), rx.next()).await {
+            Ok(Some(ev)) => match ev {
+                Event::NotifySubscribe(sub) => {
+                    // A phone subscribed → push our announce so it shows us as a peer.
+                    dbg_log("advertise: central subscribed → notify announce");
+                    let _ = sub.notification.clone().try_send(announce());
+                }
+                Event::ReadRequest(req) => {
+                    let _ = req.response.send(Response::Success(announce()));
+                }
+                Event::WriteRequest(req) => {
+                    // Inbound packets (handshake/messages) — discovery doesn't need
+                    // them yet; ack so the central isn't left hanging.
+                    let _ = req.response.send(Response::Success(vec![]));
+                }
+                Event::NotifyUnsubscribe => {}
+            },
+            Ok(None) => break,
+            Err(_) => {} // 1s tick — re-check ADVERTISING
+        }
+    }
+    let _ = peripheral.stop_advertising().await;
+    Ok(())
 }

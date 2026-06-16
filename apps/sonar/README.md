@@ -24,7 +24,7 @@ composeApp/src/
 | Encrypted media (MIP-04)            |   ✅    |   ✅    |
 | Profiles / verify safety numbers    |   ✅    |   ✅    |
 | Location channels ("Around you")    |   ✅ GPS | ⚪️ opt-in IP geolocation (Settings) |
-| BLE mesh — discovery (radar)        |   ✅    |   ✅ native CoreBluetooth/BlueZ bridge |
+| BLE mesh — discovery (both ways)    |   ✅    |   ✅ scan + advertise (CoreBluetooth/BlueZ) |
 | BLE mesh — messaging (DMs/broadcast)|   ✅    |   ⚪️ next stage (Noise-over-GATT transport) |
 | Unify nearby payments (BLE)         |   ✅    |   ⚪️ not yet (same bridge, later) |
 | Lightning wallet (⚡PAY)            |   ✅ (Breez) | ⚪️ unavailable (no desktop Breez build yet) |
@@ -33,15 +33,21 @@ Desktop covers the entire **internet-backed** surface — exactly the slice that
 interops cross-platform over the same Nostr relays — plus **BLE discovery**.
 
 - **BLE mesh** was never a hardware or Compose limitation — it's a JVM-library
-  gap (no pure-JVM BLE library). The desktop now drives Bluetooth through a small
-  native bridge, **`core/sonar-ble`** (Rust `btleplug` → CoreBluetooth on macOS /
-  BlueZ on Linux), loaded over JNA exactly like the Rust core. The **central/scan
-  role is live**: the radar shows nearby bitchat-mesh advertisers. Still to come:
-  the **peripheral** role (advertising, so phones discover the desktop) and the
-  **Noise-over-GATT** message transport — at which point desktop joins the mesh
-  fully. macOS CoreBluetooth (`CBPeripheralManager`, since 10.9) supports the
-  peripheral role, and the original bitchat ships its mesh natively on the Mac App
-  Store, so the path is proven.
+  gap (no pure-JVM BLE library). The desktop drives Bluetooth through a small
+  native bridge, **`core/sonar-ble`**, loaded over JNA exactly like the Rust core,
+  in **both roles**:
+  - **central/scan** (`btleplug` → CoreBluetooth/BlueZ) — the radar shows nearby
+    bitchat-mesh phones;
+  - **peripheral/advertise + GATT server** (`bluster`) — the desktop advertises
+    the bitchat service and, when a phone subscribes, serves a signed **announce**
+    built by the same `meshBuildAnnounce` Rust function the phones use, so the
+    phone shows the desktop as a named peer.
+
+  (`bluster` is vendored + patched — upstream advertises macOS service UUIDs as
+  `NSString` instead of `CBUUID`, which CoreBluetooth rejects with "invalid
+  parameters"; see `core/sonar-ble/vendor/bluster/SONAR_PATCH.md`.) Still to come:
+  the **Noise-over-GATT message transport** (encrypted DMs/broadcast over the
+  link) — at which point the desktop joins the mesh fully.
   - **macOS permission**: BLE needs the Bluetooth grant. The packaged `.app`
     carries `NSBluetoothAlwaysUsageDescription` and prompts on first use. With
     `./gradlew :composeApp:run` (no `.app` bundle) macOS can't prompt, so scanning

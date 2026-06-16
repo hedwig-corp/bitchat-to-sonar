@@ -13,9 +13,27 @@ package chat.bitchat.sonar
  * DMs / broadcasts return false / empty here for now.
  */
 actual object MeshRadio {
+    @Volatile private var nick: String = "sonar"
+
     actual fun available(): Boolean = BleBridge.available
-    actual fun start() { BleBridge.start() }
-    actual fun stop() { BleBridge.stop() }
+
+    actual fun start() {
+        BleBridge.start() // central: scan for nearby mesh advertisers
+        // peripheral: advertise the bitchat service + serve our signed announce,
+        // so phones discover this desktop and show it as a named peer.
+        refreshAnnounce()
+        BleBridge.startAdvertising()
+    }
+
+    actual fun stop() {
+        BleBridge.stop()
+        BleBridge.stopAdvertising()
+    }
+
+    /** Rebuild + push the announce (called on start and when the nickname changes). */
+    private fun refreshAnnounce() {
+        runCatching { BleBridge.setAnnounce(MeshIdentity.announce(nick)) }
+    }
 
     actual fun peers(): List<MeshPeer> = BleBridge.peers().map { d ->
         MeshPeer(
@@ -26,9 +44,14 @@ actual object MeshRadio {
         )
     }
 
-    // Transport (Noise-over-GATT) not wired yet — discovery only.
+    // Transport (Noise-over-GATT messaging) not wired yet — discovery + announce only.
     actual fun setLocalSonarAnnounce(payload: ByteArray?) {}
-    actual fun setMeshNickname(nick: String) {}
+    actual fun setMeshNickname(nick: String) {
+        if (nick.isNotBlank() && nick != this.nick) {
+            this.nick = nick
+            if (available()) refreshAnnounce()
+        }
+    }
     actual fun sonarPeers(): Map<String, ByteArray> = emptyMap()
 
     actual fun sendMeshDm(peerId: String, messageId: String, text: String): Boolean = false
