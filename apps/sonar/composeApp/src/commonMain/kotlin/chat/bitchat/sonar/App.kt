@@ -215,7 +215,7 @@ private fun HomeScreen(state: SonarAppState) {
                 // peer's White Noise leg is folded into this row (one row/person).
                 items(state.meshDmRows, key = { "mesh:" + it.peerId }) { row ->
                     ConvRow(
-                        avatar = { SonarAvatar(row.name, 52.dp, presence = true) },
+                        avatar = { SonarAvatar(row.name, 52.dp, presence = state.dmInRange(row.peerId)) },
                         title = row.name, sub = row.preview, lock = false,
                         onLongClick = { pendingDelete = DeleteTarget(row.peerId, row.name, isMesh = true) },
                     ) { state.openDm(row.peerId, row.name) }
@@ -578,15 +578,11 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                     )
                 }
             }
-            // Voice + video call buttons (design: DMScreen trailing → push call).
-            // Calls are a Sonar-only feature: only shown for a call-capable Sonar
-            // peer (advertised CAP_CALLS over its 0x53 announce).
+            // Audio call button. Calls are Sonar-only and use live BLE when
+            // available, otherwise White Noise signaling for that peer.
             if (state.canCall(screen.id)) {
                 SNIconButton(SNIconName.Phone, size = 20.dp, weight = 2f, tint = s.text2) {
                     state.placeCall(screen.id, peerName, video = false)
-                }
-                SNIconButton(SNIconName.Videocam, size = 21.dp, weight = 2f, tint = s.text2) {
-                    state.placeCall(screen.id, peerName, video = true)
                 }
             }
         }
@@ -732,16 +728,19 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                     contentAlignment = Alignment.Center
                 ) { SNIcon(SNIconName.Mic, 20.dp, micFg, weight = 2f) }
             } else {
+                val sendEnabled = draft.isNotBlank()
+                val sendBg = if (!sendEnabled) s.surface2 else if (sendOverMesh) s.accentFill else s.netFill
+                val sendFg = if (!sendEnabled) s.text3 else if (sendOverMesh) s.onAccent else s.onNet
                 Box(
-                    Modifier.size(46.dp).clip(CircleShape).background(if (sendOverMesh) s.accentFill else s.netFill)
-                        .clickable {
+                    Modifier.size(46.dp).clip(CircleShape).background(sendBg)
+                        .clickable(enabled = sendEnabled) {
                             val d = draft; draft = ""
                             if (!state.handleCommand(d, peerName, channelGeohash = null, chatId = screen.id)) {
                                 state.send(screen.id, d)
                             }
                         },
                     contentAlignment = Alignment.Center
-                ) { Text("↑", color = if (sendOverMesh) s.onAccent else s.onNet, fontSize = 20.sp, fontWeight = FontWeight.Bold) }
+                ) { Text("↑", color = sendFg, fontSize = 20.sp, fontWeight = FontWeight.Bold) }
             }
         }
     }

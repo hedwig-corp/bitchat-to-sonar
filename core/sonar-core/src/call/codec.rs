@@ -29,7 +29,9 @@ mod tests {
 
         // A ~440 Hz tone, one 20 ms frame.
         let frame: Vec<f32> = (0..FRAME_SAMPLES)
-            .map(|i| (i as f32 * 2.0 * std::f32::consts::PI * 440.0 / SAMPLE_RATE as f32).sin() * 0.3)
+            .map(|i| {
+                (i as f32 * 2.0 * std::f32::consts::PI * 440.0 / SAMPLE_RATE as f32).sin() * 0.3
+            })
             .collect();
 
         let mut packet = vec![0u8; 4000];

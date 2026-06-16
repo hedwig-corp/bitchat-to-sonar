@@ -9,10 +9,14 @@ use sonar_core::identity::Identity;
 async fn main() {
     let hex = std::env::args().nth(1).expect("pass a hex pubkey");
     let peer = nostr::PublicKey::parse(&hex).expect("valid pubkey");
-    let relays = ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net"]
-        .into_iter()
-        .map(|r| nostr::RelayUrl::parse(r).unwrap())
-        .collect();
+    let relays = [
+        "wss://relay.damus.io",
+        "wss://nos.lol",
+        "wss://relay.primal.net",
+    ]
+    .into_iter()
+    .map(|r| nostr::RelayUrl::parse(r).unwrap())
+    .collect();
 
     let me = SonarClient::connect_in_memory(Identity::generate(), relays)
         .await
@@ -23,7 +27,10 @@ async fn main() {
     eprintln!("[invite_all] {} key package(s) found", kps.len());
     for kp in kps {
         let kp_id = kp.id.to_hex();
-        match me.start_dm_with_key_package(kp.clone(), "interop test").await {
+        match me
+            .start_dm_with_key_package(kp.clone(), "interop test")
+            .await
+        {
             Ok(gid) => eprintln!(
                 "[invite_all] invited via kp {} -> group {}",
                 &kp_id[..12],

@@ -11,7 +11,7 @@ data class MeshPeer(val id: String, val name: String, val rssi: Int, val sonar: 
 /** An incoming mesh DM (decrypted Noise text). [peerId] is the sender's STABLE
  *  fingerprint (not the rotating bitchat peerID), so messages stay in one
  *  conversation across rotation. Drained by the app into the mesh-chat store. */
-data class MeshDmIn(val peerId: String, val text: String, val tsSecs: Long)
+data class MeshDmIn(val peerId: String, val messageId: String, val text: String, val tsSecs: Long)
 
 /** An incoming PUBLIC broadcast (the BLE "Mesh" channel) from another peer. The
  *  wire carries only content + sender peerID + timestamp; the display nickname is
@@ -53,6 +53,10 @@ expect object MeshRadio {
      *  (fingerprint). Resolves the peer's CURRENT address/peerID at send time, so
      *  delivery survives rotation. Returns false only if it could not be queued. */
     fun sendMeshDm(peerId: String, messageId: String, text: String): Boolean
+    /** Send an encrypted DM only if a Noise link is established right now.
+     *  Unlike [sendMeshDm], this must not queue. Call signaling uses this so a
+     *  stale OFFER/ANSWER/END is never delivered after the peer leaves BLE. */
+    fun sendMeshDmNow(peerId: String, messageId: String, text: String): Boolean
     /** True iff an encrypted Noise link to the peer with stable [peerId]
      *  (fingerprint) is established right now. */
     fun hasMeshLink(peerId: String): Boolean

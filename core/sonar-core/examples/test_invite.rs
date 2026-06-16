@@ -12,10 +12,14 @@ async fn main() {
     let hex = std::env::args().nth(1).expect("pass a hex pubkey");
     let peer = nostr::PublicKey::parse(&hex).expect("valid pubkey");
 
-    let relays = ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net"]
-        .into_iter()
-        .map(|r| nostr::RelayUrl::parse(r).unwrap())
-        .collect();
+    let relays = [
+        "wss://relay.damus.io",
+        "wss://nos.lol",
+        "wss://relay.primal.net",
+    ]
+    .into_iter()
+    .map(|r| nostr::RelayUrl::parse(r).unwrap())
+    .collect();
 
     let me = SonarClient::connect_in_memory(Identity::generate(), relays)
         .await
@@ -24,7 +28,10 @@ async fn main() {
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
     match me.start_dm(peer, "interop test").await {
-        Ok(gid) => eprintln!("[test_invite] start_dm OK, group {}", hex::encode(gid.as_slice())),
+        Ok(gid) => eprintln!(
+            "[test_invite] start_dm OK, group {}",
+            hex::encode(gid.as_slice())
+        ),
         Err(e) => eprintln!("[test_invite] start_dm ERR: {e}"),
     }
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;

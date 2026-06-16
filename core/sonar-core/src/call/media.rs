@@ -9,7 +9,7 @@
 
 use iroh_roq::{rtp, Session, VarInt};
 use opus::{Application, Channels, Decoder, Encoder};
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{self, error::TrySendError};
 
 use crate::call::codec::SAMPLE_RATE;
 
@@ -77,8 +77,10 @@ pub async fn run_audio_session(
             match dec.decode(&packet.payload, &mut out, false) {
                 Ok(n) => {
                     out.truncate(n * ch);
-                    if speaker.send(out).await.is_err() {
-                        break; // host stopped draining
+                    match speaker.try_send(out) {
+                        Ok(()) => {}
+                        Err(TrySendError::Full(_)) => continue, // stale audio is worse than dropped audio
+                        Err(TrySendError::Closed(_)) => break,  // host stopped draining
                     }
                 }
                 Err(_) => continue, // skip a bad packet
@@ -90,6 +92,7 @@ pub async fn run_audio_session(
     // Send: encode mic PCM → RTP → send-flow. Ends when the host drops `mic`.
     let mut enc = opus_encoder(channels)?;
     let mut seq: u16 = 0;
+    let mut timestamp: u32 = 0;
     let mut buf = vec![0u8; 1500];
     let send_result = async {
         while let Some(pcm) = mic.recv().await {
@@ -97,12 +100,14 @@ pub async fn run_audio_session(
             let packet = rtp::packet::Packet {
                 header: rtp::header::Header {
                     sequence_number: seq,
+                    timestamp,
                     marker: seq == 0,
                     ..Default::default()
                 },
                 payload: bytes::Bytes::copy_from_slice(&buf[..n]),
             };
             seq = seq.wrapping_add(1);
+            timestamp = timestamp.wrapping_add(FRAME_PER_CHANNEL as u32);
             if send_flow.send_rtp(&packet).is_err() {
                 break; // connection closed
             }
@@ -201,9 +206,17 @@ mod tests {
             let (spk_b_tx, mut spk_b_rx) = mpsc::channel::<Vec<i16>>(16);
 
             let ha = tokio::spawn(run_audio_session(
-                rtc_session(conn_a), Channels::Stereo, mic_a_rx, spk_a_tx));
+                rtc_session(conn_a),
+                Channels::Stereo,
+                mic_a_rx,
+                spk_a_tx,
+            ));
             let hb = tokio::spawn(run_audio_session(
-                rtc_session(conn_b), Channels::Stereo, mic_b_rx, spk_b_tx));
+                rtc_session(conn_b),
+                Channels::Stereo,
+                mic_b_rx,
+                spk_b_tx,
+            ));
 
             // Let both receive-flows establish before sending (RTP rides
             // best-effort datagrams; early packets would otherwise drop).
@@ -223,10 +236,12 @@ mod tests {
             // Each side hears N non-silent frames.
             for _ in 0..n {
                 let ra = tokio::time::timeout(Duration::from_secs(5), spk_b_rx.recv())
-                    .await?.expect("A→B frame");
+                    .await?
+                    .expect("A→B frame");
                 assert!(ra.iter().any(|s| *s != 0));
                 let rb = tokio::time::timeout(Duration::from_secs(5), spk_a_rx.recv())
-                    .await?.expect("B→A frame");
+                    .await?
+                    .expect("B→A frame");
                 assert!(rb.iter().any(|s| *s != 0));
             }
 

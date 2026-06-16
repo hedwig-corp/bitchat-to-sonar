@@ -28,18 +28,40 @@ sealed interface Screen {
     data class Chat(val id: String, val name: String, val pay: Boolean = false) : Screen
     data class Channel(val geohash: String) : Screen
     data class GeoDm(val geohash: String, val peerHex: String, val name: String) : Screen
-    // Full-screen voice/video call (MOCK — no real audio/video). [peerId] is the
-    // backing chat id (e.g. "mesh:<id>" or a Marmot group id) so the call log
-    // appends to the right conversation; [video] picks voice vs video layout.
+    // Full-screen voice/video call. [peerId] is the folded backing chat id
+    // ("mesh:<id>" for a Sonar peer) so the call log appends to the right
+    // conversation; [video] picks voice vs video layout.
     data class Call(val peerId: String, val name: String, val video: Boolean) : Screen
 }
 
 /** A BLE-mesh DM conversation row for the home Messages list. */
 data class MeshDmRow(val peerId: String, val name: String, val preview: String, val tsSecs: Long)
 
-/** A MOCKED call-log record appended to a DM transcript when a call ends. Lives
- *  in memory only (no MessageStore/SonarCore/Marmot write) — the next step
- *  replaces the mock with real P2P. [durSecs] == 0 ⇒ the call never connected
+private fun messagePreview(content: String): String {
+    if (content.trimStart().startsWith("☎CALL") && SonarCore.callParseControl(content) != null) {
+        return "Voice call"
+    }
+    return if (PayLine.decode(content) != null) "₿ Payment" else content
+}
+
+internal fun canonicalConversationTitle(title: String): String =
+    title.trim().lowercase().split(Regex("\\s+")).filter { it.isNotEmpty() }.joinToString(" ")
+
+internal fun inferUniquePeerByTitle(
+    groupTitle: String,
+    peerTitles: Map<String, String>,
+    allGroupTitles: List<String>,
+): String? {
+    val title = canonicalConversationTitle(groupTitle).takeIf { it.isNotEmpty() } ?: return null
+    if (allGroupTitles.count { canonicalConversationTitle(it) == title } != 1) return null
+    return peerTitles.entries
+        .filter { canonicalConversationTitle(it.value) == title }
+        .map { it.key }
+        .singleOrNull()
+}
+
+/** A call-log record appended to a DM transcript when a call ends. Lives in
+ *  memory only (no MessageStore/SonarCore/Marmot write). [durSecs] == 0 ⇒ the call never connected
  *  (rendered as "Missed"); otherwise it's the connected duration. */
 data class CallRecord(
     val video: Boolean,
@@ -60,6 +82,8 @@ data class ActiveCall(
     val incoming: Boolean,
     val phase: SonarCallState,
     val connectedSecs: Int = 0,
+    val muted: Boolean = false,
+    val speakerOn: Boolean = true,
 )
 
 /** Verify-sheet model: the safety groups (empty ⇒ show [note]) + verified flag. */
@@ -98,8 +122,9 @@ class SonarAppState(private val scope: CoroutineScope) {
             UnifyRadio.stopScanning()
             UnifyRadio.stopAdvertising()
             unifyOffer = null; unifyPeers = emptyList()
+            MeshRadio.setMeshNickname("")
             MeshRadio.setLocalSonarAnnounce(null); sonarPeerProfiles = emptyMap()
-            linkByFp.clear(); foldedGroupIds = emptySet()
+            linkByFp.clear(); linkCapsByFp.clear(); foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
             MessageStore.wipe()
             SonarCore.wipe()
             stack = listOf(Screen.Home)
@@ -118,6 +143,7 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  (the node is recreated, so the iroh endpoint must be re-bound). */
     private fun resetCallState() {
         callTicker?.cancel(); callTicker = null
+        CallAudioRoute.configure(active = false, speakerOn = false)
         activeCall = null
         callStarted = false
         scannedCall.clear()
@@ -133,7 +159,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             MessageStore.wipe()
             // In-memory conversation state.
             meshChats.clear(); meshChatNames.clear(); pendingMarmotSends.clear()
-            linkByFp.clear(); persistLinks(); foldedGroupIds = emptySet()
+            linkByFp.clear(); linkCapsByFp.clear(); persistLinks(); persistLinkCaps()
+            foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
             meshBroadcast = emptyList(); meshDmRows = emptyList()
             messages = emptyList(); channelMsgs = emptyList(); chats = emptyList()
             lastWnGroups = -1; lastWnMsgs = -1
@@ -174,6 +201,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     private var callStarted = false
     private var callLoopRunning = false
     private var callTicker: kotlinx.coroutines.Job? = null
+    private var meshRealtimeLoopRunning = false
     /** Ids of ☎CALL control messages already routed to the engine (dedup). */
     private val scannedCall = mutableSetOf<String>()
 
@@ -186,27 +214,53 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     /** Place an outgoing call from [chatId]: register it, push the call screen,
-     *  and send the ☎CALL OFFER (with our dialable address) over the chat. */
+     *  and send the ☎CALL OFFER (with our dialable address) over BLE when live,
+     *  otherwise over the folded White Noise group for the same Sonar peer. */
     fun placeCall(chatId: String, peerName: String, video: Boolean) {
         if (activeCall != null) { toast = "Already in a call"; return }
+        if (video) { toast = "Video calls are coming soon."; return }
+        if (!canCall(chatId)) { toast = "No call route to this Sonar peer yet."; return }
         val callId = randomMeshId()
         // Show the ringing screen IMMEDIATELY so the tap is responsive; the iroh
         // setup (bind/offer) runs below. (ensureCallStarted is idempotent — it
         // guards on callStarted, so unlike the old iOS path it never re-binds.)
+        CallAudioRoute.configure(active = true, speakerOn = true)
         activeCall = ActiveCall(callId, chatId, peerName, video, incoming = false, phase = SonarCallState.Ringing)
         push(Screen.Call(chatId, peerName, video))
         scope.launch {
             ensureCallStarted()
-            if (!callStarted) { toast = "Calling isn’t available right now"; activeCall = null; back(); return@launch }
+            if (!callStarted) {
+                toast = "Calling isn’t available right now"
+                CallAudioRoute.configure(active = false, speakerOn = false)
+                activeCall = null
+                back()
+                return@launch
+            }
             try {
                 val addr = SonarCore.callLocalAddress()
                 SonarCore.callPlace(callId, video)
+                if (activeCall?.callId == callId && activeCall?.muted == true) {
+                    runCatching { SonarCore.callSetMuted(callId, true) }
+                }
                 sonarLog("SonarCall", "TX OFFER callId=${callId.take(8)} video=$video addrLen=${addr.length} → $chatId")
-                if (activeCall?.callId == callId) // user may have ended already
-                    send(chatId, SonarCore.callEncodeOffer(callId, video, addr, SonarClock.nowSecs()))
+                if (activeCall?.callId == callId) { // user may have ended already
+                    val sent = sendCallControl(chatId, SonarCore.callEncodeOffer(callId, video, addr, SonarClock.nowSecs()))
+                    if (!sent) {
+                        runCatching { SonarCore.callHangup(callId) }
+                        if (activeCall?.callId == callId) {
+                            CallAudioRoute.configure(active = false, speakerOn = false)
+                            activeCall = null
+                            back()
+                        }
+                    }
+                }
             } catch (e: Throwable) {
                 toast = "call failed: ${e.message}"
-                if (activeCall?.callId == callId) { activeCall = null; back() }
+                if (activeCall?.callId == callId) {
+                    CallAudioRoute.configure(active = false, speakerOn = false)
+                    activeCall = null
+                    back()
+                }
             }
         }
     }
@@ -214,10 +268,20 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Accept the incoming call: send ANSWER|accept (with our address), then dial. */
     fun acceptCall() {
         val c = activeCall ?: return
+        activeCall = c.copy(phase = SonarCallState.Connecting)
+        CallAudioRoute.configure(active = true, speakerOn = c.speakerOn)
         scope.launch {
             try {
                 val addr = SonarCore.callLocalAddress()
-                send(c.chatId, SonarCore.callEncodeAnswer(c.callId, SonarAnswer.Accept, addr))
+                val sent = sendCallControl(c.chatId, SonarCore.callEncodeAnswer(c.callId, SonarAnswer.Accept, addr))
+                if (!sent) {
+                    runCatching { SonarCore.callHangup(c.callId) }
+                    CallAudioRoute.configure(active = false, speakerOn = false)
+                    return@launch
+                }
+                if (activeCall?.callId == c.callId && activeCall?.muted == true) {
+                    runCatching { SonarCore.callSetMuted(c.callId, true) }
+                }
                 sonarLog("SonarCall", "TX ANSWER accept + dialing callId=${c.callId.take(8)}")
                 SonarCore.callAccept(c.callId)
                 sonarLog("SonarCall", "callAccept returned (dialed) callId=${c.callId.take(8)}")
@@ -229,7 +293,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun declineCall() {
         val c = activeCall ?: return
         scope.launch {
-            runCatching { send(c.chatId, SonarCore.callEncodeAnswer(c.callId, SonarAnswer.Decline, "")) }
+            runCatching { sendCallControl(c.chatId, SonarCore.callEncodeAnswer(c.callId, SonarAnswer.Decline, "")) }
             runCatching { SonarCore.callHangup(c.callId) } // engine Ended event finalizes
         }
     }
@@ -238,10 +302,28 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  engine's Ended event records the call-log entry and pops the screen. */
     fun hangupCall() {
         val c = activeCall ?: return
+        CallAudioRoute.configure(active = false, speakerOn = false)
         scope.launch {
             runCatching { SonarCore.callHangup(c.callId) }
-            runCatching { send(c.chatId, SonarCore.callEncodeEnd(c.callId, "hangup")) }
+            runCatching { sendCallControl(c.chatId, SonarCore.callEncodeEnd(c.callId, "hangup")) }
         }
+    }
+
+    fun toggleCallMute() {
+        val c = activeCall ?: return
+        val next = !c.muted
+        activeCall = c.copy(muted = next)
+        scope.launch {
+            runCatching { SonarCore.callSetMuted(c.callId, next) }
+                .onFailure { sonarLog("SonarCall", "mute toggle deferred/failed: ${it.message}") }
+        }
+    }
+
+    fun toggleCallSpeaker() {
+        val c = activeCall ?: return
+        val next = !c.speakerOn
+        activeCall = c.copy(speakerOn = next)
+        CallAudioRoute.setSpeaker(next)
     }
 
     private fun startCallLoop() {
@@ -278,6 +360,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Record the call-log entry, clear state, and pop the call screen. */
     private fun finalizeCall(c: ActiveCall, ev: SonarCallEvent) {
         callTicker?.cancel(); callTicker = null
+        CallAudioRoute.configure(active = false, speakerOn = false)
         val connected = ev.durationSecs > 0
         callLogs.getOrPut(c.chatId) { mutableListOf() }.add(
             CallRecord(video = c.video, mine = !c.incoming, durSecs = ev.durationSecs.toInt(), tsSecs = SonarClock.nowSecs())
@@ -304,40 +387,64 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private suspend fun onCallControl(chatId: String, m: SonarMsg, ctrl: SonarCallControl) {
-        sonarLog("SonarCall", "RX ${ctrl::class.simpleName} from $chatId (started=$callStarted)")
+        val callChatId = callChatIdFor(chatId)
+        sonarLog("SonarCall", "RX ${ctrl::class.simpleName} from $chatId as $callChatId (started=$callStarted)")
+        if (ctrl is SonarCallControl.Offer && !canCall(callChatId)) {
+            sonarLog("SonarCall", "ignoring offer without Sonar call route chatId=$chatId folded=$callChatId")
+            runCatching { sendCallControl(chatId, SonarCore.callEncodeAnswer(ctrl.callId, SonarAnswer.Decline, "")) }
+            return
+        }
         ensureCallStarted()
+        if (!callStarted) {
+            sonarLog("SonarCall", "ignoring call control because call endpoint is unavailable")
+            if (ctrl is SonarCallControl.Offer) {
+                runCatching { sendCallControl(callChatId, SonarCore.callEncodeAnswer(ctrl.callId, SonarAnswer.Decline, "")) }
+            }
+            return
+        }
         when (ctrl) {
             is SonarCallControl.Offer -> {
+                if (ctrl.video) {
+                    runCatching { sendCallControl(callChatId, SonarCore.callEncodeAnswer(ctrl.callId, SonarAnswer.Decline, "")) }
+                    sonarLog("SonarCall", "declined unsupported video offer callId=${ctrl.callId.take(8)}")
+                    return
+                }
                 if (activeCall != null) { // busy: auto-decline
-                    runCatching { send(chatId, SonarCore.callEncodeAnswer(ctrl.callId, SonarAnswer.Busy, "")) }
+                    runCatching { sendCallControl(callChatId, SonarCore.callEncodeAnswer(ctrl.callId, SonarAnswer.Busy, "")) }
                     return
                 }
                 runCatching { SonarCore.callIncomingOffer(ctrl.callId, ctrl.addrB64, ctrl.video) }
                 // A stale offer (peer rang while we were offline) is a missed call.
                 if (SonarClock.nowSecs() - ctrl.unixSecs > 60) {
                     runCatching { SonarCore.callHangup(ctrl.callId) }
-                    callLogs.getOrPut(chatId) { mutableListOf() }
+                    callLogs.getOrPut(callChatId) { mutableListOf() }
                         .add(CallRecord(video = ctrl.video, mine = false, durSecs = 0, tsSecs = SonarClock.nowSecs()))
                     callVersion++
                     return
                 }
-                val name = callPeerName(chatId)
-                activeCall = ActiveCall(ctrl.callId, chatId, name, ctrl.video, incoming = true, phase = SonarCallState.Ringing)
-                push(Screen.Call(chatId, name, ctrl.video))
+                val name = callPeerName(callChatId)
+                activeCall = ActiveCall(ctrl.callId, callChatId, name, ctrl.video, incoming = true, phase = SonarCallState.Ringing)
+                push(Screen.Call(callChatId, name, ctrl.video))
             }
             is SonarCallControl.Answer ->
-                runCatching { SonarCore.callAnswer(ctrl.callId, ctrl.answer, ctrl.addrB64) }
+                if (activeCall?.callId == ctrl.callId) runCatching { SonarCore.callAnswer(ctrl.callId, ctrl.answer, ctrl.addrB64) }
             is SonarCallControl.Cancel, is SonarCallControl.End ->
                 if (activeCall?.callId == ctrl.callId) runCatching { SonarCore.callHangup(ctrl.callId) }
         }
     }
 
     /** A human name for the chat the incoming call arrived on. */
-    private fun callPeerName(chatId: String): String =
-        if (isMeshChat(chatId)) meshPeerName(meshPeerId(chatId))
-        else chats.firstOrNull { it.id == chatId }
+    private fun callPeerName(chatId: String): String {
+        val folded = callChatIdFor(chatId)
+        if (isMeshChat(folded)) {
+            val peerId = meshPeerId(folded)
+            val group = npubRawFor(peerId)?.let { marmotGroupForNpub(it) }
+            return foldedPeerName(peerId, group)
+        }
+        return chats.firstOrNull { it.id == chatId }
             ?.members?.firstOrNull { it != npub && it.isNotBlank() }
             ?.let { profilesByNpub[it]?.bestName ?: (it.take(10) + "…") } ?: "secure chat"
+    }
     /** In-memory BLE-mesh DM transcripts, keyed by bitchat peerID. Mesh chats
      *  don't live in the Rust core (that's Marmot/Nostr) — they ride the Noise
      *  link, so the app holds them. Chat id on the nav stack is "mesh:<peerId>". */
@@ -377,11 +484,19 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  Noise (internet) — and after an app restart. Mirrors iOS's persisted
      *  Noise↔Nostr mapping (FavoritesPersistenceService / sonarProfilesByFingerprint). */
     private val linkByFp = mutableMapOf<String, String>()
+    /** Persisted 0x53 capability bits for the same fingerprint→npub links. Android
+     *  only keeps live Sonar announces in memory, so this preserves CAP_CALLS after
+     *  the peer leaves BLE range or the app restarts. */
+    private val linkCapsByFp = mutableMapOf<String, Int>()
 
     /** Marmot groups currently FOLDED into a BLE-mesh DM row (same person via
      *  [linkByFp]) — hidden from the standalone White Noise list so a person never
      *  shows up twice. Display-only: the group still lives in [chats]. */
     private var foldedGroupIds by mutableStateOf<Set<String>>(emptySet())
+    /** Folded Marmot group id → mesh peer fingerprint. Kept with [foldedGroupIds]
+     *  so openChat/refreshOpenDm can route a White Noise group back to the
+     *  canonical mesh conversation even while BLE is unavailable. */
+    private var foldedGroupPeerIds: Map<String, String> = emptyMap()
 
     /** White Noise chats to render on their own row: every Marmot group EXCEPT the
      *  ones folded into a mesh DM. The Messages list uses this instead of [chats]. */
@@ -399,17 +514,30 @@ class SonarAppState(private val scope: CoroutineScope) {
             val i = line.indexOf('=')
             if (i > 0) linkByFp[line.substring(0, i)] = line.substring(i + 1).trim()
         }
+        SonarCore.loadBlob("sonar.linkCaps").lineSequence().forEach { line ->
+            val i = line.indexOf('=')
+            if (i > 0) linkCapsByFp[line.substring(0, i)] = line.substring(i + 1).trim().toIntOrNull() ?: 0
+        }
     }
 
     private fun persistLinks() {
         SonarCore.saveBlob("sonar.links", linkByFp.entries.joinToString("\n") { "${it.key}=${it.value}" })
     }
 
+    private fun persistLinkCaps() {
+        SonarCore.saveBlob("sonar.linkCaps", linkCapsByFp.entries.joinToString("\n") { "${it.key}=${it.value}" })
+    }
+
     /** Record fingerprint→npub from a 0x53 (persisted on change). */
-    private fun rememberLink(peerId: String, npubHex: String) {
-        if (npubHex.length == 64 && linkByFp[peerId] != npubHex) {
+    private fun rememberLink(peerId: String, ann: SonarAnnounce) {
+        val npubHex = ann.npub.toHexLower()
+        if (npubHex.length == 64 && !linkByFp[peerId].equals(npubHex, ignoreCase = true)) {
             linkByFp[peerId] = npubHex
             persistLinks()
+        }
+        if (linkCapsByFp[peerId] != ann.capabilities) {
+            linkCapsByFp[peerId] = ann.capabilities
+            persistLinkCaps()
         }
     }
     /** GPS-derived location channels (Mesh + Ottaviano…Italy), like iOS. */
@@ -534,6 +662,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /** Start the BLE mesh radio (call once permissions are granted). */
     fun startMesh() {
+        refreshMeshIdentity()
         MeshRadio.start()
         meshPeers = MeshRadio.peers()
     }
@@ -731,6 +860,11 @@ class SonarAppState(private val scope: CoroutineScope) {
         return SonarAnnounce(1, raw, bip353.ifBlank { null }, capabilities(), unifyOffer)
     }
 
+    private fun refreshMeshIdentity() {
+        MeshRadio.setMeshNickname(nick)
+        MeshRadio.setLocalSonarAnnounce(localSonarAnnounce()?.encode())
+    }
+
     // ── Verify safety numbers (1:1 with iOS) ──
     fun isVerified(chatId: String): Boolean = SonarCore.loadBlob("verified.$chatId") == "1"
 
@@ -756,11 +890,13 @@ class SonarAppState(private val scope: CoroutineScope) {
         SonarCore.setOnboardingComplete(true)
         nick = nickname
         onboarded = true
+        refreshMeshIdentity()
     }
 
     fun updateNickname(value: String) {
         SonarCore.setNickname(value)
         nick = value
+        refreshMeshIdentity()
         // Re-publish our kind-0 profile so peers see the new name.
         if (started) scope.launch { runCatching { SonarCore.publishProfile(value) } }
     }
@@ -863,6 +999,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             try {
                 npub = SonarCore.start()
                 started = true
+                refreshMeshIdentity()
                 // Publish our kind-0 profile so peers see our nickname, not npub.
                 launch { runCatching { SonarCore.publishProfile(nick) } }
                 // Hydrate BLE-mesh transcripts from disk so private mesh chats
@@ -878,6 +1015,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // Bind the iroh call endpoint + start the call event loop early so
                 // an incoming call rings without us having to place one first.
                 launch { ensureCallStarted() }
+                startMeshRealtimeLoop()
                 poll()
             } catch (t: Throwable) {
                 toast = "connect failed: ${t.message}"
@@ -1107,15 +1245,72 @@ class SonarAppState(private val scope: CoroutineScope) {
         toast = "Out of range — your message will wait until you’re close again."
     }
 
+    /** ☎CALL signaling uses the lowest-latency route available for the SAME Sonar
+     *  conversation: immediate BLE when the Noise link is live, otherwise the
+     *  folded White Noise group learned during discovery. */
+    private suspend fun sendCallControl(chatId: String, text: String): Boolean {
+        if (isMeshChat(chatId)) {
+            val peerId = meshPeerId(chatId)
+            if (hasLiveMeshRoute(peerId)) {
+                val ok = MeshRadio.sendMeshDmNow(peerId, randomMeshId(), text)
+                if (!ok) {
+                    toast = "Call route dropped — try again in a moment."
+                    sonarLog("SonarCall", "failed to send call control on live mesh route chatId=$chatId")
+                }
+                return ok
+            }
+        }
+        val groupId = resolveMarmotGroupId(chatId)
+        if (groupId != null) {
+            return sendCallOverMarmot(groupId, text)
+        }
+        if (isMeshChat(chatId)) {
+            val peerId = meshPeerId(chatId)
+            val raw = npubRawFor(peerId)
+            if (raw != null) return sendCallOverMarmot(peerId, raw, text)
+        }
+        toast = "No call route to this Sonar peer yet."
+        sonarLog("SonarCall", "refusing call control without BLE or White Noise route chatId=$chatId")
+        return false
+    }
+
+    private suspend fun sendCallOverMarmot(groupId: String, text: String): Boolean =
+        try {
+            SonarCore.send(groupId, text)
+            true
+        } catch (e: Throwable) {
+            toast = "call signaling failed: ${e.message}"
+            sonarLog("SonarCall", "failed to send call control over White Noise group=$groupId err=${e.message}")
+            false
+        }
+
+    private suspend fun sendCallOverMarmot(peerId: String, npubRaw: ByteArray, text: String): Boolean {
+        return try {
+            refreshChats()
+            val groupId = marmotGroupForNpub(npubRaw)?.id ?: SonarCore.startChat(npubRaw.toHexLower()).also {
+                refreshChats()
+                recomputeConversations()
+            }
+            SonarCore.send(groupId, text)
+            refreshOpenDm(peerId)
+            true
+        } catch (e: Throwable) {
+            toast = "call signaling failed: ${e.message}"
+            sonarLog("SonarCall", "failed to send call control over White Noise peer=$peerId err=${e.message}")
+            false
+        }
+    }
+
     /** Send a BLE-mesh DM over the Noise link + optimistically echo it. */
-    private fun sendMesh(peerId: String, text: String) {
+    private fun sendMesh(peerId: String, text: String): Boolean {
         val ok = MeshRadio.sendMeshDm(peerId, randomMeshId(), text)
-        if (!ok) { toast = "Not connected over Bluetooth yet — stay close and try again"; return }
+        if (!ok) { toast = "Not connected over Bluetooth yet — stay close and try again"; return false }
         val msg = SonarMsg(randomMeshId(), npub, text, mine = true, MeshRadio.nowSecs())
         meshChats[peerId] = meshChats[peerId].orEmpty() + msg
         persistMesh(peerId)
         scope.launch { refreshOpenDm(peerId) }
         refreshMeshDmRows()
+        return true
     }
 
     /** Write-through a peer's BLE-mesh transcript so it survives an app restart
@@ -1163,11 +1358,48 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
-    /** The White Noise (Marmot) 1:1 group whose member list contains [npubRaw].
-     *  Member npubs are bech32, so decode each and compare the raw 32 bytes. */
-    private fun marmotGroupForNpub(npubRaw: ByteArray): SonarChat? {
-        if (npubRaw.isEmpty()) return null
-        return chats.firstOrNull { c ->
+    private fun npubHexForGroup(group: SonarChat): String? =
+        group.members.firstOrNull { it != npub && it.isNotBlank() }
+            ?.let { chat.bitchat.sonar.crypto.Bech32.decode(it)?.takeIf { d -> d.hrp == "npub" }?.data }
+            ?.takeIf { it.size == 32 }
+            ?.toHexLower()
+
+    private fun peerIdForNpubHex(npubHex: String): String? =
+        sonarPeerProfiles.entries.firstOrNull { (_, ann) -> ann.npub.toHexLower().equals(npubHex, ignoreCase = true) }?.key
+            ?: linkByFp.entries.firstOrNull { it.value.equals(npubHex, ignoreCase = true) }?.key
+
+    private fun peerIdForMarmotGroup(groupId: String): String? =
+        foldedGroupPeerIds[groupId]
+            ?: chats.firstOrNull { it.id == groupId }?.let { peerIdForMarmotGroup(it) }
+
+    private fun peerIdForMarmotGroup(group: SonarChat): String? {
+        val npubHex = npubHexForGroup(group) ?: return null
+        return peerIdForNpubHex(npubHex) ?: inferPeerLinkByUniqueTitle(group, npubHex)
+    }
+
+    private fun inferPeerLinkByUniqueTitle(group: SonarChat, npubHex: String): String? {
+        val groupTitle = chatTitle(group)
+        val groupTitles = chats.map { chatTitle(it) }
+        val peerTitles = (meshChats.keys + meshChatNames.keys)
+            .distinct()
+            .mapNotNull { peerId ->
+                val existing = linkByFp[peerId]
+                if (existing != null && !existing.equals(npubHex, ignoreCase = true)) return@mapNotNull null
+                if (sonarProfile(peerId)?.npub?.toHexLower()?.equals(npubHex, ignoreCase = true) == false) return@mapNotNull null
+                val name = meshChatNames[peerId]?.takeUnless { it.startsWith("mesh·") } ?: return@mapNotNull null
+                peerId to name
+            }
+            .toMap()
+        val peerId = inferUniquePeerByTitle(groupTitle, peerTitles, groupTitles) ?: return null
+        linkByFp[peerId] = npubHex
+        persistLinks()
+        sonarLog("SonarWN", "Recovered BLE↔White Noise link by unique title peer=${peerId.take(10)} group=${group.id.take(10)} title=$groupTitle")
+        return peerId
+    }
+
+    private fun marmotGroupsForNpub(npubRaw: ByteArray): List<SonarChat> {
+        if (npubRaw.isEmpty()) return emptyList()
+        return chats.filter { c ->
             c.members.any { m ->
                 chat.bitchat.sonar.crypto.Bech32.decode(m)
                     ?.takeIf { it.hrp == "npub" }?.data?.contentEquals(npubRaw) == true
@@ -1175,23 +1407,53 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
+    private fun marmotGroupForNpub(npubRaw: ByteArray): SonarChat? =
+        marmotGroupsForNpub(npubRaw).firstOrNull()
+
+    private suspend fun marmotMessagesForPeer(peerId: String): List<SonarMsg> {
+        val groups = npubRawFor(peerId)?.let { marmotGroupsForNpub(it) }
+            ?: chats.filter { peerIdForMarmotGroup(it) == peerId }
+        val merged = ArrayList<SonarMsg>()
+        for (group in groups) {
+            val msgs = runCatching { SonarCore.messages(group.id) }.getOrDefault(emptyList())
+            merged += msgs.map { it.copy(viaInternet = true) }
+        }
+        return merged.distinctBy { it.id }
+    }
+
+    private suspend fun latestMarmotMessage(groups: List<SonarChat>): SonarMsg? {
+        var latest: SonarMsg? = null
+        for (group in groups) {
+            val msg = runCatching { SonarCore.messages(group.id) }.getOrDefault(emptyList()).lastOrNull()
+            val current = latest
+            if (msg != null && (current == null || msg.tsSecs > current.tsSecs)) latest = msg
+        }
+        return latest
+    }
+
+    private fun callChatIdFor(chatId: String): String =
+        if (isMeshChat(chatId)) chatId else peerIdForMarmotGroup(chatId)?.let { meshChatId(it) } ?: chatId
+
     /** Rebuild the open Sonar-peer DM transcript: the mesh leg plus, for a Sonar
      *  peer with a Marmot group, the White Noise leg merged chronologically. The
      *  White Noise leg renders as internet (indigo). No-op if that DM isn't open. */
     private suspend fun refreshOpenDm(peerId: String) {
         if ((screen as? Screen.Chat)?.id != meshChatId(peerId)) return
         val mesh = meshChats[peerId].orEmpty()
-        val group = npubRawFor(peerId)?.let { marmotGroupForNpub(it) }
-        val merged = if (group != null) {
-            val wn = SonarCore.messages(group.id).map { it.copy(viaInternet = true) }
-            (mesh + wn).sortedBy { it.tsSecs }
-        } else mesh
+        val wn = marmotMessagesForPeer(peerId)
+        val merged = (mesh + wn).distinctBy { it.id }.sortedBy { it.tsSecs }
         messages = merged
         processPayLines(meshChatId(peerId), merged)
     }
 
+    private fun observedMeshPeer(peerId: String): Boolean =
+        meshPeers.any { it.id == meshChatId(peerId) }
+
+    private fun hasLiveMeshRoute(peerId: String): Boolean =
+        observedMeshPeer(peerId) && MeshRadio.hasMeshLink(peerId)
+
     /** True while a live Noise link to [peerId] exists (peer is in Bluetooth range). */
-    fun dmInRange(peerId: String): Boolean = MeshRadio.hasMeshLink(peerId)
+    fun dmInRange(peerId: String): Boolean = hasLiveMeshRoute(peerId)
 
     /** True if we know this peer's **White Noise account** (npub) — from a live
      *  0x53 OR the persisted link (so it stays true out of Bluetooth range). An
@@ -1199,16 +1461,18 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  a "Sonar app" tier: any account we know is reachable over the internet. */
     fun hasWhiteNoiseAccount(peerId: String): Boolean = npubRawFor(peerId) != null
 
-    /** True if [chatId]'s peer can be voice/video called: calls are a Sonar-only
-     *  feature, so the peer must be a mesh-routed Sonar peer whose 0x53 profile
-     *  advertised CAP_CALLS. A White Noise / non-Sonar chat cannot be called. */
-    /** A chat is callable when it is a BLE-discovered Sonar peer advertising the
-     *  calls capability, OR a White Noise (Marmot) 1:1 chat — both parties there
-     *  are Sonar users, the ☎CALL signaling rides the group, and the media goes
-     *  over iroh/internet (no Bluetooth proximity required). */
-    fun canCall(chatId: String): Boolean =
-        if (isMeshChat(chatId)) sonarProfile(meshPeerId(chatId))?.speaksCalls == true
-        else chats.any { it.id == chatId }
+    /** True if [chatId]'s peer can be voice/video called: calls are Sonar-only
+     *  (CAP_CALLS from 0x53) and require either live BLE or the npub needed to
+     *  create/reuse White Noise signaling for that same discovered peer. */
+    fun canCall(chatId: String): Boolean {
+        val peerId = if (isMeshChat(chatId)) meshPeerId(chatId) else peerIdForMarmotGroup(chatId) ?: return false
+        return callCapablePeer(peerId) &&
+            (hasLiveMeshRoute(peerId) || npubRawFor(peerId) != null)
+    }
+
+    private fun callCapablePeer(peerId: String): Boolean =
+        sonarProfile(peerId)?.speaksCalls == true ||
+            (((linkCapsByFp[peerId] ?: 0) and SonarAnnounce.CAP_CALLS) != 0)
 
     private fun randomMeshId(): String =
         (0 until 16).joinToString("") { "0123456789abcdef"[kotlin.random.Random.nextInt(16)].toString() }
@@ -1229,7 +1493,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         val notifsOn = prefBool("notifs", true)
         val touched = mutableSetOf<String>()
         for (m in incoming) {
-            val msg = SonarMsg(randomMeshId(), m.peerId, m.text, mine = false, m.tsSecs)
+            val msg = SonarMsg(m.messageId.ifBlank { randomMeshId() }, m.peerId, m.text, mine = false, m.tsSecs)
             val chatId = meshChatId(m.peerId)
             // A ☎CALL control line arriving over the mesh link: route it to the
             // engine, never store/show it as a chat message.
@@ -1281,6 +1545,16 @@ class SonarAppState(private val scope: CoroutineScope) {
         return name
     }
 
+    private fun foldedPeerName(peerId: String, group: SonarChat?): String {
+        meshPeers.firstOrNull { it.id == meshChatId(peerId) }?.name?.let {
+            meshChatNames[peerId] = it
+            return it
+        }
+        meshChatNames[peerId]?.takeUnless { it.startsWith("mesh·") }?.let { return it }
+        group?.let { return chatTitle(it) }
+        return meshChatNames[peerId] ?: ("mesh·" + peerId.take(6))
+    }
+
     /** Recompute the observable mesh DM rows (newest conversation first). Fast,
      *  BLE-leg only — for immediate feedback on send/receive. [recomputeConversations]
      *  later folds in the White Noise leg. */
@@ -1289,7 +1563,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             .filter { it.value.isNotEmpty() }
             .map { (pid, msgs) ->
                 val last = msgs.last()
-                MeshDmRow(pid, meshPeerName(pid), last.content, last.tsSecs)
+                MeshDmRow(pid, meshPeerName(pid), messagePreview(last.content), last.tsSecs)
             }
             .sortedByDescending { it.tsSecs }
     }
@@ -1301,21 +1575,41 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  standalone White Noise list ([visibleChats]). This is what stops a Bluetooth
      *  chat that continued over the internet from showing as two separate chats. */
     private suspend fun recomputeConversations() {
-        val rows = ArrayList<MeshDmRow>(meshChats.size)
+        val rowsByPeer = LinkedHashMap<String, MeshDmRow>()
         val folded = HashSet<String>()
+        fun upsert(peerId: String, row: MeshDmRow) {
+            val existing = rowsByPeer[peerId]
+            if (existing == null || row.tsSecs >= existing.tsSecs) rowsByPeer[peerId] = row
+        }
         for ((peerId, msgs) in meshChats) {
             if (msgs.isEmpty()) continue
             var last = msgs.last()
-            val group = npubRawFor(peerId)?.let { marmotGroupForNpub(it) }
-            if (group != null) {
-                folded += group.id
-                runCatching { SonarCore.messages(group.id) }.getOrDefault(emptyList())
-                    .lastOrNull()?.let { if (it.tsSecs > last.tsSecs) last = it }
+            val groups = npubRawFor(peerId)?.let { marmotGroupsForNpub(it) }.orEmpty()
+            if (groups.isNotEmpty()) {
+                groups.forEach { folded += it.id }
+                latestMarmotMessage(groups)?.let { if (it.tsSecs > last.tsSecs) last = it }
             }
-            rows.add(MeshDmRow(peerId, meshPeerName(peerId), last.content, last.tsSecs))
+            upsert(peerId, MeshDmRow(peerId, foldedPeerName(peerId, groups.firstOrNull()), messagePreview(last.content), last.tsSecs))
+        }
+        val groupPeers = LinkedHashMap<String, String>()
+        for (group in chats) {
+            val peerId = peerIdForMarmotGroup(group) ?: continue
+            folded += group.id
+            groupPeers[group.id] = peerId
+            val last = runCatching { SonarCore.messages(group.id) }.getOrDefault(emptyList()).lastOrNull()
+            upsert(
+                peerId,
+                MeshDmRow(
+                    peerId,
+                    foldedPeerName(peerId, group),
+                    last?.let { messagePreview(it.content) } ?: "Secure chat · reaches anywhere",
+                    last?.tsSecs ?: 0L,
+                )
+            )
         }
         foldedGroupIds = folded
-        meshDmRows = rows.sortedByDescending { it.tsSecs }
+        foldedGroupPeerIds = groupPeers
+        meshDmRows = rowsByPeer.values.sortedByDescending { it.tsSecs }
     }
 
     private suspend fun refreshChats() {
@@ -1361,20 +1655,17 @@ class SonarAppState(private val scope: CoroutineScope) {
                 }
                 (screen as? Screen.Channel)?.let { refreshChannel(it.geohash) }
                 (screen as? Screen.GeoDm)?.let { refreshGeoDm(it.geohash, it.peerHex) }
-                drainMeshDms()
-                drainMeshBroadcasts()
                 meshPeers = MeshRadio.peers()
                 // Sonar Discovery (0x53): keep our announce current for outgoing
                 // links and decode any peers' announces received over the mesh.
-                MeshRadio.setLocalSonarAnnounce(localSonarAnnounce()?.encode())
-                MeshRadio.setMeshNickname(nick)
+                refreshMeshIdentity()
                 sonarPeerProfiles = MeshRadio.sonarPeers()
                     .mapNotNull { (id, raw) -> SonarAnnounce.decode(raw)?.let { id to it } }
                     .toMap()
                 // Persist each peer's fingerprint→npub so its conversation stays
                 // unified after it leaves range / after a restart, then re-fold the
                 // White Noise legs into the mesh rows (one row per person).
-                sonarPeerProfiles.forEach { (peerId, ann) -> rememberLink(peerId, ann.npub.toHexLower()) }
+                sonarPeerProfiles.forEach { (peerId, ann) -> rememberLink(peerId, ann) }
                 recomputeConversations()
                 // Unify nearby: keep the payer scan alive and refresh peers +
                 // the receiver advertising (wallet/foreground gated).
@@ -1391,6 +1682,22 @@ class SonarAppState(private val scope: CoroutineScope) {
                     WalletBridge.refreshBalance()
                     walletState = WalletBridge.state()
                 }
+            }
+        }
+    }
+
+    /** BLE mesh is the real-time rail for calls, so it must not wait for the
+     *  heavier White Noise/Nostr sync poll. Drain lightweight mesh queues often
+     *  enough that ANSWER/END controls reach the call engine without UI-visible
+     *  delay. */
+    private fun startMeshRealtimeLoop() {
+        if (meshRealtimeLoopRunning) return
+        meshRealtimeLoopRunning = true
+        scope.launch {
+            while (true) {
+                drainMeshDms()
+                drainMeshBroadcasts()
+                delay(150)
             }
         }
     }

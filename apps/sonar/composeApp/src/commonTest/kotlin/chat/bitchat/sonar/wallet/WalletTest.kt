@@ -4,10 +4,11 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotEquals
 import kotlin.test.assertNull
-import kotlin.test.assertTrue
 
 class WalletSeedTest {
     private val secret = "67dea2ed018072d675f5415ecfaed7d2597555e202d85b3d65ea4e58d2d92ffa"
+    private val vectorSecret = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+    private val iosVectorEntropy = "801a82b16248f5c4c6363cae5ab6b9aff24724cb696ed41d936e53687c282806"
 
     @Test fun deterministic() {
         val a = WalletSeed.entropyHex(WalletSeed.hexToBytes(secret))
@@ -24,8 +25,11 @@ class WalletSeedTest {
         )
     }
 
-    @Test fun seed64Is64Bytes() {
-        assertEquals(64, WalletSeed.seed64(WalletSeed.hexToBytes(secret)).size)
+    @Test fun breezSeedMatchesIosSeedV1() {
+        val seed = WalletSeed.breezSeed(WalletSeed.hexToBytes(vectorSecret))
+
+        assertEquals(32, seed.size)
+        assertEquals(iosVectorEntropy, seed.toHex())
     }
 
     @Test fun notRawSecret() {
@@ -33,6 +37,9 @@ class WalletSeedTest {
         assertNotEquals(secret, WalletSeed.entropyHex(WalletSeed.hexToBytes(secret)))
     }
 }
+
+private fun ByteArray.toHex(): String =
+    joinToString("") { ((it.toInt() and 0xFF) + 0x100).toString(16).substring(1) }
 
 class MoneyTest {
     @Test fun satsFormatting() {

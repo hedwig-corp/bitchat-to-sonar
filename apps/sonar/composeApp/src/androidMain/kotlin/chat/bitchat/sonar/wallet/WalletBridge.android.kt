@@ -27,8 +27,8 @@ import java.io.File
 /**
  * Android `actual`: on-device Breez SDK Liquid wallet. Mainnet. Seed derived
  * deterministically from the Nostr identity via [WalletSeed] (HKDF), connected
- * with a raw seed (see WalletSeed for the documented deviation from iOS's
- * mnemonic path). API key from the gitignored BuildConfig field.
+ * with the same raw seed bytes used by iOS so an imported nsec restores the same
+ * wallet across both platforms. API key from the gitignored BuildConfig field.
  */
 actual object WalletBridge {
 
@@ -61,7 +61,7 @@ actual object WalletBridge {
             // call finishes on its IO thread but its result is discarded).
             val outcome = coroutineScope {
                 val work = async(Dispatchers.IO) {
-                    val seed = WalletSeed.seed64(WalletSeed.hexToBytes(secretHex))
+                    val seed = WalletSeed.breezSeed(WalletSeed.hexToBytes(secretHex))
                     val config = defaultConfig(LiquidNetwork.MAINNET, key).apply {
                         val dir = File(ctx.filesDir, "sonar-wallet/mainnet").apply { mkdirs() }
                         workingDir = dir.absolutePath

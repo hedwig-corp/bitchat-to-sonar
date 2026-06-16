@@ -346,6 +346,9 @@ final class MarmotChatModel: ObservableObject {
     }
     func callAccept(callId: String) async throws { try await service.callAccept(callId: callId) }
     func callHangup(callId: String) async throws { try await service.callHangup(callId: callId) }
+    func callSetMuted(callId: String, muted: Bool) async throws {
+        try await service.callSetMuted(callId: callId, muted: muted)
+    }
     func callWaitEvent(timeoutSeconds: UInt64) async -> CallEventInfo? {
         await service.callWaitEvent(timeoutSeconds: timeoutSeconds)
     }

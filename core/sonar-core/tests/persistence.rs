@@ -132,8 +132,14 @@ async fn self_heals_an_unencrypted_legacy_database() {
         .expect("self-heal recreates the database instead of failing");
 
     // The recreated database is a working encrypted store.
-    let _ = alice.key_package_event(relays()).expect("usable after self-heal");
-    assert_eq!(alice.groups().expect("groups").len(), 0, "fresh store starts empty");
+    let _ = alice
+        .key_package_event(relays())
+        .expect("usable after self-heal");
+    assert_eq!(
+        alice.groups().expect("groups").len(),
+        0,
+        "fresh store starts empty"
+    );
     drop(alice);
 
     // And it now reopens cleanly with the same key (it is genuinely encrypted).

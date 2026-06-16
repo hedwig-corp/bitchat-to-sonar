@@ -280,6 +280,9 @@ actual object SonarCore {
     actual suspend fun callHangup(callId: String): Unit =
         withContext(Dispatchers.IO) { requireNode().callHangup(callId) }
 
+    actual suspend fun callSetMuted(callId: String, muted: Boolean): Unit =
+        withContext(Dispatchers.IO) { requireNode().callSetMuted(callId, muted) }
+
     actual suspend fun callWaitEvent(timeoutSecs: Long): SonarCallEvent? =
         withContext(Dispatchers.IO) {
             val n = node ?: return@withContext null

@@ -165,7 +165,7 @@ object MeshLink {
                 val plain = s.noise.decrypt(ciphertext)
                 meshDecodePrivateMessage(plain)?.let { pm ->
                     sonarLog("MeshLink", "RX DM from ${nameByFp[fp] ?: fp.take(8)} (${pm.content.length} chars)")
-                    rxDms.add(MeshDmIn(fp, pm.content, System.currentTimeMillis() / 1000))
+                    rxDms.add(MeshDmIn(fp, pm.messageId, pm.content, System.currentTimeMillis() / 1000))
                 }
             }
         }
@@ -182,6 +182,11 @@ object MeshLink {
             pending.getOrPut(fp) { ConcurrentLinkedQueue() }.add(messageId to text)
             return true
         }
+        return encryptAndSend(fp, s, messageId, text)
+    }
+
+    fun sendDmNow(fp: String, messageId: String, text: String): Boolean {
+        val s = sessions[fp]?.takeIf { it.established } ?: return false
         return encryptAndSend(fp, s, messageId, text)
     }
 

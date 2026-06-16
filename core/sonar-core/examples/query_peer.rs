@@ -14,7 +14,11 @@ async fn main() {
     let timeout = Duration::from_secs(12);
 
     let client = Client::default();
-    for r in ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net"] {
+    for r in [
+        "wss://relay.damus.io",
+        "wss://nos.lol",
+        "wss://relay.primal.net",
+    ] {
         client.add_relay(r).await.unwrap();
     }
     client.connect().await;
@@ -22,7 +26,10 @@ async fn main() {
 
     // kind-0 profile
     let md = client.fetch_metadata(pk, timeout).await.unwrap();
-    println!("PROFILE (kind-0): {:?}", md.map(|m| (m.name, m.display_name)));
+    println!(
+        "PROFILE (kind-0): {:?}",
+        md.map(|m| (m.name, m.display_name))
+    );
 
     // kind-30443 KeyPackages
     let kps = client
@@ -32,31 +39,51 @@ async fn main() {
     println!("KEYPACKAGES (kind-30443): {} found", kps.len());
     for e in kps.iter() {
         let d = e.tags.iter().find_map(|t| {
-            if t.kind() == TagKind::d() { t.content().map(|s| s.to_string()) } else { None }
+            if t.kind() == TagKind::d() {
+                t.content().map(|s| s.to_string())
+            } else {
+                None
+            }
         });
-        let relays: Vec<String> = e.tags.iter()
+        let relays: Vec<String> = e
+            .tags
+            .iter()
             .filter(|t| t.kind().as_str() == "relays")
             .flat_map(|t| t.as_slice().iter().skip(1).cloned())
             .collect();
-        println!("  kp id={} created_at={} d={:?} relays={:?} content_len={}",
-            &e.id.to_hex()[..12], e.created_at.as_u64(), d, relays, e.content.len());
+        println!(
+            "  kp id={} created_at={} d={:?} relays={:?} content_len={}",
+            &e.id.to_hex()[..12],
+            e.created_at.as_u64(),
+            d,
+            relays,
+            e.content.len()
+        );
     }
 
     // Relay lists that govern WELCOME delivery: 10051 (KeyPackage relays),
     // 10050 (NIP-17 DM inbox — where gift-wrapped welcomes are read), 10002 (NIP-65).
-    for (kind, label) in [(10051u16, "KeyPackage 10051"), (10050, "DM inbox 10050"), (10002, "NIP-65 10002")] {
+    for (kind, label) in [
+        (10051u16, "KeyPackage 10051"),
+        (10050, "DM inbox 10050"),
+        (10002, "NIP-65 10002"),
+    ] {
         let rl = client
             .fetch_events(Filter::new().kind(Kind::Custom(kind)).author(pk), timeout)
             .await
             .unwrap();
         for e in rl.iter() {
-            let relays: Vec<String> = e.tags.iter()
+            let relays: Vec<String> = e
+                .tags
+                .iter()
                 .filter(|t| matches!(t.kind().as_str(), "relay" | "r"))
                 .flat_map(|t| t.as_slice().iter().skip(1).cloned())
                 .collect();
             println!("RELAY LIST ({label}): relays={:?}", relays);
         }
-        if rl.is_empty() { println!("RELAY LIST ({label}): NONE"); }
+        if rl.is_empty() {
+            println!("RELAY LIST ({label}): NONE");
+        }
     }
 
     // kind-1059 gift wraps addressed to the peer (our welcomes land here; encrypted)
@@ -64,7 +91,10 @@ async fn main() {
         .fetch_events(Filter::new().kind(Kind::GiftWrap).pubkey(pk), timeout)
         .await
         .unwrap();
-    println!("GIFT WRAPS to peer (kind-1059): {} found (welcomes/DMs, encrypted)", wraps.len());
+    println!(
+        "GIFT WRAPS to peer (kind-1059): {} found (welcomes/DMs, encrypted)",
+        wraps.len()
+    );
     let mut ts: Vec<u64> = wraps.iter().map(|e| e.created_at.as_u64()).collect();
     ts.sort_unstable();
     println!("  gift-wrap created_at (sorted): {:?}", ts);

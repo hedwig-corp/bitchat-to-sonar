@@ -663,6 +663,14 @@ impl SonarNode {
             .map_err(|e| SonarFfiError::Core(format!("call hangup: {e}")))
     }
 
+    /// Toggle local microphone capture for an active or still-connecting call.
+    /// The RTP session keeps sending timed silence frames while muted.
+    pub fn call_set_muted(&self, call_id: String, muted: bool) -> FfiResult<()> {
+        self.call_engine()?
+            .set_muted(&call_id, muted)
+            .map_err(|e| SonarFfiError::Core(format!("call mute: {e}")))
+    }
+
     /// Park up to `timeout_secs` for the next call state change. The host loops
     /// this on a dedicated thread (like `wait_for_marmot_event`); it touches no
     /// MLS state. `None` on timeout.
@@ -734,7 +742,11 @@ pub fn call_encode_offer(
 /// Encode an ANSWER control line (`node_addr_b64` empty for decline/busy).
 #[cfg(feature = "calls-audio")]
 #[uniffi::export]
-pub fn call_encode_answer(call_id: String, answer: CallAnswerKind, node_addr_b64: String) -> String {
+pub fn call_encode_answer(
+    call_id: String,
+    answer: CallAnswerKind,
+    node_addr_b64: String,
+) -> String {
     sonar_core::call::signaling::CallControl::Answer {
         call_id,
         answer: answer.into(),
@@ -1281,7 +1293,11 @@ impl MeshReassembler {
 
     /// Feed one 0x20 fragment payload (with the carrying packet's sender id hex).
     /// Returns the reassembled original bytes when complete, else nil.
-    pub fn add(&self, sender_id_hex: String, fragment_payload: Vec<u8>) -> FfiResult<Option<Vec<u8>>> {
+    pub fn add(
+        &self,
+        sender_id_hex: String,
+        fragment_payload: Vec<u8>,
+    ) -> FfiResult<Option<Vec<u8>>> {
         let sender_bytes = hex::decode(&sender_id_hex).map_err(invalid("sender id"))?;
         let sender: [u8; 8] = sender_bytes
             .try_into()

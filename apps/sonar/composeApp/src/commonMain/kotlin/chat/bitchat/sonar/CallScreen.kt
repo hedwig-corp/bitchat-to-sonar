@@ -26,9 +26,6 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -58,10 +55,8 @@ private val CallCtlBg = Color(0x1FFFFFFF)    // rgba(255,255,255,0.12)
 private val CallCyan = Color(0xFF22D3EE)
 
 /**
- * Full-screen MOCKED voice/video call (design: call.jsx CallView + theme.css
- * .call*). Ringing → connected after 2s, then an mm:ss timer; controls toggle
- * local state only. No real mic/camera/audio — End appends a mocked call-log
- * record to the DM and pops. Always dark, mirroring iOS SonarCallScreen.
+ * Full-screen voice call (design: call.jsx CallView + theme.css .call*).
+ * State is driven by the real call engine via [SonarAppState.activeCall].
  */
 @Composable
 fun CallScreen(state: SonarAppState, screen: Screen.Call) {
@@ -74,6 +69,8 @@ fun CallScreen(state: SonarAppState, screen: Screen.Call) {
     val incoming = call?.incoming == true
     val phase = call?.phase ?: SonarCallState.Ringing
     val secs = call?.connectedSecs ?: 0
+    val muted = call?.muted == true
+    val speakerOn = call?.speakerOn == true
     val connected = phase == SonarCallState.Connected
     val ringing = phase == SonarCallState.Ringing || phase == SonarCallState.Connecting
     // Transport line (Bluetooth in range / internet otherwise) — same as the DM.
@@ -82,10 +79,7 @@ fun CallScreen(state: SonarAppState, screen: Screen.Call) {
     val rawPeer = chatId.removePrefix("mesh:")
     val mesh = run { state.payVersion; isMeshRoute && state.dmInRange(rawPeer) }
 
-    // Local UI toggles (the engine has no mute/camera control yet — cosmetic v1).
-    var muted by remember { mutableStateOf(false) }
-    var speaker by remember { mutableStateOf(video) }
-    var camOn by remember { mutableStateOf(true) }
+    val camOn = false
 
     val status = when {
         connected -> fmtCall(secs)
@@ -163,19 +157,13 @@ fun CallScreen(state: SonarAppState, screen: Screen.Call) {
                 horizontalArrangement = Arrangement.spacedBy(14.dp, Alignment.CenterHorizontally),
                 verticalAlignment = Alignment.Top
             ) {
-                if (incoming && !connected) {
+                if (incoming && phase == SonarCallState.Ringing) {
                     // Incoming call: Decline (red) + Accept (green).
                     CallBtn(SNIconName.PhoneDown, "Decline", active = false, end = true) { state.declineCall() }
                     CallBtn(SNIconName.Phone, "Accept", active = false, accept = true) { state.acceptCall() }
                 } else {
-                    CallBtn(if (muted) SNIconName.MicOff else SNIconName.Mic, if (muted) "Unmute" else "Mute", active = muted) { muted = !muted }
-                    if (video) {
-                        CallBtn(if (camOn) SNIconName.Videocam else SNIconName.VideoOff, if (camOn) "Stop video" else "Start video", active = !camOn) { camOn = !camOn }
-                        CallBtn(SNIconName.CameraFlip, "Flip", active = false) { /* mock */ }
-                    } else {
-                        CallBtn(SNIconName.Speaker, "Speaker", active = speaker) { speaker = !speaker }
-                        CallBtn(SNIconName.Videocam, "Video", active = false) { /* mock — upgrade to video */ }
-                    }
+                    CallBtn(SNIconName.MicOff, if (muted) "Muted" else "Mute", active = muted) { state.toggleCallMute() }
+                    CallBtn(SNIconName.Speaker, "Speaker", active = speakerOn) { state.toggleCallSpeaker() }
                     CallBtn(SNIconName.PhoneDown, "End", active = false, end = true) { state.hangupCall() }
                 }
             }

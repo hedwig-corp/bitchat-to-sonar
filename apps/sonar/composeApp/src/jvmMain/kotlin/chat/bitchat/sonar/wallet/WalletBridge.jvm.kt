@@ -26,9 +26,9 @@ import kotlinx.coroutines.withTimeoutOrNull
  * via the KMP package's `jvm` variant (a UniFFI/JNA binding) loading the host
  * `libbreez_sdk_liquid_bindings.dylib` off the classpath. Mainnet. The seed is
  * derived deterministically from the Nostr identity via [WalletSeed] (HKDF) and
- * connected with a raw 64-byte seed — byte-for-byte the Android path — so the
- * desktop reconstructs the SAME wallet as the phone for the same identity (no
- * key export/import step: same nsec ⇒ same wallet).
+ * connected with the same raw seed bytes as Android and iOS, so the desktop
+ * reconstructs the SAME wallet for the same identity (no key export/import step:
+ * same nsec ⇒ same wallet).
  *
  * The API key is read from the gitignored generated resource `/breez_api_key.txt`
  * (build.gradle's `generateBreezKeyResource`), the desktop twin of Android's
@@ -67,7 +67,7 @@ actual object WalletBridge {
             // call finishes on its IO thread but its result is discarded).
             val outcome = coroutineScope {
                 val work = async(Dispatchers.IO) {
-                    val seed = WalletSeed.seed64(WalletSeed.hexToBytes(secretHex))
+                    val seed = WalletSeed.breezSeed(WalletSeed.hexToBytes(secretHex))
                     val config = defaultConfig(LiquidNetwork.MAINNET, key).apply {
                         val dir = DesktopEnv.file("sonar-wallet/mainnet").apply { mkdirs() }
                         workingDir = dir.absolutePath

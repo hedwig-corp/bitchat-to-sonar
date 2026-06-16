@@ -88,7 +88,11 @@ async fn two_instances_exchange_dms_through_a_relay() {
     alice.sync().await.expect("alice syncs");
 
     let alice_view = alice.messages(&alice_group).expect("alice messages");
-    assert_eq!(alice_view.len(), 2, "alice sees her message and bob's reply");
+    assert_eq!(
+        alice_view.len(),
+        2,
+        "alice sees her message and bob's reply"
+    );
     let reply = alice_view
         .iter()
         .find(|m| m.sender == bob.identity().public_key())
@@ -189,7 +193,10 @@ async fn two_instances_exchange_geohash_channel_messages() {
     let view = bob.fetch_geohash(geohash, 100).await.expect("bob fetches");
     assert_eq!(view.len(), 2, "both public messages visible");
 
-    let from_alice = view.iter().find(|m| m.content == "hello from alice").unwrap();
+    let from_alice = view
+        .iter()
+        .find(|m| m.content == "hello from alice")
+        .unwrap();
     assert_eq!(from_alice.nickname, "alice");
     assert!(!from_alice.mine, "alice's message is not bob's");
 
@@ -222,7 +229,10 @@ async fn geohash_presence_counts_participants() {
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 
     // Only alice has announced so far — she counts herself locally.
-    alice.send_geohash_presence(gh).await.expect("alice announces");
+    alice
+        .send_geohash_presence(gh)
+        .await
+        .expect("alice announces");
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
     assert_eq!(
         bob.geohash_presence_count(gh).await.unwrap(),
@@ -245,7 +255,10 @@ async fn geohash_presence_counts_participants() {
     );
 
     // Re-announcing refreshes the heartbeat, it does not double-count.
-    alice.send_geohash_presence(gh).await.expect("alice re-announces");
+    alice
+        .send_geohash_presence(gh)
+        .await
+        .expect("alice re-announces");
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
     assert_eq!(
         bob.geohash_presence_count(gh).await.unwrap(),
@@ -280,7 +293,10 @@ async fn geohash_dm_between_channel_participants() {
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 
     // Both post publicly so each learns the other's per-geohash pubkey.
-    alice.send_geohash(gh, "hi from alice", "alice").await.unwrap();
+    alice
+        .send_geohash(gh, "hi from alice", "alice")
+        .await
+        .unwrap();
     bob.send_geohash(gh, "hi from bob", "bob").await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(450)).await;
 
@@ -313,7 +329,10 @@ async fn geohash_dm_between_channel_participants() {
     assert_eq!(bob_inbox[0].content, "hey bob, privately");
     assert!(!bob_inbox[0].mine, "the DM is from alice");
 
-    let alice_thread = alice.fetch_geo_dm(gh, &bob_pk).await.expect("alice reads thread");
+    let alice_thread = alice
+        .fetch_geo_dm(gh, &bob_pk)
+        .await
+        .expect("alice reads thread");
     assert_eq!(alice_thread.len(), 1);
     assert!(alice_thread[0].mine, "alice's own sent DM is mine");
 }

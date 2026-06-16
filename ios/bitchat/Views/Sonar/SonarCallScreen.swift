@@ -2,17 +2,12 @@
 // SonarCallScreen.swift
 // bitchat
 //
-// Voice/video call screen — a 1:1 reproduction of CallView in
+// Voice call screen — a 1:1 reproduction of CallView in
 // design/handoff/project/sonar/call.jsx + the .call* styles in theme.css.
 // The phase (ringing/connecting/connected + the seconds timer) is driven by the
 // REAL call engine via `store.activeCall` (iroh transport + Opus audio). "End"
-// is real (store.hangupCall()).
-//
-// HONEST v1 LIMITATIONS (still "fake" parts of this view):
-//   - Mute / Speaker / Video / Flip buttons are COSMETIC — they toggle only the
-//     button appearance, not the engine (no set_muted / audio routing / camera).
-//   - VIDEO is NOT implemented: the media is audio-only; the "video" feed is a
-//     placeholder gradient. A video call is an audio call behind a video UI.
+// is real (store.hangupCall()), and mute/speaker controls route through the
+// engine/AVAudioSession instead of being visual-only toggles.
 // The screen is always dark, matching the design's `.call` surface.
 //
 // This is free and unencumbered software released into the public domain.
@@ -28,15 +23,11 @@ struct SonarCallScreen: View {
     let peerId: String
     let video: Bool
 
-    @State private var muted = false
-    @State private var speaker: Bool
     @State private var camOn = true
 
     init(peerId: String, video: Bool) {
         self.peerId = peerId
         self.video = video
-        // call.jsx: speaker defaults on for video calls.
-        _speaker = State(initialValue: video)
     }
 
     // MARK: Derived (driven by the real call engine via store.activeCall)
@@ -46,6 +37,8 @@ struct SonarCallScreen: View {
     private var connected: Bool { call?.phase == .connected }
     private var ringing: Bool { call?.phase == .ringing || call?.phase == .connecting }
     private var secs: Int { call?.connectedSecs ?? 0 }
+    private var muted: Bool { call?.muted == true }
+    private var speakerOn: Bool { call?.speakerOn == true }
     private var peerName: String { call?.peerName ?? store.peerItem(peerId).name }
     private var mesh: Bool { store.dmTransport(peerId) == .mesh }
     private var encLine: String { mesh ? "Bluetooth" : "internet" }
@@ -225,31 +218,13 @@ struct SonarCallScreen: View {
 
     private var controls: some View {
         HStack(alignment: .top, spacing: 14) {
-            if incoming && !connected {
+            if incoming && call?.phase == .ringing {
                 // Incoming call: Decline (red) + Accept (green).
                 SNCallButton(icon: .phoneDown, label: "Decline", end: true) { store.declineCall() }
                 SNCallButton(icon: .phone, label: "Accept", accept: true) { store.acceptCall() }
             } else {
-                SNCallButton(
-                    icon: muted ? .micOff : .mic,
-                    label: muted ? "Unmute" : "Mute",
-                    active: muted
-                ) { muted.toggle() }
-
-                if video {
-                    SNCallButton(
-                        icon: camOn ? .videocam : .videoOff,
-                        label: camOn ? "Stop video" : "Start video",
-                        active: !camOn
-                    ) { camOn.toggle() }
-                    // Flip camera — cosmetic (no camera control yet).
-                    SNCallButton(icon: .cameraFlip, label: "Flip") {}
-                } else {
-                    SNCallButton(icon: .speaker, label: "Speaker", active: speaker) { speaker.toggle() }
-                    // Upgrade to video — cosmetic (call.jsx).
-                    SNCallButton(icon: .videocam, label: "Video") {}
-                }
-
+                SNCallButton(icon: .micOff, label: muted ? "Muted" : "Mute", active: muted) { store.toggleCallMute() }
+                SNCallButton(icon: .speaker, label: "Speaker", active: speakerOn) { store.toggleCallSpeaker() }
                 SNCallButton(icon: .phoneDown, label: "End", end: true) { store.hangupCall() }
             }
         }

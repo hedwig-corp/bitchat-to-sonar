@@ -1,0 +1,24 @@
+{
+  "originHash" : "c11960be7540836ad5a0f46affb91d645773789350a76a0ffd98531ea1558284",
+  "pins" : [
+    {
+      "identity" : "breez-sdk-liquid-swift",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/breez/breez-sdk-liquid-swift",
+      "state" : {
+        "revision" : "20d47c93c2142719a2aad8e67bc6a202b51ab78c",
+        "version" : "0.11.13"
+      }
+    },
+    {
+      "identity" : "swift-secp256k1",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/21-DOT-DEV/swift-secp256k1",
+      "state" : {
+        "revision" : "8c62aba8a3011c9bcea232e5ee007fb0b34a15e2",
+        "version" : "0.21.1"
+      }
+    }
+  ],
+  "version" : 3
+}

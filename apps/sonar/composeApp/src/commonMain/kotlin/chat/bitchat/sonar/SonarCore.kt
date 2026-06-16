@@ -230,6 +230,9 @@ expect object SonarCore {
     /** Hang up / cancel a call (tears down media + connection). */
     suspend fun callHangup(callId: String)
 
+    /** Toggle the local microphone for this call without tearing media down. */
+    suspend fun callSetMuted(callId: String, muted: Boolean)
+
     /** Park up to [timeoutSecs] for the next call state change (poll on a
      *  background coroutine; mirrors the Marmot wait loop). null on timeout. */
     suspend fun callWaitEvent(timeoutSecs: Long): SonarCallEvent?

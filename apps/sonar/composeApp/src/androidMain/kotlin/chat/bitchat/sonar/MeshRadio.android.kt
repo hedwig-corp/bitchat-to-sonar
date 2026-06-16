@@ -88,8 +88,8 @@ actual object MeshRadio {
         // (SHA256 of its noise static key), so a peer stays ONE radar node + ONE
         // conversation across peerID + BLE-address rotation (issue #12).
         // Buffer incoming Noise DMs (the listener fires on a BLE callback thread).
-        MeshGatt.addMessageListener { fingerprint, text ->
-            meshDmInbox.add(MeshDmIn(fingerprint, text, System.currentTimeMillis() / 1000))
+        MeshGatt.addMessageListener { fingerprint, messageId, text ->
+            meshDmInbox.add(MeshDmIn(fingerprint, messageId, text, System.currentTimeMillis() / 1000))
         }
         // Buffer incoming public broadcasts (the BLE "Mesh" channel).
         MeshGatt.addBroadcastListener { pm ->
@@ -237,15 +237,17 @@ actual object MeshRadio {
             .sortedByDescending { it.rssi }
     }
 
-    actual fun setLocalSonarAnnounce(payload: ByteArray?) { MeshGatt.sonarPayload = payload }
+    actual fun setLocalSonarAnnounce(payload: ByteArray?) { MeshGatt.updateSonarPayload(payload) }
 
     /** Push the display nickname carried in our bitchat announce. */
-    actual fun setMeshNickname(nick: String) { if (nick.isNotBlank()) MeshGatt.nickname = nick }
+    actual fun setMeshNickname(nick: String) { MeshGatt.updateNickname(nick) }
 
     actual fun sonarPeers(): Map<String, ByteArray> = HashMap(sonarProfiles)
 
     actual fun sendMeshDm(peerId: String, messageId: String, text: String): Boolean =
         MeshGatt.sendTextToPeer(peerId, messageId, text)
+    actual fun sendMeshDmNow(peerId: String, messageId: String, text: String): Boolean =
+        MeshGatt.sendTextToPeerNow(peerId, messageId, text)
 
     actual fun hasMeshLink(peerId: String): Boolean = MeshGatt.hasLink(peerId)
 

@@ -173,42 +173,42 @@ mod tests {
     #[tokio::test]
     async fn two_nodes_connect_and_exchange() -> Result<()> {
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        let a = CallTransport::bind_relay_less([1u8; 32]).await?;
-        let b = CallTransport::bind_relay_less([2u8; 32]).await?;
-        let a_addr = a.endpoint_addr();
-        let (a_id, b_id) = (a.endpoint_id(), b.endpoint_id());
+            let a = CallTransport::bind_relay_less([1u8; 32]).await?;
+            let b = CallTransport::bind_relay_less([2u8; 32]).await?;
+            let a_addr = a.endpoint_addr();
+            let (a_id, b_id) = (a.endpoint_id(), b.endpoint_id());
 
-        // b dials a; a accepts.
-        let (conn_b, conn_a) = tokio::join!(b.connect(a_addr), a.accept());
-        let conn_b = conn_b?;
-        let conn_a = conn_a?;
+            // b dials a; a accepts.
+            let (conn_b, conn_a) = tokio::join!(b.connect(a_addr), a.accept());
+            let conn_b = conn_b?;
+            let conn_a = conn_a?;
 
-        // Endpoint-id pinning check (the security property §3.1 relies on).
-        assert_eq!(conn_a.remote_id(), b_id);
-        assert_eq!(conn_b.remote_id(), a_id);
+            // Endpoint-id pinning check (the security property §3.1 relies on).
+            assert_eq!(conn_a.remote_id(), b_id);
+            assert_eq!(conn_b.remote_id(), a_id);
 
-        // b opens a bi-stream and sends; a accepts it and echoes.
-        let payload = b"sonar-call-hello";
-        let send = async {
-            let (mut s, mut r) = conn_b.open_bi().await?;
-            s.write_all(payload).await?;
-            s.finish()?;
-            let got = r.read_to_end(1024).await?;
-            anyhow::Ok(got)
-        };
-        let echo = async {
-            let (mut s, mut r) = conn_a.accept_bi().await?;
-            let got = r.read_to_end(1024).await?;
-            s.write_all(&got).await?;
-            s.finish()?;
+            // b opens a bi-stream and sends; a accepts it and echoes.
+            let payload = b"sonar-call-hello";
+            let send = async {
+                let (mut s, mut r) = conn_b.open_bi().await?;
+                s.write_all(payload).await?;
+                s.finish()?;
+                let got = r.read_to_end(1024).await?;
+                anyhow::Ok(got)
+            };
+            let echo = async {
+                let (mut s, mut r) = conn_a.accept_bi().await?;
+                let got = r.read_to_end(1024).await?;
+                s.write_all(&got).await?;
+                s.finish()?;
+                anyhow::Ok(())
+            };
+            let (got, ()) = tokio::try_join!(send, echo)?;
+            assert_eq!(got, payload);
+
+            a.close().await;
+            b.close().await;
             anyhow::Ok(())
-        };
-        let (got, ()) = tokio::try_join!(send, echo)?;
-        assert_eq!(got, payload);
-
-        a.close().await;
-        b.close().await;
-        anyhow::Ok(())
         })
         .await
         .context("connection test timed out (needs relay/direct-address wait)")??;

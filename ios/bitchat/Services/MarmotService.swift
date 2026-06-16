@@ -425,6 +425,9 @@ final class MarmotService: @unchecked Sendable {
     }
     func callAccept(callId: String) async throws { try await runCall(callQueue) { try $0.callAccept(callId: callId) } }
     func callHangup(callId: String) async throws { try await runCall(callQueue) { try $0.callHangup(callId: callId) } }
+    func callSetMuted(callId: String, muted: Bool) async throws {
+        try await runCall(callQueue) { try $0.callSetMuted(callId: callId, muted: muted) }
+    }
 
     /// Park up to `timeoutSeconds` for the next call state change (off the engine
     /// + action queues), mirroring `waitForMarmotEvent`.

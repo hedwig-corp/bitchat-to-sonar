@@ -20,6 +20,9 @@ use crate::call::codec::SAMPLE_RATE;
 
 /// Mono samples in a 20 ms frame at [`SAMPLE_RATE`].
 const FRAME_SAMPLES: usize = (SAMPLE_RATE as usize / 1000) * 20; // 960
+/// Keep at most this many decoded frames queued locally. Beyond this, play the
+/// freshest audio and drop old samples so a call does not drift seconds behind.
+const PLAYBACK_BUFFER_FRAMES: usize = 6; // ~120 ms
 
 /// A running cpal stream on its own thread. Drop to stop capture/playback.
 pub struct AudioDevice {
@@ -112,6 +115,16 @@ where
 /// Capture the mic as mono 48 kHz / 20 ms i16 frames, sent to `mic_tx`. Feed
 /// `mic_tx`'s receiver to `run_audio_session`.
 pub fn start_capture(mic_tx: mpsc::Sender<Vec<i16>>) -> Result<AudioDevice> {
+    start_capture_with_mute(mic_tx, Arc::new(AtomicBool::new(false)))
+}
+
+/// Capture the mic like [`start_capture`], replacing outgoing frames with
+/// silence while `muted` is true. Keeping the frame cadence avoids renegotiating
+/// or starving the RTP sender when the user toggles mute.
+pub fn start_capture_with_mute(
+    mic_tx: mpsc::Sender<Vec<i16>>,
+    muted: Arc<AtomicBool>,
+) -> Result<AudioDevice> {
     spawn_stream(true, move |device| {
         let (cfg, fmt, ch) = config_48k(device, true)?;
         let mut acc: Vec<i16> = Vec::with_capacity(FRAME_SAMPLES);
@@ -128,10 +141,12 @@ pub fn start_capture(mic_tx: mpsc::Sender<Vec<i16>>) -> Result<AudioDevice> {
                             let sum: i32 = frame.iter().map(|&s| $to_i16(s) as i32).sum();
                             acc.push((sum / ch as i32) as i16);
                             if acc.len() >= FRAME_SAMPLES {
-                                let _ = mic.try_send(std::mem::replace(
-                                    &mut acc,
-                                    Vec::with_capacity(FRAME_SAMPLES),
-                                ));
+                                let mut frame =
+                                    std::mem::replace(&mut acc, Vec::with_capacity(FRAME_SAMPLES));
+                                if muted.load(Ordering::Relaxed) {
+                                    frame.fill(0);
+                                }
+                                let _ = mic.try_send(frame);
                             }
                         }
                     },
@@ -154,7 +169,8 @@ pub fn start_capture(mic_tx: mpsc::Sender<Vec<i16>>) -> Result<AudioDevice> {
 pub fn start_playback(speaker_rx: mpsc::Receiver<Vec<i16>>) -> Result<AudioDevice> {
     spawn_stream(false, move |device| {
         let (cfg, fmt, ch) = config_48k(device, false)?;
-        let mut buf: VecDeque<i16> = VecDeque::with_capacity(FRAME_SAMPLES * 4);
+        let max_buffer_samples = FRAME_SAMPLES * PLAYBACK_BUFFER_FRAMES;
+        let mut buf: VecDeque<i16> = VecDeque::with_capacity(max_buffer_samples);
         let mut rx = speaker_rx;
         let on_err = |e| tracing::warn!("playback stream error: {e}");
 
@@ -166,7 +182,16 @@ pub fn start_playback(speaker_rx: mpsc::Receiver<Vec<i16>>) -> Result<AudioDevic
                         // Pull decoded mono frames (non-blocking) until we have enough.
                         while buf.len() < out.len() / ch {
                             match rx.try_recv() {
-                                Ok(frame) => buf.extend(frame),
+                                Ok(frame) => {
+                                    let overflow = buf
+                                        .len()
+                                        .saturating_add(frame.len())
+                                        .saturating_sub(max_buffer_samples);
+                                    for _ in 0..overflow {
+                                        let _ = buf.pop_front();
+                                    }
+                                    buf.extend(frame);
+                                }
                                 Err(_) => break, // none ready → underrun (filled with 0 below)
                             }
                         }

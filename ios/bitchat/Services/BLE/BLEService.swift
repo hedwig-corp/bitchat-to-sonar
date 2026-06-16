@@ -193,6 +193,9 @@ final class BLEService: NSObject {
         let maxChunk: Int?
         let directedPeer: PeerID?
         let transferId: String?
+        let spacingMs: Int?
+        let repeatCount: Int
+        let repeatGapMs: Int
     }
     private var pendingPeripheralWrites: [String: [PendingWrite]] = [:]
     private var pendingFragmentTransfers: [PendingFragmentTransfer] = []
@@ -631,20 +634,37 @@ final class BLEService: NSObject {
     }
     
     // MARK: Connectivity and peers
+
+    /// Resolve a UI/conversation peer key to the current 16-hex mesh routing ID.
+    /// Sonar conversations are often keyed by the stable Noise fingerprint
+    /// (SHA256(public key), 64 hex); BLE sessions are keyed by its 16-hex prefix.
+    private func routingPeerID(for peerID: PeerID) -> PeerID? {
+        if peerID.isGeoDM || peerID.isGeoChat || peerID.isEmpty { return nil }
+        if peerID.prefix == .noise { return peerID.toShort() }
+        if peerID.isShort { return peerID }
+        if peerID.bare.count == 64, peerID.isHex {
+            let fingerprint = peerID.bare.lowercased()
+            if let live = collectionsQueue.sync(execute: {
+                peers.first { $0.value.noisePublicKey?.sha256Fingerprint() == fingerprint }?.key
+            }) {
+                return live
+            }
+            return PeerID(str: fingerprint.prefix(16))
+        }
+        return peerID.toShort()
+    }
     
     func isPeerConnected(_ peerID: PeerID) -> Bool {
-        // Accept both 16-hex short IDs and 64-hex Noise keys
-        let shortID = peerID.toShort()
-        return collectionsQueue.sync { peers[shortID]?.isConnected ?? false }
+        guard let routingID = routingPeerID(for: peerID) else { return false }
+        return collectionsQueue.sync { peers[routingID]?.isConnected ?? false }
     }
 
     func isPeerReachable(_ peerID: PeerID) -> Bool {
-        // Accept both 16-hex short IDs and 64-hex Noise keys
-        let shortID = peerID.toShort()
+        guard let routingID = routingPeerID(for: peerID) else { return false }
         return collectionsQueue.sync {
             // Must be mesh-attached: at least one live direct link to the mesh
             let meshAttached = peers.values.contains { $0.isConnected }
-            guard let info = peers[shortID] else { return false }
+            guard let info = peers[routingID] else { return false }
             if info.isConnected { return true }
             guard meshAttached else { return false }
             // Apply reachability retention window
@@ -672,15 +692,26 @@ final class BLEService: NSObject {
     // MARK: Protocol utilities
     
     func getFingerprint(for peerID: PeerID) -> String? {
+        if peerID.prefix != .noise,
+           peerID.bare.count == 64,
+           peerID.isHex {
+            let requested = peerID.bare
+            let exact = collectionsQueue.sync(execute: {
+                peers.values.contains { $0.noisePublicKey?.sha256Fingerprint() == requested }
+            })
+            if exact { return requested }
+        }
+        guard let routingID = routingPeerID(for: peerID) else { return nil }
         return collectionsQueue.sync {
-            return peers[peerID]?.noisePublicKey?.sha256Fingerprint()
+            return peers[routingID]?.noisePublicKey?.sha256Fingerprint()
         }
     }
     
     func getNoiseSessionState(for peerID: PeerID) -> LazyHandshakeState {
-        if noiseService.hasEstablishedSession(with: peerID) {
+        guard let routingID = routingPeerID(for: peerID) else { return .none }
+        if noiseService.hasEstablishedSession(with: routingID) {
             return .established
-        } else if noiseService.hasSession(with: peerID) {
+        } else if noiseService.hasSession(with: routingID) {
             return .handshaking
         } else {
             return .none
@@ -731,6 +762,28 @@ final class BLEService: NSObject {
     
     func sendPrivateMessage(_ content: String, to peerID: PeerID, recipientNickname: String, messageID: String) {
         sendPrivateMessage(content, to: peerID, messageID: messageID)
+    }
+
+    /// Immediate BLE-only private send for real-time controls such as ☎CALL.
+    /// Unlike normal chat sends, this never queues or falls back to Nostr.
+    func sendPrivateMessageNow(_ content: String, to peerID: PeerID, messageID: String) -> Bool {
+        guard let target = routingPeerID(for: peerID) else {
+            SecureLogger.debug("SonarCall: immediate BLE send has no routing peer for \(peerID.id.prefix(16))", category: .session)
+            return false
+        }
+        let direct = linkState(for: target)
+        let hasNoise = noiseService.hasEstablishedSession(with: target)
+        guard (direct.hasPeripheral || direct.hasCentral), hasNoise else {
+            SecureLogger.debug(
+                "SonarCall: immediate BLE send unavailable requested=\(peerID.id.prefix(16)) target=\(target.id) peripheral=\(direct.hasPeripheral) central=\(direct.hasCentral) noise=\(hasNoise)",
+                category: .session
+            )
+            return false
+        }
+        messageQueue.async { [weak self] in
+            self?.sendPrivateMessageNowOnQueue(content, to: target, messageID: messageID)
+        }
+        return true
     }
 
     func sendFileBroadcast(_ filePacket: BitchatFilePacket, transferId: String) {
@@ -2750,7 +2803,7 @@ extension BLEService: CBPeripheralManagerDelegate {
                 }
             }
         }
-    }    
+    }
 }
 
 // MARK: - Advertising Builders & Alias Rotation
@@ -2763,14 +2816,14 @@ extension BLEService {
         // No Local Name for privacy
         return data
     }
-    
+
     // No alias rotation or advertising restarts required.
 }
 
 // MARK: - Private Helpers
 
 extension BLEService {
-    
+
     /// Notify UI on the MainActor to satisfy Swift concurrency isolation
     private func notifyUI(_ block: @escaping () -> Void) {
         // Always hop onto the MainActor so calls to @MainActor delegates are safe
@@ -3293,6 +3346,57 @@ extension BLEService {
             }
         }
     }
+
+    private func sendPrivateMessageNowOnQueue(_ content: String, to recipientID: PeerID, messageID: String) {
+        guard noiseService.hasEstablishedSession(with: recipientID) else { return }
+        do {
+            let privateMessage = PrivateMessagePacket(messageID: messageID, content: content)
+            guard let tlvData = privateMessage.encode() else {
+                SecureLogger.error("Failed to encode immediate private message with TLV")
+                return
+            }
+
+            var messagePayload = Data([NoisePayloadType.privateMessage.rawValue])
+            messagePayload.append(tlvData)
+
+            let encrypted = try noiseService.encrypt(messagePayload, for: recipientID)
+            let packet = BitchatPacket(
+                type: MessageType.noiseEncrypted.rawValue,
+                senderID: myPeerIDData,
+                recipientID: Data(hexString: recipientID.id),
+                timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+                payload: encrypted,
+                signature: nil,
+                ttl: messageTTL
+            )
+
+            let pad = padPolicy(for: packet.type)
+            guard let data = packet.toBinaryData(padding: pad) else { return }
+            if data.count > TransportConfig.bleCallControlFragmentSize {
+                SecureLogger.debug(
+                    "SonarCall: immediate BLE control fragmenting target=\(recipientID.id) bytes=\(data.count)",
+                    category: .session
+                )
+                sendFragmentedPacket(
+                    packet,
+                    pad: pad,
+                    maxChunk: TransportConfig.bleCallControlFragmentSize,
+                    directedOnlyPeer: recipientID,
+                    spacingMs: TransportConfig.bleCallControlFragmentSpacingMs,
+                    repeatCount: TransportConfig.bleCallControlFragmentRepeatCount,
+                    repeatGapMs: TransportConfig.bleCallControlFragmentRoundSpacingMs
+                )
+            } else {
+                SecureLogger.debug(
+                    "SonarCall: immediate BLE control sending target=\(recipientID.id) bytes=\(data.count)",
+                    category: .session
+                )
+                sendOnAllLinks(packet: packet, data: data, pad: pad, directedOnlyPeer: recipientID)
+            }
+        } catch {
+            SecureLogger.error("Failed to encrypt immediate private message: \(error)")
+        }
+    }
     
     private func initiateNoiseHandshake(with peerID: PeerID) {
         // Use NoiseEncryptionService for handshake
@@ -3394,8 +3498,26 @@ extension BLEService {
     
     // MARK: Fragmentation (Required for messages > BLE MTU)
     
-    private func sendFragmentedPacket(_ packet: BitchatPacket, pad: Bool, maxChunk: Int? = nil, directedOnlyPeer: PeerID? = nil, transferId: String? = nil) {
-        let context = PendingFragmentTransfer(packet: packet, pad: pad, maxChunk: maxChunk, directedPeer: directedOnlyPeer, transferId: transferId)
+    private func sendFragmentedPacket(
+        _ packet: BitchatPacket,
+        pad: Bool,
+        maxChunk: Int? = nil,
+        directedOnlyPeer: PeerID? = nil,
+        transferId: String? = nil,
+        spacingMs: Int? = nil,
+        repeatCount: Int = 1,
+        repeatGapMs: Int = 0
+    ) {
+        let context = PendingFragmentTransfer(
+            packet: packet,
+            pad: pad,
+            maxChunk: maxChunk,
+            directedPeer: directedOnlyPeer,
+            transferId: transferId,
+            spacingMs: spacingMs,
+            repeatCount: max(1, repeatCount),
+            repeatGapMs: max(0, repeatGapMs)
+        )
         if packet.type == MessageType.fileTransfer.rawValue {
             let shouldQueue = collectionsQueue.sync {
                 self.activeTransfers.count >= TransportConfig.bleMaxConcurrentTransfers
@@ -3503,7 +3625,8 @@ extension BLEService {
                 }
             }
         }
-        let perFragMs = (context.directedPeer != nil || packet.recipientID != nil) ? TransportConfig.bleFragmentSpacingDirectedMs : TransportConfig.bleFragmentSpacingMs
+        let perFragMs = context.spacingMs
+            ?? ((context.directedPeer != nil || packet.recipientID != nil) ? TransportConfig.bleFragmentSpacingDirectedMs : TransportConfig.bleFragmentSpacingMs)
 
         let transferIdentifier: String? = {
             guard let id = reservedTransferId else { return nil }
@@ -3514,7 +3637,7 @@ extension BLEService {
             return id
         }()
 
-        var scheduledItems: [(item: DispatchWorkItem, index: Int)] = []
+        var scheduledPackets: [(packet: BitchatPacket, recipient: Data?, index: Int)] = []
 
         for (index, fragment) in fragments.enumerated() {
             var payload = Data()
@@ -3542,7 +3665,11 @@ extension BLEService {
                 isRSR: packet.isRSR
             )
 
-            let workItem = DispatchWorkItem { [weak self] in
+            scheduledPackets.append((packet: fragmentPacket, recipient: fragmentRecipient, index: index))
+        }
+
+        func makeWorkItem(fragmentPacket: BitchatPacket, fragmentRecipient: Data?) -> DispatchWorkItem {
+            DispatchWorkItem { [weak self] in
                 guard let self = self else { return }
                 if let transferId = transferIdentifier {
                     let isActive = self.collectionsQueue.sync { self.activeTransfers[transferId] != nil }
@@ -3556,12 +3683,13 @@ extension BLEService {
                     self.markFragmentSent(transferId: transferId)
                 }
             }
-
-            scheduledItems.append((item: workItem, index: index))
         }
 
-        if let transferId = transferIdentifier {
-            let workItems = scheduledItems.map { $0.item }
+        let transferWorkItems: [DispatchWorkItem]? = transferIdentifier == nil
+            ? nil
+            : scheduledPackets.map { makeWorkItem(fragmentPacket: $0.packet, fragmentRecipient: $0.recipient) }
+
+        if let transferId = transferIdentifier, let workItems = transferWorkItems {
             collectionsQueue.async(flags: .barrier) { [weak self] in
                 guard let self = self, var state = self.activeTransfers[transferId] else { return }
                 state.workItems = workItems
@@ -3569,9 +3697,21 @@ extension BLEService {
             }
         }
 
-        for (workItem, index) in scheduledItems {
-            let delayMs = index * perFragMs
-            messageQueue.asyncAfter(deadline: .now() + .milliseconds(delayMs), execute: workItem)
+        let roundMs = (max(totalFragments - 1, 0) * perFragMs) + context.repeatGapMs
+        if let workItems = transferWorkItems, context.repeatCount == 1 {
+            for (index, workItem) in workItems.enumerated() {
+                messageQueue.asyncAfter(deadline: .now() + .milliseconds(index * perFragMs), execute: workItem)
+            }
+            return
+        }
+        for round in 0..<context.repeatCount {
+            for item in scheduledPackets {
+                let delayMs = (round * roundMs) + (item.index * perFragMs)
+                messageQueue.asyncAfter(
+                    deadline: .now() + .milliseconds(delayMs),
+                    execute: makeWorkItem(fragmentPacket: item.packet, fragmentRecipient: item.recipient)
+                )
+            }
         }
     }
     
@@ -4102,6 +4242,9 @@ extension BLEService {
         // only populated by verified announces); else drop.
         guard let signingKey = collectionsQueue.sync(execute: { peers[peerID]?.signingPublicKey }) else {
             SecureLogger.debug("Ignoring Sonar announce from unknown peer \(peerID.id.prefix(8))…", category: .security)
+            messageQueue.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+                self?.sendAnnounce(forceSend: true)
+            }
             return
         }
 

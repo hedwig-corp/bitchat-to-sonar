@@ -294,6 +294,7 @@ actual object SonarCore {
     actual suspend fun callAnswer(callId: String, answer: SonarAnswer, addrB64: String) {}
     actual suspend fun callAccept(callId: String) {}
     actual suspend fun callHangup(callId: String) {}
+    actual suspend fun callSetMuted(callId: String, muted: Boolean) {}
     actual suspend fun callWaitEvent(timeoutSecs: Long): SonarCallEvent? {
         kotlinx.coroutines.delay(timeoutSecs.coerceIn(1, 30) * 1000) // park, don't busy-spin
         return null

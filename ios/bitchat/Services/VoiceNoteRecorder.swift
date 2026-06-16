@@ -25,7 +25,7 @@ protocol VoiceRecording: ObservableObject {
     /// Normalized input level 0…1 for the live waveform.
     var level: CGFloat { get }
     /// Request mic permission + begin recording. No-op if already recording.
-    func start() async
+    func start() async -> Bool
     /// Stop + keep the file; returns its URL (nil if nothing was recorded).
     func finish() -> URL?
     /// Stop + discard the file.
@@ -43,10 +43,10 @@ final class VoiceNoteRecorder: NSObject, ObservableObject, VoiceRecording {
     private var fileURL: URL?
     private var timer: Timer?
 
-    func start() async {
-        guard recorder == nil else { return }
+    func start() async -> Bool {
+        guard recorder == nil else { return true }
         let granted = await Self.requestPermission()
-        guard granted else { return }
+        guard granted else { return false }
         let session = AVAudioSession.sharedInstance()
         try? session.setCategory(.playAndRecord, mode: .default, options: [.duckOthers])
         try? session.setActive(true)
@@ -59,13 +59,14 @@ final class VoiceNoteRecorder: NSObject, ObservableObject, VoiceRecording {
             AVNumberOfChannelsKey: 1,
             AVEncoderAudioQualityKey: AVAudioQuality.medium.rawValue,
         ]
-        guard let rec = try? AVAudioRecorder(url: url, settings: settings) else { return }
+        guard let rec = try? AVAudioRecorder(url: url, settings: settings) else { return false }
         rec.isMeteringEnabled = true
-        guard rec.record() else { return }
+        guard rec.record() else { return false }
         recorder = rec
         fileURL = url
         elapsed = 0
         startTimer()
+        return true
     }
 
     func finish() -> URL? {
@@ -133,13 +134,14 @@ final class FakeVoiceRecording: ObservableObject, VoiceRecording {
     @Published private(set) var level: CGFloat = 0.5
     private var timer: Timer?
 
-    func start() async {
+    func start() async -> Bool {
         elapsed = 0
         let t = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.elapsed += 1 }
         }
         RunLoop.main.add(t, forMode: .common)
         timer = t
+        return true
     }
     func finish() -> URL? { timer?.invalidate(); timer = nil; return nil }
     func cancel() { timer?.invalidate(); timer = nil }

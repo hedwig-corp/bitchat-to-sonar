@@ -1,5 +1,6 @@
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import org.jetbrains.compose.desktop.application.dsl.TargetFormat
+import org.gradle.api.tasks.Exec
 import java.util.Properties
 
 plugins {
@@ -32,6 +33,30 @@ val generateBreezKeyResource = tasks.register("generateBreezKeyResource") {
         out.parentFile.mkdirs()
         out.writeText(breezApiKey)
     }
+}
+
+val repoRootDir = rootProject.projectDir.parentFile.parentFile
+val desktopMainDir = layout.projectDirectory.dir("src/jvmMain")
+val desktopBindingsFile = desktopMainDir.file("kotlin/uniffi/sonar_ffi/sonar_ffi.kt")
+val desktopResourcesDir = desktopMainDir.dir("resources")
+
+val buildDesktopRustCore = tasks.register<Exec>("buildDesktopRustCore") {
+    description = "Builds the desktop Rust core, BLE bridge, native wallet lib, and UniFFI JVM bindings."
+    group = "build"
+
+    inputs.file(repoRootDir.resolve("core/build-desktop.sh"))
+    inputs.file(repoRootDir.resolve("core/Cargo.toml"))
+    inputs.file(repoRootDir.resolve("core/Cargo.lock"))
+    inputs.file(repoRootDir.resolve("core/sonar-ble/Cargo.toml"))
+    inputs.dir(repoRootDir.resolve("core/sonar-core/src"))
+    inputs.dir(repoRootDir.resolve("core/sonar-ffi/src"))
+    inputs.dir(repoRootDir.resolve("core/sonar-ble/src"))
+    inputs.file(rootProject.file("gradle/libs.versions.toml"))
+    outputs.file(desktopBindingsFile)
+    outputs.dir(desktopResourcesDir)
+
+    workingDir(repoRootDir)
+    commandLine(repoRootDir.resolve("core/build-desktop.sh").absolutePath)
 }
 
 kotlin {
@@ -133,6 +158,8 @@ compose.desktop {
 
 // The jvm resources must carry the generated key file before packaging.
 tasks.named("jvmProcessResources") { dependsOn(generateBreezKeyResource) }
+tasks.named("compileKotlinJvm") { dependsOn(buildDesktopRustCore) }
+tasks.named("jvmProcessResources") { dependsOn(buildDesktopRustCore) }
 
 android {
     namespace = "chat.bitchat.sonar"
@@ -154,6 +181,12 @@ android {
     // The Rust core .so per ABI lives in src/androidMain/jniLibs (produced by
     // core/build-android.sh). Map it onto the Android main source set.
     sourceSets["main"].jniLibs.srcDirs("src/androidMain/jniLibs")
+
+    packaging {
+        jniLibs {
+            pickFirsts += listOf("lib/*/libc++_shared.so")
+        }
+    }
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17

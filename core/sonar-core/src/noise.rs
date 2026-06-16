@@ -125,7 +125,8 @@ impl NoiseSession {
         if ciphertext.len() < 4 + 16 {
             return Err(Error::Storage("noise: transport message too short".into()));
         }
-        let nonce = u32::from_be_bytes([ciphertext[0], ciphertext[1], ciphertext[2], ciphertext[3]]);
+        let nonce =
+            u32::from_be_bytes([ciphertext[0], ciphertext[1], ciphertext[2], ciphertext[3]]);
         let body = &ciphertext[4..];
         self.state.set_receiving_nonce(nonce as u64);
         let mut buf = vec![0u8; body.len()];

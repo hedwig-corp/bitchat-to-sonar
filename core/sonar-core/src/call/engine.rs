@@ -22,6 +22,7 @@
 //! [`accept`]: CallEngine::accept
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -97,6 +98,7 @@ struct CallSlot {
     /// The offerer's address, stored on the answerer so [`CallEngine::accept`]
     /// can dial it.
     dial_addr: Option<EndpointAddr>,
+    local_muted: bool,
     connected_at: Option<Instant>,
     active: Option<ActiveCall>,
 }
@@ -111,6 +113,7 @@ struct ActiveCall {
     /// Held mic sender so the session's send loop parks (instead of ending) when
     /// there is no capture device (hermetic/no-mic case); dropped on teardown.
     _mic_tx: mpsc::Sender<Vec<i16>>,
+    muted: Arc<AtomicBool>,
     session: tokio::task::JoinHandle<()>,
     watch: tokio::task::JoinHandle<()>,
 }
@@ -203,6 +206,7 @@ impl CallEngine {
                 state: CallStateKind::Ringing,
                 remote_id: None,
                 dial_addr: None,
+                local_muted: false,
                 connected_at: None,
                 active: None,
             },
@@ -214,7 +218,12 @@ impl CallEngine {
     /// The offerer received the peer's `ANSWER` (host-parsed). On `accept`, pin
     /// the answerer's id (the accept loop then admits its inbound dial) and go
     /// `Connecting`; on `decline`/`busy`, end the call with the matching state.
-    pub fn on_answer(&self, call_id: &str, answer: AnswerKind, remote_addr_b64: &str) -> Result<()> {
+    pub fn on_answer(
+        &self,
+        call_id: &str,
+        answer: AnswerKind,
+        remote_addr_b64: &str,
+    ) -> Result<()> {
         match answer {
             AnswerKind::Decline => {
                 self.end_call(call_id, CallStateKind::Declined, "declined");
@@ -258,6 +267,7 @@ impl CallEngine {
                 state: CallStateKind::Ringing,
                 remote_id: Some(addr.id),
                 dial_addr: Some(addr),
+                local_muted: false,
                 connected_at: None,
                 active: None,
             },
@@ -307,6 +317,21 @@ impl CallEngine {
         Ok(())
     }
 
+    /// Toggle the local microphone without changing the media session. Muting
+    /// sends silence frames on the existing RTP stream so the remote jitter
+    /// buffer and timing stay stable.
+    pub fn set_muted(&self, call_id: &str, muted: bool) -> Result<()> {
+        let mut calls = self.inner.calls.lock().unwrap();
+        let slot = calls
+            .get_mut(call_id)
+            .ok_or_else(|| anyhow!("set_muted for unknown call {call_id}"))?;
+        slot.local_muted = muted;
+        if let Some(active) = &slot.active {
+            active.muted.store(muted, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
     /// Park up to `timeout_secs` for the next call state change. The host polls
     /// this on a dedicated thread (like `waitForMarmotEvent`); it touches no MLS
     /// state. Returns `None` on timeout.
@@ -345,10 +370,18 @@ impl CallEngine {
 /// call, so this is hermetically testable), spawn the full-duplex opus/RTP loop +
 /// a connection-close watcher, store the live resources, and emit `Connected`.
 async fn connect_media(inner: Arc<Inner>, call_id: String, conn: Connection) -> Result<()> {
-    let (mic_tx, mic_rx) = mpsc::channel::<Vec<i16>>(64);
-    let (spk_tx, spk_rx) = mpsc::channel::<Vec<i16>>(64);
+    let local_muted = inner
+        .calls
+        .lock()
+        .unwrap()
+        .get(&call_id)
+        .map(|slot| slot.local_muted)
+        .unwrap_or(false);
+    let muted = Arc::new(AtomicBool::new(local_muted));
+    let (mic_tx, mic_rx) = mpsc::channel::<Vec<i16>>(4);
+    let (spk_tx, spk_rx) = mpsc::channel::<Vec<i16>>(4);
 
-    let capture = match device::start_capture(mic_tx.clone()) {
+    let capture = match device::start_capture_with_mute(mic_tx.clone(), muted.clone()) {
         Ok(d) => Some(d),
         Err(e) => {
             tracing::warn!("call {call_id}: mic capture unavailable: {e}");
@@ -378,7 +411,10 @@ async fn connect_media(inner: Arc<Inner>, call_id: String, conn: Connection) -> 
         let _ = watch_conn.closed().await;
         let removed = watch_inner.calls.lock().unwrap().remove(&watch_id);
         if let Some(slot) = removed {
-            let duration = slot.connected_at.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+            let duration = slot
+                .connected_at
+                .map(|t| t.elapsed().as_secs())
+                .unwrap_or(0);
             // Emit before dropping the slot (its ActiveCall::drop aborts THIS task).
             watch_inner.emit(&watch_id, CallStateKind::Ended, duration, "remote");
             drop(slot);
@@ -390,6 +426,7 @@ async fn connect_media(inner: Arc<Inner>, call_id: String, conn: Connection) -> 
         _capture: capture,
         _playback: playback,
         _mic_tx: mic_tx,
+        muted,
         session: session_task,
         watch,
     };
@@ -497,13 +534,25 @@ mod tests {
             // Answerer is the dialer.
             answerer.accept(call_id).await?;
 
-            assert!(wait_for(&answerer, CallStateKind::Connected).await, "answerer connected");
-            assert!(wait_for(&offerer, CallStateKind::Connected).await, "offerer connected");
+            assert!(
+                wait_for(&answerer, CallStateKind::Connected).await,
+                "answerer connected"
+            );
+            assert!(
+                wait_for(&offerer, CallStateKind::Connected).await,
+                "offerer connected"
+            );
 
             // Offerer hangs up; both sides end.
             offerer.hangup(call_id)?;
-            assert!(wait_for(&offerer, CallStateKind::Ended).await, "offerer ended");
-            assert!(wait_for(&answerer, CallStateKind::Ended).await, "answerer ended");
+            assert!(
+                wait_for(&offerer, CallStateKind::Ended).await,
+                "offerer ended"
+            );
+            assert!(
+                wait_for(&answerer, CallStateKind::Ended).await,
+                "answerer ended"
+            );
 
             anyhow::Ok(())
         })
@@ -518,7 +567,10 @@ mod tests {
         let offerer = CallEngine::start_relay_less([11u8; 32]).await?;
         offerer.place("c", CallMediaKind::Voice)?;
         offerer.on_answer("c", AnswerKind::Decline, "")?;
-        assert!(wait_for(&offerer, CallStateKind::Declined).await, "declined");
+        assert!(
+            wait_for(&offerer, CallStateKind::Declined).await,
+            "declined"
+        );
         Ok(())
     }
 }

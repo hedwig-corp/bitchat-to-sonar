@@ -97,10 +97,14 @@ fn handle_blossom_conn(
             let _ = stream.write_all(header.as_bytes());
             let _ = stream.write_all(&blob);
         } else {
-            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let _ = stream.write_all(
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
         }
     } else {
-        let _ = stream.write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let _ = stream.write_all(
+            b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
     }
     let _ = stream.flush();
 }
@@ -123,7 +127,10 @@ async fn media_sends_over_white_noise_end_to_end() {
         .await
         .expect("android connects");
 
-    android.publish_key_package().await.expect("android publishes kp");
+    android
+        .publish_key_package()
+        .await
+        .expect("android publishes kp");
     let ios_group = ios
         .start_dm(android.identity().public_key(), "ios & android")
         .await
@@ -154,7 +161,10 @@ async fn media_sends_over_white_noise_end_to_end() {
     assert!(!media_msg.mine);
     assert_eq!(media_msg.content, "from iOS");
     let url = media_msg.media[0].url.clone();
-    assert!(url.starts_with(&blossom), "imeta url points at the Blossom server");
+    assert!(
+        url.starts_with(&blossom),
+        "imeta url points at the Blossom server"
+    );
 
     // Android downloads the ciphertext from Blossom and decrypts with the group key.
     let ciphertext = reqwest::get(&url)
@@ -169,12 +179,22 @@ async fn media_sends_over_white_noise_end_to_end() {
         .engine()
         .decrypt_media_by_url(&android_group, &url, &ciphertext)
         .expect("android decrypts");
-    assert_eq!(decrypted, image, "iOS→Android media round-trips byte-for-byte");
+    assert_eq!(
+        decrypted, image,
+        "iOS→Android media round-trips byte-for-byte"
+    );
 
     // Reverse direction: Android → iOS.
     let reply = b"and back -- Android to iOS".to_vec();
     android
-        .send_media(&android_group, reply.clone(), "reply.bin", "application/octet-stream", "from Android", &blossom)
+        .send_media(
+            &android_group,
+            reply.clone(),
+            "reply.bin",
+            "application/octet-stream",
+            "from Android",
+            &blossom,
+        )
         .await
         .expect("android sends media");
     ios.sync().await.expect("ios syncs");
@@ -184,7 +204,13 @@ async fn media_sends_over_white_noise_end_to_end() {
         .find(|m| m.media.first().map(|r| r.url != url).unwrap_or(false))
         .expect("ios sees android's media");
     let url2 = back.media[0].url.clone();
-    let ct2 = reqwest::get(&url2).await.unwrap().bytes().await.unwrap().to_vec();
+    let ct2 = reqwest::get(&url2)
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap()
+        .to_vec();
     let dec2 = ios
         .engine()
         .decrypt_media_by_url(&ios_group, &url2, &ct2)

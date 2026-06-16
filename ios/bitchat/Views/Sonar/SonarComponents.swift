@@ -1014,7 +1014,10 @@ final class SNAudioPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
             player?.delegate = self
             duration = player?.duration ?? 0
         }
-        player?.play()
+        guard player?.play() == true else {
+            playing = false
+            return
+        }
         playing = true
     }
 
@@ -1030,6 +1033,7 @@ struct SNComposer: View {
     let onSend: (String) -> Void
     let onPlus: () -> Void
     let onCommand: (String) -> Void
+    var voiceEnabled: Bool = true
     /// Hold-to-record produced a voice note at this file URL (audio/mp4 .m4a).
     var onVoice: (URL) -> Void = { _ in }
 
@@ -1038,6 +1042,8 @@ struct SNComposer: View {
     @StateObject private var voice = VoiceNoteRecorder()
     @State private var recording = false
     @State private var dragX: CGFloat = 0
+    @State private var voiceError: String?
+    @State private var recordingStartTask: Task<Bool, Never>?
     private var cancelArmed: Bool { dragX < -100 }
     #endif
 
@@ -1084,16 +1090,48 @@ struct SNComposer: View {
                 }
             }
             #if os(iOS)
-            if recording { recordingBar } else { inputRow }
-            #else
-            inputRow
+            if let voiceError {
+                HStack {
+                    Text(verbatim: voiceError)
+                        .font(SonarTheme.uiFont(size: 12.5, weight: .medium))
+                        .foregroundColor(SonarTheme.danger)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 14)
+                .padding(.top, 8)
+                .transition(.opacity.combined(with: .move(edge: .bottom)))
+            }
             #endif
+            inputRow
         }
         .background(SonarTheme.bg)
     }
 
     private var inputRow: some View {
         HStack(alignment: .bottom, spacing: 8) {
+            #if os(iOS)
+            if recording {
+                recordingStatus
+            } else {
+                composeFields
+            }
+            if hasText && !recording {
+                sendButton
+            } else if voiceEnabled {
+                micButton
+            } else {
+                sendButton
+            }
+            #else
+            composeFields
+            sendButton
+            #endif
+        }
+        .padding(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12))
+    }
+
+    private var composeFields: some View {
+        Group {
             Button(action: onPlus) {
                 Circle()
                     .fill(SonarTheme.surface2)
@@ -1116,14 +1154,7 @@ struct SNComposer: View {
             .padding(.horizontal, 14)
             .frame(minHeight: 36)
             .background(RoundedRectangle(cornerRadius: 19, style: .continuous).fill(SonarTheme.surface2))
-
-            #if os(iOS)
-            if hasText { sendButton } else { micButton }
-            #else
-            sendButton
-            #endif
         }
-        .padding(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12))
     }
 
     private var sendButton: some View {
@@ -1138,43 +1169,85 @@ struct SNComposer: View {
                 .padding(.bottom, 1)
         }
         .buttonStyle(SNScaleStyle(scale: 0.92))
+        .disabled(!hasText)
     }
 
     #if os(iOS)
     /// Hold-to-record mic (design: bc-sendbtn mic). Press starts recording; drag
     /// left past the threshold cancels; release sends the note.
     private var micButton: some View {
-        Circle()
-            .fill(SonarTheme.surface2)
+        let net = transport == .internet
+        return Circle()
+            .fill(recording ? (net ? SonarTheme.netFill : SonarTheme.accentFill) : SonarTheme.surface2)
             .frame(width: 34, height: 34)
-            .overlay(SNIcon(name: .mic, size: 18, weight: 2).foregroundColor(SonarTheme.text2))
+            .overlay(
+                SNIcon(name: .mic, size: 18, weight: 2)
+                    .foregroundColor(recording ? (net ? SonarTheme.onNet : SonarTheme.onAccent) : SonarTheme.text2)
+            )
             .padding(.bottom, 1)
             .gesture(
                 DragGesture(minimumDistance: 0)
                     .onChanged { g in
                         if !recording {
-                            recording = true
-                            dragX = 0
-                            Task { await voice.start() }
+                            beginVoiceRecording()
                         } else {
                             dragX = min(0, g.translation.width)
                         }
                     }
                     .onEnded { _ in
-                        let cancel = cancelArmed
-                        recording = false
-                        dragX = 0
-                        if cancel { voice.cancel() } else if let url = voice.finish() { onVoice(url) }
+                        endVoiceRecording(send: true)
                     }
             )
     }
 
-    /// The Telegram/Signal-style recording bar (design: VoiceRecorder): trash,
-    /// rec dot, timer, live waveform, slide-to-cancel hint, send.
-    private var recordingBar: some View {
-        let net = transport == .internet
-        return HStack(alignment: .center, spacing: 8) {
-            Button { recording = false; dragX = 0; voice.cancel() } label: {
+    private func beginVoiceRecording() {
+        recording = true
+        dragX = 0
+        voiceError = nil
+        recordingStartTask = Task { await voice.start() }
+    }
+
+    private func endVoiceRecording(send: Bool) {
+        let cancel = cancelArmed || !send
+        let startTask = recordingStartTask
+        recordingStartTask = nil
+        Task { @MainActor in
+            let started: Bool
+            if let startTask {
+                started = await startTask.value
+            } else {
+                started = false
+            }
+            recording = false
+            dragX = 0
+            guard started else {
+                voice.cancel()
+                showVoiceError("Microphone access is needed for voice notes.")
+                return
+            }
+            if cancel {
+                voice.cancel()
+            } else if let url = voice.finish() {
+                onVoice(url)
+            }
+        }
+    }
+
+    private func showVoiceError(_ message: String) {
+        voiceError = message
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 2_800_000_000)
+            if voiceError == message {
+                voiceError = nil
+            }
+        }
+    }
+
+    /// The Telegram/Signal-style recording status (design: VoiceRecorder): trash,
+    /// rec dot, timer, live waveform and slide-to-cancel hint.
+    private var recordingStatus: some View {
+        HStack(alignment: .center, spacing: 8) {
+            Button { endVoiceRecording(send: false) } label: {
                 SNIcon(name: .trash, size: 19, weight: 2).foregroundColor(SonarTheme.danger)
             }
             HStack(spacing: 9) {
@@ -1199,12 +1272,7 @@ struct SNComposer: View {
             .padding(.horizontal, 12)
             .frame(minHeight: 36)
             .background(RoundedRectangle(cornerRadius: 19, style: .continuous).fill(SonarTheme.surface2))
-            Circle()
-                .fill(net ? SonarTheme.netFill : SonarTheme.accentFill)
-                .frame(width: 34, height: 34)
-                .overlay(SNIcon(name: .mic, size: 18, weight: 2).foregroundColor(net ? SonarTheme.onNet : SonarTheme.onAccent))
         }
-        .padding(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12))
     }
     #endif
 }

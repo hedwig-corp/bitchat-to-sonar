@@ -108,7 +108,8 @@ struct SonarChannelScreen: View {
                 onPlus: { sheet = true },
                 onCommand: { cmd in
                     store.onCommand(.init(type: .ch, id: chId, target: slapTarget), cmd)
-                }
+                },
+                voiceEnabled: false
             )
         }
         .background(SonarTheme.bg.ignoresSafeArea())
