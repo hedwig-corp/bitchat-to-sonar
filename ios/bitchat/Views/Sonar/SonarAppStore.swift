@@ -2044,6 +2044,16 @@ final class SonarAppStore: ObservableObject {
         guard activeCall == nil else { return }
         let callId = UUID().uuidString
         let name = peerItem(convId).name
+        // Diagnostic (NSLog → surfaces via `devicectl process launch --console`):
+        // pin down which transport the ☎CALL OFFER will ride. If transport is
+        // "internet" the OFFER goes over White Noise (batched, non-real-time) and
+        // the remote never rings in time — the BLE mesh handshake must be live.
+        let mg = marmotGroupId(convId) != nil
+        let pid = PeerID(str: convId)
+        let pc = chatViewModel.meshService.isPeerConnected(pid)
+        let pr = chatViewModel.meshService.isPeerReachable(pid)
+        let diag = "SonarCall: placeCall convId=\(convId.prefix(16)) marmotGroup=\(mg) transport=\(dmTransport(convId)) peerConnected=\(pc) reachable=\(pr) noiseSession=\(chatViewModel.meshService.getNoiseSessionState(for: pid))"
+        print(diag); NSLog("%@", diag)
         // Show the ringing screen IMMEDIATELY so the tap is responsive — the iroh
         // setup (bind/offer) runs in the background. The endpoint is already bound
         // at boot via ensureCallStarted(), so we must NOT call callStart() again
