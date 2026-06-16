@@ -1131,8 +1131,13 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** True if [chatId]'s peer can be voice/video called: calls are a Sonar-only
      *  feature, so the peer must be a mesh-routed Sonar peer whose 0x53 profile
      *  advertised CAP_CALLS. A White Noise / non-Sonar chat cannot be called. */
+    /** A chat is callable when it is a BLE-discovered Sonar peer advertising the
+     *  calls capability, OR a White Noise (Marmot) 1:1 chat — both parties there
+     *  are Sonar users, the ☎CALL signaling rides the group, and the media goes
+     *  over iroh/internet (no Bluetooth proximity required). */
     fun canCall(chatId: String): Boolean =
-        isMeshChat(chatId) && sonarProfile(meshPeerId(chatId))?.speaksCalls == true
+        if (isMeshChat(chatId)) sonarProfile(meshPeerId(chatId))?.speaksCalls == true
+        else chats.any { it.id == chatId }
 
     private fun randomMeshId(): String =
         (0 until 16).joinToString("") { "0123456789abcdef"[kotlin.random.Random.nextInt(16)].toString() }

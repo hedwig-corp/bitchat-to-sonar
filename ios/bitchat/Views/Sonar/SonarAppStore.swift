@@ -1700,8 +1700,13 @@ final class SonarAppStore: ObservableObject {
     /// the calls capability (discovery bit 2) over its 0x53 Sonar profile can
     /// be called. White Noise / plain bitchat peers cannot.
     func canCall(_ id: String) -> Bool {
-        guard let profile = sonarProfiles[id] else { return false }
-        return profile.capabilities & SonarCapability.calls != 0
+        if let profile = sonarProfiles[id] {
+            return profile.capabilities & SonarCapability.calls != 0
+        }
+        // A White Noise (Marmot) 1:1 chat: both parties are Sonar users, so it is
+        // callable over the internet — the ☎CALL signaling rides the Marmot group
+        // and the media goes over iroh (no Bluetooth proximity required).
+        return marmotGroupId(id) != nil
     }
 
     /// Sends a sealed coin over the conversation's current rail. The balance
