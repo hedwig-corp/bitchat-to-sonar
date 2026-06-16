@@ -261,20 +261,23 @@ actual object SonarCore {
         node ?: error("SonarCore not started — call start() first")
 
     private fun loadOrCreateIdentity(): SonarIdentity {
-        val saved = DesktopEnv.getString("nsec")
+        // Stored in the OS keystore (macOS Keychain), NOT plaintext prefs — the nsec
+        // also derives the wallet seed. [DesktopSecrets.get] migrates a legacy
+        // plaintext nsec in transparently.
+        val saved = DesktopSecrets.get("nsec")
         if (saved != null) {
             runCatching { return SonarIdentity.import(saved) }
         }
         val id = SonarIdentity.generate()
-        DesktopEnv.putString("nsec", id.nsec())
+        DesktopSecrets.put("nsec", id.nsec())
         return id
     }
 
     private fun loadOrCreateDbKey(): String {
-        DesktopEnv.getString("dbKeyHex")?.let { return it }
+        DesktopSecrets.get("dbKeyHex")?.let { return it }
         val bytes = ByteArray(32).also { SecureRandom().nextBytes(it) }
         val hex = bytes.joinToString("") { b -> "%02x".format(b) }
-        DesktopEnv.putString("dbKeyHex", hex)
+        DesktopSecrets.put("dbKeyHex", hex)
         return hex
     }
 }

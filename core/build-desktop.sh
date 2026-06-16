@@ -124,11 +124,45 @@ case "$UNAME_S" in
   Linux)  BREEZ_GOARCH="$([[ $JNA_ARCH == aarch64 ]] && echo linux-aarch64 || echo linux-amd64)";  BREEZ_LIB="libbreez_sdk_liquid_bindings.so" ;;
   *)      BREEZ_GOARCH="windows-amd64"; BREEZ_LIB="breez_sdk_liquid_bindings.dll" ;;
 esac
+
+# Pinned SHA256 of the Breez native lib per "<version>|<goarch>". This is a
+# fund-path native library fetched from a Git TAG (mutable — a tag can be
+# force-moved), so we verify integrity and refuse to ship a mismatch. Update these
+# when bumping breez-sdk-liquid in libs.versions.toml:
+#   curl -fsSL <url> | shasum -a 256
+breez_sha256() {
+  case "$1|$2" in
+    "0.11.13|darwin-aarch64") echo "164d0bd874a9f9e20d6950335274cb6d66dd4c180f5e3a17e80f56a0613919e0" ;;
+    "0.11.13|darwin-amd64")   echo "9573f1541fb3e2f10932a1593a5d7ae2cc5fcd984d311db09b4f3034a92fbeb6" ;;
+    "0.11.13|linux-aarch64")  echo "38ffe3af352277bd6b9ef4f07e740d53133936a0c629060e9f5b76d22c58f54f" ;;
+    "0.11.13|linux-amd64")    echo "656d228c168da625745d18ecd545c1ebee76db9e78ebd6b09937c3cc17eebc2c" ;;
+    "0.11.13|windows-amd64")  echo "718a8305a03dfbc71fedd18c2566933f1b4dd1d25f92a1032c9d3c9ca2435c40" ;;
+    *) echo "" ;;
+  esac
+}
+sha256_of() { if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d' ' -f1; else sha256sum "$1" | cut -d' ' -f1; fi; }
+
 if [[ -n "$BREEZ_VER" ]]; then
   BREEZ_URL="https://raw.githubusercontent.com/breez/breez-sdk-liquid-go/v$BREEZ_VER/breez_sdk_liquid/lib/$BREEZ_GOARCH/$BREEZ_LIB"
+  BREEZ_DEST="$RES_DIR/$JNA_PREFIX/$BREEZ_LIB"
   echo "Fetching Breez SDK Liquid native lib v$BREEZ_VER ($BREEZ_GOARCH)..."
-  if curl -fsSL -o "$RES_DIR/$JNA_PREFIX/$BREEZ_LIB" "$BREEZ_URL"; then
-    [[ -n "$JNA_PREFIX_ALT" ]] && cp "$RES_DIR/$JNA_PREFIX/$BREEZ_LIB" "$RES_DIR/$JNA_PREFIX_ALT/$BREEZ_LIB"
+  if curl -fsSL -o "$BREEZ_DEST" "$BREEZ_URL"; then
+    WANT_SHA="$(breez_sha256 "$BREEZ_VER" "$BREEZ_GOARCH")"
+    GOT_SHA="$(sha256_of "$BREEZ_DEST")"
+    if [[ -z "$WANT_SHA" ]]; then
+      echo "warning: no pinned SHA256 for breez $BREEZ_VER/$BREEZ_GOARCH — integrity NOT verified." >&2
+      echo "         Add it to breez_sha256() in build-desktop.sh after bumping the version." >&2
+    elif [[ "$WANT_SHA" != "$GOT_SHA" ]]; then
+      rm -f "$BREEZ_DEST"
+      echo "error: Breez native lib checksum mismatch ($BREEZ_GOARCH) — refusing to ship an" >&2
+      echo "       unverified fund-path library." >&2
+      echo "       expected $WANT_SHA" >&2
+      echo "       got      $GOT_SHA" >&2
+      exit 1
+    else
+      echo "Breez native lib SHA256 verified ($BREEZ_GOARCH)."
+    fi
+    [[ -f "$BREEZ_DEST" && -n "$JNA_PREFIX_ALT" ]] && cp "$BREEZ_DEST" "$RES_DIR/$JNA_PREFIX_ALT/$BREEZ_LIB"
   else
     echo "warning: could not fetch $BREEZ_URL — desktop ⚡PAY wallet will be unavailable" >&2
   fi

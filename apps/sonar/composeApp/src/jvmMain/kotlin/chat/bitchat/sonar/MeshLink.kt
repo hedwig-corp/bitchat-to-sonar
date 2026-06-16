@@ -42,6 +42,7 @@ object MeshLink {
     private val nameByFp = ConcurrentHashMap<String, String>()
     private val seenByFp = ConcurrentHashMap<String, Long>()           // fp -> last-activity ms
     private val sonarByPeerId = ConcurrentHashMap<String, ByteArray>() // peerId -> 0x53 payload
+    private val sonarSeenAt = ConcurrentHashMap<String, Long>()        // peerId -> last 0x53 ms (for TTL)
     private val rxDms = ConcurrentLinkedQueue<MeshDmIn>()
     private val pending = ConcurrentHashMap<String, ConcurrentLinkedQueue<Pair<String, String>>>()
 
@@ -87,6 +88,7 @@ object MeshLink {
                 TYPE_NOISE_HANDSHAKE -> handleHandshake(sender, info.payload)
                 TYPE_NOISE_ENCRYPTED -> handleEncrypted(sender, info.payload)
                 TYPE_SONAR -> {
+                    sonarSeenAt[sender] = System.currentTimeMillis()
                     if (sonarByPeerId.put(sender, info.payload) == null) {
                         sonarLog("MeshLink", "RX 0x53 Sonar announce from ${nameByFp[fpByPeerId[sender]] ?: sender} → peer is a full Sonar user (npub for WN fallback)")
                     }
@@ -95,11 +97,17 @@ object MeshLink {
         }
         val now = System.currentTimeMillis()
         seenByFp.entries.removeIf { now - it.value > PEER_TTL_MS }
+        // Expire stale 0x53 payloads too (parity with seenByFp) so a peer that left
+        // range stops being reported as a live Sonar user by [sonarPeers].
+        sonarSeenAt.entries.removeIf { now - it.value > PEER_TTL_MS }
+        sonarByPeerId.keys.retainAll(sonarSeenAt.keys)
 
         // Broadcast our signed 0x53 Sonar announce every ~3s so connected phones
         // learn our npub and can continue the chat over White Noise out of range.
+        // Only while a peer is actually around (a connected central writes its
+        // announce → seenByFp) — no point signing + notifying into the void.
         val payload = sonarPayload
-        if (payload != null && now - lastSonarSendMs >= 3_000L) {
+        if (payload != null && seenByFp.isNotEmpty() && now - lastSonarSendMs >= 3_000L) {
             lastSonarSendMs = now
             runCatching { BleBridge.notify(MeshIdentity.buildSonarPacket(payload)) }
         }
@@ -222,6 +230,6 @@ object MeshLink {
 
     fun wipe() {
         sessions.clear(); fpByPeerId.clear(); peerIdByFp.clear()
-        nameByFp.clear(); seenByFp.clear(); sonarByPeerId.clear(); rxDms.clear(); pending.clear()
+        nameByFp.clear(); seenByFp.clear(); sonarByPeerId.clear(); sonarSeenAt.clear(); rxDms.clear(); pending.clear()
     }
 }
