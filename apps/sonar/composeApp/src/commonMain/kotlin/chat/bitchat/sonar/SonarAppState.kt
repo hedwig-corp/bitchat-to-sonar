@@ -1003,10 +1003,11 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** True while a live Noise link to [peerId] exists (peer is in Bluetooth range). */
     fun dmInRange(peerId: String): Boolean = MeshRadio.hasMeshLink(peerId)
 
-    /** True if [peerId] is a full Sonar peer we can reach over White Noise — its
-     *  npub is known from a live 0x53 OR the persisted link (so it stays true out
-     *  of Bluetooth range). */
-    fun isSonarPeer(peerId: String): Boolean = npubRawFor(peerId) != null
+    /** True if we know this peer's **White Noise account** (npub) — from a live
+     *  0x53 OR the persisted link (so it stays true out of Bluetooth range). An
+     *  npub IS a White Noise account, so this gates White-Noise *reachability*, not
+     *  a "Sonar app" tier: any account we know is reachable over the internet. */
+    fun hasWhiteNoiseAccount(peerId: String): Boolean = npubRawFor(peerId) != null
 
     /** True if [chatId]'s peer can be voice/video called: calls are a Sonar-only
      *  feature, so the peer must be a mesh-routed Sonar peer whose 0x53 profile

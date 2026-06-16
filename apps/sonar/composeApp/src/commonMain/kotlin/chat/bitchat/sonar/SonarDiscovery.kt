@@ -31,6 +31,8 @@ data class SonarAnnounce(
     val capabilities: Int,      // u8 bitfield
     val bolt12Offer: String? = null,
 ) {
+    // Informational only — any npub IS a White Noise account (speaks Marmot), so
+    // this bit does NOT gate White Noise; kept for wire compatibility.
     val speaksMarmot: Boolean get() = capabilities and CAP_MARMOT != 0
     val speaksPay: Boolean get() = capabilities and CAP_PAY != 0
     val speaksCalls: Boolean get() = capabilities and CAP_CALLS != 0
