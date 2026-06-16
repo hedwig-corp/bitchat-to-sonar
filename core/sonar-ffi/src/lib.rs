@@ -579,14 +579,16 @@ fn media_kind(video: bool) -> sonar_core::call::signaling::CallMediaKind {
 #[cfg(feature = "calls-audio")]
 #[uniffi::export]
 impl SonarNode {
-    /// Bind the iroh call endpoint once for this session. `iroh_secret_hex` =
-    /// 64-char hex of the 32-byte key (derive it host-side from the Nostr secret
-    /// via the same HKDF the core uses). Idempotent-ish: a second call rebinds.
-    pub fn call_start(&self, iroh_secret_hex: String) -> FfiResult<()> {
-        let secret = parse_db_key(&iroh_secret_hex)?; // 32-byte hex parser, reused
+    /// Bind the iroh call endpoint once for this session. The iroh Ed25519 key is
+    /// derived IN-CORE from this node's Nostr secret (HKDF, `call::identity`), so
+    /// the host passes nothing and never reimplements the derivation; the NodeId
+    /// is stable across launches. Idempotent-ish: a second call rebinds.
+    pub fn call_start(&self) -> FfiResult<()> {
+        let nostr_secret = self.client.identity().keys().secret_key().to_secret_bytes();
+        let iroh_secret = sonar_core::call::identity::derive_iroh_secret(&nostr_secret);
         let engine = self
             .runtime
-            .block_on(sonar_core::call::engine::CallEngine::start(secret))
+            .block_on(sonar_core::call::engine::CallEngine::start(iroh_secret))
             .map_err(|e| SonarFfiError::Core(format!("call start: {e}")))?;
         *self.call.lock().unwrap() = Some(Arc::new(engine));
         Ok(())
