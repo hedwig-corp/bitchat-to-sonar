@@ -1479,3 +1479,171 @@ I kept the functional cyan/indigo transport colors intact (they encode Bluetooth
 
 One note: the icon's artwork has a faint watermark in the source PNG — if this is a licensed/stock mark, swap in the clean vector when you have it and I'll regenerate the chips. Want me to also feature the icon in the landing hero (e.g. above the phone), or keep the radar as the hero visual?
 
+## User
+
+we should also allow to export the nsec of nostr to allow to move on another wallet. During login we should also allow to insert a previous nsec to restore the wallet
+
+## Assistant
+
+_[tool: snip]_
+
+Good additions for a self-custody messenger. Let me look at the onboarding flow and the key card to add: (1) restore-from-nsec at login, (2) export nsec from settings.
+
+_[tool: read_file]_
+
+_[tool: read_file]_
+
+_[tool: grep]_
+
+_[tool: grep]_
+
+Clear. I'll add: a demo `nsec`, a **restore-from-key** path in onboarding, and an **export private key** sheet (reused on mobile + desktop). Starting with data + a reusable ExportKeySheet:
+
+_[tool: str_replace_edit]_
+
+Now add the `ExportKeySheet` component in settings.jsx (after KeyShareCard), plus a `copy`/`eye` icon. Let me add the component:
+
+_[tool: str_replace_edit]_
+
+_[tool: str_replace_edit]_
+
+_[tool: str_replace_edit]_
+
+Now add the icons (eye, eyeOff) and wire the Export row into the mobile SettingsScreen Safety section:
+
+_[tool: str_replace_edit]_
+
+_[tool: read_file]_
+
+_[tool: str_replace_edit]_
+
+Now the onboarding restore path. I'll add a "Restore from a key" ghost button on step 0 and a restore step. Let me update the Onboarding function:
+
+_[tool: str_replace_edit]_
+
+_[tool: str_replace_edit]_
+
+Now wire `onRestore` in app.jsx where Onboarding is rendered:
+
+_[tool: grep]_
+
+_[tool: str_replace_edit]_
+
+Now add the CSS for the nsec input and warning. Let me add near the onboarding/keyshare styles:
+
+_[tool: str_replace_edit]_
+
+Now wire export into the desktop settings modal. Let me find its Privacy/Safety section:
+
+_[tool: grep]_
+
+_[tool: read_file]_
+
+_[tool: str_replace_edit]_
+
+Now verify mobile. Reset to onboarding to test the restore path, then export. Check console too:
+
+_[tool: eval_js]_
+
+_[tool: sleep]_
+
+_[tool: eval_js]_
+
+_[tool: sleep]_
+
+_[tool: save_screenshot]_
+
+_[tool: get_webview_logs]_
+
+Preview not loaded — let me open it fresh and check for errors:
+
+_[tool: show_html]_
+
+_[tool: get_webview_logs]_
+
+I'm fixing/verifying a feature, so a screenshot is warranted. Let me re-run:
+
+_[tool: show_html]_
+
+The KeyShareCard renders great. The persisted state shows Profile. Let me reset to onboarding and test the restore flow:
+
+_[tool: eval_js]_
+
+_[tool: show_html]_
+
+show_html doesn't reload. Let me reload via JS and wait:
+
+_[tool: eval_js]_
+
+_[tool: sleep]_
+
+_[tool: eval_js]_
+
+Onboarding step 0 now has "Get started" + "I already have a key". Let me open the restore screen and capture it:
+
+_[tool: eval_js]_
+
+_[tool: sleep]_
+
+_[tool: save_screenshot]_
+
+Restore screen looks great. Let me test paste → enable → restore:
+
+_[tool: eval_js]_
+
+_[tool: sleep]_
+
+_[tool: eval_js]_
+
+_[tool: eval_js]_
+
+_[tool: sleep]_
+
+_[tool: eval_js]_
+
+Restore works end to end — paste enables the button, and "Restore account" lands on Home. Now verify the export sheet from Settings:
+
+_[tool: eval_js]_
+
+_[tool: sleep]_
+
+_[tool: eval_js]_
+
+_[tool: sleep]_
+
+_[tool: save_screenshot]_
+
+The screenshot shows the settings list (the sheet may not have rendered in capture). Let me verify the sheet is actually in the DOM:
+
+_[tool: eval_js]_
+
+The export sheet is there. Let me test reveal + copy, then capture it properly:
+
+_[tool: eval_js]_
+
+_[tool: eval_js]_
+
+_[tool: multi_screenshot]_
+
+Synchronous reads fired before React re-rendered. Let me verify reveal + copy with proper timing:
+
+_[tool: eval_js]_
+
+_[tool: sleep]_
+
+_[tool: eval_js]_
+
+I've toggled it an even number of times. Let me click once and confirm reveal shows the full key:
+
+_[tool: eval_js]_
+
+_[tool: sleep]_
+
+_[tool: eval_js]_
+
+Reveal works — masked → full nsec. Everything functions on mobile. Now reset to a clean state and let the verifier do the full sweep (including desktop):
+
+_[tool: eval_js]_
+
+_[tool: ready_for_verification]_
+

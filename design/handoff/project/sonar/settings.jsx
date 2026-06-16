@@ -98,6 +98,50 @@ function KeyShareCard({ compact }) {
   );
 }
 
+/* ── Export private key (nsec) — self-custody escape hatch, reused everywhere ── */
+function ExportKeySheet({ onClose }) {
+  const [revealed, setRevealed] = React.useState(false);
+  const [copied, setCopied] = React.useState(false);
+  const nsec = BC_DATA.nsec;
+  const masked = nsec.slice(0, 5) + ' ' + '\u2022'.repeat(28);
+  const copy = () => {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(nsec);
+      else {
+        const ta = document.createElement('textarea');
+        ta.value = nsec; ta.style.position = 'fixed'; ta.style.opacity = '0';
+        document.body.appendChild(ta); ta.select();
+        try { document.execCommand('copy'); } catch (e) { /* ignore */ }
+        document.body.removeChild(ta);
+      }
+    } catch (e) { /* ignore */ }
+    setCopied(true);
+    clearTimeout(window.__bcNsecT);
+    window.__bcNsecT = setTimeout(() => setCopied(false), 1700);
+  };
+  return (
+    <Sheet onClose={onClose} title="Export private key">
+      <div className="nsec-warn">
+        <BCIcon name="shield" size={18} weight={2} />
+        <span>This <b>nsec</b> key <b>is</b> your account. Anyone who has it can read your messages and spend your balance. Paste it into another Nostr app to move in — never share it with a person.</span>
+      </div>
+      <button className={'nsec-field' + (revealed ? ' on' : '')} onClick={() => setRevealed(!revealed)}>
+        <span className="nsec-value">{revealed ? nsec : masked}</span>
+        <span className="nsec-eye"><BCIcon name={revealed ? 'eyeOff' : 'eye'} size={17} weight={2} /></span>
+      </button>
+      <div className="keyshare-btns" style={{ padding: '0 8px' }}>
+        <button className={'keyshare-btn primary' + (copied ? ' done' : '')} onClick={copy}>
+          <BCIcon name={copied ? 'check' : 'copy'} size={17} weight={2.2} />
+          {copied ? 'Copied' : 'Copy private key'}
+        </button>
+      </div>
+      <p className="bc-note" style={{ textAlign: 'center', padding: '12px 18px 4px' }}>
+        Tip: store it in a password manager. Sonar can\u2019t recover it for you.
+      </p>
+    </Sheet>
+  );
+}
+
 /* ── Profile screen ── */
 function ProfileScreen({ app, nav, pop, onRename }) {
   const [editing, setEditing] = React.useState(false);
@@ -221,6 +265,7 @@ function SettingsScreen({ app, nav, pop, push, mode, onToggleMode, toggleNetwork
   const [appicon, setAppicon] = React.useState(false);
   const [wipeAsk, setWipeAsk] = React.useState(false);
   const [curSheet, setCurSheet] = React.useState(false);
+  const [exportKey, setExportKey] = React.useState(false);
   const prefs = app.prefs || {};
   const verifiedCount = Object.keys(app.verified).length;
   const shortKey = BC_DATA.pubkey.slice(0, 14) + '\u2026' + BC_DATA.pubkey.slice(-6);
@@ -270,6 +315,7 @@ function SettingsScreen({ app, nav, pop, push, mode, onToggleMode, toggleNetwork
           <StRow icon="check" label="Read receipts" onClick={() => onPref('readReceipts', !prefs.readReceipts)} toggle={!!prefs.readReceipts} />
           <StRow icon="inbox" label="Message requests" value={prefs.requests > 0 ? String(prefs.requests) : ''} onClick={() => setRequests(true)} />
           <StRow icon="shieldCheck" tone="cyan" label="Verified people" value={String(verifiedCount)} onClick={() => push('nearby')} />
+          <StRow icon="importKey" label="Export private key" sub="Move your account to another wallet" onClick={() => setExportKey(true)} />
           <StRow icon="trash" tone="red" danger label="Emergency wipe" sub="Deletes your key, chats and nickname" onClick={() => setWipeAsk(true)} />
         </div>
         <p className="st-note">Tip: triple-tap the sonar title on the home screen to wipe instantly.</p>
@@ -300,8 +346,9 @@ function SettingsScreen({ app, nav, pop, push, mode, onToggleMode, toggleNetwork
         </Sheet>
       )}
       {wipeAsk && <WipeSheet onClose={() => setWipeAsk(false)} onWipe={onWipe} />}
+      {exportKey && <ExportKeySheet onClose={() => setExportKey(false)} />}
     </div>
   );
 }
 
-Object.assign(window, { SettingsScreen, ProfileScreen, ShareCode, KeyShareCard, StRow, StSwitch });
+Object.assign(window, { SettingsScreen, ProfileScreen, ShareCode, KeyShareCard, ExportKeySheet, StRow, StSwitch });

@@ -53,6 +53,7 @@ window.BC_DATA = {
   ],
   safety: ['37294', '18056', '99214', '70338', '52181', '04967', '33852', '61490', '27745', '88130', '46021', '75913'],
   pubkey: 'npub1w4j8mc7q0e2v9zk5xr3thl6f8s2a7d4ynq9c3uxe650pgh8vrtsq4k9dj',
+  nsec: 'nsec18gk4m2c7q0e2v9zk5xr3thl6f8s2a7d4ynq9c3uxe650pgh8vrtsq9w7xda',
   myFingerprint: 'a3f9 2c41 770e 5b2d',
   nicknames: ['quietfox', 'tram12', 'lakeswim', 'verdigris', 'morningstatic', 'papercrane', 'northpine', 'softsignal'],
 };

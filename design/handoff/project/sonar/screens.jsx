@@ -2,25 +2,47 @@
 // Depends on: components.jsx exports + BC_DATA.
 
 /* ── Onboarding (3 steps) ── */
-function Onboarding({ initialNick, onDone }) {
+function Onboarding({ initialNick, onDone, onRestore }) {
   const [step, setStep] = React.useState(0);
   const [nick, setNick] = React.useState(initialNick || '');
+  const [restoring, setRestoring] = React.useState(false);
+  const [nsec, setNsec] = React.useState('');
   const can = nick.trim().length >= 2;
+  const nsecOk = /^nsec1[0-9a-z]{20,}$/.test(nsec.trim());
   const surprise = () => {
     const list = BC_DATA.nicknames;
     setNick(list[Math.floor(Math.random() * list.length)]);
   };
   return (
-    <div className="bc-onboard" data-screen-label={'Onboarding step ' + (step + 1)}>
+    <div className="bc-onboard" data-screen-label={restoring ? 'Onboarding restore' : 'Onboarding step ' + (step + 1)}>
       <div className="bc-obtop">
-        {step > 0 && (
-          <button className="bc-iconbtn" onClick={() => setStep(step - 1)} aria-label="Back">
+        {(step > 0 || restoring) && (
+          <button className="bc-iconbtn" onClick={() => { if (restoring) setRestoring(false); else setStep(step - 1); }} aria-label="Back">
             <BCIcon name="back" size={21} weight={2.1} />
           </button>
         )}
       </div>
 
-      {step === 0 && (
+      {restoring && (
+        <div className="bc-obbody" key="restore">
+          <div className="bc-obmark"><BCIcon name="importKey" size={34} weight={1.7} /></div>
+          <h1 className="bc-obtitle">Restore your account</h1>
+          <p className="bc-obsub">Paste the <b>nsec</b> private key from your old device or another Nostr app. Your nickname, contacts and balance come back with it.</p>
+          <textarea
+            className="bc-nsecinput" value={nsec} rows={3}
+            placeholder="nsec1…"
+            spellCheck={false} autoCapitalize="none" autoCorrect="off"
+            onChange={(e) => setNsec(e.target.value)}
+          ></textarea>
+          <button className="bc-suggest" onClick={() => setNsec(BC_DATA.nsec)}>
+            <BCIcon name="copy" size={15} weight={2} />
+            Paste from clipboard
+          </button>
+          <p className="bc-note">Sonar never sends this key anywhere — it’s decoded on this phone to unlock your identity.</p>
+        </div>
+      )}
+
+      {!restoring && step === 0 && (
         <div className="bc-obbody" key="s0">
           <div className="bc-obmark brand"><img src="sonar/brand/sonar-icon.png" alt="Sonar" /></div>
           <h1 className="bc-obtitle">Sense who’s nearby before you see them.</h1>
@@ -49,7 +71,7 @@ function Onboarding({ initialNick, onDone }) {
         </div>
       )}
 
-      {step === 1 && (
+      {!restoring && step === 1 && (
         <div className="bc-obbody" key="s1">
           <h1 className="bc-obtitle">Pick a nickname</h1>
           <p className="bc-obsub">It’s just what people see — change it anytime.</p>
@@ -72,7 +94,7 @@ function Onboarding({ initialNick, onDone }) {
         </div>
       )}
 
-      {step === 2 && (
+      {!restoring && step === 2 && (
         <div className="bc-obbody" key="s2">
           <Avatar name={nick.trim()} size={92} style={{ marginBottom: 22 }} />
           <h1 className="bc-obtitle">You’re in, {nick.trim()}.</h1>
@@ -86,14 +108,24 @@ function Onboarding({ initialNick, onDone }) {
       )}
 
       <div className="bc-obfooter">
-        <div className="bc-dots">
-          <span className={step === 0 ? 'on' : ''}></span>
-          <span className={step === 1 ? 'on' : ''}></span>
-          <span className={step === 2 ? 'on' : ''}></span>
-        </div>
-        {step === 0 && <button className="bc-primary" onClick={() => setStep(1)}>Get started</button>}
-        {step === 1 && <button className="bc-primary" disabled={!can} onClick={() => setStep(2)}>Continue</button>}
-        {step === 2 && <button className="bc-primary" onClick={() => onDone(nick.trim())}>Start chatting</button>}
+        {!restoring && (
+          <div className="bc-dots">
+            <span className={step === 0 ? 'on' : ''}></span>
+            <span className={step === 1 ? 'on' : ''}></span>
+            <span className={step === 2 ? 'on' : ''}></span>
+          </div>
+        )}
+        {restoring && (
+          <button className="bc-primary" disabled={!nsecOk} onClick={() => onRestore(nsec.trim())}>Restore account</button>
+        )}
+        {!restoring && step === 0 && (
+          <React.Fragment>
+            <button className="bc-primary" onClick={() => setStep(1)}>Get started</button>
+            <button className="bc-ghost" onClick={() => { setNsec(''); setRestoring(true); }}>I already have a key</button>
+          </React.Fragment>
+        )}
+        {!restoring && step === 1 && <button className="bc-primary" disabled={!can} onClick={() => setStep(2)}>Continue</button>}
+        {!restoring && step === 2 && <button className="bc-primary" onClick={() => onDone(nick.trim())}>Start chatting</button>}
       </div>
     </div>
   );

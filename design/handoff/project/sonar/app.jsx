@@ -233,7 +233,11 @@ function SonarApp() {
             >
               {app.onboarded
                 ? screen
-                : <Onboarding initialNick={app.nick} onDone={(n) => setApp((a) => ({ ...a, onboarded: true, nick: n, stack: [{ s: 'home' }], nav: '' }))} />}
+                : <Onboarding
+                    initialNick={app.nick}
+                    onDone={(n) => setApp((a) => ({ ...a, onboarded: true, nick: n, stack: [{ s: 'home' }], nav: '' }))}
+                    onRestore={() => setApp((a) => ({ ...a, onboarded: true, nick: 'quietfox', restored: true, stack: [{ s: 'home' }], nav: '' }))}
+                  />}
             </div>
           </IOSDevice>
         </div>

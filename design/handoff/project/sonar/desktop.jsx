@@ -402,6 +402,7 @@ function DkSettingsModal({ app, mode, onToggleMode, toggleNetwork, onPref, onRen
   const [draft, setDraft] = React.useState(app.nick || '');
   const [wipeAsk, setWipeAsk] = React.useState(false);
   const [curOpen, setCurOpen] = React.useState(false);
+  const [exportKey, setExportKey] = React.useState(false);
   const prefs = app.prefs || {};
   const shortKey = BC_DATA.pubkey.slice(0, 14) + '\u2026' + BC_DATA.pubkey.slice(-6);
   const save = () => {
@@ -484,6 +485,7 @@ function DkSettingsModal({ app, mode, onToggleMode, toggleNetwork, onPref, onRen
         <div className="st-card">
           <StRow icon="faceid" label="App lock" sub="Require Touch ID to open Sonar" onClick={() => onPref('appLock', !prefs.appLock)} toggle={!!prefs.appLock} />
           <StRow icon="check" label="Read receipts" onClick={() => onPref('readReceipts', !prefs.readReceipts)} toggle={!!prefs.readReceipts} />
+          <StRow icon="importKey" label="Export private key" sub="Move your account to another wallet" onClick={() => setExportKey(true)} />
           <StRow icon="trash" tone="red" danger label="Emergency wipe" sub="Deletes your key, chats and nickname" onClick={() => setWipeAsk(!wipeAsk)} />
         </div>
         {wipeAsk && (
@@ -498,6 +500,7 @@ function DkSettingsModal({ app, mode, onToggleMode, toggleNetwork, onPref, onRen
           <StRow icon="info" label="About Sonar" sub="Open protocols — Bluetooth mesh + Nostr" onClick={() => {}} />
         </div>
       </div>
+      {exportKey && <ExportKeySheet onClose={() => setExportKey(false)} />}
     </div>
   );
 }

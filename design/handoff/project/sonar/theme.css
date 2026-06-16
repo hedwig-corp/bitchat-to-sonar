@@ -1021,6 +1021,40 @@
 .keyshare-btn:active { transform: scale(0.97); }
 .keyshare-btn.primary { background: var(--accent-fill); color: var(--on-accent); }
 .keyshare-btn.primary.done { background: var(--green); color: #fff; }
+
+/* ── nsec import / export ── */
+.bc-nsecinput {
+  width: 100%; padding: 14px 16px; resize: none;
+  border: none; outline: none; border-radius: 16px;
+  background: var(--surface2); color: var(--text);
+  font-family: var(--mono); font-size: 15px; line-height: 1.5;
+  word-break: break-all;
+  box-shadow: inset 0 0 0 1.5px transparent; transition: box-shadow 0.15s;
+}
+.bc-nsecinput:focus { box-shadow: inset 0 0 0 1.5px var(--accent); }
+.bc-nsecinput::placeholder { color: var(--text3); }
+.nsec-warn {
+  display: flex; gap: 11px; align-items: flex-start;
+  margin: 2px 8px 12px; padding: 13px 15px;
+  border-radius: 14px;
+  background: rgba(212, 58, 62, 0.10); color: var(--text);
+  font-size: 13px; line-height: 1.5;
+}
+.nsec-warn svg { color: var(--danger); flex: none; margin-top: 1px; }
+.nsec-warn b { font-weight: 750; }
+.nsec-field {
+  display: flex; align-items: center; gap: 10px;
+  width: calc(100% - 16px); margin: 0 8px 12px; padding: 14px 15px;
+  border: none; border-radius: 14px; cursor: pointer;
+  background: var(--surface2); font-family: inherit; text-align: left;
+}
+.nsec-field:active { background: var(--press); }
+.nsec-value {
+  flex: 1; min-width: 0; font-family: var(--mono); font-size: 13px;
+  color: var(--text2); word-break: break-all; line-height: 1.5;
+}
+.nsec-field.on .nsec-value { color: var(--text); }
+.nsec-eye { color: var(--text3); flex: none; display: flex; }
 .pf-request { display: flex; align-items: center; gap: 12px; padding: 10px 12px 4px; }
 .pf-reqmain { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
 .pf-reqname { font-size: 16px; font-weight: 700; }
