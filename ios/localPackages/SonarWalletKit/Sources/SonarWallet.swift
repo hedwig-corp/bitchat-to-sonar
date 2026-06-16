@@ -1,6 +1,6 @@
 //
 // SonarWallet.swift
-// SonarWalletKit
+// WalletKit
 //
 // This is free and unencumbered software released into the public domain.
 // For more information, see <https://unlicense.org>
@@ -9,19 +9,16 @@
 #if os(iOS)
 
 import Foundation
-import SonarWalletKit
+import BreezSDKLiquid
 
-/// Swift façade over the KMP `IosWalletBridge`: async/await instead of
-/// callbacks, plain Swift value types instead of KMP classes, and a
-/// one-call `configure(apiKey:mainnet:)` that wires Keychain storage and
-/// the Breez working directory.
-///
-/// No singleton — construct one and inject it (the underlying
-/// `SonarWalletComponent` Kotlin object is process-global, so use one
-/// instance per process in practice).
+/// Swift façade over the OFFICIAL Breez SDK Liquid Swift bindings — the same SDK
+/// the Android/desktop app uses via the Breez KMP package, consumed directly
+/// instead of through the retired SonarWalletKit KMP framework. async/await over
+/// Breez's blocking calls, plain Swift value types, a one-call
+/// `configure(apiKey:mainnet:)`, and a deterministic per-identity seed.
 public final class SonarWallet {
 
-    // MARK: - Public model types (callers must not import SonarWalletKit)
+    // MARK: - Public model types (callers must not import BreezSDKLiquid)
 
     public struct Payment: Sendable, Equatable {
         public let id: String
@@ -34,313 +31,289 @@ public final class SonarWallet {
 
     public struct Destination: Sendable, Equatable {
         public let raw: String
-        /// "bolt11", "bolt12_offer", "lightning_address", "lnurl_pay", ...
+        /// "bolt11", "bolt12_offer", "lightning_address", "lnurl_pay", "unknown".
         public let kind: String
-        /// Embedded amount, when the destination carries one.
         public let amountSats: Int64?
         public let note: String
     }
 
     public enum WalletError: Error, Equatable {
-        /// `configure(apiKey:mainnet:)` has not been called.
         case notConfigured
-        /// Failure inside the wallet engine (Breez SDK, key manager...).
         case core(String)
     }
 
-    /// A fiat currency the wallet can display amounts in (USD, EUR, GBP, CHF).
     public struct SupportedCurrency: Sendable, Equatable {
         public let code: String
         public let symbol: String
         public let decimals: Int
     }
 
-    /// A live BTC→fiat exchange rate for one currency.
     public struct ExchangeRate: Sendable, Equatable {
         public let currencyCode: String
-        /// Fiat units per 1 BTC.
         public let rate: Double
     }
 
     // MARK: - State
 
-    private let bridge = IosWalletBridge()
+    private let storage = KeychainWalletStorage()
+    private let queue = DispatchQueue(label: "chat.bitchat.sonar.wallet.sdk")
+    private var sdk: BindingLiquidSdk?
+    private var apiKey: String = ""
+    private var mainnet = true
+    private var workingDir = ""
+    private var ratesCache: [ExchangeRate] = []
+
+    private static let seedKey = "seed.v1"
+    private static let modeKey = "display.mode"
+    private static let currencyKey = "display.currency"
+
     public private(set) var isConfigured = false
 
     public init() {}
 
-    deinit {
-        bridge.destroy()
-    }
+    deinit { try? sdk?.disconnect() }
 
     // MARK: - Configuration
 
-    /// Wire the wallet engine: Keychain-backed storage + working directory
-    /// at `Application Support/sonar-wallet`. Must be called once before
-    /// any other method.
+    /// Store the API key + working directory (`Application Support/sonar-wallet`).
+    /// Must be called once before any other method.
     public func configure(apiKey: String, mainnet: Bool) throws {
-        let appSupport = FileManager.default.urls(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask
-        )[0]
-        let workingDir = appSupport.appendingPathComponent("sonar-wallet", isDirectory: true)
-        try FileManager.default.createDirectory(at: workingDir, withIntermediateDirectories: true)
-
-        SonarWalletComponent.shared.configure(
-            breezApiKey: apiKey,
-            workingDir: workingDir.path,
-            mainnet: mainnet,
-            storage: KeychainWalletStorage()
-        )
-        isConfigured = true
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let dir = appSupport.appendingPathComponent("sonar-wallet", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        self.apiKey = apiKey
+        self.mainnet = mainnet
+        self.workingDir = dir.path
+        self.isConfigured = true
     }
 
-    // MARK: - Wallet lifecycle
+    // MARK: - Wallet lifecycle (seed-based; deterministic per identity)
 
     public func hasWallet() async throws -> Bool {
         try ensureConfigured()
-        return await withCheckedContinuation { continuation in
-            bridge.hasWallet { result in
-                continuation.resume(returning: result.boolValue)
-            }
-        }
+        return storage.getData(Self.seedKey) != nil
     }
 
-    /// Generate and persist a fresh BIP39 mnemonic. Returns the mnemonic so
-    /// the app can offer a manual backup flow. Throws if a wallet exists.
-    @discardableResult
-    public func createWallet() async throws -> String {
-        try ensureConfigured()
-        return try await withCheckedThrowingContinuation { continuation in
-            bridge.createWallet(
-                onSuccess: { continuation.resume(returning: $0) },
-                onError: { continuation.resume(throwing: WalletError.core($0)) }
-            )
-        }
-    }
-
-    /// Create the wallet DETERMINISTICALLY from caller-supplied 32-byte
-    /// entropy (`entropyHex` = 64 hex chars) → a 24-word BIP39 mnemonic.
-    /// Lets the host derive one-wallet-per-identity (e.g. from a Nostr key).
-    /// Does NOT start the node — call `startNode()` afterward. Throws if a
-    /// wallet already exists or the entropy is malformed.
+    /// Persist the deterministic seed from caller-supplied entropy (32-byte hex).
+    /// Returns the hex (callers discard it; there is no BIP39 mnemonic here — we
+    /// connect Breez with the raw seed, like the Android app).
     @discardableResult
     public func createWalletFromEntropy(entropyHex: String) async throws -> String {
         try ensureConfigured()
-        return try await withCheckedThrowingContinuation { continuation in
-            bridge.createWalletFromEntropy(
-                entropyHex: entropyHex,
-                onSuccess: { continuation.resume(returning: $0) },
-                onError: { continuation.resume(throwing: WalletError.core($0)) }
-            )
+        guard let seed = Self.bytes(fromHex: entropyHex), seed.count >= 16 else {
+            throw WalletError.core("bad entropy")
         }
+        storage.putData(Self.seedKey, Data(seed))
+        return entropyHex
     }
 
-    /// The stored mnemonic, or nil when no wallet exists.
+    /// Generate + persist a random 32-byte seed (standalone path).
+    @discardableResult
+    public func createWallet() async throws -> String {
+        try ensureConfigured()
+        var seed = [UInt8](repeating: 0, count: 32)
+        _ = SecRandomCopyBytes(kSecRandomDefault, seed.count, &seed)
+        storage.putData(Self.seedKey, Data(seed))
+        return Self.hex(seed)
+    }
+
     public func loadWallet() async throws -> String? {
         try ensureConfigured()
-        return try await withCheckedThrowingContinuation { continuation in
-            bridge.loadWallet(
-                onResult: { continuation.resume(returning: $0) },
-                onError: { continuation.resume(throwing: WalletError.core($0)) }
-            )
-        }
+        return storage.getData(Self.seedKey).map { Self.hex([UInt8]($0)) }
     }
 
     // MARK: - Node lifecycle
 
     public func startNode() async throws {
         try ensureConfigured()
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            bridge.startNode(
-                onSuccess: { continuation.resume() },
-                onError: { continuation.resume(throwing: WalletError.core($0)) }
-            )
+        guard let seedData = storage.getData(Self.seedKey) else {
+            throw WalletError.core("no wallet seed")
         }
+        let seed = [UInt8](seedData)
+        let key = apiKey, dir = workingDir
+        let net: LiquidNetwork = mainnet ? .mainnet : .testnet
+        let node: BindingLiquidSdk = try await run {
+            var config = try defaultConfig(network: net, breezApiKey: key)
+            config.workingDir = dir
+            return try connect(req: ConnectRequest(config: config, mnemonic: nil, passphrase: nil, seed: seed))
+        }
+        self.sdk = node
     }
 
     public func stopNode() async throws {
-        try ensureConfigured()
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            bridge.stopNode(
-                onSuccess: { continuation.resume() },
-                onError: { continuation.resume(throwing: WalletError.core($0)) }
-            )
-        }
+        let node = sdk
+        sdk = nil
+        try await run { try node?.disconnect() }
     }
 
     // MARK: - Observation
 
-    /// Live wallet balance in sats. The stream ends when the task consuming
-    /// it is cancelled.
+    /// Live balance in sats. Polls `getInfo` every ~5s (Breez has no Combine
+    /// publisher); ends when the consuming task is cancelled.
     public func balanceStream() -> AsyncStream<Int64> {
-        let bridge = self.bridge
-        return AsyncStream { continuation in
-            let handle = bridge.observeBalance { amount in
-                continuation.yield(amount.sats)
+        AsyncStream { continuation in
+            let task = Task { [weak self] in
+                while !Task.isCancelled {
+                    if let bal = try? await self?.balanceSats() { continuation.yield(bal) }
+                    try? await Task.sleep(nanoseconds: 5_000_000_000)
+                }
+                continuation.finish()
             }
-            continuation.onTermination = { _ in
-                handle.cancel()
-            }
+            continuation.onTermination = { _ in task.cancel() }
         }
     }
 
-    /// Incoming payments as they settle.
+    /// Incoming payments. Breez surfaces these via an event listener; v1 keeps the
+    /// balance fresh (above) and leaves this stream idle.
     public func incomingPaymentsStream() -> AsyncStream<Payment> {
-        let bridge = self.bridge
-        return AsyncStream { continuation in
-            let handle = bridge.observeIncomingPayments { payment in
-                continuation.yield(Self.map(payment))
-            }
-            continuation.onTermination = { _ in
-                handle.cancel()
-            }
-        }
+        AsyncStream { _ in }
+    }
+
+    private func balanceSats() async throws -> Int64 {
+        guard let node = sdk else { throw WalletError.notConfigured }
+        return try await run { Int64(try node.getInfo().walletInfo.balanceSat) }
     }
 
     // MARK: - Payments
 
-    /// Send to any Lightning destination: BOLT11 invoice, BOLT12 offer,
-    /// LNURL-pay, or a BIP-353 address (`user@domain`) — the Breez SDK
-    /// resolves BIP-353 internally. Pass `amountSats` > 0 for amountless
-    /// destinations; 0 when the destination embeds the amount.
     @discardableResult
-    public func send(
-        destination: String,
-        amountSats: Int64 = 0,
-        note: String = ""
-    ) async throws -> Payment {
-        try ensureConfigured()
-        return try await withCheckedThrowingContinuation { continuation in
-            bridge.send(
-                destination: destination,
-                amountSats: amountSats,
-                payerNote: note,
-                onSuccess: { continuation.resume(returning: Self.map($0)) },
-                onError: { continuation.resume(throwing: WalletError.core($0)) }
-            )
+    public func send(destination: String, amountSats: Int64 = 0, note: String = "") async throws -> Payment {
+        guard let node = sdk else { throw WalletError.notConfigured }
+        return try await run {
+            let amount: PayAmount? = amountSats > 0 ? .bitcoin(receiverAmountSat: UInt64(amountSats)) : nil
+            let prepared = try node.prepareSendPayment(req: PrepareSendRequest(destination: destination, amount: amount))
+            let resp = try node.sendPayment(req: SendPaymentRequest(prepareResponse: prepared, useAssetFees: nil, payerNote: note.isEmpty ? nil : note))
+            return Self.map(resp.payment)
         }
     }
 
-    /// Parse/classify a destination string (also resolves BIP-353).
+    /// Lightweight classification (no node round-trip) so the composer can label a
+    /// pasted destination. Breez resolves the real type at send time.
     public func parseDestination(_ input: String) async throws -> Destination {
-        try ensureConfigured()
-        return try await withCheckedThrowingContinuation { continuation in
-            bridge.parseDestination(
-                input: input,
-                onSuccess: { destination in
-                    continuation.resume(returning: Destination(
-                        raw: destination.raw,
-                        kind: destination.type.name.lowercased(),
-                        amountSats: destination.amount.map(\.sats),
-                        note: destination.description_
-                    ))
-                },
-                onError: { continuation.resume(throwing: WalletError.core($0)) }
-            )
-        }
+        let s = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = s.lowercased()
+        let kind: String
+        if lower.hasPrefix("lno") { kind = "bolt12_offer" }
+        else if lower.hasPrefix("lnbc") || lower.hasPrefix("lntb") { kind = "bolt11" }
+        else if lower.hasPrefix("lnurl") { kind = "lnurl_pay" }
+        else if s.contains("@") { kind = "lightning_address" }
+        else { kind = "unknown" }
+        return Destination(raw: s, kind: kind, amountSats: nil, note: "")
     }
 
-    /// Create a reusable BOLT12 offer for receiving payments.
+    /// Reusable amountless BOLT12 offer for receiving.
     public func createOffer() async throws -> String {
-        try ensureConfigured()
-        return try await withCheckedThrowingContinuation { continuation in
-            bridge.createOffer(
-                onSuccess: { continuation.resume(returning: $0) },
-                onError: { continuation.resume(throwing: WalletError.core($0)) }
-            )
+        guard let node = sdk else { throw WalletError.notConfigured }
+        return try await run {
+            let prepared = try node.prepareReceivePayment(req: PrepareReceiveRequest(paymentMethod: .bolt12Offer, amount: nil))
+            let resp = try node.receivePayment(req: ReceivePaymentRequest(prepareResponse: prepared, description: "Sonar", useDescriptionHash: nil, payerNote: nil))
+            return resp.destination
         }
     }
 
-    // MARK: - Money display (fiat/bitcoin, exchange rates)
-    //
-    // The SDK owns conversion + locale-aware formatting (Approach B); Swift
-    // never formats fiat. The display mode ("bitcoin"|"fiat") and currency
-    // (ISO code) are persisted by the SDK via the injected KeyValueStore.
+    // MARK: - Money display (plain Swift; sats or fiat via the cached rate)
 
-    /// Fiat currencies the wallet can display in (USD, EUR, GBP, CHF).
-    /// Synchronous — a fixed list, no node required.
     public func supportedCurrencies() -> [SupportedCurrency] {
-        bridge.supportedCurrencies().map {
-            SupportedCurrency(code: $0.code, symbol: $0.symbol, decimals: Int($0.decimals))
-        }
+        [
+            SupportedCurrency(code: "USD", symbol: "$", decimals: 2),
+            SupportedCurrency(code: "EUR", symbol: "€", decimals: 2),
+            SupportedCurrency(code: "GBP", symbol: "£", decimals: 2),
+            SupportedCurrency(code: "CHF", symbol: "₣", decimals: 2),
+        ]
     }
 
-    /// Fetch live BTC→fiat rates from the node. Returns [] on any error so
-    /// callers can treat "no rate" uniformly (and keep showing sats).
     public func fetchExchangeRates() async -> [ExchangeRate] {
-        await withCheckedContinuation { continuation in
-            bridge.fetchExchangeRates(
-                onSuccess: { rates in
-                    continuation.resume(returning: rates.map(Self.map))
-                },
-                onError: { _ in continuation.resume(returning: []) }
-            )
-        }
+        guard let node = sdk else { return ratesCache }
+        let rates: [ExchangeRate] = (try? await run {
+            try node.fetchFiatRates().map { ExchangeRate(currencyCode: $0.coin.uppercased(), rate: $0.value) }
+        }) ?? ratesCache
+        ratesCache = rates.isEmpty ? ratesCache : rates
+        return ratesCache
     }
 
-    /// Last successfully fetched rates (may be empty before the first fetch).
-    public func cachedExchangeRates() -> [ExchangeRate] {
-        bridge.cachedExchangeRates().map(Self.map)
-    }
+    public func cachedExchangeRates() -> [ExchangeRate] { ratesCache }
 
-    /// Persisted display mode: "bitcoin" or "fiat".
-    public func displayMode() -> String { bridge.displayMode() }
+    public func displayMode() -> String { storage.getString(Self.modeKey) ?? "bitcoin" }
 
-    /// Persist a new display mode ("bitcoin"|"fiat"). Returns the value the
-    /// SDK actually stored (echoes the input on success).
     @discardableResult
     public func setDisplayMode(_ mode: String) async -> String {
-        await withCheckedContinuation { continuation in
-            bridge.setDisplayMode(mode: mode) { continuation.resume(returning: $0) }
-        }
+        storage.putString(Self.modeKey, mode); return mode
     }
 
-    /// Persisted display currency (ISO code, e.g. "EUR").
-    public func displayCurrency() -> String { bridge.displayCurrency() }
+    public func displayCurrency() -> String { storage.getString(Self.currencyKey) ?? "USD" }
 
-    /// Persist a new display currency (ISO code). Returns the stored value.
     @discardableResult
     public func setDisplayCurrency(_ code: String) async -> String {
-        await withCheckedContinuation { continuation in
-            bridge.setDisplayCurrency(code: code) { continuation.resume(returning: $0) }
-        }
+        storage.putString(Self.currencyKey, code); return code
     }
 
-    /// SDK-formatted amount using the persisted mode + cached/fallback rate.
-    /// NOTE: the SDK silently falls back to a bundled reference rate when no
-    /// live rate is cached — callers that require honest offline behavior
-    /// must gate the fiat path on their own `hasLiveRate` flag and only call
-    /// this for the fiat case (see `SonarWalletProviding.format`).
+    /// SDK-free formatting: fiat when the mode is "fiat" AND a live rate exists,
+    /// else sats. Callers gate the fiat path on their own `hasLiveRate`.
     public func formatAmount(sats: Int64) -> String {
-        bridge.formatAmount(sats: sats)
+        if displayMode() == "fiat", let rate = rate(for: displayCurrency()) {
+            let fiat = Double(sats) / 100_000_000.0 * rate
+            let cur = supportedCurrencies().first { $0.code == displayCurrency() }
+            return "\(cur?.symbol ?? "")\(String(format: "%.2f", fiat))"
+        }
+        return "\(sats) sats"
     }
 
-    /// Convert typed fiat (or sats) text to sats using the live/persisted
-    /// rate. Returns 0 when the input cannot be parsed.
+    /// Convert typed fiat (or sats) text to sats using the cached rate. 0 if unparseable.
     public func parseFiatInput(_ text: String, currencyCode: String) -> Int64 {
-        bridge.parseFiatInput(text: text, currencyCode: currencyCode)
+        let cleaned = text.filter { $0.isNumber || $0 == "." }
+        guard let value = Double(cleaned) else { return 0 }
+        if displayMode() == "fiat", let rate = rate(for: currencyCode), rate > 0 {
+            return Int64((value / rate) * 100_000_000.0)
+        }
+        return Int64(value)
     }
 
     // MARK: - Helpers
+
+    private func rate(for currency: String) -> Double? {
+        ratesCache.first { $0.currencyCode == currency.uppercased() }?.rate
+    }
 
     private func ensureConfigured() throws {
         guard isConfigured else { throw WalletError.notConfigured }
     }
 
-    private static func map(_ rate: SonarWalletKit.ExchangeRate) -> ExchangeRate {
-        ExchangeRate(currencyCode: rate.currency.code, rate: rate.rate)
+    /// Run a blocking Breez call off the main thread, surfacing errors as WalletError.core.
+    private func run<T>(_ body: @escaping () throws -> T) async throws -> T {
+        try await withCheckedThrowingContinuation { cont in
+            queue.async {
+                do { cont.resume(returning: try body()) }
+                catch { cont.resume(throwing: WalletError.core("\(error)")) }
+            }
+        }
     }
 
-    private static func map(_ payment: LightningPayment) -> Payment {
+    private static func map(_ p: BreezSDKLiquid.Payment) -> Payment {
         Payment(
-            id: payment.id,
-            amountSats: payment.amount.sats,
-            isIncoming: payment.direction == .incoming,
-            timestamp: Date(timeIntervalSince1970: TimeInterval(payment.timestampEpochSeconds)),
-            note: payment.description_,
-            feesSats: payment.feesSat?.int64Value
+            id: p.txId ?? p.destination ?? UUID().uuidString,
+            amountSats: Int64(p.amountSat),
+            isIncoming: p.paymentType == .receive,
+            timestamp: Date(timeIntervalSince1970: TimeInterval(p.timestamp)),
+            note: nil,
+            feesSats: Int64(p.feesSat)
         )
+    }
+
+    private static func bytes(fromHex hex: String) -> [UInt8]? {
+        let s = hex.hasPrefix("0x") ? String(hex.dropFirst(2)) : hex
+        guard s.count % 2 == 0 else { return nil }
+        var out = [UInt8](); out.reserveCapacity(s.count / 2)
+        var idx = s.startIndex
+        while idx < s.endIndex {
+            let next = s.index(idx, offsetBy: 2)
+            guard let b = UInt8(s[idx..<next], radix: 16) else { return nil }
+            out.append(b); idx = next
+        }
+        return out
+    }
+
+    private static func hex(_ bytes: [UInt8]) -> String {
+        bytes.map { String(format: "%02x", $0) }.joined()
     }
 }
 
