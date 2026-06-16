@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
 members = ["sonar-core", "sonar-ffi"]
+# Vendored, iroh-1.0-ported fork of iroh-roq (the RTP-over-QUIC media layer);
+# a `calls`-feature path dependency of sonar-core, NOT a workspace member, so the
+# default build never touches it. See sonar-core/Cargo.toml for why it's vendored.
+exclude = ["vendor/iroh-roq"]
 
 [workspace.package]
 version = "0.1.0"

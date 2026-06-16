@@ -80,6 +80,16 @@ impl CallTransport {
     }
 }
 
+/// Wrap a call [`Connection`] in an iroh-roq RTP-over-QUIC session. The media
+/// layer opens one send/receive *flow* per track (audio, later video) on it —
+/// `session.new_send_flow(id)` / `new_receive_flow(id)`. This links our vendored
+/// iroh-roq (ported to iroh 1.0, `core/vendor/iroh-roq`) against our iroh 1.0
+/// connections, proving the RTP media transport integrates end-to-end. Both
+/// resolve to the same iroh 1.0, so the `Connection` passes between them.
+pub fn rtc_session(conn: Connection) -> iroh_roq::Session {
+    iroh_roq::Session::new(conn)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
