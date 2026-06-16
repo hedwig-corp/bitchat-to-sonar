@@ -189,18 +189,23 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  and send the ☎CALL OFFER (with our dialable address) over the chat. */
     fun placeCall(chatId: String, peerName: String, video: Boolean) {
         if (activeCall != null) { toast = "Already in a call"; return }
+        val callId = randomMeshId()
+        // Show the ringing screen IMMEDIATELY so the tap is responsive; the iroh
+        // setup (bind/offer) runs below. (ensureCallStarted is idempotent — it
+        // guards on callStarted, so unlike the old iOS path it never re-binds.)
+        activeCall = ActiveCall(callId, chatId, peerName, video, incoming = false, phase = SonarCallState.Ringing)
+        push(Screen.Call(chatId, peerName, video))
         scope.launch {
             ensureCallStarted()
-            if (!callStarted) { toast = "Calling isn’t available right now"; return@launch }
-            val callId = randomMeshId()
+            if (!callStarted) { toast = "Calling isn’t available right now"; activeCall = null; back(); return@launch }
             try {
                 val addr = SonarCore.callLocalAddress()
                 SonarCore.callPlace(callId, video)
-                activeCall = ActiveCall(callId, chatId, peerName, video, incoming = false, phase = SonarCallState.Ringing)
-                push(Screen.Call(chatId, peerName, video))
-                send(chatId, SonarCore.callEncodeOffer(callId, video, addr, SonarClock.nowSecs()))
+                if (activeCall?.callId == callId) // user may have ended already
+                    send(chatId, SonarCore.callEncodeOffer(callId, video, addr, SonarClock.nowSecs()))
             } catch (e: Throwable) {
-                toast = "call failed: ${e.message}"; activeCall = null
+                toast = "call failed: ${e.message}"
+                if (activeCall?.callId == callId) { activeCall = null; back() }
             }
         }
     }
