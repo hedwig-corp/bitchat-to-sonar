@@ -21,3 +21,7 @@ pub mod signaling;
 /// the default build never compiles iroh.
 #[cfg(feature = "calls")]
 pub mod transport;
+
+/// The opus audio codec. Gated behind `calls-audio`.
+#[cfg(feature = "calls-audio")]
+pub mod codec;

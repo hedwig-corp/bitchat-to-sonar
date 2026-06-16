@@ -3685,6 +3685,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "opus"
+version = "0.3.0"
+source = "git+https://github.com/DCNick3/opus-rs.git?branch=unsafe-libopus#a3de7e71b35ab0a80be38c0d2420b18f0bd41411"
+dependencies = [
+ "cfg-if",
+ "unsafe-libopus",
+]
+
+[[package]]
 name = "p256"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5043,6 +5052,7 @@ dependencies = [
  "nostr-blossom",
  "nostr-relay-builder",
  "nostr-sdk",
+ "opus",
  "reqwest 0.12.28",
  "rusqlite",
  "serde",
@@ -5855,6 +5865,12 @@ dependencies = [
  "crypto-common 0.1.7",
  "subtle",
 ]
+
+[[package]]
+name = "unsafe-libopus"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6fb35e7378283bedf293ae94ec89dea4e2cf4c513be303a77ee93a5a3cba23c4"
 
 [[package]]
 name = "untrusted"
