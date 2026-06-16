@@ -1,18 +1,32 @@
 package chat.bitchat.sonar
 
 /**
- * Desktop (JVM) `actual`: BLE mesh is hardware-gated and there is no portable
- * desktop BLE peripheral/central stack (most desktops can't advertise a GATT
- * server), so the mesh radio is reported unavailable and every operation is an
- * inert no-op. The desktop app's cross-platform-testable surface is the internet
- * (White Noise / Nostr) transport in [SonarCore]; mesh requires phones.
+ * Desktop (JVM) `actual`: BLE **discovery** via the native `sonar-ble` bridge
+ * ([BleBridge]) — CoreBluetooth on macOS / BlueZ on Linux. This gives the desktop
+ * radar real nearby bitchat-mesh devices, disproving the "JVM can't do BLE" idea
+ * (the wall was the lack of a pure-JVM BLE library, not the JVM or the hardware).
+ *
+ * Implemented today: the central/scan role — peers() surfaces nearby advertisers
+ * of the bitchat mesh service. NOT yet implemented (still no-ops): peripheral
+ * advertising (so phones discover the desktop), and the encrypted Noise-over-GATT
+ * message transport. Those are the next stages toward full mesh interop, so mesh
+ * DMs / broadcasts return false / empty here for now.
  */
 actual object MeshRadio {
-    actual fun available(): Boolean = false
-    actual fun start() {}
-    actual fun stop() {}
-    actual fun peers(): List<MeshPeer> = emptyList()
+    actual fun available(): Boolean = BleBridge.available
+    actual fun start() { BleBridge.start() }
+    actual fun stop() { BleBridge.stop() }
 
+    actual fun peers(): List<MeshPeer> = BleBridge.peers().map { d ->
+        MeshPeer(
+            id = "mesh:" + d.id,
+            name = d.name?.takeIf { it.isNotBlank() } ?: ("mesh·" + d.id.take(6)),
+            rssi = d.rssi,
+            sonar = false, // a full Sonar peer is only known after the 0x53 announce (GATT, next stage)
+        )
+    }
+
+    // Transport (Noise-over-GATT) not wired yet — discovery only.
     actual fun setLocalSonarAnnounce(payload: ByteArray?) {}
     actual fun setMeshNickname(nick: String) {}
     actual fun sonarPeers(): Map<String, ByteArray> = emptyMap()

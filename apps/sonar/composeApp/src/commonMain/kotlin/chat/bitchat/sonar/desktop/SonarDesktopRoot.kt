@@ -65,6 +65,10 @@ fun DesktopApp() {
     val state = remember { SonarAppState(scope) }
     LaunchedEffect(state) { SonarLifecycle.onForeground = { state.setForeground(it) } }
     LaunchedEffect(Unit) { state.boot() }
+    // Start the BLE radio (desktop: native CoreBluetooth/BlueZ scan via the
+    // sonar-ble bridge). No-op where BLE is unavailable. The poll loop then
+    // refreshes meshPeers, so the radar lights up with nearby mesh devices.
+    LaunchedEffect(Unit) { state.startMesh() }
     SonarTheme(dark = state.dark) {
         val s = sonar
         Surface(Modifier.fillMaxSize(), color = s.bg) {

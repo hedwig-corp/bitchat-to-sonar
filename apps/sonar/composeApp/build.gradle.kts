@@ -70,7 +70,20 @@ compose.desktop {
             packageName = "Sonar"
             packageVersion = "1.0.0"
             description = "Sonar — Bluetooth mesh + Nostr secure messaging (desktop)"
-            macOS { bundleID = "chat.bitchat.sonar.desktop" }
+            macOS {
+                bundleID = "chat.bitchat.sonar.desktop"
+                // Required so macOS shows the Bluetooth permission prompt for the
+                // packaged app — the desktop BLE radio (sonar-ble / CoreBluetooth)
+                // needs it. Without an .app bundle (e.g. `gradle run`) macOS can't
+                // prompt, so BLE only works when the launching app already has the
+                // Bluetooth grant.
+                infoPlist {
+                    extraKeysRawXml = """
+                        <key>NSBluetoothAlwaysUsageDescription</key>
+                        <string>Sonar uses Bluetooth to find people nearby and relay messages over the mesh.</string>
+                    """.trimIndent()
+                }
+            }
         }
     }
 }

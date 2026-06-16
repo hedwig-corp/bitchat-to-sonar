@@ -98,7 +98,21 @@ cargo run -p "$CRATE" --features cli --bin uniffi-bindgen -- generate \
   --library "$BUILT" \
   --language kotlin --out-dir "$KOTLIN_DIR"
 
+# --- Build the BLE radio bridge (sonar-ble: native CoreBluetooth/BlueZ over a C
+#     ABI, loaded by JNA) and drop its dynamic library next to the core's. It's a
+#     SEPARATE cargo workspace (its BLE deps stay out of sonar-ffi / CI). ---------
+BLE_LIB="$(echo "$LIB" | sed 's/sonar_ffi/sonar_ble/')"  # libsonar_ble.<ext>
+echo "Building sonar-ble (BLE radio bridge)..."
+( cd "$SCRIPT_DIR/sonar-ble" && cargo build --release --lib )
+BLE_BUILT="$SCRIPT_DIR/sonar-ble/target/release/$BLE_LIB"
+if [[ -f "$BLE_BUILT" ]]; then
+  cp "$BLE_BUILT" "$RES_DIR/$JNA_PREFIX/$BLE_LIB"
+  [[ -n "$JNA_PREFIX_ALT" ]] && cp "$BLE_BUILT" "$RES_DIR/$JNA_PREFIX_ALT/$BLE_LIB"
+else
+  echo "warning: $BLE_BUILT not found — desktop BLE will be unavailable" >&2
+fi
+
 echo ""
 echo "Done. Outputs under $OUT:"
-find "$RES_DIR" -name "$LIB" -exec ls -lh {} \; | awk '{print "  " $NF " (" $5 ")"}'
+find "$RES_DIR" \( -name "$LIB" -o -name "$BLE_LIB" \) -exec ls -lh {} \; | awk '{print "  " $NF " (" $5 ")"}'
 find "$KOTLIN_DIR/uniffi" -name "*.kt" | sed 's/^/  /'
