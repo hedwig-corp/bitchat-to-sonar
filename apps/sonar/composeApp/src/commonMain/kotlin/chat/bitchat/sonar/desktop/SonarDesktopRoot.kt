@@ -197,7 +197,7 @@ private fun DesktopSidebar(state: SonarAppState) {
 
             // Messages (mesh DMs — empty on desktop — + White Noise secure chats)
             item { SNSectionLabel("Messages") }
-            if (state.chats.isEmpty() && state.meshDmRows.isEmpty()) {
+            if (state.visibleChats.isEmpty() && state.meshDmRows.isEmpty()) {
                 item { EmptyHint("No secure chats yet — use Search to paste an npub and start one.") }
             }
             items(state.meshDmRows, key = { "mesh:" + it.peerId }) { row ->
@@ -206,7 +206,7 @@ private fun DesktopSidebar(state: SonarAppState) {
                     name = row.name, preview = row.preview, mesh = true, verified = false,
                 ) { state.select { openDm(row.peerId, row.name) } }
             }
-            items(state.chats, key = { it.id }) { chat ->
+            items(state.visibleChats, key = { it.id }) { chat ->
                 val title = state.chatTitle(chat)
                 DmRow(
                     selected = (state.screen as? Screen.Chat)?.id == chat.id,

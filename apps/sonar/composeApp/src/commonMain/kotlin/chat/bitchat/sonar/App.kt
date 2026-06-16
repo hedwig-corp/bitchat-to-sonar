@@ -182,9 +182,10 @@ private fun HomeScreen(state: SonarAppState) {
                 }
                 if (state.locationChannels.isEmpty()) item { LocationHint() }
                 item { SNSectionLabel("Messages") }
-                if (state.chats.isEmpty() && state.meshDmRows.isEmpty()) item { EmptyMessages() }
+                if (state.visibleChats.isEmpty() && state.meshDmRows.isEmpty()) item { EmptyMessages() }
                 // BLE-mesh DMs (incl. ones started by a peer messaging us) — over
-                // Bluetooth, so a cyan dot instead of the internet lock.
+                // Bluetooth, so a cyan dot instead of the internet lock. A Sonar
+                // peer's White Noise leg is folded into this row (one row/person).
                 items(state.meshDmRows, key = { "mesh:" + it.peerId }) { row ->
                     ConvRow(
                         avatar = { SonarAvatar(row.name, 52.dp, presence = true) },
@@ -192,7 +193,7 @@ private fun HomeScreen(state: SonarAppState) {
                         onLongClick = { pendingDelete = DeleteTarget(row.peerId, row.name, isMesh = true) },
                     ) { state.openDm(row.peerId, row.name) }
                 }
-                items(state.chats, key = { it.id }) { chat ->
+                items(state.visibleChats, key = { it.id }) { chat ->
                     val chatTitle = state.chatTitle(chat)
                     ConvRow(
                         avatar = { SonarAvatar(chatTitle, 52.dp, presence = false) },

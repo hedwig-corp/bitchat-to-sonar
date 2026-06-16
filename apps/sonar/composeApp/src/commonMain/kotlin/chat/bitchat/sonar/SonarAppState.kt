@@ -70,6 +70,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             UnifyRadio.stopAdvertising()
             unifyOffer = null; unifyPeers = emptyList()
             MeshRadio.setLocalSonarAnnounce(null); sonarPeerProfiles = emptyMap()
+            linkByFp.clear(); foldedGroupIds = emptySet()
             MessageStore.wipe()
             SonarCore.wipe()
             stack = listOf(Screen.Home)
@@ -92,6 +93,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             MessageStore.wipe()
             // In-memory conversation state.
             meshChats.clear(); meshChatNames.clear(); pendingMarmotSends.clear()
+            linkByFp.clear(); persistLinks(); foldedGroupIds = emptySet()
             meshBroadcast = emptyList(); meshDmRows = emptyList()
             messages = emptyList(); channelMsgs = emptyList(); chats = emptyList()
             lastWnGroups = -1; lastWnMsgs = -1
@@ -140,6 +142,49 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /** The Sonar Discovery profile for a mesh peer (its BLE id), if any. */
     fun sonarProfile(peerId: String): SonarAnnounce? = sonarPeerProfiles[peerId]
+
+    /** Durable BLE-fingerprint → Nostr-npub(hex) links, learned from 0x53 Sonar
+     *  announces and PERSISTED (blob "sonar.links"). This is what makes one
+     *  conversation survive the transport switch: a Sonar peer met over Bluetooth
+     *  keeps the SAME thread when they leave range and we reach them over White
+     *  Noise (internet) — and after an app restart. Mirrors iOS's persisted
+     *  Noise↔Nostr mapping (FavoritesPersistenceService / sonarProfilesByFingerprint). */
+    private val linkByFp = mutableMapOf<String, String>()
+
+    /** Marmot groups currently FOLDED into a BLE-mesh DM row (same person via
+     *  [linkByFp]) — hidden from the standalone White Noise list so a person never
+     *  shows up twice. Display-only: the group still lives in [chats]. */
+    private var foldedGroupIds by mutableStateOf<Set<String>>(emptySet())
+
+    /** White Noise chats to render on their own row: every Marmot group EXCEPT the
+     *  ones folded into a mesh DM. The Messages list uses this instead of [chats]. */
+    val visibleChats: List<SonarChat> get() = chats.filterNot { it.id in foldedGroupIds }
+
+    /** This peer's npub (32 raw bytes) if known — from a live 0x53 OR the persisted
+     *  [linkByFp] (so it still resolves out of range / after restart). The bridge
+     *  that unifies the BLE-Noise and White-Noise legs of one conversation. */
+    private fun npubRawFor(peerId: String): ByteArray? =
+        sonarProfile(peerId)?.npub
+            ?: linkByFp[peerId]?.hexToBytesOrEmpty()?.takeIf { it.size == 32 }
+
+    private fun loadLinks() {
+        SonarCore.loadBlob("sonar.links").lineSequence().forEach { line ->
+            val i = line.indexOf('=')
+            if (i > 0) linkByFp[line.substring(0, i)] = line.substring(i + 1).trim()
+        }
+    }
+
+    private fun persistLinks() {
+        SonarCore.saveBlob("sonar.links", linkByFp.entries.joinToString("\n") { "${it.key}=${it.value}" })
+    }
+
+    /** Record fingerprint→npub from a 0x53 (persisted on change). */
+    private fun rememberLink(peerId: String, npubHex: String) {
+        if (npubHex.length == 64 && linkByFp[peerId] != npubHex) {
+            linkByFp[peerId] = npubHex
+            persistLinks()
+        }
+    }
     /** GPS-derived location channels (Mesh + Ottaviano…Italy), like iOS. */
     var locationChannels by mutableStateOf<List<GeoChannel>>(emptyList())
         private set
@@ -574,10 +619,12 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // survive a restart (parity with the iOS MessageStore). Precedes
                 // refreshMeshDmRows so the Messages list is populated at launch.
                 meshChats.putAll(MessageStore.loadAllMeshDms())
+                loadLinks() // durable fingerprint↔npub so BLE chats stay unified after restart
                 refreshMeshDmRows()
                 setupWallet()
                 refreshLocationChannels()
                 refreshChats()
+                recomputeConversations() // fold White Noise legs into mesh rows at launch
                 poll()
             } catch (t: Throwable) {
                 toast = "connect failed: ${t.message}"
@@ -738,8 +785,8 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  chat, or the Sonar peer's group for a mesh-routed DM. null ⇒ no group yet. */
     private fun resolveMarmotGroupId(chatId: String): String? {
         if (!isMeshChat(chatId)) return chatId
-        val prof = sonarProfile(meshPeerId(chatId)) ?: return null
-        return marmotGroupForNpub(prof.npub)?.id
+        val raw = npubRawFor(meshPeerId(chatId)) ?: return null
+        return marmotGroupForNpub(raw)?.id
     }
 
     /** True if [chatId] can carry media (an existing Marmot group backs it). */
@@ -783,8 +830,8 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  plain bitchat peer out of range waits (Step 2 adds favorite → NIP-17). */
     private fun sendDmAuto(peerId: String, text: String) {
         if (MeshRadio.hasMeshLink(peerId)) { sendMesh(peerId, text); return }
-        val prof = sonarProfile(peerId)
-        if (prof != null) { sendOverMarmot(peerId, prof.npub, text); return }
+        val raw = npubRawFor(peerId)
+        if (raw != null) { sendOverMarmot(peerId, raw, text); return }
         toast = "Out of range — your message will wait until you’re close again."
     }
 
@@ -862,7 +909,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     private suspend fun refreshOpenDm(peerId: String) {
         if ((screen as? Screen.Chat)?.id != meshChatId(peerId)) return
         val mesh = meshChats[peerId].orEmpty()
-        val group = sonarProfile(peerId)?.let { marmotGroupForNpub(it.npub) }
+        val group = npubRawFor(peerId)?.let { marmotGroupForNpub(it) }
         val merged = if (group != null) {
             val wn = SonarCore.messages(group.id).map { it.copy(viaInternet = true) }
             (mesh + wn).sortedBy { it.tsSecs }
@@ -874,8 +921,10 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** True while a live Noise link to [peerId] exists (peer is in Bluetooth range). */
     fun dmInRange(peerId: String): Boolean = MeshRadio.hasMeshLink(peerId)
 
-    /** True if [peerId] is a full Sonar peer (sent a 0x53 announce with an npub). */
-    fun isSonarPeer(peerId: String): Boolean = sonarProfile(peerId) != null
+    /** True if [peerId] is a full Sonar peer we can reach over White Noise — its
+     *  npub is known from a live 0x53 OR the persisted link (so it stays true out
+     *  of Bluetooth range). */
+    fun isSonarPeer(peerId: String): Boolean = npubRawFor(peerId) != null
 
     private fun randomMeshId(): String =
         (0 until 16).joinToString("") { "0123456789abcdef"[kotlin.random.Random.nextInt(16)].toString() }
@@ -942,7 +991,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         return name
     }
 
-    /** Recompute the observable mesh DM rows (newest conversation first). */
+    /** Recompute the observable mesh DM rows (newest conversation first). Fast,
+     *  BLE-leg only — for immediate feedback on send/receive. [recomputeConversations]
+     *  later folds in the White Noise leg. */
     private fun refreshMeshDmRows() {
         meshDmRows = meshChats.entries
             .filter { it.value.isNotEmpty() }
@@ -951,6 +1002,30 @@ class SonarAppState(private val scope: CoroutineScope) {
                 MeshDmRow(pid, meshPeerName(pid), last.content, last.tsSecs)
             }
             .sortedByDescending { it.tsSecs }
+    }
+
+    /** Unify the Messages list into one row per PERSON. For each BLE-mesh peer,
+     *  resolve its npub (live 0x53 or persisted link) and, if a White Noise (Marmot)
+     *  group for that npub exists, FOLD it in: the row's preview/timestamp reflect
+     *  the latest message across BOTH transports, and the group is hidden from the
+     *  standalone White Noise list ([visibleChats]). This is what stops a Bluetooth
+     *  chat that continued over the internet from showing as two separate chats. */
+    private suspend fun recomputeConversations() {
+        val rows = ArrayList<MeshDmRow>(meshChats.size)
+        val folded = HashSet<String>()
+        for ((peerId, msgs) in meshChats) {
+            if (msgs.isEmpty()) continue
+            var last = msgs.last()
+            val group = npubRawFor(peerId)?.let { marmotGroupForNpub(it) }
+            if (group != null) {
+                folded += group.id
+                runCatching { SonarCore.messages(group.id) }.getOrDefault(emptyList())
+                    .lastOrNull()?.let { if (it.tsSecs > last.tsSecs) last = it }
+            }
+            rows.add(MeshDmRow(peerId, meshPeerName(peerId), last.content, last.tsSecs))
+        }
+        foldedGroupIds = folded
+        meshDmRows = rows.sortedByDescending { it.tsSecs }
     }
 
     private suspend fun refreshChats() {
@@ -998,6 +1073,11 @@ class SonarAppState(private val scope: CoroutineScope) {
                 sonarPeerProfiles = MeshRadio.sonarPeers()
                     .mapNotNull { (id, raw) -> SonarAnnounce.decode(raw)?.let { id to it } }
                     .toMap()
+                // Persist each peer's fingerprint→npub so its conversation stays
+                // unified after it leaves range / after a restart, then re-fold the
+                // White Noise legs into the mesh rows (one row per person).
+                sonarPeerProfiles.forEach { (peerId, ann) -> rememberLink(peerId, ann.npub.toHexLower()) }
+                recomputeConversations()
                 // Unify nearby: keep the payer scan alive and refresh peers +
                 // the receiver advertising (wallet/foreground gated).
                 startUnify()
