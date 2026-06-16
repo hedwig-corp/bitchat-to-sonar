@@ -112,6 +112,30 @@ else
   echo "warning: $BLE_BUILT not found — desktop BLE will be unavailable" >&2
 fi
 
+# --- Fetch the Breez SDK Liquid native lib (on-device ⚡PAY wallet) -------------
+# The KMP `jvm` variant (technology.breez.liquid:breez-sdk-liquid-kmp) is a
+# UniFFI/JNA binding that loads libbreez_sdk_liquid_bindings off the classpath but
+# does NOT bundle it. Breez ships the prebuilt host libs in the Go bindings repo;
+# we pull the one matching our exact KMP version (kept in sync with libs.versions
+# .toml) so the desktop wallet reconstructs the SAME wallet as Android/iOS.
+BREEZ_VER="$(sed -n 's/^breez-sdk-liquid *= *"\([^"]*\)".*/\1/p' "$REPO_ROOT/apps/sonar/gradle/libs.versions.toml" | head -1)"
+case "$UNAME_S" in
+  Darwin) BREEZ_GOARCH="$([[ $JNA_ARCH == aarch64 ]] && echo darwin-aarch64 || echo darwin-amd64)"; BREEZ_LIB="libbreez_sdk_liquid_bindings.dylib" ;;
+  Linux)  BREEZ_GOARCH="$([[ $JNA_ARCH == aarch64 ]] && echo linux-aarch64 || echo linux-amd64)";  BREEZ_LIB="libbreez_sdk_liquid_bindings.so" ;;
+  *)      BREEZ_GOARCH="windows-amd64"; BREEZ_LIB="breez_sdk_liquid_bindings.dll" ;;
+esac
+if [[ -n "$BREEZ_VER" ]]; then
+  BREEZ_URL="https://raw.githubusercontent.com/breez/breez-sdk-liquid-go/v$BREEZ_VER/breez_sdk_liquid/lib/$BREEZ_GOARCH/$BREEZ_LIB"
+  echo "Fetching Breez SDK Liquid native lib v$BREEZ_VER ($BREEZ_GOARCH)..."
+  if curl -fsSL -o "$RES_DIR/$JNA_PREFIX/$BREEZ_LIB" "$BREEZ_URL"; then
+    [[ -n "$JNA_PREFIX_ALT" ]] && cp "$RES_DIR/$JNA_PREFIX/$BREEZ_LIB" "$RES_DIR/$JNA_PREFIX_ALT/$BREEZ_LIB"
+  else
+    echo "warning: could not fetch $BREEZ_URL — desktop ⚡PAY wallet will be unavailable" >&2
+  fi
+else
+  echo "warning: breez-sdk-liquid version not found in libs.versions.toml — skipping wallet lib" >&2
+fi
+
 echo ""
 echo "Done. Outputs under $OUT:"
 find "$RES_DIR" \( -name "$LIB" -o -name "$BLE_LIB" \) -exec ls -lh {} \; | awk '{print "  " $NF " (" $5 ")"}'

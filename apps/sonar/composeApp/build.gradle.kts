@@ -9,6 +9,31 @@ plugins {
     alias(libs.plugins.compose.compiler)
 }
 
+// Breez API key from a gitignored secret — NEVER hardcode or commit it.
+// Resolution order: local.properties `breez.apiKey`, else env `BREEZ_API_KEY`,
+// else empty (wallet UI then shows "unavailable", like iOS with no key).
+val breezApiKey: String = run {
+    val lp = rootProject.file("local.properties")
+    val fromFile = if (lp.exists()) {
+        Properties().apply { lp.inputStream().use { load(it) } }.getProperty("breez.apiKey")
+    } else null
+    (fromFile ?: System.getenv("BREEZ_API_KEY") ?: "").trim()
+}
+
+// Desktop has no Android-style BuildConfig, so the key is written to a generated
+// resource (`/breez_api_key.txt`) the jvm WalletBridge reads at runtime. The dir
+// is gitignored; the value never lands in source.
+val breezKeyResDir = layout.buildDirectory.dir("generated/breezKey")
+val generateBreezKeyResource = tasks.register("generateBreezKeyResource") {
+    val out = breezKeyResDir.get().file("breez_api_key.txt").asFile
+    inputs.property("breezApiKey", breezApiKey)
+    outputs.file(out)
+    doLast {
+        out.parentFile.mkdirs()
+        out.writeText(breezApiKey)
+    }
+}
+
 kotlin {
     androidTarget {
         compilerOptions {
@@ -49,10 +74,19 @@ kotlin {
             implementation("net.java.dev.jna:jna:5.14.0@aar")
         }
         val jvmMain by getting {
+            // The desktop Breez API key is written here by `generateBreezKeyResource`
+            // (gitignored generated dir), mirroring Android's BuildConfig field.
+            resources.srcDir(breezKeyResDir)
             dependencies {
                 implementation(compose.desktop.currentOs)
                 // Swing/AWT EDT main dispatcher for Dispatchers.Main on desktop.
                 implementation(libs.coroutines.swing)
+                // On-device Lightning wallet (Breez SDK Liquid) for ⚡PAY — same
+                // KMP artifact as Android; Gradle resolves its `jvm` variant (a
+                // UniFFI/JNA binding). The host native lib (libbreez_sdk_liquid_
+                // bindings.dylib) is fetched into jvmMain/resources by
+                // core/build-desktop.sh, where JNA loads it off the classpath.
+                implementation(libs.breez.sdk.liquid)
                 // UniFFI Kotlin bindings load the host dynamic library via JNA.
                 // Plain jar (the @aar variant is Android-only); the bundled
                 // libjnidispatch ships in the jna jar for the desktop OS.
@@ -94,16 +128,8 @@ compose.desktop {
     }
 }
 
-// Breez API key from a gitignored secret — NEVER hardcode or commit it.
-// Resolution order: local.properties `breez.apiKey`, else env `BREEZ_API_KEY`,
-// else empty (wallet UI then shows "unavailable", like iOS with no key).
-val breezApiKey: String = run {
-    val lp = rootProject.file("local.properties")
-    val fromFile = if (lp.exists()) {
-        Properties().apply { lp.inputStream().use { load(it) } }.getProperty("breez.apiKey")
-    } else null
-    (fromFile ?: System.getenv("BREEZ_API_KEY") ?: "").trim()
-}
+// The jvm resources must carry the generated key file before packaging.
+tasks.named("jvmProcessResources") { dependsOn(generateBreezKeyResource) }
 
 android {
     namespace = "chat.bitchat.sonar"
