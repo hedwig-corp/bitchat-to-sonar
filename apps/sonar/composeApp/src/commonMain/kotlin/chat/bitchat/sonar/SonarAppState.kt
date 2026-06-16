@@ -201,6 +201,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             try {
                 val addr = SonarCore.callLocalAddress()
                 SonarCore.callPlace(callId, video)
+                sonarLog("SonarCall", "TX OFFER callId=${callId.take(8)} video=$video addrLen=${addr.length} → $chatId")
                 if (activeCall?.callId == callId) // user may have ended already
                     send(chatId, SonarCore.callEncodeOffer(callId, video, addr, SonarClock.nowSecs()))
             } catch (e: Throwable) {
@@ -217,8 +218,10 @@ class SonarAppState(private val scope: CoroutineScope) {
             try {
                 val addr = SonarCore.callLocalAddress()
                 send(c.chatId, SonarCore.callEncodeAnswer(c.callId, SonarAnswer.Accept, addr))
+                sonarLog("SonarCall", "TX ANSWER accept + dialing callId=${c.callId.take(8)}")
                 SonarCore.callAccept(c.callId)
-            } catch (e: Throwable) { toast = "couldn’t accept: ${e.message}" }
+                sonarLog("SonarCall", "callAccept returned (dialed) callId=${c.callId.take(8)}")
+            } catch (e: Throwable) { sonarLog("SonarCall", "accept FAILED: ${e.message}"); toast = "couldn’t accept: ${e.message}" }
         }
     }
 
@@ -253,6 +256,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private fun onCallEvent(ev: SonarCallEvent) {
+        sonarLog("SonarCall", "engine event: ${ev.state} callId=${ev.callId.take(8)} dur=${ev.durationSecs}")
         val c = activeCall ?: return
         if (ev.callId != c.callId) return
         when (ev.state) {
@@ -300,6 +304,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private suspend fun onCallControl(chatId: String, m: SonarMsg, ctrl: SonarCallControl) {
+        sonarLog("SonarCall", "RX ${ctrl::class.simpleName} from $chatId (started=$callStarted)")
         ensureCallStarted()
         when (ctrl) {
             is SonarCallControl.Offer -> {
