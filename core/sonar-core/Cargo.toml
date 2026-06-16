@@ -53,6 +53,11 @@ thiserror.workspace = true
 hex.workspace = true
 tracing.workspace = true
 serde.workspace = true
+# Derive the iroh call key from the Sonar Nostr secret (HKDF-SHA256). Pure Rust,
+# always compiled (the derivation is CI-tested); the iroh transport itself stays
+# behind the `calls` feature.
+hkdf = "0.12"
+sha2 = "0.10"
 # Noise XX session crypto for the BLE mesh transport (bitchat uses
 # Noise_XX_25519_ChaChaPoly_SHA256). `snow` is a vetted pure-Rust Noise impl.
 snow = "0.9"

@@ -14,6 +14,7 @@
 //! endpoint + cpal/opus media pipeline live behind the `calls` / `calls-audio`
 //! Cargo features (added in a later phase) so the messaging core stays lean.
 
+pub mod identity;
 pub mod signaling;
 
 /// The iroh QUIC transport for call media. Gated behind the `calls` feature so
