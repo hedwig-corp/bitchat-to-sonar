@@ -11,4 +11,10 @@ CODE_SIGN_STYLE = Automatic
 PRODUCT_BUNDLE_IDENTIFIER = sh.hedwig.sonar
 
 APP_GROUP_ID = group.sh.hedwig.sonar
+
+// Default (empty) BREEZ_API_KEY: the wallet stays inactive unless a real key is
+// provided. Secrets live ONLY in the gitignored Local.xcconfig, included below
+// so local Release builds / archives (TestFlight) pick up the key + signing team
+// without ever committing them. CI should inject BREEZ_API_KEY the same way.
 BREEZ_API_KEY =
+#include? "Local.xcconfig"
