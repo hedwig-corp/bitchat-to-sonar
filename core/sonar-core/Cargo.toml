@@ -6,7 +6,28 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+# P2P voice/video calls — the iroh QUIC transport (NodeId-authenticated,
+# NAT-hole-punching). Feature-gated so the default messaging build + `cargo
+# test --workspace` (CI) stay lean and never compile iroh. The `☎CALL`
+# signaling codec (call::signaling) is NOT gated — it is pure and always built.
+# The cpal/opus media pipeline lands behind a later `calls-audio` feature
+# (plan: docs/plans/2026-06-16-p2p-calls-iroh-callme.md).
+calls = ["dep:iroh", "dep:anyhow"]
+
 [dependencies]
+# iroh: authenticated, encrypted, NAT-traversing P2P QUIC transport for the
+# call media path (peers addressed by an Ed25519 NodeId). Optional + gated.
+#
+# VERSION NOTE: we use iroh 1.0 (modern, buildable dep tree). The media RTP
+# layer iroh-roq 0.1 still pins iroh ^0.33, whose old dep tree (rcgen 0.13.2,
+# netwatch 0.3) does NOT compile on the current toolchain — so the media phase
+# must either wait for an iroh-roq release on iroh 1.0, or build RTP-over-iroh
+# directly on iroh 1.0 datagrams + the `rtp` crate (skip iroh-roq). See the
+# plan's "P0 attempt findings". The transport (this module) is iroh-only and
+# builds cleanly on 1.0.
+iroh = { version = "1", optional = true }
+anyhow = { version = "1", optional = true }
 mdk-core.workspace = true
 mdk-storage-traits.workspace = true
 mdk-memory-storage.workspace = true
