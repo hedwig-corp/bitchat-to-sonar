@@ -8,7 +8,7 @@ SWIFT_VERSION = 5.0
 DEVELOPMENT_TEAM = L3N5LHJD5Y
 CODE_SIGN_STYLE = Automatic
 
-PRODUCT_BUNDLE_IDENTIFIER = chat.bitchat
+PRODUCT_BUNDLE_IDENTIFIER = sh.hedwig.sonar
 
-APP_GROUP_ID = group.chat.bitchat
+APP_GROUP_ID = group.sh.hedwig.sonar
 BREEZ_API_KEY =
