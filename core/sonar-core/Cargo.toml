@@ -16,13 +16,16 @@ rust-version.workspace = true
 calls = ["dep:iroh", "dep:iroh-roq", "dep:anyhow", "dep:bytes"]
 # Adds the opus audio codec to the call media path. Separate from `calls` so a
 # call build can opt in to audio. The cpal device-I/O layer lands here too later.
-calls-audio = ["calls", "dep:opus"]
+calls-audio = ["calls", "dep:opus", "dep:cpal"]
 
 [dependencies]
 # Opus codec for call audio (48 kHz / 20 ms Voip frames). Uses the pure-Rust
 # `unsafe-libopus` backend (same fork callme uses) so it cross-compiles to
 # iOS/Android with NO C/libopus build — the single biggest cross-compile win.
 opus = { git = "https://github.com/DCNick3/opus-rs.git", branch = "unsafe-libopus", default-features = false, features = ["unsafe-libopus-backend"], optional = true }
+# Cross-platform audio device I/O for call mic/speaker. CoreAudio on Apple, oboe
+# (AAudio/OpenSL over the NDK) on Android. Optional; behind calls-audio.
+cpal = { version = "0.15.3", optional = true }
 # iroh: authenticated, encrypted, NAT-traversing P2P QUIC transport for the call
 # media path (peers addressed by an Ed25519 EndpointId). Optional + gated.
 #
@@ -85,6 +88,10 @@ getrandom = "0.2"
 # Target-scoped so iOS keeps the CommonCrypto path untouched.
 [target.'cfg(target_os = "android")'.dependencies]
 libsqlite3-sys = { version = "0.35", features = ["bundled-sqlcipher-vendored-openssl"] }
+# cpal's Android backend = oboe (C++ over AAudio); `oboe-shared-stdcxx` links the
+# shared libc++ (the app must ship libc++_shared.so in jniLibs). Optional; only
+# pulled with calls-audio.
+cpal = { version = "0.15.3", features = ["oboe-shared-stdcxx"], optional = true }
 
 [dev-dependencies]
 nostr-relay-builder.workspace = true

@@ -26,6 +26,18 @@ fn channels_count(c: Channels) -> usize {
     }
 }
 
+/// Names of the default input/output audio devices (cpal). A minimal touchpoint
+/// that links the platform device-audio backend (CoreAudio on Apple, oboe on
+/// Android) — the cross-compile proof that the device-audio path builds for each
+/// target before the full capture/playback pipeline is wired in.
+pub fn default_audio_devices() -> (Option<String>, Option<String>) {
+    use cpal::traits::{DeviceTrait, HostTrait};
+    let host = cpal::default_host();
+    let input = host.default_input_device().and_then(|d| d.name().ok());
+    let output = host.default_output_device().and_then(|d| d.name().ok());
+    (input, output)
+}
+
 /// A configured opus encoder for call audio (Voip, 48 kHz).
 pub fn opus_encoder(channels: Channels) -> anyhow::Result<Encoder> {
     Ok(Encoder::new(SAMPLE_RATE, channels, Application::Voip)?)
