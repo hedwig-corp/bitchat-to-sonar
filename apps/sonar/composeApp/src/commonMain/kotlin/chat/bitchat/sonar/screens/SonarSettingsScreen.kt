@@ -173,6 +173,20 @@ fun SonarSettingsScreen(state: SonarAppState) {
             SNSectionLabel("Data & storage")
             SNSettingsCard {
                 SNSettingsRow(icon = SNIconName.Pin, label = "Storage", value = "Local only", trail = SNTrail.None) {}
+                // Desktop-only: no GPS sensor, so offer opt-in IP geolocation to
+                // populate the "Around you" geohash channels. Hidden on mobile
+                // (configurable() == false there). Off by default — enabling it
+                // sends your IP to a location service.
+                if (chat.bitchat.sonar.LocationChannels.configurable()) {
+                    SNSettingsRow(
+                        icon = SNIconName.Globe, tone = SNTone.Cyan, label = "Approximate location",
+                        sub = "Find nearby channels via your IP — sends your IP to a location service",
+                        toggle = state.prefBool("ipLocation"),
+                    ) {
+                        state.togglePref("ipLocation")
+                        state.refreshLocationChannels()
+                    }
+                }
                 SNSettingsRow(
                     icon = SNIconName.Globe, label = "Data usage",
                     value = if (state.prefBool("wifiOnly")) "Wi-Fi only" else "Always",

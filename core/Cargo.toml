@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["sonar-core", "sonar-ffi"]
+# sonar-ble is the desktop BLE bridge — its own workspace (own [workspace]) so its
+# btleplug/CoreBluetooth deps stay out of this workspace + `cargo test --workspace`.
+exclude = ["sonar-ble"]
 
 [workspace.package]
 version = "0.1.0"

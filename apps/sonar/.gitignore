@@ -6,3 +6,11 @@ captures/
 # Rust core artifacts (regenerate with core/build-android.sh)
 composeApp/src/androidMain/jniLibs/
 composeApp/src/androidMain/kotlin/uniffi/
+# Desktop Rust core artifacts (regenerate with core/build-desktop.sh)
+composeApp/src/jvmMain/kotlin/uniffi/
+composeApp/src/jvmMain/resources/darwin/
+composeApp/src/jvmMain/resources/darwin-aarch64/
+composeApp/src/jvmMain/resources/darwin-x86-64/
+composeApp/src/jvmMain/resources/linux-x86-64/
+composeApp/src/jvmMain/resources/linux-aarch64/
+composeApp/src/jvmMain/resources/win32-x86-64/
