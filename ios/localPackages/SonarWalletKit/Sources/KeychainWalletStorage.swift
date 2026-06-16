@@ -1,6 +1,6 @@
 //
 // KeychainWalletStorage.swift
-// SonarWalletKit
+// WalletKit
 //
 // This is free and unencumbered software released into the public domain.
 // For more information, see <https://unlicense.org>
@@ -10,55 +10,39 @@
 
 import Foundation
 import Security
-import SonarWalletKit
 
-/// Keychain-backed implementation of the `WalletKitStorage` SPI exported by
-/// the SonarWalletKit KMP framework. The wallet engine stores its BIP39
-/// mnemonic (and small bits of wallet state, e.g. the cached BOLT12 offer)
-/// through this class, so everything lands in the iOS Keychain instead of
-/// NSUserDefaults.
-///
-/// Deliberately standalone (raw Security framework, own service name) — it
-/// must NOT depend on the app's KeychainManager so the package stays
-/// self-contained.
-///
-/// Thread-safe: every method is a single atomic SecItem* call; the wallet
-/// engine invokes these from background dispatchers.
-public final class KeychainWalletStorage: NSObject, WalletKitStorage {
+/// Keychain-backed store for the Sonar wallet: the deterministic seed (so the
+/// Breez node restarts from a background push without leaving the device) plus
+/// small display prefs. Standalone — raw Security framework, own service name —
+/// so the package stays self-contained. Every method is a single atomic SecItem*
+/// call; the wallet façade invokes these from a background queue.
+public final class KeychainWalletStorage {
 
     /// Keychain service namespace for all wallet entries.
     public static let service = "chat.bitchat.sonar.wallet"
 
-    public override init() {
-        super.init()
-    }
+    public init() {}
 
-    // MARK: - WalletKitStorage
+    // MARK: - Public API (plain Swift, no KMP types)
 
-    public func getString(key: String) -> String? {
+    public func getString(_ key: String) -> String? {
         guard let data = read(key) else { return nil }
         return String(data: data, encoding: .utf8)
     }
 
-    public func putString(key: String, value: String) {
+    public func putString(_ key: String, _ value: String) {
         write(key, Data(value.utf8))
     }
 
-    public func getBytes(key: String) -> KotlinByteArray? {
-        guard let data = read(key) else { return nil }
-        return Self.toKotlin(data)
-    }
+    public func getData(_ key: String) -> Data? { read(key) }
 
-    public func putBytes(key: String, value: KotlinByteArray) {
-        write(key, Self.toData(value))
-    }
+    public func putData(_ key: String, _ value: Data) { write(key, value) }
 
-    public func remove(key: String) {
+    public func remove(_ key: String) {
         SecItemDelete(query(key) as CFDictionary)
     }
 
     public func clear() {
-        // Delete every generic-password item under our service.
         let q: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: Self.service,
@@ -66,7 +50,7 @@ public final class KeychainWalletStorage: NSObject, WalletKitStorage {
         SecItemDelete(q as CFDictionary)
     }
 
-    public func contains(key: String) -> Bool {
+    public func contains(_ key: String) -> Bool {
         var q = query(key)
         q[kSecReturnData as String] = false
         return SecItemCopyMatching(q as CFDictionary, nil) == errSecSuccess
@@ -93,8 +77,6 @@ public final class KeychainWalletStorage: NSObject, WalletKitStorage {
     }
 
     private func write(_ key: String, _ data: Data) {
-        // The seed must survive device restarts (Breez node starts from a
-        // background push) but never leave this device.
         let attrs: [String: Any] = [
             kSecValueData as String: data,
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
@@ -105,24 +87,6 @@ public final class KeychainWalletStorage: NSObject, WalletKitStorage {
         if status == errSecDuplicateItem {
             SecItemUpdate(query(key) as CFDictionary, attrs as CFDictionary)
         }
-    }
-
-    // MARK: - KotlinByteArray <-> Data
-
-    static func toKotlin(_ data: Data) -> KotlinByteArray {
-        let array = KotlinByteArray(size: Int32(data.count))
-        for (i, byte) in data.enumerated() {
-            array.set(index: Int32(i), value: Int8(bitPattern: byte))
-        }
-        return array
-    }
-
-    static func toData(_ array: KotlinByteArray) -> Data {
-        var data = Data(capacity: Int(array.size))
-        for i in 0..<array.size {
-            data.append(UInt8(bitPattern: array.get(index: i)))
-        }
-        return data
     }
 }
 

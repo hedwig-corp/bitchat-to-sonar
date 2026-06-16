@@ -35,7 +35,11 @@ fn entries() -> &'static Vec<RelayEntry> {
                 if host.is_empty() {
                     return None;
                 }
-                Some(RelayEntry { host: host.to_string(), lat, lon })
+                Some(RelayEntry {
+                    host: host.to_string(),
+                    lat,
+                    lon,
+                })
             })
             .collect()
     })
@@ -77,7 +81,10 @@ mod tests {
 
     #[test]
     fn directory_parses() {
-        assert!(entries().len() > 100, "expected a populated relay directory");
+        assert!(
+            entries().len() > 100,
+            "expected a populated relay directory"
+        );
     }
 
     #[test]

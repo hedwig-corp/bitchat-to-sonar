@@ -22,6 +22,7 @@ class MainActivity : ComponentActivity() {
         }
         add(Manifest.permission.ACCESS_FINE_LOCATION)
         add(Manifest.permission.ACCESS_COARSE_LOCATION)
+        add(Manifest.permission.RECORD_AUDIO) // voice notes
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             add(Manifest.permission.POST_NOTIFICATIONS)
         }
@@ -30,15 +31,20 @@ class MainActivity : ComponentActivity() {
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
             // Whatever the user granted, (re)try starting the mesh radio.
-            MeshRadio.start()
+            startMeshRadio()
         }
+
+    private fun startMeshRadio() {
+        MeshRadio.setMeshNickname(SonarCore.nickname())
+        MeshRadio.start()
+    }
 
     /** Request any not-yet-granted permission in a single dialog sequence. */
     private fun requestAllPermissions() {
         val missing = requiredPermissions.filter {
             checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED
         }
-        if (missing.isEmpty()) MeshRadio.start() else permissionLauncher.launch(missing.toTypedArray())
+        if (missing.isEmpty()) startMeshRadio() else permissionLauncher.launch(missing.toTypedArray())
     }
 
     private var unlockCb: ((Boolean) -> Unit)? = null

@@ -258,6 +258,51 @@ actual object SonarCore {
         Unit
     }
 
+    // ── P2P voice calls (delegate to the generated SonarNode call_* binding) ──
+
+    actual suspend fun callStart(): Unit = withContext(Dispatchers.IO) { requireNode().callStart() }
+
+    actual suspend fun callLocalAddress(): String =
+        withContext(Dispatchers.IO) { requireNode().callLocalAddress() }
+
+    actual suspend fun callPlace(callId: String, video: Boolean): Unit =
+        withContext(Dispatchers.IO) { requireNode().callPlace(callId, video) }
+
+    actual suspend fun callIncomingOffer(callId: String, addrB64: String, video: Boolean): Unit =
+        withContext(Dispatchers.IO) { requireNode().callOnIncomingOffer(callId, addrB64, video) }
+
+    actual suspend fun callAnswer(callId: String, answer: SonarAnswer, addrB64: String): Unit =
+        withContext(Dispatchers.IO) { requireNode().callOnAnswer(callId, answer.toFfi(), addrB64) }
+
+    actual suspend fun callAccept(callId: String): Unit =
+        withContext(Dispatchers.IO) { requireNode().callAccept(callId) }
+
+    actual suspend fun callHangup(callId: String): Unit =
+        withContext(Dispatchers.IO) { requireNode().callHangup(callId) }
+
+    actual suspend fun callSetMuted(callId: String, muted: Boolean): Unit =
+        withContext(Dispatchers.IO) { requireNode().callSetMuted(callId, muted) }
+
+    actual suspend fun callWaitEvent(timeoutSecs: Long): SonarCallEvent? =
+        withContext(Dispatchers.IO) {
+            val n = node ?: return@withContext null
+            n.callWaitEvent(timeoutSecs.toULong())?.let {
+                SonarCallEvent(it.callId, it.state.toCommon(), it.durationSecs.toLong(), it.reason)
+            }
+        }
+
+    actual fun callEncodeOffer(callId: String, video: Boolean, addrB64: String, unixSecs: Long): String =
+        uniffi.sonar_ffi.callEncodeOffer(callId, video, addrB64, unixSecs.toULong())
+
+    actual fun callEncodeAnswer(callId: String, answer: SonarAnswer, addrB64: String): String =
+        uniffi.sonar_ffi.callEncodeAnswer(callId, answer.toFfi(), addrB64)
+
+    actual fun callEncodeEnd(callId: String, reason: String): String =
+        uniffi.sonar_ffi.callEncodeEnd(callId, reason)
+
+    actual fun callParseControl(content: String): SonarCallControl? =
+        uniffi.sonar_ffi.callParseControl(content)?.toCommon()
+
     private fun requireNode(): SonarNode =
         node ?: error("SonarCore not started — call start() first")
 
@@ -278,4 +323,40 @@ actual object SonarCore {
         prefs().edit().putString("dbKeyHex", hex).apply()
         return hex
     }
+}
+
+// ── Mapping between the generated UniFFI call types and the commonMain types ──
+
+private fun SonarAnswer.toFfi(): uniffi.sonar_ffi.CallAnswerKind = when (this) {
+    SonarAnswer.Accept -> uniffi.sonar_ffi.CallAnswerKind.ACCEPT
+    SonarAnswer.Decline -> uniffi.sonar_ffi.CallAnswerKind.DECLINE
+    SonarAnswer.Busy -> uniffi.sonar_ffi.CallAnswerKind.BUSY
+}
+
+private fun uniffi.sonar_ffi.CallAnswerKind.toCommon(): SonarAnswer = when (this) {
+    uniffi.sonar_ffi.CallAnswerKind.ACCEPT -> SonarAnswer.Accept
+    uniffi.sonar_ffi.CallAnswerKind.DECLINE -> SonarAnswer.Decline
+    uniffi.sonar_ffi.CallAnswerKind.BUSY -> SonarAnswer.Busy
+}
+
+private fun uniffi.sonar_ffi.CallStateInfo.toCommon(): SonarCallState = when (this) {
+    uniffi.sonar_ffi.CallStateInfo.RINGING -> SonarCallState.Ringing
+    uniffi.sonar_ffi.CallStateInfo.CONNECTING -> SonarCallState.Connecting
+    uniffi.sonar_ffi.CallStateInfo.CONNECTED -> SonarCallState.Connected
+    uniffi.sonar_ffi.CallStateInfo.ENDED -> SonarCallState.Ended
+    uniffi.sonar_ffi.CallStateInfo.FAILED -> SonarCallState.Failed
+    uniffi.sonar_ffi.CallStateInfo.DECLINED -> SonarCallState.Declined
+    uniffi.sonar_ffi.CallStateInfo.BUSY -> SonarCallState.Busy
+    uniffi.sonar_ffi.CallStateInfo.MISSED -> SonarCallState.Missed
+}
+
+private fun uniffi.sonar_ffi.CallControlInfo.toCommon(): SonarCallControl = when (this) {
+    is uniffi.sonar_ffi.CallControlInfo.Offer ->
+        SonarCallControl.Offer(callId, video, nodeAddrB64, unixSecs.toLong())
+    is uniffi.sonar_ffi.CallControlInfo.Answer ->
+        SonarCallControl.Answer(callId, answer.toCommon(), nodeAddrB64)
+    is uniffi.sonar_ffi.CallControlInfo.Cancel ->
+        SonarCallControl.Cancel(callId)
+    is uniffi.sonar_ffi.CallControlInfo.End ->
+        SonarCallControl.End(callId, reason)
 }

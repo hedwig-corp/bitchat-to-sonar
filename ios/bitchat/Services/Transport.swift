@@ -47,6 +47,7 @@ protocol Transport: AnyObject {
     func sendMessage(_ content: String, mentions: [String])
     func sendMessage(_ content: String, mentions: [String], messageID: String, timestamp: Date)
     func sendPrivateMessage(_ content: String, to peerID: PeerID, recipientNickname: String, messageID: String)
+    func sendPrivateMessageNow(_ content: String, to peerID: PeerID, messageID: String) -> Bool
     func sendReadReceipt(_ receipt: ReadReceipt, to peerID: PeerID)
     func sendFavoriteNotification(to peerID: PeerID, isFavorite: Bool)
     func sendBroadcastAnnounce()
@@ -70,6 +71,7 @@ extension Transport {
     func sendFileBroadcast(_ packet: BitchatFilePacket, transferId: String) {}
     func sendFilePrivate(_ packet: BitchatFilePacket, to peerID: PeerID, transferId: String) {}
     func cancelTransfer(_ transferId: String) {}
+    func sendPrivateMessageNow(_ content: String, to peerID: PeerID, messageID: String) -> Bool { false }
 
     func sendMessage(_ content: String, mentions: [String], messageID: String, timestamp: Date) {
         sendMessage(content, mentions: mentions)

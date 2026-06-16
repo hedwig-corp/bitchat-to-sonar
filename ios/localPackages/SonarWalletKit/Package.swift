@@ -1,16 +1,11 @@
 // swift-tools-version:5.9
 import PackageDescription
 
-// SonarWalletKit: Lightning wallet engine (Breez SDK Liquid via the
-// unify-wallet KMP `shared/wallet-kit` module) + a thin Swift layer.
-//
-// Frameworks/SonarWalletKit.xcframework is BUILT from the unify-wallet
-// repo (branch sonar-wallet-kit):
-//   ./gradlew :shared:wallet-kit:assembleSonarWalletKitReleaseXCFramework
-// then copied here. See docs/WALLET-INTEGRATION.md.
-//
-// iOS-only: the KMP framework has no macOS slice, so this product must be
-// linked ONLY into the iOS app target.
+// WalletKit: the Sonar Lightning wallet — a thin Swift façade over the OFFICIAL
+// Breez SDK Liquid Swift bindings (prebuilt xcframework via SPM). This replaces
+// the old `SonarWalletKit` KMP framework (built from the unify-wallet repo): Sonar
+// isn't reusing unify-wallet's Kotlin, so we consume Breez directly — the same way
+// the Android/desktop app uses the Breez KMP package. iOS-only.
 let package = Package(
     name: "SonarWalletKit",
     platforms: [
@@ -22,19 +17,20 @@ let package = Package(
             targets: ["WalletKit"]
         ),
     ],
+    dependencies: [
+        // Breez SDK Liquid official Swift bindings — pinned to the SAME version as
+        // the Android/desktop KMP package (0.11.13) so the wallet behaves
+        // identically across platforms. SPM downloads the prebuilt xcframework.
+        .package(url: "https://github.com/breez/breez-sdk-liquid-swift", exact: "0.11.13"),
+    ],
     targets: [
-        // Thin Swift layer: Keychain-backed storage + async/await façade.
+        // Thin Swift layer: Keychain-backed seed + async/await façade over Breez.
         .target(
             name: "WalletKit",
             dependencies: [
-                "SonarWalletKit",
+                .product(name: "BreezSDKLiquid", package: "breez-sdk-liquid-swift"),
             ],
             path: "Sources"
-        ),
-        // Kotlin/Native static framework (iosArm64 + iosSimulatorArm64).
-        .binaryTarget(
-            name: "SonarWalletKit",
-            path: "Frameworks/SonarWalletKit.xcframework"
         ),
     ]
 )

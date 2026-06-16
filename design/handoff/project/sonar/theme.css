@@ -435,6 +435,117 @@
 .bc-msg .media-visual + .media-cap,
 .bc-msg .media-audio { margin-top: 0; }
 
+/* ── voice & video calls ── */
+.call {
+  position: absolute; inset: 0; z-index: 30;
+  display: flex; flex-direction: column; align-items: center;
+  background:
+    radial-gradient(120% 80% at 50% -10%, rgba(34, 211, 238, 0.10), transparent 60%),
+    linear-gradient(180deg, #0B1418 0%, #060809 60%);
+  color: #EFF3F4;
+  overflow: hidden;
+}
+.call.video { background: #05070A; }
+.call-remote { position: absolute; inset: 0; z-index: 0; }
+.call-feed {
+  position: absolute; inset: 0;
+  background:
+    radial-gradient(70% 50% at 60% 35%, hsl(var(--rh) 38% 38%), transparent 70%),
+    radial-gradient(80% 60% at 30% 80%, hsl(calc(var(--rh) + 40) 36% 30%), transparent 70%),
+    linear-gradient(160deg, hsl(var(--rh) 30% 22%), #06080A 80%);
+  animation: callDrift 9s ease-in-out infinite alternate;
+}
+.call-remoteoff { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: linear-gradient(160deg, #11171C, #06080A); }
+.call-vignette { position: absolute; inset: 0; background: linear-gradient(180deg, rgba(0,0,0,0.45) 0%, transparent 22%, transparent 60%, rgba(0,0,0,0.6) 100%); }
+
+.call-top {
+  position: relative; z-index: 2; width: 100%;
+  display: flex; flex-direction: column; align-items: center; gap: 12px;
+  padding: 62px 20px 0;
+}
+.call-enc {
+  display: inline-flex; align-items: center; gap: 7px; white-space: nowrap;
+  padding: 7px 14px; border-radius: 999px;
+  background: rgba(65, 188, 118, 0.16); color: #84DCAA;
+  font-size: 12.5px; font-weight: 600;
+  backdrop-filter: blur(8px);
+}
+.call-topnames { display: flex; flex-direction: column; align-items: center; gap: 2px; }
+.call-topname { font-size: 22px; font-weight: 800; letter-spacing: -0.01em; text-shadow: 0 1px 12px rgba(0,0,0,0.5); }
+.call-toptime { font-size: 14px; color: rgba(255,255,255,0.8); font-variant-numeric: tabular-nums; }
+
+.call-center {
+  position: relative; z-index: 2; flex: 1;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;
+}
+.call-avatar { border-radius: 50%; }
+.call-avatar.ringing { animation: callRing 1.8s ease-out infinite; border-radius: 50%; }
+.call-name { font-size: 30px; font-weight: 800; letter-spacing: -0.02em; margin-top: 22px; }
+.call-sub { font-size: 16px; color: rgba(255,255,255,0.7); font-variant-numeric: tabular-nums; }
+
+.call-pip {
+  position: absolute; right: 16px; bottom: 168px; z-index: 3;
+  width: 104px; height: 150px; border-radius: 18px; overflow: hidden;
+  box-shadow: 0 8px 26px rgba(0,0,0,0.5), inset 0 0 0 1px rgba(255,255,255,0.12);
+}
+.call-pipfeed {
+  position: absolute; inset: 0;
+  background:
+    radial-gradient(70% 60% at 50% 35%, hsl(var(--sh) 40% 42%), transparent 70%),
+    linear-gradient(160deg, hsl(var(--sh) 32% 26%), #06080A 85%);
+}
+.call-piplabel { position: absolute; left: 8px; bottom: 7px; font-size: 11px; font-weight: 600; color: rgba(255,255,255,0.85); text-shadow: 0 1px 4px rgba(0,0,0,0.6); }
+
+.call-controls {
+  position: relative; z-index: 3; width: 100%; margin-top: auto;
+  display: flex; align-items: flex-start; justify-content: center; gap: 14px;
+  padding: 22px 18px 46px;
+}
+.call.video .call-controls {
+  background: linear-gradient(180deg, transparent, rgba(0,0,0,0.5));
+}
+.call-btn {
+  display: flex; flex-direction: column; align-items: center; gap: 7px;
+  border: none; background: none; cursor: pointer;
+  font-family: inherit; font-size: 11.5px; font-weight: 600; color: rgba(255,255,255,0.85);
+  width: 64px;
+}
+.call-btn > svg {
+  width: 58px; height: 58px; padding: 17px; border-radius: 50%;
+  background: rgba(255,255,255,0.12); color: #fff;
+  box-sizing: border-box; transition: background 0.15s, transform 0.12s;
+  backdrop-filter: blur(6px);
+}
+.call-btn:active > svg { transform: scale(0.92); }
+.call-btn.active > svg { background: #fff; color: #0B1418; }
+.call-btn.end > svg { background: var(--danger); color: #fff; }
+
+/* call log row in chat */
+.call-log {
+  align-self: center; display: flex; align-items: center; gap: 9px;
+  margin-top: 10px; padding: 8px 14px;
+  background: var(--surface2); border-radius: 14px;
+  font-size: 13px; color: var(--text2); max-width: 80%;
+}
+.call-logicon { color: var(--green); display: flex; }
+.call-logicon.missed { color: var(--danger); }
+.call-loglabel { font-weight: 650; color: var(--text); }
+.call-logtime { color: var(--text3); font-size: 11.5px; }
+
+@keyframes callRing {
+  0% { box-shadow: 0 0 0 0 rgba(34,211,238,0.4); }
+  70% { box-shadow: 0 0 0 26px rgba(34,211,238,0); }
+  100% { box-shadow: 0 0 0 0 rgba(34,211,238,0); }
+}
+@keyframes callDrift {
+  from { transform: scale(1.04) translate(0, 0); }
+  to { transform: scale(1.12) translate(-2%, -2%); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .call-avatar.ringing { animation: none; }
+  .call-feed { animation: none; }
+}
+
 /* ── composer ── */
 .bc-composerwrap { position: relative; z-index: 6; background: var(--bg); }
 .bc-composer { display: flex; align-items: flex-end; gap: 8px; padding: 8px 12px 36px; }

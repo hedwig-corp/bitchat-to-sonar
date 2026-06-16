@@ -25,6 +25,20 @@ class SonarDiscoveryTest {
         assertTrue(!decoded.speaksPay)
     }
 
+    @Test fun roundTripWithCallsCapability() {
+        val a = SonarAnnounce(
+            1, npub, null,
+            SonarAnnounce.CAP_MARMOT or SonarAnnounce.CAP_PAY or SonarAnnounce.CAP_CALLS
+        )
+        val decoded = SonarAnnounce.decode(a.encode())!!
+        assertEquals(a, decoded)
+        assertTrue(decoded.speaksMarmot)
+        assertTrue(decoded.speaksPay)
+        assertTrue(decoded.speaksCalls)
+        // A peer without the calls bit must not be reported as call-capable.
+        assertTrue(!SonarAnnounce(1, npub, null, SonarAnnounce.CAP_MARMOT).speaksCalls)
+    }
+
     @Test fun decodeRejectsMissingNpub() {
         // Only a version TLV, no 0x02 → invalid.
         assertNull(SonarAnnounce.decode(byteArrayOf(0x01, 0x01, 0x01)))

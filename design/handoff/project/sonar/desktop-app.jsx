@@ -181,6 +181,17 @@ function SonarDesktop() {
   });
   const sendVoice = (id, sec) => (app.sel.type === 'channel' ? sendVoiceCh(id, sec) : sendVoiceDm(id, sec));
 
+  const [call, setCall] = React.useState(null); // { id, kind }
+  const endCall = (peerId, kind, sec) => {
+    setCall(null);
+    setApp((a) => ({
+      ...a,
+      dmMsgs: { ...a.dmMsgs, [peerId]: [...(a.dmMsgs[peerId] || []), {
+        call: true, kind, mine: true, dur: sec ? fmtCall(sec) : null, missed: !sec, time: bcNow(),
+      }] },
+    }));
+  };
+
   const fontStack = BC_FONTS[t.typeface] || BC_FONTS.Figtree;
   const showRail = app.rail && app.sel.type !== 'radar';
 
@@ -204,6 +215,7 @@ function SonarDesktop() {
                   onSendCh={sendCh} onSendDm={sendDm}
                   onCommand={onCommand} onSelect={select}
                   onPay={sendPay} onClaimPay={claimPay} openPay={!!app.sel.pay} onMedia={sendMedia} onVoice={sendVoice}
+                  onCall={(id, kind) => setCall({ id, kind })}
                 />}
             {showRail && (
               <DkRail
@@ -222,6 +234,16 @@ function SonarDesktop() {
                 onClose={() => setSettings(false)}
               />
             )}
+            {call && (() => {
+              const cpeer = BC_DATA.peers.find((p) => p.id === call.id) || BC_DATA.peers[0];
+              return (
+                <CallView
+                  peer={cpeer} kind={call.kind} nick={app.nick}
+                  transport={cpeer.inRange ? 'mesh' : 'internet'}
+                  onEnd={(sec) => endCall(call.id, call.kind, sec)}
+                />
+              );
+            })()}
           </div>
         </div>
       </div>

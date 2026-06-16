@@ -20,6 +20,11 @@ required-features = ["cli"]
 [features]
 # Host-only helper used by core/build-ios.sh; never enabled for device builds.
 cli = ["uniffi/cli"]
+# P2P voice calls: exposes the `call_*` SonarNode methods + the ☎CALL signaling
+# helpers, backed by sonar-core's iroh/cpal/opus call engine. The device build
+# scripts (build-ios.sh / build-android.sh) enable this; the default `cargo test`
+# build stays lean (no iroh/cpal/opus). The whole call FFI is `#[cfg]`-gated on it.
+calls-audio = ["sonar-core/calls-audio"]
 
 [dependencies]
 sonar-core = { path = "../sonar-core" }
@@ -28,3 +33,12 @@ nostr.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 hex.workspace = true
+
+# Android-only: the JNI shim in src/android_jni.rs publishes the JavaVM +
+# Application Context to `ndk_context` so the crates that reach Android system
+# services via JNI (hickory-resolver during iroh Endpoint::bind, cpal/oboe for
+# AAudio) work when this .so is dlopen'd by UniFFI's JNA bindings. Both are
+# already in the dependency tree (pulled by iroh/cpal) — reused, default features.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+ndk-context = "0.1.1"

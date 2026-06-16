@@ -27,6 +27,8 @@ enum SonarCapability {
     /// The peer speaks the ⚡PAY payment convention (docs/SONAR-PAYMENTS.md);
     /// a BIP-353 payment address MAY additionally be advertised (TLV 0x03).
     static let payments: UInt8 = 0b0000_0010
+    /// The peer supports Sonar voice/video calls — a Sonar-only feature.
+    static let calls: UInt8 = 0b0000_0100
 }
 
 /// Payload of the Sonar discovery announce (BitchatPacket raw type 0x53).
@@ -148,8 +150,9 @@ struct SonarLocalProfile {
     let paymentsEnabled: Bool
 
     var capabilities: UInt8 {
-        // Always speaks Marmot DMs; ⚡PAY only when the wallet is configured.
-        var caps = SonarCapability.marmotDM
+        // Always speaks Marmot DMs and Sonar calls; ⚡PAY only when the wallet
+        // is configured.
+        var caps = SonarCapability.marmotDM | SonarCapability.calls
         if paymentsEnabled { caps |= SonarCapability.payments }
         return caps
     }

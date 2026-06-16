@@ -43,13 +43,21 @@ struct SonarDMScreen: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            SNNavHeader(onBack: { store.pop() }) {
+            SNNavHeader(onBack: { store.pop() }, content: {
                 SonarAvatar(name: peer.name, size: 36, presence: peer.inRange)
                 SNHeaderTitle(name: peer.name, verified: verified) {
                     SNIcon(name: .lock, size: 11, weight: 2.4)
                     Text(verbatim: (verified ? "Verified · " : "") + subTransport)
                 }
-            }
+            }, trailing: {
+                // Calls are Sonar-only and currently audio-only: shown when the
+                // peer advertised calls and BLE or White Noise can signal.
+                if store.canCall(peerId) {
+                    SNIconButton(action: { store.placeCall(peerId, video: false) }) {
+                        SNIcon(name: .phone, size: 20)
+                    }
+                }
+            })
 
             banner
 
@@ -86,7 +94,9 @@ struct SonarDMScreen: View {
                 onPlus: { sheet = true },
                 onCommand: { cmd in
                     store.onCommand(.init(type: .dm, id: peerId, target: peer.name), cmd)
-                }
+                },
+                voiceEnabled: store.canSendMedia(peerId),
+                onVoice: { store.sendVoiceNote(peerId, url: $0) }
             )
         }
         .background(SonarTheme.bg.ignoresSafeArea())

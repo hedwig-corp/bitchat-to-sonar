@@ -27,7 +27,9 @@ fn media_survives_noise_and_fragmentation_over_the_mesh() {
     let mut receiver = res.into_session().expect("receiver session");
 
     // 2. A media-sized blob (8 KB — far larger than a single BLE write).
-    let image: Vec<u8> = (0..8192u32).map(|i| (i.wrapping_mul(7) % 251) as u8).collect();
+    let image: Vec<u8> = (0..8192u32)
+        .map(|i| (i.wrapping_mul(7) % 251) as u8)
+        .collect();
 
     // 3. Sender: Noise-encrypt the media, then fragment the ciphertext into
     //    BLE-sized chunks (each becomes the payload of a 0x20 fragment packet).
@@ -63,7 +65,10 @@ fn media_survives_noise_and_fragmentation_over_the_mesh() {
         }
     }
     let reassembled = reassembled.expect("all fragments arrived → reassembled");
-    assert_eq!(reassembled, ciphertext, "reassembly reproduces the ciphertext");
+    assert_eq!(
+        reassembled, ciphertext,
+        "reassembly reproduces the ciphertext"
+    );
 
     let decrypted = receiver.decrypt(&reassembled).expect("decrypt media");
     assert_eq!(

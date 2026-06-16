@@ -244,7 +244,11 @@ private fun PeerCard(
             }
             Spacer(Modifier.width(12.dp))
             SNPill("Message", primary = false, onClick = onMessage)
-            // "Send sats" only for full Sonar peers (they advertise pay capability).
+            // "Send sats" for peers we have a White Noise account for (a rich 0x53
+            // announce ⇒ an npub we can pay). NOT a "Sonar-only" tier: the actual
+            // ⚡PAY rides the chat (PayLine over Bluetooth in range, White Noise out
+            // of range), so paying a met contact later over the internet already
+            // works — this radar pill is just the in-range shortcut.
             if (p.sonar) {
                 Spacer(Modifier.width(8.dp))
                 SNPill("Send sats", primary = true, onClick = onSendSats)

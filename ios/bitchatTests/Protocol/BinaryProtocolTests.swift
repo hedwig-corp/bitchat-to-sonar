@@ -435,6 +435,16 @@ struct BinaryProtocolTests {
         #expect(decodedMessage.isPrivate)
         #expect(decodedMessage.recipientNickname == TestConstants.testNickname2)
     }
+
+    @Test func privateMessagePacketSupportsLongContent() throws {
+        let content = String(repeating: "x", count: 700)
+        let packet = PrivateMessagePacket(messageID: "call-offer", content: content)
+        let encoded = try #require(packet.encode(), "Failed to encode long private content")
+        let decoded = try #require(PrivateMessagePacket.decode(from: encoded), "Failed to decode long private content")
+
+        #expect(decoded.messageID == "call-offer")
+        #expect(decoded.content == content)
+    }
     
     @Test func messageWithMentions() throws {
         let mentions = [TestConstants.testNickname2, TestConstants.testNickname3]

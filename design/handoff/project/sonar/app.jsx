@@ -178,6 +178,15 @@ function SonarApp() {
     };
   });
 
+  const endCall = (peerId, kind, sec) => setApp((a) => ({
+    ...a,
+    stack: a.stack.length > 1 ? a.stack.slice(0, -1) : a.stack,
+    nav: 'pop',
+    dmMsgs: { ...a.dmMsgs, [peerId]: [...(a.dmMsgs[peerId] || []), {
+      call: true, kind, mine: true, dur: sec ? fmtCall(sec) : null, missed: !sec, time: bcNow(),
+    }] },
+  }));
+
   const onCommand = (ctx, cmd) => {
     if (cmd === 'who' || cmd === 'msg') { push('nearby'); return; }
     if (cmd === 'slap') {
@@ -197,6 +206,9 @@ function SonarApp() {
     screen = <DMScreen key={screenKey} app={app} nav={app.nav} pop={pop} push={push} peerId={top.id} onSend={sendDm} onCommand={onCommand} onVerify={(pid) => setApp((a) => ({ ...a, verified: { ...a.verified, [pid]: true } }))} onPay={(sats) => sendPay(top.id, sats)} onClaimPay={claimPay} openPay={!!top.pay} onMedia={sendMediaDm} onVoice={sendVoiceDm} />;
   } else if (top.s === 'nearby') {
     screen = <SonarScreen key={screenKey} app={app} nav={app.nav} pop={pop} push={push} />;
+  } else if (top.s === 'call') {
+    const cpeer = BC_DATA.peers.find((p) => p.id === top.id) || BC_DATA.peers[0];
+    screen = <CallView key={screenKey} peer={cpeer} kind={top.kind} nick={app.nick} transport={cpeer.inRange ? 'mesh' : 'internet'} onEnd={(sec) => endCall(top.id, top.kind, sec)} />;
   } else if (top.s === 'settings') {
     screen = <SettingsScreen key={screenKey} app={app} nav={app.nav} pop={pop} push={push} mode={t.mode} onToggleMode={() => setTweak('mode', t.mode === 'dark' ? 'light' : 'dark')} toggleNetwork={toggleNetwork} onWipe={wipe} onPref={setPref} />;
   } else if (top.s === 'profile') {

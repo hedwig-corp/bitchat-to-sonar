@@ -19,6 +19,8 @@
          country), like the iOS app. Coarse is enough for the coarser levels. -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <!-- Voice notes (hold-to-record mic in the composer). -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
 
     <application

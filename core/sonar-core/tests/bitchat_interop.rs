@@ -6,8 +6,8 @@
 //! Bluetooth. The byte-vector test is the canonical interop anchor: Sonar must
 //! produce the identical bytes bitchat's Swift encoder produces.
 
-use sonar_core::mesh::fragment::{Fragment, Reassembler};
 use sonar_core::mesh::file_packet::{fragment, FilePacket};
+use sonar_core::mesh::fragment::{Fragment, Reassembler};
 use sonar_core::mesh::msg_type;
 use sonar_core::noise::{NoiseHandshake, NoiseKeypair};
 
@@ -91,7 +91,9 @@ fn decodes_legacy_8byte_filesize_and_2byte_content() {
 /// bitchat-compatible 0x20 fragments and reassemble + decode intact.
 #[test]
 fn large_file_packet_fragments_and_reassembles() {
-    let content: Vec<u8> = (0..200_000u32).map(|i| (i.wrapping_mul(31) % 255) as u8).collect();
+    let content: Vec<u8> = (0..200_000u32)
+        .map(|i| (i.wrapping_mul(31) % 255) as u8)
+        .collect();
     let packet = FilePacket {
         file_name: Some("big.bin".to_string()),
         file_size: Some(content.len() as u64),
@@ -101,9 +103,12 @@ fn large_file_packet_fragments_and_reassembles() {
     let encoded = packet.encode().expect("encode"); // > 65535 → must fragment
     assert!(encoded.len() > u16::MAX as usize);
 
-    let frags: Vec<Fragment> = fragment(&encoded, [7u8; 8], msg_type::FILE_TRANSFER, 400).expect("fragment");
+    let frags: Vec<Fragment> =
+        fragment(&encoded, [7u8; 8], msg_type::FILE_TRANSFER, 400).expect("fragment");
     assert!(frags.len() > 1);
-    assert!(frags.iter().all(|f| f.original_type == msg_type::FILE_TRANSFER));
+    assert!(frags
+        .iter()
+        .all(|f| f.original_type == msg_type::FILE_TRANSFER));
 
     // Reassemble out of order, through the on-wire 0x20 payload codec.
     let mut reasm = Reassembler::new();
@@ -145,8 +150,13 @@ fn reassembler_and_fragment_reject_abusive_inputs() {
     assert!(fragment(&huge, [1u8; 8], msg_type::FILE_TRANSFER, 1).is_none());
 
     // A valid (total == MAX_FRAGMENTS) stream still works.
-    let ok = fragment(&vec![7u8; MAX_FRAGMENTS as usize], [2u8; 8], msg_type::FILE_TRANSFER, 1)
-        .expect("at-limit fragmentation is allowed");
+    let ok = fragment(
+        &vec![7u8; MAX_FRAGMENTS as usize],
+        [2u8; 8],
+        msg_type::FILE_TRANSFER,
+        1,
+    )
+    .expect("at-limit fragmentation is allowed");
     assert_eq!(ok.len(), MAX_FRAGMENTS as usize);
 }
 

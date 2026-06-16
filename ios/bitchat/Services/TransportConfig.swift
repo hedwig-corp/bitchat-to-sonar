@@ -103,6 +103,10 @@ enum TransportConfig {
     // Aggressive pacing causes packet loss; needs 25-30ms between fragments for reliable delivery
     static let bleFragmentSpacingMs: Int = 30
     static let bleFragmentSpacingDirectedMs: Int = 25
+    static let bleCallControlFragmentSize: Int = 180
+    static let bleCallControlFragmentSpacingMs: Int = 75
+    static let bleCallControlFragmentRoundSpacingMs: Int = 350
+    static let bleCallControlFragmentRepeatCount: Int = 3
     static let bleAnnounceIntervalSeconds: TimeInterval = 4.0
     static let bleDutyOnDurationDense: TimeInterval = 3.0
     static let bleDutyOffDurationDense: TimeInterval = 15.0

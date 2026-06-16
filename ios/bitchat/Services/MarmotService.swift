@@ -403,6 +403,71 @@ final class MarmotService: @unchecked Sendable {
         }
     }
 
+    // MARK: - P2P voice calls (iroh transport; separate from the MLS engine)
+
+    /// Quick call ops run here; `callWaitQueue` parks separately so a long
+    /// `callWaitEvent` never blocks `callAccept`/`callHangup`. The call engine is
+    /// independent of MLS, and `SonarNode` is Send+Sync, so a dedicated queue
+    /// (grabbing the node ref race-free on `workQueue`) is safe.
+    private let callQueue = DispatchQueue(label: "chat.bitchat.marmot-call", qos: .userInitiated)
+    private let callWaitQueue = DispatchQueue(label: "chat.bitchat.marmot-call-wait", qos: .utility)
+
+    func callStart() async throws { try await runCall(callQueue) { try $0.callStart() } }
+    func callLocalAddress() async throws -> String { try await runCall(callQueue) { try $0.callLocalAddress() } }
+    func callPlace(callId: String, video: Bool) async throws {
+        try await runCall(callQueue) { try $0.callPlace(callId: callId, video: video) }
+    }
+    func callIncomingOffer(callId: String, addrB64: String, video: Bool) async throws {
+        try await runCall(callQueue) { try $0.callOnIncomingOffer(callId: callId, remoteAddrB64: addrB64, video: video) }
+    }
+    func callAnswer(callId: String, answer: CallAnswerKind, addrB64: String) async throws {
+        try await runCall(callQueue) { try $0.callOnAnswer(callId: callId, answer: answer, remoteAddrB64: addrB64) }
+    }
+    func callAccept(callId: String) async throws { try await runCall(callQueue) { try $0.callAccept(callId: callId) } }
+    func callHangup(callId: String) async throws { try await runCall(callQueue) { try $0.callHangup(callId: callId) } }
+    func callSetMuted(callId: String, muted: Bool) async throws {
+        try await runCall(callQueue) { try $0.callSetMuted(callId: callId, muted: muted) }
+    }
+
+    /// Park up to `timeoutSeconds` for the next call state change (off the engine
+    /// + action queues), mirroring `waitForMarmotEvent`.
+    func callWaitEvent(timeoutSeconds: UInt64) async -> CallEventInfo? {
+        guard let node = await runNonThrowing({ $0.node }) else {
+            try? await Task.sleep(nanoseconds: timeoutSeconds * 1_000_000_000)
+            return nil
+        }
+        return await withCheckedContinuation { continuation in
+            callWaitQueue.async {
+                continuation.resume(returning: node.callWaitEvent(timeoutSecs: timeoutSeconds))
+            }
+        }
+    }
+
+    /// Run a blocking call op on `queue`, with the node grabbed race-free on the
+    /// engine queue, mapping Rust errors like `run`.
+    private func runCall<T: Sendable>(
+        _ queue: DispatchQueue,
+        _ body: @escaping @Sendable (SonarNode) throws -> T
+    ) async throws -> T {
+        guard let node = await runNonThrowing({ $0.node }) else { throw ServiceError.notConnected }
+        return try await withCheckedThrowingContinuation { continuation in
+            queue.async {
+                do {
+                    continuation.resume(returning: try body(node))
+                } catch let error as SonarFfiError {
+                    switch error {
+                    case .InvalidInput(let message):
+                        continuation.resume(throwing: ServiceError.invalidInput(message))
+                    case .Core(let message):
+                        continuation.resume(throwing: ServiceError.core(message))
+                    }
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
     // MARK: - Internals
 
     private func requireNode() throws -> SonarNode {

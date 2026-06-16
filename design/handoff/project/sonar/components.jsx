@@ -236,9 +236,10 @@ function MsgList({ msgs, showAuthors, peerName, onClaim, pay }) {
       <div className="bc-datechip">Today</div>
       {msgs.map((m, i) => {
         if (m.pay) return <PayBubble key={i} m={m} peerName={peerName} onClaim={onClaim ? () => onClaim(i) : null} pay={pay} />;
+        if (m.call) return <CallLog key={i} m={m} peerName={peerName} />;
         if (m.action) return <div key={i} className="bc-action-msg">{m.text}</div>;
         const prev = msgs[i - 1];
-        const cont = !!prev && !prev.action && !prev.pay && prev.author === m.author && !!prev.mine === !!m.mine;
+        const cont = !!prev && !prev.action && !prev.pay && !prev.call && prev.author === m.author && !!prev.mine === !!m.mine;
         if (m.media) {
           return (
             <MediaBubble

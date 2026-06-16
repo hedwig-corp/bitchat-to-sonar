@@ -277,7 +277,10 @@ impl Announce {
     /// that the Ed25519 announce signature covers). Returns None on oversize.
     pub fn encode(&self) -> Option<Vec<u8>> {
         let nick = self.nickname.as_bytes();
-        if nick.len() > 255 || self.noise_public_key.len() > 255 || self.signing_public_key.len() > 255 {
+        if nick.len() > 255
+            || self.noise_public_key.len() > 255
+            || self.signing_public_key.len() > 255
+        {
             return None;
         }
         let mut out = Vec::new();
@@ -494,23 +497,34 @@ pub struct PrivateMessage {
 
 const PM_TLV_MESSAGE_ID: u8 = 0x00;
 const PM_TLV_CONTENT: u8 = 0x01;
+const PM_TLV_MESSAGE_ID_LONG: u8 = 0x02;
+const PM_TLV_CONTENT_LONG: u8 = 0x03;
 
 impl PrivateMessage {
     /// Encode the TLV (messageID 0x00, content 0x01) — order matches Swift.
+    /// Fields larger than the legacy one-byte length use long field types with
+    /// a two-byte big-endian length. Old clients could not encode these payloads
+    /// anyway; short fields stay byte-for-byte compatible.
     pub fn encode(&self) -> Option<Vec<u8>> {
         let id = self.message_id.as_bytes();
         let content = self.content.as_bytes();
-        if id.len() > 255 || content.len() > 255 {
-            return None;
-        }
-        let mut out = Vec::with_capacity(4 + id.len() + content.len());
-        out.push(PM_TLV_MESSAGE_ID);
-        out.push(id.len() as u8);
-        out.extend_from_slice(id);
-        out.push(PM_TLV_CONTENT);
-        out.push(content.len() as u8);
-        out.extend_from_slice(content);
+        let mut out = Vec::with_capacity(8 + id.len() + content.len());
+        Self::encode_field(&mut out, PM_TLV_MESSAGE_ID, PM_TLV_MESSAGE_ID_LONG, id)?;
+        Self::encode_field(&mut out, PM_TLV_CONTENT, PM_TLV_CONTENT_LONG, content)?;
         Some(out)
+    }
+
+    fn encode_field(out: &mut Vec<u8>, short_type: u8, long_type: u8, value: &[u8]) -> Option<()> {
+        if value.len() <= u8::MAX as usize {
+            out.push(short_type);
+            out.push(value.len() as u8);
+        } else {
+            let len = u16::try_from(value.len()).ok()?;
+            out.push(long_type);
+            out.extend_from_slice(&len.to_be_bytes());
+        }
+        out.extend_from_slice(value);
+        Some(())
     }
 
     /// Decode the TLV. Swift's decoder rejects unknown TLV types here (unlike the
@@ -519,20 +533,41 @@ impl PrivateMessage {
         let mut o = 0usize;
         let mut message_id: Option<String> = None;
         let mut content: Option<String> = None;
-        while o + 2 <= data.len() {
+        while o < data.len() {
             let t = data[o];
             o += 1;
-            let len = data[o] as usize;
-            o += 1;
+            let len = match t {
+                PM_TLV_MESSAGE_ID | PM_TLV_CONTENT => {
+                    if o + 1 > data.len() {
+                        return None;
+                    }
+                    let len = data[o] as usize;
+                    o += 1;
+                    len
+                }
+                PM_TLV_MESSAGE_ID_LONG | PM_TLV_CONTENT_LONG => {
+                    if o + 2 > data.len() {
+                        return None;
+                    }
+                    let len = u16::from_be_bytes([data[o], data[o + 1]]) as usize;
+                    o += 2;
+                    len
+                }
+                _ => return None,
+            };
             if o + len > data.len() {
                 return None;
             }
             let value = &data[o..o + len];
             o += len;
             match t {
-                PM_TLV_MESSAGE_ID => message_id = String::from_utf8(value.to_vec()).ok(),
-                PM_TLV_CONTENT => content = String::from_utf8(value.to_vec()).ok(),
-                _ => return None,
+                PM_TLV_MESSAGE_ID | PM_TLV_MESSAGE_ID_LONG => {
+                    message_id = String::from_utf8(value.to_vec()).ok()
+                }
+                PM_TLV_CONTENT | PM_TLV_CONTENT_LONG => {
+                    content = String::from_utf8(value.to_vec()).ok()
+                }
+                _ => unreachable!(),
             }
         }
         Some(PrivateMessage {
@@ -563,7 +598,13 @@ pub fn split_noise_plaintext(plain: &[u8]) -> Option<(u8, &[u8])> {
 // encrypted private payloads and will be ported for M3 with real test vectors.)
 
 /// Wrap a raw Noise handshake message in a directed 0x10 packet.
-pub fn handshake_packet(sender: [u8; 8], recipient: [u8; 8], ttl: u8, timestamp: u64, noise_msg: Vec<u8>) -> Packet {
+pub fn handshake_packet(
+    sender: [u8; 8],
+    recipient: [u8; 8],
+    ttl: u8,
+    timestamp: u64,
+    noise_msg: Vec<u8>,
+) -> Packet {
     let mut p = Packet::new(msg_type::NOISE_HANDSHAKE, ttl, timestamp, sender);
     p.recipient_id = Some(recipient);
     p.payload = noise_msg;
@@ -571,7 +612,13 @@ pub fn handshake_packet(sender: [u8; 8], recipient: [u8; 8], ttl: u8, timestamp:
 }
 
 /// Wrap a Noise ciphertext in a directed 0x11 packet.
-pub fn encrypted_packet(sender: [u8; 8], recipient: [u8; 8], ttl: u8, timestamp: u64, ciphertext: Vec<u8>) -> Packet {
+pub fn encrypted_packet(
+    sender: [u8; 8],
+    recipient: [u8; 8],
+    ttl: u8,
+    timestamp: u64,
+    ciphertext: Vec<u8>,
+) -> Packet {
     let mut p = Packet::new(msg_type::NOISE_ENCRYPTED, ttl, timestamp, sender);
     p.recipient_id = Some(recipient);
     p.payload = ciphertext;
@@ -651,7 +698,9 @@ pub mod fragment {
 
     impl Reassembler {
         pub fn new() -> Self {
-            Reassembler { buckets: HashMap::new() }
+            Reassembler {
+                buckets: HashMap::new(),
+            }
         }
 
         /// Feed one fragment (with the carrying packet's `sender`). Returns the
@@ -881,7 +930,12 @@ mod tests {
 
     #[test]
     fn packet_roundtrip_broadcast_no_sig() {
-        let mut p = Packet::new(msg_type::MESSAGE, 7, 0x0102030405060708, [1, 2, 3, 4, 5, 6, 7, 8]);
+        let mut p = Packet::new(
+            msg_type::MESSAGE,
+            7,
+            0x0102030405060708,
+            [1, 2, 3, 4, 5, 6, 7, 8],
+        );
         p.payload = b"hello mesh".to_vec();
         let wire = p.encode().unwrap();
         let back = Packet::decode(&wire).unwrap();
@@ -909,7 +963,11 @@ mod tests {
         assert_eq!(raw[0], 1, "version");
         assert_eq!(raw[1], 0x02, "type");
         assert_eq!(raw[2], 0x07, "ttl");
-        assert_eq!(&raw[3..11], &[0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77], "timestamp BE");
+        assert_eq!(
+            &raw[3..11],
+            &[0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77],
+            "timestamp BE"
+        );
         assert_eq!(raw[11], 0, "flags (no recipient/sig)");
         assert_eq!(&raw[12..14], &[0x00, 0x00], "payload length BE");
         assert_eq!(&raw[14..22], &[0xAA; 8], "sender id");
@@ -1010,7 +1068,10 @@ mod tests {
         let signer = MeshSigner::generate();
         let other = MeshSigner::generate();
         let mut p = signed_announce_packet(&signer);
-        assert!(!verify_packet(&p, &other.public_key()), "wrong key rejected");
+        assert!(
+            !verify_packet(&p, &other.public_key()),
+            "wrong key rejected"
+        );
         p.payload[0] ^= 0xFF; // tamper
         assert!(!verify_packet(&p, &signer.public_key()), "tamper rejected");
     }
@@ -1028,13 +1089,19 @@ mod tests {
 
     #[test]
     fn ed25519_verify_rejects_malformed_inputs() {
-        assert!(!ed25519_verify(&[0u8; 10], b"x", &[0u8; 64]), "bad pubkey len");
+        assert!(
+            !ed25519_verify(&[0u8; 10], b"x", &[0u8; 64]),
+            "bad pubkey len"
+        );
         assert!(!ed25519_verify(&[0u8; 32], b"x", &[0u8; 10]), "bad sig len");
     }
 
     #[test]
     fn private_message_tlv_roundtrip() {
-        let pm = PrivateMessage { message_id: "abc-123".into(), content: "ciao mesh".into() };
+        let pm = PrivateMessage {
+            message_id: "abc-123".into(),
+            content: "ciao mesh".into(),
+        };
         let enc = pm.encode().unwrap();
         // First TLV is messageID (0x00), then content (0x01).
         assert_eq!(enc[0], PM_TLV_MESSAGE_ID);
@@ -1042,8 +1109,23 @@ mod tests {
     }
 
     #[test]
+    fn private_message_tlv_long_content_roundtrip() {
+        let pm = PrivateMessage {
+            message_id: "call-offer".into(),
+            content: "x".repeat(700),
+        };
+        let enc = pm.encode().unwrap();
+        assert_eq!(enc[0], PM_TLV_MESSAGE_ID);
+        assert_eq!(enc[2 + "call-offer".len()], PM_TLV_CONTENT_LONG);
+        assert_eq!(PrivateMessage::decode(&enc).unwrap(), pm);
+    }
+
+    #[test]
     fn noise_private_message_plaintext_framing() {
-        let pm = PrivateMessage { message_id: "id".into(), content: "hi".into() };
+        let pm = PrivateMessage {
+            message_id: "id".into(),
+            content: "hi".into(),
+        };
         let plain = encode_private_message_plaintext(&pm).unwrap();
         let (t, rest) = split_noise_plaintext(&plain).unwrap();
         assert_eq!(t, noise_payload::PRIVATE_MESSAGE);

@@ -60,6 +60,8 @@ actual object MeshRadio {
 
     actual fun sendMeshDm(peerId: String, messageId: String, text: String): Boolean =
         MeshLink.sendDm(peerId, messageId, text)
+    actual fun sendMeshDmNow(peerId: String, messageId: String, text: String): Boolean =
+        MeshLink.sendDmNow(peerId, messageId, text)
     actual fun hasMeshLink(peerId: String): Boolean = MeshLink.hasLink(peerId)
     actual fun drainMeshDm(): List<MeshDmIn> = MeshLink.drainDms()
     actual fun nowSecs(): Long = System.currentTimeMillis() / 1000

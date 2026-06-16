@@ -17,6 +17,7 @@ import java.security.SecureRandom
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import uniffi.sonar_ffi.MeshAnnounceInfo
+import uniffi.sonar_ffi.MeshReassembler
 import uniffi.sonar_ffi.MeshPublicMessage
 import uniffi.sonar_ffi.NoiseKeypairHex
 import uniffi.sonar_ffi.SonarNoise
@@ -27,6 +28,7 @@ import uniffi.sonar_ffi.meshBuildPublicMessage
 import uniffi.sonar_ffi.meshDecodePacket
 import uniffi.sonar_ffi.meshDecodePrivateMessage
 import uniffi.sonar_ffi.meshEncodePrivateMessage
+import uniffi.sonar_ffi.meshFragment
 import uniffi.sonar_ffi.meshParseAnnounce
 import uniffi.sonar_ffi.meshParsePublicMessage
 import uniffi.sonar_ffi.noiseGenerateKeypair
@@ -65,8 +67,11 @@ object MeshGatt {
     private const val TYPE_MESSAGE: UByte = 0x02u // public broadcast (Mesh channel)
     private const val TYPE_NOISE_HANDSHAKE: UByte = 0x10u
     private const val TYPE_NOISE_ENCRYPTED: UByte = 0x11u
+    private const val TYPE_FRAGMENT: UByte = 0x20u
     private const val TYPE_SONAR_0X53: UByte = 0x53u
     private const val DEFAULT_TTL: UByte = 7u
+    private const val MAX_SINGLE_GATT_PACKET_BYTES = 480
+    private const val FRAGMENT_CHUNK_SIZE: UInt = 350u
 
     private val ctx: Context get() = AppContextHolder.ctx
     private fun manager() = ctx.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
@@ -104,9 +109,9 @@ object MeshGatt {
     /** bitchat peerID = SHA256(noise static pubkey)[:8], hex. */
     private val myPeerIdHex by lazy { Sha256.hash(keypair.publicHex.hexToBytes()).copyOf(8).toHex() }
     /** Display nickname carried in our announce (set by the host). */
-    @Volatile var nickname: String = "sonar"
+    @Volatile private var nickname: String = ""
     /** Our latest Sonar Discovery (0x53) payload, broadcast alongside the announce. */
-    @Volatile var sonarPayload: ByteArray? = null
+    @Volatile private var sonarPayload: ByteArray? = null
 
     private var server: BluetoothGattServer? = null
     private var characteristic: BluetoothGattCharacteristic? = null
@@ -127,10 +132,11 @@ object MeshGatt {
      *  by BLE address. This is what the app keys conversations/radar by, so a peer
      *  stays one identity across peerID + MAC rotation (issue #12). */
     private val fingerprintByAddr = ConcurrentHashMap<String, String>()
+    private val reassembler = MeshReassembler()
 
     // Listeners (fired from BLE callback threads → concurrent lists). The String
     // identity passed to onText/onSonar/onLink is the stable FINGERPRINT.
-    private val onText = java.util.concurrent.CopyOnWriteArrayList<(String, String) -> Unit>()
+    private val onText = java.util.concurrent.CopyOnWriteArrayList<(String, String, String) -> Unit>()
     private val onSonar = java.util.concurrent.CopyOnWriteArrayList<(String, ByteArray) -> Unit>()
     private val onAnnounce = java.util.concurrent.CopyOnWriteArrayList<(String, MeshAnnounceInfo, String) -> Unit>()
     private val onLink = java.util.concurrent.CopyOnWriteArrayList<(String) -> Unit>()
@@ -138,7 +144,7 @@ object MeshGatt {
     /** Dedup public broadcasts by message id (we receive from multiple links). */
     private val seenBroadcastIds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
-    fun addMessageListener(cb: (fingerprint: String, text: String) -> Unit) { onText.add(cb) }
+    fun addMessageListener(cb: (fingerprint: String, messageId: String, text: String) -> Unit) { onText.add(cb) }
     fun addSonarListener(cb: (fingerprint: String, payload: ByteArray) -> Unit) { onSonar.add(cb) }
     /** Fired when a peer's signed announce is received + verified. The third arg
      *  is the peer's stable fingerprint (SHA256 of its noise static pubkey). */
@@ -154,6 +160,25 @@ object MeshGatt {
     /** This device's 8-byte mesh node id (== bitchat peerID). MeshRadio puts it
      *  in the advert so two Sonar-Android peers can elect a single dialer. */
     fun nodeId(): ByteArray = myPeerIdHex.hexToBytes().copyOf(8)
+
+    fun updateNickname(value: String) {
+        val next = value.trim()
+        if (next == nickname) return
+        nickname = next
+        broadcastDiscoveryNow(if (next.isBlank()) "nickname-clear" else "nickname")
+    }
+
+    fun updateSonarPayload(payload: ByteArray?) {
+        val current = sonarPayload
+        val changed = when {
+            current == null && payload == null -> false
+            current == null || payload == null -> true
+            else -> !current.contentEquals(payload)
+        }
+        if (!changed) return
+        sonarPayload = payload?.copyOf()
+        broadcastDiscoveryNow("sonar")
+    }
 
     /**
      * Dialer election to avoid Android↔Android bidirectional GATT contention
@@ -177,12 +202,15 @@ object MeshGatt {
 
     // ── Packet builders (via the byte-exact Rust core) ──
 
-    private fun announceBytes(): ByteArray? = runCatching {
-        meshBuildAnnounce(
-            ed25519SeedHex, myPeerIdHex, nickname, keypair.publicHex,
-            DEFAULT_TTL, System.currentTimeMillis().toULong(),
-        )
-    }.getOrNull()
+    private fun announceBytes(): ByteArray? {
+        val nick = nickname.takeIf { it.isNotBlank() } ?: return null
+        return runCatching {
+            meshBuildAnnounce(
+                ed25519SeedHex, myPeerIdHex, nick, keypair.publicHex,
+                DEFAULT_TTL, System.currentTimeMillis().toULong(),
+            )
+        }.getOrNull()
+    }
 
     private fun sonarBytes(): ByteArray? = sonarPayload?.let { p ->
         runCatching {
@@ -194,6 +222,46 @@ object MeshGatt {
                 DEFAULT_TTL, System.currentTimeMillis().toULong(), p,
             )
         }.getOrNull()
+    }
+
+    private fun broadcastDiscoveryNow(reason: String) {
+        handler.post {
+            val ann = announceBytes()
+            val sonar = sonarBytes()
+            android.util.Log.i(
+                TAG,
+                "refresh discovery ($reason) announce=${ann?.size ?: 0}B sonar=${sonar?.size ?: 0}B",
+            )
+            clientGatt.forEach { (_, gatt) ->
+                val ch = clientChar[gatt.device.address] ?: return@forEach
+                ann?.let { writePacket(gatt, ch, it) }
+                sonar?.let { p -> handler.postDelayed({ writePacket(gatt, ch, p) }, 150) }
+            }
+            serverDevices.forEach { (_, device) ->
+                ann?.let { notify(device, it) }
+                sonar?.let { p -> handler.postDelayed({ notify(device, p) }, 150) }
+            }
+        }
+    }
+
+    private fun sendDiscoveryToAddr(addr: String, reason: String) {
+        val ann = announceBytes()
+        val sonar = sonarBytes()
+        android.util.Log.i(
+            TAG,
+            "refresh discovery ($reason) addr=$addr announce=${ann?.size ?: 0}B sonar=${sonar?.size ?: 0}B",
+        )
+        val gatt = clientGatt[addr]
+        val ch = clientChar[addr]
+        if (gatt != null && ch != null) {
+            ann?.let { writePacket(gatt, ch, it) }
+            sonar?.let { writePacket(gatt, ch, it) }
+        }
+        val device = serverDevices[addr]
+        if (device != null) {
+            ann?.let { notify(device, it) }
+            sonar?.let { notify(device, it) }
+        }
     }
 
     // ── GATT server (peripheral) ──
@@ -251,13 +319,11 @@ object MeshGatt {
             preparedWrite: Boolean, responseNeeded: Boolean, offset: Int, value: ByteArray,
         ) {
             if (responseNeeded) server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
-            // The central just subscribed → broadcast our announce, then the 0x53.
-            // GATT serializes writes/notifies, so defer the 0x53 so it doesn't
-            // collide with the announce (the priority for discovery).
-            val ann = announceBytes()
-            android.util.Log.i(TAG, "server ${device.address}: central subscribed → notify announce (${ann?.size}B)")
-            ann?.let { notify(device, it) }
-            sonarBytes()?.let { p -> handler.postDelayed({ notify(device, p) }, 150) }
+            // The central just subscribed → send a short discovery burst. iOS only
+            // accepts 0x53 after it has verified the base 0x01 announce, and the
+            // first GATT notification pair is easy to lose during role setup.
+            android.util.Log.i(TAG, "server ${device.address}: central subscribed → notify discovery burst")
+            notifyDiscoveryBurst(device)
         }
 
         override fun onCharacteristicWriteRequest(
@@ -484,6 +550,7 @@ object MeshGatt {
             }
             TYPE_NOISE_HANDSHAKE -> handleHandshake(addr, info.payload, fromServer, device, gatt)
             TYPE_NOISE_ENCRYPTED -> handleEncrypted(addr, info.payload, fromServer)
+            TYPE_FRAGMENT -> handleFragment(addr, info.senderIdHex, info.payload, fromServer, device, gatt)
             TYPE_SONAR_0X53 -> {
                 // Tag the 0x53 with the peer's STABLE fingerprint (from its 0x01
                 // announce, which precedes the 0x53) so its Sonar profile/npub
@@ -493,6 +560,19 @@ object MeshGatt {
             }
             else -> android.util.Log.i(TAG, "ignoring mesh packet type=${info.packetType} from $addr")
         }
+    }
+
+    private fun handleFragment(
+        addr: String,
+        senderIdHex: String,
+        payload: ByteArray,
+        fromServer: Boolean,
+        device: BluetoothDevice?,
+        gatt: BluetoothGatt?,
+    ) {
+        val full = runCatching { reassembler.add(senderIdHex, payload) }.getOrNull() ?: return
+        android.util.Log.i(TAG, "reassembled fragment stream from $addr (${full.size}B)")
+        handlePacket(addr, full, fromServer, device, gatt)
     }
 
     // ── Noise DM handshake (lazy) ──
@@ -574,7 +654,7 @@ object MeshGatt {
             // Surface the STABLE fingerprint so the app keys the conversation by
             // peer identity across peerID + BLE-address rotation (issue #12).
             val idFp = fp ?: peerIdByAddr[addr] ?: addr
-            meshDecodePrivateMessage(plain)?.let { pm -> onText.forEach { it(idFp, pm.content) } }
+            meshDecodePrivateMessage(plain)?.let { pm -> onText.forEach { it(idFp, pm.messageId, pm.content) } }
         }
     }
 
@@ -590,21 +670,70 @@ object MeshGatt {
         flushPending(fp)
     }
 
-    /** Send an encrypted DM to an established peer (private message TLV inside). */
-    fun sendText(peerAddress: String, messageId: String, text: String): Boolean = runCatching {
-        val link = (clientLinks[peerAddress] ?: serverLinks[peerAddress])?.takeIf { it.established } ?: return false
+    private fun encryptedPrivatePacket(peerAddress: String, link: Link, messageId: String, text: String): ByteArray {
         val plain = meshEncodePrivateMessage(messageId, text)
         val ciphertext = link.noise.encrypt(plain)
         val peerId = peerIdByAddr[peerAddress] ?: ""
-        val packet = meshBuildPacket(TYPE_NOISE_ENCRYPTED, myPeerIdHex, peerId, DEFAULT_TTL, System.currentTimeMillis().toULong(), ciphertext)
-        if (clientLinks.containsKey(peerAddress)) {
-            val gatt = clientGatt[peerAddress] ?: return false
-            val ch = clientChar[peerAddress] ?: return false
-            writePacket(gatt, ch, packet); true
-        } else {
-            serverDevices[peerAddress]?.let { notify(it, packet); true } ?: false
+        return meshBuildPacket(TYPE_NOISE_ENCRYPTED, myPeerIdHex, peerId, DEFAULT_TTL, System.currentTimeMillis().toULong(), ciphertext)
+    }
+
+    private fun randomFragmentIdHex(): String =
+        ByteArray(8).also { SecureRandom().nextBytes(it) }.toHex()
+
+    private fun writePacketMaybeFragmented(
+        peerAddress: String,
+        packet: ByteArray,
+        write: (ByteArray) -> Unit,
+    ): Boolean = runCatching {
+        if (packet.size <= MAX_SINGLE_GATT_PACKET_BYTES) {
+            write(packet)
+            return@runCatching true
         }
-    }.getOrDefault(false)
+
+        val peerId = peerIdByAddr[peerAddress] ?: ""
+        val fragments = meshFragment(packet, randomFragmentIdHex(), TYPE_NOISE_ENCRYPTED, FRAGMENT_CHUNK_SIZE)
+        android.util.Log.i(TAG, "fragmenting 0x11 packet ${packet.size}B into ${fragments.size} chunk(s) → $peerAddress")
+        fragments.forEach { payload ->
+            val fragmentPacket = meshBuildPacket(
+                TYPE_FRAGMENT,
+                myPeerIdHex,
+                peerId,
+                DEFAULT_TTL,
+                System.currentTimeMillis().toULong(),
+                payload,
+            )
+            write(fragmentPacket)
+        }
+        true
+    }.getOrElse {
+        android.util.Log.w(TAG, "fragment/write failed for $peerAddress: ${it.message}")
+        false
+    }
+
+    /** Send an encrypted DM to an established, writable peer route. */
+    fun sendText(peerAddress: String, messageId: String, text: String): Boolean = runCatching {
+        val client = clientLinks[peerAddress]?.takeIf { it.established }
+        val gatt = clientGatt[peerAddress]
+        val ch = clientChar[peerAddress]
+        if (client != null && gatt != null && ch != null) {
+            return@runCatching writePacketMaybeFragmented(
+                peerAddress,
+                encryptedPrivatePacket(peerAddress, client, messageId, text),
+            ) { writePacket(gatt, ch, it) }
+        }
+        val server = serverLinks[peerAddress]?.takeIf { it.established }
+        val device = serverDevices[peerAddress]
+        if (server != null && device != null) {
+            return@runCatching writePacketMaybeFragmented(
+                peerAddress,
+                encryptedPrivatePacket(peerAddress, server, messageId, text),
+            ) { notify(device, it) }
+        }
+        false
+    }.getOrElse {
+        android.util.Log.w(TAG, "sendText failed for $peerAddress: ${it.message}")
+        false
+    }
 
     /** DMs queued for a peer that has no live link yet, flushed when one forms.
      *  Mesh links are intermittent (BLE MAC rotation + scanner stalls), so a peer
@@ -612,13 +741,15 @@ object MeshGatt {
      *  queue the message instead of failing, and deliver it on (re)connect. */
     private val pendingSends = ConcurrentHashMap<String, java.util.concurrent.ConcurrentLinkedQueue<Pair<String, String>>>()
 
-    /** The BLE address with an established Noise link to the peer identified by
-     *  [fingerprint]. Resolves the CURRENT address even after the peer rotated its
-     *  peerID/MAC — `sendText` then addresses that address's current peerID. */
-    private fun establishedAddrFor(fingerprint: String): String? =
+    private fun canSendOnAddr(addr: String): Boolean =
+        (clientLinks[addr]?.established == true && clientGatt[addr] != null && clientChar[addr] != null) ||
+            (serverLinks[addr]?.established == true && serverDevices[addr] != null)
+
+    /** The BLE address with an established, writable Noise route to [fingerprint].
+     *  Resolves the current address after peerID/MAC rotation. */
+    private fun sendableAddrFor(fingerprint: String): String? =
         fingerprintByAddr.entries.firstOrNull { (a, fp) ->
-            fp == fingerprint &&
-                ((clientLinks[a]?.established == true) || (serverLinks[a]?.established == true))
+            fp == fingerprint && canSendOnAddr(a)
         }?.key
 
     /** Send a DM addressed by the peer's stable fingerprint (the radar/UI key).
@@ -627,26 +758,33 @@ object MeshGatt {
      *  UI echoes it optimistically); "false" used to surface a scary "not
      *  connected" toast even though the peer was right there. */
     fun sendTextToPeer(fingerprint: String, messageId: String, text: String): Boolean {
-        val addr = establishedAddrFor(fingerprint)
-        if (addr != null) return sendText(addr, messageId, text)
+        val addr = sendableAddrFor(fingerprint)
+        if (addr != null && sendText(addr, messageId, text)) return true
         pendingSends.getOrPut(fingerprint) { java.util.concurrent.ConcurrentLinkedQueue() }.add(messageId to text)
         return true
+    }
+
+    /** Immediate send for real-time controls. Never queues. */
+    fun sendTextToPeerNow(fingerprint: String, messageId: String, text: String): Boolean {
+        val addr = sendableAddrFor(fingerprint) ?: return false
+        sendDiscoveryToAddr(addr, "pre-control")
+        return sendText(addr, messageId, text)
     }
 
     /** Flush any queued DMs to [fingerprint] now that an encrypted link is up. */
     private fun flushPending(fingerprint: String) {
         val q = pendingSends[fingerprint] ?: return
-        val addr = establishedAddrFor(fingerprint) ?: return
         while (true) {
             val (mid, txt) = q.poll() ?: break
-            sendText(addr, mid, txt)
+            if (!sendTextToPeerNow(fingerprint, mid, txt)) {
+                q.add(mid to txt)
+                break
+            }
         }
     }
 
-    /** True iff there is an established encrypted link to [fingerprint] right now. */
-    fun hasLink(fingerprint: String): Boolean = fingerprintByAddr.entries.any { (a, fp) ->
-        fp == fingerprint && ((clientLinks[a]?.established == true) || (serverLinks[a]?.established == true))
-    }
+    /** True iff there is an established encrypted route we can write to right now. */
+    fun hasLink(fingerprint: String): Boolean = sendableAddrFor(fingerprint) != null
 
     /** True iff [addr] is currently linked (dialed, dialing, or accepted as a
      *  server) — used by the scanner to decide whether a re-sighting should
@@ -756,6 +894,21 @@ object MeshGatt {
     private fun notify(device: BluetoothDevice, packet: ByteArray) {
         serverNotifyQueue.getOrPut(device.address) { java.util.concurrent.ConcurrentLinkedQueue() }.add(packet)
         pumpServerNotify(device.address)
+    }
+
+    private fun notifyDiscoveryBurst(device: BluetoothDevice) {
+        listOf(0L, 350L, 1_200L).forEach { delayMs ->
+            handler.postDelayed({
+                val ann = announceBytes()
+                val sonar = sonarBytes()
+                android.util.Log.i(
+                    TAG,
+                    "server ${device.address}: discovery notify announce=${ann?.size ?: 0}B sonar=${sonar?.size ?: 0}B delay=${delayMs}ms",
+                )
+                ann?.let { notify(device, it) }
+                sonar?.let { p -> handler.postDelayed({ notify(device, p) }, 150) }
+            }, delayMs)
+        }
     }
 
     @Synchronized

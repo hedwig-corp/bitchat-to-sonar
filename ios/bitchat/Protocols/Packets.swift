@@ -111,25 +111,32 @@ struct PrivateMessagePacket {
     private enum TLVType: UInt8 {
         case messageID = 0x00
         case content = 0x01
+        case messageIDLong = 0x02
+        case contentLong = 0x03
     }
 
     func encode() -> Data? {
         var data = Data()
-        data.reserveCapacity(2 + min(messageID.count, 255) + 2 + min(content.count, 255))
+        guard let messageIDData = messageID.data(using: .utf8), messageIDData.count <= UInt16.max else { return nil }
+        guard let contentData = content.data(using: .utf8), contentData.count <= UInt16.max else { return nil }
+        data.reserveCapacity(8 + messageIDData.count + contentData.count)
 
-        // TLV for messageID
-        guard let messageIDData = messageID.data(using: .utf8), messageIDData.count <= 255 else { return nil }
-        data.append(TLVType.messageID.rawValue)
-        data.append(UInt8(messageIDData.count))
-        data.append(messageIDData)
-
-        // TLV for content
-        guard let contentData = content.data(using: .utf8), contentData.count <= 255 else { return nil }
-        data.append(TLVType.content.rawValue)
-        data.append(UInt8(contentData.count))
-        data.append(contentData)
+        appendTLV(.messageID, longType: .messageIDLong, value: messageIDData, to: &data)
+        appendTLV(.content, longType: .contentLong, value: contentData, to: &data)
 
         return data
+    }
+
+    private func appendTLV(_ type: TLVType, longType: TLVType, value: Data, to data: inout Data) {
+        if value.count <= 255 {
+            data.append(type.rawValue)
+            data.append(UInt8(value.count))
+        } else {
+            data.append(longType.rawValue)
+            data.append(UInt8((value.count >> 8) & 0xff))
+            data.append(UInt8(value.count & 0xff))
+        }
+        data.append(value)
     }
 
     static func decode(from data: Data) -> PrivateMessagePacket? {
@@ -137,21 +144,30 @@ struct PrivateMessagePacket {
         var messageID: String?
         var content: String?
 
-        while offset + 2 <= data.count {
+        while offset < data.count {
             guard let type = TLVType(rawValue: data[offset]) else { return nil }
             offset += 1
 
-            let length = Int(data[offset])
-            offset += 1
+            let length: Int
+            switch type {
+            case .messageID, .content:
+                guard offset + 1 <= data.count else { return nil }
+                length = Int(data[offset])
+                offset += 1
+            case .messageIDLong, .contentLong:
+                guard offset + 2 <= data.count else { return nil }
+                length = (Int(data[offset]) << 8) | Int(data[offset + 1])
+                offset += 2
+            }
 
             guard offset + length <= data.count else { return nil }
             let value = data[offset..<offset + length]
             offset += length
 
             switch type {
-            case .messageID:
+            case .messageID, .messageIDLong:
                 messageID = String(data: value, encoding: .utf8)
-            case .content:
+            case .content, .contentLong:
                 content = String(data: value, encoding: .utf8)
             }
         }

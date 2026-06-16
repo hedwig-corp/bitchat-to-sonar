@@ -15,6 +15,10 @@ import SwiftUI
 
 struct SonarHomeScreen: View {
     @EnvironmentObject private var store: SonarAppStore
+    // NB: do NOT add @ObservedObject GeohashBookmarksStore.shared here — that
+    // singleton is LocationStateManager, whose objectWillChange the store already
+    // republishes (SonarAppStore.init), so saving/unsaving updates the section
+    // live through `store`. Observing it directly is redundant double-observation.
 
     @State private var wipeAsk = false
     @State private var pendingDelete: SNDMRow?
@@ -44,13 +48,19 @@ struct SonarHomeScreen: View {
                 }
                 ScrollView {
                     VStack(spacing: 0) {
-                        SNSectionLabel("Nearby channels")
+                        SNSectionLabel("Around you")
                         channelList
+                        let saved = store.savedChannels
+                        if !saved.isEmpty {
+                            SNSectionLabel("Saved channels")
+                            savedList(saved)
+                        }
                         SNSectionLabel("Messages")
                         dmList
                     }
                     .padding(.bottom, 120)
                 }
+                .onAppear { store.resolveSavedChannelNames() }
             }
             floatingBar
         }
@@ -102,21 +112,10 @@ struct SonarHomeScreen: View {
     }
 
     private var channelList: some View {
-        let channels = store.channels
         return VStack(spacing: 0) {
-            ForEach(Array(channels.enumerated()), id: \.element.id) { i, ch in
-                SNConvRow(
-                    title: ch.name,
-                    divider: i < channels.count - 1 || !store.locationReady,
-                    action: { store.openChannel(ch) },
-                    avatar: { SNPlaceTile(size: 52, icon: ch.id == "mesh" ? .mesh : .pin) },
-                    sub: {
-                        Text(verbatim: ch.preview)
-                            .font(SonarTheme.uiFont(size: 14))
-                            .foregroundColor(SonarTheme.text2)
-                    }
-                )
-            }
+            // "Around you" collapses the geohash precision ladder (+ Mesh) into one
+            // card with a tier picker (design: HereCard) instead of a flat list.
+            SNHereCard(channels: store.channels) { store.openChannel($0) }
             if !store.locationReady {
                 SNConvRow(
                     title: "Channels around you",
@@ -127,6 +126,27 @@ struct SonarHomeScreen: View {
                         Text(verbatim: store.locationPermissionDenied
                             ? "Location access is off — allow it in iOS Settings"
                             : "Enable location to find channels around you")
+                            .font(SonarTheme.uiFont(size: 14))
+                            .foregroundColor(SonarTheme.text2)
+                    }
+                )
+            }
+        }
+    }
+
+    // Design HomeScreen "Saved channels": a flat list of explicitly bookmarked
+    // channels (BC_DATA.channels), each a PlaceTile + humanized name row that
+    // opens the channel. Live "N here now" count, else "Saved channel".
+    private func savedList(_ saved: [SNChannelItem]) -> some View {
+        VStack(spacing: 0) {
+            ForEach(Array(saved.enumerated()), id: \.element.id) { i, c in
+                SNConvRow(
+                    title: c.name,
+                    divider: i < saved.count - 1,
+                    action: { store.openChannel(c) },
+                    avatar: { SNPlaceTile(size: 52) },
+                    sub: {
+                        Text(verbatim: c.preview)
                             .font(SonarTheme.uiFont(size: 14))
                             .foregroundColor(SonarTheme.text2)
                     }

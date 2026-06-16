@@ -104,6 +104,11 @@ private fun avatarHash(str: String): Long {
     return h
 }
 
+/** hsl hue (0..360) from the design's `bcHash` (FNV-1a), for the call video-feed
+ *  and PiP gradients (`--rh` / `--sh` in theme.css). Same hash the avatar uses,
+ *  so a peer's call backdrop matches their identicon. */
+fun bcHue(name: String): Float = (avatarHash(name.ifBlank { "?" }) % 360L).toFloat()
+
 @Composable
 fun SNPrimaryButton(
     label: String,

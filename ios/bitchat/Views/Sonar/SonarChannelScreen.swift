@@ -15,6 +15,9 @@ import SwiftUI
 
 struct SonarChannelScreen: View {
     @EnvironmentObject private var store: SonarAppStore
+    // NB: GeohashBookmarksStore.shared is LocationStateManager, whose
+    // objectWillChange the store already republishes — so toggling the bookmark
+    // re-renders this view through `store`. No direct @ObservedObject needed.
     let chId: String
 
     @State private var sheet = false
@@ -22,6 +25,12 @@ struct SonarChannelScreen: View {
     @State private var toast: String?
 
     private var ch: SNChannelItem { store.channelItem(chId) }
+
+    /// Raw geohash for a location channel ("geo:<gh>"), nil for the Mesh channel
+    /// (Mesh is always present and never bookmarkable).
+    private var geohash: String? {
+        chId.hasPrefix("geo:") ? String(chId.dropFirst(4)) : nil
+    }
 
     /// Channel routing is real: geohash channels go over Nostr (kind 20000),
     /// the #mesh channel broadcasts over Bluetooth.
@@ -44,10 +53,26 @@ struct SonarChannelScreen: View {
                     Text(verbatim: ch.sub)
                 }
             } trailing: {
-                SNIconButton(action: { store.push(.nearby) }) {
-                    SNIcon(name: .rings, size: 20)
+                HStack(spacing: 2) {
+                    // Save/unsave this channel to the home "Saved channels" list
+                    // (geohash channels only — Mesh is always present).
+                    if let gh = geohash {
+                        let saved = GeohashBookmarksStore.shared.isBookmarked(gh)
+                        SNIconButton(action: {
+                            GeohashBookmarksStore.shared.toggle(gh)
+                            showToast(GeohashBookmarksStore.shared.isBookmarked(gh) ? "Channel saved" : "Removed from saved channels")
+                        }) {
+                            Image(systemName: saved ? "bookmark.fill" : "bookmark")
+                                .font(.system(size: 18, weight: .semibold))
+                                .foregroundColor(saved ? SonarTheme.accent : SonarTheme.text2)
+                        }
+                        .accessibilityLabel(saved ? "Unsave channel" : "Save channel")
+                    }
+                    SNIconButton(action: { store.push(.nearby) }) {
+                        SNIcon(name: .rings, size: 20)
+                    }
+                    .accessibilityLabel("People nearby")
                 }
-                .accessibilityLabel("People nearby")
             }
 
             SNBanner(icon: .people, tone: .publicRoom, bold: "Public channel", rest: " — anyone nearby can read")
@@ -83,7 +108,8 @@ struct SonarChannelScreen: View {
                 onPlus: { sheet = true },
                 onCommand: { cmd in
                     store.onCommand(.init(type: .ch, id: chId, target: slapTarget), cmd)
-                }
+                },
+                voiceEnabled: false
             )
         }
         .background(SonarTheme.bg.ignoresSafeArea())

@@ -1040,3 +1040,194 @@ Verified clean on both platforms — the voice recorder (hold-to-record, lock, s
 
 Sonar now covers the complete chat surface: radar discovery, transport-colored messaging, optional bitcoin/fiat payments, location channels, and rich media — consistent across mobile, desktop/iPad, and the landing page. Just say the word for whatever's next.
 
+## User
+
+Add inside the mobile and desktop sides the design to implement video call and calls normal like the xchat that I attached as a image
+
+## Assistant
+
+_[tool: snip]_
+
+_[tool: grep]_
+
+_[tool: read_file]_
+
+Good context. I'll build a dedicated call experience (voice + video) shared by both apps, then add the phone/video buttons to the chat headers like XChat. Creating the call module:
+
+_[tool: write_file]_
+
+Now the call icons:
+
+_[tool: str_replace_edit]_
+
+Now the call CSS. Appending to theme.css after the media block:
+
+_[tool: str_replace_edit]_
+
+Fixing a CSS typo in the drift keyframe:
+
+_[tool: str_replace_edit]_
+
+Now wire it into mobile. Add the call/video buttons to the DM header:
+
+_[tool: str_replace_edit]_
+
+Now render `CallLog` in MsgList:
+
+_[tool: str_replace_edit]_
+
+_[tool: str_replace_edit]_
+
+_[tool: read_file]_
+
+_[tool: read_file]_
+
+_[tool: str_replace_edit]_
+
+_[tool: grep]_
+
+_[tool: str_replace_edit]_
+
+Now let me verify mobile renders the call. Load Maya's DM and trigger a video call:
+
+_[tool: show_html]_
+
+_[tool: get_webview_logs]_
+
+No errors. Now navigate into Maya's DM and start a video call:
+
+_[tool: eval_js]_
+
+_[tool: sleep]_
+
+_[tool: eval_js]_
+
+_[tool: sleep]_
+
+_[tool: save_screenshot]_
+
+I accidentally opened the Lugano channel (its preview contains "Maya:"). Let me target the DM row by its title precisely:
+
+_[tool: eval_js]_
+
+_[tool: sleep]_
+
+_[tool: eval_js]_
+
+_[tool: sleep]_
+
+_[tool: eval_js]_
+
+_[tool: sleep]_
+
+_[tool: save_screenshot]_
+
+Call started (both buttons present) but the call screen renders black in the snapshot. Let me inspect the live DOM to see what's actually there:
+
+_[tool: eval_js]_
+
+The DOM confirms everything is present — enc pill, "Maya", remote feed, 4 controls. The black snapshot is just html-to-image failing on the gradient/backdrop-filter layers (it's connected now, showing the faux video feed). State persists in the stack, so a real reload-capture will show it. Let me grab a true pixel screenshot:
+
+_[tool: show_html]_
+
+Two real captures are black, yet the DOM reports the elements exist — I need to find out why nothing paints. Let me inspect computed styles and positions:
+
+_[tool: eval_js]_
+
+Found it: `.call` is stuck at `opacity: 0`. The `bcFade` entrance animation never completes when the preview iframe isn't the actively-painting tab, freezing it on the `from` (opacity:0) frame. The fade is non-essential — removing it so the call always paints:
+
+_[tool: str_replace_edit]_
+
+_[tool: show_html]_
+
+Rendering now. One layout bug: in **video** mode the controls float up under the title instead of sitting at the bottom (voice mode has a flex spacer, video doesn't). Pinning controls to the bottom:
+
+_[tool: str_replace_edit]_
+
+_[tool: show_html]_
+
+Video call layout is correct — title, centered avatar (ringing), and controls pinned to the bottom with the red End. Let me let it connect, then test ending → call log, and the voice variant:
+
+_[tool: sleep]_
+
+_[tool: eval_js]_
+
+_[tool: eval_js]_
+
+_[tool: sleep]_
+
+_[tool: eval_js]_
+
+Mobile is fully working — connected video shows the feed + self-PiP + timer, and ending drops an "Outgoing video call · 0:20" log into the chat. Now wire desktop. Let me see the chat header:
+
+_[tool: read_file]_
+
+_[tool: read_file]_
+
+I'll add call/video buttons (DM only) to the desktop header, and thread an `onCall` prop:
+
+_[tool: str_replace_edit]_
+
+Now the desktop shell — call state, overlay, and call-log handler. Let me read the render block:
+
+_[tool: read_file]_
+
+_[tool: read_file]_
+
+_[tool: str_replace_edit]_
+
+_[tool: grep]_
+
+_[tool: str_replace_edit]_
+
+_[tool: show_html]_
+
+_[tool: get_webview_logs]_
+
+Desktop now has the phone + video buttons in the DM header. Let me trigger a voice call to confirm the full-window overlay:
+
+_[tool: eval_js]_
+
+_[tool: sleep]_
+
+_[tool: save_screenshot]_
+
+Desktop voice call fills the window cleanly. The encryption pill is wrapping to two lines — pinning it to one line:
+
+_[tool: str_replace_edit]_
+
+_[tool: eval_js]_
+
+_[tool: sleep]_
+
+_[tool: eval_js]_
+
+Desktop call works end to end — overlay fills the window, ending drops "Outgoing call · 0:11" into the chat and closes. Both platforms are done. Handing off for verification:
+
+_[tool: done]_
+
+_[tool: fork_verifier_agent]_
+
+Voice and video calling are now in both apps, styled like XChat:
+
+- **Chat headers** (DM only) get a **phone** and **video** button, just like the reference.
+- **Voice call** — full-screen: encryption pill ("End-to-end encrypted · Bluetooth/internet"), big avatar with a ringing pulse, name, "Calling…" → live timer, and Mute / Speaker / Video / End controls.
+- **Video call** — full-bleed remote feed with a self-view PiP, name + timer up top, and Mute / Stop video / Flip / End.
+- **Transport-aware** like everything else — Bluetooth when the peer is in range, internet otherwise.
+- Ending a call drops a tidy **call-log row** ("Outgoing video call · 0:20") into the conversation.
+- Desktop shows the call as a **full-window overlay**; mobile pushes it as a screen.
+
+The verifier is sweeping both platforms (voice, video, end-logs, channel-has-no-call-buttons, enc pill). I'll fix anything it flags.
+
+## User
+
+No issues found
+
+## Assistant
+
+_[tool: snip]_
+
+Verified clean on both platforms — voice and video calling work end to end: header buttons (DM-only), full-screen/overlay call UI, ringing→connected timer, transport-aware encryption labels, and call-log rows after hanging up.
+
+Sonar now covers the full messenger surface across mobile, desktop/iPad, and the landing page: radar discovery, transport-colored chats, optional bitcoin/fiat payments, location channels, rich media, voice notes, and now calls. Ready for whatever's next.
+

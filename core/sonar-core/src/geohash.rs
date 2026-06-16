@@ -39,10 +39,18 @@ pub fn decode_center(geohash: &str) -> Option<(f64, f64)> {
             let bit = (val >> i) & 1;
             if is_lon {
                 let mid = (lon0 + lon1) / 2.0;
-                if bit == 1 { lon0 = mid } else { lon1 = mid }
+                if bit == 1 {
+                    lon0 = mid
+                } else {
+                    lon1 = mid
+                }
             } else {
                 let mid = (lat0 + lat1) / 2.0;
-                if bit == 1 { lat0 = mid } else { lat1 = mid }
+                if bit == 1 {
+                    lat0 = mid
+                } else {
+                    lat1 = mid
+                }
             }
             is_lon = !is_lon;
         }

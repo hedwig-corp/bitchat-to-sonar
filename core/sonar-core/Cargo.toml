@@ -6,7 +6,46 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+# P2P voice/video calls — the iroh QUIC transport (NodeId-authenticated,
+# NAT-hole-punching). Feature-gated so the default messaging build + `cargo
+# test --workspace` (CI) stay lean and never compile iroh. The `☎CALL`
+# signaling codec (call::signaling) is NOT gated — it is pure and always built.
+# The cpal/opus media pipeline lands behind a later `calls-audio` feature
+# (plan: docs/plans/2026-06-16-p2p-calls-iroh-callme.md).
+calls = ["dep:iroh", "dep:iroh-roq", "dep:anyhow", "dep:bytes", "dep:base64", "dep:serde_json"]
+# Adds the opus audio codec to the call media path. Separate from `calls` so a
+# call build can opt in to audio. The cpal device-I/O layer lands here too later.
+calls-audio = ["calls", "dep:opus", "dep:cpal"]
+
 [dependencies]
+# Opus codec for call audio (48 kHz / 20 ms Voip frames). Uses the pure-Rust
+# `unsafe-libopus` backend (same fork callme uses) so it cross-compiles to
+# iOS/Android with NO C/libopus build — the single biggest cross-compile win.
+opus = { git = "https://github.com/DCNick3/opus-rs.git", branch = "unsafe-libopus", default-features = false, features = ["unsafe-libopus-backend"], optional = true }
+# Cross-platform audio device I/O for call mic/speaker. CoreAudio on Apple, oboe
+# (AAudio/OpenSL over the NDK) on Android. Optional; behind calls-audio.
+cpal = { version = "0.15.3", optional = true }
+# iroh: authenticated, encrypted, NAT-traversing P2P QUIC transport for the call
+# media path (peers addressed by an Ed25519 EndpointId). Optional + gated.
+#
+# VERSION NOTE: we use iroh 1.0 (modern, buildable dep tree). The RTP-over-QUIC
+# media layer is iroh-roq — but crates.io iroh-roq 0.1 pins iroh ^0.33, whose old
+# tree (rcgen 0.13.2, netwatch 0.3) does NOT compile on the current toolchain.
+# So we VENDOR iroh-roq (core/vendor/iroh-roq) ported to iroh 1.0 (iroh-quinn-proto
+# → noq-proto, coding::Codec → Encodable/Decodable) and depend on it by path. Both
+# resolve to the SAME iroh 1.0, so connections pass cleanly between the two.
+iroh = { version = "1", optional = true }
+iroh-roq = { path = "../vendor/iroh-roq", optional = true }
+anyhow = { version = "1", optional = true }
+# RTP packet payloads for the media flows (iroh-roq re-exports the `rtp` crate;
+# we just need Bytes to build packet payloads).
+bytes = { version = "1", optional = true }
+# Serialize the iroh `EndpointAddr` (serde) into the `nodeAddrB64` field of the
+# ☎CALL signaling: serde_json bytes → base64url(no-pad). Both pure Rust, behind
+# the `calls` feature so the default messaging build never pulls them.
+base64 = { version = "0.22", optional = true }
+serde_json = { version = "1", optional = true }
 mdk-core.workspace = true
 mdk-storage-traits.workspace = true
 mdk-memory-storage.workspace = true
@@ -32,6 +71,11 @@ thiserror.workspace = true
 hex.workspace = true
 tracing.workspace = true
 serde.workspace = true
+# Derive the iroh call key from the Sonar Nostr secret (HKDF-SHA256). Pure Rust,
+# always compiled (the derivation is CI-tested); the iroh transport itself stays
+# behind the `calls` feature.
+hkdf = "0.12"
+sha2 = "0.10"
 # Noise XX session crypto for the BLE mesh transport (bitchat uses
 # Noise_XX_25519_ChaChaPoly_SHA256). `snow` is a vetted pure-Rust Noise impl.
 snow = "0.9"
@@ -49,6 +93,10 @@ getrandom = "0.2"
 # Target-scoped so iOS keeps the CommonCrypto path untouched.
 [target.'cfg(target_os = "android")'.dependencies]
 libsqlite3-sys = { version = "0.35", features = ["bundled-sqlcipher-vendored-openssl"] }
+# cpal's Android backend = oboe (C++ over AAudio); `oboe-shared-stdcxx` links the
+# shared libc++ (the app must ship libc++_shared.so in jniLibs). Optional; only
+# pulled with calls-audio.
+cpal = { version = "0.15.3", features = ["oboe-shared-stdcxx"], optional = true }
 
 [dev-dependencies]
 nostr-relay-builder.workspace = true

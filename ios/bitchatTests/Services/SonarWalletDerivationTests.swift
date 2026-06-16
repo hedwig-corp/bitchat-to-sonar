@@ -38,11 +38,8 @@ final class SonarWalletDerivationTests: XCTestCase {
     }
 
     func testDerivationIsStableAcrossRuns() {
-        // Pin a known vector so an accidental change to salt/info is caught.
-        // (Value computed by this same implementation; guards against drift.)
         let hex = SonarWalletDerivation.entropyHex(fromSecret: secretA)
-        XCTAssertEqual(hex.count, 64)
-        XCTAssertTrue(hex.allSatisfy { $0.isHexDigit })
+        XCTAssertEqual(hex, "801a82b16248f5c4c6363cae5ab6b9aff24724cb696ed41d936e53687c282806")
     }
 
     func testNsecRoundTripFeedsDerivation() throws {

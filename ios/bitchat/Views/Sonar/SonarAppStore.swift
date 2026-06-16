@@ -17,13 +17,45 @@
 //
 
 import BitLogger
+import AVFoundation
 import Combine
 import CryptoKit
 import Foundation
+import SonarCore
 import SwiftUI
 #if canImport(UIKit)
 import UIKit
 #endif
+
+private enum SonarCallAudioRoute {
+    static func configure(active: Bool, speakerOn: Bool) {
+        #if os(iOS)
+        let session = AVAudioSession.sharedInstance()
+        do {
+            if active {
+                try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth])
+                try session.setActive(true)
+                try session.overrideOutputAudioPort(speakerOn ? .speaker : .none)
+            } else {
+                try? session.overrideOutputAudioPort(.none)
+                try session.setActive(false, options: .notifyOthersOnDeactivation)
+            }
+        } catch {
+            SecureLogger.error("call audio route failed: \(error)", category: .session)
+        }
+        #endif
+    }
+
+    static func setSpeaker(_ speakerOn: Bool) {
+        #if os(iOS)
+        do {
+            try AVAudioSession.sharedInstance().overrideOutputAudioPort(speakerOn ? .speaker : .none)
+        } catch {
+            SecureLogger.error("speaker route failed: \(error)", category: .session)
+        }
+        #endif
+    }
+}
 
 // MARK: - Routes (stack entries below home)
 
@@ -33,6 +65,9 @@ enum SonarRoute: Hashable {
     case nearby
     case settings
     case profile
+    /// Voice call route. Carries the DM peer id + kind; video is kept for route
+    /// compatibility but is not admitted until camera/video media is implemented.
+    case call(String, video: Bool)
 }
 
 // MARK: - View models consumed by the screens
@@ -58,6 +93,49 @@ struct SNPayInfo: Equatable {
     let state: SonarPayEntry.State
 }
 
+/// A call kind (call.jsx `kind`). Drives icons + labels everywhere.
+enum SNCallKind: String, Equatable {
+    case voice
+    case video
+}
+
+/// The descriptor of a finished call, rendered as a CallLog row inside the DM
+/// transcript (call.jsx `CallLog`). MOCK-ONLY and in-memory — see
+/// `SonarAppStore.callLogs`.
+struct SNCallInfo: Equatable {
+    let kind: SNCallKind
+    /// The call never connected (secs == 0) ⇒ shown as a missed call (red).
+    let missed: Bool
+    /// `fmtCall(secs)` when the call connected, else nil.
+    let dur: String?
+}
+
+/// A stored call record: its timeline `date` (used to merge it
+/// chronologically into the transcript) plus the prebuilt CallLog message.
+struct SNCallRecord: Identifiable, Equatable {
+    let id: String
+    let date: Date
+    let message: SNMessage
+}
+
+/// The in-flight P2P call the call screen renders. `incoming` ⇒ we are the callee
+/// (show Accept/Decline); `phase` tracks the engine state machine.
+struct SNActiveCall: Equatable {
+    let callId: String
+    /// The conversation id the ☎CALL signaling rides (DM peer id or Marmot conv).
+    let convId: String
+    /// The real-time rail the call was admitted on. Calls must not recalculate this
+    /// through the normal chat fallback router while answer/end messages are in flight.
+    let signalingVia: SNVia
+    let peerName: String
+    let video: Bool
+    let incoming: Bool
+    var phase: CallStateInfo
+    var connectedSecs: Int = 0
+    var muted: Bool = false
+    var speakerOn: Bool = true
+}
+
 struct SNMessage: Identifiable, Equatable {
     var id: String = UUID().uuidString
     var mine: Bool = false
@@ -69,6 +147,8 @@ struct SNMessage: Identifiable, Equatable {
     var state: String?
     /// Non-nil = render as a PayBubble instead of a text bubble.
     var pay: SNPayInfo?
+    /// Non-nil = render a compact CallLog row instead of a bubble (call.jsx).
+    var call: SNCallInfo?
     /// Encrypted media attachments (White Noise / Marmot MIP-04). Non-empty ⇒
     /// render a media bubble (image inline, else a file chip).
     var media: [SNMediaItem] = []
@@ -96,6 +176,9 @@ struct SNChannelItem: Identifiable {
     let preview: String     // home row second line
     let count: Int
     let channel: ChannelID
+    /// Short precision-tier label for the "Around you" ladder (design HereCard
+    /// `here-scale`): "Mesh" or the geohash level (Block / Area / City / …).
+    var tier: String = ""
 }
 
 /// A person: a mesh peer (direct / relayed / unreachable mutual favorite)
@@ -215,6 +298,18 @@ final class SonarAppStore: ObservableObject {
     @Published private(set) var walletState: SonarWalletState
     /// Radar "Send sats" quick-pay: the DM screen opens with the PaySheet up.
     private var pendingPayPeer: String?
+    /// In-memory call records, keyed by DM peer id (the same id the call route +
+    /// dmMsgs use). Nothing here is persisted or written to MessageStore/Marmot.
+    @Published private(set) var callLogs: [String: [SNCallRecord]] = [:]
+
+    /// The in-flight P2P call the [SonarCallScreen] renders, or nil. Driven by the
+    /// real iroh/opus engine via `callWaitEvent`.
+    @Published private(set) var activeCall: SNActiveCall?
+    private var callStarted = false
+    private var callLoopTask: Task<Void, Never>?
+    private var callTickerTask: Task<Void, Never>?
+    /// Ids of ☎CALL control messages already routed to the engine (dedup).
+    private var scannedCallMessageIDs = Set<String>()
 
     private var cancellables = Set<AnyCancellable>()
     /// Texts queued for a Sonar peer (keyed by npub) while their White
@@ -311,6 +406,9 @@ final class SonarAppStore: ObservableObject {
                 // Publish our kind-0 profile (NIP-01) so peers resolve our
                 // nickname instead of our npub. MIP-00 identity == Nostr pubkey.
                 if npub != nil { self.marmot.publishProfile(name: self.chatViewModel.nickname) }
+                // Bind the iroh call endpoint + start the event loop once we're
+                // connected, so an incoming call rings without placing one first.
+                if npub != nil { self.ensureCallStarted() }
                 // The wallet derives from the same identity (nsec); once the
                 // Marmot identity exists, (re)attempt the deferred wallet setup.
                 #if os(iOS)
@@ -351,11 +449,11 @@ final class SonarAppStore: ObservableObject {
         updateReceiverAdvertising()
         chatViewModel.objectWillChange
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in self?.processIncomingPayLines() }
+            .sink { [weak self] _ in self?.processIncomingPayLines(); self?.processIncomingCallLines() }
             .store(in: &cancellables)
         marmot.$messagesByGroup
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in self?.processIncomingPayLines() }
+            .sink { [weak self] _ in self?.processIncomingPayLines(); self?.processIncomingCallLines() }
             .store(in: &cancellables)
 
         // Restore persisted Sonar profiles so a peer's mesh + White Noise legs
@@ -647,8 +745,9 @@ final class SonarAppStore: ObservableObject {
 
     // MARK: Sonar discovery (mesh announce of npub + payment address)
 
-    /// Discovered Sonar profile for a nearby peer (nil = plain bitchat peer).
-    func sonarProfile(_ id: String) -> SonarPeerProfile? { sonarProfiles[id] }
+    /// Known Sonar profile for a peer (live 0x53 when available, otherwise the
+    /// persisted fingerprint link). Nil means a plain bitchat peer.
+    func sonarProfile(_ id: String) -> SonarPeerProfile? { resolvedSonarProfile(id) }
 
     /// Plain-language network line for peer-row subtitles: which network the
     /// chat runs on and how far it can reach.
@@ -658,15 +757,14 @@ final class SonarAppStore: ObservableObject {
     }
 
     func networkLabel(forPeer id: String) -> String {
-        networkLabel(sonar: sonarProfiles[id] != nil, mutualFavorite: isMutualFavorite(id))
+        networkLabel(sonar: resolvedSonarProfile(id) != nil, mutualFavorite: isMutualFavorite(id))
     }
 
     /// Protocols the chat counterpart speaks — shown ONLY on the verify
     /// sheet's "Speaks" line; everywhere else uses plain-language labels.
     func speaks(_ id: String) -> String {
-        (marmotGroupId(id) != nil || sonarProfiles[id] != nil)
-            ? "bitchat mesh + White Noise"
-            : "bitchat mesh"
+        if resolvedSonarProfile(id) != nil { return "Sonar mesh + White Noise" }
+        return marmotGroupId(id) != nil ? "White Noise" : "bitchat mesh"
     }
 
     // MARK: Favorites (out-of-range internet delivery for bitchat peers)
@@ -758,7 +856,30 @@ final class SonarAppStore: ObservableObject {
         if let live = sonarProfiles.first(where: { $0.value.npub == npub })?.key {
             return chatViewModel.getFingerprint(for: PeerID(str: live)) ?? live
         }
-        return sonarProfilesByFingerprint.first(where: { $0.value.npub == npub })?.key
+        if let persisted = sonarProfilesByFingerprint.first(where: { $0.value.npub == npub })?.key {
+            return persisted
+        }
+        // Fallback: a favorite we've met over BLE carries the noise↔nostr link, so a
+        // White Noise chat with that npub is the SAME person as the mesh chat — fold
+        // it even when we never captured a 0x53 announce from them (the gap that made
+        // one person show as two chats). Compare canonically so a hex-vs-npub format
+        // mismatch never blocks the fold.
+        guard let target = Self.nostrPubkeyData(npub) else { return nil }
+        for (noiseKey, rel) in FavoritesPersistenceService.shared.favorites {
+            if let nostr = rel.peerNostrPublicKey, Self.nostrPubkeyData(nostr) == target {
+                return noiseKey.sha256Fingerprint()
+            }
+        }
+        return nil
+    }
+
+    /// Canonical 32-byte Nostr pubkey from a bech32 `npub1…` OR a 64-char hex string.
+    private static func nostrPubkeyData(_ s: String) -> Data? {
+        if s.hasPrefix("npub1") {
+            guard let d = try? Bech32.decode(s), d.hrp == "npub", d.data.count == 32 else { return nil }
+            return d.data
+        }
+        return Data(hexString: s).flatMap { $0.count == 32 ? $0 : nil }
     }
 
     /// Inject our Sonar profile into BLEService once the Marmot identity is
@@ -832,6 +953,38 @@ final class SonarAppStore: ObservableObject {
         return item(for: ch)
     }
 
+    /// Explicitly saved/bookmarked geohash channels (design home "Saved
+    /// channels"), one row each. Raw geohashes from GeohashBookmarksStore become
+    /// humanized SNChannelItems with a live "N here now" count; the friendly
+    /// place name resolves asynchronously (until then, the precision-tier label
+    /// — NEVER the raw geohash, per the design rule). Mesh is always present so
+    /// it is never bookmarked.
+    var savedChannels: [SNChannelItem] {
+        locationManager.bookmarks.map { gh in
+            let count = chatViewModel.geohashParticipantCount(for: gh)
+            let level = Self.level(forLength: gh.count)
+            let name = locationManager.bookmarkNames[gh] ?? level.displayName
+            return SNChannelItem(
+                id: "geo:" + gh,
+                name: name,
+                sub: "Public · \(count) here now",
+                preview: count > 0 ? "\(count) here now" : "Saved channel",
+                count: count,
+                channel: .location(GeohashChannel(level: level, geohash: gh)),
+                tier: level.displayName
+            )
+        }
+    }
+
+    /// Kick off friendly place-name resolution for all saved channels (the
+    /// design shows place names, never raw geohashes). Idempotent — safe to call
+    /// on appear; mirrors LocationChannelsSheet's per-row `resolveBookmarkNameIfNeeded`.
+    func resolveSavedChannelNames() {
+        for gh in locationManager.bookmarks {
+            locationManager.resolveBookmarkNameIfNeeded(for: gh)
+        }
+    }
+
     private func meshChannelItem() -> SNChannelItem {
         let n = meshCount
         return SNChannelItem(
@@ -840,7 +993,8 @@ final class SonarAppStore: ObservableObject {
             sub: "Public · \(n) in range",
             preview: n > 0 ? "\(n) people in Bluetooth range" : "Bluetooth · works without internet",
             count: n,
-            channel: .mesh
+            channel: .mesh,
+            tier: "Mesh"
         )
     }
 
@@ -853,7 +1007,8 @@ final class SonarAppStore: ObservableObject {
             sub: "Public · \(count) here now",
             preview: "\(ch.level.displayName) · \(count) here now",
             count: count,
-            channel: .location(ch)
+            channel: .location(ch),
+            tier: ch.level.displayName
         )
     }
 
@@ -980,7 +1135,7 @@ final class SonarAppStore: ObservableObject {
             // Sonar discovery peers carry their npub (and optionally a
             // payment address); subtitles end with the plain-language
             // network line ("Sonar · reaches anywhere" etc.).
-            let sonar = sonarProfiles[peer.peerID.id] != nil
+            let sonar = resolvedSonarProfile(peer.peerID.id) != nil
             let network = networkLabel(sonar: sonar, mutualFavorite: peer.isMutualFavorite)
             if peer.isConnected {
                 items.append(SNPeerItem(
@@ -1053,13 +1208,23 @@ final class SonarAppStore: ObservableObject {
                 angle: 0, r: 0, unify: true, avatarSeed: unifyId
             )
         }
+        if let profile = resolvedSonarProfile(id),
+           let group = marmotGroup(forNpub: profile.npub) {
+            return SNPeerItem(
+                id: id,
+                name: marmot.title(for: group),
+                inRange: false, bars: 0,
+                hint: "Out of range", detail: networkLabel(forPeer: id),
+                angle: 0, r: 0, sonar: true
+            )
+        }
         let peerID = PeerID(str: id)
         return SNPeerItem(
             id: id,
             name: chatViewModel.nicknameForPeer(peerID),
             inRange: false, bars: 0,
             hint: "Out of range", detail: networkLabel(forPeer: id),
-            angle: 0, r: 0, sonar: sonarProfiles[id] != nil
+            angle: 0, r: 0, sonar: resolvedSonarProfile(id) != nil
         )
     }
 
@@ -1070,6 +1235,56 @@ final class SonarAppStore: ObservableObject {
 
     func marmotGroupId(_ id: String) -> String? {
         id.hasPrefix(Self.marmotIDPrefix) ? String(id.dropFirst(Self.marmotIDPrefix.count)) : nil
+    }
+
+    private func callMarmotGroupId(_ id: String) -> String? {
+        if let groupId = marmotGroupId(id) { return groupId }
+        guard let profile = resolvedSonarProfile(id) else { return nil }
+        return marmotGroup(forNpub: profile.npub)?.id
+    }
+
+    private func callProfile(_ id: String) -> SonarPeerProfile? {
+        if let profile = resolvedSonarProfile(id) { return profile }
+        guard let groupId = marmotGroupId(id),
+              let group = marmot.groups.first(where: { $0.id == groupId }),
+              let otherNpub = group.memberNpubs.first(where: { $0 != marmot.npub })
+        else { return nil }
+        if let peerKey = sonarPeerKey(forNpub: otherNpub) {
+            return resolvedSonarProfile(peerKey)
+        }
+        return sonarProfiles.first(where: { $0.value.npub == otherNpub })?.value
+            ?? sonarProfilesByFingerprint.first(where: { $0.value.npub == otherNpub })?.value
+    }
+
+    private func callSignalingVia(_ id: String) -> SNVia? {
+        if meshReachable(id) { return .mesh }
+        if callMarmotGroupId(id) != nil { return .internet }
+        if resolvedSonarProfile(id) != nil { return .internet }
+        return nil
+    }
+
+    private func foldedConversationId(forMarmotGroupId groupId: String) -> String? {
+        guard let group = marmot.groups.first(where: { $0.id == groupId }),
+              let otherNpub = group.memberNpubs.first(where: { $0 != marmot.npub })
+        else { return nil }
+        return sonarPeerKey(forNpub: otherNpub)
+    }
+
+    private func callConversationId(_ id: String) -> String {
+        if let groupId = marmotGroupId(id),
+           let folded = foldedConversationId(forMarmotGroupId: groupId) {
+            return folded
+        }
+        return id
+    }
+
+    private func callDisplayName(_ id: String) -> String {
+        if !meshReachable(id),
+           let groupId = callMarmotGroupId(id),
+           let group = marmot.groups.first(where: { $0.id == groupId }) {
+            return marmot.title(for: group)
+        }
+        return peerItem(id).name
     }
 
     // MARK: Messages (home rows)
@@ -1104,9 +1319,9 @@ final class SonarAppStore: ObservableObject {
             let msgs = marmot.messagesByGroup[group.id] ?? []
             let last = msgs.last
             let otherNpub = group.memberNpubs.first(where: { $0 != marmot.npub })
-            // Live peer id (only when currently discovered over 0x53) lets us build
-            // a fresh row; the persisted fingerprint still folds into an EXISTING
-            // mesh row when the peer isn't advertising (BLE down / after restart).
+            // Live peer id (when currently discovered over 0x53) gives us mesh
+            // presence; the persisted fingerprint still lets us build the SAME
+            // Sonar row when BLE is down / after restart.
             let liveSonarPeerId = otherNpub.flatMap { np in
                 sonarProfiles.first(where: { $0.value.npub == np })?.key
             }
@@ -1129,18 +1344,21 @@ final class SonarAppStore: ObservableObject {
                 }
                 continue
             }
-            if let liveSonarPeerId, let foldKey {
-                // Discovered Sonar peer with no mesh transcript yet → one row.
-                let peerID = PeerID(str: liveSonarPeerId)
+            if let foldKey {
+                // Discovered Sonar peer with no mesh transcript yet, or a persisted
+                // Sonar peer now out of range → one folded row, not a White Noise
+                // duplicate.
+                let rowId = liveSonarPeerId ?? foldKey
+                let peerID = PeerID(str: rowId)
                 let mesh = chatViewModel.meshService
                 byKey[foldKey] = SNDMRow(
-                    id: liveSonarPeerId,
-                    title: chatViewModel.nicknameForPeer(peerID),
-                    preview: last.map { Self.previewText($0.content) } ?? networkLabel(forPeer: liveSonarPeerId),
+                    id: rowId,
+                    title: liveSonarPeerId == nil ? marmot.title(for: group) : chatViewModel.nicknameForPeer(peerID),
+                    preview: last.map { Self.previewText($0.content) } ?? networkLabel(forPeer: rowId),
                     time: last.map { Self.listTime($0.createdAt) } ?? "",
                     unread: false,
-                    presence: mesh.isPeerConnected(peerID) || mesh.isPeerReachable(peerID),
-                    verified: isVerified(liveSonarPeerId),
+                    presence: liveSonarPeerId != nil && (mesh.isPeerConnected(peerID) || mesh.isPeerReachable(peerID)),
+                    verified: isVerified(rowId) || (marmotVerified[group.id] ?? false),
                     isMarmot: false,
                     lastDate: last?.createdAt
                 )
@@ -1193,6 +1411,11 @@ final class SonarAppStore: ObservableObject {
     }
 
     private func payMapping(_ content: String, fallbackVia: SNVia) -> PayMapping {
+        // ☎CALL signaling lines ride the chat like ⚡PAY but are never shown. The
+        // cheap prefix prefilter avoids an FFI call for ordinary chat messages.
+        if Self.looksLikeCallControl(content), callParseControl(content: content) != nil {
+            return .hidden
+        }
         guard let line = SonarPayMessage.decode(content) else { return .notPay }
         guard case .pay(let pid, let sats) = line else { return .hidden }
         let entry = payLedger.entry(for: pid)
@@ -1207,17 +1430,17 @@ final class SonarAppStore: ObservableObject {
 
     func dmMsgs(_ id: String) -> [SNMessage] {
         if let groupId = marmotGroupId(id) {
-            return (marmot.messagesByGroup[groupId] ?? []).compactMap { m in
+            let dated: [(Date, SNMessage)] = (marmot.messagesByGroup[groupId] ?? []).compactMap { m in
                 switch payMapping(m.content, fallbackVia: .internet) {
                 case .hidden:
                     return nil
                 case .bubble(let pay, let payVia):
-                    return SNMessage(
+                    return (m.createdAt, SNMessage(
                         id: m.id, mine: m.isMine, text: m.content,
                         time: Self.clock(m.createdAt), via: payVia, pay: pay
-                    )
+                    ))
                 case .notPay:
-                    return SNMessage(
+                    return (m.createdAt, SNMessage(
                         id: m.id,
                         mine: m.isMine,
                         author: String(m.senderNpub.prefix(12)),
@@ -1225,9 +1448,10 @@ final class SonarAppStore: ObservableObject {
                         time: Self.clock(m.createdAt),
                         via: .internet,
                         media: Self.mediaItems(m, groupId: groupId)
-                    )
+                    ))
                 }
             }
+            return mergeCallLogs(into: dated, id: id)
         }
         let peerID = PeerID(str: id)
         let via = dmTransport(id)
@@ -1286,7 +1510,19 @@ final class SonarAppStore: ObservableObject {
             }
             dated.sort { $0.0 < $1.0 }
         }
-        return dated.map(\.1)
+        return mergeCallLogs(into: dated, id: id)
+    }
+
+    /// Fold the MOCK in-memory call records for `id` into the transcript,
+    /// chronologically (stable sort keeps same-instant messages in place). A
+    /// no-op when this peer has no recorded calls.
+    private func mergeCallLogs(into dated: [(Date, SNMessage)], id: String) -> [SNMessage] {
+        let calls = callLogs[id] ?? []
+        guard !calls.isEmpty else { return dated.map(\.1) }
+        var combined = dated
+        for c in calls { combined.append((c.date, c.message)) }
+        combined.sort { $0.0 < $1.0 }
+        return combined.map(\.1)
     }
 
     /// DM routing mirrors MessageRouter: Bluetooth when the peer is reachable
@@ -1381,6 +1617,30 @@ final class SonarAppStore: ObservableObject {
         }
         guard let gid = groupId else { return }
         marmot.sendMedia(groupId: gid, data: data, filename: filename, mime: mime)
+    }
+
+    /// Send a recorded voice note (AAC .m4a at `url`). Over the BLE mesh it rides
+    /// bitchat's file transfer as a `[voice]` note (interops with stock bitchat);
+    /// otherwise it's encrypted + uploaded over White Noise (Marmot) like any
+    /// media. Same routing as `sendImage`, audio mime. Cleans up the temp file.
+    func sendVoiceNote(_ id: String, url: URL) {
+        defer { try? FileManager.default.removeItem(at: url) }
+        if meshReachable(id) {
+            chatViewModel.selectedPrivateChatPeer = PeerID(str: id)
+            chatViewModel.sendVoiceNote(at: url)
+            return
+        }
+        guard let data = try? Data(contentsOf: url) else { return }
+        let groupId: String?
+        if let gid = marmotGroupId(id) {
+            groupId = gid
+        } else if let profile = resolvedSonarProfile(id) {
+            groupId = marmotGroup(forNpub: profile.npub)?.id
+        } else {
+            groupId = nil
+        }
+        guard let gid = groupId else { return }
+        marmot.sendMedia(groupId: gid, data: data, filename: url.lastPathComponent, mime: "audio/mp4")
     }
 
     /// Send an image over the BLE mesh by reusing ChatViewModel's bitchat file
@@ -1552,10 +1812,20 @@ final class SonarAppStore: ObservableObject {
     /// capability (discovery bit 1). Never bitchat-only peers.
     func paymentCapable(_ id: String) -> Bool {
         if marmotGroupId(id) != nil { return true }
-        if let profile = sonarProfiles[id] {
+        if let profile = resolvedSonarProfile(id) {
             return profile.capabilities & SonarCapability.payments != 0
         }
         return false
+    }
+
+    /// Voice/video calls are a Sonar-only feature. Prefer live BLE signaling, but
+    /// keep the same call affordance after discovery when White Noise signaling
+    /// exists or can be established from the persisted npub.
+    func canCall(_ id: String) -> Bool {
+        guard let profile = callProfile(id),
+              profile.capabilities & SonarCapability.calls != 0
+        else { return false }
+        return callSignalingVia(id) != nil
     }
 
     /// Sends a sealed coin over the conversation's current rail. The balance
@@ -1669,9 +1939,13 @@ final class SonarAppStore: ObservableObject {
     }
 
     /// Maps a raw last-message content to the home-row preview ("₿ Payment"
-    /// for any ⚡PAY line so the codec never leaks into list rows).
+    /// for any ⚡PAY line, "Voice call" for ☎CALL signaling, so codecs never
+    /// leak into list rows).
     static func previewText(_ content: String) -> String {
-        SonarPayMessage.decode(content) != nil ? "\u{20BF} Payment" : content
+        if looksLikeCallControl(content), callParseControl(content: content) != nil {
+            return "Voice call"
+        }
+        return SonarPayMessage.decode(content) != nil ? "\u{20BF} Payment" : content
     }
 
     /// Radar "Send sats": open the DM with the PaySheet already up.
@@ -1841,6 +2115,356 @@ final class SonarAppStore: ObservableObject {
         if !path.isEmpty { path.removeLast() }
     }
 
+    // MARK: Calls
+
+    /// mm:ss formatter (call.jsx `fmtCall`): minutes unpadded, seconds padded.
+    static func fmtCall(_ sec: Int) -> String {
+        "\(sec / 60):" + String(format: "%02d", sec % 60)
+    }
+
+    // MARK: - Real P2P voice calls (iroh transport; ☎CALL over the chat)
+
+    /// Bind the iroh endpoint once + start the call event loop (idempotent).
+    func ensureCallStarted() {
+        guard !callStarted else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await self.marmot.callStart()
+                await MainActor.run { self.callStarted = true; self.startCallLoop() }
+            } catch {
+                SecureLogger.error("call start failed: \(error)", category: .session)
+            }
+        }
+    }
+
+    /// Place an outgoing call from `convId`: register it, push the call screen,
+    /// and send the ☎CALL OFFER (with our dialable address) over the chat.
+    func placeCall(_ convId: String, video: Bool) {
+        guard activeCall == nil else { return }
+        guard !video else {
+            SecureLogger.debug("SonarCall: video calls are disabled until media support is wired", category: .session)
+            return
+        }
+        guard canCall(convId), let via = callSignalingVia(convId) else {
+            SecureLogger.debug("SonarCall: refusing call without BLE or White Noise route convId=\(convId.prefix(16))", category: .session)
+            return
+        }
+        let callId = UUID().uuidString
+        let name = callDisplayName(convId)
+        // Show the ringing screen IMMEDIATELY so the tap is responsive — the iroh
+        // setup (bind/offer) runs in the background. The endpoint is already bound
+        // at boot via ensureCallStarted(), so we must NOT call callStart() again
+        // here (a second bind blocks — which made the tap "take forever").
+        SonarCallAudioRoute.configure(active: true, speakerOn: true)
+        activeCall = SNActiveCall(callId: callId, convId: convId, signalingVia: via, peerName: name, video: video, incoming: false, phase: .ringing)
+        push(.call(convId, video: video))
+        let alreadyStarted = callStarted
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                if !alreadyStarted {
+                    try await self.marmot.callStart()
+                    await MainActor.run { self.callStarted = true; self.startCallLoop() }
+                }
+                let addr = try await self.marmot.callLocalAddress()
+                try await self.marmot.callPlace(callId: callId, video: video)
+                if await MainActor.run(body: { self.activeCall?.callId == callId && self.activeCall?.muted == true }) {
+                    try? await self.marmot.callSetMuted(callId: callId, muted: true)
+                }
+                let line = callEncodeOffer(callId: callId, video: video, nodeAddrB64: addr, unixSecs: UInt64(Date().timeIntervalSince1970))
+                await MainActor.run {
+                    guard self.activeCall?.callId == callId else { return } // user already ended
+                    if !self.sendCallControl(convId, line, via: via) {
+                        Task { [weak self] in try? await self?.marmot.callHangup(callId: callId) }
+                        SonarCallAudioRoute.configure(active: false, speakerOn: false)
+                        self.activeCall = nil
+                        self.pop()
+                    }
+                }
+            } catch {
+                SecureLogger.error("call place failed: \(error)", category: .session)
+                await MainActor.run {
+                    guard self.activeCall?.callId == callId else { return }
+                    SonarCallAudioRoute.configure(active: false, speakerOn: false)
+                    self.activeCall = nil
+                    self.pop()
+                }
+            }
+        }
+    }
+
+    /// Accept the incoming call: send ANSWER|accept (with our address), then dial.
+    func acceptCall() {
+        guard let c = activeCall else { return }
+        var next = c
+        next.phase = .connecting
+        activeCall = next
+        SonarCallAudioRoute.configure(active: true, speakerOn: c.speakerOn)
+        let alreadyStarted = callStarted
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                // The endpoint is normally bound at boot; ensure it before dialing
+                // in case ensureCallStarted() failed (e.g. no network at launch).
+                if !alreadyStarted {
+                    try await self.marmot.callStart()
+                    await MainActor.run { self.callStarted = true; self.startCallLoop() }
+                }
+                let addr = try await self.marmot.callLocalAddress()
+                let line = callEncodeAnswer(callId: c.callId, answer: .accept, nodeAddrB64: addr)
+                let sent = await MainActor.run { self.sendCallControl(c.convId, line, via: c.signalingVia) }
+                guard sent else {
+                    try? await self.marmot.callHangup(callId: c.callId)
+                    await MainActor.run { SonarCallAudioRoute.configure(active: false, speakerOn: false) }
+                    return
+                }
+                if await MainActor.run(body: { self.activeCall?.callId == c.callId && self.activeCall?.muted == true }) {
+                    try? await self.marmot.callSetMuted(callId: c.callId, muted: true)
+                }
+                try await self.marmot.callAccept(callId: c.callId)
+            } catch {
+                SecureLogger.error("call accept failed: \(error)", category: .session)
+            }
+        }
+    }
+
+    /// Decline the incoming call: send ANSWER|decline + tear down the local slot.
+    func declineCall() {
+        guard let c = activeCall else { return }
+        let line = callEncodeAnswer(callId: c.callId, answer: .decline, nodeAddrB64: "")
+        _ = sendCallControl(c.convId, line, via: c.signalingVia)
+        Task { [weak self] in try? await self?.marmot.callHangup(callId: c.callId) }
+    }
+
+    /// Hang up an outgoing/connected call: tear down media + signal END. The
+    /// engine's Ended event records the call-log entry and pops the screen.
+    func hangupCall() {
+        guard let c = activeCall else { return }
+        SonarCallAudioRoute.configure(active: false, speakerOn: false)
+        let line = callEncodeEnd(callId: c.callId, reason: "hangup")
+        _ = sendCallControl(c.convId, line, via: c.signalingVia)
+        Task { [weak self] in try? await self?.marmot.callHangup(callId: c.callId) }
+    }
+
+    func toggleCallMute() {
+        guard var c = activeCall else { return }
+        c.muted.toggle()
+        activeCall = c
+        Task { [weak self] in try? await self?.marmot.callSetMuted(callId: c.callId, muted: c.muted) }
+    }
+
+    func toggleCallSpeaker() {
+        guard var c = activeCall else { return }
+        c.speakerOn.toggle()
+        activeCall = c
+        SonarCallAudioRoute.setSpeaker(c.speakerOn)
+    }
+
+    private func startCallLoop() {
+        guard callLoopTask == nil else { return }
+        // Detached: the parking loop must NOT be MainActor-isolated. The blocking
+        // wait already parks off-main (MarmotService.callWaitQueue); keeping the
+        // loop body off the main actor too means even a degenerate fast-return
+        // can't starve the UI. State mutation hops back via MainActor.run below.
+        callLoopTask = Task.detached(priority: .utility) { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                let ev = await self.marmot.callWaitEvent(timeoutSeconds: 20)
+                if Task.isCancelled { return }
+                if let ev { await MainActor.run { self.onCallEvent(ev) } }
+            }
+        }
+    }
+
+    private func onCallEvent(_ ev: CallEventInfo) {
+        guard var c = activeCall, ev.callId == c.callId else { return }
+        switch ev.state {
+        case .ringing: break
+        case .connecting: c.phase = .connecting; activeCall = c
+        case .connected: c.phase = .connected; c.connectedSecs = 0; activeCall = c; startCallTicker()
+        case .ended, .failed, .declined, .busy, .missed: finalizeCall(c, ev)
+        }
+    }
+
+    private func startCallTicker() {
+        callTickerTask?.cancel()
+        callTickerTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard let self else { return }
+                await MainActor.run {
+                    if var c = self.activeCall { c.connectedSecs += 1; self.activeCall = c }
+                }
+            }
+        }
+    }
+
+    /// Record the call-log entry, clear state, and pop the call screen.
+    private func finalizeCall(_ c: SNActiveCall, _ ev: CallEventInfo) {
+        callTickerTask?.cancel(); callTickerTask = nil
+        SonarCallAudioRoute.configure(active: false, speakerOn: false)
+        let secs = Int(ev.durationSecs)
+        recordCall(convId: c.convId, video: c.video, mine: !c.incoming, seconds: secs)
+        activeCall = nil
+        if case .call? = path.last { pop() }
+    }
+
+    /// Tear down call state on wipe/erase so calling rebinds cleanly after the
+    /// node is recreated (the iroh endpoint must be re-bound).
+    private func resetCallState() {
+        callTickerTask?.cancel(); callTickerTask = nil
+        callLoopTask?.cancel(); callLoopTask = nil
+        SonarCallAudioRoute.configure(active: false, speakerOn: false)
+        activeCall = nil
+        callStarted = false
+        scannedCallMessageIDs = []
+    }
+
+    private func recordCall(convId: String, video: Bool, mine: Bool, seconds: Int) {
+        let connected = seconds > 0
+        let now = Date()
+        let record = SNCallRecord(
+            id: UUID().uuidString,
+            date: now,
+            message: SNMessage(
+                mine: mine,
+                text: "",
+                time: Self.clock(now),
+                call: SNCallInfo(
+                    kind: video ? .video : .voice,
+                    missed: !connected,
+                    dur: connected ? Self.fmtCall(seconds) : nil
+                )
+            )
+        )
+        callLogs[convId, default: []].append(record)
+    }
+
+    /// Scan inbound mesh + Marmot messages for ☎CALL control lines (deduped) and
+    /// route them to the engine — never rendered as chat. Mirrors the ⚡PAY scan.
+    /// Wire prefix of a ☎CALL control line (mirrors Rust `CALL_PREFIX`). Used as a
+    /// pure-Swift prefilter so plain chat never crosses the FFI boundary.
+    private static let callPrefix = "☎CALL"
+
+    /// Cheap allocation-light check matching Rust `CallControl::is_control`
+    /// (`content.trim_start().starts_with(CALL_PREFIX)`). No FFI.
+    private static func looksLikeCallControl(_ content: String) -> Bool {
+        content.drop(while: { $0.isWhitespace }).hasPrefix(callPrefix)
+    }
+
+    private func processIncomingCallLines() {
+        let my = chatViewModel.meshService.myPeerID
+        for (peerID, msgs) in chatViewModel.privateChats {
+            for m in msgs where m.senderPeerID != my {
+                guard !scannedCallMessageIDs.contains(m.id) else { continue }
+                scannedCallMessageIDs.insert(m.id)
+                // Pure-Swift prefilter: skip the FFI for every non-☎CALL message
+                // (i.e. essentially all chat) so this main-queue sink never
+                // marshals ordinary messages into the core just to get back nil.
+                guard Self.looksLikeCallControl(m.content) else { continue }
+                if let ctrl = callParseControl(content: m.content) {
+                    handleCallControl(ctrl, convId: peerID.id, via: .mesh)
+                }
+            }
+        }
+        for (groupId, msgs) in marmot.messagesByGroup {
+            for m in msgs where !m.isMine {
+                guard !scannedCallMessageIDs.contains(m.id) else { continue }
+                scannedCallMessageIDs.insert(m.id)
+                guard Self.looksLikeCallControl(m.content) else { continue }
+                if let ctrl = callParseControl(content: m.content) {
+                    handleCallControl(ctrl, convId: Self.marmotIDPrefix + groupId, via: .internet)
+                }
+            }
+        }
+    }
+
+    @discardableResult
+    private func sendCallControl(_ convId: String, _ line: String, via: SNVia) -> Bool {
+        switch via {
+        case .mesh:
+            guard meshReachable(convId) else {
+                SecureLogger.debug("SonarCall: dropping control without mesh route convId=\(convId.prefix(16))", category: .session)
+                return false
+            }
+            let sent = chatViewModel.meshService.sendPrivateMessageNow(line, to: PeerID(str: convId), messageID: UUID().uuidString)
+            if !sent {
+                SecureLogger.debug("SonarCall: dropping control without established Noise route convId=\(convId.prefix(16))", category: .session)
+            }
+            return sent
+        case .internet:
+            if let groupId = callMarmotGroupId(convId) {
+                marmot.send(line, to: groupId)
+                return true
+            }
+            guard let profile = resolvedSonarProfile(convId) else {
+                SecureLogger.debug("SonarCall: internet signaling requires Marmot group convId=\(convId.prefix(16))", category: .session)
+                return false
+            }
+            sendOverMarmot(line, npub: profile.npub)
+            return true
+        }
+    }
+
+    private func handleCallControl(_ ctrl: CallControlInfo, convId: String, via: SNVia) {
+        let conversationId = callConversationId(convId)
+        if case let .offer(callId, _, _, _) = ctrl, !canCall(conversationId) {
+            SecureLogger.debug("SonarCall: ignoring offer without Sonar call route convId=\(convId.prefix(16)) folded=\(conversationId.prefix(16)) via=\(via)", category: .session)
+            _ = sendCallControl(convId, callEncodeAnswer(callId: callId, answer: .decline, nodeAddrB64: ""), via: via)
+            return
+        }
+        let signalingVia = callSignalingVia(conversationId) ?? via
+
+        switch ctrl {
+        case let .offer(callId, video, nodeAddrB64, unixSecs):
+            guard !video else {
+                SecureLogger.debug("SonarCall: declining unsupported video OFFER convId=\(conversationId.prefix(16))", category: .session)
+                _ = sendCallControl(conversationId, callEncodeAnswer(callId: callId, answer: .decline, nodeAddrB64: ""), via: signalingVia)
+                return
+            }
+            if activeCall != nil { // busy: auto-decline
+                _ = sendCallControl(conversationId, callEncodeAnswer(callId: callId, answer: .busy, nodeAddrB64: ""), via: signalingVia)
+                return
+            }
+            let stale = Date().timeIntervalSince1970 - Double(unixSecs) > 60
+            let name = callDisplayName(conversationId)
+            let alreadyStarted = callStarted
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    // The endpoint is already bound at boot — do NOT call callStart()
+                    // again (a second bind blocks, so the incoming OFFER would never
+                    // ring). Only bind if boot's ensureCallStarted actually failed.
+                    if !alreadyStarted {
+                        try await self.marmot.callStart()
+                        await MainActor.run { self.callStarted = true; self.startCallLoop() }
+                    }
+                    try await self.marmot.callIncomingOffer(callId: callId, addrB64: nodeAddrB64, video: video)
+                    if stale {
+                        try? await self.marmot.callHangup(callId: callId)
+                        await MainActor.run { self.recordCall(convId: conversationId, video: video, mine: false, seconds: 0) }
+                        return
+                    }
+                    await MainActor.run {
+                        self.activeCall = SNActiveCall(callId: callId, convId: conversationId, signalingVia: signalingVia, peerName: name, video: video, incoming: true, phase: .ringing)
+                        self.push(.call(conversationId, video: video))
+                    }
+                } catch {
+                    SecureLogger.error("incoming offer failed: \(error)", category: .session)
+                }
+            }
+        case let .answer(callId, answer, nodeAddrB64):
+            if activeCall?.callId == callId {
+                Task { [weak self] in try? await self?.marmot.callAnswer(callId: callId, answer: answer, addrB64: nodeAddrB64) }
+            }
+        case let .cancel(callId):
+            if activeCall?.callId == callId { Task { [weak self] in try? await self?.marmot.callHangup(callId: callId) } }
+        case let .end(callId, _):
+            if activeCall?.callId == callId { Task { [weak self] in try? await self?.marmot.callHangup(callId: callId) } }
+        }
+    }
+
     // MARK: Commands (composer "/" layer)
 
     struct CommandContext {
@@ -1911,6 +2535,10 @@ final class SonarAppStore: ObservableObject {
         pendingMarmotSends = [:]
         scannedPayMessageIDs = []
         pendingPayPeer = nil
+        callLogs = [:]
+        // The node is recreated by eraseChatsKeepIdentity → reset call state so
+        // the iroh endpoint rebinds (the marmot.$npub sink calls ensureCallStarted).
+        resetCallState()
         // ⚡PAY coins live inside the erased chats — clear the ledger too. The
         // Lightning wallet seed/balance is separate and is NOT touched.
         payLedger.wipe()
@@ -1963,6 +2591,8 @@ final class SonarAppStore: ObservableObject {
         clearMediaDiskCache()
         scannedPayMessageIDs = []
         pendingPayPeer = nil
+        callLogs = [:]
+        resetCallState()
         bip353 = ""
         defaults.removeObject(forKey: Keys.bip353)
         onboarded = false
