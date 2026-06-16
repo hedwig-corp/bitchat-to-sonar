@@ -54,4 +54,11 @@ impl Peripheral {
         self.peripheral_manager.add_service(service);
         Ok(())
     }
+
+    /// PATCH (Sonar): notify subscribed centrals with `data` on the registered
+    /// notify characteristic. Returns false when there's no characteristic yet or
+    /// CoreBluetooth's transmit queue is full.
+    pub fn notify(&self, data: &[u8]) -> bool {
+        self.peripheral_manager.notify(data)
+    }
 }

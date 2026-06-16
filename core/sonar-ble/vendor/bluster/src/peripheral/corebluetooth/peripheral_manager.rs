@@ -1,5 +1,6 @@
 use std::{
     ffi::CString,
+    sync::atomic::{AtomicPtr, Ordering},
     sync::{Once, ONCE_INIT},
 };
 
@@ -30,6 +31,13 @@ use super::{
 };
 
 static REGISTER_DELEGATE_CLASS: Once = ONCE_INIT;
+
+// PATCH (Sonar): upstream bluster has no notify path on CoreBluetooth (it never
+// registers didSubscribeToCharacteristic and can't push notifications). We retain
+// the last notify-capable CBMutableCharacteristic here so `notify()` can call
+// updateValue:forCharacteristic:onSubscribedCentrals: on it. The characteristic
+// is kept alive by the service that owns it.
+static NOTIFY_CHAR: AtomicPtr<Object> = AtomicPtr::new(std::ptr::null_mut());
 
 #[derive(Debug)]
 pub struct PeripheralManager {
@@ -182,6 +190,8 @@ impl PeripheralManager {
                                                 permissions:permissions],
                     };
 
+                    // PATCH (Sonar): retain a notify-capable characteristic for notify().
+                    NOTIFY_CHAR.store(mutable_characteristic, Ordering::SeqCst);
                     Id::from_ptr(mutable_characteristic as *mut NSObject)
                 }
             })
@@ -200,6 +210,28 @@ impl PeripheralManager {
                 .get_ivar::<*mut Object>(PERIPHERAL_MANAGER_IVAR);
 
             let _: Result<(), ()> = msg_send![peripheral_manager, addService: service];
+        }
+    }
+
+    // PATCH (Sonar): push `data` to subscribed centrals on the retained notify
+    // characteristic via updateValue:forCharacteristic:onSubscribedCentrals:.
+    // Returns false if no characteristic exists yet or CoreBluetooth's transmit
+    // queue is full (retry later). This is the notify path upstream bluster lacks.
+    pub fn notify(self: &Self, data: &[u8]) -> bool {
+        let chr = NOTIFY_CHAR.load(Ordering::SeqCst);
+        if chr.is_null() {
+            return false;
+        }
+        unsafe {
+            let peripheral_manager = *self
+                .peripheral_manager_delegate
+                .get_ivar::<*mut Object>(PERIPHERAL_MANAGER_IVAR);
+            let value = NSData::with_bytes(data);
+            let ok: BOOL = msg_send![peripheral_manager,
+                updateValue: value
+                forCharacteristic: chr
+                onSubscribedCentrals: nil];
+            ok.into_bool()
         }
     }
 }

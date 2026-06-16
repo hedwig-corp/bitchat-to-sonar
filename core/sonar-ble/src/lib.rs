@@ -276,6 +276,20 @@ async fn run_peripheral() -> Result<(), Box<dyn std::error::Error>> {
     let chr = Uuid08::from_u128(BITCHAT_CHAR_U128);
 
     let peripheral = Peripheral::new().await?;
+
+    // CoreBluetooth silently ignores addService:/startAdvertising: until the
+    // CBPeripheralManager is powered on — so WAIT for power-on BEFORE registering
+    // the GATT service. (Adding it first drops it, and a central then discovers
+    // no service: the Android client logs `servicesDiscovered svc=false`.)
+    let mut tries = 0;
+    while !peripheral.is_powered().await? {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        tries += 1;
+        if tries > 50 {
+            return Err("peripheral never powered on".into());
+        }
+    }
+
     let (tx, mut rx) = futures::channel::mpsc::channel(32);
     let characteristic = Characteristic::new(
         chr,
@@ -292,15 +306,10 @@ async fn run_peripheral() -> Result<(), Box<dyn std::error::Error>> {
     chars.insert(characteristic);
     peripheral.add_service(&Service::new(svc, true, chars))?;
     peripheral.register_gatt().await?;
+    // Let CoreBluetooth commit the service (didAddService) before advertising, so
+    // the GATT DB is populated by the time a central connects + discovers.
+    tokio::time::sleep(Duration::from_millis(400)).await;
 
-    let mut tries = 0;
-    while !peripheral.is_powered().await? {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        tries += 1;
-        if tries > 50 {
-            return Err("peripheral never powered on".into());
-        }
-    }
     peripheral.start_advertising("Sonar", &[svc]).await?;
     dbg_log("advertise: started (bitchat service)");
 
@@ -308,26 +317,41 @@ async fn run_peripheral() -> Result<(), Box<dyn std::error::Error>> {
         ANNOUNCE.lock().ok().and_then(|a| a.clone()).unwrap_or_default()
     }
 
+    let mut last_notify = Instant::now()
+        .checked_sub(Duration::from_secs(60))
+        .unwrap_or_else(Instant::now);
     while ADVERTISING.load(Ordering::SeqCst) {
-        match tokio::time::timeout(Duration::from_secs(1), rx.next()).await {
+        // Push our announce to any subscribed central every ~2s. bluster's
+        // CoreBluetooth backend has no didSubscribe callback, so instead of
+        // sending on-subscribe we just keep notifying; updateValue only reaches
+        // subscribed centrals, so a phone that just subscribed picks up the next
+        // tick and then shows this desktop as a peer.
+        if last_notify.elapsed() >= Duration::from_secs(2) {
+            let ann = announce();
+            if !ann.is_empty() {
+                let sent = peripheral.notify(&ann);
+                dbg_log(&format!("advertise: notify announce ({} bytes) sent={}", ann.len(), sent));
+            }
+            last_notify = Instant::now();
+        }
+        match tokio::time::timeout(Duration::from_millis(500), rx.next()).await {
             Ok(Some(ev)) => match ev {
                 Event::NotifySubscribe(sub) => {
-                    // A phone subscribed → push our announce so it shows us as a peer.
-                    dbg_log("advertise: central subscribed → notify announce");
                     let _ = sub.notification.clone().try_send(announce());
                 }
                 Event::ReadRequest(req) => {
                     let _ = req.response.send(Response::Success(announce()));
                 }
                 Event::WriteRequest(req) => {
-                    // Inbound packets (handshake/messages) — discovery doesn't need
-                    // them yet; ack so the central isn't left hanging.
+                    // The central's packets (its announce / handshake). Discovery
+                    // doesn't consume them yet; ack so it isn't left hanging.
+                    dbg_log(&format!("advertise: rx write {} bytes from central", req.data.len()));
                     let _ = req.response.send(Response::Success(vec![]));
                 }
                 Event::NotifyUnsubscribe => {}
             },
             Ok(None) => break,
-            Err(_) => {} // 1s tick — re-check ADVERTISING
+            Err(_) => {} // tick — re-check ADVERTISING + re-notify
         }
     }
     let _ = peripheral.stop_advertising().await;
