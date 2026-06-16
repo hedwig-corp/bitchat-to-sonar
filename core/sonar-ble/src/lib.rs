@@ -51,6 +51,10 @@ static ADVERTISING: AtomicBool = AtomicBool::new(false);
 /// its own advertising while connected, so scanning alone can't see it).
 static RX_PACKETS: Lazy<Mutex<Vec<Vec<u8>>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
+/// Packets the JVM mesh engine wants pushed to subscribed centrals (Noise
+/// handshake replies, encrypted DMs). The advertise loop drains + notifies them.
+static TX_PACKETS: Lazy<Mutex<Vec<Vec<u8>>>> = Lazy::new(|| Mutex::new(Vec::new()));
+
 fn hex_encode(b: &[u8]) -> String {
     let mut s = String::with_capacity(b.len() * 2);
     for byte in b {
@@ -307,6 +311,24 @@ pub extern "C" fn sonar_ble_stop_advertising() {
     ADVERTISING.store(false, Ordering::SeqCst);
 }
 
+/// Queue a raw packet to notify to subscribed centrals (the JVM mesh engine sends
+/// Noise handshake replies + encrypted DMs this way). The advertise loop flushes it.
+///
+/// # Safety
+/// `ptr` must point to `len` readable bytes, or be null.
+#[no_mangle]
+pub unsafe extern "C" fn sonar_ble_notify(ptr: *const u8, len: usize) {
+    if ptr.is_null() || len == 0 {
+        return;
+    }
+    let bytes = std::slice::from_raw_parts(ptr, len).to_vec();
+    if let Ok(mut q) = TX_PACKETS.lock() {
+        if q.len() < 256 {
+            q.push(bytes);
+        }
+    }
+}
+
 async fn run_peripheral() -> Result<(), Box<dyn std::error::Error>> {
     let svc = Uuid08::from_u128(BITCHAT_SERVICE_U128);
     let chr = Uuid08::from_u128(BITCHAT_CHAR_U128);
@@ -370,6 +392,11 @@ async fn run_peripheral() -> Result<(), Box<dyn std::error::Error>> {
             }
             last_notify = Instant::now();
         }
+        // Flush packets the JVM mesh engine queued (handshake replies, DMs).
+        let tx: Vec<Vec<u8>> = TX_PACKETS.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
+        for pkt in tx {
+            peripheral.notify(&pkt);
+        }
         // Drain packets centrals wrote to us (bluster's event channel is a no-op
         // on macOS; we patched it to queue writes — take them here).
         let writes = peripheral.take_writes();
@@ -383,7 +410,8 @@ async fn run_peripheral() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        match tokio::time::timeout(Duration::from_millis(500), rx.next()).await {
+        // Short tick so handshake replies / DMs queued by the JVM flush quickly.
+        match tokio::time::timeout(Duration::from_millis(120), rx.next()).await {
             Ok(Some(ev)) => match ev {
                 Event::NotifySubscribe(sub) => {
                     let _ = sub.notification.clone().try_send(announce());

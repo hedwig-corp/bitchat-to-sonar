@@ -3,6 +3,7 @@ package chat.bitchat.sonar
 import chat.bitchat.sonar.crypto.Sha256
 import uniffi.sonar_ffi.NoiseKeypairHex
 import uniffi.sonar_ffi.meshBuildAnnounce
+import uniffi.sonar_ffi.meshBuildPacket
 import uniffi.sonar_ffi.noiseGenerateKeypair
 import java.security.SecureRandom
 
@@ -45,7 +46,10 @@ object MeshIdentity {
     }
 
     /** bitchat peerID = SHA256(noise static pubkey)[:8], hex. */
-    private val peerIdHex: String by lazy { hex(Sha256.hash(unhex(keypair.publicHex)).copyOf(8)) }
+    val peerIdHex: String by lazy { hex(Sha256.hash(unhex(keypair.publicHex)).copyOf(8)) }
+
+    /** Our Noise static private key (for the responder handshake). */
+    fun noisePrivHex(): String = keypair.privateHex
 
     /** The signed bitchat ANNOUNCE (type 0x01) for [nickname], current timestamp. */
     fun announce(nickname: String): ByteArray = meshBuildAnnounce(
@@ -56,4 +60,13 @@ object MeshIdentity {
         DEFAULT_TTL,
         System.currentTimeMillis().toULong(),
     )
+
+    /** Build an UNSIGNED mesh packet (Noise handshake / encrypted DM) from us to
+     *  [recipientIdHex], wrapping [payload]. */
+    fun buildPacket(packetType: UByte, recipientIdHex: String, payload: ByteArray): ByteArray =
+        meshBuildPacket(packetType, peerIdHex, recipientIdHex, DEFAULT_TTL, System.currentTimeMillis().toULong(), payload)
+
+    /** Stable peer fingerprint = SHA256(noise static pubkey), full hex. */
+    fun fingerprintOf(noisePublicKeyHex: String): String =
+        runCatching { hex(Sha256.hash(unhex(noisePublicKeyHex))) }.getOrDefault("")
 }

@@ -15,6 +15,7 @@ private interface BleLib : Library {
     fun sonar_ble_start_advertising()
     fun sonar_ble_stop_advertising()
     fun sonar_ble_drain_rx_json(): Pointer?
+    fun sonar_ble_notify(data: ByteArray?, len: Long)
 }
 
 /**
@@ -54,6 +55,10 @@ object BleBridge {
     fun setAnnounce(bytes: ByteArray) { lib?.sonar_ble_set_announce(bytes, bytes.size.toLong()) }
     fun startAdvertising() { lib?.sonar_ble_start_advertising() }
     fun stopAdvertising() { lib?.sonar_ble_stop_advertising() }
+
+    /** Send a raw mesh packet (Noise handshake reply / encrypted DM) to subscribed
+     *  centrals via the GATT notify path. */
+    fun notify(bytes: ByteArray) { lib?.sonar_ble_notify(bytes, bytes.size.toLong()) }
 
     /** Packets centrals wrote to our GATT characteristic (announce/handshake). */
     fun drainRx(): List<ByteArray> {
