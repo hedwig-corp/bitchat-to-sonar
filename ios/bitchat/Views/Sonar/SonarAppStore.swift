@@ -686,6 +686,22 @@ final class SonarAppStore: ObservableObject {
         marmot.connectIfNeeded()
     }
 
+    /// `nsec1…` backup of the current identity for the "Export private key"
+    /// sheet (self-custody). Nil until the secure-chat identity has loaded.
+    func exportNsec() async -> String? {
+        await marmot.exportNsec()
+    }
+
+    /// Restore an existing account from a pasted `nsec1…` backup on the
+    /// "I already have a key" onboarding path: import the identity, then finish
+    /// onboarding. Throws on an invalid key.
+    func restoreAccount(nsec: String) async throws {
+        try await marmot.restoreIdentity(nsec: nsec)
+        onboarded = true
+        defaults.set(true, forKey: Keys.onboarded)
+        path = []
+    }
+
     /// Start Unify scanning while the Nearby/radar screen is visible; stop it
     /// when it goes away. Keeps the extra BLE scan off except when the user is
     /// actually looking for someone nearby to pay.

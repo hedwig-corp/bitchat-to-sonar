@@ -24,6 +24,8 @@ enum SNIconName: String {
     case phone, videocam, phoneDown, micOff, videoOff, speaker, cameraFlip
     // Key sharing (settings.jsx KeyShareCard): copy key / share key.
     case copy, share
+    // Private-key export / import (settings.jsx ExportKeySheet, onboarding restore).
+    case eye, eyeOff, importKey
 }
 
 private enum SNIconElement {
@@ -168,6 +170,20 @@ private let snIconTable: [SNIconName: [SNIconElement]] = [
         .circle(17, 6, 2.4, filled: false),
         .circle(17, 18, 2.4, filled: false),
         .path("M8.6 10.9 14.9 7.1M8.6 13.1l6.3 3.8"),
+    ],
+    .eye: [
+        .path("M2.5 12s3.5-6.5 9.5-6.5S21.5 12 21.5 12s-3.5 6.5-9.5 6.5S2.5 12 2.5 12z"),
+        .circle(12, 12, 2.8, filled: false),
+    ],
+    .eyeOff: [
+        .path("M4.5 5 19.5 19"),
+        .path("M9.5 5.7A9 9 0 0 1 12 5.5c6 0 9.5 6.5 9.5 6.5a16 16 0 0 1-2.9 3.6M6.4 7.6A16 16 0 0 0 2.5 12s3.5 6.5 9.5 6.5a8.8 8.8 0 0 0 3.1-.55"),
+        .path("M9.8 10.2a2.8 2.8 0 0 0 3.9 4"),
+    ],
+    .importKey: [
+        .circle(8, 12, 3.2, filled: false),
+        .path("M11.2 12h9M16.5 12v3M20.2 12v2.4"),
+        .path("M14 5.5 11 8.5M14 5.5l-3-3M11 8.5l-2.4-2.4"),
     ],
 ]
 

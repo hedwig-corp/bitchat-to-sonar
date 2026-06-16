@@ -13,6 +13,11 @@
 //
 
 import SwiftUI
+#if canImport(UIKit)
+import UIKit
+#elseif canImport(AppKit)
+import AppKit
+#endif
 
 struct SonarSettingsScreen: View {
     @EnvironmentObject private var store: SonarAppStore
@@ -22,6 +27,7 @@ struct SonarSettingsScreen: View {
     @State private var eraseAsk = false
     @State private var walletSheet = false
     @State private var currencySheet = false
+    @State private var exportKeySheet = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -91,6 +97,12 @@ struct SonarSettingsScreen: View {
                             store.push(.nearby)
                         }
                         SNSettingsRow(
+                            icon: .importKey, tone: .cyan, label: "Export private key",
+                            sub: "Move your account to another wallet"
+                        ) {
+                            exportKeySheet = true
+                        }
+                        SNSettingsRow(
                             icon: .trash, tone: .cyan, label: "Erase all chats",
                             sub: "Clears conversations — keeps your identity"
                         ) {
@@ -158,6 +170,9 @@ struct SonarSettingsScreen: View {
                 onClose: { currencySheet = false }
             )
         }
+        .snSheet(isPresented: $exportKeySheet, title: "Export private key") {
+            SNExportKeySheetContent()
+        }
     }
 
     /// Real balance when the wallet is ready, in the chosen display unit;
@@ -207,6 +222,104 @@ struct SonarSettingsScreen: View {
             .foregroundColor(SonarTheme.text3)
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(EdgeInsets(top: 0, leading: 24, bottom: 4, trailing: 24))
+    }
+}
+
+// MARK: - Export private key sheet (ExportKeySheet) — self-custody escape hatch
+
+/// Reveal + copy the `nsec1…` private key so the user can move their account to
+/// another Nostr wallet. Ported from ExportKeySheet in settings.jsx.
+struct SNExportKeySheetContent: View {
+    @EnvironmentObject private var store: SonarAppStore
+
+    @State private var nsec: String?
+    @State private var revealed = false
+    @State private var copied = false
+
+    /// First 5 chars + 28 bullets, matching the prototype's masked form.
+    private var masked: String {
+        guard let nsec else { return "" }
+        return String(nsec.prefix(5)) + " " + String(repeating: "\u{2022}", count: 28)
+    }
+
+    private func copyKey() {
+        guard let nsec else { return }
+        #if canImport(UIKit)
+        UIPasteboard.general.string = nsec
+        #elseif canImport(AppKit)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(nsec, forType: .string)
+        #endif
+        withAnimation(.easeOut(duration: 0.15)) { copied = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.7) {
+            withAnimation(.easeOut(duration: 0.15)) { copied = false }
+        }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // nsec-warn
+            HStack(alignment: .top, spacing: 11) {
+                SNIcon(name: .shield, size: 18, weight: 2)
+                    .foregroundColor(SonarTheme.danger)
+                (Text("This ") + Text("nsec").fontWeight(.bold) + Text(" key ")
+                    + Text("is").fontWeight(.bold)
+                    + Text(" your account. Anyone who has it can read your messages and spend your balance. Paste it into another Nostr app to move in — never share it with a person."))
+                    .font(SonarTheme.uiFont(size: 13))
+                    .lineSpacing(13 * 0.5)
+                    .foregroundColor(SonarTheme.text)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(EdgeInsets(top: 13, leading: 15, bottom: 13, trailing: 15))
+            .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(SonarTheme.danger.opacity(0.10)))
+            .padding(EdgeInsets(top: 2, leading: 8, bottom: 12, trailing: 8))
+
+            // nsec-field — tap to reveal / hide
+            Button { if nsec != nil { revealed.toggle() } } label: {
+                HStack(spacing: 10) {
+                    Text(verbatim: nsec == nil ? "Loading\u{2026}" : (revealed ? (nsec ?? "") : masked))
+                        .font(SonarTheme.monoFont(size: 13))
+                        .lineSpacing(13 * 0.5)
+                        .foregroundColor(revealed ? SonarTheme.text : SonarTheme.text2)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .multilineTextAlignment(.leading)
+                    SNIcon(name: revealed ? .eyeOff : .eye, size: 17, weight: 2)
+                        .foregroundColor(SonarTheme.text3)
+                }
+                .padding(EdgeInsets(top: 14, leading: 15, bottom: 14, trailing: 15))
+                .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(SonarTheme.surface2))
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(SNScaleStyle(scale: 0.99))
+            .disabled(nsec == nil)
+            .padding(EdgeInsets(top: 0, leading: 8, bottom: 12, trailing: 8))
+
+            // copy
+            Button(action: copyKey) {
+                HStack(spacing: 7) {
+                    SNIcon(name: copied ? .check : .copy, size: 17, weight: 2.2)
+                    Text(verbatim: copied ? "Copied" : "Copy private key")
+                        .font(SonarTheme.uiFont(size: 14.5, weight: .bold))
+                }
+                .foregroundColor(SonarTheme.onAccent)
+                .frame(maxWidth: .infinity)
+                .padding(12)
+                .background(RoundedRectangle(cornerRadius: 13, style: .continuous).fill(copied ? SonarTheme.green : SonarTheme.accentFill))
+            }
+            .buttonStyle(SNScaleStyle(scale: 0.97))
+            .disabled(nsec == nil)
+            .padding(.horizontal, 8)
+
+            Text("Tip: store it in a password manager. Sonar can\u{2019}t recover it for you.")
+                .font(SonarTheme.uiFont(size: 13))
+                .lineSpacing(13 * 0.5)
+                .foregroundColor(SonarTheme.text3)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: .infinity)
+                .padding(EdgeInsets(top: 12, leading: 18, bottom: 4, trailing: 18))
+        }
+        .task { nsec = await store.exportNsec() }
     }
 }
 

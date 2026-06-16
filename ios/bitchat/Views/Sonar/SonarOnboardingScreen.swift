@@ -10,6 +10,11 @@
 //
 
 import SwiftUI
+#if canImport(UIKit)
+import UIKit
+#elseif canImport(AppKit)
+import AppKit
+#endif
 
 struct SonarOnboardingScreen: View {
     @EnvironmentObject private var store: SonarAppStore
@@ -19,8 +24,21 @@ struct SonarOnboardingScreen: View {
     @FocusState private var nickFocused: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
+    // "I already have a key" — restore an existing identity from an nsec backup.
+    @State private var restoring = false
+    @State private var nsec = ""
+    @State private var restoreError: String?
+    @State private var restoreInFlight = false
+    @FocusState private var nsecFocused: Bool
+
     private var can: Bool { nick.trimmingCharacters(in: .whitespaces).count >= 2 }
     private var trimmedNick: String { nick.trimmingCharacters(in: .whitespaces) }
+
+    /// Matches the prototype's nsec validation: bech32 `nsec1…`.
+    private var nsecOk: Bool {
+        let t = nsec.trimmingCharacters(in: .whitespacesAndNewlines)
+        return t.range(of: "^nsec1[0-9a-z]{20,}$", options: .regularExpression) != nil
+    }
 
     /// Nickname suggestions from the design handoff (data.js) — design copy,
     /// not demo data: tapping "Surprise me" picks one as the user's real nick.
@@ -34,8 +52,11 @@ struct SonarOnboardingScreen: View {
         VStack(spacing: 0) {
             // bc-obtop
             HStack {
-                if step > 0 {
-                    SNIconButton(action: { advance(to: step - 1) }) {
+                if step > 0 || restoring {
+                    SNIconButton(action: {
+                        if restoring { restoring = false; restoreError = nil }
+                        else { advance(to: step - 1) }
+                    }) {
                         SNIcon(name: .back, size: 21, weight: 2.1)
                     }
                 }
@@ -46,33 +67,50 @@ struct SonarOnboardingScreen: View {
 
             // bc-obbody
             Group {
-                switch step {
-                case 0: stepIntro
-                case 1: stepNickname
-                default: stepDone
+                if restoring {
+                    stepRestore
+                } else {
+                    switch step {
+                    case 0: stepIntro
+                    case 1: stepNickname
+                    default: stepDone
+                    }
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
             .transition(reduceMotion ? .opacity : .offset(y: 10).combined(with: .opacity))
-            .id(step)
+            .id(restoring ? -1 : step)
 
             // bc-obfooter
             VStack(spacing: 16) {
-                HStack(spacing: 6) {
-                    ForEach(0..<3, id: \.self) { i in
-                        Circle()
-                            .fill(step == i ? SonarTheme.accent : SonarTheme.hairline)
-                            .frame(width: 7, height: 7)
+                if !restoring {
+                    HStack(spacing: 6) {
+                        ForEach(0..<3, id: \.self) { i in
+                            Circle()
+                                .fill(step == i ? SonarTheme.accent : SonarTheme.hairline)
+                                .frame(width: 7, height: 7)
+                        }
                     }
                 }
-                switch step {
-                case 0:
-                    SNPrimaryButton(label: "Get started") { advance(to: 1) }
-                case 1:
-                    SNPrimaryButton(label: "Continue", disabled: !can) { advance(to: 2) }
-                default:
-                    SNPrimaryButton(label: "Start chatting") {
-                        store.completeOnboarding(nick: trimmedNick)
+                if restoring {
+                    SNPrimaryButton(label: restoreInFlight ? "Restoring\u{2026}" : "Restore account", disabled: !nsecOk || restoreInFlight) {
+                        restore()
+                    }
+                } else {
+                    switch step {
+                    case 0:
+                        SNPrimaryButton(label: "Get started") { advance(to: 1) }
+                        SNGhostButton(label: "I already have a key") {
+                            nsec = ""
+                            restoreError = nil
+                            withAnimation(reduceMotion ? nil : .easeOut(duration: 0.35)) { restoring = true }
+                        }
+                    case 1:
+                        SNPrimaryButton(label: "Continue", disabled: !can) { advance(to: 2) }
+                    default:
+                        SNPrimaryButton(label: "Start chatting") {
+                            store.completeOnboarding(nick: trimmedNick)
+                        }
                     }
                 }
             }
@@ -219,6 +257,111 @@ struct SonarOnboardingScreen: View {
                 .foregroundColor(SonarTheme.text3)
                 .padding(.top, 18)
             Spacer()
+        }
+    }
+
+    // Restore — paste an existing nsec ("I already have a key")
+    private var stepRestore: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Spacer()
+            RoundedRectangle(cornerRadius: 23, style: .continuous)
+                .fill(SonarTheme.accentFill)
+                .frame(width: 74, height: 74)
+                .overlay(
+                    SNIcon(name: .importKey, size: 34, weight: 1.7)
+                        .foregroundColor(SonarTheme.onAccent)
+                )
+                .padding(.bottom, 28)
+            Text("Restore your account")
+                .font(SonarTheme.uiFont(size: 30, weight: .heavy))
+                .kerning(-30 * 0.02)
+                .foregroundColor(SonarTheme.text)
+                .padding(.bottom, 10)
+            (Text("Paste the ") + Text("nsec").fontWeight(.bold)
+                + Text(" private key from your old device or another Nostr app. Your nickname, contacts and balance come back with it."))
+                .font(SonarTheme.uiFont(size: 16))
+                .lineSpacing(16 * 0.3)
+                .foregroundColor(SonarTheme.text2)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.bottom, 22)
+            ZStack(alignment: .topLeading) {
+                if nsec.isEmpty {
+                    Text(verbatim: "nsec1\u{2026}")
+                        .font(SonarTheme.monoFont(size: 15))
+                        .foregroundColor(SonarTheme.text3)
+                        .padding(EdgeInsets(top: 14, leading: 16, bottom: 0, trailing: 16))
+                        .allowsHitTesting(false)
+                }
+                TextEditor(text: $nsec)
+                    .font(SonarTheme.monoFont(size: 15))
+                    .foregroundColor(SonarTheme.text)
+                    .focused($nsecFocused)
+                    .frame(minHeight: 84)
+                    .scrollContentBackground(.hidden)
+                    .padding(EdgeInsets(top: 6, leading: 11, bottom: 6, trailing: 11))
+                    #if os(iOS)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    #endif
+            }
+            .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(SonarTheme.surface2))
+            .overlay(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .strokeBorder(nsecFocused ? SonarTheme.accent : Color.clear, lineWidth: 1.5)
+            )
+            Button(action: pasteFromClipboard) {
+                HStack(spacing: 7) {
+                    SNIcon(name: .copy, size: 15, weight: 2)
+                    Text("Paste from clipboard")
+                        .font(SonarTheme.uiFont(size: 14, weight: .bold))
+                }
+                .foregroundColor(SonarTheme.accentDeep)
+                .padding(EdgeInsets(top: 9, leading: 14, bottom: 9, trailing: 14))
+                .background(Capsule().fill(SonarTheme.accentSoft))
+            }
+            .buttonStyle(SNScaleStyle(scale: 0.96))
+            .padding(.top, 12)
+            if let restoreError {
+                Text(verbatim: restoreError)
+                    .font(SonarTheme.uiFont(size: 13))
+                    .lineSpacing(13 * 0.3)
+                    .foregroundColor(SonarTheme.danger)
+                    .padding(.top, 12)
+            }
+            Text("Sonar never sends this key anywhere — it\u{2019}s decoded on this phone to unlock your identity.")
+                .font(SonarTheme.uiFont(size: 13))
+                .lineSpacing(13 * 0.3)
+                .foregroundColor(SonarTheme.text3)
+                .padding(.top, 18)
+            Spacer()
+        }
+    }
+
+    private func pasteFromClipboard() {
+        #if canImport(UIKit)
+        if let s = UIPasteboard.general.string {
+            nsec = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        #elseif canImport(AppKit)
+        if let s = NSPasteboard.general.string(forType: .string) {
+            nsec = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        #endif
+    }
+
+    private func restore() {
+        let key = nsec.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard nsecOk, !restoreInFlight else { return }
+        restoreInFlight = true
+        restoreError = nil
+        Task { @MainActor in
+            do {
+                try await store.restoreAccount(nsec: key)
+                // store.restoreAccount flips `onboarded`; the root view swaps to home.
+            } catch {
+                restoreError = "That key couldn\u{2019}t be imported. Check you pasted the full nsec1\u{2026} key."
+                restoreInFlight = false
+            }
         }
     }
 }

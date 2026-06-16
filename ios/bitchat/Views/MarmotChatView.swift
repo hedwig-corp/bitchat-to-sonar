@@ -121,6 +121,29 @@ final class MarmotChatModel: ObservableObject {
         }
     }
 
+    /// `nsec1…` backup of the connected identity, for the "Export private key"
+    /// self-custody escape hatch. Nil until the identity has loaded.
+    func exportNsec() async -> String? {
+        await service.exportNsec()
+    }
+
+    /// Restore an existing identity from a pasted `nsec1…` backup (onboarding
+    /// "I already have a key"): validate it, persist it as THE identity, then
+    /// connect as it. Throws on an invalid key so the caller can surface it.
+    func restoreIdentity(nsec raw: String) async throws {
+        let nsec = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Validate by importing — throws on a malformed/!nsec key, so we never
+        // persist garbage over a (possibly existing) identity.
+        _ = try await service.loadIdentityNpub(nsec: nsec)
+        _ = keychain.saveIdentityKey(Data(nsec.utf8), forKey: Self.nsecKeychainKey)
+        // Drive the full connect sequence directly (performConnect reads the
+        // nsec we just persisted); guard concurrent connectIfNeeded with busy.
+        busy = true
+        defer { busy = false }
+        npub = nil
+        await performConnect()
+    }
+
     /// Await until the Marmot node is connected (or a short timeout), kicking
     /// off a connect if none is in flight. Lets start/send wait through the
     /// reconnect window (e.g. right after "erase all chats" or a cold launch)
