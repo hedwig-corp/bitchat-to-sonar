@@ -820,7 +820,30 @@ final class SonarAppStore: ObservableObject {
         if let live = sonarProfiles.first(where: { $0.value.npub == npub })?.key {
             return chatViewModel.getFingerprint(for: PeerID(str: live)) ?? live
         }
-        return sonarProfilesByFingerprint.first(where: { $0.value.npub == npub })?.key
+        if let persisted = sonarProfilesByFingerprint.first(where: { $0.value.npub == npub })?.key {
+            return persisted
+        }
+        // Fallback: a favorite we've met over BLE carries the noise↔nostr link, so a
+        // White Noise chat with that npub is the SAME person as the mesh chat — fold
+        // it even when we never captured a 0x53 announce from them (the gap that made
+        // one person show as two chats). Compare canonically so a hex-vs-npub format
+        // mismatch never blocks the fold.
+        guard let target = Self.nostrPubkeyData(npub) else { return nil }
+        for (noiseKey, rel) in FavoritesPersistenceService.shared.favorites {
+            if let nostr = rel.peerNostrPublicKey, Self.nostrPubkeyData(nostr) == target {
+                return noiseKey.sha256Fingerprint()
+            }
+        }
+        return nil
+    }
+
+    /// Canonical 32-byte Nostr pubkey from a bech32 `npub1…` OR a 64-char hex string.
+    private static func nostrPubkeyData(_ s: String) -> Data? {
+        if s.hasPrefix("npub1") {
+            guard let d = try? Bech32.decode(s), d.hrp == "npub", d.data.count == 32 else { return nil }
+            return d.data
+        }
+        return Data(hexString: s).flatMap { $0.count == 32 ? $0 : nil }
     }
 
     /// Inject our Sonar profile into BLEService once the Marmot identity is
