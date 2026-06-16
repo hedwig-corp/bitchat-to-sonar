@@ -280,4 +280,26 @@ actual object SonarCore {
         DesktopSecrets.put("dbKeyHex", hex)
         return hex
     }
+
+    // ── P2P voice calls — UNAVAILABLE on desktop ──────────────────────────────
+    // The iroh call engine (calls-audio: iroh + opus + cpal) is not built into the
+    // desktop sonar_ffi dylib, so calls no-op here: callStart throws → the app's
+    // ensureCallStarted catches it → callStarted stays false → the call UI is never
+    // offered (graceful, like a keyless wallet). Wiring desktop calls (build the
+    // host dylib with calls-audio) is the documented follow-up.
+    actual suspend fun callStart() { error("calls unavailable on desktop") }
+    actual suspend fun callLocalAddress(): String = ""
+    actual suspend fun callPlace(callId: String, video: Boolean) {}
+    actual suspend fun callIncomingOffer(callId: String, addrB64: String, video: Boolean) {}
+    actual suspend fun callAnswer(callId: String, answer: SonarAnswer, addrB64: String) {}
+    actual suspend fun callAccept(callId: String) {}
+    actual suspend fun callHangup(callId: String) {}
+    actual suspend fun callWaitEvent(timeoutSecs: Long): SonarCallEvent? {
+        kotlinx.coroutines.delay(timeoutSecs.coerceIn(1, 30) * 1000) // park, don't busy-spin
+        return null
+    }
+    actual fun callEncodeOffer(callId: String, video: Boolean, addrB64: String, unixSecs: Long): String = ""
+    actual fun callEncodeAnswer(callId: String, answer: SonarAnswer, addrB64: String): String = ""
+    actual fun callEncodeEnd(callId: String, reason: String): String = ""
+    actual fun callParseControl(content: String): SonarCallControl? = null
 }

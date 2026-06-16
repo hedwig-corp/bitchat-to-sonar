@@ -8,6 +8,7 @@
 
 import SwiftUI
 import BitLogger
+import SonarCore
 
 /// UI state for Marmot (MLS-over-Nostr) secure chats — the White Noise
 /// interop path. Owns a `MarmotService` and persists the generated Nostr
@@ -330,6 +331,23 @@ final class MarmotChatModel: ObservableObject {
     func stopPolling() {
         syncTask?.cancel()
         syncTask = nil
+    }
+
+    // MARK: - P2P voice calls (pass-throughs to the call engine in MarmotService)
+
+    func callStart() async throws { try await service.callStart() }
+    func callLocalAddress() async throws -> String { try await service.callLocalAddress() }
+    func callPlace(callId: String, video: Bool) async throws { try await service.callPlace(callId: callId, video: video) }
+    func callIncomingOffer(callId: String, addrB64: String, video: Bool) async throws {
+        try await service.callIncomingOffer(callId: callId, addrB64: addrB64, video: video)
+    }
+    func callAnswer(callId: String, answer: CallAnswerKind, addrB64: String) async throws {
+        try await service.callAnswer(callId: callId, answer: answer, addrB64: addrB64)
+    }
+    func callAccept(callId: String) async throws { try await service.callAccept(callId: callId) }
+    func callHangup(callId: String) async throws { try await service.callHangup(callId: callId) }
+    func callWaitEvent(timeoutSeconds: UInt64) async -> CallEventInfo? {
+        await service.callWaitEvent(timeoutSeconds: timeoutSeconds)
     }
 
     /// Delete ONE White Noise / Marmot chat locally (messages + MLS keys), then

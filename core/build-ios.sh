@@ -35,6 +35,13 @@ unset OPENSSL_DIR OPENSSL_LIB_DIR OPENSSL_INCLUDE_DIR OPENSSL_NO_VENDOR \
 CRATE="sonar-ffi"
 LIB_NAME="libsonar_ffi.a"
 FFI_MODULE="sonar_ffiFFI" # uniffi: <crate_name>FFI
+
+# P2P voice calls (iroh + cpal/opus) are ON by default so the shipped app can
+# place real calls; the host links AudioToolbox/CoreAudio (SonarCore/Package.swift).
+# Override with SONAR_FEATURES="" for a lean messaging-only build.
+SONAR_FEATURES="${SONAR_FEATURES-calls-audio}"
+FEATURE_ARGS=()
+[[ -n "$SONAR_FEATURES" ]] && FEATURE_ARGS=(--features "$SONAR_FEATURES")
 PKG_DIR="$REPO_ROOT/ios/localPackages/SonarCore"
 XCFRAMEWORK="$PKG_DIR/Frameworks/sonarffi.xcframework"
 GEN_DIR="$SCRIPT_DIR/target/uniffi-swift"
@@ -72,8 +79,8 @@ for target in "${TARGETS[@]}"; do
         *-apple-ios*)    export IPHONEOS_DEPLOYMENT_TARGET="16.0" ;;
         *-apple-darwin*) export MACOSX_DEPLOYMENT_TARGET="13.0" ;;
     esac
-    log "cargo build --release --target $target"
-    cargo build --release --target "$target" -p "$CRATE" --lib
+    log "cargo build --release --target $target ${SONAR_FEATURES:+($SONAR_FEATURES)}"
+    cargo build --release --target "$target" -p "$CRATE" --lib ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
 done
 
 # --- generate Swift bindings (library mode, against the host slice) ----------

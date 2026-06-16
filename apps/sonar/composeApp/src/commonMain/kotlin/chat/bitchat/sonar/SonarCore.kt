@@ -58,6 +58,34 @@ data class SonarChannelMsg(
     val tsSecs: Long,
 )
 
+// ── P2P voice calls (iroh transport, ☎CALL signaling) ──
+
+/** State of a 1:1 P2P call, as the core engine reports it. */
+enum class SonarCallState { Ringing, Connecting, Connected, Ended, Failed, Declined, Busy, Missed }
+
+/** A call state change emitted by the engine (drained via [SonarCore.callWaitEvent]). */
+data class SonarCallEvent(
+    val callId: String,
+    val state: SonarCallState,
+    /** Connected seconds — only meaningful for [SonarCallState.Ended]. */
+    val durationSecs: Long,
+    val reason: String,
+)
+
+/** The answerer's verdict on an incoming offer. */
+enum class SonarAnswer { Accept, Decline, Busy }
+
+/** A parsed inbound `☎CALL` control line. Rides encrypted chat content like
+ *  ⚡PAY; the host scan loop feeds message text to [SonarCore.callParseControl]
+ *  and routes the result to the call engine WITHOUT rendering it as a bubble. */
+sealed class SonarCallControl {
+    abstract val callId: String
+    data class Offer(override val callId: String, val video: Boolean, val addrB64: String, val unixSecs: Long) : SonarCallControl()
+    data class Answer(override val callId: String, val answer: SonarAnswer, val addrB64: String) : SonarCallControl()
+    data class Cancel(override val callId: String) : SonarCallControl()
+    data class End(override val callId: String, val reason: String) : SonarCallControl()
+}
+
 /**
  * Shared boundary to the headless Rust core (`sonar-core`). UI in `commonMain`
  * calls these; each platform provides the `actual`:
@@ -175,4 +203,42 @@ expect object SonarCore {
      *  by its group id. Local-only — the peer is NOT notified. Idempotent. Backs
      *  per-chat "delete this conversation". */
     suspend fun deleteChat(chatId: String)
+
+    // ── P2P voice calls (iroh transport; ☎CALL rides chat signaling) ──
+
+    /** Bind the iroh call endpoint once for this session. The Ed25519 call key is
+     *  derived in-core from our Nostr identity, so nothing is passed. Idempotent-ish. */
+    suspend fun callStart()
+
+    /** Our dialable address (`nodeAddrB64`) to embed in a ☎CALL OFFER/ANSWER. */
+    suspend fun callLocalAddress(): String
+
+    /** Begin an OUTGOING call (offerer); returns at Ringing. The host then sends
+     *  the encoded OFFER over the peer's chat transport. */
+    suspend fun callPlace(callId: String, video: Boolean)
+
+    /** Register an inbound OFFER the host parsed from a ☎CALL line. */
+    suspend fun callIncomingOffer(callId: String, addrB64: String, video: Boolean)
+
+    /** The offerer received the peer's ANSWER: accept pins the answerer + connects
+     *  (awaiting their dial); decline/busy ends the call. */
+    suspend fun callAnswer(callId: String, answer: SonarAnswer, addrB64: String)
+
+    /** The user accepted an incoming call: we dial the offerer + start media. */
+    suspend fun callAccept(callId: String)
+
+    /** Hang up / cancel a call (tears down media + connection). */
+    suspend fun callHangup(callId: String)
+
+    /** Park up to [timeoutSecs] for the next call state change (poll on a
+     *  background coroutine; mirrors the Marmot wait loop). null on timeout. */
+    suspend fun callWaitEvent(timeoutSecs: Long): SonarCallEvent?
+
+    /** Encode a ☎CALL OFFER/ANSWER/END line to send as encrypted chat content. */
+    fun callEncodeOffer(callId: String, video: Boolean, addrB64: String, unixSecs: Long): String
+    fun callEncodeAnswer(callId: String, answer: SonarAnswer, addrB64: String): String
+    fun callEncodeEnd(callId: String, reason: String): String
+
+    /** Parse chat content as a ☎CALL line. null = not a control line (render it). */
+    fun callParseControl(content: String): SonarCallControl?
 }

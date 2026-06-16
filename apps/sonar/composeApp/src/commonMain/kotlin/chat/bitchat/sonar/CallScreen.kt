@@ -65,25 +65,34 @@ private val CallCyan = Color(0xFF22D3EE)
  */
 @Composable
 fun CallScreen(state: SonarAppState, screen: Screen.Call) {
-    val video = screen.video
-    // Transport (Bluetooth in range / internet otherwise) — same as the DM screen.
-    val isMeshRoute = screen.peerId.startsWith("mesh:")
-    val rawPeer = screen.peerId.removePrefix("mesh:")
+    // Driven by the real call engine via state.activeCall (the controller pops
+    // this screen when the call ends). Fall back to the route args if it's
+    // momentarily null during teardown.
+    val call = state.activeCall
+    val video = call?.video ?: screen.video
+    val name = call?.peerName ?: screen.name.ifBlank { "secure chat" }
+    val incoming = call?.incoming == true
+    val phase = call?.phase ?: SonarCallState.Ringing
+    val secs = call?.connectedSecs ?: 0
+    val connected = phase == SonarCallState.Connected
+    val ringing = phase == SonarCallState.Ringing || phase == SonarCallState.Connecting
+    // Transport line (Bluetooth in range / internet otherwise) — same as the DM.
+    val chatId = call?.chatId ?: screen.peerId
+    val isMeshRoute = chatId.startsWith("mesh:")
+    val rawPeer = chatId.removePrefix("mesh:")
     val mesh = run { state.payVersion; isMeshRoute && state.dmInRange(rawPeer) }
-    val name = screen.name.ifBlank { "secure chat" }
 
-    var phase by remember { mutableStateOf("ringing") } // ringing → connected
-    var secs by remember { mutableStateOf(0) }
+    // Local UI toggles (the engine has no mute/camera control yet — cosmetic v1).
     var muted by remember { mutableStateOf(false) }
     var speaker by remember { mutableStateOf(video) }
     var camOn by remember { mutableStateOf(true) }
 
-    LaunchedEffect(Unit) {
-        kotlinx.coroutines.delay(2000); phase = "connected"
-        while (true) { kotlinx.coroutines.delay(1000); secs++ }
+    val status = when {
+        connected -> fmtCall(secs)
+        phase == SonarCallState.Connecting -> "Connecting…"
+        incoming -> if (video) "Incoming video call" else "Incoming call"
+        else -> if (video) "Ringing…" else "Calling…"
     }
-    val end: () -> Unit = { state.endCall(screen.peerId, video, if (phase == "connected") secs else 0) }
-    val status = if (phase == "ringing") (if (video) "Ringing…" else "Calling…") else fmtCall(secs)
     val encLine = if (mesh) "Bluetooth" else "internet"
 
     Box(
@@ -94,7 +103,7 @@ fun CallScreen(state: SonarAppState, screen: Screen.Call) {
     ) {
         // VIDEO remote feed: drifting gradient when connected+camera on, else avatar.
         if (video) {
-            if (phase == "connected" && camOn) {
+            if (connected && camOn) {
                 CallFeed(hue = bcHue(name), Modifier.fillMaxSize())
             } else {
                 Box(
@@ -137,7 +146,7 @@ fun CallScreen(state: SonarAppState, screen: Screen.Call) {
                 // VOICE: centered avatar (ring pulse while ringing) + name + status.
                 Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        CallAvatar(name, ringing = phase == "ringing")
+                        CallAvatar(name, ringing = ringing)
                         Spacer(Modifier.height(22.dp))
                         Text(name, color = CallText, fontSize = 30.sp, fontWeight = FontWeight.Black, maxLines = 1)
                         Spacer(Modifier.height(8.dp))
@@ -154,20 +163,26 @@ fun CallScreen(state: SonarAppState, screen: Screen.Call) {
                 horizontalArrangement = Arrangement.spacedBy(14.dp, Alignment.CenterHorizontally),
                 verticalAlignment = Alignment.Top
             ) {
-                CallBtn(if (muted) SNIconName.MicOff else SNIconName.Mic, if (muted) "Unmute" else "Mute", active = muted) { muted = !muted }
-                if (video) {
-                    CallBtn(if (camOn) SNIconName.Videocam else SNIconName.VideoOff, if (camOn) "Stop video" else "Start video", active = !camOn) { camOn = !camOn }
-                    CallBtn(SNIconName.CameraFlip, "Flip", active = false) { /* mock */ }
+                if (incoming && !connected) {
+                    // Incoming call: Decline (red) + Accept (green).
+                    CallBtn(SNIconName.PhoneDown, "Decline", active = false, end = true) { state.declineCall() }
+                    CallBtn(SNIconName.Phone, "Accept", active = false, accept = true) { state.acceptCall() }
                 } else {
-                    CallBtn(SNIconName.Speaker, "Speaker", active = speaker) { speaker = !speaker }
-                    CallBtn(SNIconName.Videocam, "Video", active = false) { /* mock — upgrade to video */ }
+                    CallBtn(if (muted) SNIconName.MicOff else SNIconName.Mic, if (muted) "Unmute" else "Mute", active = muted) { muted = !muted }
+                    if (video) {
+                        CallBtn(if (camOn) SNIconName.Videocam else SNIconName.VideoOff, if (camOn) "Stop video" else "Start video", active = !camOn) { camOn = !camOn }
+                        CallBtn(SNIconName.CameraFlip, "Flip", active = false) { /* mock */ }
+                    } else {
+                        CallBtn(SNIconName.Speaker, "Speaker", active = speaker) { speaker = !speaker }
+                        CallBtn(SNIconName.Videocam, "Video", active = false) { /* mock — upgrade to video */ }
+                    }
+                    CallBtn(SNIconName.PhoneDown, "End", active = false, end = true) { state.hangupCall() }
                 }
-                CallBtn(SNIconName.PhoneDown, "End", active = false, end = true, onClick = end)
             }
         }
 
         // VIDEO PiP self-feed (bottom-right above the controls).
-        if (video && phase == "connected" && camOn) {
+        if (video && connected && camOn) {
             Box(
                 Modifier.align(Alignment.BottomEnd).padding(end = 16.dp, bottom = 168.dp)
                     .size(width = 104.dp, height = 150.dp).clip(RoundedCornerShape(18.dp))
@@ -184,9 +199,10 @@ fun CallScreen(state: SonarAppState, screen: Screen.Call) {
 
 /** One round control button (58dp) with a label below (design: .call-btn). */
 @Composable
-private fun CallBtn(icon: SNIconName, label: String, active: Boolean, end: Boolean = false, onClick: () -> Unit) {
-    val bg = when { end -> CallDanger; active -> Color.White; else -> CallCtlBg }
-    val fg = when { end -> Color.White; active -> Color(0xFF0B1418); else -> Color.White }
+private fun CallBtn(icon: SNIconName, label: String, active: Boolean, end: Boolean = false, accept: Boolean = false, onClick: () -> Unit) {
+    val green = Color(0xFF41BC76)
+    val bg = when { accept -> green; end -> CallDanger; active -> Color.White; else -> CallCtlBg }
+    val fg = when { accept || end -> Color.White; active -> Color(0xFF0B1418); else -> Color.White }
     Column(
         Modifier.width(64.dp).clickable(onClick = onClick),
         horizontalAlignment = Alignment.CenterHorizontally

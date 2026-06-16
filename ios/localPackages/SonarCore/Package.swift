@@ -32,6 +32,17 @@ let package = Package(
                 // xcframeworks don't propagate that to Xcode — declare it here.
                 .linkedFramework("Security"),
                 .linkedFramework("CoreFoundation"),
+                // cpal's CoreAudio backend (P2P call mic/speaker, behind the Rust
+                // `calls-audio` feature) links these Apple audio frameworks. Same
+                // static-lib gotcha as above — declare them for the consumer.
+                // Harmless when the xcframework is built without calls-audio.
+                .linkedFramework("AudioToolbox"),
+                .linkedFramework("CoreAudio"),
+                .linkedFramework("AVFoundation"),
+                // iroh's network-interface/DNS discovery (netdev, hickory-resolver,
+                // system_configuration crates) calls SystemConfiguration. Same
+                // static-lib gotcha — the framework link isn't propagated.
+                .linkedFramework("SystemConfiguration"),
             ]
         ),
         // Binary framework containing the Rust static library + C headers.

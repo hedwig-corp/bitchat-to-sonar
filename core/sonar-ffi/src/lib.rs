@@ -18,6 +18,12 @@ use sonar_core::GroupId;
 
 uniffi::setup_scaffolding!();
 
+// Android-only JNI shim that initializes `ndk_context` (JavaVM + app Context) so
+// iroh's DNS read on `Endpoint::bind()` and cpal/oboe audio work when this `.so`
+// is loaded by UniFFI's JNA bindings (no JNI_OnLoad fires under JNA).
+#[cfg(target_os = "android")]
+mod android_jni;
+
 /// Flat error: only the rendered message crosses the FFI boundary
 /// (`SonarFfiError.InvalidInput(message:)` / `.Core(message:)` in Swift).
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -170,6 +176,10 @@ pub struct GeoMessageInfo {
 pub struct SonarNode {
     runtime: tokio::runtime::Runtime,
     client: SonarClient,
+    /// Lazily-started P2P call engine (iroh + cpal/opus). Cloned out under a short
+    /// lock so a long `call_wait_event` park never blocks `call_hangup` etc.
+    #[cfg(feature = "calls-audio")]
+    call: Mutex<Option<Arc<sonar_core::call::engine::CallEngine>>>,
 }
 
 #[uniffi::export]
@@ -212,7 +222,12 @@ impl SonarNode {
             &db_path,
             db_key,
         ))?;
-        Ok(Arc::new(Self { runtime, client }))
+        Ok(Arc::new(Self {
+            runtime,
+            client,
+            #[cfg(feature = "calls-audio")]
+            call: Mutex::new(None),
+        }))
     }
 
     /// Publish our kind-30443 KeyPackage so others can start groups with us.
@@ -445,6 +460,326 @@ impl SonarNode {
             .block_on(self.client.fetch_geo_dm(&geohash, &peer_hex))?;
         Ok(msgs.into_iter().map(geo_message_info).collect())
     }
+}
+
+// ── P2P voice calls (iroh transport + cpal/opus media) ──────────────────────
+//
+// The CallEngine is started lazily (`call_start`) and stored in the SonarNode.
+// The engine never sends ☎CALL lines itself: the host serializes OFFER/ANSWER/
+// END (built via the `call_encode_*` helpers, carrying `call_local_address`)
+// over the existing Marmot/NIP-17 transports and feeds inbound control lines
+// (parsed via `call_parse_control`) back in. All call methods are BLOCKING like
+// the rest of SonarNode; the host polls `call_wait_event` on a dedicated thread.
+
+/// Public call state for the host UI (mirrors `sonar_core::call::engine::CallStateKind`).
+#[cfg(feature = "calls-audio")]
+#[derive(uniffi::Enum)]
+pub enum CallStateInfo {
+    Ringing,
+    Connecting,
+    Connected,
+    Ended,
+    Failed,
+    Declined,
+    Busy,
+    Missed,
+}
+
+#[cfg(feature = "calls-audio")]
+impl From<sonar_core::call::engine::CallStateKind> for CallStateInfo {
+    fn from(s: sonar_core::call::engine::CallStateKind) -> Self {
+        use sonar_core::call::engine::CallStateKind as K;
+        match s {
+            K::Ringing => Self::Ringing,
+            K::Connecting => Self::Connecting,
+            K::Connected => Self::Connected,
+            K::Ended => Self::Ended,
+            K::Failed => Self::Failed,
+            K::Declined => Self::Declined,
+            K::Busy => Self::Busy,
+            K::Missed => Self::Missed,
+        }
+    }
+}
+
+/// A call state change drained by `call_wait_event`.
+#[cfg(feature = "calls-audio")]
+#[derive(uniffi::Record)]
+pub struct CallEventInfo {
+    pub call_id: String,
+    pub state: CallStateInfo,
+    /// Connected duration in seconds — only meaningful for `Ended`.
+    pub duration_secs: u64,
+    /// Human reason for `Ended`/`Failed`/`Declined`/`Busy` (else empty).
+    pub reason: String,
+}
+
+/// The answerer's verdict on an incoming offer (mirrors `signaling::AnswerKind`).
+#[cfg(feature = "calls-audio")]
+#[derive(uniffi::Enum)]
+pub enum CallAnswerKind {
+    Accept,
+    Decline,
+    Busy,
+}
+
+#[cfg(feature = "calls-audio")]
+impl From<CallAnswerKind> for sonar_core::call::signaling::AnswerKind {
+    fn from(a: CallAnswerKind) -> Self {
+        use sonar_core::call::signaling::AnswerKind as A;
+        match a {
+            CallAnswerKind::Accept => A::Accept,
+            CallAnswerKind::Decline => A::Decline,
+            CallAnswerKind::Busy => A::Busy,
+        }
+    }
+}
+
+#[cfg(feature = "calls-audio")]
+impl From<sonar_core::call::signaling::AnswerKind> for CallAnswerKind {
+    fn from(a: sonar_core::call::signaling::AnswerKind) -> Self {
+        use sonar_core::call::signaling::AnswerKind as A;
+        match a {
+            A::Accept => Self::Accept,
+            A::Decline => Self::Decline,
+            A::Busy => Self::Busy,
+        }
+    }
+}
+
+/// A parsed inbound `☎CALL` control line (the host scan loop feeds raw message
+/// content to `call_parse_control` and routes the result to the call engine).
+#[cfg(feature = "calls-audio")]
+#[derive(uniffi::Enum)]
+pub enum CallControlInfo {
+    Offer {
+        call_id: String,
+        video: bool,
+        node_addr_b64: String,
+        unix_secs: u64,
+    },
+    Answer {
+        call_id: String,
+        answer: CallAnswerKind,
+        node_addr_b64: String,
+    },
+    Cancel {
+        call_id: String,
+    },
+    End {
+        call_id: String,
+        reason: String,
+    },
+}
+
+#[cfg(feature = "calls-audio")]
+fn media_kind(video: bool) -> sonar_core::call::signaling::CallMediaKind {
+    use sonar_core::call::signaling::CallMediaKind as M;
+    if video {
+        M::Video
+    } else {
+        M::Voice
+    }
+}
+
+#[cfg(feature = "calls-audio")]
+#[uniffi::export]
+impl SonarNode {
+    /// Bind the iroh call endpoint once for this session. The iroh Ed25519 key is
+    /// derived IN-CORE from this node's Nostr secret (HKDF, `call::identity`), so
+    /// the host passes nothing and never reimplements the derivation; the NodeId
+    /// is stable across launches. Idempotent-ish: a second call rebinds.
+    pub fn call_start(&self) -> FfiResult<()> {
+        let nostr_secret = self.client.identity().keys().secret_key().to_secret_bytes();
+        let iroh_secret = sonar_core::call::identity::derive_iroh_secret(&nostr_secret);
+        let engine = self
+            .runtime
+            .block_on(sonar_core::call::engine::CallEngine::start(iroh_secret))
+            .map_err(|e| SonarFfiError::Core(format!("call start: {e}")))?;
+        *self.call.lock().unwrap() = Some(Arc::new(engine));
+        Ok(())
+    }
+
+    /// Our dialable address as the `nodeAddrB64` token to embed in an OFFER/ANSWER.
+    pub fn call_local_address(&self) -> FfiResult<String> {
+        self.call_engine()?
+            .local_addr_b64()
+            .map_err(|e| SonarFfiError::Core(format!("local address: {e}")))
+    }
+
+    /// Begin an OUTGOING call (offerer). Returns immediately (Ringing); the host
+    /// then sends `call_encode_offer(call_id, video, call_local_address(), now)`.
+    pub fn call_place(&self, call_id: String, video: bool) -> FfiResult<()> {
+        self.call_engine()?
+            .place(&call_id, media_kind(video))
+            .map_err(|e| SonarFfiError::Core(format!("call place: {e}")))
+    }
+
+    /// Register an inbound OFFER the host parsed (`call_parse_control`).
+    pub fn call_on_incoming_offer(
+        &self,
+        call_id: String,
+        remote_addr_b64: String,
+        video: bool,
+    ) -> FfiResult<()> {
+        self.call_engine()?
+            .on_incoming_offer(&call_id, &remote_addr_b64, media_kind(video))
+            .map_err(|e| SonarFfiError::Core(format!("incoming offer: {e}")))
+    }
+
+    /// The offerer received the peer's ANSWER (host-parsed). On accept this pins
+    /// the answerer + goes Connecting (awaiting their dial); decline/busy ends it.
+    pub fn call_on_answer(
+        &self,
+        call_id: String,
+        answer: CallAnswerKind,
+        remote_addr_b64: String,
+    ) -> FfiResult<()> {
+        self.call_engine()?
+            .on_answer(&call_id, answer.into(), &remote_addr_b64)
+            .map_err(|e| SonarFfiError::Core(format!("on answer: {e}")))
+    }
+
+    /// The user accepted an incoming call: we are the dialer. Dials the offerer
+    /// and starts media. Blocks on the QUIC connect.
+    pub fn call_accept(&self, call_id: String) -> FfiResult<()> {
+        let engine = self.call_engine()?;
+        self.runtime
+            .block_on(engine.accept(&call_id))
+            .map_err(|e| SonarFfiError::Core(format!("call accept: {e}")))
+    }
+
+    /// Hang up / cancel a call: tears down media + connection, emits `Ended`.
+    pub fn call_hangup(&self, call_id: String) -> FfiResult<()> {
+        self.call_engine()?
+            .hangup(&call_id)
+            .map_err(|e| SonarFfiError::Core(format!("call hangup: {e}")))
+    }
+
+    /// Park up to `timeout_secs` for the next call state change. The host loops
+    /// this on a dedicated thread (like `wait_for_marmot_event`); it touches no
+    /// MLS state. `None` on timeout.
+    ///
+    /// If the engine is not bound yet (`call_start` hasn't run, or it failed),
+    /// we STILL park for the timeout instead of returning instantly — otherwise
+    /// the host's `while { waitEvent(20) }` loop busy-spins (on iOS that loop is
+    /// MainActor-isolated → the UI freezes). Mirrors `wait_for_marmot_event`,
+    /// which also blocks the timeout when there is nothing yet to wait on.
+    pub fn call_wait_event(&self, timeout_secs: u64) -> Option<CallEventInfo> {
+        // Snapshot the engine under a SHORT lock: bind it to a `let` so the
+        // guard drops at the `;`, never held across the block_on park below
+        // (so a long wait can't block `call_hangup`/`call_start`).
+        let engine = self.call.lock().unwrap().clone();
+        let Some(engine) = engine else {
+            // No engine: park the node's runtime for the (capped) timeout, then
+            // report "nothing happened". `.max(1)` floors a 0 timeout so we can
+            // never spin; capping at 30s bounds a bogus/hostile huge value.
+            let secs = timeout_secs.clamp(1, 30);
+            self.runtime
+                .block_on(tokio::time::sleep(std::time::Duration::from_secs(secs)));
+            return None;
+        };
+        // Engine present: `next_event` already honors the timeout internally
+        // (tokio::time::timeout over an mpsc recv → None on elapse).
+        let ev = self.runtime.block_on(engine.next_event(timeout_secs))?;
+        Some(CallEventInfo {
+            call_id: ev.call_id,
+            state: ev.state.into(),
+            duration_secs: ev.duration_secs,
+            reason: ev.reason,
+        })
+    }
+}
+
+#[cfg(feature = "calls-audio")]
+impl SonarNode {
+    /// Clone the started engine out under a short lock (so a parked
+    /// `call_wait_event` never blocks another call method).
+    fn call_engine(&self) -> FfiResult<Arc<sonar_core::call::engine::CallEngine>> {
+        self.call
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| SonarFfiError::Core("call engine not started (call_start first)".into()))
+    }
+}
+
+// ── Pure ☎CALL signaling codec (no iroh; shared by both apps) ──
+
+/// Encode an OFFER control line to send as encrypted message content.
+#[cfg(feature = "calls-audio")]
+#[uniffi::export]
+pub fn call_encode_offer(
+    call_id: String,
+    video: bool,
+    node_addr_b64: String,
+    unix_secs: u64,
+) -> String {
+    sonar_core::call::signaling::CallControl::Offer {
+        call_id,
+        media: media_kind(video),
+        node_addr_b64,
+        unix_secs,
+    }
+    .encode()
+}
+
+/// Encode an ANSWER control line (`node_addr_b64` empty for decline/busy).
+#[cfg(feature = "calls-audio")]
+#[uniffi::export]
+pub fn call_encode_answer(call_id: String, answer: CallAnswerKind, node_addr_b64: String) -> String {
+    sonar_core::call::signaling::CallControl::Answer {
+        call_id,
+        answer: answer.into(),
+        node_addr_b64,
+    }
+    .encode()
+}
+
+/// Encode a CANCEL control line (offerer retracted before answer).
+#[cfg(feature = "calls-audio")]
+#[uniffi::export]
+pub fn call_encode_cancel(call_id: String) -> String {
+    sonar_core::call::signaling::CallControl::Cancel { call_id }.encode()
+}
+
+/// Encode an END control line (either side hung up a connected call).
+#[cfg(feature = "calls-audio")]
+#[uniffi::export]
+pub fn call_encode_end(call_id: String, reason: String) -> String {
+    sonar_core::call::signaling::CallControl::End { call_id, reason }.encode()
+}
+
+/// Parse message content as a `☎CALL` control line. `None` for plain chat,
+/// `⚡PAY` lines, unknown versions, and malformed lines (so they are ignored).
+#[cfg(feature = "calls-audio")]
+#[uniffi::export]
+pub fn call_parse_control(content: String) -> Option<CallControlInfo> {
+    use sonar_core::call::signaling::{CallControl, CallMediaKind};
+    Some(match CallControl::parse(&content)? {
+        CallControl::Offer {
+            call_id,
+            media,
+            node_addr_b64,
+            unix_secs,
+        } => CallControlInfo::Offer {
+            call_id,
+            video: media == CallMediaKind::Video,
+            node_addr_b64,
+            unix_secs,
+        },
+        CallControl::Answer {
+            call_id,
+            answer,
+            node_addr_b64,
+        } => CallControlInfo::Answer {
+            call_id,
+            answer: answer.into(),
+            node_addr_b64,
+        },
+        CallControl::Cancel { call_id } => CallControlInfo::Cancel { call_id },
+        CallControl::End { call_id, reason } => CallControlInfo::End { call_id, reason },
+    })
 }
 
 // ── Noise XX session for the BLE mesh (the tested core crypto, on Android) ──

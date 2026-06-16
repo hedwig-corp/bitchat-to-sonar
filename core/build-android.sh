@@ -39,6 +39,14 @@ echo "Using NDK: $ANDROID_NDK_HOME"
 
 CRATE="sonar-ffi"
 LIB="libsonar_ffi.so"
+
+# P2P voice calls (iroh + cpal/opus via oboe) are ON by default so the shipped
+# app can place real calls. oboe links the SHARED libc++ runtime, so we ship
+# libc++_shared.so alongside each .so (below). Override with SONAR_FEATURES=""
+# for a lean messaging-only build.
+SONAR_FEATURES="${SONAR_FEATURES-calls-audio}"
+FEATURE_ARGS=()
+[[ -n "$SONAR_FEATURES" ]] && FEATURE_ARGS=(--features "$SONAR_FEATURES")
 # Write straight into the CMP app's androidMain (the canonical consumer), the
 # way build-ios.sh assembles ios/localPackages/SonarCore. Override OUT to retarget.
 OUT="${OUT:-$REPO_ROOT/apps/sonar/composeApp/src/androidMain}"
@@ -63,10 +71,29 @@ rm -rf "$JNILIBS" "$KOTLIN_DIR/uniffi"
 mkdir -p "$JNILIBS" "$KOTLIN_DIR"
 
 # --- Build the 3 ABIs (cargo-ndk copies each .so into jniLibs/<abi>/) ---------
-echo "Building $CRATE for arm64-v8a, armeabi-v7a, x86_64..."
+echo "Building $CRATE for arm64-v8a, armeabi-v7a, x86_64 ${SONAR_FEATURES:+($SONAR_FEATURES)}..."
 cargo ndk -o "$JNILIBS" \
   -t arm64-v8a -t armeabi-v7a -t x86_64 \
-  build -p "$CRATE" --lib --release
+  build -p "$CRATE" --lib --release ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
+
+# --- Ship libc++_shared.so (oboe links the shared C++ runtime) ----------------
+# Only needed for the calls-audio build (cpal→oboe). The NDK prebuilt sysroot
+# holds one per target triple; copy it next to each abi's libsonar_ffi.so.
+if [[ "$SONAR_FEATURES" == *calls-audio* ]]; then
+  NDK_HOST="$(ls "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt" 2>/dev/null | head -1)"
+  SYSROOT_LIB="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/$NDK_HOST/sysroot/usr/lib"
+  copy_libcxx() { # <abi> <triple>
+    local src="$SYSROOT_LIB/$2/libc++_shared.so"
+    if [[ -f "$src" ]]; then
+      cp "$src" "$JNILIBS/$1/" && echo "  shipped libc++_shared.so for $1"
+    else
+      echo "warn: libc++_shared.so not found for $1 at $src" >&2
+    fi
+  }
+  copy_libcxx arm64-v8a   aarch64-linux-android
+  copy_libcxx armeabi-v7a arm-linux-androideabi
+  copy_libcxx x86_64      x86_64-linux-android
+fi
 
 # --- Generate the Kotlin bindings (library mode, reads metadata from a .so) ---
 echo "Generating Kotlin bindings..."

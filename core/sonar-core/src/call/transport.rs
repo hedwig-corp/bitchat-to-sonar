@@ -65,6 +65,11 @@ impl CallTransport {
         self.endpoint.addr()
     }
 
+    /// Our dialable address as the `nodeAddrB64` token for a `☎CALL` OFFER/ANSWER.
+    pub fn local_addr_b64(&self) -> Result<String> {
+        encode_addr(&self.endpoint_addr())
+    }
+
     /// Dial a peer (the answerer dials, per the signaling design §4.3).
     pub async fn connect(&self, addr: EndpointAddr) -> Result<Connection> {
         self.endpoint
@@ -101,6 +106,26 @@ pub fn rtc_session(conn: Connection) -> iroh_roq::Session {
     iroh_roq::Session::new(conn)
 }
 
+/// Serialize an [`EndpointAddr`] to the opaque `nodeAddrB64` signaling token:
+/// serde_json bytes → base64url (no padding, matching the `☎CALL` grammar). The
+/// [`super::signaling`] codec treats this as opaque; the call engine is the only
+/// producer/consumer.
+pub fn encode_addr(addr: &EndpointAddr) -> Result<String> {
+    use base64::Engine;
+    let json = serde_json::to_vec(addr).context("serialize EndpointAddr")?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json))
+}
+
+/// Inverse of [`encode_addr`]: decode a `nodeAddrB64` token back to a dialable
+/// [`EndpointAddr`].
+pub fn decode_addr(token: &str) -> Result<EndpointAddr> {
+    use base64::Engine;
+    let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(token)
+        .context("base64-decode EndpointAddr")?;
+    serde_json::from_slice(&json).context("deserialize EndpointAddr")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,6 +149,19 @@ mod tests {
         a.close().await;
         b.close().await;
         a2.close().await;
+        Ok(())
+    }
+
+    /// The `nodeAddrB64` codec round-trips a bound endpoint's full dialable
+    /// address (the token that travels in a `☎CALL` OFFER/ANSWER).
+    #[tokio::test]
+    async fn endpoint_addr_b64_roundtrips() -> Result<()> {
+        let a = CallTransport::bind([9u8; 32]).await?;
+        let token = a.local_addr_b64()?;
+        let decoded = decode_addr(&token)?;
+        assert_eq!(decoded, a.endpoint_addr());
+        assert_eq!(decoded.id, a.endpoint_id());
+        a.close().await;
         Ok(())
     }
 
