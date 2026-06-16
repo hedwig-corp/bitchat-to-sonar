@@ -3,8 +3,14 @@
 The complete design handoff bundle lives in `design/handoff/`. It is **vendored**
 (checked in) so agents read it from disk instead of re-fetching every time.
 
-- **Source share:** https://api.anthropic.com/v1/design/h/LiZ0wCa-wc3TUfTpZosL3w?open_file=Sonar+Desktop.html (Claude Design / claude.ai/design)
-- **Last synced:** 2026-06-16. Two design refreshes landed this day, both vendored here:
+- **Source share:** https://api.anthropic.com/v1/design/h/UQethAMsRlMNd4xMzNISTA?open_file=Sonar+Prototype.html (Claude Design / claude.ai/design)
+- **Last synced:** 2026-06-16. Three design refreshes landed this day, all vendored here:
+  - **Profile key-management** (`UQethAMsRlMNd4xMzNISTA`): reworks the profile view key
+    management. ADDS a `KeyShareCard` in `project/sonar/settings.jsx` (QR + tap-to-expand
+    full key + "Copy key"/"Share" buttons); renames the "Keys" section to **Safety** with the
+    fingerprint row gaining a "Read this aloud to verify in person" subtitle; new `copy`/`share`
+    icons in `icons.jsx`; `.keyshare*` styles in `theme.css`; and image-based app-icon tiles +
+    a new `project/sonar/brand/` asset folder (brand chip in onboarding/header).
   - **Sonar Desktop** (`LiZ0wCa-wc3TUfTpZosL3w`): the desktop split view, implemented in the
     Compose Multiplatform app (`apps/sonar`). Project files matched the prior vendoring
     byte-for-byte — only the bundle README changed.
@@ -15,8 +21,8 @@ The complete design handoff bundle lives in `design/handoff/`. It is **vendored*
     `if (m.call) <CallLog>`, and new icons (phone/videocam/phoneDown/micOff/videoOff/speaker/
     cameraFlip). Mocked in the prototype (ringing→connected after 2s); real P2P (iroh /
     n0-computer `callme`, issue #21) is the implementation.
-- **Prior source shares:** `A6e-y7WFkbHYzGBYedgCxw` (2026-06-16), `H5tEQgWekwCuHihJuEYcxw`
-  (2026-06-14), earlier 2026-06-12.
+- **Prior source shares:** `LiZ0wCa-wc3TUfTpZosL3w` (2026-06-16), `A6e-y7WFkbHYzGBYedgCxw`
+  (2026-06-16), `H5tEQgWekwCuHihJuEYcxw` (2026-06-14), earlier 2026-06-12.
 
 ## What's the source of truth
 

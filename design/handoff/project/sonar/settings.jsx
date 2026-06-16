@@ -47,11 +47,61 @@ function ShareCode({ seed, size = 164 }) {
   );
 }
 
+/* ── Key sharing: QR to scan + one-tap copy/share — used on mobile & desktop ── */
+function KeyShareCard({ compact }) {
+  const [copied, setCopied] = React.useState(false);
+  const [full, setFull] = React.useState(false);
+  const key = BC_DATA.pubkey;
+  const shortKey = key.slice(0, 18) + '\u2026' + key.slice(-8);
+  const copy = () => {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(key);
+      } else {
+        const ta = document.createElement('textarea');
+        ta.value = key; ta.style.position = 'fixed'; ta.style.opacity = '0';
+        document.body.appendChild(ta); ta.select();
+        try { document.execCommand('copy'); } catch (e) { /* ignore */ }
+        document.body.removeChild(ta);
+      }
+    } catch (e) { /* ignore */ }
+    setCopied(true);
+    clearTimeout(window.__bcCopyT);
+    window.__bcCopyT = setTimeout(() => setCopied(false), 1700);
+  };
+  const share = () => {
+    try {
+      if (navigator.share) { navigator.share({ title: 'My Sonar key', text: key }); return; }
+    } catch (e) { /* ignore */ }
+    copy();
+  };
+  return (
+    <div className={'keyshare' + (compact ? ' compact' : '')}>
+      <div className="keyshare-qr">
+        <ShareCode seed={key} size={compact ? 150 : 184} />
+      </div>
+      <div className="keyshare-caption">Let someone scan this to add you — keys are exchanged directly, never through a server.</div>
+      <button className="keyshare-keyrow" onClick={() => setFull(!full)} title="Tap to expand">
+        <span className={'keyshare-key' + (full ? ' full' : '')}>{full ? key : shortKey}</span>
+      </button>
+      <div className="keyshare-btns">
+        <button className={'keyshare-btn primary' + (copied ? ' done' : '')} onClick={copy}>
+          <BCIcon name={copied ? 'check' : 'copy'} size={17} weight={2.2} />
+          {copied ? 'Copied' : 'Copy key'}
+        </button>
+        <button className="keyshare-btn" onClick={share}>
+          <BCIcon name="share" size={17} weight={2} />
+          Share
+        </button>
+      </div>
+    </div>
+  );
+}
+
 /* ── Profile screen ── */
 function ProfileScreen({ app, nav, pop, onRename }) {
   const [editing, setEditing] = React.useState(false);
   const [draft, setDraft] = React.useState(app.nick || '');
-  const [showKey, setShowKey] = React.useState(false);
   const shortKey = BC_DATA.pubkey.slice(0, 14) + '\u2026' + BC_DATA.pubkey.slice(-6);
   const save = () => {
     if (draft.trim().length >= 2) onRename(draft.trim());
@@ -86,24 +136,18 @@ function ProfileScreen({ app, nav, pop, onRename }) {
           <span className="pf-key">{shortKey}</span>
         </div>
 
-        <div className="pf-codecard">
-          <ShareCode seed={BC_DATA.pubkey} />
-          <span className="pf-codecaption">Show this code to someone nearby to start an encrypted chat.</span>
+        <SectionLabel>Your key</SectionLabel>
+        <div className="st-card" style={{ padding: '4px 4px 10px' }}>
+          <KeyShareCard />
         </div>
-
-        <SectionLabel>Keys</SectionLabel>
+        <SectionLabel>Safety</SectionLabel>
         <div className="st-card">
           <StRow
-            icon="key" tone="cyan" label="Key fingerprint"
+            icon="key" tone="cyan" label="Fingerprint" sub="Read this aloud to verify in person"
             value={<span style={{ fontFamily: 'var(--mono)', fontSize: 12.5 }}>{BC_DATA.myFingerprint}</span>}
             trail={null} onClick={() => {}}
           />
-          <StRow
-            icon="lock" label="Public key" sub={showKey ? null : 'Tap to reveal'}
-            onClick={() => setShowKey(!showKey)}
-          />
         </div>
-        {showKey ? <div className="bc-pubkey" style={{ textAlign: 'left', padding: '2px 26px 8px' }}>{BC_DATA.pubkey}</div> : null}
         <p className="st-note">Your nickname is just what people see — your key never leaves this phone.</p>
       </div>
     </div>
@@ -143,9 +187,8 @@ function RequestsSheet({ onClose, onResolve }) {
 }
 
 const SN_APP_ICONS = [
-  { id: 'cyan', bg: 'var(--accent-fill)', fg: 'var(--on-accent)' },
-  { id: 'midnight', bg: '#0B0E10', fg: '#22D3EE' },
-  { id: 'paper', bg: '#F2F6F7', fg: '#0891B2' },
+  { id: 'default', src: 'sonar/brand/sonar-icon.png', label: 'Default' },
+  { id: 'square', src: 'sonar/brand/sonar-square.png', label: 'Square' },
 ];
 
 function AppIconSheet({ onClose, current, onPick }) {
@@ -155,16 +198,15 @@ function AppIconSheet({ onClose, current, onPick }) {
         {SN_APP_ICONS.map((ic) => (
           <button
             key={ic.id}
-            className={'ai-tile' + (current === ic.id ? ' on' : '')}
-            style={{ background: ic.bg, color: ic.fg }}
+            className={'ai-tile img' + ((current || 'default') === ic.id ? ' on' : '')}
             onClick={() => { onPick(ic.id); onClose(); }}
-            aria-label={'App icon ' + ic.id}
+            aria-label={'App icon ' + ic.label}
           >
-            <BCIcon name="rings" size={30} weight={1.7} />
+            <img src={ic.src} alt={ic.label} />
           </button>
         ))}
       </div>
-      <p className="bc-verifycopy" style={{ paddingTop: 0 }}>Quiet options only — no badges, no noise.</p>
+      <p className="bc-verifycopy" style={{ paddingTop: 0 }}>The Sonar mark — quiet, no badges.</p>
       <div className="bc-sheetactions">
         <button className="bc-ghost" onClick={onClose}>Done</button>
       </div>
@@ -200,7 +242,7 @@ function SettingsScreen({ app, nav, pop, push, mode, onToggleMode, toggleNetwork
         <SectionLabel>App</SectionLabel>
         <div className="st-card">
           <StRow icon="moon" label="Appearance" value={mode === 'dark' ? 'Dark' : 'Light'} onClick={onToggleMode} />
-          <StRow icon="rings" label="App icon" value={prefs.icon === 'cyan' ? 'Cyan' : prefs.icon === 'midnight' ? 'Midnight' : 'Paper'} onClick={() => setAppicon(true)} />
+          <StRow icon="rings" label="App icon" value={(prefs.icon || 'default') === 'square' ? 'Square' : 'Default'} onClick={() => setAppicon(true)} />
           <StRow icon="bell" label="Notifications" value={prefs.notifs ? 'On' : 'Off'} onClick={() => setNotif(true)} />
         </div>
 
@@ -262,4 +304,4 @@ function SettingsScreen({ app, nav, pop, push, mode, onToggleMode, toggleNetwork
   );
 }
 
-Object.assign(window, { SettingsScreen, ProfileScreen, ShareCode, StRow, StSwitch });
+Object.assign(window, { SettingsScreen, ProfileScreen, ShareCode, KeyShareCard, StRow, StSwitch });

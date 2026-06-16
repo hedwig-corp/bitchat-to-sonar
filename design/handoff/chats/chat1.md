@@ -1231,3 +1231,251 @@ Verified clean on both platforms — voice and video calling work end to end: he
 
 Sonar now covers the full messenger surface across mobile, desktop/iPad, and the landing page: radar discovery, transport-colored chats, optional bitcoin/fiat payments, location channels, rich media, voice notes, and now calls. Ready for whatever's next.
 
+## User
+
+on the setting the pubkey sharing is really not user friendly, we should ahve the QR to scan but also a easy way to copy and paste
+
+## Assistant
+
+_[tool: update_todos]_
+
+_[tool: grep]_
+
+Right — currently it's a QR-ish code plus a "tap to reveal" raw key with no obvious copy/share. I'll redesign this into a proper "Your key" block: a prominent QR to scan, a one-tap **Copy** button, and **Share**. Let me read the Profile screen section in full.
+
+_[tool: read_file]_
+
+Now I'll build a reusable **KeyShareCard** — a clear QR to scan, plus tappable key with **Copy** and **Share** buttons. Replacing the code card and the awkward "tap to reveal" row:
+
+_[tool: str_replace_edit]_
+
+_[tool: str_replace_edit]_
+
+_[tool: str_replace_edit]_
+
+The KeyShareCard was inserted before ProfileScreen, so the `showKey` state and its old markup now appear twice. Let me re-read to apply the ProfileScreen edits against the current text.
+
+_[tool: read_file]_
+
+Good — only the real ProfileScreen remains (my edits failed atomically, nothing was duplicated). Now applying the three edits against the actual text:
+
+_[tool: str_replace_edit]_
+
+The `save` line differs. Let me apply each edit precisely:
+
+_[tool: str_replace_edit]_
+
+The file literally contains `\u2026` as source text, so I must escape the backslash in my match string:
+
+_[tool: str_replace_edit]_
+
+Now the CSS for the KeyShareCard. Let me add it after the profile styles:
+
+_[tool: str_replace_edit]_
+
+_[tool: grep]_
+
+_[tool: str_replace_edit]_
+
+Now the desktop settings modal — let me find its key/pubkey section and swap in the same card:
+
+_[tool: grep]_
+
+The desktop settings modal has the profile header at line ~444 (`pf-key`). Let me read that area to insert the KeyShareCard right after the profile head:
+
+_[tool: read_file]_
+
+_[tool: str_replace_edit]_
+
+Now verify both. Desktop first (the file you're viewing) — open Settings and check the key card:
+
+_[tool: show_html]_
+
+_[tool: get_webview_logs]_
+
+I'm fixing/verifying a UI change, so a quick screenshot is warranted. Let me open the desktop settings modal and capture the key card:
+
+_[tool: show_html]_
+
+Renders cleanly. Now open the Settings modal to see the new key card:
+
+_[tool: eval_js]_
+
+_[tool: sleep]_
+
+_[tool: eval_js]_
+
+Card is there with QR, shortened key, and Copy/Share buttons. Let me scroll the modal to it and screenshot, then test the Copy interaction:
+
+_[tool: eval_js]_
+
+_[tool: sleep]_
+
+_[tool: save_screenshot]_
+
+_[tool: eval_js]_
+
+_[tool: sleep]_
+
+_[tool: eval_js]_
+
+Copy works — label flips to "Copied" with the green confirm state. The card (QR + shortened key + Copy/Share) is confirmed in the desktop modal; the html-to-image capture dropped the modal layer but the DOM checks pass. Both platforms now share the `KeyShareCard`. Handing off for full visual verification:
+
+_[tool: ready_for_verification]_
+
+Done — the public-key sharing is now genuinely user-friendly on both mobile (Profile screen) and desktop (Settings modal), using one shared **KeyShareCard**:
+
+- **A real QR to scan** — framed in white with the Sonar mark in the center, captioned "Let someone scan this to add you."
+- **One-tap Copy** — big primary button that flips to a green "Copied ✓"; uses the native clipboard (with a fallback).
+- **Share** — invokes the OS share sheet, falling back to copy.
+- The key itself is a **tappable monospace pill** showing a shortened form (`npub1w4j8mc7…tsq4k9dj`) that expands to the full key on tap — no more buried "tap to reveal" row.
+- The fingerprint stays separately under **Safety** ("read this aloud to verify in person").
+
+A verifier is checking the mobile flow now. The previous behavior (a code with no copy affordance + a hidden raw key) is gone.
+
+## User
+
+remove the logo from the qr code for now and leave it clean like in your design
+
+## Assistant
+
+I'll remove the center badge from the QR so it stays clean.
+
+_[tool: snip]_
+
+_[tool: str_replace_edit]_
+
+Now remove the now-unused badge CSS to keep things tidy:
+
+_[tool: str_replace_edit]_
+
+Done — the center logo is removed; the QR is now clean black-on-white. Let me confirm it renders on the mobile profile you're viewing:
+
+_[tool: ready_for_verification]_
+
+Done — the QR badge is gone on both mobile and desktop; it's now a clean black-on-white code with the Copy/Share buttons below.
+
+## User
+
+This is the icon for the app and we should update all the deisng and change the icon
+
+## Assistant
+
+This is a strong brand mark — the sprinting figure with the lightning/speed trail. I'll integrate it as Sonar's app icon and brand mark everywhere (onboarding, wordmarks, landing, app-icon picker), while keeping the functional cyan/indigo transport colors intact. Let me look at the source icons first.
+
+_[tool: image_metadata]_
+
+_[tool: image_metadata]_
+
+_[tool: image_metadata]_
+
+_[tool: view_image]_
+
+_[tool: view_image]_
+
+The play-store square (full-bleed) and the web squircle (rounded, transparent corners) are both clean. I'll copy both into the project and wire them in as the brand mark. Let me set up the assets and a small helper.
+
+_[tool: copy_files]_
+
+Now let me find all the brand-mark locations to replace:
+
+_[tool: grep]_
+
+Now I'll wire the icon in across Sonar. Adding brand styles, then replacing each mark. First the CSS:
+
+_[tool: str_replace_edit]_
+
+_[tool: read_file]_
+
+_[tool: str_replace_edit]_
+
+Now the mobile screens — onboarding mark and home wordmark:
+
+_[tool: str_replace_edit]_
+
+Now the desktop sidebar brand:
+
+_[tool: read_file]_
+
+_[tool: str_replace_edit]_
+
+Now the app-icon picker in settings — show the real icon:
+
+_[tool: read_file]_
+
+_[tool: str_replace_edit]_
+
+Now fix the settings row that referenced the old icon ids, and add `.ai-tile.img` styles:
+
+_[tool: grep]_
+
+_[tool: str_replace_edit]_
+
+_[tool: str_replace_edit]_
+
+_[tool: str_replace_edit]_
+
+Now update the default `icon` pref and the landing page. First the pref default:
+
+_[tool: grep]_
+
+_[tool: str_replace_edit]_
+
+Now the landing page — favicon, nav/footer wordmark logo, and a brand chip in the hero. Let me find them:
+
+_[tool: grep]_
+
+_[tool: read_file]_
+
+_[tool: read_file]_
+
+_[tool: str_replace_edit]_
+
+Now add favicons to the two prototype HTML files:
+
+_[tool: grep]_
+
+_[tool: str_replace_edit]_
+
+_[tool: str_replace_edit]_
+
+Now let me verify the mobile prototype — onboarding mark + home wordmark. Replay onboarding to see the mark:
+
+_[tool: eval_js]_
+
+_[tool: sleep]_
+
+_[tool: show_html]_
+
+_[tool: get_webview_logs]_
+
+The new icon shows in onboarding. Let me check the home wordmark:
+
+_[tool: eval_js]_
+
+_[tool: sleep]_
+
+_[tool: save_screenshot]_
+
+Home wordmark looks great — the sprint icon chip sits cleanly next to "sonar." Let me spot-check the desktop sidebar and app-icon picker:
+
+_[tool: show_html]_
+
+The new icon is now live across the whole product — desktop sidebar shows it too. Let me reset the demo to a clean state and deliver:
+
+_[tool: eval_js]_
+
+_[tool: ready_for_verification]_
+
+The new Sonar icon — the sprinting figure with the lightning trail — is now the brand mark everywhere:
+
+- **Mobile**: onboarding hero mark + home wordmark chip
+- **Desktop/iPad**: sidebar wordmark
+- **Settings → App icon**: shows the real icon (Default + Square)
+- **Landing page**: nav + footer wordmark, plus favicon and apple-touch-icon
+- **Favicons** wired into all three HTML files
+
+I kept the functional cyan/indigo transport colors intact (they encode Bluetooth vs internet), so the icon reads as the identity while the UI logic stays clear. The full IconKitchen export (iOS/Android/web sizes) is preserved in `uploads/` for the real app builds. Verifier's doing a pass now.
+
+One note: the icon's artwork has a faint watermark in the source PNG — if this is a licensed/stock mark, swap in the clean vector when you have it and I'll regenerate the chips. Want me to also feature the icon in the landing hero (e.g. above the phone), or keep the radar as the hero visual?
+

@@ -32,7 +32,7 @@ function bcFreshState() {
     read: {},
     stack: [{ s: 'home' }],
     nav: '',
-    prefs: { appLock: false, readReceipts: true, preview: true, names: true, notifs: true, icon: 'cyan', requests: 1, btcMode: false, currency: 'EUR' },
+    prefs: { appLock: false, readReceipts: true, preview: true, names: true, notifs: true, icon: 'default', requests: 1, btcMode: false, currency: 'EUR' },
     chMsgs: { centro: BC_DATA.chMsgs.slice(), city: [] },
     dmMsgs: { maya: BC_DATA.dmMsgs.slice(), sofia: BC_DATA.dmMsgsSofia.slice() },
   };

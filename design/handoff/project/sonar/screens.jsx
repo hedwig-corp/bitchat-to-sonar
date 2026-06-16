@@ -22,7 +22,7 @@ function Onboarding({ initialNick, onDone }) {
 
       {step === 0 && (
         <div className="bc-obbody" key="s0">
-          <div className="bc-obmark"><BCIcon name="rings" size={40} weight={1.5} /></div>
+          <div className="bc-obmark brand"><img src="sonar/brand/sonar-icon.png" alt="Sonar" /></div>
           <h1 className="bc-obtitle">Sense who’s nearby before you see them.</h1>
           <p className="bc-obsub">Sonar connects phones directly — no phone number, no account, no servers.</p>
           <div className="bc-obrow">
@@ -163,7 +163,10 @@ function HomeScreen({ app, t, nav, push, toggleNetwork, onWipe }) {
         <button className="bc-iconbtn" onClick={() => push('settings')} aria-label="Settings">
           <Avatar name={app.nick || 'you'} size={32} />
         </button>
-        <div className="bc-htitle" style={{ textAlign: 'center', paddingLeft: 0 }} onClick={titleTap} title="Triple-tap to wipe">sonar</div>
+        <div className="bc-htitle sn-wordmark" style={{ paddingLeft: 0 }} onClick={titleTap} title="Triple-tap to wipe">
+          <img className="sn-brandchip lg" src="sonar/brand/sonar-icon.png" alt="" />
+          sonar
+        </div>
         <button className="bc-iconbtn" onClick={() => push('nearby')} aria-label="People nearby">
           <BCIcon name="rings" size={22} />
         </button>

@@ -48,6 +48,8 @@ const BC_ICONS = {
   videoOff: <><path d="M3.5 7h9a2.5 2.5 0 0 1 2.5 2.5v.5l5-2.6v7.2l-5-2.6" /><path d="M4.5 4.5l15 15" /></>,
   speaker: <><path d="M5 9.5v5h3l4 3.5v-12L8 9.5z" /><path d="M15.5 9a4 4 0 0 1 0 6M17.8 6.8a7 7 0 0 1 0 10.4" /></>,
   cameraFlip: <><rect x="3.5" y="6.5" width="17" height="13" rx="3" /><path d="M8.5 13a3.5 3.5 0 0 1 6-2.4M15.5 13a3.5 3.5 0 0 1-6 2.4" /><path d="M14.2 8.2 14.6 10.4 12.4 10.2M9.8 17.8 9.4 15.6 11.6 15.8" /><path d="M8 6.5l1-2h6l1 2" /></>,
+  copy: <><rect x="8.5" y="8.5" width="11" height="11" rx="2.6" /><path d="M15.5 8.5V6a2 2 0 0 0-2-2h-7a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2.5" /></>,
+  share: <><circle cx="6.5" cy="12" r="2.4" /><circle cx="17" cy="6" r="2.4" /><circle cx="17" cy="18" r="2.4" /><path d="M8.6 10.9 14.9 7.1M8.6 13.1l6.3 3.8" /></>,
 };
 
 function BCIcon({ name, size = 20, weight = 1.8, style, className }) {

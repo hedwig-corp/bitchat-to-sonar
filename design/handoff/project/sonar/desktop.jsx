@@ -47,11 +47,7 @@ function DkSidebar({ app, sel, onSelect, toggleNetwork, onSettings }) {
         </button>
       </div>
       <div className="dk-brand">
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
-          <circle cx="12" cy="12" r="2" fill="currentColor" stroke="none"></circle>
-          <circle cx="12" cy="12" r="5.8"></circle>
-          <circle cx="12" cy="12" r="9.4"></circle>
-        </svg>
+        <img className="sn-brandchip" src="sonar/brand/sonar-icon.png" alt="" />
         sonar
       </div>
       <StatusChip network={app.network} meshCount={meshCount} variant="banner" onToggle={toggleNetwork} />
@@ -442,6 +438,11 @@ function DkSettingsModal({ app, mode, onToggleMode, toggleNetwork, onPref, onRen
             </div>
           )}
           <span className="pf-key">{shortKey}</span>
+        </div>
+
+        <SectionLabel>Your key</SectionLabel>
+        <div className="st-card" style={{ padding: '4px 4px 8px' }}>
+          <KeyShareCard compact />
         </div>
 
         <SectionLabel>App</SectionLabel>
