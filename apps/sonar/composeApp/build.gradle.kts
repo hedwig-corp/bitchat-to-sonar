@@ -106,6 +106,9 @@ compose.desktop {
             description = "Sonar — Bluetooth mesh + Nostr secure messaging (desktop)"
             macOS {
                 bundleID = "chat.bitchat.sonar.desktop"
+                // Reuse the Android launcher icon (sonar rings on #0A1418),
+                // rendered 1:1 to .icns so the Mac app matches the phone.
+                iconFile.set(project.file("sonar.icns"))
                 // Required so macOS shows the Bluetooth permission prompt for the
                 // packaged app — the desktop BLE radio (sonar-ble / CoreBluetooth)
                 // needs it. Without an .app bundle (e.g. `gradle run`) macOS can't
