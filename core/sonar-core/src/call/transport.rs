@@ -27,20 +27,31 @@ pub struct CallTransport {
 }
 
 impl CallTransport {
-    /// Bind an endpoint with a host-persisted 32-byte iroh secret. Uses the
-    /// `Minimal` preset (sets the mandatory crypto provider, no n0 relay): the
-    /// dialable [`EndpointAddr`] (id + direct addresses) is exchanged in the
-    /// `☎CALL` signaling, so a call connects without depending on n0 discovery.
-    /// A relay/discovery preset can be layered in later for NAT'd peers.
+    /// Bind an endpoint for a call, with the iroh secret derived from the Sonar
+    /// identity (`call::identity::derive_iroh_secret`). Uses the `N0` preset
+    /// (crypto + address discovery) WITH relays enabled — relays give NAT
+    /// hole-punching for real cross-network calls between two phones; the dialable
+    /// [`EndpointAddr`] is still exchanged in the `☎CALL` signaling.
     pub async fn bind(secret: [u8; 32]) -> Result<Self> {
+        Self::build(secret, true).await
+    }
+
+    async fn build(secret: [u8; 32], relays: bool) -> Result<Self> {
         let secret_key = SecretKey::from_bytes(&secret);
-        let endpoint = Endpoint::builder(presets::Minimal)
+        let mut builder = Endpoint::builder(presets::N0)
             .secret_key(secret_key)
-            .alpns(vec![CALL_ALPN.to_vec()])
-            .bind()
-            .await
-            .context("bind iroh endpoint")?;
+            .alpns(vec![CALL_ALPN.to_vec()]);
+        if !relays {
+            builder = builder.relay_mode(iroh::RelayMode::Disabled);
+        }
+        let endpoint = builder.bind().await.context("bind iroh endpoint")?;
         Ok(Self { endpoint })
+    }
+
+    /// Relay-less bind (direct addresses only) — for hermetic same-network tests.
+    #[cfg(test)]
+    pub(crate) async fn bind_relay_less(secret: [u8; 32]) -> Result<Self> {
+        Self::build(secret, false).await
     }
 
     /// Our endpoint id (Ed25519 public key).
@@ -116,22 +127,16 @@ mod tests {
         Ok(())
     }
 
-    /// P0 follow-on: two in-process iroh nodes connect over the call ALPN, pin
-    /// each other's endpoint id, and exchange a payload over a QUIC bi-stream
-    /// (the connection the media pipeline will run inside).
-    ///
-    /// IGNORED: a relay-less localhost connection needs the dialer to have the
-    /// listener's *direct addresses*, which iroh's sync `addr()` may not have
-    /// populated immediately after `bind()` — so this hangs without either a
-    /// local relay or a `watch_addr()` wait for direct addresses. Wrapped in a
-    /// timeout so `--ignored` fails fast instead of hanging. Resolving this
-    /// (local relay or direct-address wait) is the next transport step.
+    /// P0: two in-process iroh nodes connect over the call ALPN (relay-less,
+    /// direct addresses via the `N0` preset), pin each other's endpoint id, and
+    /// exchange a payload over a QUIC bi-stream — the connection the media
+    /// pipeline runs inside. Wrapped in a timeout so a connectivity regression
+    /// fails fast instead of hanging.
     #[tokio::test]
-    #[ignore = "needs a local relay or direct-address wait; see doc comment"]
     async fn two_nodes_connect_and_exchange() -> Result<()> {
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        let a = CallTransport::bind([1u8; 32]).await?;
-        let b = CallTransport::bind([2u8; 32]).await?;
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let a = CallTransport::bind_relay_less([1u8; 32]).await?;
+        let b = CallTransport::bind_relay_less([2u8; 32]).await?;
         let a_addr = a.endpoint_addr();
         let (a_id, b_id) = (a.endpoint_id(), b.endpoint_id());
 
