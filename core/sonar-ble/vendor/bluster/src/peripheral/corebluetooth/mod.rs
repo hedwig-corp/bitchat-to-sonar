@@ -61,4 +61,9 @@ impl Peripheral {
     pub fn notify(&self, data: &[u8]) -> bool {
         self.peripheral_manager.notify(data)
     }
+
+    /// PATCH (Sonar): drain bytes written to our characteristic by centrals.
+    pub fn take_writes(&self) -> Vec<Vec<u8>> {
+        self.peripheral_manager.take_writes()
+    }
 }

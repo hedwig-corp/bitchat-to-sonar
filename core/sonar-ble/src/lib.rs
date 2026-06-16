@@ -44,6 +44,20 @@ const BITCHAT_SERVICE: Uuid = Uuid::from_u128(BITCHAT_SERVICE_U128);
 /// what makes a phone show this desktop as a named mesh peer.
 static ANNOUNCE: Lazy<Mutex<Option<Vec<u8>>>> = Lazy::new(|| Mutex::new(None));
 static ADVERTISING: AtomicBool = AtomicBool::new(false);
+
+/// Packets centrals wrote to our GATT characteristic (their announce / handshake).
+/// Drained by the JVM, which decodes the announce to name + dedupe a peer — this
+/// is how the desktop learns a phone that connected to it (the phone suppresses
+/// its own advertising while connected, so scanning alone can't see it).
+static RX_PACKETS: Lazy<Mutex<Vec<Vec<u8>>>> = Lazy::new(|| Mutex::new(Vec::new()));
+
+fn hex_encode(b: &[u8]) -> String {
+    let mut s = String::with_capacity(b.len() * 2);
+    for byte in b {
+        s.push_str(&format!("{byte:02x}"));
+    }
+    s
+}
 /// Drop a peer from the radar this long after its last advertisement. Generous
 /// because CoreBluetooth coalesces duplicate adverts (it reports a peripheral
 /// once per scan), so refreshes only arrive on each periodic re-scan below.
@@ -137,7 +151,20 @@ pub extern "C" fn sonar_ble_peers_json() -> *mut c_char {
     CString::new(json).unwrap_or_default().into_raw()
 }
 
-/// Free a string returned by [`sonar_ble_peers_json`].
+/// JSON array of hex-encoded packets written to our GATT characteristic by
+/// connected centrals (their announce / handshake), draining the queue. The JVM
+/// decodes these to learn + name the peer. Free with [`sonar_ble_free`].
+#[no_mangle]
+pub extern "C" fn sonar_ble_drain_rx_json() -> *mut c_char {
+    let items: Vec<serde_json::Value> = RX_PACKETS
+        .lock()
+        .map(|mut q| q.drain(..).map(|b| serde_json::Value::String(hex_encode(&b))).collect())
+        .unwrap_or_default();
+    let json = serde_json::Value::Array(items).to_string();
+    CString::new(json).unwrap_or_default().into_raw()
+}
+
+/// Free a string returned by [`sonar_ble_peers_json`] / [`sonar_ble_drain_rx_json`].
 ///
 /// # Safety
 /// `ptr` must be a pointer previously returned by this library, or null.
@@ -164,8 +191,12 @@ async fn scan_loop() {
         RUNNING.store(false, Ordering::SeqCst);
         return;
     };
-    match central.start_scan(ScanFilter::default()).await {
-        Ok(_) => dbg_log("scan_loop: scan started"),
+    // Scan FILTERED to the bitchat service (like the Android app) — far more
+    // reliable than scanning everything and checking the parsed service UUID,
+    // which CoreBluetooth often reports empty (especially while also advertising).
+    let filter = ScanFilter { services: vec![BITCHAT_SERVICE] };
+    match central.start_scan(filter.clone()).await {
+        Ok(_) => dbg_log("scan_loop: scan started (bitchat filter)"),
         Err(e) => dbg_log(&format!("scan_loop: start_scan ERR {e}")),
     }
 
@@ -180,8 +211,13 @@ async fn scan_loop() {
         // Periodic re-scan: CoreBluetooth coalesces duplicate advertisements, so
         // without restarting the scan a still-present device is never re-reported.
         if last_rescan.elapsed() >= RESCAN_EVERY {
-            let _ = central.stop_scan().await;
-            let _ = central.start_scan(ScanFilter::default()).await;
+            let stop = central.stop_scan().await;
+            let start = central.start_scan(filter.clone()).await;
+            let total = DEVICES.lock().map(|d| d.len()).unwrap_or(0);
+            dbg_log(&format!(
+                "scan: rescan stop={:?} start={:?} (total devices seen={})",
+                stop.is_ok(), start.is_ok(), total
+            ));
             last_rescan = Instant::now();
         }
     }
@@ -206,11 +242,11 @@ async fn handle_event(central: &btleplug::platform::Adapter, ev: CentralEvent) {
     let props = p.properties().await.ok().flatten();
     let name = props.as_ref().and_then(|pr| pr.local_name.clone());
     let rssi = props.as_ref().and_then(|pr| pr.rssi).unwrap_or(0);
-    let services = props.as_ref().map(|pr| pr.services.clone()).unwrap_or_default();
-    let bitchat = services.contains(&BITCHAT_SERVICE);
-    if bitchat {
-        dbg_log(&format!("discovered BITCHAT peer {id} rssi={rssi}"));
-    }
+    // The scan is filtered to the bitchat service, so every reported peripheral
+    // matched it — even when CoreBluetooth hands back an empty parsed services
+    // array (common). So treat all scan results as bitchat peers.
+    let bitchat = true;
+    dbg_log(&format!("discovered BITCHAT peer {id} rssi={rssi}"));
     if let Ok(mut d) = DEVICES.lock() {
         d.insert(
             id.to_string(),
@@ -333,6 +369,19 @@ async fn run_peripheral() -> Result<(), Box<dyn std::error::Error>> {
                 dbg_log(&format!("advertise: notify announce ({} bytes) sent={}", ann.len(), sent));
             }
             last_notify = Instant::now();
+        }
+        // Drain packets centrals wrote to us (bluster's event channel is a no-op
+        // on macOS; we patched it to queue writes — take them here).
+        let writes = peripheral.take_writes();
+        if !writes.is_empty() {
+            dbg_log(&format!("advertise: rx {} write packet(s) from central", writes.len()));
+            if let Ok(mut q) = RX_PACKETS.lock() {
+                for w in writes {
+                    if q.len() < 256 {
+                        q.push(w);
+                    }
+                }
+            }
         }
         match tokio::time::timeout(Duration::from_millis(500), rx.next()).await {
             Ok(Some(ev)) => match ev {

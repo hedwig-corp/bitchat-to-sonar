@@ -1,11 +1,19 @@
+use std::sync::Mutex;
+
 use objc::{msg_send, runtime::{BOOL, NO, Object, Sel, YES}, sel, sel_impl};
-use objc_foundation::{INSArray, INSString, NSArray, NSObject, NSString};
+use objc_foundation::{INSArray, INSData, INSString, NSArray, NSData, NSObject, NSString};
 
 use super::{
     constants::POWERED_ON_IVAR,
     ffi::{CBATTError, CBManagerState},
     into_bool::IntoBool,
 };
+
+// PATCH (Sonar): upstream bluster's CoreBluetooth callbacks are stubs (see the
+// TODO below) — write requests were acked but the bytes thrown away. Queue them
+// so PeripheralManager::take_writes() can hand the central's packets (its
+// announce / handshake) to the app.
+pub static WRITE_QUEUE: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
 // TODO: Implement event stream for all below callback
 
@@ -92,6 +100,19 @@ pub extern "C" fn peripheral_manager_did_receive_write_requests(
 ) {
     unsafe {
         for request in (*(requests as *mut NSArray<NSObject>)).to_vec() {
+            // PATCH (Sonar): capture the written bytes before acking.
+            let value: *mut Object = msg_send![request, value];
+            if !value.is_null() {
+                let data = value as *mut NSData;
+                let bytes = (*data).bytes().to_vec();
+                if !bytes.is_empty() {
+                    if let Ok(mut q) = WRITE_QUEUE.lock() {
+                        if q.len() < 256 {
+                            q.push(bytes);
+                        }
+                    }
+                }
+            }
             let _: Result<(), ()> = msg_send![peripheral, respondToRequest:request
                                         withResult:CBATTError::CBATTErrorSuccess];
         }

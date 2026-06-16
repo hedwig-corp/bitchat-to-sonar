@@ -234,6 +234,16 @@ impl PeripheralManager {
             ok.into_bool()
         }
     }
+
+    // PATCH (Sonar): drain the bytes written to our characteristic by connected
+    // centrals (their announce / handshake packets). Upstream bluster discarded
+    // them; see events::WRITE_QUEUE.
+    pub fn take_writes(self: &Self) -> Vec<Vec<u8>> {
+        super::events::WRITE_QUEUE
+            .lock()
+            .map(|mut q| std::mem::take(&mut *q))
+            .unwrap_or_default()
+    }
 }
 
 impl Default for PeripheralManager {

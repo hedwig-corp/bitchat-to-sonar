@@ -14,6 +14,7 @@ private interface BleLib : Library {
     fun sonar_ble_set_announce(data: ByteArray?, len: Long)
     fun sonar_ble_start_advertising()
     fun sonar_ble_stop_advertising()
+    fun sonar_ble_drain_rx_json(): Pointer?
 }
 
 /**
@@ -53,6 +54,18 @@ object BleBridge {
     fun setAnnounce(bytes: ByteArray) { lib?.sonar_ble_set_announce(bytes, bytes.size.toLong()) }
     fun startAdvertising() { lib?.sonar_ble_start_advertising() }
     fun stopAdvertising() { lib?.sonar_ble_stop_advertising() }
+
+    /** Packets centrals wrote to our GATT characteristic (announce/handshake). */
+    fun drainRx(): List<ByteArray> {
+        val l = lib ?: return emptyList()
+        val ptr = l.sonar_ble_drain_rx_json() ?: return emptyList()
+        val json = try { ptr.getString(0) } finally { l.sonar_ble_free(ptr) }
+        return HEX.findAll(json).mapNotNull { runCatching { hexToBytes(it.groupValues[1]) }.getOrNull() }.toList()
+    }
+
+    private val HEX = Regex("\"([0-9a-fA-F]+)\"")
+    private fun hexToBytes(s: String): ByteArray =
+        ByteArray(s.length / 2) { ((s[it * 2].digitToInt(16) shl 4) or s[it * 2 + 1].digitToInt(16)).toByte() }
 
     /** Fresh bitchat-mesh peers discovered by the background scan. */
     fun peers(): List<Dev> {

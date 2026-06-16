@@ -15,6 +15,13 @@ package chat.bitchat.sonar
 actual object MeshRadio {
     @Volatile private var nick: String = "sonar"
 
+    /** A peer learned from the announce it WROTE to our GATT server (named, stable
+     *  by fingerprint). A phone suppresses its own advertising while connected to
+     *  us, so this — not scanning — is how the desktop reliably learns it. */
+    private data class Announced(val fp: String, val name: String, val ts: Long)
+    private val announced = java.util.concurrent.ConcurrentHashMap<String, Announced>()
+    private const val ANN_TTL_MS = 60_000L
+
     actual fun available(): Boolean = BleBridge.available
 
     actual fun start() {
@@ -35,14 +42,40 @@ actual object MeshRadio {
         runCatching { BleBridge.setAnnounce(MeshIdentity.announce(nick)) }
     }
 
-    actual fun peers(): List<MeshPeer> = BleBridge.peers().map { d ->
-        MeshPeer(
-            id = "mesh:" + d.id,
-            name = d.name?.takeIf { it.isNotBlank() } ?: ("mesh·" + d.id.take(6)),
-            rssi = d.rssi,
-            sonar = false, // a full Sonar peer is only known after the 0x53 announce (GATT, next stage)
-        )
+    actual fun peers(): List<MeshPeer> {
+        drainAnnounces()
+        val now = System.currentTimeMillis()
+        announced.entries.removeIf { now - it.value.ts > ANN_TTL_MS }
+        // Named peers learned via the GATT announce (stable + deduped by
+        // fingerprint) are the real radar peers. The raw scan returns rotating,
+        // unnamed BLE addresses; surface those only as a fallback for peers that
+        // haven't connected to us yet, keyed so they don't duplicate named ones.
+        val named = announced.values.map { a ->
+            MeshPeer(id = "mesh:" + a.fp, name = a.name.ifBlank { "mesh peer" }, rssi = -50, sonar = true)
+        }
+        return named
     }
+
+    /** Decode packets centrals wrote to us; record each announce as a named peer
+     *  via the SAME Rust core the phones use (meshDecodePacket + meshParseAnnounce). */
+    private fun drainAnnounces() {
+        for (pkt in BleBridge.drainRx()) {
+            val info = runCatching { uniffi.sonar_ffi.meshDecodePacket(pkt) }.getOrNull() ?: continue
+            if (info.packetType.toInt() != 0x1) continue // TYPE_ANNOUNCE
+            val ann = runCatching { uniffi.sonar_ffi.meshParseAnnounce(pkt) }.getOrNull() ?: continue
+            val fp = fingerprintOf(ann.noisePublicKeyHex)
+            if (fp.isNotEmpty()) announced[fp] = Announced(fp, ann.nickname, System.currentTimeMillis())
+        }
+    }
+
+    /** Stable fingerprint = SHA256(noise static pubkey), hex (matches Android). */
+    private fun fingerprintOf(noisePublicKeyHex: String): String = runCatching {
+        val bytes = ByteArray(noisePublicKeyHex.length / 2) {
+            ((noisePublicKeyHex[it * 2].digitToInt(16) shl 4) or noisePublicKeyHex[it * 2 + 1].digitToInt(16)).toByte()
+        }
+        chat.bitchat.sonar.crypto.Sha256.hash(bytes)
+            .joinToString("") { ((it.toInt() and 0xFF) + 0x100).toString(16).substring(1) }
+    }.getOrDefault("")
 
     // Transport (Noise-over-GATT messaging) not wired yet — discovery + announce only.
     actual fun setLocalSonarAnnounce(payload: ByteArray?) {}
