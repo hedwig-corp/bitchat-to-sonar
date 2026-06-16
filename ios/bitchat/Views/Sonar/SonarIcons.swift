@@ -22,6 +22,8 @@ enum SNIconName: String {
     case trash, info, compose, coin, bolt, mic
     // Calls (call.jsx): phone/videocam start a call; the in-call controls.
     case phone, videocam, phoneDown, micOff, videoOff, speaker, cameraFlip
+    // Key sharing (settings.jsx KeyShareCard): copy key / share key.
+    case copy, share
 }
 
 private enum SNIconElement {
@@ -156,6 +158,16 @@ private let snIconTable: [SNIconName: [SNIconElement]] = [
         .path("M8.5 13a3.5 3.5 0 0 1 6-2.4M15.5 13a3.5 3.5 0 0 1-6 2.4"),
         .path("M14.2 8.2 14.6 10.4 12.4 10.2M9.8 17.8 9.4 15.6 11.6 15.8"),
         .path("M8 6.5l1-2h6l1 2"),
+    ],
+    .copy: [
+        .rect(8.5, 8.5, 11, 11, 2.6),
+        .path("M15.5 8.5V6a2 2 0 0 0-2-2h-7a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2.5"),
+    ],
+    .share: [
+        .circle(6.5, 12, 2.4, filled: false),
+        .circle(17, 6, 2.4, filled: false),
+        .circle(17, 18, 2.4, filled: false),
+        .path("M8.6 10.9 14.9 7.1M8.6 13.1l6.3 3.8"),
     ],
 ]
 
