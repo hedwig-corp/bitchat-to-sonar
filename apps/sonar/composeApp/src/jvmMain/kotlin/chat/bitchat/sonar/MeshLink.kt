@@ -86,26 +86,47 @@ object MeshLink {
 
     private fun touch(fp: String) { seenByFp[fp] = System.currentTimeMillis() }
 
-    /** Noise XX responder: read m1 → reply m2 → read m3 → established. */
+    /** Noise XX responder: read m1 → reply m2 → read m3 → established.
+     *
+     *  A handshake packet arriving on an ALREADY-established session means the
+     *  phone reconnected its GATT link and is starting a FRESH handshake — and we
+     *  can't see the disconnect (bluster stubs the CoreBluetooth disconnect
+     *  callback), so without this the desktop keeps the stale session, ignores the
+     *  new m1, and the phone can never re-establish (its chat shows "out of
+     *  range"). So tear down + start fresh whenever a handshake doesn't fit the
+     *  current state. */
     private fun handleHandshake(senderPeerId: String, m: ByteArray) {
         val fp = fpByPeerId[senderPeerId] ?: senderPeerId
+        if (sessions[fp]?.established == true) {
+            sonarLog("MeshLink", "re-handshake from ${nameByFp[fp] ?: fp.take(8)} → resetting session")
+            sessions.remove(fp)
+        }
         val s = sessions.getOrPut(fp) { Session(SonarNoise.responder(MeshIdentity.noisePrivHex())) }
-        if (s.established) { touch(fp); return }
         synchronized(s) {
-            runCatching {
-                s.noise.readMessage(m) // m1, then m3
-                if (s.noise.isFinished()) {
-                    s.noise.intoSession(); s.established = true
-                    sonarLog("MeshLink", "Noise link ESTABLISHED with ${nameByFp[fp] ?: fp.take(8)}")
-                    flushPending(fp)
-                } else {
-                    val m2 = s.noise.writeMessage()
-                    BleBridge.notify(MeshIdentity.buildPacket(TYPE_NOISE_HANDSHAKE.toUByte(), senderPeerId, m2))
-                }
-            }.onFailure { sessions.remove(fp) }
+            if (!feedHandshake(fp, senderPeerId, s, m)) {
+                // Wrong message for this state (a fresh m1 mid-handshake) — restart.
+                val fresh = Session(SonarNoise.responder(MeshIdentity.noisePrivHex()))
+                sessions[fp] = fresh
+                synchronized(fresh) { feedHandshake(fp, senderPeerId, fresh, m) }
+            }
         }
         touch(fp)
     }
+
+    /** Returns false if [m] couldn't be processed (caller restarts the handshake). */
+    private fun feedHandshake(fp: String, senderPeerId: String, s: Session, m: ByteArray): Boolean =
+        runCatching {
+            s.noise.readMessage(m) // m1, then m3
+            if (s.noise.isFinished()) {
+                s.noise.intoSession(); s.established = true
+                sonarLog("MeshLink", "Noise link ESTABLISHED with ${nameByFp[fp] ?: fp.take(8)}")
+                flushPending(fp)
+            } else {
+                val m2 = s.noise.writeMessage()
+                BleBridge.notify(MeshIdentity.buildPacket(TYPE_NOISE_HANDSHAKE.toUByte(), senderPeerId, m2))
+            }
+            true
+        }.getOrElse { sessions.remove(fp); false }
 
     private fun handleEncrypted(senderPeerId: String, ciphertext: ByteArray) {
         val fp = fpByPeerId[senderPeerId] ?: senderPeerId
