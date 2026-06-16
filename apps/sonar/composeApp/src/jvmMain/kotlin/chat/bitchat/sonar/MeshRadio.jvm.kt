@@ -20,7 +20,7 @@ actual object MeshRadio {
      *  us, so this — not scanning — is how the desktop reliably learns it. */
     private data class Announced(val fp: String, val name: String, val ts: Long)
     private val announced = java.util.concurrent.ConcurrentHashMap<String, Announced>()
-    private const val ANN_TTL_MS = 60_000L
+    private const val ANN_TTL_MS = 90_000L
 
     actual fun available(): Boolean = BleBridge.available
 
@@ -53,19 +53,37 @@ actual object MeshRadio {
         val named = announced.values.map { a ->
             MeshPeer(id = "mesh:" + a.fp, name = a.name.ifBlank { "mesh peer" }, rssi = -50, sonar = true)
         }
-        return named
+        if (named.isNotEmpty()) return named
+        // No connected (named) peer yet → fast path: our FILTERED scan sees phones
+        // advertising before they dial us, so the radar isn't empty for ~20s. A
+        // phone rapidly rotates its BLE address, so collapse all current scan hits
+        // into ONE "nearby phone" node (it becomes a named peer once it connects +
+        // writes its announce). Imperfect if several phones are nearby, but matches
+        // the common case and avoids a flickering cloud of rotating addresses.
+        val scan = BleBridge.peers()
+        if (scan.isEmpty()) return emptyList()
+        val strongest = scan.maxByOrNull { it.rssi } ?: scan.first()
+        return listOf(MeshPeer(id = "mesh:nearby", name = "nearby phone", rssi = strongest.rssi, sonar = false))
     }
 
     /** Decode packets centrals wrote to us; record each announce as a named peer
      *  via the SAME Rust core the phones use (meshDecodePacket + meshParseAnnounce). */
     private fun drainAnnounces() {
-        for (pkt in BleBridge.drainRx()) {
+        val pkts = BleBridge.drainRx()
+        if (pkts.isEmpty()) return
+        val now = System.currentTimeMillis()
+        for (pkt in pkts) {
             val info = runCatching { uniffi.sonar_ffi.meshDecodePacket(pkt) }.getOrNull() ?: continue
             if (info.packetType.toInt() != 0x1) continue // TYPE_ANNOUNCE
             val ann = runCatching { uniffi.sonar_ffi.meshParseAnnounce(pkt) }.getOrNull() ?: continue
             val fp = fingerprintOf(ann.noisePublicKeyHex)
-            if (fp.isNotEmpty()) announced[fp] = Announced(fp, ann.nickname, System.currentTimeMillis())
+            if (fp.isNotEmpty()) announced[fp] = Announced(fp, ann.nickname, now)
         }
+        // A connected phone re-writes its announce only occasionally, but keeps
+        // writing handshake/keepalive packets — so ANY inbound write means the
+        // known peer is still here. Refresh so the radar doesn't flicker between
+        // announces (the mobile apps keep a peer while its Noise link is live).
+        announced.replaceAll { _, a -> a.copy(ts = now) }
     }
 
     /** Stable fingerprint = SHA256(noise static pubkey), hex (matches Android). */
