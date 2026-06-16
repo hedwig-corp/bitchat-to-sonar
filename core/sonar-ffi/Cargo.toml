@@ -20,6 +20,11 @@ required-features = ["cli"]
 [features]
 # Host-only helper used by core/build-ios.sh; never enabled for device builds.
 cli = ["uniffi/cli"]
+# P2P voice calls: exposes the `call_*` SonarNode methods + the ☎CALL signaling
+# helpers, backed by sonar-core's iroh/cpal/opus call engine. The device build
+# scripts (build-ios.sh / build-android.sh) enable this; the default `cargo test`
+# build stays lean (no iroh/cpal/opus). The whole call FFI is `#[cfg]`-gated on it.
+calls-audio = ["sonar-core/calls-audio"]
 
 [dependencies]
 sonar-core = { path = "../sonar-core" }
