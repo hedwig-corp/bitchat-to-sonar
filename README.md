@@ -1,130 +1,149 @@
-<img width="256" height="256" alt="icon_128x128@2x" src="https://github.com/user-attachments/assets/90133f83-b4f6-41c6-aab9-25d0859d2a47" />
+<img width="256" height="256" alt="Sonar" src="https://github.com/user-attachments/assets/90133f83-b4f6-41c6-aab9-25d0859d2a47" />
 
-## bitchat
+# Sonar
 
-A decentralized peer-to-peer messaging app with dual transport architecture: local Bluetooth mesh networks for offline communication and internet-based Nostr protocol for global reach. No accounts, no phone numbers, no central servers. It's the side-groupchat.
+> Sense who's nearby before you see them.
 
-[bitchat.free](http://bitchat.free)
+Sonar is a decentralized, privacy-first messenger and Lightning wallet. It speaks
+two transports — a local **Bluetooth LE mesh** for offline, proximity
+communication and the internet-based **Nostr** protocol for global reach — and
+adds end-to-end-encrypted group messaging (Marmot / MLS over Nostr), nearby
+Bluetooth payments, and peer-to-peer voice/video calls on top. No accounts, no
+phone numbers, no central servers — your identity is a key you hold.
 
-📲 [App Store](https://apps.apple.com/us/app/bitchat-mesh/id6748219622)
+Sonar grew out of [bitchat](https://github.com/permissionlesstech/bitchat) and
+keeps its mesh + Nostr foundation, then rebuilds the product around a single
+shared Rust core that drives native iOS/macOS and Compose Multiplatform
+(Android/Desktop) apps.
 
 ## License
 
-This project is released into the public domain. See the [LICENSE](LICENSE) file for details.
+This project is released into the public domain. See the [LICENSE](LICENSE) file
+for details.
 
 ## Features
 
-- **Dual Transport Architecture**: Bluetooth mesh for offline + Nostr protocol for internet-based messaging
-- **Location-Based Channels**: Geographic chat rooms using geohash coordinates over global Nostr relays
-- **Intelligent Message Routing**: Automatically chooses best transport (Bluetooth → Nostr fallback)
-- **Decentralized Mesh Network**: Automatic peer discovery and multi-hop message relay over Bluetooth LE
-- **Privacy First**: No accounts, no phone numbers, no persistent identifiers
-- **Private Message End-to-End Encryption**: [Noise Protocol](https://noiseprotocol.org) for mesh, NIP-17 for Nostr
-- **IRC-Style Commands**: Familiar `/slap`, `/msg`, `/who` style interface
-- **Universal App**: Native support for iOS and macOS
-- **Emergency Wipe**: Triple-tap to instantly clear all data
-- **Performance Optimizations**: LZ4 message compression, adaptive battery modes, and optimized networking
+- **Dual transport** — Bluetooth LE mesh for offline, Nostr for internet-based messaging, with automatic transport selection (Bluetooth → Nostr fallback → smart queueing).
+- **White Noise secure DMs** — end-to-end-encrypted group messaging via [Marmot](https://github.com/marmot-protocol/mdk) (MLS over Nostr); interoperable with the White Noise client in both directions.
+- **Encrypted media** — image / file / voice sharing over the Marmot media module (MIP-04).
+- **⚡ Lightning wallet** — an embedded wallet (Breez SDK Liquid; BOLT12 / BIP-353 capable) tied to the same identity, so the same key restores the same wallet.
+- **Nearby payments over BLE** — bidirectional, payments-only Lightning over Bluetooth (`⚡PAY`), no chat required.
+- **Voice & video calls** — peer-to-peer `☎CALL` over an [iroh](https://github.com/n0-computer/iroh) QUIC transport (NodeId-authenticated, NAT hole-punching).
+- **Location channels** — geographic chat rooms addressed by geohash, with live presence, over global Nostr relays.
+- **Tor by default** — all internet traffic is routed through a local Tor SOCKS5 proxy, fail-closed when Tor isn't ready.
+- **Privacy first** — no accounts, no phone numbers, no persistent identifiers; mesh DMs use the [Noise Protocol](https://noiseprotocol.org) (XX pattern), Nostr DMs use NIP-17 gift-wrapping.
+- **Multi-platform** — native SwiftUI on iOS/macOS, Compose Multiplatform on Android/Desktop, all over one Rust core.
 
-## [Technical Architecture](https://deepwiki.com/permissionlesstech/bitchat)
+## Architecture
 
-BitChat uses a **hybrid messaging architecture** with two complementary transport layers:
+Sonar is **one headless Rust core, many thin app shells**. The core owns identity,
+messaging, payments, and call signaling; each platform provides only the UI and
+the OS-specific bits (radios, storage, notifications, wallet).
 
-### Bluetooth Mesh Network (Offline)
+```
+core/                     shared Rust core (Cargo workspace)
+├── sonar-core/           identity + Marmot (MLS over Nostr) + geohash + mesh + call signaling
+├── sonar-ffi/            UniFFI bindings → Swift (xcframework) + Kotlin (.so / JNA)
+└── sonar-ble/            desktop BLE bridge (CoreBluetooth/BlueZ over JNA; own workspace)
 
-- **Local Communication**: Direct peer-to-peer within Bluetooth range
-- **Multi-hop Relay**: Messages route through nearby devices (max 7 hops)
-- **No Internet Required**: Works completely offline in disaster scenarios
-- **Noise Protocol Encryption**: End-to-end encryption with forward secrecy
-- **Binary Protocol**: Compact packet format optimized for Bluetooth LE constraints
-- **Automatic Discovery**: Peer discovery and connection management
-- **Adaptive Power**: Battery-optimized duty cycling
+ios/                      native SwiftUI reference app (iOS + macOS)
+apps/sonar/               Compose Multiplatform app (Android + Desktop JVM)
+web/                      SvelteKit marketing landing page
+relays/                   curated Nostr relay list
+design/                   vendored design handoff (source of truth for the UI)
+docs/                     protocol & feature specs (payments, discovery, calls, Tor, …)
+```
 
-### Nostr Protocol (Internet)
+The core is generated into each app by the build scripts in `core/`
+(`build-ios.sh`, `build-android.sh`, `build-desktop.sh`) — they compile the Rust
+staticlib/cdylib and emit the UniFFI Swift/Kotlin bindings. The shipped binary
+artifacts (e.g. `sonarffi.xcframework`) are **generated, not committed** — rebuild
+them before archiving.
 
-- **Global Reach**: Connect with users worldwide via internet relays
-- **Location Channels**: Geographic chat rooms using geohash coordinates
-- **290+ Relay Network**: Distributed across the globe for reliability
-- **NIP-17 Encryption**: Gift-wrapped private messages for internet privacy
-- **Ephemeral Keys**: Fresh cryptographic identity per geohash area
+### Transports
 
-### Channel Types
+**Bluetooth mesh (offline)** — direct peer-to-peer within range, multi-hop relay
+(up to 7 hops), no internet required, Noise-encrypted with forward secrecy, over a
+compact binary protocol tuned for BLE.
 
-#### `mesh #bluetooth`
+**Nostr (internet)** — global reach over a distributed relay network, NIP-17
+gift-wrapped DMs, ephemeral per-geohash keys for location channels.
 
-- **Transport**: Bluetooth Low Energy mesh network
-- **Scope**: Local devices within multi-hop range
-- **Internet**: Not required
-- **Use Case**: Offline communication, protests, disasters, remote areas
+### Channel types
 
-#### Location Channels (`block #dr5rsj7`, `neighborhood #dr5rs`, `country #dr`)
+| Channel | Transport | Scope |
+| --- | --- | --- |
+| `mesh #bluetooth` | Bluetooth LE mesh | Local devices within multi-hop range — offline, protests, disasters, remote areas |
+| Location (`block #dr5rsj7`, `neighborhood #dr5rs`, `country #dr`) | Nostr over internet | Geographic areas by geohash precision (`block` 7 → `region` 2 chars) |
 
-- **Transport**: Nostr protocol over internet
-- **Scope**: Geographic areas defined by geohash precision
-  - `block` (7 chars): City block level
-  - `neighborhood` (6 chars): District/neighborhood
-  - `city` (5 chars): City level
-  - `province` (4 chars): State/province
-  - `region` (2 chars): Country/large region
-- **Internet**: Required (connects to Nostr relays)
-- **Use Case**: Location-based community chat, local events, regional discussions
+### Account model
 
-### Direct Message Routing
+Your identity is a Nostr keypair (`npub`/`nsec`). The same key restores the same
+profile **and** the same Lightning wallet across devices and transports — a single
+person is one conversation whether they're reachable over BLE or White Noise.
 
-Private messages use **intelligent transport selection**:
+For protocol detail, see the [Technical Whitepaper](WHITEPAPER.md), the Noise
+write-up in [BRING_THE_NOISE.md](BRING_THE_NOISE.md), and the specs under
+[`docs/`](docs/).
 
-1. **Bluetooth First** (preferred when available)
+## Platform support
 
-   - Direct connection with established Noise session
-   - Fastest and most private option
+| Capability | iOS / macOS | Android | Desktop (JVM) |
+|---|:---:|:---:|:---:|
+| White Noise (Marmot) secure DMs | ✅ | ✅ | ✅ |
+| Geohash channels + presence | ✅ | ✅ | ✅ |
+| Encrypted media (MIP-04) | ✅ | ✅ | ✅ |
+| BLE mesh — discovery | ✅ | ✅ | ✅ (scan + advertise) |
+| BLE mesh — messaging | ✅ | ✅ | ⚪️ next stage (Noise-over-GATT) |
+| Nearby payments over BLE (`⚡PAY`) | ✅ | ✅ | ⚪️ later |
+| Lightning wallet | ✅ (Breez) | ✅ (Breez) | ⚪️ no desktop Breez build yet |
+| Voice / video calls (`☎CALL`) | 🚧 in progress | 🚧 in progress | 🚧 |
 
-2. **Nostr Fallback** (when Bluetooth unavailable)
+See [`apps/sonar/README.md`](apps/sonar/README.md) for the full Android/Desktop matrix and its caveats.
 
-   - Uses recipient's Nostr public key
-   - NIP-17 gift-wrapping for privacy
-   - Routes through global relay network
+## Build & run
 
-3. **Smart Queuing** (when neither available)
-   - Messages queued until transport becomes available
-   - Automatic delivery when connection established
+### iOS / macOS
 
-For detailed protocol documentation, see the [Technical Whitepaper](WHITEPAPER.md).
+```bash
+cd ios
+open bitchat.xcodeproj
+```
 
-## Repository layout
+To run on a device:
 
-Two apps over one shared Rust core (`core/`):
+- Copy the local config: `cp Configs/Local.xcconfig.example Configs/Local.xcconfig`
+- Set your `DEVELOPMENT_TEAM` (and, if you fork it, `PRODUCT_BUNDLE_IDENTIFIER` / `APP_GROUP_ID`) in `Configs/Local.xcconfig`. The app group must stay `group.<bundle id>`.
+- The Rust core is a generated artifact — rebuild it before building the app:
 
-- **`ios/`** — the native SwiftUI **reference implementation** (iOS/macOS): `bitchat/`, `bitchat.xcodeproj`, its SPM `localPackages/`, and `Configs/`.
-- **`apps/`** — **Compose Multiplatform** apps (umbrella for current + future Compose apps); today `apps/sonar/` (Android).
-- `design/` (handoff bundle) and `docs/` (incl. `docs/brainstorms/`) stay at the top level, shared across apps.
+  ```bash
+  ./core/build-ios.sh
+  ```
 
-## Setup
+For a quick macOS run from source: `brew install just && just run` (and `just clean` afterwards to restore the project for mobile builds).
 
-### Option 1: Using Xcode
+### Android / Desktop (Compose Multiplatform)
 
-   ```bash
-   cd ios
-   open bitchat.xcodeproj
-   ```
+```bash
+cd apps/sonar
+./gradlew :composeApp:assembleDebug        # Android APK
+./gradlew :composeApp:run                  # Compose Desktop
+```
 
-   To run on a device there're a few steps to prepare the code:
-   - Clone the local configs: `cp Configs/Local.xcconfig.example Configs/Local.xcconfig`
-   - Add your Developer Team ID into the newly created `Configs/Local.xcconfig`
-      - Bundle ID would be set to `chat.bitchat.<team_id>` (unless you set to something else)
-   - Entitlements need to be updated manually (TODO: Automate):
-      - Search and replace `group.chat.bitchat` with `group.<your_bundle_id>` (e.g. `group.chat.bitchat.ABC123`)
+The Gradle build invokes the Rust core build (`core/build-android.sh` /
+`build-desktop.sh`) to produce the JNI `.so` / host dylib and the Kotlin bindings.
 
-### Option 2: Using `just`
+### Web (landing page)
 
-   ```bash
-   brew install just
-   ```
-
-Want to try this on macos: `just run` will set it up and run from source.
-Run `just clean` afterwards to restore things to original state for mobile app building and development.
+```bash
+cd web
+npm install
+npm run dev
+```
 
 ## Localization
 
 - Base app resources live under `ios/bitchat/Localization/Base.lproj/`. Add new copy to `Localizable.strings` and plural rules to `Localizable.stringsdict`.
 - Share extension strings are separate in `ios/bitchatShareExtension/Localization/Base.lproj/Localizable.strings`.
 - Prefer keys that describe intent (`app_info.features.offline.title`) and reuse existing ones where possible.
-- Run `xcodebuild -project ios/bitchat.xcodeproj -scheme "bitchat (macOS)" -configuration Debug CODE_SIGNING_ALLOWED=NO build` to compile-check any localization updates.
+- Compile-check localization changes: `xcodebuild -project ios/bitchat.xcodeproj -scheme "bitchat (macOS)" -configuration Debug CODE_SIGNING_ALLOWED=NO build`.
