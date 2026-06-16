@@ -45,7 +45,16 @@ object MeshLink {
     private val rxDms = ConcurrentLinkedQueue<MeshDmIn>()
     private val pending = ConcurrentHashMap<String, ConcurrentLinkedQueue<Pair<String, String>>>()
 
+    /** Our encoded SonarAnnounce (npub + caps) to broadcast as a signed 0x53, so
+     *  phones treat us as a full Sonar peer and continue our chat over White Noise
+     *  when out of BLE range. Null = nothing to advertise yet. */
+    @Volatile private var sonarPayload: ByteArray? = null
+    @Volatile private var lastSonarSendMs = 0L
+
     @Volatile private var running = false
+
+    /** Set/clear the SonarAnnounce payload broadcast as our 0x53 (from the app). */
+    fun setSonarPayload(payload: ByteArray?) { sonarPayload = payload }
 
     fun start() {
         if (running) return
@@ -77,11 +86,23 @@ object MeshLink {
                 }
                 TYPE_NOISE_HANDSHAKE -> handleHandshake(sender, info.payload)
                 TYPE_NOISE_ENCRYPTED -> handleEncrypted(sender, info.payload)
-                TYPE_SONAR -> sonarByPeerId[sender] = info.payload
+                TYPE_SONAR -> {
+                    if (sonarByPeerId.put(sender, info.payload) == null) {
+                        sonarLog("MeshLink", "RX 0x53 Sonar announce from ${nameByFp[fpByPeerId[sender]] ?: sender} → peer is a full Sonar user (npub for WN fallback)")
+                    }
+                }
             }
         }
         val now = System.currentTimeMillis()
         seenByFp.entries.removeIf { now - it.value > PEER_TTL_MS }
+
+        // Broadcast our signed 0x53 Sonar announce every ~3s so connected phones
+        // learn our npub and can continue the chat over White Noise out of range.
+        val payload = sonarPayload
+        if (payload != null && now - lastSonarSendMs >= 3_000L) {
+            lastSonarSendMs = now
+            runCatching { BleBridge.notify(MeshIdentity.buildSonarPacket(payload)) }
+        }
     }
 
     private fun touch(fp: String) { seenByFp[fp] = System.currentTimeMillis() }

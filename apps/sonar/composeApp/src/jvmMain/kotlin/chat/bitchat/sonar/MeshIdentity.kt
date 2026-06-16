@@ -4,6 +4,7 @@ import chat.bitchat.sonar.crypto.Sha256
 import uniffi.sonar_ffi.NoiseKeypairHex
 import uniffi.sonar_ffi.meshBuildAnnounce
 import uniffi.sonar_ffi.meshBuildPacket
+import uniffi.sonar_ffi.meshBuildSignedPacket
 import uniffi.sonar_ffi.noiseGenerateKeypair
 import java.security.SecureRandom
 
@@ -17,6 +18,7 @@ import java.security.SecureRandom
  */
 object MeshIdentity {
     private const val DEFAULT_TTL: UByte = 7u
+    private const val TYPE_SONAR: UByte = 0x53u
 
     private fun hex(b: ByteArray): String =
         b.joinToString("") { ((it.toInt() and 0xFF) + 0x100).toString(16).substring(1) }
@@ -65,6 +67,14 @@ object MeshIdentity {
      *  [recipientIdHex], wrapping [payload]. */
     fun buildPacket(packetType: UByte, recipientIdHex: String, payload: ByteArray): ByteArray =
         meshBuildPacket(packetType, peerIdHex, recipientIdHex, DEFAULT_TTL, System.currentTimeMillis().toULong(), payload)
+
+    /** Build our SIGNED Sonar Discovery (0x53) packet wrapping [payload] (the
+     *  encoded SonarAnnounce: npub + capabilities). MUST be Ed25519-signed with
+     *  the same key as the 0x01 announce, or peers reject it as unverified — which
+     *  is what lets a Sonar peer continue our BLE chat over White Noise (internet)
+     *  when we go out of Bluetooth range. */
+    fun buildSonarPacket(payload: ByteArray): ByteArray =
+        meshBuildSignedPacket(seedHex, TYPE_SONAR, peerIdHex, "", DEFAULT_TTL, System.currentTimeMillis().toULong(), payload)
 
     /** Stable peer fingerprint = SHA256(noise static pubkey), full hex. */
     fun fingerprintOf(noisePublicKeyHex: String): String =

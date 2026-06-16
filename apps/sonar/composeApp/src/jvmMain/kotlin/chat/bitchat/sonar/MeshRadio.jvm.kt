@@ -45,7 +45,11 @@ actual object MeshRadio {
         return listOf(MeshPeer(id = "mesh:nearby", name = "nearby phone", rssi = strongest.rssi, sonar = false))
     }
 
-    actual fun setLocalSonarAnnounce(payload: ByteArray?) {}
+    actual fun setLocalSonarAnnounce(payload: ByteArray?) {
+        // Broadcast our npub/capabilities as a signed 0x53 so phones treat us as a
+        // full Sonar peer (enables the White Noise fallback out of BLE range).
+        MeshLink.setSonarPayload(payload)
+    }
     actual fun setMeshNickname(nick: String) {
         if (nick.isNotBlank() && nick != this.nick) {
             this.nick = nick
