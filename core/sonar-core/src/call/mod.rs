@@ -33,3 +33,7 @@ pub mod media;
 /// cpal mic capture + speaker playback. Gated behind `calls-audio`.
 #[cfg(feature = "calls-audio")]
 pub mod device;
+
+/// The call state machine (place/accept/hangup, events). Gated behind `calls-audio`.
+#[cfg(feature = "calls-audio")]
+pub mod engine;
