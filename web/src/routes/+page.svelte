@@ -2,7 +2,7 @@
   import Nav from '$lib/components/Nav.svelte';
   import Radar from '$lib/components/Radar.svelte';
   import Footer from '$lib/components/Footer.svelte';
-  import { DEMO_URL, DOWNLOAD_HREF, TESTFLIGHT_URL, ANDROID_APK_URL } from '$lib/links.js';
+  import { DEMO_URL, DOWNLOAD_HREF, TESTFLIGHT_URL, TESTFLIGHT_MACOS_URL, ANDROID_APK_URL } from '$lib/links.js';
 </script>
 
 <svelte:head>
@@ -176,9 +176,10 @@
 <section class="alt band" id="download">
   <div class="wrap">
     <h2>Hear the room before you enter it.</h2>
-    <p class="lede">Free, open source, end-to-end encrypted. iPhone beta on TestFlight — Android alpha APK available now.</p>
+    <p class="lede">Free, open source, end-to-end encrypted. iPhone and Mac beta on TestFlight — Android alpha APK available now.</p>
     <div class="ctas">
       <a class="btn primary" href={TESTFLIGHT_URL} target="_blank" rel="noopener">Join the iPhone beta (TestFlight)</a>
+      <a class="btn primary" href={TESTFLIGHT_MACOS_URL} target="_blank" rel="noopener">Join the Mac beta (TestFlight)</a>
       <a class="btn primary" href={ANDROID_APK_URL}>Download for Android (APK)</a>
       <a class="btn ghost" href={DEMO_URL}>Try the interactive demo</a>
     </div>
