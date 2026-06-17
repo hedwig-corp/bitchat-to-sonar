@@ -644,17 +644,19 @@ struct ContentView: View {
                 recordingIndicator
             }
 
-            HStack(alignment: .center, spacing: 4) {
+            HStack(alignment: .bottom, spacing: 4) {
                 TextField(
                     "",
                     text: $messageText,
                     prompt: Text(
                         String(localized: "content.input.message_placeholder", comment: "Placeholder shown in the chat composer")
                     )
-                    .foregroundColor(secondaryTextColor.opacity(0.6))
+                    .foregroundColor(secondaryTextColor.opacity(0.6)),
+                    axis: .vertical
                 )
                 .textFieldStyle(.plain)
                 .font(.bitchatSystem(size: 15, design: .monospaced))
+                .lineLimit(1...5)
                 .foregroundColor(textColor)
                 .focused($isTextFieldFocused)
                 .autocorrectionDisabled(true)
