@@ -5,6 +5,13 @@ IPHONEOS_DEPLOYMENT_TARGET = 16.0
 MACOSX_DEPLOYMENT_TARGET = 15.0
 SWIFT_VERSION = 5.0
 
+// The native Rust dependencies (arti.xcframework, libarti_bitchat.a,
+// libsonar_ffi.a) ship arm64-only slices for macOS. Archives force
+// ONLY_ACTIVE_ARCH=NO and would otherwise try to build the x86_64 slice,
+// failing to link the Arti FFI symbols. macOS is Apple-silicon only here,
+// so exclude x86_64 for the macOS SDK (iOS builds are unaffected).
+EXCLUDED_ARCHS[sdk=macosx*] = x86_64
+
 DEVELOPMENT_TEAM = L3N5LHJD5Y
 CODE_SIGN_STYLE = Automatic
 
