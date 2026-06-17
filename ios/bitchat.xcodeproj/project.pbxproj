@@ -61,8 +61,8 @@
 /* Begin PBXFileReference section */
 		03C57F452B55FD0FD8F51421 /* bitchatTests_macOS.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = bitchatTests_macOS.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		61F92EBA29C47C0FCC482F1F /* bitchatShareExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = bitchatShareExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
-		8F3A7C058C2C8E1A06C8CF8B /* bitchat.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = bitchat.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		96D0D41CA19EE5A772AA8434 /* bitchat.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = bitchat.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		8F3A7C058C2C8E1A06C8CF8B /* bitchat.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Sonar.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		96D0D41CA19EE5A772AA8434 /* bitchat.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Sonar.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A6F183FC2E948783006A9046 /* tor-nolzma.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = "tor-nolzma.xcframework"; path = "localPackages/Tor/Frameworks/tor-nolzma.xcframework"; sourceTree = "<group>"; };
 		C0DB1DE27F0AAB5092663E8E /* bitchatTests_iOS.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = bitchatTests_iOS.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		E0A1B2C3D4E5F6012345678A /* relays/online_relays_gps.csv */ = {isa = PBXFileReference; lastKnownFileType = text; path = ../relays/online_relays_gps.csv; sourceTree = "<group>"; };
@@ -490,7 +490,7 @@
 				SDKROOT = iphoneos;
 				SWIFT_VERSION = "$(SWIFT_VERSION)";
 				TARGETED_DEVICE_FAMILY = "1,2";
-				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/bitchat.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/bitchat";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Sonar.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Sonar";
 			};
 			name = Debug;
 		};
@@ -515,7 +515,7 @@
 				SDKROOT = iphoneos;
 				SWIFT_VERSION = "$(SWIFT_VERSION)";
 				TARGETED_DEVICE_FAMILY = "1,2";
-				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/bitchat.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/bitchat";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Sonar.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Sonar";
 			};
 			name = Release;
 		};
@@ -541,7 +541,7 @@
 				PRODUCT_BUNDLE_IDENTIFIER = "$(PRODUCT_BUNDLE_IDENTIFIER).tests";
 				SDKROOT = macosx;
 				SWIFT_VERSION = "$(SWIFT_VERSION)";
-				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/bitchat.app/Contents/MacOS/bitchat";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Sonar.app/Contents/MacOS/Sonar";
 			};
 			name = Release;
 		};
@@ -581,7 +581,7 @@
 			baseConfigurationReferenceAnchor = A6E367C92E76469E0032EA8A /* Configs */;
 			baseConfigurationReferenceRelativePath = Debug.xcconfig;
 			buildSettings = {
-				ASSETCATALOG_COMPILER_APPICON_NAME = AppIconDebug;
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = YES;
 				CODE_SIGNING_ALLOWED = YES;
 				CODE_SIGNING_REQUIRED = YES;
@@ -599,7 +599,7 @@
 				);
 				MARKETING_VERSION = 1.6.0;
 				PRODUCT_BUNDLE_IDENTIFIER = "$(PRODUCT_BUNDLE_IDENTIFIER)";
-				PRODUCT_NAME = bitchat;
+				PRODUCT_NAME = Sonar;
 				SDKROOT = iphoneos;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;
@@ -632,7 +632,7 @@
 				PRODUCT_BUNDLE_IDENTIFIER = "$(PRODUCT_BUNDLE_IDENTIFIER).tests";
 				SDKROOT = macosx;
 				SWIFT_VERSION = "$(SWIFT_VERSION)";
-				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/bitchat.app/Contents/MacOS/bitchat";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Sonar.app/Contents/MacOS/Sonar";
 			};
 			name = Debug;
 		};
@@ -659,7 +659,7 @@
 				);
 				MARKETING_VERSION = 1.6.0;
 				PRODUCT_BUNDLE_IDENTIFIER = "$(PRODUCT_BUNDLE_IDENTIFIER)";
-				PRODUCT_NAME = bitchat;
+				PRODUCT_NAME = Sonar;
 				SDKROOT = iphoneos;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;
@@ -696,7 +696,7 @@
 				MACOSX_DEPLOYMENT_TARGET = "$(MACOSX_DEPLOYMENT_TARGET)";
 				MARKETING_VERSION = 1.6.0;
 				PRODUCT_BUNDLE_IDENTIFIER = "$(PRODUCT_BUNDLE_IDENTIFIER)";
-				PRODUCT_NAME = bitchat;
+				PRODUCT_NAME = Sonar;
 				REGISTER_APP_GROUPS = YES;
 				SDKROOT = macosx;
 				SWIFT_VERSION = "$(SWIFT_VERSION)";
@@ -789,7 +789,7 @@
 				MACOSX_DEPLOYMENT_TARGET = "$(MACOSX_DEPLOYMENT_TARGET)";
 				MARKETING_VERSION = 1.6.0;
 				PRODUCT_BUNDLE_IDENTIFIER = "$(PRODUCT_BUNDLE_IDENTIFIER)";
-				PRODUCT_NAME = bitchat;
+				PRODUCT_NAME = Sonar;
 				REGISTER_APP_GROUPS = YES;
 				SDKROOT = macosx;
 				SWIFT_VERSION = "$(SWIFT_VERSION)";
