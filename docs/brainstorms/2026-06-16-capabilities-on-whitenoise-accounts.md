@@ -2,6 +2,12 @@
 
 **Date:** 2026-06-16
 
+**Implemented follow-up:** see
+[`docs/SONAR-DISCOVERY.md`](../SONAR-DISCOVERY.md). The final implementation
+uses a public Nostr kind-30078 Sonar descriptor for stable call capability and
+protocol-route metadata; it does not publish live Iroh node addresses in the
+kind-0 profile.
+
 ## Problem
 
 A Sonar user **is** an npub — a **White Noise account** (Nostr identity). White Noise
