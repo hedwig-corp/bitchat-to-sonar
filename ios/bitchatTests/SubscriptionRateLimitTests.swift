@@ -8,7 +8,7 @@
 
 import Testing
 import Foundation
-@testable import bitchat
+@testable import Sonar
 
 /// Tests for BCH-01-004 fix: Rate-limiting subscription-triggered announces
 /// to prevent device enumeration attacks

@@ -69,9 +69,7 @@ struct SonarSettingsScreen: View {
                             value: walletValue,
                             divider: true
                         ) {
-                            // Real balance is just informational; anything
-                            // less than ready explains the setup state.
-                            if store.balanceSats == nil { walletSheet = true }
+                            walletSheet = true
                         }
                         // Show balance in fiat (default) or bitcoin (sats).
                         SNSettingsRow(
@@ -154,10 +152,7 @@ struct SonarSettingsScreen: View {
             )
         }
         .snSheet(isPresented: $walletSheet, title: "Your wallet") {
-            SNWalletSetupSheetContent(
-                settingUp: store.walletState == .settingUp,
-                onClose: { walletSheet = false }
-            )
+            SNWalletSheetContent(onClose: { walletSheet = false })
         }
         .snSheet(isPresented: $currencySheet, title: "Currency") {
             SNCurrencyPickerContent(

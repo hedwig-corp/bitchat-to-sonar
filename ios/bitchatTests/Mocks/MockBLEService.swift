@@ -8,7 +8,7 @@
 
 import Foundation
 import CoreBluetooth
-@testable import bitchat
+@testable import Sonar
 
 /// In-memory BLE test harness used by E2E/Integration tests.
 ///

@@ -520,10 +520,7 @@ private struct MacConversationPane: View {
             )
         }
         .snSheet(isPresented: $walletSheet, title: "Your wallet") {
-            SNWalletSetupSheetContent(
-                settingUp: store.walletState == .settingUp,
-                onClose: { walletSheet = false }
-            )
+            SNWalletSheetContent(onClose: { walletSheet = false })
         }
         .snSheet(
             isPresented: Binding(
@@ -1530,10 +1527,7 @@ private struct MacCommandPalette: View {
             DispatchQueue.main.async { focused = true }
         }
         .snSheet(isPresented: $walletSheet, title: "Your wallet") {
-            SNWalletSetupSheetContent(
-                settingUp: store.walletState == .settingUp,
-                onClose: { walletSheet = false }
-            )
+            SNWalletSheetContent(onClose: { walletSheet = false })
         }
     }
 
@@ -1789,10 +1783,7 @@ private struct MacProfilePane: View {
             bip353Draft = store.bip353
         }
         .snSheet(isPresented: $walletSheet, title: "Your wallet") {
-            SNWalletSetupSheetContent(
-                settingUp: store.walletState == .settingUp,
-                onClose: { walletSheet = false }
-            )
+            SNWalletSheetContent(onClose: { walletSheet = false })
         }
         .snSheet(isPresented: $currencySheet, title: "Currency") {
             SNCurrencyPickerContent(
@@ -1978,7 +1969,7 @@ private struct MacProfilePane: View {
                     value: walletValue,
                     divider: store.balanceSats != nil
                 ) {
-                    if store.balanceSats == nil { walletSheet = true }
+                    walletSheet = true
                 }
                 if store.balanceSats != nil {
                     SNSettingsRow(
@@ -2104,10 +2095,7 @@ private struct MacSettingsModal: View {
             )
         }
         .snSheet(isPresented: $walletSheet, title: "Your wallet") {
-            SNWalletSetupSheetContent(
-                settingUp: store.walletState == .settingUp,
-                onClose: { walletSheet = false }
-            )
+            SNWalletSheetContent(onClose: { walletSheet = false })
         }
         .snSheet(isPresented: $currencySheet, title: "Currency") {
             SNCurrencyPickerContent(
@@ -2245,7 +2233,7 @@ private struct MacSettingsModal: View {
                     value: walletValue,
                     divider: store.balanceSats != nil
                 ) {
-                    if store.balanceSats == nil { walletSheet = true }
+                    walletSheet = true
                 }
                 if store.balanceSats != nil {
                     SNSettingsRow(

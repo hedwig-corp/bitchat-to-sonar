@@ -202,3 +202,147 @@ final class SonarPayLedger: ObservableObject {
         }
     }
 }
+
+// MARK: - Direct wallet payment activity
+
+/// Local activity for direct wallet payments (Sonar metadata BOLT12 or Unify).
+/// Unlike `SonarPayEntry`, this is not a claimable chat state machine: money is
+/// paid directly by the wallet and the wallet payment id is the settlement link.
+struct SonarPaymentActivity: Codable, Equatable, Identifiable {
+    enum Kind: String, Codable {
+        case sonarDirect
+        case unifyNearby
+        case walletIncoming
+    }
+
+    enum Direction: String, Codable {
+        case outgoing
+        case incoming
+    }
+
+    enum Status: String, Codable {
+        case pending
+        case paid
+        case failed
+    }
+
+    let id: String
+    let kind: Kind
+    let peerKey: String
+    let peerName: String
+    let direction: Direction
+    let sats: Int64
+    let via: String
+    let createdAt: Date
+    let destinationHash: String?
+    var status: Status
+    var walletPaymentId: String?
+    var feesSats: Int64?
+    var settledAt: Date?
+    var failure: String?
+
+    init(
+        id: String,
+        kind: Kind,
+        peerKey: String,
+        peerName: String,
+        direction: Direction,
+        sats: Int64,
+        via: String,
+        createdAt: Date,
+        destinationHash: String?,
+        status: Status,
+        walletPaymentId: String? = nil,
+        feesSats: Int64? = nil,
+        settledAt: Date? = nil,
+        failure: String? = nil
+    ) {
+        self.id = id
+        self.kind = kind
+        self.peerKey = peerKey
+        self.peerName = peerName
+        self.direction = direction
+        self.sats = sats
+        self.via = via
+        self.createdAt = createdAt
+        self.destinationHash = destinationHash
+        self.status = status
+        self.walletPaymentId = walletPaymentId
+        self.feesSats = feesSats
+        self.settledAt = settledAt
+        self.failure = failure
+    }
+}
+
+final class SonarPaymentActivityLedger: ObservableObject {
+    static let defaultsKey = "sonar.payment.activity.v1"
+
+    @Published private(set) var entries: [String: SonarPaymentActivity]
+
+    private let defaults: UserDefaults
+    private let key: String
+
+    init(defaults: UserDefaults = .standard, key: String = SonarPaymentActivityLedger.defaultsKey) {
+        self.defaults = defaults
+        self.key = key
+        if let data = defaults.data(forKey: key),
+           let stored = try? JSONDecoder().decode([String: SonarPaymentActivity].self, from: data) {
+            entries = stored
+        } else {
+            entries = [:]
+        }
+    }
+
+    var sorted: [SonarPaymentActivity] {
+        entries.values.sorted {
+            ($0.settledAt ?? $0.createdAt) > ($1.settledAt ?? $1.createdAt)
+        }
+    }
+
+    func activities(peerKey: String) -> [SonarPaymentActivity] {
+        sorted.filter { $0.peerKey == peerKey }
+    }
+
+    @discardableResult
+    func recordPending(_ activity: SonarPaymentActivity) -> Bool {
+        guard entries[activity.id] == nil else { return false }
+        entries[activity.id] = activity
+        persist()
+        return true
+    }
+
+    @discardableResult
+    func markPaid(_ id: String, payment: SonarWalletPayment) -> Bool {
+        guard var entry = entries[id] else { return false }
+        entry.status = .paid
+        entry.walletPaymentId = payment.id
+        entry.feesSats = payment.feesSats
+        entry.settledAt = payment.timestamp
+        entry.failure = nil
+        entries[id] = entry
+        persist()
+        return true
+    }
+
+    @discardableResult
+    func markFailed(_ id: String, message: String) -> Bool {
+        guard var entry = entries[id] else { return false }
+        entry.status = .failed
+        entry.failure = message
+        entry.settledAt = Date()
+        entries[id] = entry
+        persist()
+        return true
+    }
+
+    func wipe() {
+        entries = [:]
+        defaults.removeObject(forKey: key)
+    }
+
+    private func persist() {
+        if let data = try? JSONEncoder().encode(entries) {
+            defaults.set(data, forKey: key)
+        }
+    }
+}

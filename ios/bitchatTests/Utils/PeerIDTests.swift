@@ -8,7 +8,7 @@
 
 import Testing
 import Foundation
-@testable import bitchat
+@testable import Sonar
 
 struct PeerIDTests {
     private let hex16 = "0011223344556677"

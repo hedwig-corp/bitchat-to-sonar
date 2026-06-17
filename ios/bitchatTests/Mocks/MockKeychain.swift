@@ -7,7 +7,7 @@
 //
 
 import Foundation
-@testable import bitchat
+@testable import Sonar
 
 final class MockKeychain: KeychainManagerProtocol {
     private var storage: [String: Data] = [:]

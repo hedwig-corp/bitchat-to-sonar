@@ -22,8 +22,9 @@ use crate::marmot::{
     ChatMessage, Incoming, MarmotEngine, KEY_PACKAGE_KIND, SYNC_STATE_FILE_SUFFIX,
 };
 use crate::sonar_descriptor::{
-    descriptor_content_json, descriptor_tags, parse_descriptor_event, SonarDescriptor,
-    SONAR_DESCRIPTOR_D_TAG, SONAR_DESCRIPTOR_KIND,
+    descriptor_content_json, descriptor_d_tags, descriptor_tags, meta_descriptor_content_json,
+    parse_descriptor_event, SonarDescriptor, SONAR_CALL_DESCRIPTOR_D_TAG, SONAR_DESCRIPTOR_KIND,
+    SONAR_META_DESCRIPTOR_D_TAG,
 };
 use crate::{Error, Result};
 
@@ -733,11 +734,19 @@ impl SonarClient {
         &self,
         calls_enabled: bool,
         signaling: Vec<String>,
+        bolt12_offer: Option<String>,
     ) -> Result<()> {
-        let content = descriptor_content_json(calls_enabled, signaling)?;
-        let builder =
-            EventBuilder::new(Kind::Custom(SONAR_DESCRIPTOR_KIND), content).tags(descriptor_tags());
-        self.nostr.send_event_builder(builder).await?;
+        // Migration: publish the old call-only descriptor for old clients and
+        // the new unified metadata descriptor for direct BOLT12 payments.
+        let call_content = descriptor_content_json(calls_enabled, signaling.clone())?;
+        let call_builder = EventBuilder::new(Kind::Custom(SONAR_DESCRIPTOR_KIND), call_content)
+            .tags(descriptor_tags(SONAR_CALL_DESCRIPTOR_D_TAG));
+        self.nostr.send_event_builder(call_builder).await?;
+
+        let meta_content = meta_descriptor_content_json(calls_enabled, signaling, bolt12_offer)?;
+        let meta_builder = EventBuilder::new(Kind::Custom(SONAR_DESCRIPTOR_KIND), meta_content)
+            .tags(descriptor_tags(SONAR_META_DESCRIPTOR_D_TAG));
+        self.nostr.send_event_builder(meta_builder).await?;
         Ok(())
     }
 
@@ -748,25 +757,28 @@ impl SonarClient {
         &self,
         author: PublicKey,
     ) -> Result<Option<SonarDescriptor>> {
-        let filter = Filter::new()
-            .kind(Kind::Custom(SONAR_DESCRIPTOR_KIND))
-            .author(author)
-            .custom_tag(
-                SingleLetterTag::lowercase(Alphabet::D),
-                SONAR_DESCRIPTOR_D_TAG,
-            )
-            .limit(5);
-        let mut events: Vec<Event> = self
-            .nostr
-            .fetch_events_from(self.relays.clone(), filter, FETCH_TIMEOUT)
-            .await?
-            .into_iter()
-            .collect();
-        events.sort_by_key(|event| std::cmp::Reverse(event.created_at));
-        Ok(events
-            .into_iter()
-            .filter(|event| event.pubkey == author)
-            .find_map(|event| parse_descriptor_event(&event)))
+        for d_tag in descriptor_d_tags() {
+            let filter = Filter::new()
+                .kind(Kind::Custom(SONAR_DESCRIPTOR_KIND))
+                .author(author)
+                .custom_tag(SingleLetterTag::lowercase(Alphabet::D), d_tag)
+                .limit(5);
+            let mut events: Vec<Event> = self
+                .nostr
+                .fetch_events_from(self.relays.clone(), filter, FETCH_TIMEOUT)
+                .await?
+                .into_iter()
+                .collect();
+            events.sort_by_key(|event| std::cmp::Reverse(event.created_at));
+            if let Some(descriptor) = events
+                .into_iter()
+                .filter(|event| event.pubkey == author)
+                .find_map(|event| parse_descriptor_event(&event))
+            {
+                return Ok(Some(descriptor));
+            }
+        }
+        Ok(None)
     }
 
     /// Start a DM/group with `peer`: fetch their KeyPackage, create the MLS

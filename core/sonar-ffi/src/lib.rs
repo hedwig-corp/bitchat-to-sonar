@@ -170,6 +170,8 @@ pub struct SonarDescriptorInfo {
     pub signaling: Vec<String>,
     pub transports: Vec<String>,
     pub call_identity: String,
+    pub bolt12_offer: Option<String>,
+    pub payment_receipts: Vec<String>,
     pub published_at_secs: u64,
 }
 
@@ -286,11 +288,13 @@ impl SonarNode {
         &self,
         calls_enabled: bool,
         signaling: Vec<String>,
+        bolt12_offer: Option<String>,
     ) -> FfiResult<()> {
-        self.runtime.block_on(
-            self.client
-                .publish_sonar_descriptor(calls_enabled, signaling),
-        )?;
+        self.runtime.block_on(self.client.publish_sonar_descriptor(
+            calls_enabled,
+            signaling,
+            bolt12_offer,
+        ))?;
         Ok(())
     }
 
@@ -308,6 +312,8 @@ impl SonarNode {
             signaling: d.signaling,
             transports: d.transports,
             call_identity: d.call_identity,
+            bolt12_offer: d.bolt12_offer,
+            payment_receipts: d.payment_receipts,
             published_at_secs: d.published_at_secs,
         }))
     }

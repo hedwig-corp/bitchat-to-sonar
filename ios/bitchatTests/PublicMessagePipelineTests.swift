@@ -7,7 +7,7 @@
 
 import Testing
 import Foundation
-@testable import bitchat
+@testable import Sonar
 
 @MainActor
 private final class TestPipelineDelegate: PublicMessagePipelineDelegate {

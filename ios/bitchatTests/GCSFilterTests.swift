@@ -1,6 +1,6 @@
 import Testing
 import struct Foundation.Data
-@testable import bitchat
+@testable import Sonar
 
 struct GCSFilterTests {
     @Test func buildFilterWithDuplicateIdsProducesStableEncoding() {

@@ -4,13 +4,16 @@ use nostr::prelude::*;
 use serde::{Deserialize, Serialize};
 
 pub const SONAR_DESCRIPTOR_KIND: u16 = 30078;
-pub const SONAR_DESCRIPTOR_D_TAG: &str = "sonar.call.v1";
+pub const SONAR_CALL_DESCRIPTOR_D_TAG: &str = "sonar.call.v1";
+pub const SONAR_META_DESCRIPTOR_D_TAG: &str = "sonar.meta.v1";
 
-const CURRENT_SCHEMA: u16 = 1;
+const CALL_SCHEMA: u16 = 1;
+const META_SCHEMA: u16 = 2;
 const APP_NAME: &str = "sonar";
 const CALL_IDENTITY_V1: &str = "iroh-hkdf-sonar-call-iroh-v1";
 const MAX_DESCRIPTOR_CONTENT_BYTES: usize = 4096;
 const MAX_LIST_ITEMS: usize = 8;
+const MAX_BOLT12_OFFER_BYTES: usize = 2048;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SonarDescriptor {
@@ -20,6 +23,8 @@ pub struct SonarDescriptor {
     pub signaling: Vec<String>,
     pub transports: Vec<String>,
     pub call_identity: String,
+    pub bolt12_offer: Option<String>,
+    pub payment_receipts: Vec<String>,
     pub published_at_secs: u64,
 }
 
@@ -32,12 +37,30 @@ struct DescriptorContent {
     signaling: Vec<String>,
     transports: Vec<String>,
     call_identity: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payments: Option<DescriptorPayments>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct DescriptorPayments {
+    receive: Vec<DescriptorPaymentReceive>,
+    receipts: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct DescriptorPaymentReceive {
+    #[serde(rename = "type")]
+    method_type: String,
+    offer: String,
+    network: String,
+    proofs: Vec<String>,
+    future_proofs: Vec<String>,
 }
 
 impl DescriptorContent {
-    fn new(calls_enabled: bool, signaling: Vec<String>) -> Self {
+    fn legacy_call(calls_enabled: bool, signaling: Vec<String>) -> Self {
         Self {
-            schema: CURRENT_SCHEMA,
+            schema: CALL_SCHEMA,
             app: APP_NAME.to_string(),
             calls: calls_enabled,
             media: if calls_enabled {
@@ -52,13 +75,63 @@ impl DescriptorContent {
                 Vec::new()
             },
             call_identity: CALL_IDENTITY_V1.to_string(),
+            payments: None,
+        }
+    }
+
+    fn meta(calls_enabled: bool, signaling: Vec<String>, bolt12_offer: Option<String>) -> Self {
+        let payments =
+            bolt12_offer
+                .and_then(normalize_bolt12_offer)
+                .map(|offer| DescriptorPayments {
+                    receive: vec![DescriptorPaymentReceive {
+                        method_type: "bolt12_offer".to_string(),
+                        offer,
+                        network: "bitcoin".to_string(),
+                        proofs: vec!["preimage".to_string()],
+                        future_proofs: vec!["bolt12_payer_proof".to_string()],
+                    }],
+                    receipts: vec!["sonar.payment.receipt.v1".to_string()],
+                });
+        Self {
+            schema: META_SCHEMA,
+            app: APP_NAME.to_string(),
+            calls: calls_enabled,
+            media: if calls_enabled {
+                vec!["voice".to_string(), "video".to_string()]
+            } else {
+                Vec::new()
+            },
+            signaling: normalize_list(signaling, default_signaling_routes()),
+            transports: if calls_enabled {
+                vec!["iroh".to_string()]
+            } else {
+                Vec::new()
+            },
+            call_identity: CALL_IDENTITY_V1.to_string(),
+            payments,
         }
     }
 
     fn into_descriptor(self, published_at_secs: u64) -> Option<SonarDescriptor> {
-        if self.schema != CURRENT_SCHEMA || self.app != APP_NAME {
+        if !matches!(self.schema, CALL_SCHEMA | META_SCHEMA) || self.app != APP_NAME {
             return None;
         }
+        let (bolt12_offer, payment_receipts) = self
+            .payments
+            .map(|payments| {
+                let offer = payments
+                    .receive
+                    .into_iter()
+                    .find(|receive| {
+                        receive.method_type == "bolt12_offer"
+                            && receive.network.eq_ignore_ascii_case("bitcoin")
+                    })
+                    .and_then(|receive| normalize_bolt12_offer(receive.offer));
+                let receipts = normalize_list(payments.receipts, Vec::new());
+                (offer, receipts)
+            })
+            .unwrap_or((None, Vec::new()));
         Some(SonarDescriptor {
             schema: self.schema,
             calls: self.calls,
@@ -66,6 +139,8 @@ impl DescriptorContent {
             signaling: normalize_list(self.signaling, Vec::new()),
             transports: normalize_list(self.transports, Vec::new()),
             call_identity: self.call_identity,
+            bolt12_offer,
+            payment_receipts,
             published_at_secs,
         })
     }
@@ -81,14 +156,26 @@ pub fn descriptor_content_json(
     calls_enabled: bool,
     signaling: Vec<String>,
 ) -> serde_json::Result<String> {
-    serde_json::to_string(&DescriptorContent::new(calls_enabled, signaling))
+    serde_json::to_string(&DescriptorContent::legacy_call(calls_enabled, signaling))
 }
 
-pub fn descriptor_tags() -> Vec<Tag> {
+pub fn meta_descriptor_content_json(
+    calls_enabled: bool,
+    signaling: Vec<String>,
+    bolt12_offer: Option<String>,
+) -> serde_json::Result<String> {
+    serde_json::to_string(&DescriptorContent::meta(
+        calls_enabled,
+        signaling,
+        bolt12_offer,
+    ))
+}
+
+pub fn descriptor_tags(d_tag: &str) -> Vec<Tag> {
     vec![
         Tag::custom(
             TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::D)),
-            [SONAR_DESCRIPTOR_D_TAG],
+            [d_tag],
         ),
         Tag::hashtag(APP_NAME),
     ]
@@ -97,7 +184,10 @@ pub fn descriptor_tags() -> Vec<Tag> {
 pub fn parse_descriptor_event(event: &Event) -> Option<SonarDescriptor> {
     if event.kind != Kind::Custom(SONAR_DESCRIPTOR_KIND)
         || event.content.len() > MAX_DESCRIPTOR_CONTENT_BYTES
-        || !has_descriptor_d_tag(event)
+        || !has_descriptor_d_tag(
+            event,
+            &[SONAR_CALL_DESCRIPTOR_D_TAG, SONAR_META_DESCRIPTOR_D_TAG],
+        )
     {
         return None;
     }
@@ -105,10 +195,16 @@ pub fn parse_descriptor_event(event: &Event) -> Option<SonarDescriptor> {
     content.into_descriptor(event.created_at.as_secs())
 }
 
-fn has_descriptor_d_tag(event: &Event) -> bool {
+pub fn descriptor_d_tags() -> [&'static str; 2] {
+    [SONAR_META_DESCRIPTOR_D_TAG, SONAR_CALL_DESCRIPTOR_D_TAG]
+}
+
+fn has_descriptor_d_tag(event: &Event, accepted: &[&str]) -> bool {
     event.tags.iter().any(|tag| {
         tag.single_letter_tag() == Some(SingleLetterTag::lowercase(Alphabet::D))
-            && tag.content() == Some(SONAR_DESCRIPTOR_D_TAG)
+            && tag.content().map_or(false, |content| {
+                accepted.iter().any(|value| *value == content)
+            })
     })
 }
 
@@ -140,6 +236,18 @@ fn is_protocol_token(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
+fn normalize_bolt12_offer(value: String) -> Option<String> {
+    let offer = value.trim().to_ascii_lowercase();
+    if offer.starts_with("lno")
+        && offer.len() <= MAX_BOLT12_OFFER_BYTES
+        && offer.bytes().all(|b| b.is_ascii_alphanumeric())
+    {
+        Some(offer)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,18 +265,58 @@ mod tests {
         )
         .expect("descriptor json");
         let event = EventBuilder::new(Kind::Custom(SONAR_DESCRIPTOR_KIND), content)
-            .tags(descriptor_tags())
+            .tags(descriptor_tags(SONAR_CALL_DESCRIPTOR_D_TAG))
             .sign_with_keys(&keys)
             .expect("sign descriptor");
 
         let parsed = parse_descriptor_event(&event).expect("valid descriptor");
-        assert_eq!(parsed.schema, CURRENT_SCHEMA);
+        assert_eq!(parsed.schema, CALL_SCHEMA);
         assert!(parsed.calls);
         assert_eq!(parsed.media, vec!["voice", "video"]);
         assert_eq!(parsed.signaling, vec!["marmot"]);
         assert_eq!(parsed.transports, vec!["iroh"]);
         assert_eq!(parsed.call_identity, CALL_IDENTITY_V1);
+        assert_eq!(parsed.bolt12_offer, None);
+        assert!(parsed.payment_receipts.is_empty());
         assert_eq!(parsed.published_at_secs, event.created_at.as_secs());
+    }
+
+    #[test]
+    fn meta_descriptor_includes_bolt12_payment_metadata() {
+        let keys = Keys::generate();
+        let offer = "lno1qsgqmqvgm96frzdg8m0gc6nzeqffvzsqzrxqy32afmr3jn9ggl9g2s8sugfvxn4xqzqxqsq"
+            .to_string();
+        let content =
+            meta_descriptor_content_json(true, default_signaling_routes(), Some(offer.clone()))
+                .expect("descriptor json");
+        let event = EventBuilder::new(Kind::Custom(SONAR_DESCRIPTOR_KIND), content)
+            .tags(descriptor_tags(SONAR_META_DESCRIPTOR_D_TAG))
+            .sign_with_keys(&keys)
+            .expect("sign descriptor");
+
+        let parsed = parse_descriptor_event(&event).expect("valid descriptor");
+        assert_eq!(parsed.schema, META_SCHEMA);
+        assert_eq!(parsed.bolt12_offer, Some(offer));
+        assert_eq!(
+            parsed.payment_receipts,
+            vec!["sonar.payment.receipt.v1".to_string()]
+        );
+    }
+
+    #[test]
+    fn meta_descriptor_without_offer_clears_payment_metadata() {
+        let keys = Keys::generate();
+        let content = meta_descriptor_content_json(true, default_signaling_routes(), None)
+            .expect("descriptor json");
+        let event = EventBuilder::new(Kind::Custom(SONAR_DESCRIPTOR_KIND), content)
+            .tags(descriptor_tags(SONAR_META_DESCRIPTOR_D_TAG))
+            .sign_with_keys(&keys)
+            .expect("sign descriptor");
+
+        let parsed = parse_descriptor_event(&event).expect("valid descriptor");
+        assert_eq!(parsed.schema, META_SCHEMA);
+        assert!(parsed.bolt12_offer.is_none());
+        assert!(parsed.payment_receipts.is_empty());
     }
 
     #[test]

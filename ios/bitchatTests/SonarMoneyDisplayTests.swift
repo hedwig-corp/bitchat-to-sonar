@@ -14,7 +14,7 @@
 
 import Combine
 import XCTest
-@testable import bitchat
+@testable import Sonar
 
 final class SonarMoneyDisplayTests: XCTestCase {
 
@@ -38,7 +38,9 @@ final class SonarMoneyDisplayTests: XCTestCase {
         var statePublisher: AnyPublisher<SonarWalletState, Never> {
             Just(state).eraseToAnyPublisher()
         }
-        func send(destination: String, amountSats: Int64, note: String?) async throws {}
+        func send(destination: String, amountSats: Int64, note: String?) async throws -> SonarWalletPayment {
+            SonarWalletPayment(id: "fake", amountSats: amountSats, isIncoming: false, timestamp: Date(), note: note)
+        }
         func createOffer() async throws -> String { "lno1fake" }
 
         func setDisplayMode(_ mode: String) async { displayMode = mode }

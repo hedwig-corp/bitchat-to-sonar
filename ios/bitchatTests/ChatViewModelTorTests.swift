@@ -7,7 +7,7 @@
 
 import Testing
 import Foundation
-@testable import bitchat
+@testable import Sonar
 
 // MARK: - Test Helpers
 
