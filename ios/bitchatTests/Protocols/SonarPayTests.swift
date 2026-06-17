@@ -10,7 +10,7 @@
 //
 
 import XCTest
-@testable import bitchat
+@testable import Sonar
 
 final class SonarPayTests: XCTestCase {
 
@@ -83,6 +83,13 @@ final class SonarPayTests: XCTestCase {
 
     private func entry(state: SonarPayEntry.State = .sealed, direction: SonarPayEntry.Direction = .outgoing) -> SonarPayEntry {
         SonarPayEntry(id: uuid, peerKey: "peer1", sats: 21000, direction: direction, state: state, via: "mesh")
+    }
+
+    private func freshActivityLedger() -> (SonarPaymentActivityLedger, UserDefaults, String) {
+        let suite = "sonar.payment.activity.tests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+        return (SonarPaymentActivityLedger(defaults: defaults), defaults, suite)
     }
 
     func testRecordIsIdempotent() {
@@ -175,6 +182,103 @@ final class SonarPayTests: XCTestCase {
 
         let reloaded = SonarPayLedger(defaults: defaults)
         XCTAssertNil(reloaded.entry(for: uuid))
+
+        defaults.removePersistentDomain(forName: suite)
+    }
+
+    // MARK: - Direct payment activity
+
+    func testDirectPaymentActivityPersistsPaidWalletMetadata() {
+        let (ledger, defaults, suite) = freshActivityLedger()
+        let created = Date(timeIntervalSince1970: 1_800_000_000)
+        let settled = created.addingTimeInterval(5)
+        let activity = SonarPaymentActivity(
+            id: uuid,
+            kind: .sonarDirect,
+            peerKey: "peer1",
+            peerName: "Alice",
+            direction: .outgoing,
+            sats: 21000,
+            via: "internet",
+            createdAt: created,
+            destinationHash: "abc123",
+            status: .pending
+        )
+        XCTAssertTrue(ledger.recordPending(activity))
+        XCTAssertFalse(ledger.recordPending(activity))
+
+        let payment = SonarWalletPayment(
+            id: "wallet-payment-1",
+            amountSats: 21000,
+            isIncoming: false,
+            timestamp: settled,
+            note: "Sonar payment \(uuid)",
+            feesSats: 7
+        )
+        XCTAssertTrue(ledger.markPaid(uuid, payment: payment))
+
+        let reloaded = SonarPaymentActivityLedger(defaults: defaults)
+        let saved = reloaded.activities(peerKey: "peer1").first
+        XCTAssertEqual(saved?.status, .paid)
+        XCTAssertEqual(saved?.walletPaymentId, "wallet-payment-1")
+        XCTAssertEqual(saved?.feesSats, 7)
+        XCTAssertEqual(saved?.settledAt, settled)
+        XCTAssertEqual(saved?.destinationHash, "abc123")
+        XCTAssertEqual(saved?.kind, .sonarDirect)
+
+        defaults.removePersistentDomain(forName: suite)
+    }
+
+    func testDirectPaymentActivityRecordsFailure() {
+        let (ledger, defaults, suite) = freshActivityLedger()
+        let activity = SonarPaymentActivity(
+            id: uuid,
+            kind: .unifyNearby,
+            peerKey: "unify:peer1",
+            peerName: "Unify user",
+            direction: .outgoing,
+            sats: 1000,
+            via: "internet",
+            createdAt: Date(),
+            destinationHash: nil,
+            status: .pending
+        )
+        ledger.recordPending(activity)
+        XCTAssertTrue(ledger.markFailed(uuid, message: "route not found"))
+        XCTAssertEqual(ledger.activities(peerKey: "unify:peer1").first?.status, .failed)
+        XCTAssertEqual(ledger.activities(peerKey: "unify:peer1").first?.failure, "route not found")
+        XCTAssertNotNil(ledger.activities(peerKey: "unify:peer1").first?.settledAt)
+
+        defaults.removePersistentDomain(forName: suite)
+    }
+
+    func testWalletIncomingPaymentActivityPersists() {
+        let (ledger, defaults, suite) = freshActivityLedger()
+        let settled = Date(timeIntervalSince1970: 1_800_000_100)
+        let activity = SonarPaymentActivity(
+            id: "wallet-payment-2",
+            kind: .walletIncoming,
+            peerKey: "wallet",
+            peerName: "External wallet",
+            direction: .incoming,
+            sats: 5000,
+            via: "internet",
+            createdAt: settled,
+            destinationHash: nil,
+            status: .paid,
+            walletPaymentId: "payment-2",
+            feesSats: 0,
+            settledAt: settled
+        )
+
+        XCTAssertTrue(ledger.recordPending(activity))
+
+        let reloaded = SonarPaymentActivityLedger(defaults: defaults)
+        let saved = reloaded.activities(peerKey: "wallet").first
+        XCTAssertEqual(saved?.kind, .walletIncoming)
+        XCTAssertEqual(saved?.direction, .incoming)
+        XCTAssertEqual(saved?.walletPaymentId, "payment-2")
+        XCTAssertEqual(saved?.status, .paid)
 
         defaults.removePersistentDomain(forName: suite)
     }

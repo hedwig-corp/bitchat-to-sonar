@@ -10,7 +10,7 @@
 //
 
 import XCTest
-@testable import bitchat
+@testable import Sonar
 
 final class SonarDiscoveryTests: XCTestCase {
 

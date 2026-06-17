@@ -6,7 +6,7 @@
 //
 
 import Testing
-@testable import bitchat
+@testable import Sonar
 
 struct BinaryProtocolPaddingTests {
     @Test func padded_vs_unpadded_length() throws {

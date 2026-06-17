@@ -83,6 +83,8 @@ final class MarmotService: @unchecked Sendable {
         let signaling: [String]
         let transports: [String]
         let callIdentity: String
+        let bolt12Offer: String?
+        let paymentReceipts: [String]
         let publishedAt: Date
 
         private static let supportedCallIdentity = "iroh-hkdf-sonar-call-iroh-v1"
@@ -92,6 +94,13 @@ final class MarmotService: @unchecked Sendable {
                 && callIdentity == Self.supportedCallIdentity
                 && signaling.contains("marmot")
                 && transports.contains("iroh")
+        }
+
+        var supportsDirectPayments: Bool {
+            guard let offer = bolt12Offer?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !offer.isEmpty
+            else { return false }
+            return offer.lowercased().hasPrefix("lno")
         }
     }
 
@@ -224,11 +233,12 @@ final class MarmotService: @unchecked Sendable {
 
     /// Publish the public Sonar descriptor for this app build. Keep the route
     /// list honest: account-level internet call signaling currently uses Marmot.
-    func publishSonarDescriptor(callsEnabled: Bool = true) async throws {
+    func publishSonarDescriptor(callsEnabled: Bool = true, bolt12Offer: String? = nil) async throws {
         try await run {
             try $0.requireNode().publishSonarDescriptor(
                 callsEnabled: callsEnabled,
-                signaling: ["marmot"]
+                signaling: ["marmot"],
+                bolt12Offer: bolt12Offer
             )
         }
     }
@@ -245,6 +255,8 @@ final class MarmotService: @unchecked Sendable {
                     signaling: $0.signaling,
                     transports: $0.transports,
                     callIdentity: $0.callIdentity,
+                    bolt12Offer: $0.bolt12Offer,
+                    paymentReceipts: $0.paymentReceipts,
                     publishedAt: Date(timeIntervalSince1970: TimeInterval($0.publishedAtSecs))
                 )
             }

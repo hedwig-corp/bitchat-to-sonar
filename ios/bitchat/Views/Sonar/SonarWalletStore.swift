@@ -46,6 +46,34 @@ struct SonarCurrency: Equatable, Identifiable {
     var id: String { code }
 }
 
+/// Wallet payment metadata surfaced to app state after a send settles.
+/// This is intentionally independent from the Breez SDK type so UI code does
+/// not import wallet internals.
+struct SonarWalletPayment: Equatable, Codable, Sendable {
+    let id: String
+    let amountSats: Int64
+    let isIncoming: Bool
+    let timestamp: Date
+    let note: String?
+    let feesSats: Int64?
+
+    init(
+        id: String,
+        amountSats: Int64,
+        isIncoming: Bool,
+        timestamp: Date,
+        note: String?,
+        feesSats: Int64? = nil
+    ) {
+        self.id = id
+        self.amountSats = amountSats
+        self.isIncoming = isIncoming
+        self.timestamp = timestamp
+        self.note = note
+        self.feesSats = feesSats
+    }
+}
+
 /// Minimal, locale-grouped sats formatting — the ONLY money formatting done
 /// in Swift. Used for the honest offline case (no live rate) where we must
 /// NOT show a fiat conversion. Everything else flows through the SDK.
@@ -62,11 +90,17 @@ protocol SonarWalletProviding: AnyObject {
     var state: SonarWalletState { get }
     var statePublisher: AnyPublisher<SonarWalletState, Never> { get }
 
-    /// Pay `amountSats` to `destination` (a BOLT12 offer in the ⚡PAY flow).
-    func send(destination: String, amountSats: Int64, note: String?) async throws
+    /// Pay `amountSats` to `destination` and return wallet metadata for local
+    /// payment activity.
+    @discardableResult
+    func send(destination: String, amountSats: Int64, note: String?) async throws -> SonarWalletPayment
 
     /// Create a reusable BOLT12 offer that the counterpart can pay into.
     func createOffer() async throws -> String
+
+    /// Incoming wallet payments as the wallet backend observes them. Older
+    /// backends may return an idle stream until they expose settlement events.
+    func incomingPayments() -> AsyncStream<SonarWalletPayment>
 
     // MARK: Money display
 
@@ -109,6 +143,10 @@ extension SonarWalletProviding {
     var effectiveShowsFiat: Bool {
         displayMode == "fiat" && hasLiveRate
     }
+
+    func incomingPayments() -> AsyncStream<SonarWalletPayment> {
+        AsyncStream { continuation in continuation.finish() }
+    }
 }
 
 /// Default wallet: nothing is configured. Every operation fails loudly so
@@ -133,7 +171,7 @@ final class UnconfiguredWallet: SonarWalletProviding {
         Just(.notConfigured).eraseToAnyPublisher()
     }
 
-    func send(destination: String, amountSats: Int64, note: String?) async throws {
+    func send(destination: String, amountSats: Int64, note: String?) async throws -> SonarWalletPayment {
         throw WalletError.notConfigured
     }
 

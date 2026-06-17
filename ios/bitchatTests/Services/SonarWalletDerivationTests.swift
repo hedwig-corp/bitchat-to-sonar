@@ -7,7 +7,7 @@
 //
 
 import XCTest
-@testable import bitchat
+@testable import Sonar
 
 /// The Lightning wallet entropy is derived deterministically from the chat
 /// identity's Nostr secret (one identity = one wallet, reconstructable from the

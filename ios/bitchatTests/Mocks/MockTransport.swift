@@ -9,7 +9,7 @@
 import Foundation
 import Combine
 import CoreBluetooth
-@testable import bitchat
+@testable import Sonar
 
 /// Mock Transport implementation for testing ChatViewModel in isolation.
 /// Records all method calls and allows test code to verify interactions.

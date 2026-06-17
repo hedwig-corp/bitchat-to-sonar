@@ -98,8 +98,9 @@ try await wallet.setupIfNeeded()            // configure → create wallet on
 wallet.statePublisher                       // .notConfigured / .settingUp /
                                             // .ready(balanceSats:) — balance
                                             // updates live via observeBalance
-try await wallet.send(destination: "user@domain", amountSats: 1000, note: "hi")
+let payment = try await wallet.send(destination: "user@domain", amountSats: 1000, note: "hi")
 // destination = BOLT11 / BOLT12 offer / LNURL-pay / BIP-353 (resolved by Breez)
+// payment.id / payment.feesSats feed Sonar's local activity list.
 let offer = try await wallet.createOffer()  // reusable BOLT12 receive offer
 let parsed = try await wallet.parseDestination("lno1...")
 for await payment in wallet.incomingPayments() { ... }

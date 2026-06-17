@@ -8,7 +8,7 @@
 
 import Testing
 import Foundation
-@testable import bitchat
+@testable import Sonar
 
 struct MeshTopologyTrackerTests {
     private func hex(_ value: String) throws -> Data {

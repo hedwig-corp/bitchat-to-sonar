@@ -90,6 +90,8 @@ struct SNPayInfo: Equatable {
     let id: String          // payment uuid
     let sats: Int64
     let state: SonarPayEntry.State
+    var direct: Bool = false
+    var failed: Bool = false
 }
 
 /// A call kind (call.jsx `kind`). Drives icons + labels everywhere.
@@ -308,6 +310,8 @@ final class SonarAppStore: ObservableObject {
     let wallet: SonarWalletProviding
     /// Local state of every ⚡PAY coin sent/received (docs/SONAR-PAYMENTS.md).
     let payLedger: SonarPayLedger
+    /// Local wallet payment activity for direct BOLT12 / Unify sends.
+    let paymentActivityLedger: SonarPaymentActivityLedger
     private let keychain: KeychainManagerProtocol
     private let locationManager = LocationChannelManager.shared
     private let relayManager = NostrRelayManager.shared
@@ -353,6 +357,10 @@ final class SonarAppStore: ObservableObject {
     private var pendingMarmotSends: [String: [String]] = [:]
     /// Chat-message ids whose ⚡PAY control lines were already processed.
     private var scannedPayMessageIDs = Set<String>()
+    private var publishedBolt12Offer: String?
+    private var publishedPaymentMetadataWithoutOffer = false
+    private var publishingPaymentMetadata = false
+    private var incomingWalletTask: Task<Void, Never>?
 
     convenience init() {
         let keychain = KeychainManager()
@@ -385,6 +393,7 @@ final class SonarAppStore: ObservableObject {
         idBridge: NostrIdentityBridge,
         wallet: SonarWalletProviding = UnconfiguredWallet(),
         payLedger: SonarPayLedger = SonarPayLedger(),
+        paymentActivityLedger: SonarPaymentActivityLedger = SonarPaymentActivityLedger(),
         unify: UnifyNearbyService = UnifyNearbyService(),
         unifyReceiver: UnifyReceiverService = UnifyReceiverService()
     ) {
@@ -394,6 +403,7 @@ final class SonarAppStore: ObservableObject {
         self.idBridge = idBridge
         self.wallet = wallet
         self.payLedger = payLedger
+        self.paymentActivityLedger = paymentActivityLedger
         self.unify = unify
         self.unifyReceiver = unifyReceiver
         walletState = wallet.state
@@ -451,6 +461,7 @@ final class SonarAppStore: ObservableObject {
                 #if os(iOS) || os(macOS)
                 if npub != nil { (self.wallet as? BridgedWallet)?.retrySetup() }
                 #endif
+                if npub != nil { self.publishPaymentMetadataIfNeeded() }
             }
             .store(in: &cancellables)
         // Messages typed to an out-of-range Sonar peer before their White
@@ -463,6 +474,7 @@ final class SonarAppStore: ObservableObject {
         // Payments: mirror the wallet state and watch both transcript
         // stores for incoming ⚡PAY control lines (claim/settle/reveal).
         republish(payLedger.objectWillChange)
+        republish(paymentActivityLedger.objectWillChange)
         wallet.statePublisher
             .receive(on: DispatchQueue.main)
             .sink { [weak self] state in
@@ -474,6 +486,8 @@ final class SonarAppStore: ObservableObject {
                 UserDefaults.standard.set(configured, forKey: Keys.walletConfigured)
                 // Start/stop the Unify receiver as the wallet becomes (un)ready.
                 self.updateReceiverAdvertising()
+                self.publishPaymentMetadataIfNeeded()
+                self.updateWalletPaymentObservation()
             }
             .store(in: &cancellables)
         // Seed the flag from the current state so the first announce is correct.
@@ -484,6 +498,8 @@ final class SonarAppStore: ObservableObject {
         }
         // Seed receiver advertising from the current state (foreground at launch).
         updateReceiverAdvertising()
+        publishPaymentMetadataIfNeeded()
+        updateWalletPaymentObservation()
         chatViewModel.objectWillChange
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.processIncomingPayLines(); self?.processIncomingCallLines() }
@@ -963,6 +979,12 @@ final class SonarAppStore: ObservableObject {
         return Data(hexString: s).flatMap { $0.count == 32 ? $0 : nil }
     }
 
+    private static func sha256Hex(_ value: String) -> String {
+        SHA256.hash(data: Data(value.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
+
     /// Inject our Sonar profile into BLEService once the Marmot identity is
     /// known. The provider runs on BLE's message queue, so it only captures
     /// plain values and reads UserDefaults (thread-safe) — never this store.
@@ -988,6 +1010,77 @@ final class SonarAppStore: ObservableObject {
                 paymentsEnabled: UserDefaults.standard.bool(forKey: walletConfiguredKey)
             )
         }
+    }
+
+    private func publishPaymentMetadataIfNeeded() {
+        guard marmot.npub != nil else { return }
+        guard case .ready = walletState else {
+            publishPaymentMetadataWithoutOfferIfNeeded()
+            return
+        }
+        guard !publishingPaymentMetadata else { return }
+        publishingPaymentMetadata = true
+        Task { [weak self] in
+            guard let self else { return }
+            defer { self.publishingPaymentMetadata = false }
+            do {
+                let offer = try await self.wallet.createOffer()
+                guard case .ready = self.walletState else {
+                    self.publishPaymentMetadataWithoutOfferIfNeeded()
+                    return
+                }
+                guard self.publishedBolt12Offer != offer else { return }
+                self.publishedBolt12Offer = offer
+                self.publishedPaymentMetadataWithoutOffer = false
+                self.marmot.publishSonarDescriptor(bolt12Offer: offer)
+            } catch {
+                self.publishPaymentMetadataWithoutOfferIfNeeded()
+                SecureLogger.error("Sonar descriptor payment metadata publish failed: \(error)", category: .session)
+            }
+        }
+    }
+
+    private func publishPaymentMetadataWithoutOfferIfNeeded() {
+        guard publishedBolt12Offer != nil || !publishedPaymentMetadataWithoutOffer else { return }
+        publishedBolt12Offer = nil
+        publishedPaymentMetadataWithoutOffer = true
+        marmot.publishSonarDescriptor(bolt12Offer: nil)
+    }
+
+    private func updateWalletPaymentObservation() {
+        guard case .ready = walletState else {
+            incomingWalletTask?.cancel()
+            incomingWalletTask = nil
+            return
+        }
+        guard incomingWalletTask == nil else { return }
+        let stream = wallet.incomingPayments()
+        incomingWalletTask = Task { [weak self] in
+            for await payment in stream {
+                guard !Task.isCancelled else { return }
+                self?.recordIncomingWalletPayment(payment)
+            }
+        }
+    }
+
+    private func recordIncomingWalletPayment(_ payment: SonarWalletPayment) {
+        guard payment.isIncoming else { return }
+        let activityId = "wallet-\(payment.id)"
+        paymentActivityLedger.recordPending(SonarPaymentActivity(
+            id: activityId,
+            kind: .walletIncoming,
+            peerKey: "wallet",
+            peerName: "External wallet",
+            direction: .incoming,
+            sats: payment.amountSats,
+            via: SNVia.internet.rawValue,
+            createdAt: payment.timestamp,
+            destinationHash: nil,
+            status: .paid,
+            walletPaymentId: payment.id,
+            feesSats: payment.feesSats,
+            settledAt: payment.timestamp
+        ))
     }
 
     // MARK: Connectivity (status chip + connection sheet)
@@ -1351,6 +1444,21 @@ final class SonarAppStore: ObservableObject {
         return marmot.sonarDescriptorsByNpub[npub]
     }
 
+    private func paymentDescriptor(_ id: String) -> MarmotService.SonarDescriptor? {
+        guard let npub = callNpub(id) else { return nil }
+        marmot.ensureSonarDescriptor(npub)
+        return marmot.sonarDescriptorsByNpub[npub]
+    }
+
+    private func directPaymentOffer(_ id: String) -> String? {
+        guard let descriptor = paymentDescriptor(id),
+              descriptor.supportsDirectPayments,
+              let offer = descriptor.bolt12Offer?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !offer.isEmpty
+        else { return nil }
+        return offer
+    }
+
     private func callSignalingVia(_ id: String) -> SNVia? {
         if meshReachable(id) { return .mesh }
         if callMarmotGroupId(id) != nil { return .internet }
@@ -1523,9 +1631,34 @@ final class SonarAppStore: ObservableObject {
         )
     }
 
+    private func paymentActivityRows(for id: String) -> [(Date, SNMessage)] {
+        paymentActivityLedger.activities(peerKey: id).map { activity in
+            let displayDate = activity.settledAt ?? activity.createdAt
+            let state: SonarPayEntry.State = activity.status == .paid ? .claimed : .settling
+            let via = SNVia(rawValue: activity.via) ?? .internet
+            return (
+                displayDate,
+                SNMessage(
+                    id: "payment-activity-\(activity.id)",
+                    mine: activity.direction == .outgoing,
+                    text: "",
+                    time: Self.clock(displayDate),
+                    via: via,
+                    pay: SNPayInfo(
+                        id: activity.id,
+                        sats: activity.sats,
+                        state: state,
+                        direct: true,
+                        failed: activity.status == .failed
+                    )
+                )
+            )
+        }
+    }
+
     func dmMsgs(_ id: String) -> [SNMessage] {
         if let groupId = marmotGroupId(id) {
-            let dated: [(Date, SNMessage)] = (marmot.messagesByGroup[groupId] ?? []).compactMap { m in
+            var dated: [(Date, SNMessage)] = (marmot.messagesByGroup[groupId] ?? []).compactMap { m in
                 switch payMapping(m.content, fallbackVia: .internet) {
                 case .hidden:
                     return nil
@@ -1546,6 +1679,7 @@ final class SonarAppStore: ObservableObject {
                     ))
                 }
             }
+            dated += paymentActivityRows(for: id)
             return mergeCallLogs(into: dated, id: id)
         }
         let peerID = PeerID(str: id)
@@ -1605,6 +1739,7 @@ final class SonarAppStore: ObservableObject {
             }
             dated.sort { $0.0 < $1.0 }
         }
+        dated += paymentActivityRows(for: id)
         return mergeCallLogs(into: dated, id: id)
     }
 
@@ -1613,11 +1748,14 @@ final class SonarAppStore: ObservableObject {
     /// peer has no recorded calls.
     private func mergeCallLogs(into dated: [(Date, SNMessage)], id: String) -> [SNMessage] {
         let calls = callLogs[id] ?? []
-        guard !calls.isEmpty else { return dated.map(\.1) }
         var combined = dated
         for c in calls { combined.append((c.date, c.message)) }
-        combined.sort { $0.0 < $1.0 }
-        return combined.map(\.1)
+        return combined.enumerated()
+            .sorted {
+                if $0.element.0 == $1.element.0 { return $0.offset < $1.offset }
+                return $0.element.0 < $1.element.0
+            }
+            .map { $0.element.1 }
     }
 
     /// DM routing mirrors MessageRouter: Bluetooth when the peer is reachable
@@ -1899,6 +2037,12 @@ final class SonarAppStore: ObservableObject {
         return nil
     }
 
+    /// Wallet payment activity, newest first. Includes direct Sonar BOLT12
+    /// sends and Unify nearby sends; legacy claimable coins stay in PayLedger.
+    var paymentActivities: [SonarPaymentActivity] {
+        paymentActivityLedger.sorted
+    }
+
     // MARK: Money display
 
     /// The EFFECTIVE money string for an amount (fiat when the user picked fiat
@@ -1936,15 +2080,10 @@ final class SonarAppStore: ObservableObject {
         wallet.parseFiatInput(text, currencyCode: displayCurrency)
     }
 
-    /// ⚡PAY lines may only travel to counterparts that speak them: Marmot
-    /// (White Noise) chats and Sonar peers announcing the payments
-    /// capability (discovery bit 1). Never bitchat-only peers.
+    /// Direct payments require explicit `sonar.meta.v1` receive metadata.
+    /// Old call-only descriptors or BLE capability bits do not unlock sending.
     func paymentCapable(_ id: String) -> Bool {
-        if marmotGroupId(id) != nil { return true }
-        if let profile = resolvedSonarProfile(id) {
-            return profile.capabilities & SonarCapability.payments != 0
-        }
-        return false
+        directPaymentOffer(id) != nil
     }
 
     /// Voice/video calls are a Sonar-only feature. Prefer live BLE signaling, but
@@ -1959,18 +2098,42 @@ final class SonarAppStore: ObservableObject {
         return callDescriptor(id)?.supportsMarmotCallSignaling == true
     }
 
-    /// Sends a sealed coin over the conversation's current rail. The balance
-    /// is NOT deducted here — real sats only move at claim time, when the
-    /// wallet pays the receiver's offer (honest deviation from the demo).
+    /// Sends money directly to the receiver's BOLT12 offer from their
+    /// `sonar.meta.v1` descriptor. Legacy claimable ⚡PAY is receive-only during
+    /// migration; new clients no longer initiate sealed coins.
     func sendPay(_ id: String, sats: Int64) {
-        guard sats > 0, paymentCapable(id) else { return }
-        let uuid = UUID().uuidString.lowercased()
+        guard sats > 0,
+              case .ready = walletState,
+              let offer = directPaymentOffer(id)
+        else { return }
+        let activityId = UUID().uuidString.lowercased()
         let via = dmTransport(id)
-        payLedger.record(SonarPayEntry(
-            id: uuid, peerKey: id, sats: sats,
-            direction: .outgoing, state: .sealed, via: via.rawValue
+        paymentActivityLedger.recordPending(SonarPaymentActivity(
+            id: activityId,
+            kind: .sonarDirect,
+            peerKey: id,
+            peerName: peerItem(id).name,
+            direction: .outgoing,
+            sats: sats,
+            via: via.rawValue,
+            createdAt: Date(),
+            destinationHash: Self.sha256Hex(offer),
+            status: .pending
         ))
-        sendDm(id, SonarPayMessage.pay(id: uuid, sats: sats).encoded())
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let payment = try await self.wallet.send(
+                    destination: offer,
+                    amountSats: sats,
+                    note: "Sonar payment \(activityId)"
+                )
+                self.paymentActivityLedger.markPaid(activityId, payment: payment)
+            } catch {
+                self.paymentActivityLedger.markFailed(activityId, message: error.localizedDescription)
+                SecureLogger.error("Sonar direct payment failed: \(error)", category: .session)
+            }
+        }
     }
 
     /// Receiver tapped a sealed coin: create a BOLT12 offer and send the
@@ -2161,13 +2324,32 @@ final class SonarAppStore: ObservableObject {
     /// Direct Lightning send to the Unify receiver's served offer/invoice. This
     /// is NOT the ⚡PAY sealed-coin chat path — Unify peers don't chat.
     private func payUnify(_ id: String, destination: String, sats: Int64) {
+        let activityId = UUID().uuidString.lowercased()
+        paymentActivityLedger.recordPending(SonarPaymentActivity(
+            id: activityId,
+            kind: .unifyNearby,
+            peerKey: id,
+            peerName: peerItem(id).name,
+            direction: .outgoing,
+            sats: sats,
+            via: SNVia.internet.rawValue,
+            createdAt: Date(),
+            destinationHash: Self.sha256Hex(destination),
+            status: .pending
+        ))
         unifyPay = (id, .paying(destination: destination, sats: sats))
         Task { [weak self] in
             guard let self else { return }
             do {
-                try await self.wallet.send(destination: destination, amountSats: sats, note: "Unify nearby payment")
+                let payment = try await self.wallet.send(
+                    destination: destination,
+                    amountSats: sats,
+                    note: "Unify nearby payment \(activityId)"
+                )
+                self.paymentActivityLedger.markPaid(activityId, payment: payment)
                 self.unifyPay = (id, .sent(sats: sats))
             } catch {
+                self.paymentActivityLedger.markFailed(activityId, message: error.localizedDescription)
                 self.unifyPay = (id, .failed(error.localizedDescription))
             }
         }
@@ -2697,9 +2879,10 @@ final class SonarAppStore: ObservableObject {
         // The node is recreated by eraseChatsKeepIdentity → reset call state so
         // the iroh endpoint rebinds (the marmot.$npub sink calls ensureCallStarted).
         resetCallState()
-        // ⚡PAY coins live inside the erased chats — clear the ledger too. The
-        // Lightning wallet seed/balance is separate and is NOT touched.
+        // Payment rows render inside conversations — clear local ledgers too.
+        // The Lightning wallet seed/balance is separate and is NOT touched.
         payLedger.wipe()
+        paymentActivityLedger.wipe()
         mediaImageCache = [:]
         clearMediaDiskCache()
         objectWillChange.send()
@@ -2738,6 +2921,11 @@ final class SonarAppStore: ObservableObject {
         // Stop advertising as a Unify receiver (the served offer is derived
         // from the wallet seed being wiped below).
         unifyReceiver.stop()
+        incomingWalletTask?.cancel()
+        incomingWalletTask = nil
+        publishedBolt12Offer = nil
+        publishedPaymentMetadataWithoutOffer = false
+        publishingPaymentMetadata = false
         pendingMarmotSends = [:]
         // Forget every ⚡PAY coin and the Lightning wallet seed (separate
         // keychain service owned by SonarWalletKit).
@@ -2745,6 +2933,7 @@ final class SonarAppStore: ObservableObject {
         BridgedWallet.wipeWalletStorage()
         #endif
         payLedger.wipe()
+        paymentActivityLedger.wipe()
         mediaImageCache = [:]
         clearMediaDiskCache()
         scannedPayMessageIDs = []

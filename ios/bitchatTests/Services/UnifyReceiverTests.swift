@@ -22,7 +22,7 @@ import XCTest
 #if canImport(CoreBluetooth)
 import CoreBluetooth
 #endif
-@testable import bitchat
+@testable import Sonar
 
 final class UnifyReceiverTests: XCTestCase {
 

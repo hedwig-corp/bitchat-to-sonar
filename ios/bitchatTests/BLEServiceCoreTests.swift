@@ -8,7 +8,7 @@
 import Testing
 import Foundation
 import CoreBluetooth
-@testable import bitchat
+@testable import Sonar
 
 struct BLEServiceCoreTests {
 

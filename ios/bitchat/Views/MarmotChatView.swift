@@ -218,8 +218,8 @@ final class MarmotChatModel: ObservableObject {
 
     /// Publish the app-level Sonar descriptor. This is separate from kind-0
     /// profile metadata so protocol capability discovery can evolve safely.
-    func publishSonarDescriptor(callsEnabled: Bool = true) {
-        Task { try? await service.publishSonarDescriptor(callsEnabled: callsEnabled) }
+    func publishSonarDescriptor(callsEnabled: Bool = true, bolt12Offer: String? = nil) {
+        Task { try? await service.publishSonarDescriptor(callsEnabled: callsEnabled, bolt12Offer: bolt12Offer) }
     }
 
     /// Fetch + cache a peer's kind-0 profile, so their name/avatar replaces the
