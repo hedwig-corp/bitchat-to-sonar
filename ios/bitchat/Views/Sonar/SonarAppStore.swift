@@ -1337,6 +1337,20 @@ final class SonarAppStore: ObservableObject {
             ?? sonarProfilesByFingerprint.first(where: { $0.value.npub == otherNpub })?.value
     }
 
+    private func callNpub(_ id: String) -> String? {
+        if let profile = callProfile(id) { return profile.npub }
+        guard let groupId = marmotGroupId(id),
+              let group = marmot.groups.first(where: { $0.id == groupId })
+        else { return nil }
+        return group.memberNpubs.first(where: { $0 != marmot.npub })
+    }
+
+    private func callDescriptor(_ id: String) -> MarmotService.SonarDescriptor? {
+        guard let npub = callNpub(id) else { return nil }
+        marmot.ensureSonarDescriptor(npub)
+        return marmot.sonarDescriptorsByNpub[npub]
+    }
+
     private func callSignalingVia(_ id: String) -> SNVia? {
         if meshReachable(id) { return .mesh }
         if callMarmotGroupId(id) != nil { return .internet }
@@ -1870,6 +1884,7 @@ final class SonarAppStore: ObservableObject {
     /// up in the Messages list once the welcome round-trips.
     func startSecureChat(npub: String) {
         marmot.connectIfNeeded()
+        marmot.ensureSonarDescriptor(npub)
         marmot.startChat(with: npub)
     }
 
@@ -1930,13 +1945,15 @@ final class SonarAppStore: ObservableObject {
     }
 
     /// Voice/video calls are a Sonar-only feature. Prefer live BLE signaling, but
-    /// keep the same call affordance after discovery when White Noise signaling
-    /// exists or can be established from the persisted npub.
+    /// keep the same call affordance after either BLE discovery or signed Nostr
+    /// descriptor discovery when White Noise signaling exists.
     func canCall(_ id: String) -> Bool {
-        guard let profile = callProfile(id),
-              profile.capabilities & SonarCapability.calls != 0
-        else { return false }
-        return callSignalingVia(id) != nil
+        guard callSignalingVia(id) != nil else { return false }
+        if let profile = callProfile(id),
+           profile.capabilities & SonarCapability.calls != 0 {
+            return true
+        }
+        return callDescriptor(id)?.supportsMarmotCallSignaling == true
     }
 
     /// Sends a sealed coin over the conversation's current rail. The balance
@@ -2468,23 +2485,35 @@ final class SonarAppStore: ObservableObject {
         for (peerID, msgs) in chatViewModel.privateChats {
             for m in msgs where m.senderPeerID != my {
                 guard !scannedCallMessageIDs.contains(m.id) else { continue }
-                scannedCallMessageIDs.insert(m.id)
                 // Pure-Swift prefilter: skip the FFI for every non-☎CALL message
                 // (i.e. essentially all chat) so this main-queue sink never
                 // marshals ordinary messages into the core just to get back nil.
-                guard Self.looksLikeCallControl(m.content) else { continue }
-                if let ctrl = callParseControl(content: m.content) {
-                    handleCallControl(ctrl, convId: peerID.id, via: .mesh)
+                guard Self.looksLikeCallControl(m.content) else {
+                    scannedCallMessageIDs.insert(m.id)
+                    continue
+                }
+                guard let ctrl = callParseControl(content: m.content) else {
+                    scannedCallMessageIDs.insert(m.id)
+                    continue
+                }
+                if handleCallControl(ctrl, convId: peerID.id, via: .mesh) {
+                    scannedCallMessageIDs.insert(m.id)
                 }
             }
         }
         for (groupId, msgs) in marmot.messagesByGroup {
             for m in msgs where !m.isMine {
                 guard !scannedCallMessageIDs.contains(m.id) else { continue }
-                scannedCallMessageIDs.insert(m.id)
-                guard Self.looksLikeCallControl(m.content) else { continue }
-                if let ctrl = callParseControl(content: m.content) {
-                    handleCallControl(ctrl, convId: Self.marmotIDPrefix + groupId, via: .internet)
+                guard Self.looksLikeCallControl(m.content) else {
+                    scannedCallMessageIDs.insert(m.id)
+                    continue
+                }
+                guard let ctrl = callParseControl(content: m.content) else {
+                    scannedCallMessageIDs.insert(m.id)
+                    continue
+                }
+                if handleCallControl(ctrl, convId: Self.marmotIDPrefix + groupId, via: .internet) {
+                    scannedCallMessageIDs.insert(m.id)
                 }
             }
         }
@@ -2517,12 +2546,17 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
-    private func handleCallControl(_ ctrl: CallControlInfo, convId: String, via: SNVia) {
+    @discardableResult
+    private func handleCallControl(_ ctrl: CallControlInfo, convId: String, via: SNVia) -> Bool {
         let conversationId = callConversationId(convId)
         if case let .offer(callId, _, _, _) = ctrl, !canCall(conversationId) {
+            if shouldDeferOfferForSonarDescriptor(conversationId) {
+                SecureLogger.debug("SonarCall: deferring offer until Sonar descriptor lookup completes convId=\(convId.prefix(16)) folded=\(conversationId.prefix(16))", category: .session)
+                return false
+            }
             SecureLogger.debug("SonarCall: ignoring offer without Sonar call route convId=\(convId.prefix(16)) folded=\(conversationId.prefix(16)) via=\(via)", category: .session)
             _ = sendCallControl(convId, callEncodeAnswer(callId: callId, answer: .decline, nodeAddrB64: ""), via: via)
-            return
+            return true
         }
         let signalingVia = callSignalingVia(conversationId) ?? via
 
@@ -2530,7 +2564,7 @@ final class SonarAppStore: ObservableObject {
         case let .offer(callId, video, nodeAddrB64, unixSecs):
             if activeCall != nil { // busy: auto-decline
                 _ = sendCallControl(conversationId, callEncodeAnswer(callId: callId, answer: .busy, nodeAddrB64: ""), via: signalingVia)
-                return
+                return true
             }
             let stale = Date().timeIntervalSince1970 - Double(unixSecs) > 60
             let name = callDisplayName(conversationId)
@@ -2568,6 +2602,22 @@ final class SonarAppStore: ObservableObject {
         case let .end(callId, _):
             if activeCall?.callId == callId { Task { [weak self] in try? await self?.marmot.callHangup(callId: callId) } }
         }
+        return true
+    }
+
+    private func shouldDeferOfferForSonarDescriptor(_ conversationId: String) -> Bool {
+        // BLE discovery is authoritative when present; only defer for npub-only
+        // Marmot contacts whose public Sonar descriptor is still unknown.
+        guard callProfile(conversationId) == nil,
+              let npub = callNpub(conversationId),
+              marmot.sonarDescriptorsByNpub[npub] == nil
+        else { return false }
+        if let miss = marmot.sonarDescriptorMissesByNpub[npub],
+           Date().timeIntervalSince(miss) < 60 {
+            return false
+        }
+        marmot.ensureSonarDescriptor(npub)
+        return true
     }
 
     // MARK: Commands (composer "/" layer)

@@ -13,7 +13,7 @@ rust-version.workspace = true
 # signaling codec (call::signaling) is NOT gated — it is pure and always built.
 # The cpal/opus media pipeline lands behind a later `calls-audio` feature
 # (plan: docs/plans/2026-06-16-p2p-calls-iroh-callme.md).
-calls = ["dep:iroh", "dep:iroh-roq", "dep:anyhow", "dep:bytes", "dep:base64", "dep:serde_json"]
+calls = ["dep:iroh", "dep:iroh-roq", "dep:anyhow", "dep:bytes", "dep:base64"]
 # Adds the opus audio codec to the call media path. Separate from `calls` so a
 # call build can opt in to audio. The cpal device-I/O layer lands here too later.
 calls-audio = ["calls", "dep:opus", "dep:cpal"]
@@ -41,11 +41,10 @@ anyhow = { version = "1", optional = true }
 # RTP packet payloads for the media flows (iroh-roq re-exports the `rtp` crate;
 # we just need Bytes to build packet payloads).
 bytes = { version = "1", optional = true }
-# Serialize the iroh `EndpointAddr` (serde) into the `nodeAddrB64` field of the
-# ☎CALL signaling: serde_json bytes → base64url(no-pad). Both pure Rust, behind
-# the `calls` feature so the default messaging build never pulls them.
+# Serialize Sonar Nostr descriptors and, behind `calls`, the iroh `EndpointAddr`
+# into the `nodeAddrB64` field of the ☎CALL signaling.
 base64 = { version = "0.22", optional = true }
-serde_json = { version = "1", optional = true }
+serde_json.workspace = true
 mdk-core.workspace = true
 mdk-storage-traits.workspace = true
 mdk-memory-storage.workspace = true

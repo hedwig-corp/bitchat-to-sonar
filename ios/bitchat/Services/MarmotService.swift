@@ -74,6 +74,27 @@ final class MarmotService: @unchecked Sendable {
         }
     }
 
+    /// Public Sonar capability descriptor discovered from a peer's npub.
+    /// Contains stable protocol metadata only, never live call addresses.
+    struct SonarDescriptor: Sendable, Equatable {
+        let schema: UInt32
+        let calls: Bool
+        let media: [String]
+        let signaling: [String]
+        let transports: [String]
+        let callIdentity: String
+        let publishedAt: Date
+
+        private static let supportedCallIdentity = "iroh-hkdf-sonar-call-iroh-v1"
+
+        var supportsMarmotCallSignaling: Bool {
+            calls
+                && callIdentity == Self.supportedCallIdentity
+                && signaling.contains("marmot")
+                && transports.contains("iroh")
+        }
+    }
+
     enum ServiceError: Error, Equatable {
         /// `connect()` has not completed successfully yet.
         case notConnected
@@ -197,6 +218,35 @@ final class MarmotService: @unchecked Sendable {
         try await run {
             try $0.requireNode().fetchProfile(npub: npub).map {
                 Profile(name: $0.name, displayName: $0.displayName, about: $0.about, picture: $0.picture, nip05: $0.nip05)
+            }
+        }
+    }
+
+    /// Publish the public Sonar descriptor for this app build. Keep the route
+    /// list honest: account-level internet call signaling currently uses Marmot.
+    func publishSonarDescriptor(callsEnabled: Bool = true) async throws {
+        try await run {
+            try $0.requireNode().publishSonarDescriptor(
+                callsEnabled: callsEnabled,
+                signaling: ["marmot"]
+            )
+        }
+    }
+
+    /// Fetch a peer's public Sonar descriptor. nil means not confirmed Sonar,
+    /// not necessarily White Noise-only.
+    func fetchSonarDescriptor(npub: String) async throws -> SonarDescriptor? {
+        try await run {
+            try $0.requireNode().fetchSonarDescriptor(npub: npub).map {
+                SonarDescriptor(
+                    schema: $0.schema,
+                    calls: $0.calls,
+                    media: $0.media,
+                    signaling: $0.signaling,
+                    transports: $0.transports,
+                    callIdentity: $0.callIdentity,
+                    publishedAt: Date(timeIntervalSince1970: TimeInterval($0.publishedAtSecs))
+                )
             }
         }
     }

@@ -25,12 +25,20 @@ final class MarmotChatModel: ObservableObject {
     /// Resolved kind-0 profiles, keyed by npub — fills in human names/avatars
     /// for Marmot members instead of raw npubs.
     @Published var profilesByNpub: [String: MarmotService.Profile] = [:]
+    /// Resolved public Sonar descriptors, keyed by npub. Presence here confirms
+    /// the npub is Sonar-capable; absence is only "unknown / not fetched".
+    @Published var sonarDescriptorsByNpub: [String: MarmotService.SonarDescriptor] = [:]
+    /// Recent relay misses, keyed by npub. A miss is NOT proof the user is White
+    /// Noise-only; it only lets call-offer handling stop deferring forever.
+    @Published private(set) var sonarDescriptorMissesByNpub: [String: Date] = [:]
 
     private let service: MarmotService
     private let keychain: KeychainManagerProtocol
     private var syncTask: Task<Void, Never>?
     /// npubs whose profile fetch is in flight or done, to fetch each once.
     private var profileFetches: Set<String> = []
+    /// npubs whose Sonar descriptor fetch is in flight or done.
+    private var descriptorFetches: Set<String> = []
     /// Optimistically-echoed outgoing messages per group, kept visible until
     /// the relay round-trip brings the real copy back (then reconciled away).
     private var pendingOptimistic: [String: [MarmotService.MarmotMessage]] = [:]
@@ -109,6 +117,7 @@ final class MarmotChatModel: ObservableObject {
                 guard let self else { return }
                 await self.refresh()
                 try? await self.service.publishKeyPackage()
+                try? await self.service.publishSonarDescriptor()
             }
             // Run the live subscription loop for as long as we're connected, so
             // welcomes + messages arrive in real time globally (not only while a
@@ -174,6 +183,7 @@ final class MarmotChatModel: ObservableObject {
             for group in groups {
                 for member in group.memberNpubs where member != npub {
                     ensureProfile(member)
+                    ensureSonarDescriptor(member)
                 }
             }
         } catch {
@@ -201,6 +211,12 @@ final class MarmotChatModel: ObservableObject {
         Task { try? await service.publishProfile(name: trimmed) }
     }
 
+    /// Publish the app-level Sonar descriptor. This is separate from kind-0
+    /// profile metadata so protocol capability discovery can evolve safely.
+    func publishSonarDescriptor(callsEnabled: Bool = true) {
+        Task { try? await service.publishSonarDescriptor(callsEnabled: callsEnabled) }
+    }
+
     /// Fetch + cache a peer's kind-0 profile, so their name/avatar replaces the
     /// raw npub in the chat list, header, and avatar. Retries (via the periodic
     /// `refresh()`) until the peer has published a profile.
@@ -215,6 +231,30 @@ final class MarmotChatModel: ObservableObject {
                     self.profilesByNpub[npubToFetch] = profile
                 } else {
                     self.profileFetches.remove(npubToFetch) // not published yet — allow retry
+                }
+            }
+        }
+    }
+
+    /// Fetch + cache a peer's public Sonar descriptor. Not finding one keeps the
+    /// npub usable for White Noise/Marmot chat, but it does not unlock calls.
+    func ensureSonarDescriptor(_ npubToFetch: String) {
+        guard !npubToFetch.isEmpty, npubToFetch != npub else { return }
+        guard sonarDescriptorsByNpub[npubToFetch] == nil else { return }
+        if let miss = sonarDescriptorMissesByNpub[npubToFetch],
+           Date().timeIntervalSince(miss) < 60 {
+            return
+        }
+        guard descriptorFetches.insert(npubToFetch).inserted else { return }
+        Task {
+            let descriptor = try? await service.fetchSonarDescriptor(npub: npubToFetch)
+            await MainActor.run {
+                if let descriptor {
+                    self.sonarDescriptorsByNpub[npubToFetch] = descriptor
+                    self.sonarDescriptorMissesByNpub[npubToFetch] = nil
+                } else {
+                    self.sonarDescriptorMissesByNpub[npubToFetch] = Date()
+                    self.descriptorFetches.remove(npubToFetch)
                 }
             }
         }
@@ -253,6 +293,7 @@ final class MarmotChatModel: ObservableObject {
     func startChat(with peer: String) {
         let trimmed = peer.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        ensureSonarDescriptor(trimmed)
         Task {
             // Wait through the connect/reconnect window (post-erase or cold
             // launch) so a fresh chat doesn't fail with "not connected yet".

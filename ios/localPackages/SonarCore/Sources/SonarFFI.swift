@@ -968,6 +968,12 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func fetchProfile(npub: String) throws  -> ProfileInfo?
 
     /**
+     * Fetch a peer's Sonar descriptor (npub or hex pubkey). `None` means the
+     * peer is not confirmed Sonar-capable through this relay set.
+     */
+    func fetchSonarDescriptor(npub: String) throws  -> SonarDescriptorInfo?
+
+    /**
      * The 1:1 geohash DM conversation with a participant, oldest first.
      */
     func geoDmMessages(geohash: String, peerHex: String) throws  -> [GeoMessageInfo]
@@ -1008,6 +1014,12 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * avatar instead of a raw npub. `name` is used for both name + display_name.
      */
     func publishProfile(name: String, about: String?, picture: String?) throws
+
+    /**
+     * Publish this identity's public Sonar descriptor. `signaling` should list
+     * only routes this app build can actually use, in preference order.
+     */
+    func publishSonarDescriptor(callsEnabled: Bool, signaling: [String]) throws
 
     /**
      * Send a 1:1 encrypted DM to a geohash channel participant (NIP-17).
@@ -1319,6 +1331,19 @@ open func fetchProfile(npub: String)throws  -> ProfileInfo?  {
 }
 
     /**
+     * Fetch a peer's Sonar descriptor (npub or hex pubkey). `None` means the
+     * peer is not confirmed Sonar-capable through this relay set.
+     */
+open func fetchSonarDescriptor(npub: String)throws  -> SonarDescriptorInfo?  {
+    return try  FfiConverterOptionTypeSonarDescriptorInfo.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_fetch_sonar_descriptor(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(npub),$0
+    )
+})
+}
+
+    /**
      * The 1:1 geohash DM conversation with a participant, oldest first.
      */
 open func geoDmMessages(geohash: String, peerHex: String)throws  -> [GeoMessageInfo]  {
@@ -1411,6 +1436,19 @@ open func publishProfile(name: String, about: String?, picture: String?)throws  
         FfiConverterString.lower(name),
         FfiConverterOptionString.lower(about),
         FfiConverterOptionString.lower(picture),$0
+    )
+}
+}
+
+    /**
+     * Publish this identity's public Sonar descriptor. `signaling` should list
+     * only routes this app build can actually use, in preference order.
+     */
+open func publishSonarDescriptor(callsEnabled: Bool, signaling: [String])throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_publish_sonar_descriptor(
+            self.uniffiCloneHandle(),
+        FfiConverterBool.lower(callsEnabled),
+        FfiConverterSequenceString.lower(signaling),$0
     )
 }
 }
@@ -2635,6 +2673,85 @@ public func FfiConverterTypeProfileInfo_lower(_ value: ProfileInfo) -> RustBuffe
     return FfiConverterTypeProfileInfo.lower(value)
 }
 
+
+/**
+ * FFI-friendly Sonar app descriptor published as a NIP-78-style kind-30078
+ * event. This is public capability metadata only; live call addresses are
+ * exchanged inside encrypted ☎CALL signaling.
+ */
+public struct SonarDescriptorInfo: Equatable, Hashable {
+    public var schema: UInt32
+    public var calls: Bool
+    public var media: [String]
+    public var signaling: [String]
+    public var transports: [String]
+    public var callIdentity: String
+    public var publishedAtSecs: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(schema: UInt32, calls: Bool, media: [String], signaling: [String], transports: [String], callIdentity: String, publishedAtSecs: UInt64) {
+        self.schema = schema
+        self.calls = calls
+        self.media = media
+        self.signaling = signaling
+        self.transports = transports
+        self.callIdentity = callIdentity
+        self.publishedAtSecs = publishedAtSecs
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension SonarDescriptorInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSonarDescriptorInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SonarDescriptorInfo {
+        return
+            try SonarDescriptorInfo(
+                schema: FfiConverterUInt32.read(from: &buf),
+                calls: FfiConverterBool.read(from: &buf),
+                media: FfiConverterSequenceString.read(from: &buf),
+                signaling: FfiConverterSequenceString.read(from: &buf),
+                transports: FfiConverterSequenceString.read(from: &buf),
+                callIdentity: FfiConverterString.read(from: &buf),
+                publishedAtSecs: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SonarDescriptorInfo, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.schema, into: &buf)
+        FfiConverterBool.write(value.calls, into: &buf)
+        FfiConverterSequenceString.write(value.media, into: &buf)
+        FfiConverterSequenceString.write(value.signaling, into: &buf)
+        FfiConverterSequenceString.write(value.transports, into: &buf)
+        FfiConverterString.write(value.callIdentity, into: &buf)
+        FfiConverterUInt64.write(value.publishedAtSecs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSonarDescriptorInfo_lift(_ buf: RustBuffer) throws -> SonarDescriptorInfo {
+    return try FfiConverterTypeSonarDescriptorInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSonarDescriptorInfo_lower(_ value: SonarDescriptorInfo) -> RustBuffer {
+    return FfiConverterTypeSonarDescriptorInfo.lower(value)
+}
+
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
@@ -3286,6 +3403,30 @@ fileprivate struct FfiConverterOptionTypeProfileInfo: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeSonarDescriptorInfo: FfiConverterRustBuffer {
+    typealias SwiftType = SonarDescriptorInfo?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeSonarDescriptorInfo.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeSonarDescriptorInfo.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeCallControlInfo: FfiConverterRustBuffer {
     typealias SwiftType = CallControlInfo?
 
@@ -3834,6 +3975,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_fetch_profile() != 10147) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_fetch_sonar_descriptor() != 2804) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_geo_dm_messages() != 48140) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3856,6 +4000,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_profile() != 42572) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_sonar_descriptor() != 49203) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_send_geo_dm() != 38953) {

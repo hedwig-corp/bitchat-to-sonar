@@ -5,8 +5,9 @@
 //! M1 scope: explicit polling via [`SonarClient::sync`] (deterministic for
 //! e2e tests). Live subscriptions land with the native shells.
 
-use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
@@ -14,9 +15,16 @@ use mdk_core::prelude::*;
 use nostr::prelude::*;
 use nostr_blossom::prelude::*;
 use nostr_sdk::{Client, RelayPoolNotification};
+use serde::{Deserialize, Serialize};
 
 use crate::identity::Identity;
-use crate::marmot::{ChatMessage, MarmotEngine, KEY_PACKAGE_KIND};
+use crate::marmot::{
+    ChatMessage, Incoming, MarmotEngine, KEY_PACKAGE_KIND, SYNC_STATE_FILE_SUFFIX,
+};
+use crate::sonar_descriptor::{
+    descriptor_content_json, descriptor_tags, parse_descriptor_event, SonarDescriptor,
+    SONAR_DESCRIPTOR_D_TAG, SONAR_DESCRIPTOR_KIND,
+};
 use crate::{Error, Result};
 
 /// Blossom user-server-list event kind (BUD-03): the user's preferred blob
@@ -91,7 +99,7 @@ const GIFTWRAP_LOOKBACK_SECS: u64 = 7 * 24 * 60 * 60;
 /// Safety overlap subtracted from the watermark on every incremental fetch, to
 /// cover clock skew and events that landed on a relay mid-sync. Already-seen
 /// events are tolerated (MDK dedups on processing), so a small overlap is free.
-const SYNC_OVERLAP_SECS: u64 = 60;
+const SYNC_OVERLAP_SECS: u64 = 5 * 60;
 
 /// Stable subscription ids for the live Marmot tail (so re-subscribing the
 /// group filter REPLACES it rather than stacking new subscriptions).
@@ -105,6 +113,164 @@ const SUB_MARMOT_GROUPS: &str = "sonar-marmot-groups";
 /// loses a message permanently. When full, the oldest half is dropped (amortizes
 /// the shift cost vs dropping one-at-a-time).
 const MARMOT_BUFFER_CAP: usize = 1024;
+
+const SYNC_STATE_VERSION: u32 = 1;
+const SYNC_STATE_PROCESSED_EVENT_CAP: usize = 20_000;
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct SyncStateDisk {
+    version: u32,
+    watermark_secs: u64,
+    processed_event_ids: Vec<String>,
+}
+
+#[derive(Debug)]
+struct SyncState {
+    path: Option<PathBuf>,
+    watermark_secs: u64,
+    processed_event_ids: HashSet<String>,
+    processed_event_order: VecDeque<String>,
+    dirty: bool,
+}
+
+impl SyncState {
+    fn load(path: Option<PathBuf>, fallback_watermark_secs: u64, storage_empty: bool) -> Self {
+        if storage_empty {
+            return Self::new(path, 0, Vec::new());
+        }
+
+        let disk = path
+            .as_ref()
+            .and_then(|path| fs::read(path).ok())
+            .and_then(|bytes| serde_json::from_slice::<SyncStateDisk>(&bytes).ok())
+            .filter(|state| state.version == SYNC_STATE_VERSION);
+
+        let (disk_watermark, processed_event_ids) = disk
+            .map(|state| (state.watermark_secs, state.processed_event_ids))
+            .unwrap_or((0, Vec::new()));
+        let watermark_secs = conservative_watermark(disk_watermark, fallback_watermark_secs);
+
+        Self::new(path, watermark_secs, processed_event_ids)
+    }
+
+    fn new(path: Option<PathBuf>, watermark_secs: u64, processed_event_ids: Vec<String>) -> Self {
+        let mut state = Self {
+            path,
+            watermark_secs,
+            processed_event_ids: HashSet::new(),
+            processed_event_order: VecDeque::new(),
+            dirty: false,
+        };
+        for id in processed_event_ids {
+            state.mark_processed_id(id);
+        }
+        state.dirty = false;
+        state
+    }
+
+    fn watermark_secs(&self) -> u64 {
+        self.watermark_secs
+    }
+
+    fn has_processed(&self, event_id: &str) -> bool {
+        self.processed_event_ids.contains(event_id)
+    }
+
+    fn mark_processed(&mut self, event_id: &EventId) {
+        self.mark_processed_id(event_id.to_hex());
+    }
+
+    fn mark_processed_id(&mut self, event_id: String) {
+        if !self.processed_event_ids.insert(event_id.clone()) {
+            return;
+        }
+        self.processed_event_order.push_back(event_id);
+        while self.processed_event_order.len() > SYNC_STATE_PROCESSED_EVENT_CAP {
+            if let Some(oldest) = self.processed_event_order.pop_front() {
+                self.processed_event_ids.remove(&oldest);
+            }
+        }
+        self.dirty = true;
+    }
+
+    fn advance_watermark(&mut self, watermark_secs: u64) {
+        if watermark_secs > self.watermark_secs {
+            self.watermark_secs = watermark_secs;
+            self.dirty = true;
+        }
+    }
+
+    fn rewind_for_retry(&mut self, event_secs: u64) {
+        if self.watermark_secs == 0 {
+            return;
+        }
+        let retry_from = event_secs.saturating_sub(SYNC_OVERLAP_SECS);
+        if retry_from < self.watermark_secs {
+            self.watermark_secs = retry_from;
+            self.dirty = true;
+        }
+    }
+
+    fn save_if_dirty(&mut self) -> Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
+        let Some(path) = self.path.as_ref() else {
+            self.dirty = false;
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| {
+                Error::Storage(format!("create sync-state dir {}: {e}", parent.display()))
+            })?;
+        }
+        let disk = SyncStateDisk {
+            version: SYNC_STATE_VERSION,
+            watermark_secs: self.watermark_secs,
+            processed_event_ids: self.processed_event_order.iter().cloned().collect(),
+        };
+        let bytes = serde_json::to_vec(&disk)?;
+        let tmp = sync_state_tmp_path(path);
+        fs::write(&tmp, bytes)
+            .map_err(|e| Error::Storage(format!("write sync state {}: {e}", tmp.display())))?;
+        fs::rename(&tmp, path)
+            .map_err(|e| Error::Storage(format!("replace sync state {}: {e}", path.display())))?;
+        self.dirty = false;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MarmotProcessReport {
+    processed: usize,
+    retryable_failures: usize,
+    oldest_retryable_secs: Option<u64>,
+}
+
+impl MarmotProcessReport {
+    fn record_processed(&mut self) {
+        self.processed += 1;
+    }
+
+    fn record_retryable(&mut self, event_secs: u64) {
+        self.retryable_failures += 1;
+        self.oldest_retryable_secs = Some(
+            self.oldest_retryable_secs
+                .map_or(event_secs, |oldest| oldest.min(event_secs)),
+        );
+    }
+
+    fn absorb(&mut self, other: Self) {
+        self.processed += other.processed;
+        self.retryable_failures += other.retryable_failures;
+        if let Some(secs) = other.oldest_retryable_secs {
+            self.oldest_retryable_secs = Some(
+                self.oldest_retryable_secs
+                    .map_or(secs, |oldest| oldest.min(secs)),
+            );
+        }
+    }
+}
 
 /// One received geohash channel event (ephemeral kind-20000), buffered from the
 /// live subscription. Geohash channels are public ephemeral events — relays do
@@ -170,12 +336,10 @@ pub struct SonarClient {
     geo_presence: GeoPresenceBuf,
     geo_subscribed: Arc<Mutex<HashSet<String>>>,
     identity_secret: [u8; 32],
-    /// Unix-seconds watermark of the last successful [`SonarClient::sync`].
-    /// Scopes each poll's `.since(...)` so we fetch only NEW welcomes/messages
-    /// instead of re-downloading + re-processing all history every 5s. 0 until
-    /// the first sync completes (an unbounded backfill, like White Noise's
-    /// `since = None` on a fresh account).
-    last_sync: Arc<Mutex<u64>>,
+    /// Durable relay sync cursor plus recently processed event IDs. This keeps
+    /// restart catch-up conservative: a failed event can be replayed later
+    /// instead of being skipped by an advanced watermark.
+    sync_state: Arc<Mutex<SyncState>>,
     /// Live Marmot events (welcomes 1059→us + group 445s) pushed by the
     /// notification handler. Drained + MLS-processed on the host's serialized
     /// engine thread via `drain_pending_marmot` — the handler NEVER touches the
@@ -184,6 +348,12 @@ pub struct SonarClient {
     /// Fired whenever a live Marmot event is buffered, so `wait_for_marmot_event`
     /// wakes the host to drain in real time (push) instead of polling.
     marmot_notify: Arc<tokio::sync::Notify>,
+    /// True after the real-session Marmot live tail is opened. Local group
+    /// changes use this to decide whether to refresh the live kind-445 filter.
+    live_marmot_enabled: Arc<Mutex<bool>>,
+    /// The group-id set currently installed in the live kind-445 subscription.
+    /// This prevents stacking duplicate REQs and lets deletes narrow/unsubscribe.
+    marmot_group_subscriptions: Arc<Mutex<HashSet<String>>>,
     /// Whether to join geohash-nearest relays on subscribe (real sessions); off
     /// for in-memory/test sessions so they stay network-free against a MockRelay.
     allow_geo_relays: bool,
@@ -203,15 +373,23 @@ impl SonarClient {
         db_path: impl AsRef<Path>,
         db_key: [u8; 32],
     ) -> Result<Self> {
+        let db_path = db_path.as_ref();
         let engine = MarmotEngine::persistent(identity.clone(), db_path, db_key)?;
-        Self::with_engine(identity, relays, engine, true).await
+        Self::with_engine(
+            identity,
+            relays,
+            engine,
+            true,
+            Some(sync_state_path_for_db(db_path)),
+        )
+        .await
     }
 
     /// Connect with a volatile in-memory store. State is lost when the client is
     /// dropped. Intended for tests and ephemeral/anonymous sessions.
     pub async fn connect_in_memory(identity: Identity, relays: Vec<RelayUrl>) -> Result<Self> {
         let engine = MarmotEngine::in_memory(identity.clone());
-        Self::with_engine(identity, relays, engine, false).await
+        Self::with_engine(identity, relays, engine, false, None).await
     }
 
     async fn with_engine(
@@ -219,6 +397,7 @@ impl SonarClient {
         relays: Vec<RelayUrl>,
         engine: MarmotEngine,
         allow_geo_relays: bool,
+        sync_state_path: Option<PathBuf>,
     ) -> Result<Self> {
         let nostr = Client::new(identity.keys().clone());
         for relay in &relays {
@@ -237,6 +416,8 @@ impl SonarClient {
 
         let pending_marmot: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
         let marmot_notify = Arc::new(tokio::sync::Notify::new());
+        let live_marmot_enabled = Arc::new(Mutex::new(false));
+        let marmot_group_subscriptions = Arc::new(Mutex::new(HashSet::new()));
 
         let handler_geo = geo.clone();
         let handler_dm = geo_dm.clone();
@@ -402,6 +583,16 @@ impl SonarClient {
         // White Noise history every time. The gift-wrap fetch still applies its
         // 7-day NIP-59 lookback on top of this.
         let resume_watermark = engine.latest_message_secs();
+        let storage_empty = resume_watermark == 0
+            && engine
+                .groups()
+                .map(|groups| groups.is_empty())
+                .unwrap_or(true);
+        let sync_state = Arc::new(Mutex::new(SyncState::load(
+            sync_state_path,
+            resume_watermark,
+            storage_empty,
+        )));
         let client = Self {
             engine,
             nostr,
@@ -411,9 +602,11 @@ impl SonarClient {
             geo_presence,
             geo_subscribed,
             identity_secret,
-            last_sync: Arc::new(Mutex::new(resume_watermark)),
+            sync_state,
             pending_marmot,
             marmot_notify,
+            live_marmot_enabled,
+            marmot_group_subscriptions,
             allow_geo_relays,
         };
         // Open the live Marmot subscriptions for real sessions. In-memory test
@@ -473,6 +666,9 @@ impl SonarClient {
         let creation = self
             .engine
             .create_group(name, vec![key_package], self.relays.clone())?;
+        if let Err(err) = self.resubscribe_marmot_groups_if_live().await {
+            tracing::debug!(%err, "marmot group live resubscribe failed after local group create");
+        }
         for (member, rumor) in creation.welcomes {
             let wrapped = self.engine.gift_wrap_welcome(&member, rumor).await?;
             self.nostr.send_event(&wrapped).await?;
@@ -530,6 +726,49 @@ impl SonarClient {
         }))
     }
 
+    /// Publish Sonar's public, NIP-78-style app descriptor. This is intentionally
+    /// capability + route metadata only: live Iroh node addresses stay inside
+    /// encrypted ☎CALL OFFER/ANSWER messages.
+    pub async fn publish_sonar_descriptor(
+        &self,
+        calls_enabled: bool,
+        signaling: Vec<String>,
+    ) -> Result<()> {
+        let content = descriptor_content_json(calls_enabled, signaling)?;
+        let builder =
+            EventBuilder::new(Kind::Custom(SONAR_DESCRIPTOR_KIND), content).tags(descriptor_tags());
+        self.nostr.send_event_builder(builder).await?;
+        Ok(())
+    }
+
+    /// Fetch a peer's freshest valid Sonar descriptor from our account relays.
+    /// Returns `None` for White Noise-only peers, old Sonar clients, privacy-off
+    /// clients, relay misses, or malformed descriptors.
+    pub async fn fetch_sonar_descriptor(
+        &self,
+        author: PublicKey,
+    ) -> Result<Option<SonarDescriptor>> {
+        let filter = Filter::new()
+            .kind(Kind::Custom(SONAR_DESCRIPTOR_KIND))
+            .author(author)
+            .custom_tag(
+                SingleLetterTag::lowercase(Alphabet::D),
+                SONAR_DESCRIPTOR_D_TAG,
+            )
+            .limit(5);
+        let mut events: Vec<Event> = self
+            .nostr
+            .fetch_events_from(self.relays.clone(), filter, FETCH_TIMEOUT)
+            .await?
+            .into_iter()
+            .collect();
+        events.sort_by_key(|event| std::cmp::Reverse(event.created_at));
+        Ok(events
+            .into_iter()
+            .filter(|event| event.pubkey == author)
+            .find_map(|event| parse_descriptor_event(&event)))
+    }
+
     /// Start a DM/group with `peer`: fetch their KeyPackage, create the MLS
     /// group, and deliver the gift-wrapped welcome.
     pub async fn start_dm(&self, peer: PublicKey, name: &str) -> Result<GroupId> {
@@ -537,6 +776,9 @@ impl SonarClient {
         let creation = self
             .engine
             .create_group(name, vec![key_package], self.relays.clone())?;
+        if let Err(err) = self.resubscribe_marmot_groups_if_live().await {
+            tracing::debug!(%err, "marmot group live resubscribe failed after local group create");
+        }
         for (member, rumor) in creation.welcomes {
             let wrapped = self.engine.gift_wrap_welcome(&member, rumor).await?;
             self.nostr.send_event(&wrapped).await?;
@@ -655,7 +897,7 @@ impl SonarClient {
     pub async fn sync(&self) -> Result<()> {
         // Watermark from the previous successful sync (0 on the first poll of a
         // session → an unbounded backfill, bounded only by the `#p`/`#h` scope).
-        let since_secs = *self.last_sync.lock().unwrap();
+        let since_secs = self.sync_watermark_secs();
         // Capture the start time as the next watermark BEFORE fetching, so any
         // event that lands mid-sync is re-covered by the overlap next poll.
         let started = Timestamp::now().as_secs();
@@ -675,24 +917,37 @@ impl SonarClient {
         // which carry our 1059/445 events — fetching from them only makes the
         // sync wait on their EOSE. The MLS group + KeyPackage relay lists are
         // built from `self.relays`, so conformant peers publish welcomes there.
-        for event in self
+        let mut process_report = MarmotProcessReport::default();
+        let ids_before = self.current_group_ids()?;
+        let wraps = self
             .nostr
             .fetch_events_from(self.relays.clone(), wraps, FETCH_TIMEOUT)
-            .await?
-        {
-            if let Err(err) = self.engine.process_incoming(&event).await {
-                tracing::debug!(%err, "skipping gift wrap (likely duplicate)");
+            .await?;
+        process_report.absorb(self.process_marmot_events(wraps, "gift wrap").await);
+
+        // A welcome processed during sync can add group(s). Backfill each new
+        // group's full history once, then widen the live tail if it is enabled.
+        let new_group_ids: Vec<String> = self
+            .current_group_ids()?
+            .into_iter()
+            .filter(|id| !ids_before.contains(id))
+            .collect();
+        for id in &new_group_ids {
+            match self.backfill_group(id).await {
+                Ok(report) => process_report.absorb(report),
+                Err(err) => {
+                    tracing::debug!(%err, "group backfill failed during sync");
+                    process_report.record_retryable(Timestamp::now().as_secs());
+                }
             }
+        }
+        if let Err(err) = self.resubscribe_marmot_groups_if_live().await {
+            tracing::debug!(%err, "marmot group live resubscribe failed during sync");
         }
 
         // Fetch kind-445 for ALL known groups in one request (batched `#h`),
         // including any group a welcome just added above.
-        let group_ids: Vec<String> = self
-            .engine
-            .groups()?
-            .into_iter()
-            .map(|g| hex::encode(g.nostr_group_id))
-            .collect();
+        let group_ids: Vec<String> = self.current_group_ids()?.into_iter().collect();
         if !group_ids.is_empty() {
             let mut filter = Filter::new()
                 .kind(Kind::MlsGroupMessage)
@@ -702,21 +957,20 @@ impl SonarClient {
                     since_secs.saturating_sub(SYNC_OVERLAP_SECS),
                 ));
             }
-            for event in self
+            let events = self
                 .nostr
                 .fetch_events_from(self.relays.clone(), filter, FETCH_TIMEOUT)
-                .await?
-            {
-                if let Err(err) = self.engine.process_incoming(&event).await {
-                    tracing::debug!(%err, "skipping group message (likely duplicate)");
-                }
-            }
+                .await?;
+            process_report.absorb(self.process_marmot_events(events, "group message").await);
         }
 
-        // Advance the watermark only after a fully successful poll: a fetch
-        // error returns `?` above and leaves the old watermark, so the next
-        // poll re-tries the same window rather than skipping events.
-        *self.last_sync.lock().unwrap() = started;
+        if process_report.retryable_failures == 0 {
+            self.advance_sync_watermark(started)?;
+        } else if let Some(secs) = process_report.oldest_retryable_secs {
+            self.rewind_sync_watermark_for_retry(secs)?;
+        } else {
+            self.save_sync_state()?;
+        }
         Ok(())
     }
 
@@ -734,6 +988,7 @@ impl SonarClient {
         self.nostr
             .subscribe_with_id(SubscriptionId::new(SUB_MARMOT_WELCOMES), wraps, None)
             .await?;
+        *self.live_marmot_enabled.lock().unwrap() = true;
         self.subscribe_group_messages().await
     }
 
@@ -742,43 +997,157 @@ impl SonarClient {
     /// after a welcome adds a group widens the live subscription. History for a
     /// newly-added group is fetched separately by `backfill_group`.
     async fn subscribe_group_messages(&self) -> Result<()> {
-        let group_ids: Vec<String> = self
+        let group_ids = self.current_group_ids()?;
+        let sub_id = SubscriptionId::new(SUB_MARMOT_GROUPS);
+
+        if group_ids.is_empty() {
+            let had_subscription = {
+                let current = self.marmot_group_subscriptions.lock().unwrap();
+                !current.is_empty()
+            };
+            if had_subscription {
+                self.nostr.unsubscribe(&sub_id).await;
+                self.marmot_group_subscriptions.lock().unwrap().clear();
+            }
+            return Ok(());
+        }
+
+        {
+            let current = self.marmot_group_subscriptions.lock().unwrap();
+            if *current == group_ids {
+                return Ok(());
+            }
+        }
+
+        let mut group_id_list: Vec<String> = group_ids.iter().cloned().collect();
+        group_id_list.sort();
+        let filter = Filter::new()
+            .kind(Kind::MlsGroupMessage)
+            .custom_tags(SingleLetterTag::lowercase(Alphabet::H), group_id_list)
+            .since(Timestamp::now());
+        self.nostr.subscribe_with_id(sub_id, filter, None).await?;
+        *self.marmot_group_subscriptions.lock().unwrap() = group_ids;
+        Ok(())
+    }
+
+    fn current_group_ids(&self) -> Result<HashSet<String>> {
+        Ok(self
             .engine
             .groups()?
             .into_iter()
             .map(|g| hex::encode(g.nostr_group_id))
-            .collect();
-        if group_ids.is_empty() {
+            .collect())
+    }
+
+    async fn resubscribe_marmot_groups_if_live(&self) -> Result<()> {
+        let is_live = *self.live_marmot_enabled.lock().unwrap();
+        if !is_live {
             return Ok(());
         }
-        let filter = Filter::new()
-            .kind(Kind::MlsGroupMessage)
-            .custom_tags(SingleLetterTag::lowercase(Alphabet::H), group_ids)
-            .since(Timestamp::now());
-        self.nostr
-            .subscribe_with_id(SubscriptionId::new(SUB_MARMOT_GROUPS), filter, None)
-            .await?;
-        Ok(())
+        self.subscribe_group_messages().await
+    }
+
+    fn sync_watermark_secs(&self) -> u64 {
+        self.sync_state.lock().unwrap().watermark_secs()
+    }
+
+    fn is_sync_event_processed(&self, event_id: &EventId) -> bool {
+        self.sync_state
+            .lock()
+            .unwrap()
+            .has_processed(&event_id.to_hex())
+    }
+
+    fn mark_sync_event_processed(&self, event_id: &EventId) {
+        self.sync_state.lock().unwrap().mark_processed(event_id);
+    }
+
+    fn save_sync_state(&self) -> Result<()> {
+        self.sync_state.lock().unwrap().save_if_dirty()
+    }
+
+    fn advance_sync_watermark(&self, watermark_secs: u64) -> Result<()> {
+        {
+            let mut state = self.sync_state.lock().unwrap();
+            state.advance_watermark(watermark_secs);
+        }
+        self.save_sync_state()
+    }
+
+    fn rewind_sync_watermark_for_retry(&self, event_secs: u64) -> Result<()> {
+        {
+            let mut state = self.sync_state.lock().unwrap();
+            state.rewind_for_retry(event_secs);
+        }
+        self.save_sync_state()
+    }
+
+    async fn process_marmot_events(
+        &self,
+        events: impl IntoIterator<Item = Event>,
+        context: &'static str,
+    ) -> MarmotProcessReport {
+        let mut report = MarmotProcessReport::default();
+        for event in sort_marmot_events(events) {
+            if self.is_sync_event_processed(&event.id) {
+                report.record_processed();
+                continue;
+            }
+
+            match self.engine.process_incoming(&event).await {
+                Ok(Incoming::Retryable) => {
+                    tracing::debug!(
+                        event_id = %event.id,
+                        event_created_at = event.created_at.as_secs(),
+                        context,
+                        "marmot event needs retry; leaving sync cursor behind it"
+                    );
+                    report.record_retryable(event.created_at.as_secs());
+                }
+                Ok(_) => {
+                    self.mark_sync_event_processed(&event.id);
+                    report.record_processed();
+                }
+                Err(err) if is_terminal_marmot_processing_error(&err) => {
+                    tracing::debug!(
+                        %err,
+                        event_id = %event.id,
+                        context,
+                        "terminal marmot event failure; marking event processed"
+                    );
+                    self.mark_sync_event_processed(&event.id);
+                    report.record_processed();
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        %err,
+                        event_id = %event.id,
+                        event_created_at = event.created_at.as_secs(),
+                        context,
+                        "marmot event processing failed; leaving sync cursor behind it"
+                    );
+                    report.record_retryable(event.created_at.as_secs());
+                }
+            }
+        }
+        report
     }
 
     /// One-off fetch of a single group's full kind-445 history (no `since`),
     /// processed through the engine. Used when a welcome adds a group whose
     /// messages predate the sync watermark, so they'd be missed by both the
     /// watermarked `sync()` and the since-now live subscription.
-    async fn backfill_group(&self, group_id_hex: &str) -> Result<()> {
+    async fn backfill_group(&self, group_id_hex: &str) -> Result<MarmotProcessReport> {
         let filter = Filter::new()
             .kind(Kind::MlsGroupMessage)
             .custom_tag(SingleLetterTag::lowercase(Alphabet::H), group_id_hex);
-        for event in self
+        let events = self
             .nostr
             .fetch_events_from(self.relays.clone(), filter, FETCH_TIMEOUT)
-            .await?
-        {
-            if let Err(err) = self.engine.process_incoming(&event).await {
-                tracing::debug!(%err, "skipping backfilled group message (likely duplicate)");
-            }
-        }
-        Ok(())
+            .await?;
+        Ok(self
+            .process_marmot_events(events, "backfilled group message")
+            .await)
     }
 
     /// Park until a live Marmot event is buffered (or `timeout_secs` elapses).
@@ -802,40 +1171,41 @@ impl SonarClient {
     /// if anything was drained. MUST run on the host's serialized engine thread
     /// (it mutates MLS state); the notification handler only ever BUFFERS.
     pub async fn drain_pending_marmot(&self) -> Result<bool> {
-        let events: Vec<Event> = {
+        let mut events: Vec<Event> = {
             let mut buf = self.pending_marmot.lock().unwrap();
             if buf.is_empty() {
                 return Ok(false);
             }
             std::mem::take(&mut *buf)
         };
-        let ids_before: HashSet<String> = self
-            .engine
-            .groups()?
-            .into_iter()
-            .map(|g| hex::encode(g.nostr_group_id))
-            .collect();
-        for event in &events {
-            if let Err(err) = self.engine.process_incoming(event).await {
-                tracing::debug!(%err, "skipping live marmot event (likely duplicate)");
-            }
-        }
+        sort_marmot_events_in_place(&mut events);
+        let ids_before = self.current_group_ids()?;
+        let mut process_report = self
+            .process_marmot_events(events, "live marmot event")
+            .await;
         // A welcome may have joined new group(s): backfill each one's history
         // (predates the watermark + the since-now sub) and widen the live sub.
         let new_ids: Vec<String> = self
-            .engine
-            .groups()?
+            .current_group_ids()?
             .into_iter()
-            .map(|g| hex::encode(g.nostr_group_id))
             .filter(|id| !ids_before.contains(id))
             .collect();
         if !new_ids.is_empty() {
             for id in &new_ids {
-                if let Err(err) = self.backfill_group(id).await {
-                    tracing::debug!(%err, "group backfill failed (sync will retry)");
+                match self.backfill_group(id).await {
+                    Ok(report) => process_report.absorb(report),
+                    Err(err) => {
+                        tracing::debug!(%err, "group backfill failed (sync will retry)");
+                        process_report.record_retryable(Timestamp::now().as_secs());
+                    }
                 }
             }
-            let _ = self.subscribe_group_messages().await;
+            let _ = self.resubscribe_marmot_groups_if_live().await;
+        }
+        if let Some(secs) = process_report.oldest_retryable_secs {
+            self.rewind_sync_watermark_for_retry(secs)?;
+        } else {
+            self.save_sync_state()?;
         }
         Ok(true)
     }
@@ -857,9 +1227,7 @@ impl SonarClient {
     /// stop receiving its messages. Local-only; the peer is not notified.
     pub async fn delete_group(&self, group_id: &GroupId) -> Result<()> {
         self.engine.delete_group(group_id)?;
-        if self.allow_geo_relays {
-            let _ = self.subscribe_group_messages().await;
-        }
+        let _ = self.resubscribe_marmot_groups_if_live().await;
         Ok(())
     }
 
@@ -1127,6 +1495,39 @@ impl SonarClient {
     }
 }
 
+fn conservative_watermark(disk_watermark_secs: u64, fallback_watermark_secs: u64) -> u64 {
+    match (disk_watermark_secs, fallback_watermark_secs) {
+        (0, _) | (_, 0) => 0,
+        (disk, fallback) => disk.min(fallback),
+    }
+}
+
+fn sync_state_path_for_db(db_path: &Path) -> PathBuf {
+    let name = db_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("sonar.db");
+    db_path.with_file_name(format!("{name}{SYNC_STATE_FILE_SUFFIX}"))
+}
+
+fn sync_state_tmp_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("sonar-sync.json");
+    path.with_file_name(format!("{name}.tmp"))
+}
+
+fn is_terminal_marmot_processing_error(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::Nip59(_)
+            | Error::Nip44(_)
+            | Error::NostrEvent(_)
+            | Error::Mdk(mdk_core::Error::WelcomePreviouslyFailed(_))
+    )
+}
+
 /// Read the value of a single-letter tag (e.g. `g`=geohash, `n`=nickname).
 fn tag_value(event: &Event, letter: Alphabet) -> Option<String> {
     event
@@ -1134,4 +1535,78 @@ fn tag_value(event: &Event, letter: Alphabet) -> Option<String> {
         .iter()
         .find(|t| t.single_letter_tag() == Some(SingleLetterTag::lowercase(letter)))
         .and_then(|t| t.content().map(|s| s.to_string()))
+}
+
+fn sort_marmot_events(events: impl IntoIterator<Item = Event>) -> Vec<Event> {
+    let mut events: Vec<Event> = events.into_iter().collect();
+    sort_marmot_events_in_place(&mut events);
+    events
+}
+
+fn sort_marmot_events_in_place(events: &mut [Event]) {
+    events.sort_by(|a, b| {
+        a.created_at
+            .as_secs()
+            .cmp(&b.created_at.as_secs())
+            .then_with(|| a.id.to_hex().cmp(&b.id.to_hex()))
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn signed_event(keys: &Keys, created_at_secs: u64, content: &str) -> Event {
+        EventBuilder::new(Kind::MlsGroupMessage, content)
+            .custom_created_at(Timestamp::from_secs(created_at_secs))
+            .sign_with_keys(keys)
+            .expect("event signs")
+    }
+
+    #[test]
+    fn sort_marmot_events_orders_by_created_at() {
+        let keys = Keys::generate();
+        let newer = signed_event(&keys, 30, "newer");
+        let oldest = signed_event(&keys, 10, "oldest");
+        let middle = signed_event(&keys, 20, "middle");
+
+        let sorted = sort_marmot_events([newer, oldest, middle]);
+        let contents: Vec<&str> = sorted.iter().map(|event| event.content.as_str()).collect();
+
+        assert_eq!(contents, ["oldest", "middle", "newer"]);
+    }
+
+    #[test]
+    fn sync_state_uses_conservative_watermark() {
+        assert_eq!(conservative_watermark(1_000, 500), 500);
+        assert_eq!(conservative_watermark(500, 1_000), 500);
+        assert_eq!(conservative_watermark(0, 1_000), 0);
+        assert_eq!(conservative_watermark(1_000, 0), 0);
+    }
+
+    #[test]
+    fn sync_state_ignores_stale_sidecar_when_storage_is_empty() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("marmot.sqlite.sonar-sync.json");
+        let disk = SyncStateDisk {
+            version: SYNC_STATE_VERSION,
+            watermark_secs: 1_000,
+            processed_event_ids: vec!["abc".to_string()],
+        };
+        fs::write(&path, serde_json::to_vec(&disk).expect("json")).expect("write state");
+
+        let state = SyncState::load(Some(path), 0, true);
+
+        assert_eq!(state.watermark_secs(), 0);
+        assert!(!state.has_processed("abc"));
+    }
+
+    #[test]
+    fn sync_state_rewinds_for_retry_with_overlap() {
+        let mut state = SyncState::new(None, 1_000, Vec::new());
+
+        state.rewind_for_retry(900);
+
+        assert_eq!(state.watermark_secs(), 900 - SYNC_OVERLAP_SECS);
+    }
 }
