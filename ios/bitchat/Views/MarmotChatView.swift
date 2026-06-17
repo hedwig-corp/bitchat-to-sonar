@@ -16,6 +16,8 @@ import SonarCore
 @MainActor
 final class MarmotChatModel: ObservableObject {
     private static let nsecKeychainKey = "marmot-nsec"
+    private static let sonarDescriptorRefreshInterval: TimeInterval = 15 * 60
+    private static let sonarDescriptorMissRetryInterval: TimeInterval = 60
 
     @Published var npub: String?
     @Published var groups: [MarmotService.MarmotGroup] = []
@@ -37,8 +39,11 @@ final class MarmotChatModel: ObservableObject {
     private var syncTask: Task<Void, Never>?
     /// npubs whose profile fetch is in flight or done, to fetch each once.
     private var profileFetches: Set<String> = []
-    /// npubs whose Sonar descriptor fetch is in flight or done.
+    /// npubs whose Sonar descriptor fetch is currently in flight.
     private var descriptorFetches: Set<String> = []
+    /// Last successful relay lookup time per npub. A successful nil response is
+    /// tracked via `sonarDescriptorMissesByNpub`.
+    private var sonarDescriptorFetchedAtByNpub: [String: Date] = [:]
     /// Optimistically-echoed outgoing messages per group, kept visible until
     /// the relay round-trip brings the real copy back (then reconciled away).
     private var pendingOptimistic: [String: [MarmotService.MarmotMessage]] = [:]
@@ -238,22 +243,36 @@ final class MarmotChatModel: ObservableObject {
 
     /// Fetch + cache a peer's public Sonar descriptor. Not finding one keeps the
     /// npub usable for White Noise/Marmot chat, but it does not unlock calls.
+    /// Positive results are periodically refreshed so protocol upgrades or
+    /// capability changes are noticed during long-running sessions.
     func ensureSonarDescriptor(_ npubToFetch: String) {
         guard !npubToFetch.isEmpty, npubToFetch != npub else { return }
-        guard sonarDescriptorsByNpub[npubToFetch] == nil else { return }
+        if sonarDescriptorsByNpub[npubToFetch] != nil,
+           let fetchedAt = sonarDescriptorFetchedAtByNpub[npubToFetch],
+           Date().timeIntervalSince(fetchedAt) < Self.sonarDescriptorRefreshInterval {
+            return
+        }
         if let miss = sonarDescriptorMissesByNpub[npubToFetch],
-           Date().timeIntervalSince(miss) < 60 {
+           Date().timeIntervalSince(miss) < Self.sonarDescriptorMissRetryInterval {
             return
         }
         guard descriptorFetches.insert(npubToFetch).inserted else { return }
         Task {
-            let descriptor = try? await service.fetchSonarDescriptor(npub: npubToFetch)
-            await MainActor.run {
-                if let descriptor {
-                    self.sonarDescriptorsByNpub[npubToFetch] = descriptor
-                    self.sonarDescriptorMissesByNpub[npubToFetch] = nil
-                } else {
-                    self.sonarDescriptorMissesByNpub[npubToFetch] = Date()
+            do {
+                let descriptor = try await service.fetchSonarDescriptor(npub: npubToFetch)
+                await MainActor.run {
+                    self.descriptorFetches.remove(npubToFetch)
+                    self.sonarDescriptorFetchedAtByNpub[npubToFetch] = Date()
+                    if let descriptor {
+                        self.sonarDescriptorsByNpub[npubToFetch] = descriptor
+                        self.sonarDescriptorMissesByNpub[npubToFetch] = nil
+                    } else {
+                        self.sonarDescriptorsByNpub.removeValue(forKey: npubToFetch)
+                        self.sonarDescriptorMissesByNpub[npubToFetch] = Date()
+                    }
+                }
+            } catch {
+                await MainActor.run {
                     self.descriptorFetches.remove(npubToFetch)
                 }
             }
