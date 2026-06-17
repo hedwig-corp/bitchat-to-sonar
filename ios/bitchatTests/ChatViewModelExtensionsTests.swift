@@ -30,6 +30,17 @@ private func makeTestableViewModel() -> (viewModel: ChatViewModel, transport: Mo
     return (viewModel, transport)
 }
 
+@MainActor
+private func nonFavoriteNoiseKeyHex() -> String {
+    for seed in 0..<224 {
+        let key = Data((0..<32).map { UInt8(($0 + seed + 1) & 0xff) })
+        if FavoritesPersistenceService.shared.getFavoriteStatus(for: key) == nil {
+            return key.hexEncodedString()
+        }
+    }
+    return "0102030405060708090a0b0c0d0e0f100102030405060708090a0b0c0d0e0f10"
+}
+
 // MARK: - Private Chat Extension Tests
 
 struct ChatViewModelPrivateChatExtensionTests {
@@ -38,8 +49,9 @@ struct ChatViewModelPrivateChatExtensionTests {
     func sendPrivateMessage_mesh_storesAndSends() async {
         let (viewModel, transport) = makeTestableViewModel()
         // Use valid hex string for PeerID (32 bytes = 64 hex chars for Noise key usually, or just valid hex)
-        let validHex = "0102030405060708090a0b0c0d0e0f100102030405060708090a0b0c0d0e0f10"
+        let validHex = nonFavoriteNoiseKeyHex()
         let peerID = PeerID(str: validHex)
+        viewModel.privateChats[peerID] = nil
         
         // Simulate connection
         transport.connectedPeers.insert(peerID)
@@ -68,27 +80,42 @@ struct ChatViewModelPrivateChatExtensionTests {
     @Test @MainActor
     func sendPrivateMessage_unreachable_setsFailedStatus() async {
         let (viewModel, _) = makeTestableViewModel()
-        let validHex = "0102030405060708090a0b0c0d0e0f100102030405060708090a0b0c0d0e0f10"
+        let validHex = nonFavoriteNoiseKeyHex()
         let peerID = PeerID(str: validHex)
+        viewModel.privateChats[peerID] = nil
 
         viewModel.sendPrivateMessage("Hello", to: peerID)
 
         #expect(viewModel.privateChats[peerID]?.count == 1)
+        #expect(viewModel.privateChats[peerID]?.last?.recipientNickname == String(validHex.prefix(8)))
         let status = viewModel.privateChats[peerID]?.last?.deliveryStatus
         #expect({
             if case .failed = status { return true }
             return false
         }())
     }
+
+    @Test @MainActor
+    func nicknameForPeer_withoutNicknameUsesPeerKeyPrefix() async {
+        let (viewModel, _) = makeTestableViewModel()
+        let validHex = "0102030405060708090a0b0c0d0e0f100102030405060708090a0b0c0d0e0f10"
+        let peerID = PeerID(str: validHex)
+
+        #expect(viewModel.nicknameForPeer(peerID) == String(validHex.prefix(8)))
+    }
     
     @Test @MainActor
     func handlePrivateMessage_storesMessage() async {
         let (viewModel, _) = makeTestableViewModel()
-        let peerID = PeerID(str: "SENDER_001")
+        let peerID = PeerID(str: "sender_store_private")
+        let sender = "SenderStorePrivate"
+        let messageID = "msg-store-private-\(UUID().uuidString)"
+        viewModel.privateChats[peerID] = nil
+        viewModel.unreadPrivateMessages.remove(peerID)
         
         let message = BitchatMessage(
-            id: "msg-1",
-            sender: "Sender",
+            id: messageID,
+            sender: sender,
             content: "Private Content",
             timestamp: Date(),
             isRelay: false,
@@ -112,11 +139,14 @@ struct ChatViewModelPrivateChatExtensionTests {
     @Test @MainActor
     func handlePrivateMessage_deduplicates() async {
         let (viewModel, _) = makeTestableViewModel()
-        let peerID = PeerID(str: "SENDER_001")
+        let peerID = PeerID(str: "sender_dedup_private")
+        let sender = "SenderDedupPrivate"
+        let messageID = "msg-dedup-private-\(UUID().uuidString)"
+        viewModel.privateChats[peerID] = nil
         
         let message = BitchatMessage(
-            id: "msg-1",
-            sender: "Sender",
+            id: messageID,
+            sender: sender,
             content: "Content",
             timestamp: Date(),
             isRelay: false,
@@ -157,14 +187,18 @@ struct ChatViewModelPrivateChatExtensionTests {
     @Test @MainActor
     func migratePrivateChats_consolidatesHistory_onFingerprintMatch() async {
         let (viewModel, _) = makeTestableViewModel()
-        let oldPeerID = PeerID(str: "OLD_PEER")
-        let newPeerID = PeerID(str: "NEW_PEER")
+        let oldPeerID = PeerID(str: "old_peer_migrate")
+        let newPeerID = PeerID(str: "new_peer_migrate")
+        let sender = "SenderMigratePrivate"
         let fingerprint = "fp_123"
+        let messageID = "msg-old-migrate-\(UUID().uuidString)"
+        viewModel.privateChats[oldPeerID] = nil
+        viewModel.privateChats[newPeerID] = nil
         
         // Setup old chat
         let oldMessage = BitchatMessage(
-            id: "msg-old",
-            sender: "User",
+            id: messageID,
+            sender: sender,
             content: "Old message",
             timestamp: Date(),
             isRelay: false,
@@ -178,7 +212,7 @@ struct ChatViewModelPrivateChatExtensionTests {
         viewModel.peerIDToPublicKeyFingerprint[newPeerID] = fingerprint
         
         // Trigger migration
-        viewModel.migratePrivateChatsIfNeeded(for: newPeerID, senderNickname: "User")
+        viewModel.migratePrivateChatsIfNeeded(for: newPeerID, senderNickname: sender)
         
         // Verify migration
         #expect(viewModel.privateChats[newPeerID]?.count == 1)
