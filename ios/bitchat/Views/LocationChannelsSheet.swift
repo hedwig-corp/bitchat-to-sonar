@@ -414,38 +414,42 @@ struct LocationChannelsSheet: View {
         action: @escaping () -> Void
     ) -> some View {
         HStack(alignment: .center, spacing: 8) {
-            VStack(alignment: .leading) {
-                // Render title with smaller font for trailing count in parentheses
-                let parts = splitTitleAndCount(title)
-                HStack(spacing: 4) {
-                    Text(parts.base)
-                            .font(.bitchatSystem(size: 14, design: .monospaced))
-                            .fontWeight(titleBold ? .bold : .regular)
-                            .foregroundColor(titleColor ?? Color.primary)
-                        if let count = parts.countSuffix, !count.isEmpty {
-                            Text(count)
-                                .font(.bitchatSystem(size: 11, design: .monospaced))
-                                .foregroundColor(.secondary)
+            Button(action: action) {
+                HStack(alignment: .center, spacing: 8) {
+                    VStack(alignment: .leading) {
+                        // Render title with smaller font for trailing count in parentheses
+                        let parts = splitTitleAndCount(title)
+                        HStack(spacing: 4) {
+                            Text(parts.base)
+                                .font(.bitchatSystem(size: 14, design: .monospaced))
+                                .fontWeight(titleBold ? .bold : .regular)
+                                .foregroundColor(titleColor ?? Color.primary)
+                            if let count = parts.countSuffix, !count.isEmpty {
+                                Text(count)
+                                    .font(.bitchatSystem(size: 11, design: .monospaced))
+                                    .foregroundColor(.secondary)
+                            }
                         }
+                        let subtitleFull = Strings.subtitle(prefix: subtitlePrefix, name: subtitleName)
+                        Text(subtitleFull)
+                            .font(.bitchatSystem(size: 12, design: .monospaced))
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
                     }
-                let subtitleFull = Strings.subtitle(prefix: subtitlePrefix, name: subtitleName)
-                Text(subtitleFull)
-                    .font(.bitchatSystem(size: 12, design: .monospaced))
-                    .foregroundColor(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
+                    Spacer()
+                    if isSelected {
+                        Text(verbatim: "✔︎")
+                            .font(.bitchatSystem(size: 16, design: .monospaced))
+                            .foregroundColor(standardGreen)
+                    }
                 }
-                Spacer()
-                if isSelected {
-                    Text(verbatim: "✔︎")
-                        .font(.bitchatSystem(size: 16, design: .monospaced))
-                        .foregroundColor(standardGreen)
-                }
-                trailingAccessory()
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-        .contentShape(Rectangle())
-        .onTapGesture(perform: action)
+            .buttonStyle(.plain)
+            .contentShape(Rectangle())
+            trailingAccessory()
+        }
     }
 
     // Split a title like "#mesh [3 people]" into base and suffix "[3 people]"
