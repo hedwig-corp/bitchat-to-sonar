@@ -6,6 +6,9 @@ pub enum Error {
     #[error("invalid key: {0}")]
     InvalidKey(String),
 
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
+
     #[error("nostr key error: {0}")]
     NostrKey(#[from] nostr::key::Error),
 

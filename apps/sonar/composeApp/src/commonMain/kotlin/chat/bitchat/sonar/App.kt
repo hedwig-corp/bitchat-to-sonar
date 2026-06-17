@@ -141,6 +141,7 @@ private fun HomeScreen(state: SonarAppState) {
     var wipeAsk by remember { mutableStateOf(false) }
     var titleTaps by remember { mutableStateOf(0) }
     var pendingDelete by remember { mutableStateOf<DeleteTarget?>(null) }
+    var pendingInvite by remember { mutableStateOf<SonarGroupInvite?>(null) }
     val meshCount = state.meshPeers.size
     // Triple-tap the title within 1.2s → emergency wipe (1:1 with iOS).
     LaunchedEffect(titleTaps) { if (titleTaps in 1..2) { kotlinx.coroutines.delay(1200); titleTaps = 0 } }
@@ -209,7 +210,16 @@ private fun HomeScreen(state: SonarAppState) {
                     }
                 }
                 item { SNSectionLabel("Messages") }
-                if (state.visibleChats.isEmpty() && state.meshDmRows.isEmpty()) item { EmptyMessages() }
+                if (state.groupInvites.isEmpty() && state.visibleChats.isEmpty() && state.meshDmRows.isEmpty()) item { EmptyMessages() }
+                items(state.groupInvites, key = { "invite:" + it.id }) { invite ->
+                    val title = invite.groupName.ifBlank { "Group chat" }
+                    ConvRow(
+                        avatar = { SonarAvatar(title, 52.dp, presence = false) },
+                        title = title,
+                        sub = "${invite.memberCount} members · invite",
+                        lock = true,
+                    ) { pendingInvite = invite }
+                }
                 // BLE-mesh DMs (incl. ones started by a peer messaging us) — over
                 // Bluetooth, so a cyan dot instead of the internet lock. A Sonar
                 // peer's White Noise leg is folded into this row (one row/person).
@@ -217,7 +227,7 @@ private fun HomeScreen(state: SonarAppState) {
                     ConvRow(
                         avatar = { SonarAvatar(row.name, 52.dp, presence = state.dmInRange(row.peerId)) },
                         title = row.name, sub = row.preview, lock = false,
-                        onLongClick = { pendingDelete = DeleteTarget(row.peerId, row.name, isMesh = true) },
+                        onLongClick = { pendingDelete = DeleteTarget(row.peerId, row.name, isMesh = true, isGroup = false) },
                     ) { state.openDm(row.peerId, row.name) }
                 }
                 items(state.visibleChats, key = { it.id }) { chat ->
@@ -226,7 +236,7 @@ private fun HomeScreen(state: SonarAppState) {
                         avatar = { SonarAvatar(chatTitle, 52.dp, presence = false) },
                         title = chatTitle, sub = "Tap to open", lock = true,
                         verified = state.isVerified(chat.id),
-                        onLongClick = { pendingDelete = DeleteTarget(chat.id, chatTitle, isMesh = false) },
+                        onLongClick = { pendingDelete = DeleteTarget(chat.id, chatTitle, isMesh = false, isGroup = state.isMultiMemberChat(chat.id)) },
                     ) { state.openChat(chat) }
                 }
             }
@@ -260,9 +270,18 @@ private fun HomeScreen(state: SonarAppState) {
     if (composeSheet) ComposeSheet(state) { composeSheet = false }
     if (connSheet) ConnectivitySheet(online = state.started, meshCount = meshCount) { connSheet = false }
     if (wipeAsk) WipeConfirmSheet(onWipe = { wipeAsk = false; state.wipe() }, onClose = { wipeAsk = false })
+    pendingInvite?.let { invite ->
+        GroupInviteSheet(
+            invite = invite,
+            onAccept = { state.acceptGroupInvite(invite.id); pendingInvite = null },
+            onDecline = { state.declineGroupInvite(invite.id); pendingInvite = null },
+            onClose = { pendingInvite = null }
+        )
+    }
     pendingDelete?.let { t ->
         DeleteChatSheet(
             name = t.name,
+            isGroup = t.isGroup,
             onDelete = {
                 if (t.isMesh) state.deleteMeshDm(t.id) else state.deleteMarmotChat(t.id)
                 pendingDelete = null
@@ -399,11 +418,11 @@ private fun WipeConfirmSheet(onWipe: () -> Unit, onClose: () -> Unit) {
     }
 }
 
-/** A chat the user long-pressed to delete (mesh DM peer id, or Marmot group id). */
-private data class DeleteTarget(val id: String, val name: String, val isMesh: Boolean)
+/** A chat the user long-pressed to delete or leave. */
+private data class DeleteTarget(val id: String, val name: String, val isMesh: Boolean, val isGroup: Boolean)
 
 @Composable
-private fun DeleteChatSheet(name: String, onDelete: () -> Unit, onClose: () -> Unit) {
+private fun DeleteChatSheet(name: String, isGroup: Boolean, onDelete: () -> Unit, onClose: () -> Unit) {
     val s = sonar
     Box(
         Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
@@ -411,14 +430,18 @@ private fun DeleteChatSheet(name: String, onDelete: () -> Unit, onClose: () -> U
     ) {
         Surface(color = s.surface, shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)) {
             Column(Modifier.fillMaxWidth().padding(20.dp)) {
-                Text("Delete this chat?", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                Text(if (isGroup) "Leave this group?" else "Delete this chat?", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(6.dp))
                 Text(
-                    "Removes “$name” from this device only. The other person isn’t notified, and you can start the chat again later.",
+                    if (isGroup) {
+                        "Sends a leave update to “$name” and removes the conversation from this device."
+                    } else {
+                        "Removes “$name” from this device only. The other person isn’t notified, and you can start the chat again later."
+                    },
                     color = s.text2, fontSize = 13.5.sp, lineHeight = 18.sp
                 )
                 Spacer(Modifier.height(16.dp))
-                SNPrimaryButton("Delete chat", net = false) { onDelete() }
+                SNPrimaryButton(if (isGroup) "Leave group" else "Delete chat", net = false) { onDelete() }
                 Spacer(Modifier.height(8.dp))
                 Box(Modifier.fillMaxWidth().height(44.dp).clickable(onClick = onClose), contentAlignment = Alignment.Center) {
                     Text("Cancel", color = s.text2, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
@@ -455,6 +478,59 @@ private fun ConnectivitySheet(online: Boolean, meshCount: Int, onClose: () -> Un
                 Spacer(Modifier.height(10.dp))
                 Box(Modifier.fillMaxWidth().height(44.dp).clickable(onClick = onClose), contentAlignment = Alignment.Center) {
                     Text("Done", color = s.text2, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun GroupInviteSheet(
+    invite: SonarGroupInvite,
+    onAccept: () -> Unit,
+    onDecline: () -> Unit,
+    onClose: () -> Unit,
+) {
+    val s = sonar
+    val title = invite.groupName.ifBlank { "Group chat" }
+    Box(
+        Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
+        contentAlignment = Alignment.BottomCenter
+    ) {
+        Surface(color = s.surface, shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp)) {
+            Column(
+                Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 22.dp, bottom = 24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                SonarAvatar(title, 64.dp, presence = false)
+                Spacer(Modifier.height(12.dp))
+                Text(title, color = s.text, fontSize = 22.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Spacer(Modifier.height(5.dp))
+                Text(
+                    "${invite.memberCount} members · invited by ${shortNpub(invite.welcomerNpub)}",
+                    color = s.text2,
+                    fontSize = 13.5.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Spacer(Modifier.height(14.dp))
+                Text(
+                    "End-to-end encrypted — only group members can read this",
+                    color = s.text3,
+                    fontSize = 13.sp,
+                    textAlign = TextAlign.Center,
+                    lineHeight = 18.sp,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(18.dp))
+                SNPrimaryButton("Accept") { onAccept() }
+                Spacer(Modifier.height(10.dp))
+                Box(
+                    Modifier.fillMaxWidth().height(50.dp).clip(RoundedCornerShape(15.dp)).background(s.surface2)
+                        .clickable(onClick = onDecline),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text("Decline", color = s.text2, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
                 }
             }
         }
@@ -530,13 +606,13 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     LaunchedEffect(feed.size) {
         if (feed.isNotEmpty()) listState.animateScrollToItem(feed.size - 1)
     }
-    // Resolve a human name for the peer (Marmot groups often have a blank name).
+    val currentChat = state.chats.firstOrNull { it.id == screen.id }
+    val isGroup = state.isMultiMemberChat(screen.id)
+    // Resolve a human name for the peer or group (Marmot names can be blank).
     val peerName = screen.name.ifBlank {
-        state.chats.firstOrNull { it.id == screen.id }
-            ?.members?.firstOrNull { it != state.npub && it.isNotBlank() }
-            ?.let { shortNpub(it) } ?: "secure chat"
+        currentChat?.let { state.chatTitle(it) } ?: "secure chat"
     }
-    val verified = run { state.payVersion; state.isVerified(screen.id) }
+    val verified = !isGroup && run { state.payVersion; state.isVerified(screen.id) }
     // A radar-peer DM is a "mesh:" route that auto-picks transport: BLE mesh
     // (cyan/"Bluetooth") while in range, White Noise (indigo/"internet") when out
     // of range. A pure Marmot chat (non-mesh route) is always internet. Per-message
@@ -561,7 +637,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             SNIconButton(SNIconName.Back, onClick = { state.back() })
             SonarAvatar(peerName, 36.dp, presence = false)
             Spacer(Modifier.width(10.dp))
-            Column(Modifier.weight(1f).clip(RoundedCornerShape(8.dp)).clickable { verifySheet = true }) {
+            Column(Modifier.weight(1f).clip(RoundedCornerShape(8.dp)).clickable(enabled = !isGroup) { verifySheet = true }) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
                         peerName, color = s.text, fontSize = 16.sp, fontWeight = FontWeight.Bold,
@@ -604,6 +680,11 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                 icon = SNIconName.ShieldCheck, tone = chat.bitchat.sonar.ui.SNBannerTone.Enc,
                 bold = "Verified", rest = " — you confirmed $peerName’s safety number"
             )
+        } else if (isGroup) {
+            chat.bitchat.sonar.ui.SNBanner(
+                icon = SNIconName.Lock, tone = chat.bitchat.sonar.ui.SNBannerTone.Enc,
+                bold = "End-to-end encrypted", rest = " — only group members can read this"
+            )
         } else {
             chat.bitchat.sonar.ui.SNBanner(
                 icon = SNIconName.Lock, tone = chat.bitchat.sonar.ui.SNBannerTone.Enc,
@@ -617,7 +698,11 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                 chat.bitchat.sonar.ui.SNEmptyState(
                     icon = SNIconName.Lock,
                     title = "Say hi to $peerName",
-                    desc = "Messages here are end-to-end encrypted. Only the two of you can read them."
+                    desc = if (isGroup) {
+                        "Messages here are end-to-end encrypted. Only group members can read them."
+                    } else {
+                        "Messages here are end-to-end encrypted. Only the two of you can read them."
+                    }
                 )
             }
         } else {
@@ -646,8 +731,8 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                                 state.claimPay(screen.id, pay.uuid)
                             }
                         } else if (m.media.isNotEmpty()) {
-                            MediaBubble(m, state, screen.id, mesh = msgMesh)
-                        } else MessageBubble(m, msgMesh)
+                            MediaBubble(m, state, screen.id, mesh = msgMesh, author = state.groupAuthorName(m, isGroup))
+                        } else MessageBubble(m, msgMesh, author = state.groupAuthorName(m, isGroup))
                     }
                 }
             }
@@ -752,6 +837,9 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         onReactions = { addSheet = false; state.toast = "Reactions are coming soon." },
         onClose = { addSheet = false },
         canSendPhoto = state.canSendMedia(screen.id),
+        canSendPayment = !state.isMultiMemberChat(screen.id),
+        canVerify = !state.isMultiMemberChat(screen.id),
+        canShareLocation = !state.isMultiMemberChat(screen.id),
         onPhoto = { addSheet = false; pickPhoto() }
     )
     if (paySheet) PaySheet(
@@ -783,6 +871,9 @@ private fun AddToMessageSheet(
     onReactions: () -> Unit,
     onClose: () -> Unit,
     canSendPhoto: Boolean = false,
+    canSendPayment: Boolean = true,
+    canVerify: Boolean = true,
+    canShareLocation: Boolean = true,
     onPhoto: () -> Unit = {},
 ) {
     val s = sonar
@@ -797,9 +888,9 @@ private fun AddToMessageSheet(
                 if (canSendPhoto) {
                     ActionRow(SNIconName.Lock, "Send photo", "Encrypted end-to-end over White Noise", onPhoto)
                 }
-                ActionRow(SNIconName.Coin, "Send bitcoin", "Instant over Lightning", onBitcoin)
-                ActionRow(SNIconName.NavArrow, "Share location", "Only $peerName will see it", onLocation)
-                ActionRow(SNIconName.Shield, "Verify safety number", "Confirm this chat is secure", onVerify)
+                if (canSendPayment) ActionRow(SNIconName.Coin, "Send bitcoin", "Instant over Lightning", onBitcoin)
+                if (canShareLocation) ActionRow(SNIconName.NavArrow, "Share location", "Only $peerName will see it", onLocation)
+                if (canVerify) ActionRow(SNIconName.Shield, "Verify safety number", "Confirm this chat is secure", onVerify)
                 ActionRow(SNIconName.People, "Reactions", "A little fun, no noise", onReactions)
             }
         }
@@ -991,7 +1082,7 @@ private fun GeoDmScreen(state: SonarAppState, screen: Screen.GeoDm) {
 }
 
 @Composable
-private fun MessageBubble(m: SonarMsg, mesh: Boolean = false) {
+private fun MessageBubble(m: SonarMsg, mesh: Boolean = false, author: String? = null) {
     val s = sonar
     // Own bubble is cyan over BLE mesh, indigo over Nostr/internet (the design's
     // transport-colored bubbles); the other party's bubble is always the surface.
@@ -1005,6 +1096,14 @@ private fun MessageBubble(m: SonarMsg, mesh: Boolean = false) {
         Modifier.fillMaxWidth().padding(vertical = 3.dp),
         horizontalAlignment = if (m.mine) Alignment.End else Alignment.Start
     ) {
+        if (!author.isNullOrBlank()) {
+            Text(
+                author,
+                color = s.text3,
+                fontSize = 11.5.sp,
+                modifier = Modifier.padding(start = 6.dp, bottom = 2.dp)
+            )
+        }
         Box(
             Modifier.clip(RoundedCornerShape(18.dp))
                 .background(if (m.mine) mineBg else s.bubbleOther)
@@ -1027,13 +1126,21 @@ private fun MessageBubble(m: SonarMsg, mesh: Boolean = false) {
  * plus an optional caption.
  */
 @Composable
-private fun MediaBubble(m: SonarMsg, state: SonarAppState, chatId: String, mesh: Boolean) {
+private fun MediaBubble(m: SonarMsg, state: SonarAppState, chatId: String, mesh: Boolean, author: String? = null) {
     val s = sonar
     val media = m.media.first()
     Column(
         Modifier.fillMaxWidth().padding(vertical = 3.dp),
         horizontalAlignment = if (m.mine) Alignment.End else Alignment.Start
     ) {
+        if (!author.isNullOrBlank()) {
+            Text(
+                author,
+                color = s.text3,
+                fontSize = 11.5.sp,
+                modifier = Modifier.padding(start = 6.dp, bottom = 2.dp)
+            )
+        }
         if (media.isImage) {
             val img by androidx.compose.runtime.produceState<androidx.compose.ui.graphics.ImageBitmap?>(
                 null, media.url
@@ -1313,7 +1420,10 @@ private fun linkify(text: String, linkColor: androidx.compose.ui.graphics.Color)
 private fun ComposeSheet(state: SonarAppState, onClose: () -> Unit) {
     val s = sonar
     var npubEntry by remember { mutableStateOf(false) }
+    var groupEntry by remember { mutableStateOf(false) }
     var npubDraft by remember { mutableStateOf("") }
+    var groupName by remember { mutableStateOf("") }
+    var groupMembers by remember { mutableStateOf("") }
     val inRange = state.meshPeers
     Box(
         Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
@@ -1352,7 +1462,10 @@ private fun ComposeSheet(state: SonarAppState, onClose: () -> Unit) {
                     onClose(); state.push(Screen.Nearby)
                 }
                 ActionRow(SNIconName.Key, "Secure chat via npub", "Encrypted chat over the internet — reaches anywhere") {
-                    npubEntry = true
+                    npubEntry = true; groupEntry = false
+                }
+                ActionRow(SNIconName.People, "New group", "Invite nearby people or paste npubs") {
+                    groupEntry = true; npubEntry = false
                 }
                 if (npubEntry) {
                     Spacer(Modifier.height(8.dp))
@@ -1362,6 +1475,20 @@ private fun ComposeSheet(state: SonarAppState, onClose: () -> Unit) {
                         "Start secure chat",
                         disabled = !npubDraft.trim().startsWith("npub1")
                     ) { state.startChat(npubDraft.trim()); onClose() }
+                }
+                if (groupEntry) {
+                    Spacer(Modifier.height(8.dp))
+                    SheetField(groupName, "Group name") { groupName = it }
+                    Spacer(Modifier.height(8.dp))
+                    SheetField(groupMembers, "npub1… npub1…") { groupMembers = it }
+                    Spacer(Modifier.height(10.dp))
+                    val members = remember(groupMembers) {
+                        groupMembers.split(Regex("[,\\s]+")).map { it.trim() }.filter { it.startsWith("npub1") }
+                    }
+                    SNPrimaryButton(
+                        "Create group",
+                        disabled = groupName.trim().isEmpty() || members.isEmpty()
+                    ) { state.createGroup(groupName, members); onClose() }
                 }
             }
         }

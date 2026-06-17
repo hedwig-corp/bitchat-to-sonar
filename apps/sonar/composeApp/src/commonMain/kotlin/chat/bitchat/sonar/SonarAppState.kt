@@ -103,6 +103,8 @@ class SonarAppState(private val scope: CoroutineScope) {
         private set
     var chats by mutableStateOf<List<SonarChat>>(emptyList())
         private set
+    var groupInvites by mutableStateOf<List<SonarGroupInvite>>(emptyList())
+        private set
     /** Resolved kind-0 profiles by npub — fills human names for Marmot members. */
     var profilesByNpub by mutableStateOf<Map<String, SonarProfile>>(emptyMap())
         private set
@@ -128,7 +130,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             MessageStore.wipe()
             SonarCore.wipe()
             stack = listOf(Screen.Home)
-            chats = emptyList(); messages = emptyList()
+            chats = emptyList(); groupInvites = emptyList(); messages = emptyList()
             onboarded = false; nick = ""; npub = ""; started = false
             walletState = WalletState.NotConfigured
             presenceByGeohash = emptyMap()
@@ -501,6 +503,14 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** White Noise chats to render on their own row: every Marmot group EXCEPT the
      *  ones folded into a mesh DM. The Messages list uses this instead of [chats]. */
     val visibleChats: List<SonarChat> get() = chats.filterNot { it.id in foldedGroupIds }
+
+    private fun otherMembers(chat: SonarChat): List<String> =
+        chat.members.filter { it != npub && it.isNotBlank() }.distinct()
+
+    fun isDirectMarmotChat(chat: SonarChat): Boolean = otherMembers(chat).size == 1
+
+    fun isMultiMemberChat(chatId: String): Boolean =
+        chats.firstOrNull { it.id == chatId }?.let { !isDirectMarmotChat(it) } == true
 
     /** This peer's npub (32 raw bytes) if known — from a live 0x53 OR the persisted
      *  [linkByFp] (so it still resolves out of range / after restart). The bridge
@@ -876,8 +886,11 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /** Verify info for a Marmot chat: the 12 safety groups, or an honest note. */
     fun verifyInfo(chatId: String): SonarVerify {
-        val peer = chats.firstOrNull { it.id == chatId }
-            ?.members?.firstOrNull { it != npub && it.isNotBlank() }
+        val chat = chats.firstOrNull { it.id == chatId }
+        if (chat != null && !isDirectMarmotChat(chat)) {
+            return SonarVerify(emptyList(), false, "Safety numbers are available for 1:1 chats.")
+        }
+        val peer = chat?.let { otherMembers(it).firstOrNull() }
         return if (peer.isNullOrBlank() || npub.isBlank()) {
             SonarVerify(emptyList(), isVerified(chatId), "Connecting to the secure chat service — try again in a moment.")
         } else {
@@ -1030,12 +1043,20 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  title. Mirrors iOS `MarmotChatModel.title(for:)`. */
     fun chatTitle(chat: SonarChat): String {
         if (chat.name.isNotBlank()) return chat.name
-        val other = chat.members.firstOrNull { it != npub && it.isNotBlank() } ?: return "Secure chat"
+        val others = otherMembers(chat)
+        if (others.size != 1) return "Group chat"
+        val other = others.first()
         // Prefer the counterpart's resolved kind-0 profile name; fetch it once if
         // not cached; fall back to a short npub until it lands.
         profilesByNpub[other]?.bestName?.let { return it }
         ensureProfile(other)
         return if (other.length > 16) other.take(10) + "…" + other.takeLast(4) else other
+    }
+
+    fun groupAuthorName(message: SonarMsg, isGroup: Boolean): String? {
+        if (!isGroup || message.mine || message.senderNpub.isBlank()) return null
+        return profilesByNpub[message.senderNpub]?.bestName
+            ?: message.senderNpub.let { if (it.length > 16) it.take(10) + "…" + it.takeLast(4) else it }
     }
 
     /** Fetch + cache a peer's kind-0 profile once, so their name replaces the
@@ -1097,14 +1118,22 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** True when the desktop content pane should show the welcome placeholder. */
     val isHome: Boolean get() = stack.size == 1
 
-    /** Delete ONE White Noise (Marmot) chat locally (messages + MLS keys) and
-     *  drop it from the list. Local-only — the peer is not notified. */
+    /** Delete a 1:1 Marmot chat locally, or leave a multi-member Marmot group. */
     fun deleteMarmotChat(chatId: String) {
         val wasOpen = (stack.lastOrNull() as? Screen.Chat)?.id == chatId
+        val isGroup = chats.firstOrNull { it.id == chatId }?.let { !isDirectMarmotChat(it) } == true
         chats = chats.filterNot { it.id == chatId }
         if (wasOpen && stack.size > 1) stack = stack.dropLast(1) // pop WITHOUT refresh
         scope.launch {
-            SonarCore.deleteChat(chatId)
+            try {
+                if (isGroup) {
+                    SonarCore.leaveGroup(chatId)
+                } else {
+                    SonarCore.deleteChat(chatId)
+                }
+            } catch (t: Throwable) {
+                toast = if (isGroup) "couldn't leave group: ${t.message}" else "couldn't delete chat: ${t.message}"
+            }
             refreshChats()
         }
     }
@@ -1358,8 +1387,49 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
+    fun createGroup(name: String, members: List<String>) {
+        val cleanName = name.trim().ifBlank { "Group chat" }
+        val cleanMembers = members.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+        if (cleanMembers.isEmpty()) {
+            toast = "Add at least one person"
+            return
+        }
+        scope.launch {
+            try {
+                val chatId = SonarCore.startGroup(cleanMembers, cleanName)
+                refreshChats()
+                push(Screen.Chat(chatId, cleanName))
+            } catch (e: Throwable) {
+                toast = "couldn’t create group: ${e.message}"
+            }
+        }
+    }
+
+    fun acceptGroupInvite(inviteId: String) {
+        scope.launch {
+            try {
+                val chatId = SonarCore.acceptGroupInvite(inviteId)
+                refreshChats()
+                chats.firstOrNull { it.id == chatId }?.let { push(Screen.Chat(chatId, chatTitle(it))) }
+            } catch (e: Throwable) {
+                toast = "couldn’t accept invite: ${e.message}"
+            }
+        }
+    }
+
+    fun declineGroupInvite(inviteId: String) {
+        scope.launch {
+            try {
+                SonarCore.declineGroupInvite(inviteId)
+                refreshChats()
+            } catch (e: Throwable) {
+                toast = "couldn’t decline invite: ${e.message}"
+            }
+        }
+    }
+
     private fun npubHexForGroup(group: SonarChat): String? =
-        group.members.firstOrNull { it != npub && it.isNotBlank() }
+        otherMembers(group).singleOrNull()
             ?.let { chat.bitchat.sonar.crypto.Bech32.decode(it)?.takeIf { d -> d.hrp == "npub" }?.data }
             ?.takeIf { it.size == 32 }
             ?.toHexLower()
@@ -1400,6 +1470,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun marmotGroupsForNpub(npubRaw: ByteArray): List<SonarChat> {
         if (npubRaw.isEmpty()) return emptyList()
         return chats.filter { c ->
+            isDirectMarmotChat(c) &&
             c.members.any { m ->
                 chat.bitchat.sonar.crypto.Bech32.decode(m)
                     ?.takeIf { it.hrp == "npub" }?.data?.contentEquals(npubRaw) == true
@@ -1593,6 +1664,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         val groupPeers = LinkedHashMap<String, String>()
         for (group in chats) {
+            if (!isDirectMarmotChat(group)) continue
             val peerId = peerIdForMarmotGroup(group) ?: continue
             folded += group.id
             groupPeers[group.id] = peerId
@@ -1614,6 +1686,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private suspend fun refreshChats() {
         chats = SonarCore.chats()
+        groupInvites = runCatching { SonarCore.pendingGroupInvites() }.getOrDefault(emptyList())
     }
 
     private fun poll() {

@@ -28,8 +28,9 @@ struct SonarDMScreen: View {
 
     private var peer: SNPeerItem { store.peerItem(peerId) }
     private var isMarmot: Bool { store.marmotGroupId(peerId) != nil }
+    private var isMultiMemberMarmot: Bool { store.isMultiMemberMarmotGroupId(peerId) }
     private var isSonar: Bool { store.sonarProfile(peerId) != nil }
-    private var verified: Bool { store.isVerified(peerId) }
+    private var verified: Bool { !isMultiMemberMarmot && store.isVerified(peerId) }
     private var transport: SNVia { store.dmTransport(peerId) }
     private var walletReady: Bool {
         if case .ready = store.walletState { return true }
@@ -70,12 +71,14 @@ struct SonarDMScreen: View {
                     icon: .lock,
                     iconSize: 24,
                     title: "Say hi to \(peer.name)",
-                    desc: "Messages here are end-to-end encrypted. Only the two of you can read them."
+                    desc: isMultiMemberMarmot
+                        ? "Messages here are end-to-end encrypted. Only group members can read them."
+                        : "Messages here are end-to-end encrypted. Only the two of you can read them."
                 )
             } else {
                 SNMsgList(
                     msgs: msgs,
-                    showAuthors: false,
+                    showAuthors: isMultiMemberMarmot,
                     peerName: peer.name,
                     money: { store.money($0) },
                     fiatText: { store.moneySatsLine($0) },
@@ -136,9 +139,11 @@ struct SonarDMScreen: View {
                         pickPhoto = true
                     }
                 }
-                SNActionRow(icon: .shield, label: "Verify safety number", desc: "Confirm this chat is secure") {
-                    sheet = false
-                    verifySheet = true
+                if !isMultiMemberMarmot {
+                    SNActionRow(icon: .shield, label: "Verify safety number", desc: "Confirm this chat is secure") {
+                        sheet = false
+                        verifySheet = true
+                    }
                 }
             }
         }
@@ -194,6 +199,12 @@ struct SonarDMScreen: View {
                 icon: .shieldCheck, tone: .enc,
                 bold: "Verified",
                 rest: " — you confirmed \(peer.name)\u{2019}s safety number"
+            )
+        } else if isMultiMemberMarmot {
+            SNBanner(
+                icon: .lock, tone: .enc,
+                bold: "End-to-end encrypted",
+                rest: " — only group members can read this"
             )
         } else if isMarmot {
             SNBanner(

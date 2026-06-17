@@ -43,6 +43,32 @@ pub struct GroupCreation {
     pub welcomes: Vec<(PublicKey, UnsignedEvent)>,
 }
 
+/// Result of a group membership update that must be published by the caller.
+#[derive(Debug)]
+pub struct GroupMembershipUpdate {
+    pub group_id: GroupId,
+    /// Kind-445 commit/proposal event to publish to the group's relays.
+    pub evolution_event: Event,
+    /// `(member pubkey, kind-444 rumor)` pairs for newly invited members.
+    pub welcomes: Vec<(PublicKey, UnsignedEvent)>,
+    /// True when MDK staged a local commit that must be merged after publish.
+    pub requires_commit_merge: bool,
+}
+
+/// Pending group invite surfaced to the native shells for accept/decline UI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupInvite {
+    /// Kind-444 welcome event id. Use this as the stable accept/decline handle.
+    pub id: EventId,
+    pub wrapper_id: EventId,
+    pub group_id: GroupId,
+    pub group_name: String,
+    pub group_description: String,
+    pub welcomer: PublicKey,
+    pub member_count: u32,
+    pub relays: Vec<RelayUrl>,
+}
+
 /// A reference to an encrypted media blob (Marmot MIP-04) attached to a chat
 /// message — enough for the UI to render a placeholder and trigger a download.
 /// The decryption material (nonce, hashes, scheme) stays inside MDK;
@@ -97,6 +123,11 @@ pub enum Incoming {
     Message(ChatMessage),
     /// A group-membership/welcome change was applied; no chat content.
     GroupUpdated(GroupId),
+    /// A multi-member welcome was stored and is waiting for user acceptance.
+    GroupInvitePending(GroupId),
+    /// Processing a proposal produced an auto-commit that the caller must
+    /// publish and merge before the group converges.
+    GroupProposal(GroupMembershipUpdate),
     /// MDK saw the event but could not apply it yet or marked a prior attempt
     /// failed. The relay sync layer must not advance past this event.
     Retryable,
@@ -273,6 +304,53 @@ impl MarmotEngine {
         })
     }
 
+    /// Create an add-members commit for an existing group. The caller must
+    /// publish `evolution_event`, deliver any welcomes, then merge the pending
+    /// commit with [`Self::merge_pending_commit`].
+    pub fn add_members(
+        &self,
+        group_id: &GroupId,
+        member_key_packages: Vec<Event>,
+    ) -> Result<GroupMembershipUpdate> {
+        let member_pubkeys: Vec<PublicKey> = member_key_packages.iter().map(|e| e.pubkey).collect();
+        let result = dispatch!(&self.storage, |mdk| mdk
+            .add_members(group_id, &member_key_packages))?;
+        Ok(Self::to_membership_update(result, member_pubkeys, true))
+    }
+
+    /// Create a remove-members commit for an existing group.
+    pub fn remove_members(
+        &self,
+        group_id: &GroupId,
+        members: &[PublicKey],
+    ) -> Result<GroupMembershipUpdate> {
+        let result = dispatch!(&self.storage, |mdk| mdk.remove_members(group_id, members))?;
+        Ok(Self::to_membership_update(result, Vec::new(), true))
+    }
+
+    /// Create a self-demotion commit. Required before an admin leaves.
+    pub fn self_demote(&self, group_id: &GroupId) -> Result<GroupMembershipUpdate> {
+        let result = dispatch!(&self.storage, |mdk| mdk.self_demote(group_id))?;
+        Ok(Self::to_membership_update(result, Vec::new(), true))
+    }
+
+    /// Create a leave proposal for the current member.
+    pub fn leave_group(&self, group_id: &GroupId) -> Result<GroupMembershipUpdate> {
+        let result = dispatch!(&self.storage, |mdk| mdk.leave_group(group_id))?;
+        Ok(Self::to_membership_update(result, Vec::new(), false))
+    }
+
+    /// Merge a pending local commit after the caller has published it.
+    pub fn merge_pending_commit(&self, group_id: &GroupId) -> Result<()> {
+        Ok(dispatch!(&self.storage, |mdk| mdk.merge_pending_commit(group_id))?)
+    }
+
+    /// Roll back a pending local commit when publish fails before it reaches the
+    /// relays. This keeps the group usable for a later retry.
+    pub fn clear_pending_commit(&self, group_id: &GroupId) -> Result<()> {
+        Ok(dispatch!(&self.storage, |mdk| mdk.clear_pending_commit(group_id))?)
+    }
+
     /// Gift-wrap a kind-444 welcome rumor for `receiver` (NIP-59, kind 1059).
     pub async fn gift_wrap_welcome(
         &self,
@@ -399,8 +477,9 @@ impl MarmotEngine {
     }
 
     /// Process any incoming Marmot-relevant event:
-    /// - kind 1059 gift wrap → unwrap; if it holds a kind-444 welcome,
-    ///   process and auto-accept it (M1 policy; invite UX comes with the shells).
+    /// - kind 1059 gift wrap → unwrap; if it holds a kind-444 welcome, direct
+    ///   1:1 welcomes are auto-accepted for compatibility and group welcomes are
+    ///   stored pending for explicit accept/decline UI.
     /// - kind 445 group message → decrypt/apply.
     pub async fn process_incoming(&self, event: &Event) -> Result<Incoming> {
         match event.kind {
@@ -411,8 +490,20 @@ impl MarmotEngine {
                 }
                 let welcome = dispatch!(&self.storage, |mdk| mdk
                     .process_welcome(&event.id, &unwrapped.rumor))?;
-                dispatch!(&self.storage, |mdk| mdk.accept_welcome(&welcome))?;
-                Ok(Incoming::GroupUpdated(welcome.mls_group_id))
+                if welcome.member_count <= 2 {
+                    dispatch!(&self.storage, |mdk| mdk.accept_welcome(&welcome))?;
+                    return Ok(Incoming::GroupUpdated(welcome.mls_group_id));
+                }
+                match welcome.state {
+                    welcome_types::WelcomeState::Pending => {
+                        Ok(Incoming::GroupInvitePending(welcome.mls_group_id))
+                    }
+                    welcome_types::WelcomeState::Accepted => {
+                        Ok(Incoming::GroupUpdated(welcome.mls_group_id))
+                    }
+                    welcome_types::WelcomeState::Declined
+                    | welcome_types::WelcomeState::Ignored => Ok(Incoming::None),
+                }
             }
             Kind::MlsGroupMessage => {
                 match dispatch!(&self.storage, |mdk| mdk.process_message(event))? {
@@ -423,16 +514,9 @@ impl MarmotEngine {
                     | MessageProcessingResult::PendingProposal { mls_group_id } => {
                         Ok(Incoming::GroupUpdated(mls_group_id))
                     }
-                    MessageProcessingResult::Proposal(update) => {
-                        // Auto-committed proposal (e.g. a member leaving): the
-                        // caller must publish `evolution_event`; surfacing it is
-                        // M1-deferred — log and report the group as updated.
-                        tracing::warn!(
-                            group = ?update.mls_group_id,
-                            "auto-committed proposal; evolution event publication not yet wired"
-                        );
-                        Ok(Incoming::GroupUpdated(update.mls_group_id))
-                    }
+                    MessageProcessingResult::Proposal(update) => Ok(Incoming::GroupProposal(
+                        Self::to_membership_update(update, Vec::new(), true),
+                    )),
                     MessageProcessingResult::Unprocessable { .. }
                     | MessageProcessingResult::PreviouslyFailed => Ok(Incoming::Retryable),
                     _ => Ok(Incoming::None),
@@ -442,9 +526,40 @@ impl MarmotEngine {
         }
     }
 
-    /// All groups this identity belongs to.
+    /// All active groups this identity belongs to. Pending group invites are
+    /// surfaced separately via [`Self::pending_group_invites`].
     pub fn groups(&self) -> Result<Vec<group_types::Group>> {
-        Ok(dispatch!(&self.storage, |mdk| mdk.get_groups())?)
+        Ok(dispatch!(&self.storage, |mdk| mdk.get_groups())?
+            .into_iter()
+            .filter(|g| g.state == group_types::GroupState::Active)
+            .collect())
+    }
+
+    /// Pending multi-member welcomes waiting for user acceptance.
+    pub fn pending_group_invites(&self) -> Result<Vec<GroupInvite>> {
+        let welcomes = dispatch!(&self.storage, |mdk| mdk.get_pending_welcomes(None))?;
+        Ok(welcomes
+            .into_iter()
+            .filter(|w| w.member_count > 2)
+            .map(Self::to_group_invite)
+            .collect())
+    }
+
+    /// Accept a pending group invite by its kind-444 welcome event id.
+    pub fn accept_group_invite(&self, welcome_id: &EventId) -> Result<GroupId> {
+        let welcome = dispatch!(&self.storage, |mdk| mdk.get_welcome(welcome_id))?
+            .ok_or_else(|| Error::InvalidInput(format!("unknown group invite {welcome_id}")))?;
+        let group_id = welcome.mls_group_id.clone();
+        dispatch!(&self.storage, |mdk| mdk.accept_welcome(&welcome))?;
+        Ok(group_id)
+    }
+
+    /// Decline a pending group invite by its kind-444 welcome event id.
+    pub fn decline_group_invite(&self, welcome_id: &EventId) -> Result<()> {
+        let welcome = dispatch!(&self.storage, |mdk| mdk.get_welcome(welcome_id))?
+            .ok_or_else(|| Error::InvalidInput(format!("unknown group invite {welcome_id}")))?;
+        dispatch!(&self.storage, |mdk| mdk.decline_welcome(&welcome))?;
+        Ok(())
     }
 
     /// Decrypted message history for a group (storage-backed).
@@ -504,6 +619,39 @@ impl MarmotEngine {
     /// deleting a conversation in Signal/iMessage). Idempotent.
     pub fn delete_group(&self, group_id: &GroupId) -> Result<()> {
         Ok(dispatch!(&self.storage, |mdk| mdk.delete_group(group_id))?)
+    }
+
+    fn to_membership_update(
+        result: UpdateGroupResult,
+        member_pubkeys: Vec<PublicKey>,
+        requires_commit_merge: bool,
+    ) -> GroupMembershipUpdate {
+        let welcomes = result
+            .welcome_rumors
+            .unwrap_or_default()
+            .into_iter()
+            .zip(member_pubkeys)
+            .map(|(rumor, member)| (member, rumor))
+            .collect();
+        GroupMembershipUpdate {
+            group_id: result.mls_group_id,
+            evolution_event: result.evolution_event,
+            welcomes,
+            requires_commit_merge,
+        }
+    }
+
+    fn to_group_invite(welcome: welcome_types::Welcome) -> GroupInvite {
+        GroupInvite {
+            id: welcome.id,
+            wrapper_id: welcome.wrapper_event_id,
+            group_id: welcome.mls_group_id,
+            group_name: welcome.group_name,
+            group_description: welcome.group_description,
+            welcomer: welcome.welcomer,
+            member_count: welcome.member_count,
+            relays: welcome.group_relays.into_iter().collect(),
+        }
     }
 
     fn to_chat_message(&self, m: message_types::Message) -> ChatMessage {

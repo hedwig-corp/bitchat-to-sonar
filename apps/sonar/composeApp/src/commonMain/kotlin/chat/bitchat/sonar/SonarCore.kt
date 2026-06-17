@@ -1,10 +1,21 @@
 package chat.bitchat.sonar
 
-/** A White Noise (Marmot) 1:1 chat, as the UI sees it. */
+/** A White Noise (Marmot) chat, as the UI sees it. */
 data class SonarChat(
     val id: String,        // MLS group id hex
     val name: String,
     val members: List<String>,
+)
+
+/** Pending multi-member group invite awaiting explicit accept/decline. */
+data class SonarGroupInvite(
+    val id: String,
+    val groupId: String,
+    val groupName: String,
+    val groupDescription: String,
+    val welcomerNpub: String,
+    val memberCount: Int,
+    val relays: List<String>,
 )
 
 /** A decrypted message in a chat. [viaInternet] marks the transport for the
@@ -105,11 +116,32 @@ expect object SonarCore {
     /** Our npub (empty until [start]). */
     fun myNpub(): String
 
-    /** All 1:1 chats we belong to. */
+    /** All active Marmot chats we belong to. */
     suspend fun chats(): List<SonarChat>
 
     /** Start (or fetch) a 1:1 chat with a peer (npub or hex). Returns chat id. */
     suspend fun startChat(peer: String): String
+
+    /** Start a multi-member group with peers (npub or hex). Returns chat id. */
+    suspend fun startGroup(members: List<String>, name: String): String
+
+    /** Pending multi-member group invites. */
+    suspend fun pendingGroupInvites(): List<SonarGroupInvite>
+
+    /** Accept a pending group invite. Returns chat id. */
+    suspend fun acceptGroupInvite(inviteId: String): String
+
+    /** Decline a pending group invite. */
+    suspend fun declineGroupInvite(inviteId: String)
+
+    /** Add members to an existing group. */
+    suspend fun addGroupMembers(chatId: String, members: List<String>)
+
+    /** Remove members from an existing group. */
+    suspend fun removeGroupMembers(chatId: String, members: List<String>)
+
+    /** Leave a group. */
+    suspend fun leaveGroup(chatId: String)
 
     /** Send an encrypted text message to a chat. */
     suspend fun send(chatId: String, text: String)

@@ -54,6 +54,17 @@ fn parse_group_id(hex_id: &str) -> FfiResult<GroupId> {
     Ok(GroupId::from_slice(&bytes))
 }
 
+fn parse_event_id(hex_id: &str) -> FfiResult<EventId> {
+    EventId::from_hex(hex_id).map_err(invalid("event id"))
+}
+
+fn parse_pubkeys(pubkeys: Vec<String>, label: &str) -> FfiResult<Vec<PublicKey>> {
+    pubkeys
+        .into_iter()
+        .map(|pk| PublicKey::parse(&pk).map_err(invalid(label)))
+        .collect()
+}
+
 /// Parse a 64-char hex string into the 32-byte SQLCipher key.
 fn parse_db_key(db_key_hex: &str) -> FfiResult<[u8; 32]> {
     let bytes = hex::decode(db_key_hex).map_err(invalid("db key hex"))?;
@@ -121,6 +132,20 @@ pub struct GroupInfo {
     pub id_hex: String,
     pub name: String,
     pub member_npubs: Vec<String>,
+}
+
+/// FFI-friendly pending group invite summary.
+#[derive(uniffi::Record)]
+pub struct GroupInviteInfo {
+    /// Hex of the kind-444 welcome event id. Pass to accept/decline methods.
+    pub id_hex: String,
+    pub wrapper_id_hex: String,
+    pub group_id_hex: String,
+    pub group_name: String,
+    pub group_description: String,
+    pub welcomer_npub: String,
+    pub member_count: u32,
+    pub relay_urls: Vec<String>,
 }
 
 /// FFI-friendly decrypted chat message.
@@ -319,6 +344,86 @@ impl SonarNode {
         let peer = PublicKey::parse(&peer).map_err(invalid("peer pubkey"))?;
         let group_id = self.runtime.block_on(self.client.start_dm(peer, &name))?;
         Ok(hex::encode(group_id.as_slice()))
+    }
+
+    /// Start a multi-member Marmot group. `members` accepts npub or hex pubkeys.
+    pub fn start_group(&self, members: Vec<String>, name: String) -> FfiResult<String> {
+        let members = parse_pubkeys(members, "member pubkey")?;
+        let group_id = self
+            .runtime
+            .block_on(self.client.start_group(members, &name))?;
+        Ok(hex::encode(group_id.as_slice()))
+    }
+
+    /// Add members to an existing group.
+    pub fn add_group_members(&self, group_id_hex: String, members: Vec<String>) -> FfiResult<()> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        let members = parse_pubkeys(members, "member pubkey")?;
+        self.runtime
+            .block_on(self.client.add_group_members(&group_id, members))?;
+        Ok(())
+    }
+
+    /// Remove members from an existing group.
+    pub fn remove_group_members(
+        &self,
+        group_id_hex: String,
+        members: Vec<String>,
+    ) -> FfiResult<()> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        let members = parse_pubkeys(members, "member pubkey")?;
+        self.runtime
+            .block_on(self.client.remove_group_members(&group_id, members))?;
+        Ok(())
+    }
+
+    /// Leave a group and delete its local state after the leave proposal is sent.
+    pub fn leave_group(&self, group_id_hex: String) -> FfiResult<()> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        self.runtime.block_on(self.client.leave_group(&group_id))?;
+        Ok(())
+    }
+
+    /// Pending multi-member group invites awaiting accept/decline.
+    pub fn pending_group_invites(&self) -> FfiResult<Vec<GroupInviteInfo>> {
+        Ok(self
+            .client
+            .pending_group_invites()?
+            .into_iter()
+            .map(|invite| GroupInviteInfo {
+                id_hex: invite.id.to_hex(),
+                wrapper_id_hex: invite.wrapper_id.to_hex(),
+                group_id_hex: hex::encode(invite.group_id.as_slice()),
+                group_name: invite.group_name,
+                group_description: invite.group_description,
+                welcomer_npub: invite
+                    .welcomer
+                    .to_bech32()
+                    .expect("npub encoding cannot fail"),
+                member_count: invite.member_count,
+                relay_urls: invite
+                    .relays
+                    .into_iter()
+                    .map(|relay| relay.to_string())
+                    .collect(),
+            })
+            .collect())
+    }
+
+    /// Accept a pending group invite by welcome event id.
+    pub fn accept_group_invite(&self, invite_id_hex: String) -> FfiResult<String> {
+        let invite_id = parse_event_id(&invite_id_hex)?;
+        let group_id = self
+            .runtime
+            .block_on(self.client.accept_group_invite(&invite_id))?;
+        Ok(hex::encode(group_id.as_slice()))
+    }
+
+    /// Decline a pending group invite by welcome event id.
+    pub fn decline_group_invite(&self, invite_id_hex: String) -> FfiResult<()> {
+        let invite_id = parse_event_id(&invite_id_hex)?;
+        self.client.decline_group_invite(&invite_id)?;
+        Ok(())
     }
 
     /// Encrypt + publish a text message to the group.

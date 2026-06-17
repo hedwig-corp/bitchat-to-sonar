@@ -32,6 +32,17 @@ final class MarmotService: @unchecked Sendable {
         let memberNpubs: [String]
     }
 
+    struct GroupInvite: Sendable, Equatable {
+        /// Hex kind-444 welcome event id; pass it to accept/decline.
+        let id: String
+        let groupId: String
+        let groupName: String
+        let groupDescription: String
+        let welcomerNpub: String
+        let memberCount: UInt32
+        let relays: [String]
+    }
+
     struct MarmotMessage: Sendable, Equatable {
         let id: String
         let senderNpub: String
@@ -255,6 +266,69 @@ final class MarmotService: @unchecked Sendable {
     /// must have a KeyPackage on the relays. Returns the new group id (hex).
     func startDirectMessage(with peer: String, name: String) async throws -> String {
         try await run { try $0.requireNode().startDm(peer: peer, name: name) }
+    }
+
+    /// Start a multi-member group with peers (`npub1...` or hex pubkeys).
+    /// Returns the new group id (hex).
+    func startGroup(with members: [String], name: String) async throws -> String {
+        try await run {
+            try $0.requireNode().startGroup(
+                members: members.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty },
+                name: name.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+        }
+    }
+
+    /// Pending multi-member group invites awaiting explicit user action.
+    func pendingGroupInvites() async throws -> [GroupInvite] {
+        try await run {
+            try $0.requireNode().pendingGroupInvites().map {
+                GroupInvite(
+                    id: $0.idHex,
+                    groupId: $0.groupIdHex,
+                    groupName: $0.groupName,
+                    groupDescription: $0.groupDescription,
+                    welcomerNpub: $0.welcomerNpub,
+                    memberCount: $0.memberCount,
+                    relays: $0.relayUrls
+                )
+            }
+        }
+    }
+
+    /// Accept a pending group invite. Returns the group id (hex).
+    func acceptGroupInvite(_ inviteId: String) async throws -> String {
+        try await run { try $0.requireNode().acceptGroupInvite(inviteIdHex: inviteId) }
+    }
+
+    /// Decline a pending group invite.
+    func declineGroupInvite(_ inviteId: String) async throws {
+        try await run { try $0.requireNode().declineGroupInvite(inviteIdHex: inviteId) }
+    }
+
+    /// Add members to an existing group.
+    func addGroupMembers(_ members: [String], to groupId: String) async throws {
+        try await run {
+            try $0.requireNode().addGroupMembers(
+                groupIdHex: groupId,
+                members: members.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+            )
+        }
+    }
+
+    /// Remove members from an existing group.
+    func removeGroupMembers(_ members: [String], from groupId: String) async throws {
+        try await run {
+            try $0.requireNode().removeGroupMembers(
+                groupIdHex: groupId,
+                members: members.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+            )
+        }
+    }
+
+    /// Leave a group and delete its local chat state after the leave proposal is sent.
+    func leaveGroup(_ groupId: String) async throws {
+        try await run { try $0.requireNode().leaveGroup(groupIdHex: groupId) }
     }
 
     /// Encrypt and publish a text message to the group.
