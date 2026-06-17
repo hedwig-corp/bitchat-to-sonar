@@ -37,6 +37,8 @@ final class MockTransport: Transport {
     private(set) var sentFavoriteNotifications: [(peerID: PeerID, isFavorite: Bool)] = []
     private(set) var sentVerifyChallenges: [(peerID: PeerID, noiseKeyHex: String, nonceA: Data)] = []
     private(set) var sentVerifyResponses: [(peerID: PeerID, noiseKeyHex: String, nonceA: Data)] = []
+    private(set) var sentFileBroadcasts: [(packet: BitchatFilePacket, transferId: String)] = []
+    private(set) var sentFilePrivates: [(packet: BitchatFilePacket, peerID: PeerID, transferId: String)] = []
     private(set) var startServicesCallCount = 0
     private(set) var stopServicesCallCount = 0
     private(set) var emergencyDisconnectCallCount = 0
@@ -139,11 +141,11 @@ final class MockTransport: Transport {
     }
 
     func sendFileBroadcast(_ packet: BitchatFilePacket, transferId: String) {
-        // Not tracked for current tests
+        sentFileBroadcasts.append((packet, transferId))
     }
 
     func sendFilePrivate(_ packet: BitchatFilePacket, to peerID: PeerID, transferId: String) {
-        // Not tracked for current tests
+        sentFilePrivates.append((packet, peerID, transferId))
     }
 
     func cancelTransfer(_ transferId: String) {
@@ -169,6 +171,8 @@ final class MockTransport: Transport {
         sentFavoriteNotifications.removeAll()
         sentVerifyChallenges.removeAll()
         sentVerifyResponses.removeAll()
+        sentFileBroadcasts.removeAll()
+        sentFilePrivates.removeAll()
         startServicesCallCount = 0
         stopServicesCallCount = 0
         emergencyDisconnectCallCount = 0

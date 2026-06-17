@@ -322,48 +322,58 @@ extension ChatViewModel {
         }
 
         let targetPeer = selectedPrivateChatPeer
-        let message = enqueueMediaMessage(content: "[voice] \(url.lastPathComponent)", targetPeer: targetPeer)
+        let data: Data
+        do {
+            let fileSize = try mediaFileSize(at: url)
+            guard fileSize <= FileTransferLimits.maxVoiceNoteBytes else {
+                SecureLogger.warning("Voice note exceeds size limit (\(fileSize) bytes)", category: .session)
+                try? FileManager.default.removeItem(at: url)
+                addSystemMessage("Voice note is too large to send.")
+                return
+            }
+
+            data = try Data(contentsOf: url)
+            guard data.count <= FileTransferLimits.maxVoiceNoteBytes else {
+                SecureLogger.warning("Voice note exceeds size limit (\(data.count) bytes)", category: .session)
+                try? FileManager.default.removeItem(at: url)
+                addSystemMessage("Voice note is too large to send.")
+                return
+            }
+        } catch {
+            SecureLogger.error("Voice note preparation failed: \(error)", category: .session)
+            try? FileManager.default.removeItem(at: url)
+            addSystemMessage("Failed to prepare voice note for sending.")
+            return
+        }
+
+        guard let outgoing = persistOutgoingVoiceNote(sourceURL: url, data: data) else {
+            addSystemMessage("Failed to prepare voice note for sending.")
+            return
+        }
+
+        let message = enqueueMediaMessage(content: "[voice] \(outgoing.url.lastPathComponent)", targetPeer: targetPeer)
         let messageID = message.id
         let transferId = makeTransferID(messageID: messageID)
+        let packet = BitchatFilePacket(
+            fileName: outgoing.url.lastPathComponent,
+            fileSize: UInt64(data.count),
+            mimeType: "audio/mp4",
+            content: data
+        )
 
-        Task.detached(priority: .userInitiated) { [weak self] in
-            guard let self = self else { return }
-            do {
-                // Security H1: Check file size BEFORE reading into memory
-                let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
-                guard let fileSize = attrs[.size] as? Int,
-                      fileSize <= FileTransferLimits.maxVoiceNoteBytes else {
-                    let size = (attrs[.size] as? Int) ?? 0
-                    SecureLogger.warning("Voice note exceeds size limit (\(size) bytes)", category: .session)
-                    try? FileManager.default.removeItem(at: url)
-                    await MainActor.run {
-                        self.handleMediaSendFailure(messageID: messageID, reason: "Voice note too large")
-                    }
-                    return
-                }
-
-                let data = try Data(contentsOf: url)
-                let packet = BitchatFilePacket(
-                    fileName: url.lastPathComponent,
-                    fileSize: UInt64(data.count),
-                    mimeType: "audio/mp4",
-                    content: data
-                )
-                guard packet.encode() != nil else { throw MediaSendError.encodingFailed }
-                await MainActor.run {
-                    self.registerTransfer(transferId: transferId, messageID: messageID)
-                    if let peerID = targetPeer {
-                        self.meshService.sendFilePrivate(packet, to: peerID, transferId: transferId)
-                    } else {
-                        self.meshService.sendFileBroadcast(packet, transferId: transferId)
-                    }
-                }
-            } catch {
-                SecureLogger.error("Voice note send failed: \(error)", category: .session)
-                await MainActor.run {
-                    self.handleMediaSendFailure(messageID: messageID, reason: "Failed to send voice note")
-                }
+        guard packet.encode() != nil else {
+            if outgoing.createdCopy {
+                try? FileManager.default.removeItem(at: outgoing.url)
             }
+            handleMediaSendFailure(messageID: messageID, reason: "Failed to encode voice note")
+            return
+        }
+
+        registerTransfer(transferId: transferId, messageID: messageID)
+        if let peerID = targetPeer {
+            meshService.sendFilePrivate(packet, to: peerID, transferId: transferId)
+        } else {
+            meshService.sendFileBroadcast(packet, transferId: transferId)
         }
     }
 
@@ -485,6 +495,43 @@ extension ChatViewModel {
             SecureLogger.error("File send preparation failed: \(error)", category: .session)
             return nil
         }
+    }
+
+    private func persistOutgoingVoiceNote(sourceURL: URL, data: Data) -> (url: URL, createdCopy: Bool)? {
+        do {
+            let voiceDirectory = try applicationFilesDirectory()
+                .appendingPathComponent("voicenotes/outgoing", isDirectory: true)
+            try FileManager.default.createDirectory(at: voiceDirectory, withIntermediateDirectories: true, attributes: nil)
+
+            if sourceURL.standardizedFileURL.deletingLastPathComponent().path == voiceDirectory.standardizedFileURL.path {
+                return (sourceURL, false)
+            }
+        } catch {
+            SecureLogger.error("Voice note send preparation failed: \(error)", category: .session)
+            return nil
+        }
+
+        guard let savedURL = saveOutgoingFile(data: data, filename: sourceURL.lastPathComponent, mime: .mp4Audio) else {
+            return nil
+        }
+        return (savedURL, true)
+    }
+
+    private func mediaFileSize(at url: URL) throws -> Int {
+        let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
+        if let size = attrs[.size] as? NSNumber {
+            return size.intValue
+        }
+        if let size = attrs[.size] as? Int {
+            return size
+        }
+        if let size = attrs[.size] as? UInt64 {
+            return size > UInt64(Int.max) ? Int.max : Int(size)
+        }
+        if let size = attrs[.size] as? Int64 {
+            return size > Int64(Int.max) ? Int.max : Int(size)
+        }
+        throw MediaSendError.copyFailed
     }
 
     private func mediaOutgoingSubdirectory(for mime: MimeType) -> String {
