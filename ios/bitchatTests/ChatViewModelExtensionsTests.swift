@@ -103,6 +103,40 @@ struct ChatViewModelPrivateChatExtensionTests {
 
         #expect(viewModel.nicknameForPeer(peerID) == String(validHex.prefix(8)))
     }
+
+    @Test @MainActor
+    func sendVoiceNote_fromTemporaryRecorderFilePersistsOutgoingMedia() async throws {
+        let (viewModel, transport) = makeTestableViewModel()
+        let sourceURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vn-\(UUID().uuidString).m4a")
+        let audioData = Data(repeating: 0x42, count: 4096)
+        try audioData.write(to: sourceURL)
+        defer { try? FileManager.default.removeItem(at: sourceURL) }
+
+        viewModel.sendVoiceNote(at: sourceURL)
+
+        guard let message = viewModel.messages.last(where: { $0.content.hasPrefix("[voice] ") }) else {
+            Issue.record("Expected a voice marker message")
+            return
+        }
+
+        let fileName = String(message.content.dropFirst("[voice] ".count))
+        let storedURL = try viewModel.applicationFilesDirectory()
+            .appendingPathComponent("voicenotes/outgoing", isDirectory: true)
+            .appendingPathComponent(fileName)
+        defer { try? FileManager.default.removeItem(at: storedURL) }
+
+        #expect(FileManager.default.fileExists(atPath: storedURL.path))
+        let storedData = try Data(contentsOf: storedURL)
+        #expect(storedData == audioData)
+        #expect(transport.sentFileBroadcasts.count == 1)
+        #expect(transport.sentFileBroadcasts.first?.packet.fileName == fileName)
+        #expect(transport.sentFileBroadcasts.first?.packet.mimeType == "audio/mp4")
+        #expect(transport.sentFileBroadcasts.first?.packet.content == audioData)
+
+        try FileManager.default.removeItem(at: sourceURL)
+        #expect(FileManager.default.fileExists(atPath: storedURL.path))
+    }
     
     @Test @MainActor
     func handlePrivateMessage_storesMessage() async {
