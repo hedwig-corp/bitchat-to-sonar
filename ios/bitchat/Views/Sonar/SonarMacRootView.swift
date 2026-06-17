@@ -458,6 +458,8 @@ private struct MacConversationPane: View {
     @Binding var detailRailOpen: Bool
     let onSelect: (SonarMacSelection) -> Void
 
+    private static let maxInternetAttachmentBytes = 25 * 1024 * 1024
+
     @State private var actionSheet = false
     @State private var verifySheet = false
     @State private var paySheet = false
@@ -849,17 +851,44 @@ private struct MacConversationPane: View {
             if scoped { url.stopAccessingSecurityScopedResource() }
         }
 
+        let limit = attachmentLimitBytes
+        if let size = fileSizeBytes(for: url), size > limit {
+            showToast("File is too large")
+            return false
+        }
+
         guard let data = try? Data(contentsOf: url) else {
             showToast("Couldn't read \(url.lastPathComponent)")
             return false
         }
-        store.sendAttachment(
+        guard data.count <= limit else {
+            showToast("File is too large")
+            return false
+        }
+        return store.sendAttachment(
             id,
             data: data,
             filename: url.lastPathComponent,
             mime: mimeType(for: url)
         )
-        return true
+    }
+
+    private var attachmentLimitBytes: Int {
+        store.dmTransport(id) == .mesh
+            ? FileTransferLimits.maxPayloadBytes
+            : Self.maxInternetAttachmentBytes
+    }
+
+    private func fileSizeBytes(for url: URL) -> Int? {
+        if let values = try? url.resourceValues(forKeys: [.fileSizeKey]),
+           let size = values.fileSize {
+            return size
+        }
+        if let size = try? FileManager.default
+            .attributesOfItem(atPath: url.path)[.size] as? NSNumber {
+            return size.intValue
+        }
+        return nil
     }
 
     private func mimeType(for url: URL) -> String {
