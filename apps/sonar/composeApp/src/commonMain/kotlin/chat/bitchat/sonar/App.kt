@@ -48,6 +48,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -572,6 +573,8 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     var paySheet by remember { mutableStateOf(false) }
     var verifySheet by remember { mutableStateOf(false) }
     var addSheet by remember { mutableStateOf(false) }
+    var addPeopleSheet by remember { mutableStateOf(false) }
+    var removePeopleSheet by remember { mutableStateOf(false) }
     val pickPhoto = rememberPhotoPicker { bytes, name, mime ->
         state.sendImage(screen.id, bytes, name, mime)
     }
@@ -835,12 +838,25 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         onLocation = { addSheet = false; state.toast = "Location sharing is coming soon." },
         onVerify = { addSheet = false; verifySheet = true },
         onReactions = { addSheet = false; state.toast = "Reactions are coming soon." },
+        onAddPeople = { addSheet = false; addPeopleSheet = true },
+        onRemovePeople = { addSheet = false; removePeopleSheet = true },
         onClose = { addSheet = false },
         canSendPhoto = state.canSendMedia(screen.id),
         canSendPayment = !state.isMultiMemberChat(screen.id),
         canVerify = !state.isMultiMemberChat(screen.id),
         canShareLocation = !state.isMultiMemberChat(screen.id),
+        canManageGroup = isGroup,
         onPhoto = { addSheet = false; pickPhoto() }
+    )
+    if (addPeopleSheet) GroupAddPeopleSheet(
+        state = state,
+        chatId = screen.id,
+        onClose = { addPeopleSheet = false }
+    )
+    if (removePeopleSheet) GroupRemovePeopleSheet(
+        state = state,
+        chatId = screen.id,
+        onClose = { removePeopleSheet = false }
     )
     if (paySheet) PaySheet(
         peerName = peerName,
@@ -869,11 +885,14 @@ private fun AddToMessageSheet(
     onLocation: () -> Unit,
     onVerify: () -> Unit,
     onReactions: () -> Unit,
+    onAddPeople: () -> Unit,
+    onRemovePeople: () -> Unit,
     onClose: () -> Unit,
     canSendPhoto: Boolean = false,
     canSendPayment: Boolean = true,
     canVerify: Boolean = true,
     canShareLocation: Boolean = true,
+    canManageGroup: Boolean = false,
     onPhoto: () -> Unit = {},
 ) {
     val s = sonar
@@ -882,7 +901,11 @@ private fun AddToMessageSheet(
         contentAlignment = Alignment.BottomCenter
     ) {
         Surface(color = s.surface, shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)) {
-            Column(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 18.dp, bottom = 20.dp)) {
+            Column(
+                Modifier.fillMaxWidth().heightIn(max = 560.dp)
+                    .verticalScroll(rememberScrollState())
+                    .padding(start = 20.dp, end = 20.dp, top = 18.dp, bottom = 20.dp)
+            ) {
                 Text("Add to your message", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(8.dp))
                 if (canSendPhoto) {
@@ -890,8 +913,92 @@ private fun AddToMessageSheet(
                 }
                 if (canSendPayment) ActionRow(SNIconName.Coin, "Send bitcoin", "Instant over Lightning", onBitcoin)
                 if (canShareLocation) ActionRow(SNIconName.NavArrow, "Share location", "Only $peerName will see it", onLocation)
+                if (canManageGroup) {
+                    ActionRow(SNIconName.People, "Add people", "Invite local contacts or paste npubs", onAddPeople)
+                    ActionRow(SNIconName.Trash, "Remove people", "Manage current group members", onRemovePeople)
+                }
                 if (canVerify) ActionRow(SNIconName.Shield, "Verify safety number", "Confirm this chat is secure", onVerify)
                 ActionRow(SNIconName.People, "Reactions", "A little fun, no noise", onReactions)
+            }
+        }
+    }
+}
+
+@Composable
+private fun GroupAddPeopleSheet(state: SonarAppState, chatId: String, onClose: () -> Unit) {
+    val s = sonar
+    var draft by remember(chatId) { mutableStateOf("") }
+    var selected by remember(chatId) { mutableStateOf(setOf<String>()) }
+    val existing = state.groupMemberNpubs(chatId)
+    val pasted = remember(draft, existing) { parsedNpubs(draft).filter { it !in existing } }
+    val members = remember(pasted, selected) { mergedNpubs(pasted, selected) }
+    val contacts = state.groupInviteContacts(excluding = existing)
+
+    Box(
+        Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
+        contentAlignment = Alignment.BottomCenter
+    ) {
+        Surface(color = s.surface, shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)) {
+            Column(
+                Modifier.fillMaxWidth().heightIn(max = 560.dp)
+                    .verticalScroll(rememberScrollState())
+                    .padding(start = 20.dp, end = 20.dp, top = 18.dp, bottom = 20.dp)
+            ) {
+                Text("Add people", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(10.dp))
+                SheetField(draft, "npub1… npub1…") { draft = it }
+                Spacer(Modifier.height(8.dp))
+                contacts.forEach { contact ->
+                    GroupContactRow(contact, selected = contact.npub in selected) {
+                        selected = if (contact.npub in selected) selected - contact.npub else selected + contact.npub
+                    }
+                }
+                Spacer(Modifier.height(10.dp))
+                SNPrimaryButton("Add people", disabled = members.isEmpty()) {
+                    state.addGroupMembers(chatId, members)
+                    onClose()
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun GroupRemovePeopleSheet(state: SonarAppState, chatId: String, onClose: () -> Unit) {
+    val s = sonar
+    val members = state.groupMemberContacts(chatId)
+    Box(
+        Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
+        contentAlignment = Alignment.BottomCenter
+    ) {
+        Surface(color = s.surface, shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)) {
+            Column(
+                Modifier.fillMaxWidth().heightIn(max = 560.dp)
+                    .verticalScroll(rememberScrollState())
+                    .padding(start = 20.dp, end = 20.dp, top = 18.dp, bottom = 20.dp)
+            ) {
+                Text("Remove people", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(8.dp))
+                if (members.isEmpty()) {
+                    Text("No removable members.", color = s.text2, fontSize = 13.5.sp, modifier = Modifier.padding(vertical = 12.dp))
+                } else {
+                    members.forEach { member ->
+                        Row(
+                            Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp))
+                                .clickable { state.removeGroupMembers(chatId, listOf(member.npub)) }
+                                .padding(vertical = 9.dp, horizontal = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            SonarAvatar(member.title, 38.dp)
+                            Spacer(Modifier.width(12.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text(member.title, color = s.text, fontSize = 15.5.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text(member.subtitle, color = s.text2, fontSize = 12.5.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                            SNIcon(SNIconName.Trash, 17.dp, s.danger, weight = 2f)
+                        }
+                    }
+                }
             }
         }
     }
@@ -1424,13 +1531,18 @@ private fun ComposeSheet(state: SonarAppState, onClose: () -> Unit) {
     var npubDraft by remember { mutableStateOf("") }
     var groupName by remember { mutableStateOf("") }
     var groupMembers by remember { mutableStateOf("") }
+    var selectedGroupNpubs by remember { mutableStateOf(setOf<String>()) }
     val inRange = state.meshPeers
     Box(
         Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
         contentAlignment = Alignment.BottomCenter
     ) {
         Surface(color = s.surface, shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)) {
-            Column(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 18.dp, bottom = 22.dp)) {
+            Column(
+                Modifier.fillMaxWidth().heightIn(max = 620.dp)
+                    .verticalScroll(rememberScrollState())
+                    .padding(start = 20.dp, end = 20.dp, top = 18.dp, bottom = 22.dp)
+            ) {
                 Text("Start a chat", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(10.dp))
                 if (inRange.isEmpty()) {
@@ -1481,13 +1593,24 @@ private fun ComposeSheet(state: SonarAppState, onClose: () -> Unit) {
                     SheetField(groupName, "Group name") { groupName = it }
                     Spacer(Modifier.height(8.dp))
                     SheetField(groupMembers, "npub1… npub1…") { groupMembers = it }
+                    val contacts = state.groupInviteContacts()
+                    if (contacts.isNotEmpty()) {
+                        Spacer(Modifier.height(8.dp))
+                        contacts.forEach { contact ->
+                            GroupContactRow(contact, selected = contact.npub in selectedGroupNpubs) {
+                                selectedGroupNpubs =
+                                    if (contact.npub in selectedGroupNpubs) selectedGroupNpubs - contact.npub
+                                    else selectedGroupNpubs + contact.npub
+                            }
+                        }
+                    }
                     Spacer(Modifier.height(10.dp))
-                    val members = remember(groupMembers) {
-                        groupMembers.split(Regex("[,\\s]+")).map { it.trim() }.filter { it.startsWith("npub1") }
+                    val members = remember(groupMembers, selectedGroupNpubs) {
+                        mergedNpubs(parsedNpubs(groupMembers), selectedGroupNpubs)
                     }
                     SNPrimaryButton(
                         "Create group",
-                        disabled = groupName.trim().isEmpty() || members.isEmpty()
+                        disabled = groupName.trim().isEmpty() || members.size < 2
                     ) { state.createGroup(groupName, members); onClose() }
                 }
             }
@@ -1514,6 +1637,39 @@ private fun ActionRow(icon: SNIconName, label: String, desc: String, onClick: ()
         }
         SNIcon(SNIconName.Chevron, 14.dp, s.text3, weight = 2.2f)
     }
+}
+
+@Composable
+private fun GroupContactRow(contact: GroupContact, selected: Boolean, onClick: () -> Unit) {
+    val s = sonar
+    Row(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp))
+            .clickable(onClick = onClick)
+            .padding(vertical = 9.dp, horizontal = 4.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        SonarAvatar(contact.title, 38.dp)
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+            Text(contact.title, color = s.text, fontSize = 15.5.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(contact.subtitle, color = s.text2, fontSize = 12.5.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
+        Box(
+            Modifier.size(24.dp).clip(CircleShape).background(if (selected) s.accent else s.surface2),
+            contentAlignment = Alignment.Center
+        ) {
+            if (selected) SNIcon(SNIconName.Check, 13.dp, s.onAccent, weight = 2.6f)
+        }
+    }
+}
+
+private fun parsedNpubs(text: String): List<String> =
+    text.split(Regex("[,\\s]+")).map { it.trim() }.filter { it.startsWith("npub1") }
+
+private fun mergedNpubs(pasted: List<String>, selected: Set<String>): List<String> {
+    val seen = linkedSetOf<String>()
+    (pasted + selected.sorted()).forEach { if (it.isNotBlank()) seen += it }
+    return seen.toList()
 }
 
 @Composable

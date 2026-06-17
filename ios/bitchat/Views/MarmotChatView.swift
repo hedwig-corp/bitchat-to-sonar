@@ -519,13 +519,27 @@ final class MarmotChatModel: ObservableObject {
     }
 
     func isDirectGroup(_ group: MarmotService.MarmotGroup) -> Bool {
-        otherMembers(in: group).count == 1
+        group.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && otherMembers(in: group).count == 1
     }
 
     func startGroup(name: String, members: [String]) async throws -> String {
-        let id = try await service.startGroup(with: members, name: name)
+        let cleanMembers = Array(Set(members.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty })).sorted()
+        guard cleanMembers.count >= 2 else {
+            throw MarmotService.ServiceError.invalidInput("add at least two people")
+        }
+        let id = try await service.startGroup(with: cleanMembers, name: name)
         await loadLocal()
         return id
+    }
+
+    func addGroupMembers(_ members: [String], to groupId: String) async throws {
+        try await service.addGroupMembers(members, to: groupId)
+        await loadLocal()
+    }
+
+    func removeGroupMembers(_ members: [String], from groupId: String) async throws {
+        try await service.removeGroupMembers(members, from: groupId)
+        await loadLocal()
     }
 
     func acceptGroupInvite(_ invite: MarmotService.GroupInvite) async throws -> String {

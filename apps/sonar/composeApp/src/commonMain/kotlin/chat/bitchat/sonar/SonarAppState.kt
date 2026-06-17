@@ -3,6 +3,7 @@ package chat.bitchat.sonar
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import chat.bitchat.sonar.crypto.Bech32
 import chat.bitchat.sonar.store.MessageMerge
 import chat.bitchat.sonar.store.MessageStore
 import chat.bitchat.sonar.unify.UnifyBIP321
@@ -36,6 +37,9 @@ sealed interface Screen {
 
 /** A BLE-mesh DM conversation row for the home Messages list. */
 data class MeshDmRow(val peerId: String, val name: String, val preview: String, val tsSecs: Long)
+
+/** A local contact that can be invited into a Marmot group. */
+data class GroupContact(val id: String, val title: String, val subtitle: String, val npub: String)
 
 private fun messagePreview(content: String): String {
     if (content.trimStart().startsWith("☎CALL") && SonarCore.callParseControl(content) != null) {
@@ -507,10 +511,54 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun otherMembers(chat: SonarChat): List<String> =
         chat.members.filter { it != npub && it.isNotBlank() }.distinct()
 
-    fun isDirectMarmotChat(chat: SonarChat): Boolean = otherMembers(chat).size == 1
+    fun isDirectMarmotChat(chat: SonarChat): Boolean =
+        chat.name.isBlank() && otherMembers(chat).size == 1
 
     fun isMultiMemberChat(chatId: String): Boolean =
         chats.firstOrNull { it.id == chatId }?.let { !isDirectMarmotChat(it) } == true
+
+    fun groupInviteContacts(excluding: Set<String> = emptySet()): List<GroupContact> {
+        val excludedClean = excluding.map { it.trim() }.toSet() + setOf(npub).filter { it.isNotBlank() }
+        val byNpub = linkedMapOf<String, GroupContact>()
+
+        fun insert(title: String, subtitle: String, inviteNpub: String?) {
+            val clean = inviteNpub?.trim().orEmpty()
+            if (!clean.startsWith("npub1") || clean in excludedClean || clean in byNpub) return
+            val display = title.ifBlank { profilesByNpub[clean]?.bestName ?: shortNpub(clean) }
+            byNpub[clean] = GroupContact(clean, display, subtitle, clean)
+        }
+
+        meshPeers.forEach { peer ->
+            val peerId = meshPeerId(peer.id)
+            insert(peer.name, "Nearby · Bluetooth", npubStringForPeer(peerId))
+        }
+        meshDmRows.forEach { row ->
+            insert(row.name, "Known Sonar contact", npubStringForPeer(row.peerId))
+        }
+        chats.filter { isDirectMarmotChat(it) }.forEach { chat ->
+            val other = otherMembers(chat).singleOrNull()
+            insert(chatTitle(chat), "White Noise chat", other)
+        }
+
+        return byNpub.values.sortedBy { it.title.lowercase() }
+    }
+
+    fun groupMemberContacts(chatId: String): List<GroupContact> =
+        chats.firstOrNull { it.id == chatId }
+            ?.let { otherMembers(it) }
+            .orEmpty()
+            .map { member ->
+                ensureProfile(member)
+                GroupContact(
+                    id = member,
+                    title = profilesByNpub[member]?.bestName ?: shortNpub(member),
+                    subtitle = shortNpub(member),
+                    npub = member,
+                )
+            }
+
+    fun groupMemberNpubs(chatId: String): Set<String> =
+        chats.firstOrNull { it.id == chatId }?.members.orEmpty().toSet()
 
     /** This peer's npub (32 raw bytes) if known — from a live 0x53 OR the persisted
      *  [linkByFp] (so it still resolves out of range / after restart). The bridge
@@ -518,6 +566,9 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun npubRawFor(peerId: String): ByteArray? =
         sonarProfile(peerId)?.npub
             ?: linkByFp[peerId]?.hexToBytesOrEmpty()?.takeIf { it.size == 32 }
+
+    private fun npubStringForPeer(peerId: String): String? =
+        npubRawFor(peerId)?.let { Bech32.encode("npub", it) }
 
     private fun loadLinks() {
         SonarCore.loadBlob("sonar.links").lineSequence().forEach { line ->
@@ -1050,13 +1101,16 @@ class SonarAppState(private val scope: CoroutineScope) {
         // not cached; fall back to a short npub until it lands.
         profilesByNpub[other]?.bestName?.let { return it }
         ensureProfile(other)
-        return if (other.length > 16) other.take(10) + "…" + other.takeLast(4) else other
+        return shortNpub(other)
     }
+
+    private fun shortNpub(value: String): String =
+        if (value.length > 16) value.take(10) + "…" + value.takeLast(4) else value
 
     fun groupAuthorName(message: SonarMsg, isGroup: Boolean): String? {
         if (!isGroup || message.mine || message.senderNpub.isBlank()) return null
         return profilesByNpub[message.senderNpub]?.bestName
-            ?: message.senderNpub.let { if (it.length > 16) it.take(10) + "…" + it.takeLast(4) else it }
+            ?: shortNpub(message.senderNpub)
     }
 
     /** Fetch + cache a peer's kind-0 profile once, so their name replaces the
@@ -1390,8 +1444,8 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun createGroup(name: String, members: List<String>) {
         val cleanName = name.trim().ifBlank { "Group chat" }
         val cleanMembers = members.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
-        if (cleanMembers.isEmpty()) {
-            toast = "Add at least one person"
+        if (cleanMembers.size < 2) {
+            toast = "Add at least two people"
             return
         }
         scope.launch {
@@ -1401,6 +1455,48 @@ class SonarAppState(private val scope: CoroutineScope) {
                 push(Screen.Chat(chatId, cleanName))
             } catch (e: Throwable) {
                 toast = "couldn’t create group: ${e.message}"
+            }
+        }
+    }
+
+    fun addGroupMembers(chatId: String, members: List<String>) {
+        val existing = groupMemberNpubs(chatId)
+        val cleanMembers = members.map { it.trim() }
+            .filter { it.isNotEmpty() && it !in existing }
+            .distinct()
+        if (cleanMembers.isEmpty()) {
+            toast = "Add at least one new person"
+            return
+        }
+        scope.launch {
+            try {
+                SonarCore.addGroupMembers(chatId, cleanMembers)
+                refreshChats()
+                if ((screen as? Screen.Chat)?.id == chatId) {
+                    messages = SonarCore.messages(chatId)
+                    processPayLines(chatId, messages)
+                }
+            } catch (e: Throwable) {
+                toast = "couldn't add people: ${e.message}"
+            }
+        }
+    }
+
+    fun removeGroupMembers(chatId: String, members: List<String>) {
+        val cleanMembers = members.map { it.trim() }
+            .filter { it.isNotEmpty() && it != npub }
+            .distinct()
+        if (cleanMembers.isEmpty()) return
+        scope.launch {
+            try {
+                SonarCore.removeGroupMembers(chatId, cleanMembers)
+                refreshChats()
+                if ((screen as? Screen.Chat)?.id == chatId) {
+                    messages = SonarCore.messages(chatId)
+                    processPayLines(chatId, messages)
+                }
+            } catch (e: Throwable) {
+                toast = "couldn't remove people: ${e.message}"
             }
         }
     }

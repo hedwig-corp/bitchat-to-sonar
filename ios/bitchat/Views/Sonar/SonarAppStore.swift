@@ -254,6 +254,14 @@ struct SNDMRow: Identifiable {
     let lastDate: Date?
 }
 
+/// A local contact that can be invited into a Marmot group.
+struct SNGroupContact: Identifiable, Hashable {
+    let id: String          // npub, so duplicates across radar/messages collapse.
+    let title: String
+    let subtitle: String
+    let npub: String
+}
+
 /// Real verification data for the verify sheet.
 struct SNVerifyInfo {
     let available: Bool
@@ -1322,11 +1330,78 @@ final class SonarAppStore: ObservableObject {
         marmot.groups.first { $0.id == groupId }
     }
 
+    func marmotGroup(forConversationId id: String) -> MarmotService.MarmotGroup? {
+        guard let groupId = marmotGroupId(id) else { return nil }
+        return marmotGroup(byId: groupId)
+    }
+
     func isMultiMemberMarmotGroupId(_ id: String) -> Bool {
         guard let groupId = marmotGroupId(id),
               let group = marmotGroup(byId: groupId)
         else { return false }
         return !marmot.isDirectGroup(group)
+    }
+
+    func groupInviteContacts(excluding excluded: Set<String> = []) -> [SNGroupContact] {
+        let excluded = Set(excluded.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) })
+        var byNpub: [String: SNGroupContact] = [:]
+
+        func insert(title: String, subtitle: String, npub: String) {
+            let clean = npub.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard clean.hasPrefix("npub1"), !excluded.contains(clean) else { return }
+            if let mine = marmot.npub, clean == mine { return }
+            guard byNpub[clean] == nil else { return }
+            byNpub[clean] = SNGroupContact(
+                id: clean,
+                title: title.isEmpty ? Self.shortNpub(clean) : title,
+                subtitle: subtitle,
+                npub: clean
+            )
+        }
+
+        for peer in nearbyPeers where !peer.unify {
+            guard let profile = resolvedSonarProfile(peer.id) else { continue }
+            insert(
+                title: peer.name,
+                subtitle: peer.inRange ? "Nearby · Bluetooth" : "Known Sonar contact",
+                npub: profile.npub
+            )
+        }
+        for row in dmRows {
+            if let groupId = marmotGroupId(row.id),
+               let group = marmotGroup(byId: groupId),
+               let other = directOtherNpub(in: group) {
+                insert(title: row.title, subtitle: "White Noise chat", npub: other)
+            } else if let profile = resolvedSonarProfile(row.id) {
+                insert(title: row.title, subtitle: row.presence ? "Nearby · Bluetooth" : "Known Sonar contact", npub: profile.npub)
+            }
+        }
+        for group in marmot.groups where marmot.isDirectGroup(group) {
+            guard let other = directOtherNpub(in: group) else { continue }
+            insert(title: marmot.title(for: group), subtitle: "White Noise chat", npub: other)
+        }
+
+        return byNpub.values.sorted {
+            $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
+        }
+    }
+
+    func groupMemberContacts(forConversationId id: String) -> [SNGroupContact] {
+        guard let group = marmotGroup(forConversationId: id) else { return [] }
+        return marmot.otherMembers(in: group).map { npub in
+            marmot.ensureProfile(npub)
+            let title = marmot.displayName(forNpub: npub) ?? Self.shortNpub(npub)
+            return SNGroupContact(
+                id: npub,
+                title: title,
+                subtitle: Self.shortNpub(npub),
+                npub: npub
+            )
+        }
+    }
+
+    static func shortNpub(_ value: String) -> String {
+        value.count > 16 ? "\(value.prefix(10))…\(value.suffix(4))" : value
     }
 
     private func directOtherNpub(in group: MarmotService.MarmotGroup) -> String? {

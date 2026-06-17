@@ -1400,6 +1400,52 @@ struct SNActionRow: View {
     }
 }
 
+struct SNGroupContactRow: View {
+    let contact: SNGroupContact
+    var selected: Bool = false
+    var divider: Bool = false
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 12) {
+                SonarAvatar(name: contact.title, size: 38, presence: false)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(verbatim: contact.title)
+                        .font(SonarTheme.uiFont(size: 15.5, weight: .semibold))
+                        .foregroundColor(SonarTheme.text)
+                        .lineLimit(1)
+                    Text(verbatim: contact.subtitle)
+                        .font(SonarTheme.uiFont(size: 12.5))
+                        .foregroundColor(SonarTheme.text2)
+                        .lineLimit(1)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                ZStack {
+                    Circle()
+                        .fill(selected ? SonarTheme.accent : SonarTheme.surface2)
+                        .frame(width: 24, height: 24)
+                    if selected {
+                        SNIcon(name: .check, size: 13, weight: 2.6)
+                            .foregroundColor(SonarTheme.onAccent)
+                    }
+                }
+            }
+            .padding(EdgeInsets(top: 9, leading: 10, bottom: 9, trailing: 10))
+            .contentShape(Rectangle())
+            .overlay(alignment: .bottom) {
+                if divider {
+                    Rectangle()
+                        .fill(SonarTheme.hairline)
+                        .frame(height: 1)
+                        .padding(.leading, 60)
+                }
+            }
+        }
+        .buttonStyle(SNRowPressStyle(cornerRadius: 14))
+    }
+}
+
 // MARK: - Signal bars (bc-bars)
 
 struct SNBars: View {
