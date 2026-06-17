@@ -2,7 +2,7 @@
 // SonarProfileScreen.swift
 // bitchat
 //
-// Profile screen + deterministic QR-style share code, ported from
+// Profile screen + scannable key-share QR, ported from
 // ProfileScreen/ShareCode in design/handoff/project/sonar/settings.jsx.
 //
 // This is free and unencumbered software released into the public domain.
@@ -171,50 +171,16 @@ struct SonarProfileScreen: View {
     }
 }
 
-// MARK: - Deterministic share code (QR-style, generated from the pubkey)
+// MARK: - Scannable key share QR
 
 struct SNShareCode: View {
     let seed: String
     var size: CGFloat = 164
 
-    private static let n = 11
-    private static let cellSize = 4.0
-
-    private func isFinder(_ r: Int, _ c: Int) -> Bool {
-        (r < 3 && c < 3) || (r < 3 && c >= Self.n - 3) || (r >= Self.n - 3 && c < 3)
-    }
-
     var body: some View {
-        Canvas { ctx, canvasSize in
-            let unit = canvasSize.width / (Double(Self.n) * Self.cellSize)
-            for r in 0..<Self.n {
-                let rh = snHash(seed + ":" + String(r))
-                for c in 0..<Self.n {
-                    let on: Bool
-                    if isFinder(r, c) {
-                        let lr = r < 3 ? r : r - (Self.n - 3)
-                        let lc = c < 3 ? c : c - (Self.n - 3)
-                        on = !(lr == 1 && lc == 1)
-                    } else {
-                        on = (rh >> UInt32(c)) & 1 == 1
-                    }
-                    if on {
-                        let rect = CGRect(
-                            x: (Double(c) * Self.cellSize + 0.3) * unit,
-                            y: (Double(r) * Self.cellSize + 0.3) * unit,
-                            width: (Self.cellSize - 0.6) * unit,
-                            height: (Self.cellSize - 0.6) * unit
-                        )
-                        ctx.fill(
-                            Path(roundedRect: rect, cornerRadius: 0.9 * unit),
-                            with: .color(SonarTheme.text)
-                        )
-                    }
-                }
-            }
-        }
+        QRCodeImage(data: seed, size: size)
         .frame(width: size, height: size)
-        .accessibilityHidden(true)
+        .accessibilityLabel("Key share QR code")
     }
 }
 

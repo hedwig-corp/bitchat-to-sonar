@@ -3,8 +3,7 @@
 // bitchat
 //
 // Glue: adapts the app-level WalletBridgeService (SonarWalletKit / Breez)
-// to the SonarWalletProviding protocol the payments UI consumes. iOS only —
-// the wallet framework has no macOS slice.
+// to the SonarWalletProviding protocol the payments UI consumes.
 //
 // This is free and unencumbered software released into the public domain.
 // For more information, see <https://unlicense.org>
@@ -13,6 +12,7 @@
 import Combine
 import CryptoKit
 import Foundation
+import Security
 
 /// Deterministic wallet-entropy derivation from the Sonar chat identity.
 ///
@@ -58,7 +58,7 @@ enum SonarWalletDerivation {
     }
 }
 
-#if os(iOS)
+#if os(iOS) || os(macOS)
 
 @MainActor
 final class BridgedWallet: SonarWalletProviding {
@@ -86,9 +86,8 @@ final class BridgedWallet: SonarWalletProviding {
         // With no BREEZ_API_KEY this settles to .notConfigured immediately.
         let bridge = self.bridge
         Task { try? await bridge.setupIfNeeded() }
-        // NOTE: incoming-payment observation must NOT be started here — calling
-        // it before the wallet is configured crashes the Kotlin side. The
-        // receive flow (subscribe after .ready) is tracked in issue #3.
+        // NOTE: incoming-payment observation must NOT be started here. The
+        // receive flow should subscribe only after the wallet is ready.
     }
 
     /// Re-attempt setup once the chat identity exists (the entropy provider

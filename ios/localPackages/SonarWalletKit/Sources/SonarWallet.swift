@@ -6,9 +6,10 @@
 // For more information, see <https://unlicense.org>
 //
 
-#if os(iOS)
+#if os(iOS) || os(macOS)
 
 import Foundation
+import Security
 import BreezSDKLiquid
 
 /// Swift façade over the OFFICIAL Breez SDK Liquid Swift bindings — the same SDK

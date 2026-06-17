@@ -84,7 +84,7 @@ async fn group_and_message_survive_reopen() {
     // membership/commit events) instead of resetting to 0, so a relaunch syncs
     // incrementally rather than re-fetching the whole history from scratch.
     assert!(
-        alice2.latest_message_secs() >= messages[0].created_at.as_u64(),
+        alice2.latest_message_secs() >= messages[0].created_at.as_secs(),
         "watermark resumes at/after the newest stored message after reopen"
     );
     assert!(alice2.latest_message_secs() > 0);

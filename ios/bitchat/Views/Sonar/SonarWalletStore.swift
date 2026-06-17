@@ -118,7 +118,13 @@ final class UnconfiguredWallet: SonarWalletProviding {
     enum WalletError: LocalizedError {
         case notConfigured
 
-        var errorDescription: String? { "No wallet is set up on this phone yet." }
+        var errorDescription: String? {
+            #if os(macOS)
+            return "Wallet is not configured on this Mac yet."
+            #else
+            return "No wallet is set up on this phone yet."
+            #endif
+        }
     }
 
     let state: SonarWalletState = .notConfigured

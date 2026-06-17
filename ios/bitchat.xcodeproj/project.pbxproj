@@ -17,6 +17,7 @@
 		A15C0DE000000000000000A4 /* SonarCore in Frameworks */ = {isa = PBXBuildFile; productRef = A15C0DE000000000000000A2 /* SonarCore */; };
 		A15C0DE000000000000000A5 /* SonarCore in Frameworks */ = {isa = PBXBuildFile; productRef = A15C0DE000000000000000A3 /* SonarCore */; };
 		A15C0DE100000000000000B4 /* WalletKit in Frameworks */ = {isa = PBXBuildFile; productRef = A15C0DE100000000000000B2 /* WalletKit */; };
+		A15C0DE100000000000000B5 /* WalletKit in Frameworks */ = {isa = PBXBuildFile; productRef = A15C0DE100000000000000B3 /* WalletKit */; };
 		E0A1B2C3D4E5F6012345678D /* relays/online_relays_gps.csv in Resources */ = {isa = PBXBuildFile; fileRef = E0A1B2C3D4E5F6012345678A /* relays/online_relays_gps.csv */; };
 		E0A1B2C3D4E5F6012345678E /* relays/online_relays_gps.csv in Resources */ = {isa = PBXBuildFile; fileRef = E0A1B2C3D4E5F6012345678A /* relays/online_relays_gps.csv */; };
 /* End PBXBuildFile section */
@@ -160,6 +161,7 @@
 				3EE336D150427F736F32B56C /* P256K in Frameworks */,
 				A6E3EA812E7706A80032EA8A /* Tor in Frameworks */,
 				A15C0DE000000000000000A5 /* SonarCore in Frameworks */,
+				A15C0DE100000000000000B5 /* WalletKit in Frameworks */,
 			);
 		};
 		B5A5CC493FFB3D8966548140 /* Frameworks */ = {
@@ -218,6 +220,7 @@
 				137ABE739BF20ACDDF8CC605 /* Sources */,
 				0214973A876129753D39EB47 /* Resources */,
 				31F6FDADA63050361C14F3A1 /* Frameworks */,
+				A15C0DE100000000000000B6 /* Remove static Breez framework wrapper */,
 			);
 			buildRules = (
 			);
@@ -230,6 +233,7 @@
 				A6E3E5712E7703760032EA8A /* BitLogger */,
 				A6E3EA802E7706A80032EA8A /* Tor */,
 				A15C0DE000000000000000A3 /* SonarCore */,
+				A15C0DE100000000000000B3 /* WalletKit */,
 			);
 			productName = bitchat_macOS;
 			productReference = 8F3A7C058C2C8E1A06C8CF8B /* bitchat.app */;
@@ -393,6 +397,30 @@
 			);
 		};
 /* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		A15C0DE100000000000000B6 /* Remove static Breez framework wrapper */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+				"$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/breez_sdk_liquidFFI.framework",
+			);
+			name = "Remove static Breez framework wrapper";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -e\nif [ \"${PLATFORM_NAME}\" = \"macosx\" ]; then\n  rm -rf \"${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}/breez_sdk_liquidFFI.framework\"\nfi\n";
+		};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		0A08E70F08F55FD5BA8C7EF3 /* Sources */ = {
@@ -657,6 +685,7 @@
 				DEAD_CODE_STRIPPING = YES;
 				DEVELOPMENT_TEAM = "$(DEVELOPMENT_TEAM)";
 				ENABLE_PREVIEWS = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				INFOPLIST_FILE = bitchat/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = Sonar;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.social-networking";
@@ -749,6 +778,7 @@
 				DEAD_CODE_STRIPPING = YES;
 				DEVELOPMENT_TEAM = "$(DEVELOPMENT_TEAM)";
 				ENABLE_PREVIEWS = NO;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				INFOPLIST_FILE = bitchat/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = Sonar;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.social-networking";
@@ -978,6 +1008,10 @@
 			productName = SonarCore;
 		};
 		A15C0DE100000000000000B2 /* WalletKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = WalletKit;
+		};
+		A15C0DE100000000000000B3 /* WalletKit */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = WalletKit;
 		};

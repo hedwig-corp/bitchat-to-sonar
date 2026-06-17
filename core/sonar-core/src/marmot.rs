@@ -480,7 +480,7 @@ impl MarmotEngine {
                 Err(_) => continue,
             };
             for m in msgs {
-                let t = m.created_at.as_u64();
+                let t = m.created_at.as_secs();
                 if t > newest {
                     newest = t;
                 }

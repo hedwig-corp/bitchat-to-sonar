@@ -421,6 +421,92 @@ extension ChatViewModel {
     }
 
     @MainActor
+    func sendFile(data: Data, filename: String, mime: String) {
+        guard canSendMediaInCurrentContext else {
+            SecureLogger.info("File send blocked outside mesh/private context", category: .session)
+            addSystemMessage("Files are only available in mesh chats.")
+            return
+        }
+
+        let mimeType = MimeType(mime) ?? .octetStream
+        guard FileTransferLimits.isValidPayload(data.count) else {
+            SecureLogger.warning("File exceeds size limit (\(data.count) bytes)", category: .session)
+            addSystemMessage("File is too large to send.")
+            return
+        }
+
+        guard let savedURL = saveOutgoingFile(data: data, filename: filename, mime: mimeType) else {
+            addSystemMessage("Failed to prepare file for sending.")
+            return
+        }
+
+        let targetPeer = selectedPrivateChatPeer
+        let marker = mediaMarkerPrefix(for: mimeType) + " \(savedURL.lastPathComponent)"
+        let message = enqueueMediaMessage(content: marker, targetPeer: targetPeer)
+        let messageID = message.id
+        let transferId = makeTransferID(messageID: messageID)
+        let packet = BitchatFilePacket(
+            fileName: savedURL.lastPathComponent,
+            fileSize: UInt64(data.count),
+            mimeType: mimeType.mimeString,
+            content: data
+        )
+
+        guard packet.encode() != nil else {
+            handleMediaSendFailure(messageID: messageID, reason: "Failed to encode file")
+            try? FileManager.default.removeItem(at: savedURL)
+            return
+        }
+
+        registerTransfer(transferId: transferId, messageID: messageID)
+        if let peerID = targetPeer {
+            meshService.sendFilePrivate(packet, to: peerID, transferId: transferId)
+        } else {
+            meshService.sendFileBroadcast(packet, transferId: transferId)
+        }
+    }
+
+    private func saveOutgoingFile(data: Data, filename: String, mime: MimeType) -> URL? {
+        do {
+            let base = try applicationFilesDirectory()
+            let directory = base.appendingPathComponent(mediaOutgoingSubdirectory(for: mime), isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: nil)
+
+            let rawName = (filename as NSString).lastPathComponent
+            let fallbackName = "file-\(UUID().uuidString).\(mime.defaultExtension)"
+            let safeName = rawName.isEmpty || rawName == "." || rawName == ".." ? fallbackName : rawName
+            let destination = directory.appendingPathComponent("\(UUID().uuidString)-\(safeName)")
+            try data.write(to: destination, options: [.atomic])
+            return destination
+        } catch {
+            SecureLogger.error("File send preparation failed: \(error)", category: .session)
+            return nil
+        }
+    }
+
+    private func mediaOutgoingSubdirectory(for mime: MimeType) -> String {
+        switch mime.category {
+        case .audio:
+            return "voicenotes/outgoing"
+        case .image:
+            return "images/outgoing"
+        case .file:
+            return "files/outgoing"
+        }
+    }
+
+    private func mediaMarkerPrefix(for mime: MimeType) -> String {
+        switch mime.category {
+        case .audio:
+            return "[voice]"
+        case .image:
+            return "[image]"
+        case .file:
+            return "[file]"
+        }
+    }
+
+    @MainActor
     func enqueueMediaMessage(content: String, targetPeer: PeerID?) -> BitchatMessage {
         let timestamp = Date()
         let message: BitchatMessage

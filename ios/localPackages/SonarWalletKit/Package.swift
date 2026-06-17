@@ -5,11 +5,12 @@ import PackageDescription
 // Breez SDK Liquid Swift bindings (prebuilt xcframework via SPM). This replaces
 // the old `SonarWalletKit` KMP framework (built from the unify-wallet repo): Sonar
 // isn't reusing unify-wallet's Kotlin, so we consume Breez directly — the same way
-// the Android/desktop app uses the Breez KMP package. iOS-only.
+// the Android/desktop app uses the Breez KMP package.
 let package = Package(
     name: "SonarWalletKit",
     platforms: [
         .iOS(.v16),
+        .macOS("15.0"),
     ],
     products: [
         .library(

@@ -6,23 +6,20 @@
 // For more information, see <https://unlicense.org>
 //
 
-#if os(iOS)
+#if os(iOS) || os(macOS)
 
 import Combine
 import Foundation
 import WalletKit
 
 /// App-side facade over the Lightning wallet engine (Breez SDK Liquid via
-/// the `SonarWalletKit` KMP framework, wrapped by the `WalletKit` Swift
-/// package). iOS-only: the KMP framework ships no macOS slice.
+/// the local `WalletKit` Swift package).
 ///
 /// Design (mirrors `MarmotService`):
-/// - No singleton: construct one and inject it. The underlying Kotlin
-///   `SonarWalletComponent` is process-global, so keep a single instance
-///   per process in practice.
-/// - `@MainActor`: the KMP bridge fires every callback on the main thread
-///   (its coroutine scope runs on `Dispatchers.Main`); the heavy lifting
-///   happens on Kotlin background dispatchers, so nothing here blocks.
+/// - No singleton: construct one and inject it. The wrapped wallet owns
+///   its Breez SDK instance, so keep a single bridge per process in practice.
+/// - `@MainActor`: UI-facing state changes stay on the main thread. The
+///   WalletKit facade moves Breez's blocking calls off the main actor.
 /// - This service owns no UI. Stores/ViewModels observe `statePublisher`
 ///   (or `$state`) and call the async methods.
 ///
