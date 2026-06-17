@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -133,9 +134,10 @@ fun SonarChannelScreen(state: SonarAppState, screen: Screen.Channel) {
         }
 
         // composer
-        Row(Modifier.fillMaxWidth().padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
+        Row(Modifier.fillMaxWidth().padding(10.dp), verticalAlignment = Alignment.Bottom) {
             Box(
                 Modifier.weight(1f).clip(RoundedCornerShape(22.dp)).background(s.surface2)
+                    .heightIn(min = 46.dp)
                     .padding(horizontal = 16.dp, vertical = 12.dp)
             ) {
                 if (draft.isEmpty()) Text("Message $name", color = s.text3, fontSize = 16.sp)
@@ -143,6 +145,8 @@ fun SonarChannelScreen(state: SonarAppState, screen: Screen.Channel) {
                     value = draft, onValueChange = { draft = it },
                     textStyle = TextStyle(color = s.text, fontSize = 16.sp),
                     cursorBrush = SolidColor(s.accent),
+                    singleLine = false,
+                    maxLines = 5,
                     modifier = Modifier.fillMaxWidth()
                 )
             }
