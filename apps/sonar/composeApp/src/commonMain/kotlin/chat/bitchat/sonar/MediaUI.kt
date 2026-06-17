@@ -4,9 +4,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.graphics.ImageBitmap
 
 /**
- * Platform photo picker. Returns a lambda that, when invoked, opens the system
- * image picker; the chosen image is delivered as **JPEG** bytes (re-encoded so
- * the Rust core's image encoder — which doesn't take HEIC — always handles it).
+ * Platform photo picker. Static photos are delivered as JPEG bytes so the Rust
+ * core image metadata path sees a format it handles consistently. Animated GIFs
+ * are delivered as their original `image/gif` bytes so animation is not lost.
  */
 @Composable
 expect fun rememberPhotoPicker(

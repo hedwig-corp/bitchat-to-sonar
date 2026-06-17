@@ -22,9 +22,8 @@ import javax.imageio.ImageWriteParam
 
 /**
  * Desktop (JVM) `actual` photo picker: a native AWT [FileDialog] filtered to
- * images. The chosen file is re-encoded to JPEG (matching the Android actual) so
- * the Rust core's image encoder — which doesn't take HEIC/PNG-with-alpha — always
- * gets a format it handles.
+ * images. Animated GIFs are preserved; still images are re-encoded to JPEG so
+ * the Rust core's image metadata path always gets a format it handles.
  */
 @Composable
 actual fun rememberPhotoPicker(
@@ -37,9 +36,15 @@ actual fun rememberPhotoPicker(
             // Desktop runs composition, hence this scope, on the AWT event
             // thread). Decoding/re-encoding then hops to a background thread.
             val picked = pickImageFile() ?: return@launch
-            val jpeg = withContext(Dispatchers.IO) { runCatching { reencodeJpeg(picked.readBytes()) }.getOrNull() }
+            val raw = withContext(Dispatchers.IO) { runCatching { picked.readBytes() }.getOrNull() }
                 ?: return@launch
-            onPicked(jpeg, "photo.jpg", "image/jpeg")
+            if (picked.extension.equals("gif", ignoreCase = true) || raw.isGifBytes()) {
+                onPicked(raw, picked.name.ifBlank { "animation.gif" }, "image/gif")
+            } else {
+                val jpeg = withContext(Dispatchers.IO) { runCatching { reencodeJpeg(raw) }.getOrNull() }
+                    ?: return@launch
+                onPicked(jpeg, "photo.jpg", "image/jpeg")
+            }
         }
     }
 }
@@ -86,6 +91,15 @@ private fun reencodeJpeg(raw: ByteArray): ByteArray {
     writer.dispose()
     return out.toByteArray()
 }
+
+private fun ByteArray.isGifBytes(): Boolean =
+    size >= 6 &&
+        this[0] == 0x47.toByte() &&
+        this[1] == 0x49.toByte() &&
+        this[2] == 0x46.toByte() &&
+        this[3] == 0x38.toByte() &&
+        (this[4] == 0x37.toByte() || this[4] == 0x39.toByte()) &&
+        this[5] == 0x61.toByte()
 
 actual fun decodeImageBitmap(bytes: ByteArray): ImageBitmap? =
     runCatching { SkiaImage.makeFromEncoded(bytes).toComposeImageBitmap() }.getOrNull()

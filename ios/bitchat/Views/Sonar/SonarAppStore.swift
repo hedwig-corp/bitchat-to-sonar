@@ -198,6 +198,10 @@ struct SNMediaItem: Equatable {
     /// When set, the bytes are loaded locally instead of downloaded from Blossom.
     var localPath: String? = nil
     var isImage: Bool { mime.hasPrefix("image/") }
+    var isGif: Bool {
+        mime.caseInsensitiveCompare("image/gif") == .orderedSame ||
+        filename.lowercased().hasSuffix(".gif")
+    }
 }
 
 /// A public channel row: the `#mesh` channel or one geohash level around the

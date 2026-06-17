@@ -9,6 +9,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
+import android.provider.OpenableColumns
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.PickVisualMediaRequest
@@ -43,8 +44,15 @@ actual fun rememberPhotoPicker(
         uri ?: return@rememberLauncherForActivityResult
         scope.launch(Dispatchers.IO) {
             val raw = ctx.contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: return@launch
-            // Re-encode to JPEG: guarantees a format the core image encoder
-            // handles (HEIC isn't) and keeps the upload small.
+            val sourceMime = ctx.contentResolver.getType(uri).orEmpty()
+            val sourceName = ctx.displayNameForUri(uri) ?: "photo"
+            if (sourceMime.equals("image/gif", ignoreCase = true) || raw.isGifBytes()) {
+                val filename = sourceName.takeIf { it.endsWith(".gif", ignoreCase = true) } ?: "animation.gif"
+                withContext(Dispatchers.Main) { onPicked(raw, filename, "image/gif") }
+                return@launch
+            }
+            // Re-encode still images to JPEG: guarantees a format the core image
+            // metadata path handles (HEIC isn't) and keeps the upload small.
             val bmp = BitmapFactory.decodeByteArray(raw, 0, raw.size) ?: return@launch
             val out = ByteArrayOutputStream()
             bmp.compress(Bitmap.CompressFormat.JPEG, 85, out)
@@ -58,6 +66,24 @@ actual fun rememberPhotoPicker(
         )
     }
 }
+
+private fun android.content.Context.displayNameForUri(uri: android.net.Uri): String? =
+    contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+        if (cursor.moveToFirst()) {
+            cursor.getString(0)?.substringAfterLast('/')?.takeIf { it.isNotBlank() }
+        } else {
+            null
+        }
+    }
+
+private fun ByteArray.isGifBytes(): Boolean =
+    size >= 6 &&
+        this[0] == 0x47.toByte() &&
+        this[1] == 0x49.toByte() &&
+        this[2] == 0x46.toByte() &&
+        this[3] == 0x38.toByte() &&
+        (this[4] == 0x37.toByte() || this[4] == 0x39.toByte()) &&
+        this[5] == 0x61.toByte()
 
 actual fun decodeImageBitmap(bytes: ByteArray): ImageBitmap? =
     BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()

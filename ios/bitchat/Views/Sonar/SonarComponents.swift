@@ -752,6 +752,8 @@ let snCommands: [(String, String)] = [
     ("slap", "Classic IRC slap"),
 ]
 
+let snQuickEmojis: [String] = ["👍", "❤️", "😂", "🔥", "🙏", "👏", "🎉", "👀", "💯", "⚡"]
+
 /// Decode a platform image (UIImage on iOS, NSImage on macOS) from raw bytes.
 func snPlatformImage(_ data: Data) -> Image? {
     #if canImport(UIKit)
@@ -830,6 +832,11 @@ struct SNMediaBubble: View {
                     .aspectRatio(contentMode: .fit)
                     .frame(maxWidth: maxBubbleWidth, maxHeight: 300)
                     .clipShape(RoundedRectangle(cornerRadius: 18))
+                    .overlay(alignment: .topTrailing) {
+                        if item.isGif {
+                            SNGifBadge().padding(8)
+                        }
+                    }
                     .contentShape(RoundedRectangle(cornerRadius: 18))
                     .onTapGesture { viewerOpen = true }
             } else {
@@ -843,6 +850,11 @@ struct SNMediaBubble: View {
                                 .foregroundColor(SonarTheme.text3)
                         } else {
                             ProgressView()
+                        }
+                    }
+                    .overlay(alignment: .topTrailing) {
+                        if item.isGif {
+                            SNGifBadge().padding(8)
                         }
                     }
                     .contentShape(RoundedRectangle(cornerRadius: 18))
@@ -1254,6 +1266,17 @@ private struct SNMacSharePicker: NSViewRepresentable {
 }
 #endif
 
+struct SNGifBadge: View {
+    var body: some View {
+        Text(verbatim: "GIF")
+            .font(SonarTheme.monoFont(size: 10, weight: .black))
+            .foregroundColor(SonarTheme.onNet)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(SonarTheme.netFill))
+    }
+}
+
 /// "Around you" card (design: screens.jsx HereCard) — collapses the geohash
 /// precision ladder (+ Mesh) into ONE row plus a tier picker. The main row enters
 /// the selected channel; the ladder ticks pick precision (live green dot when
@@ -1443,6 +1466,7 @@ struct SNComposer: View {
     var onVoice: (URL) -> Void = { _ in }
 
     @State private var text = ""
+    @State private var showEmojiTray = false
     #if os(iOS)
     @StateObject private var voice = VoiceNoteRecorder()
     @State private var recording = false
@@ -1465,6 +1489,7 @@ struct SNComposer: View {
             onSend(tx)
         }
         text = ""
+        showEmojiTray = false
     }
 
     var body: some View {
@@ -1489,6 +1514,24 @@ struct SNComposer: View {
                                 .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(SonarTheme.surface2))
                             }
                             .buttonStyle(SNScaleStyle(scale: 0.97))
+                        }
+                    }
+                    .padding(EdgeInsets(top: 8, leading: 12, bottom: 2, trailing: 12))
+                }
+            }
+            if showEmojiTray && !slash {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(snQuickEmojis, id: \.self) { emoji in
+                            Button {
+                                text += emoji
+                            } label: {
+                                Text(verbatim: emoji)
+                                    .font(.system(size: 20))
+                                    .frame(width: 38, height: 38)
+                                    .background(Circle().fill(SonarTheme.surface2))
+                            }
+                            .buttonStyle(SNScaleStyle(scale: 0.94))
                         }
                     }
                     .padding(EdgeInsets(top: 8, leading: 12, bottom: 2, trailing: 12))
@@ -1556,6 +1599,13 @@ struct SNComposer: View {
                     .foregroundColor(SonarTheme.text)
                     .submitLabel(.send)
                     .onSubmit(send)
+                Button {
+                    showEmojiTray.toggle()
+                } label: {
+                    SNIcon(name: .smile, size: 19, weight: 2)
+                        .foregroundColor(showEmojiTray ? SonarTheme.accent : SonarTheme.text3)
+                }
+                .buttonStyle(SNScaleStyle(scale: 0.94))
             }
             .padding(.vertical, 7)
             .padding(.horizontal, 14)
