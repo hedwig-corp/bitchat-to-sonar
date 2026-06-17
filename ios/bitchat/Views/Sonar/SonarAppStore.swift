@@ -1717,12 +1717,14 @@ final class SonarAppStore: ObservableObject {
     /// Send a desktop-selected attachment. White Noise can preserve the source
     /// MIME (including video); BLE mesh uses the existing safe file-packet
     /// allowlist and falls back to a generic file for unsupported types.
-    func sendAttachment(_ id: String, data: Data, filename: String, mime: String) {
+    @discardableResult
+    func sendAttachment(_ id: String, data: Data, filename: String, mime: String) -> Bool {
         if meshReachable(id) {
+            guard FileTransferLimits.isValidPayload(data.count) else { return false }
             chatViewModel.selectedPrivateChatPeer = PeerID(str: id)
             let meshMime = MimeType(mime)?.mimeString ?? "application/octet-stream"
             chatViewModel.sendFile(data: data, filename: filename, mime: meshMime)
-            return
+            return true
         }
 
         let groupId: String?
@@ -1733,7 +1735,7 @@ final class SonarAppStore: ObservableObject {
         } else {
             groupId = nil
         }
-        guard let gid = groupId else { return }
+        guard let gid = groupId else { return false }
 
         let finalName = (filename as NSString).lastPathComponent
         marmot.sendMedia(
@@ -1742,6 +1744,7 @@ final class SonarAppStore: ObservableObject {
             filename: finalName.isEmpty ? "attachment" : finalName,
             mime: mime.isEmpty ? "application/octet-stream" : mime
         )
+        return true
     }
 
     /// Send a recorded voice note (AAC .m4a at `url`). Over the BLE mesh it rides
