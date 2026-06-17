@@ -65,8 +65,7 @@ enum SonarRoute: Hashable {
     case nearby
     case settings
     case profile
-    /// Voice call route. Carries the DM peer id + kind; video is kept for route
-    /// compatibility but is not admitted until camera/video media is implemented.
+    /// Call route. Carries the DM peer id + kind.
     case call(String, video: Bool)
 }
 
@@ -94,14 +93,13 @@ struct SNPayInfo: Equatable {
 }
 
 /// A call kind (call.jsx `kind`). Drives icons + labels everywhere.
-enum SNCallKind: String, Equatable {
+enum SNCallKind: String, Equatable, Codable {
     case voice
     case video
 }
 
 /// The descriptor of a finished call, rendered as a CallLog row inside the DM
-/// transcript (call.jsx `CallLog`). MOCK-ONLY and in-memory — see
-/// `SonarAppStore.callLogs`.
+/// transcript (call.jsx `CallLog`).
 struct SNCallInfo: Equatable {
     let kind: SNCallKind
     /// The call never connected (secs == 0) ⇒ shown as a missed call (red).
@@ -116,6 +114,39 @@ struct SNCallRecord: Identifiable, Equatable {
     let id: String
     let date: Date
     let message: SNMessage
+}
+
+private struct SNStoredCallRecord: Codable {
+    let id: String
+    let date: Date
+    let time: String
+    let mine: Bool
+    let kind: SNCallKind
+    let missed: Bool
+    let dur: String?
+
+    init(_ record: SNCallRecord) {
+        id = record.id
+        date = record.date
+        time = record.message.time
+        mine = record.message.mine
+        kind = record.message.call?.kind ?? .voice
+        missed = record.message.call?.missed ?? true
+        dur = record.message.call?.dur
+    }
+
+    var record: SNCallRecord {
+        SNCallRecord(
+            id: id,
+            date: date,
+            message: SNMessage(
+                mine: mine,
+                text: "",
+                time: time,
+                call: SNCallInfo(kind: kind, missed: missed, dur: dur)
+            )
+        )
+    }
 }
 
 /// The in-flight P2P call the call screen renders. `incoming` ⇒ we are the callee
@@ -133,7 +164,7 @@ struct SNActiveCall: Equatable {
     var phase: CallStateInfo
     var connectedSecs: Int = 0
     var muted: Bool = false
-    var speakerOn: Bool = true
+    var speakerOn: Bool = false
 }
 
 struct SNMessage: Identifiable, Equatable {
@@ -247,7 +278,11 @@ final class SonarAppStore: ObservableObject {
         /// Persisted Sonar profiles ([fingerprint: SonarPeerProfile] JSON) so a
         /// peer's npub↔identity link survives restarts (one folded conversation).
         static let sonarProfiles = "sonar.peerProfiles.v1"
+        /// Persisted local call-log rows ([conversation id: call records] JSON).
+        static let callLogs = "sonar.callLogs.v1"
     }
+
+    private static let maxStoredCallsPerConversation = 100
 
     static let marmotIDPrefix = "marmot:"
     /// SNPeerItem id prefix for a Unify Wallet peer discovered over Bluetooth.
@@ -298,8 +333,9 @@ final class SonarAppStore: ObservableObject {
     @Published private(set) var walletState: SonarWalletState
     /// Radar "Send sats" quick-pay: the DM screen opens with the PaySheet up.
     private var pendingPayPeer: String?
-    /// In-memory call records, keyed by DM peer id (the same id the call route +
-    /// dmMsgs use). Nothing here is persisted or written to MessageStore/Marmot.
+    /// Local call records, keyed by DM peer id (the same id the call route +
+    /// dmMsgs use). Persisted locally so the transcript keeps completed/missed
+    /// call rows across relaunches.
     @Published private(set) var callLogs: [String: [SNCallRecord]] = [:]
 
     /// The in-flight P2P call the [SonarCallScreen] renders, or nil. Driven by the
@@ -335,7 +371,7 @@ final class SonarAppStore: ObservableObject {
     }
 
     private static func makeWallet() -> SonarWalletProviding {
-        #if os(iOS)
+        #if os(iOS) || os(macOS)
         return BridgedWallet()
         #else
         return UnconfiguredWallet()
@@ -378,6 +414,7 @@ final class SonarAppStore: ObservableObject {
         bip353 = UserDefaults.standard.string(forKey: Keys.bip353) ?? ""
         // Drop the old prototype demo blob if it is still around.
         defaults.removeObject(forKey: Keys.legacyDemoState)
+        callLogs = Self.loadCallLogs(from: defaults)
 
         // The screens read computed properties off this store; republish
         // whenever any underlying service changes.
@@ -411,7 +448,7 @@ final class SonarAppStore: ObservableObject {
                 if npub != nil { self.ensureCallStarted() }
                 // The wallet derives from the same identity (nsec); once the
                 // Marmot identity exists, (re)attempt the deferred wallet setup.
-                #if os(iOS)
+                #if os(iOS) || os(macOS)
                 if npub != nil { (self.wallet as? BridgedWallet)?.retrySetup() }
                 #endif
             }
@@ -854,6 +891,34 @@ final class SonarAppStore: ObservableObject {
               let map = try? JSONDecoder().decode([String: SonarPeerProfile].self, from: data)
         else { return }
         sonarProfilesByFingerprint = map
+    }
+
+    private static func loadCallLogs(from defaults: UserDefaults) -> [String: [SNCallRecord]] {
+        guard let data = defaults.data(forKey: Keys.callLogs),
+              let stored = try? JSONDecoder().decode([String: [SNStoredCallRecord]].self, from: data)
+        else { return [:] }
+        return stored.mapValues { records in
+            records
+                .sorted { $0.date < $1.date }
+                .suffix(maxStoredCallsPerConversation)
+                .map(\.record)
+        }
+    }
+
+    private func persistCallLogs() {
+        let stored = callLogs.mapValues { records in
+            records
+                .sorted { $0.date < $1.date }
+                .suffix(Self.maxStoredCallsPerConversation)
+                .map(SNStoredCallRecord.init)
+        }
+        guard let data = try? JSONEncoder().encode(stored) else { return }
+        defaults.set(data, forKey: Keys.callLogs)
+    }
+
+    private func clearCallLogs() {
+        callLogs = [:]
+        defaults.removeObject(forKey: Keys.callLogs)
     }
 
     /// The Sonar profile for a peer id, preferring the live 0x53 announce and
@@ -1529,9 +1594,9 @@ final class SonarAppStore: ObservableObject {
         return mergeCallLogs(into: dated, id: id)
     }
 
-    /// Fold the MOCK in-memory call records for `id` into the transcript,
-    /// chronologically (stable sort keeps same-instant messages in place). A
-    /// no-op when this peer has no recorded calls.
+    /// Fold local call records for `id` into the transcript chronologically
+    /// (stable sort keeps same-instant messages in place). A no-op when this
+    /// peer has no recorded calls.
     private func mergeCallLogs(into dated: [(Date, SNMessage)], id: String) -> [SNMessage] {
         let calls = callLogs[id] ?? []
         guard !calls.isEmpty else { return dated.map(\.1) }
@@ -1633,6 +1698,36 @@ final class SonarAppStore: ObservableObject {
         }
         guard let gid = groupId else { return }
         marmot.sendMedia(groupId: gid, data: data, filename: filename, mime: mime)
+    }
+
+    /// Send a desktop-selected attachment. White Noise can preserve the source
+    /// MIME (including video); BLE mesh uses the existing safe file-packet
+    /// allowlist and falls back to a generic file for unsupported types.
+    func sendAttachment(_ id: String, data: Data, filename: String, mime: String) {
+        if meshReachable(id) {
+            chatViewModel.selectedPrivateChatPeer = PeerID(str: id)
+            let meshMime = MimeType(mime)?.mimeString ?? "application/octet-stream"
+            chatViewModel.sendFile(data: data, filename: filename, mime: meshMime)
+            return
+        }
+
+        let groupId: String?
+        if let gid = marmotGroupId(id) {
+            groupId = gid
+        } else if let profile = resolvedSonarProfile(id) {
+            groupId = marmotGroup(forNpub: profile.npub)?.id
+        } else {
+            groupId = nil
+        }
+        guard let gid = groupId else { return }
+
+        let finalName = (filename as NSString).lastPathComponent
+        marmot.sendMedia(
+            groupId: gid,
+            data: data,
+            filename: finalName.isEmpty ? "attachment" : finalName,
+            mime: mime.isEmpty ? "application/octet-stream" : mime
+        )
     }
 
     /// Send a recorded voice note (AAC .m4a at `url`). Over the BLE mesh it rides
@@ -2138,7 +2233,7 @@ final class SonarAppStore: ObservableObject {
         "\(sec / 60):" + String(format: "%02d", sec % 60)
     }
 
-    // MARK: - Real P2P voice calls (iroh transport; ☎CALL over the chat)
+    // MARK: - Real P2P calls (iroh transport; ☎CALL over the chat)
 
     /// Bind the iroh endpoint once + start the call event loop (idempotent).
     func ensureCallStarted() {
@@ -2158,10 +2253,6 @@ final class SonarAppStore: ObservableObject {
     /// and send the ☎CALL OFFER (with our dialable address) over the chat.
     func placeCall(_ convId: String, video: Bool) {
         guard activeCall == nil else { return }
-        guard !video else {
-            SecureLogger.debug("SonarCall: video calls are disabled until media support is wired", category: .session)
-            return
-        }
         guard canCall(convId), let via = callSignalingVia(convId) else {
             SecureLogger.debug("SonarCall: refusing call without BLE or White Noise route convId=\(convId.prefix(16))", category: .session)
             return
@@ -2172,8 +2263,8 @@ final class SonarAppStore: ObservableObject {
         // setup (bind/offer) runs in the background. The endpoint is already bound
         // at boot via ensureCallStarted(), so we must NOT call callStart() again
         // here (a second bind blocks — which made the tap "take forever").
-        SonarCallAudioRoute.configure(active: true, speakerOn: true)
-        activeCall = SNActiveCall(callId: callId, convId: convId, signalingVia: via, peerName: name, video: video, incoming: false, phase: .ringing)
+        SonarCallAudioRoute.configure(active: true, speakerOn: video)
+        activeCall = SNActiveCall(callId: callId, convId: convId, signalingVia: via, peerName: name, video: video, incoming: false, phase: .ringing, speakerOn: video)
         push(.call(convId, video: video))
         let alreadyStarted = callStarted
         Task { [weak self] in
@@ -2354,7 +2445,10 @@ final class SonarAppStore: ObservableObject {
                 )
             )
         )
-        callLogs[convId, default: []].append(record)
+        var records = callLogs[convId, default: []]
+        records.append(record)
+        callLogs[convId] = Array(records.suffix(Self.maxStoredCallsPerConversation))
+        persistCallLogs()
     }
 
     /// Scan inbound mesh + Marmot messages for ☎CALL control lines (deduped) and
@@ -2434,11 +2528,6 @@ final class SonarAppStore: ObservableObject {
 
         switch ctrl {
         case let .offer(callId, video, nodeAddrB64, unixSecs):
-            guard !video else {
-                SecureLogger.debug("SonarCall: declining unsupported video OFFER convId=\(conversationId.prefix(16))", category: .session)
-                _ = sendCallControl(conversationId, callEncodeAnswer(callId: callId, answer: .decline, nodeAddrB64: ""), via: signalingVia)
-                return
-            }
             if activeCall != nil { // busy: auto-decline
                 _ = sendCallControl(conversationId, callEncodeAnswer(callId: callId, answer: .busy, nodeAddrB64: ""), via: signalingVia)
                 return
@@ -2463,7 +2552,7 @@ final class SonarAppStore: ObservableObject {
                         return
                     }
                     await MainActor.run {
-                        self.activeCall = SNActiveCall(callId: callId, convId: conversationId, signalingVia: signalingVia, peerName: name, video: video, incoming: true, phase: .ringing)
+                        self.activeCall = SNActiveCall(callId: callId, convId: conversationId, signalingVia: signalingVia, peerName: name, video: video, incoming: true, phase: .ringing, speakerOn: video)
                         self.push(.call(conversationId, video: video))
                     }
                 } catch {
@@ -2551,7 +2640,7 @@ final class SonarAppStore: ObservableObject {
         pendingMarmotSends = [:]
         scannedPayMessageIDs = []
         pendingPayPeer = nil
-        callLogs = [:]
+        clearCallLogs()
         // The node is recreated by eraseChatsKeepIdentity → reset call state so
         // the iroh endpoint rebinds (the marmot.$npub sink calls ensureCallStarted).
         resetCallState()
@@ -2599,7 +2688,7 @@ final class SonarAppStore: ObservableObject {
         pendingMarmotSends = [:]
         // Forget every ⚡PAY coin and the Lightning wallet seed (separate
         // keychain service owned by SonarWalletKit).
-        #if os(iOS)
+        #if os(iOS) || os(macOS)
         BridgedWallet.wipeWalletStorage()
         #endif
         payLedger.wipe()
@@ -2607,7 +2696,7 @@ final class SonarAppStore: ObservableObject {
         clearMediaDiskCache()
         scannedPayMessageIDs = []
         pendingPayPeer = nil
-        callLogs = [:]
+        clearCallLogs()
         resetCallState()
         bip353 = ""
         defaults.removeObject(forKey: Keys.bip353)

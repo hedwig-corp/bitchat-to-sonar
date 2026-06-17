@@ -54,7 +54,7 @@ async fn main() {
         println!(
             "  kp id={} created_at={} d={:?} relays={:?} content_len={}",
             &e.id.to_hex()[..12],
-            e.created_at.as_u64(),
+            e.created_at.as_secs(),
             d,
             relays,
             e.content.len()
@@ -95,7 +95,7 @@ async fn main() {
         "GIFT WRAPS to peer (kind-1059): {} found (welcomes/DMs, encrypted)",
         wraps.len()
     );
-    let mut ts: Vec<u64> = wraps.iter().map(|e| e.created_at.as_u64()).collect();
+    let mut ts: Vec<u64> = wraps.iter().map(|e| e.created_at.as_secs()).collect();
     ts.sort_unstable();
     println!("  gift-wrap created_at (sorted): {:?}", ts);
 }

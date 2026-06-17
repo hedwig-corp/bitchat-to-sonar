@@ -23,6 +23,7 @@ struct SonarHomeScreen: View {
     @State private var wipeAsk = false
     @State private var pendingDelete: SNDMRow?
     @State private var connSheet = false
+    @State private var searchSheet = false
     @State private var composeSheet = false
     @State private var npubEntry = false
     @State private var npubDraft = ""
@@ -76,6 +77,9 @@ struct SonarHomeScreen: View {
         }
         .snSheet(isPresented: $connSheet, title: "Connection") {
             SNConnectivitySheetContent(onClose: { connSheet = false })
+        }
+        .snSheet(isPresented: $searchSheet, title: "Search") {
+            SNSearchSheetContent(onClose: { searchSheet = false })
         }
         .snSheet(isPresented: $composeSheet, title: "Start a chat") {
             composeContent
@@ -205,7 +209,7 @@ struct SonarHomeScreen: View {
     // sn-fab: search pill + compose FAB
     private var floatingBar: some View {
         HStack(spacing: 10) {
-            Button(action: {}) {
+            Button(action: { searchSheet = true }) {
                 HStack(spacing: 9) {
                     SNIcon(name: .search, size: 17, weight: 2)
                     Text("Search")
@@ -222,6 +226,7 @@ struct SonarHomeScreen: View {
                 .overlay(Capsule().strokeBorder(SonarTheme.hairline, lineWidth: 1))
             }
             .buttonStyle(SNScaleStyle(scale: 0.98))
+            .accessibilityLabel("Search")
 
             Button(action: { composeSheet = true }) {
                 Circle()
@@ -317,6 +322,205 @@ struct SonarHomeScreen: View {
             }
         }
         .padding(EdgeInsets(top: 6, leading: 10, bottom: 2, trailing: 10))
+    }
+}
+
+/// Live search for the mobile home search pill. It only renders data from
+/// channels, conversations and nearby peers exposed by SonarAppStore.
+struct SNSearchSheetContent: View {
+    @EnvironmentObject private var store: SonarAppStore
+    let onClose: () -> Void
+
+    @State private var query = ""
+    @FocusState private var focused: Bool
+
+    private var trimmedQuery: String {
+        query.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var normalizedQuery: String {
+        trimmedQuery.lowercased()
+    }
+
+    private var canStartSecureChat: Bool {
+        trimmedQuery.hasPrefix("npub1")
+    }
+
+    private var uniqueChannels: [SNChannelItem] {
+        var seen = Set<String>()
+        return (store.channels + store.savedChannels).filter { seen.insert($0.id).inserted }
+    }
+
+    private var filteredChannels: [SNChannelItem] {
+        filter(uniqueChannels) { "\($0.name) \($0.preview) \($0.tier)" }
+            .prefix(6)
+            .map { $0 }
+    }
+
+    private var filteredDMs: [SNDMRow] {
+        filter(store.dmRows) { "\($0.title) \($0.preview)" }
+            .prefix(6)
+            .map { $0 }
+    }
+
+    private var filteredPeers: [SNPeerItem] {
+        filter(store.nearbyPeers.filter { !$0.unify }) { "\($0.name) \($0.hint) \($0.detail)" }
+            .prefix(6)
+            .map { $0 }
+    }
+
+    private var hasResults: Bool {
+        canStartSecureChat || !filteredChannels.isEmpty || !filteredDMs.isEmpty || !filteredPeers.isEmpty
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            searchField
+            ScrollView {
+                VStack(spacing: 0) {
+                    if canStartSecureChat {
+                        npubResult
+                    }
+                    if !filteredChannels.isEmpty {
+                        section("Channels")
+                        ForEach(filteredChannels) { channel in
+                            SNActionRow(
+                                icon: channel.id == "mesh" ? .mesh : .pin,
+                                label: channel.name,
+                                desc: channel.preview
+                            ) {
+                                openChannel(channel)
+                            }
+                        }
+                    }
+                    if !filteredDMs.isEmpty {
+                        section("Messages")
+                        ForEach(filteredDMs) { row in
+                            SNActionRow(
+                                icon: row.presence ? .mesh : .lock,
+                                label: row.title,
+                                desc: row.preview
+                            ) {
+                                openDM(row.id)
+                            }
+                        }
+                    }
+                    if !filteredPeers.isEmpty {
+                        section("Nearby")
+                        ForEach(filteredPeers) { peer in
+                            SNActionRow(
+                                icon: .people,
+                                label: peer.name,
+                                desc: "\(peer.hint) · \(peer.detail)"
+                            ) {
+                                openPeer(peer.id)
+                            }
+                        }
+                    }
+                    if normalizedQuery.isEmpty {
+                        section("Discover")
+                        SNActionRow(icon: .rings, label: "People nearby", desc: "Open the radar to see everyone in range") {
+                            onClose()
+                            store.push(.nearby)
+                        }
+                    } else if !hasResults {
+                        SNEmptyState(
+                            icon: .search,
+                            iconSize: 22,
+                            title: "No results",
+                            desc: "Search people, channels, messages, or paste an npub."
+                        )
+                        .padding(.vertical, 18)
+                    }
+                }
+                .padding(.bottom, 2)
+            }
+            .frame(maxHeight: 420)
+        }
+        .onAppear {
+            store.resolveSavedChannelNames()
+            DispatchQueue.main.async { focused = true }
+        }
+    }
+
+    private var searchField: some View {
+        HStack(spacing: 10) {
+            SNIcon(name: .search, size: 17, weight: 2.2)
+                .foregroundColor(SonarTheme.text3)
+            TextField(
+                "",
+                text: $query,
+                prompt: Text("Search people, channels, messages").foregroundColor(SonarTheme.text3)
+            )
+            .textFieldStyle(.plain)
+            .font(SonarTheme.uiFont(size: 16))
+            .foregroundColor(SonarTheme.text)
+            .focused($focused)
+            #if os(iOS)
+            .textInputAutocapitalization(.never)
+            .autocorrectionDisabled()
+            #endif
+            .onSubmit { chooseFirstResult() }
+        }
+        .padding(EdgeInsets(top: 12, leading: 14, bottom: 12, trailing: 14))
+        .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(SonarTheme.surface2))
+        .padding(EdgeInsets(top: 0, leading: 0, bottom: 8, trailing: 0))
+    }
+
+    private var npubResult: some View {
+        SNActionRow(
+            icon: .key,
+            label: "Start secure chat",
+            desc: "Encrypted chat over the internet"
+        ) {
+            store.startSecureChat(npub: trimmedQuery)
+            onClose()
+        }
+    }
+
+    private func section(_ title: String) -> some View {
+        Text(title.uppercased())
+            .font(SonarTheme.uiFont(size: 11.5, weight: .bold))
+            .foregroundColor(SonarTheme.text3)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(EdgeInsets(top: 10, leading: 10, bottom: 3, trailing: 10))
+    }
+
+    private func filter<T>(_ values: [T], haystack: (T) -> String) -> [T] {
+        let q = normalizedQuery
+        guard !q.isEmpty else { return values }
+        return values.filter { haystack($0).lowercased().contains(q) }
+    }
+
+    private func chooseFirstResult() {
+        if canStartSecureChat {
+            store.startSecureChat(npub: trimmedQuery)
+            onClose()
+        } else if let channel = filteredChannels.first {
+            openChannel(channel)
+        } else if let dm = filteredDMs.first {
+            openDM(dm.id)
+        } else if let peer = filteredPeers.first {
+            openPeer(peer.id)
+        } else if normalizedQuery.isEmpty {
+            onClose()
+            store.push(.nearby)
+        }
+    }
+
+    private func openChannel(_ channel: SNChannelItem) {
+        onClose()
+        store.openChannel(channel)
+    }
+
+    private func openDM(_ id: String) {
+        onClose()
+        store.openedDM(id)
+        store.push(.dm(id))
+    }
+
+    private func openPeer(_ id: String) {
+        openDM(id)
     }
 }
 

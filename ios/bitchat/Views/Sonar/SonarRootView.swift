@@ -18,6 +18,9 @@ struct SonarRootView: View {
     var body: some View {
         Group {
             if store.onboarded {
+                #if os(macOS)
+                SonarMacRootView()
+                #else
                 NavigationStack(path: $store.path) {
                     SonarHomeScreen()
                         .sonarBareScreen()
@@ -26,15 +29,17 @@ struct SonarRootView: View {
                                 .sonarBareScreen()
                         }
                 }
+                #endif
             } else {
+                #if os(macOS)
+                SonarMacRootView()
+                #else
                 SonarOnboardingScreen()
+                #endif
             }
         }
         .preferredColorScheme(store.isDarkMode ? .dark : .light)
         .tint(SonarTheme.accent)
-        #if os(macOS)
-        .frame(width: 402, height: 874)
-        #endif
     }
 
     @ViewBuilder

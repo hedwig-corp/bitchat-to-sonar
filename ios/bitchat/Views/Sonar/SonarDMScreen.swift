@@ -50,11 +50,14 @@ struct SonarDMScreen: View {
                     Text(verbatim: (verified ? "Verified · " : "") + subTransport)
                 }
             }, trailing: {
-                // Calls are Sonar-only and currently audio-only: shown when the
-                // peer advertised calls and BLE or White Noise can signal.
+                // Calls are Sonar-only: shown when the peer advertised calls and
+                // BLE or White Noise can signal.
                 if store.canCall(peerId) {
                     SNIconButton(action: { store.placeCall(peerId, video: false) }) {
                         SNIcon(name: .phone, size: 20)
+                    }
+                    SNIconButton(action: { store.placeCall(peerId, video: true) }) {
+                        SNIcon(name: .videocam, size: 21)
                     }
                 }
             })

@@ -51,8 +51,7 @@ final class UnifyReceiverService: NSObject, ObservableObject {
     @Published private(set) var isAdvertising = false
 
     /// Supplies a reusable BOLT12 offer to serve. Injected by the host so the
-    /// receiver stays decoupled from the wallet implementation (the wallet is
-    /// iOS-only behind `WalletBridgeService`; this closure bridges it). Returns
+    /// receiver stays decoupled from the wallet implementation. Returns
     /// `nil` when no offer is available yet (wallet not ready) — we then don't
     /// advertise.
     var offerProvider: (() async -> String?)?

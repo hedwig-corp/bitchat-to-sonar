@@ -356,7 +356,7 @@ final class MarmotChatModel: ObservableObject {
         syncTask = nil
     }
 
-    // MARK: - P2P voice calls (pass-throughs to the call engine in MarmotService)
+    // MARK: - P2P calls (pass-throughs to the call engine in MarmotService)
 
     func callStart() async throws { try await service.callStart() }
     func callLocalAddress() async throws -> String { try await service.callLocalAddress() }

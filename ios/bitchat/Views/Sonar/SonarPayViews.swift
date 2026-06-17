@@ -339,6 +339,17 @@ struct SNWalletSetupSheetContent: View {
     var settingUp: Bool = false
     let onClose: () -> Void
 
+    private var message: String {
+        if settingUp {
+            return "Your wallet is being set up. Sats you receive will land here, and payments you send will settle from it — try again in a moment."
+        }
+        #if os(macOS)
+        return "Payments need the wallet to finish setup on this Mac. Check the Breez API key and wait for your Sonar identity to be ready."
+        #else
+        return "Payments in Sonar need a wallet on this phone. Yours isn\u{2019}t set up yet — once it is, money you receive lands here and payments you send come from it."
+        #endif
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             RoundedRectangle(cornerRadius: 18, style: .continuous)
@@ -349,9 +360,7 @@ struct SNWalletSetupSheetContent: View {
                         .foregroundColor(SonarTheme.goldDeep)
                 )
                 .padding(.top, 8)
-            Text(settingUp
-                ? "Your wallet is being set up. Sats you receive will land here, and payments you send will settle from it — try again in a moment."
-                : "Payments in Sonar need a wallet on this phone. Yours isn\u{2019}t set up yet — once it is, money you receive lands here and payments you send come from it.")
+            Text(message)
                 .font(SonarTheme.uiFont(size: 13.5))
                 .lineSpacing(13.5 * 0.3)
                 .foregroundColor(SonarTheme.text2)

@@ -273,7 +273,7 @@ impl SonarClient {
                         };
                         let nickname = tag_value(&event, Alphabet::N).unwrap_or_default();
                         let id = event.id.to_hex();
-                        let ts = event.created_at.as_u64();
+                        let ts = event.created_at.as_secs();
                         // Count a message AUTHOR as an active participant too —
                         // iOS's GeohashParticipantTracker counts both message
                         // authors and presence broadcasters within the activity
@@ -311,7 +311,7 @@ impl SonarClient {
                         };
                         let mut map = handler_presence.lock().unwrap();
                         let bucket = map.entry(geohash).or_default();
-                        let ts = event.created_at.as_u64();
+                        let ts = event.created_at.as_secs();
                         let slot = bucket.entry(event.pubkey.to_hex()).or_insert(0);
                         if ts > *slot {
                             *slot = ts;
@@ -369,7 +369,7 @@ impl SonarClient {
                                         id,
                                         sender: unwrapped.sender,
                                         content: unwrapped.rumor.content.clone(),
-                                        ts: unwrapped.rumor.created_at.as_u64(),
+                                        ts: unwrapped.rumor.created_at.as_secs(),
                                         mine: false,
                                     });
                                 }
@@ -658,7 +658,7 @@ impl SonarClient {
         let since_secs = *self.last_sync.lock().unwrap();
         // Capture the start time as the next watermark BEFORE fetching, so any
         // event that lands mid-sync is re-covered by the overlap next poll.
-        let started = Timestamp::now().as_u64();
+        let started = Timestamp::now().as_secs();
 
         let mut wraps = Filter::new()
             .kind(Kind::GiftWrap)
@@ -926,7 +926,7 @@ impl SonarClient {
         let rumor = EventBuilder::new(Kind::Custom(14), text)
             .tags([Tag::public_key(recipient)])
             .build(keys.public_key());
-        let ts = rumor.created_at.as_u64();
+        let ts = rumor.created_at.as_secs();
         let gift = EventBuilder::gift_wrap(&keys, &recipient, rumor, []).await?;
         // Record locally first, then publish in the background so the UI shows
         // the message instantly (relays don't echo to the sender anyway).
@@ -1006,7 +1006,7 @@ impl SonarClient {
         // to appear. Relays don't echo to the sender, so the local copy is what
         // the UI renders either way.
         let id = event.id.to_hex();
-        let ts = event.created_at.as_u64();
+        let ts = event.created_at.as_secs();
         self.geo_presence
             .lock()
             .unwrap()
@@ -1055,7 +1055,7 @@ impl SonarClient {
         {
             let mut map = self.geo_presence.lock().unwrap();
             let bucket = map.entry(geohash.to_string()).or_default();
-            bucket.insert(event.pubkey.to_hex(), event.created_at.as_u64());
+            bucket.insert(event.pubkey.to_hex(), event.created_at.as_secs());
         }
         let nostr = self.nostr.clone();
         tokio::spawn(async move {
@@ -1069,7 +1069,7 @@ impl SonarClient {
     /// Subscribes on first access. Includes this device once it has announced.
     pub async fn geohash_presence_count(&self, geohash: &str) -> Result<u32> {
         self.subscribe_geohash(geohash).await?;
-        let cutoff = Timestamp::now().as_u64().saturating_sub(PRESENCE_TTL_SECS);
+        let cutoff = Timestamp::now().as_secs().saturating_sub(PRESENCE_TTL_SECS);
         let mut map = self.geo_presence.lock().unwrap();
         let count = match map.get_mut(geohash) {
             Some(bucket) => {

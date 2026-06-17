@@ -2,19 +2,28 @@
 // SonarCallScreen.swift
 // bitchat
 //
-// Voice call screen — a 1:1 reproduction of CallView in
+// Call screen — a 1:1 reproduction of CallView in
 // design/handoff/project/sonar/call.jsx + the .call* styles in theme.css.
 // The phase (ringing/connecting/connected + the seconds timer) is driven by the
-// REAL call engine via `store.activeCall` (iroh transport + Opus audio). "End"
-// is real (store.hangupCall()), and mute/speaker controls route through the
-// engine/AVAudioSession instead of being visual-only toggles.
+// REAL call engine via `store.activeCall` (iroh transport). "End" is real
+// (store.hangupCall()), and mute/speaker controls route through the
+// engine/AVAudioSession instead of being visual-only toggles. Video calls use
+// a real local camera preview for the self PiP and the core call kind; the
+// remote panel stays explicit about missing peer frames until the core exposes
+// video frame delivery to Swift.
 // The screen is always dark, matching the design's `.call` surface.
 //
 // This is free and unencumbered software released into the public domain.
 // For more information, see <https://unlicense.org>
 //
 
+import AVFoundation
 import SwiftUI
+#if os(iOS)
+import UIKit
+#elseif os(macOS)
+import AppKit
+#endif
 
 struct SonarCallScreen: View {
     @EnvironmentObject private var store: SonarAppStore
@@ -24,6 +33,7 @@ struct SonarCallScreen: View {
     let video: Bool
 
     @State private var camOn = true
+    @State private var frontCamera = true
 
     init(peerId: String, video: Bool) {
         self.peerId = peerId
@@ -108,7 +118,7 @@ struct SonarCallScreen: View {
     private var remoteFeed: some View {
         ZStack {
             if connected && camOn {
-                SNCallFeed(hue: hue, animate: !reduceMotion)
+                SNRemoteVideoUnavailableFeed(peerName: peerName, hue: hue, animate: !reduceMotion)
             } else {
                 LinearGradient(
                     colors: [Color(sonarHex: 0x11171C), Color(sonarHex: 0x06080A)],
@@ -186,7 +196,8 @@ struct SonarCallScreen: View {
 
     private var pip: some View {
         ZStack(alignment: .bottomLeading) {
-            let sh = Double(snHash(store.nick.isEmpty ? "you" : store.nick) % 360)
+            let baseHue = snHash(store.nick.isEmpty ? "you" : store.nick)
+            let sh = Double((baseHue + (frontCamera ? 0 : 42)) % 360)
             ZStack {
                 LinearGradient(
                     colors: [Color(snHue: sh, saturation: 0.32, lightness: 0.26), Color(sonarHex: 0x06080A)],
@@ -197,6 +208,7 @@ struct SonarCallScreen: View {
                     center: UnitPoint(x: 0.5, y: 0.35),
                     startRadius: 0, endRadius: 110
                 )
+                SNLocalCameraPreview(frontCamera: frontCamera)
             }
             Text(verbatim: "you")
                 .font(SonarTheme.uiFont(size: 11, weight: .semibold))
@@ -224,7 +236,16 @@ struct SonarCallScreen: View {
                 SNCallButton(icon: .phone, label: "Accept", accept: true) { store.acceptCall() }
             } else {
                 SNCallButton(icon: .micOff, label: muted ? "Muted" : "Mute", active: muted) { store.toggleCallMute() }
-                SNCallButton(icon: .speaker, label: "Speaker", active: speakerOn) { store.toggleCallSpeaker() }
+                if video {
+                    SNCallButton(icon: camOn ? .videocam : .videoOff, label: camOn ? "Stop video" : "Start video", active: !camOn) {
+                        camOn.toggle()
+                    }
+                    SNCallButton(icon: .cameraFlip, label: "Flip") {
+                        frontCamera.toggle()
+                    }
+                } else {
+                    SNCallButton(icon: .speaker, label: "Speaker", active: speakerOn) { store.toggleCallSpeaker() }
+                }
                 SNCallButton(icon: .phoneDown, label: "End", end: true) { store.hangupCall() }
             }
         }
@@ -242,6 +263,145 @@ struct SonarCallScreen: View {
         }
     }
 }
+
+// MARK: - Local camera PiP
+
+private struct SNLocalCameraPreview: View {
+    let frontCamera: Bool
+
+    var body: some View {
+        SNPlatformCameraPreview(frontCamera: frontCamera)
+            .background(Color.black.opacity(0.18))
+    }
+}
+
+#if os(iOS)
+private struct SNPlatformCameraPreview: UIViewRepresentable {
+    let frontCamera: Bool
+
+    func makeUIView(context: Context) -> CameraPreviewView {
+        let view = CameraPreviewView()
+        context.coordinator.attach(to: view)
+        context.coordinator.set(frontCamera: frontCamera)
+        return view
+    }
+
+    func updateUIView(_ uiView: CameraPreviewView, context: Context) {
+        context.coordinator.set(frontCamera: frontCamera)
+    }
+
+    static func dismantleUIView(_ uiView: CameraPreviewView, coordinator: Coordinator) {
+        coordinator.stop()
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+}
+
+private final class CameraPreviewView: UIView {
+    override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
+    var previewLayer: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        previewLayer.videoGravity = .resizeAspectFill
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+}
+#elseif os(macOS)
+private struct SNPlatformCameraPreview: NSViewRepresentable {
+    let frontCamera: Bool
+
+    func makeNSView(context: Context) -> CameraPreviewView {
+        let view = CameraPreviewView()
+        context.coordinator.attach(to: view)
+        context.coordinator.set(frontCamera: frontCamera)
+        return view
+    }
+
+    func updateNSView(_ nsView: CameraPreviewView, context: Context) {
+        context.coordinator.set(frontCamera: frontCamera)
+    }
+
+    static func dismantleNSView(_ nsView: CameraPreviewView, coordinator: Coordinator) {
+        coordinator.stop()
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+}
+
+private final class CameraPreviewView: NSView {
+    let previewLayer = AVCaptureVideoPreviewLayer()
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer = previewLayer
+        previewLayer.videoGravity = .resizeAspectFill
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+}
+#endif
+
+#if os(iOS) || os(macOS)
+private extension SNPlatformCameraPreview {
+    final class Coordinator {
+        private weak var view: CameraPreviewView?
+        private let session = AVCaptureSession()
+        private let queue = DispatchQueue(label: "chat.bitchat.sonar-call-camera", qos: .userInitiated)
+        private var currentFrontCamera: Bool?
+
+        func attach(to view: CameraPreviewView) {
+            self.view = view
+            view.previewLayer.session = session
+        }
+
+        func set(frontCamera: Bool) {
+            guard currentFrontCamera != frontCamera else { return }
+            currentFrontCamera = frontCamera
+            AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
+                guard granted else { return }
+                self?.queue.async { self?.configure(frontCamera: frontCamera) }
+            }
+        }
+
+        func stop() {
+            queue.async {
+                if self.session.isRunning { self.session.stopRunning() }
+            }
+        }
+
+        private func configure(frontCamera: Bool) {
+            session.beginConfiguration()
+            session.sessionPreset = .medium
+            for input in session.inputs {
+                session.removeInput(input)
+            }
+
+            guard let device = cameraDevice(frontCamera: frontCamera),
+                  let input = try? AVCaptureDeviceInput(device: device),
+                  session.canAddInput(input) else {
+                session.commitConfiguration()
+                return
+            }
+            session.addInput(input)
+            session.commitConfiguration()
+            if !session.isRunning { session.startRunning() }
+        }
+
+        private func cameraDevice(frontCamera: Bool) -> AVCaptureDevice? {
+            #if os(iOS)
+            let position: AVCaptureDevice.Position = frontCamera ? .front : .back
+            return AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: position)
+                ?? AVCaptureDevice.default(for: .video)
+            #else
+            return AVCaptureDevice.default(for: .video)
+            #endif
+        }
+    }
+}
+#endif
 
 // MARK: - Round control button (.call-btn)
 
@@ -316,12 +476,13 @@ private struct SNRingingAvatar: View {
     }
 }
 
-// MARK: - Drifting video feed (.call-feed → @keyframes callDrift)
+// MARK: - Remote video unavailable state
 
-/// The remote "video" placeholder: a layered hsl gradient keyed off the peer
-/// name's hue, slowly drifting (callDrift, 9s ease-in-out alternate). Drift is
-/// disabled under Reduce Motion.
-private struct SNCallFeed: View {
+/// The core currently exposes video call signaling but not peer frame delivery.
+/// Keep the video-call surface honest: show the connected call state and the
+/// real local camera PiP, but do not fake the remote camera feed.
+private struct SNRemoteVideoUnavailableFeed: View {
+    let peerName: String
     let hue: Double
     let animate: Bool
 
@@ -347,6 +508,19 @@ private struct SNCallFeed: View {
                 center: UnitPoint(x: 0.3, y: 0.8),
                 startRadius: 0, endRadius: 460
             )
+            VStack(spacing: 14) {
+                SonarAvatar(name: peerName, size: 118)
+                VStack(spacing: 4) {
+                    Text("Remote video unavailable")
+                        .font(SonarTheme.uiFont(size: 17, weight: .bold))
+                        .foregroundColor(.white)
+                    Text("Audio is connected")
+                        .font(SonarTheme.uiFont(size: 13))
+                        .foregroundColor(.white.opacity(0.72))
+                }
+            }
+            .padding(.horizontal, 24)
+            .multilineTextAlignment(.center)
         }
     }
 

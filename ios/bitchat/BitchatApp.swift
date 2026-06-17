@@ -138,8 +138,37 @@ struct BitchatApp: App {
                 #endif
         }
         #if os(macOS)
+        .defaultSize(width: 1180, height: 780)
         .windowStyle(.hiddenTitleBar)
-        .windowResizability(.contentSize)
+        .windowResizability(.automatic)
+        .commands {
+            CommandGroup(replacing: .newItem) {
+                Button("New Chat") {
+                    NotificationCenter.default.post(name: .sonarMacOpenSearch, object: nil)
+                }
+                .keyboardShortcut("n", modifiers: .command)
+            }
+            CommandGroup(after: .appSettings) {
+                Button("Sonar Settings...") {
+                    NotificationCenter.default.post(name: .sonarMacOpenSettings, object: nil)
+                }
+                .keyboardShortcut(",", modifiers: .command)
+            }
+            CommandMenu("Sonar") {
+                Button("Search") {
+                    NotificationCenter.default.post(name: .sonarMacOpenSearch, object: nil)
+                }
+                .keyboardShortcut("k", modifiers: .command)
+                Button("People Nearby") {
+                    NotificationCenter.default.post(name: .sonarMacShowRadar, object: nil)
+                }
+                .keyboardShortcut("1", modifiers: .command)
+                Button("Profile") {
+                    NotificationCenter.default.post(name: .sonarMacOpenProfile, object: nil)
+                }
+                .keyboardShortcut("2", modifiers: .command)
+            }
+        }
         #endif
     }
 

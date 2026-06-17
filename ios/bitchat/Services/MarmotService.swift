@@ -403,7 +403,7 @@ final class MarmotService: @unchecked Sendable {
         }
     }
 
-    // MARK: - P2P voice calls (iroh transport; separate from the MLS engine)
+    // MARK: - P2P calls (iroh transport; separate from the MLS engine)
 
     /// Quick call ops run here; `callWaitQueue` parks separately so a long
     /// `callWaitEvent` never blocks `callAccept`/`callHangup`. The call engine is
