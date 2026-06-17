@@ -643,13 +643,17 @@ final class BLEService: NSObject {
         if peerID.prefix == .noise { return peerID.toShort() }
         if peerID.isShort { return peerID }
         if peerID.bare.count == 64, peerID.isHex {
-            let fingerprint = peerID.bare.lowercased()
+            let stableID = peerID.bare.lowercased()
+            let stableData = Data(hexString: stableID)
             if let live = collectionsQueue.sync(execute: {
-                peers.first { $0.value.noisePublicKey?.sha256Fingerprint() == fingerprint }?.key
+                peers.first {
+                    $0.value.noisePublicKey == stableData ||
+                    $0.value.noisePublicKey?.sha256Fingerprint() == stableID
+                }?.key
             }) {
                 return live
             }
-            return PeerID(str: fingerprint.prefix(16))
+            return PeerID(str: stableID.prefix(16))
         }
         return peerID.toShort()
     }

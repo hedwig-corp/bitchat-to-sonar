@@ -813,6 +813,32 @@ final class SonarAppStore: ObservableObject {
         networkLabel(sonar: resolvedSonarProfile(id) != nil, mutualFavorite: isMutualFavorite(id))
     }
 
+    private static func npubDisplay(_ npub: String) -> String {
+        guard npub.count > 24 else { return npub }
+        return String(npub.prefix(14)) + "..." + String(npub.suffix(6))
+    }
+
+    private func peerDisplayName(_ id: String) -> String {
+        let peerID = PeerID(str: id)
+        if let live = chatViewModel.meshService.peerNickname(peerID: peerID),
+           !live.isEmpty {
+            return live
+        }
+        if let favorite = FavoritesPersistenceService.shared.getFavoriteStatus(forPeerID: peerID),
+           !favorite.peerNickname.isEmpty {
+            return favorite.peerNickname
+        }
+        if let noiseKey = peerID.noiseKey ?? Data(hexString: peerID.id),
+           let favorite = FavoritesPersistenceService.shared.getFavoriteStatus(for: noiseKey),
+           !favorite.peerNickname.isEmpty {
+            return favorite.peerNickname
+        }
+        if let profile = resolvedSonarProfile(id) {
+            return Self.npubDisplay(profile.npub)
+        }
+        return chatViewModel.nicknameForPeer(peerID)
+    }
+
     /// Protocols the chat counterpart speaks — shown ONLY on the verify
     /// sheet's "Speaks" line; everywhere else uses plain-language labels.
     func speaks(_ id: String) -> String {
@@ -926,8 +952,13 @@ final class SonarAppStore: ObservableObject {
     /// White Noise leg is still recognized when it isn't currently advertising.
     func resolvedSonarProfile(_ id: String) -> SonarPeerProfile? {
         if let live = sonarProfiles[id] { return live }
+        if let persisted = sonarProfilesByFingerprint[id] { return persisted }
         let fp = chatViewModel.getFingerprint(for: PeerID(str: id)) ?? id
-        return sonarProfilesByFingerprint[fp]
+        if let persisted = sonarProfilesByFingerprint[fp] { return persisted }
+        if let noiseKey = PeerID(str: id).noiseKey {
+            return sonarProfilesByFingerprint[noiseKey.sha256Fingerprint()]
+        }
+        return nil
     }
 
     /// The peer key (stable fingerprint) of a persisted/live Sonar peer whose
@@ -1218,21 +1249,22 @@ final class SonarAppStore: ObservableObject {
             // network line ("Sonar · reaches anywhere" etc.).
             let sonar = resolvedSonarProfile(peer.peerID.id) != nil
             let network = networkLabel(sonar: sonar, mutualFavorite: peer.isMutualFavorite)
+            let displayName = peerDisplayName(peer.peerID.id)
             if peer.isConnected {
                 items.append(SNPeerItem(
-                    id: peer.peerID.id, name: peer.displayName, inRange: true, bars: 3,
+                    id: peer.peerID.id, name: displayName, inRange: true, bars: 3,
                     hint: "Right here", detail: "Direct connection · " + network,
                     angle: angle, r: 66 + jitter, sonar: sonar
                 ))
-            } else if peer.isReachable {
+            } else if peer.isReachable && !sonar {
                 items.append(SNPeerItem(
-                    id: peer.peerID.id, name: peer.displayName, inRange: true, bars: 2,
+                    id: peer.peerID.id, name: displayName, inRange: true, bars: 2,
                     hint: "Nearby", detail: "Relayed through the mesh · " + network,
                     angle: angle, r: 118 + jitter, sonar: sonar
                 ))
-            } else if peer.isMutualFavorite {
+            } else if peer.isMutualFavorite || sonar {
                 items.append(SNPeerItem(
-                    id: peer.peerID.id, name: peer.displayName, inRange: false, bars: 0,
+                    id: peer.peerID.id, name: displayName, inRange: false, bars: 0,
                     hint: "Out of range", detail: network,
                     angle: angle, r: 162 + jitter, sonar: sonar
                 ))
@@ -1302,7 +1334,7 @@ final class SonarAppStore: ObservableObject {
         let peerID = PeerID(str: id)
         return SNPeerItem(
             id: id,
-            name: chatViewModel.nicknameForPeer(peerID),
+            name: peerDisplayName(id),
             inRange: false, bars: 0,
             hint: "Out of range", detail: networkLabel(forPeer: id),
             angle: 0, r: 0, sonar: resolvedSonarProfile(id) != nil
@@ -1444,15 +1476,13 @@ final class SonarAppStore: ObservableObject {
                 // Sonar peer now out of range → one folded row, not a White Noise
                 // duplicate.
                 let rowId = liveSonarPeerId ?? foldKey
-                let peerID = PeerID(str: rowId)
-                let mesh = chatViewModel.meshService
                 byKey[foldKey] = SNDMRow(
                     id: rowId,
-                    title: liveSonarPeerId == nil ? marmot.title(for: group) : chatViewModel.nicknameForPeer(peerID),
+                    title: liveSonarPeerId == nil ? marmot.title(for: group) : peerDisplayName(rowId),
                     preview: last.map { Self.previewText($0.content) } ?? networkLabel(forPeer: rowId),
                     time: last.map { Self.listTime($0.createdAt) } ?? "",
                     unread: false,
-                    presence: liveSonarPeerId != nil && (mesh.isPeerConnected(peerID) || mesh.isPeerReachable(peerID)),
+                    presence: liveSonarPeerId != nil && meshReachable(rowId),
                     verified: isVerified(rowId) || (marmotVerified[group.id] ?? false),
                     isMarmot: false,
                     lastDate: last?.createdAt
@@ -1480,14 +1510,13 @@ final class SonarAppStore: ObservableObject {
     }
 
     private func meshRow(peerID: PeerID, last: BitchatMessage?) -> SNDMRow {
-        let mesh = chatViewModel.meshService
         return SNDMRow(
             id: peerID.id,
-            title: chatViewModel.nicknameForPeer(peerID),
+            title: peerDisplayName(peerID.id),
             preview: last.map { Self.previewText($0.content) } ?? networkLabel(forPeer: peerID.id),
             time: last.map { Self.listTime($0.timestamp) } ?? "",
             unread: chatViewModel.unreadPrivateMessages.contains(peerID),
-            presence: mesh.isPeerConnected(peerID) || mesh.isPeerReachable(peerID),
+            presence: meshReachable(peerID.id),
             verified: isVerified(peerID.id),
             isMarmot: false,
             lastDate: last?.timestamp
@@ -1595,7 +1624,7 @@ final class SonarAppStore: ObservableObject {
                     return (m.createdAt, SNMessage(
                         id: m.id,
                         mine: m.isMine,
-                        author: m.isMine ? nil : chatViewModel.nicknameForPeer(peerID),
+                        author: m.isMine ? nil : peerDisplayName(id),
                         text: m.content,
                         time: Self.clock(m.createdAt),
                         via: .internet,
@@ -1620,14 +1649,12 @@ final class SonarAppStore: ObservableObject {
         return combined.map(\.1)
     }
 
-    /// DM routing mirrors MessageRouter: Bluetooth when the peer is reachable
-    /// over the mesh, otherwise NIP-17 over Nostr (internet).
+    /// DM routing uses Bluetooth only while a Sonar peer is directly connected;
+    /// retained mesh reachability means the direct BLE leg already dropped, so
+    /// the conversation continues over White Noise.
     func dmTransport(_ id: String) -> SNVia {
         if marmotGroupId(id) != nil { return .internet }
-        let peerID = PeerID(str: id)
-        if peerID.isGeoDM { return .internet }
-        let mesh = chatViewModel.meshService
-        return (mesh.isPeerConnected(peerID) || mesh.isPeerReachable(peerID)) ? .mesh : .internet
+        return meshReachable(id) ? .mesh : .internet
     }
 
     func sendDm(_ id: String, _ text: String) {
@@ -1686,11 +1713,16 @@ final class SonarAppStore: ObservableObject {
     }
 
     /// True for a non-geo private peer reachable over the BLE mesh right now.
+    /// Sonar peers require a direct connection; retained mesh reachability is
+    /// still useful for plain bitchat relay but should not hold Sonar on BLE.
     private func meshReachable(_ id: String) -> Bool {
         guard marmotGroupId(id) == nil else { return false }
         let peerID = PeerID(str: id)
         guard !peerID.isGeoDM else { return false }
         let mesh = chatViewModel.meshService
+        if resolvedSonarProfile(id) != nil {
+            return mesh.isPeerConnected(peerID)
+        }
         return mesh.isPeerConnected(peerID) || mesh.isPeerReachable(peerID)
     }
 

@@ -25,7 +25,7 @@ extension ChatViewModel {
         
         // Check if blocked
         if unifiedPeerService.isBlocked(peerID) {
-            let nickname = meshService.peerNickname(peerID: peerID) ?? "user"
+            let nickname = nicknameForPeer(peerID)
             addSystemMessage(
                 String(
                     format: String(localized: "system.dm.blocked_recipient", comment: "System message when attempting to message a blocked user"),
@@ -43,19 +43,23 @@ extension ChatViewModel {
         }
         
         // Determine routing method and recipient nickname
-        guard let noiseKey = Data(hexString: peerID.id) else { return }
+        guard let peerKeyData = peerID.noiseKey ?? Data(hexString: peerID.id) else { return }
         let isConnected = meshService.isPeerConnected(peerID)
         let isReachable = meshService.isPeerReachable(peerID)
-        let favoriteStatus = FavoritesPersistenceService.shared.getFavoriteStatus(for: noiseKey)
+        let favoriteStatus = FavoritesPersistenceService.shared.getFavoriteStatus(for: peerKeyData)
+            ?? FavoritesPersistenceService.shared.getFavoriteStatus(forPeerID: peerID)
         let isMutualFavorite = favoriteStatus?.isMutual ?? false
         let hasNostrKey = favoriteStatus?.peerNostrPublicKey != nil
         
         // Get nickname from various sources
-        var recipientNickname = meshService.peerNickname(peerID: peerID)
-        if recipientNickname == nil && favoriteStatus != nil {
-            recipientNickname = favoriteStatus?.peerNickname
+        let recipientNickname: String
+        if let meshNickname = meshService.peerNickname(peerID: peerID), !meshNickname.isEmpty {
+            recipientNickname = meshNickname
+        } else if let favoriteNickname = favoriteStatus?.peerNickname, !favoriteNickname.isEmpty {
+            recipientNickname = favoriteNickname
+        } else {
+            recipientNickname = nicknameForPeer(peerID)
         }
-        recipientNickname = recipientNickname ?? "user"
         
         // Generate message ID
         let messageID = UUID().uuidString
@@ -86,7 +90,7 @@ extension ChatViewModel {
         
         // Send via appropriate transport (BLE if connected/reachable, else Nostr when possible)
         if isConnected || isReachable || (isMutualFavorite && hasNostrKey) {
-            messageRouter.sendPrivate(content, to: peerID, recipientNickname: recipientNickname ?? "user", messageID: messageID)
+            messageRouter.sendPrivate(content, to: peerID, recipientNickname: recipientNickname, messageID: messageID)
             // Optimistically mark as sent for both transports; delivery/read will update subsequently
             if let idx = privateChats[peerID]?.firstIndex(where: { $0.id == messageID }) {
                 privateChats[peerID]?[idx].deliveryStatus = .sent
@@ -98,12 +102,11 @@ extension ChatViewModel {
                     reason: String(localized: "content.delivery.reason.unreachable", comment: "Failure reason when a peer is unreachable")
                 )
             }
-            let name = recipientNickname ?? "user"
             addSystemMessage(
                 String(
                     format: String(localized: "system.dm.unreachable", comment: "System message when a recipient is unreachable"),
                     locale: .current,
-                    name
+                    recipientNickname
                 )
             )
         }
