@@ -13,6 +13,7 @@ pub mod marmot;
 pub mod mesh;
 pub mod noise;
 pub mod relay_directory;
+pub mod sonar_descriptor;
 
 pub use error::Error;
 

@@ -159,6 +159,20 @@ pub struct ProfileInfo {
     pub nip05: Option<String>,
 }
 
+/// FFI-friendly Sonar app descriptor published as a NIP-78-style kind-30078
+/// event. This is public capability metadata only; live call addresses are
+/// exchanged inside encrypted ☎CALL signaling.
+#[derive(uniffi::Record)]
+pub struct SonarDescriptorInfo {
+    pub schema: u32,
+    pub calls: bool,
+    pub media: Vec<String>,
+    pub signaling: Vec<String>,
+    pub transports: Vec<String>,
+    pub call_identity: String,
+    pub published_at_secs: u64,
+}
+
 /// FFI-friendly geohash channel message (public, plaintext).
 #[derive(uniffi::Record)]
 pub struct GeoMessageInfo {
@@ -263,6 +277,38 @@ impl SonarNode {
             about: p.about,
             picture: p.picture,
             nip05: p.nip05,
+        }))
+    }
+
+    /// Publish this identity's public Sonar descriptor. `signaling` should list
+    /// only routes this app build can actually use, in preference order.
+    pub fn publish_sonar_descriptor(
+        &self,
+        calls_enabled: bool,
+        signaling: Vec<String>,
+    ) -> FfiResult<()> {
+        self.runtime.block_on(
+            self.client
+                .publish_sonar_descriptor(calls_enabled, signaling),
+        )?;
+        Ok(())
+    }
+
+    /// Fetch a peer's Sonar descriptor (npub or hex pubkey). `None` means the
+    /// peer is not confirmed Sonar-capable through this relay set.
+    pub fn fetch_sonar_descriptor(&self, npub: String) -> FfiResult<Option<SonarDescriptorInfo>> {
+        let pubkey = PublicKey::parse(&npub).map_err(invalid("descriptor pubkey"))?;
+        let descriptor = self
+            .runtime
+            .block_on(self.client.fetch_sonar_descriptor(pubkey))?;
+        Ok(descriptor.map(|d| SonarDescriptorInfo {
+            schema: d.schema as u32,
+            calls: d.calls,
+            media: d.media,
+            signaling: d.signaling,
+            transports: d.transports,
+            call_identity: d.call_identity,
+            published_at_secs: d.published_at_secs,
         }))
     }
 

@@ -27,6 +27,9 @@ pub enum Error {
     #[error("nip44 encryption error: {0}")]
     Nip44(#[from] nostr::nips::nip44::Error),
 
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
+
     #[error("nostr client error: {0}")]
     NostrClient(#[from] nostr_sdk::client::Error),
 

@@ -32,6 +32,9 @@ pub const CHAT_RUMOR_KIND: u16 = 9;
 /// for the modern addressable kind (Kind::MlsKeyPackage is the legacy 443).
 pub const KEY_PACKAGE_KIND: u16 = 30443;
 
+/// Sidecar file suffix for Sonar's relay-sync cursor beside the MDK database.
+pub(crate) const SYNC_STATE_FILE_SUFFIX: &str = ".sonar-sync.json";
+
 /// Result of creating a group: the group plus the welcome rumors that must be
 /// gift-wrapped and delivered to each invited member.
 pub struct GroupCreation {
@@ -94,8 +97,11 @@ pub enum Incoming {
     Message(ChatMessage),
     /// A group-membership/welcome change was applied; no chat content.
     GroupUpdated(GroupId),
+    /// MDK saw the event but could not apply it yet or marked a prior attempt
+    /// failed. The relay sync layer must not advance past this event.
+    Retryable,
     /// The event was valid but produced nothing actionable (duplicates,
-    /// proposals pending, unprocessable epochs, ...).
+    /// ignored proposals, non-Marmot gift wraps, ...).
     None,
 }
 
@@ -427,6 +433,8 @@ impl MarmotEngine {
                         );
                         Ok(Incoming::GroupUpdated(update.mls_group_id))
                     }
+                    MessageProcessingResult::Unprocessable { .. }
+                    | MessageProcessingResult::PreviouslyFailed => Ok(Incoming::Retryable),
                     _ => Ok(Incoming::None),
                 }
             }
@@ -537,8 +545,12 @@ fn sidecar_paths(base: &Path) -> Vec<std::path::PathBuf> {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or_default();
-    ["", "-wal", "-shm", "-journal"]
+    let mut paths: Vec<std::path::PathBuf> = ["", "-wal", "-shm", "-journal"]
         .iter()
         .map(|suffix| base.with_file_name(format!("{name}{suffix}")))
-        .collect()
+        .collect();
+    if !name.is_empty() {
+        paths.push(base.with_file_name(format!("{name}{SYNC_STATE_FILE_SUFFIX}")));
+    }
+    paths
 }
