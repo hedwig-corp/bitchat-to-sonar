@@ -7,6 +7,7 @@ const val SONAR_STICKER_MESSAGE_MARKER = "[sonar-sticker-v1]"
 const val SONAR_STICKER_PACK_FORMAT = "sonar-sticker-pack-v1"
 const val SONAR_STICKER_PACK_KIND = 30030
 const val SONAR_USER_STICKER_PACKS_KIND = 10030
+const val SONAR_MAX_RECENT_STICKERS = 24
 
 object SonarStickers {
     fun buildChatMessage(stickerRef: SonarStickerRef): String? {
@@ -177,14 +178,28 @@ data class SonarStickerResolution(
     val sticker: SonarSticker? = null,
 )
 
+data class SonarStickerChoice(
+    val pack: SonarStickerPack,
+    val sticker: SonarSticker,
+)
+
 class SonarStickerStore {
     private val packsByCoordinate = mutableMapOf<String, SonarStickerPack>()
+    private val recentRefs = mutableListOf<SonarStickerRef>()
 
     val installedPacks: List<SonarStickerPack>
         get() = packsByCoordinate.values.sortedBy { it.title.lowercase() }
 
     val hasInstalledPacks: Boolean
         get() = packsByCoordinate.isNotEmpty()
+
+    val recentStickers: List<SonarStickerChoice>
+        get() = recentRefs.mapNotNull { ref ->
+            val pack = packsByCoordinate[ref.pack.coordinate] ?: return@mapNotNull null
+            val sticker = pack.sticker(ref.shortcode) ?: return@mapNotNull null
+            if (sticker.sha256 != ref.plaintextSha256) return@mapNotNull null
+            SonarStickerChoice(pack, sticker)
+        }
 
     fun install(pack: SonarStickerPack): Boolean {
         val clean = pack.normalizedOrNull() ?: return false
@@ -193,7 +208,10 @@ class SonarStickerStore {
     }
 
     fun remove(address: SonarStickerPackAddress) {
-        address.normalizedOrNull()?.let { packsByCoordinate.remove(it.coordinate) }
+        address.normalizedOrNull()?.let {
+            packsByCoordinate.remove(it.coordinate)
+            recentRefs.removeAll { ref -> ref.pack.coordinate == it.coordinate }
+        }
     }
 
     fun resolve(stickerRef: SonarStickerRef): SonarStickerResolution {
@@ -217,6 +235,16 @@ class SonarStickerStore {
             shortcode = sticker.shortcode,
             plaintextSha256 = sticker.sha256,
         ).normalizedOrNull()
+    }
+
+    fun recordRecent(pack: SonarStickerPack, sticker: SonarSticker): Boolean {
+        val ref = refFor(sticker, pack) ?: return false
+        recentRefs.removeAll { it == ref }
+        recentRefs.add(0, ref)
+        while (recentRefs.size > SONAR_MAX_RECENT_STICKERS) {
+            recentRefs.removeAt(recentRefs.lastIndex)
+        }
+        return true
     }
 }
 

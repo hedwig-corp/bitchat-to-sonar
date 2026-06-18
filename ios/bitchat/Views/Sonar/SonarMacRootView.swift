@@ -551,7 +551,10 @@ private struct MacConversationPane: View {
             removePeopleContent
         }
         .snSheet(isPresented: $stickerSheet, title: "Stickers") {
-            SNStickerPickerContent(packs: store.stickerStore.installedPacks) { pack, sticker in
+            SNStickerPickerContent(
+                packs: store.stickerStore.installedPacks,
+                recent: store.stickerStore.recentStickers
+            ) { pack, sticker in
                 stickerSheet = false
                 store.sendSticker(id, pack: pack, sticker: sticker)
             }

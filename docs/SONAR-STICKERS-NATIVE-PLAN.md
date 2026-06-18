@@ -51,12 +51,13 @@ This branch now covers the safe foundation for both native app surfaces:
 - feature-gated received-sticker rendering with verified HTTPS asset fetch;
 - feature-gated picker and send flow for already installed packs on existing
   White Noise/Marmot conversations.
+- bounded in-memory recent-sticker state shown in the native pickers.
 
 The feature must remain disabled until the remaining production gaps are closed:
 
 - pack install/import UI and fetch orchestration from `/stickers` links or
   Nostr pack events;
-- recent-sticker state;
+- persistent recent-sticker state across app relaunches;
 - full native target builds and end-to-end install/pick/send/render tests.
 
 ## Patch Sequence

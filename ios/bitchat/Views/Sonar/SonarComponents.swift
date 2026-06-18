@@ -866,6 +866,7 @@ struct SNStickerBubble: View {
 
 struct SNStickerPickerContent: View {
     let packs: [SonarStickerPack]
+    let recent: [SonarStickerChoice]
     let onPick: (SonarStickerPack, SonarSticker) -> Void
 
     var body: some View {
@@ -878,6 +879,21 @@ struct SNStickerPickerContent: View {
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 14)
                 } else {
+                    if !recent.isEmpty {
+                        Text("Recent")
+                            .font(SonarTheme.uiFont(size: 12, weight: .bold))
+                            .foregroundColor(SonarTheme.text3)
+                            .padding(EdgeInsets(top: 10, leading: 10, bottom: 4, trailing: 10))
+                        ForEach(recent, id: \.id) { choice in
+                            SNActionRow(
+                                icon: .smile,
+                                label: choice.sticker.alt ?? choice.sticker.shortcode,
+                                desc: choice.sticker.emoji ?? choice.pack.title
+                            ) {
+                                onPick(choice.pack, choice.sticker)
+                            }
+                        }
+                    }
                     ForEach(packs, id: \.address.coordinate) { pack in
                         Text(verbatim: pack.title)
                             .font(SonarTheme.uiFont(size: 12, weight: .bold))

@@ -909,6 +909,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     )
     if (stickerSheet) StickerPickerSheet(
         packs = state.stickerStore.installedPacks,
+        recent = state.stickerStore.recentStickers,
         onPick = { pack, sticker ->
             stickerSheet = false
             state.sendSticker(screen.id, pack, sticker)
@@ -999,6 +1000,7 @@ private fun AddToMessageSheet(
 @Composable
 private fun StickerPickerSheet(
     packs: List<SonarStickerPack>,
+    recent: List<SonarStickerChoice>,
     onPick: (SonarStickerPack, SonarSticker) -> Unit,
     onClose: () -> Unit,
 ) {
@@ -1015,6 +1017,22 @@ private fun StickerPickerSheet(
             ) {
                 Text("Stickers", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(8.dp))
+                if (recent.isNotEmpty()) {
+                    Text(
+                        "Recent",
+                        color = s.text3,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(start = 4.dp, top = 10.dp, bottom = 4.dp),
+                    )
+                    recent.forEach { choice ->
+                        ActionRow(
+                            SNIconName.Smile,
+                            choice.sticker.alt ?: choice.sticker.shortcode,
+                            choice.sticker.emoji ?: choice.pack.title,
+                        ) { onPick(choice.pack, choice.sticker) }
+                    }
+                }
                 packs.forEach { pack ->
                     Text(
                         pack.title,

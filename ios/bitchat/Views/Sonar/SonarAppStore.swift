@@ -1966,6 +1966,7 @@ final class SonarAppStore: ObservableObject {
         guard let stickerRef = stickerStore.ref(for: sticker, in: pack) else { return }
         guard let groupId = stickerMarmotGroupId(id) else { return }
         marmot.send(SonarStickers.buildChatMessage(stickerRef), to: groupId)
+        stickerStore.recordRecent(pack: pack, sticker: sticker)
     }
 
     func stickerData(_ sticker: SonarSticker) async -> Data? {

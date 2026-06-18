@@ -135,6 +135,34 @@ class StickersTest {
     }
 
     @Test
+    fun recentsTrackOnlyInstalledStickersAndStayBounded() {
+        val store = SonarStickerStore()
+        val pack = fixturePackWithManyStickers(SONAR_MAX_RECENT_STICKERS + 2)
+        val first = assertNotNull(pack.sticker("s_0"))
+
+        assertFalse(store.recordRecent(pack, first))
+        assertTrue(store.install(pack))
+
+        pack.stickers.forEach { sticker ->
+            assertTrue(store.recordRecent(pack, sticker))
+        }
+
+        assertEquals(SONAR_MAX_RECENT_STICKERS, store.recentStickers.size)
+        assertEquals("s_${pack.stickers.lastIndex}", store.recentStickers.first().sticker.shortcode)
+        assertNull(store.recentStickers.firstOrNull { it.sticker.shortcode == "s_0" })
+
+        assertTrue(store.recordRecent(pack, first))
+
+        assertEquals(SONAR_MAX_RECENT_STICKERS, store.recentStickers.size)
+        assertEquals("s_0", store.recentStickers.first().sticker.shortcode)
+        assertFalse(store.recordRecent(pack, first.copy(alt = "edited locally")))
+
+        store.remove(pack.address)
+
+        assertEquals(emptyList(), store.recentStickers)
+    }
+
+    @Test
     fun byteCacheStoresOnlyHashVerifiedBoundedStickerBytes() {
         val abcHash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         val sticker = fixtureSticker("abc", abcHash)
@@ -208,6 +236,18 @@ class StickersTest {
                 cover = fixtureSticker("cat_wave", hashA),
                 stickers = listOf(fixtureSticker("cat_wave", hashA), fixtureSticker("cat_cry", hashB)),
                 license = "CC-BY-4.0",
+            ).normalizedOrNull()
+        )
+
+    private fun fixturePackWithManyStickers(count: Int): SonarStickerPack =
+        assertNotNull(
+            SonarStickerPack(
+                address = fixtureAddress(),
+                title = "Many Stickers",
+                stickers = (0 until count).map { i ->
+                    val hash = i.toString(16).padStart(64, '0')
+                    fixtureSticker("s_$i", hash)
+                },
             ).normalizedOrNull()
         )
 

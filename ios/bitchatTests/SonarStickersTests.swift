@@ -146,6 +146,43 @@ struct SonarStickersTests {
         #expect(store.ref(for: editedSticker, in: pack) == nil)
     }
 
+    @Test func recentsTrackOnlyInstalledStickersAndStayBounded() throws {
+        let store = SonarStickerStore()
+        let pack = try #require(fixturePackWithManyStickers(count: SonarStickers.maxRecentStickers + 2))
+        let first = try #require(pack.sticker(shortcode: "s_0"))
+
+        #expect(store.recordRecent(pack: pack, sticker: first) == false)
+        store.install(pack)
+
+        for sticker in pack.stickers {
+            #expect(store.recordRecent(pack: pack, sticker: sticker))
+        }
+
+        #expect(store.recentStickers.count == SonarStickers.maxRecentStickers)
+        #expect(store.recentStickers.first?.sticker.shortcode == "s_\(pack.stickers.count - 1)")
+        #expect(store.recentStickers.contains { $0.sticker.shortcode == "s_0" } == false)
+
+        #expect(store.recordRecent(pack: pack, sticker: first))
+
+        #expect(store.recentStickers.count == SonarStickers.maxRecentStickers)
+        #expect(store.recentStickers.first?.sticker.shortcode == "s_0")
+        let editedSticker = try #require(SonarSticker(
+            shortcode: first.shortcode,
+            url: first.url,
+            sha256: first.sha256,
+            mime: first.mime,
+            width: first.width,
+            height: first.height,
+            alt: "edited locally",
+            emoji: first.emoji
+        ))
+        #expect(store.recordRecent(pack: pack, sticker: editedSticker) == false)
+
+        store.remove(pack.address)
+
+        #expect(store.recentStickers == [])
+    }
+
     @Test func assetCacheStoresOnlyHashVerifiedBoundedStickerBytes() throws {
         let abcHash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         let sticker = try #require(fixtureSticker("abc", hash: abcHash))
@@ -238,6 +275,21 @@ struct SonarStickersTests {
             cover: stickerA,
             stickers: [stickerA, stickerB],
             license: "CC-BY-4.0"
+        )
+    }
+
+    private func fixturePackWithManyStickers(count: Int) -> SonarStickerPack? {
+        guard let address = fixtureAddress() else { return nil }
+        let stickers = (0..<count).compactMap { i -> SonarSticker? in
+            let hex = String(i, radix: 16)
+            let hash = String(repeating: "0", count: 64 - hex.count) + hex
+            return fixtureSticker("s_\(i)", hash: hash)
+        }
+        guard stickers.count == count else { return nil }
+        return SonarStickerPack(
+            address: address,
+            title: "Many Stickers",
+            stickers: stickers
         )
     }
 

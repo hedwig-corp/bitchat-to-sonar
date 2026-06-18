@@ -19,6 +19,7 @@ enum SonarStickers {
     static let packFormat = "sonar-sticker-pack-v1"
     static let stickerPackKind = 30030
     static let userStickerPacksKind = 10030
+    static let maxRecentStickers = 24
 
     static func isEnabled(defaults: UserDefaults = .standard) -> Bool {
         guard defaults.object(forKey: featureFlagKey) != nil else { return enabledByDefault }
@@ -286,8 +287,18 @@ enum SonarStickerResolution: Equatable {
     case hashMismatch
 }
 
+struct SonarStickerChoice: Equatable {
+    let pack: SonarStickerPack
+    let sticker: SonarSticker
+
+    var id: String {
+        "\(pack.address.coordinate)|\(sticker.shortcode)|\(sticker.sha256)"
+    }
+}
+
 final class SonarStickerStore {
     private var packsByCoordinate: [String: SonarStickerPack] = [:]
+    private var recentRefs: [SonarStickerRef] = []
 
     var installedPacks: [SonarStickerPack] {
         packsByCoordinate.values.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
@@ -297,12 +308,23 @@ final class SonarStickerStore {
         !packsByCoordinate.isEmpty
     }
 
+    var recentStickers: [SonarStickerChoice] {
+        recentRefs.compactMap { ref in
+            guard let pack = packsByCoordinate[ref.pack.coordinate],
+                  let sticker = pack.sticker(shortcode: ref.shortcode),
+                  sticker.sha256 == ref.plaintextSha256
+            else { return nil }
+            return SonarStickerChoice(pack: pack, sticker: sticker)
+        }
+    }
+
     func install(_ pack: SonarStickerPack) {
         packsByCoordinate[pack.address.coordinate] = pack
     }
 
     func remove(_ address: SonarStickerPackAddress) {
         packsByCoordinate.removeValue(forKey: address.coordinate)
+        recentRefs.removeAll { $0.pack.coordinate == address.coordinate }
     }
 
     func resolve(_ stickerRef: SonarStickerRef) -> SonarStickerResolution {
@@ -321,6 +343,17 @@ final class SonarStickerStore {
             shortcode: sticker.shortcode,
             plaintextSha256: sticker.sha256
         )
+    }
+
+    @discardableResult
+    func recordRecent(pack: SonarStickerPack, sticker: SonarSticker) -> Bool {
+        guard let ref = ref(for: sticker, in: pack) else { return false }
+        recentRefs.removeAll { $0 == ref }
+        recentRefs.insert(ref, at: 0)
+        if recentRefs.count > SonarStickers.maxRecentStickers {
+            recentRefs.removeLast(recentRefs.count - SonarStickers.maxRecentStickers)
+        }
+        return true
     }
 }
 

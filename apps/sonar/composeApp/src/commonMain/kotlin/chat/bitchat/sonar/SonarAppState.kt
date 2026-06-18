@@ -1481,6 +1481,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         scope.launch {
             try {
                 SonarCore.send(groupId, message)
+                stickerStore.recordRecent(pack, sticker)
                 refreshOpenStickerChat(chatId, groupId)
             } catch (e: Throwable) {
                 toast = "couldn't send sticker: ${e.message}"
