@@ -6,6 +6,9 @@ package chat.bitchat.sonar
  * log to stamp a "HH:MM" time on each record, mirroring the design's `bcNow()`.
  */
 expect object SonarClock {
+    /** Current epoch milliseconds. */
+    fun nowMillis(): Long
+
     /** Current epoch seconds. */
     fun nowSecs(): Long
 

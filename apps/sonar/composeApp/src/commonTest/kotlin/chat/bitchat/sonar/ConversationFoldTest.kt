@@ -37,4 +37,126 @@ class ConversationFoldTest {
 
         assertNull(peer)
     }
+
+    @Test
+    fun freshPeerWithoutProfileWaitsForCapabilitySettleWindow() {
+        assertEquals(
+            true,
+            shouldWaitForCapabilities(
+                firstSeenMs = 1_000,
+                nowMs = 2_000,
+                hasProfile = false,
+                hasMessages = false,
+            ),
+        )
+    }
+
+    @Test
+    fun settledPeerWithoutProfileDoesNotWait() {
+        assertEquals(
+            false,
+            shouldWaitForCapabilities(
+                firstSeenMs = 1_000,
+                nowMs = 3_000,
+                hasProfile = false,
+                hasMessages = false,
+            ),
+        )
+    }
+
+    @Test
+    fun profileOrMessagesBypassCapabilityWait() {
+        assertEquals(
+            false,
+            shouldWaitForCapabilities(
+                firstSeenMs = 1_000,
+                nowMs = 2_000,
+                hasProfile = true,
+                hasMessages = false,
+            ),
+        )
+        assertEquals(
+            false,
+            shouldWaitForCapabilities(
+                firstSeenMs = 1_000,
+                nowMs = 2_000,
+                hasProfile = false,
+                hasMessages = true,
+            ),
+        )
+    }
+
+    @Test
+    fun profileCacheRoundTripsDisplayName() {
+        val encoded = encodeProfileCache(
+            mapOf(
+                "npub1vincent" to SonarProfile(
+                    name = "vincent",
+                    displayName = "Vincent",
+                    about = "hello\nthere",
+                    picture = null,
+                    nip05 = null,
+                ),
+            ),
+        )
+
+        val decoded = decodeProfileCache(encoded)
+
+        assertEquals("Vincent", decoded["npub1vincent"]?.bestName)
+        assertEquals("hello\nthere", decoded["npub1vincent"]?.about)
+        assertNull(decoded["npub1vincent"]?.picture)
+    }
+
+    @Test
+    fun profileCacheCanonicalizesHexPubkeyToNpub() {
+        val raw = ByteArray(32) { it.toByte() }
+        val hex = raw.joinToString("") { (it.toInt() and 0xFF).toString(16).padStart(2, '0') }
+        val npub = chat.bitchat.sonar.crypto.Bech32.encode("npub", raw)!!
+        val encoded = encodeProfileCache(
+            mapOf(
+                hex to SonarProfile(
+                    name = null,
+                    displayName = "Sara D",
+                    about = null,
+                    picture = null,
+                    nip05 = null,
+                ),
+            ),
+        )
+
+        val decoded = decodeProfileCache(encoded)
+
+        assertEquals("Sara D", decoded[npub]?.bestName)
+        assertNull(decoded[hex])
+        assertEquals(npub, canonicalProfileKey(hex))
+    }
+
+    @Test
+    fun malformedProfileCacheRowsAreIgnored() {
+        val decoded = decodeProfileCache("not-a-valid-row\n")
+
+        assertEquals(emptyMap(), decoded)
+    }
+
+    @Test
+    fun chatSnapshotKeepsRowsWithoutPersistingMessages() {
+        val chat = SonarChat("group-1", "", listOf("npub1sara", "npub1me"))
+        val messages = listOf(
+            SonarMsg(
+                id = "msg-1",
+                senderNpub = "npub1sara",
+                content = "hello",
+                mine = false,
+                tsSecs = 42,
+                viaInternet = true,
+                media = listOf(SonarMedia("pending-url", "image/png", "photo.png", 640, 480, null)),
+                state = null,
+            ),
+        )
+
+        val decoded = decodeChatSnapshot(encodeChatSnapshot(listOf(chat), mapOf(chat.id to messages)))
+
+        assertEquals(listOf(chat), decoded.first)
+        assertEquals(emptyMap(), decoded.second)
+    }
 }

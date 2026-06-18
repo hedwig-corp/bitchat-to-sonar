@@ -83,6 +83,66 @@ struct BLEServiceCoreTests {
         _ = await TestHelpers.waitUntil({ !ble.currentPeerSnapshots().isEmpty }, timeout: 0.3)
         #expect(ble.currentPeerSnapshots().isEmpty)
     }
+
+    @Test
+    func sonarAnnounceBeforeVerifiedAnnounce_isProcessedAfterAnnounce() async throws {
+        let ble = makeService()
+
+        let signer = NoiseEncryptionService(keychain: MockKeychain())
+        let announcement = AnnouncementPacket(
+            nickname: "Sara D",
+            noisePublicKey: signer.getStaticPublicKeyData(),
+            signingPublicKey: signer.getSigningPublicKeyData(),
+            directNeighbors: nil
+        )
+        let peerID = PeerID(publicKey: announcement.noisePublicKey)
+        let now = UInt64(Date().timeIntervalSince1970 * 1000)
+
+        let npub = Data((0..<32).map { UInt8($0) })
+        let sonarPayload = try #require(SonarAnnouncePacket(
+            npub: npub,
+            bip353: nil,
+            capabilities: SonarCapability.marmotDM | SonarCapability.calls
+        ).encode(), "Failed to encode Sonar announce")
+        let sonarPacket = try #require(signer.signPacket(BitchatPacket(
+            type: SonarAnnouncePacket.packetType,
+            senderID: Data(hexString: peerID.id) ?? Data(),
+            recipientID: nil,
+            timestamp: now,
+            payload: sonarPayload,
+            signature: nil,
+            ttl: 7
+        )), "Failed to sign Sonar packet")
+
+        let announcePayload = try #require(announcement.encode(), "Failed to encode announcement")
+        let announcePacket = try #require(signer.signPacket(BitchatPacket(
+            type: MessageType.announce.rawValue,
+            senderID: Data(hexString: peerID.id) ?? Data(),
+            recipientID: nil,
+            timestamp: now + 1,
+            payload: announcePayload,
+            signature: nil,
+            ttl: 7
+        )), "Failed to sign announce packet")
+
+        let capture = SonarProfileCapture(peerID: peerID.id)
+        let observer = NotificationCenter.default.addObserver(
+            forName: .sonarPeerProfileUpdated,
+            object: nil,
+            queue: nil
+        ) { note in
+            capture.record(note)
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+
+        ble._test_handlePacket(sonarPacket, fromPeerID: peerID, preseedPeer: false)
+        try await Task.sleep(nanoseconds: 50_000_000)
+        ble._test_handlePacket(announcePacket, fromPeerID: peerID, preseedPeer: false)
+
+        let didReceive = await TestHelpers.waitUntil({ capture.profile != nil }, timeout: TestConstants.shortTimeout)
+        #expect(didReceive)
+        #expect(capture.profile?.npub == npub)
+    }
 }
 
 private func makeService() -> BLEService {
@@ -136,5 +196,30 @@ private final class PublicCaptureDelegate: BitchatDelegate {
         lock.lock()
         defer { lock.unlock() }
         return publicMessages
+    }
+}
+
+private final class SonarProfileCapture: @unchecked Sendable {
+    private let lock = NSLock()
+    private let peerID: String
+    private var _profile: SonarAnnouncePacket?
+
+    init(peerID: String) {
+        self.peerID = peerID
+    }
+
+    var profile: SonarAnnouncePacket? {
+        lock.lock()
+        defer { lock.unlock() }
+        return _profile
+    }
+
+    func record(_ note: Notification) {
+        guard note.userInfo?[SonarDiscoveryUserInfoKey.peerID] as? String == peerID,
+              let profile = note.userInfo?[SonarDiscoveryUserInfoKey.profile] as? SonarAnnouncePacket
+        else { return }
+        lock.lock()
+        _profile = profile
+        lock.unlock()
     }
 }

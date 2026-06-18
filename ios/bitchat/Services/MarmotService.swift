@@ -25,7 +25,7 @@ final class MarmotService: @unchecked Sendable {
 
     // MARK: - Public model types (UI layers must not import SonarCore)
 
-    struct MarmotGroup: Sendable, Equatable {
+    struct MarmotGroup: Sendable, Equatable, Codable {
         /// Hex MLS group id; pass it back to `sendText`/`messages`.
         let id: String
         let name: String
@@ -43,7 +43,7 @@ final class MarmotService: @unchecked Sendable {
         let relays: [String]
     }
 
-    struct MarmotMessage: Sendable, Equatable {
+    struct MarmotMessage: Sendable, Equatable, Codable {
         let id: String
         let senderNpub: String
         let content: String
@@ -56,7 +56,7 @@ final class MarmotService: @unchecked Sendable {
 
     /// A reference to an encrypted media attachment. `url` is the Blossom URL of
     /// the CIPHERTEXT; call `fetchMedia(groupId:url:)` to download + decrypt.
-    struct MarmotMedia: Sendable, Equatable {
+    struct MarmotMedia: Sendable, Equatable, Codable {
         let url: String
         let mimeType: String
         let filename: String
@@ -71,7 +71,7 @@ final class MarmotService: @unchecked Sendable {
     /// A peer's Nostr profile (kind-0 metadata, NIP-01). A Marmot member's
     /// identity is a Nostr pubkey, so this resolves a human name + avatar
     /// instead of a raw npub.
-    struct Profile: Sendable, Equatable {
+    struct Profile: Sendable, Equatable, Codable {
         let name: String?
         let displayName: String?
         let about: String?

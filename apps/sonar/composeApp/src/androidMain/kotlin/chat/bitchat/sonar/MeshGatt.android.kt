@@ -126,6 +126,9 @@ object MeshGatt {
      *  by BLE address. This is what the app keys conversations/radar by, so a peer
      *  stays one identity across peerID + MAC rotation (issue #12). */
     private val fingerprintByAddr = ConcurrentHashMap<String, String>()
+    /** A 0x53 can arrive before the 0x01 announce on a fresh GATT link. Keep the
+     *  raw payload until the announce supplies the stable fingerprint. */
+    private val pendingSonarByAddr = ConcurrentHashMap<String, ByteArray>()
     private val reassembler = MeshReassembler()
 
     // Listeners (fired from BLE callback threads → concurrent lists). The String
@@ -288,6 +291,7 @@ object MeshGatt {
         clientGatt.values.forEach { runCatching { it.disconnect(); it.close() } }
         clientGatt.clear(); clientChar.clear(); clientLinks.clear(); clientPending.clear(); clientConnected.clear()
         serverLinks.clear(); serverDevices.clear(); peerIdByAddr.clear(); fingerprintByAddr.clear(); recentDials.clear()
+        pendingSonarByAddr.clear()
         pendingSends.clear()
     }
 
@@ -298,6 +302,7 @@ object MeshGatt {
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 serverLinks.remove(device.address); serverDevices.remove(device.address)
                 peerIdByAddr.remove(device.address); fingerprintByAddr.remove(device.address)
+                pendingSonarByAddr.remove(device.address)
                 serverNotifyQueue.remove(device.address); serverNotifying.remove(device.address)
             }
         }
@@ -484,6 +489,7 @@ object MeshGatt {
 
     private fun cleanupClient(addr: String) {
         clientLinks.remove(addr); clientChar.remove(addr); peerIdByAddr.remove(addr); fingerprintByAddr.remove(addr)
+        pendingSonarByAddr.remove(addr)
         clientPending.remove(addr); clientConnected.remove(addr)
         clientWriteQueue.remove(addr); clientWriting.remove(addr)
         clientGatt.remove(addr)?.let { runCatching { it.disconnect(); it.close() } }
@@ -511,6 +517,9 @@ object MeshGatt {
                 if (fp.isNotEmpty()) fingerprintByAddr[addr] = fp
                 clientPending.remove(addr) // a real peer answered — keep this link
                 onAnnounce.forEach { it(addr, ann, fp) }
+                pendingSonarByAddr.remove(addr)?.let { pending ->
+                    if (fp.isNotEmpty()) onSonar.forEach { it(fp, pending) }
+                }
                 // Central: now that we know the peer's peerID, open a Noise link
                 // for DMs (initiator). Peripheral waits for the peer's 0x10.
                 // Re-handshake if there is no link OR the current one is still
@@ -547,9 +556,14 @@ object MeshGatt {
             TYPE_FRAGMENT -> handleFragment(addr, info.senderIdHex, info.payload, fromServer, device, gatt)
             TYPE_SONAR_0X53 -> {
                 // Tag the 0x53 with the peer's STABLE fingerprint (from its 0x01
-                // announce, which precedes the 0x53) so its Sonar profile/npub
-                // stays correlated to the peer across peerID + BLE rotation.
-                val fp = fingerprintByAddr[addr] ?: return
+                // announce) so its Sonar profile/npub stays correlated to the
+                // peer across peerID + BLE rotation. Packet order is not
+                // guaranteed, so cache until the announce lands.
+                val fp = fingerprintByAddr[addr]
+                if (fp == null) {
+                    pendingSonarByAddr[addr] = info.payload
+                    return
+                }
                 onSonar.forEach { it(fp, info.payload) }
             }
             else -> android.util.Log.i(TAG, "ignoring mesh packet type=${info.packetType} from $addr")
