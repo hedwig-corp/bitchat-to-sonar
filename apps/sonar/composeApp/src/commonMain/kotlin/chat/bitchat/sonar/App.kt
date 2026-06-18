@@ -757,7 +757,12 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                                 onOpen = { mediaViewer = it }
                             )
                         } else if (state.stickersEnabled && stickerRef != null) {
-                            StickerBubble(m, state.stickerStore.resolve(stickerRef), mesh = msgMesh)
+                            StickerBubble(
+                                m,
+                                state.stickerStore.resolve(stickerRef),
+                                mesh = msgMesh,
+                                loadSticker = { state.stickerData(it) },
+                            )
                         } else MessageBubble(
                             m,
                             msgMesh,
@@ -1389,6 +1394,7 @@ private fun StickerBubble(
     m: SonarMsg,
     resolution: SonarStickerResolution,
     mesh: Boolean,
+    loadSticker: suspend (SonarSticker) -> ByteArray?,
 ) {
     val s = sonar
     val title = when (resolution.state) {
@@ -1405,6 +1411,24 @@ private fun StickerBubble(
     }
     val alignment = if (m.mine) Alignment.End else Alignment.Start
     val border = if (mesh) s.accent else s.net
+    val sticker = resolution.sticker.takeIf { resolution.state == SonarStickerResolutionState.Resolved }
+    var loadAttempt by remember(sticker?.sha256) { mutableStateOf(0) }
+    val loadResult by androidx.compose.runtime.produceState<Pair<Boolean, ByteArray?>>(
+        false to null,
+        sticker?.sha256,
+        loadAttempt,
+    ) {
+        value = if (sticker == null) {
+            true to null
+        } else {
+            true to loadSticker(sticker)
+        }
+    }
+    val stickerBytes = loadResult.second
+    val stickerImage = remember(stickerBytes) {
+        stickerBytes?.let { decodeImageBitmap(it) }
+    }
+    val renderAsGif = sticker?.mime == "image/gif" && stickerBytes?.looksLikeGifBytes() == true
     Column(
         Modifier.fillMaxWidth().padding(vertical = 4.dp),
         horizontalAlignment = alignment,
@@ -1418,14 +1442,41 @@ private fun StickerBubble(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Text(
-                glyph,
-                color = s.text,
-                fontSize = 30.sp,
-                fontWeight = FontWeight.Bold,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
+            when {
+                stickerBytes != null && (renderAsGif || stickerImage != null) -> {
+                    MediaImage(
+                        bytes = stickerBytes,
+                        isGif = renderAsGif,
+                        modifier = Modifier.size(132.dp),
+                    )
+                }
+                sticker != null && !loadResult.first -> {
+                    androidx.compose.material3.CircularProgressIndicator(
+                        color = s.text3,
+                        strokeWidth = 2.dp,
+                        modifier = Modifier.size(28.dp),
+                    )
+                }
+                sticker != null -> {
+                    Text(
+                        "Retry",
+                        color = s.accent,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.clickable { loadAttempt += 1 },
+                    )
+                }
+                else -> {
+                    Text(
+                        glyph,
+                        color = s.text,
+                        fontSize = 30.sp,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
             Text(
                 title,
                 color = s.text2,

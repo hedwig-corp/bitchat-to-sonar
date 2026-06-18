@@ -27,6 +27,18 @@ import SwiftUI
 import UIKit
 #endif
 
+private final class SonarStickerNoRedirectDelegate: NSObject, URLSessionTaskDelegate {
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        completionHandler(nil)
+    }
+}
+
 private enum SonarCallAudioRoute {
     static func configure(active: Bool, speakerOn: Bool) {
         #if os(iOS)
@@ -330,6 +342,12 @@ final class SonarAppStore: ObservableObject {
     /// Local wallet payment activity for direct BOLT12 / Unify sends.
     let paymentActivityLedger: SonarPaymentActivityLedger
     let stickerStore = SonarStickerStore()
+    private let stickerAssetCache = SonarStickerAssetCache()
+    private let stickerAssetSession = URLSession(
+        configuration: .ephemeral,
+        delegate: SonarStickerNoRedirectDelegate(),
+        delegateQueue: nil
+    )
     private let keychain: KeychainManagerProtocol
     private let locationManager = LocationChannelManager.shared
     private let relayManager = NostrRelayManager.shared
@@ -1948,6 +1966,32 @@ final class SonarAppStore: ObservableObject {
         guard let stickerRef = stickerStore.ref(for: sticker, in: pack) else { return }
         guard let groupId = stickerMarmotGroupId(id) else { return }
         marmot.send(SonarStickers.buildChatMessage(stickerRef), to: groupId)
+    }
+
+    func stickerData(_ sticker: SonarSticker) async -> Data? {
+        if let cached = stickerAssetCache.data(for: sticker) { return cached }
+        guard let url = URL(string: sticker.url),
+              url.scheme?.lowercased() == "https"
+        else { return nil }
+        do {
+            let request = URLRequest(url: url)
+            let (bytes, response) = try await stickerAssetSession.bytes(for: request)
+            if let http = response as? HTTPURLResponse,
+               !(200...299).contains(http.statusCode) {
+                return nil
+            }
+            var data = Data()
+            for try await byte in bytes {
+                data.append(byte)
+                if data.count > SonarStickerAssetCache.defaultMaxStickerBytes {
+                    return nil
+                }
+            }
+            guard stickerAssetCache.storeVerified(data, for: sticker) else { return nil }
+            return stickerAssetCache.data(for: sticker)
+        } catch {
+            return nil
+        }
     }
 
     private func stickerMarmotGroupId(_ id: String) -> String? {

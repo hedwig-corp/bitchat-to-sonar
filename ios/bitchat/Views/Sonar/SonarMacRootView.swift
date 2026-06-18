@@ -745,7 +745,8 @@ private struct MacConversationPane: View {
                         }
                     },
                     loadMedia: { await store.mediaData($0) },
-                    resolveSticker: { store.stickerStore.resolve($0) }
+                    resolveSticker: { store.stickerStore.resolve($0) },
+                    loadSticker: { await store.stickerData($0) }
                 )
             }
         }

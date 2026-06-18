@@ -123,6 +123,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     var stickersEnabled by mutableStateOf(SONAR_STICKERS_ENABLED_BY_DEFAULT)
         private set
     val stickerStore = SonarStickerStore()
+    private val stickerByteCache = SonarStickerByteCache()
     private val sonarDescriptorFetches = mutableSetOf<String>()
     private val sonarDescriptorFetchedAt = mutableMapOf<String, Long>()
     private val sonarDescriptorMissedAt = mutableMapOf<String, Long>()
@@ -1485,6 +1486,16 @@ class SonarAppState(private val scope: CoroutineScope) {
                 toast = "couldn't send sticker: ${e.message}"
             }
         }
+    }
+
+    suspend fun stickerData(sticker: SonarSticker): ByteArray? {
+        stickerByteCache.get(sticker)?.let { return it }
+        val bytes = SonarStickerAssetFetcher.fetch(
+            sticker.url,
+            SonarStickerByteCache.DEFAULT_MAX_STICKER_BYTES,
+        ) ?: return null
+        if (!stickerByteCache.putVerified(sticker, bytes)) return null
+        return stickerByteCache.get(sticker)
     }
 
     private suspend fun refreshOpenStickerChat(chatId: String, groupId: String) {

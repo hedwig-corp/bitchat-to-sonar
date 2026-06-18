@@ -47,15 +47,13 @@ This branch now covers the safe foundation for both native app surfaces:
 - shared Rust/Kotlin/Swift sticker chat-message contract;
 - native installed-pack store and exact shortcode-plus-hash resolver;
 - bounded, SHA-256 verified sticker-byte cache primitives;
-- feature-gated received-sticker placeholder rendering;
+- feature-gated received-sticker rendering with verified HTTPS asset fetch;
 - feature-gated picker and send flow for already installed packs on existing
   White Noise/Marmot conversations.
 
 The feature must remain disabled until the remaining production gaps are closed:
 
 - pack install/import from `/stickers` links or Nostr pack events;
-- async sticker-byte download wired into the cache and row rendering;
-- actual sticker image rendering after byte verification;
 - recent-sticker state;
 - full native target builds and end-to-end install/pick/send/render tests.
 

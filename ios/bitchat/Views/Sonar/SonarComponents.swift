@@ -667,6 +667,8 @@ struct SNMsgList: View {
     var loadMedia: ((SNMediaItem) async -> Data?)? = nil
     /// Resolve a parsed sticker ref against installed packs.
     var resolveSticker: (SonarStickerRef) -> SonarStickerResolution = { _ in .missingPack }
+    /// Download and verify sticker bytes before rendering.
+    var loadSticker: ((SonarSticker) async -> Data?)? = nil
 
     var body: some View {
         GeometryReader { geo in
@@ -700,7 +702,8 @@ struct SNMsgList: View {
                                 SNStickerBubble(
                                     m: m,
                                     resolution: resolveSticker(stickerRef),
-                                    maxBubbleWidth: geo.size.width * 0.60
+                                    maxBubbleWidth: geo.size.width * 0.60,
+                                    load: loadSticker
                                 )
                             } else if m.action {
                                 Text(verbatim: m.text)
@@ -740,6 +743,11 @@ struct SNStickerBubble: View {
     let m: SNMessage
     let resolution: SonarStickerResolution
     let maxBubbleWidth: CGFloat
+    var load: ((SonarSticker) async -> Data?)? = nil
+
+    @State private var bytes: Data?
+    @State private var failed = false
+    @State private var loadAttempt = 0
 
     private var title: String {
         switch resolution {
@@ -767,16 +775,21 @@ struct SNStickerBubble: View {
         }
     }
 
+    private var resolvedSticker: SonarSticker? {
+        if case .resolved(let sticker) = resolution { return sticker }
+        return nil
+    }
+
+    private var loadKey: String {
+        [resolvedSticker?.sha256 ?? "", String(loadAttempt)].joined(separator: "|")
+    }
+
     var body: some View {
         HStack(spacing: 0) {
             if m.mine { Spacer(minLength: 40) }
             VStack(alignment: m.mine ? .trailing : .leading, spacing: 5) {
                 VStack(spacing: 8) {
-                    Text(verbatim: glyph)
-                        .font(SonarTheme.uiFont(size: 30, weight: .bold))
-                        .foregroundColor(SonarTheme.text)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.55)
+                    content
                     Text(verbatim: title)
                         .font(SonarTheme.uiFont(size: 12.5, weight: .semibold))
                         .foregroundColor(SonarTheme.text2)
@@ -795,6 +808,59 @@ struct SNStickerBubble: View {
         }
         .padding(.horizontal, 2)
         .padding(.top, 7)
+        .task(id: loadKey) {
+            bytes = nil
+            failed = false
+            guard let sticker = resolvedSticker else { return }
+            guard let load else {
+                failed = true
+                return
+            }
+            if let data = await load(sticker) {
+                bytes = data
+            } else {
+                failed = true
+            }
+        }
+    }
+
+    @ViewBuilder private var content: some View {
+        if let sticker = resolvedSticker {
+            if let bytes, sticker.mime == "image/gif", bytes.snLooksLikeGif {
+                SNGifView(data: bytes)
+                    .frame(width: min(maxBubbleWidth, 178), height: 134)
+                    .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                    .overlay(alignment: .topTrailing) {
+                        SNGifBadge().padding(7)
+                    }
+            } else if let bytes, let decoded = snDecodedPlatformImage(bytes) {
+                let size = snFittedMediaSize(decoded.size, maxWidth: min(maxBubbleWidth, 178), maxHeight: 160)
+                decoded.image
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: size.width, height: size.height)
+                    .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+            } else if failed {
+                Button {
+                    loadAttempt += 1
+                } label: {
+                    Text(verbatim: "Retry")
+                        .font(SonarTheme.uiFont(size: 12, weight: .semibold))
+                        .foregroundColor(SonarTheme.accent)
+                }
+                .buttonStyle(.plain)
+                .frame(width: min(maxBubbleWidth, 178), minHeight: 82)
+            } else {
+                ProgressView()
+                    .frame(width: min(maxBubbleWidth, 178), minHeight: 82)
+            }
+        } else {
+            Text(verbatim: glyph)
+                .font(SonarTheme.uiFont(size: 30, weight: .bold))
+                .foregroundColor(SonarTheme.text)
+                .lineLimit(1)
+                .minimumScaleFactor(0.55)
+        }
     }
 }
 

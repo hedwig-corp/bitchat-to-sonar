@@ -203,6 +203,10 @@ class SonarStickerByteCache(
     }
 }
 
+expect object SonarStickerAssetFetcher {
+    suspend fun fetch(url: String, maxBytes: Int): ByteArray?
+}
+
 private fun String.removePrefixOrNull(prefix: String): String? =
     takeIf { startsWith(prefix) }?.removePrefix(prefix)
 
