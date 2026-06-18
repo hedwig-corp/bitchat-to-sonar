@@ -185,6 +185,11 @@ struct SNMessage: Identifiable, Equatable {
     /// Encrypted media attachments (White Noise / Marmot MIP-04). Non-empty ⇒
     /// render a media bubble (image inline, else a file chip).
     var media: [SNMediaItem] = []
+    /// Parsed sticker control payload. The UI renders it only when the sticker
+    /// feature flag is enabled; otherwise the legacy fallback text is shown.
+    var stickerRef: SonarStickerRef? {
+        SonarStickers.parseChatMessage(text)
+    }
 }
 
 /// A media attachment on a Sonar message. `url` is the Blossom URL of the
@@ -324,6 +329,7 @@ final class SonarAppStore: ObservableObject {
     let payLedger: SonarPayLedger
     /// Local wallet payment activity for direct BOLT12 / Unify sends.
     let paymentActivityLedger: SonarPaymentActivityLedger
+    let stickerStore = SonarStickerStore()
     private let keychain: KeychainManagerProtocol
     private let locationManager = LocationChannelManager.shared
     private let relayManager = NostrRelayManager.shared

@@ -665,6 +665,8 @@ struct SNMsgList: View {
     var onTapAuthor: ((SNMessage) -> Void)? = nil
     /// Download + decrypt a media attachment to raw bytes (cached by the store).
     var loadMedia: ((SNMediaItem) async -> Data?)? = nil
+    /// Resolve a parsed sticker ref against installed packs.
+    var resolveSticker: (SonarStickerRef) -> SonarStickerResolution = { _ in .missingPack }
 
     var body: some View {
         GeometryReader { geo in
@@ -693,6 +695,12 @@ struct SNMsgList: View {
                                     maxBubbleWidth: geo.size.width * 0.72,
                                     showState: m.mine && i == msgs.count - 1,
                                     load: loadMedia
+                                )
+                            } else if SonarStickers.isEnabled(), let stickerRef = m.stickerRef {
+                                SNStickerBubble(
+                                    m: m,
+                                    resolution: resolveSticker(stickerRef),
+                                    maxBubbleWidth: geo.size.width * 0.60
                                 )
                             } else if m.action {
                                 Text(verbatim: m.text)
@@ -725,6 +733,68 @@ struct SNMsgList: View {
                 }
             }
         }
+    }
+}
+
+struct SNStickerBubble: View {
+    let m: SNMessage
+    let resolution: SonarStickerResolution
+    let maxBubbleWidth: CGFloat
+
+    private var title: String {
+        switch resolution {
+        case .resolved(let sticker):
+            return sticker.alt ?? sticker.shortcode
+        case .missingPack:
+            return "Sticker pack unavailable"
+        case .missingSticker:
+            return "Sticker unavailable"
+        case .hashMismatch:
+            return "Sticker changed"
+        }
+    }
+
+    private var glyph: String {
+        switch resolution {
+        case .resolved(let sticker):
+            return sticker.emoji ?? sticker.shortcode
+        case .missingPack:
+            return "pack"
+        case .missingSticker:
+            return "sticker"
+        case .hashMismatch:
+            return "hash"
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            if m.mine { Spacer(minLength: 40) }
+            VStack(alignment: m.mine ? .trailing : .leading, spacing: 5) {
+                VStack(spacing: 8) {
+                    Text(verbatim: glyph)
+                        .font(SonarTheme.uiFont(size: 30, weight: .bold))
+                        .foregroundColor(SonarTheme.text)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.55)
+                    Text(verbatim: title)
+                        .font(SonarTheme.uiFont(size: 12.5, weight: .semibold))
+                        .foregroundColor(SonarTheme.text2)
+                        .multilineTextAlignment(.center)
+                        .lineLimit(2)
+                }
+                .padding(14)
+                .frame(width: min(maxBubbleWidth, 178), minHeight: 134)
+                .background(RoundedRectangle(cornerRadius: 18, style: .continuous).fill(SonarTheme.surface2))
+                .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).strokeBorder(SonarTheme.hairline, lineWidth: 1))
+                Text(verbatim: m.time)
+                    .font(SonarTheme.uiFont(size: 10.5))
+                    .foregroundColor(SonarTheme.text3)
+            }
+            if !m.mine { Spacer(minLength: 40) }
+        }
+        .padding(.horizontal, 2)
+        .padding(.top, 7)
     }
 }
 

@@ -737,7 +737,8 @@ private struct MacConversationPane: View {
                             walletSheet = true
                         }
                     },
-                    loadMedia: { await store.mediaData($0) }
+                    loadMedia: { await store.mediaData($0) },
+                    resolveSticker: { store.stickerStore.resolve($0) }
                 )
             }
         }
