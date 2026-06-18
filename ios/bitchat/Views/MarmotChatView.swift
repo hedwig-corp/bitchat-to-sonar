@@ -11,6 +11,84 @@ import BitLogger
 import CryptoKit
 import SonarCore
 
+enum SNMarmotProfileCache {
+    static let defaultsKey = "marmot.profilesByNpub.v1"
+
+    static func canonicalKey(_ value: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("npub1"),
+           let decoded = try? Bech32.decode(trimmed),
+           decoded.hrp == "npub",
+           decoded.data.count == 32,
+           let encoded = try? Bech32.encode(hrp: "npub", data: decoded.data) {
+            return encoded
+        }
+        if let data = Data(hexString: trimmed), data.count == 32,
+           let encoded = try? Bech32.encode(hrp: "npub", data: data) {
+            return encoded
+        }
+        return trimmed
+    }
+
+    static func load(from defaults: UserDefaults) -> [String: MarmotService.Profile] {
+        guard let data = defaults.data(forKey: defaultsKey),
+              let profiles = try? JSONDecoder().decode([String: MarmotService.Profile].self, from: data)
+        else { return [:] }
+        return normalized(profiles)
+    }
+
+    static func save(_ profiles: [String: MarmotService.Profile], to defaults: UserDefaults) {
+        guard let data = try? JSONEncoder().encode(normalized(profiles)) else { return }
+        defaults.set(data, forKey: defaultsKey)
+    }
+
+    static func clear(from defaults: UserDefaults) {
+        defaults.removeObject(forKey: defaultsKey)
+    }
+
+    private static func normalized(_ profiles: [String: MarmotService.Profile]) -> [String: MarmotService.Profile] {
+        profiles.reduce(into: [:]) { result, entry in
+            let key = canonicalKey(entry.key)
+            if result[key]?.bestName == nil || entry.value.bestName != nil {
+                result[key] = entry.value
+            }
+        }
+    }
+}
+
+enum SNMarmotChatSnapshotCache {
+    private static let defaultsKey = "marmot.chatSnapshot.v1"
+
+    private struct Snapshot: Codable {
+        let groups: [MarmotService.MarmotGroup]
+    }
+
+    static func load(from defaults: UserDefaults) -> ([MarmotService.MarmotGroup], [String: [MarmotService.MarmotMessage]]) {
+        guard let data = defaults.data(forKey: defaultsKey),
+              let snapshot = try? JSONDecoder().decode(Snapshot.self, from: data)
+        else { return ([], [:]) }
+        // Rewrite older snapshots that included message bodies/media outside the
+        // encrypted chat database. The startup cache is row metadata only.
+        save(groups: snapshot.groups, messagesByGroup: [:], to: defaults)
+        return (snapshot.groups, [:])
+    }
+
+    static func save(
+        groups: [MarmotService.MarmotGroup],
+        messagesByGroup: [String: [MarmotService.MarmotMessage]],
+        to defaults: UserDefaults
+    ) {
+        _ = messagesByGroup
+        let snapshot = Snapshot(groups: groups)
+        guard let data = try? JSONEncoder().encode(snapshot) else { return }
+        defaults.set(data, forKey: defaultsKey)
+    }
+
+    static func clear(from defaults: UserDefaults) {
+        defaults.removeObject(forKey: defaultsKey)
+    }
+}
+
 /// UI state for Marmot (MLS-over-Nostr) secure chats — the White Noise
 /// interop path. Owns a `MarmotService` and persists the generated Nostr
 /// identity in the keychain (wiped by emergency wipe like everything else).
@@ -38,8 +116,9 @@ final class MarmotChatModel: ObservableObject {
 
     private let service: MarmotService
     private let keychain: KeychainManagerProtocol
+    private let defaults: UserDefaults
     private var syncTask: Task<Void, Never>?
-    /// npubs whose profile fetch is in flight or done, to fetch each once.
+    /// npubs whose profile fetch is in flight or done, to fetch each once per session.
     private var profileFetches: Set<String> = []
     /// npubs whose Sonar descriptor fetch is currently in flight.
     private var descriptorFetches: Set<String> = []
@@ -67,10 +146,16 @@ final class MarmotChatModel: ObservableObject {
 
     init(
         service: MarmotService = MarmotService(),
-        keychain: KeychainManagerProtocol = KeychainManager()
+        keychain: KeychainManagerProtocol = KeychainManager(),
+        defaults: UserDefaults = .standard
     ) {
         self.service = service
         self.keychain = keychain
+        self.defaults = defaults
+        self.profilesByNpub = SNMarmotProfileCache.load(from: defaults)
+        let cached = SNMarmotChatSnapshotCache.load(from: defaults)
+        self.groups = cached.0
+        self.messagesByGroup = cached.1
     }
 
     /// Connect on first appearance: reuse the keychain identity if present,
@@ -202,6 +287,11 @@ final class MarmotChatModel: ObservableObject {
             self.groups = groups
             self.pendingGroupInvites = invites
             self.messagesByGroup = reconcileOptimistic(into: byGroup)
+            SNMarmotChatSnapshotCache.save(
+                groups: groups,
+                messagesByGroup: self.messagesByGroup,
+                to: defaults
+            )
             // Resolve a human name for every counterpart (once each).
             for group in groups {
                 for member in group.memberNpubs where member != npub {
@@ -253,16 +343,24 @@ final class MarmotChatModel: ObservableObject {
     /// raw npub in the chat list, header, and avatar. Retries (via the periodic
     /// `refresh()`) until the peer has published a profile.
     func ensureProfile(_ npubToFetch: String) {
-        guard !npubToFetch.isEmpty, npubToFetch != npub else { return }
-        guard profilesByNpub[npubToFetch] == nil else { return } // already resolved
-        guard profileFetches.insert(npubToFetch).inserted else { return } // in flight
+        let key = SNMarmotProfileCache.canonicalKey(npubToFetch)
+        let ownKey = npub.map(SNMarmotProfileCache.canonicalKey)
+        guard !key.isEmpty, key != ownKey else { return }
+        let hadCachedProfile = profilesByNpub[key] != nil || profilesByNpub[npubToFetch] != nil
+        guard profileFetches.insert(key).inserted else { return } // in flight
         Task {
-            let profile = try? await service.fetchProfile(npub: npubToFetch)
+            let profile = try? await service.fetchProfile(npub: key)
             await MainActor.run {
                 if let profile, profile.bestName != nil {
-                    self.profilesByNpub[npubToFetch] = profile
+                    self.profilesByNpub[key] = profile
+                    if key != npubToFetch {
+                        self.profilesByNpub.removeValue(forKey: npubToFetch)
+                    }
+                    SNMarmotProfileCache.save(self.profilesByNpub, to: self.defaults)
                 } else {
-                    self.profileFetches.remove(npubToFetch) // not published yet — allow retry
+                    if !hadCachedProfile {
+                        self.profileFetches.remove(key) // not published yet — allow retry
+                    }
                 }
             }
         }
@@ -308,7 +406,8 @@ final class MarmotChatModel: ObservableObject {
 
     /// Best display name for a member npub, if we've resolved their profile.
     func displayName(forNpub member: String) -> String? {
-        profilesByNpub[member]?.bestName
+        profilesByNpub[SNMarmotProfileCache.canonicalKey(member)]?.bestName
+            ?? profilesByNpub[member]?.bestName
     }
 
     /// Merge still-pending optimistic echoes into the freshly-synced
@@ -381,9 +480,6 @@ final class MarmotChatModel: ObservableObject {
     func send(_ text: String, to groupId: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        // Optimistic echo: show the outgoing message immediately, before the
-        // relay round-trip, so the conversation doesn't appear to swallow it.
-        // refresh() reconciles it away once the real copy comes back.
         let echo = MarmotService.MarmotMessage(
             id: Self.optimisticIDPrefix + UUID().uuidString,
             senderNpub: npub ?? "",
@@ -392,8 +488,6 @@ final class MarmotChatModel: ObservableObject {
             isMine: true,
             media: []
         )
-        pendingOptimistic[groupId, default: []].append(echo)
-        messagesByGroup[groupId, default: []].append(echo)
         Task {
             do {
                 // Wait through the connect/reconnect window so a send right after
@@ -401,6 +495,16 @@ final class MarmotChatModel: ObservableObject {
                 guard await ensureConnected() else {
                     throw MarmotService.ServiceError.notConnected
                 }
+                // A row-only startup snapshot may know the group before the local
+                // SQLCipher transcript is hydrated. Load it before appending the
+                // optimistic echo so opening/sending cannot briefly replace history
+                // with one outgoing bubble.
+                await loadLocal()
+                // Optimistic echo: show the outgoing message immediately, before the
+                // relay round-trip, so the conversation doesn't appear to swallow it.
+                // refresh() reconciles it away once the real copy comes back.
+                pendingOptimistic[groupId, default: []].append(echo)
+                messagesByGroup[groupId, default: []].append(echo)
                 try await service.sendText(groupId: groupId, text: trimmed)
                 await refresh()
             } catch {
@@ -442,13 +546,16 @@ final class MarmotChatModel: ObservableObject {
                 )
             ]
         )
-        pendingOptimistic[groupId, default: []].append(echo)
-        messagesByGroup[groupId, default: []].append(echo)
         Task {
+            var echoVisible = false
             do {
                 guard await ensureConnected() else {
                     throw MarmotService.ServiceError.notConnected
                 }
+                await loadLocal()
+                pendingOptimistic[groupId, default: []].append(echo)
+                messagesByGroup[groupId, default: []].append(echo)
+                echoVisible = true
                 try await service.sendMedia(
                     groupId: groupId, data: data, filename: filename, mime: mime, caption: caption
                 )
@@ -456,17 +563,19 @@ final class MarmotChatModel: ObservableObject {
                 await refresh()
             } catch {
                 pendingOptimistic[groupId]?.removeAll { $0.id == echo.id }
-                let failed = MarmotService.MarmotMessage(
-                    id: Self.failedOptimisticIDPrefix + UUID().uuidString,
-                    senderNpub: echo.senderNpub,
-                    content: echo.content,
-                    createdAt: echo.createdAt,
-                    isMine: true,
-                    media: echo.media
-                )
-                pendingOptimistic[groupId, default: []].append(failed)
-                messagesByGroup[groupId, default: []].removeAll { $0.id == echo.id }
-                messagesByGroup[groupId, default: []].append(failed)
+                if echoVisible {
+                    let failed = MarmotService.MarmotMessage(
+                        id: Self.failedOptimisticIDPrefix + UUID().uuidString,
+                        senderNpub: echo.senderNpub,
+                        content: echo.content,
+                        createdAt: echo.createdAt,
+                        isMine: true,
+                        media: echo.media
+                    )
+                    pendingOptimistic[groupId, default: []].append(failed)
+                    messagesByGroup[groupId, default: []].removeAll { $0.id == echo.id }
+                    messagesByGroup[groupId, default: []].append(failed)
+                }
                 onFailure?()
                 self.errorText = Self.describe(error)
             }
@@ -547,6 +656,7 @@ final class MarmotChatModel: ObservableObject {
         messagesByGroup[groupId] = nil
         pendingOptimistic[groupId] = nil
         profileFetches = []
+        SNMarmotChatSnapshotCache.save(groups: groups, messagesByGroup: messagesByGroup, to: defaults)
     }
 
     /// Leave a multi-member Marmot group, then drop it from the in-memory state.
@@ -561,6 +671,7 @@ final class MarmotChatModel: ObservableObject {
         messagesByGroup[groupId] = nil
         pendingOptimistic[groupId] = nil
         profileFetches = []
+        SNMarmotChatSnapshotCache.save(groups: groups, messagesByGroup: messagesByGroup, to: defaults)
     }
 
     /// Panic-wipe the encrypted Marmot database + its Keychain key and reset
@@ -575,6 +686,10 @@ final class MarmotChatModel: ObservableObject {
         messagesByGroup = [:]
         pendingOptimistic = [:]
         descriptorBolt12Offer = nil
+        profilesByNpub = [:]
+        profileFetches = []
+        SNMarmotProfileCache.clear(from: defaults)
+        SNMarmotChatSnapshotCache.clear(from: defaults)
     }
 
     /// Erase every White Noise / Marmot chat but KEEP the identity: wipe the
@@ -593,6 +708,8 @@ final class MarmotChatModel: ObservableObject {
         pendingOptimistic = [:]
         profilesByNpub = [:]
         profileFetches = []
+        SNMarmotProfileCache.clear(from: defaults)
+        SNMarmotChatSnapshotCache.clear(from: defaults)
         errorText = nil
         // Reopen a fresh DB with the SAME identity and republish our KeyPackage.
         // Await a FORCED reconnect (not `connectIfNeeded()`, whose busy/npub
@@ -616,7 +733,12 @@ final class MarmotChatModel: ObservableObject {
     }
 
     func otherMembers(in group: MarmotService.MarmotGroup) -> [String] {
-        Array(Set(group.memberNpubs.filter { $0 != npub && !$0.isEmpty })).sorted()
+        let ownKey = npub.map(SNMarmotProfileCache.canonicalKey)
+        return Array(Set(group.memberNpubs.map(SNMarmotProfileCache.canonicalKey).filter {
+            guard !$0.isEmpty else { return false }
+            guard let ownKey else { return true }
+            return $0 != ownKey
+        })).sorted()
     }
 
     func isDirectGroup(_ group: MarmotService.MarmotGroup) -> Bool {

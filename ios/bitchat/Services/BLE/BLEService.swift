@@ -114,6 +114,11 @@ final class BLEService: NSObject {
     // invoked from the message queue, so it must be thread-safe and must not
     // touch main-actor state.
     var sonarProfileProvider: (() -> SonarLocalProfile?)?
+    // 0x53 can beat the corresponding 0x01 announce on a fresh BLE link.
+    // Cache it briefly by peerID, then verify it after the announce installs
+    // the peer's signing key.
+    private var pendingSonarAnnounces: [PeerID: BitchatPacket] = [:]
+    private let pendingSonarAnnounceCap = 128
     
     // Application state tracking (thread-safe)
     #if os(iOS)
@@ -393,6 +398,7 @@ final class BLEService: NSObject {
             pendingFragmentTransfers.removeAll()
             pendingNotifications.removeAll()
             pendingDirectedRelays.removeAll()
+            pendingSonarAnnounces.removeAll()
             ingressByMessageID.removeAll()
             recentPacketTimestamps.removeAll()
             scheduledRelays.values.forEach { $0.cancel() }
@@ -579,6 +585,7 @@ final class BLEService: NSObject {
         // Clear pending notifications
         collectionsQueue.sync(flags: .barrier) {
             pendingNotifications.removeAll()
+            pendingSonarAnnounces.removeAll()
         }
 
         // Stop timer
@@ -611,6 +618,7 @@ final class BLEService: NSObject {
             pendingMessagesAfterHandshake.removeAll()
             pendingNoisePayloadsAfterHandshake.removeAll()
             pendingDirectedRelays.removeAll()
+            pendingSonarAnnounces.removeAll()
             return entries
         }
 
@@ -4181,6 +4189,10 @@ extension BLEService {
             claimedNickname: announcement.nickname
         )
 
+        if let pendingSonar = takePendingSonarAnnounce(for: peerID) {
+            handleSonarAnnounce(pendingSonar, from: peerID)
+        }
+
         // Notify UI on main thread
         notifyUI { [weak self] in
             guard let self = self else { return }
@@ -4243,9 +4255,11 @@ extension BLEService {
         }
 
         // The peer must exist from a verified bitchat announce (peers[] is
-        // only populated by verified announces); else drop.
+        // only populated by verified announces); else queue until that announce
+        // arrives so the npub link is not lost to packet ordering.
         guard let signingKey = collectionsQueue.sync(execute: { peers[peerID]?.signingPublicKey }) else {
-            SecureLogger.debug("Ignoring Sonar announce from unknown peer \(peerID.id.prefix(8))…", category: .security)
+            queuePendingSonarAnnounce(packet, from: peerID)
+            SecureLogger.debug("Queued Sonar announce from unknown peer \(peerID.id.prefix(8))…", category: .security)
             messageQueue.asyncAfter(deadline: .now() + 0.25) { [weak self] in
                 self?.sendAnnounce(forceSend: true)
             }
@@ -4271,6 +4285,22 @@ extension BLEService {
                 SonarDiscoveryUserInfoKey.profile: announce
             ]
         )
+    }
+
+    private func queuePendingSonarAnnounce(_ packet: BitchatPacket, from peerID: PeerID) {
+        collectionsQueue.sync(flags: .barrier) {
+            if pendingSonarAnnounces.count >= pendingSonarAnnounceCap,
+               let oldest = pendingSonarAnnounces.min(by: { $0.value.timestamp < $1.value.timestamp })?.key {
+                pendingSonarAnnounces.removeValue(forKey: oldest)
+            }
+            pendingSonarAnnounces[peerID] = packet
+        }
+    }
+
+    private func takePendingSonarAnnounce(for peerID: PeerID) -> BitchatPacket? {
+        collectionsQueue.sync(flags: .barrier) {
+            pendingSonarAnnounces.removeValue(forKey: peerID)
+        }
     }
 
     // Handle REQUEST_SYNC: decode payload and respond with missing packets via sync manager

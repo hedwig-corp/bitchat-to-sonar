@@ -159,16 +159,16 @@ final class SonarDiscoveryTests: XCTestCase {
         // Marmot DMs are always advertised; ⚡PAY is gated on a configured wallet.
         XCTAssertEqual(
             SonarLocalProfile(npub: npub, bip353: nil, paymentsEnabled: false).capabilities,
-            SonarCapability.marmotDM
+            SonarCapability.marmotDM | SonarCapability.calls
         )
         XCTAssertEqual(
             SonarLocalProfile(npub: npub, bip353: nil, paymentsEnabled: true).capabilities,
-            SonarCapability.marmotDM | SonarCapability.payments
+            SonarCapability.marmotDM | SonarCapability.payments | SonarCapability.calls
         )
         // BIP-353 presence does not change capabilities; the wallet flag does.
         XCTAssertEqual(
             SonarLocalProfile(npub: npub, bip353: "satoshi@example.org", paymentsEnabled: true).capabilities,
-            SonarCapability.marmotDM | SonarCapability.payments
+            SonarCapability.marmotDM | SonarCapability.payments | SonarCapability.calls
         )
     }
 }

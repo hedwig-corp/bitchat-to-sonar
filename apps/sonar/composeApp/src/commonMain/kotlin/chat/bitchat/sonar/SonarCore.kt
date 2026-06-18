@@ -1,5 +1,7 @@
 package chat.bitchat.sonar
 
+import chat.bitchat.sonar.crypto.Bech32
+
 /** A White Noise (Marmot) chat, as the UI sees it. */
 data class SonarChat(
     val id: String,        // MLS group id hex
@@ -82,6 +84,143 @@ data class SonarDescriptor(
             "marmot" in signaling &&
             "iroh" in transports &&
             callIdentity == "iroh-hkdf-sonar-call-iroh-v1"
+}
+
+internal const val PROFILE_CACHE_BLOB_KEY = "profiles.byNpub.v1"
+internal const val CHAT_SNAPSHOT_BLOB_KEY = "chats.snapshot.v1"
+
+internal fun canonicalProfileKey(value: String): String {
+    val clean = value.trim()
+    val decoded = Bech32.decode(clean)
+    if (decoded?.hrp == "npub" && decoded.data.size == 32) {
+        return Bech32.encode("npub", decoded.data) ?: clean
+    }
+    val hex = clean.hexBytesOrNull()
+    if (hex?.size == 32) {
+        return Bech32.encode("npub", hex) ?: clean
+    }
+    return clean
+}
+
+internal fun encodeProfileCache(profiles: Map<String, SonarProfile>): String =
+    normalizedProfileCache(profiles).entries
+        .sortedBy { it.key }
+        .joinToString("\n") { (npub, profile) ->
+            listOf(
+                hexEnc(npub),
+                profileField(profile.name),
+                profileField(profile.displayName),
+                profileField(profile.about),
+                profileField(profile.picture),
+                profileField(profile.nip05),
+            ).joinToString("\t")
+        }
+
+internal fun decodeProfileCache(blob: String): Map<String, SonarProfile> =
+    blob.lineSequence()
+        .mapNotNull { line ->
+            if (line.isBlank()) return@mapNotNull null
+            val parts = line.split("\t")
+            if (parts.size != 6) return@mapNotNull null
+            val npub = hexDec(parts[0])?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            val name = profileFieldValue(parts[1]) ?: return@mapNotNull null
+            val displayName = profileFieldValue(parts[2]) ?: return@mapNotNull null
+            val about = profileFieldValue(parts[3]) ?: return@mapNotNull null
+            val picture = profileFieldValue(parts[4]) ?: return@mapNotNull null
+            val nip05 = profileFieldValue(parts[5]) ?: return@mapNotNull null
+            val profile = SonarProfile(
+                name = name.value,
+                displayName = displayName.value,
+                about = about.value,
+                picture = picture.value,
+                nip05 = nip05.value,
+            )
+            npub to profile
+        }
+        .let { normalizedProfileCache(it.toMap()) }
+
+internal fun normalizedProfileCache(profiles: Map<String, SonarProfile>): Map<String, SonarProfile> =
+    profiles.entries.fold(linkedMapOf()) { result, (key, profile) ->
+        val canonical = canonicalProfileKey(key)
+        if (result[canonical]?.bestName == null || profile.bestName != null) {
+            result[canonical] = profile
+        }
+        result
+    }
+
+@Suppress("UNUSED_PARAMETER")
+internal fun encodeChatSnapshot(chats: List<SonarChat>, messagesByChat: Map<String, List<SonarMsg>>): String =
+    buildString {
+        chats.sortedBy { it.id }.forEach { chat ->
+            append("c\t")
+            append(hexEnc(chat.id)).append('\t')
+            append(hexEnc(chat.name)).append('\t')
+            append(chat.members.joinToString(",") { hexEnc(it) })
+            append('\n')
+        }
+    }
+
+internal fun decodeChatSnapshot(blob: String): Pair<List<SonarChat>, Map<String, List<SonarMsg>>> {
+    val chats = mutableListOf<SonarChat>()
+    blob.lineSequence().forEach { line ->
+        if (line.isBlank()) return@forEach
+        val parts = line.split('\t')
+        when (parts.firstOrNull()) {
+            "c" -> {
+                if (parts.size != 4) return@forEach
+                val id = hexDec(parts[1]) ?: return@forEach
+                val name = hexDec(parts[2]) ?: return@forEach
+                val members = parts[3]
+                    .takeIf { it.isNotEmpty() }
+                    ?.split(",")
+                    ?.mapNotNull { hexDec(it) }
+                    .orEmpty()
+                chats += SonarChat(id, name, members)
+            }
+        }
+    }
+    return chats to emptyMap()
+}
+
+private fun profileField(value: String?): String =
+    value?.let { "1" + hexEnc(it) } ?: "0"
+
+private data class ProfileFieldValue(val value: String?)
+
+private fun profileFieldValue(token: String): ProfileFieldValue? =
+    when {
+        token == "0" -> ProfileFieldValue(null)
+        token.startsWith("1") -> hexDec(token.drop(1))?.let { ProfileFieldValue(it) }
+        else -> null
+    }
+
+private fun hexEnc(s: String): String =
+    s.encodeToByteArray().joinToString("") {
+        ((it.toInt() and 0xFF) + 0x100).toString(16).substring(1)
+    }
+
+private fun hexDec(s: String): String? {
+    if (s.isEmpty()) return ""
+    if (s.length % 2 != 0) return null
+    val bytes = ByteArray(s.length / 2)
+    for (i in bytes.indices) {
+        val hi = s[2 * i].digitToIntOrNull(16) ?: return null
+        val lo = s[2 * i + 1].digitToIntOrNull(16) ?: return null
+        bytes[i] = ((hi shl 4) or lo).toByte()
+    }
+    return bytes.decodeToString()
+}
+
+private fun String.hexBytesOrNull(): ByteArray? {
+    val clean = trim().removePrefix("0x").removePrefix("0X")
+    if (clean.isEmpty() || clean.length % 2 != 0) return null
+    val bytes = ByteArray(clean.length / 2)
+    for (i in bytes.indices) {
+        val hi = clean[2 * i].digitToIntOrNull(16) ?: return null
+        val lo = clean[2 * i + 1].digitToIntOrNull(16) ?: return null
+        bytes[i] = ((hi shl 4) or lo).toByte()
+    }
+    return bytes
 }
 
 /** A public message in a geohash channel. */

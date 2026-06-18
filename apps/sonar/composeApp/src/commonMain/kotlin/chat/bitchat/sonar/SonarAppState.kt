@@ -68,6 +68,20 @@ internal fun inferUniquePeerByTitle(
         .singleOrNull()
 }
 
+internal const val CAPABILITY_SETTLE_MS = 1_500L
+
+internal fun shouldWaitForCapabilities(
+    firstSeenMs: Long?,
+    nowMs: Long,
+    hasProfile: Boolean,
+    hasMessages: Boolean,
+    settleMs: Long = CAPABILITY_SETTLE_MS,
+): Boolean {
+    if (hasProfile || hasMessages) return false
+    val first = firstSeenMs ?: return false
+    return nowMs - first < settleMs
+}
+
 /** A call-log record appended to a DM transcript when a call ends. Lives in
  *  memory only (no MessageStore/SonarCore/Marmot write). [durSecs] == 0 ⇒ the call never connected
  *  (rendered as "Missed"); otherwise it's the connected duration. */
@@ -103,20 +117,30 @@ data class SonarVerify(val safety: List<String>, val verified: Boolean, val note
  * it shifts to Compose Multiplatform.
  */
 class SonarAppState(private val scope: CoroutineScope) {
+    private val initialChatSnapshotBlob = SonarCore.loadBlob(CHAT_SNAPSHOT_BLOB_KEY)
+    private val initialChatSnapshot = decodeChatSnapshot(initialChatSnapshotBlob)
     var npub by mutableStateOf("")
         private set
     var started by mutableStateOf(false)
         private set
     var connecting by mutableStateOf(false)
         private set
-    var chats by mutableStateOf<List<SonarChat>>(emptyList())
+    var chats by mutableStateOf<List<SonarChat>>(initialChatSnapshot.first)
         private set
+    private var chatSnapshotMessagesByChat: Map<String, List<SonarMsg>> = initialChatSnapshot.second
     var groupInvites by mutableStateOf<List<SonarGroupInvite>>(emptyList())
         private set
     /** Resolved kind-0 profiles by npub — fills human names for Marmot members. */
-    var profilesByNpub by mutableStateOf<Map<String, SonarProfile>>(emptyMap())
+    var profilesByNpub by mutableStateOf(decodeProfileCache(SonarCore.loadBlob(PROFILE_CACHE_BLOB_KEY)))
         private set
     private val profileFetches = mutableSetOf<String>()
+
+    init {
+        if (initialChatSnapshotBlob.isNotEmpty()) {
+            persistChatSnapshot()
+        }
+    }
+
     /** Public Sonar descriptors by raw npub hex, used for out-of-BLE call parity. */
     var sonarDescriptorsByNpubHex by mutableStateOf<Map<String, SonarDescriptor>>(emptyMap())
         private set
@@ -143,10 +167,13 @@ class SonarAppState(private val scope: CoroutineScope) {
             linkByFp.clear(); linkCapsByFp.clear(); foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
             sonarDescriptorsByNpubHex = emptyMap()
             sonarDescriptorFetches.clear(); sonarDescriptorFetchedAt.clear(); sonarDescriptorMissedAt.clear()
+            rawMeshPeerIds = emptySet(); meshPeerFirstSeenMs.clear(); pendingCapabilityRefreshPeers.clear()
+            profilesByNpub = emptyMap(); profileFetches.clear()
             MessageStore.wipe()
             SonarCore.wipe()
             stack = listOf(Screen.Home)
-            chats = emptyList(); groupInvites = emptyList(); messages = emptyList()
+            chats = emptyList(); chatSnapshotMessagesByChat = emptyMap(); groupInvites = emptyList(); messages = emptyList()
+            clearChatSnapshot()
             onboarded = false; nick = ""; npub = ""; started = false
             walletState = WalletState.NotConfigured
             presenceByGeohash = emptyMap()
@@ -179,9 +206,10 @@ class SonarAppState(private val scope: CoroutineScope) {
             // In-memory conversation state.
             meshChats.clear(); meshChatNames.clear(); pendingMarmotSends.clear()
             linkByFp.clear(); linkCapsByFp.clear(); persistLinks(); persistLinkCaps()
+            profilesByNpub = emptyMap(); profileFetches.clear(); persistProfileCache()
             foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
             meshBroadcast = emptyList(); meshDmRows = emptyList()
-            messages = emptyList(); channelMsgs = emptyList(); chats = emptyList()
+            messages = emptyList(); channelMsgs = emptyList(); chats = emptyList(); clearChatSnapshot()
             lastWnGroups = -1; lastWnMsgs = -1
             // ⚡PAY coins live inside the erased chats — reset the ledger. The
             // Lightning wallet seed/balance is separate and is NOT touched.
@@ -461,9 +489,10 @@ class SonarAppState(private val scope: CoroutineScope) {
             val group = npubRawFor(peerId)?.let { marmotGroupForNpub(it) }
             return foldedPeerName(peerId, group)
         }
+        val mine = canonicalProfileKey(npub)
         return chats.firstOrNull { it.id == chatId }
-            ?.members?.firstOrNull { it != npub && it.isNotBlank() }
-            ?.let { profilesByNpub[it]?.bestName ?: (it.take(10) + "…") } ?: "secure chat"
+            ?.members?.firstOrNull { canonicalProfileKey(it) != mine && it.isNotBlank() }
+            ?.let { profilesByNpub[canonicalProfileKey(it)]?.bestName ?: (it.take(10) + "…") } ?: "secure chat"
     }
     /** In-memory BLE-mesh DM transcripts, keyed by bitchat peerID. Mesh chats
      *  don't live in the Rust core (that's Marmot/Nostr) — they ride the Noise
@@ -487,6 +516,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         private set
     var meshPeers by mutableStateOf<List<MeshPeer>>(emptyList())
         private set
+    private var rawMeshPeerIds: Set<String> = emptySet()
+    private val meshPeerFirstSeenMs = mutableMapOf<String, Long>()
+    private val pendingCapabilityRefreshPeers = mutableSetOf<String>()
     /** Nearby Unify Wallet users (payments-only, gold badge on the radar). */
     var unifyPeers by mutableStateOf<List<UnifyPeer>>(emptyList())
         private set
@@ -496,6 +528,55 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /** The Sonar Discovery profile for a mesh peer (its BLE id), if any. */
     fun sonarProfile(peerId: String): SonarAnnounce? = sonarPeerProfiles[peerId]
+
+    private fun refreshSonarDiscoveryProfiles() {
+        sonarPeerProfiles = MeshRadio.sonarPeers()
+            .mapNotNull { (id, raw) -> SonarAnnounce.decode(raw)?.let { id to it } }
+            .toMap()
+        sonarPeerProfiles.forEach { (peerId, ann) -> rememberLink(peerId, ann) }
+    }
+
+    private fun updateMeshPeersFromRadio(nowMs: Long = SonarClock.nowMillis()) {
+        val rawPeers = MeshRadio.peers()
+        rawMeshPeerIds = rawPeers.map { meshPeerId(it.id) }.toSet()
+        meshPeerFirstSeenMs.keys.retainAll(rawMeshPeerIds + meshChats.keys + linkByFp.keys)
+        meshPeers = rawPeers.filter { peer ->
+            val peerId = meshPeerId(peer.id)
+            if (peer.name.isNotBlank()) meshChatNames[peerId] = peer.name
+            val first = meshPeerFirstSeenMs.getOrPut(peerId) { nowMs }
+            val hasProfile = peer.sonar || sonarPeerProfiles.containsKey(peerId) || linkByFp.containsKey(peerId)
+            val hasMessages = meshChats[peerId]?.isNotEmpty() == true
+            val wait = shouldWaitForCapabilities(first, nowMs, hasProfile, hasMessages)
+            if (wait) scheduleCapabilitySettleRefresh(peerId, first, nowMs)
+            !wait
+        }
+    }
+
+    private fun scheduleCapabilitySettleRefresh(peerId: String, firstSeenMs: Long, nowMs: Long) {
+        val remaining = CAPABILITY_SETTLE_MS - (nowMs - firstSeenMs)
+        if (remaining <= 0 || !pendingCapabilityRefreshPeers.add(peerId)) return
+        scope.launch {
+            delay(remaining + 50)
+            pendingCapabilityRefreshPeers.remove(peerId)
+            refreshSonarDiscoveryProfiles()
+            updateMeshPeersFromRadio()
+            recomputeConversations()
+        }
+    }
+
+    private fun shouldHoldStandaloneMarmotChat(chat: SonarChat, nowMs: Long = SonarClock.nowMillis()): Boolean {
+        if (!isDirectMarmotChat(chat)) return false
+        val title = canonicalConversationTitle(chatTitle(chat)).takeIf { it.isNotEmpty() } ?: return false
+        return meshChatNames.any { (peerId, name) ->
+            canonicalConversationTitle(name) == title &&
+                shouldWaitForCapabilities(
+                    firstSeenMs = meshPeerFirstSeenMs[peerId],
+                    nowMs = nowMs,
+                    hasProfile = sonarPeerProfiles.containsKey(peerId) || linkByFp.containsKey(peerId),
+                    hasMessages = false,
+                ).also { if (it) scheduleCapabilitySettleRefresh(peerId, meshPeerFirstSeenMs[peerId] ?: nowMs, nowMs) }
+        }
+    }
 
     /** Durable BLE-fingerprint → Nostr-npub(hex) links, learned from 0x53 Sonar
      *  announces and PERSISTED (blob "sonar.links"). This is what makes one
@@ -520,10 +601,16 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /** White Noise chats to render on their own row: every Marmot group EXCEPT the
      *  ones folded into a mesh DM. The Messages list uses this instead of [chats]. */
-    val visibleChats: List<SonarChat> get() = chats.filterNot { it.id in foldedGroupIds }
+    val visibleChats: List<SonarChat> get() =
+        chats.filterNot { it.id in foldedGroupIds || shouldHoldStandaloneMarmotChat(it) }
 
-    private fun otherMembers(chat: SonarChat): List<String> =
-        chat.members.filter { it != npub && it.isNotBlank() }.distinct()
+    private fun otherMembers(chat: SonarChat): List<String> {
+        val mine = canonicalProfileKey(npub)
+        return chat.members
+            .map { canonicalProfileKey(it) }
+            .filter { it != mine && it.isNotBlank() }
+            .distinct()
+    }
 
     fun isDirectMarmotChat(chat: SonarChat): Boolean =
         otherMembers(chat).size == 1
@@ -538,7 +625,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         fun insert(title: String, subtitle: String, inviteNpub: String?) {
             val clean = inviteNpub?.trim().orEmpty()
             if (!clean.startsWith("npub1") || clean in excludedClean || clean in byNpub) return
-            val display = title.ifBlank { profilesByNpub[clean]?.bestName ?: shortNpub(clean) }
+            val display = title.ifBlank { profilesByNpub[canonicalProfileKey(clean)]?.bestName ?: shortNpub(clean) }
             byNpub[clean] = GroupContact(clean, display, subtitle, clean)
         }
 
@@ -563,9 +650,10 @@ class SonarAppState(private val scope: CoroutineScope) {
             .orEmpty()
             .map { member ->
                 ensureProfile(member)
+                val key = canonicalProfileKey(member)
                 GroupContact(
                     id = member,
-                    title = profilesByNpub[member]?.bestName ?: shortNpub(member),
+                    title = profilesByNpub[key]?.bestName ?: shortNpub(member),
                     subtitle = shortNpub(member),
                     npub = member,
                 )
@@ -746,7 +834,8 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun startMesh() {
         refreshMeshIdentity()
         MeshRadio.start()
-        meshPeers = MeshRadio.peers()
+        refreshSonarDiscoveryProfiles()
+        updateMeshPeersFromRadio()
     }
 
     // ── Unify nearby payments (separate BLE service; payments-only) ──
@@ -1166,7 +1255,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         val other = others.first()
         // Prefer the counterpart's resolved kind-0 profile name; fetch it once if
         // not cached; fall back to a short npub until it lands.
-        profilesByNpub[other]?.bestName?.let { return it }
+        profilesByNpub[canonicalProfileKey(other)]?.bestName?.let { return it }
         ensureProfile(other)
         return shortNpub(other)
     }
@@ -1176,23 +1265,25 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun groupAuthorName(message: SonarMsg, isGroup: Boolean): String? {
         if (!isGroup || message.mine || message.senderNpub.isBlank()) return null
-        return profilesByNpub[message.senderNpub]?.bestName
+        return profilesByNpub[canonicalProfileKey(message.senderNpub)]?.bestName
             ?: shortNpub(message.senderNpub)
     }
 
     /** Fetch + cache a peer's kind-0 profile once, so their name replaces the
      *  raw npub in the chat list/header. */
     fun ensureProfile(otherNpub: String) {
-        if (otherNpub.isBlank() || otherNpub == npub) return
-        if (profilesByNpub.containsKey(otherNpub)) return // already resolved
-        if (!profileFetches.add(otherNpub)) return        // fetch already in flight
+        val key = canonicalProfileKey(otherNpub)
+        if (key.isBlank() || key == canonicalProfileKey(npub)) return
+        val hadCachedProfile = profilesByNpub.containsKey(key) || profilesByNpub.containsKey(otherNpub)
+        if (!profileFetches.add(key)) return        // fetch already in flight
         scope.launch {
-            val p = SonarCore.fetchProfile(otherNpub)
+            val p = SonarCore.fetchProfile(key)
             if (p?.bestName != null) {
-                profilesByNpub = profilesByNpub + (otherNpub to p)
+                profilesByNpub = normalizedProfileCache(profilesByNpub + (key to p) - otherNpub)
+                persistProfileCache()
             } else {
                 // Not published yet — allow a later retry (driven by poll()).
-                profileFetches.remove(otherNpub)
+                if (!hadCachedProfile) profileFetches.remove(key)
             }
         }
     }
@@ -1236,10 +1327,15 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
+    private fun persistProfileCache() {
+        SonarCore.saveBlob(PROFILE_CACHE_BLOB_KEY, encodeProfileCache(profilesByNpub))
+    }
+
     fun openChat(chat: SonarChat) {
         push(Screen.Chat(chat.id, chatTitle(chat)))
         scope.launch {
-            messages = mergePendingMediaUploads(chat.id, SonarCore.messages(chat.id))
+            runCatching { refreshChats() }
+            messages = mergePendingMediaUploads(chat.id, marmotMessages(chat.id))
             processPayLines(chat.id, messages)
         }
     }
@@ -1882,7 +1978,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         return chats.filter { c ->
             isDirectMarmotChat(c) &&
             c.members.any { m ->
-                chat.bitchat.sonar.crypto.Bech32.decode(m)
+                chat.bitchat.sonar.crypto.Bech32.decode(canonicalProfileKey(m))
                     ?.takeIf { it.hrp == "npub" }?.data?.contentEquals(npubRaw) == true
             }
         }
@@ -1891,12 +1987,20 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun marmotGroupForNpub(npubRaw: ByteArray): SonarChat? =
         marmotGroupsForNpub(npubRaw).firstOrNull()
 
+    private suspend fun marmotMessages(groupId: String): List<SonarMsg> {
+        val loaded = runCatching { SonarCore.messages(groupId) }.getOrNull()
+        if (!started && loaded.isNullOrEmpty()) {
+            return chatSnapshotMessagesByChat[groupId].orEmpty()
+        }
+        return loaded ?: chatSnapshotMessagesByChat[groupId].orEmpty()
+    }
+
     private suspend fun marmotMessagesForPeer(peerId: String): List<SonarMsg> {
         val groups = npubRawFor(peerId)?.let { marmotGroupsForNpub(it) }
             ?: chats.filter { peerIdForMarmotGroup(it) == peerId }
         val merged = ArrayList<SonarMsg>()
         for (group in groups) {
-            val msgs = runCatching { SonarCore.messages(group.id) }.getOrDefault(emptyList())
+            val msgs = marmotMessages(group.id)
             merged += msgs.map { it.copy(viaInternet = true) }
         }
         return merged.distinctBy { it.id }
@@ -1905,7 +2009,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     private suspend fun latestMarmotMessage(groups: List<SonarChat>): SonarMsg? {
         var latest: SonarMsg? = null
         for (group in groups) {
-            val msg = runCatching { SonarCore.messages(group.id) }.getOrDefault(emptyList()).lastOrNull()
+            val msg = marmotMessages(group.id).lastOrNull()
             val current = latest
             if (msg != null && (current == null || msg.tsSecs > current.tsSecs)) latest = msg
         }
@@ -1928,7 +2032,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private fun observedMeshPeer(peerId: String): Boolean =
-        meshPeers.any { it.id == meshChatId(peerId) }
+        peerId in rawMeshPeerIds
 
     private fun hasLiveMeshRoute(peerId: String): Boolean =
         observedMeshPeer(peerId) && MeshRadio.hasMeshLink(peerId)
@@ -2038,7 +2142,10 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  one, else a short id. Remembers whatever it resolves. */
     private fun meshPeerName(peerId: String): String {
         val live = meshPeers.firstOrNull { it.id == "mesh:$peerId" }?.name
-        val name = live ?: meshChatNames[peerId] ?: ("mesh·" + peerId.take(6))
+        val profileName = npubStringForPeer(peerId)
+            ?.let { profilesByNpub[canonicalProfileKey(it)]?.bestName }
+        val remembered = meshChatNames[peerId]?.takeUnless { it.isKeyFallbackName() }
+        val name = live ?: profileName ?: remembered ?: ("mesh·" + peerId.take(6))
         meshChatNames[peerId] = name
         return name
     }
@@ -2048,10 +2155,19 @@ class SonarAppState(private val scope: CoroutineScope) {
             meshChatNames[peerId] = it
             return it
         }
-        meshChatNames[peerId]?.takeUnless { it.startsWith("mesh·") }?.let { return it }
+        meshChatNames[peerId]?.takeUnless { it.isKeyFallbackName() }?.let { return it }
+        npubStringForPeer(peerId)
+            ?.let { profilesByNpub[canonicalProfileKey(it)]?.bestName }
+            ?.let { name ->
+                meshChatNames[peerId] = name
+                return name
+            }
         group?.let { return chatTitle(it) }
         return meshChatNames[peerId] ?: ("mesh·" + peerId.take(6))
     }
+
+    private fun String.isKeyFallbackName(): Boolean =
+        startsWith("mesh·") || startsWith("npub1")
 
     /** Recompute the observable mesh DM rows (newest conversation first). Fast,
      *  BLE-leg only — for immediate feedback on send/receive. [recomputeConversations]
@@ -2095,7 +2211,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             val peerId = peerIdForMarmotGroup(group) ?: continue
             folded += group.id
             groupPeers[group.id] = peerId
-            val last = runCatching { SonarCore.messages(group.id) }.getOrDefault(emptyList()).lastOrNull()
+            val last = marmotMessages(group.id).lastOrNull()
             upsert(
                 peerId,
                 MeshDmRow(
@@ -2111,8 +2227,22 @@ class SonarAppState(private val scope: CoroutineScope) {
         meshDmRows = rowsByPeer.values.sortedByDescending { it.tsSecs }
     }
 
+    private fun persistChatSnapshot() {
+        SonarCore.saveBlob(CHAT_SNAPSHOT_BLOB_KEY, encodeChatSnapshot(chats, chatSnapshotMessagesByChat))
+    }
+
+    private fun clearChatSnapshot() {
+        chatSnapshotMessagesByChat = emptyMap()
+        SonarCore.saveBlob(CHAT_SNAPSHOT_BLOB_KEY, "")
+    }
+
     private suspend fun refreshChats() {
-        chats = SonarCore.chats()
+        val loadedChats = SonarCore.chats()
+        if (started || loadedChats.isNotEmpty()) {
+            chats = loadedChats
+            chatSnapshotMessagesByChat = emptyMap()
+            persistChatSnapshot()
+        }
         for (c in chats) {
             c.members.forEach {
                 if (it != npub && it.isNotBlank()) ensureSonarDescriptor(it)
@@ -2164,17 +2294,14 @@ class SonarAppState(private val scope: CoroutineScope) {
                 }
                 (screen as? Screen.Channel)?.let { refreshChannel(it.geohash) }
                 (screen as? Screen.GeoDm)?.let { refreshGeoDm(it.geohash, it.peerHex) }
-                meshPeers = MeshRadio.peers()
                 // Sonar Discovery (0x53): keep our announce current for outgoing
                 // links and decode any peers' announces received over the mesh.
                 refreshMeshIdentity()
-                sonarPeerProfiles = MeshRadio.sonarPeers()
-                    .mapNotNull { (id, raw) -> SonarAnnounce.decode(raw)?.let { id to it } }
-                    .toMap()
                 // Persist each peer's fingerprint→npub so its conversation stays
                 // unified after it leaves range / after a restart, then re-fold the
                 // White Noise legs into the mesh rows (one row per person).
-                sonarPeerProfiles.forEach { (peerId, ann) -> rememberLink(peerId, ann) }
+                refreshSonarDiscoveryProfiles()
+                updateMeshPeersFromRadio()
                 recomputeConversations()
                 // Unify nearby: keep the payer scan alive and refresh peers +
                 // the receiver advertising (wallet/foreground gated).
