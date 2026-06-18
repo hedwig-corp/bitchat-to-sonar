@@ -215,7 +215,7 @@ struct SonarHomeScreen: View {
                         unread: d.unread,
                         divider: i < rows.count - 1,
                         action: {
-                            store.openedDM(d.id)
+                            store.openedDM(d.id, marmotGroupId: d.marmotGroupId)
                             store.push(.dm(d.id))
                         },
                         avatar: { SonarAvatar(name: d.title, size: 52, presence: d.presence) },
@@ -583,7 +583,7 @@ struct SNSearchSheetContent: View {
                                 label: row.title,
                                 desc: row.preview
                             ) {
-                                openDM(row.id)
+                                openDM(row)
                             }
                         }
                     }
@@ -681,7 +681,7 @@ struct SNSearchSheetContent: View {
         } else if let channel = filteredChannels.first {
             openChannel(channel)
         } else if let dm = filteredDMs.first {
-            openDM(dm.id)
+            openDM(dm)
         } else if let peer = filteredPeers.first {
             openPeer(peer.id)
         } else if normalizedQuery.isEmpty {
@@ -693,6 +693,12 @@ struct SNSearchSheetContent: View {
     private func openChannel(_ channel: SNChannelItem) {
         onClose()
         store.openChannel(channel)
+    }
+
+    private func openDM(_ row: SNDMRow) {
+        onClose()
+        store.openedDM(row.id, marmotGroupId: row.marmotGroupId)
+        store.push(.dm(row.id))
     }
 
     private func openDM(_ id: String) {

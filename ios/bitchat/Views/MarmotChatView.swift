@@ -143,6 +143,7 @@ final class MarmotChatModel: ObservableObject {
     private let keychain: KeychainManagerProtocol
     private let defaults: UserDefaults
     private var syncTask: Task<Void, Never>?
+    private var relayConnectTask: Task<Void, Never>?
     private var relayBusy = false
     /// npubs whose profile fetch is in flight or done, to fetch each once per session.
     private var profileFetches: Set<String> = []
@@ -208,8 +209,9 @@ final class MarmotChatModel: ObservableObject {
     }
 
     /// The actual connect sequence (awaitable, NOT guarded). Reuse the keychain
-    /// identity, open the encrypted DB, load local chats, publish our KeyPackage.
-    /// Used by the lazy `connectIfNeeded()` and the erase-and-reconnect path —
+    /// identity, open the encrypted DB, load local group metadata, then schedule
+    /// relay setup behind first-paint local reads. Used by the lazy
+    /// `connectIfNeeded()` and the erase-and-reconnect path —
     /// the latter must NOT be blocked by the `busy`/`npub` guard, which would
     /// silently leave the node disconnected ("not connected yet" until restart).
     private func performConnect() async {
@@ -246,9 +248,9 @@ final class MarmotChatModel: ObservableObject {
         //    failure must NOT hide already-persisted chats.
         do {
             _ = try await service.connectLocal(nsec: storedNsec)
-            await loadLocalSummaries()
+            await loadLocalGroupMetadata()
             self.errorText = nil
-            connectRelaysIfNeeded()
+            scheduleRelayConnect()
         } catch {
             let desc = Self.describe(error)
             SecureLogger.warning("⚠️ Marmot local open failed: \(desc)", category: .session)
@@ -294,8 +296,23 @@ final class MarmotChatModel: ObservableObject {
         return await service.isConnected()
     }
 
+    private func scheduleRelayConnect(delaySeconds: Double = 2) {
+        guard relayConnectTask == nil else { return }
+        relayConnectTask = Task { [weak self] in
+            let nanos = UInt64(max(0, delaySeconds) * 1_000_000_000)
+            if nanos > 0 {
+                try? await Task.sleep(nanoseconds: nanos)
+            }
+            guard !Task.isCancelled else { return }
+            self?.connectRelaysIfNeeded()
+            self?.relayConnectTask = nil
+        }
+    }
+
     private func connectRelaysIfNeeded() {
         guard !relayBusy else { return }
+        relayConnectTask?.cancel()
+        relayConnectTask = nil
         relayBusy = true
         Task { [weak self] in
             guard let self else { return }
@@ -303,7 +320,6 @@ final class MarmotChatModel: ObservableObject {
             do {
                 _ = try await self.service.connect(nsec: nil)
                 self.errorText = nil
-                await self.refresh()
                 try? await self.service.publishKeyPackage()
                 try? await self.service.publishSonarDescriptor()
                 self.startPolling()
@@ -376,6 +392,25 @@ final class MarmotChatModel: ObservableObject {
     /// so the chat list paints instantly on launch regardless of relay health.
     func loadLocal() async {
         await loadLocalSummaries()
+    }
+
+    /// Startup local read: load only row metadata, not even one message per
+    /// group. The selected chat's `messagesPage` must stay ahead of background
+    /// summaries/sync on the serialized engine queue.
+    private func loadLocalGroupMetadata() async {
+        do {
+            let groups = try await service.groups()
+            let invites = try await service.pendingGroupInvites()
+            self.groups = groups
+            self.pendingGroupInvites = invites
+            SNMarmotChatSnapshotCache.save(
+                groups: groups,
+                messagesByGroup: messagesByGroup,
+                to: defaults
+            )
+        } catch {
+            self.errorText = Self.describe(error)
+        }
     }
 
     /// Load the latest local transcript window for one group. Used by chat open
@@ -769,6 +804,8 @@ final class MarmotChatModel: ObservableObject {
     }
 
     func stopPolling() {
+        relayConnectTask?.cancel()
+        relayConnectTask = nil
         syncTask?.cancel()
         syncTask = nil
     }

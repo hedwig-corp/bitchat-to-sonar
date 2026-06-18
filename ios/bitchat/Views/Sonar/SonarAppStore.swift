@@ -282,6 +282,8 @@ struct SNDMRow: Identifiable {
     let verified: Bool
     let isMarmot: Bool
     let lastDate: Date?
+    /// Marmot MLS group backing this row, even when the row id is a folded peer id.
+    var marmotGroupId: String? = nil
 }
 
 /// A local contact that can be invited into a Marmot group.
@@ -1877,7 +1879,8 @@ final class SonarAppStore: ObservableObject {
                     presence: false,
                     verified: false,
                     isMarmot: true,
-                    lastDate: last?.createdAt
+                    lastDate: last?.createdAt,
+                    marmotGroupId: group.id
                 ))
                 continue
             }
@@ -1912,7 +1915,8 @@ final class SonarAppStore: ObservableObject {
                         presence: existing.presence,
                         verified: existing.verified,
                         isMarmot: false,
-                        lastDate: last.createdAt
+                        lastDate: last.createdAt,
+                        marmotGroupId: group.id
                     )
                 }
                 continue
@@ -1932,7 +1936,8 @@ final class SonarAppStore: ObservableObject {
                     presence: liveSonarPeerId != nil && meshReachable(rowId),
                     verified: isVerified(rowId) || (marmotVerified[group.id] ?? false),
                     isMarmot: false,
-                    lastDate: last?.createdAt
+                    lastDate: last?.createdAt,
+                    marmotGroupId: group.id
                 )
                 continue
             }
@@ -1948,7 +1953,8 @@ final class SonarAppStore: ObservableObject {
                 presence: false,
                 verified: marmotVerified[group.id] ?? false,
                 isMarmot: true,
-                lastDate: last?.createdAt
+                lastDate: last?.createdAt,
+                marmotGroupId: group.id
             ))
         }
         let rows = Array(byKey.values) + marmotRows
@@ -2623,9 +2629,13 @@ final class SonarAppStore: ObservableObject {
         try? FileManager.default.removeItem(at: base.appendingPathComponent("media-cache", isDirectory: true))
     }
 
-    func openedDM(_ id: String) {
+    func openedDM(_ id: String, marmotGroupId knownMarmotGroupId: String? = nil) {
+        if let knownMarmotGroupId {
+            rememberMarmotGroup(knownMarmotGroupId, forConversationId: id)
+        }
         let sonarProfile = resolvedSonarProfile(id)
-        let groupId = marmotGroupId(id)
+        let groupId = knownMarmotGroupId
+            ?? marmotGroupId(id)
             ?? sonarProfile.flatMap { marmotGroup(forNpub: $0.npub)?.id }
         let hasMarmotGroup = groupId != nil
         if !hasMarmotGroup {
@@ -2670,9 +2680,18 @@ final class SonarAppStore: ObservableObject {
                 let fp = self.chatViewModel.getFingerprint(for: PeerID(str: id)) ?? id
                 self.rememberMarmotGroup(hydratedGroupId, forConversationId: fp)
             }
-            self.localHydratingDMs.remove(id)
-            guard !Task.isCancelled else { return }
+            let needsHistoryBackfill = hydratedGroupId.map {
+                self.marmot.messagesByGroup[$0]?.isEmpty ?? true
+            } ?? false
+            if !needsHistoryBackfill {
+                self.localHydratingDMs.remove(id)
+            }
+            guard !Task.isCancelled else {
+                self.localHydratingDMs.remove(id)
+                return
+            }
             await self.marmot.refreshWhenConnected(groupId: hydratedGroupId, hydrateBeforeSync: false)
+            self.localHydratingDMs.remove(id)
         }
     }
 
