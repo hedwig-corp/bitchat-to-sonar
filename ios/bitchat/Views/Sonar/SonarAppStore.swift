@@ -2065,7 +2065,7 @@ final class SonarAppStore: ObservableObject {
     }
 
     private func paymentActivityRows(for id: String) -> [(Date, SNMessage)] {
-        paymentActivityLedger.activities(peerKey: id).map { activity in
+        paymentActivityLedger.activities(peerKey: id).filter { payLedger.entry(for: $0.id) == nil }.map { activity in
             let displayDate = activity.settledAt ?? activity.createdAt
             let state: SonarPayEntry.State = activity.status == .paid ? .claimed : .settling
             let via = SNVia(rawValue: activity.via) ?? .internet
@@ -2941,6 +2941,20 @@ final class SonarAppStore: ObservableObject {
                     note: "Sonar payment \(activityId)"
                 )
                 self.paymentActivityLedger.markPaid(activityId, payment: payment)
+                // Record as already-claimed in the pay ledger so the sender's
+                // own transcript renders the bubble via payMapping (not only
+                // paymentActivityRows). processIncomingPayLines skips self
+                // messages, so this manual record is required.
+                self.payLedger.record(SonarPayEntry(
+                    id: activityId, peerKey: id, sats: sats,
+                    direction: .outgoing, state: .claimed, via: via.rawValue
+                ))
+                // Notify the receiver: a ⚡PAY sealed coin followed immediately
+                // by ⚡PAYDONE. The receiver's processIncomingPayLines records
+                // the coin as incoming/sealed, then transitions it to claimed —
+                // showing "Added to your balance" with no claim step.
+                self.sendDm(id, SonarPayMessage.pay(id: activityId, sats: sats).encoded())
+                self.sendDm(id, SonarPayMessage.done(id: activityId).encoded())
             } catch {
                 self.paymentActivityLedger.markFailed(activityId, message: error.localizedDescription)
                 SecureLogger.error("Sonar direct payment failed: \(error)", category: .session)
