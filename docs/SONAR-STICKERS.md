@@ -287,6 +287,8 @@ The viewer does not evaluate HTML from relay data.
 
 - Native app install/picker/send UI must be implemented in both `ios/` and
   `apps/sonar/` before stickers are a complete cross-platform user feature.
+  The rollout plan, safety gates, and commit sequence live in
+  [`SONAR-STICKERS-NATIVE-PLAN.md`](SONAR-STICKERS-NATIVE-PLAN.md).
 - The route styling should be reconciled with the Claude Design file
   `Sonar Stickers.html` when that design is available.
 - The current cover tag does not encode MIME; a future version may add MIME while
