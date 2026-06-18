@@ -51,6 +51,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -147,6 +148,7 @@ private fun HomeScreen(state: SonarAppState) {
     var wipeAsk by remember { mutableStateOf(false) }
     var titleTaps by remember { mutableStateOf(0) }
     var pendingDelete by remember { mutableStateOf<DeleteTarget?>(null) }
+    var pendingInvite by remember { mutableStateOf<SonarGroupInvite?>(null) }
     val meshCount = state.meshPeers.size
     // Triple-tap the title within 1.2s → emergency wipe (1:1 with iOS).
     LaunchedEffect(titleTaps) { if (titleTaps in 1..2) { kotlinx.coroutines.delay(1200); titleTaps = 0 } }
@@ -215,7 +217,16 @@ private fun HomeScreen(state: SonarAppState) {
                     }
                 }
                 item { SNSectionLabel("Messages") }
-                if (state.visibleChats.isEmpty() && state.meshDmRows.isEmpty()) item { EmptyMessages() }
+                if (state.groupInvites.isEmpty() && state.visibleChats.isEmpty() && state.meshDmRows.isEmpty()) item { EmptyMessages() }
+                items(state.groupInvites, key = { "invite:" + it.id }) { invite ->
+                    val title = invite.groupName.ifBlank { "Group chat" }
+                    ConvRow(
+                        avatar = { SonarAvatar(title, 52.dp, presence = false) },
+                        title = title,
+                        sub = "${invite.memberCount} members · invite",
+                        lock = true,
+                    ) { pendingInvite = invite }
+                }
                 // BLE-mesh DMs (incl. ones started by a peer messaging us) — over
                 // Bluetooth, so a cyan dot instead of the internet lock. A Sonar
                 // peer's White Noise leg is folded into this row (one row/person).
@@ -223,7 +234,7 @@ private fun HomeScreen(state: SonarAppState) {
                     ConvRow(
                         avatar = { SonarAvatar(row.name, 52.dp, presence = state.dmInRange(row.peerId)) },
                         title = row.name, sub = row.preview, lock = false,
-                        onLongClick = { pendingDelete = DeleteTarget(row.peerId, row.name, isMesh = true) },
+                        onLongClick = { pendingDelete = DeleteTarget(row.peerId, row.name, isMesh = true, isGroup = false) },
                     ) { state.openDm(row.peerId, row.name) }
                 }
                 items(state.visibleChats, key = { it.id }) { chat ->
@@ -232,7 +243,7 @@ private fun HomeScreen(state: SonarAppState) {
                         avatar = { SonarAvatar(chatTitle, 52.dp, presence = false) },
                         title = chatTitle, sub = "Tap to open", lock = true,
                         verified = state.isVerified(chat.id),
-                        onLongClick = { pendingDelete = DeleteTarget(chat.id, chatTitle, isMesh = false) },
+                        onLongClick = { pendingDelete = DeleteTarget(chat.id, chatTitle, isMesh = false, isGroup = state.isMultiMemberChat(chat.id)) },
                     ) { state.openChat(chat) }
                 }
             }
@@ -266,9 +277,18 @@ private fun HomeScreen(state: SonarAppState) {
     if (composeSheet) ComposeSheet(state) { composeSheet = false }
     if (connSheet) ConnectivitySheet(online = state.started, meshCount = meshCount) { connSheet = false }
     if (wipeAsk) WipeConfirmSheet(onWipe = { wipeAsk = false; state.wipe() }, onClose = { wipeAsk = false })
+    pendingInvite?.let { invite ->
+        GroupInviteSheet(
+            invite = invite,
+            onAccept = { state.acceptGroupInvite(invite.id); pendingInvite = null },
+            onDecline = { state.declineGroupInvite(invite.id); pendingInvite = null },
+            onClose = { pendingInvite = null }
+        )
+    }
     pendingDelete?.let { t ->
         DeleteChatSheet(
             name = t.name,
+            isGroup = t.isGroup,
             onDelete = {
                 if (t.isMesh) state.deleteMeshDm(t.id) else state.deleteMarmotChat(t.id)
                 pendingDelete = null
@@ -405,11 +425,11 @@ private fun WipeConfirmSheet(onWipe: () -> Unit, onClose: () -> Unit) {
     }
 }
 
-/** A chat the user long-pressed to delete (mesh DM peer id, or Marmot group id). */
-private data class DeleteTarget(val id: String, val name: String, val isMesh: Boolean)
+/** A chat the user long-pressed to delete or leave. */
+private data class DeleteTarget(val id: String, val name: String, val isMesh: Boolean, val isGroup: Boolean)
 
 @Composable
-private fun DeleteChatSheet(name: String, onDelete: () -> Unit, onClose: () -> Unit) {
+private fun DeleteChatSheet(name: String, isGroup: Boolean, onDelete: () -> Unit, onClose: () -> Unit) {
     val s = sonar
     Box(
         Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
@@ -417,14 +437,18 @@ private fun DeleteChatSheet(name: String, onDelete: () -> Unit, onClose: () -> U
     ) {
         Surface(color = s.surface, shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)) {
             Column(Modifier.fillMaxWidth().padding(20.dp)) {
-                Text("Delete this chat?", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                Text(if (isGroup) "Leave this group?" else "Delete this chat?", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(6.dp))
                 Text(
-                    "Removes “$name” from this device only. The other person isn’t notified, and you can start the chat again later.",
+                    if (isGroup) {
+                        "Sends a leave update to “$name” and removes the conversation from this device."
+                    } else {
+                        "Removes “$name” from this device only. The other person isn’t notified, and you can start the chat again later."
+                    },
                     color = s.text2, fontSize = 13.5.sp, lineHeight = 18.sp
                 )
                 Spacer(Modifier.height(16.dp))
-                SNPrimaryButton("Delete chat", net = false) { onDelete() }
+                SNPrimaryButton(if (isGroup) "Leave group" else "Delete chat", net = false) { onDelete() }
                 Spacer(Modifier.height(8.dp))
                 Box(Modifier.fillMaxWidth().height(44.dp).clickable(onClick = onClose), contentAlignment = Alignment.Center) {
                     Text("Cancel", color = s.text2, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
@@ -468,6 +492,59 @@ private fun ConnectivitySheet(online: Boolean, meshCount: Int, onClose: () -> Un
 }
 
 @Composable
+private fun GroupInviteSheet(
+    invite: SonarGroupInvite,
+    onAccept: () -> Unit,
+    onDecline: () -> Unit,
+    onClose: () -> Unit,
+) {
+    val s = sonar
+    val title = invite.groupName.ifBlank { "Group chat" }
+    Box(
+        Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
+        contentAlignment = Alignment.BottomCenter
+    ) {
+        Surface(color = s.surface, shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp)) {
+            Column(
+                Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 22.dp, bottom = 24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                SonarAvatar(title, 64.dp, presence = false)
+                Spacer(Modifier.height(12.dp))
+                Text(title, color = s.text, fontSize = 22.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Spacer(Modifier.height(5.dp))
+                Text(
+                    "${invite.memberCount} members · invited by ${shortNpub(invite.welcomerNpub)}",
+                    color = s.text2,
+                    fontSize = 13.5.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Spacer(Modifier.height(14.dp))
+                Text(
+                    "End-to-end encrypted — only group members can read this",
+                    color = s.text3,
+                    fontSize = 13.sp,
+                    textAlign = TextAlign.Center,
+                    lineHeight = 18.sp,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(18.dp))
+                SNPrimaryButton("Accept") { onAccept() }
+                Spacer(Modifier.height(10.dp))
+                Box(
+                    Modifier.fillMaxWidth().height(50.dp).clip(RoundedCornerShape(15.dp)).background(s.surface2)
+                        .clickable(onClick = onDecline),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text("Decline", color = s.text2, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun EmptyMessages() {
     val s = sonar
     Column(
@@ -499,9 +576,12 @@ private fun ChannelHint() {
 private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     val s = sonar
     var draft by remember { mutableStateOf("") }
+    var emojiTray by remember { mutableStateOf(false) }
     var paySheet by remember { mutableStateOf(false) }
     var verifySheet by remember { mutableStateOf(false) }
     var addSheet by remember { mutableStateOf(false) }
+    var addPeopleSheet by remember { mutableStateOf(false) }
+    var removePeopleSheet by remember { mutableStateOf(false) }
     var mediaViewer by remember { mutableStateOf<SonarMedia?>(null) }
     val mediaActions = rememberMediaActions()
     val pickPhoto = rememberPhotoPicker { bytes, name, mime ->
@@ -538,13 +618,13 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     LaunchedEffect(feed.size) {
         if (feed.isNotEmpty()) listState.animateScrollToItem(feed.size - 1)
     }
-    // Resolve a human name for the peer (Marmot groups often have a blank name).
+    val currentChat = state.chats.firstOrNull { it.id == screen.id }
+    val isGroup = state.isMultiMemberChat(screen.id)
+    // Resolve a human name for the peer or group (Marmot names can be blank).
     val peerName = screen.name.ifBlank {
-        state.chats.firstOrNull { it.id == screen.id }
-            ?.members?.firstOrNull { it != state.npub && it.isNotBlank() }
-            ?.let { shortNpub(it) } ?: "secure chat"
+        currentChat?.let { state.chatTitle(it) } ?: "secure chat"
     }
-    val verified = run { state.payVersion; state.isVerified(screen.id) }
+    val verified = !isGroup && run { state.payVersion; state.isVerified(screen.id) }
     // A radar-peer DM is a "mesh:" route that auto-picks transport: BLE mesh
     // (cyan/"Bluetooth") while in range, White Noise (indigo/"internet") when out
     // of range. A pure Marmot chat (non-mesh route) is always internet. Per-message
@@ -570,7 +650,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             SNIconButton(SNIconName.Back, onClick = { state.back() })
             SonarAvatar(peerName, 36.dp, presence = false)
             Spacer(Modifier.width(10.dp))
-            Column(Modifier.weight(1f).clip(RoundedCornerShape(8.dp)).clickable { verifySheet = true }) {
+            Column(Modifier.weight(1f).clip(RoundedCornerShape(8.dp)).clickable(enabled = !isGroup) { verifySheet = true }) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
                         peerName, color = s.text, fontSize = 16.sp, fontWeight = FontWeight.Bold,
@@ -613,6 +693,11 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                 icon = SNIconName.ShieldCheck, tone = chat.bitchat.sonar.ui.SNBannerTone.Enc,
                 bold = "Verified", rest = " — you confirmed $peerName’s safety number"
             )
+        } else if (isGroup) {
+            chat.bitchat.sonar.ui.SNBanner(
+                icon = SNIconName.Lock, tone = chat.bitchat.sonar.ui.SNBannerTone.Enc,
+                bold = "End-to-end encrypted", rest = " — only group members can read this"
+            )
         } else {
             chat.bitchat.sonar.ui.SNBanner(
                 icon = SNIconName.Lock, tone = chat.bitchat.sonar.ui.SNBannerTone.Enc,
@@ -626,7 +711,11 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                 chat.bitchat.sonar.ui.SNEmptyState(
                     icon = SNIconName.Lock,
                     title = "Say hi to $peerName",
-                    desc = "Messages here are end-to-end encrypted. Only the two of you can read them."
+                    desc = if (isGroup) {
+                        "Messages here are end-to-end encrypted. Only group members can read them."
+                    } else {
+                        "Messages here are end-to-end encrypted. Only the two of you can read them."
+                    }
                 )
             }
         } else {
@@ -655,14 +744,22 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                                 state.claimPay(screen.id, pay.uuid)
                             }
                         } else if (m.media.isNotEmpty()) {
-                            MediaBubble(m, state, screen.id, mesh = msgMesh, onOpen = { mediaViewer = it })
-                        } else MessageBubble(m, msgMesh)
+                            MediaBubble(
+                                m,
+                                state,
+                                screen.id,
+                                mesh = msgMesh,
+                                author = state.groupAuthorName(m, isGroup),
+                                onOpen = { mediaViewer = it }
+                            )
+                        } else MessageBubble(m, msgMesh, author = state.groupAuthorName(m, isGroup))
                     }
                 }
             }
         }
 
         if (draft.startsWith("/")) SlashHints(draft) { draft = it }
+        if (emojiTray && !recording) EmojiTray { draft += it }
         // ONE composer row in BOTH states. Only the left (plus↔trash) and middle
         // (text field↔recording pill) swap; the mic Box on the right MUST stay
         // mounted while recording, or Compose cancels its hold-to-record gesture
@@ -699,6 +796,14 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                         modifier = Modifier.fillMaxWidth()
                     )
                 }
+            }
+            if (!recording) {
+                Spacer(Modifier.width(8.dp))
+                Box(
+                    Modifier.size(40.dp).clip(CircleShape).background(if (emojiTray) s.accentSoft else s.surface2)
+                        .clickable { emojiTray = !emojiTray },
+                    contentAlignment = Alignment.Center
+                ) { SNIcon(SNIconName.Smile, 20.dp, if (emojiTray) s.accent else s.text2, weight = 2f) }
             }
             Spacer(Modifier.width(8.dp))
             if (draft.isEmpty() && state.canSendMedia(screen.id)) {
@@ -747,6 +852,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                     Modifier.size(46.dp).clip(CircleShape).background(sendBg)
                         .clickable(enabled = sendEnabled) {
                             val d = draft; draft = ""
+                            emojiTray = false
                             if (!state.handleCommand(d, peerName, channelGeohash = null, chatId = screen.id)) {
                                 state.send(screen.id, d)
                             }
@@ -773,9 +879,25 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         onLocation = { addSheet = false; state.toast = "Location sharing is coming soon." },
         onVerify = { addSheet = false; verifySheet = true },
         onReactions = { addSheet = false; state.toast = "Reactions are coming soon." },
+        onAddPeople = { addSheet = false; addPeopleSheet = true },
+        onRemovePeople = { addSheet = false; removePeopleSheet = true },
         onClose = { addSheet = false },
         canSendPhoto = state.canSendMedia(screen.id),
+        canSendPayment = !state.isMultiMemberChat(screen.id),
+        canVerify = !state.isMultiMemberChat(screen.id),
+        canShareLocation = !state.isMultiMemberChat(screen.id),
+        canManageGroup = isGroup,
         onPhoto = { addSheet = false; pickPhoto() }
+    )
+    if (addPeopleSheet) GroupAddPeopleSheet(
+        state = state,
+        chatId = screen.id,
+        onClose = { addPeopleSheet = false }
+    )
+    if (removePeopleSheet) GroupRemovePeopleSheet(
+        state = state,
+        chatId = screen.id,
+        onClose = { removePeopleSheet = false }
     )
     if (paySheet) PaySheet(
         peerName = peerName,
@@ -804,8 +926,14 @@ private fun AddToMessageSheet(
     onLocation: () -> Unit,
     onVerify: () -> Unit,
     onReactions: () -> Unit,
+    onAddPeople: () -> Unit,
+    onRemovePeople: () -> Unit,
     onClose: () -> Unit,
     canSendPhoto: Boolean = false,
+    canSendPayment: Boolean = true,
+    canVerify: Boolean = true,
+    canShareLocation: Boolean = true,
+    canManageGroup: Boolean = false,
     onPhoto: () -> Unit = {},
 ) {
     val s = sonar
@@ -814,16 +942,104 @@ private fun AddToMessageSheet(
         contentAlignment = Alignment.BottomCenter
     ) {
         Surface(color = s.surface, shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)) {
-            Column(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 18.dp, bottom = 20.dp)) {
+            Column(
+                Modifier.fillMaxWidth().heightIn(max = 560.dp)
+                    .verticalScroll(rememberScrollState())
+                    .padding(start = 20.dp, end = 20.dp, top = 18.dp, bottom = 20.dp)
+            ) {
                 Text("Add to your message", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(8.dp))
                 if (canSendPhoto) {
-                    ActionRow(SNIconName.Lock, "Send photo", "Encrypted end-to-end over White Noise", onPhoto)
+                    ActionRow(SNIconName.Lock, "Send photo or GIF", "Encrypted end-to-end over White Noise", onPhoto)
                 }
-                ActionRow(SNIconName.Coin, "Send bitcoin", "Instant over Lightning", onBitcoin)
-                ActionRow(SNIconName.NavArrow, "Share location", "Only $peerName will see it", onLocation)
-                ActionRow(SNIconName.Shield, "Verify safety number", "Confirm this chat is secure", onVerify)
+                if (canSendPayment) ActionRow(SNIconName.Coin, "Send bitcoin", "Instant over Lightning", onBitcoin)
+                if (canShareLocation) ActionRow(SNIconName.NavArrow, "Share location", "Only $peerName will see it", onLocation)
+                if (canManageGroup) {
+                    ActionRow(SNIconName.People, "Add people", "Invite local contacts or paste npubs", onAddPeople)
+                    ActionRow(SNIconName.Trash, "Remove people", "Manage current group members", onRemovePeople)
+                }
+                if (canVerify) ActionRow(SNIconName.Shield, "Verify safety number", "Confirm this chat is secure", onVerify)
                 ActionRow(SNIconName.People, "Reactions", "A little fun, no noise", onReactions)
+            }
+        }
+    }
+}
+
+@Composable
+private fun GroupAddPeopleSheet(state: SonarAppState, chatId: String, onClose: () -> Unit) {
+    val s = sonar
+    var draft by remember(chatId) { mutableStateOf("") }
+    var selected by remember(chatId) { mutableStateOf(setOf<String>()) }
+    val existing = state.groupMemberNpubs(chatId)
+    val pasted = remember(draft, existing) { parsedNpubs(draft).filter { it !in existing } }
+    val members = remember(pasted, selected) { mergedNpubs(pasted, selected) }
+    val contacts = state.groupInviteContacts(excluding = existing)
+
+    Box(
+        Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
+        contentAlignment = Alignment.BottomCenter
+    ) {
+        Surface(color = s.surface, shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)) {
+            Column(
+                Modifier.fillMaxWidth().heightIn(max = 560.dp)
+                    .verticalScroll(rememberScrollState())
+                    .padding(start = 20.dp, end = 20.dp, top = 18.dp, bottom = 20.dp)
+            ) {
+                Text("Add people", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(10.dp))
+                SheetField(draft, "npub1… npub1…") { draft = it }
+                Spacer(Modifier.height(8.dp))
+                contacts.forEach { contact ->
+                    GroupContactRow(contact, selected = contact.npub in selected) {
+                        selected = if (contact.npub in selected) selected - contact.npub else selected + contact.npub
+                    }
+                }
+                Spacer(Modifier.height(10.dp))
+                SNPrimaryButton("Add people", disabled = members.isEmpty()) {
+                    state.addGroupMembers(chatId, members)
+                    onClose()
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun GroupRemovePeopleSheet(state: SonarAppState, chatId: String, onClose: () -> Unit) {
+    val s = sonar
+    val members = state.groupMemberContacts(chatId)
+    Box(
+        Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
+        contentAlignment = Alignment.BottomCenter
+    ) {
+        Surface(color = s.surface, shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)) {
+            Column(
+                Modifier.fillMaxWidth().heightIn(max = 560.dp)
+                    .verticalScroll(rememberScrollState())
+                    .padding(start = 20.dp, end = 20.dp, top = 18.dp, bottom = 20.dp)
+            ) {
+                Text("Remove people", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(8.dp))
+                if (members.isEmpty()) {
+                    Text("No removable members.", color = s.text2, fontSize = 13.5.sp, modifier = Modifier.padding(vertical = 12.dp))
+                } else {
+                    members.forEach { member ->
+                        Row(
+                            Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp))
+                                .clickable { state.removeGroupMembers(chatId, listOf(member.npub)) }
+                                .padding(vertical = 9.dp, horizontal = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            SonarAvatar(member.title, 38.dp)
+                            Spacer(Modifier.width(12.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text(member.title, color = s.text, fontSize = 15.5.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text(member.subtitle, color = s.text2, fontSize = 12.5.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                            SNIcon(SNIconName.Trash, 17.dp, s.danger, weight = 2f)
+                        }
+                    }
+                }
             }
         }
     }
@@ -868,6 +1084,28 @@ private fun SlashHints(draft: String, onPick: (String) -> Unit) {
                 Text("/$cmd", color = s.accent, fontSize = 14.sp, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.width(10.dp))
                 Text(desc, color = s.text3, fontSize = 13.sp)
+            }
+        }
+    }
+}
+
+private val quickEmojis = listOf("👍", "❤️", "😂", "🔥", "🙏", "👏", "🎉", "👀", "💯", "⚡")
+
+@Composable
+private fun EmojiTray(onPick: (String) -> Unit) {
+    val s = sonar
+    Row(
+        Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
+            .padding(start = 10.dp, end = 10.dp, top = 8.dp, bottom = 2.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        quickEmojis.forEach { emoji ->
+            Box(
+                Modifier.size(38.dp).clip(CircleShape).background(s.surface2)
+                    .clickable { onPick(emoji) },
+                contentAlignment = Alignment.Center
+            ) {
+                Text(emoji, fontSize = 20.sp)
             }
         }
     }
@@ -1014,7 +1252,7 @@ private fun GeoDmScreen(state: SonarAppState, screen: Screen.GeoDm) {
 }
 
 @Composable
-private fun MessageBubble(m: SonarMsg, mesh: Boolean = false) {
+private fun MessageBubble(m: SonarMsg, mesh: Boolean = false, author: String? = null) {
     val s = sonar
     // Own bubble is cyan over BLE mesh, indigo over Nostr/internet (the design's
     // transport-colored bubbles); the other party's bubble is always the surface.
@@ -1028,6 +1266,14 @@ private fun MessageBubble(m: SonarMsg, mesh: Boolean = false) {
         Modifier.fillMaxWidth().padding(vertical = 3.dp),
         horizontalAlignment = if (m.mine) Alignment.End else Alignment.Start
     ) {
+        if (!author.isNullOrBlank()) {
+            Text(
+                author,
+                color = s.text3,
+                fontSize = 11.5.sp,
+                modifier = Modifier.padding(start = 6.dp, bottom = 2.dp)
+            )
+        }
         Box(
             Modifier.clip(RoundedCornerShape(18.dp))
                 .background(if (m.mine) mineBg else s.bubbleOther)
@@ -1055,6 +1301,7 @@ private fun MediaBubble(
     state: SonarAppState,
     chatId: String,
     mesh: Boolean,
+    author: String? = null,
     onOpen: (SonarMedia) -> Unit,
 ) {
     val s = sonar
@@ -1063,11 +1310,22 @@ private fun MediaBubble(
         Modifier.fillMaxWidth().padding(vertical = 3.dp),
         horizontalAlignment = if (m.mine) Alignment.End else Alignment.Start
     ) {
+        if (!author.isNullOrBlank()) {
+            Text(
+                author,
+                color = s.text3,
+                fontSize = 11.5.sp,
+                modifier = Modifier.padding(start = 6.dp, bottom = 2.dp)
+            )
+        }
         if (media.isImage) {
-            val img by androidx.compose.runtime.produceState<androidx.compose.ui.graphics.ImageBitmap?>(
+            val mediaBytes by androidx.compose.runtime.produceState<ByteArray?>(
                 null, media.url
             ) {
-                value = state.mediaData(chatId, media)?.let { decodeImageBitmap(it) }
+                value = state.mediaData(chatId, media)
+            }
+            val img = androidx.compose.runtime.remember(mediaBytes) {
+                mediaBytes?.let { decodeImageBitmap(it) }
             }
             Box(
                 Modifier.widthIn(max = 240.dp).clip(RoundedCornerShape(18.dp)).background(s.surface2)
@@ -1075,13 +1333,14 @@ private fun MediaBubble(
                 contentAlignment = Alignment.Center
             ) {
                 val bmp = img
-                if (bmp != null) {
-                    androidx.compose.foundation.Image(
-                        bitmap = bmp,
-                        contentDescription = media.filename,
-                        contentScale = ContentScale.Fit,
+                val bytes = mediaBytes
+                if (bytes != null && (media.isGif || bmp != null)) {
+                    MediaImage(
+                        bytes = bytes,
+                        isGif = media.isGif,
                         modifier = Modifier.widthIn(max = 240.dp).heightIn(max = 300.dp)
                     )
+                    if (media.isGif) GifBadge(Modifier.align(Alignment.TopEnd).padding(8.dp))
                 } else {
                     Box(
                         Modifier.size(width = 180.dp, height = 130.dp),
@@ -1091,6 +1350,7 @@ private fun MediaBubble(
                             color = s.text3, strokeWidth = 2.dp
                         )
                     }
+                    if (media.isGif) GifBadge(Modifier.align(Alignment.TopEnd).padding(8.dp))
                 }
             }
         } else if (media.mimeType.startsWith("audio/")) {
@@ -1329,6 +1589,18 @@ private fun MediaActionText(label: String, enabled: Boolean, onClick: () -> Unit
     )
 }
 
+@Composable
+private fun GifBadge(modifier: Modifier = Modifier) {
+    Text(
+        "GIF",
+        color = sonar.onNet,
+        fontSize = 10.sp,
+        fontWeight = FontWeight.Black,
+        modifier = modifier.clip(RoundedCornerShape(7.dp)).background(sonar.netFill)
+            .padding(horizontal = 6.dp, vertical = 3.dp)
+    )
+}
+
 /**
  * Audio / voice-note bubble (design: MediaBubble `media-audio` — play button +
  * `MediaWave` + duration). Downloads + decrypts the note on appear, then plays it
@@ -1561,14 +1833,22 @@ private fun linkify(text: String, linkColor: androidx.compose.ui.graphics.Color)
 private fun ComposeSheet(state: SonarAppState, onClose: () -> Unit) {
     val s = sonar
     var npubEntry by remember { mutableStateOf(false) }
+    var groupEntry by remember { mutableStateOf(false) }
     var npubDraft by remember { mutableStateOf("") }
+    var groupName by remember { mutableStateOf("") }
+    var groupMembers by remember { mutableStateOf("") }
+    var selectedGroupNpubs by remember { mutableStateOf(setOf<String>()) }
     val inRange = state.meshPeers
     Box(
         Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
         contentAlignment = Alignment.BottomCenter
     ) {
         Surface(color = s.surface, shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)) {
-            Column(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 18.dp, bottom = 22.dp)) {
+            Column(
+                Modifier.fillMaxWidth().heightIn(max = 620.dp)
+                    .verticalScroll(rememberScrollState())
+                    .padding(start = 20.dp, end = 20.dp, top = 18.dp, bottom = 22.dp)
+            ) {
                 Text("Start a chat", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(10.dp))
                 if (inRange.isEmpty()) {
@@ -1600,7 +1880,10 @@ private fun ComposeSheet(state: SonarAppState, onClose: () -> Unit) {
                     onClose(); state.push(Screen.Nearby)
                 }
                 ActionRow(SNIconName.Key, "Secure chat via npub", "Encrypted chat over the internet — reaches anywhere") {
-                    npubEntry = true
+                    npubEntry = true; groupEntry = false
+                }
+                ActionRow(SNIconName.People, "New group", "Invite nearby people or paste npubs") {
+                    groupEntry = true; npubEntry = false
                 }
                 if (npubEntry) {
                     Spacer(Modifier.height(8.dp))
@@ -1610,6 +1893,31 @@ private fun ComposeSheet(state: SonarAppState, onClose: () -> Unit) {
                         "Start secure chat",
                         disabled = !npubDraft.trim().startsWith("npub1")
                     ) { state.startChat(npubDraft.trim()); onClose() }
+                }
+                if (groupEntry) {
+                    Spacer(Modifier.height(8.dp))
+                    SheetField(groupName, "Group name") { groupName = it }
+                    Spacer(Modifier.height(8.dp))
+                    SheetField(groupMembers, "npub1… npub1…") { groupMembers = it }
+                    val contacts = state.groupInviteContacts()
+                    if (contacts.isNotEmpty()) {
+                        Spacer(Modifier.height(8.dp))
+                        contacts.forEach { contact ->
+                            GroupContactRow(contact, selected = contact.npub in selectedGroupNpubs) {
+                                selectedGroupNpubs =
+                                    if (contact.npub in selectedGroupNpubs) selectedGroupNpubs - contact.npub
+                                    else selectedGroupNpubs + contact.npub
+                            }
+                        }
+                    }
+                    Spacer(Modifier.height(10.dp))
+                    val members = remember(groupMembers, selectedGroupNpubs) {
+                        mergedNpubs(parsedNpubs(groupMembers), selectedGroupNpubs)
+                    }
+                    SNPrimaryButton(
+                        "Create group",
+                        disabled = groupName.trim().isEmpty() || members.size < 2
+                    ) { state.createGroup(groupName, members); onClose() }
                 }
             }
         }
@@ -1635,6 +1943,39 @@ private fun ActionRow(icon: SNIconName, label: String, desc: String, onClick: ()
         }
         SNIcon(SNIconName.Chevron, 14.dp, s.text3, weight = 2.2f)
     }
+}
+
+@Composable
+private fun GroupContactRow(contact: GroupContact, selected: Boolean, onClick: () -> Unit) {
+    val s = sonar
+    Row(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp))
+            .clickable(onClick = onClick)
+            .padding(vertical = 9.dp, horizontal = 4.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        SonarAvatar(contact.title, 38.dp)
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+            Text(contact.title, color = s.text, fontSize = 15.5.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(contact.subtitle, color = s.text2, fontSize = 12.5.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
+        Box(
+            Modifier.size(24.dp).clip(CircleShape).background(if (selected) s.accent else s.surface2),
+            contentAlignment = Alignment.Center
+        ) {
+            if (selected) SNIcon(SNIconName.Check, 13.dp, s.onAccent, weight = 2.6f)
+        }
+    }
+}
+
+private fun parsedNpubs(text: String): List<String> =
+    text.split(Regex("[,\\s]+")).map { it.trim() }.filter { it.startsWith("npub1") }
+
+private fun mergedNpubs(pasted: List<String>, selected: Set<String>): List<String> {
+    val seen = linkedSetOf<String>()
+    (pasted + selected.sorted()).forEach { if (it.isNotBlank()) seen += it }
+    return seen.toList()
 }
 
 @Composable

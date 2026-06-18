@@ -101,9 +101,13 @@ scan to `/tmp/sonar-ble.log`.
 ## Build & run — Android
 
 ```bash
-ANDROID_NDK_HOME=/path/to/ndk core/build-android.sh   # Rust core .so + bindings
+# Gradle runs :composeApp:buildAndroidRustCore first, generating Rust .so files
+# and UniFFI bindings under androidMain from core/build-android.sh.
 cd apps/sonar
 ./gradlew :composeApp:installDebug
+
+# Optional manual regeneration/debug:
+ANDROID_NDK_HOME=/path/to/ndk ../../core/build-android.sh
 ```
 
 ## Tests

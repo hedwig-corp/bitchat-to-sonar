@@ -36,9 +36,28 @@ val generateBreezKeyResource = tasks.register("generateBreezKeyResource") {
 }
 
 val repoRootDir = rootProject.projectDir.parentFile.parentFile
+val androidMainDir = layout.projectDirectory.dir("src/androidMain")
+val androidBindingsFile = androidMainDir.file("kotlin/uniffi/sonar_ffi/sonar_ffi.kt")
+val androidJniLibsDir = androidMainDir.dir("jniLibs")
 val desktopMainDir = layout.projectDirectory.dir("src/jvmMain")
 val desktopBindingsFile = desktopMainDir.file("kotlin/uniffi/sonar_ffi/sonar_ffi.kt")
 val desktopResourcesDir = desktopMainDir.dir("resources")
+
+val buildAndroidRustCore = tasks.register<Exec>("buildAndroidRustCore") {
+    description = "Builds the Android Rust core and UniFFI Android bindings."
+    group = "build"
+
+    inputs.file(repoRootDir.resolve("core/build-android.sh"))
+    inputs.file(repoRootDir.resolve("core/Cargo.toml"))
+    inputs.file(repoRootDir.resolve("core/Cargo.lock"))
+    inputs.dir(repoRootDir.resolve("core/sonar-core/src"))
+    inputs.dir(repoRootDir.resolve("core/sonar-ffi/src"))
+    outputs.file(androidBindingsFile)
+    outputs.dir(androidJniLibsDir)
+
+    workingDir(repoRootDir)
+    commandLine(repoRootDir.resolve("core/build-android.sh").absolutePath)
+}
 
 val buildDesktopRustCore = tasks.register<Exec>("buildDesktopRustCore") {
     description = "Builds the desktop Rust core, BLE bridge, native wallet lib, and UniFFI JVM bindings."
@@ -160,6 +179,7 @@ compose.desktop {
 tasks.named("jvmProcessResources") { dependsOn(generateBreezKeyResource) }
 tasks.named("compileKotlinJvm") { dependsOn(buildDesktopRustCore) }
 tasks.named("jvmProcessResources") { dependsOn(buildDesktopRustCore) }
+tasks.named("preBuild") { dependsOn(buildAndroidRustCore) }
 
 android {
     namespace = "chat.bitchat.sonar"

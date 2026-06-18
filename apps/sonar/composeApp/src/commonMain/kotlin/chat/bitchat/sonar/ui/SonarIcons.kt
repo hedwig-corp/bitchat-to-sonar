@@ -30,7 +30,7 @@ import kotlin.math.sqrt
  */
 enum class SNIconName {
     Back, Chevron, Lock, Plus, Pin, People, Mesh, Globe, Check, Shield,
-    ShieldCheck, X, NavArrow, Dice, Rings, Moon, Trash, Info, Coin, Bolt,
+    ShieldCheck, X, Smile, NavArrow, Dice, Rings, Moon, Trash, Info, Coin, Bolt,
     Pencil, Key, Search, Mic, Play, Pause, Bookmark, BookmarkFill,
     // Call glyphs (design icons.jsx): voice/video buttons + in-call controls.
     Phone, Videocam, PhoneDown, MicOff, VideoOff, Speaker, CameraFlip,
@@ -63,6 +63,7 @@ private val ICONS: Map<SNIconName, List<Shape>> = mapOf(
     SNIconName.Shield to listOf(Shape.P("M12 3.4l7 2.7v5.2c0 4.4-2.9 7.4-7 9-4.1-1.6-7-4.6-7-9V6.1z")),
     SNIconName.ShieldCheck to listOf(Shape.P("M12 3.4l7 2.7v5.2c0 4.4-2.9 7.4-7 9-4.1-1.6-7-4.6-7-9V6.1z"), Shape.P("M8.8 12.1l2.3 2.3 4.3-4.6")),
     SNIconName.X to listOf(Shape.P("M6.5 6.5l11 11M17.5 6.5l-11 11")),
+    SNIconName.Smile to listOf(Shape.C(12f, 12f, 8.2f), Shape.C(9.1f, 10.2f, 1.1f, fill = true), Shape.C(14.9f, 10.2f, 1.1f, fill = true), Shape.P("M8.7 14.2a4.5 4.5 0 0 0 6.6 0")),
     SNIconName.NavArrow to listOf(Shape.P("M20.4 3.6 3.8 10.2l6.6 3.4 3.4 6.6z")),
     SNIconName.Dice to listOf(Shape.R(4.2f, 4.2f, 15.6f, 15.6f, 4f), Shape.C(8.8f, 8.8f, 1.2f, fill = true), Shape.C(15.2f, 8.8f, 1.2f, fill = true), Shape.C(12f, 12f, 1.2f, fill = true), Shape.C(8.8f, 15.2f, 1.2f, fill = true), Shape.C(15.2f, 15.2f, 1.2f, fill = true)),
     SNIconName.Rings to listOf(Shape.C(12f, 12f, 2f, fill = true), Shape.C(12f, 12f, 5.8f), Shape.C(12f, 12f, 9.4f)),

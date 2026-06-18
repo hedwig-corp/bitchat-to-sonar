@@ -36,6 +36,21 @@ object Bech32 {
         return d.data.joinToString("") { ((it.toInt() and 0xFF) + 0x100).toString(16).substring(1) }
     }
 
+    /** Encode 8-bit payload bytes as BIP-173 bech32. Returns null on invalid input. */
+    fun encode(hrp: String, data: ByteArray): String? {
+        val cleanHrp = hrp.lowercase()
+        if (cleanHrp.isEmpty() || cleanHrp.any { it.code < 33 || it.code > 126 }) return null
+        val fiveBit = convertBits(data.map { it.toInt() and 0xFF }.toIntArray(), 8, 5, true)
+            ?: return null
+        val values = fiveBit.map { it.toInt() and 0xFF }.toIntArray()
+        val checksum = createChecksum(cleanHrp, values)
+        return buildString {
+            append(cleanHrp)
+            append('1')
+            for (v in values + checksum) append(CHARSET[v])
+        }
+    }
+
     private fun polymod(values: IntArray): Int {
         val gen = intArrayOf(0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3)
         var chk = 1
@@ -57,6 +72,11 @@ object Bech32 {
 
     private fun verifyChecksum(hrp: String, data: IntArray): Boolean =
         polymod(hrpExpand(hrp) + data) == 1
+
+    private fun createChecksum(hrp: String, data: IntArray): IntArray {
+        val mod = polymod(hrpExpand(hrp) + data + IntArray(6)) xor 1
+        return IntArray(6) { i -> (mod ushr (5 * (5 - i))) and 31 }
+    }
 
     private fun convertBits(data: IntArray, from: Int, to: Int, pad: Boolean): ByteArray? {
         var acc = 0

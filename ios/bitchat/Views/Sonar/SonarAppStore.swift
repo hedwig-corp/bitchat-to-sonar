@@ -198,6 +198,10 @@ struct SNMediaItem: Equatable {
     /// When set, the bytes are loaded locally instead of downloaded from Blossom.
     var localPath: String? = nil
     var isImage: Bool { mime.hasPrefix("image/") }
+    var isGif: Bool {
+        mime.caseInsensitiveCompare("image/gif") == .orderedSame ||
+        filename.lowercased().hasSuffix(".gif")
+    }
 }
 
 /// A public channel row: the `#mesh` channel or one geohash level around the
@@ -254,6 +258,14 @@ struct SNDMRow: Identifiable {
     let verified: Bool
     let isMarmot: Bool
     let lastDate: Date?
+}
+
+/// A local contact that can be invited into a Marmot group.
+struct SNGroupContact: Identifiable, Hashable {
+    let id: String          // npub, so duplicates across radar/messages collapse.
+    let title: String
+    let subtitle: String
+    let npub: String
 }
 
 /// Real verification data for the verify sheet.
@@ -1445,11 +1457,94 @@ final class SonarAppStore: ObservableObject {
 
     /// The White Noise (Marmot) 1:1 group whose counterpart is `npub`.
     func marmotGroup(forNpub npub: String) -> MarmotService.MarmotGroup? {
-        marmot.groups.first { $0.memberNpubs.contains(npub) }
+        marmot.groups.first { marmot.isDirectGroup($0) && $0.memberNpubs.contains(npub) }
     }
 
     func marmotGroupId(_ id: String) -> String? {
         id.hasPrefix(Self.marmotIDPrefix) ? String(id.dropFirst(Self.marmotIDPrefix.count)) : nil
+    }
+
+    private func marmotGroup(byId groupId: String) -> MarmotService.MarmotGroup? {
+        marmot.groups.first { $0.id == groupId }
+    }
+
+    func marmotGroup(forConversationId id: String) -> MarmotService.MarmotGroup? {
+        guard let groupId = marmotGroupId(id) else { return nil }
+        return marmotGroup(byId: groupId)
+    }
+
+    func isMultiMemberMarmotGroupId(_ id: String) -> Bool {
+        guard let groupId = marmotGroupId(id),
+              let group = marmotGroup(byId: groupId)
+        else { return false }
+        return !marmot.isDirectGroup(group)
+    }
+
+    func groupInviteContacts(excluding excluded: Set<String> = []) -> [SNGroupContact] {
+        let excluded = Set(excluded.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) })
+        var byNpub: [String: SNGroupContact] = [:]
+
+        func insert(title: String, subtitle: String, npub: String) {
+            let clean = npub.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard clean.hasPrefix("npub1"), !excluded.contains(clean) else { return }
+            if let mine = marmot.npub, clean == mine { return }
+            guard byNpub[clean] == nil else { return }
+            byNpub[clean] = SNGroupContact(
+                id: clean,
+                title: title.isEmpty ? Self.shortNpub(clean) : title,
+                subtitle: subtitle,
+                npub: clean
+            )
+        }
+
+        for peer in nearbyPeers where !peer.unify {
+            guard let profile = resolvedSonarProfile(peer.id) else { continue }
+            insert(
+                title: peer.name,
+                subtitle: peer.inRange ? "Nearby · Bluetooth" : "Known Sonar contact",
+                npub: profile.npub
+            )
+        }
+        for row in dmRows {
+            if let groupId = marmotGroupId(row.id),
+               let group = marmotGroup(byId: groupId),
+               let other = directOtherNpub(in: group) {
+                insert(title: row.title, subtitle: "White Noise chat", npub: other)
+            } else if let profile = resolvedSonarProfile(row.id) {
+                insert(title: row.title, subtitle: row.presence ? "Nearby · Bluetooth" : "Known Sonar contact", npub: profile.npub)
+            }
+        }
+        for group in marmot.groups where marmot.isDirectGroup(group) {
+            guard let other = directOtherNpub(in: group) else { continue }
+            insert(title: marmot.title(for: group), subtitle: "White Noise chat", npub: other)
+        }
+
+        return byNpub.values.sorted {
+            $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
+        }
+    }
+
+    func groupMemberContacts(forConversationId id: String) -> [SNGroupContact] {
+        guard let group = marmotGroup(forConversationId: id) else { return [] }
+        return marmot.otherMembers(in: group).map { npub in
+            marmot.ensureProfile(npub)
+            let title = marmot.displayName(forNpub: npub) ?? Self.shortNpub(npub)
+            return SNGroupContact(
+                id: npub,
+                title: title,
+                subtitle: Self.shortNpub(npub),
+                npub: npub
+            )
+        }
+    }
+
+    static func shortNpub(_ value: String) -> String {
+        value.count > 16 ? "\(value.prefix(10))…\(value.suffix(4))" : value
+    }
+
+    private func directOtherNpub(in group: MarmotService.MarmotGroup) -> String? {
+        guard marmot.isDirectGroup(group) else { return nil }
+        return marmot.otherMembers(in: group).first
     }
 
     private func callMarmotGroupId(_ id: String) -> String? {
@@ -1461,8 +1556,8 @@ final class SonarAppStore: ObservableObject {
     private func callProfile(_ id: String) -> SonarPeerProfile? {
         if let profile = resolvedSonarProfile(id) { return profile }
         guard let groupId = marmotGroupId(id),
-              let group = marmot.groups.first(where: { $0.id == groupId }),
-              let otherNpub = group.memberNpubs.first(where: { $0 != marmot.npub })
+              let group = marmotGroup(byId: groupId),
+              let otherNpub = directOtherNpub(in: group)
         else { return nil }
         if let peerKey = sonarPeerKey(forNpub: otherNpub) {
             return resolvedSonarProfile(peerKey)
@@ -1474,9 +1569,9 @@ final class SonarAppStore: ObservableObject {
     private func callNpub(_ id: String) -> String? {
         if let profile = callProfile(id) { return profile.npub }
         guard let groupId = marmotGroupId(id),
-              let group = marmot.groups.first(where: { $0.id == groupId })
+              let group = marmotGroup(byId: groupId)
         else { return nil }
-        return group.memberNpubs.first(where: { $0 != marmot.npub })
+        return directOtherNpub(in: group)
     }
 
     private func callDescriptor(_ id: String) -> MarmotService.SonarDescriptor? {
@@ -1508,8 +1603,8 @@ final class SonarAppStore: ObservableObject {
     }
 
     private func foldedConversationId(forMarmotGroupId groupId: String) -> String? {
-        guard let group = marmot.groups.first(where: { $0.id == groupId }),
-              let otherNpub = group.memberNpubs.first(where: { $0 != marmot.npub })
+        guard let group = marmotGroup(byId: groupId),
+              let otherNpub = directOtherNpub(in: group)
         else { return nil }
         return sonarPeerKey(forNpub: otherNpub)
     }
@@ -1562,7 +1657,21 @@ final class SonarAppStore: ObservableObject {
         for group in marmot.groups {
             let msgs = marmot.messagesByGroup[group.id] ?? []
             let last = msgs.last
-            let otherNpub = group.memberNpubs.first(where: { $0 != marmot.npub })
+            guard marmot.isDirectGroup(group) else {
+                marmotRows.append(SNDMRow(
+                    id: Self.marmotIDPrefix + group.id,
+                    title: marmot.title(for: group),
+                    preview: last.map { Self.previewText($0.content) } ?? "Secure group · reaches anywhere",
+                    time: last.map { Self.listTime($0.createdAt) } ?? "",
+                    unread: false,
+                    presence: false,
+                    verified: false,
+                    isMarmot: true,
+                    lastDate: last?.createdAt
+                ))
+                continue
+            }
+            let otherNpub = directOtherNpub(in: group)
             // Live peer id (when currently discovered over 0x53) gives us mesh
             // presence; the persisted fingerprint still lets us build the SAME
             // Sonar row when BLE is down / after restart.
@@ -2403,8 +2512,13 @@ final class SonarAppStore: ObservableObject {
 
     func verifyInfo(for id: String) -> SNVerifyInfo {
         if let groupId = marmotGroupId(id) {
-            let other = marmot.groups.first { $0.id == groupId }?
-                .memberNpubs.first { $0 != marmot.npub }
+            guard let group = marmotGroup(byId: groupId), marmot.isDirectGroup(group) else {
+                return SNVerifyInfo(
+                    available: false, safety: [], publicKey: "",
+                    note: "Safety numbers are available for 1:1 chats."
+                )
+            }
+            let other = directOtherNpub(in: group)
             if let mine = marmot.npub, let other {
                 return SNVerifyInfo(
                     available: true,
@@ -2874,13 +2988,21 @@ final class SonarAppStore: ObservableObject {
 
     // MARK: Delete a single chat (per-row)
 
-    /// Delete ONE conversation from this device. Handles all three Messages-row
+    /// Delete or leave ONE conversation. Handles all three Messages-row
     /// kinds: a pure White Noise/Marmot group (`marmot:<id>`), a mesh/bitchat
     /// peer, or a Sonar peer whose conversation spans BOTH a mesh leg and a White
-    /// Noise leg (delete both). Local-only — the other party is not notified.
+    /// Noise leg (delete both). Multi-member Marmot groups publish a leave
+    /// proposal; other deletes are local-only.
     func deleteChat(_ id: String) {
         if let groupId = marmotGroupId(id) {
-            Task { await marmot.deleteGroup(groupId) }
+            let shouldLeave = isMultiMemberMarmotGroupId(id)
+            Task {
+                if shouldLeave {
+                    await marmot.leaveGroup(groupId)
+                } else {
+                    await marmot.deleteGroup(groupId)
+                }
+            }
         } else {
             // Mesh / Sonar peer: delete the mesh transcript...
             chatViewModel.deleteConversation(with: PeerID(str: id))

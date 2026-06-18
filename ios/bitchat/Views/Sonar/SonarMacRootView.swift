@@ -250,9 +250,28 @@ private struct SonarMacSidebar: View {
                     }
 
                     SNSectionLabel("Messages")
-                    if store.dmRows.isEmpty {
+                    if store.dmRows.isEmpty && store.marmot.pendingGroupInvites.isEmpty {
                         MacEmptySidebarHint("No secure chats yet. Use Search or the radar to start one.")
                     } else {
+                        ForEach(store.marmot.pendingGroupInvites, id: \.id) { invite in
+                            let title = invite.groupName.isEmpty ? "Group chat" : invite.groupName
+                            MacPaletteRow(icon: .people, title: title, sub: "\(invite.memberCount) members · invite") {
+                                Task {
+                                    if let groupId = try? await store.marmot.acceptGroupInvite(invite) {
+                                        let id = SonarAppStore.marmotIDPrefix + groupId
+                                        store.openedDM(id)
+                                        selection = .dm(id)
+                                    }
+                                }
+                            }
+                            .contextMenu {
+                                Button(role: .destructive) {
+                                    Task { try? await store.marmot.declineGroupInvite(invite) }
+                                } label: {
+                                    Label("Decline invite", systemImage: "xmark.circle")
+                                }
+                            }
+                        }
                         ForEach(store.dmRows) { row in
                             MacDMRow(
                                 row: row,
@@ -464,6 +483,10 @@ private struct MacConversationPane: View {
     @State private var verifySheet = false
     @State private var paySheet = false
     @State private var walletSheet = false
+    @State private var addPeopleSheet = false
+    @State private var removePeopleSheet = false
+    @State private var groupAddDraft = ""
+    @State private var selectedAddNpubs: Set<String> = []
     @State private var importMedia = false
     @State private var importFile = false
     @State private var authorSheet: SonarAppStore.SNChannelAuthor?
@@ -487,7 +510,8 @@ private struct MacConversationPane: View {
 
     private var channel: SNChannelItem { store.channelItem(id) }
     private var peer: SNPeerItem { store.peerItem(id) }
-    private var verified: Bool { !isChannel && store.isVerified(id) }
+    private var isMultiMemberMarmot: Bool { !isChannel && store.isMultiMemberMarmotGroupId(id) }
+    private var verified: Bool { !isChannel && !isMultiMemberMarmot && store.isVerified(id) }
     private var transport: SNVia { isChannel ? (id == "mesh" ? .mesh : .internet) : store.dmTransport(id) }
 
     var body: some View {
@@ -518,6 +542,12 @@ private struct MacConversationPane: View {
                 onClose: { paySheet = false },
                 onSend: { sats in store.sendPay(id, sats: sats) }
             )
+        }
+        .snSheet(isPresented: $addPeopleSheet, title: "Add people") {
+            addPeopleContent
+        }
+        .snSheet(isPresented: $removePeopleSheet, title: "Remove people") {
+            removePeopleContent
         }
         .snSheet(isPresented: $walletSheet, title: "Your wallet") {
             SNWalletSheetContent(onClose: { walletSheet = false })
@@ -565,6 +595,12 @@ private struct MacConversationPane: View {
             allowsMultipleSelection: true
         ) { result in
             importAttachments(result)
+        }
+        .onChange(of: addPeopleSheet) { open in
+            if !open {
+                groupAddDraft = ""
+                selectedAddNpubs = []
+            }
         }
     }
 
@@ -638,6 +674,8 @@ private struct MacConversationPane: View {
             SNBanner(icon: .people, tone: .publicRoom, bold: "Public channel", rest: " - anyone nearby can read")
         } else if verified {
             SNBanner(icon: .shieldCheck, tone: .enc, bold: "Verified", rest: " - you confirmed \(peer.name)'s safety number")
+        } else if isMultiMemberMarmot {
+            SNBanner(icon: .lock, tone: .enc, bold: "End-to-end encrypted", rest: " - only group members can read this")
         } else if transport == .internet && !peer.inRange {
             SNBanner(icon: .globe, tone: .net, bold: "Out of Bluetooth range", rest: " - encrypted over the internet instead")
         } else {
@@ -681,12 +719,14 @@ private struct MacConversationPane: View {
                     icon: .lock,
                     iconSize: 24,
                     title: "Say hi to \(peer.name)",
-                    desc: "Messages here are end-to-end encrypted. Only the two of you can read them."
+                    desc: isMultiMemberMarmot
+                        ? "Messages here are end-to-end encrypted. Only group members can read them."
+                        : "Messages here are end-to-end encrypted. Only the two of you can read them."
                 )
             } else {
                 SNMsgList(
                     msgs: msgs,
-                    showAuthors: false,
+                    showAuthors: isMultiMemberMarmot,
                     peerName: peer.name,
                     money: { store.money($0) },
                     fiatText: { store.moneySatsLine($0) },
@@ -759,7 +799,17 @@ private struct MacConversationPane: View {
                     importFile = true
                 }
             }
-            if !isChannel {
+            if !isChannel && isMultiMemberMarmot {
+                SNActionRow(icon: .people, label: "Add people", desc: "Invite local contacts or paste npubs") {
+                    actionSheet = false
+                    addPeopleSheet = true
+                }
+                SNActionRow(icon: .trash, label: "Remove people", desc: "Manage current group members") {
+                    actionSheet = false
+                    removePeopleSheet = true
+                }
+            }
+            if !isChannel && !isMultiMemberMarmot {
                 SNActionRow(icon: .shield, label: "Verify safety number", desc: "Confirm this chat is secure") {
                     actionSheet = false
                     verifySheet = true
@@ -770,6 +820,108 @@ private struct MacConversationPane: View {
                 onSelect(.radar)
             }
         }
+    }
+
+    private var addPeopleContent: some View {
+        let existing = Set(store.marmotGroup(forConversationId: id)?.memberNpubs ?? [])
+        let pasted = parsedNpubs(from: groupAddDraft).filter { !existing.contains($0) }
+        let members = mergedNpubs(pasted: pasted, selected: selectedAddNpubs)
+        let contacts = store.groupInviteContacts(excluding: existing)
+
+        return ScrollView {
+            VStack(spacing: 8) {
+                TextField(
+                    "",
+                    text: $groupAddDraft,
+                    prompt: Text(verbatim: "npub1... npub1...").foregroundColor(SonarTheme.text3)
+                )
+                .textFieldStyle(.plain)
+                .font(SonarTheme.monoFont(size: 13))
+                .foregroundColor(SonarTheme.text)
+                .padding(EdgeInsets(top: 11, leading: 14, bottom: 11, trailing: 14))
+                .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(SonarTheme.surface2))
+
+                if !contacts.isEmpty {
+                    VStack(spacing: 0) {
+                        ForEach(Array(contacts.enumerated()), id: \.element.id) { i, contact in
+                            SNGroupContactRow(
+                                contact: contact,
+                                selected: selectedAddNpubs.contains(contact.npub),
+                                divider: i < contacts.count - 1
+                            ) {
+                                if selectedAddNpubs.contains(contact.npub) {
+                                    selectedAddNpubs.remove(contact.npub)
+                                } else {
+                                    selectedAddNpubs.insert(contact.npub)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                SNPrimaryButton(label: "Add people", disabled: members.isEmpty) {
+                    guard let groupId = store.marmotGroupId(id) else { return }
+                    addPeopleSheet = false
+                    Task { try? await store.marmot.addGroupMembers(members, to: groupId) }
+                }
+            }
+            .padding(EdgeInsets(top: 6, leading: 10, bottom: 2, trailing: 10))
+        }
+        .frame(maxHeight: 430)
+    }
+
+    private var removePeopleContent: some View {
+        let members = store.groupMemberContacts(forConversationId: id)
+        return ScrollView {
+            VStack(spacing: 0) {
+                if members.isEmpty {
+                    Text("No removable members.")
+                        .font(SonarTheme.uiFont(size: 13.5))
+                        .foregroundColor(SonarTheme.text2)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 14)
+                } else {
+                    ForEach(members) { member in
+                        Button {
+                            guard let groupId = store.marmotGroupId(id) else { return }
+                            Task { try? await store.marmot.removeGroupMembers([member.npub], from: groupId) }
+                        } label: {
+                            HStack(spacing: 12) {
+                                SonarAvatar(name: member.title, size: 38)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(verbatim: member.title)
+                                        .font(SonarTheme.uiFont(size: 15.5, weight: .semibold))
+                                        .foregroundColor(SonarTheme.text)
+                                        .lineLimit(1)
+                                    Text(verbatim: member.subtitle)
+                                        .font(SonarTheme.uiFont(size: 12.5))
+                                        .foregroundColor(SonarTheme.text2)
+                                        .lineLimit(1)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                SNIcon(name: .trash, size: 17, weight: 2)
+                                    .foregroundColor(SonarTheme.danger)
+                            }
+                            .padding(EdgeInsets(top: 9, leading: 10, bottom: 9, trailing: 10))
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(SNRowPressStyle(cornerRadius: 14))
+                    }
+                }
+            }
+        }
+        .frame(maxHeight: 430)
+    }
+
+    private func parsedNpubs(from text: String) -> [String] {
+        text.components(separatedBy: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: ",")))
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { $0.hasPrefix("npub1") }
+    }
+
+    private func mergedNpubs(pasted: [String], selected: Set<String>) -> [String] {
+        var seen = Set<String>()
+        return (pasted + selected.sorted()).filter { seen.insert($0).inserted }
     }
 
     private var slapTarget: String {
@@ -1384,6 +1536,7 @@ private struct MacRadarPeerRow: View {
 private enum MacPaletteCommand: String, CaseIterable, Identifiable {
     case profile
     case secureChat
+    case newGroup
     case settings
     case nearby
 
@@ -1393,6 +1546,7 @@ private enum MacPaletteCommand: String, CaseIterable, Identifiable {
         switch self {
         case .profile: return .key
         case .secureChat: return .key
+        case .newGroup: return .people
         case .settings: return .list
         case .nearby: return .rings
         }
@@ -1402,6 +1556,7 @@ private enum MacPaletteCommand: String, CaseIterable, Identifiable {
         switch self {
         case .profile: return "Profile"
         case .secureChat: return "Secure chat via npub"
+        case .newGroup: return "New group"
         case .settings: return "Settings"
         case .nearby: return "People Nearby"
         }
@@ -1411,6 +1566,7 @@ private enum MacPaletteCommand: String, CaseIterable, Identifiable {
         switch self {
         case .profile: return "Identity, key sharing, safety, and payment address"
         case .secureChat: return "Encrypted chat over the internet - reaches anywhere"
+        case .newGroup: return "Invite people by npub"
         case .settings: return "Appearance, network, wallet, and privacy"
         case .nearby: return "Open Sonar discovery"
         }
@@ -1425,6 +1581,10 @@ private struct MacCommandPalette: View {
     @State private var query = ""
     @State private var npubDraft = ""
     @State private var npubEntry = false
+    @State private var groupNameDraft = ""
+    @State private var groupMembersDraft = ""
+    @State private var selectedGroupNpubs: Set<String> = []
+    @State private var groupEntry = false
     @State private var walletSheet = false
     @FocusState private var focused: Bool
 
@@ -1483,6 +1643,15 @@ private struct MacCommandPalette: View {
                                 onStart: { startSecureChatFromDraft() }
                             )
                         }
+                        if groupEntry {
+                            MacGroupComposeCard(
+                                name: $groupNameDraft,
+                                members: $groupMembersDraft,
+                                selected: $selectedGroupNpubs,
+                                contacts: store.groupInviteContacts(),
+                                onStart: { startGroupFromDraft() }
+                            )
+                        }
                         section("Channels")
                         ForEach(filteredChannels) { channel in
                             MacPaletteRow(icon: channel.id == "mesh" ? .mesh : .pin, title: channel.name, sub: channel.preview) {
@@ -1525,6 +1694,16 @@ private struct MacCommandPalette: View {
         }
         .onAppear {
             DispatchQueue.main.async { focused = true }
+        }
+        .onChange(of: isPresented) { open in
+            if !open {
+                npubEntry = false
+                groupEntry = false
+                npubDraft = ""
+                groupNameDraft = ""
+                groupMembersDraft = ""
+                selectedGroupNpubs = []
+            }
         }
         .snSheet(isPresented: $walletSheet, title: "Your wallet") {
             SNWalletSheetContent(onClose: { walletSheet = false })
@@ -1608,7 +1787,16 @@ private struct MacCommandPalette: View {
                     npubDraft = trimmedQuery
                 }
                 npubEntry = true
+                groupEntry = false
             }
+        case .newGroup:
+            if groupNameDraft.isEmpty, !trimmedQuery.hasPrefix("npub") {
+                groupNameDraft = trimmedQuery
+            } else if groupMembersDraft.isEmpty, trimmedQuery.hasPrefix("npub") {
+                groupMembersDraft = trimmedQuery
+            }
+            npubEntry = false
+            groupEntry = true
         case .settings:
             openSettings()
             isPresented = false
@@ -1664,6 +1852,31 @@ private struct MacCommandPalette: View {
         guard npub.hasPrefix("npub1") else { return }
         store.startSecureChat(npub: npub)
         isPresented = false
+    }
+
+    private func startGroupFromDraft() {
+        let name = groupNameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let members = mergedNpubs(pasted: parsedNpubs(from: groupMembersDraft), selected: selectedGroupNpubs)
+        guard !name.isEmpty, members.count >= 2 else { return }
+        Task {
+            if let groupId = try? await store.marmot.startGroup(name: name, members: members) {
+                let id = SonarAppStore.marmotIDPrefix + groupId
+                store.openedDM(id)
+                selection = .dm(id)
+                isPresented = false
+            }
+        }
+    }
+
+    private func parsedNpubs(from text: String) -> [String] {
+        text.components(separatedBy: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: ",")))
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { $0.hasPrefix("npub1") }
+    }
+
+    private func mergedNpubs(pasted: [String], selected: Set<String>) -> [String] {
+        var seen = Set<String>()
+        return (pasted + selected.sorted()).filter { seen.insert($0).inserted }
     }
 }
 
@@ -1737,6 +1950,88 @@ private struct MacNpubComposeCard: View {
             }
 
             SNPrimaryButton(label: "Start secure chat", disabled: !canStart) {
+                onStart()
+            }
+        }
+        .padding(EdgeInsets(top: 4, leading: 14, bottom: 7, trailing: 14))
+    }
+}
+
+private struct MacGroupComposeCard: View {
+    @Binding var name: String
+    @Binding var members: String
+    @Binding var selected: Set<String>
+    let contacts: [SNGroupContact]
+    let onStart: () -> Void
+
+    private var pastedNpubs: [String] {
+        members.components(separatedBy: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: ",")))
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { $0.hasPrefix("npub1") }
+    }
+
+    private var memberNpubs: [String] {
+        var seen = Set<String>()
+        return (pastedNpubs + selected.sorted()).filter { seen.insert($0).inserted }
+    }
+
+    private var canStart: Bool {
+        !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && memberNpubs.count >= 2
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            TextField(
+                "",
+                text: $name,
+                prompt: Text("Group name").foregroundColor(SonarTheme.text3)
+            )
+            .textFieldStyle(.plain)
+            .font(SonarTheme.uiFont(size: 14))
+            .foregroundColor(SonarTheme.text)
+            .onSubmit {
+                if canStart {
+                    onStart()
+                }
+            }
+            .padding(EdgeInsets(top: 11, leading: 14, bottom: 11, trailing: 14))
+            .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(SonarTheme.surface2))
+
+            TextField(
+                "",
+                text: $members,
+                prompt: Text(verbatim: "npub1... npub1...").foregroundColor(SonarTheme.text3)
+            )
+            .textFieldStyle(.plain)
+            .font(SonarTheme.monoFont(size: 13))
+            .foregroundColor(SonarTheme.text)
+            .onSubmit {
+                if canStart {
+                    onStart()
+                }
+            }
+            .padding(EdgeInsets(top: 11, leading: 14, bottom: 11, trailing: 14))
+            .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(SonarTheme.surface2))
+
+            if !contacts.isEmpty {
+                VStack(spacing: 0) {
+                    ForEach(Array(contacts.enumerated()), id: \.element.id) { i, contact in
+                        SNGroupContactRow(
+                            contact: contact,
+                            selected: selected.contains(contact.npub),
+                            divider: i < contacts.count - 1
+                        ) {
+                            if selected.contains(contact.npub) {
+                                selected.remove(contact.npub)
+                            } else {
+                                selected.insert(contact.npub)
+                            }
+                        }
+                    }
+                }
+            }
+
+            SNPrimaryButton(label: "Create group", disabled: !canStart) {
                 onStart()
             }
         }

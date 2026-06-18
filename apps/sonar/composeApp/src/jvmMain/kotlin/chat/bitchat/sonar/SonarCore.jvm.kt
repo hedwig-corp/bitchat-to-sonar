@@ -68,6 +68,45 @@ actual object SonarCore {
         requireNode().startDm(peer.trim(), "")
     }
 
+    actual suspend fun startGroup(members: List<String>, name: String): String = withContext(Dispatchers.IO) {
+        requireNode().startGroup(members.map { it.trim() }.filter { it.isNotEmpty() }, name.trim())
+    }
+
+    actual suspend fun pendingGroupInvites(): List<SonarGroupInvite> = withContext(Dispatchers.IO) {
+        val n = node ?: return@withContext emptyList()
+        n.pendingGroupInvites().map {
+            SonarGroupInvite(
+                id = it.idHex,
+                groupId = it.groupIdHex,
+                groupName = it.groupName,
+                groupDescription = it.groupDescription,
+                welcomerNpub = it.welcomerNpub,
+                memberCount = it.memberCount.toInt(),
+                relays = it.relayUrls,
+            )
+        }
+    }
+
+    actual suspend fun acceptGroupInvite(inviteId: String): String = withContext(Dispatchers.IO) {
+        requireNode().acceptGroupInvite(inviteId)
+    }
+
+    actual suspend fun declineGroupInvite(inviteId: String) = withContext(Dispatchers.IO) {
+        requireNode().declineGroupInvite(inviteId)
+    }
+
+    actual suspend fun addGroupMembers(chatId: String, members: List<String>) = withContext(Dispatchers.IO) {
+        requireNode().addGroupMembers(chatId, members.map { it.trim() }.filter { it.isNotEmpty() })
+    }
+
+    actual suspend fun removeGroupMembers(chatId: String, members: List<String>) = withContext(Dispatchers.IO) {
+        requireNode().removeGroupMembers(chatId, members.map { it.trim() }.filter { it.isNotEmpty() })
+    }
+
+    actual suspend fun leaveGroup(chatId: String) = withContext(Dispatchers.IO) {
+        requireNode().leaveGroup(chatId)
+    }
+
     actual suspend fun send(chatId: String, text: String) = withContext(Dispatchers.IO) {
         requireNode().sendText(chatId, text)
     }
