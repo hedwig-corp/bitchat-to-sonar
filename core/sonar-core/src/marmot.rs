@@ -678,6 +678,10 @@ impl MarmotEngine {
     /// timestamp is strictly before the cursor `(before_secs, before_id)`.
     /// When the cursor is `None`, returns the newest messages (first page).
     /// Messages are returned newest-first for display.
+    ///
+    /// Uses bounded-memory scanning via [`messages_page`] instead of loading
+    /// the full transcript. Memory stays O(batch + limit) regardless of total
+    /// message count.
     pub fn messages_cursor_page(
         &self,
         group_id: &GroupId,
@@ -692,40 +696,42 @@ impl MarmotEngine {
             return self.messages_page(group_id, limit, 0);
         }
 
-        // Transitional backend: MDK currently exposes bounded offset pages, not
-        // a stable `(created_at, event_id)` storage cursor. Keep the API stable
-        // for callers while the storage-level cursor query lands.
-        let all_msgs = self.messages(group_id)?;
-        let mut sorted: Vec<ChatMessage> = all_msgs;
-        sorted.sort_by(|a, b| {
-            b.created_at
-                .cmp(&a.created_at)
-                .then_with(|| b.id.to_hex().cmp(&a.id.to_hex()))
-        });
+        let cursor_secs = before_secs.unwrap();
+        let cursor_id_hex = before_id.map(|id| id.to_hex());
+        let scan_batch = limit.max(20);
+        let mut chat_offset = 0usize;
+        let mut result = Vec::with_capacity(limit);
 
-        let filtered: Vec<ChatMessage> = if let Some(cursor_secs) = before_secs {
-            let cursor_id_hex = before_id.map(|id| id.to_hex());
-            sorted
-                .into_iter()
-                .filter(|m| {
-                    let msg_secs = m.created_at.as_secs();
-                    if msg_secs < cursor_secs {
-                        return true;
-                    }
-                    if msg_secs == cursor_secs {
-                        if let Some(ref cid) = cursor_id_hex {
-                            return m.id.to_hex() < *cid;
-                        }
-                    }
-                    false
-                })
-                .take(limit)
-                .collect()
-        } else {
-            sorted.into_iter().take(limit).collect()
-        };
+        loop {
+            let batch = self.messages_page(group_id, scan_batch, chat_offset)?;
+            if batch.is_empty() {
+                break;
+            }
 
-        Ok(filtered)
+            for msg in batch {
+                let msg_secs = msg.created_at.as_secs();
+                if msg_secs > cursor_secs {
+                    continue;
+                }
+                if msg_secs == cursor_secs {
+                    match cursor_id_hex {
+                        Some(ref cid) if msg.id.to_hex() < *cid => {}
+                        _ => continue,
+                    }
+                }
+                result.push(msg);
+                if result.len() >= limit {
+                    return Ok(result);
+                }
+            }
+
+            chat_offset += scan_batch;
+            if chat_offset >= MESSAGE_PAGE_RAW_SCAN_LIMIT {
+                break;
+            }
+        }
+
+        Ok(result)
     }
 
     /// Latest local transcript windows for the most recent groups. This is the
