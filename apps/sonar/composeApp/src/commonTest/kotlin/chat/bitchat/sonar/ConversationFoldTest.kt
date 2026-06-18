@@ -87,6 +87,45 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun recentMarmotActivityIsBoundedToSettleWindow() {
+        assertEquals(
+            true,
+            hasRecentMarmotActivityForCapabilitySettle(
+                latestMessageTsSecs = 1,
+                nowMs = 2_000,
+            ),
+        )
+        assertEquals(
+            false,
+            hasRecentMarmotActivityForCapabilitySettle(
+                latestMessageTsSecs = 1,
+                nowMs = 3_000,
+            ),
+        )
+        assertEquals(
+            false,
+            hasRecentMarmotActivityForCapabilitySettle(
+                latestMessageTsSecs = null,
+                nowMs = 2_000,
+            ),
+        )
+        assertEquals(
+            true,
+            hasRecentMarmotActivityForCapabilitySettle(
+                latestMessageTsSecs = 3,
+                nowMs = 2_000,
+            ),
+        )
+        assertEquals(
+            false,
+            hasRecentMarmotActivityForCapabilitySettle(
+                latestMessageTsSecs = 10,
+                nowMs = 2_000,
+            ),
+        )
+    }
+
+    @Test
     fun profileCacheRoundTripsDisplayName() {
         val encoded = encodeProfileCache(
             mapOf(

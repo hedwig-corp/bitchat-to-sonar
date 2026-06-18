@@ -85,6 +85,17 @@ internal fun shouldWaitForCapabilities(
     return nowMs - first < settleMs
 }
 
+internal fun hasRecentMarmotActivityForCapabilitySettle(
+    latestMessageTsSecs: Long?,
+    nowMs: Long,
+    settleMs: Long = CAPABILITY_SETTLE_MS,
+): Boolean {
+    val latest = latestMessageTsSecs ?: return false
+    if (latest <= 0) return false
+    val ageMs = nowMs - (latest * 1_000L)
+    return ageMs > -settleMs && ageMs < settleMs
+}
+
 /** A call-log record appended to a DM transcript when a call ends. Lives in
  *  memory only (no MessageStore/SonarCore/Marmot write). [durSecs] == 0 ⇒ the call never connected
  *  (rendered as "Missed"); otherwise it's the connected duration. */
@@ -570,7 +581,8 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun shouldHoldStandaloneMarmotChat(chat: SonarChat, nowMs: Long = SonarClock.nowMillis()): Boolean {
         if (!isDirectMarmotChat(chat)) return false
         val title = canonicalConversationTitle(chatTitle(chat)).takeIf { it.isNotEmpty() } ?: return false
-        return meshChatNames.any { (peerId, name) ->
+        // Hold if a name-matched peer is still settling capabilities.
+        val nameMatched = meshChatNames.any { (peerId, name) ->
             canonicalConversationTitle(name) == title &&
                 shouldWaitForCapabilities(
                     firstSeenMs = meshPeerFirstSeenMs[peerId],
@@ -578,6 +590,22 @@ class SonarAppState(private val scope: CoroutineScope) {
                     hasProfile = sonarPeerProfiles.containsKey(peerId) || linkByFp.containsKey(peerId),
                     hasMessages = false,
                 ).also { if (it) scheduleCapabilitySettleRefresh(peerId, meshPeerFirstSeenMs[peerId] ?: nowMs, nowMs) }
+        }
+        if (nameMatched) return true
+        if (!hasRecentMarmotActivityForCapabilitySettle(chatSnapshotMessagesByChat[chat.id]?.lastOrNull()?.tsSecs, nowMs)) {
+            return false
+        }
+        // Also hold if ANY mesh peer is still within its settle window and
+        // hasn't resolved capabilities yet — the pending 0x53 announce may be
+        // the one that provides the name we need to fold by.  This broad fallback
+        // is limited to fresh Marmot activity so old standalone rows do not blink.
+        return meshPeerFirstSeenMs.any { (peerId, firstMs) ->
+            shouldWaitForCapabilities(
+                firstSeenMs = firstMs,
+                nowMs = nowMs,
+                hasProfile = sonarPeerProfiles.containsKey(peerId) || linkByFp.containsKey(peerId),
+                hasMessages = meshChats[peerId]?.isNotEmpty() == true,
+            ).also { if (it) scheduleCapabilitySettleRefresh(peerId, firstMs, nowMs) }
         }
     }
 

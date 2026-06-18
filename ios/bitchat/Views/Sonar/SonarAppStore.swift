@@ -1146,6 +1146,15 @@ final class SonarAppStore: ObservableObject {
         return true
     }
 
+    private func hasRecentMarmotActivityForCapabilitySettle(
+        _ latestMessage: MarmotService.MarmotMessage?,
+        now: Date
+    ) -> Bool {
+        guard let latestMessage else { return false }
+        let age = now.timeIntervalSince(latestMessage.createdAt)
+        return age > -Self.capabilitySettleWindow && age < Self.capabilitySettleWindow
+    }
+
     private func scheduleCapabilitySettleRefresh(for key: String, after remaining: TimeInterval) {
         guard pendingCapabilityRefreshKeys.insert(key).inserted else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + remaining + 0.05) { [weak self] in
@@ -1155,15 +1164,32 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
-    private func shouldHoldStandaloneMarmotGroup(_ group: MarmotService.MarmotGroup, now: Date) -> Bool {
+    private func shouldHoldStandaloneMarmotGroup(
+        _ group: MarmotService.MarmotGroup,
+        latestMessage: MarmotService.MarmotMessage?,
+        now: Date
+    ) -> Bool {
         guard marmot.isDirectGroup(group) else { return false }
         let title = snCanonicalConversationTitle(marmot.title(for: group))
         guard !title.isEmpty else { return false }
         let my = chatViewModel.meshService.myPeerID
+        // Hold if a name-matched peer is still settling capabilities.
         for peer in chatViewModel.allPeers where peer.peerID != my && (peer.isConnected || peer.isReachable) {
             let key = markMeshPeerSeen(peer.peerID, now: now)
             guard snCanonicalConversationTitle(peerDisplayName(peer.peerID.id)) == title else { continue }
             if shouldWaitForCapabilities(peerID: peer.peerID, key: key, now: now) {
+                return true
+            }
+        }
+        guard hasRecentMarmotActivityForCapabilitySettle(latestMessage, now: now) else { return false }
+        // Also hold if ANY mesh peer is still within its settle window and
+        // hasn't resolved capabilities yet — the pending 0x53 announce may be
+        // the one that provides the name we need to fold by.  This broad fallback
+        // is limited to fresh Marmot activity so old standalone rows do not blink.
+        for peer in chatViewModel.allPeers where peer.peerID != my && (peer.isConnected || peer.isReachable) {
+            let key = chatViewModel.getFingerprint(for: peer.peerID) ?? peer.peerID.id
+            let hasMessages = hasMeshMessages(peerID: peer.peerID, key: key)
+            if shouldWaitForCapabilities(peerID: peer.peerID, key: key, now: now, hasMessages: hasMessages) {
                 return true
             }
         }
@@ -1971,7 +1997,7 @@ final class SonarAppStore: ObservableObject {
                 )
                 continue
             }
-            if shouldHoldStandaloneMarmotGroup(group, now: now) {
+            if shouldHoldStandaloneMarmotGroup(group, latestMessage: last, now: now) {
                 continue
             }
             marmotRows.append(SNDMRow(
