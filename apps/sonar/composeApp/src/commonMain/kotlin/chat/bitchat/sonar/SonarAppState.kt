@@ -25,6 +25,20 @@ private const val LOCAL_TRANSCRIPT_PAGE_LIMIT = 100
 private const val LOCAL_SUMMARY_PAGE_LIMIT = 20
 private const val LOCAL_SUMMARY_CHAT_LIMIT = 5
 
+/** Max messages held per peer in the outbox (FIFO eviction on overflow). */
+private const val OUTBOX_MAX_PER_PEER = 100
+/** Queued messages older than this are silently expired on flush (24 hours). */
+private const val OUTBOX_TTL_SECS = 24 * 60 * 60L
+
+/** A message queued in the outbox when neither BLE mesh nor npub route is
+ *  available. Mirrors iOS `MessageRouter.QueuedMessage`. */
+data class QueuedMessage(
+    val content: String,
+    val peerId: String,
+    val messageId: String,
+    val timestampSecs: Long,
+)
+
 sealed interface Screen {
     data object Home : Screen
     data object Settings : Screen
@@ -172,6 +186,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             sonarDescriptorFetches.clear(); sonarDescriptorFetchedAt.clear(); sonarDescriptorMissedAt.clear()
             rawMeshPeerIds = emptySet(); meshPeerFirstSeenMs.clear(); pendingCapabilityRefreshPeers.clear()
             profilesByNpub = emptyMap(); profileFetches.clear()
+            outbox.clear()
             MessageStore.wipe()
             SonarCore.wipe()
             stack = listOf(Screen.Home)
@@ -207,7 +222,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             // Local transcripts on disk (mesh DMs, channels, geo DMs).
             MessageStore.wipe()
             // In-memory conversation state.
-            meshChats.clear(); meshChatNames.clear(); pendingMarmotSends.clear()
+            meshChats.clear(); meshChatNames.clear(); pendingMarmotSends.clear(); outbox.clear()
             linkByFp.clear(); linkCapsByFp.clear(); persistLinks(); persistLinkCaps()
             profilesByNpub = emptyMap(); profileFetches.clear(); persistProfileCache()
             foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
@@ -541,6 +556,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private fun updateMeshPeersFromRadio(nowMs: Long = SonarClock.nowMillis()) {
         val rawPeers = MeshRadio.peers()
+        val previousPeerIds = rawMeshPeerIds
         rawMeshPeerIds = rawPeers.map { meshPeerId(it.id) }.toSet()
         meshPeerFirstSeenMs.keys.retainAll(rawMeshPeerIds + meshChats.keys + linkByFp.keys)
         meshPeers = rawPeers.filter { peer ->
@@ -552,6 +568,13 @@ class SonarAppState(private val scope: CoroutineScope) {
             val wait = shouldWaitForCapabilities(first, nowMs, hasProfile, hasMessages)
             if (wait) scheduleCapabilitySettleRefresh(peerId, first, nowMs)
             !wait
+        }
+        // When a peer (re)appears on the BLE mesh, flush any queued messages.
+        // This mirrors iOS MessageRouter's flush-on-transport-available path.
+        for (peerId in rawMeshPeerIds) {
+            if (peerId !in previousPeerIds && outbox.containsKey(peerId)) {
+                flushOutbox(peerId)
+            }
         }
     }
 
@@ -694,10 +717,14 @@ class SonarAppState(private val scope: CoroutineScope) {
         SonarCore.saveBlob("sonar.linkCaps", linkCapsByFp.entries.joinToString("\n") { "${it.key}=${it.value}" })
     }
 
-    /** Record fingerprint→npub from a 0x53 (persisted on change). */
+    /** Record fingerprint→npub from a 0x53 (persisted on change). When a new
+     *  mapping is learned this is also the trigger to flush any queued outbox
+     *  messages — the peer now has a reachable npub route (mirrors iOS
+     *  MessageRouter's NotificationCenter observation on favoriteStatusChanged). */
     private fun rememberLink(peerId: String, ann: SonarAnnounce) {
         val npubHex = ann.npub.toHexLower()
-        if (npubHex.length == 64 && !linkByFp[peerId].equals(npubHex, ignoreCase = true)) {
+        val isNewLink = npubHex.length == 64 && !linkByFp[peerId].equals(npubHex, ignoreCase = true)
+        if (isNewLink) {
             linkByFp[peerId] = npubHex
             persistLinks()
         }
@@ -706,6 +733,11 @@ class SonarAppState(private val scope: CoroutineScope) {
             persistLinkCaps()
         }
         ensureSonarDescriptorHex(npubHex)
+        // A new or updated link means we can now reach this peer via White Noise
+        // — flush any queued messages that were waiting for this route.
+        if (isNewLink || outbox.containsKey(peerId)) {
+            flushOutbox(peerId)
+        }
     }
     /** GPS-derived location channels (Mesh + Ottaviano…Italy), like iOS. */
     var locationChannels by mutableStateOf<List<GeoChannel>>(emptyList())
@@ -1085,7 +1117,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 resetCallState()
 
                 MessageStore.wipe()
-                meshChats.clear(); meshChatNames.clear(); pendingMarmotSends.clear()
+                meshChats.clear(); meshChatNames.clear(); pendingMarmotSends.clear(); outbox.clear()
                 linkByFp.clear(); linkCapsByFp.clear(); persistLinks(); persistLinkCaps()
                 foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
                 sonarPeerProfiles = emptyMap()
@@ -1744,13 +1776,16 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     /** Auto-pick the transport for a radar-peer DM (mirrors iOS `sendDm`): a live
-     *  Noise link ⇒ BLE mesh; otherwise White Noise (Marmot) for a Sonar peer. A
-     *  plain bitchat peer out of range waits (Step 2 adds favorite → NIP-17). */
+     *  Noise link ⇒ BLE mesh; otherwise White Noise (Marmot) for a Sonar peer. When
+     *  neither route is available the message is queued in the outbox (mirrors iOS
+     *  MessageRouter) and auto-sent when the peer reconnects or their npub is learned. */
     private fun sendDmAuto(peerId: String, text: String) {
         if (MeshRadio.hasMeshLink(peerId)) { sendMesh(peerId, text); return }
         val raw = npubRawFor(peerId)
         if (raw != null) { sendOverMarmot(peerId, raw, text); return }
-        toast = "Out of range — your message will wait until you’re close again."
+        // Neither BLE mesh link nor npub available — queue for later delivery.
+        enqueueOutbox(peerId, text)
+        toast = "Out of range — message queued and will send automatically."
     }
 
     /** ☎CALL signaling uses the lowest-latency route available for the SAME Sonar
@@ -1834,6 +1869,12 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  [flushPendingMarmot] once the group appears in [chats]. */
     private val pendingMarmotSends = mutableMapOf<String, MutableList<String>>()
 
+    // ── Outbox: per-peer message queue for offline/unreachable peers ──
+    // Mirrors iOS MessageRouter outbox. When neither BLE mesh link nor npub is
+    // available, messages are queued here instead of being dropped. Flushed
+    // automatically when the peer reconnects over BLE or their npub is learned.
+    private val outbox = mutableMapOf<String, MutableList<QueuedMessage>>()
+
     /** Continue a Sonar-peer conversation over White Noise (Marmot) when out of
      *  Bluetooth range, creating the 1:1 group on first send (mirrors iOS
      *  `sendOverMarmot`). */
@@ -1863,6 +1904,75 @@ class SonarAppState(private val scope: CoroutineScope) {
             val group = marmotGroupForNpub(npubHex.hexToBytesOrEmpty()) ?: continue
             pendingMarmotSends.remove(npubHex)
             scope.launch { for (tx in texts) runCatching { SonarCore.send(group.id, tx) } }
+        }
+    }
+
+    // ── Outbox queue (mirrors iOS MessageRouter outbox) ──
+
+    /** Queue a message for [peerId] when no transport is available. Enforces
+     *  per-peer size limit (FIFO eviction) matching iOS behaviour. */
+    private fun enqueueOutbox(peerId: String, text: String) {
+        val queue = outbox.getOrPut(peerId) { mutableListOf() }
+        val message = QueuedMessage(
+            content = text,
+            peerId = peerId,
+            messageId = randomMeshId(),
+            timestampSecs = SonarClock.nowSecs(),
+        )
+        queue.add(message)
+        // FIFO eviction when the queue exceeds the cap.
+        if (queue.size > OUTBOX_MAX_PER_PEER) {
+            val evicted = queue.removeFirst()
+            sonarLog("SonarOutbox", "overflow for ${peerId.take(10)}… — evicted oldest id=${evicted.messageId.take(8)}…")
+        }
+        sonarLog("SonarOutbox", "queued for ${peerId.take(10)}… id=${message.messageId.take(8)}… queue=${queue.size}")
+    }
+
+    /** Try to deliver all queued messages for [peerId]. Expired messages (>24h)
+     *  are silently dropped. Messages that still can't be sent remain queued. */
+    private fun flushOutbox(peerId: String) {
+        val queue = outbox[peerId] ?: return
+        if (queue.isEmpty()) { outbox.remove(peerId); return }
+        val now = SonarClock.nowSecs()
+        val remaining = mutableListOf<QueuedMessage>()
+
+        sonarLog("SonarOutbox", "flushing ${queue.size} message(s) for ${peerId.take(10)}…")
+
+        for (msg in queue) {
+            // TTL check: drop messages older than 24 hours.
+            if (now - msg.timestampSecs > OUTBOX_TTL_SECS) {
+                sonarLog("SonarOutbox", "expired id=${msg.messageId.take(8)}… age=${now - msg.timestampSecs}s")
+                continue
+            }
+            // Try to send via the best available transport.
+            if (MeshRadio.hasMeshLink(peerId)) {
+                sendMesh(peerId, msg.content)
+            } else {
+                val raw = npubRawFor(peerId)
+                if (raw != null) {
+                    sendOverMarmot(peerId, raw, msg.content)
+                } else {
+                    // Still no route — keep in queue.
+                    remaining.add(msg)
+                    continue
+                }
+            }
+            sonarLog("SonarOutbox", "delivered id=${msg.messageId.take(8)}… to ${peerId.take(10)}…")
+        }
+
+        if (remaining.isEmpty()) {
+            outbox.remove(peerId)
+        } else {
+            outbox[peerId] = remaining
+        }
+    }
+
+    /** Flush outbox for ALL peers that now have a reachable transport. Called
+     *  periodically and on transport-change events. */
+    private fun flushAllOutbox() {
+        if (outbox.isEmpty()) return
+        for (peerId in outbox.keys.toList()) {
+            flushOutbox(peerId)
         }
     }
 
@@ -2334,6 +2444,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // publish one) so chats show a human name, not a raw npub.
                 for (c in chats) c.members.forEach { if (it != npub) ensureProfile(it) }
                 flushPendingMarmot() // a queued out-of-range send whose group just landed
+                flushAllOutbox() // retry any outbox messages whose peer is now reachable
                 maybeNotify()
                 // Marmot/Nostr chats refresh from the core; mesh chats are local
                 // and refreshed by drainMeshDms() below. A mesh-route DM merges
