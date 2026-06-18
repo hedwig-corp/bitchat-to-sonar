@@ -25,20 +25,6 @@ private const val LOCAL_TRANSCRIPT_PAGE_LIMIT = 100
 private const val LOCAL_SUMMARY_PAGE_LIMIT = 20
 private const val LOCAL_SUMMARY_CHAT_LIMIT = 5
 
-/** Max messages held per peer in the outbox (FIFO eviction on overflow). */
-private const val OUTBOX_MAX_PER_PEER = 100
-/** Queued messages older than this are silently expired on flush (24 hours). */
-private const val OUTBOX_TTL_SECS = 24 * 60 * 60L
-
-/** A message queued in the outbox when neither BLE mesh nor npub route is
- *  available. Mirrors iOS `MessageRouter.QueuedMessage`. */
-data class QueuedMessage(
-    val content: String,
-    val peerId: String,
-    val messageId: String,
-    val timestampSecs: Long,
-)
-
 sealed interface Screen {
     data object Home : Screen
     data object Settings : Screen
@@ -572,7 +558,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         // When a peer (re)appears on the BLE mesh, flush any queued messages.
         // This mirrors iOS MessageRouter's flush-on-transport-available path.
         for (peerId in rawMeshPeerIds) {
-            if (peerId !in previousPeerIds && outbox.containsKey(peerId)) {
+            if (peerId !in previousPeerIds && outbox.contains(peerId)) {
                 flushOutbox(peerId)
             }
         }
@@ -735,7 +721,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         ensureSonarDescriptorHex(npubHex)
         // A new or updated link means we can now reach this peer via White Noise
         // — flush any queued messages that were waiting for this route.
-        if (isNewLink || outbox.containsKey(peerId)) {
+        if (isNewLink || outbox.contains(peerId)) {
             flushOutbox(peerId)
         }
     }
@@ -1780,6 +1766,12 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  neither route is available the message is queued in the outbox (mirrors iOS
      *  MessageRouter) and auto-sent when the peer reconnects or their npub is learned. */
     private fun sendDmAuto(peerId: String, text: String) {
+        if (outbox.contains(peerId)) {
+            enqueueOutbox(peerId, text)
+            flushOutbox(peerId)
+            toast = "Message queued and will send in order."
+            return
+        }
         if (MeshRadio.hasMeshLink(peerId)) { sendMesh(peerId, text); return }
         val raw = npubRawFor(peerId)
         if (raw != null) { sendOverMarmot(peerId, raw, text); return }
@@ -1874,7 +1866,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     // Mirrors iOS MessageRouter outbox. When neither BLE mesh link nor npub is
     // available, messages are queued here instead of being dropped. Flushed
     // automatically when the peer reconnects over BLE or their npub is learned.
-    private val outbox = mutableMapOf<String, MutableList<QueuedMessage>>()
+    private val outbox = SonarOutbox()
     private val flushingOutboxPeers = mutableSetOf<String>()
 
     /** Continue a Sonar-peer conversation over White Noise (Marmot) when out of
@@ -1896,7 +1888,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         scope.launch {
             try {
                 SonarCore.startChat(npubHex) // start_dm accepts a hex pubkey
-                refreshChats(); flushPendingMarmot(); refreshOpenDm(peerId)
+                refreshChats(); flushPendingMarmot(); flushOutbox(peerId); refreshOpenDm(peerId)
             } catch (e: Throwable) { toast = "couldn’t start secure chat: ${e.message}" }
             finally { startingMarmotChats.remove(npubHex) }
         }
@@ -1917,26 +1909,17 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Queue a message for [peerId] when no transport is available. Enforces
      *  per-peer size limit (FIFO eviction) matching iOS behaviour. */
     private fun enqueueOutbox(peerId: String, text: String) {
-        val queue = outbox.getOrPut(peerId) { mutableListOf() }
-        val message = QueuedMessage(
-            content = text,
-            peerId = peerId,
-            messageId = randomMeshId(),
-            timestampSecs = SonarClock.nowSecs(),
-        )
-        queue.add(message)
-        // FIFO eviction when the queue exceeds the cap.
-        if (queue.size > OUTBOX_MAX_PER_PEER) {
-            val evicted = queue.removeFirst()
+        val result = outbox.enqueue(peerId, text, randomMeshId(), SonarClock.nowSecs())
+        result.evicted?.let { evicted ->
             sonarLog("SonarOutbox", "overflow for ${peerId.take(10)}… — evicted oldest id=${evicted.messageId.take(8)}…")
         }
-        sonarLog("SonarOutbox", "queued for ${peerId.take(10)}… id=${message.messageId.take(8)}… queue=${queue.size}")
+        sonarLog("SonarOutbox", "queued for ${peerId.take(10)}… id=${result.message.messageId.take(8)}… queue=${result.depth}")
     }
 
     /** Try to deliver all queued messages for [peerId]. Expired messages (>24h)
      *  are silently dropped. Messages that still can't be sent remain queued. */
     private fun flushOutbox(peerId: String) {
-        if (!outbox.containsKey(peerId) || !flushingOutboxPeers.add(peerId)) return
+        if (!outbox.contains(peerId) || !flushingOutboxPeers.add(peerId)) return
         scope.launch {
             try {
                 flushOutboxNow(peerId)
@@ -1947,8 +1930,8 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private suspend fun flushOutboxNow(peerId: String) {
-        val queue = outbox[peerId]?.toList() ?: return
-        if (queue.isEmpty()) { outbox.remove(peerId); return }
+        val queue = outbox.snapshot(peerId)
+        if (queue.isEmpty()) { outbox.finishFlush(peerId, 0, emptyList()); return }
         val now = SonarClock.nowSecs()
         val remaining = mutableListOf<QueuedMessage>()
         var marmotGroupId: String? = null
@@ -1957,7 +1940,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
         for ((index, msg) in queue.withIndex()) {
             // TTL check: drop messages older than 24 hours.
-            if (now - msg.timestampSecs > OUTBOX_TTL_SECS) {
+            if (outbox.isExpired(msg, now)) {
                 sonarLog("SonarOutbox", "expired id=${msg.messageId.take(8)}… age=${now - msg.timestampSecs}s")
                 continue
             }
@@ -1975,23 +1958,14 @@ class SonarAppState(private val scope: CoroutineScope) {
                 }
             }
             if (!delivered) {
-                remaining.add(msg)
-                queue.drop(index + 1)
-                    .filter { now - it.timestampSecs <= OUTBOX_TTL_SECS }
-                    .let { remaining.addAll(it) }
+                remaining.addAll(outbox.remainingAfterFailure(queue, index, now))
                 sonarLog("SonarOutbox", "kept ${remaining.size} message(s) queued for ${peerId.take(10)}…")
                 break
             }
             sonarLog("SonarOutbox", "delivered id=${msg.messageId.take(8)}… to ${peerId.take(10)}…")
         }
 
-        val appended = outbox[peerId].orEmpty().drop(queue.size)
-        val next = (remaining + appended).toMutableList()
-        if (next.isEmpty()) {
-            outbox.remove(peerId)
-        } else {
-            outbox[peerId] = next
-        }
+        outbox.finishFlush(peerId, queue.size, remaining)
     }
 
     private suspend fun ensureMarmotGroupForOutbox(peerId: String, npubRaw: ByteArray): String? {
@@ -2035,7 +2009,7 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  periodically and on transport-change events. */
     private fun flushAllOutbox() {
         if (outbox.isEmpty()) return
-        for (peerId in outbox.keys.toList()) {
+        for (peerId in outbox.peerIds()) {
             flushOutbox(peerId)
         }
     }
