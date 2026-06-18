@@ -1053,16 +1053,23 @@ struct SNMediaViewer: View {
 
     private func saveMedia() {
         #if os(iOS)
-        if item.mime.hasPrefix("image/"), let data = bytes, let image = UIImage(data: data) {
+        if item.mime.hasPrefix("image/"), let data = bytes {
+            let resourceOptions = PHAssetResourceCreationOptions()
+            resourceOptions.originalFilename = safeFilename
             PHPhotoLibrary.shared().performChanges({
-                PHAssetChangeRequest.creationRequestForAsset(from: image)
+                let request = PHAssetCreationRequest.forAsset()
+                request.addResource(with: .photo, data: data, options: resourceOptions)
             }) { ok, _ in
                 DispatchQueue.main.async { status = ok ? "Saved to Photos" : "Couldn't save media" }
             }
-        } else if item.mime.hasPrefix("video/"), let url = writeTempFile() {
+        } else if item.mime.hasPrefix("video/"), let url = writeTempFile(track: false) {
+            let resourceOptions = PHAssetResourceCreationOptions()
+            resourceOptions.originalFilename = safeFilename
             PHPhotoLibrary.shared().performChanges({
-                PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
+                let request = PHAssetCreationRequest.forAsset()
+                request.addResource(with: .video, fileURL: url, options: resourceOptions)
             }) { ok, _ in
+                try? FileManager.default.removeItem(at: url)
                 DispatchQueue.main.async { status = ok ? "Saved to Photos" : "Couldn't save media" }
             }
         } else {
@@ -1113,7 +1120,7 @@ struct SNMediaViewer: View {
         return name.isEmpty ? "attachment" : name
     }
 
-    private func writeTempFile() -> URL? {
+    private func writeTempFile(track: Bool = true) -> URL? {
         guard let data = bytes else { return nil }
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("sonar-media-exports", isDirectory: true)
@@ -1126,7 +1133,9 @@ struct SNMediaViewer: View {
             let options: Data.WritingOptions = .atomic
             #endif
             try data.write(to: url, options: options)
-            tempURLs.append(url)
+            if track {
+                tempURLs.append(url)
+            }
             return url
         } catch {
             status = "Couldn't prepare media"
