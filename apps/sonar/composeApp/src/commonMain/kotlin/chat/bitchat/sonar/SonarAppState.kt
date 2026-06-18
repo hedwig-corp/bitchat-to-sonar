@@ -21,6 +21,9 @@ import kotlinx.coroutines.launch
 
 private const val SONAR_DESCRIPTOR_TTL_SECS = 15 * 60L
 private const val SONAR_DESCRIPTOR_MISS_TTL_SECS = 60L
+private const val LOCAL_TRANSCRIPT_PAGE_LIMIT = 100
+private const val LOCAL_SUMMARY_PAGE_LIMIT = 20
+private const val LOCAL_SUMMARY_CHAT_LIMIT = 5
 
 sealed interface Screen {
     data object Home : Screen
@@ -1193,7 +1196,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         val showPreview = prefBool("notifPreview", true)
         val openChatId = (screen as? Screen.Chat)?.id
         for (c in chats) {
-            val msgs = SonarCore.messages(c.id)
+            val msgs = SonarCore.messagesPage(c.id, 1)
             val newestIncoming = msgs.lastOrNull { !it.mine }
             val prev = lastSeenTs[c.id]
             if (enabled && seededSeen && prev != null && newestIncoming != null &&
@@ -1334,9 +1337,15 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun openChat(chat: SonarChat) {
         push(Screen.Chat(chat.id, chatTitle(chat)))
         scope.launch {
+            val local = mergePendingMediaUploads(chat.id, marmotMessagesPage(chat.id))
+            messages = local
+            processPayLines(chat.id, local)
             runCatching { refreshChats() }
-            messages = mergePendingMediaUploads(chat.id, marmotMessages(chat.id))
-            processPayLines(chat.id, messages)
+            if ((screen as? Screen.Chat)?.id == chat.id) {
+                val fresh = mergePendingMediaUploads(chat.id, marmotMessagesPage(chat.id))
+                messages = fresh
+                processPayLines(chat.id, fresh)
+            }
         }
     }
 
@@ -1350,7 +1359,13 @@ class SonarAppState(private val scope: CoroutineScope) {
         push(Screen.Chat(id, name, pay))
         messages = meshChats[peerId].orEmpty() // immediate mesh view; Marmot leg merges in async
         processPayLines(id, messages)
-        scope.launch { refreshChats(); refreshOpenDm(peerId) }
+        scope.launch {
+            refreshOpenDm(peerId) // hydrate local Marmot transcript before chat list refresh
+            refreshChats()
+            // Reconcile the open transcript after chat-list refresh may discover
+            // the peer's Marmot group mapping.
+            refreshOpenDm(peerId)
+        }
     }
 
     private fun meshChatId(peerId: String) = "mesh:$peerId"
@@ -1445,7 +1460,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         scope.launch {
             try {
                 SonarCore.send(chatId, t)
-                messages = mergePendingMediaUploads(chatId, SonarCore.messages(chatId))
+                messages = mergePendingMediaUploads(chatId, marmotMessagesPage(chatId))
                 processPayLines(chatId, messages)
                 processCallLines(chatId, messages)
             } catch (e: Throwable) {
@@ -1531,7 +1546,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private suspend fun existingPublishedMediaUrls(groupId: String): Set<String> =
-        runCatching { SonarCore.messages(groupId) }
+        runCatching { SonarCore.messagesPage(groupId, LOCAL_TRANSCRIPT_PAGE_LIMIT) }
             .getOrDefault(messages)
             .asSequence()
             .flatMap { it.media.asSequence() }
@@ -1599,7 +1614,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                             messages = merged
                             processPayLines(chatId, merged)
                         } else {
-                            val fresh = SonarCore.messages(groupId)
+                            val fresh = SonarCore.messagesPage(groupId, LOCAL_TRANSCRIPT_PAGE_LIMIT)
                             messages = mergePendingMediaUploads(chatId, fresh)
                             processPayLines(chatId, messages)
                         }
@@ -1699,7 +1714,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                             messages = merged
                             processPayLines(chatId, merged)
                         } else {
-                            val fresh = SonarCore.messages(groupId)
+                            val fresh = SonarCore.messagesPage(groupId, LOCAL_TRANSCRIPT_PAGE_LIMIT)
                             messages = mergePendingMediaUploads(chatId, fresh)
                             processPayLines(chatId, messages)
                         }
@@ -1883,7 +1898,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 SonarCore.addGroupMembers(chatId, cleanMembers)
                 refreshChats()
                 if ((screen as? Screen.Chat)?.id == chatId) {
-                    messages = mergePendingMediaUploads(chatId, SonarCore.messages(chatId))
+                    messages = mergePendingMediaUploads(chatId, marmotMessagesPage(chatId))
                     processPayLines(chatId, messages)
                 }
             } catch (e: Throwable) {
@@ -1902,7 +1917,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 SonarCore.removeGroupMembers(chatId, cleanMembers)
                 refreshChats()
                 if ((screen as? Screen.Chat)?.id == chatId) {
-                    messages = mergePendingMediaUploads(chatId, SonarCore.messages(chatId))
+                    messages = mergePendingMediaUploads(chatId, marmotMessagesPage(chatId))
                     processPayLines(chatId, messages)
                 }
             } catch (e: Throwable) {
@@ -1988,11 +2003,21 @@ class SonarAppState(private val scope: CoroutineScope) {
         marmotGroupsForNpub(npubRaw).firstOrNull()
 
     private suspend fun marmotMessages(groupId: String): List<SonarMsg> {
-        val loaded = runCatching { SonarCore.messages(groupId) }.getOrNull()
+        val loaded = runCatching { SonarCore.messagesPage(groupId, LOCAL_TRANSCRIPT_PAGE_LIMIT) }.getOrNull()
         if (!started && loaded.isNullOrEmpty()) {
             return chatSnapshotMessagesByChat[groupId].orEmpty()
         }
         return loaded ?: chatSnapshotMessagesByChat[groupId].orEmpty()
+    }
+
+    private suspend fun marmotMessagesPage(groupId: String): List<SonarMsg> {
+        val loaded = runCatching {
+            SonarCore.messagesPage(groupId, LOCAL_TRANSCRIPT_PAGE_LIMIT)
+        }.getOrNull()
+        if (!started && loaded.isNullOrEmpty()) {
+            return chatSnapshotMessagesByChat[groupId].orEmpty().takeLast(LOCAL_TRANSCRIPT_PAGE_LIMIT)
+        }
+        return loaded ?: chatSnapshotMessagesByChat[groupId].orEmpty().takeLast(LOCAL_TRANSCRIPT_PAGE_LIMIT)
     }
 
     private suspend fun marmotMessagesForPeer(peerId: String): List<SonarMsg> {
@@ -2006,10 +2031,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         return merged.distinctBy { it.id }
     }
 
-    private suspend fun latestMarmotMessage(groups: List<SonarChat>): SonarMsg? {
+    private fun latestMarmotMessage(groups: List<SonarChat>): SonarMsg? {
         var latest: SonarMsg? = null
         for (group in groups) {
-            val msg = marmotMessages(group.id).lastOrNull()
+            val msg = chatSnapshotMessagesByChat[group.id]?.lastOrNull()
             val current = latest
             if (msg != null && (current == null || msg.tsSecs > current.tsSecs)) latest = msg
         }
@@ -2211,7 +2236,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             val peerId = peerIdForMarmotGroup(group) ?: continue
             folded += group.id
             groupPeers[group.id] = peerId
-            val last = marmotMessages(group.id).lastOrNull()
+            val last = latestMarmotMessage(listOf(group))
             upsert(
                 peerId,
                 MeshDmRow(
@@ -2240,15 +2265,43 @@ class SonarAppState(private val scope: CoroutineScope) {
         val loadedChats = SonarCore.chats()
         if (started || loadedChats.isNotEmpty()) {
             chats = loadedChats
-            chatSnapshotMessagesByChat = emptyMap()
+            val activeIds = loadedChats.mapTo(hashSetOf()) { it.id }
+            chatSnapshotMessagesByChat = chatSnapshotMessagesByChat.filterKeys { it in activeIds }
             persistChatSnapshot()
         }
+        refreshTopChatLocalSummaries()
         for (c in chats) {
             c.members.forEach {
                 if (it != npub && it.isNotBlank()) ensureSonarDescriptor(it)
             }
         }
         groupInvites = runCatching { SonarCore.pendingGroupInvites() }.getOrDefault(emptyList())
+    }
+
+    private suspend fun refreshTopChatLocalSummaries() {
+        if (chats.isEmpty()) return
+        val updated = chatSnapshotMessagesByChat.toMutableMap()
+        val pages = runCatching {
+            SonarCore.recentMessagePages(LOCAL_SUMMARY_CHAT_LIMIT, LOCAL_SUMMARY_PAGE_LIMIT)
+        }.getOrDefault(emptyList())
+        for (page in pages) {
+            if (page.messages.isNotEmpty()) {
+                updated[page.chatId] = page.messages
+            }
+        }
+        chatSnapshotMessagesByChat = updated
+        orderChatsByLocalRecency()
+        persistChatSnapshot()
+    }
+
+    private fun orderChatsByLocalRecency() {
+        chats = chats.withIndex()
+            .sortedWith(
+                compareByDescending<IndexedValue<SonarChat>> {
+                    chatSnapshotMessagesByChat[it.value.id]?.lastOrNull()?.tsSecs ?: 0L
+                }.thenBy { it.index }
+            )
+            .map { it.value }
     }
 
     private fun poll() {
@@ -2269,7 +2322,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // isn't open (the offer arrives over White Noise/Marmot).
                 var wnMsgs = 0
                 for (c in chats) {
-                    val ms = runCatching { SonarCore.messages(c.id) }.getOrDefault(emptyList())
+                    val ms = runCatching { SonarCore.messagesPage(c.id, LOCAL_TRANSCRIPT_PAGE_LIMIT) }.getOrDefault(emptyList())
                     wnMsgs += ms.size
                     processCallLines(c.id, ms)
                 }
@@ -2288,7 +2341,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 (screen as? Screen.Chat)?.let {
                     if (isMeshChat(it.id)) refreshOpenDm(meshPeerId(it.id))
                     else {
-                        messages = mergePendingMediaUploads(it.id, SonarCore.messages(it.id))
+                        messages = mergePendingMediaUploads(it.id, marmotMessagesPage(it.id))
                         processPayLines(it.id, messages)
                     }
                 }

@@ -8,6 +8,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
@@ -19,9 +20,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::identity::Identity;
 use crate::marmot::{
-    ChatMessage, GroupCreation, GroupInvite, GroupMembershipUpdate, Incoming, MarmotEngine,
-    KEY_PACKAGE_KIND, SYNC_STATE_FILE_SUFFIX,
+    ChatMessage, DeliveryState, GroupCreation, GroupInvite, GroupMembershipUpdate, Incoming,
+    MarmotEngine, RecentMessagePage, KEY_PACKAGE_KIND, SYNC_STATE_FILE_SUFFIX,
 };
+use crate::outbox::{outbox_state_path_for_db, OutboxState};
 use crate::sonar_descriptor::{
     descriptor_content_json, descriptor_d_tags, descriptor_tags, meta_descriptor_content_json,
     parse_descriptor_event, SonarDescriptor, SONAR_CALL_DESCRIPTOR_D_TAG, SONAR_DESCRIPTOR_KIND,
@@ -376,6 +378,10 @@ pub struct SonarClient {
     /// restart catch-up conservative: a failed event can be replayed later
     /// instead of being skipped by an advanced watermark.
     sync_state: Arc<Mutex<SyncState>>,
+    /// Durable local delivery metadata for Signal-style outgoing text sends.
+    /// The actual decrypted message body stays in MDK storage; this sidecar
+    /// records pending/sent/failed state and the encrypted relay event to retry.
+    outbox_state: Arc<Mutex<OutboxState>>,
     /// Live Marmot events (welcomes 1059→us + group 445s) pushed by the
     /// notification handler. Drained + MLS-processed on the host's serialized
     /// engine thread via `drain_pending_marmot` — the handler NEVER touches the
@@ -390,6 +396,12 @@ pub struct SonarClient {
     /// The group-id set currently installed in the live kind-445 subscription.
     /// This prevents stacking duplicate REQs and lets deletes narrow/unsubscribe.
     marmot_group_subscriptions: Arc<Mutex<HashSet<String>>>,
+    /// Startup repair queue for existing groups whose local DB has MLS/group
+    /// state but no chat-message page. This covers older installs where the
+    /// sync watermark could be advanced by membership/commit events before the
+    /// transcript body was locally populated.
+    initial_empty_transcript_backfills: Arc<Mutex<HashSet<String>>>,
+    initial_backfill_scanned: Arc<AtomicBool>,
     /// Whether to join geohash-nearest relays on subscribe (real sessions); off
     /// for in-memory/test sessions so they stay network-free against a MockRelay.
     allow_geo_relays: bool,
@@ -417,6 +429,7 @@ impl SonarClient {
             engine,
             true,
             Some(sync_state_path_for_db(db_path)),
+            Some(outbox_state_path_for_db(db_path)),
         )
         .await
     }
@@ -425,7 +438,7 @@ impl SonarClient {
     /// dropped. Intended for tests and ephemeral/anonymous sessions.
     pub async fn connect_in_memory(identity: Identity, relays: Vec<RelayUrl>) -> Result<Self> {
         let engine = MarmotEngine::in_memory(identity.clone());
-        Self::with_engine(identity, relays, engine, false, None).await
+        Self::with_engine(identity, relays, engine, false, None, None).await
     }
 
     async fn with_engine(
@@ -434,6 +447,7 @@ impl SonarClient {
         engine: MarmotEngine,
         allow_geo_relays: bool,
         sync_state_path: Option<PathBuf>,
+        outbox_state_path: Option<PathBuf>,
     ) -> Result<Self> {
         let nostr = Client::new(identity.keys().clone());
         for relay in &relays {
@@ -454,6 +468,8 @@ impl SonarClient {
         let marmot_notify = Arc::new(tokio::sync::Notify::new());
         let live_marmot_enabled = Arc::new(Mutex::new(false));
         let marmot_group_subscriptions = Arc::new(Mutex::new(HashSet::new()));
+        let initial_empty_transcript_backfills = Arc::new(Mutex::new(HashSet::new()));
+        let initial_backfill_scanned = Arc::new(AtomicBool::new(false));
 
         let handler_geo = geo.clone();
         let handler_dm = geo_dm.clone();
@@ -629,6 +645,7 @@ impl SonarClient {
             resume_watermark,
             storage_empty,
         )));
+        let outbox_state = Arc::new(Mutex::new(OutboxState::load(outbox_state_path)));
         let client = Self {
             engine,
             nostr,
@@ -639,10 +656,13 @@ impl SonarClient {
             geo_subscribed,
             identity_secret,
             sync_state,
+            outbox_state,
             pending_marmot,
             marmot_notify,
             live_marmot_enabled,
             marmot_group_subscriptions,
+            initial_empty_transcript_backfills,
+            initial_backfill_scanned,
             allow_geo_relays,
         };
         // Open the live Marmot subscriptions for real sessions. In-memory test
@@ -652,6 +672,7 @@ impl SonarClient {
             if let Err(err) = client.subscribe_marmot().await {
                 tracing::debug!(%err, "marmot live subscribe failed (sync() still covers it)");
             }
+            client.retry_outbox().await;
         }
         Ok(client)
     }
@@ -1018,12 +1039,125 @@ impl SonarClient {
         self.engine.decline_group_invite(welcome_id)
     }
 
-    /// Encrypt, publish, and locally record a text message.
+    /// Encrypt and durably record a text message locally before relay publish.
+    ///
+    /// This is Signal-style send sequencing: the MDK local DB becomes visible
+    /// first, Sonar marks the row pending in the outbox, and relay publish runs
+    /// in the background. Publish success/failure only updates local delivery
+    /// state; it does not gate transcript visibility.
     pub async fn send_text(&self, group_id: &GroupId, text: &str) -> Result<()> {
         let event = self.engine.create_text_message(group_id, text)?;
-        self.nostr.send_event(&event).await?;
-        self.engine.process_incoming(&event).await?;
+        let incoming = self.engine.process_incoming(&event).await?;
+        let Incoming::Message(message) = incoming else {
+            return Err(Error::Storage(
+                "created text message did not produce a local transcript row".into(),
+            ));
+        };
+        self.mark_outbox_pending(group_id, &message, &event)?;
+        self.spawn_outbox_publish(message.id.to_hex(), event);
         Ok(())
+    }
+
+    fn mark_outbox_pending(
+        &self,
+        group_id: &GroupId,
+        message: &ChatMessage,
+        event: &Event,
+    ) -> Result<()> {
+        self.outbox_state.lock().unwrap().mark_pending(
+            hex::encode(group_id.as_slice()),
+            message.id.to_hex(),
+            event.id.to_hex(),
+            event.as_json(),
+            Timestamp::now().as_secs(),
+        )
+    }
+
+    fn spawn_outbox_publish(&self, message_id_hex: String, event: Event) {
+        if self.relays.is_empty() {
+            return;
+        }
+        let nostr = self.nostr.clone();
+        let outbox_state = self.outbox_state.clone();
+        tokio::spawn(async move {
+            let result = nostr.send_event(&event).await;
+            let now_secs = Timestamp::now().as_secs();
+            let mut outbox = outbox_state.lock().unwrap();
+            match result {
+                Ok(output) => {
+                    if let Err(err) = require_relay_success(&output, "text publish") {
+                        let _ = outbox.mark_failed_by_message_id(
+                            &message_id_hex,
+                            err.to_string(),
+                            now_secs,
+                        );
+                    } else {
+                        let _ = outbox.mark_sent_by_message_id(&message_id_hex, now_secs);
+                    }
+                }
+                Err(err) => {
+                    let _ = outbox.mark_failed_by_message_id(
+                        &message_id_hex,
+                        err.to_string(),
+                        now_secs,
+                    );
+                }
+            }
+        });
+    }
+
+    pub async fn reload_outbox_and_retry(&self) {
+        if self.relays.is_empty() {
+            return;
+        }
+        self.outbox_state.lock().unwrap().reload_from_disk();
+        self.retry_outbox().await;
+    }
+
+    async fn retry_outbox(&self) {
+        if self.relays.is_empty() {
+            return;
+        }
+        let active_group_ids = match self.engine.groups() {
+            Ok(groups) => groups
+                .into_iter()
+                .map(|group| hex::encode(group.mls_group_id.as_slice()))
+                .collect::<HashSet<_>>(),
+            Err(err) => {
+                tracing::debug!(%err, "failed to load active Marmot groups for outbox retry");
+                return;
+            }
+        };
+        let retryable = {
+            let mut outbox = self.outbox_state.lock().unwrap();
+            match outbox.retryable_events(Timestamp::now().as_secs(), &active_group_ids) {
+                Ok(events) => events,
+                Err(err) => {
+                    tracing::debug!(%err, "failed to load retryable outbox events");
+                    return;
+                }
+            }
+        };
+        for (message_id_hex, event) in retryable {
+            self.spawn_outbox_publish(message_id_hex, event);
+        }
+    }
+
+    fn record_delivery_for_incoming(&self, incoming: &Incoming) {
+        let Incoming::Message(message) = incoming else {
+            return;
+        };
+        if !message.mine {
+            return;
+        }
+        if let Err(err) = self
+            .outbox_state
+            .lock()
+            .unwrap()
+            .mark_sent_by_message_id(&message.id.to_hex(), Timestamp::now().as_secs())
+        {
+            tracing::debug!(%err, "failed to mark outbox message sent after incoming echo");
+        }
     }
 
     // ── Encrypted media (Marmot MIP-04 + Blossom) ─────────────────────────
@@ -1173,6 +1307,22 @@ impl SonarClient {
                 }
             }
         }
+        // Existing installs can have group/MLS rows locally while the chat
+        // transcript page is empty. Full-backfill those groups once. The scan
+        // is deferred from client construction to the first sync so it does not
+        // delay local-only first paint.
+        self.populate_empty_transcript_backfills_once();
+        let empty_transcript_group_ids = self.take_initial_empty_transcript_backfills();
+        for id in &empty_transcript_group_ids {
+            match self.backfill_group(id).await {
+                Ok(report) => process_report.absorb(report),
+                Err(err) => {
+                    tracing::debug!(%err, "empty transcript backfill failed during sync");
+                    self.requeue_initial_empty_transcript_backfill(id);
+                    process_report.record_retryable(Timestamp::now().as_secs());
+                }
+            }
+        }
         if let Err(err) = self.resubscribe_marmot_groups_if_live().await {
             tracing::debug!(%err, "marmot group live resubscribe failed during sync");
         }
@@ -1203,6 +1353,7 @@ impl SonarClient {
         } else {
             self.save_sync_state()?;
         }
+        self.retry_outbox().await;
         Ok(())
     }
 
@@ -1269,6 +1420,44 @@ impl SonarClient {
             .into_iter()
             .map(|g| hex::encode(g.nostr_group_id))
             .collect())
+    }
+
+    fn empty_transcript_group_ids(engine: &MarmotEngine) -> HashSet<String> {
+        let Ok(groups) = engine.groups() else {
+            return HashSet::new();
+        };
+        groups
+            .into_iter()
+            .filter_map(
+                |group| match engine.messages_page(&group.mls_group_id, 1, 0) {
+                    Ok(page) if page.is_empty() => Some(hex::encode(group.nostr_group_id)),
+                    _ => None,
+                },
+            )
+            .collect()
+    }
+
+    fn populate_empty_transcript_backfills_once(&self) {
+        if self.initial_backfill_scanned.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let mut set = self.initial_empty_transcript_backfills.lock().unwrap();
+        *set = Self::empty_transcript_group_ids(&self.engine);
+    }
+
+    fn take_initial_empty_transcript_backfills(&self) -> Vec<String> {
+        self.initial_empty_transcript_backfills
+            .lock()
+            .unwrap()
+            .drain()
+            .collect()
+    }
+
+    fn requeue_initial_empty_transcript_backfill(&self, group_id_hex: &str) {
+        self.initial_empty_transcript_backfills
+            .lock()
+            .unwrap()
+            .insert(group_id_hex.to_string());
     }
 
     async fn resubscribe_marmot_groups_if_live(&self) -> Result<()> {
@@ -1354,7 +1543,8 @@ impl SonarClient {
                         }
                     }
                 }
-                Ok(_) => {
+                Ok(incoming) => {
+                    self.record_delivery_for_incoming(&incoming);
                     self.mark_sync_event_processed(&event.id);
                     report.record_processed();
                 }
@@ -1465,7 +1655,64 @@ impl SonarClient {
     }
 
     pub fn messages(&self, group_id: &GroupId) -> Result<Vec<ChatMessage>> {
-        self.engine.messages(group_id)
+        self.engine.messages(group_id).map(|msgs| {
+            msgs.into_iter()
+                .map(|m| self.with_delivery_state(m))
+                .collect()
+        })
+    }
+
+    pub fn messages_page(
+        &self,
+        group_id: &GroupId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<ChatMessage>> {
+        self.engine
+            .messages_page(group_id, limit, offset)
+            .map(|msgs| {
+                msgs.into_iter()
+                    .map(|m| self.with_delivery_state(m))
+                    .collect()
+            })
+    }
+
+    pub fn recent_message_pages(
+        &self,
+        group_limit: usize,
+        page_limit: usize,
+    ) -> Result<Vec<RecentMessagePage>> {
+        self.engine
+            .recent_message_pages(group_limit, page_limit)
+            .map(|pages| {
+                pages
+                    .into_iter()
+                    .map(|mut page| {
+                        page.messages = page
+                            .messages
+                            .into_iter()
+                            .map(|m| self.with_delivery_state(m))
+                            .collect();
+                        page
+                    })
+                    .collect()
+            })
+    }
+
+    fn with_delivery_state(&self, mut message: ChatMessage) -> ChatMessage {
+        if let Some(state) = self
+            .outbox_state
+            .lock()
+            .unwrap()
+            .status_for_message(&message.id.to_hex())
+        {
+            message.delivery_state = state;
+        } else if message.mine {
+            message.delivery_state = DeliveryState::Sent;
+        } else {
+            message.delivery_state = DeliveryState::Received;
+        }
+        message
     }
 
     pub fn members(&self, group_id: &GroupId) -> Result<Vec<PublicKey>> {
@@ -1477,6 +1724,10 @@ impl SonarClient {
     /// stop receiving its messages. Local-only; the peer is not notified.
     pub async fn delete_group(&self, group_id: &GroupId) -> Result<()> {
         self.engine.delete_group(group_id)?;
+        self.outbox_state
+            .lock()
+            .unwrap()
+            .remove_group_entries(&hex::encode(group_id.as_slice()))?;
         let _ = self.resubscribe_marmot_groups_if_live().await;
         Ok(())
     }

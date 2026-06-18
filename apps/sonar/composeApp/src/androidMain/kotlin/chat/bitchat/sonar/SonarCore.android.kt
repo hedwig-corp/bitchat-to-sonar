@@ -123,25 +123,57 @@ actual object SonarCore {
 
     actual suspend fun messages(chatId: String): List<SonarMsg> = withContext(Dispatchers.IO) {
         val n = node ?: return@withContext emptyList()
-        n.messages(chatId).map {
-            SonarMsg(
-                id = it.idHex,
-                senderNpub = it.senderNpub,
-                content = it.content,
-                mine = it.mine,
-                tsSecs = it.createdAtSecs.toLong(),
-                media = it.media.map { m ->
-                    SonarMedia(
-                        url = m.url,
-                        mimeType = m.mimeType,
-                        filename = m.filename,
-                        width = m.width?.toInt(),
-                        height = m.height?.toInt(),
-                        durationMs = m.durationMs?.toLong(),
-                    )
-                },
-                state = if (it.mine) "Sent" else null,
+        n.messages(chatId).map { it.toCommon() }
+    }
+
+    actual suspend fun messagesPage(chatId: String, limit: Int, offset: Int): List<SonarMsg> =
+        withContext(Dispatchers.IO) {
+            require(limit > 0) { "messagesPage limit must be greater than zero" }
+            require(offset >= 0) { "messagesPage offset must be non-negative" }
+            val n = node ?: return@withContext emptyList()
+            n.messagesPage(chatId, limit.toUInt(), offset.toUInt()).map { it.toCommon() }
+        }
+
+    actual suspend fun recentMessagePages(groupLimit: Int, pageLimit: Int): List<SonarRecentTranscriptPage> =
+        withContext(Dispatchers.IO) {
+            require(groupLimit >= 0) { "recentMessagePages groupLimit must be non-negative" }
+            require(pageLimit >= 0) { "recentMessagePages pageLimit must be non-negative" }
+            val n = node ?: return@withContext emptyList()
+            n.recentMessagePages(groupLimit.toUInt(), pageLimit.toUInt()).map {
+                SonarRecentTranscriptPage(
+                    chatId = it.groupIdHex,
+                    latestTsSecs = it.latestCreatedAtSecs.toLong(),
+                    messages = it.messages.map { message -> message.toCommon() },
+                )
+            }
+        }
+
+    private fun uniffi.sonar_ffi.MessageInfo.toCommon(): SonarMsg = SonarMsg(
+        id = idHex,
+        senderNpub = senderNpub,
+        content = content,
+        mine = mine,
+        tsSecs = createdAtSecs.toLong(),
+        media = media.map { m ->
+            SonarMedia(
+                url = m.url,
+                mimeType = m.mimeType,
+                filename = m.filename,
+                width = m.width?.toInt(),
+                height = m.height?.toInt(),
+                durationMs = m.durationMs?.toLong(),
             )
+        },
+        state = deliveryState.toUiState(mine),
+    )
+
+    private fun String.toUiState(mine: Boolean): String? {
+        if (!mine) return null
+        return when (this) {
+            "pending" -> "Sending"
+            "failed" -> "Couldn't send"
+            "sent" -> "Sent"
+            else -> "Sent"
         }
     }
 

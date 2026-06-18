@@ -282,6 +282,8 @@ struct SNDMRow: Identifiable {
     let verified: Bool
     let isMarmot: Bool
     let lastDate: Date?
+    /// Marmot MLS group backing this row, even when the row id is a folded peer id.
+    var marmotGroupId: String? = nil
 }
 
 /// A local contact that can be invited into a Marmot group.
@@ -316,6 +318,9 @@ final class SonarAppStore: ObservableObject {
         /// Persisted Sonar profiles ([fingerprint: SonarPeerProfile] JSON) so a
         /// peer's npub↔identity link survives restarts (one folded conversation).
         static let sonarProfiles = "sonar.peerProfiles.v1"
+        /// Persisted conversation id -> Marmot group id links. This lets a folded
+        /// Sonar DM open its encrypted local transcript immediately after restart.
+        static let marmotConversationGroups = "sonar.marmotConversationGroups.v1"
         /// Persisted local call-log rows ([conversation id: call records] JSON).
         static let callLogs = "sonar.callLogs.v1"
     }
@@ -368,6 +373,9 @@ final class SonarAppStore: ObservableObject {
     /// peer's mesh (Noise) and White Noise (Marmot) legs folded into ONE
     /// conversation even when the live 0x53 announce isn't currently arriving.
     private var sonarProfilesByFingerprint: [String: SonarPeerProfile] = [:]
+    /// Folded DM id -> Marmot group id. DM rows often use a peer/fingerprint id,
+    /// while the encrypted transcript is keyed by the Marmot MLS group id.
+    private var marmotGroupIdsByConversationId: [String: String] = [:]
     /// Our optional BIP-353 payment address ("" = unset, TLV omitted).
     @Published private(set) var bip353: String
     /// Mirrors wallet.state for the UI (balance row, PaySheet, claims).
@@ -378,6 +386,9 @@ final class SonarAppStore: ObservableObject {
     /// dmMsgs use). Persisted locally so the transcript keeps completed/missed
     /// call rows across relaunches.
     @Published private(set) var callLogs: [String: [SNCallRecord]] = [:]
+    /// Conversations currently checking their bounded local DB transcript. While
+    /// this is set, the DM screen must not show a "new empty chat" state yet.
+    @Published private(set) var localHydratingDMs: Set<String> = []
 
     /// The in-flight P2P call the [SonarCallScreen] renders, or nil. Driven by the
     /// real iroh/opus engine via `callWaitEvent`.
@@ -392,6 +403,13 @@ final class SonarAppStore: ObservableObject {
     /// Texts queued for a Sonar peer (keyed by npub) while their White
     /// Noise group is being created on first out-of-range send.
     private var pendingMarmotSends: [String: [String]] = [:]
+    /// Per-conversation Marmot warm-up work started by openedDM. Home rows and
+    /// destination onAppear can both fire; only one local hydrate/sync pass per
+    /// chat should run at a time.
+    private var openingDMTasks: [String: Task<Void, Never>] = [:]
+    /// Per-conversation background relay reconciliation. Kept separate from
+    /// `openingDMTasks` so a later open never waits for relay sync/backfill.
+    private var refreshingDMTasks: [String: Task<Void, Never>] = [:]
     /// Chat-message ids whose ⚡PAY control lines were already processed.
     private var scannedPayMessageIDs = Set<String>()
     /// Stable mesh peer key -> first sighting time. We briefly hold unresolved
@@ -566,6 +584,7 @@ final class SonarAppStore: ObservableObject {
         // Restore persisted Sonar profiles so a peer's mesh + White Noise legs
         // stay folded into one conversation across restarts (before dmRows runs).
         hydrateSonarProfiles()
+        hydrateMarmotConversationGroups()
 
         if onboarded {
             marmot.connectIfNeeded()
@@ -979,6 +998,10 @@ final class SonarAppStore: ObservableObject {
             sonarProfilesByFingerprint[fp] = profile
             persistSonarProfiles()
         }
+        if let group = marmotGroup(forNpub: profile.npub) {
+            rememberMarmotGroup(group.id, forConversationId: peerID)
+            rememberMarmotGroup(group.id, forConversationId: fp)
+        }
         meshPeerFirstSeenAt[fp] = nil
         pendingCapabilityRefreshKeys.remove(fp)
     }
@@ -993,6 +1016,38 @@ final class SonarAppStore: ObservableObject {
               let map = try? JSONDecoder().decode([String: SonarPeerProfile].self, from: data)
         else { return }
         sonarProfilesByFingerprint = map
+    }
+
+    private func persistMarmotConversationGroups() {
+        guard let data = try? JSONEncoder().encode(marmotGroupIdsByConversationId) else { return }
+        defaults.set(data, forKey: Keys.marmotConversationGroups)
+    }
+
+    private func hydrateMarmotConversationGroups() {
+        guard let data = defaults.data(forKey: Keys.marmotConversationGroups),
+              let map = try? JSONDecoder().decode([String: String].self, from: data)
+        else { return }
+        marmotGroupIdsByConversationId = map.filter { !$0.key.isEmpty && !$0.value.isEmpty }
+    }
+
+    private func rememberMarmotGroup(_ groupId: String, forConversationId id: String) {
+        guard !groupId.isEmpty, !id.isEmpty else { return }
+        if marmotGroupIdsByConversationId[id] == groupId { return }
+        marmotGroupIdsByConversationId[id] = groupId
+        persistMarmotConversationGroups()
+    }
+
+    private func forgetMarmotGroupMappings(forGroupId groupId: String) {
+        let oldCount = marmotGroupIdsByConversationId.count
+        marmotGroupIdsByConversationId = marmotGroupIdsByConversationId.filter { $0.value != groupId }
+        if marmotGroupIdsByConversationId.count != oldCount {
+            persistMarmotConversationGroups()
+        }
+    }
+
+    private func clearMarmotConversationGroups() {
+        marmotGroupIdsByConversationId = [:]
+        defaults.removeObject(forKey: Keys.marmotConversationGroups)
     }
 
     private static func loadCallLogs(from defaults: UserDefaults) -> [String: [SNCallRecord]] {
@@ -1573,7 +1628,24 @@ final class SonarAppStore: ObservableObject {
     }
 
     func marmotGroupId(_ id: String) -> String? {
-        id.hasPrefix(Self.marmotIDPrefix) ? String(id.dropFirst(Self.marmotIDPrefix.count)) : nil
+        if id.hasPrefix(Self.marmotIDPrefix) {
+            return String(id.dropFirst(Self.marmotIDPrefix.count))
+        }
+        if let mapped = marmotGroupIdsByConversationId[id] {
+            return mapped
+        }
+        if let fp = chatViewModel.getFingerprint(for: PeerID(str: id)),
+           let mapped = marmotGroupIdsByConversationId[fp] {
+            rememberMarmotGroup(mapped, forConversationId: id)
+            return mapped
+        }
+        guard let profile = resolvedSonarProfile(id),
+              let group = marmotGroup(forNpub: profile.npub)
+        else { return nil }
+        rememberMarmotGroup(group.id, forConversationId: id)
+        let fp = chatViewModel.getFingerprint(for: PeerID(str: id)) ?? id
+        rememberMarmotGroup(group.id, forConversationId: fp)
+        return group.id
     }
 
     private func marmotGroup(byId groupId: String) -> MarmotService.MarmotGroup? {
@@ -1810,7 +1882,8 @@ final class SonarAppStore: ObservableObject {
                     presence: false,
                     verified: false,
                     isMarmot: true,
-                    lastDate: last?.createdAt
+                    lastDate: last?.createdAt,
+                    marmotGroupId: group.id
                 ))
                 continue
             }
@@ -1825,9 +1898,16 @@ final class SonarAppStore: ObservableObject {
                 sonarPeerKey(forNpub: npub)
                     ?? inferFoldKeyByUniqueTitle(for: group, otherNpub: npub, rowsByKey: byKey)
             }
+            if let liveSonarPeerId {
+                rememberMarmotGroup(group.id, forConversationId: liveSonarPeerId)
+            }
+            if let foldKey {
+                rememberMarmotGroup(group.id, forConversationId: foldKey)
+            }
             if let foldKey, let existing = byKey[foldKey] {
                 // Same person as a mesh/bitchat chat → merge the White Noise leg
                 // into that one row instead of showing a duplicate conversation.
+                rememberMarmotGroup(group.id, forConversationId: existing.id)
                 if let last, last.createdAt > (existing.lastDate ?? .distantPast) {
                     byKey[foldKey] = SNDMRow(
                         id: existing.id,
@@ -1838,7 +1918,8 @@ final class SonarAppStore: ObservableObject {
                         presence: existing.presence,
                         verified: existing.verified,
                         isMarmot: false,
-                        lastDate: last.createdAt
+                        lastDate: last.createdAt,
+                        marmotGroupId: group.id
                     )
                 }
                 continue
@@ -1848,6 +1929,7 @@ final class SonarAppStore: ObservableObject {
                 // Sonar peer now out of range → one folded row, not a White Noise
                 // duplicate.
                 let rowId = liveSonarPeerId ?? foldKey
+                rememberMarmotGroup(group.id, forConversationId: rowId)
                 byKey[foldKey] = SNDMRow(
                     id: rowId,
                     title: liveSonarPeerId == nil ? marmot.title(for: group) : peerDisplayName(rowId),
@@ -1857,7 +1939,8 @@ final class SonarAppStore: ObservableObject {
                     presence: liveSonarPeerId != nil && meshReachable(rowId),
                     verified: isVerified(rowId) || (marmotVerified[group.id] ?? false),
                     isMarmot: false,
-                    lastDate: last?.createdAt
+                    lastDate: last?.createdAt,
+                    marmotGroupId: group.id
                 )
                 continue
             }
@@ -1873,7 +1956,8 @@ final class SonarAppStore: ObservableObject {
                 presence: false,
                 verified: marmotVerified[group.id] ?? false,
                 isMarmot: true,
-                lastDate: last?.createdAt
+                lastDate: last?.createdAt,
+                marmotGroupId: group.id
             ))
         }
         let rows = Array(byKey.values) + marmotRows
@@ -2548,28 +2632,106 @@ final class SonarAppStore: ObservableObject {
         try? FileManager.default.removeItem(at: base.appendingPathComponent("media-cache", isDirectory: true))
     }
 
-    func openedDM(_ id: String) {
-        if marmotGroupId(id) != nil {
-            marmot.startPolling()
-            Task {
-                guard await marmot.ensureConnected() else { return }
-                await marmot.loadLocal()
-                await marmot.refresh()
-            }
-        } else {
+    func openedDM(_ id: String, marmotGroupId knownMarmotGroupId: String? = nil) {
+        if let knownMarmotGroupId {
+            rememberMarmotGroup(knownMarmotGroupId, forConversationId: id)
+        }
+        let sonarProfile = resolvedSonarProfile(id)
+        let groupId = knownMarmotGroupId
+            ?? marmotGroupId(id)
+            ?? sonarProfile.flatMap { marmotGroup(forNpub: $0.npub)?.id }
+        let hasMarmotGroup = groupId != nil
+        if !hasMarmotGroup {
             chatViewModel.startPrivateChat(with: PeerID(str: id))
-            // Sonar peers may carry a White Noise leg of the conversation:
-            // keep that transcript fresh while the screen is open (resolved =
-            // live OR persisted, so it works even when not currently in range).
-            if resolvedSonarProfile(id) != nil {
-                marmot.connectIfNeeded()
-                marmot.startPolling()
-                Task {
-                    guard await marmot.ensureConnected() else { return }
-                    await marmot.loadLocal()
-                    await marmot.refresh()
+        }
+        // Sonar peers may carry a White Noise leg of the conversation. Opening
+        // hydrates local DB state first, then reconciles relays in the
+        // background; duplicate open notifications for the same id join the
+        // in-flight work instead of starting another sync.
+        guard hasMarmotGroup || sonarProfile != nil else { return }
+        marmot.connectIfNeeded()
+        let warmupKey = groupId ?? id
+        if let task = openingDMTasks[warmupKey], !task.isCancelled {
+            localHydratingDMs.insert(id)
+            Task { [weak self] in
+                await task.value
+                self?.localHydratingDMs.remove(id)
+            }
+            return
+        }
+        localHydratingDMs.insert(id)
+        openingDMTasks[warmupKey] = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                self.openingDMTasks[warmupKey] = nil
+            }
+            guard await self.marmot.loadLocalWhenConnected(groupId: groupId) else {
+                self.localHydratingDMs.remove(id)
+                return
+            }
+            guard !Task.isCancelled else {
+                self.localHydratingDMs.remove(id)
+                return
+            }
+            let hydratedGroupId = groupId
+                ?? sonarProfile.flatMap { self.marmotGroup(forNpub: $0.npub)?.id }
+            if let hydratedGroupId {
+                await self.marmot.loadLocalPage(groupId: hydratedGroupId)
+                self.rememberMarmotGroup(hydratedGroupId, forConversationId: id)
+                let fp = self.chatViewModel.getFingerprint(for: PeerID(str: id)) ?? id
+                self.rememberMarmotGroup(hydratedGroupId, forConversationId: fp)
+            }
+            let needsHistoryBackfill = hydratedGroupId.map {
+                self.marmot.messagesByGroup[$0]?.isEmpty ?? true
+            } ?? false
+            if !needsHistoryBackfill {
+                self.localHydratingDMs.remove(id)
+            }
+            guard !Task.isCancelled else {
+                self.localHydratingDMs.remove(id)
+                return
+            }
+            self.refreshMarmotDMInBackground(
+                warmupKey: warmupKey,
+                conversationId: id,
+                groupId: hydratedGroupId,
+                keepLoadingUntilComplete: needsHistoryBackfill
+            )
+        }
+    }
+
+    func isLocallyHydratingDM(_ id: String) -> Bool {
+        localHydratingDMs.contains(id)
+    }
+
+    private func refreshMarmotDMInBackground(
+        warmupKey: String,
+        conversationId id: String,
+        groupId: String?,
+        keepLoadingUntilComplete: Bool
+    ) {
+        if let task = refreshingDMTasks[warmupKey], !task.isCancelled {
+            if keepLoadingUntilComplete {
+                localHydratingDMs.insert(id)
+                Task { [weak self] in
+                    await task.value
+                    self?.localHydratingDMs.remove(id)
                 }
             }
+            return
+        }
+        if keepLoadingUntilComplete {
+            localHydratingDMs.insert(id)
+        }
+        refreshingDMTasks[warmupKey] = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                self.refreshingDMTasks[warmupKey] = nil
+                if keepLoadingUntilComplete {
+                    self.localHydratingDMs.remove(id)
+                }
+            }
+            await self.marmot.refreshWhenConnected(groupId: groupId, hydrateBeforeSync: false)
         }
     }
 
@@ -3409,6 +3571,7 @@ final class SonarAppStore: ObservableObject {
     /// proposal; other deletes are local-only.
     func deleteChat(_ id: String) {
         if let groupId = marmotGroupId(id) {
+            forgetMarmotGroupMappings(forGroupId: groupId)
             let shouldLeave = isMultiMemberMarmotGroupId(id)
             Task {
                 if shouldLeave {
@@ -3422,6 +3585,7 @@ final class SonarAppStore: ObservableObject {
             chatViewModel.deleteConversation(with: PeerID(str: id))
             // ...and the folded White Noise leg, if this peer has one.
             if let profile = resolvedSonarProfile(id), let g = marmotGroup(forNpub: profile.npub) {
+                forgetMarmotGroupMappings(forGroupId: g.id)
                 Task { await marmot.deleteGroup(g.id) }
             }
         }
@@ -3449,9 +3613,15 @@ final class SonarAppStore: ObservableObject {
         // with the SAME identity so new secure chats still work.
         Task { await marmot.eraseChatsKeepIdentity() }
         // Drop queued sends + pay-scan state that referenced the erased chats.
+        openingDMTasks.values.forEach { $0.cancel() }
+        openingDMTasks = [:]
+        refreshingDMTasks.values.forEach { $0.cancel() }
+        refreshingDMTasks = [:]
         pendingMarmotSends = [:]
         scannedPayMessageIDs = []
         pendingPayPeer = nil
+        localHydratingDMs = []
+        clearMarmotConversationGroups()
         clearCallLogs()
         // The node is recreated by eraseChatsKeepIdentity → reset call state so
         // the iroh endpoint rebinds (the marmot.$npub sink calls ensureCallStarted).
@@ -3495,6 +3665,12 @@ final class SonarAppStore: ObservableObject {
         meshPeerFirstSeenAt = [:]
         pendingCapabilityRefreshKeys = []
         defaults.removeObject(forKey: Keys.sonarProfiles)
+        openingDMTasks.values.forEach { $0.cancel() }
+        openingDMTasks = [:]
+        refreshingDMTasks.values.forEach { $0.cancel() }
+        refreshingDMTasks = [:]
+        localHydratingDMs = []
+        clearMarmotConversationGroups()
         // Stop scanning for Unify peers and clear the discovered list (no
         // secrets are stored, but the list must not survive a panic wipe).
         unify.stop()

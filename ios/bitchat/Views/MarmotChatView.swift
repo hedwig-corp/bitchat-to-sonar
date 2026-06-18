@@ -13,9 +13,32 @@ import SonarCore
 
 enum SNMarmotProfileCache {
     static let defaultsKey = "marmot.profilesByNpub.v1"
+    private static let cacheLimit = 4_096
+    private static let canonicalLock = NSLock()
+    private static var canonicalCache: [String: String] = [:]
 
     static func canonicalKey(_ value: String) -> String {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        canonicalLock.lock()
+        if let cached = canonicalCache[trimmed] {
+            canonicalLock.unlock()
+            return cached
+        }
+        canonicalLock.unlock()
+
+        let canonical = computeCanonicalKey(trimmed)
+
+        canonicalLock.lock()
+        if canonicalCache.count >= cacheLimit {
+            canonicalCache.removeAll(keepingCapacity: true)
+        }
+        canonicalCache[trimmed] = canonical
+        canonicalLock.unlock()
+
+        return canonical
+    }
+
+    private static func computeCanonicalKey(_ trimmed: String) -> String {
         if trimmed.hasPrefix("npub1"),
            let decoded = try? Bech32.decode(trimmed),
            decoded.hrp == "npub",
@@ -97,6 +120,9 @@ final class MarmotChatModel: ObservableObject {
     private static let nsecKeychainKey = "marmot-nsec"
     private static let sonarDescriptorRefreshInterval: TimeInterval = 15 * 60
     private static let sonarDescriptorMissRetryInterval: TimeInterval = 60
+    private static let localTranscriptPageLimit: UInt32 = 100
+    private static let localSummaryPageLimit: UInt32 = 20
+    private static let localSummaryGroupLimit: UInt32 = 50
 
     @Published var npub: String?
     @Published var groups: [MarmotService.MarmotGroup] = []
@@ -118,6 +144,9 @@ final class MarmotChatModel: ObservableObject {
     private let keychain: KeychainManagerProtocol
     private let defaults: UserDefaults
     private var syncTask: Task<Void, Never>?
+    private var startupLocalSummaryTask: Task<Void, Never>?
+    private var relayConnectTask: Task<Void, Never>?
+    private var relayBusy = false
     /// npubs whose profile fetch is in flight or done, to fetch each once per session.
     private var profileFetches: Set<String> = []
     /// npubs whose Sonar descriptor fetch is currently in flight.
@@ -137,6 +166,16 @@ final class MarmotChatModel: ObservableObject {
 
     static func stateText(for message: MarmotService.MarmotMessage) -> String? {
         guard message.isMine else { return nil }
+        switch message.deliveryState {
+        case "pending":
+            return message.media.isEmpty ? "Sending" : "Uploading"
+        case "failed":
+            return "Couldn't send"
+        case "sent":
+            return "Sent"
+        default:
+            break
+        }
         if message.id.hasPrefix(failedOptimisticIDPrefix) { return "Couldn't send" }
         if message.id.hasPrefix(optimisticIDPrefix) {
             return message.media.isEmpty ? "Sending" : "Uploading"
@@ -172,8 +211,9 @@ final class MarmotChatModel: ObservableObject {
     }
 
     /// The actual connect sequence (awaitable, NOT guarded). Reuse the keychain
-    /// identity, open the encrypted DB, load local chats, publish our KeyPackage.
-    /// Used by the lazy `connectIfNeeded()` and the erase-and-reconnect path —
+    /// identity, open the encrypted DB, load local group metadata, then schedule
+    /// relay setup behind first-paint local reads. Used by the lazy
+    /// `connectIfNeeded()` and the erase-and-reconnect path —
     /// the latter must NOT be blocked by the `busy`/`npub` guard, which would
     /// silently leave the node disconnected ("not connected yet" until restart).
     private func performConnect() async {
@@ -205,33 +245,17 @@ final class MarmotChatModel: ObservableObject {
             }
             self.npub = np
         }
-        // 2) Connect (opens the encrypted DB) → load the LOCAL chats right away
-        //    (they don't need the relays) → then publish our KeyPackage. A relay
-        //    publish failure must NOT hide already-persisted chats — that was
-        //    the "chats vanish on restart, reappear on the next launch" bug.
+        // 2) Open the encrypted DB with no relays first → load LOCAL chats right
+        //    away → then attach real relays in the background. A relay publish
+        //    failure must NOT hide already-persisted chats.
         do {
-            _ = try await service.connect(nsec: storedNsec)
-            // Paint persisted chats from the encrypted DB IMMEDIATELY — they do
-            // not need the relays. The relay drain (syncOnce) + KeyPackage
-            // publish must NOT gate first paint, or the UI freezes on
-            // "Connecting…" for the entire relay round-trip even though every
-            // chat is already on disk (the user's "sync on launch is slow"
-            // report). Run them detached.
-            await loadLocal()
+            _ = try await service.connectLocal(nsec: storedNsec)
+            await loadLocalGroupMetadata()
             self.errorText = nil
-            Task { [weak self] in
-                guard let self else { return }
-                await self.refresh()
-                try? await self.service.publishKeyPackage()
-                try? await self.service.publishSonarDescriptor()
-            }
-            // Run the live subscription loop for as long as we're connected, so
-            // welcomes + messages arrive in real time globally (not only while a
-            // specific chat is open).
-            startPolling()
+            scheduleStartupLocalSummariesThenRelay()
         } catch {
             let desc = Self.describe(error)
-            SecureLogger.warning("⚠️ Marmot connect failed: \(desc)", category: .session)
+            SecureLogger.warning("⚠️ Marmot local open failed: \(desc)", category: .session)
             self.errorText = desc
         }
     }
@@ -274,15 +298,193 @@ final class MarmotChatModel: ObservableObject {
         return await service.isConnected()
     }
 
+    private func scheduleRelayConnect(delaySeconds: Double = 2) {
+        guard relayConnectTask == nil else { return }
+        relayConnectTask = Task { [weak self] in
+            let nanos = UInt64(max(0, delaySeconds) * 1_000_000_000)
+            if nanos > 0 {
+                try? await Task.sleep(nanoseconds: nanos)
+            }
+            guard !Task.isCancelled else { return }
+            self?.connectRelaysIfNeeded()
+            self?.relayConnectTask = nil
+        }
+    }
+
+    private func scheduleStartupLocalSummariesThenRelay(delaySeconds: Double = 0.25) {
+        guard startupLocalSummaryTask == nil else { return }
+        startupLocalSummaryTask = Task { [weak self] in
+            let nanos = UInt64(max(0, delaySeconds) * 1_000_000_000)
+            if nanos > 0 {
+                try? await Task.sleep(nanoseconds: nanos)
+            }
+            guard let self, !Task.isCancelled else { return }
+            await self.loadLocalSummaries(resolveMembers: false)
+            guard !Task.isCancelled else { return }
+            self.startupLocalSummaryTask = nil
+            self.scheduleRelayConnect(delaySeconds: 0.25)
+        }
+    }
+
+    private func connectRelaysIfNeeded() {
+        guard !relayBusy else { return }
+        relayConnectTask?.cancel()
+        relayConnectTask = nil
+        relayBusy = true
+        Task { [weak self] in
+            guard let self else { return }
+            defer { self.relayBusy = false }
+            do {
+                _ = try await self.service.connect(nsec: nil)
+                self.errorText = nil
+                try? await self.service.publishKeyPackage()
+                try? await self.service.publishSonarDescriptor()
+                self.startPolling()
+            } catch MarmotService.ServiceError.cancelled {
+                return
+            } catch {
+                let desc = Self.describe(error)
+                SecureLogger.warning("⚠️ Marmot relay connect failed: \(desc)", category: .session)
+                self.errorText = desc
+            }
+        }
+    }
+
+    func ensureRelayConnected(timeoutSeconds: Double = 10) async -> Bool {
+        if await service.isRelayConnected() { return true }
+        connectRelaysIfNeeded()
+        let start = Date()
+        while Date().timeIntervalSince(start) < timeoutSeconds {
+            if await service.isRelayConnected() { return true }
+            try? await Task.sleep(nanoseconds: 250_000_000)
+        }
+        return await service.isRelayConnected()
+    }
+
+    /// Best-effort local hydration for screen open paths. This never waits for
+    /// relay connect/sync; if the encrypted DB is not open yet, connectIfNeeded()
+    /// continues opening it in the background.
+    func loadLocalIfConnected(groupId: String? = nil) async {
+        guard await service.isConnected() else {
+            connectIfNeeded()
+            return
+        }
+        await loadLocalWindow(groupId: groupId)
+    }
+
+    /// Wait only for the local Marmot node/DB to open, then hydrate local state.
+    /// This deliberately performs no relay sync.
+    @discardableResult
+    func loadLocalWhenConnected(groupId: String? = nil, timeoutSeconds: Double = 10) async -> Bool {
+        guard await ensureConnected(timeoutSeconds: timeoutSeconds) else { return false }
+        await loadLocalWindow(groupId: groupId)
+        return true
+    }
+
+    /// Background reconciliation for open chats. Kept separate from local
+    /// hydration so relay sync cannot gate first paint.
+    func refreshWhenConnected(groupId: String? = nil, hydrateBeforeSync: Bool = true) async {
+        guard await ensureConnected() else { return }
+        if hydrateBeforeSync {
+            await loadLocalWindow(groupId: groupId)
+        }
+        if await ensureRelayConnected() {
+            do {
+                try await service.syncOnce()
+                self.errorText = nil
+            } catch {
+                self.errorText = Self.describe(error)
+            }
+        }
+        await loadLocalWindow(groupId: groupId)
+    }
+
+    private func loadLocalWindow(groupId: String?) async {
+        if let groupId {
+            await loadLocalPage(groupId: groupId)
+        } else {
+            await loadLocalSummaries()
+        }
+    }
+
     /// Load groups + messages from the LOCAL encrypted DB only (no relay I/O),
     /// so the chat list paints instantly on launch regardless of relay health.
     func loadLocal() async {
+        await loadLocalSummaries()
+    }
+
+    /// Startup local read: load only row metadata, not even one message per
+    /// group. The selected chat's `messagesPage` must stay ahead of background
+    /// summaries/sync on the serialized engine queue.
+    private func loadLocalGroupMetadata() async {
         do {
             let groups = try await service.groups()
             let invites = try await service.pendingGroupInvites()
-            var byGroup: [String: [MarmotService.MarmotMessage]] = [:]
-            for group in groups {
-                byGroup[group.id] = try await service.messages(groupId: group.id)
+            self.groups = groups
+            self.pendingGroupInvites = invites
+            SNMarmotChatSnapshotCache.save(
+                groups: groups,
+                messagesByGroup: messagesByGroup,
+                to: defaults
+            )
+        } catch {
+            self.errorText = Self.describe(error)
+        }
+    }
+
+    /// Load the latest local transcript window for one group. Used by chat open
+    /// so existing conversations paint from the encrypted DB without scanning
+    /// all groups or all messages.
+    func loadLocalPage(groupId: String) async {
+        do {
+            let groups = try await service.groups()
+            let invites = try await service.pendingGroupInvites()
+            let page = try await service.messagesPage(
+                groupId: groupId,
+                limit: Self.localTranscriptPageLimit
+            )
+            var byGroup = messagesByGroup
+            byGroup[groupId] = page
+            self.groups = groups
+            self.pendingGroupInvites = invites
+            self.messagesByGroup = reconcileOptimistic(into: byGroup)
+            SNMarmotChatSnapshotCache.save(
+                groups: groups,
+                messagesByGroup: self.messagesByGroup,
+                to: defaults
+            )
+            if let group = groups.first(where: { $0.id == groupId }) {
+                let relayReady = await service.isRelayConnected()
+                for member in group.memberNpubs where member != npub {
+                    ensureProfile(member)
+                    if relayReady {
+                        ensureSonarDescriptor(member)
+                    }
+                }
+            }
+        } catch {
+            self.errorText = Self.describe(error)
+        }
+    }
+
+    /// Load row metadata plus the newest local message per group. This keeps the
+    /// chat list fresh without scanning full transcripts on cold start, polling,
+    /// or idle reconciliation. Already-loaded active transcripts are preserved
+    /// and merged with the newest row.
+    func loadLocalSummaries(resolveMembers: Bool = true) async {
+        do {
+            let groups = try await service.groups()
+            let invites = try await service.pendingGroupInvites()
+            var byGroup = messagesByGroup
+            let pages = try await service.recentMessagePages(
+                groupLimit: Self.localSummaryGroupLimit,
+                pageLimit: Self.localSummaryPageLimit
+            )
+            for page in pages {
+                byGroup[page.groupId] = Self.mergeMessages(
+                    existing: messagesByGroup[page.groupId] ?? [],
+                    incoming: page.messages
+                )
             }
             self.groups = groups
             self.pendingGroupInvites = invites
@@ -292,11 +494,15 @@ final class MarmotChatModel: ObservableObject {
                 messagesByGroup: self.messagesByGroup,
                 to: defaults
             )
-            // Resolve a human name for every counterpart (once each).
-            for group in groups {
-                for member in group.memberNpubs where member != npub {
-                    ensureProfile(member)
-                    ensureSonarDescriptor(member)
+            if resolveMembers {
+                let relayReady = await service.isRelayConnected()
+                for group in groups {
+                    for member in group.memberNpubs where member != npub {
+                        ensureProfile(member)
+                        if relayReady {
+                            ensureSonarDescriptor(member)
+                        }
+                    }
                 }
             }
         } catch {
@@ -304,17 +510,31 @@ final class MarmotChatModel: ObservableObject {
         }
     }
 
+    private static func mergeMessages(
+        existing: [MarmotService.MarmotMessage],
+        incoming: [MarmotService.MarmotMessage]
+    ) -> [MarmotService.MarmotMessage] {
+        var byID: [String: MarmotService.MarmotMessage] = [:]
+        for message in existing { byID[message.id] = message }
+        for message in incoming { byID[message.id] = message }
+        return byID.values.sorted { $0.createdAt < $1.createdAt }
+    }
+
     /// Poll the relays once, then reflect the (possibly updated) local state.
     /// Local chats are loaded even when the relay sync fails, so a relay outage
     /// never hides already-persisted conversations.
     func refresh() async {
-        do {
-            try await service.syncOnce()
-            self.errorText = nil
-        } catch {
-            self.errorText = Self.describe(error)
+        if await service.isRelayConnected() {
+            do {
+                try await service.syncOnce()
+                self.errorText = nil
+            } catch {
+                self.errorText = Self.describe(error)
+            }
+        } else {
+            connectRelaysIfNeeded()
         }
-        await loadLocal()
+        await loadLocalSummaries()
     }
 
     /// Publish our own kind-0 profile so peers see our nickname, not our npub.
@@ -398,7 +618,7 @@ final class MarmotChatModel: ObservableObject {
                 }
             } catch {
                 await MainActor.run {
-                    self.descriptorFetches.remove(npubToFetch)
+                    _ = self.descriptorFetches.remove(npubToFetch)
                 }
             }
         }
@@ -464,13 +684,14 @@ final class MarmotChatModel: ObservableObject {
         Task {
             // Wait through the connect/reconnect window (post-erase or cold
             // launch) so a fresh chat doesn't fail with "not connected yet".
-            guard await ensureConnected() else {
+            guard await ensureRelayConnected() else {
                 self.errorText = "Not connected yet — try again in a moment."
                 return
             }
             do {
-                _ = try await service.startDirectMessage(with: trimmed, name: "")
-                await refresh()
+                let groupId = try await service.startDirectMessage(with: trimmed, name: "")
+                await loadLocalPage(groupId: groupId)
+                await refreshWhenConnected(groupId: groupId, hydrateBeforeSync: false)
             } catch {
                 self.errorText = Self.describe(error)
             }
@@ -480,14 +701,6 @@ final class MarmotChatModel: ObservableObject {
     func send(_ text: String, to groupId: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        let echo = MarmotService.MarmotMessage(
-            id: Self.optimisticIDPrefix + UUID().uuidString,
-            senderNpub: npub ?? "",
-            content: trimmed,
-            createdAt: Date(),
-            isMine: true,
-            media: []
-        )
         Task {
             do {
                 // Wait through the connect/reconnect window so a send right after
@@ -496,22 +709,13 @@ final class MarmotChatModel: ObservableObject {
                     throw MarmotService.ServiceError.notConnected
                 }
                 // A row-only startup snapshot may know the group before the local
-                // SQLCipher transcript is hydrated. Load it before appending the
-                // optimistic echo so opening/sending cannot briefly replace history
-                // with one outgoing bubble.
-                await loadLocal()
-                // Optimistic echo: show the outgoing message immediately, before the
-                // relay round-trip, so the conversation doesn't appear to swallow it.
-                // refresh() reconciles it away once the real copy comes back.
-                pendingOptimistic[groupId, default: []].append(echo)
-                messagesByGroup[groupId, default: []].append(echo)
+                // SQLCipher transcript is hydrated. Load it before sending so
+                // a local-first pending row is merged into the existing page.
+                await loadLocalPage(groupId: groupId)
                 try await service.sendText(groupId: groupId, text: trimmed)
-                await refresh()
+                await loadLocalPage(groupId: groupId)
+                await refreshWhenConnected(groupId: groupId, hydrateBeforeSync: false)
             } catch {
-                // Sending failed: drop the optimistic echo so it doesn't
-                // linger as if it were delivered.
-                pendingOptimistic[groupId]?.removeAll { $0.id == echo.id }
-                messagesByGroup[groupId]?.removeAll { $0.id == echo.id }
                 self.errorText = Self.describe(error)
             }
         }
@@ -552,15 +756,18 @@ final class MarmotChatModel: ObservableObject {
                 guard await ensureConnected() else {
                     throw MarmotService.ServiceError.notConnected
                 }
-                await loadLocal()
+                await loadLocalPage(groupId: groupId)
                 pendingOptimistic[groupId, default: []].append(echo)
                 messagesByGroup[groupId, default: []].append(echo)
                 echoVisible = true
+                guard await ensureRelayConnected() else {
+                    throw MarmotService.ServiceError.notConnected
+                }
                 try await service.sendMedia(
                     groupId: groupId, data: data, filename: filename, mime: mime, caption: caption
                 )
                 onComplete?()
-                await refresh()
+                await refreshWhenConnected(groupId: groupId, hydrateBeforeSync: false)
             } catch {
                 pendingOptimistic[groupId]?.removeAll { $0.id == echo.id }
                 if echoVisible {
@@ -615,7 +822,7 @@ final class MarmotChatModel: ObservableObject {
                 if Task.isCancelled { return }
                 if woke {
                     let drained = (try? await self.service.drainPending()) ?? false
-                    if drained { await self.loadLocal() }
+                    if drained { await self.loadLocalSummaries() }
                 } else {
                     await self.refresh() // idle safety reconciliation
                 }
@@ -624,13 +831,20 @@ final class MarmotChatModel: ObservableObject {
     }
 
     func stopPolling() {
+        startupLocalSummaryTask?.cancel()
+        startupLocalSummaryTask = nil
+        relayConnectTask?.cancel()
+        relayConnectTask = nil
         syncTask?.cancel()
         syncTask = nil
     }
 
     // MARK: - P2P calls (pass-throughs to the call engine in MarmotService)
 
-    func callStart() async throws { try await service.callStart() }
+    func callStart() async throws {
+        guard await ensureRelayConnected() else { throw MarmotService.ServiceError.notConnected }
+        try await service.callStart()
+    }
     func callLocalAddress() async throws -> String { try await service.callLocalAddress() }
     func callPlace(callId: String, video: Bool) async throws { try await service.callPlace(callId: callId, video: video) }
     func callIncomingOffer(callId: String, addrB64: String, video: Bool) async throws {
@@ -780,6 +994,8 @@ final class MarmotChatModel: ObservableObject {
         switch error {
         case MarmotService.ServiceError.notConnected:
             return "Not connected yet — try again in a moment."
+        case MarmotService.ServiceError.cancelled:
+            return "Operation cancelled."
         case MarmotService.ServiceError.invalidInput(let detail):
             return "Invalid input: \(detail)"
         case MarmotService.ServiceError.core(let detail):

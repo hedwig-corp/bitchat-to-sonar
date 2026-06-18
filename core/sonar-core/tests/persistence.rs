@@ -7,8 +7,10 @@
 
 use mdk_core::prelude::GroupId;
 use nostr::RelayUrl;
+use sonar_core::client::SonarClient;
 use sonar_core::identity::Identity;
-use sonar_core::marmot::{Incoming, MarmotEngine};
+use sonar_core::marmot::{DeliveryState, Incoming, MarmotEngine};
+use tokio::time::{sleep, Duration};
 
 /// A fixed 32-byte SQLCipher key (the host supplies this at runtime).
 const DB_KEY: [u8; 32] = [0x42; 32];
@@ -42,10 +44,19 @@ async fn group_and_message_survive_reopen() {
             .merge_pending_commit(&group_id)
             .expect("merge after simulated welcome delivery");
 
-        // Send a message and process it back so it lands in storage as "ours"
+        // Send messages and process them back so they land in storage as "ours"
         // (mirrors what SonarClient::send_text does after publishing).
         let event = alice
-            .create_text_message(&group_id, "persisted hello")
+            .create_text_message(&group_id, "persisted hello 1")
+            .expect("create message");
+        let processed = alice
+            .process_incoming(&event)
+            .await
+            .expect("process own message");
+        assert!(matches!(processed, Incoming::Message(_)));
+        sleep(Duration::from_secs(1)).await;
+        let event = alice
+            .create_text_message(&group_id, "persisted hello 2")
             .expect("create message");
         let processed = alice
             .process_incoming(&event)
@@ -53,9 +64,25 @@ async fn group_and_message_survive_reopen() {
             .expect("process own message");
         assert!(matches!(processed, Incoming::Message(_)));
 
+        // Store a newer non-chat membership row after the chat messages. The
+        // paged transcript API must skip this MDK bookkeeping row and still
+        // return the latest real chat message.
+        sleep(Duration::from_secs(1)).await;
+        let charlie = MarmotEngine::in_memory(Identity::generate());
+        let charlie_kp = charlie
+            .key_package_event(relays())
+            .expect("charlie key package");
+        let update = alice
+            .add_members(&group_id, vec![charlie_kp])
+            .expect("add charlie");
+        assert!(update.requires_commit_merge);
+        alice
+            .merge_pending_commit(&group_id)
+            .expect("merge after simulated membership delivery");
+
         // Sanity check within the live session.
         assert_eq!(alice.groups().unwrap().len(), 1);
-        assert_eq!(alice.messages(&group_id).unwrap().len(), 1);
+        assert_eq!(alice.messages(&group_id).unwrap().len(), 2);
 
         (group_id, event)
     }; // alice dropped here → SQLite handle closed, data flushed to disk.
@@ -77,10 +104,21 @@ async fn group_and_message_survive_reopen() {
 
     // The message is still there, with the right content + sender.
     let messages = alice2.messages(&group_id).expect("messages after reopen");
-    assert_eq!(messages.len(), 1, "message survived reopen");
-    assert_eq!(messages[0].content, "persisted hello");
+    assert_eq!(messages.len(), 2, "messages survived reopen");
+    assert!(messages.iter().any(|m| m.content == "persisted hello 1"));
+    assert!(messages.iter().any(|m| m.content == "persisted hello 2"));
     assert_eq!(messages[0].sender, alice_pubkey);
     assert!(messages[0].mine);
+    let latest_page = alice2
+        .messages_page(&group_id, 1, 0)
+        .expect("latest local message page");
+    assert_eq!(latest_page.len(), 1);
+    assert_eq!(latest_page[0].content, "persisted hello 2");
+    let previous_page = alice2
+        .messages_page(&group_id, 1, 1)
+        .expect("previous local message page");
+    assert_eq!(previous_page.len(), 1);
+    assert_eq!(previous_page[0].content, "persisted hello 1");
 
     // The sync watermark RESUMES from the persisted history (at or after the
     // stored message's timestamp — `latest_message_secs` also counts non-chat
@@ -91,6 +129,101 @@ async fn group_and_message_survive_reopen() {
         "watermark resumes at/after the newest stored message after reopen"
     );
     assert!(alice2.latest_message_secs() > 0);
+}
+
+#[tokio::test]
+async fn local_first_send_persists_pending_message_before_relay_publish() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let outbox_path = db_path.with_file_name("marmot.sqlite.sonar-outbox.json");
+
+    let bob = MarmotEngine::in_memory(Identity::generate());
+    let bob_kp = bob.key_package_event(relays()).expect("bob key package");
+
+    let alice_identity = Identity::generate();
+    let group_id = {
+        let client = SonarClient::connect(alice_identity.clone(), Vec::new(), &db_path, DB_KEY)
+            .await
+            .expect("connect local-only client");
+        let creation = client
+            .engine()
+            .create_group("alice & bob", vec![bob_kp], Vec::new())
+            .expect("create local group");
+        let group_id = creation.group.mls_group_id.clone();
+        client
+            .engine()
+            .merge_pending_commit(&group_id)
+            .expect("merge local group");
+
+        client
+            .send_text(&group_id, "visible before relay")
+            .await
+            .expect("local-first send");
+        let page = client
+            .messages_page(&group_id, 10, 0)
+            .expect("local page after send");
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].content, "visible before relay");
+        assert_eq!(page[0].delivery_state, DeliveryState::Pending);
+        assert!(outbox_path.exists(), "pending outbox sidecar is durable");
+        group_id
+    };
+
+    let reopened = SonarClient::connect(alice_identity, Vec::new(), &db_path, DB_KEY)
+        .await
+        .expect("reopen local-only client");
+    let page = reopened
+        .messages_page(&group_id, 10, 0)
+        .expect("local page after reopen");
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].content, "visible before relay");
+    assert_eq!(page[0].delivery_state, DeliveryState::Pending);
+}
+
+#[tokio::test]
+async fn recent_message_pages_returns_newest_groups_with_bounded_windows() {
+    let alice = MarmotEngine::in_memory(Identity::generate());
+    let mut created = Vec::new();
+
+    for idx in 0..6 {
+        let bob = MarmotEngine::in_memory(Identity::generate());
+        let bob_kp = bob.key_package_event(relays()).expect("bob key package");
+        let creation = alice
+            .create_group(&format!("chat {idx}"), vec![bob_kp], relays())
+            .expect("create group");
+        let group_id = creation.group.mls_group_id.clone();
+        alice
+            .merge_pending_commit(&group_id)
+            .expect("merge after simulated welcome delivery");
+
+        for msg_idx in 0..3 {
+            let event = alice
+                .create_text_message(&group_id, &format!("chat {idx} message {msg_idx}"))
+                .expect("create message");
+            assert!(matches!(
+                alice
+                    .process_incoming(&event)
+                    .await
+                    .expect("process own message"),
+                Incoming::Message(_)
+            ));
+        }
+        created.push(group_id);
+        sleep(Duration::from_secs(1)).await;
+    }
+
+    let pages = alice
+        .recent_message_pages(5, 2)
+        .expect("recent local transcript pages");
+    assert_eq!(pages.len(), 5);
+    assert_eq!(pages[0].group_id, created[5]);
+    assert_eq!(pages[4].group_id, created[1]);
+    assert!(!pages.iter().any(|page| page.group_id == created[0]));
+    assert!(pages.iter().all(|page| page.messages.len() == 2));
+    assert!(pages[0]
+        .messages
+        .iter()
+        .all(|message| message.content.starts_with("chat 5 message ")));
 }
 
 #[tokio::test]
@@ -161,10 +294,29 @@ async fn wipe_removes_the_database() {
             .expect("open persistent engine");
         let _ = alice.key_package_event(relays()).expect("key package");
     }
+    let sync_path = db_path.with_file_name("marmot.sqlite.sonar-sync.json");
+    let sync_tmp_path = db_path.with_file_name("marmot.sqlite.sonar-sync.json.tmp");
+    let outbox_path = db_path.with_file_name("marmot.sqlite.sonar-outbox.json");
+    let outbox_tmp_path = db_path.with_file_name("marmot.sqlite.sonar-outbox.json.tmp");
+    std::fs::write(&sync_path, b"{}").expect("fake sync sidecar");
+    std::fs::write(&sync_tmp_path, b"{}").expect("fake sync temp sidecar");
+    std::fs::write(&outbox_path, b"{}").expect("fake outbox sidecar");
+    std::fs::write(&outbox_tmp_path, b"{}").expect("fake outbox temp sidecar");
     assert!(db_path.exists());
+    assert!(sync_path.exists());
+    assert!(sync_tmp_path.exists());
+    assert!(outbox_path.exists());
+    assert!(outbox_tmp_path.exists());
 
     MarmotEngine::wipe(&db_path).expect("wipe");
     assert!(!db_path.exists(), "db file removed by wipe");
+    assert!(!sync_path.exists(), "sync sidecar removed by wipe");
+    assert!(!sync_tmp_path.exists(), "sync temp sidecar removed by wipe");
+    assert!(!outbox_path.exists(), "outbox sidecar removed by wipe");
+    assert!(
+        !outbox_tmp_path.exists(),
+        "outbox temp sidecar removed by wipe"
+    );
 
     // Wipe is idempotent.
     MarmotEngine::wipe(&db_path).expect("wipe again is a no-op");

@@ -157,8 +157,20 @@ pub struct MessageInfo {
     pub created_at_secs: u64,
     /// True when the local identity sent it.
     pub mine: bool,
+    /// Local delivery state: received, pending, sent, or failed.
+    pub delivery_state: String,
     /// Encrypted media attachments (Marmot MIP-04), empty for a plain text message.
     pub media: Vec<MediaInfo>,
+}
+
+/// FFI-friendly transcript window for one recent group.
+#[derive(uniffi::Record)]
+pub struct RecentMessagePageInfo {
+    pub group_id_hex: String,
+    /// Newest message timestamp in this page, for stable chat-list ordering.
+    pub latest_created_at_secs: u64,
+    /// Oldest first within the bounded page.
+    pub messages: Vec<MessageInfo>,
 }
 
 /// FFI-friendly reference to an encrypted media attachment. `url` is the Blossom
@@ -226,7 +238,9 @@ pub struct SonarNode {
 #[uniffi::export]
 impl SonarNode {
     /// Connect `identity` to the given relays (e.g. `wss://relay.damus.io`) with
-    /// a persistent, encrypted SQLCipher store.
+    /// a persistent, encrypted SQLCipher store. Passing an empty relay list opens
+    /// the local encrypted DB only; hosts use that for Signal-style first paint
+    /// before they attach network relays in the background.
     ///
     /// - `db_path`: absolute filesystem path for the database (the Swift host
     ///   passes e.g. `<Application Support>/sonar-marmot/marmot.sqlite`; the host
@@ -241,9 +255,6 @@ impl SonarNode {
         db_path: String,
         db_key_hex: String,
     ) -> FfiResult<Arc<Self>> {
-        if relay_urls.is_empty() {
-            return Err(SonarFfiError::InvalidInput("relay_urls is empty".into()));
-        }
         if db_path.is_empty() {
             return Err(SonarFfiError::InvalidInput("db_path is empty".into()));
         }
@@ -455,6 +466,14 @@ impl SonarNode {
         Ok(())
     }
 
+    /// Reload the durable outbox sidecar and retry pending sends. Hosts call this
+    /// after replacing a local-only node with a relay-backed node so sends created
+    /// during relay connect are not stranded until app restart.
+    pub fn retry_outbox(&self) -> FfiResult<()> {
+        self.runtime.block_on(self.client.reload_outbox_and_retry());
+        Ok(())
+    }
+
     /// Block until a live Marmot event (welcome or group message) has been pushed
     /// by the relay subscriptions, or `timeout_secs` elapses. Returns true if
     /// there is something to drain. Touches NO MLS state, so the host may call it
@@ -496,28 +515,55 @@ impl SonarNode {
         let group_id = parse_group_id(&group_id_hex)?;
         let mut msgs = self.client.messages(&group_id)?;
         msgs.sort_by_key(|m| m.created_at);
-        Ok(msgs
+        Ok(msgs.into_iter().map(message_info).collect())
+    }
+
+    /// Bounded local chat-message window for a group, oldest first within the
+    /// page. `offset` counts chat messages in newest-first order; non-chat MDK
+    /// rows such as commits/proposals are skipped by the core.
+    pub fn messages_page(
+        &self,
+        group_id_hex: String,
+        limit: u32,
+        offset: u32,
+    ) -> FfiResult<Vec<MessageInfo>> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        if limit == 0 {
+            return Err(SonarFfiError::InvalidInput(
+                "messages_page limit must be greater than zero".into(),
+            ));
+        }
+        let mut msgs = self
+            .client
+            .messages_page(&group_id, limit as usize, offset as usize)?;
+        msgs.sort_by_key(|m| m.created_at);
+        Ok(msgs.into_iter().map(message_info).collect())
+    }
+
+    /// Bounded local transcript windows for the most recent groups, newest
+    /// conversation first. Used by chat-list hydration so first paint is local
+    /// DB only and does not wait on relay sync or full-history scans.
+    pub fn recent_message_pages(
+        &self,
+        group_limit: u32,
+        page_limit: u32,
+    ) -> FfiResult<Vec<RecentMessagePageInfo>> {
+        if group_limit == 0 || page_limit == 0 {
+            return Ok(Vec::new());
+        }
+        self.client
+            .recent_message_pages(group_limit as usize, page_limit as usize)?
             .into_iter()
-            .map(|m| MessageInfo {
-                id_hex: m.id.to_hex(),
-                sender_npub: m.sender.to_bech32().expect("npub encoding cannot fail"),
-                content: m.content,
-                created_at_secs: m.created_at.as_secs(),
-                mine: m.mine,
-                media: m
-                    .media
-                    .into_iter()
-                    .map(|r| MediaInfo {
-                        url: r.url,
-                        mime_type: r.mime_type,
-                        filename: r.filename,
-                        width: r.width,
-                        height: r.height,
-                        duration_ms: r.duration_ms,
-                    })
-                    .collect(),
+            .map(|page| {
+                let mut messages = page.messages;
+                messages.sort_by_key(|m| m.created_at);
+                Ok(RecentMessagePageInfo {
+                    group_id_hex: hex::encode(page.group_id.as_slice()),
+                    latest_created_at_secs: page.latest_created_at.as_secs(),
+                    messages: messages.into_iter().map(message_info).collect(),
+                })
             })
-            .collect())
+            .collect()
     }
 
     /// Encrypt + upload `data` to a Blossom server, then publish a media message
@@ -847,8 +893,9 @@ impl SonarNode {
             // report "nothing happened". `.max(1)` floors a 0 timeout so we can
             // never spin; capping at 30s bounds a bogus/hostile huge value.
             let secs = timeout_secs.clamp(1, 30);
-            self.runtime
-                .block_on(tokio::time::sleep(std::time::Duration::from_secs(secs)));
+            self.runtime.block_on(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+            });
             return None;
         };
         // Engine present: `next_event` already honors the timeout internally
@@ -1478,6 +1525,29 @@ fn geo_message_info(m: sonar_core::geohash::GeoMessage) -> GeoMessageInfo {
     }
 }
 
+fn message_info(m: sonar_core::marmot::ChatMessage) -> MessageInfo {
+    MessageInfo {
+        id_hex: m.id.to_hex(),
+        sender_npub: m.sender.to_bech32().expect("npub encoding cannot fail"),
+        content: m.content,
+        created_at_secs: m.created_at.as_secs(),
+        mine: m.mine,
+        delivery_state: m.delivery_state.as_str().to_string(),
+        media: m
+            .media
+            .into_iter()
+            .map(|r| MediaInfo {
+                url: r.url,
+                mime_type: r.mime_type,
+                filename: r.filename,
+                width: r.width,
+                height: r.height,
+                duration_ms: r.duration_ms,
+            })
+            .collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1507,11 +1577,8 @@ mod tests {
         let id = SonarIdentity::generate();
         let key = "00".repeat(32);
         let db = "/tmp/sonar-ffi-test-unused.sqlite".to_string();
-        // empty relays
-        assert!(matches!(
-            SonarNode::connect(id.clone(), vec![], db.clone(), key.clone()),
-            Err(SonarFfiError::InvalidInput(_))
-        ));
+        // Empty relays are allowed: the host can open the encrypted local DB
+        // first, then attach real relays after first paint.
         // bad relay url
         assert!(matches!(
             SonarNode::connect(
@@ -1537,6 +1604,23 @@ mod tests {
             SonarNode::connect(id, vec!["wss://relay.example".into()], String::new(), key),
             Err(SonarFfiError::InvalidInput(_))
         ));
+    }
+
+    #[cfg(feature = "calls-audio")]
+    #[test]
+    fn call_wait_without_engine_times_out() {
+        let id = SonarIdentity::generate();
+        let key = "00".repeat(32);
+        let db = format!(
+            "/tmp/sonar-ffi-call-wait-{}.sqlite",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let node = SonarNode::connect(id, vec![], db.clone(), key).unwrap();
+        assert!(node.call_wait_event(0).is_none());
+        let _ = wipe_marmot_database(db);
     }
 
     #[test]

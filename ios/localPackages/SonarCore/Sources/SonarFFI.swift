@@ -1020,6 +1020,13 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func messages(groupIdHex: String) throws  -> [MessageInfo]
 
     /**
+     * Bounded local chat-message window for a group, oldest first within the
+     * page. `offset` counts chat messages in newest-first order; non-chat MDK
+     * rows such as commits/proposals are skipped by the core.
+     */
+    func messagesPage(groupIdHex: String, limit: UInt32, offset: UInt32) throws  -> [MessageInfo]
+
+    /**
      * Pending multi-member group invites awaiting accept/decline.
      */
     func pendingGroupInvites() throws  -> [GroupInviteInfo]
@@ -1047,9 +1054,23 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func publishSonarDescriptor(callsEnabled: Bool, signaling: [String], bolt12Offer: String?) throws
 
     /**
+     * Bounded local transcript windows for the most recent groups, newest
+     * conversation first. Used by chat-list hydration so first paint is local
+     * DB only and does not wait on relay sync or full-history scans.
+     */
+    func recentMessagePages(groupLimit: UInt32, pageLimit: UInt32) throws  -> [RecentMessagePageInfo]
+
+    /**
      * Remove members from an existing group.
      */
     func removeGroupMembers(groupIdHex: String, members: [String]) throws
+
+    /**
+     * Reload the durable outbox sidecar and retry pending sends. Hosts call this
+     * after replacing a local-only node with a relay-backed node so sends created
+     * during relay connect are not stranded until app restart.
+     */
+    func retryOutbox() throws
 
     /**
      * Send a 1:1 encrypted DM to a geohash channel participant (NIP-17).
@@ -1161,7 +1182,9 @@ open class SonarNode: SonarNodeProtocol, @unchecked Sendable {
 
     /**
      * Connect `identity` to the given relays (e.g. `wss://relay.damus.io`) with
-     * a persistent, encrypted SQLCipher store.
+     * a persistent, encrypted SQLCipher store. Passing an empty relay list opens
+     * the local encrypted DB only; hosts use that for Signal-style first paint
+     * before they attach network relays in the background.
      *
      * - `db_path`: absolute filesystem path for the database (the Swift host
      * passes e.g. `<Application Support>/sonar-marmot/marmot.sqlite`; the host
@@ -1487,6 +1510,22 @@ open func messages(groupIdHex: String)throws  -> [MessageInfo]  {
 }
 
     /**
+     * Bounded local chat-message window for a group, oldest first within the
+     * page. `offset` counts chat messages in newest-first order; non-chat MDK
+     * rows such as commits/proposals are skipped by the core.
+     */
+open func messagesPage(groupIdHex: String, limit: UInt32, offset: UInt32)throws  -> [MessageInfo]  {
+    return try  FfiConverterSequenceTypeMessageInfo.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_messages_page(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(groupIdHex),
+        FfiConverterUInt32.lower(limit),
+        FfiConverterUInt32.lower(offset),$0
+    )
+})
+}
+
+    /**
      * Pending multi-member group invites awaiting accept/decline.
      */
 open func pendingGroupInvites()throws  -> [GroupInviteInfo]  {
@@ -1547,6 +1586,21 @@ open func publishSonarDescriptor(callsEnabled: Bool, signaling: [String], bolt12
 }
 
     /**
+     * Bounded local transcript windows for the most recent groups, newest
+     * conversation first. Used by chat-list hydration so first paint is local
+     * DB only and does not wait on relay sync or full-history scans.
+     */
+open func recentMessagePages(groupLimit: UInt32, pageLimit: UInt32)throws  -> [RecentMessagePageInfo]  {
+    return try  FfiConverterSequenceTypeRecentMessagePageInfo.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_recent_message_pages(
+            self.uniffiCloneHandle(),
+        FfiConverterUInt32.lower(groupLimit),
+        FfiConverterUInt32.lower(pageLimit),$0
+    )
+})
+}
+
+    /**
      * Remove members from an existing group.
      */
 open func removeGroupMembers(groupIdHex: String, members: [String])throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
@@ -1554,6 +1608,18 @@ open func removeGroupMembers(groupIdHex: String, members: [String])throws   {try
             self.uniffiCloneHandle(),
         FfiConverterString.lower(groupIdHex),
         FfiConverterSequenceString.lower(members),$0
+    )
+}
+}
+
+    /**
+     * Reload the durable outbox sidecar and retry pending sends. Hosts call this
+     * after replacing a local-only node with a relay-backed node so sends created
+     * during relay connect are not stranded until app restart.
+     */
+open func retryOutbox()throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_retry_outbox(
+            self.uniffiCloneHandle(),$0
     )
 }
 }
@@ -2680,6 +2746,10 @@ public struct MessageInfo: Equatable, Hashable {
      */
     public var mine: Bool
     /**
+     * Local delivery state: received, pending, sent, or failed.
+     */
+    public var deliveryState: String
+    /**
      * Encrypted media attachments (Marmot MIP-04), empty for a plain text message.
      */
     public var media: [MediaInfo]
@@ -2691,6 +2761,9 @@ public struct MessageInfo: Equatable, Hashable {
          * True when the local identity sent it.
          */mine: Bool,
         /**
+         * Local delivery state: received, pending, sent, or failed.
+         */deliveryState: String,
+        /**
          * Encrypted media attachments (Marmot MIP-04), empty for a plain text message.
          */media: [MediaInfo]) {
         self.idHex = idHex
@@ -2698,6 +2771,7 @@ public struct MessageInfo: Equatable, Hashable {
         self.content = content
         self.createdAtSecs = createdAtSecs
         self.mine = mine
+        self.deliveryState = deliveryState
         self.media = media
     }
 
@@ -2722,6 +2796,7 @@ public struct FfiConverterTypeMessageInfo: FfiConverterRustBuffer {
                 content: FfiConverterString.read(from: &buf),
                 createdAtSecs: FfiConverterUInt64.read(from: &buf),
                 mine: FfiConverterBool.read(from: &buf),
+                deliveryState: FfiConverterString.read(from: &buf),
                 media: FfiConverterSequenceTypeMediaInfo.read(from: &buf)
         )
     }
@@ -2732,6 +2807,7 @@ public struct FfiConverterTypeMessageInfo: FfiConverterRustBuffer {
         FfiConverterString.write(value.content, into: &buf)
         FfiConverterUInt64.write(value.createdAtSecs, into: &buf)
         FfiConverterBool.write(value.mine, into: &buf)
+        FfiConverterString.write(value.deliveryState, into: &buf)
         FfiConverterSequenceTypeMediaInfo.write(value.media, into: &buf)
     }
 }
@@ -2876,6 +2952,79 @@ public func FfiConverterTypeProfileInfo_lift(_ buf: RustBuffer) throws -> Profil
 #endif
 public func FfiConverterTypeProfileInfo_lower(_ value: ProfileInfo) -> RustBuffer {
     return FfiConverterTypeProfileInfo.lower(value)
+}
+
+
+/**
+ * FFI-friendly transcript window for one recent group.
+ */
+public struct RecentMessagePageInfo: Equatable, Hashable {
+    public var groupIdHex: String
+    /**
+     * Newest message timestamp in this page, for stable chat-list ordering.
+     */
+    public var latestCreatedAtSecs: UInt64
+    /**
+     * Oldest first within the bounded page.
+     */
+    public var messages: [MessageInfo]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(groupIdHex: String,
+        /**
+         * Newest message timestamp in this page, for stable chat-list ordering.
+         */latestCreatedAtSecs: UInt64,
+        /**
+         * Oldest first within the bounded page.
+         */messages: [MessageInfo]) {
+        self.groupIdHex = groupIdHex
+        self.latestCreatedAtSecs = latestCreatedAtSecs
+        self.messages = messages
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension RecentMessagePageInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRecentMessagePageInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RecentMessagePageInfo {
+        return
+            try RecentMessagePageInfo(
+                groupIdHex: FfiConverterString.read(from: &buf),
+                latestCreatedAtSecs: FfiConverterUInt64.read(from: &buf),
+                messages: FfiConverterSequenceTypeMessageInfo.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: RecentMessagePageInfo, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.groupIdHex, into: &buf)
+        FfiConverterUInt64.write(value.latestCreatedAtSecs, into: &buf)
+        FfiConverterSequenceTypeMessageInfo.write(value.messages, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRecentMessagePageInfo_lift(_ buf: RustBuffer) throws -> RecentMessagePageInfo {
+    return try FfiConverterTypeRecentMessagePageInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRecentMessagePageInfo_lower(_ value: RecentMessagePageInfo) -> RustBuffer {
+    return FfiConverterTypeRecentMessagePageInfo.lower(value)
 }
 
 
@@ -3835,6 +3984,31 @@ fileprivate struct FfiConverterSequenceTypeMessageInfo: FfiConverterRustBuffer {
         return seq
     }
 }
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeRecentMessagePageInfo: FfiConverterRustBuffer {
+    typealias SwiftType = [RecentMessagePageInfo]
+
+    public static func write(_ value: [RecentMessagePageInfo], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeRecentMessagePageInfo.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [RecentMessagePageInfo] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [RecentMessagePageInfo]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeRecentMessagePageInfo.read(from: &buf))
+        }
+        return seq
+    }
+}
 /**
  * Encode an ANSWER control line (`node_addr_b64` empty for decline/busy).
  */
@@ -4243,6 +4417,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_messages() != 63355) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_messages_page() != 43697) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_pending_group_invites() != 31608) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -4258,7 +4435,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_sonar_descriptor() != 7979) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_recent_message_pages() != 17660) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_remove_group_members() != 5580) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_retry_outbox() != 58495) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_send_geo_dm() != 38953) {
@@ -4318,7 +4501,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_constructor_sonaridentity_import() != 46969) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_constructor_sonarnode_connect() != 2559) {
+    if (uniffi_sonar_ffi_checksum_constructor_sonarnode_connect() != 58965) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_constructor_sonarnoise_initiator() != 18155) {

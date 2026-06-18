@@ -19,9 +19,12 @@ use mdk_core::encrypted_media::{EncryptedMediaUpload, MediaReference};
 use mdk_core::prelude::*;
 use mdk_memory_storage::MdkMemoryStorage;
 use mdk_sqlite_storage::{EncryptionConfig, MdkSqliteStorage};
+use mdk_storage_traits::groups::{MessageSortOrder, Pagination};
 use nostr::prelude::*;
+use serde::{Deserialize, Serialize};
 
 use crate::identity::Identity;
+use crate::outbox::OUTBOX_STATE_FILE_SUFFIX;
 use crate::{Error, Result};
 
 /// Kind used for the inner chat rumor inside a 445 (matches White Noise / the
@@ -34,6 +37,11 @@ pub const KEY_PACKAGE_KIND: u16 = 30443;
 
 /// Sidecar file suffix for Sonar's relay-sync cursor beside the MDK database.
 pub(crate) const SYNC_STATE_FILE_SUFFIX: &str = ".sonar-sync.json";
+
+/// Maximum raw MDK rows to scan while building a chat-only page. MDK stores
+/// commits/proposals alongside application chat rows, so a single raw page can
+/// be empty after filtering even when older chat messages exist.
+const MESSAGE_PAGE_RAW_SCAN_LIMIT: usize = 10_000;
 
 /// Result of creating a group: the group plus the welcome rumors that must be
 /// gift-wrapped and delivered to each invited member.
@@ -84,6 +92,29 @@ pub struct MediaRef {
     pub duration_ms: Option<u64>,
 }
 
+/// Local delivery state for a transcript row. Network/relay work updates this
+/// state by mutating Sonar-owned outbox metadata; the UI reads it with the
+/// local transcript page instead of inventing app-layer optimistic rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryState {
+    Received,
+    Pending,
+    Sent,
+    Failed,
+}
+
+impl DeliveryState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Received => "received",
+            Self::Pending => "pending",
+            Self::Sent => "sent",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 impl From<&MediaReference> for MediaRef {
     fn from(r: &MediaReference) -> Self {
         let (width, height) = match r.dimensions {
@@ -112,8 +143,17 @@ pub struct ChatMessage {
     pub created_at: Timestamp,
     /// True when `sender` is the local identity.
     pub mine: bool,
+    pub delivery_state: DeliveryState,
     /// Encrypted media attachments (MIP-04 `imeta` tags), if any.
     pub media: Vec<MediaRef>,
+}
+
+/// Bounded transcript page for one recent group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecentMessagePage {
+    pub group_id: GroupId,
+    pub latest_created_at: Timestamp,
+    pub messages: Vec<ChatMessage>,
 }
 
 /// What came out of processing an incoming event.
@@ -233,7 +273,7 @@ impl MarmotEngine {
     /// Erase the on-disk SQLCipher database at `db_path` and its sidecar files.
     ///
     /// Used by panic-wipe. No engine must hold the file open when this is called.
-    /// Removes `db_path` plus the SQLite `-wal`, `-shm`, and `-journal` sidecars;
+    /// Removes `db_path`, SQLite sidecars, and Sonar sync/outbox sidecars;
     /// missing files are not an error (idempotent).
     pub fn wipe(db_path: impl AsRef<Path>) -> Result<()> {
         let base = db_path.as_ref();
@@ -576,6 +616,99 @@ impl MarmotEngine {
             .collect())
     }
 
+    /// Bounded decrypted chat-message window for a group, newest window first
+    /// before caller-side display sorting. Offset counts chat messages, not raw
+    /// MDK storage rows, because MDK stores commits/proposals beside kind-9
+    /// application messages.
+    pub fn messages_page(
+        &self,
+        group_id: &GroupId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<ChatMessage>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let raw_batch = limit.saturating_mul(4).clamp(32, 500);
+        let mut raw_offset = 0usize;
+        let mut raw_scanned = 0usize;
+        let mut chat_skipped = 0usize;
+        let mut page_messages = Vec::with_capacity(limit);
+
+        while page_messages.len() < limit && raw_scanned < MESSAGE_PAGE_RAW_SCAN_LIMIT {
+            let remaining_scan = MESSAGE_PAGE_RAW_SCAN_LIMIT - raw_scanned;
+            let batch_limit = raw_batch.min(remaining_scan);
+            let page = Pagination::with_sort_order(
+                Some(batch_limit),
+                Some(raw_offset),
+                MessageSortOrder::CreatedAtFirst,
+            );
+            let raw_msgs = dispatch!(&self.storage, |mdk| mdk.get_messages(group_id, Some(page)))?;
+            if raw_msgs.is_empty() {
+                break;
+            }
+
+            let raw_len = raw_msgs.len();
+            raw_scanned += raw_len;
+            raw_offset += raw_len;
+            for msg in raw_msgs {
+                if msg.kind.as_u16() != CHAT_RUMOR_KIND {
+                    continue;
+                }
+                if chat_skipped < offset {
+                    chat_skipped += 1;
+                    continue;
+                }
+                page_messages.push(self.to_chat_message(msg));
+                if page_messages.len() >= limit {
+                    break;
+                }
+            }
+
+            if raw_len < batch_limit {
+                break;
+            }
+        }
+
+        Ok(page_messages)
+    }
+
+    /// Latest local transcript windows for the most recent groups. This is the
+    /// Signal-style chat-list hydration path: rank conversations by local DB
+    /// recency, return only a small window for the newest groups, and leave
+    /// relay sync completely out of first paint.
+    pub fn recent_message_pages(
+        &self,
+        group_limit: usize,
+        page_limit: usize,
+    ) -> Result<Vec<RecentMessagePage>> {
+        if group_limit == 0 || page_limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut pages = Vec::new();
+        for group in self.groups()? {
+            let messages = self.messages_page(&group.mls_group_id, page_limit, 0)?;
+            let Some(latest_created_at) = messages.iter().map(|m| m.created_at).max() else {
+                continue;
+            };
+            pages.push(RecentMessagePage {
+                group_id: group.mls_group_id,
+                latest_created_at,
+                messages,
+            });
+        }
+
+        pages.sort_by(|a, b| {
+            b.latest_created_at
+                .cmp(&a.latest_created_at)
+                .then_with(|| a.group_id.as_slice().cmp(b.group_id.as_slice()))
+        });
+        pages.truncate(group_limit);
+        Ok(pages)
+    }
+
     /// Members of a group.
     pub fn members(&self, group_id: &GroupId) -> Result<Vec<PublicKey>> {
         Ok(dispatch!(&self.storage, |mdk| mdk.get_members(group_id))?
@@ -663,6 +796,11 @@ impl MarmotEngine {
             content: m.content.clone(),
             created_at: m.created_at,
             mine: m.pubkey == self.identity.public_key(),
+            delivery_state: if m.pubkey == self.identity.public_key() {
+                DeliveryState::Sent
+            } else {
+                DeliveryState::Received
+            },
             media,
         }
     }
@@ -693,12 +831,18 @@ fn sidecar_paths(base: &Path) -> Vec<std::path::PathBuf> {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or_default();
-    let mut paths: Vec<std::path::PathBuf> = ["", "-wal", "-shm", "-journal"]
-        .iter()
-        .map(|suffix| base.with_file_name(format!("{name}{suffix}")))
-        .collect();
-    if !name.is_empty() {
-        paths.push(base.with_file_name(format!("{name}{SYNC_STATE_FILE_SUFFIX}")));
-    }
+    let mut paths: Vec<std::path::PathBuf> = [
+        "",
+        "-wal",
+        "-shm",
+        "-journal",
+        SYNC_STATE_FILE_SUFFIX,
+        OUTBOX_STATE_FILE_SUFFIX,
+    ]
+    .iter()
+    .map(|suffix| base.with_file_name(format!("{name}{suffix}")))
+    .collect();
+    paths.push(base.with_file_name(format!("{name}{SYNC_STATE_FILE_SUFFIX}.tmp")));
+    paths.push(base.with_file_name(format!("{name}{OUTBOX_STATE_FILE_SUFFIX}.tmp")));
     paths
 }
