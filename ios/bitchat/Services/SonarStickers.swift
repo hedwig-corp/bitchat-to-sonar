@@ -16,6 +16,9 @@ enum SonarStickers {
     static let featureFlagKey = "sonar.stickers.enabled"
     static let enabledByDefault = false
     static let messageMarker = "[sonar-sticker-v1]"
+    static let packFormat = "sonar-sticker-pack-v1"
+    static let stickerPackKind = 30030
+    static let userStickerPacksKind = 10030
 
     static func isEnabled(defaults: UserDefaults = .standard) -> Bool {
         guard defaults.object(forKey: featureFlagKey) != nil else { return enabledByDefault }
@@ -40,6 +43,99 @@ enum SonarStickers {
               let pack = SonarStickerPackAddress.parse(packValue)
         else { return nil }
         return SonarStickerRef(pack: pack, shortcode: shortcode, plaintextSha256: sha256)
+    }
+
+    static func parsePackEvent(kind: Int, pubkeyHex: String, tags: [[String]]) -> SonarStickerPack? {
+        guard kind == stickerPackKind,
+              hasTagValue(tags, name: "pack_format", value: packFormat),
+              let identifier = tagValue(tags, name: "d"),
+              let title = tagValue(tags, name: "title"),
+              let address = SonarStickerPackAddress(authorPubkeyHex: pubkeyHex, identifier: identifier)
+        else { return nil }
+        let imageTag = tags.first { $0.first == "image" }
+        let cover: SonarSticker?
+        if let imageTag {
+            guard let parsedCover = parseCoverTag(imageTag) else { return nil }
+            cover = parsedCover
+        } else {
+            cover = nil
+        }
+        var stickers: [SonarSticker] = []
+        for tag in tags where tag.first == "sticker" {
+            guard let sticker = parseStickerTag(tag) else { return nil }
+            stickers.append(sticker)
+        }
+        return SonarStickerPack(
+            address: address,
+            title: title,
+            description: tagValue(tags, name: "description"),
+            cover: cover,
+            stickers: stickers,
+            license: tagValue(tags, name: "license")
+        )
+    }
+
+    static func parseInstalledPackList(kind: Int, tags: [[String]]) -> [SonarStickerPackAddress] {
+        guard kind == userStickerPacksKind else { return [] }
+        var seen = Set<String>()
+        var packs: [SonarStickerPackAddress] = []
+        for tag in tags where tag.first == "a" {
+            guard tag.count > 1,
+                  let pack = SonarStickerPackAddress.parse(tag[1]),
+                  seen.insert(pack.coordinate).inserted
+            else { continue }
+            packs.append(pack)
+        }
+        return packs
+    }
+
+    private static func tagValue(_ tags: [[String]], name: String) -> String? {
+        tags.first { $0.first == name }?.dropFirst().first
+    }
+
+    private static func hasTagValue(_ tags: [[String]], name: String, value: String) -> Bool {
+        tags.contains { $0.first == name && $0.dropFirst().first == value }
+    }
+
+    private static func parseStickerTag(_ tag: [String]) -> SonarSticker? {
+        guard tag.count >= 6,
+              let dim = parseStickerDim(tag[5])
+        else { return nil }
+        return SonarSticker(
+            shortcode: tag[1],
+            url: tag[2],
+            sha256: tag[3],
+            mime: tag[4],
+            width: dim.width,
+            height: dim.height,
+            alt: tag.count > 6 && !tag[6].isEmpty ? tag[6] : nil,
+            emoji: tag.count > 7 && !tag[7].isEmpty ? tag[7] : nil
+        )
+    }
+
+    private static func parseCoverTag(_ tag: [String]) -> SonarSticker? {
+        guard tag.count >= 3,
+              let dim = parseStickerDim(tag.count > 3 ? tag[3] : "")
+        else { return nil }
+        return SonarSticker(
+            shortcode: "cover",
+            url: tag[1],
+            sha256: tag[2],
+            mime: "image/webp",
+            width: dim.width,
+            height: dim.height,
+            alt: "Sticker pack cover"
+        )
+    }
+
+    private static func parseStickerDim(_ value: String) -> (width: Int?, height: Int?)? {
+        guard !value.isEmpty else { return (nil, nil) }
+        let parts = value.split(separator: "x", omittingEmptySubsequences: false)
+        guard parts.count == 2,
+              let width = Int(parts[0]),
+              let height = Int(parts[1])
+        else { return nil }
+        return (width, height)
     }
 }
 

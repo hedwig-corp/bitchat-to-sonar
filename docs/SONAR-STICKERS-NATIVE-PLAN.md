@@ -46,6 +46,7 @@ This branch now covers the safe foundation for both native app surfaces:
 
 - shared Rust/Kotlin/Swift sticker chat-message contract;
 - native installed-pack store and exact shortcode-plus-hash resolver;
+- native Nostr sticker pack and installed-pack-list tag parsing;
 - bounded, SHA-256 verified sticker-byte cache primitives;
 - feature-gated received-sticker rendering with verified HTTPS asset fetch;
 - feature-gated picker and send flow for already installed packs on existing
@@ -53,7 +54,8 @@ This branch now covers the safe foundation for both native app surfaces:
 
 The feature must remain disabled until the remaining production gaps are closed:
 
-- pack install/import from `/stickers` links or Nostr pack events;
+- pack install/import UI and fetch orchestration from `/stickers` links or
+  Nostr pack events;
 - recent-sticker state;
 - full native target builds and end-to-end install/pick/send/render tests.
 

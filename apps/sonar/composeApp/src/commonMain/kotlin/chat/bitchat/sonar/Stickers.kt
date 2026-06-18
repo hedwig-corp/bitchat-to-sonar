@@ -4,6 +4,9 @@ import chat.bitchat.sonar.crypto.Sha256
 
 const val SONAR_STICKERS_ENABLED_BY_DEFAULT = false
 const val SONAR_STICKER_MESSAGE_MARKER = "[sonar-sticker-v1]"
+const val SONAR_STICKER_PACK_FORMAT = "sonar-sticker-pack-v1"
+const val SONAR_STICKER_PACK_KIND = 30030
+const val SONAR_USER_STICKER_PACKS_KIND = 10030
 
 object SonarStickers {
     fun buildChatMessage(stickerRef: SonarStickerRef): String? {
@@ -23,6 +26,40 @@ object SonarStickers {
         val shortcode = fields[1].removePrefixOrNull("shortcode=") ?: return null
         val sha256 = fields[2].removePrefixOrNull("sha256=") ?: return null
         return SonarStickerRef(pack, shortcode, sha256).normalizedOrNull()
+    }
+
+    fun parsePackEvent(kind: Int, pubkeyHex: String, tags: List<List<String>>): SonarStickerPack? {
+        if (kind != SONAR_STICKER_PACK_KIND || !hasTagValue(tags, "pack_format", SONAR_STICKER_PACK_FORMAT)) {
+            return null
+        }
+        val identifier = tagValue(tags, "d") ?: return null
+        val title = tagValue(tags, "title") ?: return null
+        val address = SonarStickerPackAddress(pubkeyHex, identifier).normalizedOrNull() ?: return null
+        val imageTag = tags.firstOrNull { it.firstOrNull() == "image" }
+        val cover = if (imageTag == null) null else parseCoverTag(imageTag) ?: return null
+        val stickers = mutableListOf<SonarSticker>()
+        for (tag in tags.filter { it.firstOrNull() == "sticker" }) {
+            stickers += parseStickerTag(tag) ?: return null
+        }
+        return SonarStickerPack(
+            address = address,
+            title = title,
+            description = tagValue(tags, "description"),
+            cover = cover,
+            stickers = stickers,
+            license = tagValue(tags, "license"),
+        ).normalizedOrNull()
+    }
+
+    fun parseInstalledPackList(kind: Int, tags: List<List<String>>): List<SonarStickerPackAddress> {
+        if (kind != SONAR_USER_STICKER_PACKS_KIND) return emptyList()
+        val seen = mutableSetOf<String>()
+        val packs = mutableListOf<SonarStickerPackAddress>()
+        for (coordinate in tags.filter { it.firstOrNull() == "a" }.mapNotNull { it.getOrNull(1) }) {
+            val pack = SonarStickerPackAddress.parse(coordinate) ?: continue
+            if (seen.add(pack.coordinate)) packs += pack
+        }
+        return packs
     }
 }
 
@@ -205,6 +242,48 @@ class SonarStickerByteCache(
 
 expect object SonarStickerAssetFetcher {
     suspend fun fetch(url: String, maxBytes: Int): ByteArray?
+}
+
+private fun tagValue(tags: List<List<String>>, name: String): String? =
+    tags.firstOrNull { it.firstOrNull() == name }?.getOrNull(1)
+
+private fun hasTagValue(tags: List<List<String>>, name: String, value: String): Boolean =
+    tags.any { it.firstOrNull() == name && it.getOrNull(1) == value }
+
+private fun parseStickerTag(tag: List<String>): SonarSticker? {
+    if (tag.size < 6) return null
+    val (width, height) = parseStickerDim(tag.getOrNull(5).orEmpty()) ?: return null
+    return SonarSticker(
+        shortcode = tag[1],
+        url = tag[2],
+        sha256 = tag[3],
+        mime = tag[4],
+        width = width,
+        height = height,
+        alt = tag.getOrNull(6)?.takeIf { it.isNotEmpty() },
+        emoji = tag.getOrNull(7)?.takeIf { it.isNotEmpty() },
+    ).normalizedOrNull()
+}
+
+private fun parseCoverTag(tag: List<String>): SonarSticker? {
+    if (tag.size < 3) return null
+    val (width, height) = parseStickerDim(tag.getOrNull(3).orEmpty()) ?: return null
+    return SonarSticker(
+        shortcode = "cover",
+        url = tag[1],
+        sha256 = tag[2],
+        mime = "image/webp",
+        width = width,
+        height = height,
+        alt = "Sticker pack cover",
+    ).normalizedOrNull()
+}
+
+private fun parseStickerDim(value: String): Pair<Int?, Int?>? {
+    if (value.isEmpty()) return null to null
+    val parts = value.split('x')
+    if (parts.size != 2) return null
+    return (parts[0].toIntOrNull() ?: return null) to (parts[1].toIntOrNull() ?: return null)
 }
 
 private fun String.removePrefixOrNull(prefix: String): String? =

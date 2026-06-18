@@ -159,6 +159,56 @@ struct SonarStickersTests {
         #expect(cache.storeVerified(data, for: wrongHashSticker) == false)
     }
 
+    @Test func parsesNostrPackEventAndInstalledPackListTags() throws {
+        let pack = try #require(SonarStickers.parsePackEvent(
+            kind: SonarStickers.stickerPackKind,
+            pubkeyHex: pubkey,
+            tags: fixturePackTags()
+        ))
+
+        #expect(pack.address == fixtureAddress())
+        #expect(pack.title == "Sonar Signal Cats")
+        #expect(pack.description == "Native sticker contract fixture for Signal-style pack import.")
+        #expect(pack.license == "CC-BY-4.0")
+        #expect(pack.cover?.sha256 == hashA)
+        #expect(pack.stickers.map(\.shortcode) == ["cat_wave", "cat_cry"])
+        #expect(pack.sticker(shortcode: "cat_wave")?.alt == "Cat waving")
+        #expect(pack.sticker(shortcode: "cat_wave")?.emoji == "🙂")
+
+        let address = try #require(fixtureAddress())
+        let installed = SonarStickers.parseInstalledPackList(
+            kind: SonarStickers.userStickerPacksKind,
+            tags: [
+                ["a", address.coordinate],
+                ["a", address.coordinate],
+                ["a", "invalid"]
+            ]
+        )
+
+        #expect(installed == [address])
+    }
+
+    @Test func rejectsMalformedNostrStickerPackTags() throws {
+        let address = try #require(fixtureAddress())
+
+        #expect(SonarStickers.parsePackEvent(
+            kind: SonarStickers.stickerPackKind,
+            pubkeyHex: pubkey,
+            tags: fixturePackTagsWithoutFormat()
+        ) == nil)
+        #expect(SonarStickers.parsePackEvent(
+            kind: SonarStickers.stickerPackKind,
+            pubkeyHex: pubkey,
+            tags: fixturePackTagsWithBadStickerDim()
+        ) == nil)
+        #expect(SonarStickers.parsePackEvent(
+            kind: SonarStickers.stickerPackKind,
+            pubkeyHex: "not-a-pubkey",
+            tags: fixturePackTags()
+        ) == nil)
+        #expect(SonarStickers.parseInstalledPackList(kind: 1, tags: [["a", address.coordinate]]) == [])
+    }
+
     private func fixtureAddress() -> SonarStickerPackAddress? {
         SonarStickerPackAddress(authorPubkeyHex: pubkey, identifier: "signal-0123456789abcdef0123456789abcdef")
     }
@@ -189,5 +239,49 @@ struct SonarStickersTests {
             stickers: [stickerA, stickerB],
             license: "CC-BY-4.0"
         )
+    }
+
+    private func fixturePackTags() -> [[String]] {
+        [
+            ["d", "signal-0123456789abcdef0123456789abcdef"],
+            ["title", "Sonar Signal Cats"],
+            ["pack_format", SonarStickers.packFormat],
+            ["description", "Native sticker contract fixture for Signal-style pack import."],
+            ["image", "https://blossom.example/stickers/\(hashA)/cat-wave.webp", hashA, "512x512"],
+            ["license", "CC-BY-4.0"],
+            [
+                "sticker",
+                "cat_wave",
+                "https://blossom.example/stickers/\(hashA)/cat-wave.webp",
+                hashA,
+                "image/webp",
+                "512x512",
+                "Cat waving",
+                "🙂"
+            ],
+            [
+                "sticker",
+                "cat_cry",
+                "https://blossom.example/stickers/\(hashB)/cat-cry.webp",
+                hashB,
+                "image/webp",
+                "512x512",
+                "Cat crying",
+                "😿"
+            ]
+        ]
+    }
+
+    private func fixturePackTagsWithoutFormat() -> [[String]] {
+        fixturePackTags().filter { $0.first != "pack_format" }
+    }
+
+    private func fixturePackTagsWithBadStickerDim() -> [[String]] {
+        fixturePackTags().map { tag in
+            guard tag.first == "sticker", tag.dropFirst().first == "cat_wave" else { return tag }
+            var edited = tag
+            edited[5] = "large"
+            return edited
+        }
     }
 }

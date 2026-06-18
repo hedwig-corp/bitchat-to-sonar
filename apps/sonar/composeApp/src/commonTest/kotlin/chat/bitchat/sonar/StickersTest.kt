@@ -146,6 +146,40 @@ class StickersTest {
         assertFalse(cache.putVerified(sticker.copy(sha256 = hashA), "abc".encodeToByteArray()))
     }
 
+    @Test
+    fun parsesNostrPackEventAndInstalledPackListTags() {
+        val tags = fixturePackTags()
+        val pack = assertNotNull(SonarStickers.parsePackEvent(SONAR_STICKER_PACK_KIND, pubkey, tags))
+
+        assertEquals(fixtureAddress(), pack.address)
+        assertEquals("Sonar Signal Cats", pack.title)
+        assertEquals("Native sticker contract fixture for Signal-style pack import.", pack.description)
+        assertEquals("CC-BY-4.0", pack.license)
+        assertEquals(hashA, pack.cover?.sha256)
+        assertEquals(listOf("cat_wave", "cat_cry"), pack.stickers.map { it.shortcode })
+        assertEquals("Cat waving", pack.sticker("cat_wave")?.alt)
+        assertEquals("🙂", pack.sticker("cat_wave")?.emoji)
+
+        val installed = SonarStickers.parseInstalledPackList(
+            SONAR_USER_STICKER_PACKS_KIND,
+            listOf(
+                listOf("a", fixtureAddress().coordinate),
+                listOf("a", fixtureAddress().coordinate),
+                listOf("a", "invalid"),
+            ),
+        )
+
+        assertEquals(listOf(fixtureAddress()), installed)
+    }
+
+    @Test
+    fun rejectsMalformedNostrStickerPackTags() {
+        assertNull(SonarStickers.parsePackEvent(SONAR_STICKER_PACK_KIND, pubkey, fixturePackTagsWithoutFormat()))
+        assertNull(SonarStickers.parsePackEvent(SONAR_STICKER_PACK_KIND, pubkey, fixturePackTagsWithBadStickerDim()))
+        assertNull(SonarStickers.parsePackEvent(SONAR_STICKER_PACK_KIND, "not-a-pubkey", fixturePackTags()))
+        assertEquals(emptyList(), SonarStickers.parseInstalledPackList(1, listOf(listOf("a", fixtureAddress().coordinate))))
+    }
+
     private fun fixtureAddress(): SonarStickerPackAddress =
         assertNotNull(
             SonarStickerPackAddress(pubkey, "signal-0123456789abcdef0123456789abcdef").normalizedOrNull()
@@ -176,4 +210,46 @@ class StickersTest {
                 license = "CC-BY-4.0",
             ).normalizedOrNull()
         )
+
+    private fun fixturePackTags(): List<List<String>> =
+        listOf(
+            listOf("d", "signal-0123456789abcdef0123456789abcdef"),
+            listOf("title", "Sonar Signal Cats"),
+            listOf("pack_format", SONAR_STICKER_PACK_FORMAT),
+            listOf("description", "Native sticker contract fixture for Signal-style pack import."),
+            listOf("image", "https://blossom.example/stickers/$hashA/cat-wave.webp", hashA, "512x512"),
+            listOf("license", "CC-BY-4.0"),
+            listOf(
+                "sticker",
+                "cat_wave",
+                "https://blossom.example/stickers/$hashA/cat-wave.webp",
+                hashA,
+                "image/webp",
+                "512x512",
+                "Cat waving",
+                "🙂",
+            ),
+            listOf(
+                "sticker",
+                "cat_cry",
+                "https://blossom.example/stickers/$hashB/cat-cry.webp",
+                hashB,
+                "image/webp",
+                "512x512",
+                "Cat crying",
+                "😿",
+            ),
+        )
+
+    private fun fixturePackTagsWithoutFormat(): List<List<String>> =
+        fixturePackTags().filterNot { it.firstOrNull() == "pack_format" }
+
+    private fun fixturePackTagsWithBadStickerDim(): List<List<String>> =
+        fixturePackTags().map { tag ->
+            if (tag.firstOrNull() == "sticker" && tag.getOrNull(1) == "cat_wave") {
+                tag.toMutableList().also { it[5] = "large" }
+            } else {
+                tag
+            }
+        }
 }
