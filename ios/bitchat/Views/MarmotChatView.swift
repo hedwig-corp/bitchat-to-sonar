@@ -348,6 +348,7 @@ final class MarmotChatModel: ObservableObject {
         _ server: MarmotService.MarmotMessage,
         matchesOptimistic optimistic: MarmotService.MarmotMessage
     ) -> Bool {
+        guard !optimistic.id.hasPrefix(failedOptimisticIDPrefix) else { return false }
         guard server.isMine, server.content == optimistic.content else { return false }
         guard !optimistic.media.isEmpty else { return server.media.isEmpty }
         return optimistic.media.allSatisfy { pending in
