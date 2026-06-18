@@ -395,6 +395,11 @@ pub struct SonarClient {
     /// The group-id set currently installed in the live kind-445 subscription.
     /// This prevents stacking duplicate REQs and lets deletes narrow/unsubscribe.
     marmot_group_subscriptions: Arc<Mutex<HashSet<String>>>,
+    /// Startup repair queue for existing groups whose local DB has MLS/group
+    /// state but no chat-message page. This covers older installs where the
+    /// sync watermark could be advanced by membership/commit events before the
+    /// transcript body was locally populated.
+    initial_empty_transcript_backfills: Arc<Mutex<HashSet<String>>>,
     /// Whether to join geohash-nearest relays on subscribe (real sessions); off
     /// for in-memory/test sessions so they stay network-free against a MockRelay.
     allow_geo_relays: bool,
@@ -461,6 +466,8 @@ impl SonarClient {
         let marmot_notify = Arc::new(tokio::sync::Notify::new());
         let live_marmot_enabled = Arc::new(Mutex::new(false));
         let marmot_group_subscriptions = Arc::new(Mutex::new(HashSet::new()));
+        let initial_empty_transcript_backfills =
+            Arc::new(Mutex::new(Self::empty_transcript_group_ids(&engine)));
 
         let handler_geo = geo.clone();
         let handler_dm = geo_dm.clone();
@@ -652,6 +659,7 @@ impl SonarClient {
             marmot_notify,
             live_marmot_enabled,
             marmot_group_subscriptions,
+            initial_empty_transcript_backfills,
             allow_geo_relays,
         };
         // Open the live Marmot subscriptions for real sessions. In-memory test
@@ -1270,6 +1278,21 @@ impl SonarClient {
                 }
             }
         }
+        // Existing installs can have group/MLS rows locally while the chat
+        // transcript page is empty. Full-backfill those groups once on startup
+        // so old chats populate the encrypted DB instead of waiting on a slow
+        // relay refresh path after every open.
+        let empty_transcript_group_ids = self.take_initial_empty_transcript_backfills();
+        for id in &empty_transcript_group_ids {
+            match self.backfill_group(id).await {
+                Ok(report) => process_report.absorb(report),
+                Err(err) => {
+                    tracing::debug!(%err, "empty transcript backfill failed during sync");
+                    self.requeue_initial_empty_transcript_backfill(id);
+                    process_report.record_retryable(Timestamp::now().as_secs());
+                }
+            }
+        }
         if let Err(err) = self.resubscribe_marmot_groups_if_live().await {
             tracing::debug!(%err, "marmot group live resubscribe failed during sync");
         }
@@ -1367,6 +1390,36 @@ impl SonarClient {
             .into_iter()
             .map(|g| hex::encode(g.nostr_group_id))
             .collect())
+    }
+
+    fn empty_transcript_group_ids(engine: &MarmotEngine) -> HashSet<String> {
+        let Ok(groups) = engine.groups() else {
+            return HashSet::new();
+        };
+        groups
+            .into_iter()
+            .filter_map(
+                |group| match engine.messages_page(&group.mls_group_id, 1, 0) {
+                    Ok(page) if page.is_empty() => Some(hex::encode(group.nostr_group_id)),
+                    _ => None,
+                },
+            )
+            .collect()
+    }
+
+    fn take_initial_empty_transcript_backfills(&self) -> Vec<String> {
+        self.initial_empty_transcript_backfills
+            .lock()
+            .unwrap()
+            .drain()
+            .collect()
+    }
+
+    fn requeue_initial_empty_transcript_backfill(&self, group_id_hex: &str) {
+        self.initial_empty_transcript_backfills
+            .lock()
+            .unwrap()
+            .insert(group_id_hex.to_string());
     }
 
     async fn resubscribe_marmot_groups_if_live(&self) -> Result<()> {

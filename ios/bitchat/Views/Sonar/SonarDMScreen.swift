@@ -70,7 +70,11 @@ struct SonarDMScreen: View {
             banner
 
             let msgs = store.dmMsgs(peerId)
-            if msgs.isEmpty {
+            if msgs.isEmpty && store.isLocallyHydratingDM(peerId) {
+                ProgressView()
+                    .tint(SonarTheme.accent)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if msgs.isEmpty {
                 SNEmptyState(
                     icon: .lock,
                     iconSize: 24,
