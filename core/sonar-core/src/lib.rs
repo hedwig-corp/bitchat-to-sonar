@@ -12,6 +12,7 @@ pub mod identity;
 pub mod marmot;
 pub mod mesh;
 pub mod noise;
+pub mod outbox;
 pub mod relay_directory;
 pub mod sonar_descriptor;
 

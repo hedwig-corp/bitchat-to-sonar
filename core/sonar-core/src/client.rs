@@ -19,9 +19,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::identity::Identity;
 use crate::marmot::{
-    ChatMessage, GroupCreation, GroupInvite, GroupMembershipUpdate, Incoming, MarmotEngine,
-    KEY_PACKAGE_KIND, SYNC_STATE_FILE_SUFFIX,
+    ChatMessage, DeliveryState, GroupCreation, GroupInvite, GroupMembershipUpdate, Incoming,
+    MarmotEngine, KEY_PACKAGE_KIND, SYNC_STATE_FILE_SUFFIX,
 };
+use crate::outbox::{outbox_state_path_for_db, OutboxState};
 use crate::sonar_descriptor::{
     descriptor_content_json, descriptor_d_tags, descriptor_tags, meta_descriptor_content_json,
     parse_descriptor_event, SonarDescriptor, SONAR_CALL_DESCRIPTOR_D_TAG, SONAR_DESCRIPTOR_KIND,
@@ -376,6 +377,10 @@ pub struct SonarClient {
     /// restart catch-up conservative: a failed event can be replayed later
     /// instead of being skipped by an advanced watermark.
     sync_state: Arc<Mutex<SyncState>>,
+    /// Durable local delivery metadata for Signal-style outgoing text sends.
+    /// The actual decrypted message body stays in MDK storage; this sidecar
+    /// records pending/sent/failed state and the encrypted relay event to retry.
+    outbox_state: Arc<Mutex<OutboxState>>,
     /// Live Marmot events (welcomes 1059→us + group 445s) pushed by the
     /// notification handler. Drained + MLS-processed on the host's serialized
     /// engine thread via `drain_pending_marmot` — the handler NEVER touches the
@@ -417,6 +422,7 @@ impl SonarClient {
             engine,
             true,
             Some(sync_state_path_for_db(db_path)),
+            Some(outbox_state_path_for_db(db_path)),
         )
         .await
     }
@@ -425,7 +431,7 @@ impl SonarClient {
     /// dropped. Intended for tests and ephemeral/anonymous sessions.
     pub async fn connect_in_memory(identity: Identity, relays: Vec<RelayUrl>) -> Result<Self> {
         let engine = MarmotEngine::in_memory(identity.clone());
-        Self::with_engine(identity, relays, engine, false, None).await
+        Self::with_engine(identity, relays, engine, false, None, None).await
     }
 
     async fn with_engine(
@@ -434,6 +440,7 @@ impl SonarClient {
         engine: MarmotEngine,
         allow_geo_relays: bool,
         sync_state_path: Option<PathBuf>,
+        outbox_state_path: Option<PathBuf>,
     ) -> Result<Self> {
         let nostr = Client::new(identity.keys().clone());
         for relay in &relays {
@@ -629,6 +636,7 @@ impl SonarClient {
             resume_watermark,
             storage_empty,
         )));
+        let outbox_state = Arc::new(Mutex::new(OutboxState::load(outbox_state_path)));
         let client = Self {
             engine,
             nostr,
@@ -639,6 +647,7 @@ impl SonarClient {
             geo_subscribed,
             identity_secret,
             sync_state,
+            outbox_state,
             pending_marmot,
             marmot_notify,
             live_marmot_enabled,
@@ -652,6 +661,7 @@ impl SonarClient {
             if let Err(err) = client.subscribe_marmot().await {
                 tracing::debug!(%err, "marmot live subscribe failed (sync() still covers it)");
             }
+            client.retry_outbox().await;
         }
         Ok(client)
     }
@@ -1018,12 +1028,99 @@ impl SonarClient {
         self.engine.decline_group_invite(welcome_id)
     }
 
-    /// Encrypt, publish, and locally record a text message.
+    /// Encrypt and durably record a text message locally before relay publish.
+    ///
+    /// This is Signal-style send sequencing: the MDK local DB becomes visible
+    /// first, Sonar marks the row pending in the outbox, and relay publish runs
+    /// in the background. Publish success/failure only updates local delivery
+    /// state; it does not gate transcript visibility.
     pub async fn send_text(&self, group_id: &GroupId, text: &str) -> Result<()> {
         let event = self.engine.create_text_message(group_id, text)?;
-        self.nostr.send_event(&event).await?;
-        self.engine.process_incoming(&event).await?;
+        let incoming = self.engine.process_incoming(&event).await?;
+        let Incoming::Message(message) = incoming else {
+            return Err(Error::Storage(
+                "created text message did not produce a local transcript row".into(),
+            ));
+        };
+        self.mark_outbox_pending(group_id, &message, &event)?;
+        self.spawn_outbox_publish(message.id.to_hex(), event);
         Ok(())
+    }
+
+    fn mark_outbox_pending(
+        &self,
+        group_id: &GroupId,
+        message: &ChatMessage,
+        event: &Event,
+    ) -> Result<()> {
+        self.outbox_state.lock().unwrap().mark_pending(
+            hex::encode(group_id.as_slice()),
+            message.id.to_hex(),
+            event.id.to_hex(),
+            event.as_json(),
+            Timestamp::now().as_secs(),
+        )
+    }
+
+    fn spawn_outbox_publish(&self, message_id_hex: String, event: Event) {
+        if self.relays.is_empty() {
+            return;
+        }
+        let nostr = self.nostr.clone();
+        let outbox_state = self.outbox_state.clone();
+        tokio::spawn(async move {
+            let result = nostr.send_event(&event).await;
+            let now_secs = Timestamp::now().as_secs();
+            let mut outbox = outbox_state.lock().unwrap();
+            match result {
+                Ok(_) => {
+                    let _ = outbox.mark_sent_by_message_id(&message_id_hex, now_secs);
+                }
+                Err(err) => {
+                    let _ = outbox.mark_failed_by_message_id(
+                        &message_id_hex,
+                        err.to_string(),
+                        now_secs,
+                    );
+                }
+            }
+        });
+    }
+
+    async fn retry_outbox(&self) {
+        if self.relays.is_empty() {
+            return;
+        }
+        let retryable = {
+            let mut outbox = self.outbox_state.lock().unwrap();
+            match outbox.retryable_events(Timestamp::now().as_secs()) {
+                Ok(events) => events,
+                Err(err) => {
+                    tracing::debug!(%err, "failed to load retryable outbox events");
+                    return;
+                }
+            }
+        };
+        for (message_id_hex, event) in retryable {
+            self.spawn_outbox_publish(message_id_hex, event);
+        }
+    }
+
+    fn record_delivery_for_incoming(&self, incoming: &Incoming) {
+        let Incoming::Message(message) = incoming else {
+            return;
+        };
+        if !message.mine {
+            return;
+        }
+        if let Err(err) = self
+            .outbox_state
+            .lock()
+            .unwrap()
+            .mark_sent_by_message_id(&message.id.to_hex(), Timestamp::now().as_secs())
+        {
+            tracing::debug!(%err, "failed to mark outbox message sent after incoming echo");
+        }
     }
 
     // ── Encrypted media (Marmot MIP-04 + Blossom) ─────────────────────────
@@ -1203,6 +1300,7 @@ impl SonarClient {
         } else {
             self.save_sync_state()?;
         }
+        self.retry_outbox().await;
         Ok(())
     }
 
@@ -1354,7 +1452,8 @@ impl SonarClient {
                         }
                     }
                 }
-                Ok(_) => {
+                Ok(incoming) => {
+                    self.record_delivery_for_incoming(&incoming);
                     self.mark_sync_event_processed(&event.id);
                     report.record_processed();
                 }
@@ -1465,7 +1564,42 @@ impl SonarClient {
     }
 
     pub fn messages(&self, group_id: &GroupId) -> Result<Vec<ChatMessage>> {
-        self.engine.messages(group_id)
+        self.engine.messages(group_id).map(|msgs| {
+            msgs.into_iter()
+                .map(|m| self.with_delivery_state(m))
+                .collect()
+        })
+    }
+
+    pub fn messages_page(
+        &self,
+        group_id: &GroupId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<ChatMessage>> {
+        self.engine
+            .messages_page(group_id, limit, offset)
+            .map(|msgs| {
+                msgs.into_iter()
+                    .map(|m| self.with_delivery_state(m))
+                    .collect()
+            })
+    }
+
+    fn with_delivery_state(&self, mut message: ChatMessage) -> ChatMessage {
+        if let Some(state) = self
+            .outbox_state
+            .lock()
+            .unwrap()
+            .status_for_message(&message.id.to_hex())
+        {
+            message.delivery_state = state;
+        } else if message.mine {
+            message.delivery_state = DeliveryState::Sent;
+        } else {
+            message.delivery_state = DeliveryState::Received;
+        }
+        message
     }
 
     pub fn members(&self, group_id: &GroupId) -> Result<Vec<PublicKey>> {

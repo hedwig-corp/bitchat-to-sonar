@@ -50,8 +50,49 @@ final class MarmotService: @unchecked Sendable {
         let createdAt: Date
         /// True when the local identity sent it.
         let isMine: Bool
+        /// Core-owned local delivery state: received, pending, sent, or failed.
+        let deliveryState: String?
         /// Encrypted media attachments (Marmot MIP-04), empty for plain text.
         let media: [MarmotMedia]
+
+        init(
+            id: String,
+            senderNpub: String,
+            content: String,
+            createdAt: Date,
+            isMine: Bool,
+            deliveryState: String? = nil,
+            media: [MarmotMedia]
+        ) {
+            self.id = id
+            self.senderNpub = senderNpub
+            self.content = content
+            self.createdAt = createdAt
+            self.isMine = isMine
+            self.deliveryState = deliveryState
+            self.media = media
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case id
+            case senderNpub
+            case content
+            case createdAt
+            case isMine
+            case deliveryState
+            case media
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            self.id = try container.decode(String.self, forKey: .id)
+            self.senderNpub = try container.decode(String.self, forKey: .senderNpub)
+            self.content = try container.decode(String.self, forKey: .content)
+            self.createdAt = try container.decode(Date.self, forKey: .createdAt)
+            self.isMine = try container.decode(Bool.self, forKey: .isMine)
+            self.deliveryState = try container.decodeIfPresent(String.self, forKey: .deliveryState)
+            self.media = try container.decode([MarmotMedia].self, forKey: .media)
+        }
     }
 
     /// A reference to an encrypted media attachment. `url` is the Blossom URL of
@@ -140,6 +181,11 @@ final class MarmotService: @unchecked Sendable {
     /// cooperative pool.
     private let workQueue = DispatchQueue(label: "chat.bitchat.marmot-service", qos: .userInitiated)
 
+    /// Relay connection setup can be slow and must not block local transcript
+    /// reads on `workQueue`. Build the relay-backed node here, then swap it in
+    /// under `workQueue` once ready.
+    private let relayConnectQueue = DispatchQueue(label: "chat.bitchat.marmot-relay-connect", qos: .utility)
+
     /// Separate queue for the parked `waitForMarmotEvent` call ONLY. It blocks
     /// for up to its timeout, so it must NOT share the serial engine queue (that
     /// would stall syncs/sends). The wait touches no MLS state, so this is safe.
@@ -148,6 +194,7 @@ final class MarmotService: @unchecked Sendable {
     // Guarded by `workQueue`.
     private var identity: SonarIdentity?
     private var node: SonarNode?
+    private var relayConnected = false
 
     init(relayUrls: [String] = MarmotService.defaultRelayUrls) {
         self.relayUrls = relayUrls
@@ -161,7 +208,40 @@ final class MarmotService: @unchecked Sendable {
     @discardableResult
     func connect(nsec: String? = nil) async throws -> String {
         let relayUrls = self.relayUrls
-        return try await run { service in
+        let identity = try await run { service in
+            let identity: SonarIdentity
+            if let nsec {
+                identity = try SonarIdentity.import(nsec: nsec)
+            } else if let existing = service.identity {
+                identity = existing
+            } else {
+                identity = SonarIdentity.generate()
+            }
+            service.identity = identity
+            return identity
+        }
+        let (dbPath, dbKeyHex) = try Self.databaseConfig()
+        let node = try await connectNode(
+            identity: identity,
+            relayUrls: relayUrls,
+            dbPath: dbPath,
+            dbKeyHex: dbKeyHex
+        )
+        await runNonThrowing { service in
+            service.identity = identity
+            service.node = node
+            service.relayConnected = true
+            return ()
+        }
+        return identity.npub()
+    }
+
+    /// Open the encrypted local DB without attaching any relays. This is the
+    /// Signal-style first-paint path: local transcript reads become available
+    /// before network setup has a chance to block them.
+    @discardableResult
+    func connectLocal(nsec: String? = nil) async throws -> String {
+        try await run { service in
             let identity: SonarIdentity
             if let nsec {
                 identity = try SonarIdentity.import(nsec: nsec)
@@ -173,12 +253,13 @@ final class MarmotService: @unchecked Sendable {
             let (dbPath, dbKeyHex) = try Self.databaseConfig()
             let node = try SonarNode.connect(
                 identity: identity,
-                relayUrls: relayUrls,
+                relayUrls: [],
                 dbPath: dbPath,
                 dbKeyHex: dbKeyHex
             )
             service.identity = identity
             service.node = node
+            service.relayConnected = false
             return identity.npub()
         }
     }
@@ -212,6 +293,11 @@ final class MarmotService: @unchecked Sendable {
     /// before the first connect and during a reconnect (e.g. after erase).
     func isConnected() async -> Bool {
         await runNonThrowing { $0.node != nil }
+    }
+
+    /// True when the current node was opened with the real relay set.
+    func isRelayConnected() async -> Bool {
+        await runNonThrowing { $0.node != nil && $0.relayConnected }
     }
 
     /// `nsec1...` backup export of the connected identity (nil before `connect`).
@@ -404,9 +490,13 @@ final class MarmotService: @unchecked Sendable {
     /// not block syncs/sends; `SonarNode` is internally Send+Sync, so calling it
     /// from `waitQueue` with a reference grabbed race-free on `workQueue` is safe.
     func waitForMarmotEvent(timeoutSeconds: UInt64) async -> Bool {
-        guard let node = await runNonThrowing({ $0.node }) else {
-            // Not connected yet: wait out the timeout so the caller's loop does
-            // not busy-spin until a node exists.
+        guard let node = await runNonThrowing({ service -> SonarNode? in
+            guard service.relayConnected else { return nil }
+            return service.node
+        }) else {
+            // Local-only startup is intentionally disconnected from relays.
+            // Wait out the timeout so polling loops do not busy-spin or call
+            // generated non-throwing FFI wait wrappers on a local-only node.
             try? await Task.sleep(nanoseconds: timeoutSeconds * 1_000_000_000)
             return false
         }
@@ -436,26 +526,38 @@ final class MarmotService: @unchecked Sendable {
     /// Decrypted message history for a group, oldest first.
     func messages(groupId: String) async throws -> [MarmotMessage] {
         try await run {
-            try $0.requireNode().messages(groupIdHex: groupId).map {
-                MarmotMessage(
-                    id: $0.idHex,
-                    senderNpub: $0.senderNpub,
-                    content: $0.content,
-                    createdAt: Date(timeIntervalSince1970: TimeInterval($0.createdAtSecs)),
-                    isMine: $0.mine,
-                    media: $0.media.map {
-                        MarmotMedia(
-                            url: $0.url,
-                            mimeType: $0.mimeType,
-                            filename: $0.filename,
-                            width: $0.width,
-                            height: $0.height,
-                            durationMs: $0.durationMs
-                        )
-                    }
+            try $0.requireNode().messages(groupIdHex: groupId).map(Self.marmotMessage)
+        }
+    }
+
+    /// Bounded local message window for a group, oldest first within the page.
+    func messagesPage(groupId: String, limit: UInt32, offset: UInt32 = 0) async throws -> [MarmotMessage] {
+        try await run {
+            try $0.requireNode()
+                .messagesPage(groupIdHex: groupId, limit: limit, offset: offset)
+                .map(Self.marmotMessage)
+        }
+    }
+
+    private static func marmotMessage(_ message: MessageInfo) -> MarmotMessage {
+        MarmotMessage(
+            id: message.idHex,
+            senderNpub: message.senderNpub,
+            content: message.content,
+            createdAt: Date(timeIntervalSince1970: TimeInterval(message.createdAtSecs)),
+            isMine: message.mine,
+            deliveryState: message.deliveryState,
+            media: message.media.map {
+                MarmotMedia(
+                    url: $0.url,
+                    mimeType: $0.mimeType,
+                    filename: $0.filename,
+                    width: $0.width,
+                    height: $0.height,
+                    durationMs: $0.durationMs
                 )
             }
-        }
+        )
     }
 
     // MARK: - Persistence (SQLCipher store for White Noise / Marmot)
@@ -531,11 +633,41 @@ final class MarmotService: @unchecked Sendable {
         await runNonThrowing { service in
             service.node = nil
             service.identity = nil
+            service.relayConnected = false
             if let url = try? Self.databaseURL() {
                 try? wipeMarmotDatabase(dbPath: url.path)
             }
             _ = KeychainManager().deleteIdentityKey(forKey: Self.dbKeychainKey)
             return ()
+        }
+    }
+
+    private func connectNode(
+        identity: SonarIdentity,
+        relayUrls: [String],
+        dbPath: String,
+        dbKeyHex: String
+    ) async throws -> SonarNode {
+        try await withCheckedThrowingContinuation { continuation in
+            relayConnectQueue.async {
+                do {
+                    continuation.resume(returning: try SonarNode.connect(
+                        identity: identity,
+                        relayUrls: relayUrls,
+                        dbPath: dbPath,
+                        dbKeyHex: dbKeyHex
+                    ))
+                } catch let error as SonarFfiError {
+                    switch error {
+                    case .InvalidInput(let message):
+                        continuation.resume(throwing: ServiceError.invalidInput(message))
+                    case .Core(let message):
+                        continuation.resume(throwing: ServiceError.core(message))
+                    }
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
         }
     }
 
@@ -568,7 +700,10 @@ final class MarmotService: @unchecked Sendable {
     /// Park up to `timeoutSeconds` for the next call state change (off the engine
     /// + action queues), mirroring `waitForMarmotEvent`.
     func callWaitEvent(timeoutSeconds: UInt64) async -> CallEventInfo? {
-        guard let node = await runNonThrowing({ $0.node }) else {
+        guard let node = await runNonThrowing({ service -> SonarNode? in
+            guard service.relayConnected else { return nil }
+            return service.node
+        }) else {
             try? await Task.sleep(nanoseconds: timeoutSeconds * 1_000_000_000)
             return nil
         }

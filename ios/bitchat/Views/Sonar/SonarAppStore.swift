@@ -392,6 +392,10 @@ final class SonarAppStore: ObservableObject {
     /// Texts queued for a Sonar peer (keyed by npub) while their White
     /// Noise group is being created on first out-of-range send.
     private var pendingMarmotSends: [String: [String]] = [:]
+    /// Per-conversation Marmot warm-up work started by openedDM. Home rows and
+    /// destination onAppear can both fire; only one local hydrate/sync pass per
+    /// chat should run at a time.
+    private var openingDMTasks: [String: Task<Void, Never>] = [:]
     /// Chat-message ids whose ⚡PAY control lines were already processed.
     private var scannedPayMessageIDs = Set<String>()
     /// Stable mesh peer key -> first sighting time. We briefly hold unresolved
@@ -2549,27 +2553,35 @@ final class SonarAppStore: ObservableObject {
     }
 
     func openedDM(_ id: String) {
-        if marmotGroupId(id) != nil {
-            marmot.startPolling()
-            Task {
-                guard await marmot.ensureConnected() else { return }
-                await marmot.loadLocal()
-                await marmot.refresh()
-            }
-        } else {
+        let sonarProfile = resolvedSonarProfile(id)
+        let groupId = marmotGroupId(id)
+            ?? sonarProfile.flatMap { marmotGroup(forNpub: $0.npub)?.id }
+        let hasMarmotGroup = groupId != nil
+        if !hasMarmotGroup {
             chatViewModel.startPrivateChat(with: PeerID(str: id))
-            // Sonar peers may carry a White Noise leg of the conversation:
-            // keep that transcript fresh while the screen is open (resolved =
-            // live OR persisted, so it works even when not currently in range).
-            if resolvedSonarProfile(id) != nil {
-                marmot.connectIfNeeded()
-                marmot.startPolling()
-                Task {
-                    guard await marmot.ensureConnected() else { return }
-                    await marmot.loadLocal()
-                    await marmot.refresh()
-                }
+        }
+        // Sonar peers may carry a White Noise leg of the conversation. Opening
+        // hydrates local DB state first, then reconciles relays in the
+        // background; duplicate open notifications for the same id join the
+        // in-flight work instead of starting another sync.
+        guard hasMarmotGroup || sonarProfile != nil else { return }
+        marmot.connectIfNeeded()
+        let warmupKey = groupId ?? id
+        if let task = openingDMTasks[warmupKey], !task.isCancelled {
+            return
+        }
+        openingDMTasks[warmupKey] = Task { [weak self] in
+            guard let self else { return }
+            defer { self.openingDMTasks[warmupKey] = nil }
+            guard await self.marmot.loadLocalWhenConnected(groupId: groupId) else { return }
+            guard !Task.isCancelled else { return }
+            let hydratedGroupId = groupId
+                ?? sonarProfile.flatMap { self.marmotGroup(forNpub: $0.npub)?.id }
+            if let hydratedGroupId, hydratedGroupId != groupId {
+                await self.marmot.loadLocalPage(groupId: hydratedGroupId)
             }
+            guard !Task.isCancelled else { return }
+            await self.marmot.refreshWhenConnected(groupId: hydratedGroupId, hydrateBeforeSync: false)
         }
     }
 

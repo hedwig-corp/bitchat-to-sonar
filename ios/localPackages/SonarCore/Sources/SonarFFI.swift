@@ -1020,6 +1020,13 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func messages(groupIdHex: String) throws  -> [MessageInfo]
 
     /**
+     * Bounded local chat-message window for a group, oldest first within the
+     * page. `offset` counts chat messages in newest-first order; non-chat MDK
+     * rows such as commits/proposals are skipped by the core.
+     */
+    func messagesPage(groupIdHex: String, limit: UInt32, offset: UInt32) throws  -> [MessageInfo]
+
+    /**
      * Pending multi-member group invites awaiting accept/decline.
      */
     func pendingGroupInvites() throws  -> [GroupInviteInfo]
@@ -1161,7 +1168,9 @@ open class SonarNode: SonarNodeProtocol, @unchecked Sendable {
 
     /**
      * Connect `identity` to the given relays (e.g. `wss://relay.damus.io`) with
-     * a persistent, encrypted SQLCipher store.
+     * a persistent, encrypted SQLCipher store. Passing an empty relay list opens
+     * the local encrypted DB only; hosts use that for Signal-style first paint
+     * before they attach network relays in the background.
      *
      * - `db_path`: absolute filesystem path for the database (the Swift host
      * passes e.g. `<Application Support>/sonar-marmot/marmot.sqlite`; the host
@@ -1482,6 +1491,22 @@ open func messages(groupIdHex: String)throws  -> [MessageInfo]  {
     uniffi_sonar_ffi_fn_method_sonarnode_messages(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(groupIdHex),$0
+    )
+})
+}
+
+    /**
+     * Bounded local chat-message window for a group, oldest first within the
+     * page. `offset` counts chat messages in newest-first order; non-chat MDK
+     * rows such as commits/proposals are skipped by the core.
+     */
+open func messagesPage(groupIdHex: String, limit: UInt32, offset: UInt32)throws  -> [MessageInfo]  {
+    return try  FfiConverterSequenceTypeMessageInfo.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_messages_page(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(groupIdHex),
+        FfiConverterUInt32.lower(limit),
+        FfiConverterUInt32.lower(offset),$0
     )
 })
 }
@@ -2680,6 +2705,10 @@ public struct MessageInfo: Equatable, Hashable {
      */
     public var mine: Bool
     /**
+     * Local delivery state: received, pending, sent, or failed.
+     */
+    public var deliveryState: String
+    /**
      * Encrypted media attachments (Marmot MIP-04), empty for a plain text message.
      */
     public var media: [MediaInfo]
@@ -2691,6 +2720,9 @@ public struct MessageInfo: Equatable, Hashable {
          * True when the local identity sent it.
          */mine: Bool,
         /**
+         * Local delivery state: received, pending, sent, or failed.
+         */deliveryState: String,
+        /**
          * Encrypted media attachments (Marmot MIP-04), empty for a plain text message.
          */media: [MediaInfo]) {
         self.idHex = idHex
@@ -2698,6 +2730,7 @@ public struct MessageInfo: Equatable, Hashable {
         self.content = content
         self.createdAtSecs = createdAtSecs
         self.mine = mine
+        self.deliveryState = deliveryState
         self.media = media
     }
 
@@ -2722,6 +2755,7 @@ public struct FfiConverterTypeMessageInfo: FfiConverterRustBuffer {
                 content: FfiConverterString.read(from: &buf),
                 createdAtSecs: FfiConverterUInt64.read(from: &buf),
                 mine: FfiConverterBool.read(from: &buf),
+                deliveryState: FfiConverterString.read(from: &buf),
                 media: FfiConverterSequenceTypeMediaInfo.read(from: &buf)
         )
     }
@@ -2732,6 +2766,7 @@ public struct FfiConverterTypeMessageInfo: FfiConverterRustBuffer {
         FfiConverterString.write(value.content, into: &buf)
         FfiConverterUInt64.write(value.createdAtSecs, into: &buf)
         FfiConverterBool.write(value.mine, into: &buf)
+        FfiConverterString.write(value.deliveryState, into: &buf)
         FfiConverterSequenceTypeMediaInfo.write(value.media, into: &buf)
     }
 }
@@ -4243,6 +4278,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_messages() != 63355) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_messages_page() != 43697) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_pending_group_invites() != 31608) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -4318,7 +4356,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_constructor_sonaridentity_import() != 46969) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_constructor_sonarnode_connect() != 2559) {
+    if (uniffi_sonar_ffi_checksum_constructor_sonarnode_connect() != 58965) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_constructor_sonarnoise_initiator() != 18155) {
