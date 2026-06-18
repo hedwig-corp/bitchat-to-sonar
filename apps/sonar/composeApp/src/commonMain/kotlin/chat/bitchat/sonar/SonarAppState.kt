@@ -1276,6 +1276,13 @@ class SonarAppState(private val scope: CoroutineScope) {
             val pendingId = "pending-media-${randomMeshId()}"
             val pendingUrl = "$pendingMediaUrlPrefix${randomMeshId()}"
             val startedAtSecs = SonarClock.nowSecs()
+            val existingMediaUrls = runCatching { SonarCore.messages(groupId) }
+                .getOrDefault(messages)
+                .asSequence()
+                .flatMap { it.media.asSequence() }
+                .map { it.url }
+                .filterNot { it.startsWith(pendingMediaUrlPrefix) }
+                .toSet()
             val pending = SonarMsg(
                 id = pendingId,
                 senderNpub = npub,
@@ -1299,7 +1306,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                             val peerId = meshPeerId(chatId)
                             val mesh = meshChats[peerId].orEmpty()
                             val wn = marmotMessagesForPeer(peerId)
-                            val matched = cacheUploadedMediaBytes(wn, data, filename, mime, startedAtSecs, pendingUrl)
+                            val matched = cacheUploadedMediaBytes(wn, data, filename, mime, startedAtSecs, pendingUrl, existingMediaUrls)
                             val merged = (mesh + wn + if (matched) emptyList() else listOf(pending))
                                 .distinctBy { it.id }
                                 .sortedBy { it.tsSecs }
@@ -1307,7 +1314,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                             processPayLines(chatId, merged)
                         } else {
                             val fresh = SonarCore.messages(groupId)
-                            val matched = cacheUploadedMediaBytes(fresh, data, filename, mime, startedAtSecs, pendingUrl)
+                            val matched = cacheUploadedMediaBytes(fresh, data, filename, mime, startedAtSecs, pendingUrl, existingMediaUrls)
                             messages = (fresh + if (matched) emptyList() else listOf(pending))
                                 .distinctBy { it.id }
                                 .sortedBy { it.tsSecs }
@@ -1331,17 +1338,19 @@ class SonarAppState(private val scope: CoroutineScope) {
         mime: String,
         startedAtSecs: Long,
         pendingUrl: String,
+        existingMediaUrls: Set<String>,
     ): Boolean {
         val published = messages.asSequence()
             .filter { it.mine }
-            .filter { it.tsSecs >= startedAtSecs - 30 }
+            .filter { it.tsSecs >= startedAtSecs }
             .sortedBy { it.tsSecs }
             .flatMap { it.media.asSequence() }
             .firstOrNull {
                 it.filename == filename &&
                     it.mimeType == mime &&
                     !it.url.startsWith(pendingMediaUrlPrefix) &&
-                    mediaCache[it.url] == null
+                    mediaCache[it.url] == null &&
+                    it.url !in existingMediaUrls
             }
         if (published != null) {
             mediaCache[published.url] = data

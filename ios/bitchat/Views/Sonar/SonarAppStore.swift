@@ -1962,6 +1962,7 @@ final class SonarAppStore: ObservableObject {
         let localURL: String
         let data: Data
         let startedAt: Date
+        let existingMediaURLs: Set<String>
     }
 
     /// Bytes for uploads we just started, keyed by group/filename/mime/caption.
@@ -2000,8 +2001,13 @@ final class SonarAppStore: ObservableObject {
         data: Data
     ) {
         let key = Self.pendingUploadMediaKey(groupId: groupId, filename: filename, mime: mime, caption: caption)
+        let existingMediaURLs = Set(
+            marmot.messagesByGroup[groupId, default: []]
+                .flatMap { $0.media.map(\.url) }
+                .filter { !$0.hasPrefix(Self.pendingMediaURLPrefix) }
+        )
         pendingUploadMediaCache[key, default: []].append(
-            PendingUploadMedia(localURL: localURL, data: data, startedAt: Date())
+            PendingUploadMedia(localURL: localURL, data: data, startedAt: Date(), existingMediaURLs: existingMediaURLs)
         )
         mediaImageCache[localURL] = data
     }
@@ -2037,7 +2043,8 @@ final class SonarAppStore: ObservableObject {
                     )
                     guard var pending = pendingUploadMediaCache[key], !pending.isEmpty else { continue }
                     guard let index = pending.firstIndex(where: {
-                        message.createdAt >= $0.startedAt.addingTimeInterval(-30)
+                        message.createdAt.timeIntervalSince1970 >= floor($0.startedAt.timeIntervalSince1970)
+                            && !$0.existingMediaURLs.contains(media.url)
                     }) else { continue }
                     let upload = pending.remove(at: index)
                     mediaImageCache[media.url] = upload.data
