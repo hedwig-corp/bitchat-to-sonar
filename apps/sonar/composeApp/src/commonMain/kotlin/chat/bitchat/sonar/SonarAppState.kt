@@ -1231,6 +1231,15 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (cameToForeground) {
             if (bypassRelock) bypassRelock = false        // return from our own unlock prompt
             else if (AppLock.isEnabled()) locked = true   // genuine app-switch → re-lock
+            if (started) {
+                refreshKnownContactDescriptors()
+                scope.launch {
+                    val offer = if (walletState is WalletState.Ready) {
+                        runCatching { WalletBridge.createOffer() }.getOrNull()
+                    } else null
+                    runCatching { SonarCore.publishSonarDescriptor(callsEnabled = true, bolt12Offer = offer) }
+                }
+            }
         }
         // Unify receiver is foreground-only (matches iOS) — react immediately.
         scope.launch { updateUnifyReceiver() }
@@ -1283,6 +1292,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // refreshMeshDmRows so the Messages list is populated at launch.
                 meshChats.putAll(MessageStore.loadAllMeshDms())
                 loadLinks() // durable fingerprint↔npub so BLE chats stay unified after restart
+                refreshKnownContactDescriptors()
                 refreshMeshDmRows()
                 setupWallet()
                 refreshLocationChannels()
@@ -1380,6 +1390,13 @@ class SonarAppState(private val scope: CoroutineScope) {
                 sonarDescriptorMissedAt[key] = SonarClock.nowSecs()
             }
             sonarDescriptorFetches.remove(key)
+        }
+    }
+
+    private fun refreshKnownContactDescriptors() {
+        for (npubHex in linkByFp.values) {
+            sonarDescriptorMissedAt.remove(npubHex.lowercase())
+            ensureSonarDescriptorHex(npubHex)
         }
     }
 

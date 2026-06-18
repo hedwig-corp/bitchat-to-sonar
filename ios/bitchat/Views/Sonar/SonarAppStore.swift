@@ -522,6 +522,7 @@ final class SonarAppStore: ObservableObject {
                 if npub != nil { (self.wallet as? BridgedWallet)?.retrySetup() }
                 #endif
                 if npub != nil { self.publishPaymentMetadataIfNeeded() }
+                if npub != nil { self.refreshKnownContactDescriptors() }
             }
             .store(in: &cancellables)
         // Messages typed to an out-of-range Sonar peer before their White
@@ -841,8 +842,15 @@ final class SonarAppStore: ObservableObject {
     /// background, so we advertise the receiver only while foreground.
     func setForeground(_ foreground: Bool) {
         guard isForeground != foreground else { return }
+        let cameToForeground = foreground && !isForeground
         isForeground = foreground
         updateReceiverAdvertising()
+        if cameToForeground {
+            refreshKnownContactDescriptors()
+            publishedBolt12Offer = nil
+            publishedPaymentMetadataWithoutOffer = false
+            publishPaymentMetadataIfNeeded()
+        }
     }
 
     /// Start advertising as a Unify receiver iff the wallet is ready AND the
@@ -1004,6 +1012,16 @@ final class SonarAppStore: ObservableObject {
         }
         meshPeerFirstSeenAt[fp] = nil
         pendingCapabilityRefreshKeys.remove(fp)
+    }
+
+    /// Refresh Sonar descriptors for every persisted fingerprint↔npub link so
+    /// payment and call capabilities stay current for contacts discovered over
+    /// BLE even when they're out of range. Called at boot and on foreground
+    /// return; `ensureSonarDescriptor`'s 15-minute TTL avoids redundant fetches.
+    private func refreshKnownContactDescriptors() {
+        let npubs = sonarProfilesByFingerprint.values.map(\.npub)
+        guard !npubs.isEmpty else { return }
+        marmot.refreshDescriptors(forKnownNpubs: npubs)
     }
 
     private func persistSonarProfiles() {

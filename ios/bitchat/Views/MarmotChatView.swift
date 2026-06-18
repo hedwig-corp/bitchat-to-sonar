@@ -646,6 +646,16 @@ final class MarmotChatModel: ObservableObject {
         }
     }
 
+    /// Proactively refresh Sonar descriptors for a set of known npubs (e.g. all
+    /// persisted fingerprint↔npub links). Clears stale miss timestamps so peers
+    /// who recently published a descriptor are retried immediately.
+    func refreshDescriptors(forKnownNpubs npubs: [String]) {
+        for npub in npubs {
+            sonarDescriptorMissesByNpub[npub] = nil
+            ensureSonarDescriptor(npub)
+        }
+    }
+
     /// Best display name for a member npub, if we've resolved their profile.
     func displayName(forNpub member: String) -> String? {
         profilesByNpub[SNMarmotProfileCache.canonicalKey(member)]?.bestName
