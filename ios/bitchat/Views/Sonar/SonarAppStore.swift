@@ -1579,7 +1579,8 @@ final class SonarAppStore: ObservableObject {
     }
 
     func peerItem(_ id: String) -> SNPeerItem {
-        if let groupId = marmotGroupId(id) {
+        if let item = nearbyPeerItem(forConversationId: id) { return item }
+        if id.hasPrefix(Self.marmotIDPrefix), let groupId = marmotGroupId(id) {
             let group = marmot.groups.first { $0.id == groupId }
             return SNPeerItem(
                 id: id,
@@ -1589,7 +1590,6 @@ final class SonarAppStore: ObservableObject {
                 angle: 0, r: 0
             )
         }
-        if let item = nearbyPeers.first(where: { $0.id == id }) { return item }
         if let unifyId = unifyPeerId(id) {
             let name = unify.peers.first { $0.id == unifyId }?.name
                 ?? UnifyNearbyContract.advertisedNamePrefix
@@ -1615,6 +1615,33 @@ final class SonarAppStore: ObservableObject {
             inRange: false, bars: 0,
             hint: "Out of range", detail: networkLabel(forPeer: id),
             angle: 0, r: 0, sonar: resolvedSonarProfile(id) != nil
+        )
+    }
+
+    private func nearbyPeerItem(forConversationId id: String) -> SNPeerItem? {
+        let peers = nearbyPeers
+        if let exact = peers.first(where: { $0.id == id }) { return exact }
+        guard !id.hasPrefix(Self.marmotIDPrefix),
+              let targetFingerprint = chatViewModel.getFingerprint(for: PeerID(str: id)),
+              let live = peers.first(where: { item in
+                  guard !item.unify,
+                        let fingerprint = chatViewModel.getFingerprint(for: PeerID(str: item.id))
+                  else { return false }
+                  return fingerprint == targetFingerprint
+              })
+        else { return nil }
+        return SNPeerItem(
+            id: id,
+            name: live.name,
+            inRange: live.inRange,
+            bars: live.bars,
+            hint: live.hint,
+            detail: live.detail,
+            angle: live.angle,
+            r: live.r,
+            sonar: live.sonar,
+            unify: live.unify,
+            avatarSeed: live.avatarSeed
         )
     }
 

@@ -773,7 +773,11 @@ final class BLEService: NSObject {
     }
     
     func sendPrivateMessage(_ content: String, to peerID: PeerID, recipientNickname: String, messageID: String) {
-        sendPrivateMessage(content, to: peerID, messageID: messageID)
+        guard let target = routingPeerID(for: peerID) else {
+            SecureLogger.debug("Private BLE send has no routing peer for \(peerID.id.prefix(16))", category: .session)
+            return
+        }
+        sendPrivateMessage(content, to: target, messageID: messageID)
     }
 
     /// Immediate BLE-only private send for real-time controls such as ☎CALL.
@@ -834,9 +838,10 @@ final class BLEService: NSObject {
                 SecureLogger.error("❌ Failed to encode file packet for private send", category: .session)
                 return
             }
-            // Normalize to short form (SHA256-derived 16-hex) for wire protocol compatibility
-            // This ensures 64-hex Noise keys are converted to the canonical routing format
-            let targetID = peerID.toShort()
+            guard let targetID = self.routingPeerID(for: peerID) else {
+                SecureLogger.error("❌ No routing peer for private file transfer: \(peerID)", category: .session)
+                return
+            }
             guard let recipientData = Data(hexString: targetID.id) else {
                 SecureLogger.error("❌ Invalid recipient peer ID for file transfer: \(peerID)", category: .session)
                 return
@@ -857,7 +862,7 @@ final class BLEService: NSObject {
                 packet = signed
             }
 
-            SecureLogger.debug("📁 Sending private file transfer to \(peerID.id.prefix(8))… bytes=\(payload.count)", category: .session)
+            SecureLogger.debug("📁 Sending private file transfer to \(targetID.id.prefix(8))… requested=\(peerID.id.prefix(8))… bytes=\(payload.count)", category: .session)
             self.broadcastPacket(packet, transferId: transferId)
         }
     }
