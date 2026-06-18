@@ -50,6 +50,7 @@ pub struct ImportedSignalPack {
     pub author: Option<String>,
     pub cover: Option<ImportedSignalSticker>,
     pub stickers: Vec<ImportedSignalSticker>,
+    pub skipped_sticker_ids: Vec<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -60,6 +61,19 @@ pub struct ImportedSignalSticker {
     pub mime: String,
     pub bytes: Vec<u8>,
     pub sha256: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SignalImportOptions {
+    /// Accept invalid TLS certificates when fetching encrypted Signal CDN blobs.
+    ///
+    /// This is only intended for local networks that intercept TLS with a
+    /// private CA. Sticker contents are still authenticated by Signal's
+    /// pack-key HMAC before they are returned.
+    pub accept_invalid_certs: bool,
+    /// Continue importing when one sticker asset is missing or cannot be
+    /// decrypted. Skipped ids are reported in [`ImportedSignalPack`].
+    pub skip_failed_stickers: bool,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -119,10 +133,17 @@ impl SignalPackLink {
 }
 
 pub async fn import_signal_pack(link: &str) -> Result<ImportedSignalPack> {
+    import_signal_pack_with_options(link, SignalImportOptions::default()).await
+}
+
+pub async fn import_signal_pack_with_options(
+    link: &str,
+    options: SignalImportOptions,
+) -> Result<ImportedSignalPack> {
     let link = SignalPackLink::parse(link)?;
     let keys = derive_keys(&link.pack_key_bytes()?)?;
     let manifest_url = signal_manifest_url(&link.pack_id);
-    let manifest_ciphertext = fetch_limited(&manifest_url, MAX_MANIFEST_BYTES).await?;
+    let manifest_ciphertext = fetch_limited(&manifest_url, MAX_MANIFEST_BYTES, options).await?;
     let manifest_plaintext = decrypt_attachment(&manifest_ciphertext, &keys)?;
     let manifest = SignalStickerPackProto::decode(manifest_plaintext.as_slice())
         .map_err(|e| StickerError::Proto(format!("decode Signal sticker manifest: {e}")))?;
@@ -162,13 +183,23 @@ pub async fn import_signal_pack(link: &str) -> Result<ImportedSignalPack> {
     }
 
     let mut assets = BTreeMap::new();
+    let mut skipped_sticker_ids = Vec::new();
     for id in ids {
         let url = signal_sticker_url(&link.pack_id, id);
-        let ciphertext = fetch_limited(&url, MAX_STICKER_BYTES).await?;
-        let bytes = decrypt_attachment(&ciphertext, &keys)?;
-        let mime = detect_sticker_mime(&bytes);
-        let emoji = emojis_by_id.get(&id).cloned().flatten();
-        assets.insert(id, imported_sticker(id, emoji, mime, bytes)?);
+        let imported = match fetch_limited(&url, MAX_STICKER_BYTES, options).await {
+            Ok(ciphertext) => {
+                let bytes = decrypt_attachment(&ciphertext, &keys)?;
+                let mime = detect_sticker_mime(&bytes);
+                let emoji = emojis_by_id.get(&id).cloned().flatten();
+                imported_sticker(id, emoji, mime, bytes)?
+            }
+            Err(_) if options.skip_failed_stickers => {
+                skipped_sticker_ids.push(id);
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+        assets.insert(id, imported);
     }
 
     let mut stickers = Vec::with_capacity(manifest.stickers.len());
@@ -176,12 +207,16 @@ pub async fn import_signal_pack(link: &str) -> Result<ImportedSignalPack> {
         let id = sticker
             .id
             .ok_or_else(|| StickerError::Signal("sticker missing id".into()))?;
-        stickers.push(
-            assets
-                .get(&id)
-                .cloned()
-                .ok_or_else(|| StickerError::Signal(format!("missing sticker asset {id}")))?,
-        );
+        if let Some(asset) = assets.get(&id) {
+            stickers.push(asset.clone());
+        } else if !skipped_sticker_ids.contains(&id) {
+            return Err(StickerError::Signal(format!("missing sticker asset {id}")));
+        }
+    }
+    if stickers.is_empty() {
+        return Err(StickerError::Signal(
+            "Signal pack has no importable stickers".into(),
+        ));
     }
     let cover = manifest
         .cover
@@ -194,6 +229,7 @@ pub async fn import_signal_pack(link: &str) -> Result<ImportedSignalPack> {
         author: normalize_optional_string(manifest.author.as_deref()),
         cover,
         stickers,
+        skipped_sticker_ids,
     })
 }
 
@@ -283,8 +319,13 @@ fn decrypt_attachment(
         .map_err(|e| StickerError::Crypto(format!("AES-CBC decrypt failed: {e}")))
 }
 
-async fn fetch_limited(url: &str, max_bytes: usize) -> Result<Vec<u8>> {
+async fn fetch_limited(
+    url: &str,
+    max_bytes: usize,
+    options: SignalImportOptions,
+) -> Result<Vec<u8>> {
     let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(options.accept_invalid_certs)
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(60))
         .build()

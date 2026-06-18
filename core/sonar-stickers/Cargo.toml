@@ -29,7 +29,7 @@ hkdf = { version = "0.12", optional = true }
 hmac = { version = "0.12", optional = true }
 nostr = { workspace = true, optional = true }
 prost = { version = "0.13", optional = true }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"], optional = true }
 serde.workspace = true
 sha2 = "0.10"
 thiserror.workspace = true

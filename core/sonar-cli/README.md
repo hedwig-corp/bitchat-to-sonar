@@ -39,6 +39,12 @@ Options:
   to Sonar's media fallback server.
 - `--site-url <https-url>`: stickers page used in the returned link. Defaults
   to `SONAR_STICKERS_SITE_URL` or the bundled `/stickers` web route.
+- `--accept-invalid-signal-certs`: fetch encrypted Signal CDN blobs even when
+  local TLS interception breaks certificate validation. The decrypted sticker
+  data is still authenticated by Signal's pack-key HMAC before publishing.
+- `--skip-missing-signal-stickers`: publish the pack with the importable
+  stickers when the Signal manifest references an unavailable asset. Skipped
+  Signal ids are reported in the JSON output.
 
 The Signal `pack_key` is only used locally for decryption and is never included
 in the published Nostr event.

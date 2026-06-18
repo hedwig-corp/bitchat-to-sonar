@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 use sonar_core::client::{SonarClient, DEFAULT_BLOSSOM_SERVER};
 use sonar_core::identity::Identity;
 use sonar_core::GroupId;
-use sonar_stickers::signal::{import_signal_pack, ImportedSignalPack, ImportedSignalSticker};
+use sonar_stickers::signal::{
+    import_signal_pack_with_options, ImportedSignalPack, ImportedSignalSticker, SignalImportOptions,
+};
 use sonar_stickers::{
     build_pack_tags, PackAddress, Sticker, StickerError, StickerPack, STICKER_PACK_KIND,
 };
@@ -123,6 +125,12 @@ struct PostArgs {
     /// Public stickers page URL. Defaults to SONAR_STICKERS_SITE_URL or the bundled web route.
     #[arg(long)]
     site_url: Option<String>,
+    /// Accept invalid TLS certificates when fetching encrypted Signal CDN blobs.
+    #[arg(long)]
+    accept_invalid_signal_certs: bool,
+    /// Continue when a Signal pack references an unavailable sticker asset.
+    #[arg(long)]
+    skip_missing_signal_stickers: bool,
 }
 
 #[derive(Args, Debug)]
@@ -187,6 +195,7 @@ enum Output {
         relays: Vec<String>,
         blossom_server: String,
         website_url: String,
+        skipped_signal_sticker_ids: Vec<u32>,
     },
     Group {
         id: String,
@@ -281,7 +290,15 @@ async fn run(cli: Cli) -> Result<()> {
 
 async fn post_sticker_pack(loaded: &LoadedConfig, args: PostArgs) -> Result<Output> {
     let identity = loaded.identity()?;
-    let imported = import_signal_pack(&args.signal_link).await?;
+    let imported = import_signal_pack_with_options(
+        &args.signal_link,
+        SignalImportOptions {
+            accept_invalid_certs: args.accept_invalid_signal_certs,
+            skip_failed_stickers: args.skip_missing_signal_stickers,
+        },
+    )
+    .await?;
+    let skipped_signal_sticker_ids = imported.skipped_sticker_ids.clone();
     let pack = upload_imported_signal_pack(&identity, &args.blossom, imported).await?;
     let event = EventBuilder::new(Kind::Custom(STICKER_PACK_KIND), "")
         .tags(build_pack_tags(&pack))
@@ -316,6 +333,7 @@ async fn post_sticker_pack(loaded: &LoadedConfig, args: PostArgs) -> Result<Outp
         relays,
         blossom_server: args.blossom,
         website_url,
+        skipped_signal_sticker_ids,
     })
 }
 
