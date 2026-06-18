@@ -15,7 +15,7 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "0576A29205865664C0937536"
-               BuildableName = "bitchat.app"
+               BuildableName = "Sonar.app"
                BlueprintName = "bitchat_macOS"
                ReferencedContainer = "container:bitchat.xcodeproj">
             </BuildableReference>
@@ -31,7 +31,7 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "0576A29205865664C0937536"
-            BuildableName = "bitchat.app"
+            BuildableName = "Sonar.app"
             BlueprintName = "bitchat_macOS"
             ReferencedContainer = "container:bitchat.xcodeproj">
          </BuildableReference>
@@ -65,7 +65,7 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "0576A29205865664C0937536"
-            BuildableName = "bitchat.app"
+            BuildableName = "Sonar.app"
             BlueprintName = "bitchat_macOS"
             ReferencedContainer = "container:bitchat.xcodeproj">
          </BuildableReference>
@@ -89,7 +89,7 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "0576A29205865664C0937536"
-            BuildableName = "bitchat.app"
+            BuildableName = "Sonar.app"
             BlueprintName = "bitchat_macOS"
             ReferencedContainer = "container:bitchat.xcodeproj">
          </BuildableReference>

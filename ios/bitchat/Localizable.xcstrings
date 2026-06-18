@@ -1,6 +1,24 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    " · %@ nearby on mesh" : {
+
+    },
+    " · reaches anyone" : {
+
+    },
+    " key " : {
+
+    },
+    " private key from your old device or another Nostr app. Your nickname, contacts and balance come back with it." : {
+
+    },
+    " your account. Anyone who has it can read your messages and spend your balance. Paste it into another Nostr app to move in — never share it with a person." : {
+
+    },
+    "* %@ *" : {
+
+    },
     "%@" : {
       "comment" : "Non-localizable symbol used in code",
       "extractionState" : "manual",
@@ -182,6 +200,16 @@
       },
       "shouldTranslate" : false
     },
+    "%@ · %@ here now" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$@ · %2$@ here now"
+          }
+        }
+      }
+    },
     "%@ active" : {
       "comment" : "A label at the bottom of the people list sheet showing the number of active users.",
       "localizations" : {
@@ -360,6 +388,15 @@
           }
         }
       }
+    },
+    "%@ in range - scanning" : {
+
+    },
+    "%@ in range · scanning" : {
+
+    },
+    "%@ people in range" : {
+
     },
     "app_info.app_name" : {
       "extractionState" : "manual",
@@ -6268,6 +6305,189 @@
         }
       }
     },
+    "Audio is connected" : {
+
+    },
+    "Choose an image" : {
+      "comment" : "A label displayed above a button that allows the user to choose an image to send.",
+      "extractionState" : "manual",
+      "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "اختر صورة"
+          }
+        },
+        "bn" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "একটি ছবি নির্বাচন করুন"
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bild auswählen"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Choose an image"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Elige una imagen"
+          }
+        },
+        "fil" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Pumili ng larawan"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Choisir une image"
+          }
+        },
+        "he" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "בחר תמונה"
+          }
+        },
+        "hi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "एक चित्र चुनें"
+          }
+        },
+        "id" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Pilih gambar"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Scegli un’immagine"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "画像を選択"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이미지를 선택하세요"
+          }
+        },
+        "ms" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Pilih imej"
+          }
+        },
+        "ne" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "एउटा तस्वीर चयन गर्नुहोस्"
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kies een afbeelding"
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wybierz obraz"
+          }
+        },
+        "pt" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Escolher uma imagem"
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Escolha uma imagem"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Выберите изображение"
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Välj en bild"
+          }
+        },
+        "ta" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ஒரு படத்தைத் தேர்ந்தெடுக்கவும்"
+          }
+        },
+        "th" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "เลือกภาพ"
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bir görüntü seç"
+          }
+        },
+        "uk" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Виберіть зображення"
+          }
+        },
+        "ur" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ایک تصویر منتخب کریں"
+          }
+        },
+        "vi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Chọn một hình ảnh"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "选择图像"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "選擇圖像"
+          }
+        }
+      }
+    },
     "close" : {
       "comment" : "Button to dismiss fullscreen media viewer",
       "localizations" : {
@@ -6446,6 +6666,9 @@
           }
         }
       }
+    },
+    "cmd K" : {
+
     },
     "common.cancel" : {
       "extractionState" : "manual",
@@ -7699,6 +7922,9 @@
           }
         }
       }
+    },
+    "Compare these numbers with %@ in person or on a call. If they match, nobody is in the middle." : {
+
     },
     "content.accessibility.add_favorite" : {
       "extractionState" : "manual",
@@ -20793,6 +21019,15 @@
         }
       }
     },
+    "End-to-end encrypted groups over the internet" : {
+
+    },
+    "esc" : {
+
+    },
+    "far · internet" : {
+
+    },
     "fingerprint.action.mark_verified" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -22583,6 +22818,9 @@
         }
       }
     },
+    "Friends can verify this fingerprint in person to be sure it’s really you." : {
+
+    },
     "geohash_people.action.block" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -23477,6 +23715,200 @@
           }
         }
       }
+    },
+    "Identity, key sharing, payments, and safety" : {
+
+    },
+    "Images are only available in mesh chats." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "الصور متاحة فقط في محادثات الميش."
+          }
+        },
+        "bn" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ছবি শুধু মেশ চ্যাটে উপলব্ধ।"
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bilder sind nur im Mesh-Chat verfügbar."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Images are only available in mesh chats."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Las imágenes solo están disponibles en los chats de mesh."
+          }
+        },
+        "fil" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ang mga larawan ay available lamang sa mga mesh chat."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Les images sont uniquement disponibles dans les discussions mesh."
+          }
+        },
+        "he" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "תמונות זמינות רק בצ׳אט של mesh."
+          }
+        },
+        "hi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "चित्र केवल मेश चैट में ही उपलब्ध हैं।"
+          }
+        },
+        "id" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Gambar hanya tersedia di obrolan mesh."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Le immagini sono disponibili solo nelle chat mesh."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "画像はメッシュチャットでのみ利用できます。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이미지는 메쉬 채팅에서만 사용할 수 있습니다."
+          }
+        },
+        "ms" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Imej hanya tersedia dalam sembang mesh."
+          }
+        },
+        "ne" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "तस्बिरहरू केवल मेष च्याटमा मात्र उपलब्ध छन्।"
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Afbeeldingen zijn alleen beschikbaar in mesh-chats."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Obrazy są dostępne tylko na czatach mesh."
+          }
+        },
+        "pt" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "As imagens só estão disponíveis nos chats mesh."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "As imagens só estão disponíveis nos chats mesh."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Изображения доступны только в mesh-чатах."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bilder är bara tillgängliga i mesh-chattar."
+          }
+        },
+        "ta" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "படங்கள் மெஷ் உரையாடல்களில் மட்டுமே கிடைக்கும்."
+          }
+        },
+        "th" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "รูปภาพใช้งานได้เฉพาะในแชต mesh เท่านั้น"
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Görseller yalnızca mesh sohbetlerinde kullanılabilir."
+          }
+        },
+        "uk" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Зображення доступні лише в mesh-чатах."
+          }
+        },
+        "ur" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "تصاویر صرف میش چیٹس میں دستیاب ہیں۔"
+          }
+        },
+        "vi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hình ảnh chỉ khả dụng trong các cuộc trò chuyện mesh."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "图片仅可在 mesh 聊天中使用。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "圖片僅能在 mesh 聊天中使用。"
+          }
+        }
+      }
+    },
+    "is" : {
+
+    },
+    "It’s just what people see — change it anytime." : {
+
+    },
+    "Leave this empty if you do not want to announce a payment address to nearby Sonar peers." : {
+
+    },
+    "Let someone scan this to add you — keys are exchanged directly, never through a server." : {
+
     },
     "location_channels.action.open_settings" : {
       "extractionState" : "manual",
@@ -30869,6 +31301,60 @@
         }
       }
     },
+    "More places nearby" : {
+
+    },
+    "Nearby" : {
+
+    },
+    "nearby · Bluetooth" : {
+
+    },
+    "nickname" : {
+
+    },
+    "No account was created anywhere — your identity lives on this phone." : {
+
+    },
+    "No secure chats yet" : {
+
+    },
+    "No signup. Your identity is a private key created on this phone — nobody else ever sees it." : {
+
+    },
+    "Nobody in Bluetooth range right now." : {
+
+    },
+    "nsec" : {
+
+    },
+    "Offline" : {
+
+    },
+    "Online" : {
+
+    },
+    "Paste a friend's npub above — or have them message yours from White Noise." : {
+
+    },
+    "Paste from clipboard" : {
+
+    },
+    "Paste the " : {
+
+    },
+    "Payment address (BIP-353)" : {
+
+    },
+    "People nearby can send you money at this address. It's shared with your Sonar announce — leave it empty to share nothing." : {
+
+    },
+    "Pick a nickname" : {
+
+    },
+    "Profile" : {
+
+    },
     "recording %@" : {
       "comment" : "Voice note recording duration indicator",
       "localizations" : {
@@ -31048,6 +31534,18 @@
         }
       }
     },
+    "Remote video unavailable" : {
+
+    },
+    "Restore your account" : {
+
+    },
+    "Safety number" : {
+
+    },
+    "sats" : {
+
+    },
     "save" : {
       "comment" : "Button to save media to device",
       "localizations" : {
@@ -31226,6 +31724,45 @@
           }
         }
       }
+    },
+    "Save" : {
+
+    },
+    "Search" : {
+
+    },
+    "Search people, channels, commands" : {
+
+    },
+    "Search people, channels, messages" : {
+
+    },
+    "Sense who’s nearby before you see them." : {
+
+    },
+    "Set up your wallet to choose a currency." : {
+
+    },
+    "Settings" : {
+
+    },
+    "sonar" : {
+
+    },
+    "Sonar" : {
+
+    },
+    "Sonar connects phones directly — no phone number, no account, no servers." : {
+
+    },
+    "Sonar never sends this key anywhere — it’s decoded on this phone to unlock your identity." : {
+
+    },
+    "Speaks %@" : {
+
+    },
+    "Surprise me" : {
+
     },
     "system.chat.blocked" : {
       "extractionState" : "manual",
@@ -33912,6 +34449,30 @@
         }
       }
     },
+    "Tap someone to chat" : {
+
+    },
+    "This " : {
+
+    },
+    "This deletes every conversation from this phone — Bluetooth chats and White Noise secure chats. Your identity, nickname and wallet stay, so you can start fresh without setting up again." : {
+
+    },
+    "This deletes your key, your nickname and every conversation from this phone. There is no account to recover — gone is gone." : {
+
+    },
+    "This removes the conversation from this device only. The other person isn't notified." : {
+
+    },
+    "Tip: store it in a password manager. Sonar can’t recover it for you." : {
+
+    },
+    "Today" : {
+
+    },
+    "user@domain" : {
+
+    },
     "verification.my_qr.accessibility_label" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -35702,6 +36263,9 @@
         }
       }
     },
+    "via %@" : {
+
+    },
     "Voice notes are only available in mesh chats." : {
       "extractionState" : "manual",
       "localizations" : {
@@ -35881,364 +36445,23 @@
         }
       }
     },
-    "Images are only available in mesh chats." : {
-      "extractionState" : "manual",
-      "localizations" : {
-        "ar" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "الصور متاحة فقط في محادثات الميش."
-          }
-        },
-        "bn" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "ছবি শুধু মেশ চ্যাটে উপলব্ধ।"
-          }
-        },
-        "de" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Bilder sind nur im Mesh-Chat verfügbar."
-          }
-        },
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Images are only available in mesh chats."
-          }
-        },
-        "es" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Las imágenes solo están disponibles en los chats de mesh."
-          }
-        },
-        "fil" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Ang mga larawan ay available lamang sa mga mesh chat."
-          }
-        },
-        "fr" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Les images sont uniquement disponibles dans les discussions mesh."
-          }
-        },
-        "he" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "תמונות זמינות רק בצ׳אט של mesh."
-          }
-        },
-        "hi" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "चित्र केवल मेश चैट में ही उपलब्ध हैं।"
-          }
-        },
-        "id" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Gambar hanya tersedia di obrolan mesh."
-          }
-        },
-        "it" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Le immagini sono disponibili solo nelle chat mesh."
-          }
-        },
-        "ja" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "画像はメッシュチャットでのみ利用できます。"
-          }
-        },
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "이미지는 메쉬 채팅에서만 사용할 수 있습니다."
-          }
-        },
-        "ms" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Imej hanya tersedia dalam sembang mesh."
-          }
-        },
-        "ne" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "तस्बिरहरू केवल मेष च्याटमा मात्र उपलब्ध छन्।"
-          }
-        },
-        "nl" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Afbeeldingen zijn alleen beschikbaar in mesh-chats."
-          }
-        },
-        "pl" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Obrazy są dostępne tylko na czatach mesh."
-          }
-        },
-        "pt" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "As imagens só estão disponíveis nos chats mesh."
-          }
-        },
-        "pt-BR" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "As imagens só estão disponíveis nos chats mesh."
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Изображения доступны только в mesh-чатах."
-          }
-        },
-        "sv" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Bilder är bara tillgängliga i mesh-chattar."
-          }
-        },
-        "ta" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "படங்கள் மெஷ் உரையாடல்களில் மட்டுமே கிடைக்கும்."
-          }
-        },
-        "th" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "รูปภาพใช้งานได้เฉพาะในแชต mesh เท่านั้น"
-          }
-        },
-        "tr" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Görseller yalnızca mesh sohbetlerinde kullanılabilir."
-          }
-        },
-        "uk" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Зображення доступні лише в mesh-чатах."
-          }
-        },
-        "ur" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "تصاویر صرف میش چیٹس میں دستیاب ہیں۔"
-          }
-        },
-        "vi" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Hình ảnh chỉ khả dụng trong các cuộc trò chuyện mesh."
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "图片仅可在 mesh 聊天中使用。"
-          }
-        },
-        "zh-Hant" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "圖片僅能在 mesh 聊天中使用。"
-          }
-        }
-      }
+    "Wallet not ready" : {
+
     },
-    "Choose an image" : {
-      "comment" : "A label displayed above a button that allows the user to choose an image to send.",
-      "extractionState" : "manual",
-      "localizations" : {
-        "ar" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "اختر صورة"
-          }
-        },
-        "bn" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "একটি ছবি নির্বাচন করুন"
-          }
-        },
-        "de" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Bild auswählen"
-          }
-        },
-        "en" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Choose an image"
-          }
-        },
-        "es" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Elige una imagen"
-          }
-        },
-        "fil" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Pumili ng larawan"
-          }
-        },
-        "fr" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Choisir une image"
-          }
-        },
-        "he" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "בחר תמונה"
-          }
-        },
-        "hi" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "एक चित्र चुनें"
-          }
-        },
-        "id" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Pilih gambar"
-          }
-        },
-        "it" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Scegli un’immagine"
-          }
-        },
-        "ja" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "画像を選択"
-          }
-        },
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "이미지를 선택하세요"
-          }
-        },
-        "ms" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Pilih imej"
-          }
-        },
-        "ne" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "एउटा तस्वीर चयन गर्नुहोस्"
-          }
-        },
-        "nl" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Kies een afbeelding"
-          }
-        },
-        "pl" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Wybierz obraz"
-          }
-        },
-        "pt" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Escolher uma imagem"
-          }
-        },
-        "pt-BR" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Escolha uma imagem"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Выберите изображение"
-          }
-        },
-        "sv" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Välj en bild"
-          }
-        },
-        "ta" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "ஒரு படத்தைத் தேர்ந்தெடுக்கவும்"
-          }
-        },
-        "th" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "เลือกภาพ"
-          }
-        },
-        "tr" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Bir görüntü seç"
-          }
-        },
-        "uk" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Виберіть зображення"
-          }
-        },
-        "ur" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "ایک تصویر منتخب کریں"
-          }
-        },
-        "vi" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Chọn một hình ảnh"
-          }
-        },
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "选择图像"
-          }
-        },
-        "zh-Hant" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "選擇圖像"
-          }
-        }
-      }
+    "You’re in, %@." : {
+
+    },
+    "YOUR KEY FINGERPRINT" : {
+
+    },
+    "Your key is not ready yet - connecting to the secure chat service." : {
+
+    },
+    "Your nickname is just what people see — your key never leaves this phone." : {
+
+    },
+    "Your nickname is what people see. Your key stays on this device unless you explicitly export it." : {
+
     }
   },
   "version" : "1.1"
