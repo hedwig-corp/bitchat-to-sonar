@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "secret_key_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "author_pubkey_hex": "6a04ab98d9e4774ad806e302dddeb63bea16b5cb5f223ee77478e861bb583eb3",
+  "pack": {
+    "identifier": "signal-0123456789abcdef0123456789abcdef",
+    "title": "Sonar Signal Cats",
+    "description": "Native sticker contract fixture for Signal-style pack import.",
+    "license": "CC-BY-4.0",
+    "cover_shortcode": "cat_wave",
+    "stickers": [
+      {
+        "shortcode": "cat_wave",
+        "url": "https://blossom.example/stickers/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/cat-wave.webp",
+        "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "mime": "image/webp",
+        "width": 512,
+        "height": 512,
+        "alt": "Cat waving",
+        "emoji": "\ud83d\ude42"
+      },
+      {
+        "shortcode": "cat_cry",
+        "url": "https://blossom.example/stickers/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc/cat-cry.webp",
+        "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "mime": "image/webp",
+        "width": 512,
+        "height": 512,
+        "alt": "Cat crying",
+        "emoji": "\ud83d\ude3f"
+      }
+    ]
+  },
+  "installed_pack_addresses": [
+    "30030:6a04ab98d9e4774ad806e302dddeb63bea16b5cb5f223ee77478e861bb583eb3:signal-0123456789abcdef0123456789abcdef",
+    "30030:6a04ab98d9e4774ad806e302dddeb63bea16b5cb5f223ee77478e861bb583eb3:signal-0123456789abcdef0123456789abcdef"
+  ],
+  "sent_ref": {
+    "pack": "30030:6a04ab98d9e4774ad806e302dddeb63bea16b5cb5f223ee77478e861bb583eb3:signal-0123456789abcdef0123456789abcdef",
+    "shortcode": "cat_wave",
+    "plaintext_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "edited_pack_mismatch": {
+    "pack": "30030:6a04ab98d9e4774ad806e302dddeb63bea16b5cb5f223ee77478e861bb583eb3:signal-0123456789abcdef0123456789abcdef",
+    "shortcode": "cat_wave",
+    "plaintext_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  },
+  "invalid": {
+    "non_https_url": "http://blossom.example/stickers/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/cat-wave.webp",
+    "duplicate_shortcode": "cat_wave",
+    "duplicate_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  }
+}
