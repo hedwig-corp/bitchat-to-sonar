@@ -165,6 +165,8 @@ final class MarmotService: @unchecked Sendable {
     enum ServiceError: Error, Equatable {
         /// `connect()` has not completed successfully yet.
         case notConnected
+        /// A newer session change superseded this async operation.
+        case cancelled
         /// Invalid caller input (bad nsec/npub/group id/relay URL).
         case invalidInput(String)
         /// Failure inside the Rust core (relay I/O, MLS, MDK...).
@@ -201,6 +203,7 @@ final class MarmotService: @unchecked Sendable {
     private var identity: SonarIdentity?
     private var node: SonarNode?
     private var relayConnected = false
+    private var sessionGeneration: UInt64 = 0
 
     init(relayUrls: [String] = MarmotService.defaultRelayUrls) {
         self.relayUrls = relayUrls
@@ -214,7 +217,7 @@ final class MarmotService: @unchecked Sendable {
     @discardableResult
     func connect(nsec: String? = nil) async throws -> String {
         let relayUrls = self.relayUrls
-        let identity = try await run { service in
+        let (identity, generation) = try await run { service in
             let identity: SonarIdentity
             if let nsec {
                 identity = try SonarIdentity.import(nsec: nsec)
@@ -224,7 +227,8 @@ final class MarmotService: @unchecked Sendable {
                 identity = SonarIdentity.generate()
             }
             service.identity = identity
-            return identity
+            service.sessionGeneration = service.sessionGeneration &+ 1
+            return (identity, service.sessionGeneration)
         }
         let (dbPath, dbKeyHex) = try Self.databaseConfig()
         let node = try await connectNode(
@@ -233,11 +237,19 @@ final class MarmotService: @unchecked Sendable {
             dbPath: dbPath,
             dbKeyHex: dbKeyHex
         )
-        await runNonThrowing { service in
+        let installed = await runNonThrowing { service in
+            guard service.sessionGeneration == generation,
+                  service.identity?.npub() == identity.npub()
+            else {
+                return false
+            }
             service.identity = identity
             service.node = node
             service.relayConnected = true
-            return ()
+            return true
+        }
+        guard installed else {
+            throw ServiceError.cancelled
         }
         try await run { try $0.requireNode().retryOutbox() }
         return identity.npub()
@@ -267,6 +279,7 @@ final class MarmotService: @unchecked Sendable {
             service.identity = identity
             service.node = node
             service.relayConnected = false
+            service.sessionGeneration = service.sessionGeneration &+ 1
             return identity.npub()
         }
     }
@@ -287,6 +300,7 @@ final class MarmotService: @unchecked Sendable {
                 identity = SonarIdentity.generate()
             }
             service.identity = identity
+            service.sessionGeneration = service.sessionGeneration &+ 1
             return identity.npub()
         }
     }
@@ -654,6 +668,7 @@ final class MarmotService: @unchecked Sendable {
     /// SQLite sidecars), and forget the Keychain DB key. Idempotent.
     func wipeDatabase() async {
         await runNonThrowing { service in
+            service.sessionGeneration = service.sessionGeneration &+ 1
             service.node = nil
             service.identity = nil
             service.relayConnected = false

@@ -340,6 +340,8 @@ final class MarmotChatModel: ObservableObject {
                 try? await self.service.publishKeyPackage()
                 try? await self.service.publishSonarDescriptor()
                 self.startPolling()
+            } catch MarmotService.ServiceError.cancelled {
+                return
             } catch {
                 let desc = Self.describe(error)
                 SecureLogger.warning("⚠️ Marmot relay connect failed: \(desc)", category: .session)
@@ -986,6 +988,8 @@ final class MarmotChatModel: ObservableObject {
         switch error {
         case MarmotService.ServiceError.notConnected:
             return "Not connected yet — try again in a moment."
+        case MarmotService.ServiceError.cancelled:
+            return "Operation cancelled."
         case MarmotService.ServiceError.invalidInput(let detail):
             return "Invalid input: \(detail)"
         case MarmotService.ServiceError.core(let detail):
