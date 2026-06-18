@@ -407,6 +407,9 @@ final class SonarAppStore: ObservableObject {
     /// destination onAppear can both fire; only one local hydrate/sync pass per
     /// chat should run at a time.
     private var openingDMTasks: [String: Task<Void, Never>] = [:]
+    /// Per-conversation background relay reconciliation. Kept separate from
+    /// `openingDMTasks` so a later open never waits for relay sync/backfill.
+    private var refreshingDMTasks: [String: Task<Void, Never>] = [:]
     /// Chat-message ids whose ⚡PAY control lines were already processed.
     private var scannedPayMessageIDs = Set<String>()
     /// Stable mesh peer key -> first sighting time. We briefly hold unresolved
@@ -2648,6 +2651,18 @@ final class SonarAppStore: ObservableObject {
         guard hasMarmotGroup || sonarProfile != nil else { return }
         marmot.connectIfNeeded()
         let warmupKey = groupId ?? id
+        if let groupId,
+           let cached = marmot.messagesByGroup[groupId],
+           !cached.isEmpty {
+            localHydratingDMs.remove(id)
+            refreshMarmotDMInBackground(
+                warmupKey: warmupKey,
+                conversationId: id,
+                groupId: groupId,
+                keepLoadingUntilComplete: false
+            )
+            return
+        }
         if let task = openingDMTasks[warmupKey], !task.isCancelled {
             localHydratingDMs.insert(id)
             Task { [weak self] in
@@ -2690,13 +2705,48 @@ final class SonarAppStore: ObservableObject {
                 self.localHydratingDMs.remove(id)
                 return
             }
-            await self.marmot.refreshWhenConnected(groupId: hydratedGroupId, hydrateBeforeSync: false)
-            self.localHydratingDMs.remove(id)
+            self.refreshMarmotDMInBackground(
+                warmupKey: warmupKey,
+                conversationId: id,
+                groupId: hydratedGroupId,
+                keepLoadingUntilComplete: needsHistoryBackfill
+            )
         }
     }
 
     func isLocallyHydratingDM(_ id: String) -> Bool {
         localHydratingDMs.contains(id)
+    }
+
+    private func refreshMarmotDMInBackground(
+        warmupKey: String,
+        conversationId id: String,
+        groupId: String?,
+        keepLoadingUntilComplete: Bool
+    ) {
+        if let task = refreshingDMTasks[warmupKey], !task.isCancelled {
+            if keepLoadingUntilComplete {
+                localHydratingDMs.insert(id)
+                Task { [weak self] in
+                    await task.value
+                    self?.localHydratingDMs.remove(id)
+                }
+            }
+            return
+        }
+        if keepLoadingUntilComplete {
+            localHydratingDMs.insert(id)
+        }
+        refreshingDMTasks[warmupKey] = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                self.refreshingDMTasks[warmupKey] = nil
+                if keepLoadingUntilComplete {
+                    self.localHydratingDMs.remove(id)
+                }
+            }
+            await self.marmot.refreshWhenConnected(groupId: groupId, hydrateBeforeSync: false)
+        }
     }
 
     func closedDM(_ id: String) {
@@ -3577,6 +3627,10 @@ final class SonarAppStore: ObservableObject {
         // with the SAME identity so new secure chats still work.
         Task { await marmot.eraseChatsKeepIdentity() }
         // Drop queued sends + pay-scan state that referenced the erased chats.
+        openingDMTasks.values.forEach { $0.cancel() }
+        openingDMTasks = [:]
+        refreshingDMTasks.values.forEach { $0.cancel() }
+        refreshingDMTasks = [:]
         pendingMarmotSends = [:]
         scannedPayMessageIDs = []
         pendingPayPeer = nil
@@ -3625,6 +3679,10 @@ final class SonarAppStore: ObservableObject {
         meshPeerFirstSeenAt = [:]
         pendingCapabilityRefreshKeys = []
         defaults.removeObject(forKey: Keys.sonarProfiles)
+        openingDMTasks.values.forEach { $0.cancel() }
+        openingDMTasks = [:]
+        refreshingDMTasks.values.forEach { $0.cancel() }
+        refreshingDMTasks = [:]
         localHydratingDMs = []
         clearMarmotConversationGroups()
         // Stop scanning for Unify peers and clear the discovered list (no
