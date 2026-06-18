@@ -40,6 +40,8 @@ pub const DEFAULT_BLOSSOM_SERVER: &str = "https://blossom.primal.net";
 /// SENDER (untrusted), so this bounds memory use against a malicious/huge blob.
 /// Comfortably above any real image while well under MDK's 100 MB MIP-04 limit.
 const MAX_MEDIA_DOWNLOAD_BYTES: usize = 25 * 1024 * 1024;
+const MEDIA_DOWNLOAD_ATTEMPTS: usize = 3;
+const MEDIA_DOWNLOAD_RETRY_DELAY: Duration = Duration::from_millis(350);
 
 /// Shared HTTP client for Blossom media downloads. Built once so every blob
 /// reuses keep-alive connections + the TLS session cache instead of paying a
@@ -87,6 +89,38 @@ async fn http_get(url: &str) -> Result<Vec<u8>> {
         out.extend_from_slice(&chunk);
     }
     Ok(out)
+}
+
+async fn http_get_with_retries(url: &str) -> Result<Vec<u8>> {
+    for attempt in 1..=MEDIA_DOWNLOAD_ATTEMPTS {
+        match http_get(url).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(error)
+                if attempt < MEDIA_DOWNLOAD_ATTEMPTS && retryable_media_http_error(&error) =>
+            {
+                tokio::time::sleep(MEDIA_DOWNLOAD_RETRY_DELAY).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("media download retry loop always returns");
+}
+
+fn retryable_media_http_error(error: &Error) -> bool {
+    let Error::Http(message) = error else {
+        return false;
+    };
+    if message.contains("refusing non-https")
+        || message.contains("media too large")
+        || message.contains("media exceeds size cap")
+    {
+        return false;
+    }
+    if message.contains("HTTP 4") && !message.contains("HTTP 408") && !message.contains("HTTP 429")
+    {
+        return false;
+    }
+    true
 }
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1024,7 +1058,7 @@ impl SonarClient {
     /// Download the encrypted blob at `url` and decrypt it with the group media
     /// key (resolved from the message's imeta tag). Returns plaintext bytes.
     pub async fn fetch_media(&self, group_id: &GroupId, url: &str) -> Result<Vec<u8>> {
-        let ciphertext = http_get(url).await?;
+        let ciphertext = http_get_with_retries(url).await?;
         self.engine.decrypt_media_by_url(group_id, url, &ciphertext)
     }
 
@@ -1836,6 +1870,29 @@ mod tests {
             .custom_created_at(Timestamp::from_secs(created_at_secs))
             .sign_with_keys(keys)
             .expect("descriptor signs")
+    }
+
+    #[test]
+    fn media_http_retry_classifier_retries_transient_body_errors() {
+        assert!(retryable_media_http_error(&Error::Http(
+            "error decoding response body".into()
+        )));
+        assert!(retryable_media_http_error(&Error::Http(
+            "GET https://example.test/blob -> HTTP 503 Service Unavailable".into()
+        )));
+    }
+
+    #[test]
+    fn media_http_retry_classifier_rejects_permanent_errors() {
+        assert!(!retryable_media_http_error(&Error::Http(
+            "refusing non-https media url: http://127.0.0.1/blob".into()
+        )));
+        assert!(!retryable_media_http_error(&Error::Http(
+            "GET https://example.test/blob -> HTTP 404 Not Found".into()
+        )));
+        assert!(!retryable_media_http_error(&Error::Http(
+            "media exceeds size cap".into()
+        )));
     }
 
     #[test]

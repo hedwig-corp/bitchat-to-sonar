@@ -1255,6 +1255,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     // ── Media (White Noise / Marmot MIP-04) ──
     /** Decrypted-media cache (raw bytes), keyed by the ciphertext's Blossom URL. */
     private val mediaCache = mutableMapOf<String, ByteArray>()
+    private val pendingMediaUrlPrefix = "pending-media-"
 
     /** The Marmot group id backing [chatId]: the chat id itself for a White Noise
      *  chat, or the Sonar peer's group for a mesh-routed DM. null ⇒ no group yet. */
@@ -1272,19 +1273,82 @@ class SonarAppState(private val scope: CoroutineScope) {
         scope.launch {
             val groupId = resolveMarmotGroupId(chatId)
             if (groupId == null) { toast = "Start the secure chat first, then send a photo."; return@launch }
+            val pendingId = "pending-media-${randomMeshId()}"
+            val pendingUrl = "$pendingMediaUrlPrefix${randomMeshId()}"
+            val startedAtSecs = SonarClock.nowSecs()
+            val pending = SonarMsg(
+                id = pendingId,
+                senderNpub = npub,
+                content = "",
+                mine = true,
+                tsSecs = startedAtSecs,
+                viaInternet = true,
+                media = listOf(SonarMedia(pendingUrl, mime, filename, null, null, null)),
+                state = "Uploading",
+            )
+            mediaCache[pendingUrl] = data
+            if ((screen as? Screen.Chat)?.id == chatId) {
+                messages = (messages + pending).distinctBy { it.id }.sortedBy { it.tsSecs }
+            }
             try {
                 SonarCore.sendMedia(groupId, data, filename, mime, "")
                 // Refresh the open conversation so the sent image shows.
                 (screen as? Screen.Chat)?.let { sc ->
                     if (sc.id == chatId) {
-                        if (isMeshChat(chatId)) refreshOpenDm(meshPeerId(chatId))
-                        else { messages = SonarCore.messages(groupId); processPayLines(chatId, messages) }
+                        if (isMeshChat(chatId)) {
+                            val peerId = meshPeerId(chatId)
+                            val mesh = meshChats[peerId].orEmpty()
+                            val wn = marmotMessagesForPeer(peerId)
+                            val matched = cacheUploadedMediaBytes(wn, data, filename, mime, startedAtSecs, pendingUrl)
+                            val merged = (mesh + wn + if (matched) emptyList() else listOf(pending))
+                                .distinctBy { it.id }
+                                .sortedBy { it.tsSecs }
+                            messages = merged
+                            processPayLines(chatId, merged)
+                        } else {
+                            val fresh = SonarCore.messages(groupId)
+                            val matched = cacheUploadedMediaBytes(fresh, data, filename, mime, startedAtSecs, pendingUrl)
+                            messages = (fresh + if (matched) emptyList() else listOf(pending))
+                                .distinctBy { it.id }
+                                .sortedBy { it.tsSecs }
+                            processPayLines(chatId, messages)
+                        }
                     }
                 }
             } catch (e: Throwable) {
+                messages = messages.map {
+                    if (it.id == pendingId) it.copy(state = "Couldn't send") else it
+                }
                 toast = "couldn't send photo: ${e.message}"
             }
         }
+    }
+
+    private fun cacheUploadedMediaBytes(
+        messages: List<SonarMsg>,
+        data: ByteArray,
+        filename: String,
+        mime: String,
+        startedAtSecs: Long,
+        pendingUrl: String,
+    ): Boolean {
+        val published = messages.asSequence()
+            .filter { it.mine }
+            .filter { it.tsSecs >= startedAtSecs - 30 }
+            .sortedBy { it.tsSecs }
+            .flatMap { it.media.asSequence() }
+            .firstOrNull {
+                it.filename == filename &&
+                    it.mimeType == mime &&
+                    !it.url.startsWith(pendingMediaUrlPrefix) &&
+                    mediaCache[it.url] == null
+            }
+        if (published != null) {
+            mediaCache[published.url] = data
+            mediaCache.remove(pendingUrl)
+            return true
+        }
+        return false
     }
 
     /** Send a recorded voice note (AAC .m4a bytes) to a White Noise chat — same

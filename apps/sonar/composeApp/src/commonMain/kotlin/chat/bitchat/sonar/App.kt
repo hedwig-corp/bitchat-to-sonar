@@ -729,7 +729,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                     // Index-keyed call records avoid duplicate keys when two calls end
                     // in the same second (identical ts/dur/kind would otherwise collide).
                     key = { i, it -> if (it is CallRecord) "c:$i" else "m:${(it as SonarMsg).id}" }
-                ) { _, item ->
+                ) { i, item ->
                     if (item is CallRecord) {
                         CallLogRow(item)
                     } else {
@@ -750,9 +750,15 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                                 screen.id,
                                 mesh = msgMesh,
                                 author = state.groupAuthorName(m, isGroup),
+                                showState = m.mine && i == feed.lastIndex,
                                 onOpen = { mediaViewer = it }
                             )
-                        } else MessageBubble(m, msgMesh, author = state.groupAuthorName(m, isGroup))
+                        } else MessageBubble(
+                            m,
+                            msgMesh,
+                            author = state.groupAuthorName(m, isGroup),
+                            showState = m.mine && i == feed.lastIndex,
+                        )
                     }
                 }
             }
@@ -1252,7 +1258,7 @@ private fun GeoDmScreen(state: SonarAppState, screen: Screen.GeoDm) {
 }
 
 @Composable
-private fun MessageBubble(m: SonarMsg, mesh: Boolean = false, author: String? = null) {
+private fun MessageBubble(m: SonarMsg, mesh: Boolean = false, author: String? = null, showState: Boolean = false) {
     val s = sonar
     // Own bubble is cyan over BLE mesh, indigo over Nostr/internet (the design's
     // transport-colored bubbles); the other party's bubble is always the surface.
@@ -1286,6 +1292,35 @@ private fun MessageBubble(m: SonarMsg, mesh: Boolean = false, author: String? = 
                 Text(annotated, color = if (m.mine) onMine else s.text, fontSize = 16.sp)
             }
         }
+        if (showState) MessageStatusFooter(m, mesh)
+    }
+}
+
+@Composable
+private fun MessageStatusFooter(m: SonarMsg, mesh: Boolean) {
+    val state = m.state ?: return
+    val s = sonar
+    val pending = state == "Sending" || state == "Uploading"
+    val failed = state == "Couldn't send"
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(3.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier.padding(top = 3.dp, start = 4.dp, end = 4.dp)
+    ) {
+        if (pending) {
+            androidx.compose.material3.CircularProgressIndicator(
+                color = s.text3,
+                strokeWidth = 1.4.dp,
+                modifier = Modifier.size(11.dp),
+            )
+        } else {
+            SNIcon(if (failed) SNIconName.X else SNIconName.Check, 11.dp, if (failed) s.danger else s.text3, weight = 2.6f)
+        }
+        Text(
+            "$state · ${if (mesh) "Bluetooth" else "internet"}",
+            color = if (failed) s.danger else s.text3,
+            fontSize = 11.sp,
+        )
     }
 }
 
@@ -1302,6 +1337,7 @@ private fun MediaBubble(
     chatId: String,
     mesh: Boolean,
     author: String? = null,
+    showState: Boolean = false,
     onOpen: (SonarMedia) -> Unit,
 ) {
     val s = sonar
@@ -1319,14 +1355,17 @@ private fun MediaBubble(
             )
         }
         if (media.isImage) {
-            val mediaBytes by androidx.compose.runtime.produceState<ByteArray?>(
-                null, media.url
+            var loadAttempt by remember(media.url, chatId) { mutableStateOf(0) }
+            val loadResult by androidx.compose.runtime.produceState<Pair<Boolean, ByteArray?>>(
+                false to null, media.url, chatId, loadAttempt
             ) {
-                value = state.mediaData(chatId, media)
+                value = true to state.mediaData(chatId, media)
             }
+            val mediaBytes = loadResult.second
             val img = androidx.compose.runtime.remember(mediaBytes) {
                 mediaBytes?.let { decodeImageBitmap(it) }
             }
+            val renderAsGif = media.isGif && mediaBytes?.looksLikeGifBytes() == true
             Box(
                 Modifier.widthIn(max = 240.dp).clip(RoundedCornerShape(18.dp)).background(s.surface2)
                     .clickable { onOpen(media) },
@@ -1334,15 +1373,32 @@ private fun MediaBubble(
             ) {
                 val bmp = img
                 val bytes = mediaBytes
-                if (bytes != null && (media.isGif || bmp != null)) {
-                    MediaImage(
-                        bytes = bytes,
-                        isGif = media.isGif,
-                        modifier = Modifier.widthIn(max = 240.dp).heightIn(max = 300.dp)
-                    )
-                    if (media.isGif) GifBadge(Modifier.align(Alignment.TopEnd).padding(8.dp))
-                } else {
-                    Box(
+                when {
+                    bytes != null && (renderAsGif || bmp != null) -> {
+                        MediaImage(
+                            bytes = bytes,
+                            isGif = renderAsGif,
+                            modifier = Modifier.widthIn(max = 240.dp).heightIn(max = 300.dp)
+                        )
+                        if (renderAsGif) GifBadge(Modifier.align(Alignment.TopEnd).padding(8.dp))
+                    }
+                    bytes != null -> InlineMediaFileChip(media = media, onOpen = { onOpen(media) })
+                    loadResult.first -> Box(
+                        Modifier.size(width = 180.dp, height = 130.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text("Couldn't load image", color = s.text3, fontSize = 12.sp)
+                            Text(
+                                "Retry",
+                                color = s.accent,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.clickable { loadAttempt += 1 }
+                            )
+                        }
+                    }
+                    else -> Box(
                         Modifier.size(width = 180.dp, height = 130.dp),
                         contentAlignment = Alignment.Center
                     ) {
@@ -1350,25 +1406,48 @@ private fun MediaBubble(
                             color = s.text3, strokeWidth = 2.dp
                         )
                     }
-                    if (media.isGif) GifBadge(Modifier.align(Alignment.TopEnd).padding(8.dp))
                 }
+                if (media.isGif && bytes == null) GifBadge(Modifier.align(Alignment.TopEnd).padding(8.dp))
             }
         } else if (media.mimeType.startsWith("audio/")) {
             AudioBubble(m, state, chatId, media, mesh = mesh)
         } else {
-            Row(
-                Modifier.clip(RoundedCornerShape(14.dp)).background(s.surface2)
-                    .clickable { onOpen(media) }
-                    .padding(horizontal = 12.dp, vertical = 9.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(media.filename, color = s.text, fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold)
-            }
+            InlineMediaFileChip(media = media, onOpen = { onOpen(media) })
         }
         if (m.content.isNotEmpty()) {
             Spacer(Modifier.height(3.dp))
             Text(m.content, color = s.text, fontSize = 14.5.sp)
         }
+        if (showState) MessageStatusFooter(m, mesh)
+    }
+}
+
+private fun ByteArray.looksLikeGifBytes(): Boolean =
+    size >= 6 &&
+        this[0] == 0x47.toByte() &&
+        this[1] == 0x49.toByte() &&
+        this[2] == 0x46.toByte() &&
+        this[3] == 0x38.toByte() &&
+        (this[4] == 0x37.toByte() || this[4] == 0x39.toByte()) &&
+        this[5] == 0x61.toByte()
+
+@Composable
+private fun InlineMediaFileChip(media: SonarMedia, onOpen: () -> Unit) {
+    val s = sonar
+    Row(
+        Modifier.clip(RoundedCornerShape(14.dp)).background(s.surface2)
+            .clickable { onOpen() }
+            .padding(horizontal = 12.dp, vertical = 9.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            media.filename,
+            color = s.text,
+            fontSize = 13.5.sp,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
     }
 }
 
@@ -1385,7 +1464,11 @@ private fun MediaViewer(
     val scope = rememberCoroutineScope()
     var chrome by remember(media.url) { mutableStateOf(true) }
     var status by remember(media.url) { mutableStateOf<String?>(null) }
-    val loadResult by androidx.compose.runtime.produceState<Pair<Boolean, ByteArray?>>(false to null, media.url) {
+    var loadAttempt by remember(media.url, chatId) { mutableStateOf(0) }
+    val loadResult by androidx.compose.runtime.produceState<Pair<Boolean, ByteArray?>>(
+        false to null, media.url, chatId, loadAttempt
+    ) {
+        status = null
         value = true to state.mediaData(chatId, media)
     }
     val loadedBytes = loadResult.second
@@ -1413,7 +1496,23 @@ private fun MediaViewer(
                 modifier = Modifier.fillMaxSize()
             )
             loadResult.first -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text("Couldn't load media", color = Color.White.copy(alpha = 0.82f), fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text(
+                        "Couldn't load media",
+                        color = Color.White.copy(alpha = 0.82f),
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Text(
+                        "Retry",
+                        color = Color.White,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.clip(CircleShape).background(Color.White.copy(alpha = 0.16f))
+                            .clickable { loadAttempt += 1 }
+                            .padding(horizontal = 18.dp, vertical = 9.dp)
+                    )
+                }
             }
             else -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 androidx.compose.material3.CircularProgressIndicator(color = s.text3, strokeWidth = 2.dp)

@@ -30,6 +30,8 @@ data class SonarMsg(
     val viaInternet: Boolean = false,
     /// Encrypted media attachments (Marmot MIP-04), empty for plain text.
     val media: List<SonarMedia> = emptyList(),
+    /// Local UI send state. Protocol receipts are not persisted here yet.
+    val state: String? = null,
 )
 
 /** A reference to an encrypted media attachment. [url] is the Blossom URL of the

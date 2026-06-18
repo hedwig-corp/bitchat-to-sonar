@@ -518,7 +518,11 @@ final class SonarAppStore: ObservableObject {
             .store(in: &cancellables)
         marmot.$messagesByGroup
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in self?.processIncomingPayLines(); self?.processIncomingCallLines() }
+            .sink { [weak self] _ in
+                self?.cachePublishedUploadMedia()
+                self?.processIncomingPayLines()
+                self?.processIncomingCallLines()
+            }
             .store(in: &cancellables)
 
         // Restore persisted Sonar profiles so a peer's mesh + White Noise legs
@@ -1822,6 +1826,7 @@ final class SonarAppStore: ObservableObject {
                         text: m.content,
                         time: Self.clock(m.createdAt),
                         via: .internet,
+                        state: MarmotChatModel.stateText(for: m),
                         media: Self.mediaItems(m, groupId: groupId)
                     ))
                 }
@@ -1880,6 +1885,7 @@ final class SonarAppStore: ObservableObject {
                         text: m.content,
                         time: Self.clock(m.createdAt),
                         via: .internet,
+                        state: MarmotChatModel.stateText(for: m),
                         media: Self.mediaItems(m, groupId: group.id)
                     ))
                 }
@@ -1952,10 +1958,100 @@ final class SonarAppStore: ObservableObject {
     /// Blossom URL. Cleared by `wipe()` and `eraseAllChats()`.
     private var mediaImageCache: [String: Data] = [:]
 
+    private struct PendingUploadMedia {
+        let localURL: String
+        let data: Data
+        let startedAt: Date
+    }
+
+    /// Bytes for uploads we just started, keyed by group/filename/mime/caption.
+    /// When the canonical Marmot message appears, these bytes are copied under
+    /// the real Blossom URL so the sent bubble does not briefly fall back to a
+    /// download spinner.
+    private var pendingUploadMediaCache: [String: [PendingUploadMedia]] = [:]
+    private static let pendingMediaURLPrefix = "pending-media-"
+
     /// Map a Marmot message's attachments into UI items carrying the group id.
     static func mediaItems(_ m: MarmotService.MarmotMessage, groupId: String) -> [SNMediaItem] {
         m.media.map {
             SNMediaItem(url: $0.url, mime: $0.mimeType, filename: $0.filename, groupId: groupId)
+        }
+    }
+
+    private static func pendingMediaURL() -> String {
+        pendingMediaURLPrefix + UUID().uuidString
+    }
+
+    private static func pendingUploadMediaKey(
+        groupId: String,
+        filename: String,
+        mime: String,
+        caption: String
+    ) -> String {
+        [groupId, filename, mime, caption].joined(separator: "\u{1f}")
+    }
+
+    private func rememberPendingUploadMedia(
+        groupId: String,
+        filename: String,
+        mime: String,
+        caption: String,
+        localURL: String,
+        data: Data
+    ) {
+        let key = Self.pendingUploadMediaKey(groupId: groupId, filename: filename, mime: mime, caption: caption)
+        pendingUploadMediaCache[key, default: []].append(
+            PendingUploadMedia(localURL: localURL, data: data, startedAt: Date())
+        )
+        mediaImageCache[localURL] = data
+    }
+
+    private func forgetPendingUploadMedia(
+        groupId: String,
+        filename: String,
+        mime: String,
+        caption: String,
+        localURL: String
+    ) {
+        let key = Self.pendingUploadMediaKey(groupId: groupId, filename: filename, mime: mime, caption: caption)
+        guard var pending = pendingUploadMediaCache[key] else { return }
+        pending.removeAll { $0.localURL == localURL }
+        if pending.isEmpty {
+            pendingUploadMediaCache.removeValue(forKey: key)
+        } else {
+            pendingUploadMediaCache[key] = pending
+        }
+    }
+
+    private func cachePublishedUploadMedia() {
+        guard !pendingUploadMediaCache.isEmpty else { return }
+        for (groupId, messages) in marmot.messagesByGroup {
+            for message in messages where message.isMine {
+                for media in message.media
+                    where !media.url.hasPrefix(Self.pendingMediaURLPrefix) && mediaImageCache[media.url] == nil {
+                    let key = Self.pendingUploadMediaKey(
+                        groupId: groupId,
+                        filename: media.filename,
+                        mime: media.mimeType,
+                        caption: message.content
+                    )
+                    guard var pending = pendingUploadMediaCache[key], !pending.isEmpty else { continue }
+                    guard let index = pending.firstIndex(where: {
+                        message.createdAt >= $0.startedAt.addingTimeInterval(-30)
+                    }) else { continue }
+                    let upload = pending.remove(at: index)
+                    mediaImageCache[media.url] = upload.data
+                    mediaImageCache.removeValue(forKey: upload.localURL)
+                    if let disk = Self.mediaCacheURL(for: media.url) {
+                        try? upload.data.write(to: disk, options: [.atomic, .completeFileProtection])
+                    }
+                    if pending.isEmpty {
+                        pendingUploadMediaCache.removeValue(forKey: key)
+                    } else {
+                        pendingUploadMediaCache[key] = pending
+                    }
+                }
+            }
         }
     }
 
@@ -1999,7 +2095,31 @@ final class SonarAppStore: ObservableObject {
             groupId = nil
         }
         guard let gid = groupId else { return }
-        marmot.sendMedia(groupId: gid, data: data, filename: filename, mime: mime)
+        let pendingURL = Self.pendingMediaURL()
+        rememberPendingUploadMedia(
+            groupId: gid,
+            filename: filename,
+            mime: mime,
+            caption: "",
+            localURL: pendingURL,
+            data: data
+        )
+        marmot.sendMedia(
+            groupId: gid,
+            data: data,
+            filename: filename,
+            mime: mime,
+            localPreviewURL: pendingURL,
+            onFailure: { [weak self] in
+                self?.forgetPendingUploadMedia(
+                    groupId: gid,
+                    filename: filename,
+                    mime: mime,
+                    caption: "",
+                    localURL: pendingURL
+                )
+            }
+        )
     }
 
     /// Send a desktop-selected attachment. White Noise can preserve the source
@@ -2026,11 +2146,32 @@ final class SonarAppStore: ObservableObject {
         guard let gid = groupId else { return false }
 
         let finalName = (filename as NSString).lastPathComponent
+        let safeName = finalName.isEmpty ? "attachment" : finalName
+        let safeMime = mime.isEmpty ? "application/octet-stream" : mime
+        let pendingURL = Self.pendingMediaURL()
+        rememberPendingUploadMedia(
+            groupId: gid,
+            filename: safeName,
+            mime: safeMime,
+            caption: "",
+            localURL: pendingURL,
+            data: data
+        )
         marmot.sendMedia(
             groupId: gid,
             data: data,
-            filename: finalName.isEmpty ? "attachment" : finalName,
-            mime: mime.isEmpty ? "application/octet-stream" : mime
+            filename: safeName,
+            mime: safeMime,
+            localPreviewURL: pendingURL,
+            onFailure: { [weak self] in
+                self?.forgetPendingUploadMedia(
+                    groupId: gid,
+                    filename: safeName,
+                    mime: safeMime,
+                    caption: "",
+                    localURL: pendingURL
+                )
+            }
         )
         return true
     }
@@ -2056,7 +2197,31 @@ final class SonarAppStore: ObservableObject {
             groupId = nil
         }
         guard let gid = groupId else { return }
-        marmot.sendMedia(groupId: gid, data: data, filename: url.lastPathComponent, mime: "audio/mp4")
+        let pendingURL = Self.pendingMediaURL()
+        rememberPendingUploadMedia(
+            groupId: gid,
+            filename: url.lastPathComponent,
+            mime: "audio/mp4",
+            caption: "",
+            localURL: pendingURL,
+            data: data
+        )
+        marmot.sendMedia(
+            groupId: gid,
+            data: data,
+            filename: url.lastPathComponent,
+            mime: "audio/mp4",
+            localPreviewURL: pendingURL,
+            onFailure: { [weak self] in
+                self?.forgetPendingUploadMedia(
+                    groupId: gid,
+                    filename: url.lastPathComponent,
+                    mime: "audio/mp4",
+                    caption: "",
+                    localURL: pendingURL
+                )
+            }
+        )
     }
 
     /// Send an image over the BLE mesh by reusing ChatViewModel's bitchat file
@@ -2097,27 +2262,60 @@ final class SonarAppStore: ObservableObject {
     /// Bytes for a media attachment: a local file (BLE-mesh) or download+decrypt
     /// from Blossom (Marmot), cached by URL.
     func mediaData(_ item: SNMediaItem) async -> Data? {
+        let logId = Self.mediaLogId(for: item)
         if let path = item.localPath {
-            return try? Data(contentsOf: URL(fileURLWithPath: path))
+            do {
+                let data = try Data(contentsOf: URL(fileURLWithPath: path))
+                SecureLogger.info("SonarMedia[\(logId)]: local file hit bytes=\(data.count) name=\(item.filename) mime=\(item.mime)", category: .session)
+                return data
+            } catch {
+                SecureLogger.warning("SonarMedia[\(logId)]: local file read failed name=\(item.filename) mime=\(item.mime) error=\(error.localizedDescription)", category: .session)
+                return nil
+            }
         }
-        if let cached = mediaImageCache[item.url] { return cached }
+        if let cached = mediaImageCache[item.url] {
+            SecureLogger.info("SonarMedia[\(logId)]: memory cache hit bytes=\(cached.count) name=\(item.filename) mime=\(item.mime)", category: .session)
+            return cached
+        }
         // Persistent on-disk cache: a decrypted blob survives relaunch and, on a
         // hit, returns WITHOUT touching the serialized Marmot FFI queue — so it
         // can never queue behind an in-flight sync (the cause of slow media).
         if let disk = Self.mediaCacheURL(for: item.url),
-           let data = try? Data(contentsOf: disk) {
-            mediaImageCache[item.url] = data
-            return data
+           FileManager.default.fileExists(atPath: disk.path) {
+            do {
+                let data = try Data(contentsOf: disk)
+                mediaImageCache[item.url] = data
+                SecureLogger.info("SonarMedia[\(logId)]: disk cache hit bytes=\(data.count) name=\(item.filename) mime=\(item.mime)", category: .session)
+                return data
+            } catch {
+                SecureLogger.warning("SonarMedia[\(logId)]: disk cache read failed name=\(item.filename) mime=\(item.mime) error=\(error.localizedDescription)", category: .session)
+            }
         }
+        SecureLogger.info("SonarMedia[\(logId)]: remote fetch start name=\(item.filename) mime=\(item.mime)", category: .session)
         guard let data = await marmot.fetchMedia(groupId: item.groupId, url: item.url) else {
+            SecureLogger.warning("SonarMedia[\(logId)]: remote fetch returned no data name=\(item.filename) mime=\(item.mime)", category: .session)
             return nil
         }
         mediaImageCache[item.url] = data
+        SecureLogger.info("SonarMedia[\(logId)]: remote fetch hit bytes=\(data.count) name=\(item.filename) mime=\(item.mime)", category: .session)
         // Write-through to disk, protected at rest like MessageStore plaintext.
         if let disk = Self.mediaCacheURL(for: item.url) {
-            try? data.write(to: disk, options: [.atomic, .completeFileProtection])
+            do {
+                try data.write(to: disk, options: [.atomic, .completeFileProtection])
+            } catch {
+                SecureLogger.warning("SonarMedia[\(logId)]: disk cache write failed name=\(item.filename) mime=\(item.mime) error=\(error.localizedDescription)", category: .session)
+            }
         }
         return data
+    }
+
+    private static func mediaLogId(for item: SNMediaItem) -> String {
+        let key = item.localPath ?? item.url
+        guard !key.isEmpty else { return "empty" }
+        return SHA256.hash(data: Data(key.utf8))
+            .prefix(8)
+            .map { String(format: "%02x", $0) }
+            .joined()
     }
 
     /// `<AppSupport>/media-cache/<sha256(url)>` — content-addressed by the
@@ -3047,6 +3245,7 @@ final class SonarAppStore: ObservableObject {
         payLedger.wipe()
         paymentActivityLedger.wipe()
         mediaImageCache = [:]
+        pendingUploadMediaCache = [:]
         clearMediaDiskCache()
         objectWillChange.send()
     }
@@ -3098,6 +3297,7 @@ final class SonarAppStore: ObservableObject {
         payLedger.wipe()
         paymentActivityLedger.wipe()
         mediaImageCache = [:]
+        pendingUploadMediaCache = [:]
         clearMediaDiskCache()
         scannedPayMessageIDs = []
         pendingPayPeer = nil
