@@ -1,0 +1,242 @@
+//
+// SonarStickers.swift
+// bitchat
+//
+// Native sticker models mirror core/sonar-stickers. UI remains feature-gated
+// until install, picker, send, receive, and render parity exists on every app.
+//
+// This is free and unencumbered software released into the public domain.
+// For more information, see <https://unlicense.org>
+//
+
+import Foundation
+
+enum SonarStickers {
+    static let featureFlagKey = "sonar.stickers.enabled"
+    static let enabledByDefault = false
+    static let messageMarker = "[sonar-sticker-v1]"
+
+    static func isEnabled(defaults: UserDefaults = .standard) -> Bool {
+        guard defaults.object(forKey: featureFlagKey) != nil else { return enabledByDefault }
+        return defaults.bool(forKey: featureFlagKey)
+    }
+
+    static func buildChatMessage(_ stickerRef: SonarStickerRef) -> String {
+        "[sticker] \(messageMarker) pack=\(stickerRef.pack.coordinate) shortcode=\(stickerRef.shortcode) sha256=\(stickerRef.plaintextSha256)"
+    }
+
+    static func parseChatMessage(_ content: String) -> SonarStickerRef? {
+        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("[sticker]") else { return nil }
+        var rest = String(trimmed.dropFirst("[sticker]".count)).trimmingCharacters(in: .whitespaces)
+        guard rest.hasPrefix(messageMarker) else { return nil }
+        rest = String(rest.dropFirst(messageMarker.count)).trimmingCharacters(in: .whitespaces)
+        let fields = rest.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+        guard fields.count == 3,
+              let packValue = fields[0].stripPrefix("pack="),
+              let shortcode = fields[1].stripPrefix("shortcode="),
+              let sha256 = fields[2].stripPrefix("sha256="),
+              let pack = SonarStickerPackAddress.parse(packValue)
+        else { return nil }
+        return SonarStickerRef(pack: pack, shortcode: shortcode, plaintextSha256: sha256)
+    }
+}
+
+struct SonarStickerPackAddress: Codable, Equatable, Hashable {
+    let authorPubkeyHex: String
+    let identifier: String
+
+    var coordinate: String {
+        "30030:\(authorPubkeyHex):\(identifier)"
+    }
+
+    init?(authorPubkeyHex: String, identifier: String) {
+        let pubkey = authorPubkeyHex.lowercased()
+        guard pubkey.isHex(count: 64), identifier.isStickerIdentifier else { return nil }
+        self.authorPubkeyHex = pubkey
+        self.identifier = identifier
+    }
+
+    static func parse(_ value: String) -> SonarStickerPackAddress? {
+        let parts = value.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
+        guard parts.count == 3, parts[0] == "30030" else { return nil }
+        return SonarStickerPackAddress(authorPubkeyHex: parts[1], identifier: parts[2])
+    }
+}
+
+struct SonarSticker: Codable, Equatable, Hashable {
+    let shortcode: String
+    let url: String
+    let sha256: String
+    let mime: String
+    let width: Int?
+    let height: Int?
+    let alt: String?
+    let emoji: String?
+
+    init?(
+        shortcode: String,
+        url: String,
+        sha256: String,
+        mime: String,
+        width: Int? = nil,
+        height: Int? = nil,
+        alt: String? = nil,
+        emoji: String? = nil
+    ) {
+        let cleanHash = sha256.lowercased()
+        let cleanMime = mime.lowercased()
+        guard shortcode.isStickerShortcode,
+              cleanHash.isHex(count: 64),
+              Self.allowedMimes.contains(cleanMime),
+              Self.isBlossomHttpsUrl(url, sha256: cleanHash),
+              Self.validDimensions(width: width, height: height),
+              (alt?.count ?? 0) <= 160,
+              (emoji?.count ?? 0) <= 8
+        else { return nil }
+        self.shortcode = shortcode
+        self.url = url
+        self.sha256 = cleanHash
+        self.mime = cleanMime
+        self.width = width
+        self.height = height
+        self.alt = alt?.nilIfBlank
+        self.emoji = emoji?.nilIfBlank
+    }
+
+    private static let allowedMimes: Set<String> = ["image/webp", "image/png", "image/apng", "image/gif"]
+
+    private static func validDimensions(width: Int?, height: Int?) -> Bool {
+        switch (width, height) {
+        case (nil, nil):
+            return true
+        case let (w?, h?):
+            return (1...4096).contains(w) && (1...4096).contains(h)
+        default:
+            return false
+        }
+    }
+
+    private static func isBlossomHttpsUrl(_ value: String, sha256: String) -> Bool {
+        guard let components = URLComponents(string: value),
+              components.scheme == "https",
+              components.host != nil
+        else { return false }
+        return components.path.lowercased().contains(sha256)
+    }
+}
+
+struct SonarStickerPack: Codable, Equatable {
+    let address: SonarStickerPackAddress
+    let title: String
+    let description: String?
+    let cover: SonarSticker?
+    let stickers: [SonarSticker]
+    let license: String?
+
+    init?(
+        address: SonarStickerPackAddress,
+        title: String,
+        description: String? = nil,
+        cover: SonarSticker? = nil,
+        stickers: [SonarSticker],
+        license: String? = nil
+    ) {
+        let cleanTitle = title.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        guard (1...80).contains(cleanTitle.count),
+              stickers.count > 0,
+              stickers.count <= 200,
+              (description?.count ?? 0) <= 500
+        else { return nil }
+        var shortcodes = Set<String>()
+        var hashes = Set<String>()
+        for sticker in stickers {
+            guard shortcodes.insert(sticker.shortcode).inserted,
+                  hashes.insert(sticker.sha256).inserted
+            else { return nil }
+        }
+        self.address = address
+        self.title = cleanTitle
+        self.description = description?.nilIfBlank
+        self.cover = cover
+        self.stickers = stickers
+        self.license = license?.nilIfBlank
+    }
+
+    func sticker(shortcode: String) -> SonarSticker? {
+        stickers.first { $0.shortcode == shortcode }
+    }
+}
+
+struct SonarStickerRef: Codable, Equatable, Hashable {
+    let pack: SonarStickerPackAddress
+    let shortcode: String
+    let plaintextSha256: String
+
+    init?(pack: SonarStickerPackAddress, shortcode: String, plaintextSha256: String) {
+        let cleanHash = plaintextSha256.lowercased()
+        guard shortcode.isStickerShortcode, cleanHash.isHex(count: 64) else { return nil }
+        self.pack = pack
+        self.shortcode = shortcode
+        self.plaintextSha256 = cleanHash
+    }
+}
+
+enum SonarStickerResolution: Equatable {
+    case resolved(SonarSticker)
+    case missingPack
+    case missingSticker
+    case hashMismatch
+}
+
+final class SonarStickerStore {
+    private var packsByCoordinate: [String: SonarStickerPack] = [:]
+
+    var installedPacks: [SonarStickerPack] {
+        packsByCoordinate.values.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
+    }
+
+    func install(_ pack: SonarStickerPack) {
+        packsByCoordinate[pack.address.coordinate] = pack
+    }
+
+    func remove(_ address: SonarStickerPackAddress) {
+        packsByCoordinate.removeValue(forKey: address.coordinate)
+    }
+
+    func resolve(_ stickerRef: SonarStickerRef) -> SonarStickerResolution {
+        guard let pack = packsByCoordinate[stickerRef.pack.coordinate] else { return .missingPack }
+        guard let sticker = pack.sticker(shortcode: stickerRef.shortcode) else { return .missingSticker }
+        guard sticker.sha256 == stickerRef.plaintextSha256 else { return .hashMismatch }
+        return .resolved(sticker)
+    }
+}
+
+private extension String {
+    func stripPrefix(_ prefix: String) -> String? {
+        hasPrefix(prefix) ? String(dropFirst(prefix.count)) : nil
+    }
+
+    var isStickerShortcode: Bool {
+        !isEmpty && utf8.count <= 64 && utf8.allSatisfy { byte in
+            (48...57).contains(byte) || (65...90).contains(byte) || (97...122).contains(byte) || byte == 95
+        }
+    }
+
+    var isStickerIdentifier: Bool {
+        !isEmpty && utf8.count <= 80 && utf8.allSatisfy { byte in
+            (48...57).contains(byte) || (65...90).contains(byte) || (97...122).contains(byte) || byte == 45 || byte == 46 || byte == 95
+        }
+    }
+
+    func isHex(count expectedCount: Int) -> Bool {
+        count == expectedCount && utf8.allSatisfy { byte in
+            (48...57).contains(byte) || (65...70).contains(byte) || (97...102).contains(byte)
+        }
+    }
+
+    var nilIfBlank: String? {
+        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+}
