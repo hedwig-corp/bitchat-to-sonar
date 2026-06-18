@@ -824,7 +824,7 @@ impl SonarClient {
 
         let mut published_welcomes = 0usize;
         for wrapped in wrapped_welcomes {
-            if let Err(err) = self.nostr.send_event(&wrapped).await {
+            if let Err(err) = self.publish_marmot_event(&wrapped, "group welcome").await {
                 if published_welcomes == 0 {
                     self.discard_unpublished_group_creation(&group_id);
                 } else {
@@ -869,7 +869,10 @@ impl SonarClient {
             }
         }
 
-        if let Err(err) = self.nostr.send_event(&update.evolution_event).await {
+        if let Err(err) = self
+            .publish_marmot_event(&update.evolution_event, "membership update")
+            .await
+        {
             if requires_commit_merge {
                 let _ = self.engine.clear_pending_commit(&group_id);
             }
@@ -877,7 +880,10 @@ impl SonarClient {
         }
 
         for wrapped in wrapped_welcomes {
-            if let Err(err) = self.nostr.send_event(&wrapped).await {
+            if let Err(err) = self
+                .publish_marmot_event(&wrapped, "membership welcome")
+                .await
+            {
                 tracing::debug!(
                     %err,
                     ?group_id,
@@ -894,6 +900,11 @@ impl SonarClient {
             tracing::debug!(%err, "marmot group live resubscribe failed after membership update");
         }
         Ok(())
+    }
+
+    async fn publish_marmot_event(&self, event: &Event, context: &'static str) -> Result<()> {
+        let output = self.nostr.send_event(event).await?;
+        require_relay_success(&output, context)
     }
 
     /// Add members to an existing group.
@@ -1770,9 +1781,42 @@ fn sort_marmot_events_in_place(events: &mut [Event]) {
     });
 }
 
+fn require_relay_success(
+    output: &nostr_sdk::pool::Output<EventId>,
+    context: &'static str,
+) -> Result<()> {
+    if !output.success.is_empty() {
+        if !output.failed.is_empty() {
+            tracing::debug!(
+                context,
+                success_count = output.success.len(),
+                failed_count = output.failed.len(),
+                "nostr publish partially succeeded"
+            );
+        }
+        return Ok(());
+    }
+
+    let failures = if output.failed.is_empty() {
+        "no relay accepted the event".to_string()
+    } else {
+        output
+            .failed
+            .iter()
+            .map(|(relay, reason)| format!("{relay:?}: {reason}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    Err(Error::NostrPublish(format!(
+        "{context}: no relay accepted event {} ({failures})",
+        output.val
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{HashMap, HashSet};
 
     fn signed_event(keys: &Keys, created_at_secs: u64, content: &str) -> Event {
         EventBuilder::new(Kind::MlsGroupMessage, content)
@@ -1870,5 +1914,26 @@ mod tests {
         state.rewind_for_retry(900);
 
         assert_eq!(state.watermark_secs(), 900 - SYNC_OVERLAP_SECS);
+    }
+
+    #[test]
+    fn relay_publish_requires_at_least_one_successful_relay() {
+        let relay = RelayUrl::parse("wss://relay.example.com").expect("relay url");
+        let accepted = nostr_sdk::pool::Output {
+            val: EventId::all_zeros(),
+            success: HashSet::from([relay.clone()]),
+            failed: HashMap::new(),
+        };
+        assert!(require_relay_success(&accepted, "test publish").is_ok());
+
+        let rejected = nostr_sdk::pool::Output {
+            val: EventId::all_zeros(),
+            success: HashSet::new(),
+            failed: HashMap::from([(relay, "blocked".to_string())]),
+        };
+        let err = require_relay_success(&rejected, "test publish").expect_err("must fail");
+        assert!(err
+            .to_string()
+            .contains("test publish: no relay accepted event"));
     }
 }
