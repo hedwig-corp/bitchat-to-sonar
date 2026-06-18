@@ -13,7 +13,6 @@
 
 import SwiftUI
 import PhotosUI
-import UniformTypeIdentifiers
 
 struct SonarDMScreen: View {
     @EnvironmentObject private var store: SonarAppStore
@@ -143,12 +142,17 @@ struct SonarDMScreen: View {
                 }
             }
         }
-        .photosPicker(isPresented: $pickPhoto, selection: $photoItem, matching: .images)
+        .photosPicker(
+            isPresented: $pickPhoto,
+            selection: $photoItem,
+            matching: .images,
+            preferredItemEncoding: .current
+        )
         .onChange(of: photoItem) { item in
             guard let item else { return }
             Task {
                 guard let data = try? await item.loadTransferable(type: Data.self) else { return }
-                let isGif = item.supportedContentTypes.contains { $0.conforms(to: .gif) } || data.snIsGif
+                let isGif = data.snIsGif
                 if isGif {
                     await MainActor.run {
                         _ = store.sendAttachment(peerId, data: data, filename: "animation.gif", mime: "image/gif")
