@@ -119,7 +119,7 @@ struct SonarSticker: Codable, Equatable, Hashable {
 
     private static func isBlossomHttpsUrl(_ value: String, sha256: String) -> Bool {
         guard let components = URLComponents(string: value),
-              components.scheme == "https",
+              components.scheme?.lowercased() == "https",
               components.host != nil
         else { return false }
         return components.path.lowercased().contains(sha256)

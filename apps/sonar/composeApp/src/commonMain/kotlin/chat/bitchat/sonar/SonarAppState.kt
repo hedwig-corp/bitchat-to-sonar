@@ -49,7 +49,6 @@ private fun messagePreview(content: String): String {
     if (content.trimStart().startsWith("☎CALL") && SonarCore.callParseControl(content) != null) {
         return "Voice call"
     }
-    if (SonarStickers.parseChatMessageOrNull(content) != null) return "Sticker"
     return if (PayLine.decode(content) != null) "₿ Payment" else content
 }
 

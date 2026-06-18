@@ -1368,6 +1368,7 @@ private fun StickerBubble(
                 fontSize = 30.sp,
                 fontWeight = FontWeight.Bold,
                 maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
             )
             Text(
                 title,
@@ -1376,6 +1377,7 @@ private fun StickerBubble(
                 fontWeight = FontWeight.SemiBold,
                 textAlign = TextAlign.Center,
                 maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
             )
         }
     }

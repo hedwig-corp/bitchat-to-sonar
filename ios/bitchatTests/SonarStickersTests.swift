@@ -73,6 +73,14 @@ struct SonarStickersTests {
             width: 512,
             height: 512
         ) == nil)
+        #expect(SonarSticker(
+            shortcode: "upper_https",
+            url: "HTTPS://blossom.example/stickers/\(hashA)/upper.webp",
+            sha256: hashA,
+            mime: "image/webp",
+            width: 512,
+            height: 512
+        ) != nil)
         #expect(SonarStickerPack(
             address: address,
             title: "Duplicate shortcode",
