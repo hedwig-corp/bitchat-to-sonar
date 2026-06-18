@@ -32,7 +32,10 @@ data class SonarMsg(
     val media: List<SonarMedia> = emptyList(),
     /// Local UI send state. Protocol receipts are not persisted here yet.
     val state: String? = null,
-)
+) {
+    val stickerRef: SonarStickerRef?
+        get() = SonarStickers.parseChatMessageOrNull(content)
+}
 
 /** A reference to an encrypted media attachment. [url] is the Blossom URL of the
  *  CIPHERTEXT; call [SonarCore.fetchMedia] to download + decrypt. */

@@ -49,6 +49,7 @@ private fun messagePreview(content: String): String {
     if (content.trimStart().startsWith("☎CALL") && SonarCore.callParseControl(content) != null) {
         return "Voice call"
     }
+    if (SonarStickers.parseChatMessageOrNull(content) != null) return "Sticker"
     return if (PayLine.decode(content) != null) "₿ Payment" else content
 }
 
@@ -120,6 +121,9 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Public Sonar descriptors by raw npub hex, used for out-of-BLE call parity. */
     var sonarDescriptorsByNpubHex by mutableStateOf<Map<String, SonarDescriptor>>(emptyMap())
         private set
+    var stickersEnabled by mutableStateOf(SONAR_STICKERS_ENABLED_BY_DEFAULT)
+        private set
+    val stickerStore = SonarStickerStore()
     private val sonarDescriptorFetches = mutableSetOf<String>()
     private val sonarDescriptorFetchedAt = mutableMapOf<String, Long>()
     private val sonarDescriptorMissedAt = mutableMapOf<String, Long>()

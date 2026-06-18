@@ -6,6 +6,7 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -738,6 +739,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                         // message went over mesh ⇒ cyan; otherwise indigo (internet).
                         val msgMesh = isMeshRoute && !m.viaInternet
                         val pay = PayLine.decode(m.content) as? PayLine.Pay
+                        val stickerRef = m.stickerRef
                         if (pay != null) {
                             val status = run { state.payVersion; state.payStatus(pay.uuid) }
                             PayBubble(m, pay, status, peerName, mesh = msgMesh, fiatOf = { state.fiatOrNull(it) }) {
@@ -753,6 +755,8 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                                 showState = m.mine && i == feed.lastIndex,
                                 onOpen = { mediaViewer = it }
                             )
+                        } else if (state.stickersEnabled && stickerRef != null) {
+                            StickerBubble(m, state.stickerStore.resolve(stickerRef), mesh = msgMesh)
                         } else MessageBubble(
                             m,
                             msgMesh,
@@ -1321,6 +1325,59 @@ private fun MessageStatusFooter(m: SonarMsg, mesh: Boolean) {
             color = if (failed) s.danger else s.text3,
             fontSize = 11.sp,
         )
+    }
+}
+
+@Composable
+private fun StickerBubble(
+    m: SonarMsg,
+    resolution: SonarStickerResolution,
+    mesh: Boolean,
+) {
+    val s = sonar
+    val title = when (resolution.state) {
+        SonarStickerResolutionState.Resolved -> resolution.sticker?.alt ?: resolution.sticker?.shortcode ?: "Sticker"
+        SonarStickerResolutionState.MissingPack -> "Sticker pack unavailable"
+        SonarStickerResolutionState.MissingSticker -> "Sticker unavailable"
+        SonarStickerResolutionState.HashMismatch -> "Sticker changed"
+    }
+    val glyph = when (resolution.state) {
+        SonarStickerResolutionState.Resolved -> resolution.sticker?.emoji ?: resolution.sticker?.shortcode ?: "Sticker"
+        SonarStickerResolutionState.MissingPack -> "pack"
+        SonarStickerResolutionState.MissingSticker -> "sticker"
+        SonarStickerResolutionState.HashMismatch -> "hash"
+    }
+    val alignment = if (m.mine) Alignment.End else Alignment.Start
+    val border = if (mesh) s.accent else s.net
+    Column(
+        Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        horizontalAlignment = alignment,
+    ) {
+        Column(
+            Modifier.widthIn(max = 178.dp)
+                .clip(RoundedCornerShape(18.dp))
+                .background(s.surface2)
+                .border(1.dp, border.copy(alpha = 0.22f), RoundedCornerShape(18.dp))
+                .padding(14.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(
+                glyph,
+                color = s.text,
+                fontSize = 30.sp,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1,
+            )
+            Text(
+                title,
+                color = s.text2,
+                fontSize = 12.5.sp,
+                fontWeight = FontWeight.SemiBold,
+                textAlign = TextAlign.Center,
+                maxLines = 2,
+            )
+        }
     }
 }
 
