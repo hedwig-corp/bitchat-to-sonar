@@ -1360,7 +1360,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         messages = meshChats[peerId].orEmpty() // immediate mesh view; Marmot leg merges in async
         processPayLines(id, messages)
         scope.launch {
-            refreshOpenDm(peerId)
+            refreshOpenDm(peerId) // hydrate local Marmot transcript before chat list refresh
             refreshChats()
             // Reconcile the open transcript after chat-list refresh may discover
             // the peer's Marmot group mapping.

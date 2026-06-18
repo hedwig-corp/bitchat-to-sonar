@@ -8,6 +8,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
@@ -400,6 +401,7 @@ pub struct SonarClient {
     /// sync watermark could be advanced by membership/commit events before the
     /// transcript body was locally populated.
     initial_empty_transcript_backfills: Arc<Mutex<HashSet<String>>>,
+    initial_backfill_scanned: Arc<AtomicBool>,
     /// Whether to join geohash-nearest relays on subscribe (real sessions); off
     /// for in-memory/test sessions so they stay network-free against a MockRelay.
     allow_geo_relays: bool,
@@ -466,8 +468,8 @@ impl SonarClient {
         let marmot_notify = Arc::new(tokio::sync::Notify::new());
         let live_marmot_enabled = Arc::new(Mutex::new(false));
         let marmot_group_subscriptions = Arc::new(Mutex::new(HashSet::new()));
-        let initial_empty_transcript_backfills =
-            Arc::new(Mutex::new(Self::empty_transcript_group_ids(&engine)));
+        let initial_empty_transcript_backfills = Arc::new(Mutex::new(HashSet::new()));
+        let initial_backfill_scanned = Arc::new(AtomicBool::new(false));
 
         let handler_geo = geo.clone();
         let handler_dm = geo_dm.clone();
@@ -660,6 +662,7 @@ impl SonarClient {
             live_marmot_enabled,
             marmot_group_subscriptions,
             initial_empty_transcript_backfills,
+            initial_backfill_scanned,
             allow_geo_relays,
         };
         // Open the live Marmot subscriptions for real sessions. In-memory test
@@ -1305,9 +1308,10 @@ impl SonarClient {
             }
         }
         // Existing installs can have group/MLS rows locally while the chat
-        // transcript page is empty. Full-backfill those groups once on startup
-        // so old chats populate the encrypted DB instead of waiting on a slow
-        // relay refresh path after every open.
+        // transcript page is empty. Full-backfill those groups once. The scan
+        // is deferred from client construction to the first sync so it does not
+        // delay local-only first paint.
+        self.populate_empty_transcript_backfills_once();
         let empty_transcript_group_ids = self.take_initial_empty_transcript_backfills();
         for id in &empty_transcript_group_ids {
             match self.backfill_group(id).await {
@@ -1431,6 +1435,14 @@ impl SonarClient {
                 },
             )
             .collect()
+    }
+
+    fn populate_empty_transcript_backfills_once(&self) {
+        if self.initial_backfill_scanned.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let mut set = self.initial_empty_transcript_backfills.lock().unwrap();
+        *set = Self::empty_transcript_group_ids(&self.engine);
     }
 
     fn take_initial_empty_transcript_backfills(&self) -> Vec<String> {
