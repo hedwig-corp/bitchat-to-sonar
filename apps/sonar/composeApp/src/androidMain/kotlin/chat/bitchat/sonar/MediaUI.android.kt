@@ -10,6 +10,7 @@ import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.Composable
@@ -19,12 +20,14 @@ import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.core.content.FileProvider
+import kotlinx.coroutines.CancellableContinuation
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.util.UUID
+import kotlin.coroutines.resume
 
 private const val MEDIA_SHARE_CACHE_MAX_AGE_MS = 24L * 60L * 60L * 1000L
 
@@ -62,10 +65,25 @@ actual fun decodeImageBitmap(bytes: ByteArray): ImageBitmap? =
 @Composable
 actual fun rememberMediaActions(): MediaActions {
     val ctx = LocalContext.current
-    return remember(ctx) {
+    val scope = rememberCoroutineScope()
+    val legacySaver = remember(ctx) { LegacyDocumentSaver(ctx) }
+    val legacySaveLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        scope.launch {
+            legacySaver.complete(result.data?.data)
+        }
+    }
+    return remember(ctx, legacySaver, legacySaveLauncher) {
         MediaActions(
             share = { bytes, filename, mime -> shareMedia(ctx, bytes, filename, mime) },
-            save = { bytes, filename, mime -> saveMedia(ctx, bytes, filename, mime) },
+            save = { bytes, filename, mime ->
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    saveMedia(ctx, bytes, filename, mime)
+                } else {
+                    legacySaver.save(bytes, filename, mime, legacySaveLauncher)
+                }
+            },
             open = { bytes, filename, mime -> openMedia(ctx, bytes, filename, mime) },
         )
     }
@@ -107,15 +125,7 @@ private suspend fun openMedia(ctx: Context, bytes: ByteArray, filename: String, 
 private suspend fun saveMedia(ctx: Context, bytes: ByteArray, filename: String, mime: String): Boolean =
     withContext(Dispatchers.IO) {
         runCatching {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                saveMediaStore(ctx, bytes, filename, mime)
-            } else {
-                val dir = ctx.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
-                    ?: ctx.filesDir.resolve("downloads")
-                dir.mkdirs()
-                dir.resolve(safeFilename(filename)).writeBytes(bytes)
-                true
-            }
+            saveMediaStore(ctx, bytes, filename, mime)
         }.getOrDefault(false)
     }
 
@@ -173,6 +183,57 @@ private fun cacheUri(ctx: Context, bytes: ByteArray, filename: String): Uri? {
     file.writeBytes(bytes)
     return FileProvider.getUriForFile(ctx, "${ctx.packageName}.fileprovider", file)
 }
+
+private class LegacyDocumentSaver(private val ctx: Context) {
+    private var pending: PendingDocumentSave? = null
+
+    suspend fun save(
+        bytes: ByteArray,
+        filename: String,
+        mime: String,
+        launcher: ActivityResultLauncher<Intent>,
+    ): Boolean = withContext(Dispatchers.Main) {
+        kotlinx.coroutines.suspendCancellableCoroutine { continuation ->
+            pending?.continuation?.resume(false)
+            val request = PendingDocumentSave(bytes, continuation)
+            pending = request
+            continuation.invokeOnCancellation {
+                if (pending === request) pending = null
+            }
+            val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                type = mime.ifBlank { "*/*" }
+                putExtra(Intent.EXTRA_TITLE, safeFilename(filename))
+            }
+            runCatching { launcher.launch(intent) }.onFailure {
+                if (pending === request) pending = null
+                if (continuation.isActive) continuation.resume(false)
+            }
+        }
+    }
+
+    suspend fun complete(uri: Uri?) {
+        val request = pending ?: return
+        pending = null
+        if (uri == null) {
+            if (request.continuation.isActive) request.continuation.resume(false)
+            return
+        }
+        val ok = withContext(Dispatchers.IO) {
+            runCatching {
+                val output = ctx.contentResolver.openOutputStream(uri) ?: return@runCatching false
+                output.use { it.write(request.bytes) }
+                true
+            }.getOrDefault(false)
+        }
+        if (request.continuation.isActive) request.continuation.resume(ok)
+    }
+}
+
+private class PendingDocumentSave(
+    val bytes: ByteArray,
+    val continuation: CancellableContinuation<Boolean>,
+)
 
 private fun safeFilename(filename: String): String =
     filename.substringAfterLast('/').substringAfterLast('\\').ifBlank { "attachment" }

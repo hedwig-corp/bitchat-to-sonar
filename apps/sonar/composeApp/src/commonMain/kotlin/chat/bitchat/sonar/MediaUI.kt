@@ -18,6 +18,7 @@ expect fun decodeImageBitmap(bytes: ByteArray): ImageBitmap?
 
 /** Native actions for already-decrypted media bytes. */
 class MediaActions(
+    val canShare: Boolean = true,
     val share: suspend (bytes: ByteArray, filename: String, mime: String) -> Boolean,
     val save: suspend (bytes: ByteArray, filename: String, mime: String) -> Boolean,
     val open: suspend (bytes: ByteArray, filename: String, mime: String) -> Boolean,

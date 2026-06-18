@@ -94,7 +94,8 @@ actual fun decodeImageBitmap(bytes: ByteArray): ImageBitmap? =
 actual fun rememberMediaActions(): MediaActions =
     remember {
         MediaActions(
-            share = { bytes, filename, _ -> openTempMedia(bytes, filename) },
+            canShare = false,
+            share = { _, _, _ -> false },
             save = { bytes, filename, _ -> saveMediaFile(bytes, filename) },
             open = { bytes, filename, _ -> openTempMedia(bytes, filename) },
         )
