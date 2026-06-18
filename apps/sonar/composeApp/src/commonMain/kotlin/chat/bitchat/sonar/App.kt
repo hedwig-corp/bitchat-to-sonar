@@ -907,9 +907,10 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         onPhoto = { addSheet = false; pickPhoto() },
         onSticker = { addSheet = false; stickerSheet = true }
     )
+    val stickerStoreVersion = state.stickerStoreVersion
     if (stickerSheet) StickerPickerSheet(
-        packs = state.stickerStore.installedPacks,
-        recent = state.stickerStore.recentStickers,
+        packs = remember(stickerStoreVersion) { state.stickerStore.installedPacks },
+        recent = remember(stickerStoreVersion) { state.stickerStore.recentStickers },
         onPick = { pack, sticker ->
             stickerSheet = false
             state.sendSticker(screen.id, pack, sticker)

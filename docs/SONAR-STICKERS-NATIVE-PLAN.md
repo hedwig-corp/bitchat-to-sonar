@@ -50,14 +50,15 @@ This branch now covers the safe foundation for both native app surfaces:
 - bounded, SHA-256 verified sticker-byte cache primitives;
 - feature-gated received-sticker rendering with verified HTTPS asset fetch;
 - feature-gated picker and send flow for already installed packs on existing
-  White Noise/Marmot conversations.
-- bounded in-memory recent-sticker state shown in the native pickers.
+  White Noise/Marmot conversations;
+- bounded recent-sticker state shown in the native pickers;
+- validated persisted installed-pack and recent-sticker snapshots across app
+  relaunches.
 
 The feature must remain disabled until the remaining production gaps are closed:
 
 - pack install/import UI and fetch orchestration from `/stickers` links or
   Nostr pack events;
-- persistent recent-sticker state across app relaunches;
 - full native target builds and end-to-end install/pick/send/render tests.
 
 ## Patch Sequence

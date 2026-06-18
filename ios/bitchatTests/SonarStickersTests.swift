@@ -183,6 +183,36 @@ struct SonarStickersTests {
         #expect(store.recentStickers == [])
     }
 
+    @Test func storeSnapshotPersistsPacksAndOnlyValidRecents() throws {
+        let store = SonarStickerStore()
+        let pack = try #require(fixturePack())
+        let sticker = try #require(pack.sticker(shortcode: "cat_wave"))
+
+        store.install(pack)
+        #expect(store.recordRecent(pack: pack, sticker: sticker))
+
+        let data = try #require(store.snapshotData())
+        let restored = SonarStickerStore()
+
+        #expect(restored.restoreSnapshotData(data))
+        #expect(restored.installedPacks.map(\.address.coordinate) == [pack.address.coordinate])
+        #expect(restored.recentStickers.map(\.sticker.shortcode) == ["cat_wave"])
+
+        let staleJSON = try #require(String(data: data, encoding: .utf8))
+            .replacingOccurrences(
+                of: "\"plaintextSha256\":\"\(hashA)\"",
+                with: "\"plaintextSha256\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\""
+            )
+        let staleRecentStore = SonarStickerStore()
+
+        #expect(staleRecentStore.restoreSnapshotData(Data(staleJSON.utf8)))
+        #expect(staleRecentStore.installedPacks.map(\.address.coordinate) == [pack.address.coordinate])
+        #expect(staleRecentStore.recentStickers == [])
+
+        #expect(restored.restoreSnapshotData(Data("{}".utf8)) == false)
+        #expect(restored.installedPacks.map(\.address.coordinate) == [pack.address.coordinate])
+    }
+
     @Test func assetCacheStoresOnlyHashVerifiedBoundedStickerBytes() throws {
         let abcHash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         let sticker = try #require(fixtureSticker("abc", hash: abcHash))

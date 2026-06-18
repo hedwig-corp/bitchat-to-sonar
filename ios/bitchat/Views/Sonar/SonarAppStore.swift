@@ -311,6 +311,8 @@ final class SonarAppStore: ObservableObject {
         static let sonarProfiles = "sonar.peerProfiles.v1"
         /// Persisted local call-log rows ([conversation id: call records] JSON).
         static let callLogs = "sonar.callLogs.v1"
+        /// Persisted native sticker packs and recent picker refs.
+        static let stickerStore = "sonar.stickers.store.v1"
     }
 
     private static let maxStoredCallsPerConversation = 100
@@ -552,6 +554,7 @@ final class SonarAppStore: ObservableObject {
         // Restore persisted Sonar profiles so a peer's mesh + White Noise legs
         // stay folded into one conversation across restarts (before dmRows runs).
         hydrateSonarProfiles()
+        hydrateStickerStore()
 
         if onboarded {
             marmot.connectIfNeeded()
@@ -973,6 +976,29 @@ final class SonarAppStore: ObservableObject {
               let map = try? JSONDecoder().decode([String: SonarPeerProfile].self, from: data)
         else { return }
         sonarProfilesByFingerprint = map
+    }
+
+    private func persistStickerStore() {
+        guard let data = stickerStore.snapshotData() else { return }
+        defaults.set(data, forKey: Keys.stickerStore)
+        objectWillChange.send()
+    }
+
+    private func hydrateStickerStore() {
+        guard let data = defaults.data(forKey: Keys.stickerStore) else { return }
+        if stickerStore.restoreSnapshotData(data) {
+            objectWillChange.send()
+        }
+    }
+
+    func installStickerPack(_ pack: SonarStickerPack) {
+        stickerStore.install(pack)
+        persistStickerStore()
+    }
+
+    func removeStickerPack(_ address: SonarStickerPackAddress) {
+        stickerStore.remove(address)
+        persistStickerStore()
     }
 
     private static func loadCallLogs(from defaults: UserDefaults) -> [String: [SNCallRecord]] {
@@ -1966,7 +1992,9 @@ final class SonarAppStore: ObservableObject {
         guard let stickerRef = stickerStore.ref(for: sticker, in: pack) else { return }
         guard let groupId = stickerMarmotGroupId(id) else { return }
         marmot.send(SonarStickers.buildChatMessage(stickerRef), to: groupId)
-        stickerStore.recordRecent(pack: pack, sticker: sticker)
+        if stickerStore.recordRecent(pack: pack, sticker: sticker) {
+            persistStickerStore()
+        }
     }
 
     func stickerData(_ sticker: SonarSticker) async -> Data? {
@@ -3412,6 +3440,8 @@ final class SonarAppStore: ObservableObject {
         sonarProfiles = [:]
         sonarProfilesByFingerprint = [:]
         defaults.removeObject(forKey: Keys.sonarProfiles)
+        stickerStore.clear()
+        defaults.removeObject(forKey: Keys.stickerStore)
         // Stop scanning for Unify peers and clear the discovered list (no
         // secrets are stored, but the list must not survive a panic wipe).
         unify.stop()

@@ -163,6 +163,39 @@ class StickersTest {
     }
 
     @Test
+    fun storeSnapshotPersistsPacksAndOnlyValidRecents() {
+        val store = SonarStickerStore()
+        val pack = fixturePack()
+        val sticker = assertNotNull(pack.sticker("cat_wave"))
+
+        assertTrue(store.install(pack))
+        assertTrue(store.recordRecent(pack, sticker))
+
+        val snapshot = store.exportSnapshot()
+        val restored = SonarStickerStore()
+
+        assertTrue(restored.restoreSnapshot(snapshot))
+        assertEquals(listOf(pack.address.coordinate), restored.installedPacks.map { it.address.coordinate })
+        assertEquals(listOf("cat_wave"), restored.recentStickers.map { it.sticker.shortcode })
+
+        val staleRecentSnapshot = snapshot.lines().joinToString("\n") { line ->
+            if (line.startsWith("recent|")) {
+                line.substringBeforeLast('|') + "|dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+            } else {
+                line
+            }
+        }
+        val staleRecentStore = SonarStickerStore()
+
+        assertTrue(staleRecentStore.restoreSnapshot(staleRecentSnapshot))
+        assertEquals(listOf(pack.address.coordinate), staleRecentStore.installedPacks.map { it.address.coordinate })
+        assertEquals(emptyList(), staleRecentStore.recentStickers)
+
+        assertFalse(restored.restoreSnapshot("not-a-sticker-snapshot"))
+        assertEquals(listOf(pack.address.coordinate), restored.installedPacks.map { it.address.coordinate })
+    }
+
+    @Test
     fun byteCacheStoresOnlyHashVerifiedBoundedStickerBytes() {
         val abcHash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         val sticker = fixtureSticker("abc", abcHash)

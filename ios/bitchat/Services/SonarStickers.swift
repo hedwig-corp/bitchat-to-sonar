@@ -297,6 +297,12 @@ struct SonarStickerChoice: Equatable {
 }
 
 final class SonarStickerStore {
+    private struct Snapshot: Codable {
+        let version: Int
+        let packs: [SonarStickerPack]
+        let recentRefs: [SonarStickerRef]
+    }
+
     private var packsByCoordinate: [String: SonarStickerPack] = [:]
     private var recentRefs: [SonarStickerRef] = []
 
@@ -327,6 +333,11 @@ final class SonarStickerStore {
         recentRefs.removeAll { $0.pack.coordinate == address.coordinate }
     }
 
+    func clear() {
+        packsByCoordinate.removeAll()
+        recentRefs.removeAll()
+    }
+
     func resolve(_ stickerRef: SonarStickerRef) -> SonarStickerResolution {
         guard let pack = packsByCoordinate[stickerRef.pack.coordinate] else { return .missingPack }
         guard let sticker = pack.sticker(shortcode: stickerRef.shortcode) else { return .missingSticker }
@@ -354,6 +365,93 @@ final class SonarStickerStore {
             recentRefs.removeLast(recentRefs.count - SonarStickers.maxRecentStickers)
         }
         return true
+    }
+
+    func snapshotData() -> Data? {
+        let refs = recentStickers.compactMap { choice in
+            SonarStickerRef(
+                pack: choice.pack.address,
+                shortcode: choice.sticker.shortcode,
+                plaintextSha256: choice.sticker.sha256
+            )
+        }
+        return try? JSONEncoder().encode(Snapshot(version: 1, packs: installedPacks, recentRefs: refs))
+    }
+
+    @discardableResult
+    func restoreSnapshotData(_ data: Data) -> Bool {
+        guard let snapshot = try? JSONDecoder().decode(Snapshot.self, from: data),
+              snapshot.version == 1
+        else { return false }
+
+        var cleanPacks: [String: SonarStickerPack] = [:]
+        for pack in snapshot.packs {
+            guard let clean = Self.validatedPack(pack),
+                  cleanPacks[clean.address.coordinate] == nil
+            else { return false }
+            cleanPacks[clean.address.coordinate] = clean
+        }
+
+        var cleanRefs: [SonarStickerRef] = []
+        for ref in snapshot.recentRefs {
+            guard let cleanPackAddress = SonarStickerPackAddress(
+                authorPubkeyHex: ref.pack.authorPubkeyHex,
+                identifier: ref.pack.identifier
+            ),
+                  let cleanRef = SonarStickerRef(
+                pack: cleanPackAddress,
+                shortcode: ref.shortcode,
+                plaintextSha256: ref.plaintextSha256
+            ) else { return false }
+            guard cleanRefs.count < SonarStickers.maxRecentStickers else { break }
+            guard let pack = cleanPacks[cleanRef.pack.coordinate],
+                  let sticker = pack.sticker(shortcode: cleanRef.shortcode),
+                  sticker.sha256 == cleanRef.plaintextSha256,
+                  !cleanRefs.contains(cleanRef)
+            else { continue }
+            cleanRefs.append(cleanRef)
+        }
+
+        packsByCoordinate = cleanPacks
+        recentRefs = cleanRefs
+        return true
+    }
+
+    private static func validatedPack(_ pack: SonarStickerPack) -> SonarStickerPack? {
+        guard let address = SonarStickerPackAddress(
+            authorPubkeyHex: pack.address.authorPubkeyHex,
+            identifier: pack.address.identifier
+        ) else { return nil }
+        let cover: SonarSticker?
+        if let storedCover = pack.cover {
+            guard let cleanCover = validatedSticker(storedCover) else { return nil }
+            cover = cleanCover
+        } else {
+            cover = nil
+        }
+        let stickers = pack.stickers.compactMap(validatedSticker)
+        guard stickers.count == pack.stickers.count else { return nil }
+        return SonarStickerPack(
+            address: address,
+            title: pack.title,
+            description: pack.description,
+            cover: cover,
+            stickers: stickers,
+            license: pack.license
+        )
+    }
+
+    private static func validatedSticker(_ sticker: SonarSticker) -> SonarSticker? {
+        SonarSticker(
+            shortcode: sticker.shortcode,
+            url: sticker.url,
+            sha256: sticker.sha256,
+            mime: sticker.mime,
+            width: sticker.width,
+            height: sticker.height,
+            alt: sticker.alt,
+            emoji: sticker.emoji
+        )
     }
 }
 

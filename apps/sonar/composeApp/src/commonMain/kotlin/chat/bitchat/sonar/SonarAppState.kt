@@ -21,6 +21,7 @@ import kotlinx.coroutines.launch
 
 private const val SONAR_DESCRIPTOR_TTL_SECS = 15 * 60L
 private const val SONAR_DESCRIPTOR_MISS_TTL_SECS = 60L
+private const val SONAR_STICKER_STORE_BLOB_KEY = "stickers.store.v1"
 
 sealed interface Screen {
     data object Home : Screen
@@ -123,6 +124,8 @@ class SonarAppState(private val scope: CoroutineScope) {
     var stickersEnabled by mutableStateOf(SONAR_STICKERS_ENABLED_BY_DEFAULT)
         private set
     val stickerStore = SonarStickerStore()
+    var stickerStoreVersion by mutableStateOf(0)
+        private set
     private val stickerByteCache = SonarStickerByteCache()
     private val sonarDescriptorFetches = mutableSetOf<String>()
     private val sonarDescriptorFetchedAt = mutableMapOf<String, Long>()
@@ -132,6 +135,10 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     var dark by mutableStateOf(SonarCore.isDark())
         private set
+
+    init {
+        hydrateStickerStore()
+    }
 
     fun push(s: Screen) { stack = stack + s }
     fun toggleDark() { dark = !dark; SonarCore.setDark(dark) }
@@ -149,6 +156,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             sonarDescriptorFetches.clear(); sonarDescriptorFetchedAt.clear(); sonarDescriptorMissedAt.clear()
             MessageStore.wipe()
             SonarCore.wipe()
+            stickerStore.clear(); stickerStoreVersion++
             stack = listOf(Screen.Home)
             chats = emptyList(); groupInvites = emptyList(); messages = emptyList()
             onboarded = false; nick = ""; npub = ""; started = false
@@ -1083,6 +1091,35 @@ class SonarAppState(private val scope: CoroutineScope) {
         prefsVersion++
     }
 
+    private fun hydrateStickerStore() {
+        val snapshot = SonarCore.loadBlob(SONAR_STICKER_STORE_BLOB_KEY)
+        if (snapshot.isNotBlank() && stickerStore.restoreSnapshot(snapshot)) {
+            stickerStoreVersion++
+        }
+    }
+
+    private fun persistStickerStore() {
+        SonarCore.saveBlob(SONAR_STICKER_STORE_BLOB_KEY, stickerStore.exportSnapshot())
+        stickerStoreVersion++
+    }
+
+    fun installStickerPack(pack: SonarStickerPack): Boolean {
+        val installed = stickerStore.install(pack)
+        if (installed) persistStickerStore()
+        return installed
+    }
+
+    fun removeStickerPack(address: SonarStickerPackAddress) {
+        stickerStore.remove(address)
+        persistStickerStore()
+    }
+
+    private fun recordRecentSticker(pack: SonarStickerPack, sticker: SonarSticker) {
+        if (stickerStore.recordRecent(pack, sticker)) {
+            persistStickerStore()
+        }
+    }
+
     /** Count of chats the user has marked verified (for the Settings row). */
     fun verifiedCount(): Int = chats.count { isVerified(it.id) }
 
@@ -1481,7 +1518,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         scope.launch {
             try {
                 SonarCore.send(groupId, message)
-                stickerStore.recordRecent(pack, sticker)
+                recordRecentSticker(pack, sticker)
                 refreshOpenStickerChat(chatId, groupId)
             } catch (e: Throwable) {
                 toast = "couldn't send sticker: ${e.message}"
