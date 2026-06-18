@@ -43,6 +43,9 @@ data class SonarMedia(
     val durationMs: Long?,
 ) {
     val isImage: Boolean get() = mimeType.startsWith("image/")
+    val isGif: Boolean get() =
+        mimeType.equals("image/gif", ignoreCase = true) ||
+            filename.endsWith(".gif", ignoreCase = true)
 }
 
 /** A peer's Nostr profile (kind-0 metadata, NIP-01). A Marmot member's identity

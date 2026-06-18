@@ -11,6 +11,7 @@
 //
 
 import SwiftUI
+import WebKit
 #if os(iOS)
 import UIKit
 import AVFoundation
@@ -752,6 +753,8 @@ let snCommands: [(String, String)] = [
     ("slap", "Classic IRC slap"),
 ]
 
+let snQuickEmojis: [String] = ["👍", "❤️", "😂", "🔥", "🙏", "👏", "🎉", "👀", "💯", "⚡"]
+
 /// Decode a platform image (UIImage on iOS, NSImage on macOS) from raw bytes.
 func snPlatformImage(_ data: Data) -> Image? {
     #if canImport(UIKit)
@@ -824,7 +827,16 @@ struct SNMediaBubble: View {
 
     @ViewBuilder private var content: some View {
         if let item, item.isImage {
-            if let bytes, let image = snPlatformImage(bytes) {
+            if let bytes, item.isGif {
+                SNGifView(data: bytes)
+                    .frame(width: maxBubbleWidth, height: 220)
+                    .clipShape(RoundedRectangle(cornerRadius: 18))
+                    .overlay(alignment: .topTrailing) {
+                        SNGifBadge().padding(8)
+                    }
+                    .contentShape(RoundedRectangle(cornerRadius: 18))
+                    .onTapGesture { viewerOpen = true }
+            } else if let bytes, let image = snPlatformImage(bytes) {
                 image
                     .resizable()
                     .aspectRatio(contentMode: .fit)
@@ -843,6 +855,11 @@ struct SNMediaBubble: View {
                                 .foregroundColor(SonarTheme.text3)
                         } else {
                             ProgressView()
+                        }
+                    }
+                    .overlay(alignment: .topTrailing) {
+                        if item.isGif {
+                            SNGifBadge().padding(8)
                         }
                     }
                     .contentShape(RoundedRectangle(cornerRadius: 18))
@@ -1254,6 +1271,76 @@ private struct SNMacSharePicker: NSViewRepresentable {
 }
 #endif
 
+struct SNGifBadge: View {
+    var body: some View {
+        Text(verbatim: "GIF")
+            .font(SonarTheme.monoFont(size: 10, weight: .black))
+            .foregroundColor(SonarTheme.onNet)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(SonarTheme.netFill))
+    }
+}
+
+struct SNGifView: View {
+    let data: Data
+
+    var body: some View {
+        SNGifWebView(data: data)
+    }
+}
+
+#if os(iOS)
+struct SNGifWebView: UIViewRepresentable {
+    let data: Data
+
+    func makeUIView(context: Context) -> WKWebView {
+        let view = WKWebView(frame: .zero)
+        view.isOpaque = false
+        view.backgroundColor = .clear
+        view.scrollView.backgroundColor = .clear
+        view.scrollView.isScrollEnabled = false
+        return view
+    }
+
+    func updateUIView(_ view: WKWebView, context: Context) {
+        view.loadHTMLString(html, baseURL: nil)
+    }
+
+    private var html: String {
+        let base64 = data.base64EncodedString()
+        return """
+        <html><head><meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>html,body{margin:0;width:100%;height:100%;background:transparent;overflow:hidden;}body{display:flex;align-items:center;justify-content:center;}img{max-width:100%;max-height:100%;object-fit:contain;}</style>
+        </head><body><img src="data:image/gif;base64,\(base64)" /></body></html>
+        """
+    }
+}
+#elseif os(macOS)
+struct SNGifWebView: NSViewRepresentable {
+    let data: Data
+
+    func makeNSView(context: Context) -> WKWebView {
+        let view = WKWebView(frame: .zero)
+        view.setValue(false, forKey: "drawsBackground")
+        return view
+    }
+
+    func updateNSView(_ view: WKWebView, context: Context) {
+        view.loadHTMLString(html, baseURL: nil)
+    }
+
+    private var html: String {
+        let base64 = data.base64EncodedString()
+        return """
+        <html><head><meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>html,body{margin:0;width:100%;height:100%;background:transparent;overflow:hidden;}body{display:flex;align-items:center;justify-content:center;}img{max-width:100%;max-height:100%;object-fit:contain;}</style>
+        </head><body><img src="data:image/gif;base64,\(base64)" /></body></html>
+        """
+    }
+}
+#endif
+
 /// "Around you" card (design: screens.jsx HereCard) — collapses the geohash
 /// precision ladder (+ Mesh) into ONE row plus a tier picker. The main row enters
 /// the selected channel; the ladder ticks pick precision (live green dot when
@@ -1443,6 +1530,7 @@ struct SNComposer: View {
     var onVoice: (URL) -> Void = { _ in }
 
     @State private var text = ""
+    @State private var showEmojiTray = false
     #if os(iOS)
     @StateObject private var voice = VoiceNoteRecorder()
     @State private var recording = false
@@ -1465,6 +1553,7 @@ struct SNComposer: View {
             onSend(tx)
         }
         text = ""
+        showEmojiTray = false
     }
 
     var body: some View {
@@ -1489,6 +1578,24 @@ struct SNComposer: View {
                                 .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(SonarTheme.surface2))
                             }
                             .buttonStyle(SNScaleStyle(scale: 0.97))
+                        }
+                    }
+                    .padding(EdgeInsets(top: 8, leading: 12, bottom: 2, trailing: 12))
+                }
+            }
+            if showEmojiTray && !slash {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(snQuickEmojis, id: \.self) { emoji in
+                            Button {
+                                text += emoji
+                            } label: {
+                                Text(verbatim: emoji)
+                                    .font(.system(size: 20))
+                                    .frame(width: 38, height: 38)
+                                    .background(Circle().fill(SonarTheme.surface2))
+                            }
+                            .buttonStyle(SNScaleStyle(scale: 0.94))
                         }
                     }
                     .padding(EdgeInsets(top: 8, leading: 12, bottom: 2, trailing: 12))
@@ -1556,6 +1663,13 @@ struct SNComposer: View {
                     .foregroundColor(SonarTheme.text)
                     .submitLabel(.send)
                     .onSubmit(send)
+                Button {
+                    showEmojiTray.toggle()
+                } label: {
+                    SNIcon(name: .smile, size: 19, weight: 2)
+                        .foregroundColor(showEmojiTray ? SonarTheme.accent : SonarTheme.text3)
+                }
+                .buttonStyle(SNScaleStyle(scale: 0.94))
             }
             .padding(.vertical, 7)
             .padding(.horizontal, 14)
