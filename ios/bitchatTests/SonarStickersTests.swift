@@ -255,6 +255,19 @@ struct SonarStickersTests {
         #expect(installed == [address])
     }
 
+    @Test func parsesNostrPackEventJSONAndRelayEnvelope() throws {
+        let json = try fixturePackEventJSON()
+        let pack = try #require(SonarStickers.parsePackEventJSON(json))
+
+        #expect(pack.address == fixtureAddress())
+        #expect(pack.stickers.map(\.shortcode) == ["cat_wave", "cat_cry"])
+
+        let envelopeJSON = try fixturePackEventEnvelopeJSON()
+        let envelopePack = try #require(SonarStickers.parsePackEventJSON(envelopeJSON))
+
+        #expect(envelopePack == pack)
+    }
+
     @Test func rejectsMalformedNostrStickerPackTags() throws {
         let address = try #require(fixtureAddress())
 
@@ -274,6 +287,9 @@ struct SonarStickersTests {
             tags: fixturePackTags()
         ) == nil)
         #expect(SonarStickers.parseInstalledPackList(kind: 1, tags: [["a", address.coordinate]]) == [])
+        #expect(SonarStickers.parsePackEventJSON("{\"kind\":\(SonarStickers.stickerPackKind),\"pubkey\":\"\(pubkey)\",\"tags\":[[\"pack_format\",1]]}") == nil)
+        #expect(SonarStickers.parsePackEventJSON("[\"EVENT\",\"subscription-id\",\(try fixturePackEventJSON()),\"extra\"]") == nil)
+        #expect(SonarStickers.parsePackEventJSON(String(repeating: "x", count: SonarStickers.importMaxCharacters + 1)) == nil)
     }
 
     private func fixtureAddress() -> SonarStickerPackAddress? {
@@ -352,6 +368,27 @@ struct SonarStickersTests {
                 "😿"
             ]
         ]
+    }
+
+    private func fixturePackEventObject() -> [String: Any] {
+        [
+            "kind": SonarStickers.stickerPackKind,
+            "pubkey": pubkey,
+            "tags": fixturePackTags()
+        ]
+    }
+
+    private func fixturePackEventJSON() throws -> String {
+        let data = try JSONSerialization.data(withJSONObject: fixturePackEventObject(), options: [.sortedKeys])
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    private func fixturePackEventEnvelopeJSON() throws -> String {
+        let data = try JSONSerialization.data(
+            withJSONObject: ["EVENT", "subscription-id", fixturePackEventObject()],
+            options: [.sortedKeys]
+        )
+        return String(decoding: data, as: UTF8.self)
     }
 
     private func fixturePackTagsWithoutFormat() -> [[String]] {

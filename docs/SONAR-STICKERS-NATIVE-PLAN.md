@@ -53,12 +53,14 @@ This branch now covers the safe foundation for both native app surfaces:
   White Noise/Marmot conversations;
 - bounded recent-sticker state shown in the native pickers;
 - validated persisted installed-pack and recent-sticker snapshots across app
-  relaunches.
+  relaunches;
+- feature-gated manual install UI for pasted Nostr sticker pack event JSON on
+  Compose, iOS, and macOS.
 
 The feature must remain disabled until the remaining production gaps are closed:
 
-- pack install/import UI and fetch orchestration from `/stickers` links or
-  Nostr pack events;
+- automatic fetch orchestration from `/stickers` links, Nostr profile metadata,
+  or relay pack discovery into the native install flow;
 - full native target builds and end-to-end install/pick/send/render tests.
 
 ## Patch Sequence

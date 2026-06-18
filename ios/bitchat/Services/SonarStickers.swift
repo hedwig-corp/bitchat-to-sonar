@@ -20,6 +20,7 @@ enum SonarStickers {
     static let stickerPackKind = 30030
     static let userStickerPacksKind = 10030
     static let maxRecentStickers = 24
+    static let importMaxCharacters = 256 * 1024
 
     static func isEnabled(defaults: UserDefaults = .standard) -> Bool {
         guard defaults.object(forKey: featureFlagKey) != nil else { return enabledByDefault }
@@ -88,6 +89,39 @@ enum SonarStickers {
             packs.append(pack)
         }
         return packs
+    }
+
+    static func parsePackEventJSON(_ raw: String) -> SonarStickerPack? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              trimmed.utf8.count <= importMaxCharacters,
+              let data = trimmed.data(using: .utf8),
+              let root = try? JSONSerialization.jsonObject(with: data)
+        else { return nil }
+
+        let event: [String: Any]
+        if let object = root as? [String: Any] {
+            event = object
+        } else if let envelope = root as? [Any],
+                  envelope.first as? String == "EVENT",
+                  let object = envelope.last as? [String: Any] {
+            event = object
+        } else {
+            return nil
+        }
+
+        guard let kind = event["kind"] as? Int,
+              let pubkey = event["pubkey"] as? String,
+              let rawTags = event["tags"] as? [Any]
+        else { return nil }
+
+        let tags: [[String]] = rawTags.compactMap { rawTag in
+            guard let tag = rawTag as? [Any] else { return nil }
+            let strings = tag.compactMap { $0 as? String }
+            return strings.count == tag.count ? strings : nil
+        }
+        guard tags.count == rawTags.count else { return nil }
+        return parsePackEvent(kind: kind, pubkeyHex: pubkey, tags: tags)
     }
 
     private static func tagValue(_ tags: [[String]], name: String) -> String? {

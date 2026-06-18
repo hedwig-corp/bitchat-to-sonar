@@ -26,6 +26,7 @@ struct SonarDMScreen: View {
     @State private var addPeopleSheet = false
     @State private var removePeopleSheet = false
     @State private var stickerSheet = false
+    @State private var stickerImportSheet = false
     @State private var groupAddDraft = ""
     @State private var selectedAddNpubs: Set<String> = []
     @State private var pickPhoto = false
@@ -152,6 +153,12 @@ struct SonarDMScreen: View {
                         stickerSheet = true
                     }
                 }
+                if SonarStickers.isEnabled() {
+                    SNActionRow(icon: .importKey, label: "Install sticker pack", desc: "Paste a Nostr pack event") {
+                        sheet = false
+                        stickerImportSheet = true
+                    }
+                }
                 if isMultiMemberMarmot {
                     SNActionRow(icon: .people, label: "Add people", desc: "Invite local contacts or paste npubs") {
                         sheet = false
@@ -229,6 +236,17 @@ struct SonarDMScreen: View {
                 stickerSheet = false
                 store.sendSticker(peerId, pack: pack, sticker: sticker)
             }
+        }
+        .snSheet(isPresented: $stickerImportSheet, title: "Install sticker pack") {
+            SNStickerImportContent(
+                onInstall: { store.installStickerPack(fromEventJSON: $0) },
+                onInstalled: {
+                    stickerImportSheet = false
+                    if store.canSendStickers(peerId) {
+                        stickerSheet = true
+                    }
+                }
+            )
         }
         .snSheet(isPresented: $walletSheet, title: "Your wallet") {
             SNWalletSheetContent(onClose: { walletSheet = false })

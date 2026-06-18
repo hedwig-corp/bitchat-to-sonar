@@ -797,7 +797,7 @@ struct SNStickerBubble: View {
                         .lineLimit(2)
                 }
                 .padding(14)
-                .frame(width: min(maxBubbleWidth, 178), minHeight: 134)
+                .frame(width: min(maxBubbleWidth, 178), height: 134)
                 .background(RoundedRectangle(cornerRadius: 18, style: .continuous).fill(SonarTheme.surface2))
                 .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).strokeBorder(SonarTheme.hairline, lineWidth: 1))
                 Text(verbatim: m.time)
@@ -849,10 +849,10 @@ struct SNStickerBubble: View {
                         .foregroundColor(SonarTheme.accent)
                 }
                 .buttonStyle(.plain)
-                .frame(width: min(maxBubbleWidth, 178), minHeight: 82)
+                .frame(width: min(maxBubbleWidth, 178), height: 82)
             } else {
                 ProgressView()
-                    .frame(width: min(maxBubbleWidth, 178), minHeight: 82)
+                    .frame(width: min(maxBubbleWidth, 178), height: 82)
             }
         } else {
             Text(verbatim: glyph)
@@ -913,6 +913,61 @@ struct SNStickerPickerContent: View {
             }
         }
         .frame(maxHeight: 430)
+    }
+}
+
+struct SNStickerImportContent: View {
+    @State private var draft = ""
+    @State private var status: String?
+
+    let onInstall: (String) -> Bool
+    let onInstalled: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            ZStack(alignment: .topLeading) {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(SonarTheme.surface2)
+                if draft.isEmpty {
+                    Text(verbatim: "Paste Nostr pack event JSON")
+                        .font(SonarTheme.uiFont(size: 15))
+                        .foregroundColor(SonarTheme.text3)
+                        .padding(EdgeInsets(top: 14, leading: 14, bottom: 0, trailing: 14))
+                        .allowsHitTesting(false)
+                }
+                TextEditor(text: $draft)
+                    .font(SonarTheme.uiFont(size: 14))
+                    .foregroundColor(SonarTheme.text)
+                    .scrollContentBackground(.hidden)
+                    .padding(EdgeInsets(top: 8, leading: 10, bottom: 8, trailing: 10))
+            }
+            .frame(height: 180)
+            .onChange(of: draft) { value in
+                if value.count > SonarStickers.importMaxCharacters {
+                    draft = String(value.prefix(SonarStickers.importMaxCharacters))
+                }
+                status = nil
+            }
+
+            if let status {
+                Text(verbatim: status)
+                    .font(SonarTheme.uiFont(size: 13))
+                    .foregroundColor(SonarTheme.danger)
+            }
+
+            SNPrimaryButton(
+                label: "Install",
+                disabled: draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ) {
+                if onInstall(draft) {
+                    status = nil
+                    onInstalled()
+                } else {
+                    status = "Couldn't read that sticker pack."
+                }
+            }
+        }
+        .padding(.top, 4)
     }
 }
 

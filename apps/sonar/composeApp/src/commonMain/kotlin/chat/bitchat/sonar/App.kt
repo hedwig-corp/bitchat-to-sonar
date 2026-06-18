@@ -584,6 +584,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     var addPeopleSheet by remember { mutableStateOf(false) }
     var removePeopleSheet by remember { mutableStateOf(false) }
     var stickerSheet by remember { mutableStateOf(false) }
+    var stickerImportSheet by remember { mutableStateOf(false) }
     var mediaViewer by remember { mutableStateOf<SonarMedia?>(null) }
     val mediaActions = rememberMediaActions()
     val pickPhoto = rememberPhotoPicker { bytes, name, mime ->
@@ -904,8 +905,10 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         canVerify = !state.isMultiMemberChat(screen.id),
         canShareLocation = !state.isMultiMemberChat(screen.id),
         canManageGroup = isGroup,
+        canImportStickers = state.stickersEnabled,
         onPhoto = { addSheet = false; pickPhoto() },
-        onSticker = { addSheet = false; stickerSheet = true }
+        onSticker = { addSheet = false; stickerSheet = true },
+        onImportStickerPack = { addSheet = false; stickerImportSheet = true },
     )
     val stickerStoreVersion = state.stickerStoreVersion
     if (stickerSheet) StickerPickerSheet(
@@ -916,6 +919,17 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             state.sendSticker(screen.id, pack, sticker)
         },
         onClose = { stickerSheet = false },
+    )
+    if (stickerImportSheet) StickerImportSheet(
+        onInstall = { raw ->
+            val installed = state.installStickerPackFromEventJson(raw)
+            if (installed) {
+                stickerImportSheet = false
+                if (state.canSendStickers(screen.id)) stickerSheet = true
+            }
+            installed
+        },
+        onClose = { stickerImportSheet = false },
     )
     if (addPeopleSheet) GroupAddPeopleSheet(
         state = state,
@@ -963,8 +977,10 @@ private fun AddToMessageSheet(
     canVerify: Boolean = true,
     canShareLocation: Boolean = true,
     canManageGroup: Boolean = false,
+    canImportStickers: Boolean = false,
     onPhoto: () -> Unit = {},
     onSticker: () -> Unit = {},
+    onImportStickerPack: () -> Unit = {},
 ) {
     val s = sonar
     Box(
@@ -984,6 +1000,9 @@ private fun AddToMessageSheet(
                 }
                 if (canSendStickers) {
                     ActionRow(SNIconName.Smile, "Send sticker", "From your installed packs", onSticker)
+                }
+                if (canImportStickers) {
+                    ActionRow(SNIconName.ImportKey, "Install sticker pack", "Paste a Nostr pack event", onImportStickerPack)
                 }
                 if (canSendPayment) ActionRow(SNIconName.Coin, "Send bitcoin", "Instant over Lightning", onBitcoin)
                 if (canShareLocation) ActionRow(SNIconName.NavArrow, "Share location", "Only $peerName will see it", onLocation)
@@ -1049,6 +1068,69 @@ private fun StickerPickerSheet(
                             sticker.emoji ?: sticker.mime,
                         ) { onPick(pack, sticker) }
                     }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun StickerImportSheet(
+    onInstall: (String) -> Boolean,
+    onClose: () -> Unit,
+) {
+    val s = sonar
+    var draft by remember { mutableStateOf("") }
+    var status by remember { mutableStateOf<String?>(null) }
+    Box(
+        Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
+        contentAlignment = Alignment.BottomCenter
+    ) {
+        Surface(color = s.surface, shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)) {
+            Column(
+                Modifier.fillMaxWidth().heightIn(max = 560.dp)
+                    .verticalScroll(rememberScrollState())
+                    .padding(start = 20.dp, end = 20.dp, top = 18.dp, bottom = 20.dp)
+            ) {
+                Text("Install sticker pack", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(10.dp))
+                Box(
+                    Modifier.fillMaxWidth()
+                        .heightIn(min = 150.dp)
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(s.surface2)
+                        .padding(horizontal = 14.dp, vertical = 12.dp)
+                ) {
+                    if (draft.isEmpty()) {
+                        Text(
+                            "Paste Nostr pack event JSON",
+                            color = s.text3,
+                            fontSize = 15.sp,
+                        )
+                    }
+                    BasicTextField(
+                        value = draft,
+                        onValueChange = {
+                            draft = it.take(SONAR_STICKER_IMPORT_MAX_CHARS)
+                            status = null
+                        },
+                        textStyle = TextStyle(color = s.text, fontSize = 14.sp, lineHeight = 19.sp),
+                        cursorBrush = SolidColor(s.accent),
+                        singleLine = false,
+                        maxLines = 10,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+                status?.let {
+                    Spacer(Modifier.height(10.dp))
+                    Text(it, color = s.danger, fontSize = 13.sp, lineHeight = 17.sp)
+                }
+                Spacer(Modifier.height(14.dp))
+                SNPrimaryButton(
+                    "Install",
+                    disabled = draft.isBlank(),
+                ) {
+                    if (!onInstall(draft)) status = "Couldn't read that sticker pack."
                 }
             }
         }

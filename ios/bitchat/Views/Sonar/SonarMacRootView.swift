@@ -486,6 +486,7 @@ private struct MacConversationPane: View {
     @State private var addPeopleSheet = false
     @State private var removePeopleSheet = false
     @State private var stickerSheet = false
+    @State private var stickerImportSheet = false
     @State private var groupAddDraft = ""
     @State private var selectedAddNpubs: Set<String> = []
     @State private var importMedia = false
@@ -558,6 +559,17 @@ private struct MacConversationPane: View {
                 stickerSheet = false
                 store.sendSticker(id, pack: pack, sticker: sticker)
             }
+        }
+        .snSheet(isPresented: $stickerImportSheet, title: "Install sticker pack") {
+            SNStickerImportContent(
+                onInstall: { store.installStickerPack(fromEventJSON: $0) },
+                onInstalled: {
+                    stickerImportSheet = false
+                    if store.canSendStickers(id) {
+                        stickerSheet = true
+                    }
+                }
+            )
         }
         .snSheet(isPresented: $walletSheet, title: "Your wallet") {
             SNWalletSheetContent(onClose: { walletSheet = false })
@@ -815,6 +827,12 @@ private struct MacConversationPane: View {
                 SNActionRow(icon: .smile, label: "Send sticker", desc: "From your installed packs") {
                     actionSheet = false
                     stickerSheet = true
+                }
+            }
+            if !isChannel, SonarStickers.isEnabled() {
+                SNActionRow(icon: .importKey, label: "Install sticker pack", desc: "Paste a Nostr pack event") {
+                    actionSheet = false
+                    stickerImportSheet = true
                 }
             }
             if !isChannel && isMultiMemberMarmot {

@@ -1109,6 +1109,17 @@ class SonarAppState(private val scope: CoroutineScope) {
         return installed
     }
 
+    fun installStickerPackFromEventJson(raw: String): Boolean {
+        val pack = SonarStickers.parsePackEventJsonOrNull(raw)
+        if (pack == null) {
+            toast = "Couldn't read that sticker pack."
+            return false
+        }
+        val installed = installStickerPack(pack)
+        toast = if (installed) "Sticker pack installed" else "Couldn't install that sticker pack."
+        return installed
+    }
+
     fun removeStickerPack(address: SonarStickerPackAddress) {
         stickerStore.remove(address)
         persistStickerStore()

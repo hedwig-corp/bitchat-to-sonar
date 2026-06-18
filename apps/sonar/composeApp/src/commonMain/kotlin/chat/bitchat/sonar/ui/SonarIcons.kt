@@ -31,7 +31,7 @@ import kotlin.math.sqrt
 enum class SNIconName {
     Back, Chevron, Lock, Plus, Pin, People, Mesh, Globe, Check, Shield,
     ShieldCheck, X, Smile, NavArrow, Dice, Rings, Moon, Trash, Info, Coin, Bolt,
-    Pencil, Key, Search, Mic, Play, Pause, Bookmark, BookmarkFill,
+    Pencil, Key, Search, Mic, Play, Pause, Bookmark, BookmarkFill, ImportKey,
     // Call glyphs (design icons.jsx): voice/video buttons + in-call controls.
     Phone, Videocam, PhoneDown, MicOff, VideoOff, Speaker, CameraFlip,
 }
@@ -74,6 +74,11 @@ private val ICONS: Map<SNIconName, List<Shape>> = mapOf(
     SNIconName.Bolt to listOf(Shape.P("M13 3 6 13.5h4.5L11 21l7-10.5h-4.5z")),
     SNIconName.Pencil to listOf(Shape.P("M16.8 4.6l2.6 2.6L8.6 18l-3.4.8.8-3.4z")),
     SNIconName.Key to listOf(Shape.C(8.5f, 12f, 3.4f), Shape.P("M11.9 12h8M17 12v2.8M19.9 12v2")),
+    SNIconName.ImportKey to listOf(
+        Shape.C(8f, 12f, 3.2f),
+        Shape.P("M11.2 12h9M16.5 12v3M20.2 12v2.4"),
+        Shape.P("M14 5.5 11 8.5M14 5.5l-3-3M11 8.5l-2.4-2.4"),
+    ),
     SNIconName.Search to listOf(Shape.C(10.5f, 10.5f, 5.5f), Shape.P("M14.5 14.5L20 20")),
     // ── call glyphs (verbatim from design icons.jsx) ──
     SNIconName.Phone to listOf(Shape.P("M6.5 4.5c-1 0-2 .9-2 2 0 7 6 13 13 13 1.1 0 2-1 2-2v-2.6c0-.5-.4-.9-.9-1l-3-.6c-.4-.1-.9.1-1.1.5l-1 1.6a11 11 0 0 1-5-5l1.6-1c.4-.2.6-.7.5-1.1l-.6-3c-.1-.5-.5-.9-1-.9z")),

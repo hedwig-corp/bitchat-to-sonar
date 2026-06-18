@@ -8,6 +8,7 @@ const val SONAR_STICKER_PACK_FORMAT = "sonar-sticker-pack-v1"
 const val SONAR_STICKER_PACK_KIND = 30030
 const val SONAR_USER_STICKER_PACKS_KIND = 10030
 const val SONAR_MAX_RECENT_STICKERS = 24
+const val SONAR_STICKER_IMPORT_MAX_CHARS = 256 * 1024
 private const val SONAR_STICKER_STORE_SNAPSHOT_VERSION = "sonar-sticker-store-v1"
 
 object SonarStickers {
@@ -62,6 +63,29 @@ object SonarStickers {
             if (seen.add(pack.coordinate)) packs += pack
         }
         return packs
+    }
+
+    fun parsePackEventJsonOrNull(raw: String): SonarStickerPack? {
+        val trimmed = raw.trim()
+        if (trimmed.isEmpty() || trimmed.length > SONAR_STICKER_IMPORT_MAX_CHARS) return null
+        val root = StickerJsonParser(trimmed).parse() ?: return null
+        val event = when (root) {
+            is StickerJsonValue.ObjectValue -> root
+            is StickerJsonValue.ArrayValue -> {
+                val items = root.items
+                val marker = (items.getOrNull(0) as? StickerJsonValue.StringValue)?.value
+                if (marker != "EVENT") return null
+                items.lastOrNull() as? StickerJsonValue.ObjectValue ?: return null
+            }
+            else -> return null
+        }
+        val kind = event.int("kind") ?: return null
+        val pubkey = event.string("pubkey") ?: return null
+        val tags = event.array("tags")?.items?.map { item ->
+            val tag = item as? StickerJsonValue.ArrayValue ?: return null
+            tag.items.map { tagPart -> (tagPart as? StickerJsonValue.StringValue)?.value ?: return null }
+        } ?: return null
+        return parsePackEvent(kind, pubkey, tags)
     }
 }
 
@@ -438,6 +462,144 @@ private fun Char.snapshotHexValue(): Int? =
         in 'A'..'F' -> code - 'A'.code + 10
         else -> null
     }
+
+private sealed interface StickerJsonValue {
+    data class ObjectValue(val fields: Map<String, StickerJsonValue>) : StickerJsonValue {
+        fun string(name: String): String? = (fields[name] as? StringValue)?.value
+        fun int(name: String): Int? =
+            (fields[name] as? NumberValue)?.value
+                ?.takeIf { it >= Int.MIN_VALUE.toLong() && it <= Int.MAX_VALUE.toLong() }
+                ?.toInt()
+        fun array(name: String): ArrayValue? = fields[name] as? ArrayValue
+    }
+
+    data class ArrayValue(val items: List<StickerJsonValue>) : StickerJsonValue
+    data class StringValue(val value: String) : StickerJsonValue
+    data class NumberValue(val value: Long) : StickerJsonValue
+    data object LiteralValue : StickerJsonValue
+}
+
+private class StickerJsonParser(private val raw: String) {
+    private var index = 0
+
+    fun parse(): StickerJsonValue? {
+        val value = parseValue() ?: return null
+        skipWhitespace()
+        return if (index == raw.length) value else null
+    }
+
+    private fun parseValue(): StickerJsonValue? {
+        skipWhitespace()
+        return when (raw.getOrNull(index)) {
+            '{' -> parseObject()
+            '[' -> parseArray()
+            '"' -> StickerJsonValue.StringValue(parseString() ?: return null)
+            in '0'..'9', '-' -> StickerJsonValue.NumberValue(parseNumber() ?: return null)
+            't' -> parseLiteral("true")
+            'f' -> parseLiteral("false")
+            'n' -> parseLiteral("null")
+            else -> null
+        }
+    }
+
+    private fun parseObject(): StickerJsonValue.ObjectValue? {
+        index++
+        skipWhitespace()
+        val fields = linkedMapOf<String, StickerJsonValue>()
+        if (consume('}')) return StickerJsonValue.ObjectValue(fields)
+        while (true) {
+            skipWhitespace()
+            val key = parseString() ?: return null
+            skipWhitespace()
+            if (!consume(':')) return null
+            val value = parseValue() ?: return null
+            fields[key] = value
+            skipWhitespace()
+            if (consume('}')) break
+            if (!consume(',')) return null
+        }
+        return StickerJsonValue.ObjectValue(fields)
+    }
+
+    private fun parseArray(): StickerJsonValue.ArrayValue? {
+        index++
+        skipWhitespace()
+        val items = mutableListOf<StickerJsonValue>()
+        if (consume(']')) return StickerJsonValue.ArrayValue(items)
+        while (true) {
+            items += parseValue() ?: return null
+            skipWhitespace()
+            if (consume(']')) break
+            if (!consume(',')) return null
+        }
+        return StickerJsonValue.ArrayValue(items)
+    }
+
+    private fun parseString(): String? {
+        if (!consume('"')) return null
+        val out = StringBuilder()
+        while (index < raw.length) {
+            val ch = raw[index++]
+            when (ch) {
+                '"' -> return out.toString()
+                '\\' -> {
+                    val escaped = raw.getOrNull(index++) ?: return null
+                    when (escaped) {
+                        '"', '\\', '/' -> out.append(escaped)
+                        'b' -> out.append('\b')
+                        'f' -> out.append('\u000C')
+                        'n' -> out.append('\n')
+                        'r' -> out.append('\r')
+                        't' -> out.append('\t')
+                        'u' -> {
+                            if (index + 4 > raw.length) return null
+                            val code = raw.substring(index, index + 4).toIntOrNull(16) ?: return null
+                            out.append(code.toChar())
+                            index += 4
+                        }
+                        else -> return null
+                    }
+                }
+                else -> {
+                    if (ch.code < 0x20) return null
+                    out.append(ch)
+                }
+            }
+        }
+        return null
+    }
+
+    private fun parseNumber(): Long? {
+        val start = index
+        if (raw.getOrNull(index) == '-') index++
+        val first = raw.getOrNull(index) ?: return null
+        when (first) {
+            '0' -> index++
+            in '1'..'9' -> while (raw.getOrNull(index) in '0'..'9') index++
+            else -> return null
+        }
+        if (raw.getOrNull(index) == '.' || raw.getOrNull(index) == 'e' || raw.getOrNull(index) == 'E') {
+            return null
+        }
+        return raw.substring(start, index).toLongOrNull()
+    }
+
+    private fun parseLiteral(value: String): StickerJsonValue? {
+        if (!raw.startsWith(value, index)) return null
+        index += value.length
+        return StickerJsonValue.LiteralValue
+    }
+
+    private fun consume(ch: Char): Boolean {
+        if (raw.getOrNull(index) != ch) return false
+        index++
+        return true
+    }
+
+    private fun skipWhitespace() {
+        while (raw.getOrNull(index)?.isWhitespace() == true) index++
+    }
+}
 
 class SonarStickerByteCache(
     private val maxStickerBytes: Int = DEFAULT_MAX_STICKER_BYTES,

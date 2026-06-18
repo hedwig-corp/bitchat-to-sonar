@@ -996,6 +996,13 @@ final class SonarAppStore: ObservableObject {
         persistStickerStore()
     }
 
+    @discardableResult
+    func installStickerPack(fromEventJSON raw: String) -> Bool {
+        guard let pack = SonarStickers.parsePackEventJSON(raw) else { return false }
+        installStickerPack(pack)
+        return true
+    }
+
     func removeStickerPack(_ address: SonarStickerPackAddress) {
         stickerStore.remove(address)
         persistStickerStore()

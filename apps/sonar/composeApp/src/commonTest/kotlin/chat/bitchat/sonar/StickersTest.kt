@@ -234,11 +234,29 @@ class StickersTest {
     }
 
     @Test
+    fun parsesNostrPackEventJsonAndRelayEnvelope() {
+        val eventJson = fixturePackEventJson()
+        val pack = assertNotNull(SonarStickers.parsePackEventJsonOrNull(eventJson))
+
+        assertEquals(fixtureAddress(), pack.address)
+        assertEquals(listOf("cat_wave", "cat_cry"), pack.stickers.map { it.shortcode })
+        assertEquals(pack, SonarStickers.parsePackEventJsonOrNull(eventJson.replace(",", ",\n  ")))
+
+        val relayEnvelopeJson = """["EVENT","subscription-id",$eventJson]"""
+        val envelopePack = assertNotNull(SonarStickers.parsePackEventJsonOrNull(relayEnvelopeJson))
+
+        assertEquals(pack, envelopePack)
+    }
+
+    @Test
     fun rejectsMalformedNostrStickerPackTags() {
         assertNull(SonarStickers.parsePackEvent(SONAR_STICKER_PACK_KIND, pubkey, fixturePackTagsWithoutFormat()))
         assertNull(SonarStickers.parsePackEvent(SONAR_STICKER_PACK_KIND, pubkey, fixturePackTagsWithBadStickerDim()))
         assertNull(SonarStickers.parsePackEvent(SONAR_STICKER_PACK_KIND, "not-a-pubkey", fixturePackTags()))
         assertEquals(emptyList(), SonarStickers.parseInstalledPackList(1, listOf(listOf("a", fixtureAddress().coordinate))))
+        assertNull(SonarStickers.parsePackEventJsonOrNull("""{"kind":$SONAR_STICKER_PACK_KIND,"pubkey":"$pubkey","tags":[["pack_format",1]]}"""))
+        assertNull(SonarStickers.parsePackEventJsonOrNull("""["EVENT","subscription-id",${fixturePackEventJson()},"extra"]"""))
+        assertNull(SonarStickers.parsePackEventJsonOrNull("x".repeat(SONAR_STICKER_IMPORT_MAX_CHARS + 1)))
     }
 
     private fun fixtureAddress(): SonarStickerPackAddress =
@@ -313,6 +331,16 @@ class StickersTest {
                 "😿",
             ),
         )
+
+    private fun fixturePackEventJson(): String {
+        val tagsJson = fixturePackTags().joinToString(",") { tag ->
+            tag.joinToString(prefix = "[", postfix = "]") { it.jsonString() }
+        }
+        return """{"kind":$SONAR_STICKER_PACK_KIND,"pubkey":"$pubkey","tags":[$tagsJson]}"""
+    }
+
+    private fun String.jsonString(): String =
+        "\"" + replace("\\", "\\\\").replace("\"", "\\\"") + "\""
 
     private fun fixturePackTagsWithoutFormat(): List<List<String>> =
         fixturePackTags().filterNot { it.firstOrNull() == "pack_format" }
