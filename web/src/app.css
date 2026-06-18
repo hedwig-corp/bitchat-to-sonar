@@ -260,3 +260,9 @@ footer { border-top: 1px solid var(--hairline); padding: 30px 0 44px; }
   .radar { width: 340px; height: 340px; }
   .win { width: 100%; }
 }
+@media (max-width: 560px) {
+  .navin { padding: 14px 18px; gap: 12px; }
+  .navlinks { gap: 8px; justify-content: flex-end; }
+  .prototype-link { display: none; }
+  .btn.small { padding: 8px 12px; font-size: 12.5px; }
+}

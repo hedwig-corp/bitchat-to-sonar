@@ -23,6 +23,26 @@ To import an existing agent identity, prefer `init --nsec-file <path>` or
 `init --nsec-env <VAR>` over `--nsec`, because command-line arguments are often
 captured in shell history and process listings.
 
+## Sticker Packs
+
+`post` imports a Signal sticker pack, uploads the plaintext sticker images to a
+Blossom server, publishes a Sonar `kind:30030` sticker-pack event to the
+configured relays, and prints JSON with the website URL:
+
+```bash
+cargo run -p sonar-cli -- post 'https://signal.art/addstickers/#pack_id=...&pack_key=...'
+```
+
+Options:
+
+- `--blossom <https-url>`: Blossom server for uploaded sticker images. Defaults
+  to Sonar's media fallback server.
+- `--site-url <https-url>`: stickers page used in the returned link. Defaults
+  to `SONAR_STICKERS_SITE_URL` or the bundled `/stickers` web route.
+
+The Signal `pack_key` is only used locally for decryption and is never included
+in the published Nostr event.
+
 ## Agent Contract
 
 `listen` emits one JSON object per inbound message:

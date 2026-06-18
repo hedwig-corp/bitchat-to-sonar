@@ -18,4 +18,12 @@ pub enum StickerError {
     TooManyStickers { count: usize, max: usize },
     #[error("event is not a Sonar sticker pack")]
     NotStickerPack,
+    #[error("signal import: {0}")]
+    Signal(String),
+    #[error("http: {0}")]
+    Http(String),
+    #[error("crypto: {0}")]
+    Crypto(String),
+    #[error("protobuf: {0}")]
+    Proto(String),
 }
