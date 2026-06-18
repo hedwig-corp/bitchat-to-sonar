@@ -263,9 +263,10 @@ impl MarmotEngine {
     /// All members are admins for now (the 1:1 DM shape used by White Noise).
     ///
     /// Per MDK rules the creator's pending commit must be merged only after
-    /// the caller has successfully delivered every Welcome. Until then, the
-    /// caller can clear the pending commit and retry without persisting
-    /// undeliverable invitees as active members.
+    /// the caller has successfully delivered every Welcome. The caller may
+    /// clear and discard the staged group only if delivery fails before any
+    /// Welcome is published; after partial delivery, the pending state must be
+    /// preserved so the creator does not orphan already-delivered invites.
     pub fn create_group(
         &self,
         name: &str,
@@ -303,7 +304,9 @@ impl MarmotEngine {
 
     /// Create an add-members commit for an existing group. The caller must
     /// publish `evolution_event`, deliver any welcomes, then merge the pending
-    /// commit with [`Self::merge_pending_commit`].
+    /// commit with [`Self::merge_pending_commit`]. If welcome delivery fails
+    /// after the commit event may have reached relays, preserve the pending
+    /// commit rather than rolling back local state.
     pub fn add_members(
         &self,
         group_id: &GroupId,

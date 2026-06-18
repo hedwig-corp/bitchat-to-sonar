@@ -822,11 +822,22 @@ impl SonarClient {
             }
         }
 
+        let mut published_welcomes = 0usize;
         for wrapped in wrapped_welcomes {
             if let Err(err) = self.nostr.send_event(&wrapped).await {
-                self.discard_unpublished_group_creation(&group_id);
+                if published_welcomes == 0 {
+                    self.discard_unpublished_group_creation(&group_id);
+                } else {
+                    tracing::debug!(
+                        %err,
+                        ?group_id,
+                        published_welcomes,
+                        "marmot group creation welcome publish partially failed; keeping pending group state"
+                    );
+                }
                 return Err(err.into());
             }
+            published_welcomes += 1;
         }
 
         self.engine.merge_pending_commit(&group_id)?;
@@ -867,9 +878,11 @@ impl SonarClient {
 
         for wrapped in wrapped_welcomes {
             if let Err(err) = self.nostr.send_event(&wrapped).await {
-                if requires_commit_merge {
-                    let _ = self.engine.clear_pending_commit(&group_id);
-                }
+                tracing::debug!(
+                    %err,
+                    ?group_id,
+                    "marmot membership welcome publish failed after commit publish; keeping pending commit"
+                );
                 return Err(err.into());
             }
         }

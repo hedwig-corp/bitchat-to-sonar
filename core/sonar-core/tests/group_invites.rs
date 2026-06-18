@@ -171,3 +171,82 @@ async fn staged_add_member_commit_can_be_rolled_back() {
         "failed welcome delivery must not leave the undelivered invitee as a local member"
     );
 }
+
+#[tokio::test]
+async fn partially_published_group_creation_can_still_be_merged() {
+    let relay = RelayUrl::parse("wss://relay.example.com").expect("relay url");
+    let relays = vec![relay];
+
+    let alice = MarmotEngine::in_memory(Identity::generate());
+    let bob = MarmotEngine::in_memory(Identity::generate());
+    let charlie = MarmotEngine::in_memory(Identity::generate());
+
+    let bob_kp = bob.key_package_event(relays.clone()).expect("bob kp");
+    let charlie_kp = charlie
+        .key_package_event(relays.clone())
+        .expect("charlie kp");
+
+    let creation = alice
+        .create_group("field team", vec![bob_kp, charlie_kp], relays)
+        .expect("alice creates group");
+    let group_id = creation.group.mls_group_id;
+
+    assert_eq!(
+        creation.welcomes.len(),
+        2,
+        "test needs multiple welcomes so one can be considered already published"
+    );
+
+    alice
+        .merge_pending_commit(&group_id)
+        .expect("partial welcome publish keeps creator pending commit mergeable");
+
+    let members = alice.members(&group_id).expect("members after merge");
+    assert!(members.contains(&bob.identity().public_key()));
+    assert!(members.contains(&charlie.identity().public_key()));
+}
+
+#[tokio::test]
+async fn published_add_member_commit_remains_mergeable_after_welcome_failure() {
+    let relay = RelayUrl::parse("wss://relay.example.com").expect("relay url");
+    let relays = vec![relay];
+
+    let alice = MarmotEngine::in_memory(Identity::generate());
+    let bob = MarmotEngine::in_memory(Identity::generate());
+    let charlie = MarmotEngine::in_memory(Identity::generate());
+    let charlie_pubkey = charlie.identity().public_key();
+
+    let bob_kp = bob.key_package_event(relays.clone()).expect("bob kp");
+    let creation = alice
+        .create_group("alice and bob", vec![bob_kp], relays.clone())
+        .expect("alice creates group");
+    let group_id = creation.group.mls_group_id;
+    alice
+        .merge_pending_commit(&group_id)
+        .expect("merge initial group");
+
+    let charlie_kp = charlie.key_package_event(relays).expect("charlie kp");
+    let update = alice
+        .add_members(&group_id, vec![charlie_kp])
+        .expect("stage add charlie");
+    assert_eq!(update.welcomes.len(), 1);
+    assert!(
+        !alice
+            .members(&group_id)
+            .expect("members before merge")
+            .contains(&charlie_pubkey),
+        "staged add-member state stays pending until commit merge"
+    );
+
+    alice
+        .merge_pending_commit(&group_id)
+        .expect("published add-member commit remains mergeable after welcome retry");
+
+    assert!(
+        alice
+            .members(&group_id)
+            .expect("members after merge")
+            .contains(&charlie_pubkey),
+        "kept pending commit can converge after welcome delivery is recovered"
+    );
+}
