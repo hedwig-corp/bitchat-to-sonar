@@ -1,0 +1,21 @@
+[package]
+name = "sonar-stickers"
+description = "Nostr sticker pack models and validation for Sonar"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["nostr"]
+nostr = ["dep:nostr"]
+signal-import = []
+wasm = []
+
+[dependencies]
+hex.workspace = true
+nostr = { workspace = true, optional = true }
+serde.workspace = true
+sha2 = "0.10"
+thiserror.workspace = true
+url = "2"
