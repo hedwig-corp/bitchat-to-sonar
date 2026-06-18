@@ -1334,6 +1334,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun openChat(chat: SonarChat) {
         push(Screen.Chat(chat.id, chatTitle(chat)))
         scope.launch {
+            runCatching { refreshChats() }
             messages = mergePendingMediaUploads(chat.id, marmotMessages(chat.id))
             processPayLines(chat.id, messages)
         }

@@ -2551,7 +2551,11 @@ final class SonarAppStore: ObservableObject {
     func openedDM(_ id: String) {
         if marmotGroupId(id) != nil {
             marmot.startPolling()
-            Task { await marmot.refresh() }
+            Task {
+                guard await marmot.ensureConnected() else { return }
+                await marmot.loadLocal()
+                await marmot.refresh()
+            }
         } else {
             chatViewModel.startPrivateChat(with: PeerID(str: id))
             // Sonar peers may carry a White Noise leg of the conversation:
@@ -2560,8 +2564,10 @@ final class SonarAppStore: ObservableObject {
             if resolvedSonarProfile(id) != nil {
                 marmot.connectIfNeeded()
                 marmot.startPolling()
-                if marmot.npub != nil {
-                    Task { await marmot.refresh() }
+                Task {
+                    guard await marmot.ensureConnected() else { return }
+                    await marmot.loadLocal()
+                    await marmot.refresh()
                 }
             }
         }

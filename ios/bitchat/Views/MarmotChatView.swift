@@ -480,9 +480,6 @@ final class MarmotChatModel: ObservableObject {
     func send(_ text: String, to groupId: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        // Optimistic echo: show the outgoing message immediately, before the
-        // relay round-trip, so the conversation doesn't appear to swallow it.
-        // refresh() reconciles it away once the real copy comes back.
         let echo = MarmotService.MarmotMessage(
             id: Self.optimisticIDPrefix + UUID().uuidString,
             senderNpub: npub ?? "",
@@ -491,8 +488,6 @@ final class MarmotChatModel: ObservableObject {
             isMine: true,
             media: []
         )
-        pendingOptimistic[groupId, default: []].append(echo)
-        messagesByGroup[groupId, default: []].append(echo)
         Task {
             do {
                 // Wait through the connect/reconnect window so a send right after
@@ -500,6 +495,16 @@ final class MarmotChatModel: ObservableObject {
                 guard await ensureConnected() else {
                     throw MarmotService.ServiceError.notConnected
                 }
+                // A row-only startup snapshot may know the group before the local
+                // SQLCipher transcript is hydrated. Load it before appending the
+                // optimistic echo so opening/sending cannot briefly replace history
+                // with one outgoing bubble.
+                await loadLocal()
+                // Optimistic echo: show the outgoing message immediately, before the
+                // relay round-trip, so the conversation doesn't appear to swallow it.
+                // refresh() reconciles it away once the real copy comes back.
+                pendingOptimistic[groupId, default: []].append(echo)
+                messagesByGroup[groupId, default: []].append(echo)
                 try await service.sendText(groupId: groupId, text: trimmed)
                 await refresh()
             } catch {
@@ -541,13 +546,16 @@ final class MarmotChatModel: ObservableObject {
                 )
             ]
         )
-        pendingOptimistic[groupId, default: []].append(echo)
-        messagesByGroup[groupId, default: []].append(echo)
         Task {
+            var echoVisible = false
             do {
                 guard await ensureConnected() else {
                     throw MarmotService.ServiceError.notConnected
                 }
+                await loadLocal()
+                pendingOptimistic[groupId, default: []].append(echo)
+                messagesByGroup[groupId, default: []].append(echo)
+                echoVisible = true
                 try await service.sendMedia(
                     groupId: groupId, data: data, filename: filename, mime: mime, caption: caption
                 )
@@ -555,17 +563,19 @@ final class MarmotChatModel: ObservableObject {
                 await refresh()
             } catch {
                 pendingOptimistic[groupId]?.removeAll { $0.id == echo.id }
-                let failed = MarmotService.MarmotMessage(
-                    id: Self.failedOptimisticIDPrefix + UUID().uuidString,
-                    senderNpub: echo.senderNpub,
-                    content: echo.content,
-                    createdAt: echo.createdAt,
-                    isMine: true,
-                    media: echo.media
-                )
-                pendingOptimistic[groupId, default: []].append(failed)
-                messagesByGroup[groupId, default: []].removeAll { $0.id == echo.id }
-                messagesByGroup[groupId, default: []].append(failed)
+                if echoVisible {
+                    let failed = MarmotService.MarmotMessage(
+                        id: Self.failedOptimisticIDPrefix + UUID().uuidString,
+                        senderNpub: echo.senderNpub,
+                        content: echo.content,
+                        createdAt: echo.createdAt,
+                        isMine: true,
+                        media: echo.media
+                    )
+                    pendingOptimistic[groupId, default: []].append(failed)
+                    messagesByGroup[groupId, default: []].removeAll { $0.id == echo.id }
+                    messagesByGroup[groupId, default: []].append(failed)
+                }
                 onFailure?()
                 self.errorText = Self.describe(error)
             }
