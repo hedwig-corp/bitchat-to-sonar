@@ -1534,7 +1534,7 @@ final class SonarAppStore: ObservableObject {
                     hint: "Right here", detail: "Direct connection · " + network,
                     angle: angle, r: 66 + jitter, sonar: sonar
                 ))
-            } else if peer.isReachable && !sonar {
+            } else if peer.isReachable {
                 items.append(SNPeerItem(
                     id: peer.peerID.id, name: displayName, inRange: true, bars: 2,
                     hint: "Nearby", detail: "Relayed through the mesh · " + network,
