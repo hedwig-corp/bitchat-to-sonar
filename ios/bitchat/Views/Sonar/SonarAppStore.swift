@@ -1014,37 +1014,46 @@ final class SonarAppStore: ObservableObject {
 
     private func publishPaymentMetadataIfNeeded() {
         guard marmot.npub != nil else { return }
-        guard case .ready = walletState else {
-            publishPaymentMetadataWithoutOfferIfNeeded()
-            return
-        }
         guard !publishingPaymentMetadata else { return }
         publishingPaymentMetadata = true
         Task { [weak self] in
             guard let self else { return }
             defer { self.publishingPaymentMetadata = false }
+            guard case .ready = self.walletState else {
+                await self.publishPaymentMetadataWithoutOfferIfNeeded()
+                return
+            }
             do {
                 let offer = try await self.wallet.createOffer()
                 guard case .ready = self.walletState else {
-                    self.publishPaymentMetadataWithoutOfferIfNeeded()
+                    await self.publishPaymentMetadataWithoutOfferIfNeeded()
                     return
                 }
                 guard self.publishedBolt12Offer != offer else { return }
+                try await self.marmot.publishSonarDescriptor(bolt12Offer: offer)
+                guard case .ready = self.walletState else {
+                    await self.publishPaymentMetadataWithoutOfferIfNeeded()
+                    return
+                }
                 self.publishedBolt12Offer = offer
                 self.publishedPaymentMetadataWithoutOffer = false
-                self.marmot.publishSonarDescriptor(bolt12Offer: offer)
             } catch {
-                self.publishPaymentMetadataWithoutOfferIfNeeded()
+                await self.publishPaymentMetadataWithoutOfferIfNeeded()
                 SecureLogger.error("Sonar descriptor payment metadata publish failed: \(error)", category: .session)
             }
         }
     }
 
-    private func publishPaymentMetadataWithoutOfferIfNeeded() {
+    private func publishPaymentMetadataWithoutOfferIfNeeded() async {
         guard publishedBolt12Offer != nil || !publishedPaymentMetadataWithoutOffer else { return }
+        do {
+            try await marmot.publishSonarDescriptor(bolt12Offer: nil)
+        } catch {
+            SecureLogger.error("Sonar descriptor payment metadata clear failed: \(error)", category: .session)
+            return
+        }
         publishedBolt12Offer = nil
         publishedPaymentMetadataWithoutOffer = true
-        marmot.publishSonarDescriptor(bolt12Offer: nil)
     }
 
     private func updateWalletPaymentObservation() {
