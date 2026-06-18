@@ -1,6 +1,7 @@
 package chat.bitchat.sonar
 
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.toComposeImageBitmap
@@ -8,6 +9,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.jetbrains.skia.Image as SkiaImage
+import java.awt.Desktop
 import java.awt.Frame
 import java.awt.FileDialog
 import java.awt.image.BufferedImage
@@ -87,3 +89,53 @@ private fun reencodeJpeg(raw: ByteArray): ByteArray {
 
 actual fun decodeImageBitmap(bytes: ByteArray): ImageBitmap? =
     runCatching { SkiaImage.makeFromEncoded(bytes).toComposeImageBitmap() }.getOrNull()
+
+@Composable
+actual fun rememberMediaActions(): MediaActions =
+    remember {
+        MediaActions(
+            canShare = false,
+            share = { _, _, _ -> false },
+            save = { bytes, filename, _ -> saveMediaFile(bytes, filename) },
+            open = { bytes, filename, _ -> openTempMedia(bytes, filename) },
+        )
+    }
+
+private suspend fun saveMediaFile(bytes: ByteArray, filename: String): Boolean {
+    val picked = pickSaveFile(safeFilename(filename)) ?: return false
+    return withContext(Dispatchers.IO) {
+        runCatching {
+            picked.writeBytes(bytes)
+            true
+        }.getOrDefault(false)
+    }
+}
+
+private suspend fun openTempMedia(bytes: ByteArray, filename: String): Boolean =
+    withContext(Dispatchers.IO) {
+        runCatching {
+            if (!Desktop.isDesktopSupported()) return@runCatching false
+            val file = File.createTempFile("sonar-media-", "-" + safeFilename(filename))
+            file.writeBytes(bytes)
+            file.deleteOnExit()
+            Desktop.getDesktop().open(file)
+            true
+        }.getOrDefault(false)
+    }
+
+private fun pickSaveFile(filename: String): File? {
+    val dialog = FileDialog(null as Frame?, "Save media", FileDialog.SAVE).apply {
+        file = filename
+        isVisible = true
+    }
+    return try {
+        val dir = dialog.directory ?: return null
+        val name = dialog.file ?: return null
+        File(dir, name)
+    } finally {
+        dialog.dispose()
+    }
+}
+
+private fun safeFilename(filename: String): String =
+    filename.substringAfterLast('/').substringAfterLast('\\').ifBlank { "attachment" }
