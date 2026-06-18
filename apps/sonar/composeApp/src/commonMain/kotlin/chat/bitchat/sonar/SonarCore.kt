@@ -62,6 +62,26 @@ data class SonarProfile(
         displayName?.takeIf { it.isNotBlank() } ?: name?.takeIf { it.isNotBlank() }
 }
 
+/** Public Sonar app descriptor advertised on Nostr so account-level peers can
+ *  discover which Sonar capabilities are safe to offer when BLE is unavailable. */
+data class SonarDescriptor(
+    val schema: Int,
+    val calls: Boolean,
+    val media: List<String>,
+    val signaling: List<String>,
+    val transports: List<String>,
+    val callIdentity: String,
+    val bolt12Offer: String?,
+    val paymentReceipts: List<String>,
+    val publishedAtSecs: Long,
+) {
+    val supportsCurrentCalls: Boolean get() =
+        calls &&
+            "marmot" in signaling &&
+            "iroh" in transports &&
+            callIdentity == "iroh-hkdf-sonar-call-iroh-v1"
+}
+
 /** A public message in a geohash channel. */
 data class SonarChannelMsg(
     val id: String,
@@ -175,6 +195,12 @@ expect object SonarCore {
     /** Fetch a peer's kind-0 profile (npub or hex). null if they have none. */
     suspend fun fetchProfile(npub: String): SonarProfile?
 
+    /** Publish this build's public Sonar descriptor. */
+    suspend fun publishSonarDescriptor(callsEnabled: Boolean = true, bolt12Offer: String? = null)
+
+    /** Fetch a peer's public Sonar descriptor (npub or hex). null on miss. */
+    suspend fun fetchSonarDescriptor(npub: String): SonarDescriptor?
+
     // ── Geohash public channels ──
 
     /** Geohash channels the user has joined (persisted). */
@@ -212,6 +238,9 @@ expect object SonarCore {
     /** Our Nostr secret key (`nsec1…`), empty until an identity exists. The
      *  Lightning wallet derives its deterministic seed from this. */
     fun identityNsec(): String
+
+    /** Validate and persist an existing identity. Returns the restored npub. */
+    suspend fun importIdentity(nsec: String): String
 
     /** Onboarding gate. */
     fun onboardingComplete(): Boolean

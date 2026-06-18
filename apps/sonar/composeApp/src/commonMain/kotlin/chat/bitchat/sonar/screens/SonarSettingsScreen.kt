@@ -26,6 +26,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -42,6 +44,7 @@ import chat.bitchat.sonar.ui.SNSectionLabel
 import chat.bitchat.sonar.ui.SNSettingsCard
 import chat.bitchat.sonar.ui.SNSettingsRow
 import chat.bitchat.sonar.ui.SonarAvatar
+import chat.bitchat.sonar.ui.SonarType
 import chat.bitchat.sonar.ui.SNTone
 import chat.bitchat.sonar.ui.SNTrail
 import chat.bitchat.sonar.ui.sonar
@@ -59,6 +62,7 @@ fun SonarSettingsScreen(state: SonarAppState) {
     var wipeAsk by remember { mutableStateOf(false) }
     var eraseAsk by remember { mutableStateOf(false) }
     var currencyPick by remember { mutableStateOf(false) }
+    var exportKey by remember { mutableStateOf(false) }
     var notif by remember { mutableStateOf(false) }
     var appicon by remember { mutableStateOf(false) }
     var requests by remember { mutableStateOf(false) }
@@ -145,6 +149,10 @@ fun SonarSettingsScreen(state: SonarAppState) {
                     else state.toast = "Set a screen lock on your device first"
                 }
                 SNSettingsRow(
+                    icon = SNIconName.Key, tone = SNTone.Cyan, label = "Export private key",
+                    sub = "Back up or move this account",
+                ) { exportKey = true }
+                SNSettingsRow(
                     icon = SNIconName.Check, label = "Read receipts",
                     toggle = state.prefBool("readReceipts"),
                 ) { state.togglePref("readReceipts") }
@@ -210,6 +218,7 @@ fun SonarSettingsScreen(state: SonarAppState) {
 
     if (wipeAsk) WipeSheet(onWipe = { wipeAsk = false; state.wipe() }, onClose = { wipeAsk = false })
     if (eraseAsk) EraseChatsSheet(onErase = { eraseAsk = false; state.eraseAllChats() }, onClose = { eraseAsk = false })
+    if (exportKey) ExportKeySheet(state, onClose = { exportKey = false })
     if (currencyPick) CurrencySheet(
         selected = state.currency,
         onPick = { state.selectCurrency(it); currencyPick = false },
@@ -220,6 +229,55 @@ fun SonarSettingsScreen(state: SonarAppState) {
     if (requests) RequestsSheet { requests = false }
 
     state.toast?.let { ToastBar(it) { state.toast = null } }
+}
+
+@Composable
+private fun ExportKeySheet(state: SonarAppState, onClose: () -> Unit) {
+    val s = sonar
+    val clipboard = LocalClipboardManager.current
+    var revealed by remember { mutableStateOf(false) }
+    val nsec = state.exportNsec()
+    val masked = if (nsec.isBlank()) "No private key loaded" else nsec.take(5) + " " + "*".repeat(28)
+    Sheet("Export private key", onClose) {
+        Text(
+            "This nsec key controls your Sonar account and wallet. Keep it private.",
+            color = s.text2, fontSize = 13.5.sp, lineHeight = 18.sp
+        )
+        Spacer(Modifier.height(12.dp))
+        Box(
+            Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(s.surface2)
+                .clickable(enabled = nsec.isNotBlank()) { revealed = !revealed }
+                .padding(horizontal = 14.dp, vertical = 13.dp)
+        ) {
+            Text(
+                if (revealed) nsec else masked,
+                color = if (nsec.isBlank()) s.text3 else s.text,
+                style = SonarType.mono(13.5),
+                lineHeight = 18.sp,
+            )
+        }
+        Spacer(Modifier.height(12.dp))
+        Box(
+            Modifier.fillMaxWidth().height(46.dp).clip(RoundedCornerShape(13.dp))
+                .background(if (nsec.isBlank()) s.surface2 else s.accentFill)
+                .clickable(enabled = nsec.isNotBlank()) {
+                    if (revealed) {
+                        clipboard.setText(AnnotatedString(nsec))
+                        state.toast = "Private key copied"
+                    } else {
+                        revealed = true
+                    }
+                },
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                if (revealed) "Copy private key" else "Reveal private key",
+                color = if (nsec.isBlank()) s.text3 else s.onAccent,
+                fontSize = 15.sp,
+                fontWeight = FontWeight.Bold,
+            )
+        }
+    }
 }
 
 @Composable

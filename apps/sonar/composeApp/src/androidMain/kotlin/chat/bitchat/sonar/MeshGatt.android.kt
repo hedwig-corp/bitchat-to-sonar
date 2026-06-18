@@ -77,34 +77,28 @@ object MeshGatt {
     private fun manager() = ctx.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
 
     // ── This device's mesh identity (PERSISTED across launches) ──
-    // The Noise static key + announce-signing seed are stored in the app-private
-    // "sonar" prefs (same store + sensitivity tier as the Nostr nsec) so the mesh
-    // peerID is STABLE — it used to regenerate every process, giving the phone a
-    // brand-new identity on each launch (iOS persists its Noise key in the
-    // Keychain; this is the Android-parity equivalent). Deriving these from the
-    // Nostr identity instead is tracked separately (issue #10).
-    private fun prefs() = ctx.getSharedPreferences("sonar", Context.MODE_PRIVATE)
+    // The Noise static key + announce-signing seed are stored via AndroidSecrets
+    // so the mesh peerID is stable without leaving private material in plaintext
+    // prefs. Deriving these from the Nostr identity is tracked separately.
 
-    /** Noise static keypair (X25519), loaded from prefs or generated + saved once. */
+    /** Noise static keypair (X25519), loaded from secure storage or generated + saved once. */
     private val keypair by lazy {
-        val p = prefs()
-        val priv = p.getString("mesh.noise.priv", null)
-        val pub = p.getString("mesh.noise.pub", null)
+        val priv = AndroidSecrets.getMigrating("mesh.noise.priv")
+        val pub = AndroidSecrets.getMigrating("mesh.noise.pub")
         if (priv != null && pub != null) {
             NoiseKeypairHex(priv, pub)
         } else {
             noiseGenerateKeypair().also {
-                p.edit().putString("mesh.noise.priv", it.privateHex)
-                    .putString("mesh.noise.pub", it.publicHex).apply()
+                AndroidSecrets.put("mesh.noise.priv", it.privateHex)
+                AndroidSecrets.put("mesh.noise.pub", it.publicHex)
             }
         }
     }
-    /** Ed25519 announce-signing seed (32 bytes, hex), loaded from prefs or made once. */
+    /** Ed25519 announce-signing seed (32 bytes, hex), loaded securely or made once. */
     private val ed25519SeedHex by lazy {
-        val p = prefs()
-        p.getString("mesh.ed25519.seed", null) ?: ByteArray(32)
+        AndroidSecrets.getMigrating("mesh.ed25519.seed") ?: ByteArray(32)
             .also { SecureRandom().nextBytes(it) }.toHex()
-            .also { p.edit().putString("mesh.ed25519.seed", it).apply() }
+            .also { AndroidSecrets.put("mesh.ed25519.seed", it) }
     }
     /** bitchat peerID = SHA256(noise static pubkey)[:8], hex. */
     private val myPeerIdHex by lazy { Sha256.hash(keypair.publicHex.hexToBytes()).copyOf(8).toHex() }

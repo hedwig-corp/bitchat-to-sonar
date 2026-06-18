@@ -14,12 +14,15 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -32,6 +35,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -39,6 +43,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.ui.SNFingerprintCard
+import chat.bitchat.sonar.ui.SNGhostButton
 import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconButton
 import chat.bitchat.sonar.ui.SNIconName
@@ -55,8 +60,14 @@ fun SonarOnboardingScreen(state: SonarAppState) {
     val s = sonar
     var step by remember { mutableStateOf(0) }
     var nick by remember { mutableStateOf("") }
+    var restoring by remember { mutableStateOf(false) }
+    var nsec by remember { mutableStateOf("") }
+    var restoreError by remember { mutableStateOf<String?>(null) }
+    var restoreInFlight by remember { mutableStateOf(false) }
     val trimmed = nick.trim()
     val can = trimmed.length >= 2
+    val nsecOk = nsec.trim().matches(Regex("^nsec1[0-9a-z]{20,}$"))
+    val clipboard = LocalClipboardManager.current
 
     Column(
         Modifier.fillMaxSize().background(s.bg)
@@ -64,17 +75,30 @@ fun SonarOnboardingScreen(state: SonarAppState) {
     ) {
         // Top bar (back)
         Box(Modifier.fillMaxWidth().height(40.dp)) {
-            if (step > 0) {
-                SNIconButton(SNIconName.Back, onClick = { step -= 1 })
+            if (step > 0 || restoring) {
+                SNIconButton(SNIconName.Back, onClick = {
+                    if (restoring) {
+                        restoring = false
+                        restoreError = null
+                    } else {
+                        step -= 1
+                    }
+                })
             }
         }
 
         AnimatedContent(
-            targetState = step,
+            targetState = if (restoring) -1 else step,
             transitionSpec = { fadeIn() togetherWith fadeOut() },
             modifier = Modifier.weight(1f)
         ) { st ->
             when (st) {
+                -1 -> StepRestore(
+                    nsec = nsec,
+                    error = restoreError,
+                    onChange = { nsec = it },
+                    onPaste = { clipboard.getText()?.text?.let { nsec = it.trim() } },
+                )
                 0 -> StepIntro()
                 1 -> StepNickname(nick, trimmed) { nick = it.take(20) }
                 else -> StepDone(trimmed, state.fingerprint())
@@ -83,19 +107,50 @@ fun SonarOnboardingScreen(state: SonarAppState) {
 
         // Footer
         Column(Modifier.padding(top = 18.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                repeat(3) { i ->
-                    Box(
-                        Modifier.size(7.dp).clip(CircleShape)
-                            .background(if (step == i) s.accent else s.hairline)
-                    )
+            if (!restoring) {
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    repeat(3) { i ->
+                        Box(
+                            Modifier.size(7.dp).clip(CircleShape)
+                                .background(if (step == i) s.accent else s.hairline)
+                        )
+                    }
                 }
+                Spacer(Modifier.height(16.dp))
             }
-            Spacer(Modifier.height(16.dp))
-            when (step) {
-                0 -> SNPrimaryButton("Get started") { step = 1 }
-                1 -> SNPrimaryButton("Continue", disabled = !can) { if (can) step = 2 }
-                else -> SNPrimaryButton("Start chatting") { state.completeOnboarding(trimmed) }
+            if (restoring) {
+                SNPrimaryButton(
+                    if (restoreInFlight) "Restoring..." else "Restore account",
+                    disabled = !nsecOk || restoreInFlight,
+                ) {
+                    val key = nsec.trim()
+                    restoreInFlight = true
+                    restoreError = null
+                    state.restoreAccount(key) { result ->
+                        restoreInFlight = false
+                        result.exceptionOrNull()?.let {
+                            restoreError = "That key couldn't be imported. Check you pasted the full nsec1... key."
+                        }
+                    }
+                }
+                SNGhostButton("Create a new identity") {
+                    restoring = false
+                    restoreError = null
+                    nsec = ""
+                }
+            } else {
+                when (step) {
+                    0 -> {
+                        SNPrimaryButton("Get started") { step = 1 }
+                        SNGhostButton("I already have a key") {
+                            nsec = ""
+                            restoreError = null
+                            restoring = true
+                        }
+                    }
+                    1 -> SNPrimaryButton("Continue", disabled = !can) { if (can) step = 2 }
+                    else -> SNPrimaryButton("Start chatting") { state.completeOnboarding(trimmed) }
+                }
             }
         }
     }
@@ -184,6 +239,51 @@ private fun StepNickname(nick: String, trimmed: String, onChange: (String) -> Un
             "No signup. Your identity is a private key created on this phone — nobody else ever sees it.",
             color = s.text3, fontSize = 13.sp, lineHeight = 17.sp
         )
+    }
+}
+
+@Composable
+private fun StepRestore(
+    nsec: String,
+    error: String?,
+    onChange: (String) -> Unit,
+    onPaste: () -> Unit,
+) {
+    val s = sonar
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.Center) {
+        Text("Restore account", color = s.text, fontSize = 30.sp, fontWeight = FontWeight.Black)
+        Spacer(Modifier.height(10.dp))
+        Text("Paste your nsec private key to bring this Sonar identity and wallet onto this device.", color = s.text2, fontSize = 16.sp, lineHeight = 21.sp)
+        Spacer(Modifier.height(22.dp))
+        Box(
+            Modifier.fillMaxWidth().heightIn(min = 116.dp).clip(RoundedCornerShape(16.dp)).background(s.surface2)
+                .padding(horizontal = 16.dp, vertical = 14.dp)
+        ) {
+            if (nsec.isEmpty()) Text("nsec1...", color = s.text3, fontSize = 16.sp)
+            BasicTextField(
+                value = nsec,
+                onValueChange = { onChange(it.trim()) },
+                textStyle = TextStyle(color = s.text, fontSize = 15.sp, lineHeight = 20.sp),
+                cursorBrush = SolidColor(s.accent),
+                modifier = Modifier.fillMaxWidth()
+            )
+        }
+        Spacer(Modifier.height(12.dp))
+        Row(
+            Modifier.clip(CircleShape).background(s.accentSoft).clickable(onClick = onPaste)
+                .padding(horizontal = 14.dp, vertical = 9.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            SNIcon(SNIconName.Key, 16.dp, s.accentDeep, weight = 2f)
+            Spacer(Modifier.width(7.dp))
+            Text("Paste key", color = s.accentDeep, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+        }
+        Spacer(Modifier.height(18.dp))
+        Text("Anyone with this key controls your account and wallet. Only restore from your own backup.", color = s.text3, fontSize = 13.sp, lineHeight = 17.sp)
+        if (error != null) {
+            Spacer(Modifier.height(14.dp))
+            Text(error, color = s.danger, fontSize = 13.sp, lineHeight = 17.sp)
+        }
     }
 }
 

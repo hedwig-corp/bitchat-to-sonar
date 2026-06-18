@@ -13,9 +13,8 @@ import java.security.SecureRandom
 /**
  * Android `actual`: drive the Rust core (Marmot/White Noise) through the
  * UniFFI Kotlin/JNA bindings. The FFI is blocking (owns a tokio runtime), so
- * every call hops to [Dispatchers.IO]. Identity + DB key persist in prefs
- * (NOTE: plain SharedPreferences for this test build — production must use the
- * Android Keystore / EncryptedSharedPreferences).
+ * every call hops to [Dispatchers.IO]. Identity + DB key persist via
+ * [AndroidSecrets] so private material is encrypted with Android Keystore.
  */
 actual object SonarCore {
 
@@ -159,6 +158,30 @@ actual object SonarCore {
         }.getOrNull()
     }
 
+    actual suspend fun publishSonarDescriptor(callsEnabled: Boolean, bolt12Offer: String?) = withContext(Dispatchers.IO) {
+        runCatching { node?.publishSonarDescriptor(callsEnabled, listOf("marmot"), bolt12Offer) }
+        Unit
+    }
+
+    actual suspend fun fetchSonarDescriptor(npub: String): SonarDescriptor? = withContext(Dispatchers.IO) {
+        val n = node ?: return@withContext null
+        runCatching {
+            n.fetchSonarDescriptor(npub)?.let {
+                SonarDescriptor(
+                    schema = it.schema.toInt(),
+                    calls = it.calls,
+                    media = it.media,
+                    signaling = it.signaling,
+                    transports = it.transports,
+                    callIdentity = it.callIdentity,
+                    bolt12Offer = it.bolt12Offer,
+                    paymentReceipts = it.paymentReceipts,
+                    publishedAtSecs = it.publishedAtSecs.toLong(),
+                )
+            }
+        }.getOrNull()
+    }
+
     actual suspend fun sync() = withContext(Dispatchers.IO) {
         runCatching { node?.syncOnce() }
         Unit
@@ -239,7 +262,7 @@ actual object SonarCore {
     actual fun fingerprint(): String {
         var hex = pubkeyHex
         if (hex.isEmpty()) {
-            val saved = prefs().getString("nsec", null)
+            val saved = AndroidSecrets.getMigrating("nsec")
             if (saved != null) hex = runCatching { SonarIdentity.import(saved).pubkeyHex() }.getOrDefault("")
         }
         if (hex.isEmpty()) return ""
@@ -247,7 +270,19 @@ actual object SonarCore {
         return hex.take(32).uppercase().chunked(4).joinToString(" ")
     }
 
-    actual fun identityNsec(): String = prefs().getString("nsec", "") ?: ""
+    actual fun identityNsec(): String = AndroidSecrets.getMigrating("nsec") ?: ""
+
+    actual suspend fun importIdentity(nsec: String): String = withContext(Dispatchers.IO) {
+        val identity = SonarIdentity.import(nsec.trim())
+        lock.withLock {
+            node = null
+            npub = identity.npub()
+            pubkeyHex = identity.pubkeyHex()
+            File(ctx.filesDir, "sonar-marmot").deleteRecursively()
+            AndroidSecrets.put("nsec", identity.nsec())
+            npub
+        }
+    }
 
     actual fun onboardingComplete(): Boolean = prefs().getBoolean("onboarding.complete", false)
 
@@ -273,6 +308,7 @@ actual object SonarCore {
             npub = ""; pubkeyHex = ""
             // Drop the encrypted Marmot DB + all prefs.
             File(ctx.filesDir, "sonar-marmot").deleteRecursively()
+            AndroidSecrets.clear()
             prefs().edit().clear().apply()
         }
     }
@@ -346,20 +382,20 @@ actual object SonarCore {
         node ?: error("SonarCore not started — call start() first")
 
     private fun loadOrCreateIdentity(): SonarIdentity {
-        val saved = prefs().getString("nsec", null)
+        val saved = AndroidSecrets.getMigrating("nsec")
         if (saved != null) {
             runCatching { return SonarIdentity.import(saved) }
         }
         val id = SonarIdentity.generate()
-        prefs().edit().putString("nsec", id.nsec()).apply()
+        AndroidSecrets.put("nsec", id.nsec())
         return id
     }
 
     private fun loadOrCreateDbKey(): String {
-        prefs().getString("dbKeyHex", null)?.let { return it }
+        AndroidSecrets.getMigrating("dbKeyHex")?.let { return it }
         val bytes = ByteArray(32).also { SecureRandom().nextBytes(it) }
         val hex = bytes.joinToString("") { b -> "%02x".format(b) }
-        prefs().edit().putString("dbKeyHex", hex).apply()
+        AndroidSecrets.put("dbKeyHex", hex)
         return hex
     }
 }

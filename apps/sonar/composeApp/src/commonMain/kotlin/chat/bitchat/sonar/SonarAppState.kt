@@ -16,7 +16,11 @@ import chat.bitchat.sonar.wallet.WalletBridge
 import chat.bitchat.sonar.wallet.WalletState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+
+private const val SONAR_DESCRIPTOR_TTL_SECS = 15 * 60L
+private const val SONAR_DESCRIPTOR_MISS_TTL_SECS = 60L
 
 sealed interface Screen {
     data object Home : Screen
@@ -113,6 +117,12 @@ class SonarAppState(private val scope: CoroutineScope) {
     var profilesByNpub by mutableStateOf<Map<String, SonarProfile>>(emptyMap())
         private set
     private val profileFetches = mutableSetOf<String>()
+    /** Public Sonar descriptors by raw npub hex, used for out-of-BLE call parity. */
+    var sonarDescriptorsByNpubHex by mutableStateOf<Map<String, SonarDescriptor>>(emptyMap())
+        private set
+    private val sonarDescriptorFetches = mutableSetOf<String>()
+    private val sonarDescriptorFetchedAt = mutableMapOf<String, Long>()
+    private val sonarDescriptorMissedAt = mutableMapOf<String, Long>()
     private var stack by mutableStateOf<List<Screen>>(listOf(Screen.Home))
     val screen: Screen get() = stack.last()
 
@@ -131,6 +141,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             MeshRadio.setMeshNickname("")
             MeshRadio.setLocalSonarAnnounce(null); sonarPeerProfiles = emptyMap()
             linkByFp.clear(); linkCapsByFp.clear(); foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
+            sonarDescriptorsByNpubHex = emptyMap()
+            sonarDescriptorFetches.clear(); sonarDescriptorFetchedAt.clear(); sonarDescriptorMissedAt.clear()
             MessageStore.wipe()
             SonarCore.wipe()
             stack = listOf(Screen.Home)
@@ -142,6 +154,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             mediaCache.clear()
             callLogs.clear(); callVersion++
             resetCallState()
+            pollJob?.cancel(); pollJob = null
         }
     }
 
@@ -208,6 +221,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     private var callLoopRunning = false
     private var callTicker: kotlinx.coroutines.Job? = null
     private var meshRealtimeLoopRunning = false
+    private var pollJob: Job? = null
     /** Ids of ☎CALL control messages already routed to the engine (dedup). */
     private val scannedCall = mutableSetOf<String>()
 
@@ -600,6 +614,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             linkCapsByFp[peerId] = ann.capabilities
             persistLinkCaps()
         }
+        ensureSonarDescriptorHex(npubHex)
     }
     /** GPS-derived location channels (Mesh + Ottaviano…Italy), like iOS. */
     var locationChannels by mutableStateOf<List<GeoChannel>>(emptyList())
@@ -653,6 +668,12 @@ class SonarAppState(private val scope: CoroutineScope) {
             walletState = WalletBridge.state()
             WalletBridge.fetchRates()
             rate = WalletBridge.cachedRate(currency)
+            val receiveOffer = if (walletState is WalletState.Ready) {
+                runCatching { WalletBridge.createOffer() }.getOrNull()
+            } else {
+                null
+            }
+            runCatching { SonarCore.publishSonarDescriptor(callsEnabled = true, bolt12Offer = receiveOffer) }
         }
     }
 
@@ -957,6 +978,49 @@ class SonarAppState(private val scope: CoroutineScope) {
         refreshMeshIdentity()
     }
 
+    fun exportNsec(): String = SonarCore.identityNsec()
+
+    fun restoreAccount(nsec: String, onResult: (Result<Unit>) -> Unit) {
+        scope.launch {
+            val result = runCatching {
+                val restoredNpub = SonarCore.importIdentity(nsec)
+
+                WalletBridge.shutdown()
+                UnifyRadio.stopScanning()
+                UnifyRadio.stopAdvertising()
+                unifyOffer = null; unifyPeers = emptyList()
+                pollJob?.cancel(); pollJob = null
+                resetCallState()
+
+                MessageStore.wipe()
+                meshChats.clear(); meshChatNames.clear(); pendingMarmotSends.clear()
+                linkByFp.clear(); linkCapsByFp.clear(); persistLinks(); persistLinkCaps()
+                foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
+                sonarPeerProfiles = emptyMap()
+                sonarDescriptorsByNpubHex = emptyMap()
+                sonarDescriptorFetches.clear(); sonarDescriptorFetchedAt.clear(); sonarDescriptorMissedAt.clear()
+                meshBroadcast = emptyList(); meshDmRows = emptyList()
+                chats = emptyList(); messages = emptyList(); channelMsgs = emptyList()
+                lastWnGroups = -1; lastWnMsgs = -1
+                payLedger = SonarPayLedger(); persistPay(); scannedPay.clear(); payVersion++
+                mediaCache.clear()
+                callLogs.clear(); callVersion++
+
+                npub = restoredNpub
+                started = false
+                connecting = false
+                SonarCore.setOnboardingComplete(true)
+                onboarded = true
+                nick = SonarCore.nickname()
+                stack = listOf(Screen.Home)
+                walletState = WalletBridge.state()
+                refreshMeshIdentity()
+                boot()
+            }
+            onResult(result.map { Unit })
+        }
+    }
+
     fun updateNickname(value: String) {
         SonarCore.setNickname(value)
         nick = value
@@ -1066,6 +1130,9 @@ class SonarAppState(private val scope: CoroutineScope) {
                 refreshMeshIdentity()
                 // Publish our kind-0 profile so peers see our nickname, not npub.
                 launch { runCatching { SonarCore.publishProfile(nick) } }
+                // Publish the public Sonar descriptor so account-level peers can
+                // safely offer calls over White Noise/Marmot when BLE is absent.
+                launch { runCatching { SonarCore.publishSonarDescriptor(callsEnabled = true) } }
                 // Hydrate BLE-mesh transcripts from disk so private mesh chats
                 // survive a restart (parity with the iOS MessageStore). Precedes
                 // refreshMeshDmRows so the Messages list is populated at launch.
@@ -1127,6 +1194,45 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // Not published yet — allow a later retry (driven by poll()).
                 profileFetches.remove(otherNpub)
             }
+        }
+    }
+
+    private fun canonicalNpubHex(value: String): String? {
+        val t = value.trim()
+        if (t.length == 64 && t.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }) {
+            return t.lowercase()
+        }
+        return chat.bitchat.sonar.crypto.Bech32.decode(t)
+            ?.takeIf { it.hrp == "npub" && it.data.size == 32 }
+            ?.data
+            ?.toHexLower()
+    }
+
+    private fun ensureSonarDescriptor(npubOrHex: String) {
+        val npubHex = canonicalNpubHex(npubOrHex) ?: return
+        ensureSonarDescriptorHex(npubHex)
+    }
+
+    private fun ensureSonarDescriptorHex(npubHex: String) {
+        val key = npubHex.lowercase()
+        val now = SonarClock.nowSecs()
+        val fetchedAt = sonarDescriptorFetchedAt[key]
+        if (sonarDescriptorsByNpubHex[key] != null && fetchedAt != null && now - fetchedAt < SONAR_DESCRIPTOR_TTL_SECS) {
+            return
+        }
+        val missedAt = sonarDescriptorMissedAt[key]
+        if (missedAt != null && now - missedAt < SONAR_DESCRIPTOR_MISS_TTL_SECS) return
+        if (!sonarDescriptorFetches.add(key)) return
+        scope.launch {
+            val descriptor = runCatching { SonarCore.fetchSonarDescriptor(key) }.getOrNull()
+            if (descriptor != null) {
+                sonarDescriptorsByNpubHex = sonarDescriptorsByNpubHex + (key to descriptor)
+                sonarDescriptorFetchedAt[key] = SonarClock.nowSecs()
+                sonarDescriptorMissedAt.remove(key)
+            } else {
+                sonarDescriptorMissedAt[key] = SonarClock.nowSecs()
+            }
+            sonarDescriptorFetches.remove(key)
         }
     }
 
@@ -1632,14 +1738,31 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  (CAP_CALLS from 0x53) and require either live BLE or the npub needed to
      *  create/reuse White Noise signaling for that same discovered peer. */
     fun canCall(chatId: String): Boolean {
-        val peerId = if (isMeshChat(chatId)) meshPeerId(chatId) else peerIdForMarmotGroup(chatId) ?: return false
+        val peerId = if (isMeshChat(chatId)) meshPeerId(chatId) else peerIdForMarmotGroup(chatId)
+        if (peerId == null) return marmotChatCallCapable(chatId)
         return callCapablePeer(peerId) &&
             (hasLiveMeshRoute(peerId) || npubRawFor(peerId) != null)
     }
 
-    private fun callCapablePeer(peerId: String): Boolean =
-        sonarProfile(peerId)?.speaksCalls == true ||
-            (((linkCapsByFp[peerId] ?: 0) and SonarAnnounce.CAP_CALLS) != 0)
+    private fun marmotChatCallCapable(chatId: String): Boolean {
+        val other = chats.firstOrNull { it.id == chatId }
+            ?.members
+            ?.firstOrNull { it != npub && it.isNotBlank() }
+            ?: return false
+        val npubHex = canonicalNpubHex(other) ?: return false
+        sonarDescriptorsByNpubHex[npubHex]?.let { if (it.supportsCurrentCalls) return true }
+        ensureSonarDescriptorHex(npubHex)
+        return false
+    }
+
+    private fun callCapablePeer(peerId: String): Boolean {
+        if (sonarProfile(peerId)?.speaksCalls == true) return true
+        if (((linkCapsByFp[peerId] ?: 0) and SonarAnnounce.CAP_CALLS) != 0) return true
+        val npubHex = npubRawFor(peerId)?.toHexLower() ?: return false
+        sonarDescriptorsByNpubHex[npubHex]?.let { if (it.supportsCurrentCalls) return true }
+        ensureSonarDescriptorHex(npubHex)
+        return false
+    }
 
     private fun randomMeshId(): String =
         (0 until 16).joinToString("") { "0123456789abcdef"[kotlin.random.Random.nextInt(16)].toString() }
@@ -1782,11 +1905,17 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private suspend fun refreshChats() {
         chats = SonarCore.chats()
+        for (c in chats) {
+            c.members.forEach {
+                if (it != npub && it.isNotBlank()) ensureSonarDescriptor(it)
+            }
+        }
         groupInvites = runCatching { SonarCore.pendingGroupInvites() }.getOrDefault(emptyList())
     }
 
     private fun poll() {
-        scope.launch {
+        if (pollJob?.isActive == true) return
+        pollJob = scope.launch {
             var tick = 0
             while (true) {
                 delay(4000)
