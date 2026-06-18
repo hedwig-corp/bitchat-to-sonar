@@ -123,6 +123,30 @@ actual object SonarCore {
         }.getOrNull()
     }
 
+    actual suspend fun publishSonarDescriptor(callsEnabled: Boolean, bolt12Offer: String?) = withContext(Dispatchers.IO) {
+        runCatching { node?.publishSonarDescriptor(false, listOf("marmot"), null) }
+        Unit
+    }
+
+    actual suspend fun fetchSonarDescriptor(npub: String): SonarDescriptor? = withContext(Dispatchers.IO) {
+        val n = node ?: return@withContext null
+        runCatching {
+            n.fetchSonarDescriptor(npub)?.let {
+                SonarDescriptor(
+                    schema = it.schema.toInt(),
+                    calls = it.calls,
+                    media = it.media,
+                    signaling = it.signaling,
+                    transports = it.transports,
+                    callIdentity = it.callIdentity,
+                    bolt12Offer = it.bolt12Offer,
+                    paymentReceipts = it.paymentReceipts,
+                    publishedAtSecs = it.publishedAtSecs.toLong(),
+                )
+            }
+        }.getOrNull()
+    }
+
     actual suspend fun sync() = withContext(Dispatchers.IO) {
         runCatching { node?.syncOnce() }
         Unit
@@ -210,7 +234,20 @@ actual object SonarCore {
         return hex.take(32).uppercase().chunked(4).joinToString(" ")
     }
 
-    actual fun identityNsec(): String = DesktopEnv.getString("nsec", "") ?: ""
+    actual fun identityNsec(): String = DesktopSecrets.get("nsec") ?: ""
+
+    actual suspend fun importIdentity(nsec: String): String = withContext(Dispatchers.IO) {
+        SonarNativeLoader.ensureLoaded()
+        val identity = SonarIdentity.import(nsec.trim())
+        lock.withLock {
+            node = null
+            npub = identity.npub()
+            pubkeyHex = identity.pubkeyHex()
+            marmotDir().deleteRecursively()
+            DesktopSecrets.put("nsec", identity.nsec())
+            npub
+        }
+    }
 
     actual fun onboardingComplete(): Boolean = DesktopEnv.getBoolean("onboarding.complete", false)
 

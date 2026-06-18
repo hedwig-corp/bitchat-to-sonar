@@ -120,6 +120,30 @@ actual object SonarCore {
         }.getOrNull()
     }
 
+    actual suspend fun publishSonarDescriptor(callsEnabled: Boolean, bolt12Offer: String?) = withContext(Dispatchers.IO) {
+        runCatching { node?.publishSonarDescriptor(callsEnabled, listOf("marmot"), bolt12Offer) }
+        Unit
+    }
+
+    actual suspend fun fetchSonarDescriptor(npub: String): SonarDescriptor? = withContext(Dispatchers.IO) {
+        val n = node ?: return@withContext null
+        runCatching {
+            n.fetchSonarDescriptor(npub)?.let {
+                SonarDescriptor(
+                    schema = it.schema.toInt(),
+                    calls = it.calls,
+                    media = it.media,
+                    signaling = it.signaling,
+                    transports = it.transports,
+                    callIdentity = it.callIdentity,
+                    bolt12Offer = it.bolt12Offer,
+                    paymentReceipts = it.paymentReceipts,
+                    publishedAtSecs = it.publishedAtSecs.toLong(),
+                )
+            }
+        }.getOrNull()
+    }
+
     actual suspend fun sync() = withContext(Dispatchers.IO) {
         runCatching { node?.syncOnce() }
         Unit
@@ -209,6 +233,18 @@ actual object SonarCore {
     }
 
     actual fun identityNsec(): String = prefs().getString("nsec", "") ?: ""
+
+    actual suspend fun importIdentity(nsec: String): String = withContext(Dispatchers.IO) {
+        val identity = SonarIdentity.import(nsec.trim())
+        lock.withLock {
+            node = null
+            npub = identity.npub()
+            pubkeyHex = identity.pubkeyHex()
+            File(ctx.filesDir, "sonar-marmot").deleteRecursively()
+            prefs().edit().putString("nsec", identity.nsec()).apply()
+            npub
+        }
+    }
 
     actual fun onboardingComplete(): Boolean = prefs().getBoolean("onboarding.complete", false)
 
