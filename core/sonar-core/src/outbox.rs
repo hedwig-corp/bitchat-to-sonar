@@ -4,7 +4,7 @@
 //! only the already-encrypted relay event plus delivery metadata so a local
 //! pending message can survive restart and be retried when relays attach.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -70,9 +70,7 @@ impl OutboxState {
     }
 
     pub fn status_for_message(&self, message_id_hex: &str) -> Option<DeliveryState> {
-        self.entries
-            .get(message_id_hex)
-            .map(|entry| entry.state.clone())
+        self.entries.get(message_id_hex).map(|entry| entry.state)
     }
 
     pub fn mark_pending(
@@ -139,8 +137,18 @@ impl OutboxState {
         self.save_if_dirty()
     }
 
-    pub fn retryable_events(&mut self, now_secs: u64) -> Result<Vec<(String, Event)>> {
+    pub fn retryable_events(
+        &mut self,
+        now_secs: u64,
+        active_group_ids: &HashSet<String>,
+    ) -> Result<Vec<(String, Event)>> {
         let mut out = Vec::new();
+        let before = self.entries.len();
+        self.entries
+            .retain(|_, entry| active_group_ids.contains(&entry.group_id_hex));
+        if self.entries.len() != before {
+            self.dirty = true;
+        }
         for entry in self.entries.values_mut() {
             if !matches!(entry.state, DeliveryState::Pending | DeliveryState::Failed) {
                 continue;
@@ -292,5 +300,31 @@ mod tests {
             reloaded.status_for_message("kept-message"),
             Some(DeliveryState::Pending)
         );
+    }
+
+    #[test]
+    fn retryable_events_purges_inactive_group_entries_before_decode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("outbox.json");
+        let mut outbox = OutboxState::load(Some(path.clone()));
+
+        outbox
+            .mark_pending(
+                "deleted-group".into(),
+                "deleted-message".into(),
+                "wrapper".into(),
+                "not-json".into(),
+                1,
+            )
+            .expect("mark pending");
+
+        let active_group_ids = HashSet::new();
+        let events = outbox
+            .retryable_events(2, &active_group_ids)
+            .expect("retryable events");
+        assert!(events.is_empty());
+
+        let reloaded = OutboxState::load(Some(path));
+        assert_eq!(reloaded.status_for_message("deleted-message"), None);
     }
 }

@@ -1115,9 +1115,19 @@ impl SonarClient {
         if self.relays.is_empty() {
             return;
         }
+        let active_group_ids = match self.engine.groups() {
+            Ok(groups) => groups
+                .into_iter()
+                .map(|group| hex::encode(group.mls_group_id.as_slice()))
+                .collect::<HashSet<_>>(),
+            Err(err) => {
+                tracing::debug!(%err, "failed to load active Marmot groups for outbox retry");
+                return;
+            }
+        };
         let retryable = {
             let mut outbox = self.outbox_state.lock().unwrap();
-            match outbox.retryable_events(Timestamp::now().as_secs()) {
+            match outbox.retryable_events(Timestamp::now().as_secs(), &active_group_ids) {
                 Ok(events) => events,
                 Err(err) => {
                     tracing::debug!(%err, "failed to load retryable outbox events");

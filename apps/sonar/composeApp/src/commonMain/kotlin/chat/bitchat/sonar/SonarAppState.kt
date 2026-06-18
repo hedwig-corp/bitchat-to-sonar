@@ -1362,6 +1362,8 @@ class SonarAppState(private val scope: CoroutineScope) {
         scope.launch {
             refreshOpenDm(peerId)
             refreshChats()
+            // Reconcile the open transcript after chat-list refresh may discover
+            // the peer's Marmot group mapping.
             refreshOpenDm(peerId)
         }
     }

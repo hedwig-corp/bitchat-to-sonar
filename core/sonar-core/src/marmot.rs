@@ -95,7 +95,7 @@ pub struct MediaRef {
 /// Local delivery state for a transcript row. Network/relay work updates this
 /// state by mutating Sonar-owned outbox metadata; the UI reads it with the
 /// local transcript page instead of inventing app-layer optimistic rows.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryState {
     Received,
