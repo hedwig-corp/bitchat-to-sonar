@@ -1868,12 +1868,14 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  group is created on the first out-of-range send. Flushed by
      *  [flushPendingMarmot] once the group appears in [chats]. */
     private val pendingMarmotSends = mutableMapOf<String, MutableList<String>>()
+    private val startingMarmotChats = mutableSetOf<String>()
 
     // ── Outbox: per-peer message queue for offline/unreachable peers ──
     // Mirrors iOS MessageRouter outbox. When neither BLE mesh link nor npub is
     // available, messages are queued here instead of being dropped. Flushed
     // automatically when the peer reconnects over BLE or their npub is learned.
     private val outbox = mutableMapOf<String, MutableList<QueuedMessage>>()
+    private val flushingOutboxPeers = mutableSetOf<String>()
 
     /** Continue a Sonar-peer conversation over White Noise (Marmot) when out of
      *  Bluetooth range, creating the 1:1 group on first send (mirrors iOS
@@ -1887,13 +1889,16 @@ class SonarAppState(private val scope: CoroutineScope) {
             }
             return
         }
-        pendingMarmotSends.getOrPut(npubRaw.toHexLower()) { mutableListOf() }.add(text)
+        val npubHex = npubRaw.toHexLower()
+        pendingMarmotSends.getOrPut(npubHex) { mutableListOf() }.add(text)
         toast = "Out of range — continuing over White Noise…"
+        if (!startingMarmotChats.add(npubHex)) return
         scope.launch {
             try {
-                SonarCore.startChat(npubRaw.toHexLower()) // start_dm accepts a hex pubkey
+                SonarCore.startChat(npubHex) // start_dm accepts a hex pubkey
                 refreshChats(); flushPendingMarmot(); refreshOpenDm(peerId)
             } catch (e: Throwable) { toast = "couldn’t start secure chat: ${e.message}" }
+            finally { startingMarmotChats.remove(npubHex) }
         }
     }
 
@@ -1931,41 +1936,100 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Try to deliver all queued messages for [peerId]. Expired messages (>24h)
      *  are silently dropped. Messages that still can't be sent remain queued. */
     private fun flushOutbox(peerId: String) {
-        val queue = outbox[peerId] ?: return
+        if (!outbox.containsKey(peerId) || !flushingOutboxPeers.add(peerId)) return
+        scope.launch {
+            try {
+                flushOutboxNow(peerId)
+            } finally {
+                flushingOutboxPeers.remove(peerId)
+            }
+        }
+    }
+
+    private suspend fun flushOutboxNow(peerId: String) {
+        val queue = outbox[peerId]?.toList() ?: return
         if (queue.isEmpty()) { outbox.remove(peerId); return }
         val now = SonarClock.nowSecs()
         val remaining = mutableListOf<QueuedMessage>()
+        var marmotGroupId: String? = null
 
         sonarLog("SonarOutbox", "flushing ${queue.size} message(s) for ${peerId.take(10)}…")
 
-        for (msg in queue) {
+        for ((index, msg) in queue.withIndex()) {
             // TTL check: drop messages older than 24 hours.
             if (now - msg.timestampSecs > OUTBOX_TTL_SECS) {
                 sonarLog("SonarOutbox", "expired id=${msg.messageId.take(8)}… age=${now - msg.timestampSecs}s")
                 continue
             }
             // Try to send via the best available transport.
-            if (MeshRadio.hasMeshLink(peerId)) {
+            val delivered = if (MeshRadio.hasMeshLink(peerId)) {
                 sendMesh(peerId, msg.content)
             } else {
                 val raw = npubRawFor(peerId)
                 if (raw != null) {
-                    sendOverMarmot(peerId, raw, msg.content)
+                    val groupId = marmotGroupId ?: ensureMarmotGroupForOutbox(peerId, raw)
+                    marmotGroupId = groupId
+                    groupId != null && sendOutboxOverMarmot(peerId, groupId, msg.content)
                 } else {
-                    // Still no route — keep in queue.
-                    remaining.add(msg)
-                    continue
+                    false
                 }
+            }
+            if (!delivered) {
+                remaining.add(msg)
+                queue.drop(index + 1)
+                    .filter { now - it.timestampSecs <= OUTBOX_TTL_SECS }
+                    .let { remaining.addAll(it) }
+                sonarLog("SonarOutbox", "kept ${remaining.size} message(s) queued for ${peerId.take(10)}…")
+                break
             }
             sonarLog("SonarOutbox", "delivered id=${msg.messageId.take(8)}… to ${peerId.take(10)}…")
         }
 
-        if (remaining.isEmpty()) {
+        val appended = outbox[peerId].orEmpty().drop(queue.size)
+        val next = (remaining + appended).toMutableList()
+        if (next.isEmpty()) {
             outbox.remove(peerId)
         } else {
-            outbox[peerId] = remaining
+            outbox[peerId] = next
         }
     }
+
+    private suspend fun ensureMarmotGroupForOutbox(peerId: String, npubRaw: ByteArray): String? {
+        marmotGroupForNpub(npubRaw)?.id?.let { return it }
+        val npubHex = npubRaw.toHexLower()
+        return try {
+            refreshChats()
+            marmotGroupForNpub(npubRaw)?.id ?: run {
+                if (!startingMarmotChats.add(npubHex)) return null
+                try {
+                    SonarCore.startChat(npubHex).also {
+                        refreshChats()
+                        recomputeConversations()
+                        flushPendingMarmot()
+                        refreshOpenDm(peerId)
+                    }
+                } finally {
+                    startingMarmotChats.remove(npubHex)
+                }
+            }
+        } catch (e: Throwable) {
+            startingMarmotChats.remove(npubHex)
+            toast = "couldn’t start secure chat: ${e.message}"
+            sonarLog("SonarOutbox", "failed to start White Noise group for ${peerId.take(10)}… err=${e.message}")
+            null
+        }
+    }
+
+    private suspend fun sendOutboxOverMarmot(peerId: String, groupId: String, text: String): Boolean =
+        try {
+            SonarCore.send(groupId, text)
+            refreshOpenDm(peerId)
+            true
+        } catch (e: Throwable) {
+            toast = "send failed: ${e.message}"
+            sonarLog("SonarOutbox", "failed to send queued White Noise message for ${peerId.take(10)}… err=${e.message}")
+            false
+        }
 
     /** Flush outbox for ALL peers that now have a reachable transport. Called
      *  periodically and on transport-change events. */
