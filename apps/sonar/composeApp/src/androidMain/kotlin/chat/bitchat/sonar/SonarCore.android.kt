@@ -2,6 +2,9 @@ package chat.bitchat.sonar
 
 import android.content.Context
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -147,6 +150,42 @@ actual object SonarCore {
                 )
             }
         }
+
+    actual suspend fun conversationSummaries(): List<SonarConversationSummary> = withContext(Dispatchers.IO) {
+        val n = node ?: return@withContext emptyList()
+        n.conversationSummaries().map {
+            SonarConversationSummary(
+                groupIdHex = it.groupIdHex,
+                name = it.name,
+                latestContent = it.latestContent,
+                latestSenderNpub = it.latestSenderNpub,
+                latestAtSecs = it.latestAtSecs.toLong(),
+                latestMine = it.latestMine,
+                messageCount = it.messageCount.toLong(),
+                unreadCount = it.unreadCount.toLong(),
+            )
+        }
+    }
+
+    actual suspend fun markConversationRead(chatId: String) = withContext(Dispatchers.IO) {
+        node?.markConversationRead(chatId)
+        Unit
+    }
+
+    actual suspend fun messagesCursorPage(
+        chatId: String,
+        beforeSecs: Long?,
+        beforeIdHex: String?,
+        limit: Int,
+    ): List<SonarMsg> = withContext(Dispatchers.IO) {
+        val n = node ?: return@withContext emptyList()
+        n.messagesCursorPage(
+            chatId,
+            beforeSecs?.toULong(),
+            beforeIdHex,
+            limit.toUInt(),
+        ).map { it.toCommon() }
+    }
 
     private fun uniffi.sonar_ffi.MessageInfo.toCommon(): SonarMsg = SonarMsg(
         id = idHex,
@@ -410,6 +449,18 @@ actual object SonarCore {
 
     actual fun callParseControl(content: String): SonarCallControl? =
         uniffi.sonar_ffi.callParseControl(content)?.toCommon()
+
+    private val _conversationChanged = MutableSharedFlow<String>(extraBufferCapacity = 64)
+    actual val conversationChanged: SharedFlow<String> = _conversationChanged.asSharedFlow()
+
+    actual fun installConversationListener() {
+        val n = node ?: return
+        n.setConversationChangeListener(object : uniffi.sonar_ffi.ConversationChangeListener {
+            override fun onConversationChanged(groupIdHex: String) {
+                _conversationChanged.tryEmit(groupIdHex)
+            }
+        })
+    }
 
     private fun requireNode(): SonarNode =
         node ?: error("SonarCore not started — call start() first")

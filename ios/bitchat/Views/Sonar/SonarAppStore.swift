@@ -1931,7 +1931,7 @@ final class SonarAppStore: ObservableObject {
                     title: marmot.title(for: group),
                     preview: last.map { Self.previewText($0.content) } ?? "Secure group · reaches anywhere",
                     time: last.map { Self.listTime($0.createdAt) } ?? "",
-                    unread: false,
+                    unread: (marmot.unreadByGroup[group.id] ?? 0) > 0,
                     presence: false,
                     verified: false,
                     isMarmot: true,
@@ -1988,7 +1988,7 @@ final class SonarAppStore: ObservableObject {
                     title: liveSonarPeerId == nil ? marmot.title(for: group) : peerDisplayName(rowId),
                     preview: last.map { Self.previewText($0.content) } ?? networkLabel(forPeer: rowId),
                     time: last.map { Self.listTime($0.createdAt) } ?? "",
-                    unread: false,
+                    unread: (marmot.unreadByGroup[group.id] ?? 0) > 0,
                     presence: liveSonarPeerId != nil && meshReachable(rowId),
                     verified: isVerified(rowId) || (marmotVerified[group.id] ?? false),
                     isMarmot: false,
@@ -2005,7 +2005,7 @@ final class SonarAppStore: ObservableObject {
                 title: marmot.title(for: group),
                 preview: last.map { Self.previewText($0.content) } ?? "Secure chat · reaches anywhere",
                 time: last.map { Self.listTime($0.createdAt) } ?? "",
-                unread: false,
+                unread: (marmot.unreadByGroup[group.id] ?? 0) > 0,
                 presence: false,
                 verified: marmotVerified[group.id] ?? false,
                 isMarmot: true,
@@ -2720,6 +2720,7 @@ final class SonarAppStore: ObservableObject {
     func openedDM(_ id: String, marmotGroupId knownMarmotGroupId: String? = nil) {
         if let knownMarmotGroupId {
             rememberMarmotGroup(knownMarmotGroupId, forConversationId: id)
+            marmot.markConversationRead(groupId: knownMarmotGroupId)
         }
         let sonarProfile = resolvedSonarProfile(id)
         let groupId = knownMarmotGroupId

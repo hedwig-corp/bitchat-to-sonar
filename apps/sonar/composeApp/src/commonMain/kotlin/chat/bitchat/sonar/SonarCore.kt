@@ -1,6 +1,7 @@
 package chat.bitchat.sonar
 
 import chat.bitchat.sonar.crypto.Bech32
+import kotlinx.coroutines.flow.SharedFlow
 
 /** A White Noise (Marmot) chat, as the UI sees it. */
 data class SonarChat(
@@ -231,6 +232,18 @@ private fun String.hexBytesOrNull(): ByteArray? {
     return bytes
 }
 
+/** Precomputed conversation summary from the core-owned index. */
+data class SonarConversationSummary(
+    val groupIdHex: String,
+    val name: String,
+    val latestContent: String,
+    val latestSenderNpub: String,
+    val latestAtSecs: Long,
+    val latestMine: Boolean,
+    val messageCount: Long,
+    val unreadCount: Long,
+)
+
 /** A public message in a geohash channel. */
 data class SonarChannelMsg(
     val id: String,
@@ -340,6 +353,21 @@ expect object SonarCore {
 
     /** Bounded local transcript windows for the most recent chats. */
     suspend fun recentMessagePages(groupLimit: Int, pageLimit: Int): List<SonarRecentTranscriptPage>
+
+    /** Precomputed conversation summaries from the core-owned index, ordered
+     *  by latest message timestamp (newest first). */
+    suspend fun conversationSummaries(): List<SonarConversationSummary>
+
+    /** Reset unread count for a chat to 0. */
+    suspend fun markConversationRead(chatId: String)
+
+    /** Cursor-based message page — newest first, before the given cursor. */
+    suspend fun messagesCursorPage(
+        chatId: String,
+        beforeSecs: Long? = null,
+        beforeIdHex: String? = null,
+        limit: Int,
+    ): List<SonarMsg>
 
     /** Poll the relays once (welcomes + group messages). */
     suspend fun sync()
@@ -463,4 +491,12 @@ expect object SonarCore {
 
     /** Parse chat content as a ☎CALL line. null = not a control line (render it). */
     fun callParseControl(content: String): SonarCallControl?
+
+    /** Flow of group IDs whose conversation summary changed (message sent/received,
+     *  unread count reset). Collect to trigger UI refresh on change. */
+    val conversationChanged: SharedFlow<String>
+
+    /** Install the core callback that feeds [conversationChanged]. Call once
+     *  after [start]. */
+    fun installConversationListener()
 }

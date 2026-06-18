@@ -82,6 +82,7 @@ snow = "0.9"
 # wire-interoperable with Apple's Curve25519.Signing on iOS.
 ed25519-dalek = "2"
 getrandom = "0.2"
+rusqlite = { version = "0.37", features = ["bundled-sqlcipher"] }
 
 # SQLCipher needs a crypto backend. Apple targets compile it against
 # CommonCrypto (no OpenSSL — see the mdk-sqlite-storage note above). Android

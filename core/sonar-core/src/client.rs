@@ -18,6 +18,10 @@ use nostr_blossom::prelude::*;
 use nostr_sdk::{Client, RelayPoolNotification};
 use serde::{Deserialize, Serialize};
 
+use crate::conversation_index::{
+    index_db_path_for_db, wipe_index_for_db, ConversationChangeListener, ConversationIndex,
+    ConversationSummary,
+};
 use crate::identity::Identity;
 use crate::marmot::{
     ChatMessage, DeliveryState, GroupCreation, GroupInvite, GroupMembershipUpdate, Incoming,
@@ -405,6 +409,10 @@ pub struct SonarClient {
     /// Whether to join geohash-nearest relays on subscribe (real sessions); off
     /// for in-memory/test sessions so they stay network-free against a MockRelay.
     allow_geo_relays: bool,
+    /// Persistent conversation-summary index (None for in-memory sessions).
+    conversation_index: Option<Arc<Mutex<ConversationIndex>>>,
+    /// Host-registered callback fired when a conversation summary changes.
+    change_listener: Arc<Mutex<Option<Arc<dyn ConversationChangeListener>>>>,
 }
 
 impl SonarClient {
@@ -423,22 +431,33 @@ impl SonarClient {
     ) -> Result<Self> {
         let db_path = db_path.as_ref();
         let engine = MarmotEngine::persistent(identity.clone(), db_path, db_key)?;
-        Self::with_engine(
+        let index_path = index_db_path_for_db(db_path);
+        let index = match ConversationIndex::open(&index_path, db_key) {
+            Ok(idx) => Some(idx),
+            Err(err) => {
+                tracing::warn!(%err, "conversation index open failed; continuing without");
+                None
+            }
+        };
+        let mut client = Self::with_engine(
             identity,
             relays,
             engine,
             true,
             Some(sync_state_path_for_db(db_path)),
             Some(outbox_state_path_for_db(db_path)),
+            index.map(|idx| Arc::new(Mutex::new(idx))),
         )
-        .await
+        .await?;
+        client.materialize_index_if_empty();
+        Ok(client)
     }
 
     /// Connect with a volatile in-memory store. State is lost when the client is
     /// dropped. Intended for tests and ephemeral/anonymous sessions.
     pub async fn connect_in_memory(identity: Identity, relays: Vec<RelayUrl>) -> Result<Self> {
         let engine = MarmotEngine::in_memory(identity.clone());
-        Self::with_engine(identity, relays, engine, false, None, None).await
+        Self::with_engine(identity, relays, engine, false, None, None, None).await
     }
 
     async fn with_engine(
@@ -448,6 +467,7 @@ impl SonarClient {
         allow_geo_relays: bool,
         sync_state_path: Option<PathBuf>,
         outbox_state_path: Option<PathBuf>,
+        conversation_index: Option<Arc<Mutex<ConversationIndex>>>,
     ) -> Result<Self> {
         let nostr = Client::new(identity.keys().clone());
         for relay in &relays {
@@ -664,6 +684,8 @@ impl SonarClient {
             initial_empty_transcript_backfills,
             initial_backfill_scanned,
             allow_geo_relays,
+            conversation_index,
+            change_listener: Arc::new(Mutex::new(None)),
         };
         // Open the live Marmot subscriptions for real sessions. In-memory test
         // sessions (allow_geo_relays=false) stay on the explicit `sync()` path so
@@ -896,6 +918,19 @@ impl SonarClient {
         }
 
         self.engine.merge_pending_commit(&group_id)?;
+        let name = self
+            .engine
+            .groups()
+            .ok()
+            .and_then(|gs| {
+                gs.into_iter()
+                    .find(|g| g.mls_group_id == group_id)
+                    .map(|g| g.name)
+            })
+            .unwrap_or_default();
+        self.ensure_index_for_group(&group_id, &name);
+        let group_id_hex = hex::encode(group_id.as_slice());
+        self.notify_conversation_changed(&group_id_hex);
         if let Err(err) = self.resubscribe_marmot_groups_if_live().await {
             tracing::debug!(%err, "marmot group live resubscribe failed after local group create");
         }
@@ -1021,6 +1056,7 @@ impl SonarClient {
             .into_iter()
             .find(|g| g.mls_group_id == group_id)
         {
+            self.ensure_index_for_group(&group_id, &group.name);
             let nostr_group_id = hex::encode(group.nostr_group_id);
             if let Err(err) = self.backfill_group(&nostr_group_id).await {
                 tracing::debug!(
@@ -1030,6 +1066,8 @@ impl SonarClient {
                 );
             }
         }
+        let group_id_hex = hex::encode(group_id.as_slice());
+        self.notify_conversation_changed(&group_id_hex);
         let _ = self.resubscribe_marmot_groups_if_live().await;
         Ok(group_id)
     }
@@ -1053,8 +1091,13 @@ impl SonarClient {
                 "created text message did not produce a local transcript row".into(),
             ));
         };
+        let group_name = self.resolve_group_name(group_id);
+        self.upsert_index_for_message(&message, group_name.as_deref());
+        let group_id_hex = hex::encode(group_id.as_slice());
+        self.mark_local_event_processed(&event.id);
         self.mark_outbox_pending(group_id, &message, &event)?;
         self.spawn_outbox_publish(message.id.to_hex(), event);
+        self.notify_conversation_changed(&group_id_hex);
         Ok(())
     }
 
@@ -1185,7 +1228,14 @@ impl SonarClient {
             .engine
             .create_media_event(group_id, &upload, &url, caption)?;
         self.nostr.send_event(&event).await?;
-        self.engine.process_incoming(&event).await?;
+        let incoming = self.engine.process_incoming(&event).await?;
+        if let Incoming::Message(ref message) = incoming {
+            let group_name = self.resolve_group_name(group_id);
+            self.upsert_index_for_message(message, group_name.as_deref());
+            let group_id_hex = hex::encode(group_id.as_slice());
+            self.mark_local_event_processed(&event.id);
+            self.notify_conversation_changed(&group_id_hex);
+        }
         Ok(())
     }
 
@@ -1483,6 +1533,13 @@ impl SonarClient {
         self.sync_state.lock().unwrap().mark_processed(event_id);
     }
 
+    fn mark_local_event_processed(&self, event_id: &EventId) {
+        self.mark_sync_event_processed(event_id);
+        if let Err(err) = self.save_sync_state() {
+            tracing::debug!(%err, "failed to persist locally created Marmot event marker");
+        }
+    }
+
     fn save_sync_state(&self) -> Result<()> {
         self.sync_state.lock().unwrap().save_if_dirty()
     }
@@ -1509,6 +1566,14 @@ impl SonarClient {
         context: &'static str,
     ) -> MarmotProcessReport {
         let mut report = MarmotProcessReport::default();
+        let mut changed_groups: HashSet<String> = HashSet::new();
+        let group_names: HashMap<Vec<u8>, String> = self
+            .engine
+            .groups()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|g| (g.mls_group_id.as_slice().to_vec(), g.name))
+            .collect();
         for event in sort_marmot_events(events) {
             if self.is_sync_event_processed(&event.id) {
                 report.record_processed();
@@ -1543,6 +1608,16 @@ impl SonarClient {
                         }
                     }
                 }
+                Ok(ref incoming @ Incoming::Message(ref message)) => {
+                    self.record_delivery_for_incoming(incoming);
+                    let cached_name = group_names
+                        .get(message.group_id.as_slice())
+                        .map(|s| s.as_str());
+                    self.upsert_index_for_message(message, cached_name);
+                    changed_groups.insert(hex::encode(message.group_id.as_slice()));
+                    self.mark_sync_event_processed(&event.id);
+                    report.record_processed();
+                }
                 Ok(incoming) => {
                     self.record_delivery_for_incoming(&incoming);
                     self.mark_sync_event_processed(&event.id);
@@ -1570,6 +1645,7 @@ impl SonarClient {
                 }
             }
         }
+        self.notify_conversations_changed(&changed_groups);
         report
     }
 
@@ -1723,13 +1799,137 @@ impl SonarClient {
     /// [`MarmotEngine::delete_group`]) and narrow the live 445 subscription so we
     /// stop receiving its messages. Local-only; the peer is not notified.
     pub async fn delete_group(&self, group_id: &GroupId) -> Result<()> {
+        let group_id_hex = hex::encode(group_id.as_slice());
         self.engine.delete_group(group_id)?;
         self.outbox_state
             .lock()
             .unwrap()
-            .remove_group_entries(&hex::encode(group_id.as_slice()))?;
+            .remove_group_entries(&group_id_hex)?;
+        self.remove_index_for_group(group_id);
+        self.notify_conversation_changed(&group_id_hex);
         let _ = self.resubscribe_marmot_groups_if_live().await;
         Ok(())
+    }
+
+    // ── Conversation index (Signal-style summary table) ──────────────────
+
+    pub fn set_conversation_change_listener(
+        &self,
+        listener: Option<Arc<dyn ConversationChangeListener>>,
+    ) {
+        *self.change_listener.lock().unwrap() = listener;
+    }
+
+    pub fn conversation_summaries(&self) -> Vec<ConversationSummary> {
+        let Some(ref idx) = self.conversation_index else {
+            return Vec::new();
+        };
+        idx.lock().unwrap().summaries_ordered().unwrap_or_default()
+    }
+
+    pub fn conversation_summary(&self, group_id_hex: &str) -> Option<ConversationSummary> {
+        let idx = self.conversation_index.as_ref()?;
+        idx.lock().unwrap().summary(group_id_hex).ok().flatten()
+    }
+
+    pub fn mark_conversation_read(&self, group_id_hex: &str) {
+        if let Some(ref idx) = self.conversation_index {
+            if let Err(e) = idx.lock().unwrap().mark_read(group_id_hex) {
+                tracing::warn!(%e, "index mark_read failed");
+            }
+            self.notify_conversation_changed(group_id_hex);
+        }
+    }
+
+    pub fn messages_cursor_page(
+        &self,
+        group_id: &GroupId,
+        before_secs: Option<u64>,
+        before_id: Option<&nostr::EventId>,
+        limit: usize,
+    ) -> Result<Vec<ChatMessage>> {
+        self.engine
+            .messages_cursor_page(group_id, before_secs, before_id, limit)
+            .map(|msgs| {
+                msgs.into_iter()
+                    .map(|m| self.with_delivery_state(m))
+                    .collect()
+            })
+    }
+
+    fn upsert_index_for_message(&self, message: &ChatMessage, group_name: Option<&str>) {
+        let Some(ref idx) = self.conversation_index else {
+            return;
+        };
+        let group_id_hex = hex::encode(message.group_id.as_slice());
+        let name = group_name.unwrap_or("");
+        if let Err(e) = idx.lock().unwrap().upsert_summary(
+            &group_id_hex,
+            name,
+            &message.content,
+            &message.sender.to_string(),
+            message.created_at.as_secs(),
+            message.mine,
+        ) {
+            tracing::warn!(%e, "index upsert failed");
+        }
+    }
+
+    fn ensure_index_for_group(&self, group_id: &GroupId, name: &str) {
+        let Some(ref idx) = self.conversation_index else {
+            return;
+        };
+        let group_id_hex = hex::encode(group_id.as_slice());
+        if let Err(e) = idx.lock().unwrap().ensure_group(&group_id_hex, name) {
+            tracing::warn!(%e, "index ensure_group failed");
+        }
+    }
+
+    fn resolve_group_name(&self, group_id: &GroupId) -> Option<String> {
+        self.engine.groups().ok().and_then(|gs| {
+            gs.into_iter()
+                .find(|g| g.mls_group_id == *group_id)
+                .map(|g| g.name)
+        })
+    }
+
+    fn remove_index_for_group(&self, group_id: &GroupId) {
+        let Some(ref idx) = self.conversation_index else {
+            return;
+        };
+        let group_id_hex = hex::encode(group_id.as_slice());
+        if let Err(e) = idx.lock().unwrap().remove_group(&group_id_hex) {
+            tracing::warn!(%e, "index remove_group failed");
+        }
+    }
+
+    fn notify_conversation_changed(&self, group_id_hex: &str) {
+        if let Some(l) = self.change_listener.lock().unwrap().clone() {
+            let id = group_id_hex.to_owned();
+            l.on_conversation_changed(id);
+        }
+    }
+
+    fn notify_conversations_changed(&self, group_ids: &HashSet<String>) {
+        let listener = self.change_listener.lock().unwrap().clone();
+        if let Some(l) = listener {
+            for id in group_ids {
+                l.on_conversation_changed(id.clone());
+            }
+        }
+    }
+
+    fn materialize_index_if_empty(&mut self) {
+        let Some(ref idx) = self.conversation_index else {
+            return;
+        };
+        let idx_guard = idx.lock().unwrap();
+        if !idx_guard.is_empty() {
+            return;
+        }
+        if let Err(e) = idx_guard.materialize_from(&self.engine) {
+            tracing::warn!(%e, "index materialize failed");
+        }
     }
 
     // ── Geohash public channels (kind-20000 over Nostr) ──
@@ -1992,7 +2192,11 @@ impl SonarClient {
     /// Free function — no live client may hold the DB open. Used by panic-wipe
     /// before the Swift host also clears the Keychain key.
     pub fn wipe_database(db_path: impl AsRef<Path>) -> Result<()> {
-        MarmotEngine::wipe(db_path)
+        let db_path = db_path.as_ref();
+        let db_result = MarmotEngine::wipe(db_path);
+        let index_result = wipe_index_for_db(db_path);
+        db_result?;
+        index_result
     }
 }
 

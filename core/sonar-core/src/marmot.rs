@@ -674,6 +674,60 @@ impl MarmotEngine {
         Ok(page_messages)
     }
 
+    /// Cursor-based transcript page: return up to `limit` chat messages whose
+    /// timestamp is strictly before the cursor `(before_secs, before_id)`.
+    /// When the cursor is `None`, returns the newest messages (first page).
+    /// Messages are returned newest-first for display.
+    pub fn messages_cursor_page(
+        &self,
+        group_id: &GroupId,
+        before_secs: Option<u64>,
+        before_id: Option<&EventId>,
+        limit: usize,
+    ) -> Result<Vec<ChatMessage>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        if before_secs.is_none() {
+            return self.messages_page(group_id, limit, 0);
+        }
+
+        // Transitional backend: MDK currently exposes bounded offset pages, not
+        // a stable `(created_at, event_id)` storage cursor. Keep the API stable
+        // for callers while the storage-level cursor query lands.
+        let all_msgs = self.messages(group_id)?;
+        let mut sorted: Vec<ChatMessage> = all_msgs;
+        sorted.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.id.to_hex().cmp(&a.id.to_hex()))
+        });
+
+        let filtered: Vec<ChatMessage> = if let Some(cursor_secs) = before_secs {
+            let cursor_id_hex = before_id.map(|id| id.to_hex());
+            sorted
+                .into_iter()
+                .filter(|m| {
+                    let msg_secs = m.created_at.as_secs();
+                    if msg_secs < cursor_secs {
+                        return true;
+                    }
+                    if msg_secs == cursor_secs {
+                        if let Some(ref cid) = cursor_id_hex {
+                            return m.id.to_hex() < *cid;
+                        }
+                    }
+                    false
+                })
+                .take(limit)
+                .collect()
+        } else {
+            sorted.into_iter().take(limit).collect()
+        };
+
+        Ok(filtered)
+    }
+
     /// Latest local transcript windows for the most recent groups. This is the
     /// Signal-style chat-list hydration path: rank conversations by local DB
     /// recency, return only a small window for the newest groups, and leave

@@ -6,6 +6,7 @@
 // For more information, see <https://unlicense.org>
 //
 
+import Combine
 import Foundation
 import SonarCore
 
@@ -115,6 +116,17 @@ final class MarmotService: @unchecked Sendable {
         var isAudio: Bool { mimeType.hasPrefix("audio/") }
     }
 
+    struct ConversationSummary: Sendable, Equatable {
+        let groupIdHex: String
+        let name: String
+        let latestContent: String
+        let latestSenderNpub: String
+        let latestAt: Date
+        let latestMine: Bool
+        let messageCount: UInt64
+        let unreadCount: UInt64
+    }
+
     /// A peer's Nostr profile (kind-0 metadata, NIP-01). A Marmot member's
     /// identity is a Nostr pubkey, so this resolves a human name + avatar
     /// instead of a raw npub.
@@ -172,6 +184,8 @@ final class MarmotService: @unchecked Sendable {
         /// Failure inside the Rust core (relay I/O, MLS, MDK...).
         case core(String)
     }
+
+    let conversationChanged = PassthroughSubject<String, Never>()
 
     // MARK: - Configuration
 
@@ -246,6 +260,7 @@ final class MarmotService: @unchecked Sendable {
             service.identity = identity
             service.node = node
             service.relayConnected = true
+            service.installConversationListener(on: node)
             return true
         }
         guard installed else {
@@ -279,6 +294,7 @@ final class MarmotService: @unchecked Sendable {
             service.identity = identity
             service.node = node
             service.relayConnected = false
+            service.installConversationListener(on: node)
             service.sessionGeneration = service.sessionGeneration &+ 1
             return identity.npub()
         }
@@ -777,6 +793,56 @@ final class MarmotService: @unchecked Sendable {
         }
     }
 
+    // MARK: - Conversation index (Signal-style summary table)
+
+    func conversationSummaries() async -> [ConversationSummary] {
+        await runNonThrowing { service in
+            guard let node = service.node else { return [] }
+            return node.conversationSummaries().map {
+                ConversationSummary(
+                    groupIdHex: $0.groupIdHex,
+                    name: $0.name,
+                    latestContent: $0.latestContent,
+                    latestSenderNpub: $0.latestSenderNpub,
+                    latestAt: Date(timeIntervalSince1970: TimeInterval($0.latestAtSecs)),
+                    latestMine: $0.latestMine,
+                    messageCount: $0.messageCount,
+                    unreadCount: $0.unreadCount
+                )
+            }
+        }
+    }
+
+    func markConversationRead(groupId: String) async {
+        await runNonThrowing { service in
+            service.node?.markConversationRead(groupIdHex: groupId)
+            return ()
+        }
+    }
+
+    func messagesCursorPage(
+        groupId: String,
+        beforeSecs: UInt64? = nil,
+        beforeIdHex: String? = nil,
+        limit: UInt32
+    ) async throws -> [MarmotMessage] {
+        try await run {
+            try $0.requireNode()
+                .messagesCursorPage(
+                    groupIdHex: groupId,
+                    beforeSecs: beforeSecs,
+                    beforeIdHex: beforeIdHex,
+                    limit: limit
+                )
+                .map(Self.marmotMessage)
+        }
+    }
+
+    private func installConversationListener(on node: SonarNode) {
+        let subject = conversationChanged
+        node.setConversationChangeListener(listener: MarmotConversationListener(subject: subject))
+    }
+
     // MARK: - Internals
 
     private func requireNode() throws -> SonarNode {
@@ -810,5 +876,17 @@ final class MarmotService: @unchecked Sendable {
                 continuation.resume(returning: body(self))
             }
         }
+    }
+}
+
+private final class MarmotConversationListener: ConversationChangeListener, @unchecked Sendable {
+    private let subject: PassthroughSubject<String, Never>
+
+    init(subject: PassthroughSubject<String, Never>) {
+        self.subject = subject
+    }
+
+    func onConversationChanged(groupIdHex: String) {
+        subject.send(groupIdHex)
     }
 }

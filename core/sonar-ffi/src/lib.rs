@@ -45,6 +45,21 @@ impl From<sonar_core::Error> for SonarFfiError {
 
 type FfiResult<T> = Result<T, SonarFfiError>;
 
+/// Forwards conversation-change notifications from core threads to the FFI
+/// callback on a dedicated thread via an `mpsc` channel.  The host-provided
+/// `Box<dyn ConversationChangeListener>` never leaves that single thread, so
+/// no `Send + Sync` bound on the box is required — eliminating the previous
+/// `unsafe impl`.
+struct ChannelChangeListener {
+    tx: std::sync::Mutex<std::sync::mpsc::Sender<String>>,
+}
+
+impl sonar_core::conversation_index::ConversationChangeListener for ChannelChangeListener {
+    fn on_conversation_changed(&self, group_id_hex: String) {
+        let _ = self.tx.lock().unwrap().send(group_id_hex);
+    }
+}
+
 fn invalid<E: std::fmt::Display>(what: &str) -> impl FnOnce(E) -> SonarFfiError + '_ {
     move |e| SonarFfiError::InvalidInput(format!("{what}: {e}"))
 }
@@ -73,8 +88,8 @@ fn parse_db_key(db_key_hex: &str) -> FfiResult<[u8; 32]> {
     })
 }
 
-/// Erase the persistent Marmot database at `db_path` (and its SQLite sidecars:
-/// `-wal`, `-shm`, `-journal`).
+/// Erase the persistent Marmot database at `db_path`, its SQLite sidecars
+/// (`-wal`, `-shm`, `-journal`), and the conversation-index sidecar database.
 ///
 /// Panic-wipe entry point. Call when NO `SonarNode` holds that path open (drop
 /// the node first). The Swift host should also clear the Keychain-held DB key.
@@ -221,6 +236,27 @@ pub struct GeoMessageInfo {
     pub content: String,
     pub created_at_secs: u64,
     pub mine: bool,
+}
+
+/// Callback interface for conversation-summary changes. The host implements
+/// this to receive push notifications when a chat's summary row is updated
+/// (message sent/received, group created/deleted, unread count changed).
+#[uniffi::export(callback_interface)]
+pub trait ConversationChangeListener: Send + Sync {
+    fn on_conversation_changed(&self, group_id_hex: String);
+}
+
+/// FFI-friendly conversation summary from the core-owned index.
+#[derive(uniffi::Record)]
+pub struct ConversationSummaryInfo {
+    pub group_id_hex: String,
+    pub name: String,
+    pub latest_content: String,
+    pub latest_sender_npub: String,
+    pub latest_at_secs: u64,
+    pub latest_mine: bool,
+    pub message_count: u64,
+    pub unread_count: u64,
 }
 
 /// A relay-connected Sonar node. Owns its own tokio runtime; every method is
@@ -564,6 +600,76 @@ impl SonarNode {
                 })
             })
             .collect()
+    }
+
+    // ── Conversation index (Signal-style summary table) ──────────────────
+
+    pub fn set_conversation_change_listener(
+        &self,
+        listener: Box<dyn ConversationChangeListener>,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::Builder::new()
+            .name("sonar-change-fwd".into())
+            .spawn(move || {
+                while let Ok(group_id_hex) = rx.recv() {
+                    listener.on_conversation_changed(group_id_hex);
+                }
+            })
+            .expect("spawn change-listener forwarder");
+        let core_listener: Arc<dyn sonar_core::conversation_index::ConversationChangeListener> =
+            Arc::new(ChannelChangeListener {
+                tx: std::sync::Mutex::new(tx),
+            });
+        self.client
+            .set_conversation_change_listener(Some(core_listener));
+    }
+
+    pub fn clear_conversation_change_listener(&self) {
+        self.client.set_conversation_change_listener(None);
+    }
+
+    pub fn conversation_summaries(&self) -> Vec<ConversationSummaryInfo> {
+        self.client
+            .conversation_summaries()
+            .into_iter()
+            .map(|s| ConversationSummaryInfo {
+                group_id_hex: s.group_id_hex,
+                name: s.name,
+                latest_content: s.latest_content,
+                latest_sender_npub: s.latest_sender,
+                latest_at_secs: s.latest_at_secs,
+                latest_mine: s.latest_mine,
+                message_count: s.message_count,
+                unread_count: s.unread_count,
+            })
+            .collect()
+    }
+
+    pub fn mark_conversation_read(&self, group_id_hex: String) {
+        self.client.mark_conversation_read(&group_id_hex);
+    }
+
+    pub fn messages_cursor_page(
+        &self,
+        group_id_hex: String,
+        before_secs: Option<u64>,
+        before_id_hex: Option<String>,
+        limit: u32,
+    ) -> FfiResult<Vec<MessageInfo>> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        let before_id = before_id_hex
+            .as_deref()
+            .map(EventId::from_hex)
+            .transpose()
+            .map_err(invalid("cursor event id"))?;
+        let msgs = self.client.messages_cursor_page(
+            &group_id,
+            before_secs,
+            before_id.as_ref(),
+            limit as usize,
+        )?;
+        Ok(msgs.into_iter().map(message_info).collect())
     }
 
     /// Encrypt + upload `data` to a Blossom server, then publish a media message
