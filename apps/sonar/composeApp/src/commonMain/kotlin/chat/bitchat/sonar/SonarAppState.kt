@@ -590,7 +590,8 @@ class SonarAppState(private val scope: CoroutineScope) {
                 firstSeenMs = firstMs,
                 nowMs = nowMs,
                 hasProfile = sonarPeerProfiles.containsKey(peerId) || linkByFp.containsKey(peerId),
-                hasMessages = meshChats[peerId]?.isNotEmpty() == true,
+                // Existing mesh messages are the duplicate-row case this hold prevents.
+                hasMessages = false,
             ).also { if (it) scheduleCapabilitySettleRefresh(peerId, firstMs, nowMs) }
         }
     }
