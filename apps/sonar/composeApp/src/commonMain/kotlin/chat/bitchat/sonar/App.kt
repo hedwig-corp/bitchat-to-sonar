@@ -8,11 +8,14 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.rememberTransformableState
+import androidx.compose.foundation.gestures.transformable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -52,9 +55,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.SpanStyle
@@ -496,6 +502,8 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     var paySheet by remember { mutableStateOf(false) }
     var verifySheet by remember { mutableStateOf(false) }
     var addSheet by remember { mutableStateOf(false) }
+    var mediaViewer by remember { mutableStateOf<SonarMedia?>(null) }
+    val mediaActions = rememberMediaActions()
     val pickPhoto = rememberPhotoPicker { bytes, name, mime ->
         state.sendImage(screen.id, bytes, name, mime)
     }
@@ -552,6 +560,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     val sendOverMesh = isMeshRoute && inRange
     val transport = if (sendOverMesh) "Bluetooth" else "internet"
 
+    Box(Modifier.fillMaxSize()) {
     Column(Modifier.fillMaxSize()) {
         // bc-header (DM): avatar + name + verified shield + lock·"Via internet"
         Row(
@@ -646,7 +655,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                                 state.claimPay(screen.id, pay.uuid)
                             }
                         } else if (m.media.isNotEmpty()) {
-                            MediaBubble(m, state, screen.id, mesh = msgMesh)
+                            MediaBubble(m, state, screen.id, mesh = msgMesh, onOpen = { mediaViewer = it })
                         } else MessageBubble(m, msgMesh)
                     }
                 }
@@ -746,6 +755,17 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                 ) { Text("↑", color = sendFg, fontSize = 20.sp, fontWeight = FontWeight.Bold) }
             }
         }
+    }
+    mediaViewer?.let { media ->
+        MediaViewer(
+            media = media,
+            state = state,
+            chatId = screen.id,
+            actions = mediaActions,
+            onClose = { mediaViewer = null },
+            modifier = Modifier.matchParentSize()
+        )
+    }
     }
     if (addSheet) AddToMessageSheet(
         peerName = peerName,
@@ -1030,7 +1050,13 @@ private fun MessageBubble(m: SonarMsg, mesh: Boolean = false) {
  * plus an optional caption.
  */
 @Composable
-private fun MediaBubble(m: SonarMsg, state: SonarAppState, chatId: String, mesh: Boolean) {
+private fun MediaBubble(
+    m: SonarMsg,
+    state: SonarAppState,
+    chatId: String,
+    mesh: Boolean,
+    onOpen: (SonarMedia) -> Unit,
+) {
     val s = sonar
     val media = m.media.first()
     Column(
@@ -1044,7 +1070,8 @@ private fun MediaBubble(m: SonarMsg, state: SonarAppState, chatId: String, mesh:
                 value = state.mediaData(chatId, media)?.let { decodeImageBitmap(it) }
             }
             Box(
-                Modifier.widthIn(max = 240.dp).clip(RoundedCornerShape(18.dp)).background(s.surface2),
+                Modifier.widthIn(max = 240.dp).clip(RoundedCornerShape(18.dp)).background(s.surface2)
+                    .clickable { onOpen(media) },
                 contentAlignment = Alignment.Center
             ) {
                 val bmp = img
@@ -1052,7 +1079,7 @@ private fun MediaBubble(m: SonarMsg, state: SonarAppState, chatId: String, mesh:
                     androidx.compose.foundation.Image(
                         bitmap = bmp,
                         contentDescription = media.filename,
-                        contentScale = androidx.compose.ui.layout.ContentScale.Fit,
+                        contentScale = ContentScale.Fit,
                         modifier = Modifier.widthIn(max = 240.dp).heightIn(max = 300.dp)
                     )
                 } else {
@@ -1071,6 +1098,7 @@ private fun MediaBubble(m: SonarMsg, state: SonarAppState, chatId: String, mesh:
         } else {
             Row(
                 Modifier.clip(RoundedCornerShape(14.dp)).background(s.surface2)
+                    .clickable { onOpen(media) }
                     .padding(horizontal = 12.dp, vertical = 9.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
@@ -1082,6 +1110,221 @@ private fun MediaBubble(m: SonarMsg, state: SonarAppState, chatId: String, mesh:
             Text(m.content, color = s.text, fontSize = 14.5.sp)
         }
     }
+}
+
+@Composable
+private fun MediaViewer(
+    media: SonarMedia,
+    state: SonarAppState,
+    chatId: String,
+    actions: MediaActions,
+    onClose: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val s = sonar
+    val scope = rememberCoroutineScope()
+    var chrome by remember(media.url) { mutableStateOf(true) }
+    var status by remember(media.url) { mutableStateOf<String?>(null) }
+    val loadResult by androidx.compose.runtime.produceState<Pair<Boolean, ByteArray?>>(false to null, media.url) {
+        value = true to state.mediaData(chatId, media)
+    }
+    val loadedBytes = loadResult.second
+    val image = remember(loadedBytes, media.url) {
+        if (media.isImage) loadedBytes?.let { decodeImageBitmap(it) } else null
+    }
+
+    Box(modifier.background(Color.Black)) {
+        when {
+            image != null -> ZoomableMediaImage(
+                image = image,
+                description = media.filename,
+                onSingleTap = { chrome = !chrome },
+                modifier = Modifier.fillMaxSize()
+            )
+            loadedBytes != null -> MediaFilePreview(
+                media = media,
+                onOpen = {
+                    scope.launch {
+                        val ok = actions.open(loadedBytes, media.filename, media.mimeType)
+                        status = if (ok) "Opened" else "Couldn't open media"
+                    }
+                },
+                onSingleTap = { chrome = !chrome },
+                modifier = Modifier.fillMaxSize()
+            )
+            loadResult.first -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text("Couldn't load media", color = Color.White.copy(alpha = 0.82f), fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+            }
+            else -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                androidx.compose.material3.CircularProgressIndicator(color = s.text3, strokeWidth = 2.dp)
+            }
+        }
+
+        if (chrome) {
+            Column(Modifier.fillMaxSize()) {
+                Row(
+                    Modifier.fillMaxWidth().background(Color.Black.copy(alpha = 0.62f))
+                        .padding(start = 12.dp, end = 12.dp, top = 12.dp, bottom = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(
+                        Modifier.size(38.dp).clip(CircleShape).background(Color.White.copy(alpha = 0.12f))
+                            .clickable { onClose() },
+                        contentAlignment = Alignment.Center
+                    ) { SNIcon(SNIconName.X, 18.dp, Color.White, weight = 2.2f) }
+                    Spacer(Modifier.width(12.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            media.filename,
+                            color = Color.White,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(media.mimeType, color = Color.White.copy(alpha = 0.62f), fontSize = 12.sp)
+                    }
+                    MediaActionText("Share", enabled = loadedBytes != null) {
+                        scope.launch {
+                            val ok = actions.share(loadedBytes ?: return@launch, media.filename, media.mimeType)
+                            status = if (ok) "Opening share sheet" else "Couldn't share media"
+                        }
+                    }
+                    Spacer(Modifier.width(12.dp))
+                    MediaActionText("Save", enabled = loadedBytes != null) {
+                        scope.launch {
+                            val ok = actions.save(loadedBytes ?: return@launch, media.filename, media.mimeType)
+                            status = if (ok) "Saved" else "Couldn't save media"
+                        }
+                    }
+                }
+                Spacer(Modifier.weight(1f))
+                if (status != null) {
+                    Box(Modifier.fillMaxWidth().padding(bottom = 24.dp), contentAlignment = Alignment.Center) {
+                        Text(
+                            status!!,
+                            color = Color.White,
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Medium,
+                            modifier = Modifier.clip(CircleShape).background(Color.Black.copy(alpha = 0.68f))
+                                .padding(horizontal = 14.dp, vertical = 9.dp)
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ZoomableMediaImage(
+    image: androidx.compose.ui.graphics.ImageBitmap,
+    description: String,
+    onSingleTap: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    var scale by remember(description) { mutableStateOf(1f) }
+    var offsetX by remember(description) { mutableStateOf(0f) }
+    var offsetY by remember(description) { mutableStateOf(0f) }
+    val transformState = rememberTransformableState { zoomChange, panChange, _ ->
+        val nextScale = (scale * zoomChange).coerceIn(1f, 8f)
+        scale = nextScale
+        if (nextScale > 1f) {
+            offsetX += panChange.x
+            offsetY += panChange.y
+        } else {
+            offsetX = 0f
+            offsetY = 0f
+        }
+    }
+    androidx.compose.foundation.Image(
+        bitmap = image,
+        contentDescription = description,
+        contentScale = ContentScale.Fit,
+        modifier = modifier
+            .graphicsLayer {
+                scaleX = scale
+                scaleY = scale
+                translationX = offsetX
+                translationY = offsetY
+            }
+            .transformable(transformState)
+            .pointerInput(description) {
+                detectTapGestures(
+                    onTap = { onSingleTap() },
+                    onDoubleTap = {
+                        if (scale > 1f) {
+                            scale = 1f
+                            offsetX = 0f
+                            offsetY = 0f
+                        } else {
+                            scale = 2.5f
+                        }
+                    }
+                )
+            }
+    )
+}
+
+@Composable
+private fun MediaFilePreview(
+    media: SonarMedia,
+    onOpen: () -> Unit,
+    onSingleTap: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Box(
+        modifier.pointerInput(media.url) {
+            detectTapGestures(onTap = { onSingleTap() }, onDoubleTap = { onOpen() })
+        },
+        contentAlignment = Alignment.Center
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+            Box(
+                Modifier.size(74.dp).clip(RoundedCornerShape(18.dp)).background(Color.White.copy(alpha = 0.10f)),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    if (media.mimeType.startsWith("video/")) "▶" else "·",
+                    color = Color.White.copy(alpha = 0.86f),
+                    fontSize = 30.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+            Spacer(Modifier.height(14.dp))
+            Text(
+                media.filename,
+                color = Color.White,
+                fontSize = 16.sp,
+                fontWeight = FontWeight.SemiBold,
+                textAlign = TextAlign.Center,
+                maxLines = 3,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(horizontal = 28.dp)
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(media.mimeType, color = Color.White.copy(alpha = 0.62f), fontSize = 12.sp)
+            Spacer(Modifier.height(14.dp))
+            Box(
+                Modifier.clip(CircleShape).background(Color.White.copy(alpha = 0.16f))
+                    .clickable { onOpen() }
+                    .padding(horizontal = 18.dp, vertical = 9.dp)
+            ) {
+                Text("Open", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+            }
+        }
+    }
+}
+
+@Composable
+private fun MediaActionText(label: String, enabled: Boolean, onClick: () -> Unit) {
+    Text(
+        label,
+        color = if (enabled) Color.White else Color.White.copy(alpha = 0.35f),
+        fontSize = 13.sp,
+        fontWeight = FontWeight.SemiBold,
+        modifier = Modifier.clickable(enabled = enabled) { onClick() }
+    )
 }
 
 /**
