@@ -19,7 +19,8 @@ use nostr_sdk::{Client, RelayPoolNotification};
 use serde::{Deserialize, Serialize};
 
 use crate::conversation_index::{
-    index_db_path_for_db, ConversationChangeListener, ConversationIndex, ConversationSummary,
+    index_db_path_for_db, wipe_index_for_db, ConversationChangeListener, ConversationIndex,
+    ConversationSummary,
 };
 use crate::identity::Identity;
 use crate::marmot::{
@@ -1093,6 +1094,7 @@ impl SonarClient {
         let group_name = self.resolve_group_name(group_id);
         self.upsert_index_for_message(&message, group_name.as_deref());
         let group_id_hex = hex::encode(group_id.as_slice());
+        self.mark_local_event_processed(&event.id);
         self.mark_outbox_pending(group_id, &message, &event)?;
         self.spawn_outbox_publish(message.id.to_hex(), event);
         self.notify_conversation_changed(&group_id_hex);
@@ -1231,6 +1233,7 @@ impl SonarClient {
             let group_name = self.resolve_group_name(group_id);
             self.upsert_index_for_message(message, group_name.as_deref());
             let group_id_hex = hex::encode(group_id.as_slice());
+            self.mark_local_event_processed(&event.id);
             self.notify_conversation_changed(&group_id_hex);
         }
         Ok(())
@@ -1530,6 +1533,13 @@ impl SonarClient {
         self.sync_state.lock().unwrap().mark_processed(event_id);
     }
 
+    fn mark_local_event_processed(&self, event_id: &EventId) {
+        self.mark_sync_event_processed(event_id);
+        if let Err(err) = self.save_sync_state() {
+            tracing::debug!(%err, "failed to persist locally created Marmot event marker");
+        }
+    }
+
     fn save_sync_state(&self) -> Result<()> {
         self.sync_state.lock().unwrap().save_if_dirty()
     }
@@ -1814,10 +1824,7 @@ impl SonarClient {
         let Some(ref idx) = self.conversation_index else {
             return Vec::new();
         };
-        idx.lock()
-            .unwrap()
-            .summaries_ordered()
-            .unwrap_or_default()
+        idx.lock().unwrap().summaries_ordered().unwrap_or_default()
     }
 
     pub fn conversation_summary(&self, group_id_hex: &str) -> Option<ConversationSummary> {
@@ -1879,14 +1886,11 @@ impl SonarClient {
     }
 
     fn resolve_group_name(&self, group_id: &GroupId) -> Option<String> {
-        self.engine
-            .groups()
-            .ok()
-            .and_then(|gs| {
-                gs.into_iter()
-                    .find(|g| g.mls_group_id == *group_id)
-                    .map(|g| g.name)
-            })
+        self.engine.groups().ok().and_then(|gs| {
+            gs.into_iter()
+                .find(|g| g.mls_group_id == *group_id)
+                .map(|g| g.name)
+        })
     }
 
     fn remove_index_for_group(&self, group_id: &GroupId) {
@@ -2188,7 +2192,11 @@ impl SonarClient {
     /// Free function — no live client may hold the DB open. Used by panic-wipe
     /// before the Swift host also clears the Keychain key.
     pub fn wipe_database(db_path: impl AsRef<Path>) -> Result<()> {
-        MarmotEngine::wipe(db_path)
+        let db_path = db_path.as_ref();
+        let db_result = MarmotEngine::wipe(db_path);
+        let index_result = wipe_index_for_db(db_path);
+        db_result?;
+        index_result
     }
 }
 

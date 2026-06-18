@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -37,6 +37,40 @@ pub fn index_db_path_for_db(db_path: &Path) -> std::path::PathBuf {
     db_path.with_file_name(format!("{file_name}{INDEX_DB_SUFFIX}"))
 }
 
+pub fn wipe_index_for_db(db_path: &Path) -> Result<()> {
+    for path in sqlite_file_set(index_db_path_for_db(db_path)) {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(crate::Error::Storage(format!(
+                    "index db wipe {}: {err}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn sqlite_file_set(path: PathBuf) -> Vec<PathBuf> {
+    vec![
+        path.clone(),
+        path.with_extension(format!(
+            "{}-wal",
+            path.extension().and_then(|ext| ext.to_str()).unwrap_or("")
+        )),
+        path.with_extension(format!(
+            "{}-shm",
+            path.extension().and_then(|ext| ext.to_str()).unwrap_or("")
+        )),
+        path.with_extension(format!(
+            "{}-journal",
+            path.extension().and_then(|ext| ext.to_str()).unwrap_or("")
+        )),
+    ]
+}
+
 impl ConversationIndex {
     pub fn open(path: &Path, key: [u8; 32]) -> Result<Self> {
         let db = Connection::open(path)
@@ -61,9 +95,7 @@ impl ConversationIndex {
 
     fn migrate(&self) -> Result<()> {
         self.db
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);",
-            )
+            .execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);")
             .map_err(|e| crate::Error::Storage(format!("index schema_version: {e}")))?;
 
         let current: Option<u32> = self
@@ -238,11 +270,9 @@ impl ConversationIndex {
 
     pub fn is_empty(&self) -> bool {
         self.db
-            .query_row(
-                "SELECT COUNT(*) FROM conversation_summary",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
+            .query_row("SELECT COUNT(*) FROM conversation_summary", [], |row| {
+                row.get::<_, i64>(0)
+            })
             .unwrap_or(0)
             == 0
     }
@@ -262,15 +292,14 @@ impl ConversationIndex {
                     msg.created_at.as_secs(),
                     msg.mine,
                 )?;
-                let total = engine.messages(&group.mls_group_id)?.len() as u64;
-                if total > 1 {
-                    self.db
-                        .execute(
-                            "UPDATE conversation_summary SET message_count = ?2, unread_count = 0 WHERE group_id_hex = ?1",
-                            params![group_id_hex, total as i64],
-                        )
-                        .map_err(|e| crate::Error::Storage(format!("index materialize count: {e}")))?;
-                }
+                self.db
+                    .execute(
+                        "UPDATE conversation_summary SET unread_count = 0 WHERE group_id_hex = ?1",
+                        params![group_id_hex],
+                    )
+                    .map_err(|e| {
+                        crate::Error::Storage(format!("index materialize unread reset: {e}"))
+                    })?;
             } else {
                 self.ensure_group(&group_id_hex, &group.name)?;
             }
@@ -288,6 +317,24 @@ mod tests {
         let idx = ConversationIndex::open_in_memory().unwrap();
         assert!(idx.is_empty());
         assert!(idx.summaries_ordered().unwrap().is_empty());
+    }
+
+    #[test]
+    fn wipe_index_removes_db_and_sqlite_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("marmot.sqlite");
+        let index_path = index_db_path_for_db(&db_path);
+        let paths = sqlite_file_set(index_path);
+        for path in &paths {
+            std::fs::write(path, b"test").unwrap();
+            assert!(path.exists());
+        }
+
+        wipe_index_for_db(&db_path).unwrap();
+
+        for path in paths {
+            assert!(!path.exists(), "{} should be wiped", path.display());
+        }
     }
 
     #[test]

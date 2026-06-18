@@ -414,7 +414,13 @@ fileprivate final class UniffiHandleMap<T>: @unchecked Sendable {
 
 
 // Public interface members begin here.
-
+// Magic number for the Rust proxy to call using the same mechanism as every other method,
+// to free the callback once it's dropped by Rust.
+private let IDX_CALLBACK_FREE: Int32 = 0
+// Callback return codes
+private let UNIFFI_CALLBACK_SUCCESS: Int32 = 0
+private let UNIFFI_CALLBACK_ERROR: Int32 = 1
+private let UNIFFI_CALLBACK_UNEXPECTED_ERROR: Int32 = 2
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
@@ -953,6 +959,10 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      */
     func callWaitEvent(timeoutSecs: UInt64)  -> CallEventInfo?
 
+    func clearConversationChangeListener()
+
+    func conversationSummaries()  -> [ConversationSummaryInfo]
+
     /**
      * Decline a pending group invite by welcome event id.
      */
@@ -1014,10 +1024,14 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      */
     func leaveGroup(groupIdHex: String) throws
 
+    func markConversationRead(groupIdHex: String)
+
     /**
      * Decrypted message history for a group, oldest first.
      */
     func messages(groupIdHex: String) throws  -> [MessageInfo]
+
+    func messagesCursorPage(groupIdHex: String, beforeSecs: UInt64?, beforeIdHex: String?, limit: UInt32) throws  -> [MessageInfo]
 
     /**
      * Bounded local chat-message window for a group, oldest first within the
@@ -1098,6 +1112,8 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * Encrypt + publish a text message to the group.
      */
     func sendText(groupIdHex: String, text: String) throws
+
+    func setConversationChangeListener(listener: ConversationChangeListener)
 
     /**
      * Start a 1:1 DM group with `peer` (npub or hex pubkey). Fetches their
@@ -1361,6 +1377,21 @@ open func callWaitEvent(timeoutSecs: UInt64) -> CallEventInfo?  {
 })
 }
 
+open func clearConversationChangeListener()  {try! rustCall() {
+    uniffi_sonar_ffi_fn_method_sonarnode_clear_conversation_change_listener(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+
+open func conversationSummaries() -> [ConversationSummaryInfo]  {
+    return try!  FfiConverterSequenceTypeConversationSummaryInfo.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_sonarnode_conversation_summaries(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+
     /**
      * Decline a pending group invite by welcome event id.
      */
@@ -1497,6 +1528,14 @@ open func leaveGroup(groupIdHex: String)throws   {try rustCallWithError(FfiConve
 }
 }
 
+open func markConversationRead(groupIdHex: String)  {try! rustCall() {
+    uniffi_sonar_ffi_fn_method_sonarnode_mark_conversation_read(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(groupIdHex),$0
+    )
+}
+}
+
     /**
      * Decrypted message history for a group, oldest first.
      */
@@ -1505,6 +1544,18 @@ open func messages(groupIdHex: String)throws  -> [MessageInfo]  {
     uniffi_sonar_ffi_fn_method_sonarnode_messages(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(groupIdHex),$0
+    )
+})
+}
+
+open func messagesCursorPage(groupIdHex: String, beforeSecs: UInt64?, beforeIdHex: String?, limit: UInt32)throws  -> [MessageInfo]  {
+    return try  FfiConverterSequenceTypeMessageInfo.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_messages_cursor_page(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(groupIdHex),
+        FfiConverterOptionUInt64.lower(beforeSecs),
+        FfiConverterOptionString.lower(beforeIdHex),
+        FfiConverterUInt32.lower(limit),$0
     )
 })
 }
@@ -1687,6 +1738,14 @@ open func sendText(groupIdHex: String, text: String)throws   {try rustCallWithEr
             self.uniffiCloneHandle(),
         FfiConverterString.lower(groupIdHex),
         FfiConverterString.lower(text),$0
+    )
+}
+}
+
+open func setConversationChangeListener(listener: ConversationChangeListener)  {try! rustCall() {
+    uniffi_sonar_ffi_fn_method_sonarnode_set_conversation_change_listener(
+            self.uniffiCloneHandle(),
+        FfiConverterCallbackInterfaceConversationChangeListener_lower(listener),$0
     )
 }
 }
@@ -2099,6 +2158,87 @@ public func FfiConverterTypeCallEventInfo_lift(_ buf: RustBuffer) throws -> Call
 #endif
 public func FfiConverterTypeCallEventInfo_lower(_ value: CallEventInfo) -> RustBuffer {
     return FfiConverterTypeCallEventInfo.lower(value)
+}
+
+
+/**
+ * FFI-friendly conversation summary from the core-owned index.
+ */
+public struct ConversationSummaryInfo: Equatable, Hashable {
+    public var groupIdHex: String
+    public var name: String
+    public var latestContent: String
+    public var latestSenderNpub: String
+    public var latestAtSecs: UInt64
+    public var latestMine: Bool
+    public var messageCount: UInt64
+    public var unreadCount: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(groupIdHex: String, name: String, latestContent: String, latestSenderNpub: String, latestAtSecs: UInt64, latestMine: Bool, messageCount: UInt64, unreadCount: UInt64) {
+        self.groupIdHex = groupIdHex
+        self.name = name
+        self.latestContent = latestContent
+        self.latestSenderNpub = latestSenderNpub
+        self.latestAtSecs = latestAtSecs
+        self.latestMine = latestMine
+        self.messageCount = messageCount
+        self.unreadCount = unreadCount
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension ConversationSummaryInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeConversationSummaryInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ConversationSummaryInfo {
+        return
+            try ConversationSummaryInfo(
+                groupIdHex: FfiConverterString.read(from: &buf),
+                name: FfiConverterString.read(from: &buf),
+                latestContent: FfiConverterString.read(from: &buf),
+                latestSenderNpub: FfiConverterString.read(from: &buf),
+                latestAtSecs: FfiConverterUInt64.read(from: &buf),
+                latestMine: FfiConverterBool.read(from: &buf),
+                messageCount: FfiConverterUInt64.read(from: &buf),
+                unreadCount: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ConversationSummaryInfo, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.groupIdHex, into: &buf)
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterString.write(value.latestContent, into: &buf)
+        FfiConverterString.write(value.latestSenderNpub, into: &buf)
+        FfiConverterUInt64.write(value.latestAtSecs, into: &buf)
+        FfiConverterBool.write(value.latestMine, into: &buf)
+        FfiConverterUInt64.write(value.messageCount, into: &buf)
+        FfiConverterUInt64.write(value.unreadCount, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConversationSummaryInfo_lift(_ buf: RustBuffer) throws -> ConversationSummaryInfo {
+    return try FfiConverterTypeConversationSummaryInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConversationSummaryInfo_lower(_ value: ConversationSummaryInfo) -> RustBuffer {
+    return FfiConverterTypeConversationSummaryInfo.lower(value)
 }
 
 
@@ -3498,6 +3638,142 @@ public func FfiConverterTypeSonarFfiError_lower(_ value: SonarFfiError) -> RustB
     return FfiConverterTypeSonarFfiError.lower(value)
 }
 
+
+
+
+/**
+ * Callback interface for conversation-summary changes. The host implements
+ * this to receive push notifications when a chat's summary row is updated
+ * (message sent/received, group created/deleted, unread count changed).
+ */
+public protocol ConversationChangeListener: AnyObject, Sendable {
+
+    func onConversationChanged(groupIdHex: String)
+
+}
+
+
+// Put the implementation in a struct so we don't pollute the top-level namespace
+fileprivate struct UniffiCallbackInterfaceConversationChangeListener {
+
+    // Create the VTable using a series of closures.
+    // Swift automatically converts these into C callback functions.
+    //
+    // Store the vtable directly.
+    static let vtable: UniffiVTableCallbackInterfaceConversationChangeListener = UniffiVTableCallbackInterfaceConversationChangeListener(
+        uniffiFree: { (uniffiHandle: UInt64) -> () in
+            do {
+                try FfiConverterCallbackInterfaceConversationChangeListener.handleMap.remove(handle: uniffiHandle)
+            } catch {
+                print("Uniffi callback interface ConversationChangeListener: handle missing in uniffiFree")
+            }
+        },
+        uniffiClone: { (uniffiHandle: UInt64) -> UInt64 in
+            do {
+                return try FfiConverterCallbackInterfaceConversationChangeListener.handleMap.clone(handle: uniffiHandle)
+            } catch {
+                fatalError("Uniffi callback interface ConversationChangeListener: handle missing in uniffiClone")
+            }
+        },
+        onConversationChanged: { (
+            uniffiHandle: UInt64,
+            groupIdHex: RustBuffer,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceConversationChangeListener.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onConversationChanged(
+                     groupIdHex: try FfiConverterString.lift(groupIdHex)
+                )
+            }
+
+
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        }
+    )
+
+    // Rust stores this pointer for future callback invocations, so it must live
+    // for the process lifetime (not just for the init function call).
+    static let vtablePtr: UnsafePointer<UniffiVTableCallbackInterfaceConversationChangeListener> = {
+        let ptr = UnsafeMutablePointer<UniffiVTableCallbackInterfaceConversationChangeListener>.allocate(capacity: 1)
+        ptr.initialize(to: vtable)
+        return UnsafePointer(ptr)
+    }()
+}
+
+private func uniffiCallbackInitConversationChangeListener() {
+    uniffi_sonar_ffi_fn_init_callback_vtable_conversationchangelistener(UniffiCallbackInterfaceConversationChangeListener.vtablePtr)
+}
+
+// FfiConverter protocol for callback interfaces
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterCallbackInterfaceConversationChangeListener {
+    fileprivate static let handleMap = UniffiHandleMap<ConversationChangeListener>()
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+extension FfiConverterCallbackInterfaceConversationChangeListener : FfiConverter {
+    typealias SwiftType = ConversationChangeListener
+    typealias FfiType = UInt64
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func lift(_ handle: UInt64) throws -> SwiftType {
+        try handleMap.get(handle: handle)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func lower(_ v: SwiftType) -> UInt64 {
+        return handleMap.insert(obj: v)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func write(_ v: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(v))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterCallbackInterfaceConversationChangeListener_lift(_ handle: UInt64) throws -> ConversationChangeListener {
+    return try FfiConverterCallbackInterfaceConversationChangeListener.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterCallbackInterfaceConversationChangeListener_lower(_ v: ConversationChangeListener) -> UInt64 {
+    return FfiConverterCallbackInterfaceConversationChangeListener.lower(v)
+}
+
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
@@ -3855,6 +4131,31 @@ fileprivate struct FfiConverterSequenceData: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterData.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeConversationSummaryInfo: FfiConverterRustBuffer {
+    typealias SwiftType = [ConversationSummaryInfo]
+
+    public static func write(_ value: [ConversationSummaryInfo], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeConversationSummaryInfo.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [ConversationSummaryInfo] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [ConversationSummaryInfo]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeConversationSummaryInfo.read(from: &buf))
         }
         return seq
     }
@@ -4244,8 +4545,8 @@ public func noiseGenerateKeypair()throws  -> NoiseKeypairHex  {
 })
 }
 /**
- * Erase the persistent Marmot database at `db_path` (and its SQLite sidecars:
- * `-wal`, `-shm`, `-journal`).
+ * Erase the persistent Marmot database at `db_path`, its SQLite sidecars
+ * (`-wal`, `-shm`, `-journal`), and the conversation-index sidecar database.
  *
  * Panic-wipe entry point. Call when NO `SonarNode` holds that path open (drop
  * the node first). The Swift host should also clear the Keychain-held DB key.
@@ -4330,7 +4631,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_func_noise_generate_keypair() != 35056) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_func_wipe_marmot_database() != 5401) {
+    if (uniffi_sonar_ffi_checksum_func_wipe_marmot_database() != 46581) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_meshreassembler_add() != 11739) {
@@ -4381,6 +4682,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_call_wait_event() != 8621) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_clear_conversation_change_listener() != 59668) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_conversation_summaries() != 56244) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_decline_group_invite() != 41502) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -4414,7 +4721,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_leave_group() != 44174) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_mark_conversation_read() != 18250) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_messages() != 63355) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_messages_cursor_page() != 46097) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_messages_page() != 43697) {
@@ -4457,6 +4770,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_send_text() != 23173) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_set_conversation_change_listener() != 62940) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_start_dm() != 11780) {
@@ -4510,7 +4826,11 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_constructor_sonarnoise_responder() != 10813) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_conversationchangelistener_on_conversation_changed() != 35719) {
+        return InitializationResult.apiChecksumMismatch
+    }
 
+    uniffiCallbackInitConversationChangeListener()
     return InitializationResult.ok
 }()
 

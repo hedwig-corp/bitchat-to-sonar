@@ -86,8 +86,8 @@ fn parse_db_key(db_key_hex: &str) -> FfiResult<[u8; 32]> {
     })
 }
 
-/// Erase the persistent Marmot database at `db_path` (and its SQLite sidecars:
-/// `-wal`, `-shm`, `-journal`).
+/// Erase the persistent Marmot database at `db_path`, its SQLite sidecars
+/// (`-wal`, `-shm`, `-journal`), and the conversation-index sidecar database.
 ///
 /// Panic-wipe entry point. Call when NO `SonarNode` holds that path open (drop
 /// the node first). The Swift host should also clear the Keychain-held DB key.
@@ -602,10 +602,7 @@ impl SonarNode {
 
     // ── Conversation index (Signal-style summary table) ──────────────────
 
-    pub fn set_conversation_change_listener(
-        &self,
-        listener: Box<dyn ConversationChangeListener>,
-    ) {
+    pub fn set_conversation_change_listener(&self, listener: Box<dyn ConversationChangeListener>) {
         let adapter = FfiChangeListenerAdapter { inner: listener };
         let core_listener: Arc<dyn sonar_core::conversation_index::ConversationChangeListener> =
             Arc::new(adapter);

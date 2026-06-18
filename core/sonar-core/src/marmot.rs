@@ -688,7 +688,13 @@ impl MarmotEngine {
         if limit == 0 {
             return Ok(Vec::new());
         }
+        if before_secs.is_none() {
+            return self.messages_page(group_id, limit, 0);
+        }
 
+        // Transitional backend: MDK currently exposes bounded offset pages, not
+        // a stable `(created_at, event_id)` storage cursor. Keep the API stable
+        // for callers while the storage-level cursor query lands.
         let all_msgs = self.messages(group_id)?;
         let mut sorted: Vec<ChatMessage> = all_msgs;
         sorted.sort_by(|a, b| {
