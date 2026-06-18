@@ -122,7 +122,7 @@ final class MarmotChatModel: ObservableObject {
     private static let sonarDescriptorMissRetryInterval: TimeInterval = 60
     private static let localTranscriptPageLimit: UInt32 = 100
     private static let localSummaryPageLimit: UInt32 = 20
-    private static let localSummaryGroupLimit: UInt32 = 5
+    private static let localSummaryGroupLimit: UInt32 = 50
 
     @Published var npub: String?
     @Published var groups: [MarmotService.MarmotGroup] = []
@@ -454,9 +454,12 @@ final class MarmotChatModel: ObservableObject {
                 to: defaults
             )
             if let group = groups.first(where: { $0.id == groupId }) {
+                let relayReady = await service.isRelayConnected()
                 for member in group.memberNpubs where member != npub {
                     ensureProfile(member)
-                    ensureSonarDescriptor(member)
+                    if relayReady {
+                        ensureSonarDescriptor(member)
+                    }
                 }
             }
         } catch {
@@ -492,10 +495,13 @@ final class MarmotChatModel: ObservableObject {
                 to: defaults
             )
             if resolveMembers {
+                let relayReady = await service.isRelayConnected()
                 for group in groups {
                     for member in group.memberNpubs where member != npub {
                         ensureProfile(member)
-                        ensureSonarDescriptor(member)
+                        if relayReady {
+                            ensureSonarDescriptor(member)
+                        }
                     }
                 }
             }

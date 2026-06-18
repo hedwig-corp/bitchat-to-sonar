@@ -2675,10 +2675,8 @@ final class SonarAppStore: ObservableObject {
             }
             let hydratedGroupId = groupId
                 ?? sonarProfile.flatMap { self.marmotGroup(forNpub: $0.npub)?.id }
-            if let hydratedGroupId, hydratedGroupId != groupId {
-                await self.marmot.loadLocalPage(groupId: hydratedGroupId)
-            }
             if let hydratedGroupId {
+                await self.marmot.loadLocalPage(groupId: hydratedGroupId)
                 self.rememberMarmotGroup(hydratedGroupId, forConversationId: id)
                 let fp = self.chatViewModel.getFingerprint(for: PeerID(str: id)) ?? id
                 self.rememberMarmotGroup(hydratedGroupId, forConversationId: fp)
