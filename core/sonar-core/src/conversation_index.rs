@@ -207,12 +207,8 @@ impl ConversationIndex {
             })
             .map_err(|e| crate::Error::Storage(format!("index summaries query: {e}")))?;
 
-        let mut result = Vec::new();
-        for row in rows {
-            result
-                .push(row.map_err(|e| crate::Error::Storage(format!("index summaries row: {e}")))?);
-        }
-        Ok(result)
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| crate::Error::Storage(format!("index summaries row: {e}")))
     }
 
     pub fn summary(&self, group_id_hex: &str) -> Result<Option<ConversationSummary>> {

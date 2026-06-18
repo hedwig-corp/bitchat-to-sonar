@@ -1090,7 +1090,8 @@ impl SonarClient {
                 "created text message did not produce a local transcript row".into(),
             ));
         };
-        self.upsert_index_for_message(&message);
+        let group_name = self.resolve_group_name(group_id);
+        self.upsert_index_for_message(&message, group_name.as_deref());
         let group_id_hex = hex::encode(group_id.as_slice());
         self.mark_outbox_pending(group_id, &message, &event)?;
         self.spawn_outbox_publish(message.id.to_hex(), event);
@@ -1227,7 +1228,8 @@ impl SonarClient {
         self.nostr.send_event(&event).await?;
         let incoming = self.engine.process_incoming(&event).await?;
         if let Incoming::Message(ref message) = incoming {
-            self.upsert_index_for_message(message);
+            let group_name = self.resolve_group_name(group_id);
+            self.upsert_index_for_message(message, group_name.as_deref());
             let group_id_hex = hex::encode(group_id.as_slice());
             self.notify_conversation_changed(&group_id_hex);
         }
@@ -1555,6 +1557,13 @@ impl SonarClient {
     ) -> MarmotProcessReport {
         let mut report = MarmotProcessReport::default();
         let mut changed_groups: HashSet<String> = HashSet::new();
+        let group_names: HashMap<Vec<u8>, String> = self
+            .engine
+            .groups()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|g| (g.mls_group_id.as_slice().to_vec(), g.name))
+            .collect();
         for event in sort_marmot_events(events) {
             if self.is_sync_event_processed(&event.id) {
                 report.record_processed();
@@ -1591,7 +1600,10 @@ impl SonarClient {
                 }
                 Ok(Incoming::Message(ref message)) => {
                     self.record_delivery_for_incoming(&Incoming::Message(message.clone()));
-                    self.upsert_index_for_message(message);
+                    let cached_name = group_names
+                        .get(message.group_id.as_slice())
+                        .map(|s| s.as_str());
+                    self.upsert_index_for_message(message, cached_name);
                     changed_groups.insert(hex::encode(message.group_id.as_slice()));
                     self.mark_sync_event_processed(&event.id);
                     report.record_processed();
@@ -1838,24 +1850,15 @@ impl SonarClient {
             })
     }
 
-    fn upsert_index_for_message(&self, message: &ChatMessage) {
+    fn upsert_index_for_message(&self, message: &ChatMessage, group_name: Option<&str>) {
         let Some(ref idx) = self.conversation_index else {
             return;
         };
         let group_id_hex = hex::encode(message.group_id.as_slice());
-        let group_name = self
-            .engine
-            .groups()
-            .ok()
-            .and_then(|gs| {
-                gs.into_iter()
-                    .find(|g| g.mls_group_id == message.group_id)
-                    .map(|g| g.name)
-            })
-            .unwrap_or_default();
+        let name = group_name.unwrap_or("");
         if let Err(e) = idx.lock().unwrap().upsert_summary(
             &group_id_hex,
-            &group_name,
+            name,
             &message.content,
             &message.sender.to_string(),
             message.created_at.as_secs(),
@@ -1873,6 +1876,17 @@ impl SonarClient {
         if let Err(e) = idx.lock().unwrap().ensure_group(&group_id_hex, name) {
             tracing::warn!(%e, "index ensure_group failed");
         }
+    }
+
+    fn resolve_group_name(&self, group_id: &GroupId) -> Option<String> {
+        self.engine
+            .groups()
+            .ok()
+            .and_then(|gs| {
+                gs.into_iter()
+                    .find(|g| g.mls_group_id == *group_id)
+                    .map(|g| g.name)
+            })
     }
 
     fn remove_index_for_group(&self, group_id: &GroupId) {
