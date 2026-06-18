@@ -43,6 +43,9 @@ sealed interface Screen {
     // ("mesh:<id>" for a Sonar peer) so the call log appends to the right
     // conversation; [video] picks voice vs video layout.
     data class Call(val peerId: String, val name: String, val video: Boolean) : Screen
+    data class ContactProfile(val chatId: String, val name: String) : Screen
+    data class GroupInfo(val chatId: String) : Screen
+    data object WalletActivity : Screen
 }
 
 /** A BLE-mesh DM conversation row for the home Messages list. */
@@ -827,6 +830,8 @@ class SonarAppState(private val scope: CoroutineScope) {
         private set
 
     fun payStatus(uuid: String): PayStatus? = payLedger.get(uuid)?.status
+
+    fun walletPayEntries(): List<PayEntry> = payLedger.all()
 
     private fun persistPay() { SonarCore.saveBlob("pay.ledger", payLedger.serialize()) }
 
@@ -1783,6 +1788,10 @@ class SonarAppState(private val scope: CoroutineScope) {
                 toast = "couldn't send voice note: ${e.message}"
             }
         }
+    }
+
+    fun sendGifItem(chatId: String, item: SonarGifItem) {
+        send(chatId, item.mediaUrl)
     }
 
     /** Download + decrypt a media attachment, cached by URL. */

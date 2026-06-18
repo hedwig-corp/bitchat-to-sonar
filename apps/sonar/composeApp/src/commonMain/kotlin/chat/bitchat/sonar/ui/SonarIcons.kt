@@ -34,6 +34,8 @@ enum class SNIconName {
     Pencil, Key, Search, Mic, Play, Pause, Bookmark, BookmarkFill,
     // Call glyphs (design icons.jsx): voice/video buttons + in-call controls.
     Phone, Videocam, PhoneDown, MicOff, VideoOff, Speaker, CameraFlip,
+    // Feature glyphs: stickers, GIF label, wallet activity, camera, heart.
+    Sticker, Gif, Activity, Camera, Heart, Leave, Crown,
 }
 
 private sealed interface Shape {
@@ -83,6 +85,13 @@ private val ICONS: Map<SNIconName, List<Shape>> = mapOf(
     SNIconName.VideoOff to listOf(Shape.P("M3.5 7h9a2.5 2.5 0 0 1 2.5 2.5v.5l5-2.6v7.2l-5-2.6"), Shape.P("M4.5 4.5l15 15")),
     SNIconName.Speaker to listOf(Shape.P("M5 9.5v5h3l4 3.5v-12L8 9.5z"), Shape.P("M15.5 9a4 4 0 0 1 0 6M17.8 6.8a7 7 0 0 1 0 10.4")),
     SNIconName.CameraFlip to listOf(Shape.R(3.5f, 6.5f, 17f, 13f, 3f), Shape.P("M8.5 13a3.5 3.5 0 0 1 6-2.4M15.5 13a3.5 3.5 0 0 1-6 2.4"), Shape.P("M14.2 8.2 14.6 10.4 12.4 10.2M9.8 17.8 9.4 15.6 11.6 15.8"), Shape.P("M8 6.5l1-2h6l1 2")),
+    SNIconName.Sticker to listOf(Shape.C(12f, 12f, 8.2f), Shape.P("M20.2 12a8.2 8.2 0 0 1-8.2 8.2"), Shape.P("M20.2 12c-2.8 0-5 1.8-5 4s0 4.2 0 4.2")),
+    SNIconName.Gif to listOf(Shape.R(3.2f, 5.2f, 17.6f, 13.6f, 3f), Shape.P("M10.2 14.2v-4.4c0-.6-.5-1-1-1H8a1 1 0 0 0-1 1v4.4c0 .6.5 1 1 1h1.2c.6 0 1-.5 1-1zM9.5 12.2h1"), Shape.P("M13 8.8v6.4M16.2 8.8v6.4M16.2 12h-2.4")),
+    SNIconName.Activity to listOf(Shape.P("M4 12h4l2-6 4 12 2-6h4")),
+    SNIconName.Camera to listOf(Shape.P("M4 8.5a2 2 0 0 1 2-2h2l1.5-2h5l1.5 2h2a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"), Shape.C(12f, 13f, 3.2f)),
+    SNIconName.Heart to listOf(Shape.P("M12 20s-7-4.2-7-9.2a4.2 4.2 0 0 1 7-3.1 4.2 4.2 0 0 1 7 3.1c0 5-7 9.2-7 9.2z")),
+    SNIconName.Leave to listOf(Shape.P("M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4M10 17l5-5-5-5M15 12H3")),
+    SNIconName.Crown to listOf(Shape.P("M4 17l2-10 4 4 2-6 2 6 4-4 2 10z", fill = true)),
 )
 
 @Composable

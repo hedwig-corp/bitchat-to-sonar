@@ -126,7 +126,7 @@ fun SonarSettingsScreen(state: SonarAppState) {
                     sub = "Pays like you message — Bluetooth or Lightning",
                     value = if (state.walletAvailable) "${formatThousands(balance)} sats" else "Off",
                     trail = SNTrail.None,
-                ) {}
+                ) { if (state.walletAvailable) state.push(Screen.WalletActivity) }
                 if (state.walletAvailable) {
                     SNSettingsRow(
                         icon = SNIconName.Coin, label = "Currency", value = state.currency.code,
