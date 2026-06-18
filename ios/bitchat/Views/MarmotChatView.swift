@@ -21,6 +21,7 @@ final class MarmotChatModel: ObservableObject {
 
     @Published var npub: String?
     @Published var groups: [MarmotService.MarmotGroup] = []
+    @Published var pendingGroupInvites: [MarmotService.GroupInvite] = []
     @Published var messagesByGroup: [String: [MarmotService.MarmotMessage]] = [:]
     @Published var busy = false
     @Published var errorText: String?
@@ -182,11 +183,13 @@ final class MarmotChatModel: ObservableObject {
     func loadLocal() async {
         do {
             let groups = try await service.groups()
+            let invites = try await service.pendingGroupInvites()
             var byGroup: [String: [MarmotService.MarmotMessage]] = [:]
             for group in groups {
                 byGroup[group.id] = try await service.messages(groupId: group.id)
             }
             self.groups = groups
+            self.pendingGroupInvites = invites
             self.messagesByGroup = reconcileOptimistic(into: byGroup)
             // Resolve a human name for every counterpart (once each).
             for group in groups {
@@ -459,6 +462,20 @@ final class MarmotChatModel: ObservableObject {
         profileFetches = []
     }
 
+    /// Leave a multi-member Marmot group, then drop it from the in-memory state.
+    func leaveGroup(_ groupId: String) async {
+        do {
+            try await service.leaveGroup(groupId)
+        } catch {
+            errorText = Self.describe(error)
+            return
+        }
+        groups.removeAll { $0.id == groupId }
+        messagesByGroup[groupId] = nil
+        pendingOptimistic[groupId] = nil
+        profileFetches = []
+    }
+
     /// Panic-wipe the encrypted Marmot database + its Keychain key and reset
     /// in-memory state. Called from the emergency-wipe path.
     func wipeDatabase() {
@@ -467,6 +484,7 @@ final class MarmotChatModel: ObservableObject {
         Task { await service.wipeDatabase() }
         npub = nil
         groups = []
+        pendingGroupInvites = []
         messagesByGroup = [:]
         pendingOptimistic = [:]
         descriptorBolt12Offer = nil
@@ -483,6 +501,7 @@ final class MarmotChatModel: ObservableObject {
         await service.wipeDatabase()
         npub = nil
         groups = []
+        pendingGroupInvites = []
         messagesByGroup = [:]
         pendingOptimistic = [:]
         profilesByNpub = [:]
@@ -500,12 +519,52 @@ final class MarmotChatModel: ObservableObject {
     /// Short label for a 1:1 group: the other member's npub prefix.
     func title(for group: MarmotService.MarmotGroup) -> String {
         if !group.name.isEmpty { return group.name }
-        guard let other = group.memberNpubs.first(where: { $0 != npub }) else { return "Secure chat" }
+        let others = otherMembers(in: group)
+        guard others.count == 1, let other = others.first else { return "Group chat" }
         // Prefer the counterpart's resolved kind-0 profile name; fetch it if we
         // haven't yet; fall back to a short npub until it lands.
         if let name = displayName(forNpub: other) { return name }
         ensureProfile(other)
         return String(other.prefix(12)) + "…"
+    }
+
+    func otherMembers(in group: MarmotService.MarmotGroup) -> [String] {
+        Array(Set(group.memberNpubs.filter { $0 != npub && !$0.isEmpty })).sorted()
+    }
+
+    func isDirectGroup(_ group: MarmotService.MarmotGroup) -> Bool {
+        otherMembers(in: group).count == 1
+    }
+
+    func startGroup(name: String, members: [String]) async throws -> String {
+        let cleanMembers = Array(Set(members.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty })).sorted()
+        guard cleanMembers.count >= 2 else {
+            throw MarmotService.ServiceError.invalidInput("add at least two people")
+        }
+        let id = try await service.startGroup(with: cleanMembers, name: name)
+        await loadLocal()
+        return id
+    }
+
+    func addGroupMembers(_ members: [String], to groupId: String) async throws {
+        try await service.addGroupMembers(members, to: groupId)
+        await loadLocal()
+    }
+
+    func removeGroupMembers(_ members: [String], from groupId: String) async throws {
+        try await service.removeGroupMembers(members, from: groupId)
+        await loadLocal()
+    }
+
+    func acceptGroupInvite(_ invite: MarmotService.GroupInvite) async throws -> String {
+        let id = try await service.acceptGroupInvite(invite.id)
+        await loadLocal()
+        return id
+    }
+
+    func declineGroupInvite(_ invite: MarmotService.GroupInvite) async throws {
+        try await service.declineGroupInvite(invite.id)
+        await loadLocal()
     }
 
     private static func describe(_ error: Error) -> String {

@@ -25,8 +25,13 @@ struct SonarHomeScreen: View {
     @State private var connSheet = false
     @State private var searchSheet = false
     @State private var composeSheet = false
+    @State private var pendingInvite: MarmotService.GroupInvite?
     @State private var npubEntry = false
+    @State private var groupEntry = false
     @State private var npubDraft = ""
+    @State private var groupNameDraft = ""
+    @State private var groupMembersDraft = ""
+    @State private var selectedGroupNpubs: Set<String> = []
     @State private var titleTaps: [Date] = []
 
     /// Triple-tap on the "sonar" title (taps within 1.2 s) triggers the wipe sheet.
@@ -84,10 +89,25 @@ struct SonarHomeScreen: View {
         .snSheet(isPresented: $composeSheet, title: "Start a chat") {
             composeContent
         }
+        .snSheet(
+            isPresented: Binding(
+                get: { pendingInvite != nil },
+                set: { if !$0 { pendingInvite = nil } }
+            ),
+            title: "Group invite"
+        ) {
+            if let invite = pendingInvite {
+                groupInviteContent(invite)
+            }
+        }
         .onChange(of: composeSheet) { open in
             if !open {
                 npubEntry = false
+                groupEntry = false
                 npubDraft = ""
+                groupNameDraft = ""
+                groupMembersDraft = ""
+                selectedGroupNpubs = []
             }
         }
     }
@@ -161,8 +181,9 @@ struct SonarHomeScreen: View {
 
     private var dmList: some View {
         let rows = store.dmRows
+        let invites = store.marmot.pendingGroupInvites
         return VStack(spacing: 0) {
-            if rows.isEmpty {
+            if rows.isEmpty && invites.isEmpty {
                 SNEmptyState(
                     icon: .lock,
                     iconSize: 24,
@@ -171,6 +192,21 @@ struct SonarHomeScreen: View {
                 )
                 .padding(.vertical, 28)
             } else {
+                ForEach(Array(invites.enumerated()), id: \.element.id) { i, invite in
+                    let title = invite.groupName.isEmpty ? "Group chat" : invite.groupName
+                    SNConvRow(
+                        title: title,
+                        verified: false,
+                        time: "",
+                        unread: false,
+                        divider: i < invites.count - 1 || !rows.isEmpty,
+                        action: { pendingInvite = invite },
+                        avatar: { SonarAvatar(name: title, size: 52, presence: false) },
+                        sub: {
+                            SNLockedPreview(preview: "\(invite.memberCount) members · invite")
+                        }
+                    )
+                }
                 ForEach(Array(rows.enumerated()), id: \.element.id) { i, d in
                     SNConvRow(
                         title: d.title,
@@ -187,7 +223,7 @@ struct SonarHomeScreen: View {
                     )
                     .contextMenu {
                         Button(role: .destructive) { pendingDelete = d } label: {
-                            Label("Delete chat", systemImage: "trash")
+                            Label(store.isMultiMemberMarmotGroupId(d.id) ? "Leave group" : "Delete chat", systemImage: "trash")
                         }
                     }
                 }
@@ -199,10 +235,14 @@ struct SonarHomeScreen: View {
             titleVisibility: .visible,
             presenting: pendingDelete
         ) { row in
-            Button("Delete \(row.title)", role: .destructive) { store.deleteChat(row.id) }
+            Button(store.isMultiMemberMarmotGroupId(row.id) ? "Leave \(row.title)" : "Delete \(row.title)", role: .destructive) { store.deleteChat(row.id) }
             Button("Cancel", role: .cancel) {}
-        } message: { _ in
-            Text("This removes the conversation from this device only. The other person isn't notified.")
+        } message: { row in
+            if store.isMultiMemberMarmotGroupId(row.id) {
+                Text("This sends a leave update to the group and removes the conversation from this device.")
+            } else {
+                Text("This removes the conversation from this device only. The other person isn't notified.")
+            }
         }
     }
 
@@ -248,47 +288,58 @@ struct SonarHomeScreen: View {
     // ── Compose sheet: nearby peers + radar + secure chat via npub ──
     private var composeContent: some View {
         let inRange = store.nearbyPeers.filter(\.inRange)
-        return VStack(spacing: 0) {
-            if inRange.isEmpty {
-                Text("Nobody in Bluetooth range right now.")
-                    .font(SonarTheme.uiFont(size: 13.5))
-                    .foregroundColor(SonarTheme.text2)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 10)
-            } else {
-                ForEach(Array(inRange.prefix(4).enumerated()), id: \.element.id) { i, p in
-                    SNConvRow(
-                        title: p.name,
-                        verified: store.isVerified(p.id),
-                        divider: i < min(inRange.count, 4) - 1,
-                        action: {
-                            composeSheet = false
-                            store.openedDM(p.id)
-                            store.push(.dm(p.id))
-                        },
-                        avatar: { SonarAvatar(name: p.name, size: 44, presence: true) },
-                        sub: {
-                            HStack(spacing: 6) {
-                                SNBars(n: p.bars)
-                                Text(verbatim: "\(p.hint) · \(p.detail)")
-                                    .font(SonarTheme.uiFont(size: 13.5))
-                                    .foregroundColor(SonarTheme.text2)
+        return ScrollView {
+            VStack(spacing: 0) {
+                if inRange.isEmpty {
+                    Text("Nobody in Bluetooth range right now.")
+                        .font(SonarTheme.uiFont(size: 13.5))
+                        .foregroundColor(SonarTheme.text2)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
+                } else {
+                    ForEach(Array(inRange.prefix(4).enumerated()), id: \.element.id) { i, p in
+                        SNConvRow(
+                            title: p.name,
+                            verified: store.isVerified(p.id),
+                            divider: i < min(inRange.count, 4) - 1,
+                            action: {
+                                composeSheet = false
+                                store.openedDM(p.id)
+                                store.push(.dm(p.id))
+                            },
+                            avatar: { SonarAvatar(name: p.name, size: 44, presence: true) },
+                            sub: {
+                                HStack(spacing: 6) {
+                                    SNBars(n: p.bars)
+                                    Text(verbatim: "\(p.hint) · \(p.detail)")
+                                        .font(SonarTheme.uiFont(size: 13.5))
+                                        .foregroundColor(SonarTheme.text2)
+                                }
                             }
-                        }
-                    )
+                        )
+                    }
+                }
+                SNActionRow(icon: .rings, label: "People nearby", desc: "Open the radar to see everyone in range") {
+                    composeSheet = false
+                    store.push(.nearby)
+                }
+                SNActionRow(icon: .key, label: "Secure chat via npub", desc: "Encrypted chat over the internet — reaches anywhere") {
+                    npubEntry = true
+                    groupEntry = false
+                }
+                SNActionRow(icon: .people, label: "New group", desc: "Invite people by npub") {
+                    groupEntry = true
+                    npubEntry = false
+                }
+                if npubEntry {
+                    npubField
+                }
+                if groupEntry {
+                    groupField
                 }
             }
-            SNActionRow(icon: .rings, label: "People nearby", desc: "Open the radar to see everyone in range") {
-                composeSheet = false
-                store.push(.nearby)
-            }
-            SNActionRow(icon: .key, label: "Secure chat via npub", desc: "Encrypted chat over the internet — reaches anywhere") {
-                npubEntry = true
-            }
-            if npubEntry {
-                npubField
-            }
         }
+        .frame(maxHeight: 560)
     }
 
     private var npubField: some View {
@@ -323,6 +374,137 @@ struct SonarHomeScreen: View {
         }
         .padding(EdgeInsets(top: 6, leading: 10, bottom: 2, trailing: 10))
     }
+
+    private var groupField: some View {
+        let pasted = parsedNpubs(from: groupMembersDraft)
+        let members = mergedNpubs(pasted: pasted, selected: selectedGroupNpubs)
+        let contacts = store.groupInviteContacts()
+        return ScrollView {
+            VStack(spacing: 8) {
+                TextField(
+                    "",
+                    text: $groupNameDraft,
+                    prompt: Text("Group name").foregroundColor(SonarTheme.text3)
+                )
+                .textFieldStyle(.plain)
+                .font(SonarTheme.uiFont(size: 15))
+                .foregroundColor(SonarTheme.text)
+                .padding(EdgeInsets(top: 11, leading: 14, bottom: 11, trailing: 14))
+                .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(SonarTheme.surface2))
+                TextField(
+                    "",
+                    text: $groupMembersDraft,
+                    prompt: Text(verbatim: "npub1\u{2026} npub1\u{2026}").foregroundColor(SonarTheme.text3)
+                )
+                .textFieldStyle(.plain)
+                .font(SonarTheme.monoFont(size: 13))
+                .foregroundColor(SonarTheme.text)
+                #if os(iOS)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                #endif
+                .padding(EdgeInsets(top: 11, leading: 14, bottom: 11, trailing: 14))
+                .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(SonarTheme.surface2))
+
+                if !contacts.isEmpty {
+                    VStack(spacing: 0) {
+                        ForEach(Array(contacts.enumerated()), id: \.element.id) { i, contact in
+                            SNGroupContactRow(
+                                contact: contact,
+                                selected: selectedGroupNpubs.contains(contact.npub),
+                                divider: i < contacts.count - 1
+                            ) {
+                                if selectedGroupNpubs.contains(contact.npub) {
+                                    selectedGroupNpubs.remove(contact.npub)
+                                } else {
+                                    selectedGroupNpubs.insert(contact.npub)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                SNPrimaryButton(
+                    label: "Create group",
+                    disabled: groupNameDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || members.count < 2
+                ) {
+                    let name = groupNameDraft
+                    guard members.count >= 2 else { return }
+                    composeSheet = false
+                    Task {
+                        if let groupId = try? await store.marmot.startGroup(name: name, members: members) {
+                            let id = SonarAppStore.marmotIDPrefix + groupId
+                            store.openedDM(id)
+                            store.push(.dm(id))
+                        }
+                    }
+                }
+            }
+            .padding(EdgeInsets(top: 6, leading: 10, bottom: 2, trailing: 10))
+        }
+        .frame(maxHeight: 430)
+    }
+
+    private func groupInviteContent(_ invite: MarmotService.GroupInvite) -> some View {
+        let title = invite.groupName.isEmpty ? "Group chat" : invite.groupName
+        return VStack(spacing: 14) {
+            SonarAvatar(name: title, size: 64)
+            VStack(spacing: 5) {
+                Text(verbatim: title)
+                    .font(SonarTheme.uiFont(size: 22, weight: .bold))
+                    .foregroundColor(SonarTheme.text)
+                    .lineLimit(1)
+                Text(verbatim: "\(invite.memberCount) members · invited by \(shortNpub(invite.welcomerNpub))")
+                    .font(SonarTheme.uiFont(size: 13.5))
+                    .foregroundColor(SonarTheme.text2)
+                    .lineLimit(1)
+            }
+            Text("End-to-end encrypted — only group members can read this")
+                .font(SonarTheme.uiFont(size: 13))
+                .foregroundColor(SonarTheme.text3)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: .infinity)
+            SNPrimaryButton(label: "Accept") {
+                let invite = invite
+                pendingInvite = nil
+                Task {
+                    if let groupId = try? await store.marmot.acceptGroupInvite(invite) {
+                        store.openedDM(SonarAppStore.marmotIDPrefix + groupId)
+                        store.push(.dm(SonarAppStore.marmotIDPrefix + groupId))
+                    }
+                }
+            }
+            Button {
+                let invite = invite
+                pendingInvite = nil
+                Task { try? await store.marmot.declineGroupInvite(invite) }
+            } label: {
+                Text("Decline")
+                    .font(SonarTheme.uiFont(size: 16, weight: .semibold))
+                    .foregroundColor(SonarTheme.text2)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 50)
+                    .background(RoundedRectangle(cornerRadius: 15, style: .continuous).fill(SonarTheme.surface2))
+            }
+            .buttonStyle(.plain)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private func parsedNpubs(from text: String) -> [String] {
+        text.components(separatedBy: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: ",")))
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { $0.hasPrefix("npub1") }
+    }
+
+    private func mergedNpubs(pasted: [String], selected: Set<String>) -> [String] {
+        var seen = Set<String>()
+        return (pasted + selected.sorted()).filter { seen.insert($0).inserted }
+    }
+}
+
+private func shortNpub(_ value: String) -> String {
+    value.count > 16 ? "\(value.prefix(10))…\(value.suffix(4))" : value
 }
 
 /// Live search for the mobile home search pill. It only renders data from

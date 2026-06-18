@@ -23,13 +23,18 @@ struct SonarDMScreen: View {
     @State private var showKey = false
     @State private var paySheet = false
     @State private var walletSheet = false
+    @State private var addPeopleSheet = false
+    @State private var removePeopleSheet = false
+    @State private var groupAddDraft = ""
+    @State private var selectedAddNpubs: Set<String> = []
     @State private var pickPhoto = false
     @State private var photoItem: PhotosPickerItem?
 
     private var peer: SNPeerItem { store.peerItem(peerId) }
     private var isMarmot: Bool { store.marmotGroupId(peerId) != nil }
+    private var isMultiMemberMarmot: Bool { store.isMultiMemberMarmotGroupId(peerId) }
     private var isSonar: Bool { store.sonarProfile(peerId) != nil }
-    private var verified: Bool { store.isVerified(peerId) }
+    private var verified: Bool { !isMultiMemberMarmot && store.isVerified(peerId) }
     private var transport: SNVia { store.dmTransport(peerId) }
     private var walletReady: Bool {
         if case .ready = store.walletState { return true }
@@ -70,12 +75,14 @@ struct SonarDMScreen: View {
                     icon: .lock,
                     iconSize: 24,
                     title: "Say hi to \(peer.name)",
-                    desc: "Messages here are end-to-end encrypted. Only the two of you can read them."
+                    desc: isMultiMemberMarmot
+                        ? "Messages here are end-to-end encrypted. Only group members can read them."
+                        : "Messages here are end-to-end encrypted. Only the two of you can read them."
                 )
             } else {
                 SNMsgList(
                     msgs: msgs,
-                    showAuthors: false,
+                    showAuthors: isMultiMemberMarmot,
                     peerName: peer.name,
                     money: { store.money($0) },
                     fiatText: { store.moneySatsLine($0) },
@@ -136,9 +143,21 @@ struct SonarDMScreen: View {
                         pickPhoto = true
                     }
                 }
-                SNActionRow(icon: .shield, label: "Verify safety number", desc: "Confirm this chat is secure") {
-                    sheet = false
-                    verifySheet = true
+                if isMultiMemberMarmot {
+                    SNActionRow(icon: .people, label: "Add people", desc: "Invite local contacts or paste npubs") {
+                        sheet = false
+                        addPeopleSheet = true
+                    }
+                    SNActionRow(icon: .trash, label: "Remove people", desc: "Manage current group members") {
+                        sheet = false
+                        removePeopleSheet = true
+                    }
+                }
+                if !isMultiMemberMarmot {
+                    SNActionRow(icon: .shield, label: "Verify safety number", desc: "Confirm this chat is secure") {
+                        sheet = false
+                        verifySheet = true
+                    }
                 }
             }
         }
@@ -187,11 +206,23 @@ struct SonarDMScreen: View {
                 onSend: { sats in store.sendPay(peerId, sats: sats) }
             )
         }
+        .snSheet(isPresented: $addPeopleSheet, title: "Add people") {
+            addPeopleContent
+        }
+        .snSheet(isPresented: $removePeopleSheet, title: "Remove people") {
+            removePeopleContent
+        }
         .snSheet(isPresented: $walletSheet, title: "Your wallet") {
             SNWalletSheetContent(onClose: { walletSheet = false })
         }
         .onChange(of: verifySheet) { open in
             if !open { showKey = false }
+        }
+        .onChange(of: addPeopleSheet) { open in
+            if !open {
+                groupAddDraft = ""
+                selectedAddNpubs = []
+            }
         }
     }
 
@@ -204,6 +235,12 @@ struct SonarDMScreen: View {
                 icon: .shieldCheck, tone: .enc,
                 bold: "Verified",
                 rest: " — you confirmed \(peer.name)\u{2019}s safety number"
+            )
+        } else if isMultiMemberMarmot {
+            SNBanner(
+                icon: .lock, tone: .enc,
+                bold: "End-to-end encrypted",
+                rest: " — only group members can read this"
             )
         } else if isMarmot {
             SNBanner(
@@ -334,6 +371,101 @@ struct SonarDMScreen: View {
         }
     }
 
+    private var addPeopleContent: some View {
+        let existing = Set(store.marmotGroup(forConversationId: peerId)?.memberNpubs ?? [])
+        let pasted = parsedNpubs(from: groupAddDraft).filter { !existing.contains($0) }
+        let members = mergedNpubs(pasted: pasted, selected: selectedAddNpubs)
+        let contacts = store.groupInviteContacts(excluding: existing)
+
+        return ScrollView {
+            VStack(spacing: 8) {
+                TextField(
+                    "",
+                    text: $groupAddDraft,
+                    prompt: Text(verbatim: "npub1\u{2026} npub1\u{2026}").foregroundColor(SonarTheme.text3)
+                )
+                .textFieldStyle(.plain)
+                .font(SonarTheme.monoFont(size: 13))
+                .foregroundColor(SonarTheme.text)
+                #if os(iOS)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                #endif
+                .padding(EdgeInsets(top: 11, leading: 14, bottom: 11, trailing: 14))
+                .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(SonarTheme.surface2))
+
+                if !contacts.isEmpty {
+                    VStack(spacing: 0) {
+                        ForEach(Array(contacts.enumerated()), id: \.element.id) { i, contact in
+                            SNGroupContactRow(
+                                contact: contact,
+                                selected: selectedAddNpubs.contains(contact.npub),
+                                divider: i < contacts.count - 1
+                            ) {
+                                if selectedAddNpubs.contains(contact.npub) {
+                                    selectedAddNpubs.remove(contact.npub)
+                                } else {
+                                    selectedAddNpubs.insert(contact.npub)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                SNPrimaryButton(label: "Add people", disabled: members.isEmpty) {
+                    guard let groupId = store.marmotGroupId(peerId) else { return }
+                    addPeopleSheet = false
+                    Task { try? await store.marmot.addGroupMembers(members, to: groupId) }
+                }
+            }
+            .padding(EdgeInsets(top: 6, leading: 10, bottom: 2, trailing: 10))
+        }
+        .frame(maxHeight: 430)
+    }
+
+    private var removePeopleContent: some View {
+        let members = store.groupMemberContacts(forConversationId: peerId)
+        return ScrollView {
+            VStack(spacing: 0) {
+                if members.isEmpty {
+                    Text("No removable members.")
+                        .font(SonarTheme.uiFont(size: 13.5))
+                        .foregroundColor(SonarTheme.text2)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 14)
+                } else {
+                    ForEach(members) { member in
+                        Button {
+                            guard let groupId = store.marmotGroupId(peerId) else { return }
+                            Task { try? await store.marmot.removeGroupMembers([member.npub], from: groupId) }
+                        } label: {
+                            HStack(spacing: 12) {
+                                SonarAvatar(name: member.title, size: 38)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(verbatim: member.title)
+                                        .font(SonarTheme.uiFont(size: 15.5, weight: .semibold))
+                                        .foregroundColor(SonarTheme.text)
+                                        .lineLimit(1)
+                                    Text(verbatim: member.subtitle)
+                                        .font(SonarTheme.uiFont(size: 12.5))
+                                        .foregroundColor(SonarTheme.text2)
+                                        .lineLimit(1)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                SNIcon(name: .trash, size: 17, weight: 2)
+                                    .foregroundColor(SonarTheme.danger)
+                            }
+                            .padding(EdgeInsets(top: 9, leading: 10, bottom: 9, trailing: 10))
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(SNRowPressStyle(cornerRadius: 14))
+                    }
+                }
+            }
+        }
+        .frame(maxHeight: 430)
+    }
+
     private func verifyHead(name: String, label: String) -> some View {
         VStack(spacing: 5) {
             SonarAvatar(name: name, size: 48)
@@ -341,6 +473,17 @@ struct SonarDMScreen: View {
                 .font(SonarTheme.uiFont(size: 12.5, weight: .semibold))
                 .foregroundColor(SonarTheme.text2)
         }
+    }
+
+    private func parsedNpubs(from text: String) -> [String] {
+        text.components(separatedBy: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: ",")))
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { $0.hasPrefix("npub1") }
+    }
+
+    private func mergedNpubs(pasted: [String], selected: Set<String>) -> [String] {
+        var seen = Set<String>()
+        return (pasted + selected.sorted()).filter { seen.insert($0).inserted }
     }
 }
 

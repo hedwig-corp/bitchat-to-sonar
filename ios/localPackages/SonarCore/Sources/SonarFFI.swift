@@ -879,6 +879,16 @@ public func FfiConverterTypeSonarIdentity_lower(_ value: SonarIdentity) -> UInt6
 public protocol SonarNodeProtocol: AnyObject, Sendable {
 
     /**
+     * Accept a pending group invite by welcome event id.
+     */
+    func acceptGroupInvite(inviteIdHex: String) throws  -> String
+
+    /**
+     * Add members to an existing group.
+     */
+    func addGroupMembers(groupIdHex: String, members: [String]) throws
+
+    /**
      * The user's Blossom server list (kind-10063). Empty if unset.
      */
     func blossomServers() throws  -> [String]
@@ -944,6 +954,11 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func callWaitEvent(timeoutSecs: UInt64)  -> CallEventInfo?
 
     /**
+     * Decline a pending group invite by welcome event id.
+     */
+    func declineGroupInvite(inviteIdHex: String) throws
+
+    /**
      * Delete a single chat's local Marmot state (messages + MLS keys). Local-
      * only — the peer is NOT notified. Idempotent (deleting an unknown group is
      * a no-op). Used by per-chat "delete this conversation".
@@ -995,9 +1010,19 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func groups() throws  -> [GroupInfo]
 
     /**
+     * Leave a group and delete its local state after the leave proposal is sent.
+     */
+    func leaveGroup(groupIdHex: String) throws
+
+    /**
      * Decrypted message history for a group, oldest first.
      */
     func messages(groupIdHex: String) throws  -> [MessageInfo]
+
+    /**
+     * Pending multi-member group invites awaiting accept/decline.
+     */
+    func pendingGroupInvites() throws  -> [GroupInviteInfo]
 
     /**
      * Publish the user's Blossom server list (kind-10063).
@@ -1020,6 +1045,11 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * only routes this app build can actually use, in preference order.
      */
     func publishSonarDescriptor(callsEnabled: Bool, signaling: [String], bolt12Offer: String?) throws
+
+    /**
+     * Remove members from an existing group.
+     */
+    func removeGroupMembers(groupIdHex: String, members: [String]) throws
 
     /**
      * Send a 1:1 encrypted DM to a geohash channel participant (NIP-17).
@@ -1054,6 +1084,11 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * group id as hex.
      */
     func startDm(peer: String, name: String) throws  -> String
+
+    /**
+     * Start a multi-member Marmot group. `members` accepts npub or hex pubkeys.
+     */
+    func startGroup(members: [String], name: String) throws  -> String
 
     /**
      * Poll the relays once: welcomes addressed to us, then group messages.
@@ -1147,6 +1182,30 @@ public static func connect(identity: SonarIdentity, relayUrls: [String], dbPath:
 }
 
 
+
+    /**
+     * Accept a pending group invite by welcome event id.
+     */
+open func acceptGroupInvite(inviteIdHex: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_accept_group_invite(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(inviteIdHex),$0
+    )
+})
+}
+
+    /**
+     * Add members to an existing group.
+     */
+open func addGroupMembers(groupIdHex: String, members: [String])throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_add_group_members(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(groupIdHex),
+        FfiConverterSequenceString.lower(members),$0
+    )
+}
+}
 
     /**
      * The user's Blossom server list (kind-10063). Empty if unset.
@@ -1280,6 +1339,17 @@ open func callWaitEvent(timeoutSecs: UInt64) -> CallEventInfo?  {
 }
 
     /**
+     * Decline a pending group invite by welcome event id.
+     */
+open func declineGroupInvite(inviteIdHex: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_decline_group_invite(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(inviteIdHex),$0
+    )
+}
+}
+
+    /**
      * Delete a single chat's local Marmot state (messages + MLS keys). Local-
      * only — the peer is NOT notified. Idempotent (deleting an unknown group is
      * a no-op). Used by per-chat "delete this conversation".
@@ -1394,6 +1464,17 @@ open func groups()throws  -> [GroupInfo]  {
 }
 
     /**
+     * Leave a group and delete its local state after the leave proposal is sent.
+     */
+open func leaveGroup(groupIdHex: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_leave_group(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(groupIdHex),$0
+    )
+}
+}
+
+    /**
      * Decrypted message history for a group, oldest first.
      */
 open func messages(groupIdHex: String)throws  -> [MessageInfo]  {
@@ -1401,6 +1482,17 @@ open func messages(groupIdHex: String)throws  -> [MessageInfo]  {
     uniffi_sonar_ffi_fn_method_sonarnode_messages(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(groupIdHex),$0
+    )
+})
+}
+
+    /**
+     * Pending multi-member group invites awaiting accept/decline.
+     */
+open func pendingGroupInvites()throws  -> [GroupInviteInfo]  {
+    return try  FfiConverterSequenceTypeGroupInviteInfo.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_pending_group_invites(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
@@ -1450,6 +1542,18 @@ open func publishSonarDescriptor(callsEnabled: Bool, signaling: [String], bolt12
         FfiConverterBool.lower(callsEnabled),
         FfiConverterSequenceString.lower(signaling),
         FfiConverterOptionString.lower(bolt12Offer),$0
+    )
+}
+}
+
+    /**
+     * Remove members from an existing group.
+     */
+open func removeGroupMembers(groupIdHex: String, members: [String])throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_remove_group_members(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(groupIdHex),
+        FfiConverterSequenceString.lower(members),$0
     )
 }
 }
@@ -1531,6 +1635,19 @@ open func startDm(peer: String, name: String)throws  -> String  {
     uniffi_sonar_ffi_fn_method_sonarnode_start_dm(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(peer),
+        FfiConverterString.lower(name),$0
+    )
+})
+}
+
+    /**
+     * Start a multi-member Marmot group. `members` accepts npub or hex pubkeys.
+     */
+open func startGroup(members: [String], name: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_start_group(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceString.lower(members),
         FfiConverterString.lower(name),$0
     )
 })
@@ -2056,6 +2173,93 @@ public func FfiConverterTypeGroupInfo_lift(_ buf: RustBuffer) throws -> GroupInf
 #endif
 public func FfiConverterTypeGroupInfo_lower(_ value: GroupInfo) -> RustBuffer {
     return FfiConverterTypeGroupInfo.lower(value)
+}
+
+
+/**
+ * FFI-friendly pending group invite summary.
+ */
+public struct GroupInviteInfo: Equatable, Hashable {
+    /**
+     * Hex of the kind-444 welcome event id. Pass to accept/decline methods.
+     */
+    public var idHex: String
+    public var wrapperIdHex: String
+    public var groupIdHex: String
+    public var groupName: String
+    public var groupDescription: String
+    public var welcomerNpub: String
+    public var memberCount: UInt32
+    public var relayUrls: [String]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Hex of the kind-444 welcome event id. Pass to accept/decline methods.
+         */idHex: String, wrapperIdHex: String, groupIdHex: String, groupName: String, groupDescription: String, welcomerNpub: String, memberCount: UInt32, relayUrls: [String]) {
+        self.idHex = idHex
+        self.wrapperIdHex = wrapperIdHex
+        self.groupIdHex = groupIdHex
+        self.groupName = groupName
+        self.groupDescription = groupDescription
+        self.welcomerNpub = welcomerNpub
+        self.memberCount = memberCount
+        self.relayUrls = relayUrls
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension GroupInviteInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeGroupInviteInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> GroupInviteInfo {
+        return
+            try GroupInviteInfo(
+                idHex: FfiConverterString.read(from: &buf),
+                wrapperIdHex: FfiConverterString.read(from: &buf),
+                groupIdHex: FfiConverterString.read(from: &buf),
+                groupName: FfiConverterString.read(from: &buf),
+                groupDescription: FfiConverterString.read(from: &buf),
+                welcomerNpub: FfiConverterString.read(from: &buf),
+                memberCount: FfiConverterUInt32.read(from: &buf),
+                relayUrls: FfiConverterSequenceString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: GroupInviteInfo, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.idHex, into: &buf)
+        FfiConverterString.write(value.wrapperIdHex, into: &buf)
+        FfiConverterString.write(value.groupIdHex, into: &buf)
+        FfiConverterString.write(value.groupName, into: &buf)
+        FfiConverterString.write(value.groupDescription, into: &buf)
+        FfiConverterString.write(value.welcomerNpub, into: &buf)
+        FfiConverterUInt32.write(value.memberCount, into: &buf)
+        FfiConverterSequenceString.write(value.relayUrls, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGroupInviteInfo_lift(_ buf: RustBuffer) throws -> GroupInviteInfo {
+    return try FfiConverterTypeGroupInviteInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGroupInviteInfo_lower(_ value: GroupInviteInfo) -> RustBuffer {
+    return FfiConverterTypeGroupInviteInfo.lower(value)
 }
 
 
@@ -3560,6 +3764,31 @@ fileprivate struct FfiConverterSequenceTypeGroupInfo: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeGroupInviteInfo: FfiConverterRustBuffer {
+    typealias SwiftType = [GroupInviteInfo]
+
+    public static func write(_ value: [GroupInviteInfo], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeGroupInviteInfo.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [GroupInviteInfo] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [GroupInviteInfo]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeGroupInviteInfo.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeMediaInfo: FfiConverterRustBuffer {
     typealias SwiftType = [MediaInfo]
 
@@ -3942,6 +4171,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonaridentity_pubkey_hex() != 4949) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_accept_group_invite() != 50359) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_add_group_members() != 15364) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_blossom_servers() != 8214) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3972,6 +4207,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_call_wait_event() != 8621) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_decline_group_invite() != 41502) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_delete_group() != 40442) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3999,7 +4237,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_groups() != 48990) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_leave_group() != 44174) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_messages() != 63355) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_pending_group_invites() != 31608) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_blossom_servers() != 35600) {
@@ -4012,6 +4256,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_sonar_descriptor() != 7979) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_remove_group_members() != 5580) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_send_geo_dm() != 38953) {
@@ -4030,6 +4277,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_start_dm() != 11780) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_start_group() != 41815) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_sync_once() != 45718) {

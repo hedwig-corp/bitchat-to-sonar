@@ -6,6 +6,9 @@ pub enum Error {
     #[error("invalid key: {0}")]
     InvalidKey(String),
 
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
+
     #[error("nostr key error: {0}")]
     NostrKey(#[from] nostr::key::Error),
 
@@ -32,6 +35,9 @@ pub enum Error {
 
     #[error("nostr client error: {0}")]
     NostrClient(#[from] nostr_sdk::client::Error),
+
+    #[error("nostr publish error: {0}")]
+    NostrPublish(String),
 
     #[error("no key package found on relays for {0}")]
     KeyPackageNotFound(PublicKey),

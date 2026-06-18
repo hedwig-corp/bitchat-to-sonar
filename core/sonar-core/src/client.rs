@@ -19,7 +19,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::identity::Identity;
 use crate::marmot::{
-    ChatMessage, Incoming, MarmotEngine, KEY_PACKAGE_KIND, SYNC_STATE_FILE_SUFFIX,
+    ChatMessage, GroupCreation, GroupInvite, GroupMembershipUpdate, Incoming, MarmotEngine,
+    KEY_PACKAGE_KIND, SYNC_STATE_FILE_SUFFIX,
 };
 use crate::sonar_descriptor::{
     descriptor_content_json, descriptor_d_tags, descriptor_tags, meta_descriptor_content_json,
@@ -667,14 +668,31 @@ impl SonarClient {
         let creation = self
             .engine
             .create_group(name, vec![key_package], self.relays.clone())?;
-        if let Err(err) = self.resubscribe_marmot_groups_if_live().await {
-            tracing::debug!(%err, "marmot group live resubscribe failed after local group create");
+        self.publish_group_creation(creation).await
+    }
+
+    async fn fetch_key_packages_for_members(&self, members: Vec<PublicKey>) -> Result<Vec<Event>> {
+        let mut deduped = Vec::new();
+        let mut seen = HashSet::new();
+        for member in members {
+            if member == self.identity().public_key() {
+                continue;
+            }
+            if seen.insert(member) {
+                deduped.push(member);
+            }
         }
-        for (member, rumor) in creation.welcomes {
-            let wrapped = self.engine.gift_wrap_welcome(&member, rumor).await?;
-            self.nostr.send_event(&wrapped).await?;
+        if deduped.is_empty() {
+            return Err(Error::InvalidInput(
+                "group must include at least one other member".into(),
+            ));
         }
-        Ok(creation.group.mls_group_id)
+
+        let mut key_packages = Vec::with_capacity(deduped.len());
+        for member in deduped {
+            key_packages.push(self.fetch_key_package(member).await?);
+        }
+        Ok(key_packages)
     }
 
     /// Fetch the freshest KeyPackage event for `author` from the relays.
@@ -774,21 +792,196 @@ impl SonarClient {
         Ok(newest_valid_sonar_descriptor(events, author))
     }
 
-    /// Start a DM/group with `peer`: fetch their KeyPackage, create the MLS
-    /// group, and deliver the gift-wrapped welcome.
-    pub async fn start_dm(&self, peer: PublicKey, name: &str) -> Result<GroupId> {
-        let key_package = self.fetch_key_package(peer).await?;
+    /// Start a multi-member Marmot group: fetch each member's KeyPackage,
+    /// create the MLS group, and deliver the gift-wrapped welcomes.
+    pub async fn start_group(&self, members: Vec<PublicKey>, name: &str) -> Result<GroupId> {
+        let key_packages = self.fetch_key_packages_for_members(members).await?;
         let creation = self
             .engine
-            .create_group(name, vec![key_package], self.relays.clone())?;
+            .create_group(name, key_packages, self.relays.clone())?;
+        self.publish_group_creation(creation).await
+    }
+
+    /// Start a 1:1 DM group with `peer`: fetch their KeyPackage, create the MLS
+    /// group, and deliver the gift-wrapped welcome.
+    pub async fn start_dm(&self, peer: PublicKey, name: &str) -> Result<GroupId> {
+        self.start_group(vec![peer], name).await
+    }
+
+    async fn publish_group_creation(&self, creation: GroupCreation) -> Result<GroupId> {
+        let group_id = creation.group.mls_group_id;
+        let mut wrapped_welcomes = Vec::with_capacity(creation.welcomes.len());
+
+        for (member, rumor) in creation.welcomes {
+            match self.engine.gift_wrap_welcome(&member, rumor).await {
+                Ok(wrapped) => wrapped_welcomes.push(wrapped),
+                Err(err) => {
+                    self.discard_unpublished_group_creation(&group_id);
+                    return Err(err);
+                }
+            }
+        }
+
+        let mut published_welcomes = 0usize;
+        for wrapped in wrapped_welcomes {
+            if let Err(err) = self.publish_marmot_event(&wrapped, "group welcome").await {
+                if published_welcomes == 0 {
+                    self.discard_unpublished_group_creation(&group_id);
+                } else {
+                    tracing::debug!(
+                        %err,
+                        ?group_id,
+                        published_welcomes,
+                        "marmot group creation welcome publish partially failed; keeping pending group state"
+                    );
+                }
+                return Err(err.into());
+            }
+            published_welcomes += 1;
+        }
+
+        self.engine.merge_pending_commit(&group_id)?;
         if let Err(err) = self.resubscribe_marmot_groups_if_live().await {
             tracing::debug!(%err, "marmot group live resubscribe failed after local group create");
         }
-        for (member, rumor) in creation.welcomes {
-            let wrapped = self.engine.gift_wrap_welcome(&member, rumor).await?;
-            self.nostr.send_event(&wrapped).await?;
+        Ok(group_id)
+    }
+
+    fn discard_unpublished_group_creation(&self, group_id: &GroupId) {
+        let _ = self.engine.clear_pending_commit(group_id);
+        let _ = self.engine.delete_group(group_id);
+    }
+
+    async fn publish_membership_update(&self, update: GroupMembershipUpdate) -> Result<()> {
+        let group_id = update.group_id.clone();
+        let requires_commit_merge = update.requires_commit_merge;
+        let mut wrapped_welcomes = Vec::with_capacity(update.welcomes.len());
+
+        for (member, rumor) in update.welcomes {
+            match self.engine.gift_wrap_welcome(&member, rumor).await {
+                Ok(wrapped) => wrapped_welcomes.push(wrapped),
+                Err(err) => {
+                    if requires_commit_merge {
+                        let _ = self.engine.clear_pending_commit(&group_id);
+                    }
+                    return Err(err);
+                }
+            }
         }
-        Ok(creation.group.mls_group_id)
+
+        if let Err(err) = self
+            .publish_marmot_event(&update.evolution_event, "membership update")
+            .await
+        {
+            if requires_commit_merge {
+                let _ = self.engine.clear_pending_commit(&group_id);
+            }
+            return Err(err.into());
+        }
+
+        for wrapped in wrapped_welcomes {
+            if let Err(err) = self
+                .publish_marmot_event(&wrapped, "membership welcome")
+                .await
+            {
+                tracing::debug!(
+                    %err,
+                    ?group_id,
+                    "marmot membership welcome publish failed after commit publish; keeping pending commit"
+                );
+                return Err(err.into());
+            }
+        }
+
+        if requires_commit_merge {
+            self.engine.merge_pending_commit(&group_id)?;
+        }
+        if let Err(err) = self.resubscribe_marmot_groups_if_live().await {
+            tracing::debug!(%err, "marmot group live resubscribe failed after membership update");
+        }
+        Ok(())
+    }
+
+    async fn publish_marmot_event(&self, event: &Event, context: &'static str) -> Result<()> {
+        let output = self.nostr.send_event(event).await?;
+        require_relay_success(&output, context)
+    }
+
+    /// Add members to an existing group.
+    pub async fn add_group_members(
+        &self,
+        group_id: &GroupId,
+        members: Vec<PublicKey>,
+    ) -> Result<()> {
+        let key_packages = self.fetch_key_packages_for_members(members).await?;
+        let update = self.engine.add_members(group_id, key_packages)?;
+        self.publish_membership_update(update).await
+    }
+
+    /// Remove members from an existing group.
+    pub async fn remove_group_members(
+        &self,
+        group_id: &GroupId,
+        members: Vec<PublicKey>,
+    ) -> Result<()> {
+        if members.is_empty() {
+            return Err(Error::InvalidInput(
+                "remove_group_members requires at least one member".into(),
+            ));
+        }
+        let update = self.engine.remove_members(group_id, &members)?;
+        self.publish_membership_update(update).await
+    }
+
+    /// Notify the group that this member is leaving, then remove the group from
+    /// local storage so it disappears from the chat list.
+    pub async fn leave_group(&self, group_id: &GroupId) -> Result<()> {
+        let leave_update = match self.engine.leave_group(group_id) {
+            Ok(update) => update,
+            Err(err) if err.to_string().contains("self-demote") => {
+                let demote = self.engine.self_demote(group_id)?;
+                self.publish_membership_update(demote).await?;
+                self.engine.leave_group(group_id)?
+            }
+            Err(err) => return Err(err),
+        };
+        self.publish_membership_update(leave_update).await?;
+        self.engine.delete_group(group_id)?;
+        let _ = self.resubscribe_marmot_groups_if_live().await;
+        Ok(())
+    }
+
+    /// Pending multi-member invites waiting for explicit user action.
+    pub fn pending_group_invites(&self) -> Result<Vec<GroupInvite>> {
+        self.engine.pending_group_invites()
+    }
+
+    /// Accept a pending group invite by welcome event id, then backfill its
+    /// existing group history and widen the live subscription.
+    pub async fn accept_group_invite(&self, welcome_id: &EventId) -> Result<GroupId> {
+        let group_id = self.engine.accept_group_invite(welcome_id)?;
+        if let Some(group) = self
+            .engine
+            .groups()?
+            .into_iter()
+            .find(|g| g.mls_group_id == group_id)
+        {
+            let nostr_group_id = hex::encode(group.nostr_group_id);
+            if let Err(err) = self.backfill_group(&nostr_group_id).await {
+                tracing::debug!(
+                    %err,
+                    %nostr_group_id,
+                    "marmot group backfill failed after accepting invite"
+                );
+            }
+        }
+        let _ = self.resubscribe_marmot_groups_if_live().await;
+        Ok(group_id)
+    }
+
+    /// Decline a pending group invite by welcome event id.
+    pub fn decline_group_invite(&self, welcome_id: &EventId) -> Result<()> {
+        self.engine.decline_group_invite(welcome_id)
     }
 
     /// Encrypt, publish, and locally record a text message.
@@ -1108,6 +1301,24 @@ impl SonarClient {
                         "marmot event needs retry; leaving sync cursor behind it"
                     );
                     report.record_retryable(event.created_at.as_secs());
+                }
+                Ok(Incoming::GroupProposal(update)) => {
+                    match self.publish_membership_update(update).await {
+                        Ok(()) => {
+                            self.mark_sync_event_processed(&event.id);
+                            report.record_processed();
+                        }
+                        Err(err) => {
+                            tracing::debug!(
+                                %err,
+                                event_id = %event.id,
+                                event_created_at = event.created_at.as_secs(),
+                                context,
+                                "marmot auto-commit publish failed; leaving sync cursor behind it"
+                            );
+                            report.record_retryable(event.created_at.as_secs());
+                        }
+                    }
                 }
                 Ok(_) => {
                     self.mark_sync_event_processed(&event.id);
@@ -1570,9 +1781,42 @@ fn sort_marmot_events_in_place(events: &mut [Event]) {
     });
 }
 
+fn require_relay_success(
+    output: &nostr_sdk::pool::Output<EventId>,
+    context: &'static str,
+) -> Result<()> {
+    if !output.success.is_empty() {
+        if !output.failed.is_empty() {
+            tracing::debug!(
+                context,
+                success_count = output.success.len(),
+                failed_count = output.failed.len(),
+                "nostr publish partially succeeded"
+            );
+        }
+        return Ok(());
+    }
+
+    let failures = if output.failed.is_empty() {
+        "no relay accepted the event".to_string()
+    } else {
+        output
+            .failed
+            .iter()
+            .map(|(relay, reason)| format!("{relay:?}: {reason}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    Err(Error::NostrPublish(format!(
+        "{context}: no relay accepted event {} ({failures})",
+        output.val
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{HashMap, HashSet};
 
     fn signed_event(keys: &Keys, created_at_secs: u64, content: &str) -> Event {
         EventBuilder::new(Kind::MlsGroupMessage, content)
@@ -1670,5 +1914,26 @@ mod tests {
         state.rewind_for_retry(900);
 
         assert_eq!(state.watermark_secs(), 900 - SYNC_OVERLAP_SECS);
+    }
+
+    #[test]
+    fn relay_publish_requires_at_least_one_successful_relay() {
+        let relay = RelayUrl::parse("wss://relay.example.com").expect("relay url");
+        let accepted = nostr_sdk::pool::Output {
+            val: EventId::all_zeros(),
+            success: HashSet::from([relay.clone()]),
+            failed: HashMap::new(),
+        };
+        assert!(require_relay_success(&accepted, "test publish").is_ok());
+
+        let rejected = nostr_sdk::pool::Output {
+            val: EventId::all_zeros(),
+            success: HashSet::new(),
+            failed: HashMap::from([(relay, "blocked".to_string())]),
+        };
+        let err = require_relay_success(&rejected, "test publish").expect_err("must fail");
+        assert!(err
+            .to_string()
+            .contains("test publish: no relay accepted event"));
     }
 }

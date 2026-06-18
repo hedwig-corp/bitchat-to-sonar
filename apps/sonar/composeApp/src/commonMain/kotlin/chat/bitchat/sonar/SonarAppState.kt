@@ -3,6 +3,7 @@ package chat.bitchat.sonar
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import chat.bitchat.sonar.crypto.Bech32
 import chat.bitchat.sonar.store.MessageMerge
 import chat.bitchat.sonar.store.MessageStore
 import chat.bitchat.sonar.unify.UnifyBIP321
@@ -36,6 +37,9 @@ sealed interface Screen {
 
 /** A BLE-mesh DM conversation row for the home Messages list. */
 data class MeshDmRow(val peerId: String, val name: String, val preview: String, val tsSecs: Long)
+
+/** A local contact that can be invited into a Marmot group. */
+data class GroupContact(val id: String, val title: String, val subtitle: String, val npub: String)
 
 private fun messagePreview(content: String): String {
     if (content.trimStart().startsWith("☎CALL") && SonarCore.callParseControl(content) != null) {
@@ -103,6 +107,8 @@ class SonarAppState(private val scope: CoroutineScope) {
         private set
     var chats by mutableStateOf<List<SonarChat>>(emptyList())
         private set
+    var groupInvites by mutableStateOf<List<SonarGroupInvite>>(emptyList())
+        private set
     /** Resolved kind-0 profiles by npub — fills human names for Marmot members. */
     var profilesByNpub by mutableStateOf<Map<String, SonarProfile>>(emptyMap())
         private set
@@ -128,7 +134,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             MessageStore.wipe()
             SonarCore.wipe()
             stack = listOf(Screen.Home)
-            chats = emptyList(); messages = emptyList()
+            chats = emptyList(); groupInvites = emptyList(); messages = emptyList()
             onboarded = false; nick = ""; npub = ""; started = false
             walletState = WalletState.NotConfigured
             presenceByGeohash = emptyMap()
@@ -502,12 +508,67 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  ones folded into a mesh DM. The Messages list uses this instead of [chats]. */
     val visibleChats: List<SonarChat> get() = chats.filterNot { it.id in foldedGroupIds }
 
+    private fun otherMembers(chat: SonarChat): List<String> =
+        chat.members.filter { it != npub && it.isNotBlank() }.distinct()
+
+    fun isDirectMarmotChat(chat: SonarChat): Boolean =
+        otherMembers(chat).size == 1
+
+    fun isMultiMemberChat(chatId: String): Boolean =
+        chats.firstOrNull { it.id == chatId }?.let { !isDirectMarmotChat(it) } == true
+
+    fun groupInviteContacts(excluding: Set<String> = emptySet()): List<GroupContact> {
+        val excludedClean = excluding.map { it.trim() }.toSet() + setOf(npub).filter { it.isNotBlank() }
+        val byNpub = linkedMapOf<String, GroupContact>()
+
+        fun insert(title: String, subtitle: String, inviteNpub: String?) {
+            val clean = inviteNpub?.trim().orEmpty()
+            if (!clean.startsWith("npub1") || clean in excludedClean || clean in byNpub) return
+            val display = title.ifBlank { profilesByNpub[clean]?.bestName ?: shortNpub(clean) }
+            byNpub[clean] = GroupContact(clean, display, subtitle, clean)
+        }
+
+        meshPeers.forEach { peer ->
+            val peerId = meshPeerId(peer.id)
+            insert(peer.name, "Nearby · Bluetooth", npubStringForPeer(peerId))
+        }
+        meshDmRows.forEach { row ->
+            insert(row.name, "Known Sonar contact", npubStringForPeer(row.peerId))
+        }
+        chats.filter { isDirectMarmotChat(it) }.forEach { chat ->
+            val other = otherMembers(chat).singleOrNull()
+            insert(chatTitle(chat), "White Noise chat", other)
+        }
+
+        return byNpub.values.sortedBy { it.title.lowercase() }
+    }
+
+    fun groupMemberContacts(chatId: String): List<GroupContact> =
+        chats.firstOrNull { it.id == chatId }
+            ?.let { otherMembers(it) }
+            .orEmpty()
+            .map { member ->
+                ensureProfile(member)
+                GroupContact(
+                    id = member,
+                    title = profilesByNpub[member]?.bestName ?: shortNpub(member),
+                    subtitle = shortNpub(member),
+                    npub = member,
+                )
+            }
+
+    fun groupMemberNpubs(chatId: String): Set<String> =
+        chats.firstOrNull { it.id == chatId }?.members.orEmpty().toSet()
+
     /** This peer's npub (32 raw bytes) if known — from a live 0x53 OR the persisted
      *  [linkByFp] (so it still resolves out of range / after restart). The bridge
      *  that unifies the BLE-Noise and White-Noise legs of one conversation. */
     private fun npubRawFor(peerId: String): ByteArray? =
         sonarProfile(peerId)?.npub
             ?: linkByFp[peerId]?.hexToBytesOrEmpty()?.takeIf { it.size == 32 }
+
+    private fun npubStringForPeer(peerId: String): String? =
+        npubRawFor(peerId)?.let { Bech32.encode("npub", it) }
 
     private fun loadLinks() {
         SonarCore.loadBlob("sonar.links").lineSequence().forEach { line ->
@@ -876,8 +937,11 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /** Verify info for a Marmot chat: the 12 safety groups, or an honest note. */
     fun verifyInfo(chatId: String): SonarVerify {
-        val peer = chats.firstOrNull { it.id == chatId }
-            ?.members?.firstOrNull { it != npub && it.isNotBlank() }
+        val chat = chats.firstOrNull { it.id == chatId }
+        if (chat != null && !isDirectMarmotChat(chat)) {
+            return SonarVerify(emptyList(), false, "Safety numbers are available for 1:1 chats.")
+        }
+        val peer = chat?.let { otherMembers(it).firstOrNull() }
         return if (peer.isNullOrBlank() || npub.isBlank()) {
             SonarVerify(emptyList(), isVerified(chatId), "Connecting to the secure chat service — try again in a moment.")
         } else {
@@ -1030,12 +1094,23 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  title. Mirrors iOS `MarmotChatModel.title(for:)`. */
     fun chatTitle(chat: SonarChat): String {
         if (chat.name.isNotBlank()) return chat.name
-        val other = chat.members.firstOrNull { it != npub && it.isNotBlank() } ?: return "Secure chat"
+        val others = otherMembers(chat)
+        if (others.size != 1) return "Group chat"
+        val other = others.first()
         // Prefer the counterpart's resolved kind-0 profile name; fetch it once if
         // not cached; fall back to a short npub until it lands.
         profilesByNpub[other]?.bestName?.let { return it }
         ensureProfile(other)
-        return if (other.length > 16) other.take(10) + "…" + other.takeLast(4) else other
+        return shortNpub(other)
+    }
+
+    private fun shortNpub(value: String): String =
+        if (value.length > 16) value.take(10) + "…" + value.takeLast(4) else value
+
+    fun groupAuthorName(message: SonarMsg, isGroup: Boolean): String? {
+        if (!isGroup || message.mine || message.senderNpub.isBlank()) return null
+        return profilesByNpub[message.senderNpub]?.bestName
+            ?: shortNpub(message.senderNpub)
     }
 
     /** Fetch + cache a peer's kind-0 profile once, so their name replaces the
@@ -1097,14 +1172,22 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** True when the desktop content pane should show the welcome placeholder. */
     val isHome: Boolean get() = stack.size == 1
 
-    /** Delete ONE White Noise (Marmot) chat locally (messages + MLS keys) and
-     *  drop it from the list. Local-only — the peer is not notified. */
+    /** Delete a 1:1 Marmot chat locally, or leave a multi-member Marmot group. */
     fun deleteMarmotChat(chatId: String) {
         val wasOpen = (stack.lastOrNull() as? Screen.Chat)?.id == chatId
+        val isGroup = chats.firstOrNull { it.id == chatId }?.let { !isDirectMarmotChat(it) } == true
         chats = chats.filterNot { it.id == chatId }
         if (wasOpen && stack.size > 1) stack = stack.dropLast(1) // pop WITHOUT refresh
         scope.launch {
-            SonarCore.deleteChat(chatId)
+            try {
+                if (isGroup) {
+                    SonarCore.leaveGroup(chatId)
+                } else {
+                    SonarCore.deleteChat(chatId)
+                }
+            } catch (t: Throwable) {
+                toast = if (isGroup) "couldn't leave group: ${t.message}" else "couldn't delete chat: ${t.message}"
+            }
             refreshChats()
         }
     }
@@ -1358,8 +1441,91 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
+    fun createGroup(name: String, members: List<String>) {
+        val cleanName = name.trim().ifBlank { "Group chat" }
+        val cleanMembers = members.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+        if (cleanMembers.size < 2) {
+            toast = "Add at least two people"
+            return
+        }
+        scope.launch {
+            try {
+                val chatId = SonarCore.startGroup(cleanMembers, cleanName)
+                refreshChats()
+                push(Screen.Chat(chatId, cleanName))
+            } catch (e: Throwable) {
+                toast = "couldn’t create group: ${e.message}"
+            }
+        }
+    }
+
+    fun addGroupMembers(chatId: String, members: List<String>) {
+        val existing = groupMemberNpubs(chatId)
+        val cleanMembers = members.map { it.trim() }
+            .filter { it.isNotEmpty() && it !in existing }
+            .distinct()
+        if (cleanMembers.isEmpty()) {
+            toast = "Add at least one new person"
+            return
+        }
+        scope.launch {
+            try {
+                SonarCore.addGroupMembers(chatId, cleanMembers)
+                refreshChats()
+                if ((screen as? Screen.Chat)?.id == chatId) {
+                    messages = SonarCore.messages(chatId)
+                    processPayLines(chatId, messages)
+                }
+            } catch (e: Throwable) {
+                toast = "couldn't add people: ${e.message}"
+            }
+        }
+    }
+
+    fun removeGroupMembers(chatId: String, members: List<String>) {
+        val cleanMembers = members.map { it.trim() }
+            .filter { it.isNotEmpty() && it != npub }
+            .distinct()
+        if (cleanMembers.isEmpty()) return
+        scope.launch {
+            try {
+                SonarCore.removeGroupMembers(chatId, cleanMembers)
+                refreshChats()
+                if ((screen as? Screen.Chat)?.id == chatId) {
+                    messages = SonarCore.messages(chatId)
+                    processPayLines(chatId, messages)
+                }
+            } catch (e: Throwable) {
+                toast = "couldn't remove people: ${e.message}"
+            }
+        }
+    }
+
+    fun acceptGroupInvite(inviteId: String) {
+        scope.launch {
+            try {
+                val chatId = SonarCore.acceptGroupInvite(inviteId)
+                refreshChats()
+                chats.firstOrNull { it.id == chatId }?.let { push(Screen.Chat(chatId, chatTitle(it))) }
+            } catch (e: Throwable) {
+                toast = "couldn’t accept invite: ${e.message}"
+            }
+        }
+    }
+
+    fun declineGroupInvite(inviteId: String) {
+        scope.launch {
+            try {
+                SonarCore.declineGroupInvite(inviteId)
+                refreshChats()
+            } catch (e: Throwable) {
+                toast = "couldn’t decline invite: ${e.message}"
+            }
+        }
+    }
+
     private fun npubHexForGroup(group: SonarChat): String? =
-        group.members.firstOrNull { it != npub && it.isNotBlank() }
+        otherMembers(group).singleOrNull()
             ?.let { chat.bitchat.sonar.crypto.Bech32.decode(it)?.takeIf { d -> d.hrp == "npub" }?.data }
             ?.takeIf { it.size == 32 }
             ?.toHexLower()
@@ -1400,6 +1566,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun marmotGroupsForNpub(npubRaw: ByteArray): List<SonarChat> {
         if (npubRaw.isEmpty()) return emptyList()
         return chats.filter { c ->
+            isDirectMarmotChat(c) &&
             c.members.any { m ->
                 chat.bitchat.sonar.crypto.Bech32.decode(m)
                     ?.takeIf { it.hrp == "npub" }?.data?.contentEquals(npubRaw) == true
@@ -1593,6 +1760,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         val groupPeers = LinkedHashMap<String, String>()
         for (group in chats) {
+            if (!isDirectMarmotChat(group)) continue
             val peerId = peerIdForMarmotGroup(group) ?: continue
             folded += group.id
             groupPeers[group.id] = peerId
@@ -1614,6 +1782,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private suspend fun refreshChats() {
         chats = SonarCore.chats()
+        groupInvites = runCatching { SonarCore.pendingGroupInvites() }.getOrDefault(emptyList())
     }
 
     private fun poll() {
