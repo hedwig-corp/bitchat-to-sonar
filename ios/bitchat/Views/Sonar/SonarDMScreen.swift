@@ -131,7 +131,7 @@ struct SonarDMScreen: View {
                     }
                 }
                 if store.canSendMedia(peerId) {
-                    SNActionRow(icon: .lock, label: "Send photo", desc: "Encrypted end-to-end over White Noise") {
+                    SNActionRow(icon: .lock, label: "Send photo or GIF", desc: "Encrypted end-to-end over White Noise") {
                         sheet = false
                         pickPhoto = true
                     }
@@ -142,11 +142,24 @@ struct SonarDMScreen: View {
                 }
             }
         }
-        .photosPicker(isPresented: $pickPhoto, selection: $photoItem, matching: .images)
+        .photosPicker(
+            isPresented: $pickPhoto,
+            selection: $photoItem,
+            matching: .images,
+            preferredItemEncoding: .current
+        )
         .onChange(of: photoItem) { item in
             guard let item else { return }
             Task {
                 guard let data = try? await item.loadTransferable(type: Data.self) else { return }
+                let isGif = data.snIsGif
+                if isGif {
+                    await MainActor.run {
+                        _ = store.sendAttachment(peerId, data: data, filename: "animation.gif", mime: "image/gif")
+                        photoItem = nil
+                    }
+                    return
+                }
                 // Normalize to JPEG: guarantees a format the core's image encoder
                 // handles (HEIC/etc. aren't) and keeps the upload small.
                 #if os(iOS)
@@ -328,5 +341,17 @@ struct SonarDMScreen: View {
                 .font(SonarTheme.uiFont(size: 12.5, weight: .semibold))
                 .foregroundColor(SonarTheme.text2)
         }
+    }
+}
+
+private extension Data {
+    var snIsGif: Bool {
+        count >= 6 &&
+        self[startIndex] == 0x47 &&
+        self[index(startIndex, offsetBy: 1)] == 0x49 &&
+        self[index(startIndex, offsetBy: 2)] == 0x46 &&
+        self[index(startIndex, offsetBy: 3)] == 0x38 &&
+        (self[index(startIndex, offsetBy: 4)] == 0x37 || self[index(startIndex, offsetBy: 4)] == 0x39) &&
+        self[index(startIndex, offsetBy: 5)] == 0x61
     }
 }

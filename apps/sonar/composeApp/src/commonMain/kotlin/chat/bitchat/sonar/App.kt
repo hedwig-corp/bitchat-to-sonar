@@ -499,6 +499,7 @@ private fun ChannelHint() {
 private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     val s = sonar
     var draft by remember { mutableStateOf("") }
+    var emojiTray by remember { mutableStateOf(false) }
     var paySheet by remember { mutableStateOf(false) }
     var verifySheet by remember { mutableStateOf(false) }
     var addSheet by remember { mutableStateOf(false) }
@@ -663,6 +664,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         }
 
         if (draft.startsWith("/")) SlashHints(draft) { draft = it }
+        if (emojiTray && !recording) EmojiTray { draft += it }
         // ONE composer row in BOTH states. Only the left (plus↔trash) and middle
         // (text field↔recording pill) swap; the mic Box on the right MUST stay
         // mounted while recording, or Compose cancels its hold-to-record gesture
@@ -699,6 +701,14 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                         modifier = Modifier.fillMaxWidth()
                     )
                 }
+            }
+            if (!recording) {
+                Spacer(Modifier.width(8.dp))
+                Box(
+                    Modifier.size(40.dp).clip(CircleShape).background(if (emojiTray) s.accentSoft else s.surface2)
+                        .clickable { emojiTray = !emojiTray },
+                    contentAlignment = Alignment.Center
+                ) { SNIcon(SNIconName.Smile, 20.dp, if (emojiTray) s.accent else s.text2, weight = 2f) }
             }
             Spacer(Modifier.width(8.dp))
             if (draft.isEmpty() && state.canSendMedia(screen.id)) {
@@ -747,6 +757,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                     Modifier.size(46.dp).clip(CircleShape).background(sendBg)
                         .clickable(enabled = sendEnabled) {
                             val d = draft; draft = ""
+                            emojiTray = false
                             if (!state.handleCommand(d, peerName, channelGeohash = null, chatId = screen.id)) {
                                 state.send(screen.id, d)
                             }
@@ -818,7 +829,7 @@ private fun AddToMessageSheet(
                 Text("Add to your message", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(8.dp))
                 if (canSendPhoto) {
-                    ActionRow(SNIconName.Lock, "Send photo", "Encrypted end-to-end over White Noise", onPhoto)
+                    ActionRow(SNIconName.Lock, "Send photo or GIF", "Encrypted end-to-end over White Noise", onPhoto)
                 }
                 ActionRow(SNIconName.Coin, "Send bitcoin", "Instant over Lightning", onBitcoin)
                 ActionRow(SNIconName.NavArrow, "Share location", "Only $peerName will see it", onLocation)
@@ -868,6 +879,28 @@ private fun SlashHints(draft: String, onPick: (String) -> Unit) {
                 Text("/$cmd", color = s.accent, fontSize = 14.sp, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.width(10.dp))
                 Text(desc, color = s.text3, fontSize = 13.sp)
+            }
+        }
+    }
+}
+
+private val quickEmojis = listOf("👍", "❤️", "😂", "🔥", "🙏", "👏", "🎉", "👀", "💯", "⚡")
+
+@Composable
+private fun EmojiTray(onPick: (String) -> Unit) {
+    val s = sonar
+    Row(
+        Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
+            .padding(start = 10.dp, end = 10.dp, top = 8.dp, bottom = 2.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        quickEmojis.forEach { emoji ->
+            Box(
+                Modifier.size(38.dp).clip(CircleShape).background(s.surface2)
+                    .clickable { onPick(emoji) },
+                contentAlignment = Alignment.Center
+            ) {
+                Text(emoji, fontSize = 20.sp)
             }
         }
     }
@@ -1064,10 +1097,13 @@ private fun MediaBubble(
         horizontalAlignment = if (m.mine) Alignment.End else Alignment.Start
     ) {
         if (media.isImage) {
-            val img by androidx.compose.runtime.produceState<androidx.compose.ui.graphics.ImageBitmap?>(
+            val mediaBytes by androidx.compose.runtime.produceState<ByteArray?>(
                 null, media.url
             ) {
-                value = state.mediaData(chatId, media)?.let { decodeImageBitmap(it) }
+                value = state.mediaData(chatId, media)
+            }
+            val img = androidx.compose.runtime.remember(mediaBytes) {
+                mediaBytes?.let { decodeImageBitmap(it) }
             }
             Box(
                 Modifier.widthIn(max = 240.dp).clip(RoundedCornerShape(18.dp)).background(s.surface2)
@@ -1075,13 +1111,14 @@ private fun MediaBubble(
                 contentAlignment = Alignment.Center
             ) {
                 val bmp = img
-                if (bmp != null) {
-                    androidx.compose.foundation.Image(
-                        bitmap = bmp,
-                        contentDescription = media.filename,
-                        contentScale = ContentScale.Fit,
+                val bytes = mediaBytes
+                if (bytes != null && (media.isGif || bmp != null)) {
+                    MediaImage(
+                        bytes = bytes,
+                        isGif = media.isGif,
                         modifier = Modifier.widthIn(max = 240.dp).heightIn(max = 300.dp)
                     )
+                    if (media.isGif) GifBadge(Modifier.align(Alignment.TopEnd).padding(8.dp))
                 } else {
                     Box(
                         Modifier.size(width = 180.dp, height = 130.dp),
@@ -1091,6 +1128,7 @@ private fun MediaBubble(
                             color = s.text3, strokeWidth = 2.dp
                         )
                     }
+                    if (media.isGif) GifBadge(Modifier.align(Alignment.TopEnd).padding(8.dp))
                 }
             }
         } else if (media.mimeType.startsWith("audio/")) {
@@ -1326,6 +1364,18 @@ private fun MediaActionText(label: String, enabled: Boolean, onClick: () -> Unit
         fontSize = 13.sp,
         fontWeight = FontWeight.SemiBold,
         modifier = Modifier.clickable(enabled = enabled) { onClick() }
+    )
+}
+
+@Composable
+private fun GifBadge(modifier: Modifier = Modifier) {
+    Text(
+        "GIF",
+        color = sonar.onNet,
+        fontSize = 10.sp,
+        fontWeight = FontWeight.Black,
+        modifier = modifier.clip(RoundedCornerShape(7.dp)).background(sonar.netFill)
+            .padding(horizontal = 6.dp, vertical = 3.dp)
     )
 }
 
