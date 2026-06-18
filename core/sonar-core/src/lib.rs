@@ -6,6 +6,7 @@
 
 pub mod call;
 pub mod client;
+pub mod conversation_index;
 pub mod error;
 pub mod geohash;
 pub mod identity;

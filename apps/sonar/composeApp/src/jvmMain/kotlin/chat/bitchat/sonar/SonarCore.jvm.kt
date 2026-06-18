@@ -152,6 +152,42 @@ actual object SonarCore {
             }
         }
 
+    actual suspend fun conversationSummaries(): List<SonarConversationSummary> = withContext(Dispatchers.IO) {
+        val n = node ?: return@withContext emptyList()
+        n.conversationSummaries().map {
+            SonarConversationSummary(
+                groupIdHex = it.groupIdHex,
+                name = it.name,
+                latestContent = it.latestContent,
+                latestSenderNpub = it.latestSenderNpub,
+                latestAtSecs = it.latestAtSecs.toLong(),
+                latestMine = it.latestMine,
+                messageCount = it.messageCount.toLong(),
+                unreadCount = it.unreadCount.toLong(),
+            )
+        }
+    }
+
+    actual suspend fun markConversationRead(chatId: String) = withContext(Dispatchers.IO) {
+        node?.markConversationRead(chatId)
+        Unit
+    }
+
+    actual suspend fun messagesCursorPage(
+        chatId: String,
+        beforeSecs: Long?,
+        beforeIdHex: String?,
+        limit: Int,
+    ): List<SonarMsg> = withContext(Dispatchers.IO) {
+        val n = node ?: return@withContext emptyList()
+        n.messagesCursorPage(
+            chatId,
+            beforeSecs?.toULong(),
+            beforeIdHex,
+            limit.toUInt(),
+        ).map { it.toCommon() }
+    }
+
     private fun uniffi.sonar_ffi.MessageInfo.toCommon(): SonarMsg = SonarMsg(
         id = idHex,
         senderNpub = senderNpub,
