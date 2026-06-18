@@ -1,0 +1,36 @@
+[package]
+name = "sonar-stickers"
+description = "Nostr sticker pack models and validation for Sonar"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["nostr"]
+nostr = ["dep:nostr"]
+signal-import = [
+    "dep:aes",
+    "dep:base64",
+    "dep:cbc",
+    "dep:hkdf",
+    "dep:hmac",
+    "dep:prost",
+    "dep:reqwest",
+]
+wasm = []
+
+[dependencies]
+aes = { version = "0.8", optional = true }
+base64 = { version = "0.22", optional = true }
+cbc = { version = "0.1", optional = true }
+hex.workspace = true
+hkdf = { version = "0.12", optional = true }
+hmac = { version = "0.12", optional = true }
+nostr = { workspace = true, optional = true }
+prost = { version = "0.13", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"], optional = true }
+serde.workspace = true
+sha2 = "0.10"
+thiserror.workspace = true
+url = "2"

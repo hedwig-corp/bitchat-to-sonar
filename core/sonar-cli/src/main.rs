@@ -7,16 +7,25 @@ use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand};
 use nostr::prelude::*;
+use nostr_blossom::prelude::*;
+use nostr_sdk::Client as NostrClient;
 use serde::{Deserialize, Serialize};
-use sonar_core::client::SonarClient;
+use sonar_core::client::{SonarClient, DEFAULT_BLOSSOM_SERVER};
 use sonar_core::identity::Identity;
 use sonar_core::GroupId;
+use sonar_stickers::signal::{
+    import_signal_pack_with_options, ImportedSignalPack, ImportedSignalSticker, SignalImportOptions,
+};
+use sonar_stickers::{
+    build_pack_tags, PackAddress, Sticker, StickerError, StickerPack, STICKER_PACK_KIND,
+};
 
 const CONFIG_VERSION: u32 = 1;
 const CONFIG_FILE: &str = "config.json";
 const SEEN_FILE: &str = "seen.json";
 const DB_DIR: &str = "marmot";
 const DB_FILE: &str = "marmot.sqlite";
+const DEFAULT_STICKERS_SITE_URL: &str = "https://hedwig-corp.github.io/bitchat-to-sonar/stickers";
 const DEFAULT_RELAYS: [&str; 3] = [
     "wss://relay.damus.io",
     "wss://nos.lol",
@@ -35,6 +44,8 @@ enum CliError {
     Hex(#[from] hex::FromHexError),
     #[error("sonar: {0}")]
     Sonar(#[from] sonar_core::Error),
+    #[error("sticker: {0}")]
+    Sticker(#[from] StickerError),
     #[error("nostr: {0}")]
     Nostr(#[from] nostr::types::url::Error),
 }
@@ -63,6 +74,8 @@ enum Command {
     Identity,
     /// Publish this agent's Marmot KeyPackage so peers can start DMs.
     Publish,
+    /// Import a Signal sticker pack, upload assets, and publish a Sonar sticker pack.
+    Post(PostArgs),
     /// Send an encrypted Sonar/Marmot text message to a public key.
     Send(SendArgs),
     /// Poll for inbound encrypted messages and print JSON lines.
@@ -100,6 +113,24 @@ struct SendArgs {
     /// Group name if a new 1:1 Marmot group must be created.
     #[arg(long, default_value = "Sonar agent DM")]
     group_name: String,
+}
+
+#[derive(Args, Debug)]
+struct PostArgs {
+    /// Signal sticker link from signal.art/addstickers.
+    signal_link: String,
+    /// Blossom server that will host the sticker images.
+    #[arg(long, default_value = DEFAULT_BLOSSOM_SERVER)]
+    blossom: String,
+    /// Public stickers page URL. Defaults to SONAR_STICKERS_SITE_URL or the bundled web route.
+    #[arg(long)]
+    site_url: Option<String>,
+    /// Accept invalid TLS certificates when fetching encrypted Signal CDN blobs.
+    #[arg(long)]
+    accept_invalid_signal_certs: bool,
+    /// Continue when a Signal pack references an unavailable sticker asset.
+    #[arg(long)]
+    skip_missing_signal_stickers: bool,
 }
 
 #[derive(Args, Debug)]
@@ -155,6 +186,17 @@ enum Output {
         to: String,
         group_id: String,
     },
+    PostedStickerPack {
+        title: String,
+        address: String,
+        event_id: String,
+        author_npub: String,
+        sticker_count: usize,
+        relays: Vec<String>,
+        blossom_server: String,
+        website_url: String,
+        skipped_signal_sticker_ids: Vec<u32>,
+    },
     Group {
         id: String,
         name: String,
@@ -202,6 +244,12 @@ async fn run(cli: Cli) -> Result<()> {
             })?;
             Ok(())
         }
+        Command::Post(args) => {
+            let loaded = LoadedConfig::load(home, cli.relays)?;
+            let output = post_sticker_pack(&loaded, args).await?;
+            print_json(&output)?;
+            Ok(())
+        }
         Command::Send(args) => {
             let loaded = LoadedConfig::load(home, cli.relays)?;
             let client = loaded.connect().await?;
@@ -237,6 +285,193 @@ async fn run(cli: Cli) -> Result<()> {
             print_messages(&client, args.group.as_deref())?;
             Ok(())
         }
+    }
+}
+
+async fn post_sticker_pack(loaded: &LoadedConfig, args: PostArgs) -> Result<Output> {
+    let identity = loaded.identity()?;
+    let imported = import_signal_pack_with_options(
+        &args.signal_link,
+        SignalImportOptions {
+            accept_invalid_certs: args.accept_invalid_signal_certs,
+            skip_failed_stickers: args.skip_missing_signal_stickers,
+        },
+    )
+    .await?;
+    let skipped_signal_sticker_ids = imported.skipped_sticker_ids.clone();
+    let pack = upload_imported_signal_pack(&identity, &args.blossom, imported).await?;
+    let event = EventBuilder::new(Kind::Custom(STICKER_PACK_KIND), "")
+        .tags(build_pack_tags(&pack))
+        .sign_with_keys(identity.keys())
+        .map_err(|e| CliError::Message(format!("sign sticker pack event: {e}")))?;
+    let nostr = NostrClient::new(identity.keys().clone());
+    for relay in &loaded.relays {
+        nostr
+            .add_relay(relay.clone())
+            .await
+            .map_err(|e| CliError::Message(format!("add relay {relay}: {e}")))?;
+    }
+    nostr.connect().await;
+    nostr
+        .send_event(&event)
+        .await
+        .map_err(|e| CliError::Message(format!("publish sticker pack: {e}")))?;
+
+    let relays = loaded.relay_strings();
+    let site_url = args
+        .site_url
+        .or_else(|| env::var("SONAR_STICKERS_SITE_URL").ok())
+        .unwrap_or_else(|| DEFAULT_STICKERS_SITE_URL.to_owned());
+    let website_url = sticker_pack_website_url(&site_url, &pack.address.coordinate(), &relays);
+
+    Ok(Output::PostedStickerPack {
+        title: pack.title,
+        address: pack.address.coordinate(),
+        event_id: event.id.to_hex(),
+        author_npub: identity.npub(),
+        sticker_count: pack.stickers.len(),
+        relays,
+        blossom_server: args.blossom,
+        website_url,
+        skipped_signal_sticker_ids,
+    })
+}
+
+async fn upload_imported_signal_pack(
+    identity: &Identity,
+    blossom_server: &str,
+    imported: ImportedSignalPack,
+) -> Result<StickerPack> {
+    let mut uploaded = Vec::with_capacity(imported.stickers.len());
+    for sticker in &imported.stickers {
+        let url = upload_sticker_blob(identity, blossom_server, sticker).await?;
+        uploaded.push(sticker_from_import(sticker, url)?);
+    }
+
+    let cover = match &imported.cover {
+        Some(cover) => {
+            let url = upload_sticker_blob(identity, blossom_server, cover).await?;
+            Some(Sticker::new(
+                "cover",
+                url,
+                cover.sha256.clone(),
+                cover.mime.clone(),
+                None,
+                None,
+                Some("Sticker pack cover".to_owned()),
+                short_emoji(cover.emoji.as_deref()),
+            )?)
+        }
+        None => uploaded.first().cloned(),
+    };
+    let address = PackAddress::new(
+        identity.public_key().to_hex(),
+        format!("signal-{}", imported.pack_id),
+    )?;
+    StickerPack::new(
+        address,
+        truncate_chars(&imported.title, 80),
+        signal_description(imported.author.as_deref()),
+        cover,
+        uploaded,
+        None,
+    )
+    .map_err(CliError::Sticker)
+}
+
+async fn upload_sticker_blob(
+    identity: &Identity,
+    blossom_server: &str,
+    sticker: &ImportedSignalSticker,
+) -> Result<String> {
+    let base = Url::parse(blossom_server)
+        .map_err(|e| CliError::Message(format!("bad Blossom server URL {blossom_server}: {e}")))?;
+    let descriptor = BlossomClient::new(base)
+        .upload_blob(
+            sticker.bytes.clone(),
+            Some(sticker.mime.clone()),
+            None,
+            Some(identity.keys()),
+        )
+        .await
+        .map_err(|e| CliError::Message(format!("upload sticker {}: {e}", sticker.id)))?;
+    Ok(descriptor.url.to_string())
+}
+
+fn sticker_from_import(sticker: &ImportedSignalSticker, url: String) -> Result<Sticker> {
+    Sticker::new(
+        sticker.shortcode.clone(),
+        url,
+        sticker.sha256.clone(),
+        sticker.mime.clone(),
+        None,
+        None,
+        Some(sticker_alt(sticker)),
+        short_emoji(sticker.emoji.as_deref()),
+    )
+    .map_err(CliError::Sticker)
+}
+
+fn sticker_alt(sticker: &ImportedSignalSticker) -> String {
+    match sticker.emoji.as_deref() {
+        Some(emoji) if !emoji.is_empty() => format!("Signal sticker {} {emoji}", sticker.id),
+        _ => format!("Signal sticker {}", sticker.id),
+    }
+}
+
+fn signal_description(author: Option<&str>) -> Option<String> {
+    match author.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(author) => Some(truncate_chars(
+            &format!("Imported from a Signal sticker pack by {author}."),
+            500,
+        )),
+        None => Some("Imported from a Signal sticker pack.".to_owned()),
+    }
+}
+
+fn short_emoji(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| truncate_chars(s, 8))
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect::<String>()
+}
+
+fn sticker_pack_website_url(site_url: &str, address: &str, relays: &[String]) -> String {
+    let mut url = site_url.trim().trim_end_matches('/').to_owned();
+    let separator = if url.contains('?') { '&' } else { '?' };
+    url.push(separator);
+    url.push_str("a=");
+    url.push_str(&encode_query_component(address));
+    for relay in relays {
+        url.push_str("&relay=");
+        url.push_str(&encode_query_component(relay));
+    }
+    url
+}
+
+fn encode_query_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push('%');
+            out.push(hex_digit(byte >> 4));
+            out.push(hex_digit(byte & 0x0f));
+        }
+    }
+    out
+}
+
+fn hex_digit(nibble: u8) -> char {
+    match nibble {
+        0..=9 => (b'0' + nibble) as char,
+        10..=15 => (b'A' + (nibble - 10)) as char,
+        _ => unreachable!("nibble masked to four bits"),
     }
 }
 
@@ -431,11 +666,15 @@ impl LoadedConfig {
         ensure_private_dir(&self.home)?;
         let db_dir = self.home.join(DB_DIR);
         ensure_private_dir(&db_dir)?;
-        let identity = Identity::import(&self.config.nsec)?;
+        let identity = self.identity()?;
         let db_key = parse_db_key(&self.config.db_key_hex)?;
         SonarClient::connect(identity, self.relays.clone(), db_dir.join(DB_FILE), db_key)
             .await
             .map_err(CliError::Sonar)
+    }
+
+    fn identity(&self) -> Result<Identity> {
+        Identity::import(&self.config.nsec).map_err(CliError::Sonar)
     }
 
     fn relay_strings(&self) -> Vec<String> {
@@ -714,5 +953,29 @@ mod tests {
         let start = Instant::now() - Duration::from_secs(8);
         assert_eq!(next_wait_secs(start, Some(10), 30), 1);
         assert_eq!(next_wait_secs(Instant::now(), None, 0), 1);
+    }
+
+    #[test]
+    fn website_url_encodes_address_and_relays() {
+        let url = sticker_pack_website_url(
+            "https://example.com/stickers/",
+            "30030:abc:def",
+            &[
+                "wss://relay.example.com".to_owned(),
+                "wss://nos.lol".to_owned(),
+            ],
+        );
+        assert_eq!(
+            url,
+            "https://example.com/stickers?a=30030%3Aabc%3Adef&relay=wss%3A%2F%2Frelay.example.com&relay=wss%3A%2F%2Fnos.lol"
+        );
+    }
+
+    #[test]
+    fn import_metadata_is_bounded_for_sticker_model() {
+        let title = truncate_chars(&"x".repeat(100), 80);
+        let emoji = short_emoji(Some("123456789"));
+        assert_eq!(title.chars().count(), 80);
+        assert_eq!(emoji.as_deref(), Some("12345678"));
     }
 }
