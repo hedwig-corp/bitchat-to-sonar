@@ -43,6 +43,8 @@
 	<string>bitchat uses the camera to scan QR codes to verify peers and show your local video preview during calls.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>bitchat lets you pick images from your photo library to share with nearby peers.</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>Sonar saves media you choose to download to your photo library.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>bitchat uses the microphone to record voice notes and carry encrypted calls.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>

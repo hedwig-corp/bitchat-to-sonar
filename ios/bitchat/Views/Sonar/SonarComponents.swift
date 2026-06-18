@@ -14,6 +14,7 @@ import SwiftUI
 #if os(iOS)
 import UIKit
 import AVFoundation
+import Photos
 #else
 import AppKit
 #endif
@@ -773,10 +774,30 @@ struct SNMediaBubble: View {
 
     @State private var bytes: Data?
     @State private var failed = false
+    @State private var viewerOpen = false
 
     private var item: SNMediaItem? { m.media.first }
 
     var body: some View {
+        #if os(iOS)
+        bubble
+            .fullScreenCover(isPresented: $viewerOpen) {
+                if let item {
+                    SNMediaViewer(item: item, caption: m.text, initialBytes: bytes, load: load)
+                }
+            }
+        #else
+        bubble
+            .sheet(isPresented: $viewerOpen) {
+                if let item {
+                    SNMediaViewer(item: item, caption: m.text, initialBytes: bytes, load: load)
+                        .frame(minWidth: 620, minHeight: 520)
+                }
+            }
+        #endif
+    }
+
+    private var bubble: some View {
         HStack(spacing: 0) {
             if m.mine { Spacer(minLength: 40) }
             VStack(alignment: m.mine ? .trailing : .leading, spacing: 4) {
@@ -809,6 +830,8 @@ struct SNMediaBubble: View {
                     .aspectRatio(contentMode: .fit)
                     .frame(maxWidth: maxBubbleWidth, maxHeight: 300)
                     .clipShape(RoundedRectangle(cornerRadius: 18))
+                    .contentShape(RoundedRectangle(cornerRadius: 18))
+                    .onTapGesture { viewerOpen = true }
             } else {
                 RoundedRectangle(cornerRadius: 18)
                     .fill(SonarTheme.surface2)
@@ -822,6 +845,8 @@ struct SNMediaBubble: View {
                             ProgressView()
                         }
                     }
+                    .contentShape(RoundedRectangle(cornerRadius: 18))
+                    .onTapGesture { viewerOpen = true }
             }
         } else if let item, item.mime.hasPrefix("audio/") {
             SNAudioBubble(bytes: bytes, seed: item.filename, mine: m.mine, via: m.via ?? .mesh)
@@ -845,9 +870,380 @@ struct SNMediaBubble: View {
             .padding(.vertical, 9)
             .frame(maxWidth: maxBubbleWidth, alignment: .leading)
             .background(RoundedRectangle(cornerRadius: 14).fill(SonarTheme.surface2))
+            .contentShape(RoundedRectangle(cornerRadius: 14))
+            .onTapGesture { viewerOpen = true }
         }
     }
 }
+
+/// Fullscreen media viewer: tap inline media to inspect it, pinch/double-tap to
+/// zoom images, then share or save the decrypted bytes with native OS surfaces.
+struct SNMediaViewer: View {
+    let item: SNMediaItem
+    let caption: String
+    let initialBytes: Data?
+    var load: ((SNMediaItem) async -> Data?)? = nil
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var bytes: Data?
+    @State private var failed = false
+    @State private var chrome = true
+    @State private var status: String?
+    @State private var tempURLs: [URL] = []
+
+    #if os(iOS)
+    @State private var shareItems: [Any] = []
+    @State private var showShare = false
+    @State private var exportURL: URL?
+    @State private var showExport = false
+    #else
+    @State private var shareURL: URL?
+    #endif
+
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+            content
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            if chrome {
+                viewerChrome
+                    .transition(.opacity)
+            }
+        }
+        .task(id: item.url + (item.localPath ?? "")) {
+            if let initialBytes {
+                bytes = initialBytes
+                return
+            }
+            guard bytes == nil, let load else { return }
+            if let data = await load(item) {
+                bytes = data
+            } else {
+                failed = true
+            }
+        }
+        .onDisappear {
+            tempURLs.forEach { try? FileManager.default.removeItem(at: $0) }
+            tempURLs = []
+        }
+        #if os(iOS)
+        .sheet(isPresented: $showShare) {
+            SNActivityView(items: shareItems)
+        }
+        .sheet(isPresented: $showExport) {
+            if let exportURL {
+                SNDocumentExportView(url: exportURL)
+            }
+        }
+        #else
+        .background(SNMacSharePicker(url: $shareURL))
+        #endif
+    }
+
+    @ViewBuilder private var content: some View {
+        if let bytes, item.isImage, let image = snPlatformImage(bytes) {
+            SNZoomableMediaImage(image: image) {
+                withAnimation(.easeInOut(duration: 0.16)) { chrome.toggle() }
+            }
+            .padding(.horizontal, 4)
+        } else if bytes != nil {
+            VStack(spacing: 14) {
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .fill(Color.white.opacity(0.10))
+                    .frame(width: 74, height: 74)
+                    .overlay(
+                        Text(verbatim: item.mime.hasPrefix("video/") ? "▶" : "·")
+                            .font(SonarTheme.uiFont(size: 30, weight: .bold))
+                            .foregroundColor(.white.opacity(0.86))
+                    )
+                Text(verbatim: item.filename)
+                    .font(SonarTheme.uiFont(size: 16, weight: .semibold))
+                    .foregroundColor(.white)
+                    .multilineTextAlignment(.center)
+                    .lineLimit(3)
+                    .padding(.horizontal, 28)
+                Text(verbatim: item.mime)
+                    .font(SonarTheme.uiFont(size: 12))
+                    .foregroundColor(.white.opacity(0.62))
+                Button {
+                    openMedia()
+                } label: {
+                    Text(verbatim: "Open")
+                        .font(SonarTheme.uiFont(size: 14, weight: .semibold))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 18)
+                        .padding(.vertical, 9)
+                        .background(Capsule().fill(Color.white.opacity(0.16)))
+                }
+                .buttonStyle(.plain)
+            }
+            .onTapGesture {
+                withAnimation(.easeInOut(duration: 0.16)) { chrome.toggle() }
+            }
+        } else {
+            VStack(spacing: 12) {
+                if failed {
+                    Text(verbatim: "Couldn't load media")
+                        .font(SonarTheme.uiFont(size: 14, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.82))
+                } else {
+                    ProgressView()
+                }
+            }
+        }
+    }
+
+    private var viewerChrome: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                Button { dismiss() } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 16, weight: .bold))
+                        .foregroundColor(.white)
+                        .frame(width: 38, height: 38)
+                        .background(Circle().fill(Color.white.opacity(0.12)))
+                }
+                .buttonStyle(.plain)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(verbatim: item.filename)
+                        .font(SonarTheme.uiFont(size: 14, weight: .semibold))
+                        .foregroundColor(.white)
+                        .lineLimit(1)
+                    if !caption.isEmpty {
+                        Text(verbatim: caption)
+                            .font(SonarTheme.uiFont(size: 12))
+                            .foregroundColor(.white.opacity(0.62))
+                            .lineLimit(1)
+                    }
+                }
+                Spacer(minLength: 0)
+                Button("Share") { shareMedia() }
+                    .font(SonarTheme.uiFont(size: 13, weight: .semibold))
+                    .foregroundColor(.white)
+                    .disabled(bytes == nil)
+                Button("Save") { saveMedia() }
+                    .font(SonarTheme.uiFont(size: 13, weight: .semibold))
+                    .foregroundColor(.white)
+                    .disabled(bytes == nil)
+            }
+            .padding(EdgeInsets(top: 12, leading: 12, bottom: 10, trailing: 12))
+            .background(Color.black.opacity(0.58))
+            Spacer()
+            if let status {
+                Text(verbatim: status)
+                    .font(SonarTheme.uiFont(size: 13, weight: .medium))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 9)
+                    .background(Capsule().fill(Color.black.opacity(0.62)))
+                    .padding(.bottom, 22)
+            }
+        }
+    }
+
+    private func shareMedia() {
+        guard let url = writeTempFile() else { return }
+        #if os(iOS)
+        shareItems = [url]
+        showShare = true
+        #else
+        shareURL = url
+        #endif
+    }
+
+    private func saveMedia() {
+        #if os(iOS)
+        if item.mime.hasPrefix("image/"), let data = bytes, let image = UIImage(data: data) {
+            PHPhotoLibrary.shared().performChanges({
+                PHAssetChangeRequest.creationRequestForAsset(from: image)
+            }) { ok, _ in
+                DispatchQueue.main.async { status = ok ? "Saved to Photos" : "Couldn't save media" }
+            }
+        } else if item.mime.hasPrefix("video/"), let url = writeTempFile() {
+            PHPhotoLibrary.shared().performChanges({
+                PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
+            }) { ok, _ in
+                DispatchQueue.main.async { status = ok ? "Saved to Photos" : "Couldn't save media" }
+            }
+        } else {
+            exportMedia()
+        }
+        #else
+        guard let data = bytes else { return }
+        let panel = NSSavePanel()
+        panel.canCreateDirectories = true
+        panel.nameFieldStringValue = safeFilename
+        panel.prompt = "Save"
+        if panel.runModal() == .OK, let destination = panel.url {
+            do {
+                if FileManager.default.fileExists(atPath: destination.path) {
+                    try FileManager.default.removeItem(at: destination)
+                }
+                try data.write(to: destination, options: .atomic)
+                status = "Saved"
+            } catch {
+                status = "Couldn't save media"
+            }
+        }
+        #endif
+    }
+
+    private func exportMedia() {
+        #if os(iOS)
+        guard let url = writeTempFile() else { return }
+        exportURL = url
+        showExport = true
+        #else
+        saveMedia()
+        #endif
+    }
+
+    private func openMedia() {
+        guard let url = writeTempFile() else { return }
+        #if os(iOS)
+        shareItems = [url]
+        showShare = true
+        #else
+        NSWorkspace.shared.open(url)
+        #endif
+    }
+
+    private var safeFilename: String {
+        let name = (item.filename as NSString).lastPathComponent
+        return name.isEmpty ? "attachment" : name
+    }
+
+    private func writeTempFile() -> URL? {
+        guard let data = bytes else { return nil }
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("sonar-media-exports", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let url = dir.appendingPathComponent("\(UUID().uuidString)-\(safeFilename)")
+            #if os(iOS)
+            let options: Data.WritingOptions = [.atomic, .completeFileProtection]
+            #else
+            let options: Data.WritingOptions = .atomic
+            #endif
+            try data.write(to: url, options: options)
+            tempURLs.append(url)
+            return url
+        } catch {
+            status = "Couldn't prepare media"
+            return nil
+        }
+    }
+}
+
+private struct SNZoomableMediaImage: View {
+    let image: Image
+    let onSingleTap: () -> Void
+
+    @State private var scale: CGFloat = 1
+    @State private var lastScale: CGFloat = 1
+    @State private var offset: CGSize = .zero
+    @State private var lastOffset: CGSize = .zero
+
+    var body: some View {
+        image
+            .resizable()
+            .aspectRatio(contentMode: .fit)
+            .scaleEffect(scale)
+            .offset(offset)
+            .simultaneousGesture(
+                MagnificationGesture()
+                    .onChanged { value in
+                        scale = min(max(lastScale * value, 1), 8)
+                    }
+                    .onEnded { _ in
+                        lastScale = scale
+                        if scale <= 1.01 { resetZoom(animated: true) }
+                    }
+            )
+            .simultaneousGesture(
+                DragGesture()
+                    .onChanged { value in
+                        guard scale > 1 else { return }
+                        offset = CGSize(
+                            width: lastOffset.width + value.translation.width,
+                            height: lastOffset.height + value.translation.height
+                        )
+                    }
+                    .onEnded { _ in
+                        lastOffset = offset
+                    }
+            )
+            .gesture(
+                TapGesture(count: 2)
+                    .onEnded {
+                        if scale > 1 {
+                            resetZoom(animated: true)
+                        } else {
+                            withAnimation(.easeInOut(duration: 0.18)) {
+                                scale = 2.5
+                                lastScale = 2.5
+                            }
+                        }
+                    }
+                    .exclusively(before: TapGesture(count: 1).onEnded { onSingleTap() })
+            )
+    }
+
+    private func resetZoom(animated: Bool) {
+        let changes = {
+            scale = 1
+            lastScale = 1
+            offset = .zero
+            lastOffset = .zero
+        }
+        if animated {
+            withAnimation(.easeInOut(duration: 0.18), changes)
+        } else {
+            changes()
+        }
+    }
+}
+
+#if os(iOS)
+private struct SNActivityView: UIViewControllerRepresentable {
+    let items: [Any]
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: items, applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
+}
+
+private struct SNDocumentExportView: UIViewControllerRepresentable {
+    let url: URL
+
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        let controller = UIDocumentPickerViewController(forExporting: [url])
+        controller.shouldShowFileExtensions = true
+        return controller
+    }
+
+    func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {}
+}
+#else
+private struct SNMacSharePicker: NSViewRepresentable {
+    @Binding var url: URL?
+
+    func makeNSView(context: Context) -> NSView {
+        NSView(frame: .zero)
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        guard let url else { return }
+        DispatchQueue.main.async {
+            NSSharingServicePicker(items: [url])
+                .show(relativeTo: nsView.bounds, of: nsView, preferredEdge: .minY)
+            self.url = nil
+        }
+    }
+}
+#endif
 
 /// "Around you" card (design: screens.jsx HereCard) — collapses the geohash
 /// precision ladder (+ Mesh) into ONE row plus a tier picker. The main row enters

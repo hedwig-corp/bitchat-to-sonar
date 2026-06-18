@@ -15,3 +15,14 @@ expect fun rememberPhotoPicker(
 
 /** Decode decrypted image bytes into a Compose [ImageBitmap] (null on failure). */
 expect fun decodeImageBitmap(bytes: ByteArray): ImageBitmap?
+
+/** Native actions for already-decrypted media bytes. */
+class MediaActions(
+    val share: suspend (bytes: ByteArray, filename: String, mime: String) -> Boolean,
+    val save: suspend (bytes: ByteArray, filename: String, mime: String) -> Boolean,
+    val open: suspend (bytes: ByteArray, filename: String, mime: String) -> Boolean,
+)
+
+/** Platform share/download/open integration for media viewer actions. */
+@Composable
+expect fun rememberMediaActions(): MediaActions
