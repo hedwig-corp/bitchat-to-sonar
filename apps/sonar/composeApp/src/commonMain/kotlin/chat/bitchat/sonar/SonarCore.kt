@@ -1,6 +1,7 @@
 package chat.bitchat.sonar
 
 import chat.bitchat.sonar.crypto.Bech32
+import kotlinx.coroutines.flow.SharedFlow
 
 /** A White Noise (Marmot) chat, as the UI sees it. */
 data class SonarChat(
@@ -490,4 +491,12 @@ expect object SonarCore {
 
     /** Parse chat content as a ☎CALL line. null = not a control line (render it). */
     fun callParseControl(content: String): SonarCallControl?
+
+    /** Flow of group IDs whose conversation summary changed (message sent/received,
+     *  unread count reset). Collect to trigger UI refresh on change. */
+    val conversationChanged: SharedFlow<String>
+
+    /** Install the core callback that feeds [conversationChanged]. Call once
+     *  after [start]. */
+    fun installConversationListener()
 }

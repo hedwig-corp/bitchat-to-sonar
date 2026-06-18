@@ -7,6 +7,7 @@
 //
 
 import SwiftUI
+import Combine
 import BitLogger
 import CryptoKit
 import SonarCore
@@ -139,6 +140,8 @@ final class MarmotChatModel: ObservableObject {
     /// Recent relay misses, keyed by npub. A miss is NOT proof the user is White
     /// Noise-only; it only lets call-offer handling stop deferring forever.
     @Published private(set) var sonarDescriptorMissesByNpub: [String: Date] = [:]
+    /// Unread message counts per Marmot group, keyed by group ID hex.
+    @Published var unreadByGroup: [String: UInt64] = [:]
 
     private let service: MarmotService
     private let keychain: KeychainManagerProtocol
@@ -161,6 +164,7 @@ final class MarmotChatModel: ObservableObject {
     /// when other descriptor refreshes publish capabilities without changing
     /// payment state.
     private var descriptorBolt12Offer: String?
+    private var conversationChangeSub: AnyCancellable?
     private static let optimisticIDPrefix = "optimistic-"
     private static let failedOptimisticIDPrefix = "failed-"
 
@@ -195,6 +199,13 @@ final class MarmotChatModel: ObservableObject {
         let cached = SNMarmotChatSnapshotCache.load(from: defaults)
         self.groups = cached.0
         self.messagesByGroup = cached.1
+        self.conversationChangeSub = service.conversationChanged
+            .receive(on: DispatchQueue.main)
+            .debounce(for: .milliseconds(50), scheduler: DispatchQueue.main)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                Task { await self.loadLocalSummaries(resolveMembers: false) }
+            }
     }
 
     /// Connect on first appearance: reuse the keychain identity if present,
@@ -486,6 +497,12 @@ final class MarmotChatModel: ObservableObject {
                     incoming: page.messages
                 )
             }
+            let summaries = await service.conversationSummaries()
+            var unread: [String: UInt64] = [:]
+            for s in summaries where s.unreadCount > 0 {
+                unread[s.groupIdHex] = s.unreadCount
+            }
+            self.unreadByGroup = unread
             self.groups = groups
             self.pendingGroupInvites = invites
             self.messagesByGroup = reconcileOptimistic(into: byGroup)
@@ -535,6 +552,11 @@ final class MarmotChatModel: ObservableObject {
             connectRelaysIfNeeded()
         }
         await loadLocalSummaries()
+    }
+
+    func markConversationRead(groupId: String) {
+        unreadByGroup[groupId] = nil
+        Task { await service.markConversationRead(groupId: groupId) }
     }
 
     /// Publish our own kind-0 profile so peers see our nickname, not our npub.

@@ -17,6 +17,9 @@ import chat.bitchat.sonar.wallet.WalletState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
 
 private const val SONAR_DESCRIPTOR_TTL_SECS = 15 * 60L
@@ -243,6 +246,8 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     var messages by mutableStateOf<List<SonarMsg>>(emptyList())
+        private set
+    var unreadByChat by mutableStateOf<Map<String, Long>>(emptyMap())
         private set
 
     // ── Mocked voice/video call log (in-memory only) ──
@@ -1264,6 +1269,8 @@ class SonarAppState(private val scope: CoroutineScope) {
         scope.launch {
             try {
                 npub = SonarCore.start()
+                SonarCore.installConversationListener()
+                collectConversationChanges()
                 started = true
                 refreshMeshIdentity()
                 // Publish our kind-0 profile so peers see our nickname, not npub.
@@ -1382,7 +1389,9 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun openChat(chat: SonarChat) {
         push(Screen.Chat(chat.id, chatTitle(chat)))
+        unreadByChat = unreadByChat - chat.id
         scope.launch {
+            runCatching { SonarCore.markConversationRead(chat.id) }
             val local = mergePendingMediaUploads(chat.id, marmotMessagesPage(chat.id))
             messages = local
             processPayLines(chat.id, local)
@@ -2468,6 +2477,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         chatSnapshotMessagesByChat = updated
         orderChatsByLocalRecency()
         persistChatSnapshot()
+        refreshUnreadCounts()
     }
 
     private fun orderChatsByLocalRecency() {
@@ -2478,6 +2488,26 @@ class SonarAppState(private val scope: CoroutineScope) {
                 }.thenBy { it.index }
             )
             .map { it.value }
+    }
+
+    @OptIn(kotlinx.coroutines.FlowPreview::class)
+    private fun collectConversationChanges() {
+        SonarCore.conversationChanged
+            .debounce(50)
+            .onEach {
+                refreshChats()
+                refreshUnreadCounts()
+            }
+            .launchIn(scope)
+    }
+
+    private suspend fun refreshUnreadCounts() {
+        val summaries = runCatching { SonarCore.conversationSummaries() }.getOrDefault(emptyList())
+        val counts = mutableMapOf<String, Long>()
+        for (s in summaries) {
+            if (s.unreadCount > 0) counts[s.groupIdHex] = s.unreadCount
+        }
+        unreadByChat = counts
     }
 
     private fun poll() {

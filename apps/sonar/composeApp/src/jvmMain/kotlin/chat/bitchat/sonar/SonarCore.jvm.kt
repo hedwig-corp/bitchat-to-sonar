@@ -1,6 +1,9 @@
 package chat.bitchat.sonar
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -448,4 +451,16 @@ actual object SonarCore {
     actual fun callEncodeAnswer(callId: String, answer: SonarAnswer, addrB64: String): String = ""
     actual fun callEncodeEnd(callId: String, reason: String): String = ""
     actual fun callParseControl(content: String): SonarCallControl? = null
+
+    private val _conversationChanged = MutableSharedFlow<String>(extraBufferCapacity = 64)
+    actual val conversationChanged: SharedFlow<String> = _conversationChanged.asSharedFlow()
+
+    actual fun installConversationListener() {
+        val n = node ?: return
+        n.setConversationChangeListener(object : uniffi.sonar_ffi.ConversationChangeListener {
+            override fun onConversationChanged(groupIdHex: String) {
+                _conversationChanged.tryEmit(groupIdHex)
+            }
+        })
+    }
 }

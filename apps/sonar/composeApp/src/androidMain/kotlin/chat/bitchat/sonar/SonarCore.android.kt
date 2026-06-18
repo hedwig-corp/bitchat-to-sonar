@@ -2,6 +2,9 @@ package chat.bitchat.sonar
 
 import android.content.Context
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -446,6 +449,18 @@ actual object SonarCore {
 
     actual fun callParseControl(content: String): SonarCallControl? =
         uniffi.sonar_ffi.callParseControl(content)?.toCommon()
+
+    private val _conversationChanged = MutableSharedFlow<String>(extraBufferCapacity = 64)
+    actual val conversationChanged: SharedFlow<String> = _conversationChanged.asSharedFlow()
+
+    actual fun installConversationListener() {
+        val n = node ?: return
+        n.setConversationChangeListener(object : uniffi.sonar_ffi.ConversationChangeListener {
+            override fun onConversationChanged(groupIdHex: String) {
+                _conversationChanged.tryEmit(groupIdHex)
+            }
+        })
+    }
 
     private fun requireNode(): SonarNode =
         node ?: error("SonarCore not started — call start() first")

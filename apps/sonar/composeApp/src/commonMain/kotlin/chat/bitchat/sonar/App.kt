@@ -243,6 +243,7 @@ private fun HomeScreen(state: SonarAppState) {
                         avatar = { SonarAvatar(chatTitle, 52.dp, presence = false) },
                         title = chatTitle, sub = "Tap to open", lock = true,
                         verified = state.isVerified(chat.id),
+                        unread = (state.unreadByChat[chat.id] ?: 0) > 0,
                         onLongClick = { pendingDelete = DeleteTarget(chat.id, chatTitle, isMesh = false, isGroup = state.isMultiMemberChat(chat.id)) },
                     ) { state.openChat(chat) }
                 }
