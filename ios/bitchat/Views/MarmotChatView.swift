@@ -533,7 +533,7 @@ final class MarmotChatModel: ObservableObject {
     }
 
     func isDirectGroup(_ group: MarmotService.MarmotGroup) -> Bool {
-        group.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && otherMembers(in: group).count == 1
+        otherMembers(in: group).count == 1
     }
 
     func startGroup(name: String, members: [String]) async throws -> String {

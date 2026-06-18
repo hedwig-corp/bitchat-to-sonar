@@ -262,10 +262,10 @@ impl MarmotEngine {
     /// Create a group with the given members (their signed kind-30443 events).
     /// All members are admins for now (the 1:1 DM shape used by White Noise).
     ///
-    /// NOTE: per MDK rules the creator's commit is merged immediately here —
-    /// acceptable for M1 because the caller publishes the welcomes right after;
-    /// once we have real delivery-failure handling this moves to
-    /// "merge after publish confirmed".
+    /// Per MDK rules the creator's pending commit must be merged only after
+    /// the caller has successfully delivered every Welcome. Until then, the
+    /// caller can clear the pending commit and retry without persisting
+    /// undeliverable invitees as active members.
     pub fn create_group(
         &self,
         name: &str,
@@ -291,9 +291,6 @@ impl MarmotEngine {
             member_key_packages,
             config,
         ))?;
-        dispatch!(&self.storage, |mdk| mdk
-            .merge_pending_commit(&result.group.mls_group_id))?;
-
         let welcomes = member_pubkeys
             .into_iter()
             .zip(result.welcome_rumors)

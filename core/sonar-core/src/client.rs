@@ -19,8 +19,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::identity::Identity;
 use crate::marmot::{
-    ChatMessage, GroupInvite, GroupMembershipUpdate, Incoming, MarmotEngine, KEY_PACKAGE_KIND,
-    SYNC_STATE_FILE_SUFFIX,
+    ChatMessage, GroupCreation, GroupInvite, GroupMembershipUpdate, Incoming, MarmotEngine,
+    KEY_PACKAGE_KIND, SYNC_STATE_FILE_SUFFIX,
 };
 use crate::sonar_descriptor::{
     descriptor_content_json, descriptor_d_tags, descriptor_tags, meta_descriptor_content_json,
@@ -668,14 +668,7 @@ impl SonarClient {
         let creation = self
             .engine
             .create_group(name, vec![key_package], self.relays.clone())?;
-        if let Err(err) = self.resubscribe_marmot_groups_if_live().await {
-            tracing::debug!(%err, "marmot group live resubscribe failed after local group create");
-        }
-        for (member, rumor) in creation.welcomes {
-            let wrapped = self.engine.gift_wrap_welcome(&member, rumor).await?;
-            self.nostr.send_event(&wrapped).await?;
-        }
-        Ok(creation.group.mls_group_id)
+        self.publish_group_creation(creation).await
     }
 
     async fn fetch_key_packages_for_members(&self, members: Vec<PublicKey>) -> Result<Vec<Event>> {
@@ -806,20 +799,46 @@ impl SonarClient {
         let creation = self
             .engine
             .create_group(name, key_packages, self.relays.clone())?;
-        if let Err(err) = self.resubscribe_marmot_groups_if_live().await {
-            tracing::debug!(%err, "marmot group live resubscribe failed after local group create");
-        }
-        for (member, rumor) in creation.welcomes {
-            let wrapped = self.engine.gift_wrap_welcome(&member, rumor).await?;
-            self.nostr.send_event(&wrapped).await?;
-        }
-        Ok(creation.group.mls_group_id)
+        self.publish_group_creation(creation).await
     }
 
     /// Start a 1:1 DM group with `peer`: fetch their KeyPackage, create the MLS
     /// group, and deliver the gift-wrapped welcome.
     pub async fn start_dm(&self, peer: PublicKey, name: &str) -> Result<GroupId> {
         self.start_group(vec![peer], name).await
+    }
+
+    async fn publish_group_creation(&self, creation: GroupCreation) -> Result<GroupId> {
+        let group_id = creation.group.mls_group_id;
+        let mut wrapped_welcomes = Vec::with_capacity(creation.welcomes.len());
+
+        for (member, rumor) in creation.welcomes {
+            match self.engine.gift_wrap_welcome(&member, rumor).await {
+                Ok(wrapped) => wrapped_welcomes.push(wrapped),
+                Err(err) => {
+                    self.discard_unpublished_group_creation(&group_id);
+                    return Err(err);
+                }
+            }
+        }
+
+        for wrapped in wrapped_welcomes {
+            if let Err(err) = self.nostr.send_event(&wrapped).await {
+                self.discard_unpublished_group_creation(&group_id);
+                return Err(err.into());
+            }
+        }
+
+        self.engine.merge_pending_commit(&group_id)?;
+        if let Err(err) = self.resubscribe_marmot_groups_if_live().await {
+            tracing::debug!(%err, "marmot group live resubscribe failed after local group create");
+        }
+        Ok(group_id)
+    }
+
+    fn discard_unpublished_group_creation(&self, group_id: &GroupId) {
+        let _ = self.engine.clear_pending_commit(group_id);
+        let _ = self.engine.delete_group(group_id);
     }
 
     async fn publish_membership_update(&self, update: GroupMembershipUpdate) -> Result<()> {
@@ -846,11 +865,12 @@ impl SonarClient {
             return Err(err.into());
         }
 
-        let mut welcome_error = None;
         for wrapped in wrapped_welcomes {
             if let Err(err) = self.nostr.send_event(&wrapped).await {
-                welcome_error = Some(err);
-                break;
+                if requires_commit_merge {
+                    let _ = self.engine.clear_pending_commit(&group_id);
+                }
+                return Err(err.into());
             }
         }
 
@@ -859,9 +879,6 @@ impl SonarClient {
         }
         if let Err(err) = self.resubscribe_marmot_groups_if_live().await {
             tracing::debug!(%err, "marmot group live resubscribe failed after membership update");
-        }
-        if let Some(err) = welcome_error {
-            return Err(err.into());
         }
         Ok(())
     }
@@ -926,7 +943,13 @@ impl SonarClient {
             .find(|g| g.mls_group_id == group_id)
         {
             let nostr_group_id = hex::encode(group.nostr_group_id);
-            let _ = self.backfill_group(&nostr_group_id).await?;
+            if let Err(err) = self.backfill_group(&nostr_group_id).await {
+                tracing::debug!(
+                    %err,
+                    %nostr_group_id,
+                    "marmot group backfill failed after accepting invite"
+                );
+            }
         }
         let _ = self.resubscribe_marmot_groups_if_live().await;
         Ok(group_id)

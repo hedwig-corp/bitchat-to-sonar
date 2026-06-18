@@ -21,6 +21,9 @@ async fn multi_member_welcomes_wait_for_accept_or_decline() {
     let creation = alice
         .create_group("field team", vec![bob_kp, charlie_kp], relays)
         .expect("alice creates group");
+    alice
+        .merge_pending_commit(&creation.group.mls_group_id)
+        .expect("creator merge after welcome delivery");
     assert_eq!(alice.groups().expect("alice groups").len(), 1);
 
     let (bob_pubkey, bob_welcome) = creation
@@ -84,4 +87,87 @@ async fn multi_member_welcomes_wait_for_accept_or_decline() {
         .pending_group_invites()
         .expect("charlie invites after decline")
         .is_empty());
+}
+
+#[tokio::test]
+async fn unpublished_group_creation_can_be_discarded() {
+    let relay = RelayUrl::parse("wss://relay.example.com").expect("relay url");
+    let relays = vec![relay];
+
+    let alice = MarmotEngine::in_memory(Identity::generate());
+    let bob = MarmotEngine::in_memory(Identity::generate());
+    let charlie = MarmotEngine::in_memory(Identity::generate());
+
+    let bob_kp = bob.key_package_event(relays.clone()).expect("bob kp");
+    let charlie_kp = charlie
+        .key_package_event(relays.clone())
+        .expect("charlie kp");
+
+    let creation = alice
+        .create_group("field team", vec![bob_kp, charlie_kp], relays)
+        .expect("alice creates group");
+    let group_id = creation.group.mls_group_id;
+    assert_eq!(
+        alice.groups().expect("alice groups").len(),
+        1,
+        "MDK exposes the staged group before the commit is merged"
+    );
+
+    alice
+        .clear_pending_commit(&group_id)
+        .expect("clear pending creation commit");
+    alice.delete_group(&group_id).expect("discard staged group");
+
+    assert!(
+        alice
+            .groups()
+            .expect("alice groups after discard")
+            .is_empty(),
+        "failed welcome delivery must not leave a non-retryable local group"
+    );
+}
+
+#[tokio::test]
+async fn staged_add_member_commit_can_be_rolled_back() {
+    let relay = RelayUrl::parse("wss://relay.example.com").expect("relay url");
+    let relays = vec![relay];
+
+    let alice = MarmotEngine::in_memory(Identity::generate());
+    let bob = MarmotEngine::in_memory(Identity::generate());
+    let charlie = MarmotEngine::in_memory(Identity::generate());
+    let charlie_pubkey = charlie.identity().public_key();
+
+    let bob_kp = bob.key_package_event(relays.clone()).expect("bob kp");
+    let creation = alice
+        .create_group("alice and bob", vec![bob_kp], relays.clone())
+        .expect("alice creates group");
+    let group_id = creation.group.mls_group_id;
+    alice
+        .merge_pending_commit(&group_id)
+        .expect("merge initial group");
+
+    let charlie_kp = charlie.key_package_event(relays).expect("charlie kp");
+    let update = alice
+        .add_members(&group_id, vec![charlie_kp])
+        .expect("stage add charlie");
+    assert_eq!(update.welcomes.len(), 1);
+    assert!(
+        !alice
+            .members(&group_id)
+            .expect("members before merge")
+            .contains(&charlie_pubkey),
+        "staged add-member state stays pending until commit merge"
+    );
+
+    alice
+        .clear_pending_commit(&group_id)
+        .expect("clear staged add-member commit");
+
+    assert!(
+        !alice
+            .members(&group_id)
+            .expect("members after rollback")
+            .contains(&charlie_pubkey),
+        "failed welcome delivery must not leave the undelivered invitee as a local member"
+    );
 }

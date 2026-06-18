@@ -38,6 +38,9 @@ async fn group_and_message_survive_reopen() {
             .create_group("alice & bob", vec![bob_kp], relays())
             .expect("create group");
         let group_id = creation.group.mls_group_id.clone();
+        alice
+            .merge_pending_commit(&group_id)
+            .expect("merge after simulated welcome delivery");
 
         // Send a message and process it back so it lands in storage as "ours"
         // (mirrors what SonarClient::send_text does after publishing).

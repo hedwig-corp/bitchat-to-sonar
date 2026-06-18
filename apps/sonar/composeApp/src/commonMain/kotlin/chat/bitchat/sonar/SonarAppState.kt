@@ -512,7 +512,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         chat.members.filter { it != npub && it.isNotBlank() }.distinct()
 
     fun isDirectMarmotChat(chat: SonarChat): Boolean =
-        chat.name.isBlank() && otherMembers(chat).size == 1
+        otherMembers(chat).size == 1
 
     fun isMultiMemberChat(chatId: String): Boolean =
         chats.firstOrNull { it.id == chatId }?.let { !isDirectMarmotChat(it) } == true
