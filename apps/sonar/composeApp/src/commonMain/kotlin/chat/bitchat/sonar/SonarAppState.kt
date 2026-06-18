@@ -2279,26 +2279,28 @@ class SonarAppState(private val scope: CoroutineScope) {
     private suspend fun refreshTopChatLocalSummaries() {
         if (chats.isEmpty()) return
         val updated = chatSnapshotMessagesByChat.toMutableMap()
-        for (chat in topSummaryChats()) {
-            val messages = runCatching {
-                SonarCore.messagesPage(chat.id, LOCAL_SUMMARY_PAGE_LIMIT)
-            }.getOrDefault(emptyList())
-            if (messages.isNotEmpty()) {
-                updated[chat.id] = messages
+        val pages = runCatching {
+            SonarCore.recentMessagePages(LOCAL_SUMMARY_CHAT_LIMIT, LOCAL_SUMMARY_PAGE_LIMIT)
+        }.getOrDefault(emptyList())
+        for (page in pages) {
+            if (page.messages.isNotEmpty()) {
+                updated[page.chatId] = page.messages
             }
         }
         chatSnapshotMessagesByChat = updated
+        orderChatsByLocalRecency()
+        persistChatSnapshot()
     }
 
-    private fun topSummaryChats(): List<SonarChat> =
-        chats.withIndex()
+    private fun orderChatsByLocalRecency() {
+        chats = chats.withIndex()
             .sortedWith(
                 compareByDescending<IndexedValue<SonarChat>> {
                     chatSnapshotMessagesByChat[it.value.id]?.lastOrNull()?.tsSecs ?: 0L
                 }.thenBy { it.index }
             )
-            .take(LOCAL_SUMMARY_CHAT_LIMIT)
             .map { it.value }
+    }
 
     private fun poll() {
         if (pollJob?.isActive == true) return

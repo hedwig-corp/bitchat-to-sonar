@@ -1054,6 +1054,13 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func publishSonarDescriptor(callsEnabled: Bool, signaling: [String], bolt12Offer: String?) throws
 
     /**
+     * Bounded local transcript windows for the most recent groups, newest
+     * conversation first. Used by chat-list hydration so first paint is local
+     * DB only and does not wait on relay sync or full-history scans.
+     */
+    func recentMessagePages(groupLimit: UInt32, pageLimit: UInt32) throws  -> [RecentMessagePageInfo]
+
+    /**
      * Remove members from an existing group.
      */
     func removeGroupMembers(groupIdHex: String, members: [String]) throws
@@ -1569,6 +1576,21 @@ open func publishSonarDescriptor(callsEnabled: Bool, signaling: [String], bolt12
         FfiConverterOptionString.lower(bolt12Offer),$0
     )
 }
+}
+
+    /**
+     * Bounded local transcript windows for the most recent groups, newest
+     * conversation first. Used by chat-list hydration so first paint is local
+     * DB only and does not wait on relay sync or full-history scans.
+     */
+open func recentMessagePages(groupLimit: UInt32, pageLimit: UInt32)throws  -> [RecentMessagePageInfo]  {
+    return try  FfiConverterSequenceTypeRecentMessagePageInfo.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_recent_message_pages(
+            self.uniffiCloneHandle(),
+        FfiConverterUInt32.lower(groupLimit),
+        FfiConverterUInt32.lower(pageLimit),$0
+    )
+})
 }
 
     /**
@@ -2915,6 +2937,79 @@ public func FfiConverterTypeProfileInfo_lower(_ value: ProfileInfo) -> RustBuffe
 
 
 /**
+ * FFI-friendly transcript window for one recent group.
+ */
+public struct RecentMessagePageInfo: Equatable, Hashable {
+    public var groupIdHex: String
+    /**
+     * Newest message timestamp in this page, for stable chat-list ordering.
+     */
+    public var latestCreatedAtSecs: UInt64
+    /**
+     * Oldest first within the bounded page.
+     */
+    public var messages: [MessageInfo]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(groupIdHex: String,
+        /**
+         * Newest message timestamp in this page, for stable chat-list ordering.
+         */latestCreatedAtSecs: UInt64,
+        /**
+         * Oldest first within the bounded page.
+         */messages: [MessageInfo]) {
+        self.groupIdHex = groupIdHex
+        self.latestCreatedAtSecs = latestCreatedAtSecs
+        self.messages = messages
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension RecentMessagePageInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRecentMessagePageInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RecentMessagePageInfo {
+        return
+            try RecentMessagePageInfo(
+                groupIdHex: FfiConverterString.read(from: &buf),
+                latestCreatedAtSecs: FfiConverterUInt64.read(from: &buf),
+                messages: FfiConverterSequenceTypeMessageInfo.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: RecentMessagePageInfo, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.groupIdHex, into: &buf)
+        FfiConverterUInt64.write(value.latestCreatedAtSecs, into: &buf)
+        FfiConverterSequenceTypeMessageInfo.write(value.messages, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRecentMessagePageInfo_lift(_ buf: RustBuffer) throws -> RecentMessagePageInfo {
+    return try FfiConverterTypeRecentMessagePageInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRecentMessagePageInfo_lower(_ value: RecentMessagePageInfo) -> RustBuffer {
+    return FfiConverterTypeRecentMessagePageInfo.lower(value)
+}
+
+
+/**
  * FFI-friendly Sonar app descriptor published as a NIP-78-style kind-30078
  * event. This is public capability metadata only; live call addresses are
  * exchanged inside encrypted ☎CALL signaling.
@@ -3870,6 +3965,31 @@ fileprivate struct FfiConverterSequenceTypeMessageInfo: FfiConverterRustBuffer {
         return seq
     }
 }
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeRecentMessagePageInfo: FfiConverterRustBuffer {
+    typealias SwiftType = [RecentMessagePageInfo]
+
+    public static func write(_ value: [RecentMessagePageInfo], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeRecentMessagePageInfo.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [RecentMessagePageInfo] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [RecentMessagePageInfo]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeRecentMessagePageInfo.read(from: &buf))
+        }
+        return seq
+    }
+}
 /**
  * Encode an ANSWER control line (`node_addr_b64` empty for decline/busy).
  */
@@ -4294,6 +4414,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_sonar_descriptor() != 7979) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_recent_message_pages() != 17660) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_remove_group_members() != 5580) {

@@ -163,6 +163,16 @@ pub struct MessageInfo {
     pub media: Vec<MediaInfo>,
 }
 
+/// FFI-friendly transcript window for one recent group.
+#[derive(uniffi::Record)]
+pub struct RecentMessagePageInfo {
+    pub group_id_hex: String,
+    /// Newest message timestamp in this page, for stable chat-list ordering.
+    pub latest_created_at_secs: u64,
+    /// Oldest first within the bounded page.
+    pub messages: Vec<MessageInfo>,
+}
+
 /// FFI-friendly reference to an encrypted media attachment. `url` is the Blossom
 /// URL of the CIPHERTEXT; call `fetch_media(groupId, url)` to download + decrypt.
 #[derive(uniffi::Record)]
@@ -520,6 +530,32 @@ impl SonarNode {
             .messages_page(&group_id, limit as usize, offset as usize)?;
         msgs.sort_by_key(|m| m.created_at);
         Ok(msgs.into_iter().map(message_info).collect())
+    }
+
+    /// Bounded local transcript windows for the most recent groups, newest
+    /// conversation first. Used by chat-list hydration so first paint is local
+    /// DB only and does not wait on relay sync or full-history scans.
+    pub fn recent_message_pages(
+        &self,
+        group_limit: u32,
+        page_limit: u32,
+    ) -> FfiResult<Vec<RecentMessagePageInfo>> {
+        if group_limit == 0 || page_limit == 0 {
+            return Ok(Vec::new());
+        }
+        self.client
+            .recent_message_pages(group_limit as usize, page_limit as usize)?
+            .into_iter()
+            .map(|page| {
+                let mut messages = page.messages;
+                messages.sort_by_key(|m| m.created_at);
+                Ok(RecentMessagePageInfo {
+                    group_id_hex: hex::encode(page.group_id.as_slice()),
+                    latest_created_at_secs: page.latest_created_at.as_secs(),
+                    messages: messages.into_iter().map(message_info).collect(),
+                })
+            })
+            .collect()
     }
 
     /// Encrypt + upload `data` to a Blossom server, then publish a media message

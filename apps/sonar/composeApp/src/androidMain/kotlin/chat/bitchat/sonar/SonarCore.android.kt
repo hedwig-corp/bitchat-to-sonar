@@ -134,6 +134,20 @@ actual object SonarCore {
             n.messagesPage(chatId, limit.toUInt(), offset.toUInt()).map { it.toCommon() }
         }
 
+    actual suspend fun recentMessagePages(groupLimit: Int, pageLimit: Int): List<SonarRecentTranscriptPage> =
+        withContext(Dispatchers.IO) {
+            require(groupLimit >= 0) { "recentMessagePages groupLimit must be non-negative" }
+            require(pageLimit >= 0) { "recentMessagePages pageLimit must be non-negative" }
+            val n = node ?: return@withContext emptyList()
+            n.recentMessagePages(groupLimit.toUInt(), pageLimit.toUInt()).map {
+                SonarRecentTranscriptPage(
+                    chatId = it.groupIdHex,
+                    latestTsSecs = it.latestCreatedAtSecs.toLong(),
+                    messages = it.messages.map { message -> message.toCommon() },
+                )
+            }
+        }
+
     private fun uniffi.sonar_ffi.MessageInfo.toCommon(): SonarMsg = SonarMsg(
         id = idHex,
         senderNpub = senderNpub,

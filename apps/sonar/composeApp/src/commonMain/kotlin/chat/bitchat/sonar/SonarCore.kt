@@ -36,6 +36,14 @@ data class SonarMsg(
     val state: String? = null,
 )
 
+/** Local transcript window for one recent chat, newest conversation first at
+ *  the API boundary and oldest-first inside [messages]. */
+data class SonarRecentTranscriptPage(
+    val chatId: String,
+    val latestTsSecs: Long,
+    val messages: List<SonarMsg>,
+)
+
 /** A reference to an encrypted media attachment. [url] is the Blossom URL of the
  *  CIPHERTEXT; call [SonarCore.fetchMedia] to download + decrypt. */
 data class SonarMedia(
@@ -329,6 +337,9 @@ expect object SonarCore {
 
     /** Bounded local message window for a chat, oldest first within the page. */
     suspend fun messagesPage(chatId: String, limit: Int, offset: Int = 0): List<SonarMsg>
+
+    /** Bounded local transcript windows for the most recent chats. */
+    suspend fun recentMessagePages(groupLimit: Int, pageLimit: Int): List<SonarRecentTranscriptPage>
 
     /** Poll the relays once (welcomes + group messages). */
     suspend fun sync()

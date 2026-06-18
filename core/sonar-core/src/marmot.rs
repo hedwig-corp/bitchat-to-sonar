@@ -148,6 +148,14 @@ pub struct ChatMessage {
     pub media: Vec<MediaRef>,
 }
 
+/// Bounded transcript page for one recent group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecentMessagePage {
+    pub group_id: GroupId,
+    pub latest_created_at: Timestamp,
+    pub messages: Vec<ChatMessage>,
+}
+
 /// What came out of processing an incoming event.
 #[derive(Debug)]
 pub enum Incoming {
@@ -664,6 +672,41 @@ impl MarmotEngine {
         }
 
         Ok(page_messages)
+    }
+
+    /// Latest local transcript windows for the most recent groups. This is the
+    /// Signal-style chat-list hydration path: rank conversations by local DB
+    /// recency, return only a small window for the newest groups, and leave
+    /// relay sync completely out of first paint.
+    pub fn recent_message_pages(
+        &self,
+        group_limit: usize,
+        page_limit: usize,
+    ) -> Result<Vec<RecentMessagePage>> {
+        if group_limit == 0 || page_limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut pages = Vec::new();
+        for group in self.groups()? {
+            let messages = self.messages_page(&group.mls_group_id, page_limit, 0)?;
+            let Some(latest_created_at) = messages.iter().map(|m| m.created_at).max() else {
+                continue;
+            };
+            pages.push(RecentMessagePage {
+                group_id: group.mls_group_id,
+                latest_created_at,
+                messages,
+            });
+        }
+
+        pages.sort_by(|a, b| {
+            b.latest_created_at
+                .cmp(&a.latest_created_at)
+                .then_with(|| a.group_id.as_slice().cmp(b.group_id.as_slice()))
+        });
+        pages.truncate(group_limit);
+        Ok(pages)
     }
 
     /// Members of a group.

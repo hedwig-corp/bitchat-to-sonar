@@ -95,6 +95,12 @@ final class MarmotService: @unchecked Sendable {
         }
     }
 
+    struct RecentMessagePage: Sendable, Equatable {
+        let groupId: String
+        let latestCreatedAt: Date
+        let messages: [MarmotMessage]
+    }
+
     /// A reference to an encrypted media attachment. `url` is the Blossom URL of
     /// the CIPHERTEXT; call `fetchMedia(groupId:url:)` to download + decrypt.
     struct MarmotMedia: Sendable, Equatable, Codable {
@@ -536,6 +542,22 @@ final class MarmotService: @unchecked Sendable {
             try $0.requireNode()
                 .messagesPage(groupIdHex: groupId, limit: limit, offset: offset)
                 .map(Self.marmotMessage)
+        }
+    }
+
+    /// Local transcript windows for the most recent groups, newest conversation
+    /// first. Used by home list hydration before any relay-aware sync.
+    func recentMessagePages(groupLimit: UInt32, pageLimit: UInt32) async throws -> [RecentMessagePage] {
+        try await run {
+            try $0.requireNode()
+                .recentMessagePages(groupLimit: groupLimit, pageLimit: pageLimit)
+                .map {
+                    RecentMessagePage(
+                        groupId: $0.groupIdHex,
+                        latestCreatedAt: Date(timeIntervalSince1970: TimeInterval($0.latestCreatedAtSecs)),
+                        messages: $0.messages.map(Self.marmotMessage)
+                    )
+                }
         }
     }
 

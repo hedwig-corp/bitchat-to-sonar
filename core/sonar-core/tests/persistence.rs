@@ -181,6 +181,52 @@ async fn local_first_send_persists_pending_message_before_relay_publish() {
 }
 
 #[tokio::test]
+async fn recent_message_pages_returns_newest_groups_with_bounded_windows() {
+    let alice = MarmotEngine::in_memory(Identity::generate());
+    let mut created = Vec::new();
+
+    for idx in 0..6 {
+        let bob = MarmotEngine::in_memory(Identity::generate());
+        let bob_kp = bob.key_package_event(relays()).expect("bob key package");
+        let creation = alice
+            .create_group(&format!("chat {idx}"), vec![bob_kp], relays())
+            .expect("create group");
+        let group_id = creation.group.mls_group_id.clone();
+        alice
+            .merge_pending_commit(&group_id)
+            .expect("merge after simulated welcome delivery");
+
+        for msg_idx in 0..3 {
+            let event = alice
+                .create_text_message(&group_id, &format!("chat {idx} message {msg_idx}"))
+                .expect("create message");
+            assert!(matches!(
+                alice
+                    .process_incoming(&event)
+                    .await
+                    .expect("process own message"),
+                Incoming::Message(_)
+            ));
+        }
+        created.push(group_id);
+        sleep(Duration::from_secs(1)).await;
+    }
+
+    let pages = alice
+        .recent_message_pages(5, 2)
+        .expect("recent local transcript pages");
+    assert_eq!(pages.len(), 5);
+    assert_eq!(pages[0].group_id, created[5]);
+    assert_eq!(pages[4].group_id, created[1]);
+    assert!(!pages.iter().any(|page| page.group_id == created[0]));
+    assert!(pages.iter().all(|page| page.messages.len() == 2));
+    assert!(pages[0]
+        .messages
+        .iter()
+        .all(|message| message.content.starts_with("chat 5 message ")));
+}
+
+#[tokio::test]
 async fn wrong_key_cannot_open_existing_db() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("marmot.sqlite");

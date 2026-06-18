@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::identity::Identity;
 use crate::marmot::{
     ChatMessage, DeliveryState, GroupCreation, GroupInvite, GroupMembershipUpdate, Incoming,
-    MarmotEngine, KEY_PACKAGE_KIND, SYNC_STATE_FILE_SUFFIX,
+    MarmotEngine, RecentMessagePage, KEY_PACKAGE_KIND, SYNC_STATE_FILE_SUFFIX,
 };
 use crate::outbox::{outbox_state_path_for_db, OutboxState};
 use crate::sonar_descriptor::{
@@ -1635,6 +1635,28 @@ impl SonarClient {
             .map(|msgs| {
                 msgs.into_iter()
                     .map(|m| self.with_delivery_state(m))
+                    .collect()
+            })
+    }
+
+    pub fn recent_message_pages(
+        &self,
+        group_limit: usize,
+        page_limit: usize,
+    ) -> Result<Vec<RecentMessagePage>> {
+        self.engine
+            .recent_message_pages(group_limit, page_limit)
+            .map(|pages| {
+                pages
+                    .into_iter()
+                    .map(|mut page| {
+                        page.messages = page
+                            .messages
+                            .into_iter()
+                            .map(|m| self.with_delivery_state(m))
+                            .collect();
+                        page
+                    })
                     .collect()
             })
     }
