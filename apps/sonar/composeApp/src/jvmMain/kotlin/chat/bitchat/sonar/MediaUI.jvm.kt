@@ -1,10 +1,15 @@
 package chat.bitchat.sonar
 
+import androidx.compose.foundation.Image
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.awt.SwingPanel
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.toComposeImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -19,6 +24,9 @@ import java.io.File
 import javax.imageio.IIOImage
 import javax.imageio.ImageIO
 import javax.imageio.ImageWriteParam
+import javax.swing.ImageIcon
+import javax.swing.JLabel
+import javax.swing.SwingConstants
 
 /**
  * Desktop (JVM) `actual` photo picker: a native AWT [FileDialog] filtered to
@@ -100,6 +108,36 @@ private fun ByteArray.isGifBytes(): Boolean =
         this[3] == 0x38.toByte() &&
         (this[4] == 0x37.toByte() || this[4] == 0x39.toByte()) &&
         this[5] == 0x61.toByte()
+
+@Composable
+actual fun MediaImage(
+    bytes: ByteArray,
+    isGif: Boolean,
+    modifier: Modifier
+) {
+    if (isGif) {
+        val icon = remember(bytes) { ImageIcon(bytes) }
+        SwingPanel(
+            modifier = modifier,
+            background = Color.Transparent,
+            factory = {
+                JLabel(icon).apply {
+                    horizontalAlignment = SwingConstants.CENTER
+                    verticalAlignment = SwingConstants.CENTER
+                    isOpaque = false
+                }
+            },
+            update = { label ->
+                if (label.icon !== icon) label.icon = icon
+            }
+        )
+    } else {
+        val image = remember(bytes) { decodeImageBitmap(bytes) }
+        if (image != null) {
+            Image(image, contentDescription = null, contentScale = ContentScale.Fit, modifier = modifier)
+        }
+    }
+}
 
 actual fun decodeImageBitmap(bytes: ByteArray): ImageBitmap? =
     runCatching { SkiaImage.makeFromEncoded(bytes).toComposeImageBitmap() }.getOrNull()

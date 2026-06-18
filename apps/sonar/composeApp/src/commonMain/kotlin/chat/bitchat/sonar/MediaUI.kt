@@ -1,6 +1,7 @@
 package chat.bitchat.sonar
 
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.ImageBitmap
 
 /**
@@ -12,6 +13,13 @@ import androidx.compose.ui.graphics.ImageBitmap
 expect fun rememberPhotoPicker(
     onPicked: (bytes: ByteArray, filename: String, mime: String) -> Unit
 ): () -> Unit
+
+@Composable
+expect fun MediaImage(
+    bytes: ByteArray,
+    isGif: Boolean,
+    modifier: Modifier = Modifier
+)
 
 /** Decode decrypted image bytes into a Compose [ImageBitmap] (null on failure). */
 expect fun decodeImageBitmap(bytes: ByteArray): ImageBitmap?

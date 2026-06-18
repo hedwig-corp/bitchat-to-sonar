@@ -5,28 +5,36 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.ImageDecoder
+import android.graphics.drawable.AnimatedImageDrawable
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
 import android.provider.OpenableColumns
+import android.widget.ImageView
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.core.content.FileProvider
+import androidx.compose.ui.viewinterop.AndroidView
 import kotlinx.coroutines.CancellableContinuation
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.nio.ByteBuffer
 import java.util.UUID
 import kotlin.coroutines.resume
 
@@ -84,6 +92,43 @@ private fun ByteArray.isGifBytes(): Boolean =
         this[3] == 0x38.toByte() &&
         (this[4] == 0x37.toByte() || this[4] == 0x39.toByte()) &&
         this[5] == 0x61.toByte()
+
+@Composable
+actual fun MediaImage(
+    bytes: ByteArray,
+    isGif: Boolean,
+    modifier: Modifier
+) {
+    val animated = remember(bytes, isGif) {
+        if (isGif && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            runCatching {
+                ImageDecoder.decodeDrawable(ImageDecoder.createSource(ByteBuffer.wrap(bytes)))
+            }.getOrNull()
+        } else {
+            null
+        }
+    }
+    if (animated != null) {
+        AndroidView(
+            modifier = modifier,
+            factory = { context ->
+                ImageView(context).apply {
+                    adjustViewBounds = true
+                    scaleType = ImageView.ScaleType.FIT_CENTER
+                }
+            },
+            update = { view ->
+                view.setImageDrawable(animated)
+                (animated as? AnimatedImageDrawable)?.start()
+            }
+        )
+    } else {
+        val image = remember(bytes) { decodeImageBitmap(bytes) }
+        if (image != null) {
+            Image(image, contentDescription = null, contentScale = ContentScale.Fit, modifier = modifier)
+        }
+    }
+}
 
 actual fun decodeImageBitmap(bytes: ByteArray): ImageBitmap? =
     BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()

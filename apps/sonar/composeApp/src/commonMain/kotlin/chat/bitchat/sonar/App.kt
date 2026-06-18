@@ -1097,10 +1097,13 @@ private fun MediaBubble(
         horizontalAlignment = if (m.mine) Alignment.End else Alignment.Start
     ) {
         if (media.isImage) {
-            val img by androidx.compose.runtime.produceState<androidx.compose.ui.graphics.ImageBitmap?>(
+            val mediaBytes by androidx.compose.runtime.produceState<ByteArray?>(
                 null, media.url
             ) {
-                value = state.mediaData(chatId, media)?.let { decodeImageBitmap(it) }
+                value = state.mediaData(chatId, media)
+            }
+            val img = androidx.compose.runtime.remember(mediaBytes) {
+                mediaBytes?.let { decodeImageBitmap(it) }
             }
             Box(
                 Modifier.widthIn(max = 240.dp).clip(RoundedCornerShape(18.dp)).background(s.surface2)
@@ -1108,11 +1111,11 @@ private fun MediaBubble(
                 contentAlignment = Alignment.Center
             ) {
                 val bmp = img
-                if (bmp != null) {
-                    androidx.compose.foundation.Image(
-                        bitmap = bmp,
-                        contentDescription = media.filename,
-                        contentScale = ContentScale.Fit,
+                val bytes = mediaBytes
+                if (bytes != null && (media.isGif || bmp != null)) {
+                    MediaImage(
+                        bytes = bytes,
+                        isGif = media.isGif,
                         modifier = Modifier.widthIn(max = 240.dp).heightIn(max = 300.dp)
                     )
                     if (media.isGif) GifBadge(Modifier.align(Alignment.TopEnd).padding(8.dp))

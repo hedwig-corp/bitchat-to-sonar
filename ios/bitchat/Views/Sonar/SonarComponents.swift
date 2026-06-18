@@ -11,6 +11,7 @@
 //
 
 import SwiftUI
+import WebKit
 #if os(iOS)
 import UIKit
 import AVFoundation
@@ -826,17 +827,21 @@ struct SNMediaBubble: View {
 
     @ViewBuilder private var content: some View {
         if let item, item.isImage {
-            if let bytes, let image = snPlatformImage(bytes) {
+            if let bytes, item.isGif {
+                SNGifView(data: bytes)
+                    .frame(width: maxBubbleWidth, height: 220)
+                    .clipShape(RoundedRectangle(cornerRadius: 18))
+                    .overlay(alignment: .topTrailing) {
+                        SNGifBadge().padding(8)
+                    }
+                    .contentShape(RoundedRectangle(cornerRadius: 18))
+                    .onTapGesture { viewerOpen = true }
+            } else if let bytes, let image = snPlatformImage(bytes) {
                 image
                     .resizable()
                     .aspectRatio(contentMode: .fit)
                     .frame(maxWidth: maxBubbleWidth, maxHeight: 300)
                     .clipShape(RoundedRectangle(cornerRadius: 18))
-                    .overlay(alignment: .topTrailing) {
-                        if item.isGif {
-                            SNGifBadge().padding(8)
-                        }
-                    }
                     .contentShape(RoundedRectangle(cornerRadius: 18))
                     .onTapGesture { viewerOpen = true }
             } else {
@@ -1276,6 +1281,65 @@ struct SNGifBadge: View {
             .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(SonarTheme.netFill))
     }
 }
+
+struct SNGifView: View {
+    let data: Data
+
+    var body: some View {
+        SNGifWebView(data: data)
+    }
+}
+
+#if os(iOS)
+struct SNGifWebView: UIViewRepresentable {
+    let data: Data
+
+    func makeUIView(context: Context) -> WKWebView {
+        let view = WKWebView(frame: .zero)
+        view.isOpaque = false
+        view.backgroundColor = .clear
+        view.scrollView.backgroundColor = .clear
+        view.scrollView.isScrollEnabled = false
+        return view
+    }
+
+    func updateUIView(_ view: WKWebView, context: Context) {
+        view.loadHTMLString(html, baseURL: nil)
+    }
+
+    private var html: String {
+        let base64 = data.base64EncodedString()
+        return """
+        <html><head><meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>html,body{margin:0;width:100%;height:100%;background:transparent;overflow:hidden;}body{display:flex;align-items:center;justify-content:center;}img{max-width:100%;max-height:100%;object-fit:contain;}</style>
+        </head><body><img src="data:image/gif;base64,\(base64)" /></body></html>
+        """
+    }
+}
+#elseif os(macOS)
+struct SNGifWebView: NSViewRepresentable {
+    let data: Data
+
+    func makeNSView(context: Context) -> WKWebView {
+        let view = WKWebView(frame: .zero)
+        view.setValue(false, forKey: "drawsBackground")
+        return view
+    }
+
+    func updateNSView(_ view: WKWebView, context: Context) {
+        view.loadHTMLString(html, baseURL: nil)
+    }
+
+    private var html: String {
+        let base64 = data.base64EncodedString()
+        return """
+        <html><head><meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>html,body{margin:0;width:100%;height:100%;background:transparent;overflow:hidden;}body{display:flex;align-items:center;justify-content:center;}img{max-width:100%;max-height:100%;object-fit:contain;}</style>
+        </head><body><img src="data:image/gif;base64,\(base64)" /></body></html>
+        """
+    }
+}
+#endif
 
 /// "Around you" card (design: screens.jsx HereCard) — collapses the geohash
 /// precision ladder (+ Mesh) into ONE row plus a tier picker. The main row enters
