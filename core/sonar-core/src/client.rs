@@ -1598,8 +1598,8 @@ impl SonarClient {
                         }
                     }
                 }
-                Ok(Incoming::Message(ref message)) => {
-                    self.record_delivery_for_incoming(&Incoming::Message(message.clone()));
+                Ok(ref incoming @ Incoming::Message(ref message)) => {
+                    self.record_delivery_for_incoming(incoming);
                     let cached_name = group_names
                         .get(message.group_id.as_slice())
                         .map(|s| s.as_str());

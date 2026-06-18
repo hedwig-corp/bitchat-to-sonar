@@ -2239,6 +2239,12 @@ class SonarAppState(private val scope: CoroutineScope) {
         val merged = mergePendingMediaUploads(meshChatId(peerId), mesh + wn)
         messages = merged
         processPayLines(meshChatId(peerId), merged)
+        val groups = npubRawFor(peerId)?.let { marmotGroupsForNpub(it) }
+            ?: chats.filter { peerIdForMarmotGroup(it) == peerId }
+        for (group in groups) {
+            unreadByChat = unreadByChat - group.id
+            runCatching { SonarCore.markConversationRead(group.id) }
+        }
     }
 
     private fun observedMeshPeer(peerId: String): Boolean =
@@ -2494,10 +2500,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun collectConversationChanges() {
         SonarCore.conversationChanged
             .debounce(50)
-            .onEach {
-                refreshChats()
-                refreshUnreadCounts()
-            }
+            .onEach { refreshChats() }
             .launchIn(scope)
     }
 
