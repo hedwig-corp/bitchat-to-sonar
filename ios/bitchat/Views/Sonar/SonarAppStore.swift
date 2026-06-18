@@ -2060,6 +2060,36 @@ final class SonarAppStore: ObservableObject {
                     ))
                 }
             }
+            if !id.hasPrefix(Self.marmotIDPrefix) {
+                let peerID = PeerID(str: id)
+                let via: SNVia = .mesh
+                let my = chatViewModel.meshService.myPeerID
+                dated += (chatViewModel.privateChats[peerID] ?? []).compactMap { m in
+                    let mine = m.senderPeerID == my
+                    switch payMapping(m.content, fallbackVia: via) {
+                    case .hidden:
+                        return nil
+                    case .bubble(let pay, let payVia):
+                        return (m.timestamp, SNMessage(
+                            id: m.id, mine: mine, text: m.content,
+                            time: Self.clock(m.timestamp), via: payVia, pay: pay
+                        ))
+                    case .notPay:
+                        let mediaItem = meshMediaItem(m.content)
+                        return (m.timestamp, SNMessage(
+                            id: m.id,
+                            mine: mine,
+                            author: m.sender,
+                            text: mediaItem != nil ? "" : m.content,
+                            time: Self.clock(m.timestamp),
+                            via: via,
+                            state: mine ? Self.stateText(m.deliveryStatus) : nil,
+                            media: mediaItem.map { [$0] } ?? []
+                        ))
+                    }
+                }
+                dated.sort { $0.0 < $1.0 }
+            }
             dated += paymentActivityRows(for: id)
             return mergeCallLogs(into: dated, id: id)
         }
@@ -2144,18 +2174,20 @@ final class SonarAppStore: ObservableObject {
     /// retained mesh reachability means the direct BLE leg already dropped, so
     /// the conversation continues over White Noise.
     func dmTransport(_ id: String) -> SNVia {
-        if marmotGroupId(id) != nil { return .internet }
-        return meshReachable(id) ? .mesh : .internet
+        if meshReachable(id) { return .mesh }
+        return .internet
     }
 
     func sendDm(_ id: String, _ text: String) {
+        if meshReachable(id) {
+            chatViewModel.sendPrivateMessage(text, to: PeerID(str: id))
+            return
+        }
         if let groupId = marmotGroupId(id) {
             marmot.send(text, to: groupId)
             return
         }
-        // Sonar peer out of Bluetooth range: continue over White Noise,
-        // creating the Marmot group on first send if it doesn't exist yet.
-        if let profile = resolvedSonarProfile(id), dmTransport(id) == .internet {
+        if let profile = resolvedSonarProfile(id) {
             sendOverMarmot(text, npub: profile.npub)
             return
         }
@@ -2335,7 +2367,7 @@ final class SonarAppStore: ObservableObject {
     /// Sonar peers require a direct connection; retained mesh reachability is
     /// still useful for plain bitchat relay but should not hold Sonar on BLE.
     private func meshReachable(_ id: String) -> Bool {
-        guard marmotGroupId(id) == nil else { return false }
+        guard !id.hasPrefix(Self.marmotIDPrefix) else { return false }
         let peerID = PeerID(str: id)
         guard !peerID.isGeoDM else { return false }
         let mesh = chatViewModel.meshService
