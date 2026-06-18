@@ -140,6 +140,7 @@ actual object SonarCore {
                         durationMs = m.durationMs?.toLong(),
                     )
                 },
+                state = if (it.mine) "Sent" else null,
             )
         }
     }

@@ -8,6 +8,7 @@
 
 import SwiftUI
 import BitLogger
+import CryptoKit
 import SonarCore
 
 /// UI state for Marmot (MLS-over-Nostr) secure chats — the White Noise
@@ -53,6 +54,16 @@ final class MarmotChatModel: ObservableObject {
     /// payment state.
     private var descriptorBolt12Offer: String?
     private static let optimisticIDPrefix = "optimistic-"
+    private static let failedOptimisticIDPrefix = "failed-"
+
+    static func stateText(for message: MarmotService.MarmotMessage) -> String? {
+        guard message.isMine else { return nil }
+        if message.id.hasPrefix(failedOptimisticIDPrefix) { return "Couldn't send" }
+        if message.id.hasPrefix(optimisticIDPrefix) {
+            return message.media.isEmpty ? "Sending" : "Uploading"
+        }
+        return "Sent"
+    }
 
     init(
         service: MarmotService = MarmotService(),
@@ -312,8 +323,16 @@ final class MarmotChatModel: ObservableObject {
         var merged = byGroup
         for (groupId, pending) in pendingOptimistic {
             let server = byGroup[groupId] ?? []
-            let survivors = pending.filter { opt in
-                !server.contains { $0.isMine && $0.content == opt.content }
+            var unmatchedServer = server
+            var survivors: [MarmotService.MarmotMessage] = []
+            for optimistic in pending {
+                if let match = unmatchedServer.firstIndex(where: {
+                    Self.serverMessage($0, matchesOptimistic: optimistic)
+                }) {
+                    unmatchedServer.remove(at: match)
+                } else {
+                    survivors.append(optimistic)
+                }
             }
             if survivors.isEmpty {
                 pendingOptimistic[groupId] = nil
@@ -323,6 +342,20 @@ final class MarmotChatModel: ObservableObject {
             }
         }
         return merged
+    }
+
+    private static func serverMessage(
+        _ server: MarmotService.MarmotMessage,
+        matchesOptimistic optimistic: MarmotService.MarmotMessage
+    ) -> Bool {
+        guard !optimistic.id.hasPrefix(failedOptimisticIDPrefix) else { return false }
+        guard server.isMine, server.content == optimistic.content else { return false }
+        guard !optimistic.media.isEmpty else { return server.media.isEmpty }
+        return optimistic.media.allSatisfy { pending in
+            server.media.contains {
+                $0.filename == pending.filename && $0.mimeType == pending.mimeType
+            }
+        }
     }
 
     func startChat(with peer: String) {
@@ -382,14 +415,59 @@ final class MarmotChatModel: ObservableObject {
 
     /// Send a media attachment (encrypt with the group key, upload the ciphertext
     /// to Blossom, publish the kind-445 with the imeta tag). Refreshes on success.
-    func sendMedia(groupId: String, data: Data, filename: String, mime: String, caption: String = "") {
+    func sendMedia(
+        groupId: String,
+        data: Data,
+        filename: String,
+        mime: String,
+        caption: String = "",
+        localPreviewURL: String? = nil,
+        onComplete: (() -> Void)? = nil,
+        onFailure: (() -> Void)? = nil
+    ) {
+        let echo = MarmotService.MarmotMessage(
+            id: Self.optimisticIDPrefix + UUID().uuidString,
+            senderNpub: npub ?? "",
+            content: caption,
+            createdAt: Date(),
+            isMine: true,
+            media: [
+                MarmotService.MarmotMedia(
+                    url: localPreviewURL ?? "pending-media-\(UUID().uuidString)",
+                    mimeType: mime,
+                    filename: filename,
+                    width: nil,
+                    height: nil,
+                    durationMs: nil
+                )
+            ]
+        )
+        pendingOptimistic[groupId, default: []].append(echo)
+        messagesByGroup[groupId, default: []].append(echo)
         Task {
             do {
+                guard await ensureConnected() else {
+                    throw MarmotService.ServiceError.notConnected
+                }
                 try await service.sendMedia(
                     groupId: groupId, data: data, filename: filename, mime: mime, caption: caption
                 )
+                onComplete?()
                 await refresh()
             } catch {
+                pendingOptimistic[groupId]?.removeAll { $0.id == echo.id }
+                let failed = MarmotService.MarmotMessage(
+                    id: Self.failedOptimisticIDPrefix + UUID().uuidString,
+                    senderNpub: echo.senderNpub,
+                    content: echo.content,
+                    createdAt: echo.createdAt,
+                    isMine: true,
+                    media: echo.media
+                )
+                pendingOptimistic[groupId, default: []].append(failed)
+                messagesByGroup[groupId, default: []].removeAll { $0.id == echo.id }
+                messagesByGroup[groupId, default: []].append(failed)
+                onFailure?()
                 self.errorText = Self.describe(error)
             }
         }
@@ -400,9 +478,18 @@ final class MarmotChatModel: ObservableObject {
         do {
             return try await service.fetchMedia(groupId: groupId, url: url)
         } catch {
-            self.errorText = Self.describe(error)
+            let description = Self.describe(error)
+            SecureLogger.warning("SonarMedia: Marmot fetchMedia failed group=\(groupId.prefix(12)) urlHash=\(Self.mediaLogId(for: url)) error=\(description)", category: .session)
+            self.errorText = description
             return nil
         }
+    }
+
+    private static func mediaLogId(for url: String) -> String {
+        SHA256.hash(data: Data(url.utf8))
+            .prefix(8)
+            .map { String(format: "%02x", $0) }
+            .joined()
     }
 
     /// Drive LIVE updates off the core's relay subscriptions: park on

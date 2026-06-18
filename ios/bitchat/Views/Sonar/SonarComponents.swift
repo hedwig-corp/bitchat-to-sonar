@@ -12,6 +12,9 @@
 
 import SwiftUI
 import WebKit
+#if canImport(BitLogger)
+import BitLogger
+#endif
 #if os(iOS)
 import UIKit
 import AVFoundation
@@ -480,6 +483,34 @@ struct SNBannerButton: View {
 
 // MARK: - Message bubble + list
 
+private struct SNMessageStatusFooter: View {
+    let stateText: String
+    let via: SNVia?
+
+    private var isPending: Bool {
+        stateText == "Sending" || stateText == "Uploading"
+    }
+
+    private var isFailed: Bool {
+        stateText == "Couldn't send"
+    }
+
+    var body: some View {
+        HStack(spacing: 3) {
+            if isPending {
+                ProgressView()
+                    .scaleEffect(0.55)
+                    .frame(width: 11, height: 11)
+            } else {
+                SNIcon(name: isFailed ? .x : .check, size: 11, weight: 2.6)
+            }
+            Text(verbatim: "\(stateText) · \(via?.label ?? "")")
+                .font(SonarTheme.uiFont(size: 11))
+        }
+        .foregroundColor(isFailed ? SonarTheme.danger : SonarTheme.text3)
+    }
+}
+
 struct SNMsgBubble: View {
     let m: SNMessage
     var showAuthor: Bool = false
@@ -609,12 +640,7 @@ struct SNMsgBubble: View {
                 }
             }
             if showState, let stateText = m.state {
-                HStack(spacing: 3) {
-                    SNIcon(name: .check, size: 11, weight: 2.6)
-                    Text(verbatim: "\(stateText) · \(m.via?.label ?? "")")
-                        .font(SonarTheme.uiFont(size: 11))
-                }
-                .foregroundColor(SonarTheme.text3)
+                SNMessageStatusFooter(stateText: stateText, via: m.via)
                 .padding(EdgeInsets(top: 3, leading: 4, bottom: 0, trailing: 4))
             }
         }
@@ -665,6 +691,7 @@ struct SNMsgList: View {
                                 SNMediaBubble(
                                     m: m,
                                     maxBubbleWidth: geo.size.width * 0.72,
+                                    showState: m.mine && i == msgs.count - 1,
                                     load: loadMedia
                                 )
                             } else if m.action {
@@ -755,14 +782,65 @@ let snCommands: [(String, String)] = [
 
 let snQuickEmojis: [String] = ["👍", "❤️", "😂", "🔥", "🙏", "👏", "🎉", "👀", "💯", "⚡"]
 
+private struct SNDecodedPlatformImage {
+    let image: Image
+    let size: CGSize
+}
+
 /// Decode a platform image (UIImage on iOS, NSImage on macOS) from raw bytes.
-func snPlatformImage(_ data: Data) -> Image? {
+private func snDecodedPlatformImage(_ data: Data) -> SNDecodedPlatformImage? {
     #if canImport(UIKit)
-    return UIImage(data: data).map { Image(uiImage: $0) }
+    guard let uiImage = UIImage(data: data) else { return nil }
+    return SNDecodedPlatformImage(image: Image(uiImage: uiImage), size: uiImage.size)
     #elseif canImport(AppKit)
-    return NSImage(data: data).map { Image(nsImage: $0) }
+    guard let nsImage = NSImage(data: data) else { return nil }
+    return SNDecodedPlatformImage(image: Image(nsImage: nsImage), size: nsImage.size)
     #else
     return nil
+    #endif
+}
+
+func snPlatformImage(_ data: Data) -> Image? {
+    snDecodedPlatformImage(data)?.image
+}
+
+private func snFittedMediaSize(_ size: CGSize, maxWidth: CGFloat, maxHeight: CGFloat) -> CGSize {
+    guard size.width > 0, size.height > 0 else {
+        return CGSize(width: maxWidth * 0.62, height: 150)
+    }
+    let scale = min(maxWidth / size.width, maxHeight / size.height)
+    return CGSize(width: max(1, size.width * scale), height: max(1, size.height * scale))
+}
+
+private extension Data {
+    var snLooksLikeGif: Bool {
+        count >= 6 &&
+        self[startIndex] == 0x47 &&
+        self[index(startIndex, offsetBy: 1)] == 0x49 &&
+        self[index(startIndex, offsetBy: 2)] == 0x46 &&
+        self[index(startIndex, offsetBy: 3)] == 0x38 &&
+        (self[index(startIndex, offsetBy: 4)] == 0x37 || self[index(startIndex, offsetBy: 4)] == 0x39) &&
+        self[index(startIndex, offsetBy: 5)] == 0x61
+    }
+}
+
+private func snLogMediaWarning(_ message: String) {
+    #if canImport(BitLogger)
+    SecureLogger.warning(message, category: .session)
+    #else
+    print(message)
+    #endif
+}
+
+private func snLogRecoveredUndecodableImage(_ item: SNMediaItem, bytes: Data) {
+    #if os(iOS)
+    if item.isImage {
+        if item.isGif, !bytes.snLooksLikeGif, UIImage(data: bytes) == nil {
+            snLogMediaWarning("SonarMediaView: image bytes recovered but GIF signature and UIImage decode failed bytes=\(bytes.count) name=\(item.filename) mime=\(item.mime); showing original file chip")
+        } else if !item.isGif, UIImage(data: bytes) == nil {
+            snLogMediaWarning("SonarMediaView: image bytes recovered but UIImage decode failed bytes=\(bytes.count) name=\(item.filename) mime=\(item.mime); showing original file chip")
+        }
+    }
     #endif
 }
 
@@ -773,13 +851,19 @@ func snPlatformImage(_ data: Data) -> Image? {
 struct SNMediaBubble: View {
     let m: SNMessage
     let maxBubbleWidth: CGFloat
+    var showState: Bool = false
     var load: ((SNMediaItem) async -> Data?)? = nil
 
     @State private var bytes: Data?
     @State private var failed = false
     @State private var viewerOpen = false
+    @State private var loadAttempt = 0
 
     private var item: SNMediaItem? { m.media.first }
+    private var loadKey: String {
+        guard let item else { return "" }
+        return [item.url, item.groupId, item.localPath ?? "", String(loadAttempt)].joined(separator: "|")
+    }
 
     var body: some View {
         #if os(iOS)
@@ -814,20 +898,34 @@ struct SNMediaBubble: View {
                 Text(verbatim: m.time)
                     .font(SonarTheme.uiFont(size: 10.5))
                     .foregroundColor(SonarTheme.text3)
+                if showState, let stateText = m.state {
+                    SNMessageStatusFooter(stateText: stateText, via: m.via)
+                }
             }
             if !m.mine { Spacer(minLength: 40) }
         }
         .padding(.horizontal, 2)
         .padding(.top, 7)
-        .task(id: item?.url) {
-            guard let item, bytes == nil, let load else { return }
-            if let d = await load(item) { bytes = d } else { failed = true }
+        .task(id: loadKey) {
+            bytes = nil
+            failed = false
+            guard let item else { return }
+            guard let load else {
+                failed = true
+                return
+            }
+            if let d = await load(item) {
+                bytes = d
+                snLogRecoveredUndecodableImage(item, bytes: d)
+            } else {
+                failed = true
+            }
         }
     }
 
     @ViewBuilder private var content: some View {
         if let item, item.isImage {
-            if let bytes, item.isGif {
+            if let bytes, item.isGif, bytes.snLooksLikeGif {
                 SNGifView(data: bytes)
                     .frame(width: maxBubbleWidth, height: 220)
                     .clipShape(RoundedRectangle(cornerRadius: 18))
@@ -836,23 +934,41 @@ struct SNMediaBubble: View {
                     }
                     .contentShape(RoundedRectangle(cornerRadius: 18))
                     .onTapGesture { viewerOpen = true }
-            } else if let bytes, let image = snPlatformImage(bytes) {
-                image
+            } else if let bytes, let decoded = snDecodedPlatformImage(bytes) {
+                let size = snFittedMediaSize(decoded.size, maxWidth: maxBubbleWidth, maxHeight: 300)
+                decoded.image
                     .resizable()
                     .aspectRatio(contentMode: .fit)
-                    .frame(maxWidth: maxBubbleWidth, maxHeight: 300)
+                    .frame(width: size.width, height: size.height)
+                    .background(SonarTheme.surface2)
                     .clipShape(RoundedRectangle(cornerRadius: 18))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 18)
+                            .stroke(Color.black.opacity(0.08), lineWidth: 1)
+                    )
                     .contentShape(RoundedRectangle(cornerRadius: 18))
                     .onTapGesture { viewerOpen = true }
+            } else if bytes != nil {
+                fileChip(for: item)
             } else {
                 RoundedRectangle(cornerRadius: 18)
                     .fill(SonarTheme.surface2)
                     .frame(width: maxBubbleWidth * 0.62, height: 150)
                     .overlay {
                         if failed {
-                            Text(verbatim: "Couldn't load image")
-                                .font(SonarTheme.uiFont(size: 12))
-                                .foregroundColor(SonarTheme.text3)
+                            VStack(spacing: 8) {
+                                Text(verbatim: "Couldn't load image")
+                                    .font(SonarTheme.uiFont(size: 12))
+                                    .foregroundColor(SonarTheme.text3)
+                                Button {
+                                    loadAttempt += 1
+                                } label: {
+                                    Text(verbatim: "Retry")
+                                        .font(SonarTheme.uiFont(size: 12, weight: .semibold))
+                                        .foregroundColor(SonarTheme.accent)
+                                }
+                                .buttonStyle(.plain)
+                            }
                         } else {
                             ProgressView()
                         }
@@ -868,28 +984,32 @@ struct SNMediaBubble: View {
         } else if let item, item.mime.hasPrefix("audio/") {
             SNAudioBubble(bytes: bytes, seed: item.filename, mine: m.mine, via: m.via ?? .mesh)
         } else if let item {
-            HStack(spacing: 10) {
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(SonarTheme.accent.opacity(0.18))
-                    .frame(width: 34, height: 34)
-                    .overlay(Text(verbatim: "·").font(SonarTheme.uiFont(size: 18, weight: .bold)).foregroundColor(SonarTheme.accent))
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(verbatim: item.filename)
-                        .font(SonarTheme.uiFont(size: 13.5, weight: .semibold))
-                        .foregroundColor(SonarTheme.text)
-                        .lineLimit(1)
-                    Text(verbatim: item.mime)
-                        .font(SonarTheme.uiFont(size: 11))
-                        .foregroundColor(SonarTheme.text3)
-                }
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 9)
-            .frame(maxWidth: maxBubbleWidth, alignment: .leading)
-            .background(RoundedRectangle(cornerRadius: 14).fill(SonarTheme.surface2))
-            .contentShape(RoundedRectangle(cornerRadius: 14))
-            .onTapGesture { viewerOpen = true }
+            fileChip(for: item)
         }
+    }
+
+    private func fileChip(for item: SNMediaItem) -> some View {
+        HStack(spacing: 10) {
+            RoundedRectangle(cornerRadius: 8)
+                .fill(SonarTheme.accent.opacity(0.18))
+                .frame(width: 34, height: 34)
+                .overlay(Text(verbatim: "·").font(SonarTheme.uiFont(size: 18, weight: .bold)).foregroundColor(SonarTheme.accent))
+            VStack(alignment: .leading, spacing: 1) {
+                Text(verbatim: item.filename)
+                    .font(SonarTheme.uiFont(size: 13.5, weight: .semibold))
+                    .foregroundColor(SonarTheme.text)
+                    .lineLimit(1)
+                Text(verbatim: item.mime)
+                    .font(SonarTheme.uiFont(size: 11))
+                    .foregroundColor(SonarTheme.text3)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .frame(maxWidth: maxBubbleWidth, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 14).fill(SonarTheme.surface2))
+        .contentShape(RoundedRectangle(cornerRadius: 14))
+        .onTapGesture { viewerOpen = true }
     }
 }
 
@@ -907,6 +1027,7 @@ struct SNMediaViewer: View {
     @State private var chrome = true
     @State private var status: String?
     @State private var tempURLs: [URL] = []
+    @State private var loadAttempt = 0
 
     #if os(iOS)
     @State private var shareItems: [Any] = []
@@ -927,12 +1048,18 @@ struct SNMediaViewer: View {
                     .transition(.opacity)
             }
         }
-        .task(id: item.url + (item.localPath ?? "")) {
+        .task(id: [item.url, item.groupId, item.localPath ?? "", String(loadAttempt)].joined(separator: "|")) {
+            failed = false
+            status = nil
             if let initialBytes {
                 bytes = initialBytes
                 return
             }
-            guard bytes == nil, let load else { return }
+            bytes = nil
+            guard let load else {
+                failed = true
+                return
+            }
             if let data = await load(item) {
                 bytes = data
             } else {
@@ -1003,6 +1130,17 @@ struct SNMediaViewer: View {
                     Text(verbatim: "Couldn't load media")
                         .font(SonarTheme.uiFont(size: 14, weight: .semibold))
                         .foregroundColor(.white.opacity(0.82))
+                    Button {
+                        loadAttempt += 1
+                    } label: {
+                        Text(verbatim: "Retry")
+                            .font(SonarTheme.uiFont(size: 14, weight: .semibold))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 18)
+                            .padding(.vertical, 9)
+                            .background(Capsule().fill(Color.white.opacity(0.16)))
+                    }
+                    .buttonStyle(.plain)
                 } else {
                     ProgressView()
                 }
@@ -1071,13 +1209,25 @@ struct SNMediaViewer: View {
     private func saveMedia() {
         #if os(iOS)
         if item.mime.hasPrefix("image/"), let data = bytes {
+            guard UIImage(data: data) != nil else {
+                snLogMediaWarning("SonarMediaView: Photos save skipped because image decode failed bytes=\(data.count) name=\(item.filename) mime=\(item.mime); exporting original file")
+                exportOriginalFile()
+                return
+            }
             let resourceOptions = PHAssetResourceCreationOptions()
             resourceOptions.originalFilename = safeFilename
             PHPhotoLibrary.shared().performChanges({
                 let request = PHAssetCreationRequest.forAsset()
                 request.addResource(with: .photo, data: data, options: resourceOptions)
             }) { ok, _ in
-                DispatchQueue.main.async { status = ok ? "Saved to Photos" : "Couldn't save media" }
+                DispatchQueue.main.async {
+                    if ok {
+                        status = "Saved to Photos"
+                    } else {
+                        snLogMediaWarning("SonarMediaView: Photos image save failed name=\(item.filename) mime=\(item.mime); exporting original file")
+                        exportOriginalFile()
+                    }
+                }
             }
         } else if item.mime.hasPrefix("video/"), let url = writeTempFile(track: false) {
             let resourceOptions = PHAssetResourceCreationOptions()
@@ -1087,7 +1237,14 @@ struct SNMediaViewer: View {
                 request.addResource(with: .video, fileURL: url, options: resourceOptions)
             }) { ok, _ in
                 try? FileManager.default.removeItem(at: url)
-                DispatchQueue.main.async { status = ok ? "Saved to Photos" : "Couldn't save media" }
+                DispatchQueue.main.async {
+                    if ok {
+                        status = "Saved to Photos"
+                    } else {
+                        snLogMediaWarning("SonarMediaView: Photos video save failed name=\(item.filename) mime=\(item.mime); exporting original file")
+                        exportOriginalFile()
+                    }
+                }
             }
         } else {
             exportMedia()
@@ -1120,6 +1277,11 @@ struct SNMediaViewer: View {
         #else
         saveMedia()
         #endif
+    }
+
+    private func exportOriginalFile() {
+        status = "Choose where to save"
+        exportMedia()
     }
 
     private func openMedia() {

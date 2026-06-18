@@ -1239,7 +1239,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun openChat(chat: SonarChat) {
         push(Screen.Chat(chat.id, chatTitle(chat)))
         scope.launch {
-            messages = SonarCore.messages(chat.id)
+            messages = mergePendingMediaUploads(chat.id, SonarCore.messages(chat.id))
             processPayLines(chat.id, messages)
         }
     }
@@ -1349,7 +1349,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         scope.launch {
             try {
                 SonarCore.send(chatId, t)
-                messages = SonarCore.messages(chatId)
+                messages = mergePendingMediaUploads(chatId, SonarCore.messages(chatId))
                 processPayLines(chatId, messages)
                 processCallLines(chatId, messages)
             } catch (e: Throwable) {
@@ -1361,6 +1361,87 @@ class SonarAppState(private val scope: CoroutineScope) {
     // ── Media (White Noise / Marmot MIP-04) ──
     /** Decrypted-media cache (raw bytes), keyed by the ciphertext's Blossom URL. */
     private val mediaCache = mutableMapOf<String, ByteArray>()
+    private val pendingMediaUrlPrefix = "pending-media-"
+
+    private data class PendingMediaUpload(
+        val message: SonarMsg,
+        val data: ByteArray,
+        val filename: String,
+        val mime: String,
+        val startedAtSecs: Long,
+        val pendingUrl: String,
+        val existingMediaUrls: Set<String>,
+        val completedOrder: Long? = null,
+    )
+
+    private val pendingMediaUploads = mutableMapOf<String, MutableList<PendingMediaUpload>>()
+    private var pendingMediaCompletionOrder = 0L
+
+    private fun rememberPendingMediaUpload(chatId: String, upload: PendingMediaUpload) {
+        val pending = pendingMediaUploads.getOrPut(chatId) { mutableListOf() }
+        pending.removeAll { it.message.id == upload.message.id }
+        pending += upload
+    }
+
+    private fun markPendingMediaCompleted(chatId: String, pendingId: String) {
+        val pending = pendingMediaUploads[chatId] ?: return
+        val index = pending.indexOfFirst { it.message.id == pendingId }
+        if (index >= 0 && pending[index].completedOrder == null) {
+            pendingMediaCompletionOrder += 1
+            pending[index] = pending[index].copy(completedOrder = pendingMediaCompletionOrder)
+        }
+    }
+
+    private fun markPendingMediaFailed(chatId: String, pendingId: String) {
+        val pending = pendingMediaUploads[chatId] ?: return
+        val index = pending.indexOfFirst { it.message.id == pendingId }
+        if (index >= 0) {
+            val upload = pending[index]
+            pending[index] = upload.copy(message = upload.message.copy(state = "Couldn't send"))
+        }
+    }
+
+    private fun mergePendingMediaUploads(chatId: String, published: List<SonarMsg>): List<SonarMsg> {
+        val pending = pendingMediaUploads[chatId] ?: return published.sortedBy { it.tsSecs }
+        val matchedIds = mutableSetOf<String>()
+        val usedCanonicalUrls = mutableSetOf<String>()
+        val completedUploads = pending
+            .filter { it.message.state != "Couldn't send" && it.completedOrder != null }
+            .sortedBy { it.completedOrder }
+        for (upload in completedUploads) {
+            val matched = cacheUploadedMediaBytes(
+                published,
+                upload.data,
+                upload.filename,
+                upload.mime,
+                upload.startedAtSecs,
+                upload.pendingUrl,
+                upload.existingMediaUrls,
+                usedCanonicalUrls,
+            )
+            if (matched) matchedIds += upload.message.id
+        }
+        val survivors = pending.filterNot { it.message.id in matchedIds }
+        if (survivors.isEmpty()) {
+            pendingMediaUploads.remove(chatId)
+            return published.sortedBy { it.tsSecs }
+        }
+        pendingMediaUploads[chatId] = survivors.toMutableList()
+        val survivorMessages = survivors.map { it.message }
+        val survivorIds = survivorMessages.mapTo(mutableSetOf()) { it.id }
+        return (published.filterNot { it.id in survivorIds } + survivorMessages)
+            .distinctBy { it.id }
+            .sortedBy { it.tsSecs }
+    }
+
+    private suspend fun existingPublishedMediaUrls(groupId: String): Set<String> =
+        runCatching { SonarCore.messages(groupId) }
+            .getOrDefault(messages)
+            .asSequence()
+            .flatMap { it.media.asSequence() }
+            .map { it.url }
+            .filterNot { it.startsWith(pendingMediaUrlPrefix) }
+            .toSet()
 
     /** The Marmot group id backing [chatId]: the chat id itself for a White Noise
      *  chat, or the Sonar peer's group for a mesh-routed DM. null ⇒ no group yet. */
@@ -1378,19 +1459,96 @@ class SonarAppState(private val scope: CoroutineScope) {
         scope.launch {
             val groupId = resolveMarmotGroupId(chatId)
             if (groupId == null) { toast = "Start the secure chat first, then send a photo."; return@launch }
+            val pendingId = "pending-media-${randomMeshId()}"
+            val pendingUrl = "$pendingMediaUrlPrefix${randomMeshId()}"
+            val startedAtSecs = SonarClock.nowSecs()
+            val existingMediaUrls = existingPublishedMediaUrls(groupId)
+            val pending = SonarMsg(
+                id = pendingId,
+                senderNpub = npub,
+                content = "",
+                mine = true,
+                tsSecs = startedAtSecs,
+                viaInternet = true,
+                media = listOf(SonarMedia(pendingUrl, mime, filename, null, null, null)),
+                state = "Uploading",
+            )
+            rememberPendingMediaUpload(
+                chatId,
+                PendingMediaUpload(
+                    message = pending,
+                    data = data,
+                    filename = filename,
+                    mime = mime,
+                    startedAtSecs = startedAtSecs,
+                    pendingUrl = pendingUrl,
+                    existingMediaUrls = existingMediaUrls,
+                )
+            )
+            mediaCache[pendingUrl] = data
+            if ((screen as? Screen.Chat)?.id == chatId) {
+                messages = mergePendingMediaUploads(chatId, messages)
+            }
             try {
                 SonarCore.sendMedia(groupId, data, filename, mime, "")
+                markPendingMediaCompleted(chatId, pendingId)
                 // Refresh the open conversation so the sent image shows.
                 (screen as? Screen.Chat)?.let { sc ->
                     if (sc.id == chatId) {
-                        if (isMeshChat(chatId)) refreshOpenDm(meshPeerId(chatId))
-                        else { messages = SonarCore.messages(groupId); processPayLines(chatId, messages) }
+                        if (isMeshChat(chatId)) {
+                            val peerId = meshPeerId(chatId)
+                            val mesh = meshChats[peerId].orEmpty()
+                            val wn = marmotMessagesForPeer(peerId)
+                            val merged = mergePendingMediaUploads(chatId, mesh + wn)
+                            messages = merged
+                            processPayLines(chatId, merged)
+                        } else {
+                            val fresh = SonarCore.messages(groupId)
+                            messages = mergePendingMediaUploads(chatId, fresh)
+                            processPayLines(chatId, messages)
+                        }
                     }
                 }
             } catch (e: Throwable) {
+                markPendingMediaFailed(chatId, pendingId)
+                if ((screen as? Screen.Chat)?.id == chatId) {
+                    messages = mergePendingMediaUploads(chatId, messages)
+                }
                 toast = "couldn't send photo: ${e.message}"
             }
         }
+    }
+
+    private fun cacheUploadedMediaBytes(
+        messages: List<SonarMsg>,
+        data: ByteArray,
+        filename: String,
+        mime: String,
+        startedAtSecs: Long,
+        pendingUrl: String,
+        existingMediaUrls: Set<String>,
+        usedCanonicalUrls: MutableSet<String>,
+    ): Boolean {
+        val published = messages.asSequence()
+            .filter { it.mine }
+            .filter { it.tsSecs >= startedAtSecs }
+            .sortedBy { it.tsSecs }
+            .flatMap { it.media.asSequence() }
+            .firstOrNull {
+                it.filename == filename &&
+                    it.mimeType == mime &&
+                    !it.url.startsWith(pendingMediaUrlPrefix) &&
+                    mediaCache[it.url] == null &&
+                    it.url !in existingMediaUrls &&
+                    it.url !in usedCanonicalUrls
+            }
+        if (published != null) {
+            usedCanonicalUrls += published.url
+            mediaCache[published.url] = data
+            mediaCache.remove(pendingUrl)
+            return true
+        }
+        return false
     }
 
     /** Send a recorded voice note (AAC .m4a bytes) to a White Noise chat — same
@@ -1400,12 +1558,62 @@ class SonarAppState(private val scope: CoroutineScope) {
         scope.launch {
             val groupId = resolveMarmotGroupId(chatId)
             if (groupId == null) { toast = "Start the secure chat first to send a voice note."; return@launch }
+            val filename = "vn-${(1000..99999).random()}.m4a"
+            val mime = "audio/mp4"
+            val pendingId = "pending-media-${randomMeshId()}"
+            val pendingUrl = "$pendingMediaUrlPrefix${randomMeshId()}"
+            val startedAtSecs = SonarClock.nowSecs()
+            val existingMediaUrls = existingPublishedMediaUrls(groupId)
+            val pending = SonarMsg(
+                id = pendingId,
+                senderNpub = npub,
+                content = "",
+                mine = true,
+                tsSecs = startedAtSecs,
+                viaInternet = true,
+                media = listOf(SonarMedia(pendingUrl, mime, filename, null, null, null)),
+                state = "Uploading",
+            )
+            rememberPendingMediaUpload(
+                chatId,
+                PendingMediaUpload(
+                    message = pending,
+                    data = bytes,
+                    filename = filename,
+                    mime = mime,
+                    startedAtSecs = startedAtSecs,
+                    pendingUrl = pendingUrl,
+                    existingMediaUrls = existingMediaUrls,
+                )
+            )
+            mediaCache[pendingUrl] = bytes
+            if ((screen as? Screen.Chat)?.id == chatId) {
+                messages = mergePendingMediaUploads(chatId, messages)
+            }
             try {
-                SonarCore.sendMedia(groupId, bytes, "vn-${(1000..99999).random()}.m4a", "audio/mp4", "")
+                SonarCore.sendMedia(groupId, bytes, filename, mime, "")
+                markPendingMediaCompleted(chatId, pendingId)
                 (screen as? Screen.Chat)?.let { sc ->
-                    if (sc.id == chatId) { messages = SonarCore.messages(groupId); processPayLines(chatId, messages) }
+                    if (sc.id == chatId) {
+                        if (isMeshChat(chatId)) {
+                            val peerId = meshPeerId(chatId)
+                            val mesh = meshChats[peerId].orEmpty()
+                            val wn = marmotMessagesForPeer(peerId)
+                            val merged = mergePendingMediaUploads(chatId, mesh + wn)
+                            messages = merged
+                            processPayLines(chatId, merged)
+                        } else {
+                            val fresh = SonarCore.messages(groupId)
+                            messages = mergePendingMediaUploads(chatId, fresh)
+                            processPayLines(chatId, messages)
+                        }
+                    }
                 }
             } catch (e: Throwable) {
+                markPendingMediaFailed(chatId, pendingId)
+                if ((screen as? Screen.Chat)?.id == chatId) {
+                    messages = mergePendingMediaUploads(chatId, messages)
+                }
                 toast = "couldn't send voice note: ${e.message}"
             }
         }
@@ -1579,7 +1787,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 SonarCore.addGroupMembers(chatId, cleanMembers)
                 refreshChats()
                 if ((screen as? Screen.Chat)?.id == chatId) {
-                    messages = SonarCore.messages(chatId)
+                    messages = mergePendingMediaUploads(chatId, SonarCore.messages(chatId))
                     processPayLines(chatId, messages)
                 }
             } catch (e: Throwable) {
@@ -1598,7 +1806,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 SonarCore.removeGroupMembers(chatId, cleanMembers)
                 refreshChats()
                 if ((screen as? Screen.Chat)?.id == chatId) {
-                    messages = SonarCore.messages(chatId)
+                    messages = mergePendingMediaUploads(chatId, SonarCore.messages(chatId))
                     processPayLines(chatId, messages)
                 }
             } catch (e: Throwable) {
@@ -1714,7 +1922,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         if ((screen as? Screen.Chat)?.id != meshChatId(peerId)) return
         val mesh = meshChats[peerId].orEmpty()
         val wn = marmotMessagesForPeer(peerId)
-        val merged = (mesh + wn).distinctBy { it.id }.sortedBy { it.tsSecs }
+        val merged = mergePendingMediaUploads(meshChatId(peerId), mesh + wn)
         messages = merged
         processPayLines(meshChatId(peerId), merged)
     }
@@ -1949,7 +2157,10 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // both legs (mesh + White Noise) via refreshOpenDm.
                 (screen as? Screen.Chat)?.let {
                     if (isMeshChat(it.id)) refreshOpenDm(meshPeerId(it.id))
-                    else { messages = SonarCore.messages(it.id); processPayLines(it.id, messages) }
+                    else {
+                        messages = mergePendingMediaUploads(it.id, SonarCore.messages(it.id))
+                        processPayLines(it.id, messages)
+                    }
                 }
                 (screen as? Screen.Channel)?.let { refreshChannel(it.geohash) }
                 (screen as? Screen.GeoDm)?.let { refreshGeoDm(it.geohash, it.peerHex) }
