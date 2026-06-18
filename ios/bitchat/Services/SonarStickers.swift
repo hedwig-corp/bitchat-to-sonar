@@ -9,6 +9,7 @@
 // For more information, see <https://unlicense.org>
 //
 
+import CryptoKit
 import Foundation
 
 enum SonarStickers {
@@ -196,6 +197,10 @@ final class SonarStickerStore {
         packsByCoordinate.values.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
     }
 
+    var hasInstalledPacks: Bool {
+        !packsByCoordinate.isEmpty
+    }
+
     func install(_ pack: SonarStickerPack) {
         packsByCoordinate[pack.address.coordinate] = pack
     }
@@ -209,6 +214,44 @@ final class SonarStickerStore {
         guard let sticker = pack.sticker(shortcode: stickerRef.shortcode) else { return .missingSticker }
         guard sticker.sha256 == stickerRef.plaintextSha256 else { return .hashMismatch }
         return .resolved(sticker)
+    }
+
+    func ref(for sticker: SonarSticker, in pack: SonarStickerPack) -> SonarStickerRef? {
+        guard let installed = packsByCoordinate[pack.address.coordinate],
+              installed.sticker(shortcode: sticker.shortcode) == sticker
+        else { return nil }
+        return SonarStickerRef(
+            pack: installed.address,
+            shortcode: sticker.shortcode,
+            plaintextSha256: sticker.sha256
+        )
+    }
+}
+
+final class SonarStickerAssetCache {
+    static let defaultMaxStickerBytes = 1024 * 1024
+
+    private let maxStickerBytes: Int
+    private var bytesByHash: [String: Data] = [:]
+
+    init(maxStickerBytes: Int = defaultMaxStickerBytes) {
+        self.maxStickerBytes = maxStickerBytes
+    }
+
+    func storeVerified(_ data: Data, for sticker: SonarSticker) -> Bool {
+        guard data.count <= maxStickerBytes,
+              Self.sha256Hex(data) == sticker.sha256
+        else { return false }
+        bytesByHash[sticker.sha256] = data
+        return true
+    }
+
+    func data(for sticker: SonarSticker) -> Data? {
+        bytesByHash[sticker.sha256]
+    }
+
+    private static func sha256Hex(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 }
 

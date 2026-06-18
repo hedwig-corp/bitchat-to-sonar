@@ -798,6 +798,42 @@ struct SNStickerBubble: View {
     }
 }
 
+struct SNStickerPickerContent: View {
+    let packs: [SonarStickerPack]
+    let onPick: (SonarStickerPack, SonarSticker) -> Void
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 0) {
+                if packs.isEmpty {
+                    Text("No stickers installed")
+                        .font(SonarTheme.uiFont(size: 13.5))
+                        .foregroundColor(SonarTheme.text2)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 14)
+                } else {
+                    ForEach(packs, id: \.address.coordinate) { pack in
+                        Text(verbatim: pack.title)
+                            .font(SonarTheme.uiFont(size: 12, weight: .bold))
+                            .foregroundColor(SonarTheme.text3)
+                            .padding(EdgeInsets(top: 10, leading: 10, bottom: 4, trailing: 10))
+                        ForEach(pack.stickers, id: \.sha256) { sticker in
+                            SNActionRow(
+                                icon: .smile,
+                                label: sticker.alt ?? sticker.shortcode,
+                                desc: sticker.emoji ?? pack.title
+                            ) {
+                                onPick(pack, sticker)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .frame(maxHeight: 430)
+    }
+}
+
 // MARK: - Call log row (call.jsx CallLog / theme.css .call-log)
 
 /// Compact, centered surface2 pill shown inline after a call ends. Green

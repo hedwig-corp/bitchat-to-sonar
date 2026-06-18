@@ -1,6 +1,7 @@
 package chat.bitchat.sonar
 
 import kotlin.test.Test
+import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
@@ -116,6 +117,33 @@ class StickersTest {
             SonarStickerResolution(SonarStickerResolutionState.HashMismatch),
             store.resolve(mismatchedHash),
         )
+    }
+
+    @Test
+    fun sendableRefsMustComeFromInstalledPacks() {
+        val store = SonarStickerStore()
+        val pack = fixturePack()
+        val sticker = assertNotNull(pack.sticker("cat_wave"))
+
+        assertNull(store.refFor(sticker, pack))
+
+        assertTrue(store.install(pack))
+        val stickerRef = assertNotNull(store.refFor(sticker, pack))
+
+        assertEquals(SonarStickerRef(pack.address, sticker.shortcode, sticker.sha256), stickerRef)
+        assertNull(store.refFor(sticker.copy(alt = "edited locally"), pack))
+    }
+
+    @Test
+    fun byteCacheStoresOnlyHashVerifiedBoundedStickerBytes() {
+        val abcHash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        val sticker = fixtureSticker("abc", abcHash)
+        val cache = SonarStickerByteCache(maxStickerBytes = 3)
+
+        assertTrue(cache.putVerified(sticker, "abc".encodeToByteArray()))
+        assertContentEquals("abc".encodeToByteArray(), cache.get(sticker))
+        assertFalse(cache.putVerified(sticker, "abcd".encodeToByteArray()))
+        assertFalse(cache.putVerified(sticker.copy(sha256 = hashA), "abc".encodeToByteArray()))
     }
 
     private fun fixtureAddress(): SonarStickerPackAddress =

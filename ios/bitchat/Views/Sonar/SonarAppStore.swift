@@ -1939,6 +1939,25 @@ final class SonarAppStore: ObservableObject {
         chatViewModel.sendPrivateMessage(text, to: PeerID(str: id))
     }
 
+    func canSendStickers(_ id: String) -> Bool {
+        SonarStickers.isEnabled() && stickerStore.hasInstalledPacks && stickerMarmotGroupId(id) != nil
+    }
+
+    func sendSticker(_ id: String, pack: SonarStickerPack, sticker: SonarSticker) {
+        guard SonarStickers.isEnabled() else { return }
+        guard let stickerRef = stickerStore.ref(for: sticker, in: pack) else { return }
+        guard let groupId = stickerMarmotGroupId(id) else { return }
+        marmot.send(SonarStickers.buildChatMessage(stickerRef), to: groupId)
+    }
+
+    private func stickerMarmotGroupId(_ id: String) -> String? {
+        if let groupId = marmotGroupId(id) { return groupId }
+        guard let profile = resolvedSonarProfile(id),
+              let group = marmotGroup(forNpub: profile.npub)
+        else { return nil }
+        return group.id
+    }
+
     private func sendOverMarmot(_ text: String, npub: String) {
         if let group = marmotGroup(forNpub: npub) {
             marmot.send(text, to: group.id)

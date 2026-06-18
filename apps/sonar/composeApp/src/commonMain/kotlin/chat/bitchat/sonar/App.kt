@@ -583,6 +583,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     var addSheet by remember { mutableStateOf(false) }
     var addPeopleSheet by remember { mutableStateOf(false) }
     var removePeopleSheet by remember { mutableStateOf(false) }
+    var stickerSheet by remember { mutableStateOf(false) }
     var mediaViewer by remember { mutableStateOf<SonarMedia?>(null) }
     val mediaActions = rememberMediaActions()
     val pickPhoto = rememberPhotoPicker { bytes, name, mime ->
@@ -893,11 +894,21 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         onRemovePeople = { addSheet = false; removePeopleSheet = true },
         onClose = { addSheet = false },
         canSendPhoto = state.canSendMedia(screen.id),
+        canSendStickers = state.canSendStickers(screen.id),
         canSendPayment = !state.isMultiMemberChat(screen.id),
         canVerify = !state.isMultiMemberChat(screen.id),
         canShareLocation = !state.isMultiMemberChat(screen.id),
         canManageGroup = isGroup,
-        onPhoto = { addSheet = false; pickPhoto() }
+        onPhoto = { addSheet = false; pickPhoto() },
+        onSticker = { addSheet = false; stickerSheet = true }
+    )
+    if (stickerSheet) StickerPickerSheet(
+        packs = state.stickerStore.installedPacks,
+        onPick = { pack, sticker ->
+            stickerSheet = false
+            state.sendSticker(screen.id, pack, sticker)
+        },
+        onClose = { stickerSheet = false },
     )
     if (addPeopleSheet) GroupAddPeopleSheet(
         state = state,
@@ -940,11 +951,13 @@ private fun AddToMessageSheet(
     onRemovePeople: () -> Unit,
     onClose: () -> Unit,
     canSendPhoto: Boolean = false,
+    canSendStickers: Boolean = false,
     canSendPayment: Boolean = true,
     canVerify: Boolean = true,
     canShareLocation: Boolean = true,
     canManageGroup: Boolean = false,
     onPhoto: () -> Unit = {},
+    onSticker: () -> Unit = {},
 ) {
     val s = sonar
     Box(
@@ -962,6 +975,9 @@ private fun AddToMessageSheet(
                 if (canSendPhoto) {
                     ActionRow(SNIconName.Lock, "Send photo or GIF", "Encrypted end-to-end over White Noise", onPhoto)
                 }
+                if (canSendStickers) {
+                    ActionRow(SNIconName.Smile, "Send sticker", "From your installed packs", onSticker)
+                }
                 if (canSendPayment) ActionRow(SNIconName.Coin, "Send bitcoin", "Instant over Lightning", onBitcoin)
                 if (canShareLocation) ActionRow(SNIconName.NavArrow, "Share location", "Only $peerName will see it", onLocation)
                 if (canManageGroup) {
@@ -970,6 +986,46 @@ private fun AddToMessageSheet(
                 }
                 if (canVerify) ActionRow(SNIconName.Shield, "Verify safety number", "Confirm this chat is secure", onVerify)
                 ActionRow(SNIconName.People, "Reactions", "A little fun, no noise", onReactions)
+            }
+        }
+    }
+}
+
+@Composable
+private fun StickerPickerSheet(
+    packs: List<SonarStickerPack>,
+    onPick: (SonarStickerPack, SonarSticker) -> Unit,
+    onClose: () -> Unit,
+) {
+    val s = sonar
+    Box(
+        Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
+        contentAlignment = Alignment.BottomCenter
+    ) {
+        Surface(color = s.surface, shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)) {
+            Column(
+                Modifier.fillMaxWidth().heightIn(max = 560.dp)
+                    .verticalScroll(rememberScrollState())
+                    .padding(start = 20.dp, end = 20.dp, top = 18.dp, bottom = 20.dp)
+            ) {
+                Text("Stickers", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(8.dp))
+                packs.forEach { pack ->
+                    Text(
+                        pack.title,
+                        color = s.text3,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(start = 4.dp, top = 10.dp, bottom = 4.dp),
+                    )
+                    pack.stickers.forEach { sticker ->
+                        ActionRow(
+                            SNIconName.Smile,
+                            sticker.alt ?: sticker.shortcode,
+                            sticker.emoji ?: sticker.mime,
+                        ) { onPick(pack, sticker) }
+                    }
+                }
             }
         }
     }

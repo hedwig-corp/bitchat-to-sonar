@@ -1457,6 +1457,52 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** True if [chatId] can carry media (an existing Marmot group backs it). */
     fun canSendMedia(chatId: String): Boolean = resolveMarmotGroupId(chatId) != null
 
+    fun canSendStickers(chatId: String): Boolean =
+        stickersEnabled && stickerStore.hasInstalledPacks && resolveMarmotGroupId(chatId) != null
+
+    fun sendSticker(chatId: String, pack: SonarStickerPack, sticker: SonarSticker) {
+        if (!stickersEnabled) return
+        val stickerRef = stickerStore.refFor(sticker, pack)
+        if (stickerRef == null) {
+            toast = "Sticker is no longer installed."
+            return
+        }
+        val message = SonarStickers.buildChatMessage(stickerRef)
+        if (message == null) {
+            toast = "Sticker cannot be sent."
+            return
+        }
+        val groupId = resolveMarmotGroupId(chatId)
+        if (groupId == null) {
+            toast = "Start the secure chat first, then send a sticker."
+            return
+        }
+        scope.launch {
+            try {
+                SonarCore.send(groupId, message)
+                refreshOpenStickerChat(chatId, groupId)
+            } catch (e: Throwable) {
+                toast = "couldn't send sticker: ${e.message}"
+            }
+        }
+    }
+
+    private suspend fun refreshOpenStickerChat(chatId: String, groupId: String) {
+        val current = screen as? Screen.Chat ?: return
+        if (current.id != chatId) return
+        if (isMeshChat(chatId)) {
+            val peerId = meshPeerId(chatId)
+            val merged = mergePendingMediaUploads(chatId, meshChats[peerId].orEmpty() + marmotMessagesForPeer(peerId))
+            messages = merged
+            processPayLines(chatId, merged)
+            processCallLines(chatId, merged)
+        } else {
+            messages = mergePendingMediaUploads(chatId, SonarCore.messages(groupId))
+            processPayLines(chatId, messages)
+            processCallLines(chatId, messages)
+        }
+    }
+
     /** Send an image to a White Noise chat: encrypt + Blossom upload + publish. */
     fun sendImage(chatId: String, data: ByteArray, filename: String, mime: String) {
         scope.launch {

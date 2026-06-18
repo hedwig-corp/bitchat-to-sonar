@@ -118,6 +118,47 @@ struct SonarStickersTests {
         #expect(store.resolve(mismatchedHash) == .hashMismatch)
     }
 
+    @Test func sendableRefsMustComeFromInstalledPacks() throws {
+        let store = SonarStickerStore()
+        let pack = try #require(fixturePack())
+        let sticker = try #require(pack.sticker(shortcode: "cat_wave"))
+
+        #expect(store.ref(for: sticker, in: pack) == nil)
+
+        store.install(pack)
+        let stickerRef = try #require(store.ref(for: sticker, in: pack))
+
+        #expect(stickerRef == SonarStickerRef(
+            pack: pack.address,
+            shortcode: sticker.shortcode,
+            plaintextSha256: sticker.sha256
+        ))
+        let editedSticker = try #require(SonarSticker(
+            shortcode: sticker.shortcode,
+            url: "https://blossom.example/stickers/\(hashB)/cat-edited.webp",
+            sha256: hashB,
+            mime: sticker.mime,
+            width: sticker.width,
+            height: sticker.height,
+            alt: sticker.alt,
+            emoji: sticker.emoji
+        ))
+        #expect(store.ref(for: editedSticker, in: pack) == nil)
+    }
+
+    @Test func assetCacheStoresOnlyHashVerifiedBoundedStickerBytes() throws {
+        let abcHash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        let sticker = try #require(fixtureSticker("abc", hash: abcHash))
+        let cache = SonarStickerAssetCache(maxStickerBytes: 3)
+        let data = Data("abc".utf8)
+
+        #expect(cache.storeVerified(data, for: sticker))
+        #expect(cache.data(for: sticker) == data)
+        #expect(cache.storeVerified(Data("abcd".utf8), for: sticker) == false)
+        let wrongHashSticker = try #require(fixtureSticker("abc_wrong", hash: hashA))
+        #expect(cache.storeVerified(data, for: wrongHashSticker) == false)
+    }
+
     private func fixtureAddress() -> SonarStickerPackAddress? {
         SonarStickerPackAddress(authorPubkeyHex: pubkey, identifier: "signal-0123456789abcdef0123456789abcdef")
     }

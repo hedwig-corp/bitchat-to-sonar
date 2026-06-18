@@ -485,6 +485,7 @@ private struct MacConversationPane: View {
     @State private var walletSheet = false
     @State private var addPeopleSheet = false
     @State private var removePeopleSheet = false
+    @State private var stickerSheet = false
     @State private var groupAddDraft = ""
     @State private var selectedAddNpubs: Set<String> = []
     @State private var importMedia = false
@@ -548,6 +549,12 @@ private struct MacConversationPane: View {
         }
         .snSheet(isPresented: $removePeopleSheet, title: "Remove people") {
             removePeopleContent
+        }
+        .snSheet(isPresented: $stickerSheet, title: "Stickers") {
+            SNStickerPickerContent(packs: store.stickerStore.installedPacks) { pack, sticker in
+                stickerSheet = false
+                store.sendSticker(id, pack: pack, sticker: sticker)
+            }
         }
         .snSheet(isPresented: $walletSheet, title: "Your wallet") {
             SNWalletSheetContent(onClose: { walletSheet = false })
@@ -798,6 +805,12 @@ private struct MacConversationPane: View {
                 SNActionRow(icon: .data, label: "Send file", desc: "PDFs, documents, and other files") {
                     actionSheet = false
                     importFile = true
+                }
+            }
+            if !isChannel, store.canSendStickers(id) {
+                SNActionRow(icon: .smile, label: "Send sticker", desc: "From your installed packs") {
+                    actionSheet = false
+                    stickerSheet = true
                 }
             }
             if !isChannel && isMultiMemberMarmot {

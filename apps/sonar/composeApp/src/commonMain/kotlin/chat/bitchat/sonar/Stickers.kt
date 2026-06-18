@@ -1,5 +1,7 @@
 package chat.bitchat.sonar
 
+import chat.bitchat.sonar.crypto.Sha256
+
 const val SONAR_STICKERS_ENABLED_BY_DEFAULT = false
 const val SONAR_STICKER_MESSAGE_MARKER = "[sonar-sticker-v1]"
 
@@ -144,6 +146,9 @@ class SonarStickerStore {
     val installedPacks: List<SonarStickerPack>
         get() = packsByCoordinate.values.sortedBy { it.title.lowercase() }
 
+    val hasInstalledPacks: Boolean
+        get() = packsByCoordinate.isNotEmpty()
+
     fun install(pack: SonarStickerPack): Boolean {
         val clean = pack.normalizedOrNull() ?: return false
         packsByCoordinate[clean.address.coordinate] = clean
@@ -165,6 +170,36 @@ class SonarStickerStore {
             return SonarStickerResolution(SonarStickerResolutionState.HashMismatch)
         }
         return SonarStickerResolution(SonarStickerResolutionState.Resolved, sticker)
+    }
+
+    fun refFor(sticker: SonarSticker, pack: SonarStickerPack): SonarStickerRef? {
+        val installed = packsByCoordinate[pack.address.coordinate] ?: return null
+        if (installed.sticker(sticker.shortcode) != sticker) return null
+        return SonarStickerRef(
+            pack = installed.address,
+            shortcode = sticker.shortcode,
+            plaintextSha256 = sticker.sha256,
+        ).normalizedOrNull()
+    }
+}
+
+class SonarStickerByteCache(
+    private val maxStickerBytes: Int = DEFAULT_MAX_STICKER_BYTES,
+) {
+    private val bytesByHash = mutableMapOf<String, ByteArray>()
+
+    fun putVerified(sticker: SonarSticker, bytes: ByteArray): Boolean {
+        if (bytes.size > maxStickerBytes) return false
+        if (Sha256.hash(bytes).toHexLower() != sticker.sha256) return false
+        bytesByHash[sticker.sha256] = bytes.copyOf()
+        return true
+    }
+
+    fun get(sticker: SonarSticker): ByteArray? =
+        bytesByHash[sticker.sha256]?.copyOf()
+
+    companion object {
+        const val DEFAULT_MAX_STICKER_BYTES = 1024 * 1024
     }
 }
 
@@ -191,3 +226,6 @@ private fun String.blossomPathContains(sha256: String): Boolean {
         .lowercase()
         .contains(sha256)
 }
+
+private fun ByteArray.toHexLower(): String =
+    joinToString("") { ((it.toInt() and 0xFF) + 0x100).toString(16).substring(1) }
