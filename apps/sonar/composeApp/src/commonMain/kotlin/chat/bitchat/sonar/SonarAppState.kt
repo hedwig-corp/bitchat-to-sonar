@@ -22,6 +22,8 @@ import kotlinx.coroutines.launch
 private const val SONAR_DESCRIPTOR_TTL_SECS = 15 * 60L
 private const val SONAR_DESCRIPTOR_MISS_TTL_SECS = 60L
 private const val LOCAL_TRANSCRIPT_PAGE_LIMIT = 100
+private const val LOCAL_SUMMARY_PAGE_LIMIT = 20
+private const val LOCAL_SUMMARY_CHAT_LIMIT = 5
 
 sealed interface Screen {
     data object Home : Screen
@@ -2027,10 +2029,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         return merged.distinctBy { it.id }
     }
 
-    private suspend fun latestMarmotMessage(groups: List<SonarChat>): SonarMsg? {
+    private fun latestMarmotMessage(groups: List<SonarChat>): SonarMsg? {
         var latest: SonarMsg? = null
         for (group in groups) {
-            val msg = marmotMessages(group.id).lastOrNull()
+            val msg = chatSnapshotMessagesByChat[group.id]?.lastOrNull()
             val current = latest
             if (msg != null && (current == null || msg.tsSecs > current.tsSecs)) latest = msg
         }
@@ -2232,7 +2234,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             val peerId = peerIdForMarmotGroup(group) ?: continue
             folded += group.id
             groupPeers[group.id] = peerId
-            val last = marmotMessages(group.id).lastOrNull()
+            val last = latestMarmotMessage(listOf(group))
             upsert(
                 peerId,
                 MeshDmRow(
@@ -2261,9 +2263,11 @@ class SonarAppState(private val scope: CoroutineScope) {
         val loadedChats = SonarCore.chats()
         if (started || loadedChats.isNotEmpty()) {
             chats = loadedChats
-            chatSnapshotMessagesByChat = emptyMap()
+            val activeIds = loadedChats.mapTo(hashSetOf()) { it.id }
+            chatSnapshotMessagesByChat = chatSnapshotMessagesByChat.filterKeys { it in activeIds }
             persistChatSnapshot()
         }
+        refreshTopChatLocalSummaries()
         for (c in chats) {
             c.members.forEach {
                 if (it != npub && it.isNotBlank()) ensureSonarDescriptor(it)
@@ -2271,6 +2275,30 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         groupInvites = runCatching { SonarCore.pendingGroupInvites() }.getOrDefault(emptyList())
     }
+
+    private suspend fun refreshTopChatLocalSummaries() {
+        if (chats.isEmpty()) return
+        val updated = chatSnapshotMessagesByChat.toMutableMap()
+        for (chat in topSummaryChats()) {
+            val messages = runCatching {
+                SonarCore.messagesPage(chat.id, LOCAL_SUMMARY_PAGE_LIMIT)
+            }.getOrDefault(emptyList())
+            if (messages.isNotEmpty()) {
+                updated[chat.id] = messages
+            }
+        }
+        chatSnapshotMessagesByChat = updated
+    }
+
+    private fun topSummaryChats(): List<SonarChat> =
+        chats.withIndex()
+            .sortedWith(
+                compareByDescending<IndexedValue<SonarChat>> {
+                    chatSnapshotMessagesByChat[it.value.id]?.lastOrNull()?.tsSecs ?: 0L
+                }.thenBy { it.index }
+            )
+            .take(LOCAL_SUMMARY_CHAT_LIMIT)
+            .map { it.value }
 
     private fun poll() {
         if (pollJob?.isActive == true) return

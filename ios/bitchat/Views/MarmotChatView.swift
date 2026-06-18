@@ -121,7 +121,8 @@ final class MarmotChatModel: ObservableObject {
     private static let sonarDescriptorRefreshInterval: TimeInterval = 15 * 60
     private static let sonarDescriptorMissRetryInterval: TimeInterval = 60
     private static let localTranscriptPageLimit: UInt32 = 100
-    private static let localSummaryPageLimit: UInt32 = 1
+    private static let localSummaryPageLimit: UInt32 = 20
+    private static let localSummaryGroupLimit = 5
 
     @Published var npub: String?
     @Published var groups: [MarmotService.MarmotGroup] = []
@@ -469,8 +470,8 @@ final class MarmotChatModel: ObservableObject {
         do {
             let groups = try await service.groups()
             let invites = try await service.pendingGroupInvites()
-            var byGroup: [String: [MarmotService.MarmotMessage]] = [:]
-            for group in groups {
+            var byGroup = messagesByGroup
+            for group in Self.topSummaryGroups(groups, messagesByGroup: messagesByGroup) {
                 let page = try await service.messagesPage(
                     groupId: group.id,
                     limit: Self.localSummaryPageLimit
@@ -499,6 +500,21 @@ final class MarmotChatModel: ObservableObject {
         } catch {
             self.errorText = Self.describe(error)
         }
+    }
+
+    private static func topSummaryGroups(
+        _ groups: [MarmotService.MarmotGroup],
+        messagesByGroup: [String: [MarmotService.MarmotMessage]]
+    ) -> [MarmotService.MarmotGroup] {
+        groups.enumerated()
+            .sorted {
+                let lhsDate = messagesByGroup[$0.element.id]?.last?.createdAt ?? .distantPast
+                let rhsDate = messagesByGroup[$1.element.id]?.last?.createdAt ?? .distantPast
+                if lhsDate == rhsDate { return $0.offset < $1.offset }
+                return lhsDate > rhsDate
+            }
+            .prefix(Self.localSummaryGroupLimit)
+            .map(\.element)
     }
 
     private static func mergeMessages(
