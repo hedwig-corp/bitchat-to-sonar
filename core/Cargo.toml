@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["sonar-core", "sonar-ffi"]
+members = ["sonar-core", "sonar-ffi", "sonar-cli"]
 # Excluded sub-trees, each its own build island so the default `cargo test
 # --workspace` (CI) never touches them:
 #  - vendor/iroh-roq: vendored, iroh-1.0-ported RTP-over-QUIC media layer, a

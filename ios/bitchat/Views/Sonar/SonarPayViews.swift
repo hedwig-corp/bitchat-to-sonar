@@ -2,9 +2,10 @@
 // SonarPayViews.swift
 // bitchat
 //
-// Bitcoin payments UI, ported 1:1 from design/handoff/project/sonar/pay.jsx
-// + the .pay-* styles in theme.css: the sealed-coin PayBubble (money as a
-// message) and the PaySheet amount keypad with transport-aware send.
+// Bitcoin payments UI, ported from design/handoff/project/sonar/pay.jsx
+// + the .pay-* styles in theme.css: the gold PayBubble (money as a message)
+// and the PaySheet amount keypad. New sends pay the receiver's wallet
+// directly; legacy sealed coins still render for old-schema peers.
 // Backed by the real SonarPayLedger + SonarWalletProviding — fiat lines
 // only render when the wallet has a live rate.
 //
@@ -39,12 +40,15 @@ struct SNPayBubble: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var pay: SNPayInfo { m.pay! }
-    private var sealed: Bool { pay.state == .sealed }
+    private var sealed: Bool { !pay.direct && pay.state == .sealed }
     private var viaIcon: SNIconName { m.via == .mesh ? .mesh : .bolt }
 
     var body: some View {
         VStack(alignment: m.mine ? .trailing : .leading, spacing: 0) {
-            if m.mine {
+            if pay.direct {
+                card(amount: true)
+                stateLine(directStateText)
+            } else if m.mine {
                 card(amount: true)
                 stateLine(mineStateText)
             } else if sealed || pay.state == .claiming {
@@ -74,6 +78,16 @@ struct SNPayBubble: View {
         case .sealed, .claiming: return "Sealed — waiting for \(peerName) to claim"
         case .settling: return "Claim received — paying over the internet"
         case .claimed: return "Claimed by \(peerName)"
+        }
+    }
+
+    private var directStateText: String {
+        if pay.failed { return "Payment failed" }
+        switch pay.state {
+        case .claimed:
+            return m.mine ? "Paid \(peerName)" : "Received from \(peerName)"
+        case .sealed, .claiming, .settling:
+            return m.mine ? "Sending to \(peerName)" : "Incoming payment"
         }
     }
 
@@ -203,8 +217,12 @@ struct SNPaySheet: View {
     private var sats: Int64 { Int64(v) ?? 0 }
     private var over: Bool { sats > balance }
     private var can: Bool { sats > 0 && !over }
-    private var mesh: Bool { transport == .mesh }
-
+    private var directNote: String {
+        if transport == .mesh {
+            return "Chat can stay on Bluetooth. The payment goes straight to \(peerName)\u{2019}s wallet."
+        }
+        return "Pays \(peerName)\u{2019}s wallet directly. No claim step."
+    }
     private func tap(_ k: String) {
         if k == "del" {
             v = String(v.dropLast())
@@ -314,14 +332,12 @@ struct SNPaySheet: View {
             // .bc-sheetactions
             VStack(spacing: 6) {
                 SNPrimaryButton(
-                    label: mesh ? "Send over Bluetooth" : "Send over the internet",
-                    net: !mesh,
+                    label: "Send money",
+                    net: true,
                     disabled: !can,
                     action: send
                 )
-                Text(verbatim: mesh
-                    ? "Travels phone-to-phone as ecash — works offline. Sealed until \(peerName) claims it."
-                    : "Instant over the internet. Sealed until \(peerName) claims it.")
+                Text(verbatim: directNote)
                     .font(SonarTheme.uiFont(size: 12))
                     .lineSpacing(12 * 0.5)
                     .foregroundColor(SonarTheme.text3)
@@ -330,6 +346,184 @@ struct SNPaySheet: View {
             }
             .padding(EdgeInsets(top: 6, leading: 8, bottom: 0, trailing: 8))
         }
+    }
+}
+
+// MARK: - Wallet activity sheet
+
+struct SNWalletSheetContent: View {
+    @EnvironmentObject private var store: SonarAppStore
+    let onClose: () -> Void
+
+    var body: some View {
+        if store.balanceSats == nil {
+            SNWalletSetupSheetContent(
+                settingUp: store.walletState == .settingUp,
+                onClose: onClose
+            )
+        } else {
+            SNWalletActivitySheetContent(
+                activities: store.paymentActivities,
+                money: { store.money($0) },
+                onClose: onClose
+            )
+        }
+    }
+}
+
+struct SNWalletActivitySheetContent: View {
+    let activities: [SonarPaymentActivity]
+    let money: (Int64) -> String
+    var settingUp: Bool = false
+    let onClose: () -> Void
+
+    private static let dateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateStyle = .medium
+        f.timeStyle = .short
+        return f
+    }()
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if settingUp {
+                SNWalletSetupSheetContent(settingUp: true, onClose: onClose)
+            } else if activities.isEmpty {
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .fill(SonarTheme.goldSoft)
+                    .frame(width: 56, height: 56)
+                    .overlay(SNIcon(name: .coin, size: 26).foregroundColor(SonarTheme.goldDeep))
+                    .padding(.top, 8)
+                Text("No payments yet")
+                    .font(SonarTheme.uiFont(size: 16, weight: .bold))
+                    .foregroundColor(SonarTheme.text)
+                    .padding(.top, 10)
+                Text("Direct Sonar and Unify payments will appear here after you send or receive money.")
+                    .font(SonarTheme.uiFont(size: 13.5))
+                    .lineSpacing(13.5 * 0.3)
+                    .foregroundColor(SonarTheme.text2)
+                    .multilineTextAlignment(.center)
+                    .padding(EdgeInsets(top: 6, leading: 14, bottom: 12, trailing: 14))
+                SNGhostButton(label: "Done", action: onClose)
+                    .padding(.horizontal, 8)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 8) {
+                        ForEach(activities) { activity in
+                            SNWalletActivityRow(
+                                activity: activity,
+                                money: money,
+                                dateText: Self.dateFormatter.string(from: activity.settledAt ?? activity.createdAt)
+                            )
+                        }
+                    }
+                    .padding(EdgeInsets(top: 2, leading: 8, bottom: 8, trailing: 8))
+                }
+                .frame(maxHeight: 360)
+
+                SNGhostButton(label: "Done", action: onClose)
+                    .padding(EdgeInsets(top: 4, leading: 8, bottom: 0, trailing: 8))
+            }
+        }
+    }
+}
+
+private struct SNWalletActivityRow: View {
+    let activity: SonarPaymentActivity
+    let money: (Int64) -> String
+    let dateText: String
+
+    private var title: String {
+        let prefix = activity.direction == .outgoing ? "Sent to" : "Received from"
+        return "\(prefix) \(activity.peerName)"
+    }
+
+    private var detail: String {
+        let kind: String
+        switch activity.kind {
+        case .sonarDirect: kind = "Sonar direct"
+        case .unifyNearby: kind = "Unify nearby"
+        case .walletIncoming: kind = "Wallet receive"
+        }
+        let via = SNVia(rawValue: activity.via)?.label ?? activity.via
+        return "\(kind) · \(via) · \(dateText)"
+    }
+
+    private var amountText: String {
+        let prefix = activity.direction == .outgoing ? "-" : "+"
+        return prefix + money(activity.sats)
+    }
+
+    private var statusText: String {
+        switch activity.status {
+        case .pending: return "Sending"
+        case .paid: return "Paid"
+        case .failed: return "Failed"
+        }
+    }
+
+    private var statusColor: Color {
+        switch activity.status {
+        case .pending: return SonarTheme.goldDeep
+        case .paid: return SonarTheme.green
+        case .failed: return SonarTheme.danger
+        }
+    }
+
+    private var icon: SNIconName {
+        switch activity.status {
+        case .pending: return .bolt
+        case .paid: return .check
+        case .failed: return .x
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(alignment: .top, spacing: 11) {
+                RoundedRectangle(cornerRadius: 13, style: .continuous)
+                    .fill(SonarTheme.goldSoft)
+                    .frame(width: 42, height: 42)
+                    .overlay(SNIcon(name: icon, size: 20).foregroundColor(statusColor))
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(verbatim: title)
+                        .font(SonarTheme.uiFont(size: 14.5, weight: .bold))
+                        .foregroundColor(SonarTheme.text)
+                        .lineLimit(1)
+                    Text(verbatim: detail)
+                        .font(SonarTheme.uiFont(size: 12))
+                        .foregroundColor(SonarTheme.text3)
+                        .lineLimit(2)
+                    if let fees = activity.feesSats, fees > 0 {
+                        Text(verbatim: "Fee \(sonarFormatSats(fees))")
+                            .font(SonarTheme.uiFont(size: 11.5))
+                            .foregroundColor(SonarTheme.text3)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                VStack(alignment: .trailing, spacing: 3) {
+                    Text(verbatim: amountText)
+                        .font(SonarTheme.uiFont(size: 14, weight: .heavy))
+                        .foregroundColor(activity.direction == .outgoing ? SonarTheme.text : SonarTheme.green)
+                        .lineLimit(1)
+                    Text(verbatim: statusText)
+                        .font(SonarTheme.uiFont(size: 11.5, weight: .bold))
+                        .foregroundColor(statusColor)
+                }
+            }
+
+            if activity.status == .failed, let failure = activity.failure, !failure.isEmpty {
+                Text(verbatim: failure)
+                    .font(SonarTheme.uiFont(size: 12))
+                    .foregroundColor(SonarTheme.danger)
+                    .lineLimit(2)
+                    .padding(.leading, 53)
+            }
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(SonarTheme.surface2))
     }
 }
 

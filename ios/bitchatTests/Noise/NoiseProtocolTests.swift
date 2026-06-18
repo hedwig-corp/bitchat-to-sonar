@@ -10,7 +10,7 @@ import CryptoKit
 import Foundation
 import Testing
 
-@testable import bitchat
+@testable import Sonar
 
 // MARK: - Test Vector Support
 

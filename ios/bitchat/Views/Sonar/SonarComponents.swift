@@ -1144,10 +1144,12 @@ struct SNComposer: View {
             .buttonStyle(SNScaleStyle(scale: 0.92))
 
             HStack {
-                TextField("", text: $text, prompt: Text(verbatim: placeholder).foregroundColor(SonarTheme.text3))
+                TextField("", text: $text, prompt: Text(verbatim: placeholder).foregroundColor(SonarTheme.text3), axis: .vertical)
                     .textFieldStyle(.plain)
                     .font(SonarTheme.uiFont(size: 16))
+                    .lineLimit(1...5)
                     .foregroundColor(SonarTheme.text)
+                    .submitLabel(.send)
                     .onSubmit(send)
             }
             .padding(.vertical, 7)

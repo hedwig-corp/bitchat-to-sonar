@@ -5244,6 +5244,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "sonar-cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "getrandom 0.2.17",
+ "hex",
+ "nostr",
+ "serde",
+ "serde_json",
+ "sonar-core",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "sonar-core"
 version = "0.1.0"
 dependencies = [

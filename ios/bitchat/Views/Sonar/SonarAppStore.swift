@@ -90,6 +90,8 @@ struct SNPayInfo: Equatable {
     let id: String          // payment uuid
     let sats: Int64
     let state: SonarPayEntry.State
+    var direct: Bool = false
+    var failed: Bool = false
 }
 
 /// A call kind (call.jsx `kind`). Drives icons + labels everywhere.
@@ -316,6 +318,8 @@ final class SonarAppStore: ObservableObject {
     let wallet: SonarWalletProviding
     /// Local state of every ⚡PAY coin sent/received (docs/SONAR-PAYMENTS.md).
     let payLedger: SonarPayLedger
+    /// Local wallet payment activity for direct BOLT12 / Unify sends.
+    let paymentActivityLedger: SonarPaymentActivityLedger
     private let keychain: KeychainManagerProtocol
     private let locationManager = LocationChannelManager.shared
     private let relayManager = NostrRelayManager.shared
@@ -361,6 +365,10 @@ final class SonarAppStore: ObservableObject {
     private var pendingMarmotSends: [String: [String]] = [:]
     /// Chat-message ids whose ⚡PAY control lines were already processed.
     private var scannedPayMessageIDs = Set<String>()
+    private var publishedBolt12Offer: String?
+    private var publishedPaymentMetadataWithoutOffer = false
+    private var publishingPaymentMetadata = false
+    private var incomingWalletTask: Task<Void, Never>?
 
     convenience init() {
         let keychain = KeychainManager()
@@ -393,6 +401,7 @@ final class SonarAppStore: ObservableObject {
         idBridge: NostrIdentityBridge,
         wallet: SonarWalletProviding = UnconfiguredWallet(),
         payLedger: SonarPayLedger = SonarPayLedger(),
+        paymentActivityLedger: SonarPaymentActivityLedger = SonarPaymentActivityLedger(),
         unify: UnifyNearbyService = UnifyNearbyService(),
         unifyReceiver: UnifyReceiverService = UnifyReceiverService()
     ) {
@@ -402,6 +411,7 @@ final class SonarAppStore: ObservableObject {
         self.idBridge = idBridge
         self.wallet = wallet
         self.payLedger = payLedger
+        self.paymentActivityLedger = paymentActivityLedger
         self.unify = unify
         self.unifyReceiver = unifyReceiver
         walletState = wallet.state
@@ -459,6 +469,7 @@ final class SonarAppStore: ObservableObject {
                 #if os(iOS) || os(macOS)
                 if npub != nil { (self.wallet as? BridgedWallet)?.retrySetup() }
                 #endif
+                if npub != nil { self.publishPaymentMetadataIfNeeded() }
             }
             .store(in: &cancellables)
         // Messages typed to an out-of-range Sonar peer before their White
@@ -471,6 +482,7 @@ final class SonarAppStore: ObservableObject {
         // Payments: mirror the wallet state and watch both transcript
         // stores for incoming ⚡PAY control lines (claim/settle/reveal).
         republish(payLedger.objectWillChange)
+        republish(paymentActivityLedger.objectWillChange)
         wallet.statePublisher
             .receive(on: DispatchQueue.main)
             .sink { [weak self] state in
@@ -482,6 +494,8 @@ final class SonarAppStore: ObservableObject {
                 UserDefaults.standard.set(configured, forKey: Keys.walletConfigured)
                 // Start/stop the Unify receiver as the wallet becomes (un)ready.
                 self.updateReceiverAdvertising()
+                self.publishPaymentMetadataIfNeeded()
+                self.updateWalletPaymentObservation()
             }
             .store(in: &cancellables)
         // Seed the flag from the current state so the first announce is correct.
@@ -492,6 +506,8 @@ final class SonarAppStore: ObservableObject {
         }
         // Seed receiver advertising from the current state (foreground at launch).
         updateReceiverAdvertising()
+        publishPaymentMetadataIfNeeded()
+        updateWalletPaymentObservation()
         chatViewModel.objectWillChange
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.processIncomingPayLines(); self?.processIncomingCallLines() }
@@ -821,6 +837,32 @@ final class SonarAppStore: ObservableObject {
         networkLabel(sonar: resolvedSonarProfile(id) != nil, mutualFavorite: isMutualFavorite(id))
     }
 
+    private static func npubDisplay(_ npub: String) -> String {
+        guard npub.count > 24 else { return npub }
+        return String(npub.prefix(14)) + "..." + String(npub.suffix(6))
+    }
+
+    private func peerDisplayName(_ id: String) -> String {
+        let peerID = PeerID(str: id)
+        if let live = chatViewModel.meshService.peerNickname(peerID: peerID),
+           !live.isEmpty {
+            return live
+        }
+        if let favorite = FavoritesPersistenceService.shared.getFavoriteStatus(forPeerID: peerID),
+           !favorite.peerNickname.isEmpty {
+            return favorite.peerNickname
+        }
+        if let noiseKey = peerID.noiseKey ?? Data(hexString: peerID.id),
+           let favorite = FavoritesPersistenceService.shared.getFavoriteStatus(for: noiseKey),
+           !favorite.peerNickname.isEmpty {
+            return favorite.peerNickname
+        }
+        if let profile = resolvedSonarProfile(id) {
+            return Self.npubDisplay(profile.npub)
+        }
+        return chatViewModel.nicknameForPeer(peerID)
+    }
+
     /// Protocols the chat counterpart speaks — shown ONLY on the verify
     /// sheet's "Speaks" line; everywhere else uses plain-language labels.
     func speaks(_ id: String) -> String {
@@ -934,8 +976,13 @@ final class SonarAppStore: ObservableObject {
     /// White Noise leg is still recognized when it isn't currently advertising.
     func resolvedSonarProfile(_ id: String) -> SonarPeerProfile? {
         if let live = sonarProfiles[id] { return live }
+        if let persisted = sonarProfilesByFingerprint[id] { return persisted }
         let fp = chatViewModel.getFingerprint(for: PeerID(str: id)) ?? id
-        return sonarProfilesByFingerprint[fp]
+        if let persisted = sonarProfilesByFingerprint[fp] { return persisted }
+        if let noiseKey = PeerID(str: id).noiseKey {
+            return sonarProfilesByFingerprint[noiseKey.sha256Fingerprint()]
+        }
+        return nil
     }
 
     /// The peer key (stable fingerprint) of a persisted/live Sonar peer whose
@@ -971,6 +1018,12 @@ final class SonarAppStore: ObservableObject {
         return Data(hexString: s).flatMap { $0.count == 32 ? $0 : nil }
     }
 
+    private static func sha256Hex(_ value: String) -> String {
+        SHA256.hash(data: Data(value.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
+
     /// Inject our Sonar profile into BLEService once the Marmot identity is
     /// known. The provider runs on BLE's message queue, so it only captures
     /// plain values and reads UserDefaults (thread-safe) — never this store.
@@ -996,6 +1049,86 @@ final class SonarAppStore: ObservableObject {
                 paymentsEnabled: UserDefaults.standard.bool(forKey: walletConfiguredKey)
             )
         }
+    }
+
+    private func publishPaymentMetadataIfNeeded() {
+        guard marmot.npub != nil else { return }
+        guard !publishingPaymentMetadata else { return }
+        publishingPaymentMetadata = true
+        Task { [weak self] in
+            guard let self else { return }
+            defer { self.publishingPaymentMetadata = false }
+            guard case .ready = self.walletState else {
+                await self.publishPaymentMetadataWithoutOfferIfNeeded()
+                return
+            }
+            do {
+                let offer = try await self.wallet.createOffer()
+                guard case .ready = self.walletState else {
+                    await self.publishPaymentMetadataWithoutOfferIfNeeded()
+                    return
+                }
+                guard self.publishedBolt12Offer != offer else { return }
+                try await self.marmot.publishSonarDescriptor(bolt12Offer: offer)
+                guard case .ready = self.walletState else {
+                    await self.publishPaymentMetadataWithoutOfferIfNeeded()
+                    return
+                }
+                self.publishedBolt12Offer = offer
+                self.publishedPaymentMetadataWithoutOffer = false
+            } catch {
+                await self.publishPaymentMetadataWithoutOfferIfNeeded()
+                SecureLogger.error("Sonar descriptor payment metadata publish failed: \(error)", category: .session)
+            }
+        }
+    }
+
+    private func publishPaymentMetadataWithoutOfferIfNeeded() async {
+        guard publishedBolt12Offer != nil || !publishedPaymentMetadataWithoutOffer else { return }
+        do {
+            try await marmot.publishSonarDescriptor(bolt12Offer: nil)
+        } catch {
+            SecureLogger.error("Sonar descriptor payment metadata clear failed: \(error)", category: .session)
+            return
+        }
+        publishedBolt12Offer = nil
+        publishedPaymentMetadataWithoutOffer = true
+    }
+
+    private func updateWalletPaymentObservation() {
+        guard case .ready = walletState else {
+            incomingWalletTask?.cancel()
+            incomingWalletTask = nil
+            return
+        }
+        guard incomingWalletTask == nil else { return }
+        let stream = wallet.incomingPayments()
+        incomingWalletTask = Task { [weak self] in
+            for await payment in stream {
+                guard !Task.isCancelled else { return }
+                self?.recordIncomingWalletPayment(payment)
+            }
+        }
+    }
+
+    private func recordIncomingWalletPayment(_ payment: SonarWalletPayment) {
+        guard payment.isIncoming else { return }
+        let activityId = "wallet-\(payment.id)"
+        paymentActivityLedger.recordPending(SonarPaymentActivity(
+            id: activityId,
+            kind: .walletIncoming,
+            peerKey: "wallet",
+            peerName: "External wallet",
+            direction: .incoming,
+            sats: payment.amountSats,
+            via: SNVia.internet.rawValue,
+            createdAt: payment.timestamp,
+            destinationHash: nil,
+            status: .paid,
+            walletPaymentId: payment.id,
+            feesSats: payment.feesSats,
+            settledAt: payment.timestamp
+        ))
     }
 
     // MARK: Connectivity (status chip + connection sheet)
@@ -1226,21 +1359,22 @@ final class SonarAppStore: ObservableObject {
             // network line ("Sonar · reaches anywhere" etc.).
             let sonar = resolvedSonarProfile(peer.peerID.id) != nil
             let network = networkLabel(sonar: sonar, mutualFavorite: peer.isMutualFavorite)
+            let displayName = peerDisplayName(peer.peerID.id)
             if peer.isConnected {
                 items.append(SNPeerItem(
-                    id: peer.peerID.id, name: peer.displayName, inRange: true, bars: 3,
+                    id: peer.peerID.id, name: displayName, inRange: true, bars: 3,
                     hint: "Right here", detail: "Direct connection · " + network,
                     angle: angle, r: 66 + jitter, sonar: sonar
                 ))
-            } else if peer.isReachable {
+            } else if peer.isReachable && !sonar {
                 items.append(SNPeerItem(
-                    id: peer.peerID.id, name: peer.displayName, inRange: true, bars: 2,
+                    id: peer.peerID.id, name: displayName, inRange: true, bars: 2,
                     hint: "Nearby", detail: "Relayed through the mesh · " + network,
                     angle: angle, r: 118 + jitter, sonar: sonar
                 ))
-            } else if peer.isMutualFavorite {
+            } else if peer.isMutualFavorite || sonar {
                 items.append(SNPeerItem(
-                    id: peer.peerID.id, name: peer.displayName, inRange: false, bars: 0,
+                    id: peer.peerID.id, name: displayName, inRange: false, bars: 0,
                     hint: "Out of range", detail: network,
                     angle: angle, r: 162 + jitter, sonar: sonar
                 ))
@@ -1310,7 +1444,7 @@ final class SonarAppStore: ObservableObject {
         let peerID = PeerID(str: id)
         return SNPeerItem(
             id: id,
-            name: chatViewModel.nicknameForPeer(peerID),
+            name: peerDisplayName(id),
             inRange: false, bars: 0,
             hint: "Out of range", detail: networkLabel(forPeer: id),
             angle: 0, r: 0, sonar: resolvedSonarProfile(id) != nil
@@ -1442,6 +1576,21 @@ final class SonarAppStore: ObservableObject {
         return marmot.sonarDescriptorsByNpub[npub]
     }
 
+    private func paymentDescriptor(_ id: String) -> MarmotService.SonarDescriptor? {
+        guard let npub = callNpub(id) else { return nil }
+        marmot.ensureSonarDescriptor(npub)
+        return marmot.sonarDescriptorsByNpub[npub]
+    }
+
+    private func directPaymentOffer(_ id: String) -> String? {
+        guard let descriptor = paymentDescriptor(id),
+              descriptor.supportsDirectPayments,
+              let offer = descriptor.bolt12Offer?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !offer.isEmpty
+        else { return nil }
+        return offer
+    }
+
     private func callSignalingVia(_ id: String) -> SNVia? {
         if meshReachable(id) { return .mesh }
         if callMarmotGroupId(id) != nil { return .internet }
@@ -1549,15 +1698,13 @@ final class SonarAppStore: ObservableObject {
                 // Sonar peer now out of range → one folded row, not a White Noise
                 // duplicate.
                 let rowId = liveSonarPeerId ?? foldKey
-                let peerID = PeerID(str: rowId)
-                let mesh = chatViewModel.meshService
                 byKey[foldKey] = SNDMRow(
                     id: rowId,
-                    title: liveSonarPeerId == nil ? marmot.title(for: group) : chatViewModel.nicknameForPeer(peerID),
+                    title: liveSonarPeerId == nil ? marmot.title(for: group) : peerDisplayName(rowId),
                     preview: last.map { Self.previewText($0.content) } ?? networkLabel(forPeer: rowId),
                     time: last.map { Self.listTime($0.createdAt) } ?? "",
                     unread: false,
-                    presence: liveSonarPeerId != nil && (mesh.isPeerConnected(peerID) || mesh.isPeerReachable(peerID)),
+                    presence: liveSonarPeerId != nil && meshReachable(rowId),
                     verified: isVerified(rowId) || (marmotVerified[group.id] ?? false),
                     isMarmot: false,
                     lastDate: last?.createdAt
@@ -1585,14 +1732,13 @@ final class SonarAppStore: ObservableObject {
     }
 
     private func meshRow(peerID: PeerID, last: BitchatMessage?) -> SNDMRow {
-        let mesh = chatViewModel.meshService
         return SNDMRow(
             id: peerID.id,
-            title: chatViewModel.nicknameForPeer(peerID),
+            title: peerDisplayName(peerID.id),
             preview: last.map { Self.previewText($0.content) } ?? networkLabel(forPeer: peerID.id),
             time: last.map { Self.listTime($0.timestamp) } ?? "",
             unread: chatViewModel.unreadPrivateMessages.contains(peerID),
-            presence: mesh.isPeerConnected(peerID) || mesh.isPeerReachable(peerID),
+            presence: meshReachable(peerID.id),
             verified: isVerified(peerID.id),
             isMarmot: false,
             lastDate: last?.timestamp
@@ -1628,9 +1774,34 @@ final class SonarAppStore: ObservableObject {
         )
     }
 
+    private func paymentActivityRows(for id: String) -> [(Date, SNMessage)] {
+        paymentActivityLedger.activities(peerKey: id).map { activity in
+            let displayDate = activity.settledAt ?? activity.createdAt
+            let state: SonarPayEntry.State = activity.status == .paid ? .claimed : .settling
+            let via = SNVia(rawValue: activity.via) ?? .internet
+            return (
+                displayDate,
+                SNMessage(
+                    id: "payment-activity-\(activity.id)",
+                    mine: activity.direction == .outgoing,
+                    text: "",
+                    time: Self.clock(displayDate),
+                    via: via,
+                    pay: SNPayInfo(
+                        id: activity.id,
+                        sats: activity.sats,
+                        state: state,
+                        direct: true,
+                        failed: activity.status == .failed
+                    )
+                )
+            )
+        }
+    }
+
     func dmMsgs(_ id: String) -> [SNMessage] {
         if let groupId = marmotGroupId(id) {
-            let dated: [(Date, SNMessage)] = (marmot.messagesByGroup[groupId] ?? []).compactMap { m in
+            var dated: [(Date, SNMessage)] = (marmot.messagesByGroup[groupId] ?? []).compactMap { m in
                 switch payMapping(m.content, fallbackVia: .internet) {
                 case .hidden:
                     return nil
@@ -1651,6 +1822,7 @@ final class SonarAppStore: ObservableObject {
                     ))
                 }
             }
+            dated += paymentActivityRows(for: id)
             return mergeCallLogs(into: dated, id: id)
         }
         let peerID = PeerID(str: id)
@@ -1700,7 +1872,7 @@ final class SonarAppStore: ObservableObject {
                     return (m.createdAt, SNMessage(
                         id: m.id,
                         mine: m.isMine,
-                        author: m.isMine ? nil : chatViewModel.nicknameForPeer(peerID),
+                        author: m.isMine ? nil : peerDisplayName(id),
                         text: m.content,
                         time: Self.clock(m.createdAt),
                         via: .internet,
@@ -1710,6 +1882,7 @@ final class SonarAppStore: ObservableObject {
             }
             dated.sort { $0.0 < $1.0 }
         }
+        dated += paymentActivityRows(for: id)
         return mergeCallLogs(into: dated, id: id)
     }
 
@@ -1718,21 +1891,22 @@ final class SonarAppStore: ObservableObject {
     /// peer has no recorded calls.
     private func mergeCallLogs(into dated: [(Date, SNMessage)], id: String) -> [SNMessage] {
         let calls = callLogs[id] ?? []
-        guard !calls.isEmpty else { return dated.map(\.1) }
         var combined = dated
         for c in calls { combined.append((c.date, c.message)) }
-        combined.sort { $0.0 < $1.0 }
-        return combined.map(\.1)
+        return combined.enumerated()
+            .sorted {
+                if $0.element.0 == $1.element.0 { return $0.offset < $1.offset }
+                return $0.element.0 < $1.element.0
+            }
+            .map { $0.element.1 }
     }
 
-    /// DM routing mirrors MessageRouter: Bluetooth when the peer is reachable
-    /// over the mesh, otherwise NIP-17 over Nostr (internet).
+    /// DM routing uses Bluetooth only while a Sonar peer is directly connected;
+    /// retained mesh reachability means the direct BLE leg already dropped, so
+    /// the conversation continues over White Noise.
     func dmTransport(_ id: String) -> SNVia {
         if marmotGroupId(id) != nil { return .internet }
-        let peerID = PeerID(str: id)
-        if peerID.isGeoDM { return .internet }
-        let mesh = chatViewModel.meshService
-        return (mesh.isPeerConnected(peerID) || mesh.isPeerReachable(peerID)) ? .mesh : .internet
+        return meshReachable(id) ? .mesh : .internet
     }
 
     func sendDm(_ id: String, _ text: String) {
@@ -1791,11 +1965,16 @@ final class SonarAppStore: ObservableObject {
     }
 
     /// True for a non-geo private peer reachable over the BLE mesh right now.
+    /// Sonar peers require a direct connection; retained mesh reachability is
+    /// still useful for plain bitchat relay but should not hold Sonar on BLE.
     private func meshReachable(_ id: String) -> Bool {
         guard marmotGroupId(id) == nil else { return false }
         let peerID = PeerID(str: id)
         guard !peerID.isGeoDM else { return false }
         let mesh = chatViewModel.meshService
+        if resolvedSonarProfile(id) != nil {
+            return mesh.isPeerConnected(peerID)
+        }
         return mesh.isPeerConnected(peerID) || mesh.isPeerReachable(peerID)
     }
 
@@ -2004,6 +2183,12 @@ final class SonarAppStore: ObservableObject {
         return nil
     }
 
+    /// Wallet payment activity, newest first. Includes direct Sonar BOLT12
+    /// sends and Unify nearby sends; legacy claimable coins stay in PayLedger.
+    var paymentActivities: [SonarPaymentActivity] {
+        paymentActivityLedger.sorted
+    }
+
     // MARK: Money display
 
     /// The EFFECTIVE money string for an amount (fiat when the user picked fiat
@@ -2041,18 +2226,10 @@ final class SonarAppStore: ObservableObject {
         wallet.parseFiatInput(text, currencyCode: displayCurrency)
     }
 
-    /// ⚡PAY lines may only travel to counterparts that speak them: Marmot
-    /// (White Noise) chats and Sonar peers announcing the payments
-    /// capability (discovery bit 1). Never bitchat-only peers.
+    /// Direct payments require explicit `sonar.meta.v1` receive metadata.
+    /// Old call-only descriptors or BLE capability bits do not unlock sending.
     func paymentCapable(_ id: String) -> Bool {
-        if let groupId = marmotGroupId(id),
-           let group = marmotGroup(byId: groupId) {
-            return marmot.isDirectGroup(group)
-        }
-        if let profile = resolvedSonarProfile(id) {
-            return profile.capabilities & SonarCapability.payments != 0
-        }
-        return false
+        directPaymentOffer(id) != nil
     }
 
     /// Voice/video calls are a Sonar-only feature. Prefer live BLE signaling, but
@@ -2067,18 +2244,42 @@ final class SonarAppStore: ObservableObject {
         return callDescriptor(id)?.supportsMarmotCallSignaling == true
     }
 
-    /// Sends a sealed coin over the conversation's current rail. The balance
-    /// is NOT deducted here — real sats only move at claim time, when the
-    /// wallet pays the receiver's offer (honest deviation from the demo).
+    /// Sends money directly to the receiver's BOLT12 offer from their
+    /// `sonar.meta.v1` descriptor. Legacy claimable ⚡PAY is receive-only during
+    /// migration; new clients no longer initiate sealed coins.
     func sendPay(_ id: String, sats: Int64) {
-        guard sats > 0, paymentCapable(id) else { return }
-        let uuid = UUID().uuidString.lowercased()
+        guard sats > 0,
+              case .ready = walletState,
+              let offer = directPaymentOffer(id)
+        else { return }
+        let activityId = UUID().uuidString.lowercased()
         let via = dmTransport(id)
-        payLedger.record(SonarPayEntry(
-            id: uuid, peerKey: id, sats: sats,
-            direction: .outgoing, state: .sealed, via: via.rawValue
+        paymentActivityLedger.recordPending(SonarPaymentActivity(
+            id: activityId,
+            kind: .sonarDirect,
+            peerKey: id,
+            peerName: peerItem(id).name,
+            direction: .outgoing,
+            sats: sats,
+            via: via.rawValue,
+            createdAt: Date(),
+            destinationHash: Self.sha256Hex(offer),
+            status: .pending
         ))
-        sendDm(id, SonarPayMessage.pay(id: uuid, sats: sats).encoded())
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let payment = try await self.wallet.send(
+                    destination: offer,
+                    amountSats: sats,
+                    note: "Sonar payment \(activityId)"
+                )
+                self.paymentActivityLedger.markPaid(activityId, payment: payment)
+            } catch {
+                self.paymentActivityLedger.markFailed(activityId, message: error.localizedDescription)
+                SecureLogger.error("Sonar direct payment failed: \(error)", category: .session)
+            }
+        }
     }
 
     /// Receiver tapped a sealed coin: create a BOLT12 offer and send the
@@ -2269,13 +2470,32 @@ final class SonarAppStore: ObservableObject {
     /// Direct Lightning send to the Unify receiver's served offer/invoice. This
     /// is NOT the ⚡PAY sealed-coin chat path — Unify peers don't chat.
     private func payUnify(_ id: String, destination: String, sats: Int64) {
+        let activityId = UUID().uuidString.lowercased()
+        paymentActivityLedger.recordPending(SonarPaymentActivity(
+            id: activityId,
+            kind: .unifyNearby,
+            peerKey: id,
+            peerName: peerItem(id).name,
+            direction: .outgoing,
+            sats: sats,
+            via: SNVia.internet.rawValue,
+            createdAt: Date(),
+            destinationHash: Self.sha256Hex(destination),
+            status: .pending
+        ))
         unifyPay = (id, .paying(destination: destination, sats: sats))
         Task { [weak self] in
             guard let self else { return }
             do {
-                try await self.wallet.send(destination: destination, amountSats: sats, note: "Unify nearby payment")
+                let payment = try await self.wallet.send(
+                    destination: destination,
+                    amountSats: sats,
+                    note: "Unify nearby payment \(activityId)"
+                )
+                self.paymentActivityLedger.markPaid(activityId, payment: payment)
                 self.unifyPay = (id, .sent(sats: sats))
             } catch {
+                self.paymentActivityLedger.markFailed(activityId, message: error.localizedDescription)
                 self.unifyPay = (id, .failed(error.localizedDescription))
             }
         }
@@ -2818,9 +3038,10 @@ final class SonarAppStore: ObservableObject {
         // The node is recreated by eraseChatsKeepIdentity → reset call state so
         // the iroh endpoint rebinds (the marmot.$npub sink calls ensureCallStarted).
         resetCallState()
-        // ⚡PAY coins live inside the erased chats — clear the ledger too. The
-        // Lightning wallet seed/balance is separate and is NOT touched.
+        // Payment rows render inside conversations — clear local ledgers too.
+        // The Lightning wallet seed/balance is separate and is NOT touched.
         payLedger.wipe()
+        paymentActivityLedger.wipe()
         mediaImageCache = [:]
         clearMediaDiskCache()
         objectWillChange.send()
@@ -2859,6 +3080,11 @@ final class SonarAppStore: ObservableObject {
         // Stop advertising as a Unify receiver (the served offer is derived
         // from the wallet seed being wiped below).
         unifyReceiver.stop()
+        incomingWalletTask?.cancel()
+        incomingWalletTask = nil
+        publishedBolt12Offer = nil
+        publishedPaymentMetadataWithoutOffer = false
+        publishingPaymentMetadata = false
         pendingMarmotSends = [:]
         // Forget every ⚡PAY coin and the Lightning wallet seed (separate
         // keychain service owned by SonarWalletKit).
@@ -2866,6 +3092,7 @@ final class SonarAppStore: ObservableObject {
         BridgedWallet.wipeWalletStorage()
         #endif
         payLedger.wipe()
+        paymentActivityLedger.wipe()
         mediaImageCache = [:]
         clearMediaDiskCache()
         scannedPayMessageIDs = []

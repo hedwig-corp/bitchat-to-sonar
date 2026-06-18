@@ -9,7 +9,7 @@
 import Testing
 import Foundation
 import Combine
-@testable import bitchat
+@testable import Sonar
 
 // MARK: - NostrProtocol Presence Event Tests
 

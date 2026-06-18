@@ -1294,10 +1294,17 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
            !favorite.peerNickname.isEmpty {
             return favorite.peerNickname
         }
-        if let noiseKey = Data(hexString: peerID.id),
+        if let noiseKey = peerID.noiseKey ?? Data(hexString: peerID.id),
            let favorite = FavoritesPersistenceService.shared.getFavoriteStatus(for: noiseKey),
            !favorite.peerNickname.isEmpty {
             return favorite.peerNickname
+        }
+        if let fingerprint = unifiedPeerService.getFingerprint(for: peerID) ?? meshService.getFingerprint(for: peerID),
+           !fingerprint.isEmpty {
+            return String(fingerprint.prefix(8))
+        }
+        if !peerID.bare.isEmpty {
+            return String(peerID.bare.prefix(8))
         }
         return "user"
     }

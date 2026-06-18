@@ -1,98 +1,136 @@
-# Sonar Payments — the ⚡PAY convention
+# Sonar Payments
 
-Status: v1 (June 2026). UI: `bitchat/Views/Sonar/SonarPayViews.swift`,
+Status: v2 draft (June 2026). UI: `bitchat/Views/Sonar/SonarPayViews.swift`,
 protocol/state: `bitchat/Views/Sonar/SonarPayLedger.swift`, wallet
 abstraction: `bitchat/Views/Sonar/SonarWalletStore.swift`. Design source of
 truth: `design/handoff/project/sonar/pay.jsx` + the `.pay-*` styles in
 `theme.css` (gold tokens).
 
-## Idea: money as a message
+## Current send path: direct wallet payment
 
-A payment in Sonar is a **sealed coin** that travels inside a normal
-end-to-end-encrypted chat message, over whatever rail the conversation is
-using right now — Bluetooth mesh in range, internet (NIP-17 or White
-Noise/Marmot) otherwise. The receiver sees a sealed gold card ("Payment
-from X · Tap to claim"); the actual sats settle **over Lightning at claim
-time**, not at send time.
+New Sonar clients do not create claimable chat coins when sending money. The
+receiver publishes public payment metadata in their NIP-78-style Sonar
+descriptor, and the sender pays that wallet destination directly.
 
-## Wire format
+The app publishes two addressable kind `30078` descriptor events during
+migration:
 
-⚡PAY lines are plain UTF-8 strings inside the existing encrypted chat
-content — no new packet types, no transport changes. Field separator `|`:
+- `d=sonar.call.v1`: old call-only schema for old clients.
+- `d=sonar.meta.v1`: unified Sonar metadata. This is the preferred schema and
+  carries direct payment receive metadata.
 
+The payment part of `sonar.meta.v1` is:
+
+```json
+{
+  "schema": 2,
+  "app": "sonar",
+  "payments": {
+    "receive": [
+      {
+        "type": "bolt12_offer",
+        "offer": "lno1...",
+        "network": "bitcoin",
+        "proofs": ["preimage"],
+        "future_proofs": ["bolt12_payer_proof"]
+      }
+    ],
+    "receipts": ["sonar.payment.receipt.v1"]
+  }
+}
 ```
-⚡PAY|1|<uuid>|<sats>              sealed coin (sender → receiver)
-⚡PAYCLAIM|1|<uuid>|<bolt12offer>  claim (receiver → sender)
-⚡PAYDONE|1|<uuid>                 settled (sender → receiver)
+
+Send flow:
+
+```text
+sender                                      receiver
+------                                      --------
+fetch sonar.meta.v1
+read payments.receive[bolt12_offer]
+record activity: pending
+wallet.send(offer, sats)
+record activity: paid/failed
+                                             later: payment receipt event
+                                             proves settlement with preimage
 ```
 
-- `1` is the protocol version. **Unknown versions render as plain text** —
-  nothing is hidden, nothing breaks.
-- `<uuid>` identifies one payment across all three lines (hex digits and
-  dashes, ≤64 chars; senders use a lowercased UUIDv4).
-- `<sats>` is a positive integer.
-- `<bolt12offer>` is a BOLT12 offer created by the receiver's wallet;
-  bech32 never contains `|`.
+The current proof is the Lightning preimage. When
+`lightning/bolts#1295` lands, Sonar can add payer proofs without changing the
+descriptor shape because `future_proofs` already advertises that direction.
 
-**Capability gating:** ⚡PAY lines are only ever sent to counterparts that
-speak them — Marmot (White Noise) chats and Sonar peers whose discovery
-announce sets capability **bit 1 = payments** (see `SONAR-DISCOVERY.md`).
-Never to bitchat-only peers, whose clients would show the raw codec text.
+Direct sends only unlock when a valid BOLT12 offer is present in
+`sonar.meta.v1`. Old BLE payment capability bits and old call-only descriptors
+do not unlock new sending.
 
-## Settlement flow
+## Chat UX
 
+Money still appears inside the chat. A direct send creates a local gold payment
+bubble immediately, with state lines for sending, paid, or failed. There is no
+"tap to claim" step for these bubbles.
+
+The wallet sheet also lists direct payment activity, newest first, including:
+
+- Sonar direct sends to Nostr/Sonar peers.
+- Unify nearby sends to Bluetooth-discovered Unify wallets.
+- Generic incoming wallet payments when the wallet backend reports settlement
+  events. These may not yet be attributable to a Sonar peer.
+- Status, amount, peer name, rail, wallet payment id, fee, and failure text
+  when available.
+
+## Legacy compatibility: claimable `⚡PAY`
+
+Old Sonar clients may still send claimable chat payments. New clients keep the
+old receive path so those messages do not break.
+
+Legacy wire format:
+
+```text
+⚡PAY|1|<uuid>|<sats>              sealed coin (sender -> receiver)
+⚡PAYCLAIM|1|<uuid>|<bolt12offer>  claim (receiver -> sender)
+⚡PAYDONE|1|<uuid>                 settled (sender -> receiver)
 ```
+
+Legacy settlement:
+
+```text
 sender                                   receiver
-──────                                   ────────
+------                                   --------
 ledger: outgoing sealed
-⚡PAY ───────────────────────────────────▶ ledger: incoming sealed
-                                          [sealed card, pulsing ₿ — tap]
+⚡PAY ----------------------------------> ledger: incoming sealed
                                           wallet.createOffer()
-                                          ledger: sealed → claiming
-ledger: sealed → settling  ◀───────────── ⚡PAYCLAIM
-wallet.send(offer, sats,
-  note: "Sonar payment <uuid>")
-ledger: settling → claimed
-⚡PAYDONE ───────────────────────────────▶ ledger: claiming → claimed
-["Claimed by X"]                          [payPop reveal,
-                                           "Added to your balance"]
+ledger: sealed -> settling <------------ ⚡PAYCLAIM
+wallet.send(offer, sats)
+ledger: settling -> claimed
+⚡PAYDONE ------------------------------> ledger: claiming -> claimed
 ```
 
-Failure handling: if `createOffer` or the Lightning `send` throws, the
-ledger reverts to `sealed` so the claim can be retried. Re-processing
-control lines (transcript replay after relaunch) is harmless because every
-ledger transition is an explicit, idempotent state machine.
+Unknown legacy versions render as plain text. Control-line processing is
+idempotent, so replaying old transcripts after relaunch is safe.
 
-## What is honest (deliberate deviations from the demo)
+## Local state
 
-- **Balance is NOT deducted at send.** The demo decremented a fake balance
-  when the coin was sent; in reality nothing leaves the wallet until the
-  receiver claims and the sender's wallet pays the BOLT12 offer. The
-  balance shown everywhere is the live wallet balance.
-- **Fiat lines only render with a live rate.** `SonarWalletProviding
-  .fiatText(forSats:)` returns nil when no live exchange rate is available
-  and the € line simply doesn't render. Never a hardcoded rate.
-- **No wallet, no pretending.** With `UnconfiguredWallet` (the default
-  until `Services/WalletBridgeService` is glued in), Settings shows a
-  "Set up" affordance and claiming/sending opens a sheet explaining that a
-  wallet is needed.
-- The sealed coin is a **promise riding the chat transport**, not bearer
-  money: today the receiver must be online (relative to the sender) for
-  Lightning settlement at claim time. The "ecash over Bluetooth" copy in
-  the PaySheet is the design's North Star, not yet the mechanism.
+`SonarPayLedger` stores legacy claimable coins in UserDefaults JSON under
+`sonar.pay.ledger.v1`: `{id, peerKey, sats, direction, state, via}`.
 
-## Local state: SonarPayLedger
+`SonarPaymentActivityLedger` stores direct wallet payment activity under
+`sonar.payment.activity.v1`. Entries are not claimable state machines; they are
+local audit rows for app-initiated sends and wallet-reported receives:
 
-Every coin this device sent or received lives in UserDefaults JSON
-(`sonar.pay.ledger.v1`): `{id, peerKey, sats, direction, state, via}` with
-`state ∈ sealed/claiming/settling/claimed` and `via ∈ mesh/internet` (the
-rail the coin traveled, which is what the bubble's transport icon shows).
-The emergency wipe clears the ledger.
+```text
+id, kind, peerKey, peerName, direction, sats, via, createdAt,
+destinationHash, status, walletPaymentId, feesSats, settledAt, failure
+```
 
-## Future: offline ecash
+Erase-all-chats clears both local ledgers because their rows render inside
+conversations. Emergency wipe also clears them and destroys the wallet seed.
 
-The mesh rail is designed to carry true bearer ecash (e.g. Cashu-style
-tokens minted against the wallet) so a coin can be claimed fully offline,
-phone-to-phone. The ⚡PAY framing already accommodates this: a future
-version bumps the payload (`⚡PAY|2|…`) and old clients degrade to plain
-text rather than mis-rendering.
+## Old schema behavior
+
+When a peer has only the old schema:
+
+- Calls can still use `sonar.call.v1`.
+- Incoming legacy `⚡PAY` can still be claimed.
+- New "Send money" is hidden because there is no direct receive offer to pay.
+
+This avoids presenting a claimable UX for a payment that can now settle
+directly, while keeping old peers readable during migration.

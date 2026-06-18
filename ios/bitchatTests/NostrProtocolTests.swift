@@ -8,7 +8,7 @@
 import Testing
 import CryptoKit
 import Foundation
-@testable import bitchat
+@testable import Sonar
 
 struct NostrProtocolTests {
     

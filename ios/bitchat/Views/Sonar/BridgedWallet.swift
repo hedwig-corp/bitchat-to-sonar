@@ -113,12 +113,40 @@ final class BridgedWallet: SonarWalletProviding {
             .eraseToAnyPublisher()
     }
 
-    func send(destination: String, amountSats: Int64, note: String?) async throws {
-        _ = try await bridge.send(destination: destination, amountSats: amountSats, note: note ?? "")
+    func send(destination: String, amountSats: Int64, note: String?) async throws -> SonarWalletPayment {
+        let payment = try await bridge.send(destination: destination, amountSats: amountSats, note: note ?? "")
+        return SonarWalletPayment(
+            id: payment.id,
+            amountSats: payment.amountSats,
+            isIncoming: payment.isIncoming,
+            timestamp: payment.timestamp,
+            note: payment.note,
+            feesSats: payment.feesSats
+        )
     }
 
     func createOffer() async throws -> String {
         try await bridge.createOffer()
+    }
+
+    func incomingPayments() -> AsyncStream<SonarWalletPayment> {
+        let stream = bridge.incomingPayments()
+        return AsyncStream { continuation in
+            let task = Task {
+                for await payment in stream {
+                    continuation.yield(SonarWalletPayment(
+                        id: payment.id,
+                        amountSats: payment.amountSats,
+                        isIncoming: payment.isIncoming,
+                        timestamp: payment.timestamp,
+                        note: payment.note,
+                        feesSats: payment.feesSats
+                    ))
+                }
+                continuation.finish()
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
     }
 
     // MARK: Money display — forwarded to the SDK via WalletBridgeService

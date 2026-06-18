@@ -747,7 +747,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         // mounted while recording, or Compose cancels its hold-to-record gesture
         // (the @RestrictsSuspension pointer coroutine dies with its layout node)
         // and the finger-release is never seen — the note never sends.
-        Row(Modifier.fillMaxWidth().padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
+        Row(Modifier.fillMaxWidth().padding(10.dp), verticalAlignment = Alignment.Bottom) {
             if (recording) {
                 // Slide-left-far OR tap the trash to discard.
                 Box(
@@ -765,6 +765,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                 Spacer(Modifier.width(8.dp))
                 Box(
                     Modifier.weight(1f).clip(RoundedCornerShape(22.dp)).background(s.surface2)
+                        .heightIn(min = 46.dp)
                         .padding(horizontal = 16.dp, vertical = 12.dp)
                 ) {
                     if (draft.isEmpty()) Text("Message $peerName · via $transport", color = s.text3, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -772,6 +773,8 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                         value = draft, onValueChange = { draft = it },
                         textStyle = TextStyle(color = s.text, fontSize = 16.sp),
                         cursorBrush = SolidColor(s.accent),
+                        singleLine = false,
+                        maxLines = 5,
                         modifier = Modifier.fillMaxWidth()
                     )
                 }

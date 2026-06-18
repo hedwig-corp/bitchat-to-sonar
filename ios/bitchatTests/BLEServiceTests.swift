@@ -8,7 +8,7 @@
 
 import Testing
 import CoreBluetooth
-@testable import bitchat
+@testable import Sonar
 
 struct BLEServiceTests {
     private let service: MockBLEService

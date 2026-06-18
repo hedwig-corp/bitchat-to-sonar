@@ -1,6 +1,6 @@
 import Testing
 import Foundation
-@testable import bitchat
+@testable import Sonar
 
 struct NotificationStreamAssemblerTests {
     private func makePacket(timestamp: UInt64 = 0x0102030405) -> BitchatPacket {

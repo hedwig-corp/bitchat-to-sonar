@@ -1044,7 +1044,7 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * Publish this identity's public Sonar descriptor. `signaling` should list
      * only routes this app build can actually use, in preference order.
      */
-    func publishSonarDescriptor(callsEnabled: Bool, signaling: [String]) throws
+    func publishSonarDescriptor(callsEnabled: Bool, signaling: [String], bolt12Offer: String?) throws
 
     /**
      * Remove members from an existing group.
@@ -1536,11 +1536,12 @@ open func publishProfile(name: String, about: String?, picture: String?)throws  
      * Publish this identity's public Sonar descriptor. `signaling` should list
      * only routes this app build can actually use, in preference order.
      */
-open func publishSonarDescriptor(callsEnabled: Bool, signaling: [String])throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+open func publishSonarDescriptor(callsEnabled: Bool, signaling: [String], bolt12Offer: String?)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_publish_sonar_descriptor(
             self.uniffiCloneHandle(),
         FfiConverterBool.lower(callsEnabled),
-        FfiConverterSequenceString.lower(signaling),$0
+        FfiConverterSequenceString.lower(signaling),
+        FfiConverterOptionString.lower(bolt12Offer),$0
     )
 }
 }
@@ -2890,17 +2891,21 @@ public struct SonarDescriptorInfo: Equatable, Hashable {
     public var signaling: [String]
     public var transports: [String]
     public var callIdentity: String
+    public var bolt12Offer: String?
+    public var paymentReceipts: [String]
     public var publishedAtSecs: UInt64
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(schema: UInt32, calls: Bool, media: [String], signaling: [String], transports: [String], callIdentity: String, publishedAtSecs: UInt64) {
+    public init(schema: UInt32, calls: Bool, media: [String], signaling: [String], transports: [String], callIdentity: String, bolt12Offer: String?, paymentReceipts: [String], publishedAtSecs: UInt64) {
         self.schema = schema
         self.calls = calls
         self.media = media
         self.signaling = signaling
         self.transports = transports
         self.callIdentity = callIdentity
+        self.bolt12Offer = bolt12Offer
+        self.paymentReceipts = paymentReceipts
         self.publishedAtSecs = publishedAtSecs
     }
 
@@ -2926,6 +2931,8 @@ public struct FfiConverterTypeSonarDescriptorInfo: FfiConverterRustBuffer {
                 signaling: FfiConverterSequenceString.read(from: &buf),
                 transports: FfiConverterSequenceString.read(from: &buf),
                 callIdentity: FfiConverterString.read(from: &buf),
+                bolt12Offer: FfiConverterOptionString.read(from: &buf),
+                paymentReceipts: FfiConverterSequenceString.read(from: &buf),
                 publishedAtSecs: FfiConverterUInt64.read(from: &buf)
         )
     }
@@ -2937,6 +2944,8 @@ public struct FfiConverterTypeSonarDescriptorInfo: FfiConverterRustBuffer {
         FfiConverterSequenceString.write(value.signaling, into: &buf)
         FfiConverterSequenceString.write(value.transports, into: &buf)
         FfiConverterString.write(value.callIdentity, into: &buf)
+        FfiConverterOptionString.write(value.bolt12Offer, into: &buf)
+        FfiConverterSequenceString.write(value.paymentReceipts, into: &buf)
         FfiConverterUInt64.write(value.publishedAtSecs, into: &buf)
     }
 }
@@ -4246,7 +4255,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_profile() != 42572) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_sonar_descriptor() != 49203) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_sonar_descriptor() != 7979) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_remove_group_members() != 5580) {

@@ -23,8 +23,9 @@ use crate::marmot::{
     SYNC_STATE_FILE_SUFFIX,
 };
 use crate::sonar_descriptor::{
-    descriptor_content_json, descriptor_tags, parse_descriptor_event, SonarDescriptor,
-    SONAR_DESCRIPTOR_D_TAG, SONAR_DESCRIPTOR_KIND,
+    descriptor_content_json, descriptor_d_tags, descriptor_tags, meta_descriptor_content_json,
+    parse_descriptor_event, SonarDescriptor, SONAR_CALL_DESCRIPTOR_D_TAG, SONAR_DESCRIPTOR_KIND,
+    SONAR_META_DESCRIPTOR_D_TAG,
 };
 use crate::{Error, Result};
 
@@ -758,11 +759,19 @@ impl SonarClient {
         &self,
         calls_enabled: bool,
         signaling: Vec<String>,
+        bolt12_offer: Option<String>,
     ) -> Result<()> {
-        let content = descriptor_content_json(calls_enabled, signaling)?;
-        let builder =
-            EventBuilder::new(Kind::Custom(SONAR_DESCRIPTOR_KIND), content).tags(descriptor_tags());
-        self.nostr.send_event_builder(builder).await?;
+        // Migration: publish the old call-only descriptor for old clients and
+        // the new unified metadata descriptor for direct BOLT12 payments.
+        let call_content = descriptor_content_json(calls_enabled, signaling.clone())?;
+        let call_builder = EventBuilder::new(Kind::Custom(SONAR_DESCRIPTOR_KIND), call_content)
+            .tags(descriptor_tags(SONAR_CALL_DESCRIPTOR_D_TAG));
+        self.nostr.send_event_builder(call_builder).await?;
+
+        let meta_content = meta_descriptor_content_json(calls_enabled, signaling, bolt12_offer)?;
+        let meta_builder = EventBuilder::new(Kind::Custom(SONAR_DESCRIPTOR_KIND), meta_content)
+            .tags(descriptor_tags(SONAR_META_DESCRIPTOR_D_TAG));
+        self.nostr.send_event_builder(meta_builder).await?;
         Ok(())
     }
 
@@ -773,25 +782,21 @@ impl SonarClient {
         &self,
         author: PublicKey,
     ) -> Result<Option<SonarDescriptor>> {
-        let filter = Filter::new()
-            .kind(Kind::Custom(SONAR_DESCRIPTOR_KIND))
-            .author(author)
-            .custom_tag(
-                SingleLetterTag::lowercase(Alphabet::D),
-                SONAR_DESCRIPTOR_D_TAG,
-            )
-            .limit(5);
-        let mut events: Vec<Event> = self
-            .nostr
-            .fetch_events_from(self.relays.clone(), filter, FETCH_TIMEOUT)
-            .await?
-            .into_iter()
-            .collect();
-        events.sort_by_key(|event| std::cmp::Reverse(event.created_at));
-        Ok(events
-            .into_iter()
-            .filter(|event| event.pubkey == author)
-            .find_map(|event| parse_descriptor_event(&event)))
+        let mut events = Vec::new();
+        for d_tag in descriptor_d_tags() {
+            let filter = Filter::new()
+                .kind(Kind::Custom(SONAR_DESCRIPTOR_KIND))
+                .author(author)
+                .custom_tag(SingleLetterTag::lowercase(Alphabet::D), d_tag)
+                .limit(5);
+            events.extend(
+                self.nostr
+                    .fetch_events_from(self.relays.clone(), filter, FETCH_TIMEOUT)
+                    .await?
+                    .into_iter(),
+            );
+        }
+        Ok(newest_valid_sonar_descriptor(events, author))
     }
 
     /// Start a multi-member Marmot group: fetch each member's KeyPackage,
@@ -1707,6 +1712,19 @@ fn sort_marmot_events(events: impl IntoIterator<Item = Event>) -> Vec<Event> {
     events
 }
 
+fn newest_valid_sonar_descriptor(
+    events: impl IntoIterator<Item = Event>,
+    author: PublicKey,
+) -> Option<SonarDescriptor> {
+    let mut descriptors: Vec<SonarDescriptor> = events
+        .into_iter()
+        .filter(|event| event.pubkey == author)
+        .filter_map(|event| parse_descriptor_event(&event))
+        .collect();
+    descriptors.sort_by_key(|descriptor| std::cmp::Reverse(descriptor.published_at_secs));
+    descriptors.into_iter().next()
+}
+
 fn sort_marmot_events_in_place(events: &mut [Event]) {
     events.sort_by(|a, b| {
         a.created_at
@@ -1727,6 +1745,19 @@ mod tests {
             .expect("event signs")
     }
 
+    fn signed_descriptor_event(
+        keys: &Keys,
+        d_tag: &'static str,
+        created_at_secs: u64,
+        content: String,
+    ) -> Event {
+        EventBuilder::new(Kind::Custom(SONAR_DESCRIPTOR_KIND), content)
+            .tags(descriptor_tags(d_tag))
+            .custom_created_at(Timestamp::from_secs(created_at_secs))
+            .sign_with_keys(keys)
+            .expect("descriptor signs")
+    }
+
     #[test]
     fn sort_marmot_events_orders_by_created_at() {
         let keys = Keys::generate();
@@ -1738,6 +1769,37 @@ mod tests {
         let contents: Vec<&str> = sorted.iter().map(|event| event.content.as_str()).collect();
 
         assert_eq!(contents, ["oldest", "middle", "newer"]);
+    }
+
+    #[test]
+    fn newest_valid_sonar_descriptor_uses_freshest_event_across_d_tags() {
+        let keys = Keys::generate();
+        let stale_offer =
+            "lno1qsgqmqvgm96frzdg8m0gc6nzeqffvzsqzrxqy32afmr3jn9ggl9g2s8sugfvxn4xqzqxqsq";
+        let old_meta = signed_descriptor_event(
+            &keys,
+            SONAR_META_DESCRIPTOR_D_TAG,
+            10,
+            meta_descriptor_content_json(
+                true,
+                vec!["marmot".to_string()],
+                Some(stale_offer.to_string()),
+            )
+            .expect("meta descriptor json"),
+        );
+        let new_call = signed_descriptor_event(
+            &keys,
+            SONAR_CALL_DESCRIPTOR_D_TAG,
+            20,
+            descriptor_content_json(true, vec!["marmot".to_string()])
+                .expect("call descriptor json"),
+        );
+
+        let descriptor = newest_valid_sonar_descriptor([old_meta, new_call], keys.public_key())
+            .expect("freshest descriptor");
+
+        assert_eq!(descriptor.published_at_secs, 20);
+        assert!(descriptor.bolt12_offer.is_none());
     }
 
     #[test]

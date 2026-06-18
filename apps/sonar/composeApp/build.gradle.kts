@@ -169,8 +169,8 @@ android {
         applicationId = "chat.bitchat.sonar"
         minSdk = libs.versions.android.minSdk.get().toInt()
         targetSdk = libs.versions.android.targetSdk.get().toInt()
-        versionCode = 2
-        versionName = "0.0.1-alpha.2"
+        versionCode = 3
+        versionName = "0.0.1-alpha.3"
         buildConfigField("String", "BREEZ_API_KEY", "\"$breezApiKey\"")
     }
 

@@ -9,7 +9,7 @@
 import Testing
 import CryptoKit
 import struct Foundation.UUID
-@testable import bitchat
+@testable import Sonar
 
 struct PrivateChatE2ETests {
     

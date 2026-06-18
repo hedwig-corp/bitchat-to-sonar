@@ -7,7 +7,7 @@
 //
 
 import Foundation
-@testable import bitchat
+@testable import Sonar
 
 final class MockIdentityManager: SecureIdentityStateManagerProtocol {
     private let keychain: KeychainManagerProtocol

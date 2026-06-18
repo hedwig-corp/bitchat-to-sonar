@@ -8,7 +8,7 @@
 
 import Testing
 import Foundation
-@testable import bitchat
+@testable import Sonar
 
 /// Mock context for testing
 @MainActor

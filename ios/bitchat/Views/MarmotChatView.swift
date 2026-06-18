@@ -48,6 +48,10 @@ final class MarmotChatModel: ObservableObject {
     /// Optimistically-echoed outgoing messages per group, kept visible until
     /// the relay round-trip brings the real copy back (then reconciled away).
     private var pendingOptimistic: [String: [MarmotService.MarmotMessage]] = [:]
+    /// Last desired payment offer metadata for our public descriptor. Reused
+    /// when other descriptor refreshes publish capabilities without changing
+    /// payment state.
+    private var descriptorBolt12Offer: String?
     private static let optimisticIDPrefix = "optimistic-"
 
     init(
@@ -222,7 +226,16 @@ final class MarmotChatModel: ObservableObject {
     /// Publish the app-level Sonar descriptor. This is separate from kind-0
     /// profile metadata so protocol capability discovery can evolve safely.
     func publishSonarDescriptor(callsEnabled: Bool = true) {
-        Task { try? await service.publishSonarDescriptor(callsEnabled: callsEnabled) }
+        let bolt12Offer = descriptorBolt12Offer
+        Task { try? await service.publishSonarDescriptor(callsEnabled: callsEnabled, bolt12Offer: bolt12Offer) }
+    }
+
+    /// Publish the descriptor with explicit payment metadata. The desired offer
+    /// is retained immediately so concurrent capability refreshes do not drop
+    /// it, while callers can still await the relay publish result.
+    func publishSonarDescriptor(callsEnabled: Bool = true, bolt12Offer: String?) async throws {
+        descriptorBolt12Offer = bolt12Offer
+        try await service.publishSonarDescriptor(callsEnabled: callsEnabled, bolt12Offer: bolt12Offer)
     }
 
     /// Fetch + cache a peer's kind-0 profile, so their name/avatar replaces the
@@ -474,6 +487,7 @@ final class MarmotChatModel: ObservableObject {
         pendingGroupInvites = []
         messagesByGroup = [:]
         pendingOptimistic = [:]
+        descriptorBolt12Offer = nil
     }
 
     /// Erase every White Noise / Marmot chat but KEEP the identity: wipe the

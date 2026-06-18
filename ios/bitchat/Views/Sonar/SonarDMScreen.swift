@@ -200,10 +200,7 @@ struct SonarDMScreen: View {
             removePeopleContent
         }
         .snSheet(isPresented: $walletSheet, title: "Your wallet") {
-            SNWalletSetupSheetContent(
-                settingUp: store.walletState == .settingUp,
-                onClose: { walletSheet = false }
-            )
+            SNWalletSheetContent(onClose: { walletSheet = false })
         }
         .onChange(of: verifySheet) { open in
             if !open { showKey = false }
