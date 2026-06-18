@@ -113,6 +113,16 @@ impl OutboxState {
         self.dirty = false;
     }
 
+    pub fn remove_group_entries(&mut self, group_id_hex: &str) -> Result<()> {
+        let before = self.entries.len();
+        self.entries
+            .retain(|_, entry| entry.group_id_hex != group_id_hex);
+        if self.entries.len() != before {
+            self.dirty = true;
+        }
+        self.save_if_dirty()
+    }
+
     pub fn mark_failed_by_message_id(
         &mut self,
         message_id_hex: &str,
@@ -244,6 +254,42 @@ mod tests {
         stale.reload_from_disk();
         assert_eq!(
             stale.status_for_message("message"),
+            Some(DeliveryState::Pending)
+        );
+    }
+
+    #[test]
+    fn remove_group_entries_drops_pending_sends_for_deleted_chat() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("outbox.json");
+        let mut outbox = OutboxState::load(Some(path.clone()));
+
+        outbox
+            .mark_pending(
+                "deleted-group".into(),
+                "deleted-message".into(),
+                "wrapper-1".into(),
+                "{}".into(),
+                1,
+            )
+            .expect("mark pending deleted");
+        outbox
+            .mark_pending(
+                "kept-group".into(),
+                "kept-message".into(),
+                "wrapper-2".into(),
+                "{}".into(),
+                1,
+            )
+            .expect("mark pending kept");
+        outbox
+            .remove_group_entries("deleted-group")
+            .expect("remove group entries");
+
+        let reloaded = OutboxState::load(Some(path));
+        assert_eq!(reloaded.status_for_message("deleted-message"), None);
+        assert_eq!(
+            reloaded.status_for_message("kept-message"),
             Some(DeliveryState::Pending)
         );
     }

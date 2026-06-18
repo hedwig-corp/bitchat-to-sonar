@@ -1702,6 +1702,10 @@ impl SonarClient {
     /// stop receiving its messages. Local-only; the peer is not notified.
     pub async fn delete_group(&self, group_id: &GroupId) -> Result<()> {
         self.engine.delete_group(group_id)?;
+        self.outbox_state
+            .lock()
+            .unwrap()
+            .remove_group_entries(&hex::encode(group_id.as_slice()))?;
         let _ = self.resubscribe_marmot_groups_if_live().await;
         Ok(())
     }
