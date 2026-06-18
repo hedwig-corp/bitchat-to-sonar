@@ -45,16 +45,18 @@ impl From<sonar_core::Error> for SonarFfiError {
 
 type FfiResult<T> = Result<T, SonarFfiError>;
 
-struct FfiChangeListenerAdapter {
-    inner: Box<dyn ConversationChangeListener>,
+/// Forwards conversation-change notifications from core threads to the FFI
+/// callback on a dedicated thread via an `mpsc` channel.  The host-provided
+/// `Box<dyn ConversationChangeListener>` never leaves that single thread, so
+/// no `Send + Sync` bound on the box is required — eliminating the previous
+/// `unsafe impl`.
+struct ChannelChangeListener {
+    tx: std::sync::Mutex<std::sync::mpsc::Sender<String>>,
 }
 
-unsafe impl Send for FfiChangeListenerAdapter {}
-unsafe impl Sync for FfiChangeListenerAdapter {}
-
-impl sonar_core::conversation_index::ConversationChangeListener for FfiChangeListenerAdapter {
+impl sonar_core::conversation_index::ConversationChangeListener for ChannelChangeListener {
     fn on_conversation_changed(&self, group_id_hex: String) {
-        self.inner.on_conversation_changed(group_id_hex);
+        let _ = self.tx.lock().unwrap().send(group_id_hex);
     }
 }
 
@@ -602,10 +604,23 @@ impl SonarNode {
 
     // ── Conversation index (Signal-style summary table) ──────────────────
 
-    pub fn set_conversation_change_listener(&self, listener: Box<dyn ConversationChangeListener>) {
-        let adapter = FfiChangeListenerAdapter { inner: listener };
+    pub fn set_conversation_change_listener(
+        &self,
+        listener: Box<dyn ConversationChangeListener>,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::Builder::new()
+            .name("sonar-change-fwd".into())
+            .spawn(move || {
+                while let Ok(group_id_hex) = rx.recv() {
+                    listener.on_conversation_changed(group_id_hex);
+                }
+            })
+            .expect("spawn change-listener forwarder");
         let core_listener: Arc<dyn sonar_core::conversation_index::ConversationChangeListener> =
-            Arc::new(adapter);
+            Arc::new(ChannelChangeListener {
+                tx: std::sync::Mutex::new(tx),
+            });
         self.client
             .set_conversation_change_listener(Some(core_listener));
     }
