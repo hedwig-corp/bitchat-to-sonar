@@ -143,6 +143,7 @@ final class MarmotChatModel: ObservableObject {
     private let keychain: KeychainManagerProtocol
     private let defaults: UserDefaults
     private var syncTask: Task<Void, Never>?
+    private var startupLocalSummaryTask: Task<Void, Never>?
     private var relayConnectTask: Task<Void, Never>?
     private var relayBusy = false
     /// npubs whose profile fetch is in flight or done, to fetch each once per session.
@@ -250,7 +251,7 @@ final class MarmotChatModel: ObservableObject {
             _ = try await service.connectLocal(nsec: storedNsec)
             await loadLocalGroupMetadata()
             self.errorText = nil
-            scheduleRelayConnect()
+            scheduleStartupLocalSummariesThenRelay()
         } catch {
             let desc = Self.describe(error)
             SecureLogger.warning("⚠️ Marmot local open failed: \(desc)", category: .session)
@@ -306,6 +307,21 @@ final class MarmotChatModel: ObservableObject {
             guard !Task.isCancelled else { return }
             self?.connectRelaysIfNeeded()
             self?.relayConnectTask = nil
+        }
+    }
+
+    private func scheduleStartupLocalSummariesThenRelay(delaySeconds: Double = 0.25) {
+        guard startupLocalSummaryTask == nil else { return }
+        startupLocalSummaryTask = Task { [weak self] in
+            let nanos = UInt64(max(0, delaySeconds) * 1_000_000_000)
+            if nanos > 0 {
+                try? await Task.sleep(nanoseconds: nanos)
+            }
+            guard let self, !Task.isCancelled else { return }
+            await self.loadLocalSummaries(resolveMembers: false)
+            guard !Task.isCancelled else { return }
+            self.startupLocalSummaryTask = nil
+            self.scheduleRelayConnect(delaySeconds: 0.25)
         }
     }
 
@@ -449,7 +465,7 @@ final class MarmotChatModel: ObservableObject {
     /// chat list fresh without scanning full transcripts on cold start, polling,
     /// or idle reconciliation. Already-loaded active transcripts are preserved
     /// and merged with the newest row.
-    func loadLocalSummaries() async {
+    func loadLocalSummaries(resolveMembers: Bool = true) async {
         do {
             let groups = try await service.groups()
             let invites = try await service.pendingGroupInvites()
@@ -472,10 +488,12 @@ final class MarmotChatModel: ObservableObject {
                 messagesByGroup: self.messagesByGroup,
                 to: defaults
             )
-            for group in groups {
-                for member in group.memberNpubs where member != npub {
-                    ensureProfile(member)
-                    ensureSonarDescriptor(member)
+            if resolveMembers {
+                for group in groups {
+                    for member in group.memberNpubs where member != npub {
+                        ensureProfile(member)
+                        ensureSonarDescriptor(member)
+                    }
                 }
             }
         } catch {
@@ -804,6 +822,8 @@ final class MarmotChatModel: ObservableObject {
     }
 
     func stopPolling() {
+        startupLocalSummaryTask?.cancel()
+        startupLocalSummaryTask = nil
         relayConnectTask?.cancel()
         relayConnectTask = nil
         syncTask?.cancel()
