@@ -1489,8 +1489,18 @@ class SonarAppState(private val scope: CoroutineScope) {
                 markPendingMediaCompleted(chatId, pendingId)
                 (screen as? Screen.Chat)?.let { sc ->
                     if (sc.id == chatId) {
-                        messages = mergePendingMediaUploads(chatId, SonarCore.messages(groupId))
-                        processPayLines(chatId, messages)
+                        if (isMeshChat(chatId)) {
+                            val peerId = meshPeerId(chatId)
+                            val mesh = meshChats[peerId].orEmpty()
+                            val wn = marmotMessagesForPeer(peerId)
+                            val merged = mergePendingMediaUploads(chatId, mesh + wn)
+                            messages = merged
+                            processPayLines(chatId, merged)
+                        } else {
+                            val fresh = SonarCore.messages(groupId)
+                            messages = mergePendingMediaUploads(chatId, fresh)
+                            processPayLines(chatId, messages)
+                        }
                     }
                 }
             } catch (e: Throwable) {

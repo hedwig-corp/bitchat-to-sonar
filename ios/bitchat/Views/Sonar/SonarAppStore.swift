@@ -1963,6 +1963,7 @@ final class SonarAppStore: ObservableObject {
         let data: Data
         let startedAt: Date
         let existingMediaURLs: Set<String>
+        var completedOrder: Int?
     }
 
     /// Bytes for uploads we just started, keyed by group/filename/mime/caption.
@@ -2007,9 +2008,33 @@ final class SonarAppStore: ObservableObject {
                 .filter { !$0.hasPrefix(Self.pendingMediaURLPrefix) }
         )
         pendingUploadMediaCache[key, default: []].append(
-            PendingUploadMedia(localURL: localURL, data: data, startedAt: Date(), existingMediaURLs: existingMediaURLs)
+            PendingUploadMedia(
+                localURL: localURL,
+                data: data,
+                startedAt: Date(),
+                existingMediaURLs: existingMediaURLs,
+                completedOrder: nil
+            )
         )
         mediaImageCache[localURL] = data
+    }
+
+    private var pendingUploadCompletionOrder = 0
+
+    private func markPendingUploadMediaCompleted(
+        groupId: String,
+        filename: String,
+        mime: String,
+        caption: String,
+        localURL: String
+    ) {
+        let key = Self.pendingUploadMediaKey(groupId: groupId, filename: filename, mime: mime, caption: caption)
+        guard var pending = pendingUploadMediaCache[key],
+              let index = pending.firstIndex(where: { $0.localURL == localURL }),
+              pending[index].completedOrder == nil else { return }
+        pendingUploadCompletionOrder += 1
+        pending[index].completedOrder = pendingUploadCompletionOrder
+        pendingUploadMediaCache[key] = pending
     }
 
     private func forgetPendingUploadMedia(
@@ -2042,11 +2067,17 @@ final class SonarAppStore: ObservableObject {
                         caption: message.content
                     )
                     guard var pending = pendingUploadMediaCache[key], !pending.isEmpty else { continue }
-                    guard let index = pending.firstIndex(where: {
-                        message.createdAt.timeIntervalSince1970 >= floor($0.startedAt.timeIntervalSince1970)
-                            && !$0.existingMediaURLs.contains(media.url)
-                    }) else { continue }
-                    let upload = pending.remove(at: index)
+                    let match = pending.enumerated()
+                        .filter {
+                            guard $0.element.completedOrder != nil else { return false }
+                            return message.createdAt.timeIntervalSince1970 >= floor($0.element.startedAt.timeIntervalSince1970)
+                                && !$0.element.existingMediaURLs.contains(media.url)
+                        }
+                        .min {
+                            ($0.element.completedOrder ?? Int.max) < ($1.element.completedOrder ?? Int.max)
+                        }
+                    guard let match else { continue }
+                    let upload = pending.remove(at: match.offset)
                     mediaImageCache[media.url] = upload.data
                     mediaImageCache.removeValue(forKey: upload.localURL)
                     if let disk = Self.mediaCacheURL(for: media.url) {
@@ -2117,6 +2148,15 @@ final class SonarAppStore: ObservableObject {
             filename: filename,
             mime: mime,
             localPreviewURL: pendingURL,
+            onComplete: { [weak self] in
+                self?.markPendingUploadMediaCompleted(
+                    groupId: gid,
+                    filename: filename,
+                    mime: mime,
+                    caption: "",
+                    localURL: pendingURL
+                )
+            },
             onFailure: { [weak self] in
                 self?.forgetPendingUploadMedia(
                     groupId: gid,
@@ -2170,6 +2210,15 @@ final class SonarAppStore: ObservableObject {
             filename: safeName,
             mime: safeMime,
             localPreviewURL: pendingURL,
+            onComplete: { [weak self] in
+                self?.markPendingUploadMediaCompleted(
+                    groupId: gid,
+                    filename: safeName,
+                    mime: safeMime,
+                    caption: "",
+                    localURL: pendingURL
+                )
+            },
             onFailure: { [weak self] in
                 self?.forgetPendingUploadMedia(
                     groupId: gid,
@@ -2219,6 +2268,15 @@ final class SonarAppStore: ObservableObject {
             filename: url.lastPathComponent,
             mime: "audio/mp4",
             localPreviewURL: pendingURL,
+            onComplete: { [weak self] in
+                self?.markPendingUploadMediaCompleted(
+                    groupId: gid,
+                    filename: url.lastPathComponent,
+                    mime: "audio/mp4",
+                    caption: "",
+                    localURL: pendingURL
+                )
+            },
             onFailure: { [weak self] in
                 self?.forgetPendingUploadMedia(
                     groupId: gid,

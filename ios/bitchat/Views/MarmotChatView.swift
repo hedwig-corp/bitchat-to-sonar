@@ -421,6 +421,7 @@ final class MarmotChatModel: ObservableObject {
         mime: String,
         caption: String = "",
         localPreviewURL: String? = nil,
+        onComplete: (() -> Void)? = nil,
         onFailure: (() -> Void)? = nil
     ) {
         let echo = MarmotService.MarmotMessage(
@@ -450,6 +451,7 @@ final class MarmotChatModel: ObservableObject {
                 try await service.sendMedia(
                     groupId: groupId, data: data, filename: filename, mime: mime, caption: caption
                 )
+                onComplete?()
                 await refresh()
             } catch {
                 pendingOptimistic[groupId]?.removeAll { $0.id == echo.id }
