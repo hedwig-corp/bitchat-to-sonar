@@ -1184,13 +1184,15 @@ private fun MediaViewer(
                         )
                         Text(media.mimeType, color = Color.White.copy(alpha = 0.62f), fontSize = 12.sp)
                     }
-                    MediaActionText("Share", enabled = loadedBytes != null) {
-                        scope.launch {
-                            val ok = actions.share(loadedBytes ?: return@launch, media.filename, media.mimeType)
-                            status = if (ok) "Opening share sheet" else "Couldn't share media"
+                    if (actions.canShare) {
+                        MediaActionText("Share", enabled = loadedBytes != null) {
+                            scope.launch {
+                                val ok = actions.share(loadedBytes ?: return@launch, media.filename, media.mimeType)
+                                status = if (ok) "Opening share sheet" else "Couldn't share media"
+                            }
                         }
+                        Spacer(Modifier.width(12.dp))
                     }
-                    Spacer(Modifier.width(12.dp))
                     MediaActionText("Save", enabled = loadedBytes != null) {
                         scope.launch {
                             val ok = actions.save(loadedBytes ?: return@launch, media.filename, media.mimeType)
