@@ -1579,7 +1579,8 @@ final class SonarAppStore: ObservableObject {
     }
 
     func peerItem(_ id: String) -> SNPeerItem {
-        if let groupId = marmotGroupId(id) {
+        if let item = nearbyPeerItem(forConversationId: id) { return item }
+        if id.hasPrefix(Self.marmotIDPrefix), let groupId = marmotGroupId(id) {
             let group = marmot.groups.first { $0.id == groupId }
             return SNPeerItem(
                 id: id,
@@ -1589,7 +1590,6 @@ final class SonarAppStore: ObservableObject {
                 angle: 0, r: 0
             )
         }
-        if let item = nearbyPeers.first(where: { $0.id == id }) { return item }
         if let unifyId = unifyPeerId(id) {
             let name = unify.peers.first { $0.id == unifyId }?.name
                 ?? UnifyNearbyContract.advertisedNamePrefix
@@ -1615,6 +1615,33 @@ final class SonarAppStore: ObservableObject {
             inRange: false, bars: 0,
             hint: "Out of range", detail: networkLabel(forPeer: id),
             angle: 0, r: 0, sonar: resolvedSonarProfile(id) != nil
+        )
+    }
+
+    private func nearbyPeerItem(forConversationId id: String) -> SNPeerItem? {
+        let peers = nearbyPeers
+        if let exact = peers.first(where: { $0.id == id }) { return exact }
+        guard !id.hasPrefix(Self.marmotIDPrefix),
+              let targetFingerprint = chatViewModel.getFingerprint(for: PeerID(str: id)),
+              let live = peers.first(where: { item in
+                  guard !item.unify,
+                        let fingerprint = chatViewModel.getFingerprint(for: PeerID(str: item.id))
+                  else { return false }
+                  return fingerprint == targetFingerprint
+              })
+        else { return nil }
+        return SNPeerItem(
+            id: id,
+            name: live.name,
+            inRange: live.inRange,
+            bars: live.bars,
+            hint: live.hint,
+            detail: live.detail,
+            angle: live.angle,
+            r: live.r,
+            sonar: live.sonar,
+            unify: live.unify,
+            avatarSeed: live.avatarSeed
         )
     }
 
@@ -2060,6 +2087,36 @@ final class SonarAppStore: ObservableObject {
                     ))
                 }
             }
+            if !id.hasPrefix(Self.marmotIDPrefix) {
+                let peerID = PeerID(str: id)
+                let via: SNVia = .mesh
+                let my = chatViewModel.meshService.myPeerID
+                dated += (chatViewModel.privateChats[peerID] ?? []).compactMap { m in
+                    let mine = m.senderPeerID == my
+                    switch payMapping(m.content, fallbackVia: via) {
+                    case .hidden:
+                        return nil
+                    case .bubble(let pay, let payVia):
+                        return (m.timestamp, SNMessage(
+                            id: m.id, mine: mine, text: m.content,
+                            time: Self.clock(m.timestamp), via: payVia, pay: pay
+                        ))
+                    case .notPay:
+                        let mediaItem = meshMediaItem(m.content)
+                        return (m.timestamp, SNMessage(
+                            id: m.id,
+                            mine: mine,
+                            author: m.sender,
+                            text: mediaItem != nil ? "" : m.content,
+                            time: Self.clock(m.timestamp),
+                            via: via,
+                            state: mine ? Self.stateText(m.deliveryStatus) : nil,
+                            media: mediaItem.map { [$0] } ?? []
+                        ))
+                    }
+                }
+                dated.sort { $0.0 < $1.0 }
+            }
             dated += paymentActivityRows(for: id)
             return mergeCallLogs(into: dated, id: id)
         }
@@ -2144,18 +2201,20 @@ final class SonarAppStore: ObservableObject {
     /// retained mesh reachability means the direct BLE leg already dropped, so
     /// the conversation continues over White Noise.
     func dmTransport(_ id: String) -> SNVia {
-        if marmotGroupId(id) != nil { return .internet }
-        return meshReachable(id) ? .mesh : .internet
+        if meshReachable(id) { return .mesh }
+        return .internet
     }
 
     func sendDm(_ id: String, _ text: String) {
+        if meshReachable(id) {
+            chatViewModel.sendPrivateMessage(text, to: PeerID(str: id))
+            return
+        }
         if let groupId = marmotGroupId(id) {
             marmot.send(text, to: groupId)
             return
         }
-        // Sonar peer out of Bluetooth range: continue over White Noise,
-        // creating the Marmot group on first send if it doesn't exist yet.
-        if let profile = resolvedSonarProfile(id), dmTransport(id) == .internet {
+        if let profile = resolvedSonarProfile(id) {
             sendOverMarmot(text, npub: profile.npub)
             return
         }
@@ -2335,7 +2394,7 @@ final class SonarAppStore: ObservableObject {
     /// Sonar peers require a direct connection; retained mesh reachability is
     /// still useful for plain bitchat relay but should not hold Sonar on BLE.
     private func meshReachable(_ id: String) -> Bool {
-        guard marmotGroupId(id) == nil else { return false }
+        guard !id.hasPrefix(Self.marmotIDPrefix) else { return false }
         let peerID = PeerID(str: id)
         guard !peerID.isGeoDM else { return false }
         let mesh = chatViewModel.meshService
