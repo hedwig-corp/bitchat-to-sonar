@@ -2651,18 +2651,6 @@ final class SonarAppStore: ObservableObject {
         guard hasMarmotGroup || sonarProfile != nil else { return }
         marmot.connectIfNeeded()
         let warmupKey = groupId ?? id
-        if let groupId,
-           let cached = marmot.messagesByGroup[groupId],
-           !cached.isEmpty {
-            localHydratingDMs.remove(id)
-            refreshMarmotDMInBackground(
-                warmupKey: warmupKey,
-                conversationId: id,
-                groupId: groupId,
-                keepLoadingUntilComplete: false
-            )
-            return
-        }
         if let task = openingDMTasks[warmupKey], !task.isCancelled {
             localHydratingDMs.insert(id)
             Task { [weak self] in

@@ -239,6 +239,7 @@ final class MarmotService: @unchecked Sendable {
             service.relayConnected = true
             return ()
         }
+        try await run { try $0.requireNode().retryOutbox() }
         return identity.npub()
     }
 

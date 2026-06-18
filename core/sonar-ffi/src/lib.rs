@@ -466,6 +466,14 @@ impl SonarNode {
         Ok(())
     }
 
+    /// Reload the durable outbox sidecar and retry pending sends. Hosts call this
+    /// after replacing a local-only node with a relay-backed node so sends created
+    /// during relay connect are not stranded until app restart.
+    pub fn retry_outbox(&self) -> FfiResult<()> {
+        self.runtime.block_on(self.client.reload_outbox_and_retry());
+        Ok(())
+    }
+
     /// Block until a live Marmot event (welcome or group message) has been pushed
     /// by the relay subscriptions, or `timeout_secs` elapses. Returns true if
     /// there is something to drain. Touches NO MLS state, so the host may call it

@@ -1081,8 +1081,16 @@ impl SonarClient {
             let now_secs = Timestamp::now().as_secs();
             let mut outbox = outbox_state.lock().unwrap();
             match result {
-                Ok(_) => {
-                    let _ = outbox.mark_sent_by_message_id(&message_id_hex, now_secs);
+                Ok(output) => {
+                    if let Err(err) = require_relay_success(&output, "text publish") {
+                        let _ = outbox.mark_failed_by_message_id(
+                            &message_id_hex,
+                            err.to_string(),
+                            now_secs,
+                        );
+                    } else {
+                        let _ = outbox.mark_sent_by_message_id(&message_id_hex, now_secs);
+                    }
                 }
                 Err(err) => {
                     let _ = outbox.mark_failed_by_message_id(
@@ -1093,6 +1101,14 @@ impl SonarClient {
                 }
             }
         });
+    }
+
+    pub async fn reload_outbox_and_retry(&self) {
+        if self.relays.is_empty() {
+            return;
+        }
+        self.outbox_state.lock().unwrap().reload_from_disk();
+        self.retry_outbox().await;
     }
 
     async fn retry_outbox(&self) {

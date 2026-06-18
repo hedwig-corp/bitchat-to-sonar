@@ -99,14 +99,18 @@ impl OutboxState {
         self.save_if_dirty()
     }
 
-    pub fn mark_sent_by_message_id(&mut self, message_id_hex: &str, now_secs: u64) -> Result<()> {
-        if let Some(entry) = self.entries.get_mut(message_id_hex) {
-            entry.state = DeliveryState::Sent;
-            entry.updated_at_secs = now_secs;
-            entry.last_error = None;
+    pub fn mark_sent_by_message_id(&mut self, message_id_hex: &str, _now_secs: u64) -> Result<()> {
+        if self.entries.remove(message_id_hex).is_some() {
             self.dirty = true;
         }
         self.save_if_dirty()
+    }
+
+    pub fn reload_from_disk(&mut self) {
+        let path = self.path.clone();
+        let reloaded = Self::load(path);
+        self.entries = reloaded.entries;
+        self.dirty = false;
     }
 
     pub fn mark_failed_by_message_id(
@@ -190,4 +194,57 @@ fn outbox_state_tmp_path(path: &Path) -> PathBuf {
         .and_then(|name| name.to_str())
         .unwrap_or("sonar-outbox.json");
     path.with_file_name(format!("{file_name}.tmp"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mark_sent_compacts_retry_payload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("outbox.json");
+        let mut outbox = OutboxState::load(Some(path.clone()));
+
+        outbox
+            .mark_pending(
+                "group".into(),
+                "message".into(),
+                "wrapper".into(),
+                "{}".into(),
+                1,
+            )
+            .expect("mark pending");
+        outbox
+            .mark_sent_by_message_id("message", 2)
+            .expect("mark sent");
+
+        let reloaded = OutboxState::load(Some(path));
+        assert_eq!(reloaded.status_for_message("message"), None);
+    }
+
+    #[test]
+    fn reload_from_disk_picks_up_pending_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("outbox.json");
+        let mut stale = OutboxState::load(Some(path.clone()));
+        let mut writer = OutboxState::load(Some(path));
+
+        writer
+            .mark_pending(
+                "group".into(),
+                "message".into(),
+                "wrapper".into(),
+                "{}".into(),
+                1,
+            )
+            .expect("mark pending");
+        assert_eq!(stale.status_for_message("message"), None);
+
+        stale.reload_from_disk();
+        assert_eq!(
+            stale.status_for_message("message"),
+            Some(DeliveryState::Pending)
+        );
+    }
 }

@@ -1066,6 +1066,13 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func removeGroupMembers(groupIdHex: String, members: [String]) throws
 
     /**
+     * Reload the durable outbox sidecar and retry pending sends. Hosts call this
+     * after replacing a local-only node with a relay-backed node so sends created
+     * during relay connect are not stranded until app restart.
+     */
+    func retryOutbox() throws
+
+    /**
      * Send a 1:1 encrypted DM to a geohash channel participant (NIP-17).
      */
     func sendGeoDm(geohash: String, recipientHex: String, text: String) throws
@@ -1601,6 +1608,18 @@ open func removeGroupMembers(groupIdHex: String, members: [String])throws   {try
             self.uniffiCloneHandle(),
         FfiConverterString.lower(groupIdHex),
         FfiConverterSequenceString.lower(members),$0
+    )
+}
+}
+
+    /**
+     * Reload the durable outbox sidecar and retry pending sends. Hosts call this
+     * after replacing a local-only node with a relay-backed node so sends created
+     * during relay connect are not stranded until app restart.
+     */
+open func retryOutbox()throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_retry_outbox(
+            self.uniffiCloneHandle(),$0
     )
 }
 }
@@ -4420,6 +4439,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_remove_group_members() != 5580) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_retry_outbox() != 58495) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_send_geo_dm() != 38953) {
