@@ -570,7 +570,8 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun shouldHoldStandaloneMarmotChat(chat: SonarChat, nowMs: Long = SonarClock.nowMillis()): Boolean {
         if (!isDirectMarmotChat(chat)) return false
         val title = canonicalConversationTitle(chatTitle(chat)).takeIf { it.isNotEmpty() } ?: return false
-        return meshChatNames.any { (peerId, name) ->
+        // Hold if a name-matched peer is still settling capabilities.
+        val nameMatched = meshChatNames.any { (peerId, name) ->
             canonicalConversationTitle(name) == title &&
                 shouldWaitForCapabilities(
                     firstSeenMs = meshPeerFirstSeenMs[peerId],
@@ -578,6 +579,19 @@ class SonarAppState(private val scope: CoroutineScope) {
                     hasProfile = sonarPeerProfiles.containsKey(peerId) || linkByFp.containsKey(peerId),
                     hasMessages = false,
                 ).also { if (it) scheduleCapabilitySettleRefresh(peerId, meshPeerFirstSeenMs[peerId] ?: nowMs, nowMs) }
+        }
+        if (nameMatched) return true
+        // Also hold if ANY mesh peer is still within its settle window and
+        // hasn't resolved capabilities yet — the pending 0x53 announce may be
+        // the one that provides the name we need to fold by.  Bounded by the
+        // same 1.5 s window so nothing is hidden permanently.
+        return meshPeerFirstSeenMs.any { (peerId, firstMs) ->
+            shouldWaitForCapabilities(
+                firstSeenMs = firstMs,
+                nowMs = nowMs,
+                hasProfile = sonarPeerProfiles.containsKey(peerId) || linkByFp.containsKey(peerId),
+                hasMessages = meshChats[peerId]?.isNotEmpty() == true,
+            ).also { if (it) scheduleCapabilitySettleRefresh(peerId, firstMs, nowMs) }
         }
     }
 

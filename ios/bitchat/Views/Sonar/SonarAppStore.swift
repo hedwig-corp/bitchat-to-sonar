@@ -1160,9 +1160,20 @@ final class SonarAppStore: ObservableObject {
         let title = snCanonicalConversationTitle(marmot.title(for: group))
         guard !title.isEmpty else { return false }
         let my = chatViewModel.meshService.myPeerID
+        // Hold if a name-matched peer is still settling capabilities.
         for peer in chatViewModel.allPeers where peer.peerID != my && (peer.isConnected || peer.isReachable) {
             let key = markMeshPeerSeen(peer.peerID, now: now)
             guard snCanonicalConversationTitle(peerDisplayName(peer.peerID.id)) == title else { continue }
+            if shouldWaitForCapabilities(peerID: peer.peerID, key: key, now: now) {
+                return true
+            }
+        }
+        // Also hold if ANY mesh peer is still within its settle window and
+        // hasn't resolved capabilities yet — the pending 0x53 announce may be
+        // the one that provides the name we need to fold by.  Bounded by the
+        // same 1.5 s window so nothing is hidden permanently.
+        for peer in chatViewModel.allPeers where peer.peerID != my && (peer.isConnected || peer.isReachable) {
+            let key = chatViewModel.getFingerprint(for: peer.peerID) ?? peer.peerID.id
             if shouldWaitForCapabilities(peerID: peer.peerID, key: key, now: now) {
                 return true
             }
