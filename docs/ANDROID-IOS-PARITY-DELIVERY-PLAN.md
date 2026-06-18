@@ -22,7 +22,7 @@ Deliverables:
 
 - Add Android/KMP account restore from an existing `nsec1...` backup during onboarding.
 - Add Android settings export for the current `nsec1...` private key.
-- Persist restored identity only after FFI validation succeeds.
+- Persist restored identity only after FFI validation succeeds, with Android Keystore-backed encryption for account, Marmot DB, and mesh private keys.
 - Reconnect the core, refresh wallet derivation, mesh identity, profile publishing, and discovery state after restore.
 - Add common `SonarDescriptor` APIs and Android/JVM actuals backed by existing UniFFI `publish_sonar_descriptor` and `fetch_sonar_descriptor`.
 - Publish the local descriptor at boot with honest account-level signaling routes: `marmot`.
@@ -81,7 +81,7 @@ Deliverables:
 - Add delivery status text parity.
 - Add geohash author block/report affordance if still present on iOS.
 - Add Android direct descriptor-backed payment sends and payment activity history to match the latest iOS `sonar.meta.v1` payment UI.
-- Review Android private-key storage and replace plain SharedPreferences with an encrypted store before beta distribution.
+- Add Android instrumentation smoke coverage for secure-store migration once device CI is available.
 
 Verification:
 
