@@ -1,9 +1,10 @@
 use nostr::prelude::*;
 use serde::Deserialize;
 use sonar_stickers::{
-    build_installed_packs_tags, build_pack_tags, build_sticker_ref_tag, parse_installed_pack_list,
-    parse_pack_event, parse_sticker_ref_tag, InstalledPackList, PackAddress, Sticker, StickerError,
-    StickerPack, StickerRef, STICKER_PACK_KIND, USER_STICKER_PACKS_KIND,
+    build_installed_packs_tags, build_pack_tags, build_sticker_message, build_sticker_ref_tag,
+    parse_installed_pack_list, parse_pack_event, parse_sticker_message, parse_sticker_ref_tag,
+    InstalledPackList, PackAddress, Sticker, StickerError, StickerPack, StickerRef,
+    STICKER_PACK_KIND, USER_STICKER_PACKS_KIND,
 };
 
 const FIXTURE: &str = include_str!("fixtures/sticker-contract-v1.json");
@@ -177,6 +178,20 @@ fn sticker_ref_fixture_round_trips_and_resolves_by_shortcode_and_hash() {
 
     assert_eq!(parsed, sticker_ref);
     assert_eq!(resolved.sha256, parsed.plaintext_sha256);
+}
+
+#[test]
+fn sticker_chat_message_fixture_round_trips_with_legacy_fallback() {
+    let fixture = fixture();
+    let sticker_ref = sticker_ref(&fixture.sent_ref);
+    let message = build_sticker_message(&sticker_ref);
+
+    assert_eq!(
+        message,
+        "[sticker] [sonar-sticker-v1] pack=30030:6a04ab98d9e4774ad806e302dddeb63bea16b5cb5f223ee77478e861bb583eb3:signal-0123456789abcdef0123456789abcdef shortcode=cat_wave sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    );
+    assert_eq!(parse_sticker_message(&message).unwrap(), Some(sticker_ref));
+    assert_eq!(parse_sticker_message("plain text").unwrap(), None);
 }
 
 #[test]

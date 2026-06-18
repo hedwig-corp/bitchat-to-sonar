@@ -6,6 +6,7 @@
 
 mod blossom;
 mod error;
+mod message;
 mod model;
 #[cfg(feature = "nostr")]
 mod nostr;
@@ -18,6 +19,7 @@ pub mod wasm;
 
 pub use blossom::{is_allowed_sticker_mime, is_blossom_https_url, sha256_hex};
 pub use error::{Result, StickerError};
+pub use message::{build_sticker_message, parse_sticker_message, STICKER_MESSAGE_MARKER};
 pub use model::{
     InstalledPackList, PackAddress, Sticker, StickerPack, StickerRef, PACK_FORMAT,
     STICKER_PACK_KIND, USER_STICKER_PACKS_KIND,
