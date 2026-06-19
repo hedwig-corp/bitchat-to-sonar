@@ -175,6 +175,8 @@ struct SonarMacRootView: View {
             store.path.removeAll()
         case .call:
             break
+        case .contactProfile, .groupInfo, .walletActivity:
+            break
         }
     }
 }
@@ -435,6 +437,12 @@ private struct SonarMacMainPane: View {
             MacRouteRedirect(selection: $selection, route: .profile)
         case .call(let id, let video):
             SonarCallScreen(peerId: id, video: video)
+        case .contactProfile(let id, let name):
+            SonarContactProfileScreen(peerId: id, peerName: name)
+        case .groupInfo(let id):
+            SonarGroupInfoScreen(peerId: id)
+        case .walletActivity:
+            SonarWalletActivityScreen()
         }
     }
 }
@@ -540,7 +548,11 @@ private struct MacConversationPane: View {
                 money: { store.money($0) },
                 fiatText: { store.fiatText($0) },
                 onClose: { paySheet = false },
-                onSend: { sats in store.sendPay(id, sats: sats) }
+                onSend: { sats in
+                    if let message = store.sendPay(id, sats: sats) {
+                        showToast(message)
+                    }
+                }
             )
         }
         .snSheet(isPresented: $addPeopleSheet, title: "Add people") {
@@ -730,13 +742,6 @@ private struct MacConversationPane: View {
                     peerName: peer.name,
                     money: { store.money($0) },
                     fiatText: { store.moneySatsLine($0) },
-                    onClaim: { payId in
-                        if walletReady {
-                            store.claimPay(id, payId: payId)
-                        } else {
-                            walletSheet = true
-                        }
-                    },
                     loadMedia: { await store.mediaData($0) }
                 )
             }
@@ -782,11 +787,7 @@ private struct MacConversationPane: View {
                         : "Set up or sync your wallet first"
                 ) {
                     actionSheet = false
-                    if walletReady {
-                        paySheet = true
-                    } else {
-                        walletSheet = true
-                    }
+                    openPaySheetOrWallet()
                 }
             }
             if !isChannel, store.canSendMedia(id) {
@@ -958,11 +959,7 @@ private struct MacConversationPane: View {
         case .dm(let id):
             store.openedDM(id)
             if store.consumePayRequest(id) {
-                if walletReady {
-                    paySheet = true
-                } else {
-                    walletSheet = true
-                }
+                openPaySheetOrWallet()
             }
         }
     }
@@ -978,6 +975,18 @@ private struct MacConversationPane: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.6) {
             if toast == text { toast = nil }
         }
+    }
+
+    private func openPaySheetOrWallet() {
+        guard walletReady else {
+            walletSheet = true
+            return
+        }
+        if let message = store.paymentDetailsUnavailableMessage(id) {
+            showToast(message)
+            return
+        }
+        paySheet = true
     }
 
     private func importAttachments(_ result: Result<[URL], Error>) {

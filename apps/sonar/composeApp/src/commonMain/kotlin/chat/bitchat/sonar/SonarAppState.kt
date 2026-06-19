@@ -200,7 +200,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             onboarded = false; nick = ""; npub = ""; started = false
             walletState = WalletState.NotConfigured
             presenceByGeohash = emptyMap()
-            payLedger = SonarPayLedger(); scannedPay.clear(); payVersion++
+            payLedger = SonarPayLedger(); payVersion++
             mediaCache.clear()
             callLogs.clear(); callVersion++
             resetCallState()
@@ -236,7 +236,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             lastWnGroups = -1; lastWnMsgs = -1
             // ⚡PAY coins live inside the erased chats — reset the ledger. The
             // Lightning wallet seed/balance is separate and is NOT touched.
-            payLedger = SonarPayLedger(); persistPay(); scannedPay.clear(); payVersion++
+            payLedger = SonarPayLedger(); persistPay(); payVersion++
             mediaCache.clear()
             callLogs.clear(); callVersion++
             // White Noise / Marmot DB: wipe + reconnect with the SAME identity.
@@ -668,6 +668,17 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun isMultiMemberChat(chatId: String): Boolean =
         chats.firstOrNull { it.id == chatId }?.let { !isDirectMarmotChat(it) } == true
 
+    fun hasDirectPaymentRoute(chatId: String): Boolean {
+        if (directPaymentOffer(chatId) != null) return true
+        if (isMeshChat(chatId)) {
+            val peerId = meshPeerId(chatId)
+            if (sonarProfile(peerId)?.speaksPay == true) return true
+            if (((linkCapsByFp[peerId] ?: 0) and SonarAnnounce.CAP_PAY) != 0) return true
+        }
+        paymentNpubHex(chatId)?.let { ensureSonarDescriptorHex(it) }
+        return false
+    }
+
     fun groupInviteContacts(excluding: Set<String> = emptySet()): List<GroupContact> {
         val excludedClean = excluding.map { it.trim() }.toSet() + setOf(npub).filter { it.isNotBlank() }
         val byNpub = linkedMapOf<String, GroupContact>()
@@ -842,9 +853,8 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
-    // ── ⚡PAY ledger (sealed-coin auto-claim, 1:1 with iOS) ──
+    // ── ⚡PAY ledger (direct BOLT12 receipts, 1:1 with iOS) ──
     private var payLedger = SonarPayLedger(SonarCore.loadBlob("pay.ledger"))
-    private val scannedPay = HashSet<String>()
     /** Bumped whenever the ledger changes, so pay bubbles recompose. */
     var payVersion by mutableStateOf(0)
         private set
@@ -855,58 +865,70 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private fun persistPay() { SonarCore.saveBlob("pay.ledger", payLedger.serialize()) }
 
+    private fun paymentNpubHex(chatId: String): String? =
+        if (isMeshChat(chatId)) {
+            npubRawFor(meshPeerId(chatId))?.toHexLower()
+        } else {
+            chats.firstOrNull { it.id == chatId }
+                ?.takeIf { isDirectMarmotChat(it) }
+                ?.let { otherMembers(it).singleOrNull() }
+                ?.let { canonicalNpubHex(it) }
+        }
+
+    private fun directPaymentOffer(chatId: String): String? {
+        if (isMeshChat(chatId)) {
+            sonarProfile(meshPeerId(chatId))?.bolt12Offer?.takeIf { it.isNotBlank() }?.let { return it }
+        }
+        val npubHex = paymentNpubHex(chatId) ?: return null
+        return sonarDescriptorsByNpubHex[npubHex]?.bolt12Offer?.takeIf { it.isNotBlank() }
+    }
+
+    fun paymentDetailsUnavailableMessage(chatId: String): String? {
+        if (directPaymentOffer(chatId) != null) return null
+        paymentNpubHex(chatId)?.let { ensureSonarDescriptorHex(it) }
+        return "Fetching payment details — try again in a moment."
+    }
+
+    fun sendPay(chatId: String, sats: Long): String? {
+        if (sats <= 0) return null
+        if (!walletAvailable || walletState !is WalletState.Ready) {
+            return "Set up the wallet first."
+        }
+        val offer = directPaymentOffer(chatId) ?: return paymentDetailsUnavailableMessage(chatId)
+        val payId = randomPayId()
+        scope.launch {
+            var failureMessage: String? = null
+            val ok = runCatching { WalletBridge.send(offer, sats, "Sonar payment $payId") }
+                .getOrElse {
+                    failureMessage = "Payment failed: ${it.message}"
+                    false
+                }
+            walletState = WalletBridge.state()
+            if (ok) {
+                if (payLedger.recordSealed(payId, sats, mine = true)) {
+                    persistPay()
+                    payVersion++
+                }
+                send(chatId, PayLine.Pay(payId, sats).encoded())
+                send(chatId, PayLine.Done(payId).encoded())
+            } else {
+                toast = failureMessage ?: "Payment failed"
+            }
+        }
+        return null
+    }
+
     /** Scan a chat's transcript for ⚡PAY control lines and drive the state machine. */
     fun processPayLines(chatId: String, msgs: List<SonarMsg>) {
         var changed = false
         for (m in msgs) {
             when (val line = PayLine.decode(m.content)) {
                 is PayLine.Pay -> if (payLedger.recordSealed(line.uuid, line.sats, m.mine)) changed = true
-                is PayLine.Claim -> if (scannedPay.add("claim:${line.uuid}")) {
-                    val e = payLedger.get(line.uuid)
-                    // Only the original sender settles a coin they sealed.
-                    if (e != null && e.mine && e.status == PayStatus.Sealed) {
-                        if (payLedger.markSettling(line.uuid)) changed = true
-                        settle(chatId, line.uuid, line.offer, e.sats)
-                    }
-                }
                 is PayLine.Done -> if (payLedger.markClaimedOrPending(line.uuid)) changed = true
                 null -> {}
             }
         }
         if (changed) { persistPay(); payVersion++ }
-    }
-
-    /** Sender side: pay the claimant's BOLT12 offer, then confirm with ⚡PAYDONE. */
-    private fun settle(chatId: String, uuid: String, offer: String, sats: Long) {
-        scope.launch {
-            val ok = walletAvailable && WalletBridge.send(offer, sats, "Sonar coin")
-            if (ok) {
-                payLedger.markClaimed(uuid)
-                runCatching { SonarCore.send(chatId, PayLine.Done(uuid).encoded()) }
-                walletState = WalletBridge.state()
-            } else {
-                payLedger.fail(uuid)
-            }
-            persistPay(); payVersion++
-        }
-    }
-
-    /** Receiver side: create a fresh BOLT12 offer and return it via ⚡PAYCLAIM. */
-    fun claimPay(chatId: String, uuid: String) {
-        if (!walletAvailable || walletState !is WalletState.Ready) {
-            toast = "Set up a wallet to claim payments."
-            return
-        }
-        scope.launch {
-            try {
-                val offer = WalletBridge.createOffer()
-                payLedger.markClaiming(uuid)
-                SonarCore.send(chatId, PayLine.Claim(uuid, offer).encoded())
-                persistPay(); payVersion++
-            } catch (e: Throwable) {
-                toast = "claim failed: ${e.message}"
-            }
-        }
     }
 
     /** Start the BLE mesh radio (call once permissions are granted). */
@@ -1170,7 +1192,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 meshBroadcast = emptyList(); meshDmRows = emptyList()
                 chats = emptyList(); messages = emptyList(); channelMsgs = emptyList()
                 lastWnGroups = -1; lastWnMsgs = -1
-                payLedger = SonarPayLedger(); persistPay(); scannedPay.clear(); payVersion++
+                payLedger = SonarPayLedger(); persistPay(); payVersion++
                 mediaCache.clear()
                 callLogs.clear(); callVersion++
 
@@ -1999,6 +2021,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (!ok) { toast = "Not connected over Bluetooth yet — stay close and try again"; return false }
         val msg = SonarMsg(randomMeshId(), npub, text, mine = true, MeshRadio.nowSecs())
         meshChats[peerId] = meshChats[peerId].orEmpty() + msg
+        processPayLines(meshChatId(peerId), listOf(msg))
         persistMesh(peerId)
         scope.launch { refreshOpenDm(peerId) }
         refreshMeshDmRows()
@@ -2039,6 +2062,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 try {
                     SonarCore.send(group.id, text)
                     clearSendEcho(chatId, echo.id)
+                    processPayLines(group.id, marmotMessagesPage(group.id))
                     refreshOpenDm(peerId)
                 } catch (e: Throwable) {
                     failSendEcho(chatId, echo.id)
@@ -2450,6 +2474,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 continue
             }
             meshChats[m.peerId] = meshChats[m.peerId].orEmpty() + msg
+            processPayLines(chatId, listOf(msg))
             touched += m.peerId
             if (notifsOn && !foreground && chatId != openChatId) {
                 Notifier.notify(chatId.hashCode(), meshPeerName(m.peerId), notifPreview(m.text))
@@ -2632,10 +2657,12 @@ class SonarAppState(private val scope: CoroutineScope) {
             .debounce(50)
             .onEach { groupIdHex ->
                 refreshChats()
+                val changedMessages = marmotMessagesPage(groupIdHex)
+                processPayLines(groupIdHex, changedMessages)
+                processCallLines(groupIdHex, changedMessages)
                 (screen as? Screen.Chat)?.let { sc ->
                     if (!isMeshChat(sc.id) && sc.id == groupIdHex) {
-                        messages = withSendEchoes(sc.id, mergePendingMediaUploads(sc.id, marmotMessagesPage(sc.id)))
-                        processPayLines(sc.id, messages)
+                        messages = withSendEchoes(sc.id, mergePendingMediaUploads(sc.id, changedMessages))
                     } else if (isMeshChat(sc.id)) {
                         val peerId = peerIdForMarmotGroup(groupIdHex)
                         if (peerId != null && sc.id == meshChatId(peerId)) {
@@ -2678,6 +2705,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                     val ms = runCatching { SonarCore.messagesPage(c.id, LOCAL_TRANSCRIPT_PAGE_LIMIT) }.getOrDefault(emptyList())
                     wnMsgs += ms.size
                     processCallLines(c.id, ms)
+                    processPayLines(c.id, ms)
                     if (c.members.size > 2) {
                         for (m in ms) {
                             if (!m.mine && m.senderNpub.isNotBlank()) senders.add(m.senderNpub)

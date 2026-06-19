@@ -605,7 +605,11 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         }
     }
     // Radar "Send sats" opens the chat with pay=true → jump straight to the sheet.
-    LaunchedEffect(screen.id) { if (screen.pay) paySheet = true }
+    fun openPaySheetOrRetry() {
+        val message = state.paymentDetailsUnavailableMessage(screen.id)
+        if (message != null) state.toast = message else paySheet = true
+    }
+    LaunchedEffect(screen.id) { if (screen.pay) openPaySheetOrRetry() }
     val listState = rememberLazyListState()
     // Transcript feed = chat messages (pay control lines collapsed) + mocked
     // call-log records, merged chronologically.
@@ -747,9 +751,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                         val pay = PayLine.decode(m.content) as? PayLine.Pay
                         if (pay != null) {
                             val status = run { state.payVersion; state.payStatus(pay.uuid) }
-                            PayBubble(m, pay, status, peerName, mesh = msgMesh, fiatOf = { state.fiatOrNull(it) }) {
-                                state.claimPay(screen.id, pay.uuid)
-                            }
+                            PayBubble(m, pay, status, peerName, mesh = msgMesh, fiatOf = { state.fiatOrNull(it) })
                         } else if (m.media.isNotEmpty()) {
                             MediaBubble(
                                 m,
@@ -895,7 +897,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     }
     if (addSheet) AddToMessageSheet(
         peerName = peerName,
-        onBitcoin = { addSheet = false; paySheet = true },
+        onBitcoin = { addSheet = false; openPaySheetOrRetry() },
         onLocation = { addSheet = false; state.toast = "Location sharing is coming soon." },
         onVerify = { addSheet = false; verifySheet = true },
         onReactions = { addSheet = false; state.toast = "Reactions are coming soon." },
@@ -903,7 +905,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         onRemovePeople = { addSheet = false; removePeopleSheet = true },
         onClose = { addSheet = false },
         canSendPhoto = state.canSendMedia(screen.id),
-        canSendPayment = !state.isMultiMemberChat(screen.id),
+        canSendPayment = state.hasDirectPaymentRoute(screen.id),
         canVerify = !state.isMultiMemberChat(screen.id),
         canShareLocation = !state.isMultiMemberChat(screen.id),
         canManageGroup = isGroup,
@@ -922,10 +924,10 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     if (paySheet) PaySheet(
         peerName = peerName,
         balanceSats = state.walletBalanceSats(),
-        // Mesh DMs carry ecash over Bluetooth; Marmot DMs ride the internet.
+        // The receipt follows the chat route; the actual payment settles over Lightning.
         mesh = screen.id.startsWith("mesh:"),
         fiatOf = { state.fiatOrNull(it) },
-        onSend = { sats -> state.send(screen.id, PayLine.Pay(randomPayId(), sats).encoded()) },
+        onSend = { sats -> state.sendPay(screen.id, sats)?.let { state.toast = it } },
         onClose = { paySheet = false }
     )
     if (verifySheet) VerifySheet(
@@ -1181,9 +1183,6 @@ private fun VerifySheet(
         }
     }
 }
-
-private fun randomPayId(): String =
-    (0 until 16).map { "0123456789abcdef".random() }.joinToString("")
 
 @Composable
 private fun GeoDmScreen(state: SonarAppState, screen: Screen.GeoDm) {

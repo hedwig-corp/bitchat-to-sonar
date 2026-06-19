@@ -5,7 +5,7 @@
 // Bitcoin payments UI, ported from design/handoff/project/sonar/pay.jsx
 // + the .pay-* styles in theme.css: the gold PayBubble (money as a message)
 // and the PaySheet amount keypad. New sends pay the receiver's wallet
-// directly; legacy sealed coins still render for old-schema peers.
+// directly; chat receipts render as money bubbles.
 // Backed by the real SonarPayLedger + SonarWalletProviding — fiat lines
 // only render when the wallet has a live rate.
 //
@@ -24,7 +24,7 @@ func snPayFmt(_ sats: Int64) -> String {
     return f.string(from: NSNumber(value: sats)) ?? String(sats)
 }
 
-// MARK: - Pay bubble (money as a message; incoming arrives sealed)
+// MARK: - Pay bubble (money as a message)
 
 struct SNPayBubble: View {
     let m: SNMessage           // m.pay != nil
@@ -35,12 +35,11 @@ struct SNPayBubble: View {
     /// when the primary is already sats.
     let fiatText: (Int64) -> String?
     let maxBubbleWidth: CGFloat
-    let onClaim: ((String) -> Void)?
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var pay: SNPayInfo { m.pay! }
-    private var sealed: Bool { !pay.direct && pay.state == .sealed }
+    private var pending: Bool { pay.state != .claimed }
     private var viaIcon: SNIconName { m.via == .mesh ? .mesh : .bolt }
 
     var body: some View {
@@ -48,22 +47,9 @@ struct SNPayBubble: View {
             if pay.direct {
                 card(amount: true)
                 stateLine(directStateText)
-            } else if m.mine {
-                card(amount: true)
-                stateLine(mineStateText)
-            } else if sealed || pay.state == .claiming {
-                Button {
-                    if sealed { onClaim?(pay.id) }
-                } label: {
-                    card(amount: false)
-                }
-                .buttonStyle(SNScaleStyle(scale: 0.97))
-                .disabled(!sealed || onClaim == nil)
-                stateLine("Sealed for you")
             } else {
                 card(amount: true)
-                    .modifier(SNPayPop())
-                stateLine("Added to your balance")
+                stateLine(receiptStateText)
             }
         }
         .frame(maxWidth: maxBubbleWidth, alignment: m.mine ? .trailing : .leading)
@@ -71,13 +57,12 @@ struct SNPayBubble: View {
         .padding(.top, 9)
     }
 
-    // bc-state under mine cards (sealed/claimed; "settling" is an honest
-    // in-between the demo didn't have — the Lightning payment is in flight).
-    private var mineStateText: String {
+    private var receiptStateText: String {
         switch pay.state {
-        case .sealed, .claiming: return "Sealed — waiting for \(peerName) to claim"
-        case .settling: return "Claim received — paying over the internet"
-        case .claimed: return "Claimed by \(peerName)"
+        case .claimed:
+            return m.mine ? "Paid \(peerName)" : "Received from \(peerName)"
+        case .sealed, .claiming, .settling:
+            return m.mine ? "Sending to \(peerName)" : "Incoming payment"
         }
     }
 
@@ -94,21 +79,13 @@ struct SNPayBubble: View {
     // .pay-card
     private func card(amount showAmount: Bool) -> some View {
         HStack(spacing: 12) {
-            coin(pulse: !m.mine && sealed)
+            coin(pulse: !m.mine && pending)
             VStack(alignment: .leading, spacing: 1) {
-                if showAmount {
-                    Text(verbatim: money(pay.sats))
-                        .font(SonarTheme.uiFont(size: 19, weight: .heavy))
-                        .kerning(-19 * 0.01)
-                    if let detail = fiatText(pay.sats) {
-                        Text(verbatim: detail)
-                            .font(SonarTheme.uiFont(size: 11.5, weight: .semibold))
-                            .opacity(0.72)
-                    }
-                } else {
-                    Text(verbatim: "Payment from \(peerName)")
-                        .font(SonarTheme.uiFont(size: 15, weight: .bold))
-                    Text(pay.state == .claiming ? "Claiming\u{2026}" : "Tap to claim")
+                Text(verbatim: money(pay.sats))
+                    .font(SonarTheme.uiFont(size: 19, weight: .heavy))
+                    .kerning(-19 * 0.01)
+                if let detail = fiatText(pay.sats) {
+                    Text(verbatim: detail)
                         .font(SonarTheme.uiFont(size: 11.5, weight: .semibold))
                         .opacity(0.72)
                 }

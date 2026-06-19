@@ -87,7 +87,7 @@ enum SNVia: String {
     }
 }
 
-/// Payment payload of a chat message that decoded as a ⚡PAY sealed coin
+/// Payment payload of a chat message that decoded as a ⚡PAY receipt
 /// (docs/SONAR-PAYMENTS.md). State comes from the local SonarPayLedger.
 struct SNPayInfo: Equatable {
     let id: String          // payment uuid
@@ -381,7 +381,7 @@ final class SonarAppStore: ObservableObject {
     private var marmotGroupIdsByConversationId: [String: String] = [:]
     /// Our optional BIP-353 payment address ("" = unset, TLV omitted).
     @Published private(set) var bip353: String
-    /// Mirrors wallet.state for the UI (balance row, PaySheet, claims).
+    /// Mirrors wallet.state for the UI (balance row and PaySheet).
     @Published private(set) var walletState: SonarWalletState
     /// Radar "Send sats" quick-pay: the DM screen opens with the PaySheet up.
     private var pendingPayPeer: String?
@@ -550,7 +550,7 @@ final class SonarAppStore: ObservableObject {
             .store(in: &cancellables)
 
         // Payments: mirror the wallet state and watch both transcript
-        // stores for incoming ⚡PAY control lines (claim/settle/reveal).
+        // stores for incoming ⚡PAY receipt control lines.
         republish(payLedger.objectWillChange)
         republish(paymentActivityLedger.objectWillChange)
         wallet.statePublisher
@@ -1023,6 +1023,13 @@ final class SonarAppStore: ObservableObject {
         }
         meshPeerFirstSeenAt[fp] = nil
         pendingCapabilityRefreshKeys.remove(fp)
+        // Proactively fetch the Nostr descriptor so the BOLT12 offer is ready
+        // by the time the user opens the payment sheet. Without this, the
+        // descriptor loads lazily and the payment button appears only after a
+        // second visit to the action sheet.
+        if profile.capabilities & SonarCapability.payments != 0 {
+            marmot.ensureSonarDescriptor(npub)
+        }
     }
 
     /// Refresh Sonar descriptors for every persisted fingerprint↔npub link so
@@ -2066,8 +2073,8 @@ final class SonarAppStore: ObservableObject {
 
     // MARK: DM transcript + send
 
-    /// How one chat line renders: regular text, a ⚡PAY sealed-coin bubble,
-    /// or hidden (⚡PAYCLAIM/⚡PAYDONE are protocol control lines). Unknown
+    /// How one chat line renders: regular text, a ⚡PAY receipt bubble,
+    /// or hidden (⚡PAYDONE is a protocol control line). Unknown
     /// ⚡PAY versions decode to nothing and fall through as plain text.
     private enum PayMapping {
         case notPay
@@ -2878,7 +2885,7 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
-    // MARK: Payments (⚡PAY sealed coins — docs/SONAR-PAYMENTS.md)
+    // MARK: Payments (⚡PAY receipts — docs/SONAR-PAYMENTS.md)
 
     /// Spendable balance once the wallet is ready; nil otherwise.
     var balanceSats: Int64? {
@@ -2887,7 +2894,7 @@ final class SonarAppStore: ObservableObject {
     }
 
     /// Wallet payment activity, newest first. Includes direct Sonar BOLT12
-    /// sends and Unify nearby sends; legacy claimable coins stay in PayLedger.
+    /// sends and Unify nearby sends.
     var paymentActivities: [SonarPaymentActivity] {
         paymentActivityLedger.sorted
     }
@@ -2929,10 +2936,27 @@ final class SonarAppStore: ObservableObject {
         wallet.parseFiatInput(text, currencyCode: displayCurrency)
     }
 
-    /// Direct payments require explicit `sonar.meta.v1` receive metadata.
-    /// Old call-only descriptors or BLE capability bits do not unlock sending.
+    /// Payment-capable when the peer has a BOLT12 offer from their Nostr
+    /// descriptor, OR when the peer announced the payments capability over BLE
+    /// and is currently in range (Lightning payment via the fetched offer once
+    /// the descriptor loads — the proactive fetch in handleSonarProfileNotification
+    /// ensures it arrives shortly after BLE discovery).
     func paymentCapable(_ id: String) -> Bool {
-        directPaymentOffer(id) != nil
+        if directPaymentOffer(id) != nil { return true }
+        if let profile = resolvedSonarProfile(id),
+           profile.capabilities & SonarCapability.payments != 0,
+           meshReachable(id) {
+            return true
+        }
+        return false
+    }
+
+    func paymentDetailsUnavailableMessage(_ id: String) -> String? {
+        if directPaymentOffer(id) != nil { return nil }
+        if let npub = callNpub(id) {
+            marmot.ensureSonarDescriptor(npub)
+        }
+        return "Fetching payment details — try again in a moment."
     }
 
     /// Voice/video calls are a Sonar-only feature. Prefer live BLE signaling, but
@@ -2948,13 +2972,17 @@ final class SonarAppStore: ObservableObject {
     }
 
     /// Sends money directly to the receiver's BOLT12 offer from their
-    /// `sonar.meta.v1` descriptor. Legacy claimable ⚡PAY is receive-only during
-    /// migration; new clients no longer initiate sealed coins.
-    func sendPay(_ id: String, sats: Int64) {
-        guard sats > 0,
-              case .ready = walletState,
-              let offer = directPaymentOffer(id)
-        else { return }
+    /// `sonar.meta.v1` descriptor. Returns a user-facing retry message when
+    /// the descriptor/offer is still loading.
+    @discardableResult
+    func sendPay(_ id: String, sats: Int64) -> String? {
+        guard sats > 0, case .ready = walletState else { return nil }
+        guard let offer = directPaymentOffer(id) else {
+            if let npub = callNpub(id) {
+                marmot.ensureSonarDescriptor(npub)
+            }
+            return "Fetching payment details — try again in a moment."
+        }
         let activityId = UUID().uuidString.lowercased()
         let via = dmTransport(id)
         paymentActivityLedger.recordPending(SonarPaymentActivity(
@@ -2971,53 +2999,29 @@ final class SonarAppStore: ObservableObject {
         ))
         Task { [weak self] in
             guard let self else { return }
+            let payment: SonarWalletPayment
             do {
-                let payment = try await self.wallet.send(
+                payment = try await self.wallet.send(
                     destination: offer,
                     amountSats: sats,
                     note: "Sonar payment \(activityId)"
                 )
-                self.paymentActivityLedger.markPaid(activityId, payment: payment)
-                // Record as already-claimed in the pay ledger so the sender's
-                // own transcript renders the bubble via payMapping (not only
-                // paymentActivityRows). processIncomingPayLines skips self
-                // messages, so this manual record is required.
-                self.payLedger.record(SonarPayEntry(
-                    id: activityId, peerKey: id, sats: sats,
-                    direction: .outgoing, state: .claimed, via: via.rawValue
-                ))
-                // Notify the receiver: a ⚡PAY sealed coin followed immediately
-                // by ⚡PAYDONE. The receiver's processIncomingPayLines records
-                // the coin as incoming/sealed, then transitions it to claimed —
-                // showing "Added to your balance" with no claim step.
-                self.sendDm(id, SonarPayMessage.pay(id: activityId, sats: sats).encoded())
-                self.sendDm(id, SonarPayMessage.done(id: activityId).encoded())
             } catch {
                 self.paymentActivityLedger.markFailed(activityId, message: error.localizedDescription)
                 SecureLogger.error("Sonar direct payment failed: \(error)", category: .session)
+                return
             }
+            // Wallet settled — record locally before sending receipts so the
+            // ledger is consistent even if the chat send path ever fails.
+            self.paymentActivityLedger.markPaid(activityId, payment: payment)
+            self.payLedger.record(SonarPayEntry(
+                id: activityId, peerKey: id, sats: sats,
+                direction: .outgoing, state: .claimed, via: via.rawValue
+            ))
+            self.sendDm(id, SonarPayMessage.pay(id: activityId, sats: sats).encoded())
+            self.sendDm(id, SonarPayMessage.done(id: activityId).encoded())
         }
-    }
-
-    /// Receiver tapped a sealed coin: create a BOLT12 offer and send the
-    /// claim. Requires a ready wallet (the screen shows the setup sheet
-    /// otherwise). sealed → claiming; reverts to sealed if the offer fails.
-    func claimPay(_ convId: String, payId: String) {
-        guard let entry = payLedger.entry(for: payId),
-              entry.direction == .incoming, entry.state == .sealed,
-              case .ready = walletState
-        else { return }
-        payLedger.transition(payId, to: .claiming)
-        Task { [weak self] in
-            guard let self else { return }
-            do {
-                let offer = try await self.wallet.createOffer()
-                self.sendDm(convId, SonarPayMessage.claim(id: payId, offer: offer).encoded())
-            } catch {
-                self.payLedger.transition(payId, to: .sealed)
-                SecureLogger.error("⚡PAY claim failed (createOffer): \(error)", category: .session)
-            }
-        }
+        return nil
     }
 
     /// Scans both transcript stores for ⚡PAY control lines from the
@@ -3059,37 +3063,14 @@ final class SonarAppStore: ObservableObject {
     private func handlePayLine(_ line: SonarPayMessage, convId: String, via: SNVia) {
         switch line {
         case .pay(let id, let sats):
-            // Sealed coin arrived: remember it so it survives transcript loss.
+            // Payment receipt arrived: remember it so it survives transcript loss.
             payLedger.record(SonarPayEntry(
                 id: id, peerKey: convId, sats: sats,
                 direction: .incoming, state: .sealed, via: via.rawValue
             ))
 
-        case .claim(let id, let offer):
-            // Counterpart claimed our coin: settle over Lightning, then
-            // confirm. sealed → settling → claimed; failure reverts.
-            guard let entry = payLedger.entry(for: id),
-                  entry.direction == .outgoing, entry.state == .sealed
-            else { return }
-            payLedger.transition(id, to: .settling)
-            Task { [weak self] in
-                guard let self else { return }
-                do {
-                    try await self.wallet.send(
-                        destination: offer,
-                        amountSats: entry.sats,
-                        note: "Sonar payment \(id)"
-                    )
-                    self.payLedger.transition(id, to: .claimed)
-                    self.sendDm(convId, SonarPayMessage.done(id: id).encoded())
-                } catch {
-                    self.payLedger.transition(id, to: .sealed)
-                    SecureLogger.error("⚡PAY settle failed (wallet.send): \(error)", category: .session)
-                }
-            }
-
         case .done(let id):
-            // Our claim settled: reveal the coin ("Added to your balance").
+            // The sender already settled over Lightning: reveal the receipt.
             payLedger.markIncomingClaimedOrPending(id)
         }
     }

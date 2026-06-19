@@ -15,19 +15,11 @@ import XCTest
 final class SonarPayTests: XCTestCase {
 
     private let uuid = "5f0c2c6a-9d57-4f1e-8a3b-2c41770e5b2d"
-    private let offer = "lno1qsgqmqvgm96frzdg8m0gc6nzeqffvzsqzrxqy32afmr3jn9ggl9g2s8sugfvxn4xqzqxqsq"
-
     // MARK: - Codec round trips
 
     func testPayRoundTrip() {
         let line = SonarPayMessage.pay(id: uuid, sats: 21000)
         XCTAssertEqual(line.encoded(), "\u{26A1}PAY|1|\(uuid)|21000")
-        XCTAssertEqual(SonarPayMessage.decode(line.encoded()), line)
-    }
-
-    func testClaimRoundTrip() {
-        let line = SonarPayMessage.claim(id: uuid, offer: offer)
-        XCTAssertEqual(line.encoded(), "\u{26A1}PAYCLAIM|1|\(uuid)|\(offer)")
         XCTAssertEqual(SonarPayMessage.decode(line.encoded()), line)
     }
 
@@ -41,7 +33,6 @@ final class SonarPayTests: XCTestCase {
 
     func testDecodeRejectsUnknownVersion() {
         XCTAssertNil(SonarPayMessage.decode("\u{26A1}PAY|2|\(uuid)|21000"))
-        XCTAssertNil(SonarPayMessage.decode("\u{26A1}PAYCLAIM|2|\(uuid)|\(offer)"))
         XCTAssertNil(SonarPayMessage.decode("\u{26A1}PAYDONE|0|\(uuid)"))
     }
 
@@ -54,16 +45,13 @@ final class SonarPayTests: XCTestCase {
         XCTAssertNil(SonarPayMessage.decode("\u{26A1}PAY|1|\(uuid)|12.5"))     // non-integer
         XCTAssertNil(SonarPayMessage.decode("\u{26A1}PAY|1||21000"))           // empty id
         XCTAssertNil(SonarPayMessage.decode("\u{26A1}PAY|1|not a uuid!|21000")) // bad id chars
-        XCTAssertNil(SonarPayMessage.decode("\u{26A1}PAYCLAIM|1|\(uuid)|"))    // empty offer
+        XCTAssertNil(SonarPayMessage.decode("\u{26A1}PAYCLAIM|1|\(uuid)|lno1xxx")) // removed protocol line
         XCTAssertNil(SonarPayMessage.decode("\u{26A1}PAYDONE|1|\(uuid)|extra"))
         XCTAssertNil(SonarPayMessage.decode("PAY|1|\(uuid)|21000"))            // no ⚡ prefix
     }
 
     func testDecodeDisambiguatesPrefixes() {
-        // ⚡PAYCLAIM / ⚡PAYDONE also start with "⚡PAY".
-        guard case .claim = SonarPayMessage.decode("\u{26A1}PAYCLAIM|1|\(uuid)|\(offer)") else {
-            return XCTFail("Expected .claim")
-        }
+        // ⚡PAYDONE also starts with "⚡PAY".
         guard case .done = SonarPayMessage.decode("\u{26A1}PAYDONE|1|\(uuid)") else {
             return XCTFail("Expected .done")
         }
@@ -105,42 +93,34 @@ final class SonarPayTests: XCTestCase {
     func testSenderTransitions() {
         let (ledger, _) = freshLedger()
         ledger.record(entry(direction: .outgoing))
-        // sealed → settling (⚡PAYCLAIM received) → claimed (paid)
-        XCTAssertTrue(ledger.transition(uuid, to: .settling))
+        // sealed/pending → claimed (paid)
         XCTAssertTrue(ledger.transition(uuid, to: .claimed))
         XCTAssertEqual(ledger.entry(for: uuid)?.state, .claimed)
         // claimed is terminal
         XCTAssertFalse(ledger.transition(uuid, to: .sealed))
-        XCTAssertFalse(ledger.transition(uuid, to: .settling))
         XCTAssertFalse(ledger.transition(uuid, to: .claimed))
     }
 
     func testReceiverTransitions() {
         let (ledger, _) = freshLedger()
         ledger.record(entry(direction: .incoming))
-        // sealed → claiming (offer sent) → claimed (⚡PAYDONE)
-        XCTAssertTrue(ledger.transition(uuid, to: .claiming))
+        // sealed/pending → claimed (⚡PAYDONE)
         XCTAssertTrue(ledger.transition(uuid, to: .claimed))
         XCTAssertEqual(ledger.entry(for: uuid)?.state, .claimed)
     }
 
-    func testFailureRevertsToSealed() {
+    func testOldInFlightStatesCanStillComplete() {
         let (ledger, _) = freshLedger()
-        ledger.record(entry())
-        XCTAssertTrue(ledger.transition(uuid, to: .settling))
-        // Lightning payment failed: back to sealed, claim can retry.
-        XCTAssertTrue(ledger.transition(uuid, to: .sealed))
-        XCTAssertEqual(ledger.entry(for: uuid)?.state, .sealed)
-        XCTAssertTrue(ledger.transition(uuid, to: .claiming))
-        XCTAssertTrue(ledger.transition(uuid, to: .sealed))
+        ledger.record(entry(state: .settling))
+        XCTAssertTrue(ledger.transition(uuid, to: .claimed))
+        XCTAssertEqual(ledger.entry(for: uuid)?.state, .claimed)
     }
 
     func testInvalidTransitions() {
         let (ledger, _) = freshLedger()
         ledger.record(entry())
         XCTAssertFalse(ledger.transition(uuid, to: .sealed))      // no self-loop
-        XCTAssertTrue(ledger.transition(uuid, to: .claiming))
-        XCTAssertFalse(ledger.transition(uuid, to: .settling))    // claiming ↛ settling
+        XCTAssertFalse(ledger.transition(uuid, to: .settling))    // no new claim flow
         XCTAssertFalse(ledger.transition("missing-id", to: .claimed))
     }
 
@@ -166,10 +146,10 @@ final class SonarPayTests: XCTestCase {
 
         let ledger = SonarPayLedger(defaults: defaults)
         ledger.record(entry(direction: .incoming))
-        ledger.transition(uuid, to: .claiming)
+        ledger.transition(uuid, to: .claimed)
 
         let reloaded = SonarPayLedger(defaults: defaults)
-        XCTAssertEqual(reloaded.entry(for: uuid)?.state, .claiming)
+        XCTAssertEqual(reloaded.entry(for: uuid)?.state, .claimed)
         XCTAssertEqual(reloaded.entry(for: uuid)?.sats, 21000)
         XCTAssertEqual(reloaded.entry(for: uuid)?.via, "mesh")
         XCTAssertEqual(reloaded.entry(for: uuid)?.direction, .incoming)

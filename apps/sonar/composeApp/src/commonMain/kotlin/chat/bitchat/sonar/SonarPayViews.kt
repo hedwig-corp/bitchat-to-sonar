@@ -156,8 +156,8 @@ fun PaySheet(
                     SendButton(mesh = mesh, enabled = can) { if (can) { onSend(sats); onClose() } }
                     Spacer(Modifier.height(6.dp))
                     Text(
-                        if (mesh) "Travels phone-to-phone as ecash — works offline. Sealed until $peerName claims it."
-                        else "Instant over the Lightning network. Sealed until $peerName claims it.",
+                        if (mesh) "Chat can stay on Bluetooth. The payment goes straight to $peerName's wallet over Lightning."
+                        else "Payment goes straight to $peerName's wallet over Lightning.",
                         color = s.text3, fontSize = 12.sp, lineHeight = 18.sp, textAlign = TextAlign.Center,
                         modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp)
                     )
@@ -187,10 +187,8 @@ private fun SendButton(mesh: Boolean, enabled: Boolean, onClick: () -> Unit) {
 }
 
 /**
- * Sealed-coin pay bubble — 1:1 reproduction of pay.jsx `PayBubble`. Maps the
- * ⚡PAY ledger state onto the prototype's three visuals: mine (sealed →
- * "waiting"/claimed), incoming sealed (tap-to-claim), incoming revealed
- * ("Added to your balance").
+ * Payment receipt bubble. PAY is the conversation receipt and PAYDONE marks the
+ * Lightning settlement complete; there is no in-chat claim step.
  */
 @Composable
 fun PayBubble(
@@ -200,14 +198,12 @@ fun PayBubble(
     peerName: String,
     mesh: Boolean,
     fiatOf: (Long) -> String?,
-    onClaim: () -> Unit,
 ) {
     val s = sonar
     val time = hhmm(m.tsSecs)
     val viaIcon = if (mesh) SNIconName.Mesh else SNIconName.Bolt
     val claimed = status == PayStatus.Claimed
-    val incomingSealed = !m.mine && !claimed
-    val claiming = status == PayStatus.Claiming
+    val pending = !claimed
 
     Column(
         Modifier.fillMaxWidth().padding(vertical = 4.dp),
@@ -218,30 +214,20 @@ fun PayBubble(
             RoundedCornerShape(18.dp, 18.dp, 5.dp, 18.dp) else RoundedCornerShape(18.dp, 18.dp, 18.dp, 5.dp)
         Row(
             Modifier.widthIn(min = 190.dp).clip(cardShape).background(s.goldFill)
-                .then(if (incomingSealed && !claiming) Modifier.clickable(onClick = onClaim) else Modifier)
                 .padding(start = 12.dp, top = 12.dp, end = 16.dp, bottom = 12.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            PayCoin(pulse = incomingSealed && !claiming)
+            PayCoin(pulse = !m.mine && pending)
             Spacer(Modifier.width(12.dp))
             Column(verticalArrangement = Arrangement.spacedBy(1.dp)) {
-                if (incomingSealed) {
-                    Text(
-                        if (claiming) "Claiming…" else "Payment from $peerName",
-                        color = s.onGold, fontSize = 15.sp, fontWeight = FontWeight.Bold
-                    )
-                    Text(if (claiming) "Settling into your wallet" else "Tap to claim",
-                        color = s.onGold.copy(alpha = 0.72f), fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold)
-                } else {
-                    Row(verticalAlignment = Alignment.Bottom) {
-                        Text(payFmt(pay.sats), color = s.onGold, fontSize = 19.sp, fontWeight = FontWeight.ExtraBold)
-                        Spacer(Modifier.width(2.dp))
-                        Text("sats", color = s.onGold.copy(alpha = 0.7f), fontSize = 12.sp,
-                            fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 2.dp))
-                    }
-                    fiatOf(pay.sats)?.let {
-                        Text(it, color = s.onGold.copy(alpha = 0.72f), fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold)
-                    }
+                Row(verticalAlignment = Alignment.Bottom) {
+                    Text(payFmt(pay.sats), color = s.onGold, fontSize = 19.sp, fontWeight = FontWeight.ExtraBold)
+                    Spacer(Modifier.width(2.dp))
+                    Text("sats", color = s.onGold.copy(alpha = 0.7f), fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 2.dp))
+                }
+                fiatOf(pay.sats)?.let {
+                    Text(it, color = s.onGold.copy(alpha = 0.72f), fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold)
                 }
             }
         }
@@ -253,10 +239,10 @@ fun PayBubble(
         ) {
             SNIcon(viaIcon, 11.dp, s.text3, weight = 2.4f)
             val label = when {
-                m.mine && claimed -> "Claimed by $peerName"
-                m.mine -> "Sealed — waiting for $peerName to claim"
-                claimed -> "Added to your balance"
-                else -> "Sealed for you"
+                m.mine && claimed -> "Paid $peerName"
+                m.mine -> "Sending to $peerName"
+                claimed -> "Received from $peerName"
+                else -> "Incoming payment"
             }
             Text("$label · $time", color = s.text3, fontSize = 11.sp)
         }

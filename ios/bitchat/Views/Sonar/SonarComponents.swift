@@ -659,8 +659,6 @@ struct SNMsgList: View {
     var money: (Int64) -> String = { sonarFormatSats($0) }
     /// Secondary detail line for pay bubbles; nil result = line not rendered.
     var fiatText: (Int64) -> String? = { _ in nil }
-    /// Tap-to-claim on a sealed incoming payment (uuid).
-    var onClaim: ((String) -> Void)? = nil
     /// Tap on another participant's bubble/name (geohash channels) to DM them.
     var onTapAuthor: ((SNMessage) -> Void)? = nil
     /// Download + decrypt a media attachment to raw bytes (cached by the store).
@@ -684,8 +682,7 @@ struct SNMsgList: View {
                                     peerName: peerName,
                                     money: money,
                                     fiatText: fiatText,
-                                    maxBubbleWidth: geo.size.width * 0.78,
-                                    onClaim: onClaim
+                                    maxBubbleWidth: geo.size.width * 0.78
                                 )
                             } else if !m.media.isEmpty {
                                 SNMediaBubble(

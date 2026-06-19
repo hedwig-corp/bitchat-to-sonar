@@ -25,8 +25,8 @@ step for new-client sends.
   unavailable/blocked, not crash.
 - Currency: confirm "Set up your wallet to choose a currency" appears before
   setup and that the chosen currency renders amounts correctly.
-- Legacy compatibility: if you have access to an older Sonar build, confirm an
-  old-style claimable ⚡PAY message from it still works on this build.
+- Confirm there is no "tap to claim" state. Incoming payments should appear as
+  pending/paid receipt bubbles after the sender's wallet settles them.
 
 ## 2. Interactive media attachments
 
