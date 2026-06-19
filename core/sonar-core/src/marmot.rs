@@ -313,13 +313,23 @@ impl MarmotEngine {
         member_key_packages: Vec<Event>,
         relays: Vec<RelayUrl>,
     ) -> Result<GroupCreation> {
+        self.create_group_with_description(name, "", member_key_packages, relays)
+    }
+
+    pub(crate) fn create_group_with_description(
+        &self,
+        name: &str,
+        description: &str,
+        member_key_packages: Vec<Event>,
+        relays: Vec<RelayUrl>,
+    ) -> Result<GroupCreation> {
         let mut admins: Vec<PublicKey> = member_key_packages.iter().map(|e| e.pubkey).collect();
         admins.push(self.identity.public_key());
         let member_pubkeys: Vec<PublicKey> = member_key_packages.iter().map(|e| e.pubkey).collect();
 
         let config = NostrGroupConfigData::new(
             name.to_owned(),
-            String::new(),
+            description.to_owned(),
             None, // image_hash
             None, // image_key
             None, // image_nonce
