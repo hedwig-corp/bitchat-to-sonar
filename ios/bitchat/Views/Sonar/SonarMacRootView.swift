@@ -549,8 +549,10 @@ private struct MacConversationPane: View {
                 fiatText: { store.fiatText($0) },
                 onClose: { paySheet = false },
                 onSend: { sats in
-                    if let message = store.sendPay(id, sats: sats) {
-                        showToast(message)
+                    Task {
+                        if let message = await store.sendPay(id, sats: sats) {
+                            showToast(message)
+                        }
                     }
                 }
             )
@@ -982,11 +984,13 @@ private struct MacConversationPane: View {
             walletSheet = true
             return
         }
-        if let message = store.paymentDetailsUnavailableMessage(id) {
-            showToast(message)
-            return
+        Task {
+            if let message = await store.paymentDetailsUnavailableMessage(id) {
+                showToast(message)
+                return
+            }
+            paySheet = true
         }
-        paySheet = true
     }
 
     private func importAttachments(_ result: Result<[URL], Error>) {

@@ -6305,6 +6305,9 @@
         }
       }
     },
+    "Are you sure you want to leave this group? You won’t be able to read or send messages anymore." : {
+
+    },
     "Audio is connected" : {
 
     },
@@ -6666,6 +6669,9 @@
           }
         }
       }
+    },
+    "Close" : {
+
     },
     "cmd K" : {
 
@@ -7924,6 +7930,9 @@
       }
     },
     "Compare these numbers with %@ in person or on a call. If they match, nobody is in the middle." : {
+
+    },
+    "Compare these numbers with %@ in person or on a call. If they match, this chat is end-to-end encrypted and nobody is in the middle." : {
 
     },
     "content.accessibility.add_favorite" : {
@@ -19229,6 +19238,12 @@
         }
       }
     },
+    "Decline" : {
+
+    },
+    "Direct Sonar and Unify payments will appear here after you send or receive money." : {
+
+    },
     "encryption.accessibility.establishing" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -21018,6 +21033,9 @@
           }
         }
       }
+    },
+    "End-to-end encrypted — only group members can read this" : {
+
     },
     "End-to-end encrypted groups over the internet" : {
 
@@ -23716,6 +23734,9 @@
         }
       }
     },
+    "Group name" : {
+
+    },
     "Identity, key sharing, payments, and safety" : {
 
     },
@@ -23908,6 +23929,9 @@
 
     },
     "Let someone scan this to add you — keys are exchanged directly, never through a server." : {
+
+    },
+    "Lightning wallet" : {
 
     },
     "location_channels.action.open_settings" : {
@@ -31316,7 +31340,16 @@
     "No account was created anywhere — your identity lives on this phone." : {
 
     },
+    "No payments yet" : {
+
+    },
+    "No removable members." : {
+
+    },
     "No secure chats yet" : {
+
+    },
+    "No shared groups" : {
 
     },
     "No signup. Your identity is a private key created on this phone — nobody else ever sees it." : {
@@ -31353,6 +31386,9 @@
 
     },
     "Profile" : {
+
+    },
+    "Receive" : {
 
     },
     "recording %@" : {
@@ -31731,10 +31767,16 @@
     "Search" : {
 
     },
+    "Search emoji" : {
+
+    },
     "Search people, channels, commands" : {
 
     },
     "Search people, channels, messages" : {
+
+    },
+    "Send" : {
 
     },
     "Sense who’s nearby before you see them." : {
@@ -34464,6 +34506,9 @@
     "This removes the conversation from this device only. The other person isn't notified." : {
 
     },
+    "This sends a leave update to the group and removes the conversation from this device." : {
+
+    },
     "Tip: store it in a password manager. Sonar can’t recover it for you." : {
 
     },
@@ -36263,6 +36308,12 @@
         }
       }
     },
+    "Verified" : {
+
+    },
+    "Verify safety numbers" : {
+
+    },
     "via %@" : {
 
     },
@@ -36446,6 +36497,9 @@
       }
     },
     "Wallet not ready" : {
+
+    },
+    "you" : {
 
     },
     "You’re in, %@." : {

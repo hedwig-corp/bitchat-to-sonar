@@ -205,8 +205,10 @@ struct SonarDMScreen: View {
                 fiatText: { store.fiatText($0) },
                 onClose: { paySheet = false },
                 onSend: { sats in
-                    if let message = store.sendPay(peerId, sats: sats) {
-                        showToast(message)
+                    Task {
+                        if let message = await store.sendPay(peerId, sats: sats) {
+                            showToast(message)
+                        }
                     }
                 }
             )
@@ -259,11 +261,13 @@ struct SonarDMScreen: View {
             walletSheet = true
             return
         }
-        if let message = store.paymentDetailsUnavailableMessage(peerId) {
-            showToast(message)
-            return
+        Task {
+            if let message = await store.paymentDetailsUnavailableMessage(peerId) {
+                showToast(message)
+                return
+            }
+            paySheet = true
         }
-        paySheet = true
     }
 
     private func showToast(_ text: String) {

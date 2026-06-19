@@ -579,6 +579,7 @@ private fun ChannelHint() {
 @Composable
 private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     val s = sonar
+    val scope = rememberCoroutineScope()
     var draft by remember { mutableStateOf("") }
     var emojiTray by remember { mutableStateOf(false) }
     var paySheet by remember { mutableStateOf(false) }
@@ -606,10 +607,15 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     }
     // Radar "Send sats" opens the chat with pay=true → jump straight to the sheet.
     fun openPaySheetOrRetry() {
-        val message = state.paymentDetailsUnavailableMessage(screen.id)
-        if (message != null) state.toast = message else paySheet = true
+        scope.launch {
+            val message = state.paymentDetailsUnavailableMessage(screen.id)
+            if (message != null) state.toast = message else paySheet = true
+        }
     }
-    LaunchedEffect(screen.id) { if (screen.pay) openPaySheetOrRetry() }
+    LaunchedEffect(screen.id) {
+        state.refreshDescriptorForChat(screen.id)
+        if (screen.pay) openPaySheetOrRetry()
+    }
     val listState = rememberLazyListState()
     // Transcript feed = chat messages (pay control lines collapsed) + mocked
     // call-log records, merged chronologically.
@@ -927,7 +933,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         // The receipt follows the chat route; the actual payment settles over Lightning.
         mesh = screen.id.startsWith("mesh:"),
         fiatOf = { state.fiatOrNull(it) },
-        onSend = { sats -> state.sendPay(screen.id, sats)?.let { state.toast = it } },
+        onSend = { sats -> scope.launch { state.sendPay(screen.id, sats)?.let { state.toast = it } } },
         onClose = { paySheet = false }
     )
     if (verifySheet) VerifySheet(

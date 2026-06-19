@@ -32,6 +32,7 @@ actual object SonarCore {
         "wss://relay.damus.io",
         "wss://nos.lol",
         "wss://relay.primal.net",
+        "wss://relay.kaleidoswap.com",
     )
 
     private val lock = Mutex()
@@ -235,7 +236,7 @@ actual object SonarCore {
     }
 
     actual suspend fun publishSonarDescriptor(callsEnabled: Boolean, bolt12Offer: String?) = withContext(Dispatchers.IO) {
-        runCatching { node?.publishSonarDescriptor(false, listOf("marmot"), bolt12Offer) }
+        runCatching { node?.publishSonarDescriptor(callsEnabled, listOf("marmot"), bolt12Offer) }
         Unit
     }
 

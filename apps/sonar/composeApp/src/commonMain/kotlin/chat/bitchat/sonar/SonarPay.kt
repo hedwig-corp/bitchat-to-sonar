@@ -76,7 +76,7 @@ class SonarPayLedger(blob: String = "") {
         entries.values.joinToString("\n") { "${it.uuid}|${it.sats}|${it.status}|${if (it.mine) 1 else 0}" }
 
     /** Record a receipt (idempotent). Returns true if it changed. */
-    fun recordSealed(uuid: String, sats: Long, mine: Boolean): Boolean {
+    fun recordReceipt(uuid: String, sats: Long, mine: Boolean): Boolean {
         if (entries.containsKey(uuid)) return false
         val doneWasPending = pendingDone.remove(uuid)
         val status = if (mine || doneWasPending) PayStatus.Claimed else PayStatus.Sealed

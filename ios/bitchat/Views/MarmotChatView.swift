@@ -354,7 +354,6 @@ final class MarmotChatModel: ObservableObject {
                 self.errorText = nil
                 self.relayConnected = true
                 try? await self.service.publishKeyPackage()
-                try? await self.service.publishSonarDescriptor()
                 self.startPolling()
             } catch MarmotService.ServiceError.cancelled {
                 self.relayConnected = false
@@ -632,23 +631,53 @@ final class MarmotChatModel: ObservableObject {
         }
         guard descriptorFetches.insert(npubToFetch).inserted else { return }
         Task {
-            do {
-                let descriptor = try await service.fetchSonarDescriptor(npub: npubToFetch)
-                await MainActor.run {
-                    self.descriptorFetches.remove(npubToFetch)
-                    self.sonarDescriptorFetchedAtByNpub[npubToFetch] = Date()
-                    if let descriptor {
-                        self.sonarDescriptorsByNpub[npubToFetch] = descriptor
-                        self.sonarDescriptorMissesByNpub[npubToFetch] = nil
-                    } else {
-                        self.sonarDescriptorsByNpub.removeValue(forKey: npubToFetch)
-                        self.sonarDescriptorMissesByNpub[npubToFetch] = Date()
-                    }
+            await performDescriptorFetch(npubToFetch)
+        }
+    }
+
+    /// Synchronous variant: awaits the relay fetch and returns the descriptor.
+    /// Use when the descriptor is missing and the caller needs it before
+    /// proceeding (e.g. opening a pay sheet). When the descriptor is already
+    /// cached and just stale, prefer the fire-and-forget `ensureSonarDescriptor`.
+    func fetchSonarDescriptorSync(
+        _ npubToFetch: String,
+        bypassRecentMiss: Bool = true
+    ) async -> MarmotService.SonarDescriptor? {
+        guard !npubToFetch.isEmpty, npubToFetch != npub else { return nil }
+        let cached = sonarDescriptorsByNpub[npubToFetch]
+        let hasBolt12 = cached?.bolt12Offer?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        if hasBolt12,
+           let fetchedAt = sonarDescriptorFetchedAtByNpub[npubToFetch],
+           Date().timeIntervalSince(fetchedAt) < Self.sonarDescriptorRefreshInterval {
+            return cached
+        }
+        if !bypassRecentMiss,
+           let miss = sonarDescriptorMissesByNpub[npubToFetch],
+           Date().timeIntervalSince(miss) < Self.sonarDescriptorMissRetryInterval {
+            return sonarDescriptorsByNpub[npubToFetch]
+        }
+        descriptorFetches.insert(npubToFetch)
+        await performDescriptorFetch(npubToFetch)
+        return sonarDescriptorsByNpub[npubToFetch]
+    }
+
+    private func performDescriptorFetch(_ npubToFetch: String) async {
+        do {
+            let descriptor = try await service.fetchSonarDescriptor(npub: npubToFetch)
+            await MainActor.run {
+                self.descriptorFetches.remove(npubToFetch)
+                self.sonarDescriptorFetchedAtByNpub[npubToFetch] = Date()
+                if let descriptor {
+                    self.sonarDescriptorsByNpub[npubToFetch] = descriptor
+                    self.sonarDescriptorMissesByNpub[npubToFetch] = nil
+                } else {
+                    self.sonarDescriptorsByNpub.removeValue(forKey: npubToFetch)
+                    self.sonarDescriptorMissesByNpub[npubToFetch] = Date()
                 }
-            } catch {
-                await MainActor.run {
-                    _ = self.descriptorFetches.remove(npubToFetch)
-                }
+            }
+        } catch {
+            await MainActor.run {
+                _ = self.descriptorFetches.remove(npubToFetch)
             }
         }
     }
@@ -767,6 +796,28 @@ final class MarmotChatModel: ObservableObject {
             } catch {
                 self.errorText = Self.describe(error)
             }
+        }
+    }
+
+    func send(_ texts: [String], to groupId: String) async -> Bool {
+        let trimmed = texts
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !trimmed.isEmpty else { return true }
+        do {
+            guard await ensureConnected() else {
+                throw MarmotService.ServiceError.notConnected
+            }
+            await loadLocalPage(groupId: groupId)
+            for text in trimmed {
+                try await service.sendText(groupId: groupId, text: text)
+            }
+            await loadLocalPage(groupId: groupId)
+            await refreshWhenConnected(groupId: groupId, hydrateBeforeSync: false)
+            return true
+        } catch {
+            self.errorText = Self.describe(error)
+            return false
         }
     }
 

@@ -240,8 +240,10 @@ struct SonarContactProfileScreen: View {
                 fiatText: { store.fiatText($0) },
                 onClose: { paySheet = false },
                 onSend: { sats in
-                    if let message = store.sendPay(effectiveChatId, sats: sats) {
-                        showToast(message)
+                    Task {
+                        if let message = await store.sendPay(effectiveChatId, sats: sats) {
+                            showToast(message)
+                        }
                     }
                 }
             )
@@ -293,11 +295,13 @@ struct SonarContactProfileScreen: View {
             walletSheet = true
             return
         }
-        if let message = store.paymentDetailsUnavailableMessage(effectiveChatId) {
-            showToast(message)
-            return
+        Task {
+            if let message = await store.paymentDetailsUnavailableMessage(effectiveChatId) {
+                showToast(message)
+                return
+            }
+            paySheet = true
         }
-        paySheet = true
     }
 
     private func profileAction(icon: SNIconName, label: String, enabled: Bool = true, action: @escaping () -> Void) -> some View {
