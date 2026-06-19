@@ -641,7 +641,9 @@ final class MarmotChatModel: ObservableObject {
     /// cached and just stale, prefer the fire-and-forget `ensureSonarDescriptor`.
     func fetchSonarDescriptorSync(_ npubToFetch: String) async -> MarmotService.SonarDescriptor? {
         guard !npubToFetch.isEmpty, npubToFetch != npub else { return nil }
-        if let cached = sonarDescriptorsByNpub[npubToFetch],
+        let cached = sonarDescriptorsByNpub[npubToFetch]
+        let hasBolt12 = cached?.bolt12Offer?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        if hasBolt12,
            let fetchedAt = sonarDescriptorFetchedAtByNpub[npubToFetch],
            Date().timeIntervalSince(fetchedAt) < Self.sonarDescriptorRefreshInterval {
             return cached

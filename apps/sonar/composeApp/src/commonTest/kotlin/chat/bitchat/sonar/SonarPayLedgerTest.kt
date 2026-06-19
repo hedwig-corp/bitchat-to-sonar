@@ -11,8 +11,8 @@ class SonarPayLedgerTest {
     @Test
     fun pendingReceiptBecomesClaimed() {
         val l = SonarPayLedger()
-        assertTrue(l.recordSealed("u1", 1000, mine = false))
-        assertFalse(l.recordSealed("u1", 1000, mine = false), "idempotent: no second seal")
+        assertTrue(l.recordReceipt("u1", 1000, mine = false))
+        assertFalse(l.recordReceipt("u1", 1000, mine = false), "idempotent: no second seal")
         assertEquals(PayStatus.Sealed, l.get("u1")!!.status)
 
         assertTrue(l.markClaimed("u1"))
@@ -24,15 +24,15 @@ class SonarPayLedgerTest {
     @Test
     fun outgoingReceiptIsAlreadyClaimed() {
         val l = SonarPayLedger()
-        l.recordSealed("u2", 21000, mine = true)
+        l.recordReceipt("u2", 21000, mine = true)
         assertEquals(PayStatus.Claimed, l.get("u2")!!.status)
     }
 
     @Test
     fun serializeRoundTripSurvivesRestart() {
         val l = SonarPayLedger()
-        l.recordSealed("a", 100, mine = true)
-        l.recordSealed("b", 200, mine = false)
+        l.recordReceipt("a", 100, mine = true)
+        l.recordReceipt("b", 200, mine = false)
         val blob = l.serialize()
 
         val reloaded = SonarPayLedger(blob)
@@ -54,7 +54,7 @@ class SonarPayLedgerTest {
     fun doneBeforePayRecordsIncomingAsClaimed() {
         val l = SonarPayLedger()
         assertFalse(l.markClaimedOrPending("u3"))
-        assertTrue(l.recordSealed("u3", 1000, mine = false))
+        assertTrue(l.recordReceipt("u3", 1000, mine = false))
         assertEquals(PayStatus.Claimed, l.get("u3")!!.status)
     }
 
@@ -81,8 +81,8 @@ class SonarPayLedgerTest {
 
         // 1) Sender pays the receiver's published offer, then posts ⚡PAY.
         val pay = PayLine.decode("⚡PAY|1|c1|5000") as PayLine.Pay
-        sender.recordSealed(pay.uuid, pay.sats, mine = true)
-        receiver.recordSealed(pay.uuid, pay.sats, mine = false)
+        sender.recordReceipt(pay.uuid, pay.sats, mine = true)
+        receiver.recordReceipt(pay.uuid, pay.sats, mine = false)
 
         // 2) Sender posts ⚡PAYDONE once settlement completes.
         val done = PayLine.decode("⚡PAYDONE|1|c1") as PayLine.Done

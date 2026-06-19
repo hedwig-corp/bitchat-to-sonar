@@ -928,12 +928,17 @@ class SonarAppState(private val scope: CoroutineScope) {
                 }
             walletState = WalletBridge.state()
             if (ok) {
-                if (payLedger.recordSealed(payId, sats, mine = true)) {
+                if (payLedger.recordReceipt(payId, sats, mine = true)) {
                     persistPay()
                     payVersion++
                 }
-                send(chatId, PayLine.Pay(payId, sats).encoded())
-                send(chatId, PayLine.Done(payId).encoded())
+                val receiptOk = runCatching {
+                    send(chatId, PayLine.Pay(payId, sats).encoded())
+                    send(chatId, PayLine.Done(payId).encoded())
+                }.isSuccess
+                if (!receiptOk) {
+                    toast = "Payment sent but receipt delivery failed"
+                }
             } else {
                 toast = failureMessage ?: "Payment failed"
             }
@@ -946,7 +951,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         var changed = false
         for (m in msgs) {
             when (val line = PayLine.decode(m.content)) {
-                is PayLine.Pay -> if (payLedger.recordSealed(line.uuid, line.sats, m.mine)) changed = true
+                is PayLine.Pay -> if (payLedger.recordReceipt(line.uuid, line.sats, m.mine)) changed = true
                 is PayLine.Done -> if (payLedger.markClaimedOrPending(line.uuid)) changed = true
                 null -> {}
             }
@@ -1459,9 +1464,11 @@ class SonarAppState(private val scope: CoroutineScope) {
     private suspend fun fetchSonarDescriptorSync(npubHex: String): SonarDescriptor? {
         val key = npubHex.lowercase()
         val now = SonarClock.nowSecs()
+        val cached = sonarDescriptorsByNpubHex[key]
+        val hasBolt12 = cached?.bolt12Offer?.isNotBlank() == true
         val fetchedAt = sonarDescriptorFetchedAt[key]
-        if (sonarDescriptorsByNpubHex[key] != null && fetchedAt != null && now - fetchedAt < SONAR_DESCRIPTOR_TTL_SECS) {
-            return sonarDescriptorsByNpubHex[key]
+        if (hasBolt12 && fetchedAt != null && now - fetchedAt < SONAR_DESCRIPTOR_TTL_SECS) {
+            return cached
         }
         val missedAt = sonarDescriptorMissedAt[key]
         if (missedAt != null && now - missedAt < SONAR_DESCRIPTOR_MISS_TTL_SECS) {
