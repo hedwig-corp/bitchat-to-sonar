@@ -1571,7 +1571,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (echo.state == "Couldn't send") continue
             val match = ownPublished[echo.content]
                 ?.filter { it.id !in consumedPublished }
-                ?.firstOrNull { it.tsSecs >= echo.tsSecs - 2 && it.tsSecs - echo.tsSecs < 30 }
+                ?.firstOrNull { it.tsSecs > echo.tsSecs && it.tsSecs - echo.tsSecs < 30 }
             if (match != null) {
                 fulfilled.add(echo.id)
                 consumedPublished.add(match.id)
