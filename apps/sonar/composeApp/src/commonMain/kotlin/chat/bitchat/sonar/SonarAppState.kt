@@ -1334,19 +1334,15 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun groupAuthorName(message: SonarMsg, isGroup: Boolean): String? {
         if (!isGroup || message.mine || message.senderNpub.isBlank()) return null
         return profilesByNpub[canonicalProfileKey(message.senderNpub)]?.bestName
-            ?: run { ensureProfile(message.senderNpub); shortNpub(message.senderNpub) }
+            ?: shortNpub(message.senderNpub)
     }
 
     /** Fetch + cache a peer's kind-0 profile, so their name replaces the
-     *  raw npub in the chat list/header. Re-fetches after PROFILE_REFRESH_TTL_SECS. */
+     *  raw npub in the chat list/header. */
     fun ensureProfile(otherNpub: String) {
         val key = canonicalProfileKey(otherNpub)
         if (key.isBlank() || key == canonicalProfileKey(npub)) return
         val hadCachedProfile = profilesByNpub.containsKey(key) || profilesByNpub.containsKey(otherNpub)
-        val now = SonarClock.nowSecs()
-        val fetchedAt = profileFetchedAt[key]
-        val stale = hadCachedProfile && fetchedAt != null && now - fetchedAt >= PROFILE_REFRESH_TTL_SECS
-        if (stale) profileFetches.remove(key)
         if (!profileFetches.add(key)) return        // fetch already in flight
         scope.launch {
             val p = SonarCore.fetchProfile(key)
@@ -2650,18 +2646,31 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // scan for inbound ☎CALL lines so a call rings even when the chat
                 // isn't open (the offer arrives over White Noise/Marmot).
                 var wnMsgs = 0
+                val senders = mutableSetOf<String>()
                 for (c in chats) {
                     val ms = runCatching { SonarCore.messagesPage(c.id, LOCAL_TRANSCRIPT_PAGE_LIMIT) }.getOrDefault(emptyList())
                     wnMsgs += ms.size
                     processCallLines(c.id, ms)
+                    for (m in ms) {
+                        if (!m.mine && m.senderNpub.isNotBlank()) senders.add(m.senderNpub)
+                    }
                 }
                 if (chats.size != lastWnGroups || wnMsgs != lastWnMsgs) {
                     sonarLog("SonarWN", "White Noise: ${chats.size} group(s), $wnMsgs message(s)")
                     lastWnGroups = chats.size; lastWnMsgs = wnMsgs
                 }
-                // Resolve each counterpart's kind-0 profile (retries until they
-                // publish one) so chats show a human name, not a raw npub.
+                // Resolve kind-0 profiles for chat members and message senders
+                // so chats show human names, not raw npubs.
                 for (c in chats) c.members.forEach { if (it != npub) ensureProfile(it) }
+                senders.forEach { ensureProfile(it) }
+                // Re-fetch stale profiles every ~30 minutes (450 ticks × 4s).
+                if (tick % 450 == 0) {
+                    val now = SonarClock.nowSecs()
+                    val stale = profileFetchedAt.entries
+                        .filter { now - it.value >= PROFILE_REFRESH_TTL_SECS }
+                        .map { it.key }
+                    stale.forEach { profileFetches.remove(it); profileFetchedAt.remove(it) }
+                }
                 flushPendingMarmot() // a queued out-of-range send whose group just landed
                 flushAllOutbox() // retry any outbox messages whose peer is now reachable
                 maybeNotify()
