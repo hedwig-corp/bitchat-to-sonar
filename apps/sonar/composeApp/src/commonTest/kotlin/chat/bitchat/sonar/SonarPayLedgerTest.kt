@@ -67,6 +67,14 @@ class SonarPayLedgerTest {
     }
 
     @Test
+    fun doneBeforePayRecordsIncomingAsClaimed() {
+        val l = SonarPayLedger()
+        assertFalse(l.markClaimedOrPending("u3"))
+        assertTrue(l.recordSealed("u3", 1000, mine = false))
+        assertEquals(PayStatus.Claimed, l.get("u3")!!.status)
+    }
+
+    @Test
     fun payLineCodecRoundTrips() {
         assertEquals("⚡PAY|1|u1|2100", PayLine.Pay("u1", 2100).encoded())
         assertEquals("⚡PAYCLAIM|1|u1|lno1xxx", PayLine.Claim("u1", "lno1xxx").encoded())

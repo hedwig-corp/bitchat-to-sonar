@@ -52,6 +52,7 @@ data class PayEntry(val uuid: String, val sats: Long, val status: PayStatus, val
  */
 class SonarPayLedger(blob: String = "") {
     private val entries = LinkedHashMap<String, PayEntry>()
+    private val pendingDone = HashSet<String>()
 
     init {
         for (line in blob.split("\n")) {
@@ -72,7 +73,9 @@ class SonarPayLedger(blob: String = "") {
     /** Record a freshly-sealed coin (idempotent). Returns true if it changed. */
     fun recordSealed(uuid: String, sats: Long, mine: Boolean): Boolean {
         if (entries.containsKey(uuid)) return false
-        entries[uuid] = PayEntry(uuid, sats, PayStatus.Sealed, mine)
+        val doneWasPending = pendingDone.remove(uuid)
+        val status = if (!mine && doneWasPending) PayStatus.Claimed else PayStatus.Sealed
+        entries[uuid] = PayEntry(uuid, sats, status, mine)
         return true
     }
 
@@ -84,6 +87,15 @@ class SonarPayLedger(blob: String = "") {
 
     /** Coin settled (any non-terminal → Claimed). */
     fun markClaimed(uuid: String): Boolean = transition(uuid, PayStatus.Claimed) { it != PayStatus.Claimed }
+
+    /** Mark claimed, or remember DONE when it arrives before the matching PAY. */
+    fun markClaimedOrPending(uuid: String): Boolean {
+        if (!entries.containsKey(uuid)) {
+            pendingDone.add(uuid)
+            return false
+        }
+        return markClaimed(uuid)
+    }
 
     /** A claim/settle attempt failed — revert so it can be retried. */
     fun fail(uuid: String): Boolean =

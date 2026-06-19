@@ -2064,8 +2064,10 @@ final class SonarAppStore: ObservableObject {
         )
     }
 
-    private func paymentActivityRows(for id: String) -> [(Date, SNMessage)] {
-        paymentActivityLedger.activities(peerKey: id).filter { payLedger.entry(for: $0.id) == nil }.map { activity in
+    private func paymentActivityRows(for id: String, transcriptPayIDs: Set<String>) -> [(Date, SNMessage)] {
+        paymentActivityLedger.activities(peerKey: id).filter { activity in
+            payLedger.entry(for: activity.id) == nil || !transcriptPayIDs.contains(activity.id)
+        }.map { activity in
             let displayDate = activity.settledAt ?? activity.createdAt
             let state: SonarPayEntry.State = activity.status == .paid ? .claimed : .settling
             let via = SNVia(rawValue: activity.via) ?? .internet
@@ -2143,7 +2145,8 @@ final class SonarAppStore: ObservableObject {
                 }
                 dated.sort { $0.0 < $1.0 }
             }
-            dated += paymentActivityRows(for: id)
+            let transcriptPayIDs = Set(dated.compactMap { $0.1.pay?.id })
+            dated += paymentActivityRows(for: id, transcriptPayIDs: transcriptPayIDs)
             return mergeCallLogs(into: dated, id: id)
         }
         let peerID = PeerID(str: id)
@@ -2204,7 +2207,8 @@ final class SonarAppStore: ObservableObject {
             }
             dated.sort { $0.0 < $1.0 }
         }
-        dated += paymentActivityRows(for: id)
+        let transcriptPayIDs = Set(dated.compactMap { $0.1.pay?.id })
+        dated += paymentActivityRows(for: id, transcriptPayIDs: transcriptPayIDs)
         return mergeCallLogs(into: dated, id: id)
     }
 
@@ -3053,8 +3057,7 @@ final class SonarAppStore: ObservableObject {
 
         case .done(let id):
             // Our claim settled: reveal the coin ("Added to your balance").
-            guard let entry = payLedger.entry(for: id), entry.direction == .incoming else { return }
-            payLedger.transition(id, to: .claimed)
+            payLedger.markIncomingClaimedOrPending(id)
         }
     }
 
