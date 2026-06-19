@@ -2833,12 +2833,15 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
-    /// Start a Marmot (White Noise) secure chat by npub. The new group shows
-    /// up in the Messages list once the welcome round-trips.
+    /// Start a Marmot (White Noise) secure chat by npub and navigate into it.
     func startSecureChat(npub: String) {
         marmot.connectIfNeeded()
         marmot.ensureSonarDescriptor(npub)
-        marmot.startChat(with: npub)
+        Task { @MainActor in
+            if let groupId = await marmot.startChatReturningId(with: npub) {
+                push(.dm("\(Self.marmotIDPrefix)\(groupId)"))
+            }
+        }
     }
 
     // MARK: Payments (⚡PAY sealed coins — docs/SONAR-PAYMENTS.md)
