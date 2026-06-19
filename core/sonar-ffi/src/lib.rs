@@ -497,20 +497,14 @@ impl SonarNode {
         Ok(self.client.create_invite_link(&group_id, &group_name)?)
     }
 
-    pub fn pending_join_requests(
-        &self,
-        group_id_hex: String,
-    ) -> FfiResult<Vec<JoinRequestInfo>> {
+    pub fn pending_join_requests(&self, group_id_hex: String) -> FfiResult<Vec<JoinRequestInfo>> {
         let group_id = parse_group_id(&group_id_hex)?;
         Ok(self
             .client
             .pending_join_requests(&group_id)
             .into_iter()
             .map(|r| JoinRequestInfo {
-                requester_npub: r
-                    .requester
-                    .to_bech32()
-                    .expect("npub encoding cannot fail"),
+                requester_npub: r.requester.to_bech32().expect("npub encoding cannot fail"),
                 group_id_hex: hex::encode(r.group_id.as_slice()),
                 received_at: r.received_at,
             })
@@ -536,7 +530,7 @@ impl SonarNode {
     ) -> FfiResult<()> {
         let group_id = parse_group_id(&group_id_hex)?;
         let requester = PublicKey::parse(&requester_npub).map_err(invalid("requester npub"))?;
-        self.client.decline_join_request(&group_id, &requester);
+        self.client.decline_join_request(&group_id, &requester)?;
         Ok(())
     }
 
@@ -671,10 +665,7 @@ impl SonarNode {
 
     // ── Conversation index (Signal-style summary table) ──────────────────
 
-    pub fn set_conversation_change_listener(
-        &self,
-        listener: Box<dyn ConversationChangeListener>,
-    ) {
+    pub fn set_conversation_change_listener(&self, listener: Box<dyn ConversationChangeListener>) {
         let (tx, rx) = std::sync::mpsc::channel::<String>();
         std::thread::Builder::new()
             .name("sonar-change-fwd".into())

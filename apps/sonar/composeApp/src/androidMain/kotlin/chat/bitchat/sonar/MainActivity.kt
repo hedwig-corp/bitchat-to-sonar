@@ -9,9 +9,6 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
 
@@ -90,9 +87,7 @@ class MainActivity : ComponentActivity() {
         if (uri.scheme == "sonar" && uri.host == "invite") {
             val token = uri.lastPathSegment ?: return
             if (!token.startsWith("sinvite1")) return
-            CoroutineScope(Dispatchers.IO).launch {
-                try { SonarCore.requestJoinViaLink(token) } catch (_: Throwable) {}
-            }
+            SonarLifecycle.submitInviteLink(token)
         }
     }
 

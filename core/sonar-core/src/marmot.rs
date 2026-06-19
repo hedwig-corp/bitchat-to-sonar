@@ -626,8 +626,8 @@ impl MarmotEngine {
             hex::decode(&payload.group_id).map_err(|e| Error::InvalidInput(e.to_string()))?;
         let group_id = GroupId::from_slice(&group_id_bytes);
 
-        let secret_hash_bytes =
-            hex::decode(&payload.invite_secret_hash).map_err(|e| Error::InvalidInput(e.to_string()))?;
+        let secret_hash_bytes = hex::decode(&payload.invite_secret_hash)
+            .map_err(|e| Error::InvalidInput(e.to_string()))?;
         let mut secret_hash = [0u8; 32];
         if secret_hash_bytes.len() == 32 {
             secret_hash.copy_from_slice(&secret_hash_bytes);

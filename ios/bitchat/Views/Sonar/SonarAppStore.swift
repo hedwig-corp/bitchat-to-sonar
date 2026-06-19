@@ -364,6 +364,7 @@ final class SonarAppStore: ObservableObject {
 
     /// Navigation stack below the home root.
     @Published var path: [SonarRoute] = []
+    @Published var toast: String? = nil
     @Published private(set) var onboarded: Bool
     @Published private(set) var mode: String
     @Published private(set) var marmotVerified: [String: Bool]
@@ -802,6 +803,15 @@ final class SonarAppStore: ObservableObject {
     // MARK: Appearance
 
     var isDarkMode: Bool { mode == "dark" }
+
+    @MainActor
+    func showToast(_ text: String) {
+        toast = text
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_600_000_000)
+            if toast == text { toast = nil }
+        }
+    }
 
     func toggleMode() {
         mode = mode == "dark" ? "light" : "dark"

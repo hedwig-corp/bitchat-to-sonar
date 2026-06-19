@@ -1085,6 +1085,10 @@ final class MarmotChatModel: ObservableObject {
         try await service.createInviteLink(groupId: groupId, groupName: groupName)
     }
 
+    func pendingJoinRequests(groupId: String) async throws -> [JoinRequestInfo] {
+        try await service.pendingJoinRequests(groupId: groupId)
+    }
+
     func approveJoinRequest(groupId: String, requesterNpub: String) async throws {
         try await service.approveJoinRequest(groupId: groupId, requesterNpub: requesterNpub)
         await loadLocal()

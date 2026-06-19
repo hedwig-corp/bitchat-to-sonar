@@ -3,6 +3,7 @@ package chat.bitchat.sonar.screens
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -21,6 +22,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -37,6 +39,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import chat.bitchat.sonar.Screen
 import chat.bitchat.sonar.SonarAppState
+import chat.bitchat.sonar.SonarJoinRequest
 import chat.bitchat.sonar.ui.SNBanner
 import chat.bitchat.sonar.ui.SNBannerTone
 import chat.bitchat.sonar.ui.SNGhostButton
@@ -50,7 +53,6 @@ import chat.bitchat.sonar.ui.SNSettingsRow
 import chat.bitchat.sonar.ui.SNTone
 import chat.bitchat.sonar.ui.SNTrail
 import chat.bitchat.sonar.ui.SonarAvatar
-import chat.bitchat.sonar.ui.SonarType
 import chat.bitchat.sonar.ui.sonar
 
 @Composable
@@ -65,7 +67,12 @@ fun SonarGroupInfoScreen(state: SonarAppState, screen: Screen.GroupInfo) {
     var addDraft by remember { mutableStateOf("") }
     var showLeaveSheet by remember { mutableStateOf(false) }
     var inviteLink by remember { mutableStateOf<String?>(null) }
+    var pendingJoinRequests by remember(chatId) { mutableStateOf<List<SonarJoinRequest>>(emptyList()) }
     val clipboard = LocalClipboardManager.current
+    fun refreshPendingJoinRequests() {
+        state.loadPendingJoinRequests(chatId) { pendingJoinRequests = it }
+    }
+    LaunchedEffect(chatId) { refreshPendingJoinRequests() }
 
     Box(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize().background(s.bg)) {
@@ -112,19 +119,42 @@ fun SonarGroupInfoScreen(state: SonarAppState, screen: Screen.GroupInfo) {
                         icon = SNIconName.Link,
                         tone = SNTone.Cyan,
                         label = if (inviteLink != null) "Copy invite link" else "Create invite link",
-                        sub = if (inviteLink != null) "sinvite1…${inviteLink!!.takeLast(8)}" else "Share a link to let people request to join",
+                        sub = if (inviteLink != null) "sonar://invite/sinvite1…${inviteLink!!.takeLast(8)}" else "Share a link to let people request to join",
                         trail = SNTrail.Chevron,
                         divider = false
                     ) {
                         if (inviteLink != null) {
-                            clipboard.setText(AnnotatedString(inviteLink!!))
+                            clipboard.setText(AnnotatedString(inviteDeepLink(inviteLink!!)))
                             state.toast = "Invite link copied"
                         } else {
                             state.createInviteLink(chatId, groupName) { token ->
                                 inviteLink = token
-                                clipboard.setText(AnnotatedString(token))
+                                clipboard.setText(AnnotatedString(inviteDeepLink(token)))
                                 state.toast = "Invite link created and copied"
                             }
+                        }
+                    }
+                }
+
+                // ── Pending join requests ──
+                if (pendingJoinRequests.isNotEmpty()) {
+                    SNSectionLabel("Join requests")
+                    SNSettingsCard {
+                        pendingJoinRequests.forEachIndexed { index, request ->
+                            PendingJoinRequestRow(
+                                request = request,
+                                divider = index < pendingJoinRequests.lastIndex,
+                                onApprove = {
+                                    state.approveJoinRequest(chatId, request.requesterNpub) {
+                                        refreshPendingJoinRequests()
+                                    }
+                                },
+                                onDecline = {
+                                    state.declineJoinRequest(chatId, request.requesterNpub) {
+                                        refreshPendingJoinRequests()
+                                    }
+                                }
+                            )
                         }
                     }
                 }
@@ -311,3 +341,58 @@ private fun parsedNpubs(input: String): List<String> =
         .map { it.trim() }
         .filter { it.startsWith("npub1") && it.length > 10 }
         .distinct()
+
+private fun inviteDeepLink(token: String): String = "sonar://invite/$token"
+
+private fun shortJoinRequester(value: String): String =
+    if (value.length <= 16) value else "${value.take(10)}…${value.takeLast(6)}"
+
+@Composable
+private fun PendingJoinRequestRow(
+    request: SonarJoinRequest,
+    divider: Boolean,
+    onApprove: () -> Unit,
+    onDecline: () -> Unit,
+) {
+    val s = sonar
+    Column {
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 11.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(
+                Modifier.size(34.dp).clip(RoundedCornerShape(10.dp)).background(s.greenSoft),
+                contentAlignment = Alignment.Center
+            ) { SNIcon(SNIconName.Plus, 18.dp, s.green) }
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text("Join request", color = s.text, fontSize = 16.sp, fontWeight = FontWeight.Medium)
+                Text(shortJoinRequester(request.requesterNpub), color = s.text3, fontSize = 12.5.sp, lineHeight = 16.sp)
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                JoinRequestAction("Decline", danger = true, onClick = onDecline)
+                JoinRequestAction("Approve", danger = false, onClick = onApprove)
+            }
+        }
+        if (divider) {
+            Box(
+                Modifier.fillMaxWidth().padding(start = 62.dp).height(1.dp)
+                    .background(s.hairline)
+            )
+        }
+    }
+}
+
+@Composable
+private fun JoinRequestAction(label: String, danger: Boolean, onClick: () -> Unit) {
+    val s = sonar
+    val fg = if (danger) s.danger else s.green
+    val bg = if (danger) s.surface2 else s.greenSoft
+    Box(
+        Modifier.clip(RoundedCornerShape(10.dp)).background(bg).clickable(onClick = onClick)
+            .padding(horizontal = 10.dp, vertical = 7.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(label, color = fg, fontSize = 12.5.sp, fontWeight = FontWeight.SemiBold)
+    }
+}

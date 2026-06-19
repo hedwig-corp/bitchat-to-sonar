@@ -180,9 +180,9 @@ struct BitchatApp: App {
             Task {
                 do {
                     try await sonarStore.marmot.requestJoinViaLink(token: token)
-                    await MainActor.run { sonarStore.toast = "Join request sent" }
+                    await MainActor.run { sonarStore.showToast("Join request sent") }
                 } catch {
-                    await MainActor.run { sonarStore.toast = "Couldn't join: \(error.localizedDescription)" }
+                    await MainActor.run { sonarStore.showToast("Couldn't join: \(error.localizedDescription)") }
                 }
             }
         }

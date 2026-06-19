@@ -40,6 +40,23 @@ struct SonarRootView: View {
         }
         .preferredColorScheme(store.isDarkMode ? .dark : .light)
         .tint(SonarTheme.accent)
+        .overlay(alignment: .bottom) { toastView }
+        .animation(.easeOut(duration: 0.2), value: store.toast)
+    }
+
+    @ViewBuilder
+    private var toastView: some View {
+        if let toast = store.toast {
+            Text(verbatim: toast)
+                .font(SonarTheme.uiFont(size: 13.5, weight: .semibold))
+                .foregroundColor(SonarTheme.onAccent)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(Capsule().fill(SonarTheme.accentFill))
+                .shadow(color: .black.opacity(0.14), radius: 14, y: 8)
+                .padding(.bottom, 22)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+        }
     }
 
     @ViewBuilder
