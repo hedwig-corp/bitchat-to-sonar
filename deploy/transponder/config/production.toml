@@ -1,0 +1,36 @@
+# Sonar push notification server (transponder)
+# https://github.com/marmot-protocol/transponder
+#
+# This config is Sonar-specific. The server keypair, APNS credentials, and
+# FCM credentials must be provisioned separately — see deploy/README.md.
+
+[server]
+# Path to the secp256k1 private key file (hex-encoded).
+# Generate with: transponder generate-keys --output ./secrets/server.key
+private_key_file = "/run/secrets/server.key"
+
+[relays]
+# Nostr relays the server subscribes to for kind:1059 gift-wrapped notification
+# requests. Use the same relays Sonar clients publish to.
+clearnet = [
+    "wss://relay.damus.io",
+    "wss://nos.lol",
+    "wss://nostr.relay.hedwig.sh",
+]
+
+[apns]
+# Apple Push Notification Service credentials for Sonar's iOS bundle ID.
+# The .p8 key file, key ID, and team ID come from the Apple Developer portal.
+enabled = true
+private_key_path = "/run/secrets/apns.p8"
+key_id = "PX84KR34WH"
+team_id = "ZQB239SHCM"
+bundle_id = "sh.hedwig.sonar"
+environment = "production"
+
+[fcm]
+# Firebase Cloud Messaging credentials for Sonar's Android package.
+# The service account JSON comes from the Firebase Console.
+enabled = true
+service_account_path = "/run/secrets/firebase.json"
+project_id = "sonarchat-11566"

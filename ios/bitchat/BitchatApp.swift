@@ -8,6 +8,7 @@
 
 import Tor
 import SwiftUI
+import os
 import UserNotifications
 
 @main
@@ -55,6 +56,9 @@ struct BitchatApp: App {
                     }
 
                     appDelegate.chatViewModel = chatViewModel
+                    #if os(iOS)
+                    appDelegate.sonarStore = sonarStore
+                    #endif
 
                     // Initialize network activation policy; will start Tor/Nostr only when allowed
                     NetworkActivationService.shared.start()
@@ -237,9 +241,30 @@ struct BitchatApp: App {
 #if os(iOS)
 final class AppDelegate: NSObject, UIApplicationDelegate {
     weak var chatViewModel: ChatViewModel?
+    weak var sonarStore: SonarAppStore?
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey : Any]? = nil) -> Bool {
+        application.registerForRemoteNotifications()
         return true
+    }
+
+    func application(_ application: UIApplication, didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) {
+        SonarPushRegistration.shared.didRegisterForRemoteNotifications(deviceToken: deviceToken)
+    }
+
+    func application(_ application: UIApplication, didFailToRegisterForRemoteNotificationsWithError error: Error) {
+        Logger(subsystem: "sh.hedwig.sonar", category: "push").error("APNS registration FAILED: \(error)")
+    }
+
+    func application(_ application: UIApplication, didReceiveRemoteNotification userInfo: [AnyHashable : Any], fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void) {
+        Task { @MainActor in
+            SonarPushProcessor.process(
+                userInfo: userInfo,
+                marmot: sonarStore?.marmot,
+                wallet: sonarStore?.wallet,
+                fetchCompletionHandler: completionHandler
+            )
+        }
     }
 
     func applicationWillTerminate(_ application: UIApplication) {

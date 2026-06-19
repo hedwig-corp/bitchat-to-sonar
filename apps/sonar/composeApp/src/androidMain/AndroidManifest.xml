@@ -5,6 +5,10 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- Local notifications for incoming messages (Android 13+ runtime grant). -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Push wakeup: foreground service for processing transponder/Breez pushes. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <!-- BLE mesh transport (peer discovery + GATT). Android 12+ uses the
          neverForLocation scan/advertise/connect runtime permissions; older
@@ -72,6 +76,21 @@
                 <data android:mimeType="text/plain" />
             </intent-filter>
         </activity>
+
+        <!-- FCM push wakeup handler (transponder chat + Breez wallet events). -->
+        <service
+            android:name=".push.SonarFirebaseMessagingService"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.google.firebase.MESSAGING_EVENT" />
+            </intent-filter>
+        </service>
+
+        <!-- Foreground service for processing push wakeups when the app is killed. -->
+        <service
+            android:name=".push.SonarPushProcessingService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
     </application>
 
 </manifest>

@@ -251,6 +251,15 @@ pub struct ProfileInfo {
     pub nip05: Option<String>,
 }
 
+/// Info about an incoming message discovered during drain, used by hosts to
+/// fire rich local notifications (sender name + preview).
+#[derive(uniffi::Record)]
+pub struct DrainNotificationInfo {
+    pub sender_npub: String,
+    pub group_name: String,
+    pub content_preview: String,
+}
+
 /// FFI-friendly Sonar app descriptor published as a NIP-78-style kind-30078
 /// event. This is public capability metadata only; live call addresses are
 /// exchanged inside encrypted ☎CALL signaling.
@@ -669,6 +678,13 @@ impl SonarNode {
         Ok(())
     }
 
+    /// Like `sync_once` but bypasses the live-subscription short-circuit.
+    /// Use after a foreground resume to catch events missed while backgrounded.
+    pub fn sync_force(&self) -> FfiResult<()> {
+        self.runtime.block_on(self.client.sync_force())?;
+        Ok(())
+    }
+
     /// Reload the durable outbox sidecar and retry pending sends. Hosts call this
     /// after replacing a local-only node with a relay-backed node so sends created
     /// during relay connect are not stranded until app restart.
@@ -695,10 +711,19 @@ impl SonarNode {
             .block_on(self.client.wait_for_marmot_event(timeout_secs))
     }
 
-    /// Process buffered live Marmot events through the MLS engine. Returns true if
-    /// anything was drained. MUST run on the host's serialized engine queue.
-    pub fn drain_pending_marmot(&self) -> FfiResult<bool> {
-        Ok(self.runtime.block_on(self.client.drain_pending_marmot())?)
+    /// Process buffered live Marmot events through the MLS engine. Returns
+    /// notification info for each incoming message (empty vec = nothing drained).
+    /// MUST run on the host's serialized engine queue.
+    pub fn drain_pending_marmot(&self) -> FfiResult<Vec<DrainNotificationInfo>> {
+        let notifications = self.runtime.block_on(self.client.drain_pending_marmot())?;
+        Ok(notifications
+            .into_iter()
+            .map(|n| DrainNotificationInfo {
+                sender_npub: n.sender_pubkey,
+                group_name: n.group_name,
+                content_preview: n.content_preview,
+            })
+            .collect())
     }
 
     /// All groups this identity belongs to.
@@ -941,6 +966,25 @@ impl SonarNode {
             .runtime
             .block_on(self.client.fetch_geo_dm(&geohash, &peer_hex))?;
         Ok(msgs.into_iter().map(geo_message_info).collect())
+    }
+
+    // ── Push token registration (MIP-05) ──
+
+    /// Encrypt a device push token and publish it to the transponder via a
+    /// NIP-59 gift-wrapped kind-446 event.
+    ///
+    /// `platform`: `"apns"` or `"fcm"`.
+    /// `token`: raw device token bytes (APNS) or UTF-8 FCM token string.
+    /// `server_npub`: the transponder's npub (bech32 or hex).
+    pub fn register_push_token(
+        &self,
+        platform: String,
+        token: Vec<u8>,
+        server_npub: String,
+    ) -> FfiResult<()> {
+        self.runtime
+            .block_on(self.client.register_push_token(&platform, &token, &server_npub))?;
+        Ok(())
     }
 }
 

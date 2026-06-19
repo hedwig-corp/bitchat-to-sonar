@@ -2,6 +2,7 @@ package chat.bitchat.sonar
 
 import android.app.Application
 import android.content.Context
+import chat.bitchat.sonar.push.SonarPushRegistration
 
 /** Holds the application context for the androidMain SonarCore actual. */
 object AppContextHolder {
@@ -42,5 +43,6 @@ class SonarApp : Application() {
         // Publish JavaVM + app Context to Rust's ndk_context BEFORE any FFI call
         // (iroh DNS on bind, cpal/oboe audio read it). Once per process.
         NdkContext.install(this)
+        SonarPushRegistration.ensureRegistered()
     }
 }

@@ -982,10 +982,11 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func deleteGroup(groupIdHex: String) throws 
     
     /**
-     * Process buffered live Marmot events through the MLS engine. Returns true if
-     * anything was drained. MUST run on the host's serialized engine queue.
+     * Process buffered live Marmot events through the MLS engine. Returns
+     * notification info for each incoming message (empty vec = nothing drained).
+     * MUST run on the host's serialized engine queue.
      */
-    func drainPendingMarmot() throws  -> Bool
+    func drainPendingMarmot() throws  -> [DrainNotificationInfo]
     
     /**
      * Re-subscribe with the current watermark and group set to self-heal
@@ -1105,6 +1106,16 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func recentMessagePages(groupLimit: UInt32, pageLimit: UInt32) throws  -> [RecentMessagePageInfo]
     
     /**
+     * Encrypt a device push token and publish it to the transponder via a
+     * NIP-59 gift-wrapped kind-446 event.
+     *
+     * `platform`: `"apns"` or `"fcm"`.
+     * `token`: raw device token bytes (APNS) or UTF-8 FCM token string.
+     * `server_npub`: the transponder's npub (bech32 or hex).
+     */
+    func registerPushToken(platform: String, token: Data, serverNpub: String) throws 
+    
+    /**
      * Remove members from an existing group.
      */
     func removeGroupMembers(groupIdHex: String, members: [String]) throws 
@@ -1163,6 +1174,12 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * Start a multi-member Marmot group. `members` accepts npub or hex pubkeys.
      */
     func startGroup(members: [String], name: String) throws  -> String
+    
+    /**
+     * Like `sync_once` but bypasses the live-subscription short-circuit.
+     * Use after a foreground resume to catch events missed while backgrounded.
+     */
+    func syncForce() throws 
     
     /**
      * Poll the relays once: welcomes addressed to us, then group messages.
@@ -1484,11 +1501,12 @@ open func deleteGroup(groupIdHex: String)throws   {try rustCallWithError(FfiConv
 }
     
     /**
-     * Process buffered live Marmot events through the MLS engine. Returns true if
-     * anything was drained. MUST run on the host's serialized engine queue.
+     * Process buffered live Marmot events through the MLS engine. Returns
+     * notification info for each incoming message (empty vec = nothing drained).
+     * MUST run on the host's serialized engine queue.
      */
-open func drainPendingMarmot()throws  -> Bool  {
-    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+open func drainPendingMarmot()throws  -> [DrainNotificationInfo]  {
+    return try  FfiConverterSequenceTypeDrainNotificationInfo.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_drain_pending_marmot(
             self.uniffiCloneHandle(),$0
     )
@@ -1784,6 +1802,24 @@ open func recentMessagePages(groupLimit: UInt32, pageLimit: UInt32)throws  -> [R
 }
     
     /**
+     * Encrypt a device push token and publish it to the transponder via a
+     * NIP-59 gift-wrapped kind-446 event.
+     *
+     * `platform`: `"apns"` or `"fcm"`.
+     * `token`: raw device token bytes (APNS) or UTF-8 FCM token string.
+     * `server_npub`: the transponder's npub (bech32 or hex).
+     */
+open func registerPushToken(platform: String, token: Data, serverNpub: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_register_push_token(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(platform),
+        FfiConverterData.lower(token),
+        FfiConverterString.lower(serverNpub),$0
+    )
+}
+}
+    
+    /**
      * Remove members from an existing group.
      */
 open func removeGroupMembers(groupIdHex: String, members: [String])throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
@@ -1930,6 +1966,17 @@ open func startGroup(members: [String], name: String)throws  -> String  {
         FfiConverterString.lower(name),$0
     )
 })
+}
+    
+    /**
+     * Like `sync_once` but bypasses the live-subscription short-circuit.
+     * Use after a foreground resume to catch events missed while backgrounded.
+     */
+open func syncForce()throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_sync_force(
+            self.uniffiCloneHandle(),$0
+    )
+}
 }
     
     /**
@@ -2401,6 +2448,68 @@ public func FfiConverterTypeConversationSummaryInfo_lift(_ buf: RustBuffer) thro
 #endif
 public func FfiConverterTypeConversationSummaryInfo_lower(_ value: ConversationSummaryInfo) -> RustBuffer {
     return FfiConverterTypeConversationSummaryInfo.lower(value)
+}
+
+
+/**
+ * Info about an incoming message discovered during drain, used by hosts to
+ * fire rich local notifications (sender name + preview).
+ */
+public struct DrainNotificationInfo: Equatable, Hashable {
+    public var senderNpub: String
+    public var groupName: String
+    public var contentPreview: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(senderNpub: String, groupName: String, contentPreview: String) {
+        self.senderNpub = senderNpub
+        self.groupName = groupName
+        self.contentPreview = contentPreview
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension DrainNotificationInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDrainNotificationInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DrainNotificationInfo {
+        return
+            try DrainNotificationInfo(
+                senderNpub: FfiConverterString.read(from: &buf), 
+                groupName: FfiConverterString.read(from: &buf), 
+                contentPreview: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: DrainNotificationInfo, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.senderNpub, into: &buf)
+        FfiConverterString.write(value.groupName, into: &buf)
+        FfiConverterString.write(value.contentPreview, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDrainNotificationInfo_lift(_ buf: RustBuffer) throws -> DrainNotificationInfo {
+    return try FfiConverterTypeDrainNotificationInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDrainNotificationInfo_lower(_ value: DrainNotificationInfo) -> RustBuffer {
+    return FfiConverterTypeDrainNotificationInfo.lower(value)
 }
 
 
@@ -4629,6 +4738,31 @@ fileprivate struct FfiConverterSequenceTypeConversationSummaryInfo: FfiConverter
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeDrainNotificationInfo: FfiConverterRustBuffer {
+    typealias SwiftType = [DrainNotificationInfo]
+
+    public static func write(_ value: [DrainNotificationInfo], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeDrainNotificationInfo.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [DrainNotificationInfo] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [DrainNotificationInfo]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeDrainNotificationInfo.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeGeoMessageInfo: FfiConverterRustBuffer {
     typealias SwiftType = [GeoMessageInfo]
 
@@ -5249,7 +5383,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_delete_group() != 40442) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_drain_pending_marmot() != 32220) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_drain_pending_marmot() != 2299) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_ensure_subscriptions() != 56185) {
@@ -5324,6 +5458,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_recent_message_pages() != 17660) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_register_push_token() != 41081) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_remove_group_members() != 5580) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -5358,6 +5495,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_start_group() != 41815) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_sync_force() != 34432) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_sync_once() != 45718) {

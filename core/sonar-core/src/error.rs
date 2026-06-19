@@ -53,4 +53,7 @@ pub enum Error {
 
     #[error("no relay connected within timeout")]
     NoRelayConnected,
+
+    #[error("rng error: {0}")]
+    Rng(#[from] getrandom::Error),
 }

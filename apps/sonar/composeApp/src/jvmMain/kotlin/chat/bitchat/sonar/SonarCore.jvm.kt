@@ -506,6 +506,11 @@ actual object SonarCore {
         return hex
     }
 
+    // ── Push token registration (MIP-05) ──
+
+    actual suspend fun registerPushToken(platform: String, token: ByteArray, serverNpub: String): Unit =
+        withContext(Dispatchers.IO) { requireNode().registerPushToken(platform, token, serverNpub) }
+
     // ── P2P voice calls — UNAVAILABLE on desktop ──────────────────────────────
     // The iroh call engine (calls-audio: iroh + opus + cpal) is not built into the
     // desktop sonar_ffi dylib, so calls no-op here: callStart throws → the app's

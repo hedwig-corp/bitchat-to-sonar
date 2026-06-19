@@ -285,6 +285,9 @@ final class MarmotService: @unchecked Sendable {
             service.relayConnected = true
             service.nodeLock.unlock()
             service.installConversationListener(on: node)
+            #if os(iOS)
+            SonarPushRegistration.shared.setSonarNode(node)
+            #endif
             return true
         }
         guard installed else {
@@ -321,6 +324,9 @@ final class MarmotService: @unchecked Sendable {
             service.relayConnected = false
             service.nodeLock.unlock()
             service.installConversationListener(on: node)
+            #if os(iOS)
+            SonarPushRegistration.shared.setSonarNode(node)
+            #endif
             service.sessionGeneration = service.sessionGeneration &+ 1
             return identity.npub()
         }
@@ -625,6 +631,12 @@ final class MarmotService: @unchecked Sendable {
         try await run { try $0.requireNode().syncOnce() }
     }
 
+    /// Force-sync that bypasses the live-subscription short-circuit. Use after
+    /// foreground resume to catch events missed while backgrounded.
+    func syncForce() async throws {
+        try await run { try $0.requireNode().syncForce() }
+    }
+
     /// Re-subscribe with current watermark + group set to self-heal after
     /// relay disconnects. Lighter than `syncOnce()` — no blocking fetch.
     func ensureSubscriptions() async throws {
@@ -661,9 +673,9 @@ final class MarmotService: @unchecked Sendable {
     }
 
     /// Process buffered live Marmot events through the MLS engine on the serial
-    /// engine queue. Returns true if anything was drained (→ reload the UI).
+    /// engine queue. Returns notifications for incoming messages (empty = nothing drained).
     @discardableResult
-    func drainPending() async throws -> Bool {
+    func drainPending() async throws -> [DrainNotificationInfo] {
         try await run { try $0.requireNode().drainPendingMarmot() }
     }
 

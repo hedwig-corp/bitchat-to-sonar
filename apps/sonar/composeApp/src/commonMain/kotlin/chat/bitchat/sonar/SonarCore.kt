@@ -573,6 +573,11 @@ expect object SonarCore {
      *  per-chat "delete this conversation". */
     suspend fun deleteChat(chatId: String)
 
+    // ── Push token registration (MIP-05) ──
+
+    /** Encrypt a device push token and publish it to the transponder. */
+    suspend fun registerPushToken(platform: String, token: ByteArray, serverNpub: String)
+
     // ── P2P voice calls (iroh transport; ☎CALL rides chat signaling) ──
 
     /** Bind the iroh call endpoint once for this session. The Ed25519 call key is

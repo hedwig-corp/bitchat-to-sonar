@@ -13,7 +13,7 @@ rust-version.workspace = true
 # signaling codec (call::signaling) is NOT gated — it is pure and always built.
 # The cpal/opus media pipeline lands behind a later `calls-audio` feature
 # (plan: docs/plans/2026-06-16-p2p-calls-iroh-callme.md).
-calls = ["dep:iroh", "dep:iroh-roq", "dep:anyhow", "dep:bytes", "dep:base64"]
+calls = ["dep:iroh", "dep:iroh-roq", "dep:anyhow", "dep:bytes"]
 # Adds the opus audio codec to the call media path. Separate from `calls` so a
 # call build can opt in to audio. The cpal device-I/O layer lands here too later.
 calls-audio = ["calls", "dep:opus", "dep:cpal"]
@@ -43,7 +43,7 @@ anyhow = { version = "1", optional = true }
 bytes = { version = "1", optional = true }
 # Serialize Sonar Nostr descriptors and, behind `calls`, the iroh `EndpointAddr`
 # into the `nodeAddrB64` field of the ☎CALL signaling.
-base64 = { version = "0.22", optional = true }
+base64 = "0.22"
 sonar-stickers = { path = "../sonar-stickers" }
 serde_json.workspace = true
 mdk-core.workspace = true
@@ -76,6 +76,7 @@ serde.workspace = true
 # behind the `calls` feature.
 hkdf = "0.12"
 sha2 = "0.10"
+chacha20poly1305 = "0.10"
 # Noise XX session crypto for the BLE mesh transport (bitchat uses
 # Noise_XX_25519_ChaChaPoly_SHA256). `snow` is a vetted pure-Rust Noise impl.
 snow = "0.9"

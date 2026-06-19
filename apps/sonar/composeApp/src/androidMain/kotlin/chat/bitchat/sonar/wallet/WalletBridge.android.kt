@@ -131,6 +131,14 @@ actual object WalletBridge {
     actual fun currency(): FiatCurrency = FiatCurrency.of(prefs().getString("wallet.currency", "USD"))
     actual fun setCurrency(value: FiatCurrency) { prefs().edit().putString("wallet.currency", value.code).apply() }
 
+    actual suspend fun registerWebhook(url: String): Unit = withContext(Dispatchers.IO) {
+        sdk?.registerWebhook(url)
+    }
+
+    actual suspend fun unregisterWebhook(): Unit = withContext(Dispatchers.IO) {
+        sdk?.unregisterWebhook()
+    }
+
     actual suspend fun shutdown(): Unit = withContext(Dispatchers.IO) {
         lock.withLock {
             try { sdk?.disconnect() } catch (_: Throwable) {}

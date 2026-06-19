@@ -393,6 +393,21 @@ final class MarmotChatModel: ObservableObject {
         return service.isRelayConnected()
     }
 
+    /// Re-establish relay subscriptions and catch up on missed events after the
+    /// app returns to foreground. iOS tears down TCP connections in background;
+    /// nostr-sdk may auto-reconnect the sockets, but the Marmot subscription
+    /// filters can be stale. This forces a resubscribe + a one-shot sync to
+    /// bridge the gap.
+    func refreshAfterForeground() {
+        guard service.isRelayConnected() else { return }
+        Task {
+            try? await service.ensureSubscriptions()
+            try? await service.syncForce()
+            let notifications = (try? await service.drainPending()) ?? []
+            if !notifications.isEmpty { await loadLocalSummaries() }
+        }
+    }
+
     /// Best-effort local hydration for screen open paths. This never waits for
     /// relay connect/sync; if the encrypted DB is not open yet, connectIfNeeded()
     /// continues opening it in the background.
@@ -427,6 +442,8 @@ final class MarmotChatModel: ObservableObject {
             } catch {
                 self.errorText = Self.describe(error)
             }
+            let notifications = (try? await service.drainPending()) ?? []
+            if !notifications.isEmpty { await loadLocalWindow(groupId: groupId) ; return }
         }
         await loadLocalWindow(groupId: groupId)
     }
@@ -560,8 +577,10 @@ final class MarmotChatModel: ObservableObject {
 
     /// Poll the relays once, then reflect the (possibly updated) local state.
     /// Local chats are loaded even when the relay sync fails, so a relay outage
-    /// never hides already-persisted conversations.
-    func refresh() async {
+    /// never hides already-persisted conversations. Returns notifications for
+    /// incoming messages (empty if nothing new or relay offline).
+    @discardableResult
+    func refresh() async -> [DrainNotificationInfo] {
         if service.isRelayConnected() {
             do {
                 try await service.syncOnce()
@@ -569,10 +588,13 @@ final class MarmotChatModel: ObservableObject {
             } catch {
                 self.errorText = Self.describe(error)
             }
+            let notifications = (try? await service.drainPending()) ?? []
+            if !notifications.isEmpty { await loadLocalSummaries() ; return notifications }
         } else {
             connectRelaysIfNeeded()
         }
         await loadLocalSummaries()
+        return []
     }
 
     func markConversationRead(groupId: String) {
@@ -713,6 +735,14 @@ final class MarmotChatModel: ObservableObject {
     func displayName(forNpub member: String) -> String? {
         profilesByNpub[SNMarmotProfileCache.canonicalKey(member)]?.bestName
             ?? profilesByNpub[member]?.bestName
+    }
+
+    /// Resolve sender name for push notifications: cached profile → fetch → short npub.
+    func resolveSenderName(npub: String) async -> String {
+        if let cached = displayName(forNpub: npub) { return cached }
+        if let profile = try? await service.fetchProfile(npub: npub),
+           let name = profile.bestName { return name }
+        return String(npub.prefix(12)) + "…"
     }
 
     /// Resolved author label for a Marmot group message: cached profile name,
@@ -1097,8 +1127,10 @@ final class MarmotChatModel: ObservableObject {
                 let woke = await self.service.waitForMarmotEvent(timeoutSeconds: 25)
                 if Task.isCancelled { return }
                 if woke {
-                    let drained = (try? await self.service.drainPending()) ?? false
-                    if drained { await self.loadLocalSummaries() }
+                    let notifications = (try? await self.service.drainPending()) ?? []
+                    if !notifications.isEmpty {
+                        await self.loadLocalSummaries()
+                    }
                 } else {
                     try? await self.service.ensureSubscriptions()
                 }

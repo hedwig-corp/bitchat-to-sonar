@@ -7,6 +7,8 @@ androidx-lifecycle = "2.8.4"
 coroutines = "1.9.0"
 jna = "5.14.0"
 breez-sdk-liquid = "0.11.13"
+firebase-bom = "33.7.0"
+google-services = "4.4.2"
 android-minSdk = "26"
 android-targetSdk = "35"
 android-compileSdk = "35"
@@ -20,9 +22,12 @@ coroutines-android = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-androi
 coroutines-swing = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-swing", version.ref = "coroutines" }
 jna = { module = "net.java.dev.jna:jna", version.ref = "jna" }
 breez-sdk-liquid = { module = "technology.breez.liquid:breez-sdk-liquid-kmp", version.ref = "breez-sdk-liquid" }
+firebase-bom = { module = "com.google.firebase:firebase-bom", version.ref = "firebase-bom" }
+firebase-messaging = { module = "com.google.firebase:firebase-messaging" }
 
 [plugins]
 multiplatform = { id = "org.jetbrains.kotlin.multiplatform", version.ref = "kotlin" }
 compose-compiler = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
 compose = { id = "org.jetbrains.compose", version.ref = "compose" }
 android-application = { id = "com.android.application", version.ref = "agp" }
+google-services = { id = "com.google.gms.google-services", version.ref = "google-services" }

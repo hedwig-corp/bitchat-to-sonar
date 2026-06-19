@@ -168,6 +168,24 @@ final class WalletBridgeService: ObservableObject {
         state = .notConfigured
     }
 
+    // MARK: - Push webhook
+
+    func registerWebhook(url: String) async throws {
+        do {
+            try await wallet.registerWebhook(url: url)
+        } catch let error as SonarWallet.WalletError {
+            throw Self.map(error)
+        }
+    }
+
+    func unregisterWebhook() async throws {
+        do {
+            try await wallet.unregisterWebhook()
+        } catch let error as SonarWallet.WalletError {
+            throw Self.map(error)
+        }
+    }
+
     // MARK: - Payments
 
     /// Send to any Lightning destination: BOLT11 invoice, BOLT12 offer,

@@ -37,6 +37,10 @@ actual object Notifier {
 
     actual fun canNotify(): Boolean = SystemTray.isSupported()
 
+    actual fun onWalletReady() { /* no push webhooks on desktop */ }
+
+    actual fun setPushEnabled(enabled: Boolean) { /* no push on desktop */ }
+
     actual fun notify(id: Int, title: String, body: String) {
         val icon = trayIcon ?: run { ensureChannel(); trayIcon } ?: return
         runCatching { icon.displayMessage(title, body, TrayIcon.MessageType.INFO) }

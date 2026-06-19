@@ -66,6 +66,7 @@ final class BridgedWallet: SonarWalletProviding {
     private static let nsecKeychainKey = "marmot-nsec"
 
     private let bridge: WalletBridgeService
+    var walletService: WalletBridgeService { bridge }
     private let keychain: KeychainManagerProtocol
 
     init(keychain: KeychainManagerProtocol = KeychainManager()) {

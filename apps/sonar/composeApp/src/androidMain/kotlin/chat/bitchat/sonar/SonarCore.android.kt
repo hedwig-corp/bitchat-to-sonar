@@ -482,6 +482,11 @@ actual object SonarCore {
         Unit
     }
 
+    // ── Push token registration (MIP-05) ──
+
+    actual suspend fun registerPushToken(platform: String, token: ByteArray, serverNpub: String): Unit =
+        withContext(Dispatchers.IO) { requireNode().registerPushToken(platform, token, serverNpub) }
+
     // ── P2P voice calls (delegate to the generated SonarNode call_* binding) ──
 
     actual suspend fun callStart(): Unit = withContext(Dispatchers.IO) { requireNode().callStart() }
