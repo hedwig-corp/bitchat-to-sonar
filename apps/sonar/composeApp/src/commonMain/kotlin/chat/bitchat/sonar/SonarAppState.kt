@@ -2651,8 +2651,10 @@ class SonarAppState(private val scope: CoroutineScope) {
                     val ms = runCatching { SonarCore.messagesPage(c.id, LOCAL_TRANSCRIPT_PAGE_LIMIT) }.getOrDefault(emptyList())
                     wnMsgs += ms.size
                     processCallLines(c.id, ms)
-                    for (m in ms) {
-                        if (!m.mine && m.senderNpub.isNotBlank()) senders.add(m.senderNpub)
+                    if (c.members.size > 2) {
+                        for (m in ms) {
+                            if (!m.mine && m.senderNpub.isNotBlank()) senders.add(m.senderNpub)
+                        }
                     }
                 }
                 if (chats.size != lastWnGroups || wnMsgs != lastWnMsgs) {
