@@ -2396,6 +2396,48 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
+    fun createInviteLink(chatId: String, groupName: String, onResult: (String) -> Unit) {
+        scope.launch {
+            try {
+                val token = SonarCore.createInviteLink(chatId, groupName)
+                onResult(token)
+            } catch (e: Throwable) {
+                toast = "couldn't create invite link: ${e.message}"
+            }
+        }
+    }
+
+    fun approveJoinRequest(chatId: String, requesterNpub: String) {
+        scope.launch {
+            try {
+                SonarCore.approveJoinRequest(chatId, requesterNpub)
+                refreshChats()
+                toast = "Member added"
+            } catch (e: Throwable) {
+                toast = "couldn't approve: ${e.message}"
+            }
+        }
+    }
+
+    fun declineJoinRequest(chatId: String, requesterNpub: String) {
+        scope.launch {
+            try {
+                SonarCore.declineJoinRequest(chatId, requesterNpub)
+            } catch (_: Throwable) {}
+        }
+    }
+
+    fun requestJoinViaLink(token: String) {
+        scope.launch {
+            try {
+                SonarCore.requestJoinViaLink(token)
+                toast = "Join request sent"
+            } catch (e: Throwable) {
+                toast = "couldn't join: ${e.message}"
+            }
+        }
+    }
+
     fun acceptGroupInvite(inviteId: String) {
         scope.launch {
             try {

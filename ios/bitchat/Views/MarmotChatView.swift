@@ -1081,6 +1081,23 @@ final class MarmotChatModel: ObservableObject {
         await loadLocal()
     }
 
+    func createInviteLink(groupId: String, groupName: String) async throws -> String {
+        try await service.createInviteLink(groupId: groupId, groupName: groupName)
+    }
+
+    func approveJoinRequest(groupId: String, requesterNpub: String) async throws {
+        try await service.approveJoinRequest(groupId: groupId, requesterNpub: requesterNpub)
+        await loadLocal()
+    }
+
+    func declineJoinRequest(groupId: String, requesterNpub: String) async throws {
+        try await service.declineJoinRequest(groupId: groupId, requesterNpub: requesterNpub)
+    }
+
+    func requestJoinViaLink(token: String) async throws {
+        try await service.requestJoinViaLink(token: token)
+    }
+
     func acceptGroupInvite(_ invite: MarmotService.GroupInvite) async throws -> String {
         let id = try await service.acceptGroupInvite(invite.id)
         await loadLocal()

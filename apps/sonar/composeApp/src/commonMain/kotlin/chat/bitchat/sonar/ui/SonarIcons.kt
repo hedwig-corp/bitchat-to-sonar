@@ -36,6 +36,8 @@ enum class SNIconName {
     Phone, Videocam, PhoneDown, MicOff, VideoOff, Speaker, CameraFlip,
     // Feature glyphs: stickers, GIF label, wallet activity, camera, heart.
     Sticker, Gif, Activity, Camera, Heart, Leave, Crown,
+    // Invite link.
+    Link,
 }
 
 private sealed interface Shape {
@@ -92,6 +94,11 @@ private val ICONS: Map<SNIconName, List<Shape>> = mapOf(
     SNIconName.Heart to listOf(Shape.P("M12 20s-7-4.2-7-9.2a4.2 4.2 0 0 1 7-3.1 4.2 4.2 0 0 1 7 3.1c0 5-7 9.2-7 9.2z")),
     SNIconName.Leave to listOf(Shape.P("M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4M10 17l5-5-5-5M15 12H3")),
     SNIconName.Crown to listOf(Shape.P("M4 17l2-10 4 4 2-6 2 6 4-4 2 10z", fill = true)),
+    SNIconName.Link to listOf(
+        Shape.P("M10.5 13.5l3-3"),
+        Shape.P("M14 10a3.5 3.5 0 0 1 0 5l-2 2a3.5 3.5 0 0 1-5 0 3.5 3.5 0 0 1 0-5l1-1"),
+        Shape.P("M10 14a3.5 3.5 0 0 1 0-5l2-2a3.5 3.5 0 0 1 5 0 3.5 3.5 0 0 1 0 5l-1 1"),
+    ),
 )
 
 @Composable

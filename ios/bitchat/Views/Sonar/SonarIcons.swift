@@ -26,6 +26,8 @@ enum SNIconName: String {
     case copy, share
     // Private-key export / import (settings.jsx ExportKeySheet, onboarding restore).
     case eye, eyeOff, importKey
+    // Group invite links.
+    case link
 }
 
 private enum SNIconElement {
@@ -184,6 +186,11 @@ private let snIconTable: [SNIconName: [SNIconElement]] = [
         .circle(8, 12, 3.2, filled: false),
         .path("M11.2 12h9M16.5 12v3M20.2 12v2.4"),
         .path("M14 5.5 11 8.5M14 5.5l-3-3M11 8.5l-2.4-2.4"),
+    ],
+    .link: [
+        .path("M10.5 13.5l3-3"),
+        .path("M14 10a3.5 3.5 0 0 1 0 5l-2 2a3.5 3.5 0 0 1-5 0 3.5 3.5 0 0 1 0-5l1-1"),
+        .path("M10 14a3.5 3.5 0 0 1 0-5l2-2a3.5 3.5 0 0 1 5 0 3.5 3.5 0 0 1 0 5l-1 1"),
     ],
 ]
 

@@ -29,6 +29,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -48,6 +50,7 @@ import chat.bitchat.sonar.ui.SNSettingsRow
 import chat.bitchat.sonar.ui.SNTone
 import chat.bitchat.sonar.ui.SNTrail
 import chat.bitchat.sonar.ui.SonarAvatar
+import chat.bitchat.sonar.ui.SonarType
 import chat.bitchat.sonar.ui.sonar
 
 @Composable
@@ -61,6 +64,8 @@ fun SonarGroupInfoScreen(state: SonarAppState, screen: Screen.GroupInfo) {
     var showAddPeople by remember { mutableStateOf(false) }
     var addDraft by remember { mutableStateOf("") }
     var showLeaveSheet by remember { mutableStateOf(false) }
+    var inviteLink by remember { mutableStateOf<String?>(null) }
+    val clipboard = LocalClipboardManager.current
 
     Box(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize().background(s.bg)) {
@@ -99,6 +104,30 @@ fun SonarGroupInfoScreen(state: SonarAppState, screen: Screen.GroupInfo) {
                     bold = "End-to-end encrypted",
                     rest = " — only group members can read this"
                 )
+
+                // ── Invite link section ──
+                SNSectionLabel("Invite link")
+                SNSettingsCard {
+                    SNSettingsRow(
+                        icon = SNIconName.Link,
+                        tone = SNTone.Cyan,
+                        label = if (inviteLink != null) "Copy invite link" else "Create invite link",
+                        sub = if (inviteLink != null) "sinvite1…${inviteLink!!.takeLast(8)}" else "Share a link to let people request to join",
+                        trail = SNTrail.Chevron,
+                        divider = false
+                    ) {
+                        if (inviteLink != null) {
+                            clipboard.setText(AnnotatedString(inviteLink!!))
+                            state.toast = "Invite link copied"
+                        } else {
+                            state.createInviteLink(chatId, groupName) { token ->
+                                inviteLink = token
+                                clipboard.setText(AnnotatedString(token))
+                                state.toast = "Invite link created and copied"
+                            }
+                        }
+                    }
+                }
 
                 // ── Members section ──
                 SNSectionLabel("Members (${members.size})")

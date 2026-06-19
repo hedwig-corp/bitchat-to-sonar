@@ -18,6 +18,7 @@ struct SonarGroupInfoScreen: View {
 
     @State private var addDraft = ""
     @State private var leaveSheet = false
+    @State private var inviteLink: String? = nil
 
     private var peer: SNPeerItem { store.peerItem(peerId) }
     private var members: [SNGroupContact] { store.groupMemberContacts(forConversationId: peerId) }
@@ -58,6 +59,48 @@ struct SonarGroupInfoScreen: View {
                         rest: " — only group members can read messages"
                     )
                     .padding(.bottom, 8)
+
+                    // ── Invite link ──
+                    SNSectionLabel("Invite link")
+                    SNSettingsCard {
+                        SNSettingsRow(
+                            icon: .link, tone: .cyan,
+                            label: inviteLink != nil ? "Copy invite link" : "Create invite link",
+                            sub: inviteLink != nil
+                                ? "sinvite1…\(String(inviteLink!.suffix(8)))"
+                                : "Share a link to let people request to join",
+                            trail: .chevron, divider: false
+                        ) {
+                            if let link = inviteLink {
+                                #if os(iOS)
+                                UIPasteboard.general.string = link
+                                #elseif os(macOS)
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(link, forType: .string)
+                                #endif
+                                store.toast = "Invite link copied"
+                            } else {
+                                guard let groupId = store.marmotGroupId(peerId) else { return }
+                                Task {
+                                    do {
+                                        let link = try await store.marmot.createInviteLink(
+                                            groupId: groupId, groupName: groupTitle
+                                        )
+                                        inviteLink = link
+                                        #if os(iOS)
+                                        UIPasteboard.general.string = link
+                                        #elseif os(macOS)
+                                        NSPasteboard.general.clearContents()
+                                        NSPasteboard.general.setString(link, forType: .string)
+                                        #endif
+                                        store.toast = "Invite link created and copied"
+                                    } catch {
+                                        store.toast = "Couldn't create link: \(error.localizedDescription)"
+                                    }
+                                }
+                            }
+                        }
+                    }
 
                     // ── Members ──
                     SNSectionLabel("Members")

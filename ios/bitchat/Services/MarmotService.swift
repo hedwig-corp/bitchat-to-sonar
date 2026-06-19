@@ -467,6 +467,31 @@ final class MarmotService: @unchecked Sendable {
         try await run { try $0.requireNode().leaveGroup(groupIdHex: groupId) }
     }
 
+    /// Create a shareable invite link for a group.
+    func createInviteLink(groupId: String, groupName: String) async throws -> String {
+        try await run { try $0.requireNode().createInviteLink(groupIdHex: groupId, groupName: groupName) }
+    }
+
+    /// Pending join requests for a group.
+    func pendingJoinRequests(groupId: String) async throws -> [JoinRequestInfo] {
+        try await run { try $0.requireNode().pendingJoinRequests(groupIdHex: groupId) }
+    }
+
+    /// Approve a pending join request.
+    func approveJoinRequest(groupId: String, requesterNpub: String) async throws {
+        try await run { try $0.requireNode().approveJoinRequest(groupIdHex: groupId, requesterNpub: requesterNpub) }
+    }
+
+    /// Decline a pending join request.
+    func declineJoinRequest(groupId: String, requesterNpub: String) async throws {
+        try await run { try $0.requireNode().declineJoinRequest(groupIdHex: groupId, requesterNpub: requesterNpub) }
+    }
+
+    /// Request to join a group via invite link token.
+    func requestJoinViaLink(token: String) async throws {
+        try await run { try $0.requireNode().requestJoinViaLink(inviteToken: token) }
+    }
+
     /// Encrypt and publish a text message to the group.
     func sendText(groupId: String, text: String) async throws {
         try await run { try $0.requireNode().sendText(groupIdHex: groupId, text: text) }

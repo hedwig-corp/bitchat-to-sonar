@@ -21,6 +21,13 @@ data class SonarGroupInvite(
     val relays: List<String>,
 )
 
+/** A pending join request for a group. */
+data class SonarJoinRequest(
+    val requesterNpub: String,
+    val groupId: String,
+    val receivedAt: Long,
+)
+
 /** A decrypted message in a chat. [viaInternet] marks the transport for the
  *  per-message bubble colour: false = BLE mesh (cyan), true = White Noise /
  *  Nostr internet (indigo). A Sonar-peer DM merges both legs into one thread. */
@@ -327,6 +334,21 @@ expect object SonarCore {
 
     /** Leave a group. */
     suspend fun leaveGroup(chatId: String)
+
+    /** Create a shareable invite link for a group. Returns sinvite1… token. */
+    suspend fun createInviteLink(chatId: String, groupName: String): String
+
+    /** Pending join requests for a group. */
+    suspend fun pendingJoinRequests(chatId: String): List<SonarJoinRequest>
+
+    /** Approve a pending join request. */
+    suspend fun approveJoinRequest(chatId: String, requesterNpub: String)
+
+    /** Decline a pending join request. */
+    suspend fun declineJoinRequest(chatId: String, requesterNpub: String)
+
+    /** Request to join a group via an invite link token. */
+    suspend fun requestJoinViaLink(token: String)
 
     /** Send an encrypted text message to a chat. */
     suspend fun send(chatId: String, text: String)

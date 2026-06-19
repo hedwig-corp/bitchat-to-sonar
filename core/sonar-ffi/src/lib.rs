@@ -163,6 +163,13 @@ pub struct GroupInviteInfo {
     pub relay_urls: Vec<String>,
 }
 
+#[derive(uniffi::Record)]
+pub struct JoinRequestInfo {
+    pub requester_npub: String,
+    pub group_id_hex: String,
+    pub received_at: u64,
+}
+
 /// FFI-friendly decrypted chat message.
 #[derive(uniffi::Record)]
 pub struct MessageInfo {
@@ -476,6 +483,66 @@ impl SonarNode {
     pub fn decline_group_invite(&self, invite_id_hex: String) -> FfiResult<()> {
         let invite_id = parse_event_id(&invite_id_hex)?;
         self.client.decline_group_invite(&invite_id)?;
+        Ok(())
+    }
+
+    // ── Invite links ──────────────────────────────────────────────────
+
+    pub fn create_invite_link(
+        &self,
+        group_id_hex: String,
+        group_name: String,
+    ) -> FfiResult<String> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        Ok(self.client.create_invite_link(&group_id, &group_name)?)
+    }
+
+    pub fn pending_join_requests(
+        &self,
+        group_id_hex: String,
+    ) -> FfiResult<Vec<JoinRequestInfo>> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        Ok(self
+            .client
+            .pending_join_requests(&group_id)
+            .into_iter()
+            .map(|r| JoinRequestInfo {
+                requester_npub: r
+                    .requester
+                    .to_bech32()
+                    .expect("npub encoding cannot fail"),
+                group_id_hex: hex::encode(r.group_id.as_slice()),
+                received_at: r.received_at,
+            })
+            .collect())
+    }
+
+    pub fn approve_join_request(
+        &self,
+        group_id_hex: String,
+        requester_npub: String,
+    ) -> FfiResult<()> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        let requester = PublicKey::parse(&requester_npub).map_err(invalid("requester npub"))?;
+        self.runtime
+            .block_on(self.client.approve_join_request(&group_id, &requester))?;
+        Ok(())
+    }
+
+    pub fn decline_join_request(
+        &self,
+        group_id_hex: String,
+        requester_npub: String,
+    ) -> FfiResult<()> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        let requester = PublicKey::parse(&requester_npub).map_err(invalid("requester npub"))?;
+        self.client.decline_join_request(&group_id, &requester);
+        Ok(())
+    }
+
+    pub fn request_join_via_link(&self, invite_token: String) -> FfiResult<()> {
+        self.runtime
+            .block_on(self.client.request_join_via_link(&invite_token))?;
         Ok(())
     }
 

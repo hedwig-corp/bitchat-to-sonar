@@ -111,6 +111,25 @@ actual object SonarCore {
         requireNode().leaveGroup(chatId)
     }
 
+    actual suspend fun createInviteLink(chatId: String, groupName: String): String =
+        withContext(Dispatchers.IO) { requireNode().createInviteLink(chatId, groupName) }
+
+    actual suspend fun pendingJoinRequests(chatId: String): List<SonarJoinRequest> =
+        withContext(Dispatchers.IO) {
+            requireNode().pendingJoinRequests(chatId).map {
+                SonarJoinRequest(it.requesterNpub, it.groupIdHex, it.receivedAt.toLong())
+            }
+        }
+
+    actual suspend fun approveJoinRequest(chatId: String, requesterNpub: String) =
+        withContext(Dispatchers.IO) { requireNode().approveJoinRequest(chatId, requesterNpub) }
+
+    actual suspend fun declineJoinRequest(chatId: String, requesterNpub: String) =
+        withContext(Dispatchers.IO) { requireNode().declineJoinRequest(chatId, requesterNpub) }
+
+    actual suspend fun requestJoinViaLink(token: String) =
+        withContext(Dispatchers.IO) { requireNode().requestJoinViaLink(token) }
+
     actual suspend fun send(chatId: String, text: String) = withContext(Dispatchers.IO) {
         requireNode().sendText(chatId, text)
     }
