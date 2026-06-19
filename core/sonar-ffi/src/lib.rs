@@ -637,6 +637,11 @@ impl SonarNode {
         Ok(bytes)
     }
 
+    pub fn fetch_installed_packs(&self) -> FfiResult<Vec<String>> {
+        let packs = self.runtime.block_on(self.client.fetch_installed_packs())?;
+        Ok(packs.iter().map(|p| p.coordinate()).collect())
+    }
+
     /// Delete a single chat's local Marmot state (messages + MLS keys). Local-
     /// only — the peer is NOT notified. Idempotent (deleting an unknown group is
     /// a no-op). Used by per-chat "delete this conversation".

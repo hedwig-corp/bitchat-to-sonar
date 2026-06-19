@@ -570,6 +570,10 @@ final class MarmotService: @unchecked Sendable {
         }
     }
 
+    func fetchInstalledPacks() async throws -> [String] {
+        try await run { try $0.requireNode().fetchInstalledPacks() }
+    }
+
     /// Download + decrypt the media blob at `url` for the group. Returns plaintext.
     func fetchMedia(groupId: String, url: String) async throws -> Data {
         try await run { try $0.requireNode().fetchMedia(groupIdHex: groupId, url: url) }

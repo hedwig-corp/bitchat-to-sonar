@@ -1799,8 +1799,8 @@ class SonarAppState(private val scope: CoroutineScope) {
     // ── Media (White Noise / Marmot MIP-04) ──
     /** Decrypted-media cache (raw bytes), keyed by the ciphertext's Blossom URL. */
     private val mediaCache = mutableMapOf<String, ByteArray>()
-    private val stickerPackCache = mutableMapOf<String, SonarStickerPack>()
-    private val stickerImageCache = mutableMapOf<String, ByteArray>()
+    private val stickerPackCache = linkedMapOf<String, SonarStickerPack>()
+    private val stickerImageCache = linkedMapOf<String, ByteArray>()
     private val pendingMediaUrlPrefix = "pending-media-"
 
     private data class PendingMediaUpload(
@@ -2083,6 +2083,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         stickerPackCache[cacheKey]?.let { return it }
         return try {
             SonarCore.fetchStickerPack(authorPubkeyHex, identifier, relayUrls).also {
+                if (stickerPackCache.size >= 20) stickerPackCache.remove(stickerPackCache.keys.first())
                 stickerPackCache[it.packCoordinate] = it
             }
         } catch (_: Throwable) {
@@ -2094,7 +2095,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         val cacheKey = "${expectedSha256.lowercase()}|$url"
         stickerImageCache[cacheKey]?.let { return it }
         return try {
-            SonarCore.fetchStickerImage(url, expectedSha256).also { stickerImageCache[cacheKey] = it }
+            SonarCore.fetchStickerImage(url, expectedSha256).also {
+                if (stickerImageCache.size >= 500) stickerImageCache.remove(stickerImageCache.keys.first())
+                stickerImageCache[cacheKey] = it
+            }
         } catch (_: Throwable) {
             null
         }

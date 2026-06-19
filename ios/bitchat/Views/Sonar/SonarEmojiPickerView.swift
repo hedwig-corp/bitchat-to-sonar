@@ -187,7 +187,7 @@ private struct StickerTabContent: View {
     let loadPack: (String, String, [String]) async -> StickerPackInfo?
     let loadImage: (String, String) async -> Data?
 
-    @State private var pack: StickerPackInfo?
+    @State private var packs: [StickerPackInfo] = []
     @State private var loading = true
     @State private var error: String?
 
@@ -216,38 +216,54 @@ private struct StickerTabContent: View {
                     Spacer()
                 }
                 .frame(maxWidth: .infinity)
-            } else if let pack {
-                VStack(spacing: 0) {
-                    Text(pack.title)
-                        .font(SonarTheme.uiFont(size: 12, weight: .semibold))
-                        .foregroundColor(SonarTheme.text3)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 6)
-
-                    ScrollView {
-                        let columns = Array(repeating: GridItem(.flexible(), spacing: 4), count: 4)
-                        LazyVGrid(columns: columns, spacing: 4) {
-                            ForEach(pack.stickers, id: \.shortcode) { sticker in
-                                StickerCell(sticker: sticker, loadImage: loadImage) {
-                                    onSticker(sticker, pack.packCoordinate)
+            } else if !packs.isEmpty {
+                ScrollView {
+                    let columns = Array(repeating: GridItem(.flexible(), spacing: 4), count: 4)
+                    LazyVGrid(columns: columns, spacing: 4) {
+                        ForEach(packs, id: \.packCoordinate) { pack in
+                            Section {
+                                ForEach(pack.stickers, id: \.shortcode) { sticker in
+                                    StickerCell(sticker: sticker, loadImage: loadImage) {
+                                        onSticker(sticker, pack.packCoordinate)
+                                    }
                                 }
+                            } header: {
+                                Text(pack.title)
+                                    .font(SonarTheme.uiFont(size: 12, weight: .semibold))
+                                    .foregroundColor(SonarTheme.text3)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(.horizontal, 4)
+                                    .padding(.vertical, 6)
                             }
                         }
-                        .padding(.horizontal, 8)
-                        .padding(.bottom, 8)
                     }
+                    .padding(.horizontal, 8)
+                    .padding(.bottom, 8)
                 }
             }
         }
         .task {
-            await loadPack()
+            await loadPacks()
         }
     }
 
-    private func loadPack() async {
-        pack = await loadPack(testPackAuthor, testPackId, testPackRelays)
-        if pack == nil { self.error = "Failed to load sticker pack" }
+    private func loadPacks() async {
+        let coordinates = (try? await MarmotService.shared.fetchInstalledPacks()) ?? []
+        let toFetch = coordinates.isEmpty ? ["30030:\(testPackAuthor):\(testPackId)"] : coordinates
+        var loaded: [StickerPackInfo] = []
+        for coord in toFetch {
+            let parts = coord.split(separator: ":", maxSplits: 2).map(String.init)
+            guard parts.count == 3 else { continue }
+            let relays = coord.contains(testPackAuthor) ? testPackRelays : []
+            if let p = await loadPack(parts[1], parts[2], relays) { loaded.append(p) }
+        }
+        if loaded.isEmpty {
+            if let fallback = await loadPack(testPackAuthor, testPackId, testPackRelays) {
+                loaded.append(fallback)
+            }
+        }
+        packs = loaded
+        if loaded.isEmpty { self.error = "Failed to load sticker packs" }
         loading = false
     }
 }

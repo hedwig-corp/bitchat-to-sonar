@@ -161,6 +161,9 @@ actual object SonarCore {
     actual suspend fun fetchStickerImage(url: String, expectedSha256: String): ByteArray =
         withContext(Dispatchers.IO) { requireNode().fetchStickerImage(url, expectedSha256) }
 
+    actual suspend fun fetchInstalledPacks(): List<String> =
+        withContext(Dispatchers.IO) { requireNode().fetchInstalledPacks() }
+
     actual suspend fun fetchMedia(chatId: String, url: String): ByteArray =
         withContext(Dispatchers.IO) { requireNode().fetchMedia(chatId, url) }
 

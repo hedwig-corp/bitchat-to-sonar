@@ -367,13 +367,25 @@ private fun ColumnScope.StickerTabContent(
     loadStickerImage: suspend (String, String) -> ByteArray?,
 ) {
     val s = sonar
-    var pack by remember { mutableStateOf<SonarStickerPack?>(null) }
+    var packs by remember { mutableStateOf<List<SonarStickerPack>>(emptyList()) }
     var loading by remember { mutableStateOf(true) }
     var error by remember { mutableStateOf<String?>(null) }
 
     LaunchedEffect(Unit) {
-        pack = loadStickerPack(TEST_PACK_AUTHOR, TEST_PACK_ID, TEST_PACK_RELAYS)
-        if (pack == null) error = "Failed to load sticker pack"
+        val coordinates = try { SonarCore.fetchInstalledPacks() } catch (_: Throwable) { emptyList() }
+        val toFetch = coordinates.ifEmpty { listOf("30030:$TEST_PACK_AUTHOR:$TEST_PACK_ID") }
+        val loaded = mutableListOf<SonarStickerPack>()
+        for (coord in toFetch) {
+            val parts = coord.split(":", limit = 3)
+            if (parts.size != 3) continue
+            val relays = if (coord.contains(TEST_PACK_AUTHOR)) TEST_PACK_RELAYS else emptyList()
+            loadStickerPack(parts[1], parts[2], relays)?.let { loaded += it }
+        }
+        if (loaded.isEmpty()) {
+            loadStickerPack(TEST_PACK_AUTHOR, TEST_PACK_ID, TEST_PACK_RELAYS)?.let { loaded += it }
+        }
+        packs = loaded
+        if (loaded.isEmpty()) error = "Failed to load sticker packs"
         loading = false
     }
 
@@ -391,7 +403,7 @@ private fun ColumnScope.StickerTabContent(
             Spacer(Modifier.height(8.dp))
             Text("Loading stickers…", color = s.text3, fontSize = 13.sp)
         }
-    } else if (error != null || pack == null) {
+    } else if (error != null || packs.isEmpty()) {
         SNEmptyState(
             icon = SNIconName.Sticker,
             title = "Couldn't load stickers",
@@ -399,15 +411,17 @@ private fun ColumnScope.StickerTabContent(
         )
         Spacer(Modifier.weight(1f))
     } else {
-        val p = pack!!
-        SNSectionLabel(p.title)
-
         LazyVerticalGrid(
             columns = GridCells.Fixed(4),
             modifier = Modifier.fillMaxWidth().weight(1f).padding(horizontal = 8.dp),
         ) {
-            items(p.stickers) { sticker ->
-                StickerCell(sticker, loadStickerImage) { onSticker(sticker, p.packCoordinate) }
+            for (p in packs) {
+                item(span = { GridItemSpan(maxLineSpan) }) {
+                    SNSectionLabel(p.title)
+                }
+                items(p.stickers) { sticker ->
+                    StickerCell(sticker, loadStickerImage) { onSticker(sticker, p.packCoordinate) }
+                }
             }
         }
     }

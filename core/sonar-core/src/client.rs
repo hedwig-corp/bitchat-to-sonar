@@ -18,7 +18,9 @@ use nostr_blossom::prelude::*;
 use nostr_sdk::{Client, RelayPoolNotification};
 use serde::{Deserialize, Serialize};
 
-use sonar_stickers::{parse_pack_event, StickerPack, StickerRef, STICKER_PACK_KIND};
+use sonar_stickers::{
+    parse_installed_pack_list, parse_pack_event, StickerPack, StickerRef, STICKER_PACK_KIND,
+};
 
 use crate::conversation_index::{
     index_db_path_for_db, wipe_index_for_db, ConversationChangeListener, ConversationIndex,
@@ -1328,6 +1330,24 @@ impl SonarClient {
             .ok_or_else(|| Error::Http("sticker pack not found on relays".into()))?;
         parse_pack_event(&event)
             .map_err(|e| Error::Http(format!("invalid sticker pack: {e}")))
+    }
+
+    pub async fn fetch_installed_packs(&self) -> Result<Vec<sonar_stickers::PackAddress>> {
+        let filter = Filter::new()
+            .kind(Kind::Custom(sonar_stickers::USER_STICKER_PACKS_KIND))
+            .author(self.identity().public_key())
+            .limit(1);
+        let relays: Vec<String> = self.relays.iter().map(|u| u.to_string()).collect();
+        let timeout = Duration::from_secs(10);
+        let events = self.nostr.fetch_events_from(relays, filter, timeout).await?;
+        match events.into_iter().next() {
+            Some(event) => {
+                let list = parse_installed_pack_list(&event)
+                    .map_err(|e| Error::Http(format!("invalid installed pack list: {e}")))?;
+                Ok(list.packs)
+            }
+            None => Ok(Vec::new()),
+        }
     }
 
     fn mark_outbox_pending(

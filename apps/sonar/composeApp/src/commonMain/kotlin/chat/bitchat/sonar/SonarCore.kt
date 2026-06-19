@@ -424,6 +424,9 @@ expect object SonarCore {
     /** Download a public sticker image and verify the bytes match [expectedSha256]. */
     suspend fun fetchStickerImage(url: String, expectedSha256: String): ByteArray
 
+    /** Fetch the user's installed sticker pack list (kind 10030) from relays. */
+    suspend fun fetchInstalledPacks(): List<String>
+
     /** Download + decrypt the media blob at [url] for the chat. Returns plaintext. */
     suspend fun fetchMedia(chatId: String, url: String): ByteArray
 
