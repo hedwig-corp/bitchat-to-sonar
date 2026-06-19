@@ -1005,9 +1005,10 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func fetchSonarDescriptor(npub: String) throws  -> SonarDescriptorInfo?
 
     /**
-     * Download a public sticker image by its plaintext HTTPS URL.
+     * Download a public sticker image by its plaintext HTTPS URL and verify
+     * the bytes match the sticker ref / pack hash before returning them.
      */
-    func fetchStickerImage(url: String) throws  -> Data
+    func fetchStickerImage(url: String, expectedSha256: String) throws  -> Data
 
     /**
      * Fetch a sticker pack from relays by its pack address.
@@ -1521,13 +1522,15 @@ open func fetchSonarDescriptor(npub: String)throws  -> SonarDescriptorInfo?  {
 }
 
     /**
-     * Download a public sticker image by its plaintext HTTPS URL.
+     * Download a public sticker image by its plaintext HTTPS URL and verify
+     * the bytes match the sticker ref / pack hash before returning them.
      */
-open func fetchStickerImage(url: String)throws  -> Data  {
+open func fetchStickerImage(url: String, expectedSha256: String)throws  -> Data  {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_fetch_sticker_image(
             self.uniffiCloneHandle(),
-        FfiConverterString.lower(url),$0
+        FfiConverterString.lower(url),
+        FfiConverterString.lower(expectedSha256),$0
     )
 })
 }
@@ -5178,7 +5181,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_fetch_sonar_descriptor() != 2804) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_fetch_sticker_image() != 381) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_fetch_sticker_image() != 40649) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_fetch_sticker_pack() != 19095) {

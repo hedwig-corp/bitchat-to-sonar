@@ -2090,10 +2090,11 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
-    suspend fun stickerImage(url: String): ByteArray? {
-        stickerImageCache[url]?.let { return it }
+    suspend fun stickerImage(url: String, expectedSha256: String): ByteArray? {
+        val cacheKey = "${expectedSha256.lowercase()}|$url"
+        stickerImageCache[cacheKey]?.let { return it }
         return try {
-            SonarCore.fetchStickerImage(url).also { stickerImageCache[url] = it }
+            SonarCore.fetchStickerImage(url, expectedSha256).also { stickerImageCache[cacheKey] = it }
         } catch (_: Throwable) {
             null
         }
@@ -2103,7 +2104,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         val (author, identifier) = ref.packAddressParts() ?: return null
         val pack = stickerPack(author, identifier) ?: return null
         val sticker = pack.stickerMatching(ref) ?: return null
-        return stickerImage(sticker.url)
+        return stickerImage(sticker.url, ref.plaintextSha256)
     }
 
     /** Download + decrypt a media attachment, cached by URL. */

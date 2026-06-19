@@ -822,7 +822,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             loadStickerPack = { author, identifier, relays ->
                 state.stickerPack(author, identifier, relays)
             },
-            loadStickerImage = { url -> state.stickerImage(url) },
+            loadStickerImage = { url, expectedSha256 -> state.stickerImage(url, expectedSha256) },
             onClose = { emojiTray = false }
         )
         // ONE composer row in BOTH states. Only the left (plus↔trash) and middle

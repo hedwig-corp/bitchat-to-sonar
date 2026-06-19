@@ -564,8 +564,10 @@ final class MarmotService: @unchecked Sendable {
     }
 
     /// Download a public sticker image by its plaintext HTTPS URL.
-    func fetchStickerImage(url: String) async throws -> Data {
-        try await run { try $0.requireNode().fetchStickerImage(url: url) }
+    func fetchStickerImage(url: String, expectedSha256: String) async throws -> Data {
+        try await run {
+            try $0.requireNode().fetchStickerImage(url: url, expectedSha256: expectedSha256)
+        }
     }
 
     /// Download + decrypt the media blob at `url` for the group. Returns plaintext.

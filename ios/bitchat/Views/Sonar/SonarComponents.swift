@@ -1768,7 +1768,7 @@ struct SNComposer: View {
     let onCommand: (String) -> Void
     var onSticker: (StickerInfo, String) -> Void = { _, _ in }
     var loadStickerPack: (String, String, [String]) async -> StickerPackInfo? = { _, _, _ in nil }
-    var loadStickerImage: (String) async -> Data? = { _ in nil }
+    var loadStickerImage: (String, String) async -> Data? = { _, _ in nil }
     var voiceEnabled: Bool = true
     /// Hold-to-record produced a voice note at this file URL (audio/mp4 .m4a).
     var onVoice: (URL) -> Void = { _ in }

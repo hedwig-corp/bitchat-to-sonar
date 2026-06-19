@@ -784,7 +784,9 @@ private struct MacConversationPane: View {
             },
             onSticker: { sticker, coord in
                 if isChannel {
-                    store.sendStickerToChannel(id, sticker: sticker, packCoordinate: coord)
+                    if !store.sendStickerToChannel(id, sticker: sticker, packCoordinate: coord) {
+                        showToast("Stickers aren't supported in public channels yet")
+                    }
                 } else {
                     store.sendSticker(id, sticker: sticker, packCoordinate: coord)
                 }
@@ -792,7 +794,7 @@ private struct MacConversationPane: View {
             loadStickerPack: { author, identifier, relays in
                 await store.stickerPack(authorPubkeyHex: author, identifier: identifier, relayUrls: relays)
             },
-            loadStickerImage: { await store.stickerImageData(url: $0) },
+            loadStickerImage: { await store.stickerImageData(url: $0, expectedSha256: $1) },
             voiceEnabled: !isChannel && store.canSendMedia(id),
             onVoice: { store.sendVoiceNote(id, url: $0) }
         )

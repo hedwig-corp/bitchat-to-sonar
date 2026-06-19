@@ -941,11 +941,12 @@ final class MarmotChatModel: ObservableObject {
         }
     }
 
-    func fetchStickerImage(url: String) async -> Data? {
-        if let cached = stickerImagesByURL[url] { return cached }
+    func fetchStickerImage(url: String, expectedSha256: String) async -> Data? {
+        let cacheKey = "\(expectedSha256.lowercased())|\(url)"
+        if let cached = stickerImagesByURL[cacheKey] { return cached }
         do {
-            let data = try await service.fetchStickerImage(url: url)
-            stickerImagesByURL[url] = data
+            let data = try await service.fetchStickerImage(url: url, expectedSha256: expectedSha256)
+            stickerImagesByURL[cacheKey] = data
             return data
         } catch {
             self.errorText = Self.describe(error)
@@ -965,7 +966,7 @@ final class MarmotChatModel: ObservableObject {
                       $0.sha256.caseInsensitiveCompare(ref.plaintextSha256) == .orderedSame
               })
         else { return nil }
-        return await fetchStickerImage(url: sticker.url)
+        return await fetchStickerImage(url: sticker.url, expectedSha256: ref.plaintextSha256)
     }
 
     /// Download + decrypt a media blob. The store caches the decoded image.

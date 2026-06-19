@@ -421,8 +421,8 @@ expect object SonarCore {
         relayUrls: List<String> = emptyList(),
     ): SonarStickerPack
 
-    /** Download a public sticker image by its plaintext HTTPS URL. */
-    suspend fun fetchStickerImage(url: String): ByteArray
+    /** Download a public sticker image and verify the bytes match [expectedSha256]. */
+    suspend fun fetchStickerImage(url: String, expectedSha256: String): ByteArray
 
     /** Download + decrypt the media blob at [url] for the chat. Returns plaintext. */
     suspend fun fetchMedia(chatId: String, url: String): ByteArray

@@ -21,7 +21,7 @@ struct SonarEmojiPickerView: View {
     let onEmoji: (String) -> Void
     let onSticker: (StickerInfo, String) -> Void
     let loadStickerPack: (String, String, [String]) async -> StickerPackInfo?
-    let loadStickerImage: (String) async -> Data?
+    let loadStickerImage: (String, String) async -> Data?
     let onClose: () -> Void
 
     @State private var tab = 0
@@ -185,7 +185,7 @@ private let testPackRelays = ["wss://relay.damus.io", "wss://nos.lol", "wss://re
 private struct StickerTabContent: View {
     let onSticker: (StickerInfo, String) -> Void
     let loadPack: (String, String, [String]) async -> StickerPackInfo?
-    let loadImage: (String) async -> Data?
+    let loadImage: (String, String) async -> Data?
 
     @State private var pack: StickerPackInfo?
     @State private var loading = true
@@ -260,7 +260,7 @@ private typealias StickerImage = NSImage
 
 private struct StickerCell: View {
     let sticker: StickerInfo
-    let loadImage: (String) async -> Data?
+    let loadImage: (String, String) async -> Data?
     let onTap: () -> Void
 
     @State private var image: StickerImage?
@@ -302,7 +302,7 @@ private struct StickerCell: View {
 
     private func loadImage() async {
         failed = false
-        guard let data = await loadImage(sticker.url),
+        guard let data = await loadImage(sticker.url, sticker.sha256),
               let decoded = StickerImage(data: data)
         else {
             failed = true

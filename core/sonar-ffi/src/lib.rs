@@ -606,23 +606,34 @@ impl SonarNode {
         identifier: String,
         relay_urls: Vec<String>,
     ) -> FfiResult<StickerPackInfo> {
-        let pack = self.runtime.block_on(
-            self.client
-                .fetch_sticker_pack(&author_pubkey_hex, &identifier, &relay_urls),
-        )?;
+        let pack = self.runtime.block_on(self.client.fetch_sticker_pack(
+            &author_pubkey_hex,
+            &identifier,
+            &relay_urls,
+        ))?;
         Ok(sticker_pack_info(pack))
     }
 
-    /// Download a public sticker image by its plaintext HTTPS URL.
-    pub fn fetch_sticker_image(&self, url: String) -> FfiResult<Vec<u8>> {
+    /// Download a public sticker image by its plaintext HTTPS URL and verify
+    /// the bytes match the sticker ref / pack hash before returning them.
+    pub fn fetch_sticker_image(&self, url: String, expected_sha256: String) -> FfiResult<Vec<u8>> {
         if !url.starts_with("https://") {
             return Err(SonarFfiError::InvalidInput(
                 "sticker URL must be HTTPS".into(),
             ));
         }
+        let expected_sha256 = expected_sha256.to_ascii_lowercase();
+        sonar_stickers::validate_sha256_hex(&expected_sha256)
+            .map_err(|e| SonarFfiError::InvalidInput(format!("bad sticker sha256: {e}")))?;
         let bytes = self
             .runtime
             .block_on(sonar_core::client::http_get_public(&url))?;
+        let actual_sha256 = sonar_stickers::sha256_hex(&bytes);
+        if actual_sha256 != expected_sha256 {
+            return Err(SonarFfiError::InvalidInput(format!(
+                "sticker image sha256 mismatch: expected {expected_sha256}, got {actual_sha256}"
+            )));
+        }
         Ok(bytes)
     }
 

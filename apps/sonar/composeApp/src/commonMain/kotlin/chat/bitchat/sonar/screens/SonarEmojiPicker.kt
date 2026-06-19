@@ -134,8 +134,8 @@ fun SonarEmojiPicker(
     loadStickerPack: suspend (String, String, List<String>) -> SonarStickerPack? = { author, identifier, relays ->
         runCatching { SonarCore.fetchStickerPack(author, identifier, relays) }.getOrNull()
     },
-    loadStickerImage: suspend (String) -> ByteArray? = { url ->
-        runCatching { SonarCore.fetchStickerImage(url) }.getOrNull()
+    loadStickerImage: suspend (String, String) -> ByteArray? = { url, expectedSha256 ->
+        runCatching { SonarCore.fetchStickerImage(url, expectedSha256) }.getOrNull()
     },
     onClose: () -> Unit,
 ) {
@@ -364,7 +364,7 @@ private fun ColumnScope.GifTabContent() {
 private fun ColumnScope.StickerTabContent(
     onSticker: (SonarStickerItem, String) -> Unit,
     loadStickerPack: suspend (String, String, List<String>) -> SonarStickerPack?,
-    loadStickerImage: suspend (String) -> ByteArray?,
+    loadStickerImage: suspend (String, String) -> ByteArray?,
 ) {
     val s = sonar
     var pack by remember { mutableStateOf<SonarStickerPack?>(null) }
@@ -416,14 +416,14 @@ private fun ColumnScope.StickerTabContent(
 @Composable
 private fun StickerCell(
     sticker: SonarStickerItem,
-    loadStickerImage: suspend (String) -> ByteArray?,
+    loadStickerImage: suspend (String, String) -> ByteArray?,
     onClick: () -> Unit,
 ) {
     var imageBytes by remember(sticker.url) { mutableStateOf<ByteArray?>(null) }
     var failed by remember(sticker.url) { mutableStateOf(false) }
     LaunchedEffect(sticker.url) {
         failed = false
-        imageBytes = loadStickerImage(sticker.url)
+        imageBytes = loadStickerImage(sticker.url, sticker.sha256)
         failed = imageBytes == null
     }
     Box(

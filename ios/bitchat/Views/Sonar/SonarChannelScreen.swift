@@ -110,12 +110,14 @@ struct SonarChannelScreen: View {
                     store.onCommand(.init(type: .ch, id: chId, target: slapTarget), cmd)
                 },
                 onSticker: { sticker, coord in
-                    store.sendStickerToChannel(chId, sticker: sticker, packCoordinate: coord)
+                    if !store.sendStickerToChannel(chId, sticker: sticker, packCoordinate: coord) {
+                        showToast("Stickers aren't supported in public channels yet")
+                    }
                 },
                 loadStickerPack: { author, identifier, relays in
                     await store.stickerPack(authorPubkeyHex: author, identifier: identifier, relayUrls: relays)
                 },
-                loadStickerImage: { await store.stickerImageData(url: $0) },
+                loadStickerImage: { await store.stickerImageData(url: $0, expectedSha256: $1) },
                 voiceEnabled: false
             )
         }

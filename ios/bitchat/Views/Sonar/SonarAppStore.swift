@@ -1539,14 +1539,15 @@ final class SonarAppStore: ObservableObject {
         chatViewModel.sendMessage(text)
     }
 
-    func sendStickerToChannel(_ chId: String, sticker: StickerInfo, packCoordinate: String) {
-        guard let groupId = marmotGroupId(chId) else { return }
+    func sendStickerToChannel(_ chId: String, sticker: StickerInfo, packCoordinate: String) -> Bool {
+        guard let groupId = marmotGroupId(chId) else { return false }
         marmot.sendSticker(
             groupId: groupId,
             packCoordinate: packCoordinate,
             shortcode: sticker.shortcode,
             plaintextSha256: sticker.sha256
         )
+        return true
     }
 
     private func mapPublic(_ m: BitchatMessage, via: SNVia) -> SNMessage {
@@ -2825,8 +2826,8 @@ final class SonarAppStore: ObservableObject {
         )
     }
 
-    func stickerImageData(url: String) async -> Data? {
-        await marmot.fetchStickerImage(url: url)
+    func stickerImageData(url: String, expectedSha256: String) async -> Data? {
+        await marmot.fetchStickerImage(url: url, expectedSha256: expectedSha256)
     }
 
     func stickerImageData(for ref: MarmotService.MarmotStickerRef) async -> Data? {
