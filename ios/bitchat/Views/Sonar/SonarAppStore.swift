@@ -420,6 +420,7 @@ final class SonarAppStore: ObservableObject {
     private var publishedBolt12Offer: String?
     private var publishedPaymentMetadataWithoutOffer = false
     private var publishingPaymentMetadata = false
+    private var refreshedKnownDescriptorsForRelaySession = false
     private var incomingWalletTask: Task<Void, Never>?
 
     convenience init() {
@@ -522,7 +523,14 @@ final class SonarAppStore: ObservableObject {
                 if npub != nil { (self.wallet as? BridgedWallet)?.retrySetup() }
                 #endif
                 if npub != nil { self.publishPaymentMetadataIfNeeded() }
-                if npub != nil { self.refreshKnownContactDescriptors() }
+            }
+            .store(in: &cancellables)
+        marmot.$relayConnected
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] connected in
+                guard let self, connected, !self.refreshedKnownDescriptorsForRelaySession else { return }
+                self.refreshedKnownDescriptorsForRelaySession = true
+                self.refreshKnownContactDescriptors(clearMisses: true)
             }
             .store(in: &cancellables)
         // Messages typed to an out-of-range Sonar peer before their White
@@ -1018,10 +1026,10 @@ final class SonarAppStore: ObservableObject {
     /// payment and call capabilities stay current for contacts discovered over
     /// BLE even when they're out of range. Called at boot and on foreground
     /// return; `ensureSonarDescriptor`'s 15-minute TTL avoids redundant fetches.
-    private func refreshKnownContactDescriptors() {
+    private func refreshKnownContactDescriptors(clearMisses: Bool = false) {
         let npubs = sonarProfilesByFingerprint.values.map(\.npub)
         guard !npubs.isEmpty else { return }
-        marmot.refreshDescriptors(forKnownNpubs: npubs)
+        marmot.refreshDescriptors(forKnownNpubs: npubs, clearMisses: clearMisses)
     }
 
     private func persistSonarProfiles() {
@@ -3726,6 +3734,7 @@ final class SonarAppStore: ObservableObject {
         pendingPayPeer = nil
         localHydratingDMs = []
         clearMarmotConversationGroups()
+        refreshedKnownDescriptorsForRelaySession = false
         clearCallLogs()
         // The node is recreated by eraseChatsKeepIdentity → reset call state so
         // the iroh endpoint rebinds (the marmot.$npub sink calls ensureCallStarted).
@@ -3786,6 +3795,7 @@ final class SonarAppStore: ObservableObject {
         publishedBolt12Offer = nil
         publishedPaymentMetadataWithoutOffer = false
         publishingPaymentMetadata = false
+        refreshedKnownDescriptorsForRelaySession = false
         pendingMarmotSends = [:]
         // Forget every ⚡PAY coin and the Lightning wallet seed (separate
         // keychain service owned by SonarWalletKit).

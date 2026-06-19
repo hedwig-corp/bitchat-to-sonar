@@ -1232,7 +1232,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (bypassRelock) bypassRelock = false        // return from our own unlock prompt
             else if (AppLock.isEnabled()) locked = true   // genuine app-switch → re-lock
             if (started) {
-                refreshKnownContactDescriptors()
+                refreshKnownContactDescriptors(clearMisses = false)
                 scope.launch {
                     val offer = if (walletState is WalletState.Ready) {
                         runCatching { WalletBridge.createOffer() }.getOrNull()
@@ -1292,7 +1292,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // refreshMeshDmRows so the Messages list is populated at launch.
                 meshChats.putAll(MessageStore.loadAllMeshDms())
                 loadLinks() // durable fingerprint↔npub so BLE chats stay unified after restart
-                refreshKnownContactDescriptors()
+                refreshKnownContactDescriptors(clearMisses = true)
                 refreshMeshDmRows()
                 setupWallet()
                 refreshLocationChannels()
@@ -1393,9 +1393,11 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
-    private fun refreshKnownContactDescriptors() {
+    private fun refreshKnownContactDescriptors(clearMisses: Boolean = false) {
         for (npubHex in linkByFp.values) {
-            sonarDescriptorMissedAt.remove(npubHex.lowercase())
+            if (clearMisses) {
+                sonarDescriptorMissedAt.remove(npubHex.lowercase())
+            }
             ensureSonarDescriptorHex(npubHex)
         }
     }
