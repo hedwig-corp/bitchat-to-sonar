@@ -6,8 +6,8 @@
 // (spec: docs/SONAR-PAYMENTS.md). Payments settle over Lightning first, then
 // ride the same encrypted chat rails as receipt/control lines:
 //
-//   sender →  ⚡PAY|1|<uuid>|<sats>   payment receipt appears in chat
-//   sender →  ⚡PAYDONE|1|<uuid>      confirms the Lightning payment settled
+//   sender →  ⚡PAY|1|<uuid>|<sats>              payment receipt appears in chat
+//   sender →  ⚡PAYDONE|2|<uuid>|<preimage_hex>  confirms the Lightning payment settled
 //
 // Lines are only ever sent to Sonar-capable counterparts; on anything else
 // (or an unknown version) they harmlessly render as plain text.
@@ -23,49 +23,67 @@ import Foundation
 
 /// One ⚡PAY control line. Field separator is `|`.
 enum SonarPayMessage: Equatable {
-    static let version = 1
 
     private static let payPrefix = "\u{26A1}PAY|"
     private static let donePrefix = "\u{26A1}PAYDONE|"
 
     /// Payment receipt: `⚡PAY|1|<uuid>|<sats>`.
     case pay(id: String, sats: Int64)
-    /// Settled: `⚡PAYDONE|1|<uuid>`.
-    case done(id: String)
+    /// Settled: `⚡PAYDONE|2|<uuid>` or `⚡PAYDONE|2|<uuid>|<preimage_hex>`.
+    case done(id: String, preimage: String? = nil)
 
     var id: String {
         switch self {
-        case .pay(let id, _), .done(let id): return id
+        case .pay(let id, _), .done(let id, _): return id
         }
     }
 
     func encoded() -> String {
         switch self {
         case .pay(let id, let sats):
-            return "\(Self.payPrefix)\(Self.version)|\(id)|\(sats)"
-        case .done(let id):
-            return "\(Self.donePrefix)\(Self.version)|\(id)"
+            return "\(Self.payPrefix)1|\(id)|\(sats)"
+        case .done(let id, let preimage):
+            if let preimage {
+                return "\(Self.donePrefix)2|\(id)|\(preimage)"
+            }
+            return "\(Self.donePrefix)2|\(id)"
         }
     }
 
-    /// Strict decode: nil for anything that isn't a well-formed v1 line
-    /// (unknown versions fall back to plain text on purpose).
+    /// Decode a ⚡PAY control line. Accepts v1 PAYDONE from old peers and
+    /// v2 PAYDONE with optional preimage. Unknown versions fall back to plain text.
     static func decode(_ text: String) -> SonarPayMessage? {
-        // DONE also starts with "⚡PAY", so check it first.
         if text.hasPrefix(donePrefix) {
             let rest = text.dropFirst(donePrefix.count)
             let parts = rest.split(separator: "|", omittingEmptySubsequences: false)
-            guard parts.count == 2,
-                  Int(parts[0]) == version,
+            guard let version = Int(parts.first ?? ""),
+                  parts.count >= 2,
                   isValidID(parts[1])
             else { return nil }
-            return .done(id: String(parts[1]))
+            switch version {
+            case 1:
+                guard parts.count == 2 else { return nil }
+                return .done(id: String(parts[1]))
+            case 2:
+                switch parts.count {
+                case 2:
+                    return .done(id: String(parts[1]))
+                case 3:
+                    let pre = String(parts[2])
+                    guard isValidPreimage(pre) else { return nil }
+                    return .done(id: String(parts[1]), preimage: pre)
+                default:
+                    return nil
+                }
+            default:
+                return nil
+            }
         }
         if text.hasPrefix(payPrefix) {
             let rest = text.dropFirst(payPrefix.count)
             let parts = rest.split(separator: "|", omittingEmptySubsequences: false)
             guard parts.count == 3,
-                  Int(parts[0]) == version,
+                  Int(parts[0]) == 1,
                   isValidID(parts[1]),
                   let sats = Int64(parts[2]), sats > 0
             else { return nil }
@@ -76,6 +94,10 @@ enum SonarPayMessage: Equatable {
 
     private static func isValidID(_ s: Substring) -> Bool {
         !s.isEmpty && s.count <= 64 && s.allSatisfy { $0.isHexDigit || $0 == "-" }
+    }
+
+    private static func isValidPreimage(_ s: String) -> Bool {
+        s.count == 64 && s.allSatisfy { $0.isHexDigit }
     }
 }
 
@@ -105,6 +127,8 @@ struct SonarPayEntry: Codable, Equatable {
     var state: State
     /// Transport the receipt traveled over ("mesh"/"internet").
     let via: String
+    /// Lightning preimage proving settlement (hex, 64 chars). Nil for old entries.
+    var preimage: String?
 }
 
 /// UserDefaults-persisted ledger of every ⚡PAY coin this device has sent
@@ -114,7 +138,7 @@ final class SonarPayLedger: ObservableObject {
     static let defaultsKey = "sonar.pay.ledger.v1"
 
     @Published private(set) var entries: [String: SonarPayEntry]
-    private var pendingDoneIDs = Set<String>()
+    private var pendingDone: [String: String?] = [:]
 
     private let defaults: UserDefaults
     private let key: String
@@ -140,9 +164,10 @@ final class SonarPayLedger: ObservableObject {
     func record(_ entry: SonarPayEntry) -> Bool {
         guard entries[entry.id] == nil else { return false }
         var stored = entry
-        let doneWasPending = pendingDoneIDs.remove(entry.id) != nil
+        let doneWasPending = pendingDone.keys.contains(entry.id)
         if stored.direction == .incoming, doneWasPending {
             stored.state = .claimed
+            stored.preimage = pendingDone.removeValue(forKey: entry.id) ?? nil
         }
         entries[entry.id] = stored
         persist()
@@ -152,12 +177,14 @@ final class SonarPayLedger: ObservableObject {
     /// Marks an incoming coin claimed, or remembers the DONE when relay order
     /// delivers it before the matching PAY line.
     @discardableResult
-    func markIncomingClaimedOrPending(_ id: String) -> Bool {
-        guard let entry = entries[id] else {
-            pendingDoneIDs.insert(id)
+    func markIncomingClaimedOrPending(_ id: String, preimage: String? = nil) -> Bool {
+        guard var entry = entries[id] else {
+            pendingDone[id] = preimage
             return false
         }
         guard entry.direction == .incoming else { return false }
+        entry.preimage = preimage ?? entry.preimage
+        entries[id] = entry
         return transition(id, to: .claimed)
     }
 
@@ -183,7 +210,7 @@ final class SonarPayLedger: ObservableObject {
     /// Emergency wipe: forget every payment.
     func wipe() {
         entries = [:]
-        pendingDoneIDs = []
+        pendingDone = [:]
         defaults.removeObject(forKey: key)
     }
 

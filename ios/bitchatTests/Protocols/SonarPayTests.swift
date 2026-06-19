@@ -15,6 +15,8 @@ import XCTest
 final class SonarPayTests: XCTestCase {
 
     private let uuid = "5f0c2c6a-9d57-4f1e-8a3b-2c41770e5b2d"
+    private let validPreimage = String(repeating: "a", count: 64)
+
     // MARK: - Codec round trips
 
     func testPayRoundTrip() {
@@ -23,17 +25,29 @@ final class SonarPayTests: XCTestCase {
         XCTAssertEqual(SonarPayMessage.decode(line.encoded()), line)
     }
 
-    func testDoneRoundTrip() {
+    func testDoneV2RoundTripWithoutPreimage() {
         let line = SonarPayMessage.done(id: uuid)
-        XCTAssertEqual(line.encoded(), "\u{26A1}PAYDONE|1|\(uuid)")
+        XCTAssertEqual(line.encoded(), "\u{26A1}PAYDONE|2|\(uuid)")
         XCTAssertEqual(SonarPayMessage.decode(line.encoded()), line)
     }
 
-    // MARK: - Codec rejections (unknown versions fall back to plain text)
+    func testDoneV2RoundTripWithPreimage() {
+        let line = SonarPayMessage.done(id: uuid, preimage: validPreimage)
+        XCTAssertEqual(line.encoded(), "\u{26A1}PAYDONE|2|\(uuid)|\(validPreimage)")
+        XCTAssertEqual(SonarPayMessage.decode(line.encoded()), line)
+    }
+
+    func testDecodeV1DoneBackwardCompat() {
+        let decoded = SonarPayMessage.decode("\u{26A1}PAYDONE|1|\(uuid)")
+        XCTAssertEqual(decoded, .done(id: uuid))
+    }
+
+    // MARK: - Codec rejections
 
     func testDecodeRejectsUnknownVersion() {
         XCTAssertNil(SonarPayMessage.decode("\u{26A1}PAY|2|\(uuid)|21000"))
         XCTAssertNil(SonarPayMessage.decode("\u{26A1}PAYDONE|0|\(uuid)"))
+        XCTAssertNil(SonarPayMessage.decode("\u{26A1}PAYDONE|3|\(uuid)"))
     }
 
     func testDecodeRejectsMalformedLines() {
@@ -45,14 +59,20 @@ final class SonarPayTests: XCTestCase {
         XCTAssertNil(SonarPayMessage.decode("\u{26A1}PAY|1|\(uuid)|12.5"))     // non-integer
         XCTAssertNil(SonarPayMessage.decode("\u{26A1}PAY|1||21000"))           // empty id
         XCTAssertNil(SonarPayMessage.decode("\u{26A1}PAY|1|not a uuid!|21000")) // bad id chars
-        XCTAssertNil(SonarPayMessage.decode("\u{26A1}PAYCLAIM|1|\(uuid)|lno1xxx")) // removed protocol line
-        XCTAssertNil(SonarPayMessage.decode("\u{26A1}PAYDONE|1|\(uuid)|extra"))
-        XCTAssertNil(SonarPayMessage.decode("PAY|1|\(uuid)|21000"))            // no ⚡ prefix
+        XCTAssertNil(SonarPayMessage.decode("\u{26A1}PAYCLAIM|1|\(uuid)|lno1xxx"))
+        XCTAssertNil(SonarPayMessage.decode("\u{26A1}PAYDONE|1|\(uuid)|extra")) // v1 extra parts
+        XCTAssertNil(SonarPayMessage.decode("PAY|1|\(uuid)|21000"))            // no prefix
+    }
+
+    func testDecodeRejectsInvalidPreimage() {
+        XCTAssertNil(SonarPayMessage.decode("\u{26A1}PAYDONE|2|\(uuid)|tooshort"))
+        XCTAssertNil(SonarPayMessage.decode("\u{26A1}PAYDONE|2|\(uuid)|\(String(repeating: "g", count: 64))"))
+        XCTAssertNil(SonarPayMessage.decode("\u{26A1}PAYDONE|2|\(uuid)|\(String(repeating: "a", count: 63))"))
+        XCTAssertNil(SonarPayMessage.decode("\u{26A1}PAYDONE|2|\(uuid)|\(validPreimage)|extra"))
     }
 
     func testDecodeDisambiguatesPrefixes() {
-        // ⚡PAYDONE also starts with "⚡PAY".
-        guard case .done = SonarPayMessage.decode("\u{26A1}PAYDONE|1|\(uuid)") else {
+        guard case .done = SonarPayMessage.decode("\u{26A1}PAYDONE|2|\(uuid)") else {
             return XCTFail("Expected .done")
         }
         guard case .pay = SonarPayMessage.decode("\u{26A1}PAY|1|\(uuid)|100") else {
@@ -83,7 +103,6 @@ final class SonarPayTests: XCTestCase {
     func testRecordIsIdempotent() {
         let (ledger, _) = freshLedger()
         XCTAssertTrue(ledger.record(entry()))
-        // Second record with the same id must not overwrite anything.
         var dupe = entry()
         dupe.state = .claimed
         XCTAssertFalse(ledger.record(dupe))
@@ -93,10 +112,8 @@ final class SonarPayTests: XCTestCase {
     func testSenderTransitions() {
         let (ledger, _) = freshLedger()
         ledger.record(entry(direction: .outgoing))
-        // sealed/pending → claimed (paid)
         XCTAssertTrue(ledger.transition(uuid, to: .claimed))
         XCTAssertEqual(ledger.entry(for: uuid)?.state, .claimed)
-        // claimed is terminal
         XCTAssertFalse(ledger.transition(uuid, to: .sealed))
         XCTAssertFalse(ledger.transition(uuid, to: .claimed))
     }
@@ -104,7 +121,6 @@ final class SonarPayTests: XCTestCase {
     func testReceiverTransitions() {
         let (ledger, _) = freshLedger()
         ledger.record(entry(direction: .incoming))
-        // sealed/pending → claimed (⚡PAYDONE)
         XCTAssertTrue(ledger.transition(uuid, to: .claimed))
         XCTAssertEqual(ledger.entry(for: uuid)?.state, .claimed)
     }
@@ -119,24 +135,71 @@ final class SonarPayTests: XCTestCase {
     func testInvalidTransitions() {
         let (ledger, _) = freshLedger()
         ledger.record(entry())
-        XCTAssertFalse(ledger.transition(uuid, to: .sealed))      // no self-loop
-        XCTAssertFalse(ledger.transition(uuid, to: .settling))    // no new claim flow
+        XCTAssertFalse(ledger.transition(uuid, to: .sealed))
+        XCTAssertFalse(ledger.transition(uuid, to: .settling))
         XCTAssertFalse(ledger.transition("missing-id", to: .claimed))
     }
 
     func testDoneCanRaceAheadOfClaiming() {
         let (ledger, _) = freshLedger()
         ledger.record(entry(direction: .incoming))
-        // ⚡PAYDONE processed while still sealed locally.
         XCTAssertTrue(ledger.transition(uuid, to: .claimed))
     }
 
     func testDoneCanArriveBeforePay() {
         let (ledger, _) = freshLedger()
-        // ⚡PAYDONE can race ahead of ⚡PAY over relay-backed transports.
         XCTAssertFalse(ledger.markIncomingClaimedOrPending(uuid))
         XCTAssertTrue(ledger.record(entry(direction: .incoming)))
         XCTAssertEqual(ledger.entry(for: uuid)?.state, .claimed)
+    }
+
+    func testDoneCanArriveBeforePayWithPreimage() {
+        let (ledger, _) = freshLedger()
+        XCTAssertFalse(ledger.markIncomingClaimedOrPending(uuid, preimage: validPreimage))
+        XCTAssertTrue(ledger.record(entry(direction: .incoming)))
+        XCTAssertEqual(ledger.entry(for: uuid)?.state, .claimed)
+        XCTAssertEqual(ledger.entry(for: uuid)?.preimage, validPreimage)
+    }
+
+    func testMarkIncomingClaimedStoresPreimage() {
+        let (ledger, _) = freshLedger()
+        ledger.record(entry(direction: .incoming))
+        XCTAssertTrue(ledger.markIncomingClaimedOrPending(uuid, preimage: validPreimage))
+        XCTAssertEqual(ledger.entry(for: uuid)?.state, .claimed)
+        XCTAssertEqual(ledger.entry(for: uuid)?.preimage, validPreimage)
+    }
+
+    func testPreimagePersistsAcrossRestart() {
+        let suite = "sonar.pay.tests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+
+        let ledger = SonarPayLedger(defaults: defaults)
+        var e = entry(direction: .incoming)
+        e.preimage = validPreimage
+        e.state = .claimed
+        ledger.record(e)
+
+        let reloaded = SonarPayLedger(defaults: defaults)
+        XCTAssertEqual(reloaded.entry(for: uuid)?.preimage, validPreimage)
+        XCTAssertEqual(reloaded.entry(for: uuid)?.state, .claimed)
+
+        defaults.removePersistentDomain(forName: suite)
+    }
+
+    func testOldEntriesWithoutPreimageLoadAsNil() {
+        let suite = "sonar.pay.tests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+
+        let ledger = SonarPayLedger(defaults: defaults)
+        ledger.record(entry(direction: .incoming))
+        XCTAssertNil(ledger.entry(for: uuid)?.preimage)
+
+        let reloaded = SonarPayLedger(defaults: defaults)
+        XCTAssertNil(reloaded.entry(for: uuid)?.preimage)
+
+        defaults.removePersistentDomain(forName: suite)
     }
 
     func testPersistenceRoundTrip() {

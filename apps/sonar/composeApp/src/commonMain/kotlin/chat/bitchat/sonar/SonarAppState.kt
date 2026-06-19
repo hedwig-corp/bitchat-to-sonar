@@ -12,6 +12,7 @@ import chat.bitchat.sonar.unify.UnifyRadio
 import chat.bitchat.sonar.wallet.ExchangeRate
 import chat.bitchat.sonar.wallet.FiatCurrency
 import chat.bitchat.sonar.wallet.Money
+import chat.bitchat.sonar.wallet.SendResult
 import chat.bitchat.sonar.wallet.WalletBridge
 import chat.bitchat.sonar.wallet.WalletState
 import kotlinx.coroutines.CoroutineScope
@@ -965,13 +966,13 @@ class SonarAppState(private val scope: CoroutineScope) {
         val payId = randomPayId()
         scope.launch {
             var failureMessage: String? = null
-            val ok = runCatching { WalletBridge.send(offer, sats, "Sonar payment $payId") }
+            val result = runCatching { WalletBridge.send(offer, sats, "Sonar payment $payId") }
                 .getOrElse {
                     failureMessage = "Payment failed: ${it.message}"
-                    false
+                    SendResult(false)
                 }
             walletState = WalletBridge.state()
-            if (ok) {
+            if (result.ok) {
                 if (payLedger.recordReceipt(payId, sats, mine = true)) {
                     persistPay()
                     payVersion++
@@ -980,7 +981,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                     chatId,
                     listOf(
                         PayLine.Pay(payId, sats).encoded(),
-                        PayLine.Done(payId).encoded(),
+                        PayLine.Done(payId, result.preimage).encoded(),
                     ),
                 )
                 if (!receiptOk) {
@@ -1036,7 +1037,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         for (m in msgs) {
             when (val line = PayLine.decode(m.content)) {
                 is PayLine.Pay -> if (payLedger.recordReceipt(line.uuid, line.sats, m.mine)) changed = true
-                is PayLine.Done -> if (payLedger.markClaimedOrPending(line.uuid)) changed = true
+                is PayLine.Done -> if (payLedger.markClaimedOrPending(line.uuid, line.preimage)) changed = true
                 null -> {}
             }
         }
@@ -1089,9 +1090,9 @@ class SonarAppState(private val scope: CoroutineScope) {
             val raw = UnifyRadio.fetchOffer(peerId)
             val dest = raw?.let { UnifyBIP321.parse(it) }?.lightning
             if (dest == null) { toast = "Couldn't read that user's payment request"; return@launch }
-            val ok = WalletBridge.send(dest, amountSats, "Sonar nearby")
+            val result = WalletBridge.send(dest, amountSats, "Sonar nearby")
             walletState = WalletBridge.state()
-            toast = if (ok) "Sent ${amountSats} sats" else "Payment failed"
+            toast = if (result.ok) "Sent ${amountSats} sats" else "Payment failed"
         }
     }
 

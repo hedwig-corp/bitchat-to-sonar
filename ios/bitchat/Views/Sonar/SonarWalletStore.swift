@@ -56,6 +56,7 @@ struct SonarWalletPayment: Equatable, Codable, Sendable {
     let timestamp: Date
     let note: String?
     let feesSats: Int64?
+    let preimage: String?
 
     init(
         id: String,
@@ -63,7 +64,8 @@ struct SonarWalletPayment: Equatable, Codable, Sendable {
         isIncoming: Bool,
         timestamp: Date,
         note: String?,
-        feesSats: Int64? = nil
+        feesSats: Int64? = nil,
+        preimage: String? = nil
     ) {
         self.id = id
         self.amountSats = amountSats
@@ -71,6 +73,7 @@ struct SonarWalletPayment: Equatable, Codable, Sendable {
         self.timestamp = timestamp
         self.note = note
         self.feesSats = feesSats
+        self.preimage = preimage
     }
 }
 
