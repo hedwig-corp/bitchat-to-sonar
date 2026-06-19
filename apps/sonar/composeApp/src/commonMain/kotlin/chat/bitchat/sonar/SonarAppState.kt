@@ -1571,7 +1571,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (echo.state == "Couldn't send") continue
             val match = ownPublished[echo.content]
                 ?.filter { it.id !in consumedPublished }
-                ?.firstOrNull { it.tsSecs > echo.tsSecs && it.tsSecs - echo.tsSecs < 30 }
+                ?.firstOrNull { it.tsSecs >= echo.tsSecs - 2 && it.tsSecs - echo.tsSecs < 30 }
             if (match != null) {
                 fulfilled.add(echo.id)
                 consumedPublished.add(match.id)
@@ -2576,16 +2576,13 @@ class SonarAppState(private val scope: CoroutineScope) {
             .onEach { groupIdHex ->
                 refreshChats()
                 (screen as? Screen.Chat)?.let { sc ->
-                    when {
-                        !isMeshChat(sc.id) && sc.id == groupIdHex -> {
-                            messages = withSendEchoes(sc.id, mergePendingMediaUploads(sc.id, marmotMessagesPage(sc.id)))
-                            processPayLines(sc.id, messages)
-                        }
-                        isMeshChat(sc.id) -> {
-                            val peerId = peerIdForMarmotGroup(groupIdHex)
-                            if (peerId != null && sc.id == meshChatId(peerId)) {
-                                refreshOpenDm(peerId)
-                            }
+                    if (!isMeshChat(sc.id) && sc.id == groupIdHex) {
+                        messages = withSendEchoes(sc.id, mergePendingMediaUploads(sc.id, marmotMessagesPage(sc.id)))
+                        processPayLines(sc.id, messages)
+                    } else if (isMeshChat(sc.id)) {
+                        val peerId = peerIdForMarmotGroup(groupIdHex)
+                        if (peerId != null && sc.id == meshChatId(peerId)) {
+                            refreshOpenDm(peerId)
                         }
                     }
                 }
