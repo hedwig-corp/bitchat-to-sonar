@@ -30,9 +30,12 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import chat.bitchat.sonar.PayLine
+import chat.bitchat.sonar.PaySheet
 import chat.bitchat.sonar.Screen
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.canonicalProfileKey
+import chat.bitchat.sonar.randomPayId
 import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconName
 import chat.bitchat.sonar.ui.SNNavHeader
@@ -50,6 +53,7 @@ import chat.bitchat.sonar.ui.sonar
 fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfile) {
     val s = sonar
     var showVerify by remember { mutableStateOf(false) }
+    var paySheet by remember { mutableStateOf(false) }
 
     // Derive the peer npub from the chat members list, or accept a direct
     // npub when opened from a group member tap.
@@ -92,6 +96,7 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
     }
     val verified = state.isVerified(effectiveChatId)
     val canCall = state.canCall(effectiveChatId)
+    val canPay = !state.isMultiMemberChat(effectiveChatId)
 
     // Find shared groups: multi-member groups where both the local user and this
     // contact are members.
@@ -167,6 +172,13 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
                         if (canCall) state.placeCall(effectiveChatId, screen.name, false)
                         else state.toast = "No call route to this peer yet."
                     }
+                )
+                Spacer(Modifier.width(28.dp))
+                ActionCircle(
+                    icon = SNIconName.Coin,
+                    label = "Pay",
+                    enabled = canPay,
+                    onClick = { paySheet = true }
                 )
                 Spacer(Modifier.width(28.dp))
                 ActionCircle(
@@ -298,6 +310,19 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
 
             Spacer(Modifier.height(40.dp))
         }
+    }
+    if (paySheet) {
+        val isMesh = effectiveChatId.startsWith("mesh:")
+        PaySheet(
+            peerName = screen.name,
+            balanceSats = state.walletBalanceSats(),
+            mesh = isMesh,
+            fiatOf = { state.fiatOrNull(it) },
+            onSend = { sats ->
+                state.send(effectiveChatId, PayLine.Pay(randomPayId(), sats).encoded())
+            },
+            onClose = { paySheet = false }
+        )
     }
 }
 

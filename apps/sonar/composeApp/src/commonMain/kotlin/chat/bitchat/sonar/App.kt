@@ -1182,7 +1182,7 @@ private fun VerifySheet(
     }
 }
 
-private fun randomPayId(): String =
+internal fun randomPayId(): String =
     (0 until 16).map { "0123456789abcdef".random() }.joinToString("")
 
 @Composable

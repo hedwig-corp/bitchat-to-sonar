@@ -1023,6 +1023,13 @@ final class SonarAppStore: ObservableObject {
         }
         meshPeerFirstSeenAt[fp] = nil
         pendingCapabilityRefreshKeys.remove(fp)
+        // Proactively fetch the Nostr descriptor so the BOLT12 offer is ready
+        // by the time the user opens the payment sheet. Without this, the
+        // descriptor loads lazily and the payment button appears only after a
+        // second visit to the action sheet.
+        if profile.capabilities & SonarCapability.payments != 0 {
+            marmot.ensureSonarDescriptor(npub)
+        }
     }
 
     /// Refresh Sonar descriptors for every persisted fingerprint↔npub link so
@@ -2929,10 +2936,19 @@ final class SonarAppStore: ObservableObject {
         wallet.parseFiatInput(text, currencyCode: displayCurrency)
     }
 
-    /// Direct payments require explicit `sonar.meta.v1` receive metadata.
-    /// Old call-only descriptors or BLE capability bits do not unlock sending.
+    /// Payment-capable when the peer has a BOLT12 offer from their Nostr
+    /// descriptor, OR when the peer announced the payments capability over BLE
+    /// and is currently in range (Lightning payment via the fetched offer once
+    /// the descriptor loads — the proactive fetch in handleSonarProfileNotification
+    /// ensures it arrives shortly after BLE discovery).
     func paymentCapable(_ id: String) -> Bool {
-        directPaymentOffer(id) != nil
+        if directPaymentOffer(id) != nil { return true }
+        if let profile = resolvedSonarProfile(id),
+           profile.capabilities & SonarCapability.payments != 0,
+           meshReachable(id) {
+            return true
+        }
+        return false
     }
 
     /// Voice/video calls are a Sonar-only feature. Prefer live BLE signaling, but
@@ -2948,13 +2964,18 @@ final class SonarAppStore: ObservableObject {
     }
 
     /// Sends money directly to the receiver's BOLT12 offer from their
-    /// `sonar.meta.v1` descriptor. Legacy claimable ⚡PAY is receive-only during
-    /// migration; new clients no longer initiate sealed coins.
+    /// `sonar.meta.v1` descriptor. When the offer hasn't loaded yet (BLE peer
+    /// whose descriptor is still being fetched), re-triggers the fetch and
+    /// tells the user to retry in a moment.
     func sendPay(_ id: String, sats: Int64) {
-        guard sats > 0,
-              case .ready = walletState,
-              let offer = directPaymentOffer(id)
-        else { return }
+        guard sats > 0, case .ready = walletState else { return }
+        guard let offer = directPaymentOffer(id) else {
+            if let npub = callNpub(id) {
+                marmot.ensureSonarDescriptor(npub)
+            }
+            toast = "Fetching payment details — try again in a moment."
+            return
+        }
         let activityId = UUID().uuidString.lowercased()
         let via = dmTransport(id)
         paymentActivityLedger.recordPending(SonarPaymentActivity(
