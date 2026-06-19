@@ -903,7 +903,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         onRemovePeople = { addSheet = false; removePeopleSheet = true },
         onClose = { addSheet = false },
         canSendPhoto = state.canSendMedia(screen.id),
-        canSendPayment = !state.isMultiMemberChat(screen.id),
+        canSendPayment = state.hasDirectPaymentRoute(screen.id),
         canVerify = !state.isMultiMemberChat(screen.id),
         canShareLocation = !state.isMultiMemberChat(screen.id),
         canManageGroup = isGroup,
@@ -1181,9 +1181,6 @@ private fun VerifySheet(
         }
     }
 }
-
-internal fun randomPayId(): String =
-    (0 until 16).map { "0123456789abcdef".random() }.joinToString("")
 
 @Composable
 private fun GeoDmScreen(state: SonarAppState, screen: Screen.GeoDm) {

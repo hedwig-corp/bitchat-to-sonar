@@ -25,6 +25,7 @@ struct SonarDMScreen: View {
     @State private var walletSheet = false
     @State private var addPeopleSheet = false
     @State private var removePeopleSheet = false
+    @State private var toast: String?
     @State private var groupAddDraft = ""
     @State private var selectedAddNpubs: Set<String> = []
     @State private var pickPhoto = false
@@ -123,15 +124,13 @@ struct SonarDMScreen: View {
             )
         }
         .background(SonarTheme.bg.ignoresSafeArea())
+        .overlay(alignment: .bottom) { toastView }
+        .animation(.easeOut(duration: 0.2), value: toast)
         .onAppear {
             store.openedDM(peerId)
             // Radar "Send sats" quick-pay: arrive with the PaySheet open.
             if store.consumePayRequest(peerId) {
-                if walletReady {
-                    paySheet = true
-                } else {
-                    walletSheet = true
-                }
+                openPaySheetOrWallet()
             }
         }
         .onDisappear { store.closedDM(peerId) }
@@ -143,11 +142,7 @@ struct SonarDMScreen: View {
                         desc: peer.inRange ? "Hand to hand over Bluetooth" : "Instant over the internet"
                     ) {
                         sheet = false
-                        if walletReady {
-                            paySheet = true
-                        } else {
-                            walletSheet = true
-                        }
+                        openPaySheetOrWallet()
                     }
                 }
                 if store.canSendMedia(peerId) {
@@ -216,7 +211,11 @@ struct SonarDMScreen: View {
                 money: { store.money($0) },
                 fiatText: { store.fiatText($0) },
                 onClose: { paySheet = false },
-                onSend: { sats in store.sendPay(peerId, sats: sats) }
+                onSend: { sats in
+                    if let message = store.sendPay(peerId, sats: sats) {
+                        showToast(message)
+                    }
+                }
             )
         }
         .snSheet(isPresented: $addPeopleSheet, title: "Add people") {
@@ -236,6 +235,48 @@ struct SonarDMScreen: View {
                 groupAddDraft = ""
                 selectedAddNpubs = []
             }
+        }
+    }
+
+    @ViewBuilder
+    private var toastView: some View {
+        if let toast {
+            Text(verbatim: toast)
+                .font(SonarTheme.uiFont(size: 13.5, weight: .medium))
+                .foregroundColor(SonarTheme.text)
+                .multilineTextAlignment(.center)
+                .padding(EdgeInsets(top: 11, leading: 16, bottom: 11, trailing: 16))
+                .background(
+                    RoundedRectangle(cornerRadius: 13, style: .continuous)
+                        .fill(SonarTheme.surface2)
+                        .shadow(color: Color.black.opacity(0.18), radius: 12, y: 6)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 13, style: .continuous)
+                        .strokeBorder(SonarTheme.hairline, lineWidth: 1)
+                )
+                .padding(.horizontal, 24)
+                .padding(.bottom, 88)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+        }
+    }
+
+    private func openPaySheetOrWallet() {
+        guard walletReady else {
+            walletSheet = true
+            return
+        }
+        if let message = store.paymentDetailsUnavailableMessage(peerId) {
+            showToast(message)
+            return
+        }
+        paySheet = true
+    }
+
+    private func showToast(_ text: String) {
+        toast = text
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.6) {
+            if toast == text { toast = nil }
         }
     }
 

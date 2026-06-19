@@ -38,6 +38,9 @@ sealed interface PayLine {
     }
 }
 
+internal fun randomPayId(): String =
+    (0 until 16).map { "0123456789abcdef".random() }.joinToString("")
+
 /** Lifecycle of a sealed coin, mirrored from the iOS ledger. */
 enum class PayStatus { Sealed, Claiming, Settling, Claimed, Failed }
 

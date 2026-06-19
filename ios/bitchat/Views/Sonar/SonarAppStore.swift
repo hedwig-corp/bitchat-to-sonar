@@ -2951,6 +2951,14 @@ final class SonarAppStore: ObservableObject {
         return false
     }
 
+    func paymentDetailsUnavailableMessage(_ id: String) -> String? {
+        if directPaymentOffer(id) != nil { return nil }
+        if let npub = callNpub(id) {
+            marmot.ensureSonarDescriptor(npub)
+        }
+        return "Fetching payment details — try again in a moment."
+    }
+
     /// Voice/video calls are a Sonar-only feature. Prefer live BLE signaling, but
     /// keep the same call affordance after either BLE discovery or signed Nostr
     /// descriptor discovery when White Noise signaling exists.
@@ -2964,17 +2972,16 @@ final class SonarAppStore: ObservableObject {
     }
 
     /// Sends money directly to the receiver's BOLT12 offer from their
-    /// `sonar.meta.v1` descriptor. When the offer hasn't loaded yet (BLE peer
-    /// whose descriptor is still being fetched), re-triggers the fetch and
-    /// tells the user to retry in a moment.
-    func sendPay(_ id: String, sats: Int64) {
-        guard sats > 0, case .ready = walletState else { return }
+    /// `sonar.meta.v1` descriptor. Returns a user-facing retry message when
+    /// the descriptor/offer is still loading.
+    @discardableResult
+    func sendPay(_ id: String, sats: Int64) -> String? {
+        guard sats > 0, case .ready = walletState else { return nil }
         guard let offer = directPaymentOffer(id) else {
             if let npub = callNpub(id) {
                 marmot.ensureSonarDescriptor(npub)
             }
-            toast = "Fetching payment details — try again in a moment."
-            return
+            return "Fetching payment details — try again in a moment."
         }
         let activityId = UUID().uuidString.lowercased()
         let via = dmTransport(id)
@@ -3018,6 +3025,7 @@ final class SonarAppStore: ObservableObject {
                 SecureLogger.error("Sonar direct payment failed: \(error)", category: .session)
             }
         }
+        return nil
     }
 
     /// Receiver tapped a sealed coin: create a BOLT12 offer and send the

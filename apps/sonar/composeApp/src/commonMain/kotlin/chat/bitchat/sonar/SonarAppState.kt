@@ -668,6 +668,10 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun isMultiMemberChat(chatId: String): Boolean =
         chats.firstOrNull { it.id == chatId }?.let { !isDirectMarmotChat(it) } == true
 
+    fun hasDirectPaymentRoute(chatId: String): Boolean =
+        isMeshChat(chatId) ||
+            chats.firstOrNull { it.id == chatId }?.let { isDirectMarmotChat(it) } == true
+
     fun groupInviteContacts(excluding: Set<String> = emptySet()): List<GroupContact> {
         val excludedClean = excluding.map { it.trim() }.toSet() + setOf(npub).filter { it.isNotBlank() }
         val byNpub = linkedMapOf<String, GroupContact>()

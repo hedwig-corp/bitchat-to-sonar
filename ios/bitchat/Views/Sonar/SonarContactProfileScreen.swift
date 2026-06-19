@@ -23,6 +23,8 @@ struct SonarContactProfileScreen: View {
     let peerName: String
 
     @State private var showVerify = false
+    @State private var paySheet = false
+    @State private var walletSheet = false
     @State private var toast: String?
 
     private var effectiveChatId: String {
@@ -51,6 +53,11 @@ struct SonarContactProfileScreen: View {
 
     private var verified: Bool { store.isVerified(effectiveChatId) }
     private var info: SNVerifyInfo { store.verifyInfo(for: effectiveChatId) }
+    private var canPay: Bool { store.paymentCapable(effectiveChatId) }
+    private var walletReady: Bool {
+        if case .ready = store.walletState { return true }
+        return false
+    }
 
     private var peerFullKey: String {
         let npub = resolvedNpub
@@ -113,6 +120,9 @@ struct SonarContactProfileScreen: View {
                             if store.canCall(effectiveChatId) {
                                 store.placeCall(effectiveChatId, video: false)
                             }
+                        }
+                        profileAction(icon: .coin, label: "Pay", enabled: canPay) {
+                            openPaySheetOrWallet()
                         }
                         profileAction(
                             icon: verified ? .shieldCheck : .shield,
@@ -221,6 +231,24 @@ struct SonarContactProfileScreen: View {
                 }
             }
         }
+        .snSheet(isPresented: $paySheet, title: "Send money · \(peerName)") {
+            SNPaySheet(
+                peerName: peerName,
+                balance: store.balanceSats ?? 0,
+                transport: store.dmTransport(effectiveChatId),
+                money: { store.money($0) },
+                fiatText: { store.fiatText($0) },
+                onClose: { paySheet = false },
+                onSend: { sats in
+                    if let message = store.sendPay(effectiveChatId, sats: sats) {
+                        showToast(message)
+                    }
+                }
+            )
+        }
+        .snSheet(isPresented: $walletSheet, title: "Your wallet") {
+            SNWalletSheetContent(onClose: { walletSheet = false })
+        }
         .background(SonarTheme.bg.ignoresSafeArea())
         .overlay(alignment: .bottom) {
             if let toast {
@@ -258,6 +286,18 @@ struct SonarContactProfileScreen: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.6) {
             if toast == text { toast = nil }
         }
+    }
+
+    private func openPaySheetOrWallet() {
+        guard walletReady else {
+            walletSheet = true
+            return
+        }
+        if let message = store.paymentDetailsUnavailableMessage(effectiveChatId) {
+            showToast(message)
+            return
+        }
+        paySheet = true
     }
 
     private func profileAction(icon: SNIconName, label: String, enabled: Bool = true, action: @escaping () -> Void) -> some View {

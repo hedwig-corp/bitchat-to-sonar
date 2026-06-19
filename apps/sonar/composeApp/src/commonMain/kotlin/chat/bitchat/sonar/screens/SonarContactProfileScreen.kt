@@ -96,7 +96,7 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
     }
     val verified = state.isVerified(effectiveChatId)
     val canCall = state.canCall(effectiveChatId)
-    val canPay = !state.isMultiMemberChat(effectiveChatId)
+    val canPay = state.hasDirectPaymentRoute(effectiveChatId)
 
     // Find shared groups: multi-member groups where both the local user and this
     // contact are members.
@@ -311,7 +311,7 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
             Spacer(Modifier.height(40.dp))
         }
     }
-    if (paySheet) {
+    if (paySheet && canPay) {
         val isMesh = effectiveChatId.startsWith("mesh:")
         PaySheet(
             peerName = screen.name,
