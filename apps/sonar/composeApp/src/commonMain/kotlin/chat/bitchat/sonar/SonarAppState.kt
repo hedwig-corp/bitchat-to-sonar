@@ -1566,12 +1566,16 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun withSendEchoes(chatId: String, published: List<SonarMsg>): List<SonarMsg> {
         val echoes = pendingSendEchoes[chatId] ?: return published
         val fulfilled = mutableSetOf<String>()
+        val consumedPublished = mutableSetOf<String>()
         val ownPublished = published.filter { it.mine }.groupBy { it.content }
         for (echo in echoes) {
             if (echo.state == "Couldn't send") continue
-            val matches = ownPublished[echo.content]
-            if (matches != null && matches.any { kotlin.math.abs(it.tsSecs - echo.tsSecs) < 30 }) {
+            val match = ownPublished[echo.content]
+                ?.filter { it.id !in consumedPublished }
+                ?.firstOrNull { abs(it.tsSecs - echo.tsSecs) < 30 }
+            if (match != null) {
                 fulfilled.add(echo.id)
+                consumedPublished.add(match.id)
             }
         }
         echoes.removeAll { it.id in fulfilled }
