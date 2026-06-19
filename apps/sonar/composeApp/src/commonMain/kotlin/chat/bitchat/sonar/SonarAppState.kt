@@ -24,6 +24,7 @@ import kotlinx.coroutines.launch
 
 private const val SONAR_DESCRIPTOR_TTL_SECS = 15 * 60L
 private const val SONAR_DESCRIPTOR_MISS_TTL_SECS = 60L
+private const val PROFILE_REFRESH_TTL_SECS = 30 * 60L
 private const val LOCAL_TRANSCRIPT_PAGE_LIMIT = 100
 private const val LOCAL_SUMMARY_PAGE_LIMIT = 20
 private const val LOCAL_SUMMARY_CHAT_LIMIT = 5
@@ -151,6 +152,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     var profilesByNpub by mutableStateOf(decodeProfileCache(SonarCore.loadBlob(PROFILE_CACHE_BLOB_KEY)))
         private set
     private val profileFetches = mutableSetOf<String>()
+    private val profileFetchedAt = mutableMapOf<String, Long>()
 
     init {
         if (initialChatSnapshotBlob.isNotEmpty()) {
@@ -1335,7 +1337,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             ?: shortNpub(message.senderNpub)
     }
 
-    /** Fetch + cache a peer's kind-0 profile once, so their name replaces the
+    /** Fetch + cache a peer's kind-0 profile, so their name replaces the
      *  raw npub in the chat list/header. */
     fun ensureProfile(otherNpub: String) {
         val key = canonicalProfileKey(otherNpub)
@@ -1346,9 +1348,9 @@ class SonarAppState(private val scope: CoroutineScope) {
             val p = SonarCore.fetchProfile(key)
             if (p?.bestName != null) {
                 profilesByNpub = normalizedProfileCache(profilesByNpub + (key to p) - otherNpub)
+                profileFetchedAt[key] = SonarClock.nowSecs()
                 persistProfileCache()
             } else {
-                // Not published yet — allow a later retry (driven by poll()).
                 if (!hadCachedProfile) profileFetches.remove(key)
             }
         }
@@ -2644,18 +2646,33 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // scan for inbound ☎CALL lines so a call rings even when the chat
                 // isn't open (the offer arrives over White Noise/Marmot).
                 var wnMsgs = 0
+                val senders = mutableSetOf<String>()
                 for (c in chats) {
                     val ms = runCatching { SonarCore.messagesPage(c.id, LOCAL_TRANSCRIPT_PAGE_LIMIT) }.getOrDefault(emptyList())
                     wnMsgs += ms.size
                     processCallLines(c.id, ms)
+                    if (c.members.size > 2) {
+                        for (m in ms) {
+                            if (!m.mine && m.senderNpub.isNotBlank()) senders.add(m.senderNpub)
+                        }
+                    }
                 }
                 if (chats.size != lastWnGroups || wnMsgs != lastWnMsgs) {
                     sonarLog("SonarWN", "White Noise: ${chats.size} group(s), $wnMsgs message(s)")
                     lastWnGroups = chats.size; lastWnMsgs = wnMsgs
                 }
-                // Resolve each counterpart's kind-0 profile (retries until they
-                // publish one) so chats show a human name, not a raw npub.
+                // Resolve kind-0 profiles for chat members and message senders
+                // so chats show human names, not raw npubs.
                 for (c in chats) c.members.forEach { if (it != npub) ensureProfile(it) }
+                senders.forEach { ensureProfile(it) }
+                // Re-fetch stale profiles every ~30 minutes (450 ticks × 4s).
+                if (tick % 450 == 0) {
+                    val now = SonarClock.nowSecs()
+                    val stale = profileFetchedAt.entries
+                        .filter { now - it.value >= PROFILE_REFRESH_TTL_SECS }
+                        .map { it.key }
+                    stale.forEach { profileFetches.remove(it); profileFetchedAt.remove(it) }
+                }
                 flushPendingMarmot() // a queued out-of-range send whose group just landed
                 flushAllOutbox() // retry any outbox messages whose peer is now reachable
                 maybeNotify()
