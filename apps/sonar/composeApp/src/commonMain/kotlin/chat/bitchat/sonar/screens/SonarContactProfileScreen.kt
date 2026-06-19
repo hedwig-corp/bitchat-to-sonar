@@ -246,7 +246,7 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
                         val groupName = state.chatTitle(group)
                         Row(
                             Modifier.fillMaxWidth()
-                                .clickable { state.push(Screen.Chat(group.id, groupName)) }
+                                .clickable { state.openChat(group) }
                                 .padding(horizontal = 14.dp, vertical = 11.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {

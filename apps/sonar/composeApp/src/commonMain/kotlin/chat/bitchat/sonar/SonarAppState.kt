@@ -1452,7 +1452,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun back() {
         if (stack.size > 1) stack = stack.dropLast(1)
-        messages = emptyList()
+        if (stack.lastOrNull() !is Screen.Chat) messages = emptyList()
         scope.launch { refreshChats() }
     }
 
