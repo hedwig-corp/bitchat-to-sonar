@@ -55,7 +55,8 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
     // npub when opened from a group member tap.
     val peerNpub = remember(screen.chatId, state.chats.size) {
         if (screen.chatId.startsWith("mesh:")) {
-            null
+            val peerId = screen.chatId.removePrefix("mesh:")
+            state.npubStringForPeer(peerId)?.let { canonicalProfileKey(it) }
         } else if (screen.chatId.startsWith("npub1")) {
             canonicalProfileKey(screen.chatId)
         } else {
@@ -67,11 +68,30 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
         }
     }
 
-    val verifyInfo = remember(screen.chatId, state.payVersion) {
-        state.verifyInfo(screen.chatId)
+    // When opened from group info with an npub (or mesh with a known npub),
+    // resolve to the 1:1 DM chat id so verifyInfo/isVerified/canCall work.
+    val effectiveChatId = remember(screen.chatId, peerNpub, state.chats.size) {
+        val resolvedNpub = when {
+            screen.chatId.startsWith("npub1") -> canonicalProfileKey(screen.chatId)
+            peerNpub != null -> peerNpub
+            else -> null
+        }
+        if (resolvedNpub != null) {
+            val mine = canonicalProfileKey(state.npub)
+            state.chats.firstOrNull { chat ->
+                val members = chat.members.map { canonicalProfileKey(it) }
+                members.size == 2 && mine in members && resolvedNpub in members
+            }?.id ?: screen.chatId
+        } else {
+            screen.chatId
+        }
     }
-    val verified = state.isVerified(screen.chatId)
-    val canCall = state.canCall(screen.chatId)
+
+    val verifyInfo = remember(effectiveChatId, state.payVersion) {
+        state.verifyInfo(effectiveChatId)
+    }
+    val verified = state.isVerified(effectiveChatId)
+    val canCall = state.canCall(effectiveChatId)
 
     // Find shared groups: multi-member groups where both the local user and this
     // contact are members.
@@ -136,7 +156,7 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
                     label = "Call",
                     enabled = canCall,
                     onClick = {
-                        if (canCall) state.placeCall(screen.chatId, screen.name, false)
+                        if (canCall) state.placeCall(effectiveChatId, screen.name, false)
                         else state.toast = "No call route to this peer yet."
                     }
                 )
@@ -156,7 +176,7 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
                     peerName = screen.name,
                     myName = state.nick.ifBlank { "you" },
                     info = verifyInfo,
-                    onVerify = { state.markVerified(screen.chatId) },
+                    onVerify = { state.markVerified(effectiveChatId) },
                     onDismiss = { showVerify = false }
                 )
                 Spacer(Modifier.height(12.dp))

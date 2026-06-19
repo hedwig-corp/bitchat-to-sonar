@@ -707,6 +707,24 @@ class SonarAppState(private val scope: CoroutineScope) {
                 )
             }
 
+    fun allGroupMemberContacts(chatId: String): List<GroupContact> {
+        val chat = chats.firstOrNull { it.id == chatId } ?: return emptyList()
+        return chat.members
+            .map { canonicalProfileKey(it) }
+            .filter { it.isNotBlank() }
+            .distinct()
+            .map { member ->
+                ensureProfile(member)
+                val key = canonicalProfileKey(member)
+                GroupContact(
+                    id = member,
+                    title = profilesByNpub[key]?.bestName ?: shortNpub(member),
+                    subtitle = shortNpub(member),
+                    npub = member,
+                )
+            }
+    }
+
     fun groupMemberNpubs(chatId: String): Set<String> =
         chats.firstOrNull { it.id == chatId }?.members.orEmpty().toSet()
 
@@ -717,7 +735,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         sonarProfile(peerId)?.npub
             ?: linkByFp[peerId]?.hexToBytesOrEmpty()?.takeIf { it.size == 32 }
 
-    private fun npubStringForPeer(peerId: String): String? =
+    fun npubStringForPeer(peerId: String): String? =
         npubRawFor(peerId)?.let { Bech32.encode("npub", it) }
 
     private fun loadLinks() {

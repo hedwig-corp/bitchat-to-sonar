@@ -57,6 +57,12 @@ struct SonarRootView: View {
             SonarProfileScreen()
         case .call(let id, let video):
             SonarCallScreen(peerId: id, video: video)
+        case .contactProfile(let id, let name):
+            SonarContactProfileScreen(peerId: id, peerName: name)
+        case .groupInfo(let id):
+            SonarGroupInfoScreen(peerId: id)
+        case .walletActivity:
+            SonarWalletActivityScreen()
         }
     }
 }

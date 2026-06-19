@@ -56,7 +56,7 @@ fun SonarGroupInfoScreen(state: SonarAppState, screen: Screen.GroupInfo) {
     val chatId = screen.chatId
     val chat = state.chats.firstOrNull { it.id == chatId }
     val groupName = chat?.let { state.chatTitle(it) } ?: "Group chat"
-    val members = state.groupMemberContacts(chatId)
+    val members = state.allGroupMemberContacts(chatId)
 
     var showAddPeople by remember { mutableStateOf(false) }
     var addDraft by remember { mutableStateOf("") }

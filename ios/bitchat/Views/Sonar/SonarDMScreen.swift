@@ -49,11 +49,20 @@ struct SonarDMScreen: View {
     var body: some View {
         VStack(spacing: 0) {
             SNNavHeader(onBack: { store.pop() }, content: {
-                SonarAvatar(name: peer.name, size: 36, presence: peer.inRange)
-                SNHeaderTitle(name: peer.name, verified: verified) {
-                    SNIcon(name: .lock, size: 11, weight: 2.4)
-                    Text(verbatim: (verified ? "Verified · " : "") + subTransport)
+                Button {
+                    if isMultiMemberMarmot {
+                        store.push(.groupInfo(peerId))
+                    } else {
+                        store.push(.contactProfile(peerId, peer.name))
+                    }
+                } label: {
+                    SonarAvatar(name: peer.name, size: 36, presence: peer.inRange)
+                    SNHeaderTitle(name: peer.name, verified: verified) {
+                        SNIcon(name: .lock, size: 11, weight: 2.4)
+                        Text(verbatim: (verified ? "Verified · " : "") + subTransport)
+                    }
                 }
+                .buttonStyle(.plain)
             }, trailing: {
                 // Calls are Sonar-only: shown when the peer advertised calls and
                 // BLE or White Noise can signal.
