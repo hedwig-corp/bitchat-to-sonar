@@ -134,6 +134,7 @@ final class SonarPayLedger: ObservableObject {
     static let defaultsKey = "sonar.pay.ledger.v1"
 
     @Published private(set) var entries: [String: SonarPayEntry]
+    private var pendingDoneIDs = Set<String>()
 
     private let defaults: UserDefaults
     private let key: String
@@ -158,9 +159,26 @@ final class SonarPayLedger: ObservableObject {
     @discardableResult
     func record(_ entry: SonarPayEntry) -> Bool {
         guard entries[entry.id] == nil else { return false }
-        entries[entry.id] = entry
+        var stored = entry
+        let doneWasPending = pendingDoneIDs.remove(entry.id) != nil
+        if stored.direction == .incoming, doneWasPending {
+            stored.state = .claimed
+        }
+        entries[entry.id] = stored
         persist()
         return true
+    }
+
+    /// Marks an incoming coin claimed, or remembers the DONE when relay order
+    /// delivers it before the matching PAY line.
+    @discardableResult
+    func markIncomingClaimedOrPending(_ id: String) -> Bool {
+        guard let entry = entries[id] else {
+            pendingDoneIDs.insert(id)
+            return false
+        }
+        guard entry.direction == .incoming else { return false }
+        return transition(id, to: .claimed)
     }
 
     /// Allowed transitions:
@@ -193,6 +211,7 @@ final class SonarPayLedger: ObservableObject {
     /// Emergency wipe: forget every payment.
     func wipe() {
         entries = [:]
+        pendingDoneIDs = []
         defaults.removeObject(forKey: key)
     }
 

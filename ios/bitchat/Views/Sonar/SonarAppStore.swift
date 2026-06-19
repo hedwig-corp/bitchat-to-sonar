@@ -2084,14 +2084,17 @@ final class SonarAppStore: ObservableObject {
         // The coin renders with the transport it traveled over (recorded in
         // the ledger), not the conversation's current reachability.
         let via = entry.flatMap { SNVia(rawValue: $0.via) } ?? fallbackVia
+        let isDirect = paymentActivityLedger.entries[pid] != nil
         return .bubble(
-            SNPayInfo(id: pid, sats: entry?.sats ?? sats, state: entry?.state ?? .sealed),
+            SNPayInfo(id: pid, sats: entry?.sats ?? sats, state: entry?.state ?? .sealed, direct: isDirect),
             via
         )
     }
 
-    private func paymentActivityRows(for id: String) -> [(Date, SNMessage)] {
-        paymentActivityLedger.activities(peerKey: id).map { activity in
+    private func paymentActivityRows(for id: String, transcriptPayIDs: Set<String>) -> [(Date, SNMessage)] {
+        paymentActivityLedger.activities(peerKey: id).filter { activity in
+            payLedger.entry(for: activity.id) == nil || !transcriptPayIDs.contains(activity.id)
+        }.map { activity in
             let displayDate = activity.settledAt ?? activity.createdAt
             let state: SonarPayEntry.State = activity.status == .paid ? .claimed : .settling
             let via = SNVia(rawValue: activity.via) ?? .internet
@@ -2169,7 +2172,8 @@ final class SonarAppStore: ObservableObject {
                 }
                 dated.sort { $0.0 < $1.0 }
             }
-            dated += paymentActivityRows(for: id)
+            let transcriptPayIDs = Set(dated.compactMap { $0.1.pay?.id })
+            dated += paymentActivityRows(for: id, transcriptPayIDs: transcriptPayIDs)
             return mergeCallLogs(into: dated, id: id)
         }
         let peerID = PeerID(str: id)
@@ -2230,7 +2234,8 @@ final class SonarAppStore: ObservableObject {
             }
             dated.sort { $0.0 < $1.0 }
         }
-        dated += paymentActivityRows(for: id)
+        let transcriptPayIDs = Set(dated.compactMap { $0.1.pay?.id })
+        dated += paymentActivityRows(for: id, transcriptPayIDs: transcriptPayIDs)
         return mergeCallLogs(into: dated, id: id)
     }
 
@@ -2970,6 +2975,20 @@ final class SonarAppStore: ObservableObject {
                     note: "Sonar payment \(activityId)"
                 )
                 self.paymentActivityLedger.markPaid(activityId, payment: payment)
+                // Record as already-claimed in the pay ledger so the sender's
+                // own transcript renders the bubble via payMapping (not only
+                // paymentActivityRows). processIncomingPayLines skips self
+                // messages, so this manual record is required.
+                self.payLedger.record(SonarPayEntry(
+                    id: activityId, peerKey: id, sats: sats,
+                    direction: .outgoing, state: .claimed, via: via.rawValue
+                ))
+                // Notify the receiver: a ⚡PAY sealed coin followed immediately
+                // by ⚡PAYDONE. The receiver's processIncomingPayLines records
+                // the coin as incoming/sealed, then transitions it to claimed —
+                // showing "Added to your balance" with no claim step.
+                self.sendDm(id, SonarPayMessage.pay(id: activityId, sats: sats).encoded())
+                self.sendDm(id, SonarPayMessage.done(id: activityId).encoded())
             } catch {
                 self.paymentActivityLedger.markFailed(activityId, message: error.localizedDescription)
                 SecureLogger.error("Sonar direct payment failed: \(error)", category: .session)
@@ -3068,8 +3087,7 @@ final class SonarAppStore: ObservableObject {
 
         case .done(let id):
             // Our claim settled: reveal the coin ("Added to your balance").
-            guard let entry = payLedger.entry(for: id), entry.direction == .incoming else { return }
-            payLedger.transition(id, to: .claimed)
+            payLedger.markIncomingClaimedOrPending(id)
         }
     }
 

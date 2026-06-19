@@ -844,7 +844,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                         settle(chatId, line.uuid, line.offer, e.sats)
                     }
                 }
-                is PayLine.Done -> if (payLedger.markClaimed(line.uuid)) changed = true
+                is PayLine.Done -> if (payLedger.markClaimedOrPending(line.uuid)) changed = true
                 null -> {}
             }
         }

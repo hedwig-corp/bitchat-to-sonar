@@ -151,6 +151,14 @@ final class SonarPayTests: XCTestCase {
         XCTAssertTrue(ledger.transition(uuid, to: .claimed))
     }
 
+    func testDoneCanArriveBeforePay() {
+        let (ledger, _) = freshLedger()
+        // ⚡PAYDONE can race ahead of ⚡PAY over relay-backed transports.
+        XCTAssertFalse(ledger.markIncomingClaimedOrPending(uuid))
+        XCTAssertTrue(ledger.record(entry(direction: .incoming)))
+        XCTAssertEqual(ledger.entry(for: uuid)?.state, .claimed)
+    }
+
     func testPersistenceRoundTrip() {
         let suite = "sonar.pay.tests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
