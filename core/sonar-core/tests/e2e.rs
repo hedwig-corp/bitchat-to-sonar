@@ -111,6 +111,104 @@ async fn two_instances_exchange_dms_through_a_relay() {
     assert_eq!(members.mls_group_id, *bob_group);
 }
 
+#[tokio::test]
+async fn start_dm_reuses_existing_direct_group() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url.clone()])
+        .await
+        .expect("alice connects");
+    let bob = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url.clone()])
+        .await
+        .expect("bob connects");
+
+    bob.publish_key_package().await.expect("bob publishes kp");
+
+    let first_group = alice
+        .start_dm(bob.identity().public_key(), "alice & bob")
+        .await
+        .expect("alice starts dm");
+    let second_group = alice
+        .start_dm(bob.identity().public_key(), "second tap")
+        .await
+        .expect("alice reuses dm");
+
+    assert_eq!(second_group, first_group);
+    assert_eq!(alice.groups().expect("alice groups").len(), 1);
+}
+
+#[tokio::test]
+async fn start_dm_rejects_self_before_reusing_existing_group() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url.clone()])
+        .await
+        .expect("alice connects");
+    let bob = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url.clone()])
+        .await
+        .expect("bob connects");
+
+    bob.publish_key_package().await.expect("bob publishes kp");
+    alice
+        .start_dm(bob.identity().public_key(), "")
+        .await
+        .expect("alice starts real dm");
+
+    let err = alice
+        .start_dm(alice.identity().public_key(), "self")
+        .await
+        .expect_err("self dm must fail");
+
+    assert!(err
+        .to_string()
+        .contains("direct message requires another member"));
+    assert_eq!(alice.groups().expect("alice groups").len(), 1);
+}
+
+#[tokio::test]
+async fn start_dm_does_not_reuse_named_group_reduced_to_two_members() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url.clone()])
+        .await
+        .expect("alice connects");
+    let bob = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url.clone()])
+        .await
+        .expect("bob connects");
+    let charlie = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url.clone()])
+        .await
+        .expect("charlie connects");
+
+    bob.publish_key_package().await.expect("bob publishes kp");
+    charlie
+        .publish_key_package()
+        .await
+        .expect("charlie publishes kp");
+
+    let group_chat = alice
+        .start_group(
+            vec![bob.identity().public_key(), charlie.identity().public_key()],
+            "field team",
+        )
+        .await
+        .expect("alice starts group");
+    alice
+        .remove_group_members(&group_chat, vec![charlie.identity().public_key()])
+        .await
+        .expect("alice removes charlie");
+
+    let direct_chat = alice
+        .start_dm(bob.identity().public_key(), "")
+        .await
+        .expect("alice starts separate dm");
+
+    assert_ne!(direct_chat, group_chat);
+    assert_eq!(alice.groups().expect("alice groups").len(), 2);
+}
+
 /// Per-chat delete: deleting a group locally removes ONLY that chat's state on
 /// the deleter's device; the peer is unaffected (local-only, no MLS/Nostr
 /// publish). Backs the "erase a single chat at a time" feature.

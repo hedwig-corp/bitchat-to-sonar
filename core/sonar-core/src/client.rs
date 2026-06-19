@@ -48,6 +48,7 @@ pub const DEFAULT_BLOSSOM_SERVER: &str = "https://blossom.primal.net";
 const MAX_MEDIA_DOWNLOAD_BYTES: usize = 25 * 1024 * 1024;
 const MEDIA_DOWNLOAD_ATTEMPTS: usize = 3;
 const MEDIA_DOWNLOAD_RETRY_DELAY: Duration = Duration::from_millis(350);
+const SONAR_DIRECT_DM_DESCRIPTION: &str = "sonar.direct-dm.v1";
 
 /// Shared HTTP client for Blossom media downloads. Built once so every blob
 /// reuses keep-alive connections + the TLS session cache instead of paying a
@@ -742,9 +743,12 @@ impl SonarClient {
         key_package: Event,
         name: &str,
     ) -> Result<GroupId> {
-        let creation = self
-            .engine
-            .create_group(name, vec![key_package], self.relays.clone())?;
+        let creation = self.engine.create_group_with_description(
+            name,
+            SONAR_DIRECT_DM_DESCRIPTION,
+            vec![key_package],
+            self.relays.clone(),
+        )?;
         self.publish_group_creation(creation).await
     }
 
@@ -885,25 +889,49 @@ impl SonarClient {
     /// If a 1:1 group with `peer` already exists, returns its id instead of
     /// creating a duplicate.
     pub async fn start_dm(&self, peer: PublicKey, name: &str) -> Result<GroupId> {
-        if let Some(existing) = self.find_dm_group_with(&peer) {
+        if peer == self.identity().public_key() {
+            return Err(Error::InvalidInput(
+                "direct message requires another member".into(),
+            ));
+        }
+        if let Some(existing) = self.find_dm_group_with(&peer)? {
             return Ok(existing);
         }
-        self.start_group(vec![peer], name).await
+        let key_packages = self.fetch_key_packages_for_members(vec![peer]).await?;
+        let creation = self.engine.create_group_with_description(
+            name,
+            SONAR_DIRECT_DM_DESCRIPTION,
+            key_packages,
+            self.relays.clone(),
+        )?;
+        self.publish_group_creation(creation).await
     }
 
     /// Scan active groups for an existing 1:1 DM with `peer`.
-    fn find_dm_group_with(&self, peer: &PublicKey) -> Option<GroupId> {
-        let groups = self.engine.groups().ok()?;
+    fn find_dm_group_with(&self, peer: &PublicKey) -> Result<Option<GroupId>> {
+        let groups = self.engine.groups()?;
         let me = self.identity().public_key();
         for group in groups {
-            let Ok(members) = self.engine.members(&group.mls_group_id) else {
-                continue;
-            };
-            if members.len() == 2 && members.contains(peer) && members.contains(&me) {
-                return Some(group.mls_group_id);
+            let members = self.engine.members(&group.mls_group_id)?;
+            if Self::is_reusable_dm_group(&group, &members, &me, peer) {
+                return Ok(Some(group.mls_group_id));
             }
         }
-        None
+        Ok(None)
+    }
+
+    fn is_reusable_dm_group(
+        group: &group_types::Group,
+        members: &[PublicKey],
+        me: &PublicKey,
+        peer: &PublicKey,
+    ) -> bool {
+        if members.len() != 2 || !members.contains(peer) || !members.contains(me) {
+            return false;
+        }
+
+        group.description == SONAR_DIRECT_DM_DESCRIPTION
+            || (group.description.is_empty() && group.name.is_empty())
     }
 
     async fn publish_group_creation(&self, creation: GroupCreation) -> Result<GroupId> {
