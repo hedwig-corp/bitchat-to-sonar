@@ -851,12 +851,34 @@ private func snLogRecoveredUndecodableImage(_ item: SNMediaItem, bytes: Data) {
 /// the deliberate, tasteful extension noted in the brainstorm: an inline image
 /// (downloaded + decrypted on appear, Sonar radius 18, surface placeholder while
 /// loading) or a file chip, with an optional caption and the timestamp.
+private var stickerUrlCache: [String: String] = [:]
+
+private func resolveStickerUrl(_ ref: MarmotService.MarmotStickerRef) async -> String {
+    if let cached = stickerUrlCache[ref.plaintextSha256] { return cached }
+    let parts = ref.packCoordinate.split(separator: ":", maxSplits: 2).map(String.init)
+    guard parts.count == 3 else {
+        return "https://blossom.primal.net/\(ref.plaintextSha256).webp"
+    }
+    do {
+        let pack = try await MarmotService.shared.fetchStickerPack(
+            authorPubkeyHex: parts[1], identifier: parts[2], relayUrls: [])
+        for s in pack.stickers { stickerUrlCache[s.sha256] = s.url }
+        if let match = pack.stickers.first(where: {
+            $0.shortcode == ref.shortcode && $0.sha256 == ref.plaintextSha256
+        }) {
+            return match.url
+        }
+    } catch {}
+    return "https://blossom.primal.net/\(ref.plaintextSha256).webp"
+}
+
 struct SNStickerBubble: View {
     let m: SNMessage
     var showAuthor: Bool = false
     var showState: Bool = false
 
     @State private var image: PlatformImage?
+    @State private var failed = false
 
     private var mine: Bool { m.mine }
 
@@ -880,6 +902,17 @@ struct SNStickerBubble: View {
                     .aspectRatio(contentMode: .fit)
                     .frame(width: 120, height: 120)
                 #endif
+            } else if failed {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(SonarTheme.surface2)
+                        .frame(width: 120, height: 120)
+                    if let ref = m.stickerRef {
+                        Text(":\(ref.shortcode):")
+                            .font(SonarTheme.uiFont(size: 12))
+                            .foregroundColor(SonarTheme.text3)
+                    }
+                }
             } else {
                 ZStack {
                     RoundedRectangle(cornerRadius: 12, style: .continuous)
@@ -898,11 +931,11 @@ struct SNStickerBubble: View {
         .padding(.vertical, 3)
         .task(id: m.stickerRef?.plaintextSha256) {
             guard let ref = m.stickerRef else { return }
-            let url = "https://blossom.primal.net/\(ref.plaintextSha256).webp"
+            let url = await resolveStickerUrl(ref)
             do {
                 let data = try await MarmotService.shared.fetchStickerImage(url: url)
                 image = PlatformImage(data: data)
-            } catch {}
+            } catch { failed = true }
         }
     }
 }

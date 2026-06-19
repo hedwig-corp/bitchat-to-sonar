@@ -1354,13 +1354,32 @@ private fun MessageStatusFooter(m: SonarMsg, mesh: Boolean) {
     }
 }
 
+private val stickerUrlCache = mutableMapOf<String, String>()
+
+private suspend fun resolveStickerUrl(ref: SonarStickerRef): String {
+    stickerUrlCache[ref.plaintextSha256]?.let { return it }
+    val parts = ref.packCoordinate.split(":", limit = 3)
+    if (parts.size == 3) {
+        try {
+            val pack = SonarCore.fetchStickerPack(parts[1], parts[2])
+            pack.stickers.forEach { stickerUrlCache[it.sha256] = it.url }
+            pack.stickers.find { it.shortcode == ref.shortcode && it.sha256 == ref.plaintextSha256 }
+                ?.let { return it.url }
+        } catch (_: Throwable) {}
+    }
+    return "https://blossom.primal.net/${ref.plaintextSha256}.webp"
+}
+
 @Composable
 private fun StickerBubble(m: SonarMsg, mesh: Boolean = false, author: String? = null, showState: Boolean = false) {
     val ref = m.stickerRef ?: return
-    val stickerUrl = "https://blossom.primal.net/${ref.plaintextSha256}.webp"
-    var imageBytes by remember(stickerUrl) { mutableStateOf<ByteArray?>(null) }
-    LaunchedEffect(stickerUrl) {
-        try { imageBytes = SonarCore.fetchStickerImage(stickerUrl) } catch (_: Throwable) {}
+    var imageBytes by remember(ref.plaintextSha256) { mutableStateOf<ByteArray?>(null) }
+    var failed by remember(ref.plaintextSha256) { mutableStateOf(false) }
+    LaunchedEffect(ref.plaintextSha256) {
+        try {
+            val url = resolveStickerUrl(ref)
+            imageBytes = SonarCore.fetchStickerImage(url)
+        } catch (_: Throwable) { failed = true }
     }
     Column(
         Modifier.fillMaxWidth().padding(vertical = 3.dp),
@@ -1381,6 +1400,13 @@ private fun StickerBubble(m: SonarMsg, mesh: Boolean = false, author: String? = 
                 contentDescription = ref.shortcode,
                 modifier = Modifier.size(120.dp).padding(4.dp),
             )
+        } else if (failed) {
+            Box(
+                Modifier.size(120.dp).padding(4.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(":${ref.shortcode}:", color = sonar.text3, fontSize = 12.sp)
+            }
         } else {
             Box(
                 Modifier.size(120.dp).padding(4.dp),

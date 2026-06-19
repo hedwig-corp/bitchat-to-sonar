@@ -3047,13 +3047,13 @@ public struct StickerInfo: Equatable, Hashable {
     public var shortcode: String
     public var url: String
     public var sha256: String
-    public var mime: String?
+    public var mime: String
     public var width: UInt32?
     public var height: UInt32?
     public var alt: String?
     public var emoji: String?
 
-    public init(shortcode: String, url: String, sha256: String, mime: String?, width: UInt32?, height: UInt32?, alt: String?, emoji: String?) {
+    public init(shortcode: String, url: String, sha256: String, mime: String, width: UInt32?, height: UInt32?, alt: String?, emoji: String?) {
         self.shortcode = shortcode
         self.url = url
         self.sha256 = sha256
@@ -3096,7 +3096,7 @@ public struct FfiConverterTypeStickerInfo: FfiConverterRustBuffer {
             shortcode: FfiConverterString.read(from: &buf),
             url: FfiConverterString.read(from: &buf),
             sha256: FfiConverterString.read(from: &buf),
-            mime: FfiConverterOptionString.read(from: &buf),
+            mime: FfiConverterString.read(from: &buf),
             width: FfiConverterOptionUInt32.read(from: &buf),
             height: FfiConverterOptionUInt32.read(from: &buf),
             alt: FfiConverterOptionString.read(from: &buf),
@@ -3107,7 +3107,7 @@ public struct FfiConverterTypeStickerInfo: FfiConverterRustBuffer {
         FfiConverterString.write(value.shortcode, into: &buf)
         FfiConverterString.write(value.url, into: &buf)
         FfiConverterString.write(value.sha256, into: &buf)
-        FfiConverterOptionString.write(value.mime, into: &buf)
+        FfiConverterString.write(value.mime, into: &buf)
         FfiConverterOptionUInt32.write(value.width, into: &buf)
         FfiConverterOptionUInt32.write(value.height, into: &buf)
         FfiConverterOptionString.write(value.alt, into: &buf)
@@ -3123,7 +3123,7 @@ public struct FfiConverterTypeStickerPackInfo: FfiConverterRustBuffer {
         return try StickerPackInfo(
             packCoordinate: FfiConverterString.read(from: &buf),
             title: FfiConverterString.read(from: &buf),
-            description: FfiConverterString.read(from: &buf),
+            description: FfiConverterOptionString.read(from: &buf),
             coverUrl: FfiConverterOptionString.read(from: &buf),
             stickers: FfiConverterSequenceTypeStickerInfo.read(from: &buf)
         )
@@ -3131,7 +3131,7 @@ public struct FfiConverterTypeStickerPackInfo: FfiConverterRustBuffer {
     public static func write(_ value: StickerPackInfo, into buf: inout [UInt8]) {
         FfiConverterString.write(value.packCoordinate, into: &buf)
         FfiConverterString.write(value.title, into: &buf)
-        FfiConverterString.write(value.description, into: &buf)
+        FfiConverterOptionString.write(value.description, into: &buf)
         FfiConverterOptionString.write(value.coverUrl, into: &buf)
         FfiConverterSequenceTypeStickerInfo.write(value.stickers, into: &buf)
     }
@@ -3183,11 +3183,11 @@ public struct FfiConverterSequenceTypeStickerInfo: FfiConverterRustBuffer {
 public struct StickerPackInfo: Equatable, Hashable {
     public var packCoordinate: String
     public var title: String
-    public var description: String
+    public var description: String?
     public var coverUrl: String?
     public var stickers: [StickerInfo]
 
-    public init(packCoordinate: String, title: String, description: String, coverUrl: String?, stickers: [StickerInfo]) {
+    public init(packCoordinate: String, title: String, description: String?, coverUrl: String?, stickers: [StickerInfo]) {
         self.packCoordinate = packCoordinate
         self.title = title
         self.description = description

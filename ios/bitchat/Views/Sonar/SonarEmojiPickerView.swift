@@ -169,12 +169,13 @@ struct SonarEmojiPickerView: View {
 private let testPackAuthor = "b653c822dfbec71697d379658a58909c3bef59d71b1cf5c1f7035451cde2e9f7"
 private let testPackId = "signal-8fa42aa13ec8f0efebe4b038f41afbd1"
 private let testPackRelays = ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net"]
+private var cachedStickerPack: StickerPackInfo?
 
 private struct StickerTabContent: View {
     let onSticker: (StickerInfo, String) -> Void
 
-    @State private var pack: StickerPackInfo?
-    @State private var loading = true
+    @State private var pack: StickerPackInfo? = cachedStickerPack
+    @State private var loading = cachedStickerPack == nil
     @State private var error: String?
 
     var body: some View {
@@ -232,12 +233,15 @@ private struct StickerTabContent: View {
     }
 
     private func loadPack() async {
+        if pack != nil { return }
         do {
-            pack = try await MarmotService.shared.fetchStickerPack(
+            let fetched = try await MarmotService.shared.fetchStickerPack(
                 authorPubkeyHex: testPackAuthor,
                 identifier: testPackId,
                 relayUrls: testPackRelays
             )
+            cachedStickerPack = fetched
+            pack = fetched
         } catch {
             self.error = error.localizedDescription
         }
@@ -245,20 +249,33 @@ private struct StickerTabContent: View {
     }
 }
 
+#if os(iOS)
+private typealias StickerImage = UIImage
+#else
+private typealias StickerImage = NSImage
+#endif
+
 private struct StickerCell: View {
     let sticker: StickerInfo
     let onTap: () -> Void
 
-    @State private var image: UIImage?
+    @State private var image: StickerImage?
 
     var body: some View {
         Button(action: onTap) {
             ZStack {
                 if let image {
+                    #if os(iOS)
                     Image(uiImage: image)
                         .resizable()
                         .aspectRatio(contentMode: .fit)
                         .frame(width: 60, height: 60)
+                    #else
+                    Image(nsImage: image)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 60, height: 60)
+                    #endif
                 } else {
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
                         .fill(SonarTheme.surface2)
@@ -276,7 +293,7 @@ private struct StickerCell: View {
     private func loadImage() async {
         do {
             let data = try await MarmotService.shared.fetchStickerImage(url: sticker.url)
-            image = UIImage(data: data)
+            image = StickerImage(data: data)
         } catch {}
     }
 }

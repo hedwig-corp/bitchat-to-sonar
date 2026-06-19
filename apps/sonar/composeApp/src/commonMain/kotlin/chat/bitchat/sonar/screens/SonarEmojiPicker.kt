@@ -354,16 +354,21 @@ private fun ColumnScope.GifTabContent() {
     }
 }
 
+private var cachedStickerPack: SonarStickerPack? = null
+
 @Composable
 private fun ColumnScope.StickerTabContent(onSticker: (SonarStickerItem, String) -> Unit) {
     val s = sonar
-    var pack by remember { mutableStateOf<SonarStickerPack?>(null) }
-    var loading by remember { mutableStateOf(true) }
+    var pack by remember { mutableStateOf(cachedStickerPack) }
+    var loading by remember { mutableStateOf(cachedStickerPack == null) }
     var error by remember { mutableStateOf<String?>(null) }
 
     LaunchedEffect(Unit) {
+        if (pack != null) return@LaunchedEffect
         try {
-            pack = SonarCore.fetchStickerPack(TEST_PACK_AUTHOR, TEST_PACK_ID, TEST_PACK_RELAYS)
+            val fetched = SonarCore.fetchStickerPack(TEST_PACK_AUTHOR, TEST_PACK_ID, TEST_PACK_RELAYS)
+            cachedStickerPack = fetched
+            pack = fetched
         } catch (e: Exception) {
             error = e.message ?: "Failed to load sticker pack"
         } finally {
