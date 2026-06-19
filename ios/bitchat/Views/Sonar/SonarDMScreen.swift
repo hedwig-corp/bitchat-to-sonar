@@ -100,7 +100,8 @@ struct SonarDMScreen: View {
                     peerName: peer.name,
                     money: { store.money($0) },
                     fiatText: { store.moneySatsLine($0) },
-                    loadMedia: { await store.mediaData($0) }
+                    loadMedia: { await store.mediaData($0) },
+                    loadSticker: { await store.stickerImageData(for: $0) }
                 )
             }
 
@@ -115,6 +116,10 @@ struct SonarDMScreen: View {
                 onSticker: { sticker, coord in
                     store.sendSticker(peerId, sticker: sticker, packCoordinate: coord)
                 },
+                loadStickerPack: { author, identifier, relays in
+                    await store.stickerPack(authorPubkeyHex: author, identifier: identifier, relayUrls: relays)
+                },
+                loadStickerImage: { await store.stickerImageData(url: $0) },
                 voiceEnabled: store.canSendMedia(peerId),
                 onVoice: { store.sendVoiceNote(peerId, url: $0) }
             )

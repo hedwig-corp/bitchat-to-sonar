@@ -1541,18 +1541,12 @@ final class SonarAppStore: ObservableObject {
 
     func sendStickerToChannel(_ chId: String, sticker: StickerInfo, packCoordinate: String) {
         guard let groupId = marmotGroupId(chId) else { return }
-        Task {
-            do {
-                try await MarmotService.shared.sendSticker(
-                    groupId: groupId,
-                    packCoordinate: packCoordinate,
-                    shortcode: sticker.shortcode,
-                    plaintextSha256: sticker.sha256
-                )
-            } catch {
-                SecureLogger.error("sticker send failed: \(error)", category: .session)
-            }
-        }
+        marmot.sendSticker(
+            groupId: groupId,
+            packCoordinate: packCoordinate,
+            shortcode: sticker.shortcode,
+            plaintextSha256: sticker.sha256
+        )
     }
 
     private func mapPublic(_ m: BitchatMessage, via: SNVia) -> SNMessage {
@@ -2370,18 +2364,12 @@ final class SonarAppStore: ObservableObject {
 
     func sendSticker(_ id: String, sticker: StickerInfo, packCoordinate: String) {
         guard let groupId = marmotGroupId(id) else { return }
-        Task {
-            do {
-                try await MarmotService.shared.sendSticker(
-                    groupId: groupId,
-                    packCoordinate: packCoordinate,
-                    shortcode: sticker.shortcode,
-                    plaintextSha256: sticker.sha256
-                )
-            } catch {
-                SecureLogger.error("sticker send failed: \(error)", category: .session)
-            }
-        }
+        marmot.sendSticker(
+            groupId: groupId,
+            packCoordinate: packCoordinate,
+            shortcode: sticker.shortcode,
+            plaintextSha256: sticker.sha256
+        )
     }
 
     private func sendOverMarmot(_ text: String, npub: String) {
@@ -2823,6 +2811,26 @@ final class SonarAppStore: ObservableObject {
             }
         }
         return data
+    }
+
+    func stickerPack(
+        authorPubkeyHex: String,
+        identifier: String,
+        relayUrls: [String]
+    ) async -> StickerPackInfo? {
+        await marmot.fetchStickerPack(
+            authorPubkeyHex: authorPubkeyHex,
+            identifier: identifier,
+            relayUrls: relayUrls
+        )
+    }
+
+    func stickerImageData(url: String) async -> Data? {
+        await marmot.fetchStickerImage(url: url)
+    }
+
+    func stickerImageData(for ref: MarmotService.MarmotStickerRef) async -> Data? {
+        await marmot.stickerData(for: ref)
     }
 
     private static func mediaLogId(for item: SNMediaItem) -> String {

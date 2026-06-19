@@ -51,7 +51,13 @@ data class SonarStickerRef(
     val packCoordinate: String,
     val shortcode: String,
     val plaintextSha256: String,
-)
+) {
+    fun packAddressParts(): Pair<String, String>? {
+        val parts = packCoordinate.split(":", limit = 3)
+        if (parts.size != 3 || parts[0] != "30030") return null
+        return parts[1] to parts[2]
+    }
+}
 
 /** A single sticker in a pack. */
 data class SonarStickerItem(
@@ -72,7 +78,13 @@ data class SonarStickerPack(
     val description: String?,
     val coverUrl: String?,
     val stickers: List<SonarStickerItem>,
-)
+) {
+    fun stickerMatching(ref: SonarStickerRef): SonarStickerItem? =
+        stickers.firstOrNull {
+            it.shortcode == ref.shortcode &&
+                it.sha256.equals(ref.plaintextSha256, ignoreCase = true)
+        }
+}
 
 /** Local transcript window for one recent chat, newest conversation first at
  *  the API boundary and oldest-first inside [messages]. */

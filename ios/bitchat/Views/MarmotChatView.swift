@@ -162,6 +162,8 @@ final class MarmotChatModel: ObservableObject {
     /// Optimistically-echoed outgoing messages per group, kept visible until
     /// the relay round-trip brings the real copy back (then reconciled away).
     private var pendingOptimistic: [String: [MarmotService.MarmotMessage]] = [:]
+    private var stickerPacksByCoordinate: [String: StickerPackInfo] = [:]
+    private var stickerImagesByURL: [String: Data] = [:]
     /// Last desired payment offer metadata for our public descriptor. Reused
     /// when other descriptor refreshes publish capabilities without changing
     /// payment state.
@@ -889,6 +891,83 @@ final class MarmotChatModel: ObservableObject {
         }
     }
 
+    func sendSticker(
+        groupId: String,
+        packCoordinate: String,
+        shortcode: String,
+        plaintextSha256: String
+    ) {
+        Task {
+            do {
+                guard await ensureConnected() else {
+                    throw MarmotService.ServiceError.notConnected
+                }
+                await loadLocalPage(groupId: groupId)
+                try await service.sendSticker(
+                    groupId: groupId,
+                    packCoordinate: packCoordinate,
+                    shortcode: shortcode,
+                    plaintextSha256: plaintextSha256
+                )
+                await loadLocalPage(groupId: groupId)
+                await refreshWhenConnected(groupId: groupId, hydrateBeforeSync: false)
+            } catch {
+                self.errorText = Self.describe(error)
+            }
+        }
+    }
+
+    func fetchStickerPack(
+        authorPubkeyHex: String,
+        identifier: String,
+        relayUrls: [String]
+    ) async -> StickerPackInfo? {
+        let cacheKey = "30030:\(authorPubkeyHex.lowercased()):\(identifier)"
+        if let cached = stickerPacksByCoordinate[cacheKey] { return cached }
+        do {
+            guard await ensureRelayConnected() else {
+                throw MarmotService.ServiceError.notConnected
+            }
+            let pack = try await service.fetchStickerPack(
+                authorPubkeyHex: authorPubkeyHex,
+                identifier: identifier,
+                relayUrls: relayUrls
+            )
+            stickerPacksByCoordinate[pack.packCoordinate] = pack
+            return pack
+        } catch {
+            self.errorText = Self.describe(error)
+            return nil
+        }
+    }
+
+    func fetchStickerImage(url: String) async -> Data? {
+        if let cached = stickerImagesByURL[url] { return cached }
+        do {
+            let data = try await service.fetchStickerImage(url: url)
+            stickerImagesByURL[url] = data
+            return data
+        } catch {
+            self.errorText = Self.describe(error)
+            return nil
+        }
+    }
+
+    func stickerData(for ref: MarmotService.MarmotStickerRef) async -> Data? {
+        guard let parts = Self.stickerPackParts(ref.packCoordinate),
+              let pack = await fetchStickerPack(
+                  authorPubkeyHex: parts.author,
+                  identifier: parts.identifier,
+                  relayUrls: []
+              ),
+              let sticker = pack.stickers.first(where: {
+                  $0.shortcode == ref.shortcode &&
+                      $0.sha256.caseInsensitiveCompare(ref.plaintextSha256) == .orderedSame
+              })
+        else { return nil }
+        return await fetchStickerImage(url: sticker.url)
+    }
+
     /// Download + decrypt a media blob. The store caches the decoded image.
     func fetchMedia(groupId: String, url: String) async -> Data? {
         do {
@@ -906,6 +985,12 @@ final class MarmotChatModel: ObservableObject {
             .prefix(8)
             .map { String(format: "%02x", $0) }
             .joined()
+    }
+
+    private static func stickerPackParts(_ coordinate: String) -> (author: String, identifier: String)? {
+        let parts = coordinate.split(separator: ":", maxSplits: 2, omittingEmptySubsequences: false)
+        guard parts.count == 3, parts[0] == "30030" else { return nil }
+        return (String(parts[1]), String(parts[2]))
     }
 
     /// Drive LIVE updates off the core's relay subscriptions: park on

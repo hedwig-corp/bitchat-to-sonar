@@ -1005,6 +1005,16 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func fetchSonarDescriptor(npub: String) throws  -> SonarDescriptorInfo?
 
     /**
+     * Download a public sticker image by its plaintext HTTPS URL.
+     */
+    func fetchStickerImage(url: String) throws  -> Data
+
+    /**
+     * Fetch a sticker pack from relays by its pack address.
+     */
+    func fetchStickerPack(authorPubkeyHex: String, identifier: String, relayUrls: [String]) throws  -> StickerPackInfo
+
+    /**
      * The 1:1 geohash DM conversation with a participant, oldest first.
      */
     func geoDmMessages(geohash: String, peerHex: String) throws  -> [GeoMessageInfo]
@@ -1119,15 +1129,14 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func sendMedia(groupIdHex: String, data: Data, filename: String, mime: String, caption: String, serverUrl: String) throws
 
     /**
+     * Encrypt + publish a sticker message to the group.
+     */
+    func sendSticker(groupIdHex: String, packCoordinate: String, shortcode: String, plaintextSha256: String) throws
+
+    /**
      * Encrypt + publish a text message to the group.
      */
     func sendText(groupIdHex: String, text: String) throws
-
-    func sendSticker(groupIdHex: String, packCoordinate: String, shortcode: String, plaintextSha256: String) throws
-
-    func fetchStickerPack(authorPubkeyHex: String, identifier: String, relayUrls: [String]) throws -> StickerPackInfo
-
-    func fetchStickerImage(url: String) throws -> Data
 
     func setConversationChangeListener(listener: ConversationChangeListener)
 
@@ -1512,6 +1521,32 @@ open func fetchSonarDescriptor(npub: String)throws  -> SonarDescriptorInfo?  {
 }
 
     /**
+     * Download a public sticker image by its plaintext HTTPS URL.
+     */
+open func fetchStickerImage(url: String)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_fetch_sticker_image(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(url),$0
+    )
+})
+}
+
+    /**
+     * Fetch a sticker pack from relays by its pack address.
+     */
+open func fetchStickerPack(authorPubkeyHex: String, identifier: String, relayUrls: [String])throws  -> StickerPackInfo  {
+    return try  FfiConverterTypeStickerPackInfo_lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_fetch_sticker_pack(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(authorPubkeyHex),
+        FfiConverterString.lower(identifier),
+        FfiConverterSequenceString.lower(relayUrls),$0
+    )
+})
+}
+
+    /**
      * The 1:1 geohash DM conversation with a participant, oldest first.
      */
 open func geoDmMessages(geohash: String, peerHex: String)throws  -> [GeoMessageInfo]  {
@@ -1792,6 +1827,20 @@ open func sendMedia(groupIdHex: String, data: Data, filename: String, mime: Stri
 }
 
     /**
+     * Encrypt + publish a sticker message to the group.
+     */
+open func sendSticker(groupIdHex: String, packCoordinate: String, shortcode: String, plaintextSha256: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_send_sticker(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(groupIdHex),
+        FfiConverterString.lower(packCoordinate),
+        FfiConverterString.lower(shortcode),
+        FfiConverterString.lower(plaintextSha256),$0
+    )
+}
+}
+
+    /**
      * Encrypt + publish a text message to the group.
      */
 open func sendText(groupIdHex: String, text: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
@@ -1801,38 +1850,6 @@ open func sendText(groupIdHex: String, text: String)throws   {try rustCallWithEr
         FfiConverterString.lower(text),$0
     )
 }
-}
-
-open func sendSticker(groupIdHex: String, packCoordinate: String, shortcode: String, plaintextSha256: String) throws {
-    try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
-        uniffi_sonar_ffi_fn_method_sonarnode_send_sticker(
-            self.uniffiCloneHandle(),
-            FfiConverterString.lower(groupIdHex),
-            FfiConverterString.lower(packCoordinate),
-            FfiConverterString.lower(shortcode),
-            FfiConverterString.lower(plaintextSha256), $0
-        )
-    }
-}
-
-open func fetchStickerPack(authorPubkeyHex: String, identifier: String, relayUrls: [String]) throws -> StickerPackInfo {
-    return try FfiConverterTypeStickerPackInfo.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
-        uniffi_sonar_ffi_fn_method_sonarnode_fetch_sticker_pack(
-            self.uniffiCloneHandle(),
-            FfiConverterString.lower(authorPubkeyHex),
-            FfiConverterString.lower(identifier),
-            FfiConverterSequenceString.lower(relayUrls), $0
-        )
-    })
-}
-
-open func fetchStickerImage(url: String) throws -> Data {
-    return try FfiConverterData.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
-        uniffi_sonar_ffi_fn_method_sonarnode_fetch_sticker_image(
-            self.uniffiCloneHandle(),
-            FfiConverterString.lower(url), $0
-        )
-    })
 }
 
 open func setConversationChangeListener(listener: ConversationChangeListener)  {try! rustCall() {
@@ -3027,179 +3044,6 @@ public func FfiConverterTypeMeshPublicMessage_lower(_ value: MeshPublicMessage) 
 /**
  * FFI-friendly decrypted chat message.
  */
-public struct StickerRefInfo: Equatable, Hashable {
-    public var packCoordinate: String
-    public var shortcode: String
-    public var plaintextSha256: String
-
-    public init(packCoordinate: String, shortcode: String, plaintextSha256: String) {
-        self.packCoordinate = packCoordinate
-        self.shortcode = shortcode
-        self.plaintextSha256 = plaintextSha256
-    }
-}
-
-#if compiler(>=6)
-extension StickerRefInfo: Sendable {}
-#endif
-
-public struct StickerInfo: Equatable, Hashable {
-    public var shortcode: String
-    public var url: String
-    public var sha256: String
-    public var mime: String
-    public var width: UInt32?
-    public var height: UInt32?
-    public var alt: String?
-    public var emoji: String?
-
-    public init(shortcode: String, url: String, sha256: String, mime: String, width: UInt32?, height: UInt32?, alt: String?, emoji: String?) {
-        self.shortcode = shortcode
-        self.url = url
-        self.sha256 = sha256
-        self.mime = mime
-        self.width = width
-        self.height = height
-        self.alt = alt
-        self.emoji = emoji
-    }
-}
-
-#if compiler(>=6)
-extension StickerInfo: Sendable {}
-#endif
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeStickerRefInfo: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> StickerRefInfo {
-        return try StickerRefInfo(
-            packCoordinate: FfiConverterString.read(from: &buf),
-            shortcode: FfiConverterString.read(from: &buf),
-            plaintextSha256: FfiConverterString.read(from: &buf)
-        )
-    }
-    public static func write(_ value: StickerRefInfo, into buf: inout [UInt8]) {
-        FfiConverterString.write(value.packCoordinate, into: &buf)
-        FfiConverterString.write(value.shortcode, into: &buf)
-        FfiConverterString.write(value.plaintextSha256, into: &buf)
-    }
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeStickerInfo: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> StickerInfo {
-        return try StickerInfo(
-            shortcode: FfiConverterString.read(from: &buf),
-            url: FfiConverterString.read(from: &buf),
-            sha256: FfiConverterString.read(from: &buf),
-            mime: FfiConverterString.read(from: &buf),
-            width: FfiConverterOptionUInt32.read(from: &buf),
-            height: FfiConverterOptionUInt32.read(from: &buf),
-            alt: FfiConverterOptionString.read(from: &buf),
-            emoji: FfiConverterOptionString.read(from: &buf)
-        )
-    }
-    public static func write(_ value: StickerInfo, into buf: inout [UInt8]) {
-        FfiConverterString.write(value.shortcode, into: &buf)
-        FfiConverterString.write(value.url, into: &buf)
-        FfiConverterString.write(value.sha256, into: &buf)
-        FfiConverterString.write(value.mime, into: &buf)
-        FfiConverterOptionUInt32.write(value.width, into: &buf)
-        FfiConverterOptionUInt32.write(value.height, into: &buf)
-        FfiConverterOptionString.write(value.alt, into: &buf)
-        FfiConverterOptionString.write(value.emoji, into: &buf)
-    }
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeStickerPackInfo: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> StickerPackInfo {
-        return try StickerPackInfo(
-            packCoordinate: FfiConverterString.read(from: &buf),
-            title: FfiConverterString.read(from: &buf),
-            description: FfiConverterOptionString.read(from: &buf),
-            coverUrl: FfiConverterOptionString.read(from: &buf),
-            stickers: FfiConverterSequenceTypeStickerInfo.read(from: &buf)
-        )
-    }
-    public static func write(_ value: StickerPackInfo, into buf: inout [UInt8]) {
-        FfiConverterString.write(value.packCoordinate, into: &buf)
-        FfiConverterString.write(value.title, into: &buf)
-        FfiConverterOptionString.write(value.description, into: &buf)
-        FfiConverterOptionString.write(value.coverUrl, into: &buf)
-        FfiConverterSequenceTypeStickerInfo.write(value.stickers, into: &buf)
-    }
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterOptionTypeStickerRefInfo: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> StickerRefInfo? {
-        switch try buf.readInt() as Int8 {
-        case 0: return nil
-        case 1: return try FfiConverterTypeStickerRefInfo.read(from: &buf)
-        default: throw UniffiInternalError.unexpectedOptionalTag
-        }
-    }
-    public static func write(_ value: StickerRefInfo?, into buf: inout [UInt8]) {
-        guard let value = value else {
-            buf.append(0)
-            return
-        }
-        buf.append(1)
-        FfiConverterTypeStickerRefInfo.write(value, into: &buf)
-    }
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterSequenceTypeStickerInfo: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [StickerInfo] {
-        let len: Int32 = try buf.readInt()
-        var seq = [StickerInfo]()
-        seq.reserveCapacity(Int(len))
-        for _ in 0..<len {
-            seq.append(try FfiConverterTypeStickerInfo.read(from: &buf))
-        }
-        return seq
-    }
-    public static func write(_ value: [StickerInfo], into buf: inout [UInt8]) {
-        let len = Int32(value.count)
-        buf.writeInt(len)
-        for item in value {
-            FfiConverterTypeStickerInfo.write(item, into: &buf)
-        }
-    }
-}
-
-public struct StickerPackInfo: Equatable, Hashable {
-    public var packCoordinate: String
-    public var title: String
-    public var description: String?
-    public var coverUrl: String?
-    public var stickers: [StickerInfo]
-
-    public init(packCoordinate: String, title: String, description: String?, coverUrl: String?, stickers: [StickerInfo]) {
-        self.packCoordinate = packCoordinate
-        self.title = title
-        self.description = description
-        self.coverUrl = coverUrl
-        self.stickers = stickers
-    }
-}
-
-#if compiler(>=6)
-extension StickerPackInfo: Sendable {}
-#endif
-
 public struct MessageInfo: Equatable, Hashable {
     public var idHex: String
     public var senderNpub: String
@@ -3218,7 +3062,7 @@ public struct MessageInfo: Equatable, Hashable {
      */
     public var media: [MediaInfo]
     /**
-     * Sticker reference, if this message is a sticker.
+     * Sticker reference if this message is a sticker send (nil for text/media).
      */
     public var stickerRef: StickerRefInfo?
 
@@ -3235,8 +3079,8 @@ public struct MessageInfo: Equatable, Hashable {
          * Encrypted media attachments (Marmot MIP-04), empty for a plain text message.
          */media: [MediaInfo],
         /**
-         * Sticker reference, if this message is a sticker.
-         */stickerRef: StickerRefInfo? = nil) {
+         * Sticker reference if this message is a sticker send (nil for text/media).
+         */stickerRef: StickerRefInfo?) {
         self.idHex = idHex
         self.senderNpub = senderNpub
         self.content = content
@@ -3586,6 +3430,217 @@ public func FfiConverterTypeSonarDescriptorInfo_lift(_ buf: RustBuffer) throws -
 #endif
 public func FfiConverterTypeSonarDescriptorInfo_lower(_ value: SonarDescriptorInfo) -> RustBuffer {
     return FfiConverterTypeSonarDescriptorInfo.lower(value)
+}
+
+
+/**
+ * FFI-friendly single sticker inside a pack.
+ */
+public struct StickerInfo: Equatable, Hashable {
+    public var shortcode: String
+    public var url: String
+    public var sha256: String
+    public var mime: String
+    public var width: UInt32?
+    public var height: UInt32?
+    public var alt: String?
+    public var emoji: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(shortcode: String, url: String, sha256: String, mime: String, width: UInt32?, height: UInt32?, alt: String?, emoji: String?) {
+        self.shortcode = shortcode
+        self.url = url
+        self.sha256 = sha256
+        self.mime = mime
+        self.width = width
+        self.height = height
+        self.alt = alt
+        self.emoji = emoji
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension StickerInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeStickerInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> StickerInfo {
+        return
+            try StickerInfo(
+                shortcode: FfiConverterString.read(from: &buf),
+                url: FfiConverterString.read(from: &buf),
+                sha256: FfiConverterString.read(from: &buf),
+                mime: FfiConverterString.read(from: &buf),
+                width: FfiConverterOptionUInt32.read(from: &buf),
+                height: FfiConverterOptionUInt32.read(from: &buf),
+                alt: FfiConverterOptionString.read(from: &buf),
+                emoji: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: StickerInfo, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.shortcode, into: &buf)
+        FfiConverterString.write(value.url, into: &buf)
+        FfiConverterString.write(value.sha256, into: &buf)
+        FfiConverterString.write(value.mime, into: &buf)
+        FfiConverterOptionUInt32.write(value.width, into: &buf)
+        FfiConverterOptionUInt32.write(value.height, into: &buf)
+        FfiConverterOptionString.write(value.alt, into: &buf)
+        FfiConverterOptionString.write(value.emoji, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeStickerInfo_lift(_ buf: RustBuffer) throws -> StickerInfo {
+    return try FfiConverterTypeStickerInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeStickerInfo_lower(_ value: StickerInfo) -> RustBuffer {
+    return FfiConverterTypeStickerInfo.lower(value)
+}
+
+
+/**
+ * FFI-friendly sticker pack fetched from relays.
+ */
+public struct StickerPackInfo: Equatable, Hashable {
+    public var packCoordinate: String
+    public var title: String
+    public var description: String?
+    public var coverUrl: String?
+    public var stickers: [StickerInfo]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(packCoordinate: String, title: String, description: String?, coverUrl: String?, stickers: [StickerInfo]) {
+        self.packCoordinate = packCoordinate
+        self.title = title
+        self.description = description
+        self.coverUrl = coverUrl
+        self.stickers = stickers
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension StickerPackInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeStickerPackInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> StickerPackInfo {
+        return
+            try StickerPackInfo(
+                packCoordinate: FfiConverterString.read(from: &buf),
+                title: FfiConverterString.read(from: &buf),
+                description: FfiConverterOptionString.read(from: &buf),
+                coverUrl: FfiConverterOptionString.read(from: &buf),
+                stickers: FfiConverterSequenceTypeStickerInfo.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: StickerPackInfo, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.packCoordinate, into: &buf)
+        FfiConverterString.write(value.title, into: &buf)
+        FfiConverterOptionString.write(value.description, into: &buf)
+        FfiConverterOptionString.write(value.coverUrl, into: &buf)
+        FfiConverterSequenceTypeStickerInfo.write(value.stickers, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeStickerPackInfo_lift(_ buf: RustBuffer) throws -> StickerPackInfo {
+    return try FfiConverterTypeStickerPackInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeStickerPackInfo_lower(_ value: StickerPackInfo) -> RustBuffer {
+    return FfiConverterTypeStickerPackInfo.lower(value)
+}
+
+
+/**
+ * FFI-friendly sticker reference carried on a chat message.
+ */
+public struct StickerRefInfo: Equatable, Hashable {
+    public var packCoordinate: String
+    public var shortcode: String
+    public var plaintextSha256: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(packCoordinate: String, shortcode: String, plaintextSha256: String) {
+        self.packCoordinate = packCoordinate
+        self.shortcode = shortcode
+        self.plaintextSha256 = plaintextSha256
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension StickerRefInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeStickerRefInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> StickerRefInfo {
+        return
+            try StickerRefInfo(
+                packCoordinate: FfiConverterString.read(from: &buf),
+                shortcode: FfiConverterString.read(from: &buf),
+                plaintextSha256: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: StickerRefInfo, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.packCoordinate, into: &buf)
+        FfiConverterString.write(value.shortcode, into: &buf)
+        FfiConverterString.write(value.plaintextSha256, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeStickerRefInfo_lift(_ buf: RustBuffer) throws -> StickerRefInfo {
+    return try FfiConverterTypeStickerRefInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeStickerRefInfo_lower(_ value: StickerRefInfo) -> RustBuffer {
+    return FfiConverterTypeStickerRefInfo.lower(value)
 }
 
 // Note that we don't yet support `indirect` for enums.
@@ -4399,6 +4454,30 @@ fileprivate struct FfiConverterOptionTypeSonarDescriptorInfo: FfiConverterRustBu
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeStickerRefInfo: FfiConverterRustBuffer {
+    typealias SwiftType = StickerRefInfo?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeStickerRefInfo.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeStickerRefInfo.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeCallControlInfo: FfiConverterRustBuffer {
     typealias SwiftType = CallControlInfo?
 
@@ -4665,6 +4744,31 @@ fileprivate struct FfiConverterSequenceTypeRecentMessagePageInfo: FfiConverterRu
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeRecentMessagePageInfo.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeStickerInfo: FfiConverterRustBuffer {
+    typealias SwiftType = [StickerInfo]
+
+    public static func write(_ value: [StickerInfo], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeStickerInfo.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [StickerInfo] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [StickerInfo]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeStickerInfo.read(from: &buf))
         }
         return seq
     }
@@ -5074,6 +5178,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_fetch_sonar_descriptor() != 2804) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_fetch_sticker_image() != 381) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_fetch_sticker_pack() != 19095) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_geo_dm_messages() != 48140) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -5141,6 +5251,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_send_media() != 54267) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_send_sticker() != 28650) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_send_text() != 23173) {

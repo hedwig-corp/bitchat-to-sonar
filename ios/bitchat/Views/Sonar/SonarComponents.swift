@@ -12,6 +12,7 @@
 
 import SwiftUI
 import WebKit
+import SonarCore
 #if canImport(BitLogger)
 import BitLogger
 #endif
@@ -663,6 +664,7 @@ struct SNMsgList: View {
     var onTapAuthor: ((SNMessage) -> Void)? = nil
     /// Download + decrypt a media attachment to raw bytes (cached by the store).
     var loadMedia: ((SNMediaItem) async -> Data?)? = nil
+    var loadSticker: ((MarmotService.MarmotStickerRef) async -> Data?)? = nil
 
     var body: some View {
         GeometryReader { geo in
@@ -695,7 +697,8 @@ struct SNMsgList: View {
                                 SNStickerBubble(
                                     m: m,
                                     showAuthor: showAuthors && !m.mine,
-                                    showState: m.mine && i == msgs.count - 1
+                                    showState: m.mine && i == msgs.count - 1,
+                                    load: loadSticker
                                 )
                             } else if m.action {
                                 Text(verbatim: m.text)
@@ -847,35 +850,11 @@ private func snLogRecoveredUndecodableImage(_ item: SNMediaItem, bytes: Data) {
     #endif
 }
 
-/// A media message bubble. No 1:1 design handoff exists for media, so this is
-/// the deliberate, tasteful extension noted in the brainstorm: an inline image
-/// (downloaded + decrypted on appear, Sonar radius 18, surface placeholder while
-/// loading) or a file chip, with an optional caption and the timestamp.
-private var stickerUrlCache: [String: String] = [:]
-
-private func resolveStickerUrl(_ ref: MarmotService.MarmotStickerRef) async -> String {
-    if let cached = stickerUrlCache[ref.plaintextSha256] { return cached }
-    let parts = ref.packCoordinate.split(separator: ":", maxSplits: 2).map(String.init)
-    guard parts.count == 3 else {
-        return "https://blossom.primal.net/\(ref.plaintextSha256).webp"
-    }
-    do {
-        let pack = try await MarmotService.shared.fetchStickerPack(
-            authorPubkeyHex: parts[1], identifier: parts[2], relayUrls: [])
-        for s in pack.stickers { stickerUrlCache[s.sha256] = s.url }
-        if let match = pack.stickers.first(where: {
-            $0.shortcode == ref.shortcode && $0.sha256 == ref.plaintextSha256
-        }) {
-            return match.url
-        }
-    } catch {}
-    return "https://blossom.primal.net/\(ref.plaintextSha256).webp"
-}
-
 struct SNStickerBubble: View {
     let m: SNMessage
     var showAuthor: Bool = false
     var showState: Bool = false
+    var load: ((MarmotService.MarmotStickerRef) async -> Data?)? = nil
 
     @State private var image: PlatformImage?
     @State private var failed = false
@@ -907,11 +886,9 @@ struct SNStickerBubble: View {
                     RoundedRectangle(cornerRadius: 12, style: .continuous)
                         .fill(SonarTheme.surface2)
                         .frame(width: 120, height: 120)
-                    if let ref = m.stickerRef {
-                        Text(":\(ref.shortcode):")
-                            .font(SonarTheme.uiFont(size: 12))
-                            .foregroundColor(SonarTheme.text3)
-                    }
+                    Text(verbatim: m.stickerRef?.shortcode ?? "sticker")
+                        .font(SonarTheme.uiFont(size: 12))
+                        .foregroundColor(SonarTheme.text3)
                 }
             } else {
                 ZStack {
@@ -931,11 +908,15 @@ struct SNStickerBubble: View {
         .padding(.vertical, 3)
         .task(id: m.stickerRef?.plaintextSha256) {
             guard let ref = m.stickerRef else { return }
-            let url = await resolveStickerUrl(ref)
-            do {
-                let data = try await MarmotService.shared.fetchStickerImage(url: url)
-                image = PlatformImage(data: data)
-            } catch { failed = true }
+            image = nil
+            failed = false
+            guard let data = await load?(ref),
+                  let decoded = PlatformImage(data: data)
+            else {
+                failed = true
+                return
+            }
+            image = decoded
         }
     }
 }
@@ -1786,6 +1767,8 @@ struct SNComposer: View {
     let onPlus: () -> Void
     let onCommand: (String) -> Void
     var onSticker: (StickerInfo, String) -> Void = { _, _ in }
+    var loadStickerPack: (String, String, [String]) async -> StickerPackInfo? = { _, _, _ in nil }
+    var loadStickerImage: (String) async -> Data? = { _ in nil }
     var voiceEnabled: Bool = true
     /// Hold-to-record produced a voice note at this file URL (audio/mp4 .m4a).
     var onVoice: (URL) -> Void = { _ in }
@@ -1851,6 +1834,8 @@ struct SNComposer: View {
                         showEmojiTray = false
                         onSticker(sticker, coord)
                     },
+                    loadStickerPack: loadStickerPack,
+                    loadStickerImage: loadStickerImage,
                     onClose: { showEmojiTray = false }
                 )
             }

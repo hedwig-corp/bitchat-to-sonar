@@ -98,7 +98,7 @@ struct SonarChannelScreen: View {
                         // we can't open a DM right now (honest "offline" signal).
                         showToast("\(m.author ?? "Questa persona") non \u{00E8} pi\u{00F9} nel canale")
                     }
-                })
+                }, loadSticker: { await store.stickerImageData(for: $0) })
             }
 
             SNComposer(
@@ -112,6 +112,10 @@ struct SonarChannelScreen: View {
                 onSticker: { sticker, coord in
                     store.sendStickerToChannel(chId, sticker: sticker, packCoordinate: coord)
                 },
+                loadStickerPack: { author, identifier, relays in
+                    await store.stickerPack(authorPubkeyHex: author, identifier: identifier, relayUrls: relays)
+                },
+                loadStickerImage: { await store.stickerImageData(url: $0) },
                 voiceEnabled: false
             )
         }

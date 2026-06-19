@@ -131,6 +131,12 @@ fun SonarEmojiPicker(
     onEmoji: (String) -> Unit,
     onGif: (SonarGifItem) -> Unit,
     onSticker: (SonarStickerItem, String) -> Unit,
+    loadStickerPack: suspend (String, String, List<String>) -> SonarStickerPack? = { author, identifier, relays ->
+        runCatching { SonarCore.fetchStickerPack(author, identifier, relays) }.getOrNull()
+    },
+    loadStickerImage: suspend (String) -> ByteArray? = { url ->
+        runCatching { SonarCore.fetchStickerImage(url) }.getOrNull()
+    },
     onClose: () -> Unit,
 ) {
     val s = sonar
@@ -168,7 +174,7 @@ fun SonarEmojiPicker(
         when (tab) {
             PickerTab.Emoji -> EmojiTabContent(onEmoji)
             PickerTab.Gif -> GifTabContent()
-            PickerTab.Sticker -> StickerTabContent(onSticker)
+            PickerTab.Sticker -> StickerTabContent(onSticker, loadStickerPack, loadStickerImage)
         }
     }
 }
@@ -354,26 +360,21 @@ private fun ColumnScope.GifTabContent() {
     }
 }
 
-private var cachedStickerPack: SonarStickerPack? = null
-
 @Composable
-private fun ColumnScope.StickerTabContent(onSticker: (SonarStickerItem, String) -> Unit) {
+private fun ColumnScope.StickerTabContent(
+    onSticker: (SonarStickerItem, String) -> Unit,
+    loadStickerPack: suspend (String, String, List<String>) -> SonarStickerPack?,
+    loadStickerImage: suspend (String) -> ByteArray?,
+) {
     val s = sonar
-    var pack by remember { mutableStateOf(cachedStickerPack) }
-    var loading by remember { mutableStateOf(cachedStickerPack == null) }
+    var pack by remember { mutableStateOf<SonarStickerPack?>(null) }
+    var loading by remember { mutableStateOf(true) }
     var error by remember { mutableStateOf<String?>(null) }
 
     LaunchedEffect(Unit) {
-        if (pack != null) return@LaunchedEffect
-        try {
-            val fetched = SonarCore.fetchStickerPack(TEST_PACK_AUTHOR, TEST_PACK_ID, TEST_PACK_RELAYS)
-            cachedStickerPack = fetched
-            pack = fetched
-        } catch (e: Exception) {
-            error = e.message ?: "Failed to load sticker pack"
-        } finally {
-            loading = false
-        }
+        pack = loadStickerPack(TEST_PACK_AUTHOR, TEST_PACK_ID, TEST_PACK_RELAYS)
+        if (pack == null) error = "Failed to load sticker pack"
+        loading = false
     }
 
     if (loading) {
@@ -406,17 +407,24 @@ private fun ColumnScope.StickerTabContent(onSticker: (SonarStickerItem, String) 
             modifier = Modifier.fillMaxWidth().weight(1f).padding(horizontal = 8.dp),
         ) {
             items(p.stickers) { sticker ->
-                StickerCell(sticker) { onSticker(sticker, p.packCoordinate) }
+                StickerCell(sticker, loadStickerImage) { onSticker(sticker, p.packCoordinate) }
             }
         }
     }
 }
 
 @Composable
-private fun StickerCell(sticker: SonarStickerItem, onClick: () -> Unit) {
+private fun StickerCell(
+    sticker: SonarStickerItem,
+    loadStickerImage: suspend (String) -> ByteArray?,
+    onClick: () -> Unit,
+) {
     var imageBytes by remember(sticker.url) { mutableStateOf<ByteArray?>(null) }
+    var failed by remember(sticker.url) { mutableStateOf(false) }
     LaunchedEffect(sticker.url) {
-        try { imageBytes = SonarCore.fetchStickerImage(sticker.url) } catch (_: Throwable) {}
+        failed = false
+        imageBytes = loadStickerImage(sticker.url)
+        failed = imageBytes == null
     }
     Box(
         Modifier
@@ -425,12 +433,22 @@ private fun StickerCell(sticker: SonarStickerItem, onClick: () -> Unit) {
             .clickable(onClick = onClick),
         contentAlignment = Alignment.Center,
     ) {
-        val image = remember(imageBytes) { imageBytes?.let { decodeImageBitmap(it) } }
+        val image = remember(imageBytes) {
+            imageBytes?.let { runCatching { decodeImageBitmap(it) }.getOrNull() }
+        }
+        val displayFailed = failed || (imageBytes != null && image == null)
         if (image != null) {
             androidx.compose.foundation.Image(
                 bitmap = image,
                 contentDescription = sticker.alt ?: sticker.shortcode,
                 modifier = Modifier.size(60.dp),
+            )
+        } else if (displayFailed) {
+            Text(
+                sticker.emoji ?: sticker.shortcode,
+                color = sonar.text3,
+                fontSize = 11.sp,
+                modifier = Modifier.padding(6.dp),
             )
         } else {
             Box(Modifier.size(60.dp).clip(RoundedCornerShape(8.dp)).background(sonar.surface2))

@@ -205,7 +205,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             walletState = WalletState.NotConfigured
             presenceByGeohash = emptyMap()
             payLedger = SonarPayLedger(); payVersion++
-            mediaCache.clear()
+            mediaCache.clear(); stickerPackCache.clear(); stickerImageCache.clear()
             callLogs.clear(); callVersion++
             resetCallState()
             pollJob?.cancel(); pollJob = null
@@ -241,7 +241,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             // ⚡PAY coins live inside the erased chats — reset the ledger. The
             // Lightning wallet seed/balance is separate and is NOT touched.
             payLedger = SonarPayLedger(); persistPay(); payVersion++
-            mediaCache.clear()
+            mediaCache.clear(); stickerPackCache.clear(); stickerImageCache.clear()
             callLogs.clear(); callVersion++
             // White Noise / Marmot DB: wipe + reconnect with the SAME identity.
             runCatching { SonarCore.eraseChats() }
@@ -1307,7 +1307,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 chats = emptyList(); messages = emptyList(); channelMsgs = emptyList()
                 lastWnGroups = -1; lastWnMsgs = -1
                 payLedger = SonarPayLedger(); persistPay(); payVersion++
-                mediaCache.clear()
+                mediaCache.clear(); stickerPackCache.clear(); stickerImageCache.clear()
                 callLogs.clear(); callVersion++
 
                 npub = restoredNpub
@@ -1799,6 +1799,8 @@ class SonarAppState(private val scope: CoroutineScope) {
     // ── Media (White Noise / Marmot MIP-04) ──
     /** Decrypted-media cache (raw bytes), keyed by the ciphertext's Blossom URL. */
     private val mediaCache = mutableMapOf<String, ByteArray>()
+    private val stickerPackCache = mutableMapOf<String, SonarStickerPack>()
+    private val stickerImageCache = mutableMapOf<String, ByteArray>()
     private val pendingMediaUrlPrefix = "pending-media-"
 
     private data class PendingMediaUpload(
@@ -2070,6 +2072,38 @@ class SonarAppState(private val scope: CoroutineScope) {
                 toast = "send failed: ${e.message}"
             }
         }
+    }
+
+    suspend fun stickerPack(
+        authorPubkeyHex: String,
+        identifier: String,
+        relayUrls: List<String> = emptyList(),
+    ): SonarStickerPack? {
+        val cacheKey = "30030:${authorPubkeyHex.lowercase()}:$identifier"
+        stickerPackCache[cacheKey]?.let { return it }
+        return try {
+            SonarCore.fetchStickerPack(authorPubkeyHex, identifier, relayUrls).also {
+                stickerPackCache[it.packCoordinate] = it
+            }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    suspend fun stickerImage(url: String): ByteArray? {
+        stickerImageCache[url]?.let { return it }
+        return try {
+            SonarCore.fetchStickerImage(url).also { stickerImageCache[url] = it }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    suspend fun stickerImage(ref: SonarStickerRef): ByteArray? {
+        val (author, identifier) = ref.packAddressParts() ?: return null
+        val pack = stickerPack(author, identifier) ?: return null
+        val sticker = pack.stickerMatching(ref) ?: return null
+        return stickerImage(sticker.url)
     }
 
     /** Download + decrypt a media attachment, cached by URL. */

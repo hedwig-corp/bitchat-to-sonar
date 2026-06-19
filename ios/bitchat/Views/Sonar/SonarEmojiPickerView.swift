@@ -10,10 +10,18 @@
 //
 
 import SwiftUI
+import SonarCore
+#if os(iOS)
+import UIKit
+#else
+import AppKit
+#endif
 
 struct SonarEmojiPickerView: View {
     let onEmoji: (String) -> Void
     let onSticker: (StickerInfo, String) -> Void
+    let loadStickerPack: (String, String, [String]) async -> StickerPackInfo?
+    let loadStickerImage: (String) async -> Data?
     let onClose: () -> Void
 
     @State private var tab = 0
@@ -61,7 +69,11 @@ struct SonarEmojiPickerView: View {
             switch tab {
             case 0: emojiTab
             case 1: placeholderTab("GIF search coming soon")
-            default: StickerTabContent(onSticker: onSticker)
+            default: StickerTabContent(
+                onSticker: onSticker,
+                loadPack: loadStickerPack,
+                loadImage: loadStickerImage
+            )
             }
         }
         .frame(height: 320)
@@ -169,13 +181,14 @@ struct SonarEmojiPickerView: View {
 private let testPackAuthor = "b653c822dfbec71697d379658a58909c3bef59d71b1cf5c1f7035451cde2e9f7"
 private let testPackId = "signal-8fa42aa13ec8f0efebe4b038f41afbd1"
 private let testPackRelays = ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net"]
-private var cachedStickerPack: StickerPackInfo?
 
 private struct StickerTabContent: View {
     let onSticker: (StickerInfo, String) -> Void
+    let loadPack: (String, String, [String]) async -> StickerPackInfo?
+    let loadImage: (String) async -> Data?
 
-    @State private var pack: StickerPackInfo? = cachedStickerPack
-    @State private var loading = cachedStickerPack == nil
+    @State private var pack: StickerPackInfo?
+    @State private var loading = true
     @State private var error: String?
 
     var body: some View {
@@ -216,7 +229,7 @@ private struct StickerTabContent: View {
                         let columns = Array(repeating: GridItem(.flexible(), spacing: 4), count: 4)
                         LazyVGrid(columns: columns, spacing: 4) {
                             ForEach(pack.stickers, id: \.shortcode) { sticker in
-                                StickerCell(sticker: sticker) {
+                                StickerCell(sticker: sticker, loadImage: loadImage) {
                                     onSticker(sticker, pack.packCoordinate)
                                 }
                             }
@@ -233,18 +246,8 @@ private struct StickerTabContent: View {
     }
 
     private func loadPack() async {
-        if pack != nil { return }
-        do {
-            let fetched = try await MarmotService.shared.fetchStickerPack(
-                authorPubkeyHex: testPackAuthor,
-                identifier: testPackId,
-                relayUrls: testPackRelays
-            )
-            cachedStickerPack = fetched
-            pack = fetched
-        } catch {
-            self.error = error.localizedDescription
-        }
+        pack = await loadPack(testPackAuthor, testPackId, testPackRelays)
+        if pack == nil { self.error = "Failed to load sticker pack" }
         loading = false
     }
 }
@@ -257,9 +260,11 @@ private typealias StickerImage = NSImage
 
 private struct StickerCell: View {
     let sticker: StickerInfo
+    let loadImage: (String) async -> Data?
     let onTap: () -> Void
 
     @State private var image: StickerImage?
+    @State private var failed = false
 
     var body: some View {
         Button(action: onTap) {
@@ -276,6 +281,11 @@ private struct StickerCell: View {
                         .aspectRatio(contentMode: .fit)
                         .frame(width: 60, height: 60)
                     #endif
+                } else if failed {
+                    Text(verbatim: sticker.emoji ?? sticker.shortcode)
+                        .font(SonarTheme.uiFont(size: 11))
+                        .foregroundColor(SonarTheme.text3)
+                        .frame(width: 60, height: 60)
                 } else {
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
                         .fill(SonarTheme.surface2)
@@ -291,10 +301,14 @@ private struct StickerCell: View {
     }
 
     private func loadImage() async {
-        do {
-            let data = try await MarmotService.shared.fetchStickerImage(url: sticker.url)
-            image = StickerImage(data: data)
-        } catch {}
+        failed = false
+        guard let data = await loadImage(sticker.url),
+              let decoded = StickerImage(data: data)
+        else {
+            failed = true
+            return
+        }
+        image = decoded
     }
 }
 

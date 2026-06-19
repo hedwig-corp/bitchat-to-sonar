@@ -731,7 +731,8 @@ private struct MacConversationPane: View {
                         } else {
                             showToast("\(message.author ?? "This person") is no longer in the channel")
                         }
-                    }
+                    },
+                    loadSticker: { await store.stickerImageData(for: $0) }
                 )
             }
         } else {
@@ -752,7 +753,8 @@ private struct MacConversationPane: View {
                     peerName: peer.name,
                     money: { store.money($0) },
                     fiatText: { store.moneySatsLine($0) },
-                    loadMedia: { await store.mediaData($0) }
+                    loadMedia: { await store.mediaData($0) },
+                    loadSticker: { await store.stickerImageData(for: $0) }
                 )
             }
         }
@@ -787,6 +789,10 @@ private struct MacConversationPane: View {
                     store.sendSticker(id, sticker: sticker, packCoordinate: coord)
                 }
             },
+            loadStickerPack: { author, identifier, relays in
+                await store.stickerPack(authorPubkeyHex: author, identifier: identifier, relayUrls: relays)
+            },
+            loadStickerImage: { await store.stickerImageData(url: $0) },
             voiceEnabled: !isChannel && store.canSendMedia(id),
             onVoice: { store.sendVoiceNote(id, url: $0) }
         )

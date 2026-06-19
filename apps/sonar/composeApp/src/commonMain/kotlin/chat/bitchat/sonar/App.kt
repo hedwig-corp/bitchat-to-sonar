@@ -792,6 +792,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                         } else if (m.stickerRef != null) {
                             StickerBubble(
                                 m,
+                                state = state,
                                 mesh = msgMesh,
                                 author = state.groupAuthorName(m, isGroup),
                                 showState = m.mine && i == feed.lastIndex,
@@ -818,6 +819,10 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                 emojiTray = false
                 state.sendStickerItem(screen.id, sticker, packCoordinate)
             },
+            loadStickerPack = { author, identifier, relays ->
+                state.stickerPack(author, identifier, relays)
+            },
+            loadStickerImage = { url -> state.stickerImage(url) },
             onClose = { emojiTray = false }
         )
         // ONE composer row in BOTH states. Only the left (plus↔trash) and middle
@@ -1354,32 +1359,21 @@ private fun MessageStatusFooter(m: SonarMsg, mesh: Boolean) {
     }
 }
 
-private val stickerUrlCache = mutableMapOf<String, String>()
-
-private suspend fun resolveStickerUrl(ref: SonarStickerRef): String {
-    stickerUrlCache[ref.plaintextSha256]?.let { return it }
-    val parts = ref.packCoordinate.split(":", limit = 3)
-    if (parts.size == 3) {
-        try {
-            val pack = SonarCore.fetchStickerPack(parts[1], parts[2])
-            pack.stickers.forEach { stickerUrlCache[it.sha256] = it.url }
-            pack.stickers.find { it.shortcode == ref.shortcode && it.sha256 == ref.plaintextSha256 }
-                ?.let { return it.url }
-        } catch (_: Throwable) {}
-    }
-    return "https://blossom.primal.net/${ref.plaintextSha256}.webp"
-}
-
 @Composable
-private fun StickerBubble(m: SonarMsg, mesh: Boolean = false, author: String? = null, showState: Boolean = false) {
+private fun StickerBubble(
+    m: SonarMsg,
+    state: SonarAppState,
+    mesh: Boolean = false,
+    author: String? = null,
+    showState: Boolean = false,
+) {
     val ref = m.stickerRef ?: return
-    var imageBytes by remember(ref.plaintextSha256) { mutableStateOf<ByteArray?>(null) }
-    var failed by remember(ref.plaintextSha256) { mutableStateOf(false) }
-    LaunchedEffect(ref.plaintextSha256) {
-        try {
-            val url = resolveStickerUrl(ref)
-            imageBytes = SonarCore.fetchStickerImage(url)
-        } catch (_: Throwable) { failed = true }
+    var imageBytes by remember(ref) { mutableStateOf<ByteArray?>(null) }
+    var failed by remember(ref) { mutableStateOf(false) }
+    LaunchedEffect(ref) {
+        failed = false
+        imageBytes = state.stickerImage(ref)
+        failed = imageBytes == null
     }
     Column(
         Modifier.fillMaxWidth().padding(vertical = 3.dp),
@@ -1393,19 +1387,22 @@ private fun StickerBubble(m: SonarMsg, mesh: Boolean = false, author: String? = 
                 modifier = Modifier.padding(start = 6.dp, bottom = 2.dp)
             )
         }
-        val image = remember(imageBytes) { imageBytes?.let { decodeImageBitmap(it) } }
+        val image = remember(imageBytes) {
+            imageBytes?.let { runCatching { decodeImageBitmap(it) }.getOrNull() }
+        }
+        val displayFailed = failed || (imageBytes != null && image == null)
         if (image != null) {
             androidx.compose.foundation.Image(
                 bitmap = image,
                 contentDescription = ref.shortcode,
                 modifier = Modifier.size(120.dp).padding(4.dp),
             )
-        } else if (failed) {
+        } else if (displayFailed) {
             Box(
-                Modifier.size(120.dp).padding(4.dp),
+                Modifier.size(120.dp).padding(4.dp).clip(RoundedCornerShape(12.dp)).background(sonar.surface2),
                 contentAlignment = Alignment.Center,
             ) {
-                Text(":${ref.shortcode}:", color = sonar.text3, fontSize = 12.sp)
+                Text(ref.shortcode, color = sonar.text3, fontSize = 12.sp)
             }
         } else {
             Box(

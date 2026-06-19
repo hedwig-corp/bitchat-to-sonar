@@ -86,6 +86,7 @@ final class MarmotService: @unchecked Sendable {
             case isMine
             case deliveryState
             case media
+            case stickerRef
         }
 
         init(from decoder: Decoder) throws {
@@ -97,6 +98,7 @@ final class MarmotService: @unchecked Sendable {
             self.isMine = try container.decode(Bool.self, forKey: .isMine)
             self.deliveryState = try container.decodeIfPresent(String.self, forKey: .deliveryState)
             self.media = try container.decode([MarmotMedia].self, forKey: .media)
+            self.stickerRef = try container.decodeIfPresent(MarmotStickerRef.self, forKey: .stickerRef)
         }
     }
 
