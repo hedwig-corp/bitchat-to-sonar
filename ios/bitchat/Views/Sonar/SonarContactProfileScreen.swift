@@ -38,7 +38,15 @@ struct SonarContactProfileScreen: View {
 
     private var resolvedNpub: String {
         if peerId.hasPrefix("npub1") { return peerId }
-        return store.sonarProfile(peerId)?.npub ?? ""
+        if let npub = store.sonarProfile(peerId)?.npub, !npub.isEmpty {
+            return npub
+        }
+        if let group = store.marmotGroup(forConversationId: peerId),
+           store.marmot.isDirectGroup(group),
+           let otherNpub = store.marmot.otherMembers(in: group).first {
+            return otherNpub
+        }
+        return ""
     }
 
     private var verified: Bool { store.isVerified(effectiveChatId) }
