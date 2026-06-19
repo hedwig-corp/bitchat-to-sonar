@@ -51,11 +51,13 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
     val s = sonar
     var showVerify by remember { mutableStateOf(false) }
 
-    // Derive the peer npub from the chat members list.
+    // Derive the peer npub from the chat members list, or accept a direct
+    // npub when opened from a group member tap.
     val peerNpub = remember(screen.chatId, state.chats.size) {
         if (screen.chatId.startsWith("mesh:")) {
-            // Mesh peer — chatId is "mesh:<peerId>"; npub may not be known.
             null
+        } else if (screen.chatId.startsWith("npub1")) {
+            canonicalProfileKey(screen.chatId)
         } else {
             val chat = state.chats.firstOrNull { it.id == screen.chatId }
             val mine = canonicalProfileKey(state.npub)

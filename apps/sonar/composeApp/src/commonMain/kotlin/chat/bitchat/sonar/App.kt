@@ -1109,27 +1109,6 @@ private fun SlashHints(draft: String, onPick: (String) -> Unit) {
     }
 }
 
-private val quickEmojis = listOf("👍", "❤️", "😂", "🔥", "🙏", "👏", "🎉", "👀", "💯", "⚡")
-
-@Composable
-private fun EmojiTray(onPick: (String) -> Unit) {
-    val s = sonar
-    Row(
-        Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
-            .padding(start = 10.dp, end = 10.dp, top = 8.dp, bottom = 2.dp),
-        horizontalArrangement = Arrangement.spacedBy(8.dp)
-    ) {
-        quickEmojis.forEach { emoji ->
-            Box(
-                Modifier.size(38.dp).clip(CircleShape).background(s.surface2)
-                    .clickable { onPick(emoji) },
-                contentAlignment = Alignment.Center
-            ) {
-                Text(emoji, fontSize = 20.sp)
-            }
-        }
-    }
-}
 
 @Composable
 private fun VerifySheet(

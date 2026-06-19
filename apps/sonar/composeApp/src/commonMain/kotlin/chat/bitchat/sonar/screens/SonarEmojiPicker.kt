@@ -440,6 +440,7 @@ private fun SearchField(value: String, placeholder: String, onValueChange: (Stri
             value = value,
             onValueChange = onValueChange,
             textStyle = TextStyle(color = s.text, fontSize = 15.sp),
+            cursorBrush = androidx.compose.ui.graphics.SolidColor(s.accent),
             singleLine = true,
             modifier = Modifier.fillMaxWidth().padding(start = 23.dp)
         )
