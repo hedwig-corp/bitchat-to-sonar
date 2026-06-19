@@ -2003,6 +2003,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (!ok) { toast = "Not connected over Bluetooth yet — stay close and try again"; return false }
         val msg = SonarMsg(randomMeshId(), npub, text, mine = true, MeshRadio.nowSecs())
         meshChats[peerId] = meshChats[peerId].orEmpty() + msg
+        processPayLines(meshChatId(peerId), listOf(msg))
         persistMesh(peerId)
         scope.launch { refreshOpenDm(peerId) }
         refreshMeshDmRows()
@@ -2043,6 +2044,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 try {
                     SonarCore.send(group.id, text)
                     clearSendEcho(chatId, echo.id)
+                    processPayLines(group.id, marmotMessagesPage(group.id))
                     refreshOpenDm(peerId)
                 } catch (e: Throwable) {
                     failSendEcho(chatId, echo.id)
@@ -2454,6 +2456,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 continue
             }
             meshChats[m.peerId] = meshChats[m.peerId].orEmpty() + msg
+            processPayLines(chatId, listOf(msg))
             touched += m.peerId
             if (notifsOn && !foreground && chatId != openChatId) {
                 Notifier.notify(chatId.hashCode(), meshPeerName(m.peerId), notifPreview(m.text))
@@ -2636,10 +2639,12 @@ class SonarAppState(private val scope: CoroutineScope) {
             .debounce(50)
             .onEach { groupIdHex ->
                 refreshChats()
+                val changedMessages = marmotMessagesPage(groupIdHex)
+                processPayLines(groupIdHex, changedMessages)
+                processCallLines(groupIdHex, changedMessages)
                 (screen as? Screen.Chat)?.let { sc ->
                     if (!isMeshChat(sc.id) && sc.id == groupIdHex) {
-                        messages = withSendEchoes(sc.id, mergePendingMediaUploads(sc.id, marmotMessagesPage(sc.id)))
-                        processPayLines(sc.id, messages)
+                        messages = withSendEchoes(sc.id, mergePendingMediaUploads(sc.id, changedMessages))
                     } else if (isMeshChat(sc.id)) {
                         val peerId = peerIdForMarmotGroup(groupIdHex)
                         if (peerId != null && sc.id == meshChatId(peerId)) {
@@ -2682,6 +2687,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                     val ms = runCatching { SonarCore.messagesPage(c.id, LOCAL_TRANSCRIPT_PAGE_LIMIT) }.getOrDefault(emptyList())
                     wnMsgs += ms.size
                     processCallLines(c.id, ms)
+                    processPayLines(c.id, ms)
                     if (c.members.size > 2) {
                         for (m in ms) {
                             if (!m.mine && m.senderNpub.isNotBlank()) senders.add(m.senderNpub)
