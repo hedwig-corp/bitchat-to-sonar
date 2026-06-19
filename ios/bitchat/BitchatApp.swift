@@ -177,14 +177,7 @@ struct BitchatApp: App {
             checkForSharedContent()
         } else if url.scheme == "sonar" && url.host == "invite",
                   let token = url.pathComponents.last, token.hasPrefix("sinvite1") {
-            Task {
-                do {
-                    try await sonarStore.marmot.requestJoinViaLink(token: token)
-                    await MainActor.run { sonarStore.showToast("Join request sent") }
-                } catch {
-                    await MainActor.run { sonarStore.showToast("Couldn't join: \(error.localizedDescription)") }
-                }
-            }
+            sonarStore.submitInviteLink(token)
         }
     }
 
