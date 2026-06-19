@@ -704,19 +704,27 @@ final class MarmotChatModel: ObservableObject {
         guard !trimmed.isEmpty else { return }
         ensureSonarDescriptor(trimmed)
         Task {
-            // Wait through the connect/reconnect window (post-erase or cold
-            // launch) so a fresh chat doesn't fail with "not connected yet".
-            guard await ensureRelayConnected() else {
-                self.errorText = "Not connected yet — try again in a moment."
-                return
+            _ = await startChatReturningId(with: trimmed)
+        }
+    }
+
+    func startChatReturningId(with peer: String) async -> String? {
+        let trimmed = peer.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        guard await ensureRelayConnected() else {
+            self.errorText = "Not connected yet — try again in a moment."
+            return nil
+        }
+        do {
+            let groupId = try await service.startDirectMessage(with: trimmed, name: "")
+            await loadLocalPage(groupId: groupId)
+            Task { [weak self] in
+                await self?.refreshWhenConnected(groupId: groupId, hydrateBeforeSync: false)
             }
-            do {
-                let groupId = try await service.startDirectMessage(with: trimmed, name: "")
-                await loadLocalPage(groupId: groupId)
-                await refreshWhenConnected(groupId: groupId, hydrateBeforeSync: false)
-            } catch {
-                self.errorText = Self.describe(error)
-            }
+            return groupId
+        } catch {
+            self.errorText = Self.describe(error)
+            return nil
         }
     }
 

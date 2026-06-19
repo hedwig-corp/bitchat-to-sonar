@@ -1479,9 +1479,15 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (p.isEmpty()) return
         scope.launch {
             try {
-                SonarCore.startChat(p)
+                val chatId = SonarCore.startChat(p)
                 refreshChats()
-                toast = "chat started"
+                val chat = chats.firstOrNull { it.id == chatId }
+                if (chat != null) {
+                    openChat(chat)
+                } else {
+                    push(Screen.Chat(chatId, shortNpub(p)))
+                    messages = marmotMessagesPage(chatId)
+                }
             } catch (t: Throwable) {
                 toast = "couldn't start: ${t.message}"
             }
