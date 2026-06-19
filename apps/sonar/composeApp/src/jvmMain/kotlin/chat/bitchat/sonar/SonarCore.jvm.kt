@@ -235,7 +235,7 @@ actual object SonarCore {
     }
 
     actual suspend fun publishSonarDescriptor(callsEnabled: Boolean, bolt12Offer: String?) = withContext(Dispatchers.IO) {
-        runCatching { node?.publishSonarDescriptor(false, listOf("marmot"), null) }
+        runCatching { node?.publishSonarDescriptor(false, listOf("marmot"), bolt12Offer) }
         Unit
     }
 
