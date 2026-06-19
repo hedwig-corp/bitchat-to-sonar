@@ -140,6 +140,8 @@ final class MarmotChatModel: ObservableObject {
     /// Recent relay misses, keyed by npub. A miss is NOT proof the user is White
     /// Noise-only; it only lets call-offer handling stop deferring forever.
     @Published private(set) var sonarDescriptorMissesByNpub: [String: Date] = [:]
+    /// True when the current node is relay-backed, not just the local DB node.
+    @Published private(set) var relayConnected = false
     /// Unread message counts per Marmot group, keyed by group ID hex.
     @Published var unreadByGroup: [String: UInt64] = [:]
 
@@ -261,6 +263,7 @@ final class MarmotChatModel: ObservableObject {
         //    failure must NOT hide already-persisted chats.
         do {
             _ = try await service.connectLocal(nsec: storedNsec)
+            relayConnected = false
             await loadLocalGroupMetadata()
             self.errorText = nil
             scheduleStartupLocalSummariesThenRelay()
@@ -346,14 +349,18 @@ final class MarmotChatModel: ObservableObject {
             guard let self else { return }
             defer { self.relayBusy = false }
             do {
+                self.relayConnected = false
                 _ = try await self.service.connect(nsec: nil)
                 self.errorText = nil
+                self.relayConnected = true
                 try? await self.service.publishKeyPackage()
                 try? await self.service.publishSonarDescriptor()
                 self.startPolling()
             } catch MarmotService.ServiceError.cancelled {
+                self.relayConnected = false
                 return
             } catch {
+                self.relayConnected = false
                 let desc = Self.describe(error)
                 SecureLogger.warning("⚠️ Marmot relay connect failed: \(desc)", category: .session)
                 self.errorText = desc
@@ -646,6 +653,18 @@ final class MarmotChatModel: ObservableObject {
         }
     }
 
+    /// Proactively refresh Sonar descriptors for a set of known npubs (e.g. all
+    /// persisted fingerprint↔npub links). Only the relay-ready startup pass clears
+    /// miss timestamps; foreground refreshes preserve the miss retry cooldown.
+    func refreshDescriptors(forKnownNpubs npubs: [String], clearMisses: Bool = false) {
+        for npub in npubs {
+            if clearMisses {
+                sonarDescriptorMissesByNpub[npub] = nil
+            }
+            ensureSonarDescriptor(npub)
+        }
+    }
+
     /// Best display name for a member npub, if we've resolved their profile.
     func displayName(forNpub member: String) -> String? {
         profilesByNpub[SNMarmotProfileCache.canonicalKey(member)]?.bestName
@@ -924,6 +943,7 @@ final class MarmotChatModel: ObservableObject {
         stopPolling()
         let service = self.service
         Task { await service.wipeDatabase() }
+        relayConnected = false
         npub = nil
         groups = []
         pendingGroupInvites = []
@@ -944,6 +964,7 @@ final class MarmotChatModel: ObservableObject {
     func eraseChatsKeepIdentity() async {
         let wasPolling = syncTask != nil
         stopPolling()
+        relayConnected = false
         await service.wipeDatabase()
         npub = nil
         groups = []
