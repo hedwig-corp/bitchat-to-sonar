@@ -25,11 +25,28 @@ struct SonarContactProfileScreen: View {
     @State private var showVerify = false
     @State private var toast: String?
 
-    private var verified: Bool { store.isVerified(peerId) }
-    private var info: SNVerifyInfo { store.verifyInfo(for: peerId) }
+    private var effectiveChatId: String {
+        guard peerId.hasPrefix("npub1") else { return peerId }
+        if let group = store.marmotGroup(forNpub: peerId) {
+            return SonarAppStore.marmotIDPrefix + group.id
+        }
+        if let peerKey = store.sonarPeerKey(forNpub: peerId) {
+            return peerKey
+        }
+        return peerId
+    }
+
+    private var resolvedNpub: String {
+        if peerId.hasPrefix("npub1") { return peerId }
+        return store.sonarProfile(peerId)?.npub ?? ""
+    }
+
+    private var verified: Bool { store.isVerified(effectiveChatId) }
+    private var info: SNVerifyInfo { store.verifyInfo(for: effectiveChatId) }
 
     private var peerFullKey: String {
-        store.sonarProfile(peerId)?.npub ?? ""
+        let npub = resolvedNpub
+        return npub.isEmpty ? (store.sonarProfile(peerId)?.npub ?? "") : npub
     }
 
     private var peerShortKey: String {
@@ -39,10 +56,12 @@ struct SonarContactProfileScreen: View {
     }
 
     private var sharedGroups: [SNDMRow] {
-        store.dmRows.filter { row in
+        let npub = resolvedNpub
+        guard !npub.isEmpty else { return [] }
+        return store.dmRows.filter { row in
             guard row.isMarmot, store.isMultiMemberMarmotGroupId(row.id) else { return false }
             let members = store.groupMemberContacts(forConversationId: row.id)
-            return members.contains { $0.npub == peerId || $0.id == peerId }
+            return members.contains { $0.npub == npub }
         }
     }
 
@@ -78,9 +97,9 @@ struct SonarContactProfileScreen: View {
                         profileAction(icon: .lock, label: "Message") {
                             store.pop()
                         }
-                        profileAction(icon: .phone, label: "Call", enabled: store.canCall(peerId)) {
-                            if store.canCall(peerId) {
-                                store.placeCall(peerId, video: false)
+                        profileAction(icon: .phone, label: "Call", enabled: store.canCall(effectiveChatId)) {
+                            if store.canCall(effectiveChatId) {
+                                store.placeCall(effectiveChatId, video: false)
                             }
                         }
                         profileAction(
@@ -301,7 +320,7 @@ struct SonarContactProfileScreen: View {
                     }
                 } else {
                     SNPrimaryButton(label: "They match — mark as verified") {
-                        store.markVerified(peerId)
+                        store.markVerified(effectiveChatId)
                     }
                     .padding(.horizontal, 8)
                 }
