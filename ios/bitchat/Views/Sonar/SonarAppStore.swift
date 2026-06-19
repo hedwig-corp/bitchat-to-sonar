@@ -3060,7 +3060,7 @@ final class SonarAppStore: ObservableObject {
         let receiptOk = await sendPaymentReceiptLines(
             [
                 SonarPayMessage.pay(id: activityId, sats: sats).encoded(),
-                SonarPayMessage.done(id: activityId).encoded()
+                SonarPayMessage.done(id: activityId, preimage: payment.preimage).encoded()
             ],
             to: id
         )
@@ -3110,15 +3110,13 @@ final class SonarAppStore: ObservableObject {
     private func handlePayLine(_ line: SonarPayMessage, convId: String, via: SNVia) {
         switch line {
         case .pay(let id, let sats):
-            // Payment receipt arrived: remember it so it survives transcript loss.
             payLedger.record(SonarPayEntry(
                 id: id, peerKey: convId, sats: sats,
                 direction: .incoming, state: .sealed, via: via.rawValue
             ))
 
-        case .done(let id):
-            // The sender already settled over Lightning: reveal the receipt.
-            payLedger.markIncomingClaimedOrPending(id)
+        case .done(let id, let preimage):
+            payLedger.markIncomingClaimedOrPending(id, preimage: preimage)
         }
     }
 

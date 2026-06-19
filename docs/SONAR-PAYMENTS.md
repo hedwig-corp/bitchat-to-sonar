@@ -48,10 +48,10 @@ sender                                      receiver
 fetch sonar.meta.v1
 read payments.receive[bolt12_offer]
 record activity: pending
-wallet.send(offer, sats)
+wallet.send(offer, sats) → preimage
 record activity: paid/failed
 ⚡PAY|1|<uuid>|<sats> --------------------> record incoming receipt: pending
-⚡PAYDONE|1|<uuid> -----------------------> mark receipt paid
+⚡PAYDONE|2|<uuid>|<preimage> ------------> mark receipt paid + store preimage
 ```
 
 The current proof is the Lightning preimage. When
@@ -80,14 +80,21 @@ The wallet sheet also lists direct payment activity, newest first, including:
 ## Chat receipt wire format
 
 ```text
-⚡PAY|1|<uuid>|<sats>   payment receipt (sender -> receiver)
-⚡PAYDONE|1|<uuid>      settled receipt (sender -> receiver)
+⚡PAY|1|<uuid>|<sats>                payment receipt (sender -> receiver)
+⚡PAYDONE|2|<uuid>                   settled receipt, no preimage available
+⚡PAYDONE|2|<uuid>|<preimage_hex>    settled receipt with cryptographic proof
 ```
+
+`<preimage_hex>` is the 32-byte Lightning preimage (64 hex chars). Receivers
+can verify settlement by checking `SHA256(preimage) == payment_hash`.
 
 `⚡PAY` is a receipt, not a Bitcoin claim primitive. `⚡PAYDONE` can race ahead of
 `⚡PAY` on relay-backed transports; clients remember that DONE and mark the
 matching incoming receipt paid once the `⚡PAY` line arrives. Unknown versions
 render as plain text. `⚡PAYCLAIM` is not part of the protocol.
+
+Backward compatibility: decoders accept `⚡PAYDONE|1|<uuid>` from old peers
+(no preimage, receipt still transitions to paid). New clients always emit v2.
 
 Control-line processing is idempotent, so replaying transcripts after relaunch
 is safe.
@@ -95,7 +102,7 @@ is safe.
 ## Local state
 
 `SonarPayLedger` stores chat receipt rows in UserDefaults JSON under
-`sonar.pay.ledger.v1`: `{id, peerKey, sats, direction, state, via}`.
+`sonar.pay.ledger.v1`: `{id, peerKey, sats, direction, state, via, preimage?}`.
 
 `SonarPaymentActivityLedger` stores direct wallet payment activity under
 `sonar.payment.activity.v1`. Entries are not claimable state machines; they are

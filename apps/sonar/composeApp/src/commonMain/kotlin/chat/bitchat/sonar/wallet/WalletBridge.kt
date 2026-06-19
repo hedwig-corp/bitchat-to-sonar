@@ -9,6 +9,9 @@ sealed interface WalletState {
     data class Failed(val message: String) : WalletState
 }
 
+/** Result of a wallet send: success flag plus the Lightning preimage when available. */
+data class SendResult(val ok: Boolean, val preimage: String? = null)
+
 /**
  * Thin Kotlin façade over the on-device Breez SDK Liquid wallet, the Android
  * twin of iOS `WalletBridgeService`. Seed is derived deterministically from the
@@ -36,8 +39,8 @@ expect object WalletBridge {
     suspend fun createOffer(): String
 
     /** Pay a destination (BOLT11/BOLT12/LNURL/BIP-353). amountSats=0 ⇒ amount from
-     *  the invoice/offer. Returns true on success. */
-    suspend fun send(destination: String, amountSats: Long, note: String): Boolean
+     *  the invoice/offer. Returns [SendResult] with preimage when available. */
+    suspend fun send(destination: String, amountSats: Long, note: String): SendResult
 
     /** Fetch + cache live BTC→fiat rates. */
     suspend fun fetchRates(): List<ExchangeRate>

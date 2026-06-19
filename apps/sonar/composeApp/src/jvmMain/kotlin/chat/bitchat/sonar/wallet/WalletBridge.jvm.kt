@@ -8,6 +8,7 @@ import breez_sdk_liquid.PaymentMethod
 import breez_sdk_liquid.PrepareReceiveRequest
 import breez_sdk_liquid.PrepareSendRequest
 import breez_sdk_liquid.ReceivePaymentRequest
+import breez_sdk_liquid.PaymentDetails
 import breez_sdk_liquid.SendPaymentRequest
 import breez_sdk_liquid.connect
 import breez_sdk_liquid.defaultConfig
@@ -104,19 +105,19 @@ actual object WalletBridge {
         node.receivePayment(ReceivePaymentRequest(prepared, "Sonar", null, null)).destination
     }
 
-    actual suspend fun send(destination: String, amountSats: Long, note: String): Boolean =
+    actual suspend fun send(destination: String, amountSats: Long, note: String): SendResult =
         withContext(Dispatchers.IO) {
-            val node = sdk ?: return@withContext false
-            if (amountSats < 0) return@withContext false // never let a bad amount slip through
+            val node = sdk ?: return@withContext SendResult(false)
+            if (amountSats < 0) return@withContext SendResult(false)
             try {
-                // amountSats == 0 ⇒ amountless (the invoice/offer carries the amount).
                 val amount: PayAmount? =
                     if (amountSats > 0) PayAmount.Bitcoin(amountSats.toULong()) else null
                 val prepared = node.prepareSendPayment(PrepareSendRequest(destination.trim(), amount))
-                node.sendPayment(SendPaymentRequest(prepared, null, note.ifBlank { null }))
+                val resp = node.sendPayment(SendPaymentRequest(prepared, null, note.ifBlank { null }))
+                val preimage = (resp.payment.details as? PaymentDetails.Lightning)?.preimage
                 refreshBalance()
-                true
-            } catch (t: Throwable) { false }
+                SendResult(true, preimage)
+            } catch (t: Throwable) { SendResult(false) }
         }
 
     actual suspend fun fetchRates(): List<ExchangeRate> = withContext(Dispatchers.IO) {

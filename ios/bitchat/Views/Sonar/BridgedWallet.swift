@@ -121,7 +121,8 @@ final class BridgedWallet: SonarWalletProviding {
             isIncoming: payment.isIncoming,
             timestamp: payment.timestamp,
             note: payment.note,
-            feesSats: payment.feesSats
+            feesSats: payment.feesSats,
+            preimage: payment.preimage
         )
     }
 
@@ -140,7 +141,8 @@ final class BridgedWallet: SonarWalletProviding {
                         isIncoming: payment.isIncoming,
                         timestamp: payment.timestamp,
                         note: payment.note,
-                        feesSats: payment.feesSats
+                        feesSats: payment.feesSats,
+                        preimage: payment.preimage
                     ))
                 }
                 continuation.finish()

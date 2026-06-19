@@ -28,6 +28,7 @@ public final class SonarWallet {
         public let timestamp: Date
         public let note: String?
         public let feesSats: Int64?
+        public let preimage: String?
     }
 
     public struct Destination: Sendable, Equatable {
@@ -290,13 +291,18 @@ public final class SonarWallet {
     }
 
     private static func map(_ p: BreezSDKLiquid.Payment) -> Payment {
-        Payment(
+        var preimage: String?
+        if case .lightning(_, _, _, let pi, _, _, _, _, _, _, _, _, _, _) = p.details {
+            preimage = pi
+        }
+        return Payment(
             id: p.txId ?? p.destination ?? UUID().uuidString,
             amountSats: Int64(p.amountSat),
             isIncoming: p.paymentType == .receive,
             timestamp: Date(timeIntervalSince1970: TimeInterval(p.timestamp)),
             note: nil,
-            feesSats: Int64(p.feesSat)
+            feesSats: Int64(p.feesSat),
+            preimage: preimage
         )
     }
 
