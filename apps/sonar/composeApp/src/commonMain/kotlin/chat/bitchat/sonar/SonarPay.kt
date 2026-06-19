@@ -37,7 +37,12 @@ sealed interface PayLine {
 internal fun randomPayId(): String =
     (0 until 16).map { "0123456789abcdef".random() }.joinToString("")
 
-/** Lifecycle of a direct payment receipt, mirrored from the iOS ledger. */
+/**
+ * Lifecycle of a direct payment receipt, mirrored from the iOS ledger.
+ * [Claiming], [Settling], and [Failed] are vestigial — kept only for
+ * deserializing previously persisted rows from older builds. New protocol
+ * flows only produce [Sealed] and [Claimed] entries.
+ */
 enum class PayStatus { Sealed, Claiming, Settling, Claimed, Failed }
 
 /** One tracked coin. */

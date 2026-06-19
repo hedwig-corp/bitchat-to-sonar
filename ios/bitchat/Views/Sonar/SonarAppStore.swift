@@ -2999,31 +2999,27 @@ final class SonarAppStore: ObservableObject {
         ))
         Task { [weak self] in
             guard let self else { return }
+            let payment: SonarWalletPayment
             do {
-                let payment = try await self.wallet.send(
+                payment = try await self.wallet.send(
                     destination: offer,
                     amountSats: sats,
                     note: "Sonar payment \(activityId)"
                 )
-                self.paymentActivityLedger.markPaid(activityId, payment: payment)
-                // Record as already-claimed in the pay ledger so the sender's
-                // own transcript renders the bubble via payMapping (not only
-                // paymentActivityRows). processIncomingPayLines skips self
-                // messages, so this manual record is required.
-                self.payLedger.record(SonarPayEntry(
-                    id: activityId, peerKey: id, sats: sats,
-                    direction: .outgoing, state: .claimed, via: via.rawValue
-                ))
-                // Notify the receiver: a ⚡PAY receipt followed immediately
-                // by ⚡PAYDONE. The receiver's processIncomingPayLines records
-                // the receipt as incoming/pending, then transitions it to claimed —
-                // showing "Added to your balance" with no claim step.
-                self.sendDm(id, SonarPayMessage.pay(id: activityId, sats: sats).encoded())
-                self.sendDm(id, SonarPayMessage.done(id: activityId).encoded())
             } catch {
                 self.paymentActivityLedger.markFailed(activityId, message: error.localizedDescription)
                 SecureLogger.error("Sonar direct payment failed: \(error)", category: .session)
+                return
             }
+            // Wallet settled — record locally before sending receipts so the
+            // ledger is consistent even if the chat send path ever fails.
+            self.paymentActivityLedger.markPaid(activityId, payment: payment)
+            self.payLedger.record(SonarPayEntry(
+                id: activityId, peerKey: id, sats: sats,
+                direction: .outgoing, state: .claimed, via: via.rawValue
+            ))
+            self.sendDm(id, SonarPayMessage.pay(id: activityId, sats: sats).encoded())
+            self.sendDm(id, SonarPayMessage.done(id: activityId).encoded())
         }
         return nil
     }
