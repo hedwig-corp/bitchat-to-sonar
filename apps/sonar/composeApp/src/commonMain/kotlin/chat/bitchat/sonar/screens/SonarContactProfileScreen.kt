@@ -19,6 +19,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -98,6 +99,9 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
     val verified = state.isVerified(effectiveChatId)
     val canCall = state.canCall(effectiveChatId)
     val canPay = state.hasDirectPaymentRoute(effectiveChatId)
+    LaunchedEffect(effectiveChatId) {
+        state.refreshDescriptorForChat(effectiveChatId)
+    }
 
     fun openPaySheetOrRetry() {
         scope.launch {

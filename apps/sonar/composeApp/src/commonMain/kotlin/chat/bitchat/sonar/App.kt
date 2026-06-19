@@ -612,7 +612,10 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             if (message != null) state.toast = message else paySheet = true
         }
     }
-    LaunchedEffect(screen.id) { if (screen.pay) openPaySheetOrRetry() }
+    LaunchedEffect(screen.id) {
+        state.refreshDescriptorForChat(screen.id)
+        if (screen.pay) openPaySheetOrRetry()
+    }
     val listState = rememberLazyListState()
     // Transcript feed = chat messages (pay control lines collapsed) + mocked
     // call-log records, merged chronologically.

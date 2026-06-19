@@ -420,8 +420,10 @@ final class SonarAppStore: ObservableObject {
     /// commits to a plain Bitchat row.
     private var meshPeerFirstSeenAt: [String: Date] = [:]
     private var pendingCapabilityRefreshKeys = Set<String>()
+    private var publishedCallDescriptor = false
     private var publishedBolt12Offer: String?
     private var publishingPaymentMetadata = false
+    private var needsPaymentMetadataPublish = false
     private var refreshedKnownDescriptorsForRelaySession = false
     private var incomingWalletTask: Task<Void, Never>?
 
@@ -524,14 +526,14 @@ final class SonarAppStore: ObservableObject {
                 #if os(iOS) || os(macOS)
                 if npub != nil { (self.wallet as? BridgedWallet)?.retrySetup() }
                 #endif
-                if npub != nil { self.publishPaymentMetadataIfNeeded() }
+                if npub != nil { self.publishPaymentMetadataIfNeeded(force: true) }
             }
             .store(in: &cancellables)
         marmot.$relayConnected
             .receive(on: DispatchQueue.main)
             .sink { [weak self] connected in
                 guard let self, connected else { return }
-                self.publishPaymentMetadataIfNeeded()
+                self.publishPaymentMetadataIfNeeded(force: true)
                 guard !self.refreshedKnownDescriptorsForRelaySession else { return }
                 self.refreshedKnownDescriptorsForRelaySession = true
                 self.refreshKnownContactDescriptors(clearMisses: true)
@@ -859,8 +861,9 @@ final class SonarAppStore: ObservableObject {
         updateReceiverAdvertising()
         if cameToForeground {
             refreshKnownContactDescriptors()
+            publishedCallDescriptor = false
             publishedBolt12Offer = nil
-            publishPaymentMetadataIfNeeded()
+            publishPaymentMetadataIfNeeded(force: true)
         }
     }
 
@@ -1274,20 +1277,47 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
-    private func publishPaymentMetadataIfNeeded() {
+    private func publishPaymentMetadataIfNeeded(force: Bool = false) {
         guard marmot.npub != nil, marmot.relayConnected else { return }
-        guard !publishingPaymentMetadata else { return }
+        guard !publishingPaymentMetadata else {
+            needsPaymentMetadataPublish = true
+            return
+        }
         publishingPaymentMetadata = true
         Task { [weak self] in
             guard let self else { return }
-            defer { self.publishingPaymentMetadata = false }
-            guard case .ready = self.walletState else { return }
+            defer {
+                self.publishingPaymentMetadata = false
+                if self.needsPaymentMetadataPublish {
+                    self.needsPaymentMetadataPublish = false
+                    self.publishPaymentMetadataIfNeeded(force: true)
+                }
+            }
+            let offer: String?
+            switch self.walletState {
+            case .ready:
+                do {
+                    offer = try await self.wallet.createOffer()
+                    guard case .ready = self.walletState else { return }
+                } catch {
+                    SecureLogger.error("Sonar descriptor payment metadata publish failed: \(error)", category: .session)
+                    return
+                }
+            case .settingUp:
+                return
+            case .notConfigured:
+                // Keep call signaling discoverable for users without a ready
+                // wallet, but do not overwrite a known offer with nil.
+                guard self.publishedBolt12Offer == nil else { return }
+                offer = nil
+            }
+            guard force || !self.publishedCallDescriptor || self.publishedBolt12Offer != offer else { return }
             do {
-                let offer = try await self.wallet.createOffer()
-                guard case .ready = self.walletState else { return }
-                guard self.publishedBolt12Offer != offer else { return }
                 try await self.marmot.publishSonarDescriptor(bolt12Offer: offer)
-                guard case .ready = self.walletState else { return }
+                if offer != nil {
+                    guard case .ready = self.walletState else { return }
+                }
+                self.publishedCallDescriptor = true
                 self.publishedBolt12Offer = offer
             } catch {
                 SecureLogger.error("Sonar descriptor payment metadata publish failed: \(error)", category: .session)
@@ -2265,6 +2295,27 @@ final class SonarAppStore: ObservableObject {
         chatViewModel.sendPrivateMessage(text, to: PeerID(str: id))
     }
 
+    private func sendPaymentReceiptLines(_ lines: [String], to id: String) async -> Bool {
+        guard !lines.isEmpty else { return true }
+        if meshReachable(id) {
+            for line in lines { chatViewModel.sendPrivateMessage(line, to: PeerID(str: id)) }
+            return true
+        }
+        if let groupId = marmotGroupId(id) {
+            return await marmot.send(lines, to: groupId)
+        }
+        if let profile = resolvedSonarProfile(id) {
+            if let group = marmotGroup(forNpub: profile.npub) {
+                return await marmot.send(lines, to: group.id)
+            }
+            marmot.connectIfNeeded()
+            guard let groupId = await marmot.startChatReturningId(with: profile.npub) else { return false }
+            return await marmot.send(lines, to: groupId)
+        }
+        for line in lines { chatViewModel.sendPrivateMessage(line, to: PeerID(str: id)) }
+        return true
+    }
+
     private func sendOverMarmot(_ text: String, npub: String) {
         if let group = marmotGroup(forNpub: npub) {
             marmot.send(text, to: group.id)
@@ -2987,29 +3038,35 @@ final class SonarAppStore: ObservableObject {
             destinationHash: Self.sha256Hex(offer),
             status: .pending
         ))
-        Task { [weak self] in
-            guard let self else { return }
-            let payment: SonarWalletPayment
-            do {
-                payment = try await self.wallet.send(
-                    destination: offer,
-                    amountSats: sats,
-                    note: "Sonar payment \(activityId)"
-                )
-            } catch {
-                self.paymentActivityLedger.markFailed(activityId, message: error.localizedDescription)
-                SecureLogger.error("Sonar direct payment failed: \(error)", category: .session)
-                return
-            }
-            // Wallet settled — record locally before sending receipts so the
-            // ledger is consistent even if the chat send path ever fails.
-            self.paymentActivityLedger.markPaid(activityId, payment: payment)
-            self.payLedger.record(SonarPayEntry(
-                id: activityId, peerKey: id, sats: sats,
-                direction: .outgoing, state: .claimed, via: via.rawValue
-            ))
-            self.sendDm(id, SonarPayMessage.pay(id: activityId, sats: sats).encoded())
-            self.sendDm(id, SonarPayMessage.done(id: activityId).encoded())
+        let payment: SonarWalletPayment
+        do {
+            payment = try await wallet.send(
+                destination: offer,
+                amountSats: sats,
+                note: "Sonar payment \(activityId)"
+            )
+        } catch {
+            paymentActivityLedger.markFailed(activityId, message: error.localizedDescription)
+            SecureLogger.error("Sonar direct payment failed: \(error)", category: .session)
+            return "Payment failed: \(error.localizedDescription)"
+        }
+        // Wallet settled — record locally before sending receipts so the
+        // ledger is consistent even if the chat send path ever fails.
+        paymentActivityLedger.markPaid(activityId, payment: payment)
+        payLedger.record(SonarPayEntry(
+            id: activityId, peerKey: id, sats: sats,
+            direction: .outgoing, state: .claimed, via: via.rawValue
+        ))
+        let receiptOk = await sendPaymentReceiptLines(
+            [
+                SonarPayMessage.pay(id: activityId, sats: sats).encoded(),
+                SonarPayMessage.done(id: activityId).encoded()
+            ],
+            to: id
+        )
+        if !receiptOk {
+            SecureLogger.error("Sonar direct payment receipt delivery failed", category: .session)
+            return "Payment sent but receipt delivery failed"
         }
         return nil
     }
@@ -3729,6 +3786,10 @@ final class SonarAppStore: ObservableObject {
         pendingPayPeer = nil
         localHydratingDMs = []
         clearMarmotConversationGroups()
+        publishedBolt12Offer = nil
+        publishedCallDescriptor = false
+        publishingPaymentMetadata = false
+        needsPaymentMetadataPublish = false
         refreshedKnownDescriptorsForRelaySession = false
         clearCallLogs()
         // The node is recreated by eraseChatsKeepIdentity → reset call state so
@@ -3788,7 +3849,9 @@ final class SonarAppStore: ObservableObject {
         incomingWalletTask?.cancel()
         incomingWalletTask = nil
         publishedBolt12Offer = nil
+        publishedCallDescriptor = false
         publishingPaymentMetadata = false
+        needsPaymentMetadataPublish = false
         refreshedKnownDescriptorsForRelaySession = false
         pendingMarmotSends = [:]
         // Forget every ⚡PAY coin and the Lightning wallet seed (separate

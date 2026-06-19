@@ -639,7 +639,10 @@ final class MarmotChatModel: ObservableObject {
     /// Use when the descriptor is missing and the caller needs it before
     /// proceeding (e.g. opening a pay sheet). When the descriptor is already
     /// cached and just stale, prefer the fire-and-forget `ensureSonarDescriptor`.
-    func fetchSonarDescriptorSync(_ npubToFetch: String) async -> MarmotService.SonarDescriptor? {
+    func fetchSonarDescriptorSync(
+        _ npubToFetch: String,
+        bypassRecentMiss: Bool = true
+    ) async -> MarmotService.SonarDescriptor? {
         guard !npubToFetch.isEmpty, npubToFetch != npub else { return nil }
         let cached = sonarDescriptorsByNpub[npubToFetch]
         let hasBolt12 = cached?.bolt12Offer?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
@@ -648,7 +651,8 @@ final class MarmotChatModel: ObservableObject {
            Date().timeIntervalSince(fetchedAt) < Self.sonarDescriptorRefreshInterval {
             return cached
         }
-        if let miss = sonarDescriptorMissesByNpub[npubToFetch],
+        if !bypassRecentMiss,
+           let miss = sonarDescriptorMissesByNpub[npubToFetch],
            Date().timeIntervalSince(miss) < Self.sonarDescriptorMissRetryInterval {
             return sonarDescriptorsByNpub[npubToFetch]
         }
@@ -792,6 +796,28 @@ final class MarmotChatModel: ObservableObject {
             } catch {
                 self.errorText = Self.describe(error)
             }
+        }
+    }
+
+    func send(_ texts: [String], to groupId: String) async -> Bool {
+        let trimmed = texts
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !trimmed.isEmpty else { return true }
+        do {
+            guard await ensureConnected() else {
+                throw MarmotService.ServiceError.notConnected
+            }
+            await loadLocalPage(groupId: groupId)
+            for text in trimmed {
+                try await service.sendText(groupId: groupId, text: text)
+            }
+            await loadLocalPage(groupId: groupId)
+            await refreshWhenConnected(groupId: groupId, hydrateBeforeSync: false)
+            return true
+        } catch {
+            self.errorText = Self.describe(error)
+            return false
         }
     }
 

@@ -189,6 +189,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             linkByFp.clear(); linkCapsByFp.clear(); foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
             sonarDescriptorsByNpubHex = emptyMap()
             sonarDescriptorFetches.clear(); sonarDescriptorFetchedAt.clear(); sonarDescriptorMissedAt.clear()
+            publishedSonarDescriptor = false; publishedSonarDescriptorBolt12Offer = null; publishingSonarDescriptor = false
+            needsSonarDescriptorPublish = false
             rawMeshPeerIds = emptySet(); meshPeerFirstSeenMs.clear(); pendingCapabilityRefreshPeers.clear()
             profilesByNpub = emptyMap(); profileFetches.clear()
             outbox.clear()
@@ -677,9 +679,15 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         paymentNpubHex(chatId)?.let {
             if (sonarDescriptorsByNpubHex[it]?.bolt12Offer?.isNotBlank() == true) return true
-            ensureSonarDescriptorHex(it)
         }
         return false
+    }
+
+    fun refreshDescriptorForChat(chatId: String) {
+        val keys = mutableSetOf<String>()
+        paymentNpubHex(chatId)?.let { keys.add(it.lowercase()) }
+        callDescriptorNpubHex(chatId)?.let { keys.add(it.lowercase()) }
+        keys.forEach { ensureSonarDescriptorHex(it) }
     }
 
     fun groupInviteContacts(excluding: Set<String> = emptySet()): List<GroupContact> {
@@ -819,6 +827,10 @@ class SonarAppState(private val scope: CoroutineScope) {
     var currency by mutableStateOf(WalletBridge.currency())
         private set
     private var rate: ExchangeRate? = WalletBridge.cachedRate(currency)
+    private var publishedSonarDescriptor = false
+    private var publishedSonarDescriptorBolt12Offer: String? = null
+    private var publishingSonarDescriptor = false
+    private var needsSonarDescriptorPublish = false
 
     /** Money label honoring the fiat/sats preference + live rate (iOS rule). */
     fun money(sats: Long): String = Money.format(sats, showFiat, currency, rate)
@@ -841,19 +853,51 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private fun setupWallet() {
-        if (!walletAvailable) return
+        if (!walletAvailable) {
+            scope.launch { publishSonarDescriptorIfNeeded(force = true) }
+            return
+        }
         scope.launch {
             WalletBridge.setupIfNeeded(SonarCore.identityNsec())
             walletState = WalletBridge.state()
             WalletBridge.fetchRates()
             rate = WalletBridge.cachedRate(currency)
-            val receiveOffer = if (walletState is WalletState.Ready) {
-                runCatching { WalletBridge.createOffer() }.getOrNull()
-            } else {
-                null
+            publishSonarDescriptorIfNeeded(force = true)
+        }
+    }
+
+    private suspend fun publishSonarDescriptorIfNeeded(force: Boolean = false) {
+        if (publishingSonarDescriptor) {
+            needsSonarDescriptorPublish = true
+            return
+        }
+        publishingSonarDescriptor = true
+        try {
+            val offer = when (walletState) {
+                is WalletState.Ready -> {
+                    val created = runCatching { WalletBridge.createOffer() }.getOrNull()
+                    if (created == null && !publishedSonarDescriptor) return
+                    created ?: publishedSonarDescriptorBolt12Offer
+                }
+                WalletState.SettingUp -> return
+                else -> {
+                    if (publishedSonarDescriptorBolt12Offer != null) return
+                    null
+                }
             }
-            if (receiveOffer != null) {
-                runCatching { SonarCore.publishSonarDescriptor(callsEnabled = true, bolt12Offer = receiveOffer) }
+            if (!force && publishedSonarDescriptor && publishedSonarDescriptorBolt12Offer == offer) return
+            val published = runCatching {
+                SonarCore.publishSonarDescriptor(callsEnabled = true, bolt12Offer = offer)
+            }.isSuccess
+            if (published) {
+                publishedSonarDescriptor = true
+                publishedSonarDescriptorBolt12Offer = offer
+            }
+        } finally {
+            publishingSonarDescriptor = false
+            if (needsSonarDescriptorPublish) {
+                needsSonarDescriptorPublish = false
+                publishSonarDescriptorIfNeeded(force = true)
             }
         }
     }
@@ -932,10 +976,13 @@ class SonarAppState(private val scope: CoroutineScope) {
                     persistPay()
                     payVersion++
                 }
-                val receiptOk = runCatching {
-                    send(chatId, PayLine.Pay(payId, sats).encoded())
-                    send(chatId, PayLine.Done(payId).encoded())
-                }.isSuccess
+                val receiptOk = sendPaymentReceiptLines(
+                    chatId,
+                    listOf(
+                        PayLine.Pay(payId, sats).encoded(),
+                        PayLine.Done(payId).encoded(),
+                    ),
+                )
                 if (!receiptOk) {
                     toast = "Payment sent but receipt delivery failed"
                 }
@@ -944,6 +991,43 @@ class SonarAppState(private val scope: CoroutineScope) {
             }
         }
         return null
+    }
+
+    private suspend fun sendPaymentReceiptLines(chatId: String, lines: List<String>): Boolean {
+        val clean = lines.map { it.trim() }.filter { it.isNotEmpty() }
+        if (clean.isEmpty()) return true
+        if (isMeshChat(chatId)) {
+            val peerId = meshPeerId(chatId)
+            if (hasLiveMeshRoute(peerId)) {
+                return clean.all { sendMesh(peerId, it) }
+            }
+            val raw = npubRawFor(peerId) ?: return false
+            return sendPaymentReceiptLinesOverMarmot(
+                ensureMarmotGroupForOutbox(peerId, raw) ?: return false,
+                clean,
+                refreshPeerId = peerId,
+            )
+        }
+        return sendPaymentReceiptLinesOverMarmot(chatId, clean, refreshPeerId = null)
+    }
+
+    private suspend fun sendPaymentReceiptLinesOverMarmot(
+        groupId: String,
+        lines: List<String>,
+        refreshPeerId: String?,
+    ): Boolean = try {
+        for (line in lines) {
+            SonarCore.send(groupId, line)
+        }
+        if (refreshPeerId != null) {
+            refreshOpenDm(refreshPeerId)
+        } else if ((screen as? Screen.Chat)?.id == groupId) {
+            messages = withSendEchoes(groupId, mergePendingMediaUploads(groupId, marmotMessagesPage(groupId)))
+            processPayLines(groupId, messages)
+        }
+        true
+    } catch (_: Throwable) {
+        false
     }
 
     /** Scan a chat's transcript for ⚡PAY control lines and drive the state machine. */
@@ -1308,14 +1392,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             else if (AppLock.isEnabled()) locked = true   // genuine app-switch → re-lock
             if (started) {
                 refreshKnownContactDescriptors(clearMisses = false)
-                scope.launch {
-                    val offer = if (walletState is WalletState.Ready) {
-                        runCatching { WalletBridge.createOffer() }.getOrNull()
-                    } else null
-                    if (offer != null) {
-                        runCatching { SonarCore.publishSonarDescriptor(callsEnabled = true, bolt12Offer = offer) }
-                    }
-                }
+                scope.launch { publishSonarDescriptorIfNeeded(force = true) }
             }
         }
         // Unify receiver is foreground-only (matches iOS) — react immediately.
@@ -1361,8 +1438,8 @@ class SonarAppState(private val scope: CoroutineScope) {
                 refreshMeshIdentity()
                 // Publish our kind-0 profile so peers see our nickname, not npub.
                 launch { runCatching { SonarCore.publishProfile(nick) } }
-                // Descriptor publish is deferred until the wallet is ready so we
-                // never overwrite a bolt12-bearing event with a bolt12-less one.
+                // Descriptor publish runs after wallet setup so call metadata is
+                // discoverable without racing a wallet-ready BOLT12 offer.
                 // Hydrate BLE-mesh transcripts from disk so private mesh chats
                 // survive a restart (parity with the iOS MessageStore). Precedes
                 // refreshMeshDmRows so the Messages list is populated at launch.
@@ -1461,7 +1538,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
-    private suspend fun fetchSonarDescriptorSync(npubHex: String): SonarDescriptor? {
+    private suspend fun fetchSonarDescriptorSync(
+        npubHex: String,
+        bypassRecentMiss: Boolean = true,
+    ): SonarDescriptor? {
         val key = npubHex.lowercase()
         val now = SonarClock.nowSecs()
         val cached = sonarDescriptorsByNpubHex[key]
@@ -1471,7 +1551,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             return cached
         }
         val missedAt = sonarDescriptorMissedAt[key]
-        if (missedAt != null && now - missedAt < SONAR_DESCRIPTOR_MISS_TTL_SECS) {
+        if (!bypassRecentMiss && missedAt != null && now - missedAt < SONAR_DESCRIPTOR_MISS_TTL_SECS) {
             return sonarDescriptorsByNpubHex[key]
         }
         sonarDescriptorFetches.add(key)
@@ -2478,13 +2558,8 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private fun marmotChatCallCapable(chatId: String): Boolean {
-        val other = chats.firstOrNull { it.id == chatId }
-            ?.members
-            ?.firstOrNull { it != npub && it.isNotBlank() }
-            ?: return false
-        val npubHex = canonicalNpubHex(other) ?: return false
+        val npubHex = marmotChatPeerNpubHex(chatId) ?: return false
         sonarDescriptorsByNpubHex[npubHex]?.let { if (it.supportsCurrentCalls) return true }
-        ensureSonarDescriptorHex(npubHex)
         return false
     }
 
@@ -2493,8 +2568,22 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (((linkCapsByFp[peerId] ?: 0) and SonarAnnounce.CAP_CALLS) != 0) return true
         val npubHex = npubRawFor(peerId)?.toHexLower() ?: return false
         sonarDescriptorsByNpubHex[npubHex]?.let { if (it.supportsCurrentCalls) return true }
-        ensureSonarDescriptorHex(npubHex)
         return false
+    }
+
+    private fun callDescriptorNpubHex(chatId: String): String? {
+        val peerId = if (isMeshChat(chatId)) meshPeerId(chatId) else peerIdForMarmotGroup(chatId)
+        return if (peerId == null) marmotChatPeerNpubHex(chatId) else npubRawFor(peerId)?.toHexLower()
+    }
+
+    private fun marmotChatPeerNpubHex(chatId: String): String? {
+        val mine = canonicalProfileKey(npub)
+        val other = chats.firstOrNull { it.id == chatId }
+            ?.members
+            ?.map { canonicalProfileKey(it) }
+            ?.firstOrNull { it != mine && it.isNotBlank() }
+            ?: return null
+        return canonicalNpubHex(other)
     }
 
     private fun randomMeshId(): String =
