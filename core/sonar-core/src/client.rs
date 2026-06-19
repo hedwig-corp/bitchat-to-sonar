@@ -881,8 +881,29 @@ impl SonarClient {
 
     /// Start a 1:1 DM group with `peer`: fetch their KeyPackage, create the MLS
     /// group, and deliver the gift-wrapped welcome.
+    ///
+    /// If a 1:1 group with `peer` already exists, returns its id instead of
+    /// creating a duplicate.
     pub async fn start_dm(&self, peer: PublicKey, name: &str) -> Result<GroupId> {
+        if let Some(existing) = self.find_dm_group_with(&peer) {
+            return Ok(existing);
+        }
         self.start_group(vec![peer], name).await
+    }
+
+    /// Scan active groups for an existing 1:1 DM with `peer`.
+    fn find_dm_group_with(&self, peer: &PublicKey) -> Option<GroupId> {
+        let groups = self.engine.groups().ok()?;
+        let me = self.identity().public_key();
+        for group in groups {
+            let Ok(members) = self.engine.members(&group.mls_group_id) else {
+                continue;
+            };
+            if members.len() == 2 && members.contains(peer) && members.contains(&me) {
+                return Some(group.mls_group_id);
+            }
+        }
+        None
     }
 
     async fn publish_group_creation(&self, creation: GroupCreation) -> Result<GroupId> {
