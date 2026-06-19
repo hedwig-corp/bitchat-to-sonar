@@ -718,7 +718,9 @@ final class MarmotChatModel: ObservableObject {
         do {
             let groupId = try await service.startDirectMessage(with: trimmed, name: "")
             await loadLocalPage(groupId: groupId)
-            await refreshWhenConnected(groupId: groupId, hydrateBeforeSync: false)
+            Task { [weak self] in
+                await self?.refreshWhenConnected(groupId: groupId, hydrateBeforeSync: false)
+            }
             return groupId
         } catch {
             self.errorText = Self.describe(error)
