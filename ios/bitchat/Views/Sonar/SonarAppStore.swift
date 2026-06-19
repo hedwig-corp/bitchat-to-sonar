@@ -2058,8 +2058,9 @@ final class SonarAppStore: ObservableObject {
         // The coin renders with the transport it traveled over (recorded in
         // the ledger), not the conversation's current reachability.
         let via = entry.flatMap { SNVia(rawValue: $0.via) } ?? fallbackVia
+        let isDirect = paymentActivityLedger.entries[pid] != nil
         return .bubble(
-            SNPayInfo(id: pid, sats: entry?.sats ?? sats, state: entry?.state ?? .sealed),
+            SNPayInfo(id: pid, sats: entry?.sats ?? sats, state: entry?.state ?? .sealed, direct: isDirect),
             via
         )
     }
