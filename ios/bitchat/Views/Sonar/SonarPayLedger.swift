@@ -3,13 +3,11 @@
 // bitchat
 //
 // ⚡PAY: the Sonar payment convention inside normal encrypted chat content
-// (spec: docs/SONAR-PAYMENTS.md). A payment is a "sealed coin" message that
-// rides the same rails as any DM (Bluetooth mesh or internet); actual sats
-// settle over Lightning when the receiver claims it:
+// (spec: docs/SONAR-PAYMENTS.md). Payments settle over Lightning first, then
+// ride the same encrypted chat rails as receipt/control lines:
 //
-//   sender   →  ⚡PAY|1|<uuid>|<sats>          sealed coin appears in chat
-//   receiver →  ⚡PAYCLAIM|1|<uuid>|<bolt12>   tap-to-claim, sends an offer
-//   sender   →  ⚡PAYDONE|1|<uuid>             paid the offer, coin reveals
+//   sender →  ⚡PAY|1|<uuid>|<sats>   payment receipt appears in chat
+//   sender →  ⚡PAYDONE|1|<uuid>      confirms the Lightning payment settled
 //
 // Lines are only ever sent to Sonar-capable counterparts; on anything else
 // (or an unknown version) they harmlessly render as plain text.
@@ -23,25 +21,21 @@ import Foundation
 
 // MARK: - ⚡PAY codec
 
-/// One ⚡PAY control line. Field separator is `|`; the bolt12 offer is the
-/// last field of CLAIM so bech32 content never collides with the separator.
+/// One ⚡PAY control line. Field separator is `|`.
 enum SonarPayMessage: Equatable {
     static let version = 1
 
     private static let payPrefix = "\u{26A1}PAY|"
-    private static let claimPrefix = "\u{26A1}PAYCLAIM|"
     private static let donePrefix = "\u{26A1}PAYDONE|"
 
-    /// Sealed coin: `⚡PAY|1|<uuid>|<sats>`.
+    /// Payment receipt: `⚡PAY|1|<uuid>|<sats>`.
     case pay(id: String, sats: Int64)
-    /// Claim with a BOLT12 offer: `⚡PAYCLAIM|1|<uuid>|<bolt12offer>`.
-    case claim(id: String, offer: String)
     /// Settled: `⚡PAYDONE|1|<uuid>`.
     case done(id: String)
 
     var id: String {
         switch self {
-        case .pay(let id, _), .claim(let id, _), .done(let id): return id
+        case .pay(let id, _), .done(let id): return id
         }
     }
 
@@ -49,8 +43,6 @@ enum SonarPayMessage: Equatable {
         switch self {
         case .pay(let id, let sats):
             return "\(Self.payPrefix)\(Self.version)|\(id)|\(sats)"
-        case .claim(let id, let offer):
-            return "\(Self.claimPrefix)\(Self.version)|\(id)|\(offer)"
         case .done(let id):
             return "\(Self.donePrefix)\(Self.version)|\(id)"
         }
@@ -59,19 +51,7 @@ enum SonarPayMessage: Equatable {
     /// Strict decode: nil for anything that isn't a well-formed v1 line
     /// (unknown versions fall back to plain text on purpose).
     static func decode(_ text: String) -> SonarPayMessage? {
-        // Longest prefixes first: ⚡PAYCLAIM/⚡PAYDONE also start with ⚡PAY.
-        if text.hasPrefix(claimPrefix) {
-            let rest = text.dropFirst(claimPrefix.count)
-            // version | uuid | offer (offer may itself never contain '|',
-            // bech32 forbids it, but split conservatively anyway)
-            let parts = rest.split(separator: "|", maxSplits: 2, omittingEmptySubsequences: false)
-            guard parts.count == 3,
-                  Int(parts[0]) == version,
-                  isValidID(parts[1]),
-                  !parts[2].isEmpty
-            else { return nil }
-            return .claim(id: String(parts[1]), offer: String(parts[2]))
-        }
+        // DONE also starts with "⚡PAY", so check it first.
         if text.hasPrefix(donePrefix) {
             let rest = text.dropFirst(donePrefix.count)
             let parts = rest.split(separator: "|", omittingEmptySubsequences: false)
@@ -108,8 +88,8 @@ struct SonarPayEntry: Codable, Equatable {
         case incoming
     }
 
-    /// sealed → claiming (receiver sent the offer) / settling (sender is
-    /// paying the offer) → claimed. Failures fall back to sealed.
+    /// Direct receipts use sealed/pending → claimed. The claiming/settling cases
+    /// remain decodeable for previously persisted rows from older builds.
     enum State: String, Codable {
         case sealed
         case claiming
@@ -123,7 +103,7 @@ struct SonarPayEntry: Codable, Equatable {
     let sats: Int64
     let direction: Direction
     var state: State
-    /// Transport the sealed coin traveled over ("mesh"/"internet").
+    /// Transport the receipt traveled over ("mesh"/"internet").
     let via: String
 }
 
@@ -181,22 +161,14 @@ final class SonarPayLedger: ObservableObject {
         return transition(id, to: .claimed)
     }
 
-    /// Allowed transitions:
-    ///   sealed   → claiming (receiver sent ⚡PAYCLAIM)
-    ///   sealed   → settling (sender received ⚡PAYCLAIM, paying)
-    ///   claiming → claimed  (receiver got ⚡PAYDONE)
-    ///   settling → claimed  (sender's Lightning payment succeeded)
-    ///   sealed   → claimed  (⚡PAYDONE raced ahead of local state)
-    ///   claiming → sealed   (receiver's createOffer/send failed)
-    ///   settling → sealed   (sender's Lightning payment failed)
+    /// Allowed transitions: any pending receipt state can become claimed when
+    /// ⚡PAYDONE arrives. Old claiming/settling rows can still complete.
     @discardableResult
     func transition(_ id: String, to newState: SonarPayEntry.State) -> Bool {
         guard var entry = entries[id] else { return false }
         let allowed: Bool
         switch (entry.state, newState) {
-        case (.sealed, .claiming), (.sealed, .settling), (.sealed, .claimed),
-             (.claiming, .claimed), (.settling, .claimed),
-             (.claiming, .sealed), (.settling, .sealed):
+        case (.sealed, .claimed), (.claiming, .claimed), (.settling, .claimed):
             allowed = true
         default:
             allowed = false

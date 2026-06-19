@@ -7,8 +7,8 @@
 // real Lightning wallet (bitchat/Services/WalletBridgeService.swift) is
 // injected into SonarAppStore later — until then the app runs with
 // `UnconfiguredWallet`, which honestly reports "no wallet" everywhere:
-// the Settings row shows a "Set up" affordance, claiming a sealed payment
-// explains that a wallet is needed, and no fiat line is ever rendered
+// the Settings row shows a "Set up" affordance, direct sends stay unavailable,
+// and no fiat line is ever rendered
 // from a fake rate.
 //
 // Money display (fiat-by-default + bitcoin toggle, currency picker, fiat

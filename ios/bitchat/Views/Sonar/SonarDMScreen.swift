@@ -100,13 +100,6 @@ struct SonarDMScreen: View {
                     peerName: peer.name,
                     money: { store.money($0) },
                     fiatText: { store.moneySatsLine($0) },
-                    onClaim: { payId in
-                        if walletReady {
-                            store.claimPay(peerId, payId: payId)
-                        } else {
-                            walletSheet = true
-                        }
-                    },
                     loadMedia: { await store.mediaData($0) }
                 )
             }

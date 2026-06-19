@@ -50,23 +50,23 @@ read payments.receive[bolt12_offer]
 record activity: pending
 wallet.send(offer, sats)
 record activity: paid/failed
-                                             later: payment receipt event
-                                             proves settlement with preimage
+⚡PAY|1|<uuid>|<sats> --------------------> record incoming receipt: pending
+⚡PAYDONE|1|<uuid> -----------------------> mark receipt paid
 ```
 
 The current proof is the Lightning preimage. When
 `lightning/bolts#1295` lands, Sonar can add payer proofs without changing the
 descriptor shape because `future_proofs` already advertises that direction.
 
-Direct sends only unlock when a valid BOLT12 offer is present in
-`sonar.meta.v1`. Old BLE payment capability bits and old call-only descriptors
-do not unlock new sending.
+Direct sends require a valid BOLT12 offer from the peer's Sonar metadata. BLE
+payment capability bits may show the affordance while the descriptor is being
+fetched, but sending refuses until the concrete offer is available.
 
 ## Chat UX
 
-Money still appears inside the chat. A direct send creates a local gold payment
-bubble immediately, with state lines for sending, paid, or failed. There is no
-"tap to claim" step for these bubbles.
+Money still appears inside the chat. A direct send pays the receiver's wallet,
+then posts gold payment receipt bubbles using the encrypted chat transport.
+There is no "tap to claim" step for these bubbles.
 
 The wallet sheet also lists direct payment activity, newest first, including:
 
@@ -77,39 +77,24 @@ The wallet sheet also lists direct payment activity, newest first, including:
 - Status, amount, peer name, rail, wallet payment id, fee, and failure text
   when available.
 
-## Legacy compatibility: claimable `⚡PAY`
-
-Old Sonar clients may still send claimable chat payments. New clients keep the
-old receive path so those messages do not break.
-
-Legacy wire format:
+## Chat receipt wire format
 
 ```text
-⚡PAY|1|<uuid>|<sats>              sealed coin (sender -> receiver)
-⚡PAYCLAIM|1|<uuid>|<bolt12offer>  claim (receiver -> sender)
-⚡PAYDONE|1|<uuid>                 settled (sender -> receiver)
+⚡PAY|1|<uuid>|<sats>   payment receipt (sender -> receiver)
+⚡PAYDONE|1|<uuid>      settled receipt (sender -> receiver)
 ```
 
-Legacy settlement:
+`⚡PAY` is a receipt, not a Bitcoin claim primitive. `⚡PAYDONE` can race ahead of
+`⚡PAY` on relay-backed transports; clients remember that DONE and mark the
+matching incoming receipt paid once the `⚡PAY` line arrives. Unknown versions
+render as plain text. `⚡PAYCLAIM` is not part of the protocol.
 
-```text
-sender                                   receiver
-------                                   --------
-ledger: outgoing sealed
-⚡PAY ----------------------------------> ledger: incoming sealed
-                                          wallet.createOffer()
-ledger: sealed -> settling <------------ ⚡PAYCLAIM
-wallet.send(offer, sats)
-ledger: settling -> claimed
-⚡PAYDONE ------------------------------> ledger: claiming -> claimed
-```
-
-Unknown legacy versions render as plain text. Control-line processing is
-idempotent, so replaying old transcripts after relaunch is safe.
+Control-line processing is idempotent, so replaying transcripts after relaunch
+is safe.
 
 ## Local state
 
-`SonarPayLedger` stores legacy claimable coins in UserDefaults JSON under
+`SonarPayLedger` stores chat receipt rows in UserDefaults JSON under
 `sonar.pay.ledger.v1`: `{id, peerKey, sats, direction, state, via}`.
 
 `SonarPaymentActivityLedger` stores direct wallet payment activity under
@@ -124,13 +109,11 @@ destinationHash, status, walletPaymentId, feesSats, settledAt, failure
 Erase-all-chats clears both local ledgers because their rows render inside
 conversations. Emergency wipe also clears them and destroys the wallet seed.
 
-## Old schema behavior
+## Missing offer behavior
 
-When a peer has only the old schema:
+When a peer has no direct receive offer:
 
 - Calls can still use `sonar.call.v1`.
-- Incoming legacy `⚡PAY` can still be claimed.
 - New "Send money" is hidden because there is no direct receive offer to pay.
 
-This avoids presenting a claimable UX for a payment that can now settle
-directly, while keeping old peers readable during migration.
+This avoids presenting a claimable UX for a payment that now settles directly.

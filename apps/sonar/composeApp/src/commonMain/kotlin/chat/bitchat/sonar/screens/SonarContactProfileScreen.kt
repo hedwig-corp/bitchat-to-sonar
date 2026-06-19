@@ -30,12 +30,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import chat.bitchat.sonar.PayLine
 import chat.bitchat.sonar.PaySheet
 import chat.bitchat.sonar.Screen
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.canonicalProfileKey
-import chat.bitchat.sonar.randomPayId
 import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconName
 import chat.bitchat.sonar.ui.SNNavHeader
@@ -97,6 +95,11 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
     val verified = state.isVerified(effectiveChatId)
     val canCall = state.canCall(effectiveChatId)
     val canPay = state.hasDirectPaymentRoute(effectiveChatId)
+
+    fun openPaySheetOrRetry() {
+        val message = state.paymentDetailsUnavailableMessage(effectiveChatId)
+        if (message != null) state.toast = message else paySheet = true
+    }
 
     // Find shared groups: multi-member groups where both the local user and this
     // contact are members.
@@ -178,7 +181,7 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
                     icon = SNIconName.Coin,
                     label = "Pay",
                     enabled = canPay,
-                    onClick = { paySheet = true }
+                    onClick = { openPaySheetOrRetry() }
                 )
                 Spacer(Modifier.width(28.dp))
                 ActionCircle(
@@ -319,7 +322,7 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
             mesh = isMesh,
             fiatOf = { state.fiatOrNull(it) },
             onSend = { sats ->
-                state.send(effectiveChatId, PayLine.Pay(randomPayId(), sats).encoded())
+                state.sendPay(effectiveChatId, sats)?.let { state.toast = it }
             },
             onClose = { paySheet = false }
         )
