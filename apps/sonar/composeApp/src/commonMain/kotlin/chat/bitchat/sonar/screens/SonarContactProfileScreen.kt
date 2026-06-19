@@ -148,7 +148,15 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
                 ActionCircle(
                     icon = SNIconName.Lock,
                     label = "Message",
-                    onClick = { state.back() }
+                    onClick = {
+                        if (effectiveChatId != screen.chatId) {
+                            val dmChat = state.chats.firstOrNull { it.id == effectiveChatId }
+                            if (dmChat != null) state.openChat(dmChat)
+                            else state.back()
+                        } else {
+                            state.back()
+                        }
+                    }
                 )
                 Spacer(Modifier.width(28.dp))
                 ActionCircle(

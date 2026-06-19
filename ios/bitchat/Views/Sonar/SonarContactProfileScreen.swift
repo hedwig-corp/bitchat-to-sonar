@@ -103,7 +103,11 @@ struct SonarContactProfileScreen: View {
                     // ── Action buttons ──
                     HStack(spacing: 28) {
                         profileAction(icon: .lock, label: "Message") {
-                            store.pop()
+                            if effectiveChatId != peerId {
+                                store.push(.dm(effectiveChatId))
+                            } else {
+                                store.pop()
+                            }
                         }
                         profileAction(icon: .phone, label: "Call", enabled: store.canCall(effectiveChatId)) {
                             if store.canCall(effectiveChatId) {
