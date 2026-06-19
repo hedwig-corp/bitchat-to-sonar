@@ -24,6 +24,7 @@ import kotlinx.coroutines.launch
 
 private const val SONAR_DESCRIPTOR_TTL_SECS = 15 * 60L
 private const val SONAR_DESCRIPTOR_MISS_TTL_SECS = 60L
+private const val PROFILE_REFRESH_TTL_SECS = 30 * 60L
 private const val LOCAL_TRANSCRIPT_PAGE_LIMIT = 100
 private const val LOCAL_SUMMARY_PAGE_LIMIT = 20
 private const val LOCAL_SUMMARY_CHAT_LIMIT = 5
@@ -151,6 +152,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     var profilesByNpub by mutableStateOf(decodeProfileCache(SonarCore.loadBlob(PROFILE_CACHE_BLOB_KEY)))
         private set
     private val profileFetches = mutableSetOf<String>()
+    private val profileFetchedAt = mutableMapOf<String, Long>()
 
     init {
         if (initialChatSnapshotBlob.isNotEmpty()) {
@@ -1332,23 +1334,27 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun groupAuthorName(message: SonarMsg, isGroup: Boolean): String? {
         if (!isGroup || message.mine || message.senderNpub.isBlank()) return null
         return profilesByNpub[canonicalProfileKey(message.senderNpub)]?.bestName
-            ?: shortNpub(message.senderNpub)
+            ?: run { ensureProfile(message.senderNpub); shortNpub(message.senderNpub) }
     }
 
-    /** Fetch + cache a peer's kind-0 profile once, so their name replaces the
-     *  raw npub in the chat list/header. */
+    /** Fetch + cache a peer's kind-0 profile, so their name replaces the
+     *  raw npub in the chat list/header. Re-fetches after PROFILE_REFRESH_TTL_SECS. */
     fun ensureProfile(otherNpub: String) {
         val key = canonicalProfileKey(otherNpub)
         if (key.isBlank() || key == canonicalProfileKey(npub)) return
         val hadCachedProfile = profilesByNpub.containsKey(key) || profilesByNpub.containsKey(otherNpub)
+        val now = SonarClock.nowSecs()
+        val fetchedAt = profileFetchedAt[key]
+        val stale = hadCachedProfile && fetchedAt != null && now - fetchedAt >= PROFILE_REFRESH_TTL_SECS
+        if (stale) profileFetches.remove(key)
         if (!profileFetches.add(key)) return        // fetch already in flight
         scope.launch {
             val p = SonarCore.fetchProfile(key)
             if (p?.bestName != null) {
                 profilesByNpub = normalizedProfileCache(profilesByNpub + (key to p) - otherNpub)
+                profileFetchedAt[key] = SonarClock.nowSecs()
                 persistProfileCache()
             } else {
-                // Not published yet — allow a later retry (driven by poll()).
                 if (!hadCachedProfile) profileFetches.remove(key)
             }
         }
