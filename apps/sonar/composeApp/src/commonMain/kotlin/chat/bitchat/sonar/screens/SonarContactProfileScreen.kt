@@ -22,6 +22,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -30,6 +31,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.launch
 import chat.bitchat.sonar.PaySheet
 import chat.bitchat.sonar.Screen
 import chat.bitchat.sonar.SonarAppState
@@ -50,6 +52,7 @@ import chat.bitchat.sonar.ui.sonar
 @Composable
 fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfile) {
     val s = sonar
+    val scope = rememberCoroutineScope()
     var showVerify by remember { mutableStateOf(false) }
     var paySheet by remember { mutableStateOf(false) }
 
@@ -97,8 +100,10 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
     val canPay = state.hasDirectPaymentRoute(effectiveChatId)
 
     fun openPaySheetOrRetry() {
-        val message = state.paymentDetailsUnavailableMessage(effectiveChatId)
-        if (message != null) state.toast = message else paySheet = true
+        scope.launch {
+            val message = state.paymentDetailsUnavailableMessage(effectiveChatId)
+            if (message != null) state.toast = message else paySheet = true
+        }
     }
 
     // Find shared groups: multi-member groups where both the local user and this
@@ -322,7 +327,7 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
             mesh = isMesh,
             fiatOf = { state.fiatOrNull(it) },
             onSend = { sats ->
-                state.sendPay(effectiveChatId, sats)?.let { state.toast = it }
+                scope.launch { state.sendPay(effectiveChatId, sats)?.let { state.toast = it } }
             },
             onClose = { paySheet = false }
         )

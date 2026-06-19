@@ -33,8 +33,8 @@ final class NostrRelayManager: ObservableObject {
         "wss://nos.lol",
         "wss://relay.primal.net",
         "wss://offchain.pub",
-        "wss://nostr21.com"
-        // For local testing, you can add: "ws://localhost:8080"
+        "wss://nostr21.com",
+        "wss://relay.kaleidoswap.com",
     ]
     private static let defaultRelaySet = Set(defaultRelays)
     

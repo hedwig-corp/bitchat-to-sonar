@@ -32,6 +32,7 @@ actual object SonarCore {
         "wss://relay.damus.io",
         "wss://nos.lol",
         "wss://relay.primal.net",
+        "wss://relay.kaleidoswap.com",
     )
 
     private val lock = Mutex()

@@ -354,7 +354,6 @@ final class MarmotChatModel: ObservableObject {
                 self.errorText = nil
                 self.relayConnected = true
                 try? await self.service.publishKeyPackage()
-                try? await self.service.publishSonarDescriptor()
                 self.startPolling()
             } catch MarmotService.ServiceError.cancelled {
                 self.relayConnected = false
@@ -632,23 +631,47 @@ final class MarmotChatModel: ObservableObject {
         }
         guard descriptorFetches.insert(npubToFetch).inserted else { return }
         Task {
-            do {
-                let descriptor = try await service.fetchSonarDescriptor(npub: npubToFetch)
-                await MainActor.run {
-                    self.descriptorFetches.remove(npubToFetch)
-                    self.sonarDescriptorFetchedAtByNpub[npubToFetch] = Date()
-                    if let descriptor {
-                        self.sonarDescriptorsByNpub[npubToFetch] = descriptor
-                        self.sonarDescriptorMissesByNpub[npubToFetch] = nil
-                    } else {
-                        self.sonarDescriptorsByNpub.removeValue(forKey: npubToFetch)
-                        self.sonarDescriptorMissesByNpub[npubToFetch] = Date()
-                    }
+            await performDescriptorFetch(npubToFetch)
+        }
+    }
+
+    /// Synchronous variant: awaits the relay fetch and returns the descriptor.
+    /// Use when the descriptor is missing and the caller needs it before
+    /// proceeding (e.g. opening a pay sheet). When the descriptor is already
+    /// cached and just stale, prefer the fire-and-forget `ensureSonarDescriptor`.
+    func fetchSonarDescriptorSync(_ npubToFetch: String) async -> MarmotService.SonarDescriptor? {
+        guard !npubToFetch.isEmpty, npubToFetch != npub else { return nil }
+        if let cached = sonarDescriptorsByNpub[npubToFetch],
+           let fetchedAt = sonarDescriptorFetchedAtByNpub[npubToFetch],
+           Date().timeIntervalSince(fetchedAt) < Self.sonarDescriptorRefreshInterval {
+            return cached
+        }
+        if let miss = sonarDescriptorMissesByNpub[npubToFetch],
+           Date().timeIntervalSince(miss) < Self.sonarDescriptorMissRetryInterval {
+            return sonarDescriptorsByNpub[npubToFetch]
+        }
+        descriptorFetches.insert(npubToFetch)
+        await performDescriptorFetch(npubToFetch)
+        return sonarDescriptorsByNpub[npubToFetch]
+    }
+
+    private func performDescriptorFetch(_ npubToFetch: String) async {
+        do {
+            let descriptor = try await service.fetchSonarDescriptor(npub: npubToFetch)
+            await MainActor.run {
+                self.descriptorFetches.remove(npubToFetch)
+                self.sonarDescriptorFetchedAtByNpub[npubToFetch] = Date()
+                if let descriptor {
+                    self.sonarDescriptorsByNpub[npubToFetch] = descriptor
+                    self.sonarDescriptorMissesByNpub[npubToFetch] = nil
+                } else {
+                    self.sonarDescriptorsByNpub.removeValue(forKey: npubToFetch)
+                    self.sonarDescriptorMissesByNpub[npubToFetch] = Date()
                 }
-            } catch {
-                await MainActor.run {
-                    _ = self.descriptorFetches.remove(npubToFetch)
-                }
+            }
+        } catch {
+            await MainActor.run {
+                _ = self.descriptorFetches.remove(npubToFetch)
             }
         }
     }

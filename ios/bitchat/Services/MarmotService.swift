@@ -194,6 +194,7 @@ final class MarmotService: @unchecked Sendable {
         "wss://relay.damus.io",
         "wss://nos.lol",
         "wss://relay.primal.net",
+        "wss://relay.kaleidoswap.com",
     ]
 
     private let relayUrls: [String]

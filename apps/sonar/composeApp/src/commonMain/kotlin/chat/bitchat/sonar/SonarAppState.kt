@@ -675,7 +675,10 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (sonarProfile(peerId)?.speaksPay == true) return true
             if (((linkCapsByFp[peerId] ?: 0) and SonarAnnounce.CAP_PAY) != 0) return true
         }
-        paymentNpubHex(chatId)?.let { ensureSonarDescriptorHex(it) }
+        paymentNpubHex(chatId)?.let {
+            if (sonarDescriptorsByNpubHex[it]?.bolt12Offer?.isNotBlank() == true) return true
+            ensureSonarDescriptorHex(it)
+        }
         return false
     }
 
@@ -849,7 +852,9 @@ class SonarAppState(private val scope: CoroutineScope) {
             } else {
                 null
             }
-            runCatching { SonarCore.publishSonarDescriptor(callsEnabled = true, bolt12Offer = receiveOffer) }
+            if (receiveOffer != null) {
+                runCatching { SonarCore.publishSonarDescriptor(callsEnabled = true, bolt12Offer = receiveOffer) }
+            }
         }
     }
 
@@ -883,18 +888,36 @@ class SonarAppState(private val scope: CoroutineScope) {
         return sonarDescriptorsByNpubHex[npubHex]?.bolt12Offer?.takeIf { it.isNotBlank() }
     }
 
-    fun paymentDetailsUnavailableMessage(chatId: String): String? {
-        if (directPaymentOffer(chatId) != null) return null
-        paymentNpubHex(chatId)?.let { ensureSonarDescriptorHex(it) }
+    suspend fun paymentDetailsUnavailableMessage(chatId: String): String? {
+        val npubHex = paymentNpubHex(chatId) ?: return "Fetching payment details — try again in a moment."
+        val key = npubHex.lowercase()
+        val cached = sonarDescriptorsByNpubHex[key]
+        val hasBolt12 = cached?.bolt12Offer?.isNotBlank() == true
+        if (hasBolt12) {
+            ensureSonarDescriptorHex(npubHex)
+            return null
+        }
+        fetchSonarDescriptorSync(npubHex)
+        val fetched = sonarDescriptorsByNpubHex[key]
+        if (fetched?.bolt12Offer?.isNotBlank() == true) return null
         return "Fetching payment details — try again in a moment."
     }
 
-    fun sendPay(chatId: String, sats: Long): String? {
+    suspend fun sendPay(chatId: String, sats: Long): String? {
         if (sats <= 0) return null
         if (!walletAvailable || walletState !is WalletState.Ready) {
             return "Set up the wallet first."
         }
-        val offer = directPaymentOffer(chatId) ?: return paymentDetailsUnavailableMessage(chatId)
+        val npubHex = paymentNpubHex(chatId)
+        if (npubHex != null) {
+            val key = npubHex.lowercase()
+            val hasBolt12 = sonarDescriptorsByNpubHex[key]?.bolt12Offer?.isNotBlank() == true
+            if (!hasBolt12) {
+                fetchSonarDescriptorSync(npubHex)
+            }
+        }
+        val offer = directPaymentOffer(chatId)
+        if (offer == null) return "Fetching payment details — try again in a moment."
         val payId = randomPayId()
         scope.launch {
             var failureMessage: String? = null
@@ -1284,7 +1307,9 @@ class SonarAppState(private val scope: CoroutineScope) {
                     val offer = if (walletState is WalletState.Ready) {
                         runCatching { WalletBridge.createOffer() }.getOrNull()
                     } else null
-                    runCatching { SonarCore.publishSonarDescriptor(callsEnabled = true, bolt12Offer = offer) }
+                    if (offer != null) {
+                        runCatching { SonarCore.publishSonarDescriptor(callsEnabled = true, bolt12Offer = offer) }
+                    }
                 }
             }
         }
@@ -1331,9 +1356,8 @@ class SonarAppState(private val scope: CoroutineScope) {
                 refreshMeshIdentity()
                 // Publish our kind-0 profile so peers see our nickname, not npub.
                 launch { runCatching { SonarCore.publishProfile(nick) } }
-                // Publish the public Sonar descriptor so account-level peers can
-                // safely offer calls over White Noise/Marmot when BLE is absent.
-                launch { runCatching { SonarCore.publishSonarDescriptor(callsEnabled = true) } }
+                // Descriptor publish is deferred until the wallet is ready so we
+                // never overwrite a bolt12-bearing event with a bolt12-less one.
                 // Hydrate BLE-mesh transcripts from disk so private mesh chats
                 // survive a restart (parity with the iOS MessageStore). Precedes
                 // refreshMeshDmRows so the Messages list is populated at launch.
@@ -1428,16 +1452,36 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (missedAt != null && now - missedAt < SONAR_DESCRIPTOR_MISS_TTL_SECS) return
         if (!sonarDescriptorFetches.add(key)) return
         scope.launch {
-            val descriptor = runCatching { SonarCore.fetchSonarDescriptor(key) }.getOrNull()
-            if (descriptor != null) {
-                sonarDescriptorsByNpubHex = sonarDescriptorsByNpubHex + (key to descriptor)
-                sonarDescriptorFetchedAt[key] = SonarClock.nowSecs()
-                sonarDescriptorMissedAt.remove(key)
-            } else {
-                sonarDescriptorMissedAt[key] = SonarClock.nowSecs()
-            }
-            sonarDescriptorFetches.remove(key)
+            performDescriptorFetch(key)
         }
+    }
+
+    private suspend fun fetchSonarDescriptorSync(npubHex: String): SonarDescriptor? {
+        val key = npubHex.lowercase()
+        val now = SonarClock.nowSecs()
+        val fetchedAt = sonarDescriptorFetchedAt[key]
+        if (sonarDescriptorsByNpubHex[key] != null && fetchedAt != null && now - fetchedAt < SONAR_DESCRIPTOR_TTL_SECS) {
+            return sonarDescriptorsByNpubHex[key]
+        }
+        val missedAt = sonarDescriptorMissedAt[key]
+        if (missedAt != null && now - missedAt < SONAR_DESCRIPTOR_MISS_TTL_SECS) {
+            return sonarDescriptorsByNpubHex[key]
+        }
+        sonarDescriptorFetches.add(key)
+        performDescriptorFetch(key)
+        return sonarDescriptorsByNpubHex[key]
+    }
+
+    private suspend fun performDescriptorFetch(key: String) {
+        val descriptor = runCatching { SonarCore.fetchSonarDescriptor(key) }.getOrNull()
+        if (descriptor != null) {
+            sonarDescriptorsByNpubHex = sonarDescriptorsByNpubHex + (key to descriptor)
+            sonarDescriptorFetchedAt[key] = SonarClock.nowSecs()
+            sonarDescriptorMissedAt.remove(key)
+        } else {
+            sonarDescriptorMissedAt[key] = SonarClock.nowSecs()
+        }
+        sonarDescriptorFetches.remove(key)
     }
 
     private fun refreshKnownContactDescriptors(clearMisses: Boolean = false) {
