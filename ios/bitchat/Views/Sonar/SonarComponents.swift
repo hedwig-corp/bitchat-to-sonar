@@ -1746,22 +1746,10 @@ struct SNComposer: View {
                 }
             }
             if showEmojiTray && !slash {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) {
-                        ForEach(snQuickEmojis, id: \.self) { emoji in
-                            Button {
-                                text += emoji
-                            } label: {
-                                Text(verbatim: emoji)
-                                    .font(.system(size: 20))
-                                    .frame(width: 38, height: 38)
-                                    .background(Circle().fill(SonarTheme.surface2))
-                            }
-                            .buttonStyle(SNScaleStyle(scale: 0.94))
-                        }
-                    }
-                    .padding(EdgeInsets(top: 8, leading: 12, bottom: 2, trailing: 12))
-                }
+                SonarEmojiPickerView(
+                    onEmoji: { text += $0 },
+                    onClose: { showEmojiTray = false }
+                )
             }
             #if os(iOS)
             if let voiceError {

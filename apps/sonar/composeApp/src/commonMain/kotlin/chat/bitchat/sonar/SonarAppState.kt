@@ -44,6 +44,9 @@ sealed interface Screen {
     // ("mesh:<id>" for a Sonar peer) so the call log appends to the right
     // conversation; [video] picks voice vs video layout.
     data class Call(val peerId: String, val name: String, val video: Boolean) : Screen
+    data class ContactProfile(val chatId: String, val name: String) : Screen
+    data class GroupInfo(val chatId: String) : Screen
+    data object WalletActivity : Screen
 }
 
 /** A BLE-mesh DM conversation row for the home Messages list. */
@@ -706,6 +709,24 @@ class SonarAppState(private val scope: CoroutineScope) {
                 )
             }
 
+    fun allGroupMemberContacts(chatId: String): List<GroupContact> {
+        val chat = chats.firstOrNull { it.id == chatId } ?: return emptyList()
+        return chat.members
+            .map { canonicalProfileKey(it) }
+            .filter { it.isNotBlank() }
+            .distinct()
+            .map { member ->
+                ensureProfile(member)
+                val key = canonicalProfileKey(member)
+                GroupContact(
+                    id = member,
+                    title = profilesByNpub[key]?.bestName ?: shortNpub(member),
+                    subtitle = shortNpub(member),
+                    npub = member,
+                )
+            }
+    }
+
     fun groupMemberNpubs(chatId: String): Set<String> =
         chats.firstOrNull { it.id == chatId }?.members.orEmpty().toSet()
 
@@ -716,7 +737,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         sonarProfile(peerId)?.npub
             ?: linkByFp[peerId]?.hexToBytesOrEmpty()?.takeIf { it.size == 32 }
 
-    private fun npubStringForPeer(peerId: String): String? =
+    fun npubStringForPeer(peerId: String): String? =
         npubRawFor(peerId)?.let { Bech32.encode("npub", it) }
 
     private fun loadLinks() {
@@ -829,6 +850,8 @@ class SonarAppState(private val scope: CoroutineScope) {
         private set
 
     fun payStatus(uuid: String): PayStatus? = payLedger.get(uuid)?.status
+
+    fun walletPayEntries(): List<PayEntry> = payLedger.all()
 
     private fun persistPay() { SonarCore.saveBlob("pay.ledger", payLedger.serialize()) }
 
@@ -1450,7 +1473,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun back() {
         if (stack.size > 1) stack = stack.dropLast(1)
-        messages = emptyList()
+        if (stack.lastOrNull() !is Screen.Chat) messages = emptyList()
         scope.launch { refreshChats() }
     }
 
@@ -1876,6 +1899,10 @@ class SonarAppState(private val scope: CoroutineScope) {
                 toast = "couldn't send voice note: ${e.message}"
             }
         }
+    }
+
+    fun sendGifItem(chatId: String, item: SonarGifItem) {
+        send(chatId, item.mediaUrl)
     }
 
     /** Download + decrypt a media attachment, cached by URL. */

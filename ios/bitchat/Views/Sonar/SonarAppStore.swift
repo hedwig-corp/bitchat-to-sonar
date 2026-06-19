@@ -67,6 +67,9 @@ enum SonarRoute: Hashable {
     case profile
     /// Call route. Carries the DM peer id + kind.
     case call(String, video: Bool)
+    case contactProfile(String, String)
+    case groupInfo(String)
+    case walletActivity
 }
 
 // MARK: - View models consumed by the screens

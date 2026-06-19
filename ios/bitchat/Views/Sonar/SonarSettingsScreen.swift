@@ -69,7 +69,11 @@ struct SonarSettingsScreen: View {
                             value: walletValue,
                             divider: true
                         ) {
-                            walletSheet = true
+                            if case .ready = store.walletState {
+                                store.push(.walletActivity)
+                            } else {
+                                walletSheet = true
+                            }
                         }
                         // Show balance in fiat (default) or bitcoin (sats).
                         SNSettingsRow(

@@ -137,6 +137,9 @@ internal fun SonarScreenHost(state: SonarAppState) {
         is Screen.Channel -> chat.bitchat.sonar.screens.SonarChannelScreen(state, sc)
         is Screen.GeoDm -> GeoDmScreen(state, sc)
         is Screen.Call -> CallScreen(state, sc)
+        is Screen.ContactProfile -> chat.bitchat.sonar.screens.SonarContactProfileScreen(state, sc)
+        is Screen.GroupInfo -> chat.bitchat.sonar.screens.SonarGroupInfoScreen(state, sc)
+        is Screen.WalletActivity -> chat.bitchat.sonar.screens.SonarWalletActivityScreen(state)
     }
 }
 
@@ -651,7 +654,10 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             SNIconButton(SNIconName.Back, onClick = { state.back() })
             SonarAvatar(peerName, 36.dp, presence = false)
             Spacer(Modifier.width(10.dp))
-            Column(Modifier.weight(1f).clip(RoundedCornerShape(8.dp)).clickable(enabled = !isGroup) { verifySheet = true }) {
+            Column(Modifier.weight(1f).clip(RoundedCornerShape(8.dp)).clickable {
+                if (isGroup) state.push(Screen.GroupInfo(screen.id))
+                else state.push(Screen.ContactProfile(screen.id, peerName))
+            }) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
                         peerName, color = s.text, fontSize = 16.sp, fontWeight = FontWeight.Bold,
@@ -766,7 +772,14 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         }
 
         if (draft.startsWith("/")) SlashHints(draft) { draft = it }
-        if (emojiTray && !recording) EmojiTray { draft += it }
+        if (emojiTray && !recording) chat.bitchat.sonar.screens.SonarEmojiPicker(
+            onEmoji = { draft += it },
+            onGif = { item ->
+                emojiTray = false
+                state.sendGifItem(screen.id, item)
+            },
+            onClose = { emojiTray = false }
+        )
         // ONE composer row in BOTH states. Only the left (plus↔trash) and middle
         // (text field↔recording pill) swap; the mic Box on the right MUST stay
         // mounted while recording, or Compose cancels its hold-to-record gesture
@@ -1096,27 +1109,6 @@ private fun SlashHints(draft: String, onPick: (String) -> Unit) {
     }
 }
 
-private val quickEmojis = listOf("👍", "❤️", "😂", "🔥", "🙏", "👏", "🎉", "👀", "💯", "⚡")
-
-@Composable
-private fun EmojiTray(onPick: (String) -> Unit) {
-    val s = sonar
-    Row(
-        Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
-            .padding(start = 10.dp, end = 10.dp, top = 8.dp, bottom = 2.dp),
-        horizontalArrangement = Arrangement.spacedBy(8.dp)
-    ) {
-        quickEmojis.forEach { emoji ->
-            Box(
-                Modifier.size(38.dp).clip(CircleShape).background(s.surface2)
-                    .clickable { onPick(emoji) },
-                contentAlignment = Alignment.Center
-            ) {
-                Text(emoji, fontSize = 20.sp)
-            }
-        }
-    }
-}
 
 @Composable
 private fun VerifySheet(
