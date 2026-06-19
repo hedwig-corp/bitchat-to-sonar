@@ -789,6 +789,13 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                                 showState = m.mine && i == feed.lastIndex,
                                 onOpen = { mediaViewer = it }
                             )
+                        } else if (m.stickerRef != null) {
+                            StickerBubble(
+                                m,
+                                mesh = msgMesh,
+                                author = state.groupAuthorName(m, isGroup),
+                                showState = m.mine && i == feed.lastIndex,
+                            )
                         } else MessageBubble(
                             m,
                             msgMesh,
@@ -806,6 +813,10 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             onGif = { item ->
                 emojiTray = false
                 state.sendGifItem(screen.id, item)
+            },
+            onSticker = { sticker, packCoordinate ->
+                emojiTray = false
+                state.sendStickerItem(screen.id, sticker, packCoordinate)
             },
             onClose = { emojiTray = false }
         )
@@ -1340,6 +1351,47 @@ private fun MessageStatusFooter(m: SonarMsg, mesh: Boolean) {
             color = if (failed) s.danger else s.text3,
             fontSize = 11.sp,
         )
+    }
+}
+
+@Composable
+private fun StickerBubble(m: SonarMsg, mesh: Boolean = false, author: String? = null, showState: Boolean = false) {
+    val ref = m.stickerRef ?: return
+    val stickerUrl = "https://blossom.primal.net/${ref.plaintextSha256}.webp"
+    var imageBytes by remember(stickerUrl) { mutableStateOf<ByteArray?>(null) }
+    LaunchedEffect(stickerUrl) {
+        try { imageBytes = SonarCore.fetchStickerImage(stickerUrl) } catch (_: Throwable) {}
+    }
+    Column(
+        Modifier.fillMaxWidth().padding(vertical = 3.dp),
+        horizontalAlignment = if (m.mine) Alignment.End else Alignment.Start
+    ) {
+        if (!author.isNullOrBlank()) {
+            Text(
+                author,
+                color = sonar.text3,
+                fontSize = 11.5.sp,
+                modifier = Modifier.padding(start = 6.dp, bottom = 2.dp)
+            )
+        }
+        val image = remember(imageBytes) { imageBytes?.let { decodeImageBitmap(it) } }
+        if (image != null) {
+            androidx.compose.foundation.Image(
+                bitmap = image,
+                contentDescription = ref.shortcode,
+                modifier = Modifier.size(120.dp).padding(4.dp),
+            )
+        } else {
+            Box(
+                Modifier.size(120.dp).padding(4.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                androidx.compose.material3.CircularProgressIndicator(
+                    color = sonar.text3, strokeWidth = 2.dp, modifier = Modifier.size(20.dp),
+                )
+            }
+        }
+        if (showState) MessageStatusFooter(m, mesh)
     }
 }
 

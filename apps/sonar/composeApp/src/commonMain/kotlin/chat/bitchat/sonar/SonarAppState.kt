@@ -2061,6 +2061,17 @@ class SonarAppState(private val scope: CoroutineScope) {
         send(chatId, item.mediaUrl)
     }
 
+    fun sendStickerItem(chatId: String, sticker: SonarStickerItem, packCoordinate: String) {
+        scope.launch {
+            val groupId = resolveMarmotGroupId(chatId) ?: return@launch
+            try {
+                SonarCore.sendSticker(groupId, packCoordinate, sticker.shortcode, sticker.sha256)
+            } catch (e: Throwable) {
+                toast = "send failed: ${e.message}"
+            }
+        }
+    }
+
     /** Download + decrypt a media attachment, cached by URL. */
     suspend fun mediaData(chatId: String, media: SonarMedia): ByteArray? {
         mediaCache[media.url]?.let { return it }

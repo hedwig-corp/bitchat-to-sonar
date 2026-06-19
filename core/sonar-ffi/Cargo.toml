@@ -28,6 +28,7 @@ calls-audio = ["sonar-core/calls-audio"]
 
 [dependencies]
 sonar-core = { path = "../sonar-core" }
+sonar-stickers = { path = "../sonar-stickers" }
 uniffi = "0.31"
 nostr.workspace = true
 tokio.workspace = true

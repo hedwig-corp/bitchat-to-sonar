@@ -23,6 +23,8 @@ use mdk_storage_traits::groups::{MessageSortOrder, Pagination};
 use nostr::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use sonar_stickers::{build_sticker_ref_tag, parse_sticker_ref_tag, StickerRef};
+
 use crate::identity::Identity;
 use crate::outbox::OUTBOX_STATE_FILE_SUFFIX;
 use crate::{Error, Result};
@@ -146,6 +148,8 @@ pub struct ChatMessage {
     pub delivery_state: DeliveryState,
     /// Encrypted media attachments (MIP-04 `imeta` tags), if any.
     pub media: Vec<MediaRef>,
+    /// Sticker reference, if this message is a sticker send.
+    pub sticker_ref: Option<StickerRef>,
 }
 
 /// Bounded transcript page for one recent group.
@@ -440,6 +444,23 @@ impl MarmotEngine {
     /// already recorded as "ours" in storage once processed back.
     pub fn create_text_message(&self, group_id: &GroupId, text: &str) -> Result<Event> {
         let rumor = EventBuilder::new(Kind::Custom(CHAT_RUMOR_KIND), text)
+            .build(self.identity.public_key());
+        let event = dispatch!(&self.storage, |mdk| mdk
+            .create_message(group_id, rumor, None))?;
+        Ok(event)
+    }
+
+    /// Encrypt a sticker message into a signed kind-445 event for `group_id`.
+    /// The rumor carries the sticker ref tag so the receiver can resolve the
+    /// sticker image from the pack's Blossom URL.
+    pub fn create_sticker_message(
+        &self,
+        group_id: &GroupId,
+        sticker_ref: &StickerRef,
+    ) -> Result<Event> {
+        let tag = build_sticker_ref_tag(sticker_ref);
+        let rumor = EventBuilder::new(Kind::Custom(CHAT_RUMOR_KIND), "")
+            .tags([tag])
             .build(self.identity.public_key());
         let event = dispatch!(&self.storage, |mdk| mdk
             .create_message(group_id, rumor, None))?;
@@ -925,6 +946,11 @@ impl MarmotEngine {
 
     fn to_chat_message(&self, m: message_types::Message) -> ChatMessage {
         let media = self.parse_media_refs(&m.mls_group_id, &m.tags);
+        let sticker_ref = m
+            .tags
+            .iter()
+            .find(|t| t.as_slice().first().map(|s| s.as_str()) == Some("sticker"))
+            .and_then(|t| parse_sticker_ref_tag(t).ok());
         ChatMessage {
             id: m.id,
             group_id: m.mls_group_id.clone(),
@@ -938,6 +964,7 @@ impl MarmotEngine {
                 DeliveryState::Received
             },
             media,
+            sticker_ref,
         }
     }
 }

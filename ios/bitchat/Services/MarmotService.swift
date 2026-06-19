@@ -55,6 +55,8 @@ final class MarmotService: @unchecked Sendable {
         let deliveryState: String?
         /// Encrypted media attachments (Marmot MIP-04), empty for plain text.
         let media: [MarmotMedia]
+        /// Sticker reference, if this message is a sticker.
+        let stickerRef: MarmotStickerRef?
 
         init(
             id: String,
@@ -63,7 +65,8 @@ final class MarmotService: @unchecked Sendable {
             createdAt: Date,
             isMine: Bool,
             deliveryState: String? = nil,
-            media: [MarmotMedia]
+            media: [MarmotMedia],
+            stickerRef: MarmotStickerRef? = nil
         ) {
             self.id = id
             self.senderNpub = senderNpub
@@ -72,6 +75,7 @@ final class MarmotService: @unchecked Sendable {
             self.isMine = isMine
             self.deliveryState = deliveryState
             self.media = media
+            self.stickerRef = stickerRef
         }
 
         enum CodingKeys: String, CodingKey {
@@ -114,6 +118,12 @@ final class MarmotService: @unchecked Sendable {
         var isImage: Bool { mimeType.hasPrefix("image/") }
         var isVideo: Bool { mimeType.hasPrefix("video/") }
         var isAudio: Bool { mimeType.hasPrefix("audio/") }
+    }
+
+    struct MarmotStickerRef: Sendable, Equatable, Codable {
+        let packCoordinate: String
+        let shortcode: String
+        let plaintextSha256: String
     }
 
     struct ConversationSummary: Sendable, Equatable {
@@ -519,6 +529,43 @@ final class MarmotService: @unchecked Sendable {
         }
     }
 
+    /// Send a sticker message to the group.
+    func sendSticker(
+        groupId: String,
+        packCoordinate: String,
+        shortcode: String,
+        plaintextSha256: String
+    ) async throws {
+        try await run {
+            try $0.requireNode().sendSticker(
+                groupIdHex: groupId,
+                packCoordinate: packCoordinate,
+                shortcode: shortcode,
+                plaintextSha256: plaintextSha256
+            )
+        }
+    }
+
+    /// Fetch a sticker pack from relays by author and identifier.
+    func fetchStickerPack(
+        authorPubkeyHex: String,
+        identifier: String,
+        relayUrls: [String]
+    ) async throws -> StickerPackInfo {
+        try await run {
+            try $0.requireNode().fetchStickerPack(
+                authorPubkeyHex: authorPubkeyHex,
+                identifier: identifier,
+                relayUrls: relayUrls
+            )
+        }
+    }
+
+    /// Download a public sticker image by its plaintext HTTPS URL.
+    func fetchStickerImage(url: String) async throws -> Data {
+        try await run { try $0.requireNode().fetchStickerImage(url: url) }
+    }
+
     /// Download + decrypt the media blob at `url` for the group. Returns plaintext.
     func fetchMedia(groupId: String, url: String) async throws -> Data {
         try await run { try $0.requireNode().fetchMedia(groupIdHex: groupId, url: url) }
@@ -634,6 +681,13 @@ final class MarmotService: @unchecked Sendable {
                     width: $0.width,
                     height: $0.height,
                     durationMs: $0.durationMs
+                )
+            },
+            stickerRef: message.stickerRef.map {
+                MarmotStickerRef(
+                    packCoordinate: $0.packCoordinate,
+                    shortcode: $0.shortcode,
+                    plaintextSha256: $0.plaintextSha256
                 )
             }
         )

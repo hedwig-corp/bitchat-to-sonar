@@ -112,6 +112,9 @@ struct SonarDMScreen: View {
                 onCommand: { cmd in
                     store.onCommand(.init(type: .dm, id: peerId, target: peer.name), cmd)
                 },
+                onSticker: { sticker, coord in
+                    store.sendSticker(peerId, sticker: sticker, packCoordinate: coord)
+                },
                 voiceEnabled: store.canSendMedia(peerId),
                 onVoice: { store.sendVoiceNote(peerId, url: $0) }
             )

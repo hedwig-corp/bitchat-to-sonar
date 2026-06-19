@@ -780,6 +780,13 @@ private struct MacConversationPane: View {
                     command
                 )
             },
+            onSticker: { sticker, coord in
+                if isChannel {
+                    store.sendStickerToChannel(id, sticker: sticker, packCoordinate: coord)
+                } else {
+                    store.sendSticker(id, sticker: sticker, packCoordinate: coord)
+                }
+            },
             voiceEnabled: !isChannel && store.canSendMedia(id),
             onVoice: { store.sendVoiceNote(id, url: $0) }
         )

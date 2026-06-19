@@ -13,6 +13,7 @@ import SwiftUI
 
 struct SonarEmojiPickerView: View {
     let onEmoji: (String) -> Void
+    let onSticker: (StickerInfo, String) -> Void
     let onClose: () -> Void
 
     @State private var tab = 0
@@ -60,7 +61,7 @@ struct SonarEmojiPickerView: View {
             switch tab {
             case 0: emojiTab
             case 1: placeholderTab("GIF search coming soon")
-            default: placeholderTab("Sticker packs coming soon")
+            default: StickerTabContent(onSticker: onSticker)
             }
         }
         .frame(height: 320)
@@ -160,6 +161,123 @@ struct SonarEmojiPickerView: View {
             Spacer()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+// MARK: - Sticker tab
+
+private let testPackAuthor = "b653c822dfbec71697d379658a58909c3bef59d71b1cf5c1f7035451cde2e9f7"
+private let testPackId = "signal-8fa42aa13ec8f0efebe4b038f41afbd1"
+private let testPackRelays = ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net"]
+
+private struct StickerTabContent: View {
+    let onSticker: (StickerInfo, String) -> Void
+
+    @State private var pack: StickerPackInfo?
+    @State private var loading = true
+    @State private var error: String?
+
+    var body: some View {
+        Group {
+            if loading {
+                VStack(spacing: 8) {
+                    Spacer()
+                    ProgressView()
+                        .tint(SonarTheme.accent)
+                    Text("Loading stickers…")
+                        .font(SonarTheme.uiFont(size: 13))
+                        .foregroundColor(SonarTheme.text3)
+                    Spacer()
+                }
+                .frame(maxWidth: .infinity)
+            } else if let error {
+                VStack(spacing: 8) {
+                    Spacer()
+                    Text("Couldn't load stickers")
+                        .font(SonarTheme.uiFont(size: 14, weight: .semibold))
+                        .foregroundColor(SonarTheme.text)
+                    Text(error)
+                        .font(SonarTheme.uiFont(size: 12))
+                        .foregroundColor(SonarTheme.text3)
+                    Spacer()
+                }
+                .frame(maxWidth: .infinity)
+            } else if let pack {
+                VStack(spacing: 0) {
+                    Text(pack.title)
+                        .font(SonarTheme.uiFont(size: 12, weight: .semibold))
+                        .foregroundColor(SonarTheme.text3)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+
+                    ScrollView {
+                        let columns = Array(repeating: GridItem(.flexible(), spacing: 4), count: 4)
+                        LazyVGrid(columns: columns, spacing: 4) {
+                            ForEach(pack.stickers, id: \.shortcode) { sticker in
+                                StickerCell(sticker: sticker) {
+                                    onSticker(sticker, pack.packCoordinate)
+                                }
+                            }
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.bottom, 8)
+                    }
+                }
+            }
+        }
+        .task {
+            await loadPack()
+        }
+    }
+
+    private func loadPack() async {
+        do {
+            pack = try await MarmotService.shared.fetchStickerPack(
+                authorPubkeyHex: testPackAuthor,
+                identifier: testPackId,
+                relayUrls: testPackRelays
+            )
+        } catch {
+            self.error = error.localizedDescription
+        }
+        loading = false
+    }
+}
+
+private struct StickerCell: View {
+    let sticker: StickerInfo
+    let onTap: () -> Void
+
+    @State private var image: UIImage?
+
+    var body: some View {
+        Button(action: onTap) {
+            ZStack {
+                if let image {
+                    Image(uiImage: image)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 60, height: 60)
+                } else {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(SonarTheme.surface2)
+                        .frame(width: 60, height: 60)
+                }
+            }
+            .frame(width: 72, height: 72)
+        }
+        .buttonStyle(.plain)
+        .task {
+            await loadImage()
+        }
+    }
+
+    private func loadImage() async {
+        do {
+            let data = try await MarmotService.shared.fetchStickerImage(url: sticker.url)
+            image = UIImage(data: data)
+        } catch {}
     }
 }
 

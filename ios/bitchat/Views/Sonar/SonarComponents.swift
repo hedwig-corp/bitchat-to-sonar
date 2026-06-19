@@ -691,6 +691,12 @@ struct SNMsgList: View {
                                     showState: m.mine && i == msgs.count - 1,
                                     load: loadMedia
                                 )
+                            } else if m.stickerRef != nil {
+                                SNStickerBubble(
+                                    m: m,
+                                    showAuthor: showAuthors && !m.mine,
+                                    showState: m.mine && i == msgs.count - 1
+                                )
                             } else if m.action {
                                 Text(verbatim: m.text)
                                     .font(SonarTheme.uiFont(size: 13).italic())
@@ -845,6 +851,68 @@ private func snLogRecoveredUndecodableImage(_ item: SNMediaItem, bytes: Data) {
 /// the deliberate, tasteful extension noted in the brainstorm: an inline image
 /// (downloaded + decrypted on appear, Sonar radius 18, surface placeholder while
 /// loading) or a file chip, with an optional caption and the timestamp.
+struct SNStickerBubble: View {
+    let m: SNMessage
+    var showAuthor: Bool = false
+    var showState: Bool = false
+
+    @State private var image: PlatformImage?
+
+    private var mine: Bool { m.mine }
+
+    var body: some View {
+        VStack(alignment: mine ? .trailing : .leading, spacing: 3) {
+            if showAuthor, let author = m.author {
+                Text(verbatim: author)
+                    .font(SonarTheme.uiFont(size: 12, weight: .bold))
+                    .foregroundColor(SonarTheme.authorColor(author))
+                    .padding(.leading, 6)
+            }
+            if let image {
+                #if os(iOS)
+                Image(uiImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 120, height: 120)
+                #else
+                Image(nsImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 120, height: 120)
+                #endif
+            } else {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(SonarTheme.surface2)
+                        .frame(width: 120, height: 120)
+                    ProgressView()
+                        .tint(SonarTheme.text3)
+                }
+            }
+            if showState, let stateText = m.state {
+                SNMessageStatusFooter(stateText: stateText, via: m.via)
+                    .padding(EdgeInsets(top: 1, leading: 4, bottom: 0, trailing: 4))
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: mine ? .trailing : .leading)
+        .padding(.vertical, 3)
+        .task(id: m.stickerRef?.plaintextSha256) {
+            guard let ref = m.stickerRef else { return }
+            let url = "https://blossom.primal.net/\(ref.plaintextSha256).webp"
+            do {
+                let data = try await MarmotService.shared.fetchStickerImage(url: url)
+                image = PlatformImage(data: data)
+            } catch {}
+        }
+    }
+}
+
+#if os(iOS)
+private typealias PlatformImage = UIImage
+#else
+private typealias PlatformImage = NSImage
+#endif
+
 struct SNMediaBubble: View {
     let m: SNMessage
     let maxBubbleWidth: CGFloat
@@ -1684,6 +1752,7 @@ struct SNComposer: View {
     let onSend: (String) -> Void
     let onPlus: () -> Void
     let onCommand: (String) -> Void
+    var onSticker: (StickerInfo, String) -> Void = { _, _ in }
     var voiceEnabled: Bool = true
     /// Hold-to-record produced a voice note at this file URL (audio/mp4 .m4a).
     var onVoice: (URL) -> Void = { _ in }
@@ -1745,6 +1814,10 @@ struct SNComposer: View {
             if showEmojiTray && !slash {
                 SonarEmojiPickerView(
                     onEmoji: { text += $0 },
+                    onSticker: { sticker, coord in
+                        showEmojiTray = false
+                        onSticker(sticker, coord)
+                    },
                     onClose: { showEmojiTray = false }
                 )
             }

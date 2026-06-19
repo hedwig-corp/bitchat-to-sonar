@@ -24,6 +24,7 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -35,7 +36,11 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import chat.bitchat.sonar.SonarCore
 import chat.bitchat.sonar.SonarGifItem
+import chat.bitchat.sonar.SonarStickerItem
+import chat.bitchat.sonar.SonarStickerPack
+import chat.bitchat.sonar.decodeImageBitmap
 import chat.bitchat.sonar.ui.SNEmptyState
 import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconName
@@ -112,10 +117,20 @@ private val emojiCategories = listOf(
     )),
 )
 
+/** Test sticker pack loaded on first Sticker tab open. */
+private const val TEST_PACK_AUTHOR = "b653c822dfbec71697d379658a58909c3bef59d71b1cf5c1f7035451cde2e9f7"
+private const val TEST_PACK_ID = "signal-8fa42aa13ec8f0efebe4b038f41afbd1"
+private val TEST_PACK_RELAYS = listOf(
+    "wss://relay.damus.io",
+    "wss://nos.lol",
+    "wss://relay.primal.net",
+)
+
 @Composable
 fun SonarEmojiPicker(
     onEmoji: (String) -> Unit,
     onGif: (SonarGifItem) -> Unit,
+    onSticker: (SonarStickerItem, String) -> Unit,
     onClose: () -> Unit,
 ) {
     val s = sonar
@@ -153,7 +168,7 @@ fun SonarEmojiPicker(
         when (tab) {
             PickerTab.Emoji -> EmojiTabContent(onEmoji)
             PickerTab.Gif -> GifTabContent()
-            PickerTab.Sticker -> StickerTabContent()
+            PickerTab.Sticker -> StickerTabContent(onSticker)
         }
     }
 }
@@ -340,81 +355,81 @@ private fun ColumnScope.GifTabContent() {
 }
 
 @Composable
-private fun ColumnScope.StickerTabContent() {
+private fun ColumnScope.StickerTabContent(onSticker: (SonarStickerItem, String) -> Unit) {
     val s = sonar
+    var pack by remember { mutableStateOf<SonarStickerPack?>(null) }
+    var loading by remember { mutableStateOf(true) }
+    var error by remember { mutableStateOf<String?>(null) }
 
-    Column(
-        Modifier
-            .fillMaxWidth()
-            .weight(1f)
-            .verticalScroll(rememberScrollState())
-    ) {
-        SNSectionLabel("Your stickers")
+    LaunchedEffect(Unit) {
+        try {
+            pack = SonarCore.fetchStickerPack(TEST_PACK_AUTHOR, TEST_PACK_ID, TEST_PACK_RELAYS)
+        } catch (e: Exception) {
+            error = e.message ?: "Failed to load sticker pack"
+        } finally {
+            loading = false
+        }
+    }
 
+    if (loading) {
+        Column(
+            Modifier.fillMaxWidth().weight(1f),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+        ) {
+            androidx.compose.material3.CircularProgressIndicator(
+                color = s.accent,
+                strokeWidth = 2.dp,
+                modifier = Modifier.size(24.dp),
+            )
+            Spacer(Modifier.height(8.dp))
+            Text("Loading stickers…", color = s.text3, fontSize = 13.sp)
+        }
+    } else if (error != null || pack == null) {
         SNEmptyState(
             icon = SNIconName.Sticker,
-            title = "No sticker packs yet",
-            desc = "Add sticker packs to express yourself"
+            title = "Couldn't load stickers",
+            desc = error ?: "Try again later",
         )
+        Spacer(Modifier.weight(1f))
+    } else {
+        val p = pack!!
+        SNSectionLabel(p.title)
 
-        Spacer(Modifier.height(16.dp))
-
-        Row(
-            Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 14.dp)
-                .clip(RoundedCornerShape(14.dp))
-                .background(s.surface2)
-                .clickable { }
-                .padding(horizontal = 14.dp, vertical = 12.dp),
-            verticalAlignment = Alignment.CenterVertically
+        LazyVerticalGrid(
+            columns = GridCells.Fixed(4),
+            modifier = Modifier.fillMaxWidth().weight(1f).padding(horizontal = 8.dp),
         ) {
-            Box(
-                Modifier
-                    .size(34.dp)
-                    .clip(RoundedCornerShape(10.dp))
-                    .background(s.accentSoft),
-                contentAlignment = Alignment.Center
-            ) {
-                SNIcon(SNIconName.Sticker, 18.dp, s.accentDeep)
-            }
-            Spacer(Modifier.width(12.dp))
-            Column(Modifier.weight(1f)) {
-                Text(
-                    "Add sticker pack",
-                    color = s.text,
-                    fontSize = 16.sp,
-                    fontWeight = FontWeight.Medium
-                )
-                Text(
-                    "Browse and install sticker packs",
-                    color = s.text3,
-                    fontSize = 12.5.sp
-                )
-            }
-            SNIcon(SNIconName.Chevron, 14.dp, s.text3, weight = 2.2f)
-        }
-
-        SNSectionLabel("Popular stickers")
-
-        Row(
-            Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 14.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            repeat(4) {
-                Box(
-                    Modifier
-                        .weight(1f)
-                        .height(72.dp)
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(s.surface2)
-                )
+            items(p.stickers) { sticker ->
+                StickerCell(sticker) { onSticker(sticker, p.packCoordinate) }
             }
         }
+    }
+}
 
-        Spacer(Modifier.height(16.dp))
+@Composable
+private fun StickerCell(sticker: SonarStickerItem, onClick: () -> Unit) {
+    var imageBytes by remember(sticker.url) { mutableStateOf<ByteArray?>(null) }
+    LaunchedEffect(sticker.url) {
+        try { imageBytes = SonarCore.fetchStickerImage(sticker.url) } catch (_: Throwable) {}
+    }
+    Box(
+        Modifier
+            .size(72.dp)
+            .clip(RoundedCornerShape(10.dp))
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        val image = remember(imageBytes) { imageBytes?.let { decodeImageBitmap(it) } }
+        if (image != null) {
+            androidx.compose.foundation.Image(
+                bitmap = image,
+                contentDescription = sticker.alt ?: sticker.shortcode,
+                modifier = Modifier.size(60.dp),
+            )
+        } else {
+            Box(Modifier.size(60.dp).clip(RoundedCornerShape(8.dp)).background(sonar.surface2))
+        }
     }
 }
 

@@ -42,6 +42,36 @@ data class SonarMsg(
     val media: List<SonarMedia> = emptyList(),
     /// Local send state projected from core delivery metadata.
     val state: String? = null,
+    /// Sticker reference if this message is a sticker send.
+    val stickerRef: SonarStickerRef? = null,
+)
+
+/** A sticker reference carried on a chat message. */
+data class SonarStickerRef(
+    val packCoordinate: String,
+    val shortcode: String,
+    val plaintextSha256: String,
+)
+
+/** A single sticker in a pack. */
+data class SonarStickerItem(
+    val shortcode: String,
+    val url: String,
+    val sha256: String,
+    val mime: String,
+    val width: Int?,
+    val height: Int?,
+    val alt: String?,
+    val emoji: String?,
+)
+
+/** A sticker pack fetched from relays. */
+data class SonarStickerPack(
+    val packCoordinate: String,
+    val title: String,
+    val description: String?,
+    val coverUrl: String?,
+    val stickers: List<SonarStickerItem>,
 )
 
 /** Local transcript window for one recent chat, newest conversation first at
@@ -363,6 +393,24 @@ expect object SonarCore {
         caption: String,
         serverUrl: String = "",
     )
+
+    /** Send a sticker message to a chat. */
+    suspend fun sendSticker(
+        chatId: String,
+        packCoordinate: String,
+        shortcode: String,
+        plaintextSha256: String,
+    )
+
+    /** Fetch a sticker pack from relays by author + identifier. */
+    suspend fun fetchStickerPack(
+        authorPubkeyHex: String,
+        identifier: String,
+        relayUrls: List<String> = emptyList(),
+    ): SonarStickerPack
+
+    /** Download a public sticker image by its plaintext HTTPS URL. */
+    suspend fun fetchStickerImage(url: String): ByteArray
 
     /** Download + decrypt the media blob at [url] for the chat. Returns plaintext. */
     suspend fun fetchMedia(chatId: String, url: String): ByteArray

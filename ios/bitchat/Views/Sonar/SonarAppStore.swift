@@ -212,6 +212,8 @@ struct SNMessage: Identifiable, Equatable {
     /// Encrypted media attachments (White Noise / Marmot MIP-04). Non-empty ⇒
     /// render a media bubble (image inline, else a file chip).
     var media: [SNMediaItem] = []
+    /// Non-nil = render as a sticker bubble instead of text.
+    var stickerRef: MarmotService.MarmotStickerRef?
 }
 
 /// A media attachment on a Sonar message. `url` is the Blossom URL of the
@@ -1537,6 +1539,22 @@ final class SonarAppStore: ObservableObject {
         chatViewModel.sendMessage(text)
     }
 
+    func sendStickerToChannel(_ chId: String, sticker: StickerInfo, packCoordinate: String) {
+        guard let groupId = marmotGroupId(chId) else { return }
+        Task {
+            do {
+                try await MarmotService.shared.sendSticker(
+                    groupId: groupId,
+                    packCoordinate: packCoordinate,
+                    shortcode: sticker.shortcode,
+                    plaintextSha256: sticker.sha256
+                )
+            } catch {
+                SecureLogger.error("sticker send failed: \(error)", category: .session)
+            }
+        }
+    }
+
     private func mapPublic(_ m: BitchatMessage, via: SNVia) -> SNMessage {
         let time = Self.clock(m.timestamp)
         if m.sender == "system" || m.content.hasPrefix("* ") {
@@ -2188,7 +2206,8 @@ final class SonarAppStore: ObservableObject {
                         time: Self.clock(m.createdAt),
                         via: .internet,
                         state: MarmotChatModel.stateText(for: m),
-                        media: Self.mediaItems(m, groupId: groupId)
+                        media: Self.mediaItems(m, groupId: groupId),
+                        stickerRef: m.stickerRef
                     ))
                 }
             }
@@ -2347,6 +2366,22 @@ final class SonarAppStore: ObservableObject {
         }
         for line in lines { chatViewModel.sendPrivateMessage(line, to: PeerID(str: id)) }
         return true
+    }
+
+    func sendSticker(_ id: String, sticker: StickerInfo, packCoordinate: String) {
+        guard let groupId = marmotGroupId(id) else { return }
+        Task {
+            do {
+                try await MarmotService.shared.sendSticker(
+                    groupId: groupId,
+                    packCoordinate: packCoordinate,
+                    shortcode: sticker.shortcode,
+                    plaintextSha256: sticker.sha256
+                )
+            } catch {
+                SecureLogger.error("sticker send failed: \(error)", category: .session)
+            }
+        }
     }
 
     private func sendOverMarmot(_ text: String, npub: String) {

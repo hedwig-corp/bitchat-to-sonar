@@ -109,6 +109,9 @@ struct SonarChannelScreen: View {
                 onCommand: { cmd in
                     store.onCommand(.init(type: .ch, id: chId, target: slapTarget), cmd)
                 },
+                onSticker: { sticker, coord in
+                    store.sendStickerToChannel(chId, sticker: sticker, packCoordinate: coord)
+                },
                 voiceEnabled: false
             )
         }
