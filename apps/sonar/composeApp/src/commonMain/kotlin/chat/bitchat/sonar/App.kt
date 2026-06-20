@@ -628,7 +628,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     var previewPackCoordinate by remember { mutableStateOf<String?>(null) }
     val mediaActions = rememberMediaActions()
     val pickPhoto = rememberPhotoPicker { bytes, name, mime ->
-        state.sendImage(screen.id, bytes, name, mime)
+        state.stageMediaPreview(screen.id, bytes, name, mime)
     }
     // Voice-note recorder (hold the mic to record; drag left to cancel).
     val recorder = remember { VoiceRecorder() }
@@ -952,6 +952,15 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             chatId = screen.id,
             actions = mediaActions,
             onClose = { mediaViewer = null },
+            modifier = Modifier.matchParentSize()
+        )
+    }
+    state.pendingMediaPreview?.let { preview ->
+        MediaSendPreview(
+            data = preview.data,
+            isGif = preview.mime == "image/gif",
+            onSend = { state.confirmSendPreview() },
+            onCancel = { state.cancelPreview() },
             modifier = Modifier.matchParentSize()
         )
     }
@@ -1815,6 +1824,52 @@ private fun MediaViewer(
                         )
                     }
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun MediaSendPreview(
+    data: ByteArray,
+    isGif: Boolean,
+    onSend: () -> Unit,
+    onCancel: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val s = sonar
+    val image = remember(data) { if (!isGif) decodeImageBitmap(data) else null }
+    Box(modifier.background(Color.Black)) {
+        when {
+            isGif || image != null -> MediaImage(
+                bytes = data,
+                isGif = isGif,
+                modifier = Modifier.fillMaxSize().padding(bottom = 80.dp)
+            )
+            else -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text("Couldn't decode image", color = Color.White.copy(alpha = 0.6f), fontSize = 14.sp)
+            }
+        }
+        Row(
+            Modifier.fillMaxWidth().align(Alignment.TopStart).padding(horizontal = 8.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                "←",
+                color = Color.White,
+                fontSize = 22.sp,
+                modifier = Modifier.clip(CircleShape).clickable { onCancel() }.padding(12.dp)
+            )
+        }
+        Row(
+            Modifier.fillMaxWidth().align(Alignment.BottomCenter).padding(16.dp),
+            horizontalArrangement = Arrangement.End
+        ) {
+            Box(
+                Modifier.size(52.dp).clip(CircleShape).background(s.accent).clickable { onSend() },
+                contentAlignment = Alignment.Center
+            ) {
+                Text("↑", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold)
             }
         }
     }

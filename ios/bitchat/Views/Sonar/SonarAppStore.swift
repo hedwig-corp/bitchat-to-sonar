@@ -396,6 +396,34 @@ final class SonarAppStore: ObservableObject {
     /// this is set, the DM screen must not show a "new empty chat" state yet.
     @Published private(set) var localHydratingDMs: Set<String> = []
 
+    // ── Media preview (confirmation before send) ──
+    struct PendingMediaPreview {
+        let peerId: String
+        let data: Data
+        let filename: String
+        let mime: String
+    }
+
+    @Published var pendingMediaPreview: PendingMediaPreview?
+
+    func stageMediaPreview(_ peerId: String, data: Data, filename: String, mime: String) {
+        pendingMediaPreview = PendingMediaPreview(peerId: peerId, data: data, filename: filename, mime: mime)
+    }
+
+    func confirmSendPreview() {
+        guard let preview = pendingMediaPreview else { return }
+        pendingMediaPreview = nil
+        if preview.mime == "image/gif" {
+            _ = sendAttachment(preview.peerId, data: preview.data, filename: preview.filename, mime: preview.mime)
+        } else {
+            sendImage(preview.peerId, data: preview.data, filename: preview.filename, mime: preview.mime)
+        }
+    }
+
+    func cancelPreview() {
+        pendingMediaPreview = nil
+    }
+
     /// The in-flight P2P call the [SonarCallScreen] renders, or nil. Driven by the
     /// real iroh/opus engine via `callWaitEvent`.
     @Published private(set) var activeCall: SNActiveCall?

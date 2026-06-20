@@ -1810,6 +1810,30 @@ class SonarAppState(private val scope: CoroutineScope) {
             .sortedBy { it.tsSecs }
     }
 
+    // ── Media preview (confirmation before send) ──
+    data class PendingMediaPreview(
+        val chatId: String,
+        val data: ByteArray,
+        val filename: String,
+        val mime: String,
+    )
+
+    var pendingMediaPreview by mutableStateOf<PendingMediaPreview?>(null)
+
+    fun stageMediaPreview(chatId: String, data: ByteArray, filename: String, mime: String) {
+        pendingMediaPreview = PendingMediaPreview(chatId, data, filename, mime)
+    }
+
+    fun confirmSendPreview() {
+        val preview = pendingMediaPreview ?: return
+        pendingMediaPreview = null
+        sendImage(preview.chatId, preview.data, preview.filename, preview.mime)
+    }
+
+    fun cancelPreview() {
+        pendingMediaPreview = null
+    }
+
     // ── Media (White Noise / Marmot MIP-04) ──
     /** Decrypted-media cache (raw bytes), keyed by the ciphertext's Blossom URL. */
     private val mediaCache = mutableMapOf<String, ByteArray>()
