@@ -79,28 +79,6 @@ private fun pickImageFile(): File? {
     }
 }
 
-/** Decode → flatten any alpha onto white → JPEG at quality 0.85 (matches the
- *  Android actual's `Bitmap.compress(JPEG, 85, …)`). */
-private fun reencodeJpeg(raw: ByteArray): ByteArray {
-    val src = ImageIO.read(ByteArrayInputStream(raw)) ?: error("unsupported image")
-    val rgb = BufferedImage(src.width, src.height, BufferedImage.TYPE_INT_RGB)
-    val g = rgb.createGraphics()
-    g.drawImage(src, 0, 0, java.awt.Color.WHITE, null)
-    g.dispose()
-    val writer = ImageIO.getImageWritersByFormatName("jpg").next()
-    val out = ByteArrayOutputStream()
-    ImageIO.createImageOutputStream(out).use { ios ->
-        writer.output = ios
-        val param = writer.defaultWriteParam.apply {
-            compressionMode = ImageWriteParam.MODE_EXPLICIT
-            compressionQuality = 0.85f
-        }
-        writer.write(null, IIOImage(rgb, null, null), param)
-    }
-    writer.dispose()
-    return out.toByteArray()
-}
-
 private fun ByteArray.isGifBytes(): Boolean =
     size >= 6 &&
         this[0] == 0x47.toByte() &&
