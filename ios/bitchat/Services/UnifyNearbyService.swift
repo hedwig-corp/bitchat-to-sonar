@@ -589,7 +589,12 @@ extension UnifyNearbyService: CBCentralManagerDelegate {
         rssi RSSI: NSNumber
     ) {
         // Unfiltered scan → only keep advertisers carrying the Unify service.
-        let services = advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID] ?? []
+        // Check both the primary service UUIDs and the overflow area: an iOS
+        // peripheral whose advertising payload is too full moves 128-bit UUIDs
+        // into an iOS-only overflow area reported under a separate key.
+        let primary = advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID] ?? []
+        let overflow = advertisementData[CBAdvertisementDataOverflowServiceUUIDsKey] as? [CBUUID] ?? []
+        let services = primary + overflow
         guard services.contains(UnifyNearbyContract.serviceUUID) else { return }
         // Skip Sonar apps advertising the Unify receiver — they're shown as Sonar
         // peers via the mesh, not as generic "Unify users". Also RETRACT any peer

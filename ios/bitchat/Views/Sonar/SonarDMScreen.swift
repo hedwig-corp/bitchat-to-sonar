@@ -247,18 +247,17 @@ struct SonarDMScreen: View {
         .snSheet(isPresented: $walletSheet, title: "Your wallet") {
             SNWalletSheetContent(onClose: { walletSheet = false })
         }
-        .fullScreenCover(isPresented: Binding(
-            get: { store.pendingMediaPreviews.contains { $0.peerId == peerId } },
-            set: { if !$0 { store.cancelPreview(peerId: peerId) } }
-        )) {
-            if let preview = store.pendingMediaPreviews.first(where: { $0.peerId == peerId }) {
-                MediaSendPreviewLoaderView(
-                    preview: preview,
-                    onSend: { store.confirmSendPreview(peerId: peerId) },
-                    onCancel: { store.cancelPreview(peerId: peerId) }
-                )
-            }
+        // iOS presents the media preview full-screen; macOS has no
+        // fullScreenCover, so fall back to a sheet (same content/behavior).
+#if os(iOS)
+        .fullScreenCover(isPresented: mediaPreviewPresented) {
+            mediaPreviewContent
         }
+#else
+        .sheet(isPresented: mediaPreviewPresented) {
+            mediaPreviewContent
+        }
+#endif
         .onChange(of: verifySheet) { open in
             if !open { showKey = false }
         }
@@ -267,6 +266,24 @@ struct SonarDMScreen: View {
                 groupAddDraft = ""
                 selectedAddNpubs = []
             }
+        }
+    }
+
+    private var mediaPreviewPresented: Binding<Bool> {
+        Binding(
+            get: { store.pendingMediaPreviews.contains { $0.peerId == peerId } },
+            set: { if !$0 { store.cancelPreview(peerId: peerId) } }
+        )
+    }
+
+    @ViewBuilder
+    private var mediaPreviewContent: some View {
+        if let preview = store.pendingMediaPreviews.first(where: { $0.peerId == peerId }) {
+            MediaSendPreviewLoaderView(
+                preview: preview,
+                onSend: { store.confirmSendPreview(peerId: peerId) },
+                onCancel: { store.cancelPreview(peerId: peerId) }
+            )
         }
     }
 
