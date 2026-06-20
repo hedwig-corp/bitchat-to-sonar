@@ -402,26 +402,43 @@ final class SonarAppStore: ObservableObject {
         let data: Data
         let filename: String
         let mime: String
+        let caption: String
+
+        init(peerId: String, data: Data, filename: String, mime: String, caption: String = "") {
+            self.peerId = peerId
+            self.data = data
+            self.filename = filename
+            self.mime = mime
+            self.caption = caption
+        }
     }
 
-    @Published var pendingMediaPreview: PendingMediaPreview?
+    @Published var pendingMediaPreviews: [PendingMediaPreview] = []
 
     func stageMediaPreview(_ peerId: String, data: Data, filename: String, mime: String) {
-        pendingMediaPreview = PendingMediaPreview(peerId: peerId, data: data, filename: filename, mime: mime)
+        pendingMediaPreviews = [PendingMediaPreview(peerId: peerId, data: data, filename: filename, mime: mime)]
     }
 
     func confirmSendPreview() {
-        guard let preview = pendingMediaPreview else { return }
-        pendingMediaPreview = nil
-        if preview.mime == "image/gif" {
-            _ = sendAttachment(preview.peerId, data: preview.data, filename: preview.filename, mime: preview.mime)
-        } else {
-            sendImage(preview.peerId, data: preview.data, filename: preview.filename, mime: preview.mime)
+        let items = pendingMediaPreviews
+        guard !items.isEmpty else { return }
+        pendingMediaPreviews = []
+        for preview in items {
+            if preview.mime == "image/gif" {
+                _ = sendAttachment(preview.peerId, data: preview.data, filename: preview.filename, mime: preview.mime)
+            } else {
+                #if os(iOS)
+                let bytes = UIImage(data: preview.data)?.jpegData(compressionQuality: 0.85) ?? preview.data
+                #else
+                let bytes = preview.data
+                #endif
+                sendImage(preview.peerId, data: bytes, filename: preview.filename, mime: preview.mime)
+            }
         }
     }
 
     func cancelPreview() {
-        pendingMediaPreview = nil
+        pendingMediaPreviews = []
     }
 
     /// The in-flight P2P call the [SonarCallScreen] renders, or nil. Driven by the
@@ -3437,7 +3454,7 @@ final class SonarAppStore: ObservableObject {
     }
 
     func pop() {
-        pendingMediaPreview = nil
+        pendingMediaPreviews = []
         if !path.isEmpty { path.removeLast() }
     }
 

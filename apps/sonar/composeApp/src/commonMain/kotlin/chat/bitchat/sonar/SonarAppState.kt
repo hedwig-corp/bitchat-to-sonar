@@ -1642,7 +1642,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun isMeshChat(chatId: String) = chatId.startsWith("mesh:")
 
     fun back() {
-        pendingMediaPreview = null
+        pendingMediaPreviews = emptyList()
         if (stack.size > 1) stack = stack.dropLast(1)
         if (stack.lastOrNull() !is Screen.Chat) messages = emptyList()
         scope.launch { refreshChats() }
@@ -1653,7 +1653,7 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  sidebar item so the stack never grows unbounded and a screen's Back button
      *  deselects (returns to the welcome pane) instead of walking history. */
     fun resetToHome() {
-        pendingMediaPreview = null
+        pendingMediaPreviews = emptyList()
         if (stack.size > 1) { stack = listOf(Screen.Home); messages = emptyList() }
     }
 
@@ -1818,22 +1818,26 @@ class SonarAppState(private val scope: CoroutineScope) {
         val data: ByteArray,
         val filename: String,
         val mime: String,
+        val caption: String = "",
     )
 
-    var pendingMediaPreview by mutableStateOf<PendingMediaPreview?>(null)
+    var pendingMediaPreviews by mutableStateOf<List<PendingMediaPreview>>(emptyList())
 
     fun stageMediaPreview(chatId: String, data: ByteArray, filename: String, mime: String) {
-        pendingMediaPreview = PendingMediaPreview(chatId, data, filename, mime)
+        pendingMediaPreviews = listOf(PendingMediaPreview(chatId, data, filename, mime))
     }
 
     fun confirmSendPreview() {
-        val preview = pendingMediaPreview ?: return
-        pendingMediaPreview = null
-        sendImage(preview.chatId, preview.data, preview.filename, preview.mime)
+        val items = pendingMediaPreviews
+        if (items.isEmpty()) return
+        pendingMediaPreviews = emptyList()
+        for (preview in items) {
+            sendImage(preview.chatId, preview.data, preview.filename, preview.mime)
+        }
     }
 
     fun cancelPreview() {
-        pendingMediaPreview = null
+        pendingMediaPreviews = emptyList()
     }
 
     // ── Media (White Noise / Marmot MIP-04) ──

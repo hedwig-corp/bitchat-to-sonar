@@ -955,7 +955,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             modifier = Modifier.matchParentSize()
         )
     }
-    state.pendingMediaPreview?.let { preview ->
+    state.pendingMediaPreviews.firstOrNull()?.let { preview ->
         MediaSendPreview(
             data = preview.data,
             isGif = preview.mime == "image/gif",

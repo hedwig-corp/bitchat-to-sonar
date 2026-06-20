@@ -212,13 +212,8 @@ struct SonarDMScreen: View {
                     }
                     return
                 }
-                #if os(iOS)
-                let bytes = UIImage(data: data)?.jpegData(compressionQuality: 0.85) ?? data
-                #else
-                let bytes = data
-                #endif
                 await MainActor.run {
-                    store.stageMediaPreview(peerId, data: bytes, filename: "photo.jpg", mime: "image/jpeg")
+                    store.stageMediaPreview(peerId, data: data, filename: "photo.jpg", mime: "image/jpeg")
                     photoItem = nil
                 }
             }
@@ -253,10 +248,10 @@ struct SonarDMScreen: View {
             SNWalletSheetContent(onClose: { walletSheet = false })
         }
         .fullScreenCover(isPresented: Binding(
-            get: { store.pendingMediaPreview != nil },
+            get: { !store.pendingMediaPreviews.isEmpty },
             set: { if !$0 { store.cancelPreview() } }
         )) {
-            if let preview = store.pendingMediaPreview {
+            if let preview = store.pendingMediaPreviews.first {
                 MediaSendPreviewView(
                     data: preview.data,
                     isGif: preview.mime == "image/gif",
