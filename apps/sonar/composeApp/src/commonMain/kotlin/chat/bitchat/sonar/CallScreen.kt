@@ -79,7 +79,7 @@ fun CallScreen(state: SonarAppState, screen: Screen.Call) {
     val rawPeer = chatId.removePrefix("mesh:")
     val mesh = run { state.payVersion; isMeshRoute && state.dmInRange(rawPeer) }
 
-    val camOn = false
+    val camOn = call?.camOn ?: false
 
     val status = when {
         connected -> fmtCall(secs)
@@ -163,6 +163,7 @@ fun CallScreen(state: SonarAppState, screen: Screen.Call) {
                     CallBtn(SNIconName.Phone, "Accept", active = false, accept = true) { state.acceptCall() }
                 } else {
                     CallBtn(SNIconName.MicOff, if (muted) "Muted" else "Mute", active = muted) { state.toggleCallMute() }
+                    if (video) CallBtn(SNIconName.Videocam, if (camOn) "Cam on" else "Cam off", active = camOn) { state.toggleCallCam() }
                     CallBtn(SNIconName.Speaker, "Speaker", active = speakerOn) { state.toggleCallSpeaker() }
                     CallBtn(SNIconName.PhoneDown, "End", active = false, end = true) { state.hangupCall() }
                 }
