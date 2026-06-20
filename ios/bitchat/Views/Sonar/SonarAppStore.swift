@@ -415,14 +415,24 @@ final class SonarAppStore: ObservableObject {
 
     @Published var pendingMediaPreviews: [PendingMediaPreview] = []
 
+    private var currentDMId: String? {
+        if case .dm(let id)? = path.last { return id }
+        return nil
+    }
+
     func stageMediaPreview(_ peerId: String, data: Data, filename: String, mime: String) {
+        guard currentDMId == peerId else { return }
         pendingMediaPreviews = [PendingMediaPreview(peerId: peerId, data: data, filename: filename, mime: mime)]
     }
 
-    func confirmSendPreview() {
-        let items = pendingMediaPreviews
+    func confirmSendPreview(peerId: String? = nil) {
+        let items = peerId.map { id in pendingMediaPreviews.filter { $0.peerId == id } } ?? pendingMediaPreviews
         guard !items.isEmpty else { return }
-        pendingMediaPreviews = []
+        if let peerId {
+            pendingMediaPreviews.removeAll { $0.peerId == peerId }
+        } else {
+            pendingMediaPreviews = []
+        }
         for preview in items {
             if preview.mime == "image/gif" {
                 _ = sendAttachment(preview.peerId, data: preview.data, filename: preview.filename, mime: preview.mime)
@@ -437,8 +447,12 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
-    func cancelPreview() {
-        pendingMediaPreviews = []
+    func cancelPreview(peerId: String? = nil) {
+        if let peerId {
+            pendingMediaPreviews.removeAll { $0.peerId == peerId }
+        } else {
+            pendingMediaPreviews = []
+        }
     }
 
     /// The in-flight P2P call the [SonarCallScreen] renders, or nil. Driven by the
@@ -3450,6 +3464,9 @@ final class SonarAppStore: ObservableObject {
     // MARK: Navigation
 
     func push(_ route: SonarRoute) {
+        if case .dm(let id) = route, currentDMId != id {
+            pendingMediaPreviews = []
+        }
         path.append(route)
     }
 

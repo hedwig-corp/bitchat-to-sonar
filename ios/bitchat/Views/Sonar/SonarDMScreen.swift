@@ -248,15 +248,15 @@ struct SonarDMScreen: View {
             SNWalletSheetContent(onClose: { walletSheet = false })
         }
         .fullScreenCover(isPresented: Binding(
-            get: { !store.pendingMediaPreviews.isEmpty },
-            set: { if !$0 { store.cancelPreview() } }
+            get: { store.pendingMediaPreviews.contains { $0.peerId == peerId } },
+            set: { if !$0 { store.cancelPreview(peerId: peerId) } }
         )) {
-            if let preview = store.pendingMediaPreviews.first {
+            if let preview = store.pendingMediaPreviews.first(where: { $0.peerId == peerId }) {
                 MediaSendPreviewView(
                     data: preview.data,
                     isGif: preview.mime == "image/gif",
-                    onSend: { store.confirmSendPreview() },
-                    onCancel: { store.cancelPreview() }
+                    onSend: { store.confirmSendPreview(peerId: peerId) },
+                    onCancel: { store.cancelPreview(peerId: peerId) }
                 )
             }
         }

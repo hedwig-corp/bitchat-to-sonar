@@ -19,7 +19,7 @@ Signal treats the local database as the chat state. Network receive/send/sync pa
 Before implementing any well-known chat feature (media sending, reactions, read receipts, typing indicators, group management, voice/video calls, stories, disappearing messages, link previews, contact sharing, location sharing, stickers, etc.), study how Signal implements it in their open-source clients:
 
 - **Signal-iOS**: https://github.com/signalapp/Signal-iOS
-- **Signal-Android**: https://github.com/nicegram/nicegram-Signal-Android
+- **Signal-Android**: https://github.com/signalapp/Signal-Android
 
 Check Signal's architecture for: data models, state lifecycle, memory management (file-backed vs in-memory), compression/processing timing (lazy vs eager), UI structure (navigation, editing, multi-item), cleanup paths (cancel, back, crash), and send pipeline (queued vs direct). Document in the PR description which Signal patterns were adopted, which were deferred (with tracked follow-ups), and why.
 

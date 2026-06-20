@@ -179,7 +179,12 @@ class SonarAppState(private val scope: CoroutineScope) {
     var dark by mutableStateOf(SonarCore.isDark())
         private set
 
-    fun push(s: Screen) { stack = stack + s }
+    fun push(s: Screen) {
+        if (s is Screen.Chat && (screen as? Screen.Chat)?.id != s.id) {
+            pendingMediaPreviews = emptyList()
+        }
+        stack = stack + s
+    }
     fun toggleDark() { dark = !dark; SonarCore.setDark(dark) }
 
     fun wipe() {
@@ -1824,20 +1829,33 @@ class SonarAppState(private val scope: CoroutineScope) {
     var pendingMediaPreviews by mutableStateOf<List<PendingMediaPreview>>(emptyList())
 
     fun stageMediaPreview(chatId: String, data: ByteArray, filename: String, mime: String) {
+        if ((screen as? Screen.Chat)?.id != chatId) return
         pendingMediaPreviews = listOf(PendingMediaPreview(chatId, data, filename, mime))
     }
 
-    fun confirmSendPreview() {
-        val items = pendingMediaPreviews
+    fun confirmSendPreview(chatId: String? = null) {
+        val items = if (chatId == null) {
+            pendingMediaPreviews
+        } else {
+            pendingMediaPreviews.filter { it.chatId == chatId }
+        }
         if (items.isEmpty()) return
-        pendingMediaPreviews = emptyList()
+        pendingMediaPreviews = if (chatId == null) {
+            emptyList()
+        } else {
+            pendingMediaPreviews.filterNot { it.chatId == chatId }
+        }
         for (preview in items) {
             sendImage(preview.chatId, preview.data, preview.filename, preview.mime)
         }
     }
 
-    fun cancelPreview() {
-        pendingMediaPreviews = emptyList()
+    fun cancelPreview(chatId: String? = null) {
+        pendingMediaPreviews = if (chatId == null) {
+            emptyList()
+        } else {
+            pendingMediaPreviews.filterNot { it.chatId == chatId }
+        }
     }
 
     // ── Media (White Noise / Marmot MIP-04) ──
