@@ -251,11 +251,9 @@ struct SonarDMScreen: View {
             get: { store.pendingMediaPreviews.contains { $0.peerId == peerId } },
             set: { if !$0 { store.cancelPreview(peerId: peerId) } }
         )) {
-            if let preview = store.pendingMediaPreviews.first(where: { $0.peerId == peerId }),
-               let data = try? Data(contentsOf: preview.tempURL) {
-                MediaSendPreviewView(
-                    data: data,
-                    isGif: preview.mime == "image/gif",
+            if let preview = store.pendingMediaPreviews.first(where: { $0.peerId == peerId }) {
+                MediaSendPreviewLoaderView(
+                    preview: preview,
                     onSend: { store.confirmSendPreview(peerId: peerId) },
                     onCancel: { store.cancelPreview(peerId: peerId) }
                 )
@@ -635,6 +633,38 @@ private struct MediaSendPreviewView: View {
                 }
                 .padding(16)
             }
+        }
+    }
+}
+
+private struct MediaSendPreviewLoaderView: View {
+    let preview: SonarAppStore.PendingMediaPreview
+    let onSend: () -> Void
+    let onCancel: () -> Void
+
+    @State private var data: Data?
+
+    var body: some View {
+        Group {
+            if let data {
+                MediaSendPreviewView(
+                    data: data,
+                    isGif: preview.mime == "image/gif",
+                    onSend: onSend,
+                    onCancel: onCancel
+                )
+            } else {
+                ZStack {
+                    Color.black.ignoresSafeArea()
+                    ProgressView()
+                        .tint(.white)
+                }
+            }
+        }
+        .task(id: preview.tempURL) {
+            data = await Task.detached(priority: .userInitiated) {
+                try? Data(contentsOf: preview.tempURL)
+            }.value
         }
     }
 }

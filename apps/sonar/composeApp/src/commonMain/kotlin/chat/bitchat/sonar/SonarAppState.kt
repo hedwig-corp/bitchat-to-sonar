@@ -1829,21 +1829,42 @@ class SonarAppState(private val scope: CoroutineScope) {
     )
 
     var pendingMediaPreviews by mutableStateOf<List<PendingMediaPreview>>(emptyList())
+    private var mediaPreviewGeneration = 0L
+
+    private fun nextMediaPreviewGeneration(): Long {
+        mediaPreviewGeneration += 1
+        return mediaPreviewGeneration
+    }
+
+    private fun deletePreviewTempFilesAsync(previews: List<PendingMediaPreview>) {
+        if (previews.isEmpty()) return
+        scope.launch {
+            withContext(Dispatchers.IO) {
+                for (preview in previews) {
+                    deleteTempMediaFile(preview.tempPath)
+                }
+            }
+        }
+    }
 
     private fun cleanupPreviewTempFiles() {
-        for (preview in pendingMediaPreviews) {
-            deleteTempMediaFile(preview.tempPath)
-        }
+        nextMediaPreviewGeneration()
+        val previews = pendingMediaPreviews
         pendingMediaPreviews = emptyList()
+        deletePreviewTempFilesAsync(previews)
     }
 
     fun stageMediaPreview(chatId: String, data: ByteArray, filename: String, mime: String) {
         if ((screen as? Screen.Chat)?.id != chatId) return
+        val generation = nextMediaPreviewGeneration()
+        val previous = pendingMediaPreviews
+        pendingMediaPreviews = emptyList()
+        deletePreviewTempFilesAsync(previous)
         scope.launch {
             val suffix = if (mime == "image/gif") ".gif" else ".img"
-            val path = withContext(Dispatchers.Default) { writeTempMediaFile(data, suffix) }
-            if ((screen as? Screen.Chat)?.id != chatId) {
-                withContext(Dispatchers.Default) { deleteTempMediaFile(path) }
+            val path = withContext(Dispatchers.IO) { writeTempMediaFile(data, suffix) }
+            if (mediaPreviewGeneration != generation || (screen as? Screen.Chat)?.id != chatId) {
+                withContext(Dispatchers.IO) { deleteTempMediaFile(path) }
                 return@launch
             }
             pendingMediaPreviews = listOf(PendingMediaPreview(chatId, path, filename, mime))
@@ -1857,6 +1878,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             pendingMediaPreviews.filter { it.chatId == chatId }
         }
         if (items.isEmpty()) return
+        nextMediaPreviewGeneration()
         pendingMediaPreviews = if (chatId == null) {
             emptyList()
         } else {
@@ -1864,13 +1886,17 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         for (preview in items) {
             scope.launch {
-                val raw = withContext(Dispatchers.Default) {
+                val raw = withContext(Dispatchers.IO) {
                     readTempMediaFile(preview.tempPath).also { deleteTempMediaFile(preview.tempPath) }
                 } ?: return@launch
                 if (preview.mime == "image/gif") {
                     sendImage(preview.chatId, raw, preview.filename, preview.mime)
                 } else {
                     val jpeg = withContext(Dispatchers.Default) { reencodeToJpeg(raw) }
+                    if (jpeg == null) {
+                        toast = "Couldn't encode image."
+                        return@launch
+                    }
                     sendImage(preview.chatId, jpeg, "photo.jpg", "image/jpeg")
                 }
             }
@@ -1878,19 +1904,18 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     fun cancelPreview(chatId: String? = null) {
+        nextMediaPreviewGeneration()
         val toRemove = if (chatId == null) {
             pendingMediaPreviews
         } else {
             pendingMediaPreviews.filter { it.chatId == chatId }
-        }
-        for (preview in toRemove) {
-            deleteTempMediaFile(preview.tempPath)
         }
         pendingMediaPreviews = if (chatId == null) {
             emptyList()
         } else {
             pendingMediaPreviews.filterNot { it.chatId == chatId }
         }
+        deletePreviewTempFilesAsync(toRemove)
     }
 
     // ── Media (White Noise / Marmot MIP-04) ──

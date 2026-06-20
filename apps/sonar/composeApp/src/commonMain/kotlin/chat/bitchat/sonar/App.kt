@@ -87,7 +87,9 @@ import chat.bitchat.sonar.ui.SonarAvatar
 import chat.bitchat.sonar.ui.SonarTheme
 import chat.bitchat.sonar.ui.SonarType
 import chat.bitchat.sonar.ui.sonar
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlin.math.abs
 import kotlin.math.sin
 
@@ -957,10 +959,13 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         )
     }
     state.pendingMediaPreviews.firstOrNull { it.chatId == screen.id }?.let { preview ->
-        val data = remember(preview.tempPath) { readTempMediaFile(preview.tempPath) }
-        if (data != null) {
+        val data by androidx.compose.runtime.produceState<ByteArray?>(null, preview.tempPath) {
+            value = withContext(Dispatchers.IO) { readTempMediaFile(preview.tempPath) }
+        }
+        val previewData = data
+        if (previewData != null) {
             MediaSendPreview(
-                data = data,
+                data = previewData,
                 isGif = preview.mime == "image/gif",
                 onSend = { state.confirmSendPreview(screen.id) },
                 onCancel = { state.cancelPreview(screen.id) },

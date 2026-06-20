@@ -397,7 +397,7 @@ final class SonarAppStore: ObservableObject {
     @Published private(set) var localHydratingDMs: Set<String> = []
 
     // ── Media preview (confirmation before send) ──
-    struct PendingMediaPreview {
+    struct PendingMediaPreview: Sendable {
         let peerId: String
         let tempURL: URL
         let filename: String
@@ -414,13 +414,19 @@ final class SonarAppStore: ObservableObject {
     }
 
     @Published var pendingMediaPreviews: [PendingMediaPreview] = []
+    private var mediaPreviewGeneration: UInt64 = 0
 
     private var currentDMId: String? {
         if case .dm(let id)? = path.last { return id }
         return nil
     }
 
-    private func writeTempMediaFile(_ data: Data, suffix: String) -> URL? {
+    private func nextMediaPreviewGeneration() -> UInt64 {
+        mediaPreviewGeneration += 1
+        return mediaPreviewGeneration
+    }
+
+    private nonisolated static func writeTempMediaFile(_ data: Data, suffix: String) -> URL? {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("sonar-preview")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let url = dir.appendingPathComponent(UUID().uuidString + suffix)
@@ -432,54 +438,105 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
-    private func cleanupPreviewTempFiles() {
-        for preview in pendingMediaPreviews {
-            try? FileManager.default.removeItem(at: preview.tempURL)
+    private nonisolated static func readTempMediaFile(_ url: URL) -> Data? {
+        return try? Data(contentsOf: url)
+    }
+
+    private nonisolated static func deleteTempMediaFile(_ url: URL) {
+        try? FileManager.default.removeItem(at: url)
+    }
+
+    private nonisolated static func deletePreviewTempFiles(_ previews: [PendingMediaPreview]) {
+        for preview in previews {
+            deleteTempMediaFile(preview.tempURL)
         }
+    }
+
+    private nonisolated static func reencodeToJpeg(_ data: Data) -> Data? {
+        #if canImport(UIKit)
+        return UIImage(data: data)?.jpegData(compressionQuality: 0.85)
+        #else
+        return data
+        #endif
+    }
+
+    private func deletePreviewTempFilesAsync(_ previews: [PendingMediaPreview]) {
+        guard !previews.isEmpty else { return }
+        Task.detached(priority: .utility) {
+            Self.deletePreviewTempFiles(previews)
+        }
+    }
+
+    private func cleanupPreviewTempFiles() {
+        nextMediaPreviewGeneration()
+        let previews = pendingMediaPreviews
         pendingMediaPreviews = []
+        deletePreviewTempFilesAsync(previews)
     }
 
     func stageMediaPreview(_ peerId: String, data: Data, filename: String, mime: String) {
         guard currentDMId == peerId else { return }
+        let generation = nextMediaPreviewGeneration()
+        let previous = pendingMediaPreviews
+        pendingMediaPreviews = []
+        deletePreviewTempFilesAsync(previous)
         let suffix = mime == "image/gif" ? ".gif" : ".img"
-        guard let url = writeTempMediaFile(data, suffix: suffix) else { return }
-        pendingMediaPreviews = [PendingMediaPreview(peerId: peerId, tempURL: url, filename: filename, mime: mime)]
+        Task { @MainActor in
+            guard let url = await Task.detached(priority: .userInitiated, operation: {
+                Self.writeTempMediaFile(data, suffix: suffix)
+            }).value else {
+                showToast("Couldn't prepare image.")
+                return
+            }
+            guard mediaPreviewGeneration == generation, currentDMId == peerId else {
+                Task.detached(priority: .utility) {
+                    Self.deleteTempMediaFile(url)
+                }
+                return
+            }
+            pendingMediaPreviews = [PendingMediaPreview(peerId: peerId, tempURL: url, filename: filename, mime: mime)]
+        }
     }
 
     func confirmSendPreview(peerId: String? = nil) {
         let items = peerId.map { id in pendingMediaPreviews.filter { $0.peerId == id } } ?? pendingMediaPreviews
         guard !items.isEmpty else { return }
+        nextMediaPreviewGeneration()
         if let peerId {
             pendingMediaPreviews.removeAll { $0.peerId == peerId }
         } else {
             pendingMediaPreviews = []
         }
         for preview in items {
-            guard let raw = try? Data(contentsOf: preview.tempURL) else { continue }
-            try? FileManager.default.removeItem(at: preview.tempURL)
-            if preview.mime == "image/gif" {
-                _ = sendAttachment(preview.peerId, data: raw, filename: preview.filename, mime: preview.mime)
-            } else {
-                #if os(iOS)
-                let bytes = UIImage(data: raw)?.jpegData(compressionQuality: 0.85) ?? raw
-                #else
-                let bytes = raw
-                #endif
-                sendImage(preview.peerId, data: bytes, filename: "photo.jpg", mime: "image/jpeg")
+            Task { @MainActor in
+                guard let raw = await Task.detached(priority: .userInitiated, operation: { () -> Data? in
+                    defer { Self.deleteTempMediaFile(preview.tempURL) }
+                    return Self.readTempMediaFile(preview.tempURL)
+                }).value else { return }
+                if preview.mime == "image/gif" {
+                    _ = sendAttachment(preview.peerId, data: raw, filename: preview.filename, mime: preview.mime)
+                } else {
+                    guard let bytes = await Task.detached(priority: .userInitiated, operation: {
+                        Self.reencodeToJpeg(raw)
+                    }).value else {
+                        showToast("Couldn't encode image.")
+                        return
+                    }
+                    sendImage(preview.peerId, data: bytes, filename: "photo.jpg", mime: "image/jpeg")
+                }
             }
         }
     }
 
     func cancelPreview(peerId: String? = nil) {
+        nextMediaPreviewGeneration()
         let toRemove = peerId.map { id in pendingMediaPreviews.filter { $0.peerId == id } } ?? pendingMediaPreviews
-        for preview in toRemove {
-            try? FileManager.default.removeItem(at: preview.tempURL)
-        }
         if let peerId {
             pendingMediaPreviews.removeAll { $0.peerId == peerId }
         } else {
             pendingMediaPreviews = []
         }
+        deletePreviewTempFilesAsync(toRemove)
     }
 
     /// The in-flight P2P call the [SonarCallScreen] renders, or nil. Driven by the

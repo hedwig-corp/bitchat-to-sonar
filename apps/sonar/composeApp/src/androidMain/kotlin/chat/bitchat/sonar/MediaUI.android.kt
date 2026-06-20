@@ -319,9 +319,9 @@ actual fun deleteTempMediaFile(path: String) {
     runCatching { File(path).delete() }
 }
 
-actual fun reencodeToJpeg(data: ByteArray): ByteArray {
-    val bmp = BitmapFactory.decodeByteArray(data, 0, data.size) ?: return data
+actual fun reencodeToJpeg(data: ByteArray): ByteArray? {
+    val bmp = BitmapFactory.decodeByteArray(data, 0, data.size) ?: return null
     val out = ByteArrayOutputStream()
-    bmp.compress(Bitmap.CompressFormat.JPEG, 85, out)
-    return out.toByteArray()
+    if (!bmp.compress(Bitmap.CompressFormat.JPEG, 85, out)) return null
+    return out.toByteArray().takeIf { it.isNotEmpty() }
 }

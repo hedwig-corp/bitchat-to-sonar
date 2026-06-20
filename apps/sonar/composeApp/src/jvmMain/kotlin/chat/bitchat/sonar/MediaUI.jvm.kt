@@ -185,22 +185,27 @@ actual fun deleteTempMediaFile(path: String) {
     runCatching { File(path).delete() }
 }
 
-actual fun reencodeToJpeg(data: ByteArray): ByteArray {
-    val src = ImageIO.read(ByteArrayInputStream(data)) ?: return data
+actual fun reencodeToJpeg(data: ByteArray): ByteArray? {
+    val src = ImageIO.read(ByteArrayInputStream(data)) ?: return null
     val rgb = BufferedImage(src.width, src.height, BufferedImage.TYPE_INT_RGB)
     val g = rgb.createGraphics()
     g.drawImage(src, 0, 0, java.awt.Color.WHITE, null)
     g.dispose()
-    val writer = ImageIO.getImageWritersByFormatName("jpg").next()
+    val writers = ImageIO.getImageWritersByFormatName("jpg")
+    if (!writers.hasNext()) return null
+    val writer = writers.next()
     val out = ByteArrayOutputStream()
-    ImageIO.createImageOutputStream(out).use { ios ->
-        writer.output = ios
-        val param = writer.defaultWriteParam.apply {
-            compressionMode = ImageWriteParam.MODE_EXPLICIT
-            compressionQuality = 0.85f
+    try {
+        ImageIO.createImageOutputStream(out).use { ios ->
+            writer.output = ios
+            val param = writer.defaultWriteParam.apply {
+                compressionMode = ImageWriteParam.MODE_EXPLICIT
+                compressionQuality = 0.85f
+            }
+            writer.write(null, IIOImage(rgb, null, null), param)
         }
-        writer.write(null, IIOImage(rgb, null, null), param)
+        return out.toByteArray().takeIf { it.isNotEmpty() }
+    } finally {
+        writer.dispose()
     }
-    writer.dispose()
-    return out.toByteArray()
 }

@@ -41,8 +41,8 @@ expect fun readTempMediaFile(path: String): ByteArray?
 /** Delete a temp file. Safe to call if the file doesn't exist. */
 expect fun deleteTempMediaFile(path: String)
 
-/** Re-encode raw image bytes to JPEG at quality 0.85. Returns original on failure. */
-expect fun reencodeToJpeg(data: ByteArray): ByteArray
+/** Re-encode raw image bytes to JPEG at quality 0.85, or null if decoding fails. */
+expect fun reencodeToJpeg(data: ByteArray): ByteArray?
 
 /** Platform share/download/open integration for media viewer actions. */
 @Composable
