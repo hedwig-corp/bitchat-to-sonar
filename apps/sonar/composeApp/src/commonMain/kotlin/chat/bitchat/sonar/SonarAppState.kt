@@ -15,9 +15,11 @@ import chat.bitchat.sonar.wallet.Money
 import chat.bitchat.sonar.wallet.SendResult
 import chat.bitchat.sonar.wallet.WalletBridge
 import chat.bitchat.sonar.wallet.WalletState
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
@@ -292,6 +294,9 @@ class SonarAppState(private val scope: CoroutineScope) {
     private var meshRealtimeLoopRunning = false
     private var pollJob: Job? = null
     private val refreshMutex = Mutex()
+    private var refreshRunning = false
+    private var refreshPending = false
+    private var refreshCompletion: CompletableDeferred<Unit>? = null
     /** Ids of ☎CALL control messages already routed to the engine (dedup). */
     private val scannedCall = mutableSetOf<String>()
 
@@ -3067,9 +3072,66 @@ class SonarAppState(private val scope: CoroutineScope) {
         SonarCore.saveBlob(CHAT_SNAPSHOT_BLOB_KEY, "")
     }
 
+    /** Coalesce concurrent refresh requests: one owner refreshes, other callers
+     *  await the same completion, and burst arrivals become one trailing pass. */
     private suspend fun refreshChats() {
+        var owner = false
+        var completion: CompletableDeferred<Unit>? = null
         refreshMutex.withLock {
-            refreshChatsInner()
+            if (refreshRunning) {
+                refreshPending = true
+                completion = refreshCompletion ?: CompletableDeferred<Unit>().also { refreshCompletion = it }
+            } else {
+                refreshRunning = true
+                completion = CompletableDeferred()
+                refreshCompletion = completion
+                owner = true
+            }
+        }
+        val currentCompletion = completion ?: return
+        if (!owner) {
+            currentCompletion.await()
+            return
+        }
+
+        var completed = false
+        var failure: Throwable? = null
+        try {
+            while (true) {
+                refreshChatsInner()
+                val finishedCompletion = refreshMutex.withLock {
+                    if (refreshPending) {
+                        refreshPending = false
+                        null
+                    } else {
+                        refreshRunning = false
+                        refreshCompletion.also { refreshCompletion = null }
+                    }
+                }
+                if (finishedCompletion != null) {
+                    finishedCompletion.complete(Unit)
+                    completed = true
+                    return
+                }
+            }
+        } catch (t: Throwable) {
+            failure = t
+            throw t
+        } finally {
+            if (!completed) {
+                withContext(NonCancellable) {
+                    val failedCompletion = refreshMutex.withLock {
+                        refreshRunning = false
+                        refreshPending = false
+                        refreshCompletion.also { refreshCompletion = null }
+                    }
+                    if (failedCompletion != null) {
+                        val error = failure
+                        if (error == null) failedCompletion.complete(Unit)
+                        else failedCompletion.completeExceptionally(error)
+                    }
+                }
+            }
         }
     }
 
