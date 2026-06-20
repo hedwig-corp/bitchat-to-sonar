@@ -1508,8 +1508,9 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun groupAuthorName(message: SonarMsg, isGroup: Boolean): String? {
         if (!isGroup || message.mine || message.senderNpub.isBlank()) return null
-        return profilesByNpub[canonicalProfileKey(message.senderNpub)]?.bestName
-            ?: shortNpub(message.senderNpub)
+        profilesByNpub[canonicalProfileKey(message.senderNpub)]?.bestName?.let { return it }
+        ensureProfile(message.senderNpub)
+        return shortNpub(message.senderNpub)
     }
 
     /** Fetch + cache a peer's kind-0 profile, so their name replaces the
