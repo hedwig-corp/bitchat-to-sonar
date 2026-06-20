@@ -56,7 +56,7 @@ struct ChannelChangeListener {
 
 impl sonar_core::conversation_index::ConversationChangeListener for ChannelChangeListener {
     fn on_conversation_changed(&self, group_id_hex: String) {
-        let _ = self.tx.lock().unwrap().send(group_id_hex);
+        let _ = self.tx.lock().expect("conversation change tx not poisoned").send(group_id_hex);
     }
 }
 
@@ -961,7 +961,7 @@ impl SonarNode {
         // CallEngine::start binds a fresh endpoint (presets::N0 → a network
         // round-trip that can block) AND drops the active engine — which made a
         // call placed after boot's ensureCallStarted "take forever".
-        if self.call.lock().unwrap().is_some() {
+        if self.call.lock().expect("call engine lock not poisoned").is_some() {
             return Ok(());
         }
         let nostr_secret = self.client.identity().keys().secret_key().to_secret_bytes();
@@ -970,7 +970,7 @@ impl SonarNode {
             .runtime
             .block_on(sonar_core::call::engine::CallEngine::start(iroh_secret))
             .map_err(|e| SonarFfiError::Core(format!("call start: {e}")))?;
-        *self.call.lock().unwrap() = Some(Arc::new(engine));
+        *self.call.lock().expect("call engine lock not poisoned") = Some(Arc::new(engine));
         Ok(())
     }
 
@@ -1051,7 +1051,7 @@ impl SonarNode {
         // Snapshot the engine under a SHORT lock: bind it to a `let` so the
         // guard drops at the `;`, never held across the block_on park below
         // (so a long wait can't block `call_hangup`/`call_start`).
-        let engine = self.call.lock().unwrap().clone();
+        let engine = self.call.lock().expect("call engine lock not poisoned").clone();
         let Some(engine) = engine else {
             // No engine: park the node's runtime for the (capped) timeout, then
             // report "nothing happened". `.max(1)` floors a 0 timeout so we can
@@ -1081,7 +1081,7 @@ impl SonarNode {
     fn call_engine(&self) -> FfiResult<Arc<sonar_core::call::engine::CallEngine>> {
         self.call
             .lock()
-            .unwrap()
+            .expect("call engine lock not poisoned")
             .clone()
             .ok_or_else(|| SonarFfiError::Core("call engine not started (call_start first)".into()))
     }
@@ -1231,7 +1231,7 @@ impl SonarNoise {
 
     /// Next handshake message to send to the peer.
     pub fn write_message(&self) -> FfiResult<Vec<u8>> {
-        match &mut *self.phase.lock().unwrap() {
+        match &mut *self.phase.lock().expect("noise phase lock not poisoned") {
             NoisePhase::Handshake(hs) => Ok(hs.write_message()?),
             _ => Err(SonarFfiError::Core("noise: not in handshake".into())),
         }
@@ -1239,14 +1239,14 @@ impl SonarNoise {
 
     /// Consume a handshake message received from the peer.
     pub fn read_message(&self, msg: Vec<u8>) -> FfiResult<()> {
-        match &mut *self.phase.lock().unwrap() {
+        match &mut *self.phase.lock().expect("noise phase lock not poisoned") {
             NoisePhase::Handshake(hs) => Ok(hs.read_message(&msg)?),
             _ => Err(SonarFfiError::Core("noise: not in handshake".into())),
         }
     }
 
     pub fn is_finished(&self) -> bool {
-        match &*self.phase.lock().unwrap() {
+        match &*self.phase.lock().expect("noise phase lock not poisoned") {
             NoisePhase::Handshake(hs) => hs.is_finished(),
             NoisePhase::Session(_) => true,
             NoisePhase::Spent => false,
@@ -1255,7 +1255,7 @@ impl SonarNoise {
 
     /// The peer's authenticated static key (hex), available after the handshake.
     pub fn remote_static_hex(&self) -> Option<String> {
-        match &*self.phase.lock().unwrap() {
+        match &*self.phase.lock().expect("noise phase lock not poisoned") {
             NoisePhase::Handshake(hs) => hs.remote_static().map(hex::encode),
             _ => None,
         }
@@ -1266,7 +1266,7 @@ impl SonarNoise {
     /// in the generated Kotlin binding (the GC then re-invokes it on a spent
     /// object and throws).
     pub fn into_session(&self) -> FfiResult<()> {
-        let mut g = self.phase.lock().unwrap();
+        let mut g = self.phase.lock().expect("noise phase lock not poisoned");
         match std::mem::replace(&mut *g, NoisePhase::Spent) {
             NoisePhase::Handshake(hs) => {
                 *g = NoisePhase::Session(hs.into_session()?);
@@ -1280,14 +1280,14 @@ impl SonarNoise {
     }
 
     pub fn encrypt(&self, data: Vec<u8>) -> FfiResult<Vec<u8>> {
-        match &mut *self.phase.lock().unwrap() {
+        match &mut *self.phase.lock().expect("noise phase lock not poisoned") {
             NoisePhase::Session(s) => Ok(s.encrypt(&data)?),
             _ => Err(SonarFfiError::Core("noise: no session".into())),
         }
     }
 
     pub fn decrypt(&self, data: Vec<u8>) -> FfiResult<Vec<u8>> {
-        match &mut *self.phase.lock().unwrap() {
+        match &mut *self.phase.lock().expect("noise phase lock not poisoned") {
             NoisePhase::Session(s) => Ok(s.decrypt(&data)?),
             _ => Err(SonarFfiError::Core("noise: no session".into())),
         }
@@ -1674,7 +1674,7 @@ impl MeshReassembler {
             Some(f) => f,
             None => return Ok(None),
         };
-        Ok(self.inner.lock().unwrap().add(sender, &frag))
+        Ok(self.inner.lock().expect("fragment assembler lock not poisoned").add(sender, &frag))
     }
 }
 

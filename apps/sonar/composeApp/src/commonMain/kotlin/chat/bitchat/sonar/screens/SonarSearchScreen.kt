@@ -18,6 +18,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -50,6 +51,9 @@ import chat.bitchat.sonar.ui.sonar
 fun SonarSearchScreen(state: SonarAppState) {
     val s = sonar
     var q by remember { mutableStateOf("") }
+    LaunchedEffect(state.sharedText) {
+        state.consumeSharedText()?.let { q = it }
+    }
     val query = q.trim()
     val ql = query.lowercase()
 

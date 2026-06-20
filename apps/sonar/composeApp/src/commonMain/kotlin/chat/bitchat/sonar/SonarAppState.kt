@@ -128,6 +128,7 @@ data class ActiveCall(
     val connectedSecs: Int = 0,
     val muted: Boolean = false,
     val speakerOn: Boolean = true,
+    val camOn: Boolean = false,
 )
 
 /** Verify-sheet model: the safety groups (empty ⇒ show [note]) + verified flag. */
@@ -401,6 +402,11 @@ class SonarAppState(private val scope: CoroutineScope) {
         val next = !c.speakerOn
         activeCall = c.copy(speakerOn = next)
         CallAudioRoute.setSpeaker(next)
+    }
+
+    fun toggleCallCam() {
+        val c = activeCall ?: return
+        activeCall = c.copy(camOn = !c.camOn)
     }
 
     private fun startCallLoop() {
@@ -1394,7 +1400,14 @@ class SonarAppState(private val scope: CoroutineScope) {
             else if (AppLock.isEnabled()) locked = true   // genuine app-switch → re-lock
             if (started) {
                 refreshKnownContactDescriptors(clearMisses = false)
-                scope.launch { publishSonarDescriptorIfNeeded(force = true) }
+                scope.launch {
+                    publishSonarDescriptorIfNeeded(force = true)
+                    SonarCore.sync()
+                    refreshChats()
+                    recomputeConversations()
+                    (screen as? Screen.Channel)?.let { refreshChannel(it.geohash) }
+                    refreshPresenceCounts()
+                }
             }
         }
         // Unify receiver is foreground-only (matches iOS) — react immediately.
@@ -2466,6 +2479,20 @@ class SonarAppState(private val scope: CoroutineScope) {
         val queued = pendingInviteTokens.toList()
         pendingInviteTokens.clear()
         queued.forEach { requestJoinViaLink(it) }
+    }
+
+    var sharedText: String? by mutableStateOf(null)
+        private set
+
+    fun handleSharedText(text: String) {
+        sharedText = text
+        push(Screen.Search)
+    }
+
+    fun consumeSharedText(): String? {
+        val text = sharedText
+        sharedText = null
+        return text
     }
 
     fun acceptGroupInvite(inviteId: String) {

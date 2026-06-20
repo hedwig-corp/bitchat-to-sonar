@@ -112,6 +112,21 @@ object SonarLifecycle {
         pendingInviteLinks.clear()
         queued.forEach(handler)
     }
+
+    @Volatile private var onSharedText: ((String) -> Unit)? = null
+    private val pendingSharedTexts = mutableListOf<String>()
+
+    fun submitSharedText(text: String) {
+        val handler = onSharedText
+        if (handler != null) handler(text) else pendingSharedTexts.add(text)
+    }
+
+    fun installSharedTextHandler(handler: (String) -> Unit) {
+        onSharedText = handler
+        val queued = pendingSharedTexts.toList()
+        pendingSharedTexts.clear()
+        queued.forEach(handler)
+    }
 }
 
 @Composable
@@ -121,6 +136,7 @@ fun App() {
     LaunchedEffect(state) {
         SonarLifecycle.onForeground = { state.setForeground(it) }
         SonarLifecycle.installInviteLinkHandler { state.requestJoinViaLink(it) }
+        SonarLifecycle.installSharedTextHandler { state.handleSharedText(it) }
     }
     LaunchedEffect(Unit) { state.boot() }
     SonarTheme(dark = state.dark) {
