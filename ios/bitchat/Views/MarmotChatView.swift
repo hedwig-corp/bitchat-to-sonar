@@ -924,7 +924,10 @@ final class MarmotChatModel: ObservableObject {
         relayUrls: [String]
     ) async -> StickerPackInfo? {
         let cacheKey = "30030:\(authorPubkeyHex.lowercased()):\(identifier)"
-        if let cached = stickerPacksByCoordinate[cacheKey] { return cached }
+        if let cached = stickerPacksByCoordinate.removeValue(forKey: cacheKey) {
+            stickerPacksByCoordinate[cacheKey] = cached
+            return cached
+        }
         do {
             guard await ensureRelayConnected() else {
                 throw MarmotService.ServiceError.notConnected
@@ -947,7 +950,10 @@ final class MarmotChatModel: ObservableObject {
 
     func fetchStickerImage(url: String, expectedSha256: String) async -> Data? {
         let cacheKey = "\(expectedSha256.lowercased())|\(url)"
-        if let cached = stickerImagesByURL[cacheKey] { return cached }
+        if let cached = stickerImagesByURL.removeValue(forKey: cacheKey) {
+            stickerImagesByURL[cacheKey] = cached
+            return cached
+        }
         do {
             let data = try await service.fetchStickerImage(url: url, expectedSha256: expectedSha256)
             if stickerImagesByURL.count >= 500, let oldest = stickerImagesByURL.keys.first {

@@ -950,7 +950,13 @@ impl MarmotEngine {
             .tags
             .iter()
             .find(|t| t.as_slice().first().map(|s| s.as_str()) == Some("sticker"))
-            .and_then(|t| parse_sticker_ref_tag(t).ok());
+            .and_then(|t| match parse_sticker_ref_tag(t) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    tracing::debug!("invalid sticker ref tag: {e}");
+                    None
+                }
+            });
         ChatMessage {
             id: m.id,
             group_id: m.mls_group_id.clone(),

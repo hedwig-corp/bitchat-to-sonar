@@ -2086,7 +2086,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         relayUrls: List<String> = emptyList(),
     ): SonarStickerPack? {
         val cacheKey = "30030:${authorPubkeyHex.lowercase()}:$identifier"
-        stickerPackCache[cacheKey]?.let { return it }
+        stickerPackCache.remove(cacheKey)?.let { stickerPackCache[cacheKey] = it; return it }
         return try {
             SonarCore.fetchStickerPack(authorPubkeyHex, identifier, relayUrls).also {
                 if (stickerPackCache.size >= 20) stickerPackCache.remove(stickerPackCache.keys.first())
@@ -2099,7 +2099,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     suspend fun stickerImage(url: String, expectedSha256: String): ByteArray? {
         val cacheKey = "${expectedSha256.lowercase()}|$url"
-        stickerImageCache[cacheKey]?.let { return it }
+        stickerImageCache.remove(cacheKey)?.let { stickerImageCache[cacheKey] = it; return it }
         return try {
             SonarCore.fetchStickerImage(url, expectedSha256).also {
                 if (stickerImageCache.size >= 500) stickerImageCache.remove(stickerImageCache.keys.first())

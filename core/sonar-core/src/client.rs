@@ -106,7 +106,7 @@ async fn http_get(url: &str) -> Result<Vec<u8>> {
 
 /// Download public bytes from an HTTPS URL (for plaintext sticker images).
 pub async fn http_get_public(url: &str) -> Result<Vec<u8>> {
-    http_get(url).await
+    http_get_with_retries(url).await
 }
 
 async fn http_get_with_retries(url: &str) -> Result<Vec<u8>> {
