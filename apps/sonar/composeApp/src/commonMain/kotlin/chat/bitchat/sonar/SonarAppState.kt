@@ -254,6 +254,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             payLedger = SonarPayLedger(); persistPay(); payVersion++
             mediaCache.clear(); stickerPackCache.clear(); stickerImageCache.clear(); installedPackCoordinates.clear()
             callLogs.clear(); callVersion++
+            lastSeenTs.clear(); lastNotifiedTs.clear(); seededSeen = false
             // White Noise / Marmot DB: wipe + reconnect with the SAME identity.
             runCatching { SonarCore.eraseChats() }
             // The node is recreated → re-bind the iroh call endpoint on next use.
@@ -290,10 +291,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     private var callTicker: kotlinx.coroutines.Job? = null
     private var meshRealtimeLoopRunning = false
     private var pollJob: Job? = null
-    // Signal-style serialized refresh: all refreshChats() callers go through
-    // this Mutex so concurrent coroutines coalesce into at-most-one refresh.
     private val refreshMutex = Mutex()
-    private var refreshPending = false
     /** Ids of ☎CALL control messages already routed to the engine (dedup). */
     private val scannedCall = mutableSetOf<String>()
 
@@ -1432,7 +1430,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun requestImmediateSync() {
         if (!started) return
         scope.launch {
-            SonarCore.sync()
+            runCatching { SonarCore.sync() }
             refreshChats()
             recomputeConversations()
             (screen as? Screen.Chat)?.let { sc ->
@@ -1700,6 +1698,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         val wasOpen = (stack.lastOrNull() as? Screen.Chat)?.id == chatId
         val isGroup = chats.firstOrNull { it.id == chatId }?.let { !isDirectMarmotChat(it) } == true
         chats = chats.filterNot { it.id == chatId }
+        lastSeenTs.remove(chatId); lastNotifiedTs.remove(chatId)
         if (wasOpen && stack.size > 1) stack = stack.dropLast(1) // pop WITHOUT refresh
         scope.launch {
             try {
@@ -3069,15 +3068,8 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private suspend fun refreshChats() {
-        if (refreshMutex.isLocked) {
-            refreshPending = true
-            return
-        }
         refreshMutex.withLock {
-            do {
-                refreshPending = false
-                refreshChatsInner()
-            } while (refreshPending)
+            refreshChatsInner()
         }
     }
 
