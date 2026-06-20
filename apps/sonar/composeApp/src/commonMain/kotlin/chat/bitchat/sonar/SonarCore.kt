@@ -59,6 +59,33 @@ data class SonarStickerRef(
     }
 }
 
+internal data class MeshStickerContentRef(
+    val packCoordinate: String,
+    val shortcode: String,
+    val plaintextSha256: String,
+)
+
+private const val MESH_STICKER_TAG = "sticker"
+private const val MESH_STICKER_SEPARATOR = '\u001F'
+
+internal fun meshStickerContent(
+    packCoordinate: String,
+    shortcode: String,
+    plaintextSha256: String,
+): String =
+    "$MESH_STICKER_SEPARATOR$MESH_STICKER_TAG$MESH_STICKER_SEPARATOR" +
+        "$packCoordinate$MESH_STICKER_SEPARATOR$shortcode$MESH_STICKER_SEPARATOR$plaintextSha256"
+
+internal fun meshParseStickerContent(content: String): MeshStickerContentRef? {
+    val parts = content.split(MESH_STICKER_SEPARATOR, limit = 5)
+    if (parts.size != 5 || parts[0].isNotEmpty() || parts[1] != MESH_STICKER_TAG) return null
+    return MeshStickerContentRef(
+        packCoordinate = parts[2],
+        shortcode = parts[3],
+        plaintextSha256 = parts[4],
+    )
+}
+
 /** A single sticker in a pack. */
 data class SonarStickerItem(
     val shortcode: String,

@@ -8,6 +8,7 @@
 import Foundation
 import Combine
 import BitLogger
+import SonarCore
 import SwiftUI
 
 extension ChatViewModel {
