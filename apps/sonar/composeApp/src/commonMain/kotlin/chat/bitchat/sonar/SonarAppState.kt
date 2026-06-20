@@ -2084,7 +2084,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         return try {
             SonarCore.fetchStickerPack(authorPubkeyHex, identifier, relayUrls).also {
                 if (stickerPackCache.size >= 20) stickerPackCache.remove(stickerPackCache.keys.first())
-                stickerPackCache[it.packCoordinate] = it
+                stickerPackCache[cacheKey] = it
             }
         } catch (_: Throwable) {
             null

@@ -379,7 +379,7 @@ private fun ColumnScope.StickerTabContent(
             val parts = coord.split(":", limit = 3)
             if (parts.size != 3) continue
             val relays = if (coord.contains(TEST_PACK_AUTHOR)) TEST_PACK_RELAYS else emptyList()
-            loadStickerPack(parts[1], parts[2], relays)?.let { loaded += it }
+            loadStickerPack(parts[1], parts[2], relays)?.takeIf { it.stickers.isNotEmpty() }?.let { loaded += it }
         }
         if (loaded.isEmpty()) {
             loadStickerPack(TEST_PACK_AUTHOR, TEST_PACK_ID, TEST_PACK_RELAYS)?.let { loaded += it }

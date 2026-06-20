@@ -255,7 +255,9 @@ private struct StickerTabContent: View {
             let parts = coord.split(separator: ":", maxSplits: 2).map(String.init)
             guard parts.count == 3 else { continue }
             let relays = coord.contains(testPackAuthor) ? testPackRelays : []
-            if let p = await loadPack(parts[1], parts[2], relays) { loaded.append(p) }
+            if let p = await loadPack(parts[1], parts[2], relays), !p.stickers.isEmpty {
+                loaded.append(p)
+            }
         }
         if loaded.isEmpty {
             if let fallback = await loadPack(testPackAuthor, testPackId, testPackRelays) {
@@ -312,11 +314,11 @@ private struct StickerCell: View {
         }
         .buttonStyle(.plain)
         .task {
-            await loadImage()
+            await fetchImage()
         }
     }
 
-    private func loadImage() async {
+    private func fetchImage() async {
         failed = false
         guard let data = await loadImage(sticker.url, sticker.sha256),
               let decoded = StickerImage(data: data)

@@ -933,7 +933,10 @@ final class MarmotChatModel: ObservableObject {
                 identifier: identifier,
                 relayUrls: relayUrls
             )
-            stickerPacksByCoordinate[pack.packCoordinate] = pack
+            if stickerPacksByCoordinate.count >= 20, let oldest = stickerPacksByCoordinate.keys.first {
+                stickerPacksByCoordinate.removeValue(forKey: oldest)
+            }
+            stickerPacksByCoordinate[cacheKey] = pack
             return pack
         } catch {
             self.errorText = Self.describe(error)
@@ -946,6 +949,9 @@ final class MarmotChatModel: ObservableObject {
         if let cached = stickerImagesByURL[cacheKey] { return cached }
         do {
             let data = try await service.fetchStickerImage(url: url, expectedSha256: expectedSha256)
+            if stickerImagesByURL.count >= 500, let oldest = stickerImagesByURL.keys.first {
+                stickerImagesByURL.removeValue(forKey: oldest)
+            }
             stickerImagesByURL[cacheKey] = data
             return data
         } catch {
