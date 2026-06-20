@@ -2915,9 +2915,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 mine = false, m.tsSecs, stickerRef = stickerRef,
             )
             val chatId = meshChatId(m.peerId)
-            // A ☎CALL control line arriving over the mesh link: route it to the
-            // engine, never store/show it as a chat message.
-            if (SonarCore.callParseControl(m.text) != null) {
+            if (stickerRef == null && SonarCore.callParseControl(m.text) != null) {
                 processCallLines(chatId, listOf(msg))
                 continue
             }
