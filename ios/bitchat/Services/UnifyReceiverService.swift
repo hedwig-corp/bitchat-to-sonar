@@ -170,12 +170,17 @@ final class UnifyReceiverService: NSObject, ObservableObject {
         if name != cachedName || !isAdvertising {
             cachedName = name
             manager.stopAdvertising()
-            // Advertise the Unify service + the 16-bit "I am Sonar" marker so
-            // peer Sonar apps recognize us and don't list us as a Unify user.
+            // Advertise ONLY the Unify service UUID (no Sonar marker). The
+            // 16-bit 0x53A0 marker was stripping 4 bytes from the 31-byte
+            // primary advertisement, which pushed the 128-bit Unify UUID into
+            // iOS's overflow area — invisible to Android Unify scanners.
+            // Without the marker a peer Sonar app's payer may list us as a
+            // generic "Unify user" alongside the mesh entry; that is cosmetic
+            // and acceptable — interop with the real Unify Wallet is the
+            // priority.
             manager.startAdvertising([
                 CBAdvertisementDataServiceUUIDsKey: [
                     UnifyNearbyContract.serviceUUID,
-                    UnifyNearbyContract.sonarMarkerUUID,
                 ],
                 CBAdvertisementDataLocalNameKey: name
             ])

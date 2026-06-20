@@ -3,8 +3,8 @@
 // bitchatTests
 //
 // Tests for the Unify nearby-payments RECEIVER role (Sonar getting paid by a
-// Unify user). The receiver serves `frame("bitcoin:?lno=<offer>")` from a GATT
-// characteristic and advertises the user's nickname as the v2 display name.
+// Unify user). The receiver serves `frame("bitcoin:?lno=<offer>")` from a
+// GATT characteristic and advertises the user's nickname as the v2 display name.
 //
 // Two things are verified here:
 //   1. Our `frame()` output decodes correctly via the payer's `Reassembler`
