@@ -21,7 +21,9 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 private const val SONAR_DESCRIPTOR_TTL_SECS = 15 * 60L
 private const val SONAR_DESCRIPTOR_MISS_TTL_SECS = 60L
@@ -179,7 +181,12 @@ class SonarAppState(private val scope: CoroutineScope) {
     var dark by mutableStateOf(SonarCore.isDark())
         private set
 
-    fun push(s: Screen) { stack = stack + s }
+    fun push(s: Screen) {
+        if (s is Screen.Chat && (screen as? Screen.Chat)?.id != s.id) {
+            cleanupPreviewTempFiles()
+        }
+        stack = stack + s
+    }
     fun toggleDark() { dark = !dark; SonarCore.setDark(dark) }
 
     fun wipe() {
@@ -1642,6 +1649,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun isMeshChat(chatId: String) = chatId.startsWith("mesh:")
 
     fun back() {
+        cleanupPreviewTempFiles()
         if (stack.size > 1) stack = stack.dropLast(1)
         if (stack.lastOrNull() !is Screen.Chat) messages = emptyList()
         scope.launch { refreshChats() }
@@ -1652,6 +1660,7 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  sidebar item so the stack never grows unbounded and a screen's Back button
      *  deselects (returns to the welcome pane) instead of walking history. */
     fun resetToHome() {
+        cleanupPreviewTempFiles()
         if (stack.size > 1) { stack = listOf(Screen.Home); messages = emptyList() }
     }
 
@@ -1808,6 +1817,105 @@ class SonarAppState(private val scope: CoroutineScope) {
         return (published.filterNot { it.id.startsWith(echoIdPrefix) } + echoes)
             .distinctBy { it.id }
             .sortedBy { it.tsSecs }
+    }
+
+    // ── Media preview (confirmation before send) ──
+    data class PendingMediaPreview(
+        val chatId: String,
+        val tempPath: String,
+        val filename: String,
+        val mime: String,
+        val caption: String = "",
+    )
+
+    var pendingMediaPreviews by mutableStateOf<List<PendingMediaPreview>>(emptyList())
+    private var mediaPreviewGeneration = 0L
+
+    private fun nextMediaPreviewGeneration(): Long {
+        mediaPreviewGeneration += 1
+        return mediaPreviewGeneration
+    }
+
+    private fun deletePreviewTempFilesAsync(previews: List<PendingMediaPreview>) {
+        if (previews.isEmpty()) return
+        scope.launch {
+            withContext(Dispatchers.IO) {
+                for (preview in previews) {
+                    deleteTempMediaFile(preview.tempPath)
+                }
+            }
+        }
+    }
+
+    private fun cleanupPreviewTempFiles() {
+        nextMediaPreviewGeneration()
+        val previews = pendingMediaPreviews
+        pendingMediaPreviews = emptyList()
+        deletePreviewTempFilesAsync(previews)
+    }
+
+    fun stageMediaPreview(chatId: String, data: ByteArray, filename: String, mime: String) {
+        if ((screen as? Screen.Chat)?.id != chatId) return
+        val generation = nextMediaPreviewGeneration()
+        val previous = pendingMediaPreviews
+        pendingMediaPreviews = emptyList()
+        deletePreviewTempFilesAsync(previous)
+        scope.launch {
+            val suffix = if (mime == "image/gif") ".gif" else ".img"
+            val path = withContext(Dispatchers.IO) { writeTempMediaFile(data, suffix) }
+            if (mediaPreviewGeneration != generation || (screen as? Screen.Chat)?.id != chatId) {
+                withContext(Dispatchers.IO) { deleteTempMediaFile(path) }
+                return@launch
+            }
+            pendingMediaPreviews = listOf(PendingMediaPreview(chatId, path, filename, mime))
+        }
+    }
+
+    fun confirmSendPreview(chatId: String? = null) {
+        val items = if (chatId == null) {
+            pendingMediaPreviews
+        } else {
+            pendingMediaPreviews.filter { it.chatId == chatId }
+        }
+        if (items.isEmpty()) return
+        nextMediaPreviewGeneration()
+        pendingMediaPreviews = if (chatId == null) {
+            emptyList()
+        } else {
+            pendingMediaPreviews.filterNot { it.chatId == chatId }
+        }
+        for (preview in items) {
+            scope.launch {
+                val raw = withContext(Dispatchers.IO) {
+                    readTempMediaFile(preview.tempPath).also { deleteTempMediaFile(preview.tempPath) }
+                } ?: return@launch
+                if (preview.mime == "image/gif") {
+                    sendImage(preview.chatId, raw, preview.filename, preview.mime)
+                } else {
+                    val jpeg = withContext(Dispatchers.Default) { reencodeToJpeg(raw) }
+                    if (jpeg == null) {
+                        toast = "Couldn't encode image."
+                        return@launch
+                    }
+                    sendImage(preview.chatId, jpeg, "photo.jpg", "image/jpeg")
+                }
+            }
+        }
+    }
+
+    fun cancelPreview(chatId: String? = null) {
+        nextMediaPreviewGeneration()
+        val toRemove = if (chatId == null) {
+            pendingMediaPreviews
+        } else {
+            pendingMediaPreviews.filter { it.chatId == chatId }
+        }
+        pendingMediaPreviews = if (chatId == null) {
+            emptyList()
+        } else {
+            pendingMediaPreviews.filterNot { it.chatId == chatId }
+        }
+        deletePreviewTempFilesAsync(toRemove)
     }
 
     // ── Media (White Noise / Marmot MIP-04) ──

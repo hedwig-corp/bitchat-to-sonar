@@ -16,6 +16,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.rememberTransformableState
 import androidx.compose.foundation.gestures.transformable
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -86,7 +87,9 @@ import chat.bitchat.sonar.ui.SonarAvatar
 import chat.bitchat.sonar.ui.SonarTheme
 import chat.bitchat.sonar.ui.SonarType
 import chat.bitchat.sonar.ui.sonar
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlin.math.abs
 import kotlin.math.sin
 
@@ -628,7 +631,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     var previewPackCoordinate by remember { mutableStateOf<String?>(null) }
     val mediaActions = rememberMediaActions()
     val pickPhoto = rememberPhotoPicker { bytes, name, mime ->
-        state.sendImage(screen.id, bytes, name, mime)
+        state.stageMediaPreview(screen.id, bytes, name, mime)
     }
     // Voice-note recorder (hold the mic to record; drag left to cancel).
     val recorder = remember { VoiceRecorder() }
@@ -954,6 +957,21 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             onClose = { mediaViewer = null },
             modifier = Modifier.matchParentSize()
         )
+    }
+    state.pendingMediaPreviews.firstOrNull { it.chatId == screen.id }?.let { preview ->
+        val data by androidx.compose.runtime.produceState<ByteArray?>(null, preview.tempPath) {
+            value = withContext(Dispatchers.IO) { readTempMediaFile(preview.tempPath) }
+        }
+        val previewData = data
+        if (previewData != null) {
+            MediaSendPreview(
+                data = previewData,
+                isGif = preview.mime == "image/gif",
+                onSend = { state.confirmSendPreview(screen.id) },
+                onCancel = { state.cancelPreview(screen.id) },
+                modifier = Modifier.matchParentSize()
+            )
+        }
     }
     }
     if (addSheet) AddToMessageSheet(
@@ -1815,6 +1833,47 @@ private fun MediaViewer(
                         )
                     }
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun MediaSendPreview(
+    data: ByteArray,
+    isGif: Boolean,
+    onSend: () -> Unit,
+    onCancel: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val s = sonar
+    val image = remember(data) { if (!isGif) decodeImageBitmap(data) else null }
+    Box(modifier.background(Color.Black)) {
+        when {
+            isGif || image != null -> MediaImage(
+                bytes = data,
+                isGif = isGif,
+                modifier = Modifier.fillMaxSize().padding(bottom = 80.dp)
+            )
+            else -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text("Couldn't decode image", color = Color.White.copy(alpha = 0.6f), fontSize = 14.sp)
+            }
+        }
+        Row(
+            Modifier.fillMaxWidth().align(Alignment.TopStart).padding(horizontal = 8.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            SNIconButton(SNIconName.Back, tint = Color.White, onClick = onCancel)
+        }
+        Row(
+            Modifier.fillMaxWidth().align(Alignment.BottomCenter).padding(16.dp),
+            horizontalArrangement = Arrangement.End
+        ) {
+            Box(
+                Modifier.size(52.dp).clip(CircleShape).background(s.accent).clickable { onSend() },
+                contentAlignment = Alignment.Center
+            ) {
+                Text("↑", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold)
             }
         }
     }

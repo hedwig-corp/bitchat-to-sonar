@@ -13,6 +13,9 @@
 
 import SwiftUI
 import PhotosUI
+#if os(iOS)
+import ImageIO
+#endif
 
 struct SonarDMScreen: View {
     @EnvironmentObject private var store: SonarAppStore
@@ -204,20 +207,13 @@ struct SonarDMScreen: View {
                 let isGif = data.snIsGif
                 if isGif {
                     await MainActor.run {
-                        _ = store.sendAttachment(peerId, data: data, filename: "animation.gif", mime: "image/gif")
+                        store.stageMediaPreview(peerId, data: data, filename: "animation.gif", mime: "image/gif")
                         photoItem = nil
                     }
                     return
                 }
-                // Normalize to JPEG: guarantees a format the core's image encoder
-                // handles (HEIC/etc. aren't) and keeps the upload small.
-                #if os(iOS)
-                let bytes = UIImage(data: data)?.jpegData(compressionQuality: 0.85) ?? data
-                #else
-                let bytes = data
-                #endif
                 await MainActor.run {
-                    store.sendImage(peerId, data: bytes, filename: "photo.jpg", mime: "image/jpeg")
+                    store.stageMediaPreview(peerId, data: data, filename: "photo.jpg", mime: "image/jpeg")
                     photoItem = nil
                 }
             }
@@ -250,6 +246,18 @@ struct SonarDMScreen: View {
         }
         .snSheet(isPresented: $walletSheet, title: "Your wallet") {
             SNWalletSheetContent(onClose: { walletSheet = false })
+        }
+        .fullScreenCover(isPresented: Binding(
+            get: { store.pendingMediaPreviews.contains { $0.peerId == peerId } },
+            set: { if !$0 { store.cancelPreview(peerId: peerId) } }
+        )) {
+            if let preview = store.pendingMediaPreviews.first(where: { $0.peerId == peerId }) {
+                MediaSendPreviewLoaderView(
+                    preview: preview,
+                    onSend: { store.confirmSendPreview(peerId: peerId) },
+                    onCancel: { store.cancelPreview(peerId: peerId) }
+                )
+            }
         }
         .onChange(of: verifySheet) { open in
             if !open { showKey = false }
@@ -566,6 +574,140 @@ struct SonarDMScreen: View {
         return (pasted + selected.sorted()).filter { seen.insert($0).inserted }
     }
 }
+
+private struct MediaSendPreviewView: View {
+    let data: Data
+    let isGif: Bool
+    let onSend: () -> Void
+    let onCancel: () -> Void
+
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+
+            #if os(iOS)
+            if isGif {
+                GifImageView(data: data)
+                    .ignoresSafeArea()
+                    .padding(.bottom, 80)
+            } else if let uiImage = UIImage(data: data) {
+                Image(uiImage: uiImage)
+                    .resizable()
+                    .scaledToFit()
+                    .ignoresSafeArea()
+                    .padding(.bottom, 80)
+            } else {
+                Text("Couldn't decode image")
+                    .foregroundColor(.white.opacity(0.6))
+            }
+            #else
+            Text("Preview")
+                .foregroundColor(.white.opacity(0.6))
+            #endif
+
+            VStack {
+                HStack {
+                    Button { onCancel() } label: {
+                        Image(systemName: "chevron.left")
+                            .font(.system(size: 20, weight: .semibold))
+                            .foregroundColor(.white)
+                            .padding(12)
+                    }
+                    Spacer()
+                }
+                .padding(.horizontal, 8)
+                .padding(.top, 12)
+
+                Spacer()
+
+                HStack {
+                    Spacer()
+                    Button { onSend() } label: {
+                        Image(systemName: "arrow.up")
+                            .font(.system(size: 20, weight: .bold))
+                            .foregroundColor(.white)
+                            .frame(width: 52, height: 52)
+                            .background(SonarTheme.accent)
+                            .clipShape(Circle())
+                    }
+                }
+                .padding(16)
+            }
+        }
+    }
+}
+
+private struct MediaSendPreviewLoaderView: View {
+    let preview: SonarAppStore.PendingMediaPreview
+    let onSend: () -> Void
+    let onCancel: () -> Void
+
+    @State private var data: Data?
+
+    var body: some View {
+        Group {
+            if let data {
+                MediaSendPreviewView(
+                    data: data,
+                    isGif: preview.mime == "image/gif",
+                    onSend: onSend,
+                    onCancel: onCancel
+                )
+            } else {
+                ZStack {
+                    Color.black.ignoresSafeArea()
+                    ProgressView()
+                        .tint(.white)
+                }
+            }
+        }
+        .task(id: preview.tempURL) {
+            data = await Task.detached(priority: .userInitiated) {
+                try? Data(contentsOf: preview.tempURL)
+            }.value
+        }
+    }
+}
+
+#if os(iOS)
+private struct GifImageView: UIViewRepresentable {
+    let data: Data
+
+    func makeUIView(context: Context) -> UIImageView {
+        let view = UIImageView()
+        view.contentMode = .scaleAspectFit
+        view.clipsToBounds = true
+        return view
+    }
+
+    func updateUIView(_ uiView: UIImageView, context: Context) {
+        guard uiView.image == nil && uiView.animationImages == nil else { return }
+        if let source = CGImageSourceCreateWithData(data as CFData, nil),
+           CGImageSourceGetCount(source) > 1 {
+            var images: [UIImage] = []
+            var duration: Double = 0
+            let count = CGImageSourceGetCount(source)
+            for i in 0..<count {
+                if let cgImage = CGImageSourceCreateImageAtIndex(source, i, nil) {
+                    images.append(UIImage(cgImage: cgImage))
+                    if let props = CGImageSourceCopyPropertiesAtIndex(source, i, nil) as? [String: Any],
+                       let gifProps = props[kCGImagePropertyGIFDictionary as String] as? [String: Any],
+                       let delay = gifProps[kCGImagePropertyGIFDelayTime as String] as? Double {
+                        duration += delay
+                    } else {
+                        duration += 0.1
+                    }
+                }
+            }
+            uiView.animationImages = images
+            uiView.animationDuration = duration
+            uiView.startAnimating()
+        } else {
+            uiView.image = UIImage(data: data)
+        }
+    }
+}
+#endif
 
 private extension Data {
     var snIsGif: Bool {

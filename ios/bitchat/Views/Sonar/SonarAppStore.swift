@@ -396,6 +396,149 @@ final class SonarAppStore: ObservableObject {
     /// this is set, the DM screen must not show a "new empty chat" state yet.
     @Published private(set) var localHydratingDMs: Set<String> = []
 
+    // ── Media preview (confirmation before send) ──
+    struct PendingMediaPreview: Sendable {
+        let peerId: String
+        let tempURL: URL
+        let filename: String
+        let mime: String
+        let caption: String
+
+        init(peerId: String, tempURL: URL, filename: String, mime: String, caption: String = "") {
+            self.peerId = peerId
+            self.tempURL = tempURL
+            self.filename = filename
+            self.mime = mime
+            self.caption = caption
+        }
+    }
+
+    @Published var pendingMediaPreviews: [PendingMediaPreview] = []
+    private var mediaPreviewGeneration: UInt64 = 0
+
+    private var currentDMId: String? {
+        if case .dm(let id)? = path.last { return id }
+        return nil
+    }
+
+    private func nextMediaPreviewGeneration() -> UInt64 {
+        mediaPreviewGeneration += 1
+        return mediaPreviewGeneration
+    }
+
+    private nonisolated static func writeTempMediaFile(_ data: Data, suffix: String) -> URL? {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("sonar-preview")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent(UUID().uuidString + suffix)
+        do {
+            try data.write(to: url)
+            return url
+        } catch {
+            return nil
+        }
+    }
+
+    private nonisolated static func readTempMediaFile(_ url: URL) -> Data? {
+        return try? Data(contentsOf: url)
+    }
+
+    private nonisolated static func deleteTempMediaFile(_ url: URL) {
+        try? FileManager.default.removeItem(at: url)
+    }
+
+    private nonisolated static func deletePreviewTempFiles(_ previews: [PendingMediaPreview]) {
+        for preview in previews {
+            deleteTempMediaFile(preview.tempURL)
+        }
+    }
+
+    private nonisolated static func reencodeToJpeg(_ data: Data) -> Data? {
+        #if canImport(UIKit)
+        return UIImage(data: data)?.jpegData(compressionQuality: 0.85)
+        #else
+        return data
+        #endif
+    }
+
+    private func deletePreviewTempFilesAsync(_ previews: [PendingMediaPreview]) {
+        guard !previews.isEmpty else { return }
+        Task.detached(priority: .utility) {
+            Self.deletePreviewTempFiles(previews)
+        }
+    }
+
+    private func cleanupPreviewTempFiles() {
+        nextMediaPreviewGeneration()
+        let previews = pendingMediaPreviews
+        pendingMediaPreviews = []
+        deletePreviewTempFilesAsync(previews)
+    }
+
+    func stageMediaPreview(_ peerId: String, data: Data, filename: String, mime: String) {
+        guard currentDMId == peerId else { return }
+        let generation = nextMediaPreviewGeneration()
+        let previous = pendingMediaPreviews
+        pendingMediaPreviews = []
+        deletePreviewTempFilesAsync(previous)
+        let suffix = mime == "image/gif" ? ".gif" : ".img"
+        Task { @MainActor in
+            guard let url = await Task.detached(priority: .userInitiated, operation: {
+                Self.writeTempMediaFile(data, suffix: suffix)
+            }).value else {
+                showToast("Couldn't prepare image.")
+                return
+            }
+            guard mediaPreviewGeneration == generation, currentDMId == peerId else {
+                Task.detached(priority: .utility) {
+                    Self.deleteTempMediaFile(url)
+                }
+                return
+            }
+            pendingMediaPreviews = [PendingMediaPreview(peerId: peerId, tempURL: url, filename: filename, mime: mime)]
+        }
+    }
+
+    func confirmSendPreview(peerId: String? = nil) {
+        let items = peerId.map { id in pendingMediaPreviews.filter { $0.peerId == id } } ?? pendingMediaPreviews
+        guard !items.isEmpty else { return }
+        nextMediaPreviewGeneration()
+        if let peerId {
+            pendingMediaPreviews.removeAll { $0.peerId == peerId }
+        } else {
+            pendingMediaPreviews = []
+        }
+        for preview in items {
+            Task { @MainActor in
+                guard let raw = await Task.detached(priority: .userInitiated, operation: { () -> Data? in
+                    defer { Self.deleteTempMediaFile(preview.tempURL) }
+                    return Self.readTempMediaFile(preview.tempURL)
+                }).value else { return }
+                if preview.mime == "image/gif" {
+                    _ = sendAttachment(preview.peerId, data: raw, filename: preview.filename, mime: preview.mime)
+                } else {
+                    guard let bytes = await Task.detached(priority: .userInitiated, operation: {
+                        Self.reencodeToJpeg(raw)
+                    }).value else {
+                        showToast("Couldn't encode image.")
+                        return
+                    }
+                    sendImage(preview.peerId, data: bytes, filename: "photo.jpg", mime: "image/jpeg")
+                }
+            }
+        }
+    }
+
+    func cancelPreview(peerId: String? = nil) {
+        nextMediaPreviewGeneration()
+        let toRemove = peerId.map { id in pendingMediaPreviews.filter { $0.peerId == id } } ?? pendingMediaPreviews
+        if let peerId {
+            pendingMediaPreviews.removeAll { $0.peerId == peerId }
+        } else {
+            pendingMediaPreviews = []
+        }
+        deletePreviewTempFilesAsync(toRemove)
+    }
+
     /// The in-flight P2P call the [SonarCallScreen] renders, or nil. Driven by the
     /// real iroh/opus engine via `callWaitEvent`.
     @Published private(set) var activeCall: SNActiveCall?
@@ -3405,10 +3548,14 @@ final class SonarAppStore: ObservableObject {
     // MARK: Navigation
 
     func push(_ route: SonarRoute) {
+        if case .dm(let id) = route, currentDMId != id {
+            cleanupPreviewTempFiles()
+        }
         path.append(route)
     }
 
     func pop() {
+        cleanupPreviewTempFiles()
         if !path.isEmpty { path.removeLast() }
     }
 

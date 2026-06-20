@@ -30,8 +30,8 @@ import javax.swing.SwingConstants
 
 /**
  * Desktop (JVM) `actual` photo picker: a native AWT [FileDialog] filtered to
- * images. Animated GIFs are preserved; still images are re-encoded to JPEG so
- * the Rust core's image metadata path always gets a format it handles.
+ * images. Raw bytes are passed through — JPEG re-encoding is deferred to send
+ * confirmation via [reencodeToJpeg].
  */
 @Composable
 actual fun rememberPhotoPicker(
@@ -46,13 +46,14 @@ actual fun rememberPhotoPicker(
             val picked = pickImageFile() ?: return@launch
             val raw = withContext(Dispatchers.IO) { runCatching { picked.readBytes() }.getOrNull() }
                 ?: return@launch
-            if (picked.extension.equals("gif", ignoreCase = true) || raw.isGifBytes()) {
-                onPicked(raw, picked.name.ifBlank { "animation.gif" }, "image/gif")
+            // Pass raw bytes — JPEG re-encoding happens lazily on send confirmation.
+            val name = picked.name.ifBlank { "photo" }
+            val mime = if (picked.extension.equals("gif", ignoreCase = true) || raw.isGifBytes()) {
+                "image/gif"
             } else {
-                val jpeg = withContext(Dispatchers.IO) { runCatching { reencodeJpeg(raw) }.getOrNull() }
-                    ?: return@launch
-                onPicked(jpeg, "photo.jpg", "image/jpeg")
+                "image/${picked.extension.lowercase().ifBlank { "jpeg" }}"
             }
+            onPicked(raw, name, mime)
         }
     }
 }
@@ -76,28 +77,6 @@ private fun pickImageFile(): File? {
     } finally {
         dialog.dispose() // release the native AWT peer
     }
-}
-
-/** Decode → flatten any alpha onto white → JPEG at quality 0.85 (matches the
- *  Android actual's `Bitmap.compress(JPEG, 85, …)`). */
-private fun reencodeJpeg(raw: ByteArray): ByteArray {
-    val src = ImageIO.read(ByteArrayInputStream(raw)) ?: error("unsupported image")
-    val rgb = BufferedImage(src.width, src.height, BufferedImage.TYPE_INT_RGB)
-    val g = rgb.createGraphics()
-    g.drawImage(src, 0, 0, java.awt.Color.WHITE, null)
-    g.dispose()
-    val writer = ImageIO.getImageWritersByFormatName("jpg").next()
-    val out = ByteArrayOutputStream()
-    ImageIO.createImageOutputStream(out).use { ios ->
-        writer.output = ios
-        val param = writer.defaultWriteParam.apply {
-            compressionMode = ImageWriteParam.MODE_EXPLICIT
-            compressionQuality = 0.85f
-        }
-        writer.write(null, IIOImage(rgb, null, null), param)
-    }
-    writer.dispose()
-    return out.toByteArray()
 }
 
 private fun ByteArray.isGifBytes(): Boolean =
@@ -191,3 +170,42 @@ private fun pickSaveFile(filename: String): File? {
 
 private fun safeFilename(filename: String): String =
     filename.substringAfterLast('/').substringAfterLast('\\').ifBlank { "attachment" }
+
+actual fun writeTempMediaFile(data: ByteArray, suffix: String): String {
+    val file = File.createTempFile("sonar-preview-", suffix)
+    file.deleteOnExit()
+    file.writeBytes(data)
+    return file.absolutePath
+}
+
+actual fun readTempMediaFile(path: String): ByteArray? =
+    runCatching { File(path).readBytes() }.getOrNull()
+
+actual fun deleteTempMediaFile(path: String) {
+    runCatching { File(path).delete() }
+}
+
+actual fun reencodeToJpeg(data: ByteArray): ByteArray? {
+    val src = ImageIO.read(ByteArrayInputStream(data)) ?: return null
+    val rgb = BufferedImage(src.width, src.height, BufferedImage.TYPE_INT_RGB)
+    val g = rgb.createGraphics()
+    g.drawImage(src, 0, 0, java.awt.Color.WHITE, null)
+    g.dispose()
+    val writers = ImageIO.getImageWritersByFormatName("jpg")
+    if (!writers.hasNext()) return null
+    val writer = writers.next()
+    val out = ByteArrayOutputStream()
+    try {
+        ImageIO.createImageOutputStream(out).use { ios ->
+            writer.output = ios
+            val param = writer.defaultWriteParam.apply {
+                compressionMode = ImageWriteParam.MODE_EXPLICIT
+                compressionQuality = 0.85f
+            }
+            writer.write(null, IIOImage(rgb, null, null), param)
+        }
+        return out.toByteArray().takeIf { it.isNotEmpty() }
+    } finally {
+        writer.dispose()
+    }
+}
