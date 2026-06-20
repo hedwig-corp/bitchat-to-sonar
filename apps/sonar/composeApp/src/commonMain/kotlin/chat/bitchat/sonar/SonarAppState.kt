@@ -1525,6 +1525,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 profilesByNpub = normalizedProfileCache(profilesByNpub + (key to p) - otherNpub)
                 profileFetchedAt[key] = SonarClock.nowSecs()
                 persistProfileCache()
+                recomputeConversations()
             } else {
                 if (!hadCachedProfile) profileFetches.remove(key)
             }
@@ -2943,12 +2944,15 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     /** Display name for a mesh peer: prefer the live radar name, else a remembered
-     *  one, else a short id. Remembers whatever it resolves. */
+     *  one, else a short id. Remembers whatever it resolves. Triggers an async
+     *  profile fetch when the name isn't cached yet. */
     private fun meshPeerName(peerId: String): String {
         val live = meshPeers.firstOrNull { it.id == "mesh:$peerId" }?.name
-        val profileName = npubStringForPeer(peerId)
+        val peerNpub = npubStringForPeer(peerId)
+        val profileName = peerNpub
             ?.let { profilesByNpub[canonicalProfileKey(it)]?.bestName }
         val remembered = meshChatNames[peerId]?.takeUnless { it.isKeyFallbackName() }
+        if (profileName == null && peerNpub != null) ensureProfile(peerNpub)
         val name = live ?: profileName ?: remembered ?: ("mesh·" + peerId.take(6))
         meshChatNames[peerId] = name
         return name
@@ -2960,12 +2964,14 @@ class SonarAppState(private val scope: CoroutineScope) {
             return it
         }
         meshChatNames[peerId]?.takeUnless { it.isKeyFallbackName() }?.let { return it }
-        npubStringForPeer(peerId)
+        val peerNpub = npubStringForPeer(peerId)
+        peerNpub
             ?.let { profilesByNpub[canonicalProfileKey(it)]?.bestName }
             ?.let { name ->
                 meshChatNames[peerId] = name
                 return name
             }
+        if (peerNpub != null) ensureProfile(peerNpub)
         group?.let { return chatTitle(it) }
         return meshChatNames[peerId] ?: ("mesh·" + peerId.take(6))
     }
