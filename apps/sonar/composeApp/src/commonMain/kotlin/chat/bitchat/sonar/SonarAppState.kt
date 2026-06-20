@@ -23,6 +23,8 @@ import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 private const val SONAR_DESCRIPTOR_TTL_SECS = 15 * 60L
@@ -288,6 +290,10 @@ class SonarAppState(private val scope: CoroutineScope) {
     private var callTicker: kotlinx.coroutines.Job? = null
     private var meshRealtimeLoopRunning = false
     private var pollJob: Job? = null
+    // Signal-style serialized refresh: all refreshChats() callers go through
+    // this Mutex so concurrent coroutines coalesce into at-most-one refresh.
+    private val refreshMutex = Mutex()
+    private var refreshPending = false
     /** Ids of ☎CALL control messages already routed to the engine (dedup). */
     private val scannedCall = mutableSetOf<String>()
 
@@ -1350,6 +1356,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     // ── Local notifications (fire on new incoming message while backgrounded) ──
     private var foreground = true
     private val lastSeenTs = HashMap<String, Long>()
+    private val lastNotifiedTs = HashMap<String, Long>()
     private var seededSeen = false
 
     // ── App lock ──
@@ -1422,26 +1429,47 @@ class SonarAppState(private val scope: CoroutineScope) {
         scope.launch { updateUnifyReceiver() }
     }
 
+    fun requestImmediateSync() {
+        if (!started) return
+        scope.launch {
+            SonarCore.sync()
+            refreshChats()
+            recomputeConversations()
+            (screen as? Screen.Chat)?.let { sc ->
+                if (isMeshChat(sc.id)) refreshOpenDm(meshPeerId(sc.id))
+                else {
+                    messages = withSendEchoes(sc.id, mergePendingMediaUploads(sc.id, marmotMessagesPage(sc.id)))
+                }
+            }
+        }
+    }
+
     private fun notifPreview(content: String): String =
         if (PayLine.decode(content) != null) "₿ Payment"
         else content.replace("\n", " ").let { if (it.length > 80) it.take(80) + "…" else it }
 
-    /** Notify for any chat whose newest incoming message is newer than last seen. */
+    /** Notify for any chat whose newest incoming message is newer than last seen.
+     *  Uses [lastNotifiedTs] to prevent double-fire when the conversationChanged
+     *  flow and poll loop both process the same message within one cycle. */
     private suspend fun maybeNotify() {
-        val enabled = prefBool("notifs", true) // master switch (Settings → Notifications)
+        val enabled = prefBool("notifs", true)
         val showNames = prefBool("notifNames", true)
         val showPreview = prefBool("notifPreview", true)
         val openChatId = (screen as? Screen.Chat)?.id
-        for (c in chats) {
+        val snapshot = chats
+        for (c in snapshot) {
             val msgs = SonarCore.messagesPage(c.id, 1)
             val newestIncoming = msgs.lastOrNull { !it.mine }
             val prev = lastSeenTs[c.id]
+            val alreadyNotified = lastNotifiedTs[c.id] ?: 0L
             if (enabled && seededSeen && prev != null && newestIncoming != null &&
-                newestIncoming.tsSecs > prev && !foreground && c.id != openChatId
+                newestIncoming.tsSecs > prev && newestIncoming.tsSecs > alreadyNotified &&
+                !foreground && c.id != openChatId
             ) {
                 val title = if (showNames) chatTitle(c) else "New message"
                 val body = if (showPreview) notifPreview(newestIncoming.content) else "Tap to open"
                 Notifier.notify(c.id.hashCode(), title, body)
+                lastNotifiedTs[c.id] = newestIncoming.tsSecs
             }
             lastSeenTs[c.id] = msgs.lastOrNull()?.tsSecs ?: (prev ?: 0L)
         }
@@ -3041,6 +3069,19 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private suspend fun refreshChats() {
+        if (refreshMutex.isLocked) {
+            refreshPending = true
+            return
+        }
+        refreshMutex.withLock {
+            do {
+                refreshPending = false
+                refreshChatsInner()
+            } while (refreshPending)
+        }
+    }
+
+    private suspend fun refreshChatsInner() {
         val loadedChats = SonarCore.chats()
         if (started || loadedChats.isNotEmpty()) {
             chats = loadedChats

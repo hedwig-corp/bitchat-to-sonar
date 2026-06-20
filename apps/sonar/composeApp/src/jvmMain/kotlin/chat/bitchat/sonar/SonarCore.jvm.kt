@@ -523,7 +523,7 @@ actual object SonarCore {
     actual fun callEncodeEnd(callId: String, reason: String): String = ""
     actual fun callParseControl(content: String): SonarCallControl? = null
 
-    private val _conversationChanged = MutableSharedFlow<String>(extraBufferCapacity = 64)
+    private val _conversationChanged = MutableSharedFlow<String>(extraBufferCapacity = 256)
     actual val conversationChanged: SharedFlow<String> = _conversationChanged.asSharedFlow()
 
     actual fun installConversationListener() {
