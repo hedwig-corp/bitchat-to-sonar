@@ -152,6 +152,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     private var chatSnapshotMessagesByChat: Map<String, List<SonarMsg>> = initialChatSnapshot.second
     var groupInvites by mutableStateOf<List<SonarGroupInvite>>(emptyList())
         private set
+    private val pendingInviteTokens = mutableListOf<String>()
     /** Resolved kind-0 profiles by npub — fills human names for Marmot members. */
     var profilesByNpub by mutableStateOf(decodeProfileCache(SonarCore.loadBlob(PROFILE_CACHE_BLOB_KEY)))
         private set
@@ -1452,6 +1453,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 refreshLocationChannels()
                 refreshChats()
                 recomputeConversations() // fold White Noise legs into mesh rows at launch
+                drainPendingInviteTokens()
                 // Bind the iroh call endpoint + start the call event loop early so
                 // an incoming call rings without us having to place one first.
                 launch { ensureCallStarted() }
@@ -2394,6 +2396,76 @@ class SonarAppState(private val scope: CoroutineScope) {
                 toast = "couldn't remove people: ${e.message}"
             }
         }
+    }
+
+    fun createInviteLink(chatId: String, groupName: String, onResult: (String) -> Unit) {
+        scope.launch {
+            try {
+                val token = SonarCore.createInviteLink(chatId, groupName)
+                onResult(token)
+            } catch (e: Throwable) {
+                toast = "couldn't create invite link: ${e.message}"
+            }
+        }
+    }
+
+    fun loadPendingJoinRequests(chatId: String, onResult: (List<SonarJoinRequest>) -> Unit) {
+        scope.launch {
+            try {
+                onResult(SonarCore.pendingJoinRequests(chatId))
+            } catch (e: Throwable) {
+                toast = "couldn't load join requests: ${e.message}"
+                onResult(emptyList())
+            }
+        }
+    }
+
+    fun approveJoinRequest(chatId: String, requesterNpub: String, onDone: () -> Unit = {}) {
+        scope.launch {
+            try {
+                SonarCore.approveJoinRequest(chatId, requesterNpub)
+                refreshChats()
+                toast = "Member added"
+                onDone()
+            } catch (e: Throwable) {
+                toast = "couldn't approve: ${e.message}"
+            }
+        }
+    }
+
+    fun declineJoinRequest(chatId: String, requesterNpub: String, onDone: () -> Unit = {}) {
+        scope.launch {
+            try {
+                SonarCore.declineJoinRequest(chatId, requesterNpub)
+                toast = "Request declined"
+                onDone()
+            } catch (e: Throwable) {
+                toast = "couldn't decline: ${e.message}"
+            }
+        }
+    }
+
+    fun requestJoinViaLink(token: String) {
+        if (!started) {
+            if (pendingInviteTokens.none { it == token }) pendingInviteTokens.add(token)
+            if (!connecting) boot()
+            return
+        }
+        scope.launch {
+            try {
+                SonarCore.requestJoinViaLink(token)
+                toast = "Join request sent"
+            } catch (e: Throwable) {
+                toast = "couldn't join: ${e.message}"
+            }
+        }
+    }
+
+    private fun drainPendingInviteTokens() {
+        if (pendingInviteTokens.isEmpty()) return
+        val queued = pendingInviteTokens.toList()
+        pendingInviteTokens.clear()
+        queued.forEach { requestJoinViaLink(it) }
     }
 
     fun acceptGroupInvite(inviteId: String) {

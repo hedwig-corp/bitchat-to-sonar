@@ -1,6 +1,7 @@
 package chat.bitchat.sonar
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -72,6 +73,21 @@ class MainActivity : ComponentActivity() {
         requestAllPermissions()
         setContent {
             App()
+        }
+        handleInviteIntent(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleInviteIntent(intent)
+    }
+
+    private fun handleInviteIntent(intent: Intent?) {
+        val uri = intent?.data ?: return
+        if (uri.scheme == "sonar" && uri.host == "invite") {
+            val token = uri.lastPathSegment ?: return
+            if (!token.startsWith("sinvite1")) return
+            SonarLifecycle.submitInviteLink(token)
         }
     }
 

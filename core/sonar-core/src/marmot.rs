@@ -171,6 +171,8 @@ pub enum Incoming {
     /// MDK saw the event but could not apply it yet or marked a prior attempt
     /// failed. The relay sync layer must not advance past this event.
     Retryable,
+    /// A join request was received for a group we administer.
+    JoinRequest(crate::invite_link::JoinRequest),
     /// The event was valid but produced nothing actionable (duplicates,
     /// ignored proposals, non-Marmot gift wraps, ...).
     None,
@@ -535,6 +537,10 @@ impl MarmotEngine {
         match event.kind {
             Kind::GiftWrap => {
                 let unwrapped = UnwrappedGift::from_gift_wrap(self.identity.keys(), event).await?;
+                if unwrapped.rumor.kind == Kind::Custom(crate::invite_link::JOIN_REQUEST_RUMOR_KIND)
+                {
+                    return self.handle_join_request_rumor(&unwrapped.rumor);
+                }
                 if unwrapped.rumor.kind != Kind::MlsWelcome {
                     return Ok(Incoming::None);
                 }
@@ -610,6 +616,66 @@ impl MarmotEngine {
             .ok_or_else(|| Error::InvalidInput(format!("unknown group invite {welcome_id}")))?;
         dispatch!(&self.storage, |mdk| mdk.decline_welcome(&welcome))?;
         Ok(())
+    }
+
+    // ── Invite link join requests ──────────────────────────────────────
+
+    fn handle_join_request_rumor(&self, rumor: &UnsignedEvent) -> Result<Incoming> {
+        let payload = crate::invite_link::parse_join_request_rumor(rumor)?;
+        let group_id_bytes =
+            hex::decode(&payload.group_id).map_err(|e| Error::InvalidInput(e.to_string()))?;
+        let group_id = GroupId::from_slice(&group_id_bytes);
+
+        let secret_hash_bytes = hex::decode(&payload.invite_secret_hash)
+            .map_err(|e| Error::InvalidInput(e.to_string()))?;
+        let mut secret_hash = [0u8; 32];
+        if secret_hash_bytes.len() == 32 {
+            secret_hash.copy_from_slice(&secret_hash_bytes);
+        } else {
+            return Ok(Incoming::None);
+        }
+
+        let requester = PublicKey::from_bech32(&payload.requester_npub)
+            .map_err(|e| Error::InvalidInput(e.to_string()))?;
+        let kp_event_id = payload
+            .key_package_event_id
+            .as_deref()
+            .and_then(|h| EventId::from_hex(h).ok());
+
+        let request = crate::invite_link::JoinRequest {
+            requester,
+            group_id,
+            secret_hash,
+            key_package_event_id: kp_event_id,
+            received_at: Timestamp::now().as_secs(),
+        };
+        Ok(Incoming::JoinRequest(request))
+    }
+
+    /// Gift-wrap an arbitrary rumor for a receiver (NIP-59, kind 1059).
+    /// Uses `Timestamp::now()` to avoid relay `since` filter issues.
+    pub async fn gift_wrap_rumor(
+        &self,
+        receiver: &PublicKey,
+        rumor: UnsignedEvent,
+    ) -> Result<Event> {
+        let keys = self.identity.keys();
+        let seal: Event = EventBuilder::seal(keys, receiver, rumor)
+            .await?
+            .sign(keys)
+            .await?;
+        let ephemeral = Keys::generate();
+        let content = nip44::encrypt(
+            ephemeral.secret_key(),
+            receiver,
+            seal.as_json(),
+            nip44::Version::default(),
+        )?;
+        let wrapped = EventBuilder::new(Kind::GiftWrap, content)
+            .tags([Tag::public_key(*receiver)])
+            .custom_created_at(Timestamp::now())
+            .sign_with_keys(&ephemeral)?;
+        Ok(wrapped)
     }
 
     /// Decrypted message history for a group (storage-backed).

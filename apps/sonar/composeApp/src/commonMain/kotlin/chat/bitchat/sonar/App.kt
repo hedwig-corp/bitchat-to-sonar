@@ -94,13 +94,34 @@ import kotlin.math.sin
  *  pulling Android lifecycle APIs into commonMain. */
 object SonarLifecycle {
     @Volatile var onForeground: ((Boolean) -> Unit)? = null
+    @Volatile private var onInviteLink: ((String) -> Unit)? = null
+    private val pendingInviteLinks = mutableListOf<String>()
+
+    fun submitInviteLink(token: String) {
+        val handler = onInviteLink
+        if (handler != null) {
+            handler(token)
+        } else {
+            pendingInviteLinks.add(token)
+        }
+    }
+
+    fun installInviteLinkHandler(handler: (String) -> Unit) {
+        onInviteLink = handler
+        val queued = pendingInviteLinks.toList()
+        pendingInviteLinks.clear()
+        queued.forEach(handler)
+    }
 }
 
 @Composable
 fun App() {
     val scope = rememberCoroutineScope()
     val state = remember { SonarAppState(scope) }
-    LaunchedEffect(state) { SonarLifecycle.onForeground = { state.setForeground(it) } }
+    LaunchedEffect(state) {
+        SonarLifecycle.onForeground = { state.setForeground(it) }
+        SonarLifecycle.installInviteLinkHandler { state.requestJoinViaLink(it) }
+    }
     LaunchedEffect(Unit) { state.boot() }
     SonarTheme(dark = state.dark) {
         val s = sonar

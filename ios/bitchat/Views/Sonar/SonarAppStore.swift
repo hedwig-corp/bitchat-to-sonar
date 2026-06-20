@@ -364,6 +364,7 @@ final class SonarAppStore: ObservableObject {
 
     /// Navigation stack below the home root.
     @Published var path: [SonarRoute] = []
+    @Published var toast: String? = nil
     @Published private(set) var onboarded: Bool
     @Published private(set) var mode: String
     @Published private(set) var marmotVerified: [String: Bool]
@@ -406,6 +407,7 @@ final class SonarAppStore: ObservableObject {
     /// Texts queued for a Sonar peer (keyed by npub) while their White
     /// Noise group is being created on first out-of-range send.
     private var pendingMarmotSends: [String: [String]] = [:]
+    private var pendingInviteLinks: [String] = []
     /// Per-conversation Marmot warm-up work started by openedDM. Home rows and
     /// destination onAppear can both fire; only one local hydrate/sync pass per
     /// chat should run at a time.
@@ -527,6 +529,7 @@ final class SonarAppStore: ObservableObject {
                 if npub != nil { (self.wallet as? BridgedWallet)?.retrySetup() }
                 #endif
                 if npub != nil { self.publishPaymentMetadataIfNeeded(force: true) }
+                if npub != nil { self.drainPendingInviteLinks() }
             }
             .store(in: &cancellables)
         marmot.$relayConnected
@@ -803,6 +806,15 @@ final class SonarAppStore: ObservableObject {
 
     var isDarkMode: Bool { mode == "dark" }
 
+    @MainActor
+    func showToast(_ text: String) {
+        toast = text
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_600_000_000)
+            if toast == text { toast = nil }
+        }
+    }
+
     func toggleMode() {
         mode = mode == "dark" ? "light" : "dark"
         defaults.set(mode, forKey: Keys.mode)
@@ -878,6 +890,27 @@ final class SonarAppStore: ObservableObject {
         } else {
             unifyReceiver.stop()
         }
+    }
+
+    func submitInviteLink(_ token: String) {
+        guard marmot.npub != nil else {
+            pendingInviteLinks.append(token)
+            return
+        }
+        Task {
+            do {
+                try await marmot.requestJoinViaLink(token: token)
+                await MainActor.run { toast = "Join request sent" }
+            } catch {
+                await MainActor.run { toast = "Couldn't join: \(error.localizedDescription)" }
+            }
+        }
+    }
+
+    private func drainPendingInviteLinks() {
+        let queued = pendingInviteLinks
+        pendingInviteLinks.removeAll()
+        for token in queued { submitInviteLink(token) }
     }
 
     /// Marmot (White Noise) npub once the secure-chat service connected.

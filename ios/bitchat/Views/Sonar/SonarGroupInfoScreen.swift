@@ -10,6 +10,7 @@
 // For more information, see <https://unlicense.org>
 //
 
+import SonarCore
 import SwiftUI
 
 struct SonarGroupInfoScreen: View {
@@ -18,6 +19,9 @@ struct SonarGroupInfoScreen: View {
 
     @State private var addDraft = ""
     @State private var leaveSheet = false
+    @State private var inviteLink: String? = nil
+    @State private var pendingJoinRequests: [JoinRequestInfo] = []
+    @State private var toast: String? = nil
 
     private var peer: SNPeerItem { store.peerItem(peerId) }
     private var members: [SNGroupContact] { store.groupMemberContacts(forConversationId: peerId) }
@@ -58,6 +62,52 @@ struct SonarGroupInfoScreen: View {
                         rest: " — only group members can read messages"
                     )
                     .padding(.bottom, 8)
+
+                    // ── Invite link ──
+                    SNSectionLabel("Invite link")
+                    SNSettingsCard {
+                        SNSettingsRow(
+                            icon: .link, tone: .cyan,
+                            label: inviteLink != nil ? "Copy invite link" : "Create invite link",
+                            sub: inviteLink != nil
+                                ? "sonar://invite/sinvite1…\(String(inviteLink!.suffix(8)))"
+                                : "Share a link to let people request to join",
+                            trail: .chevron, divider: false
+                        ) {
+                            if let link = inviteLink {
+                                copyInviteLink(link)
+                                showToast("Invite link copied")
+                            } else {
+                                guard let groupId = store.marmotGroupId(peerId) else { return }
+                                Task { @MainActor in
+                                    do {
+                                        let link = try await store.marmot.createInviteLink(
+                                            groupId: groupId, groupName: groupTitle
+                                        )
+                                        inviteLink = link
+                                        copyInviteLink(link)
+                                        showToast("Invite link created and copied")
+                                    } catch {
+                                        showToast("Couldn't create link: \(error.localizedDescription)")
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if !pendingJoinRequests.isEmpty {
+                        SNSectionLabel("Join requests")
+                        SNSettingsCard {
+                            ForEach(Array(pendingJoinRequests.enumerated()), id: \.element.requesterNpub) { index, request in
+                                PendingJoinRequestRow(
+                                    request: request,
+                                    divider: index < pendingJoinRequests.count - 1,
+                                    approve: { approveJoinRequest(request) },
+                                    decline: { declineJoinRequest(request) }
+                                )
+                            }
+                        }
+                    }
 
                     // ── Members ──
                     SNSectionLabel("Members")
@@ -176,6 +226,9 @@ struct SonarGroupInfoScreen: View {
             }
         }
         .background(SonarTheme.bg.ignoresSafeArea())
+        .overlay(alignment: .bottom) { toastView }
+        .animation(.easeOut(duration: 0.2), value: toast)
+        .task(id: peerId) { await loadPendingJoinRequests() }
         .snSheet(isPresented: $leaveSheet, title: "Leave group") {
             VStack(spacing: 12) {
                 Text("Are you sure you want to leave this group? You won\u{2019}t be able to read or send messages anymore.")
@@ -198,5 +251,129 @@ struct SonarGroupInfoScreen: View {
                 }
             }
         }
+    }
+
+    @ViewBuilder
+    private var toastView: some View {
+        if let toast {
+            Text(verbatim: toast)
+                .font(SonarTheme.uiFont(size: 13.5, weight: .semibold))
+                .foregroundColor(SonarTheme.onAccent)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(Capsule().fill(SonarTheme.accentFill))
+                .shadow(color: .black.opacity(0.14), radius: 14, y: 8)
+                .padding(.bottom, 22)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+        }
+    }
+
+    private func showToast(_ text: String) {
+        toast = text
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_600_000_000)
+            if toast == text { toast = nil }
+        }
+    }
+
+    private func inviteDeepLink(_ token: String) -> String {
+        "sonar://invite/\(token)"
+    }
+
+    private func copyInviteLink(_ token: String) {
+        let url = inviteDeepLink(token)
+        #if os(iOS)
+        UIPasteboard.general.string = url
+        #elseif os(macOS)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(url, forType: .string)
+        #endif
+    }
+
+    @MainActor
+    private func loadPendingJoinRequests() async {
+        guard let groupId = store.marmotGroupId(peerId) else {
+            pendingJoinRequests = []
+            return
+        }
+        do {
+            pendingJoinRequests = try await store.marmot.pendingJoinRequests(groupId: groupId)
+        } catch {
+            showToast("Couldn't load join requests: \(error.localizedDescription)")
+        }
+    }
+
+    private func approveJoinRequest(_ request: JoinRequestInfo) {
+        guard let groupId = store.marmotGroupId(peerId) else { return }
+        Task { @MainActor in
+            do {
+                try await store.marmot.approveJoinRequest(groupId: groupId, requesterNpub: request.requesterNpub)
+                pendingJoinRequests.removeAll { $0.requesterNpub == request.requesterNpub }
+                showToast("Member added")
+                await loadPendingJoinRequests()
+            } catch {
+                showToast("Couldn't approve: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func declineJoinRequest(_ request: JoinRequestInfo) {
+        guard let groupId = store.marmotGroupId(peerId) else { return }
+        Task { @MainActor in
+            do {
+                try await store.marmot.declineJoinRequest(groupId: groupId, requesterNpub: request.requesterNpub)
+                pendingJoinRequests.removeAll { $0.requesterNpub == request.requesterNpub }
+                showToast("Request declined")
+            } catch {
+                showToast("Couldn't decline: \(error.localizedDescription)")
+            }
+        }
+    }
+}
+
+private struct PendingJoinRequestRow: View {
+    let request: JoinRequestInfo
+    let divider: Bool
+    let approve: () -> Void
+    let decline: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(SonarTheme.greenSoft)
+                    SNIcon(name: .plus, size: 18)
+                        .foregroundColor(SonarTheme.green)
+                }
+                .frame(width: 34, height: 34)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Join request")
+                        .font(SonarTheme.uiFont(size: 15.5, weight: .semibold))
+                        .foregroundColor(SonarTheme.text)
+                    Text(verbatim: shortRequester(request.requesterNpub))
+                        .font(SonarTheme.uiFont(size: 12.5))
+                        .foregroundColor(SonarTheme.text3)
+                        .lineLimit(1)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                HStack(spacing: 8) {
+                    SNSmallButton(label: "Decline", expand: false, action: decline)
+                    SNSmallButton(label: "Approve", primary: true, expand: false, action: approve)
+                }
+            }
+            .padding(EdgeInsets(top: 9, leading: 14, bottom: 9, trailing: 14))
+            .overlay(alignment: .bottom) {
+                if divider {
+                    Rectangle().fill(SonarTheme.hairline).frame(height: 1).padding(.leading, 62)
+                }
+            }
+        }
+    }
+
+    private func shortRequester(_ value: String) -> String {
+        value.count <= 16 ? value : "\(value.prefix(10))…\(value.suffix(6))"
     }
 }

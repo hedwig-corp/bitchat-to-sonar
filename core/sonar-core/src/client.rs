@@ -23,6 +23,7 @@ use crate::conversation_index::{
     ConversationSummary,
 };
 use crate::identity::Identity;
+use crate::invite_link::invite_link_state_path_for_db;
 use crate::marmot::{
     ChatMessage, DeliveryState, GroupCreation, GroupInvite, GroupMembershipUpdate, Incoming,
     MarmotEngine, RecentMessagePage, KEY_PACKAGE_KIND, SYNC_STATE_FILE_SUFFIX,
@@ -414,6 +415,8 @@ pub struct SonarClient {
     conversation_index: Option<Arc<Mutex<ConversationIndex>>>,
     /// Host-registered callback fired when a conversation summary changes.
     change_listener: Arc<Mutex<Option<Arc<dyn ConversationChangeListener>>>>,
+    /// In-memory store for invite link secrets and pending join requests.
+    invite_links: Arc<crate::invite_link::InviteLinkStore>,
 }
 
 impl SonarClient {
@@ -447,6 +450,7 @@ impl SonarClient {
             true,
             Some(sync_state_path_for_db(db_path)),
             Some(outbox_state_path_for_db(db_path)),
+            Some(invite_link_state_path_for_db(db_path)),
             index.map(|idx| Arc::new(Mutex::new(idx))),
         )
         .await?;
@@ -458,7 +462,7 @@ impl SonarClient {
     /// dropped. Intended for tests and ephemeral/anonymous sessions.
     pub async fn connect_in_memory(identity: Identity, relays: Vec<RelayUrl>) -> Result<Self> {
         let engine = MarmotEngine::in_memory(identity.clone());
-        Self::with_engine(identity, relays, engine, false, None, None, None).await
+        Self::with_engine(identity, relays, engine, false, None, None, None, None).await
     }
 
     async fn with_engine(
@@ -468,6 +472,7 @@ impl SonarClient {
         allow_geo_relays: bool,
         sync_state_path: Option<PathBuf>,
         outbox_state_path: Option<PathBuf>,
+        invite_link_state_path: Option<PathBuf>,
         conversation_index: Option<Arc<Mutex<ConversationIndex>>>,
     ) -> Result<Self> {
         let nostr = Client::new(identity.keys().clone());
@@ -687,6 +692,9 @@ impl SonarClient {
             allow_geo_relays,
             conversation_index,
             change_listener: Arc::new(Mutex::new(None)),
+            invite_links: Arc::new(crate::invite_link::InviteLinkStore::load(
+                invite_link_state_path,
+            )),
         };
         // Open the live Marmot subscriptions for real sessions. In-memory test
         // sessions (allow_geo_relays=false) stay on the explicit `sync()` path so
@@ -1046,6 +1054,14 @@ impl SonarClient {
         require_relay_success(&output, context)
     }
 
+    async fn ensure_relays_connected(&self, relays: &[RelayUrl]) -> Result<()> {
+        for relay in relays {
+            self.nostr.add_relay(relay.clone()).await?;
+            self.nostr.connect_relay(relay.clone()).await?;
+        }
+        Ok(())
+    }
+
     /// Add members to an existing group.
     pub async fn add_group_members(
         &self,
@@ -1088,6 +1104,103 @@ impl SonarClient {
         self.engine.delete_group(group_id)?;
         let _ = self.resubscribe_marmot_groups_if_live().await;
         Ok(())
+    }
+
+    // ── Invite links ──────────────────────────────────────────────────
+
+    pub fn create_invite_link(&self, group_id: &GroupId, group_name: &str) -> Result<String> {
+        let relay_strings: Vec<String> = self.relays.iter().map(|r| r.to_string()).collect();
+        self.invite_links
+            .create_link(group_id, group_name, self.engine.identity(), relay_strings)
+    }
+
+    pub fn revoke_invite_link(&self, group_id: &GroupId, secret_hash: &[u8; 32]) -> Result<()> {
+        self.invite_links.revoke_link(group_id, secret_hash)
+    }
+
+    pub fn active_invite_links(
+        &self,
+        group_id: &GroupId,
+    ) -> Vec<crate::invite_link::InviteLinkMeta> {
+        self.invite_links.active_links(group_id)
+    }
+
+    pub async fn request_join_via_link(&self, token_str: &str) -> Result<()> {
+        let token = crate::invite_link::decode_invite_token(token_str)?;
+        let admin = PublicKey::from_slice(&token.admin_npub)
+            .map_err(|e| Error::InvalidInput(e.to_string()))?;
+        let group_id = GroupId::from_slice(&token.group_id);
+        let invite_relays: Vec<RelayUrl> = token
+            .relays
+            .iter()
+            .map(|url| {
+                RelayUrl::parse(url)
+                    .map_err(|e| Error::InvalidInput(format!("invite relay {url}: {e}")))
+            })
+            .collect::<Result<_>>()?;
+        let publish_relays = if invite_relays.is_empty() {
+            self.relays.clone()
+        } else {
+            invite_relays
+        };
+
+        self.ensure_relays_connected(&publish_relays).await?;
+        let kp_event = self.engine.key_package_event(publish_relays.clone())?;
+        let output = self
+            .nostr
+            .send_event_to(publish_relays.clone(), &kp_event)
+            .await?;
+        require_relay_success(&output, "invite key package publish")?;
+
+        let rumor = crate::invite_link::build_join_request_rumor(
+            &group_id,
+            &token.invite_secret,
+            &self.engine.identity().public_key(),
+            Some(&kp_event.id),
+        );
+        let wrapped = self.engine.gift_wrap_rumor(&admin, rumor).await?;
+        let output = self.nostr.send_event_to(publish_relays, &wrapped).await?;
+        require_relay_success(&output, "invite join request publish")
+    }
+
+    pub fn pending_join_requests(
+        &self,
+        group_id: &GroupId,
+    ) -> Vec<crate::invite_link::JoinRequest> {
+        self.invite_links.pending_join_requests(group_id)
+    }
+
+    pub async fn approve_join_request(
+        &self,
+        group_id: &GroupId,
+        requester: &PublicKey,
+    ) -> Result<()> {
+        if !self
+            .invite_links
+            .pending_join_requests(group_id)
+            .iter()
+            .any(|r| r.requester == *requester)
+        {
+            return Err(Error::InvalidInput("no pending join request".into()));
+        }
+        self.add_group_members(group_id, vec![*requester]).await?;
+        self.invite_links.remove_join_request(group_id, requester)?;
+        Ok(())
+    }
+
+    pub fn decline_join_request(&self, group_id: &GroupId, requester: &PublicKey) -> Result<()> {
+        self.invite_links.remove_join_request(group_id, requester)
+    }
+
+    pub fn store_join_request(&self, request: crate::invite_link::JoinRequest) -> Result<bool> {
+        if !self
+            .invite_links
+            .validate_secret(&request.group_id, &request.secret_hash)
+        {
+            return Ok(false);
+        }
+        self.invite_links.add_join_request(request)?;
+        Ok(true)
     }
 
     /// Pending multi-member invites waiting for explicit user action.
@@ -1656,6 +1769,14 @@ impl SonarClient {
                             report.record_retryable(event.created_at.as_secs());
                         }
                     }
+                }
+                Ok(Incoming::JoinRequest(request)) => {
+                    let group_hex = hex::encode(request.group_id.as_slice());
+                    if self.store_join_request(request).unwrap_or(false) {
+                        changed_groups.insert(group_hex);
+                    }
+                    self.mark_sync_event_processed(&event.id);
+                    report.record_processed();
                 }
                 Ok(ref incoming @ Incoming::Message(ref message)) => {
                     self.record_delivery_for_incoming(incoming);

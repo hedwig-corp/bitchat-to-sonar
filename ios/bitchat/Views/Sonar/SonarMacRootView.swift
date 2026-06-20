@@ -173,6 +173,8 @@ struct SonarMacRootView: View {
         case .profile:
             selection = .profile
             store.path.removeAll()
+        case .contactProfile, .groupInfo, .walletActivity:
+            break
         case .call:
             break
         case .contactProfile, .groupInfo, .walletActivity:
@@ -435,6 +437,12 @@ private struct SonarMacMainPane: View {
             MacModalRouteRedirect(openModal: onSettings)
         case .profile:
             MacRouteRedirect(selection: $selection, route: .profile)
+        case .contactProfile(let id, let name):
+            SonarContactProfileScreen(peerId: id, peerName: name)
+        case .groupInfo(let id):
+            SonarGroupInfoScreen(peerId: id)
+        case .walletActivity:
+            SonarWalletActivityScreen()
         case .call(let id, let video):
             SonarCallScreen(peerId: id, video: video)
         case .contactProfile(let id, let name):

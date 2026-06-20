@@ -174,8 +174,10 @@ struct BitchatApp: App {
 
     private func handleURL(_ url: URL) {
         if url.scheme == "bitchat" && url.host == "share" {
-            // Handle shared content
             checkForSharedContent()
+        } else if url.scheme == "sonar" && url.host == "invite",
+                  let token = url.pathComponents.last, token.hasPrefix("sinvite1") {
+            sonarStore.submitInviteLink(token)
         }
     }
 
