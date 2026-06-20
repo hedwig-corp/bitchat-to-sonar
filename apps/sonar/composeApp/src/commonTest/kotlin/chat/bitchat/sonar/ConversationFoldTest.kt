@@ -171,6 +171,47 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun profileCacheLookupResolvesGroupAuthorName() {
+        val senderNpub = "npub1vincent"
+        val cache = decodeProfileCache(
+            encodeProfileCache(
+                mapOf(
+                    senderNpub to SonarProfile(
+                        name = "vincent",
+                        displayName = "Vincent P",
+                        about = null,
+                        picture = null,
+                        nip05 = null,
+                    ),
+                ),
+            ),
+        )
+
+        val resolved = cache[canonicalProfileKey(senderNpub)]?.bestName
+        assertEquals("Vincent P", resolved)
+    }
+
+    @Test
+    fun profileCacheMissYieldsNullForGroupAuthor() {
+        val cache = decodeProfileCache(
+            encodeProfileCache(
+                mapOf(
+                    "npub1alice" to SonarProfile(
+                        name = "Alice",
+                        displayName = null,
+                        about = null,
+                        picture = null,
+                        nip05 = null,
+                    ),
+                ),
+            ),
+        )
+
+        val resolved = cache[canonicalProfileKey("npub1unknown")]?.bestName
+        assertNull(resolved)
+    }
+
+    @Test
     fun malformedProfileCacheRowsAreIgnored() {
         val decoded = decodeProfileCache("not-a-valid-row\n")
 

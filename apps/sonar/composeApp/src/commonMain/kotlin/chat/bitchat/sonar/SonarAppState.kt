@@ -1617,6 +1617,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             val local = withSendEchoes(chat.id, mergePendingMediaUploads(chat.id, marmotMessagesPage(chat.id)))
             messages = local
             processPayLines(chat.id, local)
+            for (m in local) if (!m.mine && m.senderNpub.isNotBlank()) ensureProfile(m.senderNpub)
             runCatching { refreshChats() }
             if ((screen as? Screen.Chat)?.id == chat.id) {
                 val fresh = withSendEchoes(chat.id, mergePendingMediaUploads(chat.id, marmotMessagesPage(chat.id)))

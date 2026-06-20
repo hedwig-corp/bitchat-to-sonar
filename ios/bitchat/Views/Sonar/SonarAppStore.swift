@@ -2339,7 +2339,7 @@ final class SonarAppStore: ObservableObject {
                     return (m.createdAt, SNMessage(
                         id: m.id,
                         mine: m.isMine,
-                        author: String(m.senderNpub.prefix(12)),
+                        author: marmot.marmotAuthorName(m),
                         text: m.content,
                         time: Self.clock(m.createdAt),
                         via: .internet,

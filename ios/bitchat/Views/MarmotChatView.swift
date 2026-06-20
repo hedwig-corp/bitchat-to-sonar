@@ -703,6 +703,16 @@ final class MarmotChatModel: ObservableObject {
             ?? profilesByNpub[member]?.bestName
     }
 
+    /// Resolved author label for a Marmot group message: cached profile name,
+    /// or short npub with an async fetch kicked off so it resolves on the next
+    /// SwiftUI invalidation cycle.
+    func marmotAuthorName(_ m: MarmotService.MarmotMessage) -> String? {
+        guard !m.isMine, !m.senderNpub.isEmpty else { return nil }
+        if let name = displayName(forNpub: m.senderNpub) { return name }
+        ensureProfile(m.senderNpub)
+        return SonarAppStore.shortNpub(m.senderNpub)
+    }
+
     /// Merge still-pending optimistic echoes into the freshly-synced
     /// transcripts. An optimistic message is dropped once the relay copy of
     /// the same outgoing text (mine, same content) has come back, so the
