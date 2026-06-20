@@ -2,8 +2,10 @@ package chat.bitchat.sonar.store
 
 import chat.bitchat.sonar.SonarChannelMsg
 import chat.bitchat.sonar.SonarMsg
+import chat.bitchat.sonar.SonarStickerRef
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class MessageCodecTest {
@@ -54,6 +56,33 @@ class MessageCodecTest {
 
     @Test fun meshEnvelopeRejectsGarbage() {
         assertEquals(null, MessageCodec.decodeMeshEnvelope(""))
+    }
+
+    @Test fun dmRoundTripWithStickerRef() {
+        val ref = SonarStickerRef("30030:abc123:pack", "wave", "deadbeef")
+        val msgs = listOf(
+            SonarMsg("a", "npub1xx", "", mine = true, tsSecs = 1, stickerRef = ref),
+            SonarMsg("b", "npub1yy", "plain text", mine = false, tsSecs = 2),
+        )
+        val decoded = MessageCodec.decodeDm(MessageCodec.encodeDm(msgs))
+        assertEquals(msgs.size, decoded.size)
+        assertEquals(ref, decoded[0].stickerRef)
+        assertNull(decoded[1].stickerRef)
+        assertEquals("plain text", decoded[1].content)
+    }
+
+    @Test fun dmBackwardCompatOldFormatNoSticker() {
+        val old = listOf(
+            SonarMsg("a", "npub1xx", "hello", mine = true, tsSecs = 1),
+        )
+        val encoded = old.joinToString("\n") { m ->
+            listOf(m.id, m.senderNpub, if (m.mine) "1" else "0", m.tsSecs.toString(), m.content)
+                .joinToString("\t") { s -> s.encodeToByteArray().joinToString("") { ((it.toInt() and 0xFF) + 0x100).toString(16).substring(1) } }
+        }
+        val decoded = MessageCodec.decodeDm(encoded)
+        assertEquals(1, decoded.size)
+        assertEquals("hello", decoded[0].content)
+        assertNull(decoded[0].stickerRef)
     }
 }
 

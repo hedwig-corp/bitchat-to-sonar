@@ -1644,6 +1644,34 @@ pub fn mesh_decode_private_message(plaintext: Vec<u8>) -> Option<MeshPrivateMess
     })
 }
 
+/// Encode a sticker reference as a content string suitable for a BLE mesh
+/// private message.  The wire uses ASCII Unit Separator (\x1F) delimiters so
+/// the encoded string is unambiguous against regular chat text.
+#[uniffi::export]
+pub fn mesh_sticker_content(
+    pack_coordinate: String,
+    shortcode: String,
+    plaintext_sha256: String,
+) -> String {
+    format!("\x1Fsticker\x1F{pack_coordinate}\x1F{shortcode}\x1F{plaintext_sha256}")
+}
+
+/// Try to parse a content string as a mesh-encoded sticker reference.
+/// Returns `None` for regular text messages.
+#[uniffi::export]
+pub fn mesh_parse_sticker_content(content: String) -> Option<StickerRefInfo> {
+    let parts: Vec<&str> = content.splitn(5, '\x1F').collect();
+    if parts.len() >= 5 && parts[0].is_empty() && parts[1] == "sticker" {
+        Some(StickerRefInfo {
+            pack_coordinate: parts[2].to_string(),
+            shortcode: parts[3].to_string(),
+            plaintext_sha256: parts[4].to_string(),
+        })
+    } else {
+        None
+    }
+}
+
 /// Build a SIGNED public broadcast message packet (type 0x02, recipient
 /// 0xFF*8) carrying a `BitchatMessage` payload — the BLE "Mesh" channel.
 /// Wire-compatible with iOS public messages.
@@ -1925,5 +1953,24 @@ mod tests {
     fn wipe_missing_db_is_ok() {
         // Idempotent: wiping a non-existent path succeeds.
         assert!(wipe_marmot_database("/tmp/sonar-ffi-does-not-exist.sqlite".into()).is_ok());
+    }
+
+    #[test]
+    fn sticker_content_roundtrip() {
+        let pack = "30030:abc123:mypack".to_string();
+        let code = "wave".to_string();
+        let hash = "deadbeef".to_string();
+        let encoded = mesh_sticker_content(pack.clone(), code.clone(), hash.clone());
+        let parsed = mesh_parse_sticker_content(encoded).expect("should parse");
+        assert_eq!(parsed.pack_coordinate, pack);
+        assert_eq!(parsed.shortcode, code);
+        assert_eq!(parsed.plaintext_sha256, hash);
+    }
+
+    #[test]
+    fn sticker_content_rejects_plain_text() {
+        assert!(mesh_parse_sticker_content("hello world".into()).is_none());
+        assert!(mesh_parse_sticker_content("".into()).is_none());
+        assert!(mesh_parse_sticker_content("sticker:fake".into()).is_none());
     }
 }

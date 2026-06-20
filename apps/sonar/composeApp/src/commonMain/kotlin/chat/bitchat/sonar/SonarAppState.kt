@@ -2187,6 +2187,11 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     fun sendStickerItem(chatId: String, sticker: SonarStickerItem, packCoordinate: String) {
+        if (isMeshChat(chatId)) {
+            val content = meshStickerContent(packCoordinate, sticker.shortcode, sticker.sha256)
+            sendMesh(meshPeerId(chatId), content)
+            return
+        }
         scope.launch {
             val groupId = resolveMarmotGroupId(chatId)
             if (groupId == null) {
@@ -2359,7 +2364,10 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun sendMesh(peerId: String, text: String): Boolean {
         val ok = MeshRadio.sendMeshDm(peerId, randomMeshId(), text)
         if (!ok) { toast = "Not connected over Bluetooth yet — stay close and try again"; return false }
-        val msg = SonarMsg(randomMeshId(), npub, text, mine = true, MeshRadio.nowSecs())
+        val stickerRef = meshParseStickerContent(text)?.let {
+            SonarStickerRef(it.packCoordinate, it.shortcode, it.plaintextSha256)
+        }
+        val msg = SonarMsg(randomMeshId(), npub, if (stickerRef != null) "" else text, mine = true, MeshRadio.nowSecs(), stickerRef = stickerRef)
         meshChats[peerId] = meshChats[peerId].orEmpty() + msg
         processPayLines(meshChatId(peerId), listOf(msg))
         persistMesh(peerId)
@@ -2898,7 +2906,14 @@ class SonarAppState(private val scope: CoroutineScope) {
         val notifsOn = prefBool("notifs", true)
         val touched = mutableSetOf<String>()
         for (m in incoming) {
-            val msg = SonarMsg(m.messageId.ifBlank { randomMeshId() }, m.peerId, m.text, mine = false, m.tsSecs)
+            val stickerRef = meshParseStickerContent(m.text)?.let {
+                SonarStickerRef(it.packCoordinate, it.shortcode, it.plaintextSha256)
+            }
+            val msg = SonarMsg(
+                m.messageId.ifBlank { randomMeshId() }, m.peerId,
+                if (stickerRef != null) "" else m.text,
+                mine = false, m.tsSecs, stickerRef = stickerRef,
+            )
             val chatId = meshChatId(m.peerId)
             // A ☎CALL control line arriving over the mesh link: route it to the
             // engine, never store/show it as a chat message.
@@ -2910,7 +2925,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             processPayLines(chatId, listOf(msg))
             touched += m.peerId
             if (notifsOn && !foreground && chatId != openChatId) {
-                Notifier.notify(chatId.hashCode(), meshPeerName(m.peerId), notifPreview(m.text))
+                val preview = if (stickerRef != null) "Sticker" else notifPreview(m.text)
+                Notifier.notify(chatId.hashCode(), meshPeerName(m.peerId), preview)
             }
         }
         touched.forEach { persistMesh(it) } // write-through so received DMs survive restart
@@ -2981,7 +2997,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             .filter { it.value.isNotEmpty() }
             .map { (pid, msgs) ->
                 val last = msgs.last()
-                MeshDmRow(pid, meshPeerName(pid), messagePreview(last.content), last.tsSecs)
+                MeshDmRow(pid, meshPeerName(pid), messagePreview(last.content, last.stickerRef), last.tsSecs)
             }
             .sortedByDescending { it.tsSecs }
     }

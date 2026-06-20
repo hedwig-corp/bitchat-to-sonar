@@ -2,6 +2,7 @@ package chat.bitchat.sonar.store
 
 import chat.bitchat.sonar.SonarChannelMsg
 import chat.bitchat.sonar.SonarMsg
+import chat.bitchat.sonar.SonarStickerRef
 
 /**
  * On-device persistence of transcripts that the relays do NOT keep, so they
@@ -62,16 +63,21 @@ object MessageCodec {
 
     fun encodeDm(list: List<SonarMsg>): String =
         list.joinToString("\n") { m ->
-            row(m.id, m.senderNpub, if (m.mine) "1" else "0", m.tsSecs.toString(), m.content)
+            val base = row(m.id, m.senderNpub, if (m.mine) "1" else "0", m.tsSecs.toString(), m.content)
+            val ref = m.stickerRef
+            if (ref != null) base + "\t" + hexEnc(ref.packCoordinate) + "\t" + hexEnc(ref.shortcode) + "\t" + hexEnc(ref.plaintextSha256)
+            else base
         }
 
     fun decodeDm(blob: String): List<SonarMsg> =
         blob.lineSequence().mapNotNull { line ->
             val f = unrow(line) ?: return@mapNotNull null
-            if (f.size != 5) return@mapNotNull null
+            if (f.size < 5) return@mapNotNull null
+            val stickerRef = if (f.size >= 8) SonarStickerRef(f[5], f[6], f[7]) else null
             SonarMsg(
                 id = f[0], senderNpub = f[1], content = f[4],
                 mine = f[2] == "1", tsSecs = f[3].toLongOrNull() ?: 0L,
+                stickerRef = stickerRef,
             )
         }.toList()
 
