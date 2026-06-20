@@ -59,13 +59,10 @@ actual fun rememberPhotoPicker(
                 withContext(Dispatchers.Main) { onPicked(raw, filename, "image/gif") }
                 return@launch
             }
-            // Re-encode still images to JPEG: guarantees a format the core image
-            // metadata path handles (HEIC isn't) and keeps the upload small.
-            val bmp = BitmapFactory.decodeByteArray(raw, 0, raw.size) ?: return@launch
-            val out = ByteArrayOutputStream()
-            bmp.compress(Bitmap.CompressFormat.JPEG, 85, out)
-            val jpeg = out.toByteArray()
-            withContext(Dispatchers.Main) { onPicked(jpeg, "photo.jpg", "image/jpeg") }
+            // Pass raw bytes — JPEG re-encoding happens lazily on send confirmation.
+            val name = sourceName.ifBlank { "photo" }
+            val mime = sourceMime.ifBlank { "image/jpeg" }
+            withContext(Dispatchers.Main) { onPicked(raw, name, mime) }
         }
     }
     return {
@@ -308,3 +305,23 @@ private class PendingDocumentSave(
 
 private fun safeFilename(filename: String): String =
     filename.substringAfterLast('/').substringAfterLast('\\').ifBlank { "attachment" }
+
+actual fun writeTempMediaFile(data: ByteArray, suffix: String): String {
+    val file = File.createTempFile("sonar-preview-", suffix)
+    file.writeBytes(data)
+    return file.absolutePath
+}
+
+actual fun readTempMediaFile(path: String): ByteArray? =
+    runCatching { File(path).readBytes() }.getOrNull()
+
+actual fun deleteTempMediaFile(path: String) {
+    runCatching { File(path).delete() }
+}
+
+actual fun reencodeToJpeg(data: ByteArray): ByteArray {
+    val bmp = BitmapFactory.decodeByteArray(data, 0, data.size) ?: return data
+    val out = ByteArrayOutputStream()
+    bmp.compress(Bitmap.CompressFormat.JPEG, 85, out)
+    return out.toByteArray()
+}

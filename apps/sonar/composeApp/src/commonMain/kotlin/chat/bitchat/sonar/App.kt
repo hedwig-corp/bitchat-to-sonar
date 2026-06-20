@@ -956,13 +956,16 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         )
     }
     state.pendingMediaPreviews.firstOrNull { it.chatId == screen.id }?.let { preview ->
-        MediaSendPreview(
-            data = preview.data,
-            isGif = preview.mime == "image/gif",
-            onSend = { state.confirmSendPreview(screen.id) },
-            onCancel = { state.cancelPreview(screen.id) },
-            modifier = Modifier.matchParentSize()
-        )
+        val data = remember(preview.tempPath) { readTempMediaFile(preview.tempPath) }
+        if (data != null) {
+            MediaSendPreview(
+                data = data,
+                isGif = preview.mime == "image/gif",
+                onSend = { state.confirmSendPreview(screen.id) },
+                onCancel = { state.cancelPreview(screen.id) },
+                modifier = Modifier.matchParentSize()
+            )
+        }
     }
     }
     if (addSheet) AddToMessageSheet(

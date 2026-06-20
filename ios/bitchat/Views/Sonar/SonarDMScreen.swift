@@ -251,9 +251,10 @@ struct SonarDMScreen: View {
             get: { store.pendingMediaPreviews.contains { $0.peerId == peerId } },
             set: { if !$0 { store.cancelPreview(peerId: peerId) } }
         )) {
-            if let preview = store.pendingMediaPreviews.first(where: { $0.peerId == peerId }) {
+            if let preview = store.pendingMediaPreviews.first(where: { $0.peerId == peerId }),
+               let data = try? Data(contentsOf: preview.tempURL) {
                 MediaSendPreviewView(
-                    data: preview.data,
+                    data: data,
                     isGif: preview.mime == "image/gif",
                     onSend: { store.confirmSendPreview(peerId: peerId) },
                     onCancel: { store.cancelPreview(peerId: peerId) }

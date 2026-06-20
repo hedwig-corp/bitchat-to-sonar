@@ -5,9 +5,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.ImageBitmap
 
 /**
- * Platform photo picker. Static photos are delivered as JPEG bytes so the Rust
- * core image metadata path sees a format it handles consistently. Animated GIFs
- * are delivered as their original `image/gif` bytes so animation is not lost.
+ * Platform photo picker. Raw bytes are delivered with the source MIME type so
+ * the preview shows full-quality data. JPEG re-encoding is deferred to send
+ * confirmation via [reencodeToJpeg]. GIFs are passed through unmodified.
  */
 @Composable
 expect fun rememberPhotoPicker(
@@ -31,6 +31,18 @@ class MediaActions(
     val save: suspend (bytes: ByteArray, filename: String, mime: String) -> Boolean,
     val open: suspend (bytes: ByteArray, filename: String, mime: String) -> Boolean,
 )
+
+/** Write [data] to a platform temp file, returning its absolute path. */
+expect fun writeTempMediaFile(data: ByteArray, suffix: String): String
+
+/** Read a temp file written by [writeTempMediaFile] back into memory. */
+expect fun readTempMediaFile(path: String): ByteArray?
+
+/** Delete a temp file. Safe to call if the file doesn't exist. */
+expect fun deleteTempMediaFile(path: String)
+
+/** Re-encode raw image bytes to JPEG at quality 0.85. Returns original on failure. */
+expect fun reencodeToJpeg(data: ByteArray): ByteArray
 
 /** Platform share/download/open integration for media viewer actions. */
 @Composable

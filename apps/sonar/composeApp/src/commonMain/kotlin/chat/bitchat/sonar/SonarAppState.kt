@@ -181,7 +181,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun push(s: Screen) {
         if (s is Screen.Chat && (screen as? Screen.Chat)?.id != s.id) {
-            pendingMediaPreviews = emptyList()
+            cleanupPreviewTempFiles()
         }
         stack = stack + s
     }
@@ -1647,7 +1647,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun isMeshChat(chatId: String) = chatId.startsWith("mesh:")
 
     fun back() {
-        pendingMediaPreviews = emptyList()
+        cleanupPreviewTempFiles()
         if (stack.size > 1) stack = stack.dropLast(1)
         if (stack.lastOrNull() !is Screen.Chat) messages = emptyList()
         scope.launch { refreshChats() }
@@ -1658,7 +1658,7 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  sidebar item so the stack never grows unbounded and a screen's Back button
      *  deselects (returns to the welcome pane) instead of walking history. */
     fun resetToHome() {
-        pendingMediaPreviews = emptyList()
+        cleanupPreviewTempFiles()
         if (stack.size > 1) { stack = listOf(Screen.Home); messages = emptyList() }
     }
 
@@ -1820,7 +1820,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     // ── Media preview (confirmation before send) ──
     data class PendingMediaPreview(
         val chatId: String,
-        val data: ByteArray,
+        val tempPath: String,
         val filename: String,
         val mime: String,
         val caption: String = "",
@@ -1828,9 +1828,18 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     var pendingMediaPreviews by mutableStateOf<List<PendingMediaPreview>>(emptyList())
 
+    private fun cleanupPreviewTempFiles() {
+        for (preview in pendingMediaPreviews) {
+            deleteTempMediaFile(preview.tempPath)
+        }
+        pendingMediaPreviews = emptyList()
+    }
+
     fun stageMediaPreview(chatId: String, data: ByteArray, filename: String, mime: String) {
         if ((screen as? Screen.Chat)?.id != chatId) return
-        pendingMediaPreviews = listOf(PendingMediaPreview(chatId, data, filename, mime))
+        val suffix = if (mime == "image/gif") ".gif" else ".img"
+        val path = writeTempMediaFile(data, suffix)
+        pendingMediaPreviews = listOf(PendingMediaPreview(chatId, path, filename, mime))
     }
 
     fun confirmSendPreview(chatId: String? = null) {
@@ -1846,11 +1855,26 @@ class SonarAppState(private val scope: CoroutineScope) {
             pendingMediaPreviews.filterNot { it.chatId == chatId }
         }
         for (preview in items) {
-            sendImage(preview.chatId, preview.data, preview.filename, preview.mime)
+            val raw = readTempMediaFile(preview.tempPath) ?: continue
+            deleteTempMediaFile(preview.tempPath)
+            if (preview.mime == "image/gif") {
+                sendImage(preview.chatId, raw, preview.filename, preview.mime)
+            } else {
+                val jpeg = reencodeToJpeg(raw)
+                sendImage(preview.chatId, jpeg, "photo.jpg", "image/jpeg")
+            }
         }
     }
 
     fun cancelPreview(chatId: String? = null) {
+        val toRemove = if (chatId == null) {
+            pendingMediaPreviews
+        } else {
+            pendingMediaPreviews.filter { it.chatId == chatId }
+        }
+        for (preview in toRemove) {
+            deleteTempMediaFile(preview.tempPath)
+        }
         pendingMediaPreviews = if (chatId == null) {
             emptyList()
         } else {

@@ -399,14 +399,14 @@ final class SonarAppStore: ObservableObject {
     // ── Media preview (confirmation before send) ──
     struct PendingMediaPreview {
         let peerId: String
-        let data: Data
+        let tempURL: URL
         let filename: String
         let mime: String
         let caption: String
 
-        init(peerId: String, data: Data, filename: String, mime: String, caption: String = "") {
+        init(peerId: String, tempURL: URL, filename: String, mime: String, caption: String = "") {
             self.peerId = peerId
-            self.data = data
+            self.tempURL = tempURL
             self.filename = filename
             self.mime = mime
             self.caption = caption
@@ -420,9 +420,30 @@ final class SonarAppStore: ObservableObject {
         return nil
     }
 
+    private func writeTempMediaFile(_ data: Data, suffix: String) -> URL? {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("sonar-preview")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent(UUID().uuidString + suffix)
+        do {
+            try data.write(to: url)
+            return url
+        } catch {
+            return nil
+        }
+    }
+
+    private func cleanupPreviewTempFiles() {
+        for preview in pendingMediaPreviews {
+            try? FileManager.default.removeItem(at: preview.tempURL)
+        }
+        pendingMediaPreviews = []
+    }
+
     func stageMediaPreview(_ peerId: String, data: Data, filename: String, mime: String) {
         guard currentDMId == peerId else { return }
-        pendingMediaPreviews = [PendingMediaPreview(peerId: peerId, data: data, filename: filename, mime: mime)]
+        let suffix = mime == "image/gif" ? ".gif" : ".img"
+        guard let url = writeTempMediaFile(data, suffix: suffix) else { return }
+        pendingMediaPreviews = [PendingMediaPreview(peerId: peerId, tempURL: url, filename: filename, mime: mime)]
     }
 
     func confirmSendPreview(peerId: String? = nil) {
@@ -434,20 +455,26 @@ final class SonarAppStore: ObservableObject {
             pendingMediaPreviews = []
         }
         for preview in items {
+            guard let raw = try? Data(contentsOf: preview.tempURL) else { continue }
+            try? FileManager.default.removeItem(at: preview.tempURL)
             if preview.mime == "image/gif" {
-                _ = sendAttachment(preview.peerId, data: preview.data, filename: preview.filename, mime: preview.mime)
+                _ = sendAttachment(preview.peerId, data: raw, filename: preview.filename, mime: preview.mime)
             } else {
                 #if os(iOS)
-                let bytes = UIImage(data: preview.data)?.jpegData(compressionQuality: 0.85) ?? preview.data
+                let bytes = UIImage(data: raw)?.jpegData(compressionQuality: 0.85) ?? raw
                 #else
-                let bytes = preview.data
+                let bytes = raw
                 #endif
-                sendImage(preview.peerId, data: bytes, filename: preview.filename, mime: preview.mime)
+                sendImage(preview.peerId, data: bytes, filename: "photo.jpg", mime: "image/jpeg")
             }
         }
     }
 
     func cancelPreview(peerId: String? = nil) {
+        let toRemove = peerId.map { id in pendingMediaPreviews.filter { $0.peerId == id } } ?? pendingMediaPreviews
+        for preview in toRemove {
+            try? FileManager.default.removeItem(at: preview.tempURL)
+        }
         if let peerId {
             pendingMediaPreviews.removeAll { $0.peerId == peerId }
         } else {
@@ -3465,13 +3492,13 @@ final class SonarAppStore: ObservableObject {
 
     func push(_ route: SonarRoute) {
         if case .dm(let id) = route, currentDMId != id {
-            pendingMediaPreviews = []
+            cleanupPreviewTempFiles()
         }
         path.append(route)
     }
 
     func pop() {
-        pendingMediaPreviews = []
+        cleanupPreviewTempFiles()
         if !path.isEmpty { path.removeLast() }
     }
 
