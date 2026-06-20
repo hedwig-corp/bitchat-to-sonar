@@ -36,9 +36,11 @@ private enum SonarCallAudioRoute {
                 try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth])
                 try session.setActive(true)
                 try session.overrideOutputAudioPort(speakerOn ? .speaker : .none)
+                UIDevice.current.isProximityMonitoringEnabled = true
             } else {
                 try? session.overrideOutputAudioPort(.none)
                 try session.setActive(false, options: .notifyOthersOnDeactivation)
+                UIDevice.current.isProximityMonitoringEnabled = false
             }
         } catch {
             SecureLogger.error("call audio route failed: \(error)", category: .session)
@@ -3684,11 +3686,14 @@ final class SonarAppStore: ObservableObject {
         Task { [weak self] in try? await self?.marmot.callHangup(callId: c.callId) }
     }
 
-    /// Hang up an outgoing/connected call: tear down media + signal END. The
-    /// engine's Ended event records the call-log entry and pops the screen.
+    /// Hang up an outgoing/connected call: dismiss immediately (Signal pattern),
+    /// then tear down engine + signal END in the background.
     func hangupCall() {
         guard let c = activeCall else { return }
+        callTickerTask?.cancel(); callTickerTask = nil
         SonarCallAudioRoute.configure(active: false, speakerOn: false)
+        recordCall(convId: c.convId, video: c.video, mine: !c.incoming, seconds: c.connectedSecs)
+        activeCall = nil
         let line = callEncodeEnd(callId: c.callId, reason: "hangup")
         _ = sendCallControl(c.convId, line, via: c.signalingVia)
         Task { [weak self] in try? await self?.marmot.callHangup(callId: c.callId) }

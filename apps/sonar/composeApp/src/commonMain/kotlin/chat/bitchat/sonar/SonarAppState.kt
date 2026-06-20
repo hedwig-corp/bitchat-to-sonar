@@ -375,20 +375,35 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
-    /** Decline the incoming call: send ANSWER|decline + tear down the local slot. */
+    /** Decline incoming call: dismiss immediately (Signal pattern), then engine
+     *  cleanup in the background. */
     fun declineCall() {
         val c = activeCall ?: return
+        CallAudioRoute.configure(active = false, speakerOn = false)
+        callLogs.getOrPut(c.chatId) { mutableListOf() }.add(
+            CallRecord(video = c.video, mine = false, durSecs = 0, tsSecs = SonarClock.nowSecs())
+        )
+        callVersion++
+        activeCall = null
+        if (screen is Screen.Call && stack.size > 1) stack = stack.dropLast(1)
         scope.launch {
             runCatching { sendCallControl(c.chatId, SonarCore.callEncodeAnswer(c.callId, SonarAnswer.Decline, "")) }
-            runCatching { SonarCore.callHangup(c.callId) } // engine Ended event finalizes
+            runCatching { SonarCore.callHangup(c.callId) }
         }
     }
 
-    /** Hang up an outgoing/connected call: tear down media + signal END. The
-     *  engine's Ended event records the call-log entry and pops the screen. */
+    /** Hang up an outgoing/connected call: dismiss immediately (Signal pattern),
+     *  then engine teardown + END signal in the background. */
     fun hangupCall() {
         val c = activeCall ?: return
+        callTicker?.cancel(); callTicker = null
         CallAudioRoute.configure(active = false, speakerOn = false)
+        callLogs.getOrPut(c.chatId) { mutableListOf() }.add(
+            CallRecord(video = c.video, mine = !c.incoming, durSecs = c.connectedSecs, tsSecs = SonarClock.nowSecs())
+        )
+        callVersion++
+        activeCall = null
+        if (screen is Screen.Call && stack.size > 1) stack = stack.dropLast(1)
         scope.launch {
             runCatching { SonarCore.callHangup(c.callId) }
             runCatching { sendCallControl(c.chatId, SonarCore.callEncodeEnd(c.callId, "hangup")) }
