@@ -137,9 +137,9 @@ struct SonarDMScreen: View {
                     loadImage: { await store.stickerImageData(url: $0, expectedSha256: $1) },
                     installPack: { await store.installStickerPack(coordinate: $0) },
                     uninstallPack: { await store.uninstallStickerPack(coordinate: $0) },
-                    isInstalled: { coord in
+                    isInstalled: { packCoord in
                         let installed = await store.fetchInstalledPacks()
-                        return installed.contains(where: { $0.lowercased() == coord.lowercased() })
+                        return installed.contains(where: { $0.lowercased() == packCoord.lowercased() })
                     },
                     onClose: { previewPackCoordinate = nil }
                 )
