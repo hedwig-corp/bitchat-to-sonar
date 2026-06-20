@@ -21,7 +21,9 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 private const val SONAR_DESCRIPTOR_TTL_SECS = 15 * 60L
 private const val SONAR_DESCRIPTOR_MISS_TTL_SECS = 60L
@@ -1837,9 +1839,15 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun stageMediaPreview(chatId: String, data: ByteArray, filename: String, mime: String) {
         if ((screen as? Screen.Chat)?.id != chatId) return
-        val suffix = if (mime == "image/gif") ".gif" else ".img"
-        val path = writeTempMediaFile(data, suffix)
-        pendingMediaPreviews = listOf(PendingMediaPreview(chatId, path, filename, mime))
+        scope.launch {
+            val suffix = if (mime == "image/gif") ".gif" else ".img"
+            val path = withContext(Dispatchers.Default) { writeTempMediaFile(data, suffix) }
+            if ((screen as? Screen.Chat)?.id != chatId) {
+                withContext(Dispatchers.Default) { deleteTempMediaFile(path) }
+                return@launch
+            }
+            pendingMediaPreviews = listOf(PendingMediaPreview(chatId, path, filename, mime))
+        }
     }
 
     fun confirmSendPreview(chatId: String? = null) {
@@ -1855,13 +1863,16 @@ class SonarAppState(private val scope: CoroutineScope) {
             pendingMediaPreviews.filterNot { it.chatId == chatId }
         }
         for (preview in items) {
-            val raw = readTempMediaFile(preview.tempPath) ?: continue
-            deleteTempMediaFile(preview.tempPath)
-            if (preview.mime == "image/gif") {
-                sendImage(preview.chatId, raw, preview.filename, preview.mime)
-            } else {
-                val jpeg = reencodeToJpeg(raw)
-                sendImage(preview.chatId, jpeg, "photo.jpg", "image/jpeg")
+            scope.launch {
+                val raw = withContext(Dispatchers.Default) {
+                    readTempMediaFile(preview.tempPath).also { deleteTempMediaFile(preview.tempPath) }
+                } ?: return@launch
+                if (preview.mime == "image/gif") {
+                    sendImage(preview.chatId, raw, preview.filename, preview.mime)
+                } else {
+                    val jpeg = withContext(Dispatchers.Default) { reencodeToJpeg(raw) }
+                    sendImage(preview.chatId, jpeg, "photo.jpg", "image/jpeg")
+                }
             }
         }
     }
