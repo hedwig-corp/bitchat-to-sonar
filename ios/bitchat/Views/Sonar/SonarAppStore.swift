@@ -28,7 +28,7 @@ import UIKit
 #endif
 
 private enum SonarCallAudioRoute {
-    static func configure(active: Bool, speakerOn: Bool) {
+    static func configure(active: Bool, speakerOn: Bool, proximityEnabled: Bool = false) {
         #if os(iOS)
         let session = AVAudioSession.sharedInstance()
         do {
@@ -36,7 +36,7 @@ private enum SonarCallAudioRoute {
                 try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth])
                 try session.setActive(true)
                 try session.overrideOutputAudioPort(speakerOn ? .speaker : .none)
-                UIDevice.current.isProximityMonitoringEnabled = true
+                UIDevice.current.isProximityMonitoringEnabled = proximityEnabled
             } else {
                 try? session.overrideOutputAudioPort(.none)
                 try session.setActive(false, options: .notifyOthersOnDeactivation)
@@ -659,6 +659,12 @@ final class SonarAppStore: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] note in self?.handleSonarProfileNotification(note) }
             .store(in: &cancellables)
+        #if os(iOS)
+        NotificationCenter.default.publisher(for: UIDevice.proximityStateDidChangeNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.handleCallProximityChange() }
+            .store(in: &cancellables)
+        #endif
         marmot.$npub
             .receive(on: DispatchQueue.main)
             .sink { [weak self] npub in
@@ -3564,6 +3570,10 @@ final class SonarAppStore: ObservableObject {
         if !path.isEmpty { path.removeLast() }
     }
 
+    private func popCallRouteIfNeeded() {
+        if case .call? = path.last { pop() }
+    }
+
     // MARK: Calls
 
     /// mm:ss formatter (call.jsx `fmtCall`): minutes unpadded, seconds padded.
@@ -3601,7 +3611,7 @@ final class SonarAppStore: ObservableObject {
         // setup (bind/offer) runs in the background. The endpoint is already bound
         // at boot via ensureCallStarted(), so we must NOT call callStart() again
         // here (a second bind blocks — which made the tap "take forever").
-        SonarCallAudioRoute.configure(active: true, speakerOn: video)
+        SonarCallAudioRoute.configure(active: true, speakerOn: video, proximityEnabled: !video)
         activeCall = SNActiveCall(callId: callId, convId: convId, signalingVia: via, peerName: name, video: video, incoming: false, phase: .ringing, speakerOn: video)
         push(.call(convId, video: video))
         let alreadyStarted = callStarted
@@ -3624,7 +3634,7 @@ final class SonarAppStore: ObservableObject {
                         Task { [weak self] in try? await self?.marmot.callHangup(callId: callId) }
                         SonarCallAudioRoute.configure(active: false, speakerOn: false)
                         self.activeCall = nil
-                        self.pop()
+                        self.popCallRouteIfNeeded()
                     }
                 }
             } catch {
@@ -3633,7 +3643,7 @@ final class SonarAppStore: ObservableObject {
                     guard self.activeCall?.callId == callId else { return }
                     SonarCallAudioRoute.configure(active: false, speakerOn: false)
                     self.activeCall = nil
-                    self.pop()
+                    self.popCallRouteIfNeeded()
                 }
             }
         }
@@ -3645,7 +3655,7 @@ final class SonarAppStore: ObservableObject {
         var next = c
         next.phase = .connecting
         activeCall = next
-        SonarCallAudioRoute.configure(active: true, speakerOn: c.speakerOn)
+        SonarCallAudioRoute.configure(active: true, speakerOn: c.speakerOn, proximityEnabled: !c.video)
         let alreadyStarted = callStarted
         Task { [weak self] in
             guard let self else { return }
@@ -3683,6 +3693,7 @@ final class SonarAppStore: ObservableObject {
         SonarCallAudioRoute.configure(active: false, speakerOn: false)
         recordCall(convId: c.convId, video: c.video, mine: false, seconds: 0)
         activeCall = nil
+        popCallRouteIfNeeded()
         Task { [weak self] in try? await self?.marmot.callHangup(callId: c.callId) }
     }
 
@@ -3694,6 +3705,7 @@ final class SonarAppStore: ObservableObject {
         SonarCallAudioRoute.configure(active: false, speakerOn: false)
         recordCall(convId: c.convId, video: c.video, mine: !c.incoming, seconds: c.connectedSecs)
         activeCall = nil
+        popCallRouteIfNeeded()
         let line = callEncodeEnd(callId: c.callId, reason: "hangup")
         _ = sendCallControl(c.convId, line, via: c.signalingVia)
         Task { [weak self] in try? await self?.marmot.callHangup(callId: c.callId) }
@@ -3711,6 +3723,17 @@ final class SonarAppStore: ObservableObject {
         c.speakerOn.toggle()
         activeCall = c
         SonarCallAudioRoute.setSpeaker(c.speakerOn)
+        handleCallProximityChange()
+    }
+
+    private func handleCallProximityChange() {
+        #if os(iOS)
+        guard var c = activeCall, !c.video else { return }
+        guard UIDevice.current.proximityState, c.speakerOn else { return }
+        c.speakerOn = false
+        activeCall = c
+        SonarCallAudioRoute.setSpeaker(false)
+        #endif
     }
 
     private func startCallLoop() {
@@ -3759,7 +3782,7 @@ final class SonarAppStore: ObservableObject {
         let secs = Int(ev.durationSecs)
         recordCall(convId: c.convId, video: c.video, mine: !c.incoming, seconds: secs)
         activeCall = nil
-        if case .call? = path.last { pop() }
+        popCallRouteIfNeeded()
     }
 
     /// Tear down call state on wipe/erase so calling rebinds cleanly after the

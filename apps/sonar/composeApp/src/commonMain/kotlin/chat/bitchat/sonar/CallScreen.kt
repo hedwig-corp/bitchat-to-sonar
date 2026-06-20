@@ -165,10 +165,8 @@ fun CallScreen(state: SonarAppState, screen: Screen.Call) {
                     CallBtn(if (muted) SNIconName.MicOff else SNIconName.Mic, if (muted) "Unmute" else "Mute", active = muted) { state.toggleCallMute() }
                     if (video) {
                         CallBtn(if (camOn) SNIconName.Videocam else SNIconName.VideoOff, if (camOn) "Stop video" else "Start video", active = !camOn) { state.toggleCallCam() }
-                        CallBtn(SNIconName.CameraFlip, "Flip", active = false) { /* flip camera — not yet wired */ }
                     } else {
                         CallBtn(SNIconName.Speaker, "Speaker", active = speakerOn) { state.toggleCallSpeaker() }
-                        CallBtn(SNIconName.Videocam, "Video", active = false) { /* upgrade to video — not yet wired */ }
                     }
                     CallBtn(SNIconName.PhoneDown, "End", active = false, end = true) { state.hangupCall() }
                 }

@@ -245,7 +245,6 @@ struct SonarCallScreen: View {
                     }
                 } else {
                     SNCallButton(icon: .speaker, label: "Speaker", active: speakerOn) { store.toggleCallSpeaker() }
-                    SNCallButton(icon: .videocam, label: "Video") { /* upgrade to video — not yet wired */ }
                 }
                 SNCallButton(icon: .phoneDown, label: "End", end: true) { store.hangupCall() }
             }
