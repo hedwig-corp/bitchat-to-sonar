@@ -2188,8 +2188,15 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun sendStickerItem(chatId: String, sticker: SonarStickerItem, packCoordinate: String) {
         if (isMeshChat(chatId)) {
+            val peerId = meshPeerId(chatId)
             val content = meshStickerContent(packCoordinate, sticker.shortcode, sticker.sha256)
-            sendMesh(meshPeerId(chatId), content)
+            if (MeshRadio.hasMeshLink(peerId)) { sendMesh(peerId, content); return }
+            val raw = npubRawFor(peerId)
+            if (raw != null) {
+                sendStickerOverMarmot(peerId, raw, packCoordinate, sticker)
+                return
+            }
+            toast = "Not connected — stay close and try again"
             return
         }
         scope.launch {
@@ -2362,12 +2369,13 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /** Send a BLE-mesh DM over the Noise link + optimistically echo it. */
     private fun sendMesh(peerId: String, text: String): Boolean {
-        val ok = MeshRadio.sendMeshDm(peerId, randomMeshId(), text)
+        val mid = randomMeshId()
+        val ok = MeshRadio.sendMeshDm(peerId, mid, text)
         if (!ok) { toast = "Not connected over Bluetooth yet — stay close and try again"; return false }
         val stickerRef = meshParseStickerContent(text)?.let {
             SonarStickerRef(it.packCoordinate, it.shortcode, it.plaintextSha256)
         }
-        val msg = SonarMsg(randomMeshId(), npub, if (stickerRef != null) "" else text, mine = true, MeshRadio.nowSecs(), stickerRef = stickerRef)
+        val msg = SonarMsg(mid, npub, if (stickerRef != null) "" else text, mine = true, MeshRadio.nowSecs(), stickerRef = stickerRef)
         meshChats[peerId] = meshChats[peerId].orEmpty() + msg
         processPayLines(meshChatId(peerId), listOf(msg))
         persistMesh(peerId)
@@ -2433,12 +2441,47 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     /** Flush texts queued for Sonar peers whose White Noise group now exists. */
+    private fun sendStickerOverMarmot(
+        peerId: String, npubRaw: ByteArray,
+        packCoordinate: String, sticker: SonarStickerItem,
+    ) {
+        val group = marmotGroupForNpub(npubRaw)
+        if (group != null) {
+            scope.launch {
+                runCatching { SonarCore.sendSticker(group.id, packCoordinate, sticker.shortcode, sticker.sha256) }
+                    .onFailure { toast = "send failed: ${it.message}" }
+            }
+            return
+        }
+        val npubHex = npubRaw.toHexLower()
+        val encoded = meshStickerContent(packCoordinate, sticker.shortcode, sticker.sha256)
+        pendingMarmotSends.getOrPut(npubHex) { mutableListOf() }.add(encoded)
+        toast = "Out of range — continuing over White Noise…"
+        if (!startingMarmotChats.add(npubHex)) return
+        scope.launch {
+            try {
+                SonarCore.startChat(npubHex)
+                refreshChats(); flushPendingMarmot(); refreshOpenDm(peerId)
+            } catch (e: Throwable) { toast = "couldn't start secure chat: ${e.message}" }
+            finally { startingMarmotChats.remove(npubHex) }
+        }
+    }
+
     private fun flushPendingMarmot() {
         if (pendingMarmotSends.isEmpty()) return
         for ((npubHex, texts) in pendingMarmotSends.toMap()) {
             val group = marmotGroupForNpub(npubHex.hexToBytesOrEmpty()) ?: continue
             pendingMarmotSends.remove(npubHex)
-            scope.launch { for (tx in texts) runCatching { SonarCore.send(group.id, tx) } }
+            scope.launch {
+                for (tx in texts) {
+                    val ref = meshParseStickerContent(tx)
+                    if (ref != null) {
+                        runCatching { SonarCore.sendSticker(group.id, ref.packCoordinate, ref.shortcode, ref.plaintextSha256) }
+                    } else {
+                        runCatching { SonarCore.send(group.id, tx) }
+                    }
+                }
+            }
         }
     }
 

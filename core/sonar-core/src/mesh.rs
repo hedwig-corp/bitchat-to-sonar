@@ -530,6 +530,10 @@ impl PrivateMessage {
     /// Decode the TLV. Tolerant of unknown TLV types (forward-compat, like
     /// Announce) so older clients can receive messages from newer senders that
     /// add optional fields. Requires both messageID and content.
+    ///
+    /// Known long types (2-byte length) are matched explicitly. Unknown types
+    /// are assumed short (1-byte length, max 255 bytes) — any future field
+    /// that needs a longer payload must be added to the match below.
     pub fn decode(data: &[u8]) -> Option<PrivateMessage> {
         let mut o = 0usize;
         let mut message_id: Option<String> = None;
@@ -537,9 +541,7 @@ impl PrivateMessage {
         while o < data.len() {
             let t = data[o];
             o += 1;
-            let is_long = t == PM_TLV_MESSAGE_ID_LONG
-                || t == PM_TLV_CONTENT_LONG
-                || (t > PM_TLV_CONTENT_LONG && t % 2 == 1);
+            let is_long = t == PM_TLV_MESSAGE_ID_LONG || t == PM_TLV_CONTENT_LONG;
             let len = if is_long {
                 if o + 2 > data.len() {
                     return None;
@@ -1127,13 +1129,12 @@ mod tests {
             content: "hello".into(),
         };
         let mut data = pm.encode().unwrap();
-        // Append an unknown short TLV (type 0x10, 3 bytes payload).
+        // Append two unknown short TLVs (1-byte length): decoder skips both.
         data.push(0x10);
         data.push(3);
         data.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
-        // Append an unknown long TLV (type 0x11, 2-byte length, 4 bytes payload).
         data.push(0x11);
-        data.extend_from_slice(&2u16.to_be_bytes());
+        data.push(2);
         data.extend_from_slice(&[0xDD, 0xEE]);
         let decoded = PrivateMessage::decode(&data).unwrap();
         assert_eq!(decoded, pm);

@@ -2549,6 +2549,12 @@ final class SonarAppStore: ObservableObject {
             )
             return
         }
+        let encoded = meshStickerContent(
+            packCoordinate: packCoordinate,
+            shortcode: sticker.shortcode,
+            plaintextSha256: sticker.sha256
+        )
+        pendingMarmotSends[npub, default: []].append(encoded)
         marmot.connectIfNeeded()
         marmot.startChat(with: npub)
     }
@@ -2568,7 +2574,18 @@ final class SonarAppStore: ObservableObject {
         for (npub, texts) in pendingMarmotSends {
             guard let group = marmotGroup(forNpub: npub) else { continue }
             pendingMarmotSends[npub] = nil
-            for text in texts { marmot.send(text, to: group.id) }
+            for text in texts {
+                if let ref = meshParseStickerContent(content: text) {
+                    marmot.sendSticker(
+                        groupId: group.id,
+                        packCoordinate: ref.packCoordinate,
+                        shortcode: ref.shortcode,
+                        plaintextSha256: ref.plaintextSha256
+                    )
+                } else {
+                    marmot.send(text, to: group.id)
+                }
+            }
         }
     }
 

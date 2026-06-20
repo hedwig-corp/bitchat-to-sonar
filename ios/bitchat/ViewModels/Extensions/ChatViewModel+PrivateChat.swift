@@ -885,9 +885,11 @@ extension ChatViewModel {
         } else {
             // Notify
             unreadPrivateMessages.insert(peerID)
+            let notifBody = meshParseStickerContent(content: message.content) != nil
+                ? "Sticker" : message.content
             NotificationService.shared.sendPrivateMessageNotification(
                 from: message.sender,
-                message: message.content,
+                message: notifBody,
                 peerID: peerID
             )
         }
