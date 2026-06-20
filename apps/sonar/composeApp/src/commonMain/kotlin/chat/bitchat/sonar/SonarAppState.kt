@@ -56,7 +56,8 @@ data class MeshDmRow(val peerId: String, val name: String, val preview: String, 
 /** A local contact that can be invited into a Marmot group. */
 data class GroupContact(val id: String, val title: String, val subtitle: String, val npub: String)
 
-private fun messagePreview(content: String): String {
+private fun messagePreview(content: String, stickerRef: SonarStickerRef? = null): String {
+    if (stickerRef != null) return "Sticker"
     if (content.trimStart().startsWith("☎CALL") && SonarCore.callParseControl(content) != null) {
         return "Voice call"
     }
@@ -2066,7 +2067,11 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun sendStickerItem(chatId: String, sticker: SonarStickerItem, packCoordinate: String) {
         scope.launch {
-            val groupId = resolveMarmotGroupId(chatId) ?: return@launch
+            val groupId = resolveMarmotGroupId(chatId)
+            if (groupId == null) {
+                toast = "Stickers require an encrypted chat"
+                return@launch
+            }
             try {
                 SonarCore.sendSticker(groupId, packCoordinate, sticker.shortcode, sticker.sha256)
             } catch (e: Throwable) {
@@ -2867,7 +2872,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 groups.forEach { folded += it.id }
                 latestMarmotMessage(groups)?.let { if (it.tsSecs > last.tsSecs) last = it }
             }
-            upsert(peerId, MeshDmRow(peerId, foldedPeerName(peerId, groups.firstOrNull()), messagePreview(last.content), last.tsSecs))
+            upsert(peerId, MeshDmRow(peerId, foldedPeerName(peerId, groups.firstOrNull()), messagePreview(last.content, last.stickerRef), last.tsSecs))
         }
         val groupPeers = LinkedHashMap<String, String>()
         for (group in chats) {
@@ -2881,7 +2886,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 MeshDmRow(
                     peerId,
                     foldedPeerName(peerId, group),
-                    last?.let { messagePreview(it.content) } ?: "Secure chat · reaches anywhere",
+                    last?.let { messagePreview(it.content, it.stickerRef) } ?: "Secure chat · reaches anywhere",
                     last?.tsSecs ?: 0L,
                 )
             )

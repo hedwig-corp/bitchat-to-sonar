@@ -816,6 +816,7 @@ private struct MacConversationPane: View {
                 await store.stickerPack(authorPubkeyHex: author, identifier: identifier, relayUrls: relays)
             },
             loadStickerImage: { await store.stickerImageData(url: $0, expectedSha256: $1) },
+            fetchInstalledPacks: { await store.fetchInstalledPacks() },
             voiceEnabled: !isChannel && store.canSendMedia(id),
             onVoice: { store.sendVoiceNote(id, url: $0) }
         )

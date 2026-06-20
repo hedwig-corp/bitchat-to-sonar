@@ -2018,7 +2018,7 @@ final class SonarAppStore: ObservableObject {
                 marmotRows.append(SNDMRow(
                     id: Self.marmotIDPrefix + group.id,
                     title: marmot.title(for: group),
-                    preview: last.map { Self.previewText($0.content) } ?? "Secure group · reaches anywhere",
+                    preview: last.map { Self.previewText($0.content, stickerRef: $0.stickerRef) } ?? "Secure group · reaches anywhere",
                     time: last.map { Self.listTime($0.createdAt) } ?? "",
                     unread: (marmot.unreadByGroup[group.id] ?? 0) > 0,
                     presence: false,
@@ -2054,7 +2054,7 @@ final class SonarAppStore: ObservableObject {
                     byKey[foldKey] = SNDMRow(
                         id: existing.id,
                         title: existing.title,
-                        preview: Self.previewText(last.content),
+                        preview: Self.previewText(last.content, stickerRef: last.stickerRef),
                         time: Self.listTime(last.createdAt),
                         unread: existing.unread,
                         presence: existing.presence,
@@ -2075,7 +2075,7 @@ final class SonarAppStore: ObservableObject {
                 byKey[foldKey] = SNDMRow(
                     id: rowId,
                     title: liveSonarPeerId == nil ? marmot.title(for: group) : peerDisplayName(rowId),
-                    preview: last.map { Self.previewText($0.content) } ?? networkLabel(forPeer: rowId),
+                    preview: last.map { Self.previewText($0.content, stickerRef: $0.stickerRef) } ?? networkLabel(forPeer: rowId),
                     time: last.map { Self.listTime($0.createdAt) } ?? "",
                     unread: (marmot.unreadByGroup[group.id] ?? 0) > 0,
                     presence: liveSonarPeerId != nil && meshReachable(rowId),
@@ -2092,7 +2092,7 @@ final class SonarAppStore: ObservableObject {
             marmotRows.append(SNDMRow(
                 id: Self.marmotIDPrefix + group.id,
                 title: marmot.title(for: group),
-                preview: last.map { Self.previewText($0.content) } ?? "Secure chat · reaches anywhere",
+                preview: last.map { Self.previewText($0.content, stickerRef: $0.stickerRef) } ?? "Secure chat · reaches anywhere",
                 time: last.map { Self.listTime($0.createdAt) } ?? "",
                 unread: (marmot.unreadByGroup[group.id] ?? 0) > 0,
                 presence: false,
@@ -2292,7 +2292,8 @@ final class SonarAppStore: ObservableObject {
                         time: Self.clock(m.createdAt),
                         via: .internet,
                         state: MarmotChatModel.stateText(for: m),
-                        media: Self.mediaItems(m, groupId: group.id)
+                        media: Self.mediaItems(m, groupId: group.id),
+                        stickerRef: m.stickerRef
                     ))
                 }
             }
@@ -3212,7 +3213,8 @@ final class SonarAppStore: ObservableObject {
     /// Maps a raw last-message content to the home-row preview ("₿ Payment"
     /// for any ⚡PAY line, "Voice call" for ☎CALL signaling, so codecs never
     /// leak into list rows).
-    static func previewText(_ content: String) -> String {
+    static func previewText(_ content: String, stickerRef: MarmotService.MarmotStickerRef? = nil) -> String {
+        if stickerRef != nil { return "Sticker" }
         if looksLikeCallControl(content), callParseControl(content: content) != nil {
             return "Voice call"
         }

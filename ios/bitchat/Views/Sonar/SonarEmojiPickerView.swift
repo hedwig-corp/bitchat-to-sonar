@@ -22,6 +22,7 @@ struct SonarEmojiPickerView: View {
     let onSticker: (StickerInfo, String) -> Void
     let loadStickerPack: (String, String, [String]) async -> StickerPackInfo?
     let loadStickerImage: (String, String) async -> Data?
+    let fetchInstalledPacks: () async -> [String]
     let onClose: () -> Void
 
     @State private var tab = 0
@@ -72,7 +73,8 @@ struct SonarEmojiPickerView: View {
             default: StickerTabContent(
                 onSticker: onSticker,
                 loadPack: loadStickerPack,
-                loadImage: loadStickerImage
+                loadImage: loadStickerImage,
+                fetchInstalledPacks: fetchInstalledPacks
             )
             }
         }
@@ -186,6 +188,7 @@ private struct StickerTabContent: View {
     let onSticker: (StickerInfo, String) -> Void
     let loadPack: (String, String, [String]) async -> StickerPackInfo?
     let loadImage: (String, String) async -> Data?
+    let fetchInstalledPacks: () async -> [String]
 
     @State private var packs: [StickerPackInfo] = []
     @State private var loading = true
@@ -248,7 +251,7 @@ private struct StickerTabContent: View {
     }
 
     private func loadPacks() async {
-        let coordinates = (try? await MarmotService.shared.fetchInstalledPacks()) ?? []
+        let coordinates = await fetchInstalledPacks()
         let toFetch = coordinates.isEmpty ? ["30030:\(testPackAuthor):\(testPackId)"] : coordinates
         var loaded: [StickerPackInfo] = []
         for coord in toFetch {
