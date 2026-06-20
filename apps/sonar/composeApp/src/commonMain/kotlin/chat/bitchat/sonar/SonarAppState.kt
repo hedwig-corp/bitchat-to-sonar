@@ -31,6 +31,7 @@ private const val PROFILE_REFRESH_TTL_SECS = 30 * 60L
 private const val LOCAL_TRANSCRIPT_PAGE_LIMIT = 100
 private const val LOCAL_SUMMARY_PAGE_LIMIT = 20
 private const val LOCAL_SUMMARY_CHAT_LIMIT = 5
+private const val GROUP_FOLDS_BLOB_KEY = "sonar.groupFolds"
 
 sealed interface Screen {
     data object Home : Screen
@@ -81,6 +82,15 @@ internal fun inferUniquePeerByTitle(
         .map { it.key }
         .singleOrNull()
 }
+
+private fun decodeGroupFoldMap(blob: String): Map<String, String> =
+    blob.lineSequence()
+        .mapNotNull { line ->
+            val i = line.indexOf('=')
+            if (i <= 0) null else line.substring(0, i) to line.substring(i + 1).trim()
+        }
+        .filter { (groupId, peerId) -> groupId.isNotBlank() && peerId.isNotBlank() }
+        .toMap()
 
 internal const val CAPABILITY_SETTLE_MS = 1_500L
 
@@ -145,6 +155,10 @@ data class SonarVerify(val safety: List<String>, val verified: Boolean, val note
 class SonarAppState(private val scope: CoroutineScope) {
     private val initialChatSnapshotBlob = SonarCore.loadBlob(CHAT_SNAPSHOT_BLOB_KEY)
     private val initialChatSnapshot = decodeChatSnapshot(initialChatSnapshotBlob)
+    private val initialGroupFoldMap = decodeGroupFoldMap(SonarCore.loadBlob(GROUP_FOLDS_BLOB_KEY))
+    private val initialFoldedGroupIds: Set<String> = initialChatSnapshot.first
+        .mapTo(hashSetOf()) { it.id }
+        .let { activeChatIds -> initialGroupFoldMap.keys.filterTo(hashSetOf()) { it in activeChatIds } }
     var npub by mutableStateOf("")
         private set
     var started by mutableStateOf(false)
@@ -663,18 +677,19 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Marmot groups currently FOLDED into a BLE-mesh DM row (same person via
      *  [linkByFp]) — hidden from the standalone White Noise list so a person never
      *  shows up twice. Display-only: the group still lives in [chats]. */
-    private var foldedGroupIds by mutableStateOf<Set<String>>(emptySet())
+    private var foldedGroupIds by mutableStateOf<Set<String>>(initialFoldedGroupIds)
     /** Folded Marmot group id → mesh peer fingerprint. Kept with [foldedGroupIds]
      *  so openChat/refreshOpenDm can route a White Noise group back to the
      *  canonical mesh conversation even while BLE is unavailable. */
-    private var foldedGroupPeerIds: Map<String, String> = emptyMap()
+    private var foldedGroupPeerIds: Map<String, String> =
+        initialGroupFoldMap.filterKeys { it in initialFoldedGroupIds }
     /** Persisted Marmot group id → mesh peer fingerprint. Unlike the ephemeral
      *  [foldedGroupPeerIds] (recomputed each cycle), this map survives BLE state
      *  changes and app restarts — matching iOS's `marmotGroupIdsByConversationId`.
      *  It acts as a durable fallback in [peerIdForMarmotGroup] so a conversation
      *  that was folded once stays folded even when BLE is off and the live profile
      *  lookup chain fails. */
-    private val groupFoldMap = mutableMapOf<String, String>()
+    private val groupFoldMap = initialGroupFoldMap.toMutableMap()
 
     /** White Noise chats to render on their own row: every Marmot group EXCEPT the
      *  ones folded into a mesh DM. The Messages list uses this instead of [chats]. */
@@ -796,10 +811,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             val i = line.indexOf('=')
             if (i > 0) linkCapsByFp[line.substring(0, i)] = line.substring(i + 1).trim().toIntOrNull() ?: 0
         }
-        SonarCore.loadBlob("sonar.groupFolds").lineSequence().forEach { line ->
-            val i = line.indexOf('=')
-            if (i > 0) groupFoldMap[line.substring(0, i)] = line.substring(i + 1).trim()
-        }
+        groupFoldMap.clear()
+        groupFoldMap.putAll(decodeGroupFoldMap(SonarCore.loadBlob(GROUP_FOLDS_BLOB_KEY)))
     }
 
     private fun persistLinks() {
@@ -811,7 +824,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private fun persistGroupFolds() {
-        SonarCore.saveBlob("sonar.groupFolds", groupFoldMap.entries.joinToString("\n") { "${it.key}=${it.value}" })
+        SonarCore.saveBlob(GROUP_FOLDS_BLOB_KEY, groupFoldMap.entries.joinToString("\n") { "${it.key}=${it.value}" })
     }
 
     /** Record fingerprint→npub from a 0x53 (persisted on change). When a new
