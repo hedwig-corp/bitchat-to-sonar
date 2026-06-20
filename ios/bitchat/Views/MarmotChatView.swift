@@ -152,6 +152,7 @@ final class MarmotChatModel: ObservableObject {
     private var startupLocalSummaryTask: Task<Void, Never>?
     private var relayConnectTask: Task<Void, Never>?
     private var relayBusy = false
+    private var installedPackCoordinates: Set<String> = []
     /// npubs whose profile fetch is in flight or done, to fetch each once per session.
     private var profileFetches: Set<String> = []
     /// npubs whose Sonar descriptor fetch is currently in flight.
@@ -976,17 +977,32 @@ final class MarmotChatModel: ObservableObject {
     }
 
     func fetchInstalledPacks() async -> [String] {
+        if !installedPackCoordinates.isEmpty {
+            return Array(installedPackCoordinates)
+        }
         do {
-            return try await service.fetchInstalledPacks()
+            let coords = try await service.fetchInstalledPacks()
+            installedPackCoordinates = Set(coords.map { $0.lowercased() })
+            return coords
         } catch {
             self.errorText = Self.describe(error)
             return []
         }
     }
 
+    func refreshInstalledPacks() async {
+        do {
+            let coords = try await service.fetchInstalledPacks()
+            installedPackCoordinates = Set(coords.map { $0.lowercased() })
+        } catch {
+            self.errorText = Self.describe(error)
+        }
+    }
+
     func installStickerPack(coordinate: String) async -> Bool {
         do {
             try await service.installStickerPack(coordinate: coordinate)
+            installedPackCoordinates.insert(coordinate.lowercased())
             return true
         } catch {
             self.errorText = Self.describe(error)
@@ -997,6 +1013,7 @@ final class MarmotChatModel: ObservableObject {
     func uninstallStickerPack(coordinate: String) async -> Bool {
         do {
             try await service.uninstallStickerPack(coordinate: coordinate)
+            installedPackCoordinates.remove(coordinate.lowercased())
             return true
         } catch {
             self.errorText = Self.describe(error)
@@ -1091,6 +1108,7 @@ final class MarmotChatModel: ObservableObject {
         messagesByGroup[groupId] = nil
         pendingOptimistic[groupId] = nil
         profileFetches = []
+        installedPackCoordinates = []
         SNMarmotChatSnapshotCache.save(groups: groups, messagesByGroup: messagesByGroup, to: defaults)
     }
 
@@ -1106,6 +1124,7 @@ final class MarmotChatModel: ObservableObject {
         messagesByGroup[groupId] = nil
         pendingOptimistic[groupId] = nil
         profileFetches = []
+        installedPackCoordinates = []
         SNMarmotChatSnapshotCache.save(groups: groups, messagesByGroup: messagesByGroup, to: defaults)
     }
 
@@ -1124,6 +1143,7 @@ final class MarmotChatModel: ObservableObject {
         descriptorBolt12Offer = nil
         profilesByNpub = [:]
         profileFetches = []
+        installedPackCoordinates = []
         SNMarmotProfileCache.clear(from: defaults)
         SNMarmotChatSnapshotCache.clear(from: defaults)
     }
@@ -1145,6 +1165,7 @@ final class MarmotChatModel: ObservableObject {
         pendingOptimistic = [:]
         profilesByNpub = [:]
         profileFetches = []
+        installedPackCoordinates = []
         SNMarmotProfileCache.clear(from: defaults)
         SNMarmotChatSnapshotCache.clear(from: defaults)
         errorText = nil
