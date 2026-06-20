@@ -3437,6 +3437,7 @@ final class SonarAppStore: ObservableObject {
     }
 
     func pop() {
+        pendingMediaPreview = nil
         if !path.isEmpty { path.removeLast() }
     }
 

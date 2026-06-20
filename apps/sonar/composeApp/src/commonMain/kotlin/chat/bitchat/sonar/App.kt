@@ -1854,12 +1854,7 @@ private fun MediaSendPreview(
             Modifier.fillMaxWidth().align(Alignment.TopStart).padding(horizontal = 8.dp, vertical = 12.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Text(
-                "←",
-                color = Color.White,
-                fontSize = 22.sp,
-                modifier = Modifier.clip(CircleShape).clickable { onCancel() }.padding(12.dp)
-            )
+            SNIconButton(SNIconName.Back, tint = Color.White, onClick = onCancel)
         }
         Row(
             Modifier.fillMaxWidth().align(Alignment.BottomCenter).padding(16.dp),

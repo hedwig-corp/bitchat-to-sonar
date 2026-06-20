@@ -1642,6 +1642,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun isMeshChat(chatId: String) = chatId.startsWith("mesh:")
 
     fun back() {
+        pendingMediaPreview = null
         if (stack.size > 1) stack = stack.dropLast(1)
         if (stack.lastOrNull() !is Screen.Chat) messages = emptyList()
         scope.launch { refreshChats() }
@@ -1652,6 +1653,7 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  sidebar item so the stack never grows unbounded and a screen's Back button
      *  deselects (returns to the welcome pane) instead of walking history. */
     fun resetToHome() {
+        pendingMediaPreview = null
         if (stack.size > 1) { stack = listOf(Screen.Home); messages = emptyList() }
     }
 
