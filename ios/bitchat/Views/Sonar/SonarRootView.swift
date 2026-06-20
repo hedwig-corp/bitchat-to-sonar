@@ -42,6 +42,20 @@ struct SonarRootView: View {
         .tint(SonarTheme.accent)
         .overlay(alignment: .bottom) { toastView }
         .animation(.easeOut(duration: 0.2), value: store.toast)
+        #if os(iOS)
+        .fullScreenCover(isPresented: Binding(
+            get: { store.activeCall != nil },
+            set: { showing in
+                if !showing { store.hangupCall() }
+            }
+        )) {
+            if let call = store.activeCall {
+                SonarCallScreen(peerId: call.convId, video: call.video)
+                    .environmentObject(store)
+                    .environment(\.colorScheme, .dark)
+            }
+        }
+        #endif
     }
 
     @ViewBuilder

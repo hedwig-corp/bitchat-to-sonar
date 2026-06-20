@@ -3551,6 +3551,9 @@ final class SonarAppStore: ObservableObject {
         if case .dm(let id) = route, currentDMId != id {
             cleanupPreviewTempFiles()
         }
+        #if os(iOS)
+        if case .call = route { return }
+        #endif
         path.append(route)
     }
 
@@ -3669,11 +3672,15 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
-    /// Decline the incoming call: send ANSWER|decline + tear down the local slot.
+    /// Decline the incoming call: send ANSWER|decline, tear down the local slot,
+    /// and dismiss the call screen immediately (don't wait for the engine event).
     func declineCall() {
         guard let c = activeCall else { return }
         let line = callEncodeAnswer(callId: c.callId, answer: .decline, nodeAddrB64: "")
         _ = sendCallControl(c.convId, line, via: c.signalingVia)
+        SonarCallAudioRoute.configure(active: false, speakerOn: false)
+        recordCall(convId: c.convId, video: c.video, mine: false, seconds: 0)
+        activeCall = nil
         Task { [weak self] in try? await self?.marmot.callHangup(callId: c.callId) }
     }
 
