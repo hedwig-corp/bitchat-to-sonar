@@ -1,5 +1,10 @@
 package chat.bitchat.sonar.desktop
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -22,6 +27,9 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -97,13 +105,37 @@ fun DesktopApp() {
 @Composable
 fun SonarDesktopRoot(state: SonarAppState) {
     val s = sonar
+    var detailRailOpen by remember { mutableStateOf(false) }
+    val hasDetail = state.screen is Screen.Chat || state.screen is Screen.Channel
     Surface(Modifier.fillMaxSize(), color = s.bg) {
         Row(Modifier.fillMaxSize()) {
             DesktopSidebar(state)
-            // Hairline divider between sidebar and content.
             Box(Modifier.fillMaxHeight().width(1.dp).background(s.hairline))
             Box(Modifier.weight(1f).fillMaxHeight()) {
-                if (state.isHome) DesktopWelcome() else SonarScreenHost(state)
+                if (state.isHome) {
+                    DesktopWelcome()
+                } else {
+                    Box(Modifier.fillMaxSize()) {
+                        SonarScreenHost(state)
+                        if (hasDetail) {
+                            Box(Modifier.align(Alignment.TopEnd).padding(top = 10.dp, end = 12.dp)) {
+                                SNIconButton(SNIconName.Info, size = 16.dp, tint = s.text2) {
+                                    detailRailOpen = !detailRailOpen
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            AnimatedVisibility(
+                visible = hasDetail && detailRailOpen,
+                enter = slideInHorizontally(initialOffsetX = { it }) + fadeIn(),
+                exit = slideOutHorizontally(targetOffsetX = { it }) + fadeOut(),
+            ) {
+                Row {
+                    Box(Modifier.fillMaxHeight().width(1.dp).background(s.hairline))
+                    DesktopDetailRail(state)
+                }
             }
         }
     }
@@ -358,5 +390,125 @@ private fun DesktopWelcome() {
                 textAlign = androidx.compose.ui.text.style.TextAlign.Center
             )
         }
+    }
+}
+
+/** Right-side detail rail for DM or channel info (matches iOS SonarMacDetailRail). */
+@Composable
+private fun DesktopDetailRail(state: SonarAppState) {
+    when (val scr = state.screen) {
+        is Screen.Chat -> DmDetailRail(state, scr)
+        is Screen.Channel -> ChannelDetailRail(state, scr)
+        else -> {}
+    }
+}
+
+@Composable
+private fun DmDetailRail(state: SonarAppState, scr: Screen.Chat) {
+    val s = sonar
+    val isMesh = scr.id.startsWith("mesh:")
+    val rawPeer = scr.id.removePrefix("mesh:")
+    val inRange = isMesh && state.dmInRange(rawPeer)
+    val verified = state.isVerified(scr.id)
+    Column(
+        Modifier.width(286.dp).fillMaxHeight().background(s.surface.copy(alpha = 0.4f))
+            .padding(horizontal = 18.dp, vertical = 20.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        SonarAvatar(scr.name, 72.dp, presence = if (isMesh) inRange else null)
+        Spacer(Modifier.height(12.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(scr.name, color = s.text, fontSize = 17.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            if (verified) { Spacer(Modifier.width(5.dp)); SNIcon(SNIconName.ShieldCheck, 15.dp, s.green, weight = 2.1f) }
+        }
+
+        Spacer(Modifier.height(20.dp))
+        DetailSection("Delivery") {
+            DetailRow(
+                icon = if (isMesh) SNIconName.Mesh else SNIconName.Globe,
+                label = if (isMesh && inRange) "Nearby (Bluetooth)" else if (isMesh) "Out of range" else "Internet",
+                tint = if (isMesh && inRange) s.accent else s.text2,
+            )
+            DetailRow(
+                icon = SNIconName.Lock,
+                label = "End-to-end encrypted",
+                tint = s.green,
+            )
+        }
+
+        if (verified) {
+            Spacer(Modifier.height(16.dp))
+            DetailSection("Safety") {
+                DetailRow(icon = SNIconName.ShieldCheck, label = "Identity verified", tint = s.green)
+            }
+        }
+
+        Spacer(Modifier.weight(1f))
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp, Alignment.CenterHorizontally)) {
+            SNIconButton(SNIconName.Phone, size = 18.dp, tint = s.text2) {
+                state.push(Screen.Call(peerId = scr.id, name = scr.name, video = false))
+            }
+            SNIconButton(SNIconName.Videocam, size = 18.dp, tint = s.text2) {
+                state.push(Screen.Call(peerId = scr.id, name = scr.name, video = true))
+            }
+        }
+    }
+}
+
+@Composable
+private fun ChannelDetailRail(state: SonarAppState, scr: Screen.Channel) {
+    val s = sonar
+    val isMesh = scr.geohash == "mesh"
+    val here = state.presence(scr.geohash)
+    Column(
+        Modifier.width(286.dp).fillMaxHeight().background(s.surface.copy(alpha = 0.4f))
+            .padding(horizontal = 18.dp, vertical = 20.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Box(
+            Modifier.size(56.dp).clip(RoundedCornerShape(16.dp)).background(s.accentSoft),
+            contentAlignment = Alignment.Center
+        ) { SNIcon(if (isMesh) SNIconName.Mesh else SNIconName.Pin, 26.dp, s.accentDeep) }
+        Spacer(Modifier.height(12.dp))
+        Text(
+            if (isMesh) "Bluetooth mesh" else "#${scr.geohash}",
+            color = s.text, fontSize = 17.sp, fontWeight = FontWeight.Bold
+        )
+
+        Spacer(Modifier.height(20.dp))
+        DetailSection("Transport") {
+            DetailRow(
+                icon = if (isMesh) SNIconName.Mesh else SNIconName.Globe,
+                label = if (isMesh) "Bluetooth · nearby phones" else "Internet · geohash channel",
+                tint = s.text2,
+            )
+            if (here > 0) {
+                DetailRow(icon = SNIconName.People, label = "$here here now", tint = s.accent)
+            }
+        }
+        Spacer(Modifier.weight(1f))
+    }
+}
+
+@Composable
+private fun DetailSection(title: String, content: @Composable () -> Unit) {
+    val s = sonar
+    Column(Modifier.fillMaxWidth()) {
+        Text(title.uppercase(), color = s.text3, fontSize = 11.sp, fontWeight = FontWeight.Bold, letterSpacing = 0.8.sp)
+        Spacer(Modifier.height(8.dp))
+        content()
+    }
+}
+
+@Composable
+private fun DetailRow(icon: SNIconName, label: String, tint: Color) {
+    val s = sonar
+    Row(
+        Modifier.fillMaxWidth().padding(vertical = 5.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        SNIcon(icon, 15.dp, tint, weight = 2f)
+        Spacer(Modifier.width(10.dp))
+        Text(label, color = s.text, fontSize = 13.5.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
     }
 }

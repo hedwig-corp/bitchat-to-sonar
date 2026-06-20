@@ -75,11 +75,13 @@ class MainActivity : ComponentActivity() {
             App()
         }
         handleInviteIntent(intent)
+        handleShareIntent(intent)
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         handleInviteIntent(intent)
+        handleShareIntent(intent)
     }
 
     private fun handleInviteIntent(intent: Intent?) {
@@ -89,6 +91,12 @@ class MainActivity : ComponentActivity() {
             if (!token.startsWith("sinvite1")) return
             SonarLifecycle.submitInviteLink(token)
         }
+    }
+
+    private fun handleShareIntent(intent: Intent?) {
+        if (intent?.action != Intent.ACTION_SEND) return
+        val text = intent.getStringExtra(Intent.EXTRA_TEXT) ?: return
+        SonarLifecycle.submitSharedText(text)
     }
 
     /**

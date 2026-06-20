@@ -3350,7 +3350,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
             // Migrate messages view context to stable key so header shows favorite + Nostr globe
             if let messages = privateChats[peerID] {
                 if privateChats[stableKeyHex] == nil { privateChats[stableKeyHex] = [] }
-                let existing = Set(privateChats[stableKeyHex]!.map { $0.id })
+                let existing = Set((privateChats[stableKeyHex] ?? []).map { $0.id })
                 for msg in messages where !existing.contains(msg.id) {
                     let updated = BitchatMessage(
                         id: msg.id,

@@ -13,7 +13,8 @@ import android.provider.Settings
 
 /** Android `actual`: "Messages" channel with sound, vibration, and badges — parity with iOS. */
 actual object Notifier {
-    private const val CHANNEL = "messages"
+    private const val CHANNEL = "messages_v2"
+    private const val LEGACY_CHANNEL = "messages"
 
     private val ctx: Context get() = AppContextHolder.ctx
     private fun manager() = ctx.getSystemService(NotificationManager::class.java)
@@ -21,8 +22,8 @@ actual object Notifier {
     actual fun ensureChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val nm = manager()
-            val existing = nm.getNotificationChannel(CHANNEL)
-            if (existing == null) {
+            nm.deleteNotificationChannel(LEGACY_CHANNEL)
+            if (nm.getNotificationChannel(CHANNEL) == null) {
                 nm.createNotificationChannel(
                     NotificationChannel(CHANNEL, "Messages", NotificationManager.IMPORTANCE_HIGH).apply {
                         description = "Incoming Sonar messages"
@@ -65,7 +66,6 @@ actual object Notifier {
             .setContentTitle(title)
             .setContentText(body)
             .setAutoCancel(true)
-            .setDefaults(Notification.DEFAULT_ALL)
             .setNumber(1)
             .apply { if (pi != null) setContentIntent(pi) }
             .build()

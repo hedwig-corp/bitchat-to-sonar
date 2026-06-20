@@ -1,5 +1,10 @@
 package chat.bitchat.sonar
 
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -26,6 +31,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -249,12 +255,25 @@ fun PayBubble(
     }
 }
 
-/** ₿ coin disc — 40dp, inset highlight/shadow like .pay-coin. */
+/** ₿ coin disc — 40dp, inset highlight/shadow like .pay-coin.
+ *  When [pulse] is true (incoming pending), the disc breathes 1→1.08→1 on a
+ *  2-second loop — matching the iOS `TimelineView` PayCoin pulse. */
 @Composable
 private fun PayCoin(pulse: Boolean) {
     val s = sonar
+    val scale = if (pulse) {
+        val t = rememberInfiniteTransition(label = "coinPulse")
+        val p by t.animateFloat(
+            1f, 1.08f,
+            infiniteRepeatable(tween(1000, easing = androidx.compose.animation.core.EaseInOut), RepeatMode.Reverse),
+            label = "coinPulse"
+        )
+        p
+    } else 1f
     Box(
-        Modifier.size(40.dp).clip(CircleShape).background(s.onGold.copy(alpha = 0.16f)),
+        Modifier.size(40.dp)
+            .graphicsLayer { scaleX = scale; scaleY = scale }
+            .clip(CircleShape).background(s.onGold.copy(alpha = 0.16f)),
         contentAlignment = Alignment.Center
     ) {
         Text(COIN, color = s.onGold, fontSize = 20.sp, fontWeight = FontWeight.ExtraBold)

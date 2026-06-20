@@ -2481,6 +2481,13 @@ class SonarAppState(private val scope: CoroutineScope) {
         queued.forEach { requestJoinViaLink(it) }
     }
 
+    var sharedText: String? by mutableStateOf(null)
+
+    fun handleSharedText(text: String) {
+        sharedText = text
+        push(Screen.Search)
+    }
+
     fun acceptGroupInvite(inviteId: String) {
         scope.launch {
             try {
