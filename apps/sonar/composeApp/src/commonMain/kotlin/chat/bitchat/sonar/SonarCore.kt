@@ -42,7 +42,49 @@ data class SonarMsg(
     val media: List<SonarMedia> = emptyList(),
     /// Local send state projected from core delivery metadata.
     val state: String? = null,
+    /// Sticker reference if this message is a sticker send.
+    val stickerRef: SonarStickerRef? = null,
 )
+
+/** A sticker reference carried on a chat message. */
+data class SonarStickerRef(
+    val packCoordinate: String,
+    val shortcode: String,
+    val plaintextSha256: String,
+) {
+    fun packAddressParts(): Pair<String, String>? {
+        val parts = packCoordinate.split(":", limit = 3)
+        if (parts.size != 3 || parts[0] != "30030") return null
+        return parts[1] to parts[2]
+    }
+}
+
+/** A single sticker in a pack. */
+data class SonarStickerItem(
+    val shortcode: String,
+    val url: String,
+    val sha256: String,
+    val mime: String,
+    val width: Int?,
+    val height: Int?,
+    val alt: String?,
+    val emoji: String?,
+)
+
+/** A sticker pack fetched from relays. */
+data class SonarStickerPack(
+    val packCoordinate: String,
+    val title: String,
+    val description: String?,
+    val coverUrl: String?,
+    val stickers: List<SonarStickerItem>,
+) {
+    fun stickerMatching(ref: SonarStickerRef): SonarStickerItem? =
+        stickers.firstOrNull {
+            it.shortcode == ref.shortcode &&
+                it.sha256.equals(ref.plaintextSha256, ignoreCase = true)
+        }
+}
 
 /** Local transcript window for one recent chat, newest conversation first at
  *  the API boundary and oldest-first inside [messages]. */
@@ -363,6 +405,33 @@ expect object SonarCore {
         caption: String,
         serverUrl: String = "",
     )
+
+    /** Send a sticker message to a chat. */
+    suspend fun sendSticker(
+        chatId: String,
+        packCoordinate: String,
+        shortcode: String,
+        plaintextSha256: String,
+    )
+
+    /** Fetch a sticker pack from relays by author + identifier. */
+    suspend fun fetchStickerPack(
+        authorPubkeyHex: String,
+        identifier: String,
+        relayUrls: List<String> = emptyList(),
+    ): SonarStickerPack
+
+    /** Download a public sticker image and verify the bytes match [expectedSha256]. */
+    suspend fun fetchStickerImage(url: String, expectedSha256: String): ByteArray
+
+    /** Fetch the user's installed sticker pack list (kind 10030) from relays. */
+    suspend fun fetchInstalledPacks(): List<String>
+
+    /** Add a sticker pack to the user's installed list and publish kind 10030. */
+    suspend fun installStickerPack(coordinate: String)
+
+    /** Remove a sticker pack from the user's installed list and publish kind 10030. */
+    suspend fun uninstallStickerPack(coordinate: String)
 
     /** Download + decrypt the media blob at [url] for the chat. Returns plaintext. */
     suspend fun fetchMedia(chatId: String, url: String): ByteArray

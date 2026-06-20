@@ -212,6 +212,8 @@ struct SNMessage: Identifiable, Equatable {
     /// Encrypted media attachments (White Noise / Marmot MIP-04). Non-empty ⇒
     /// render a media bubble (image inline, else a file chip).
     var media: [SNMediaItem] = []
+    /// Non-nil = render as a sticker bubble instead of text.
+    var stickerRef: MarmotService.MarmotStickerRef?
 }
 
 /// A media attachment on a Sonar message. `url` is the Blossom URL of the
@@ -1537,6 +1539,17 @@ final class SonarAppStore: ObservableObject {
         chatViewModel.sendMessage(text)
     }
 
+    func sendStickerToChannel(_ chId: String, sticker: StickerInfo, packCoordinate: String) -> Bool {
+        guard let groupId = marmotGroupId(chId) else { return false }
+        marmot.sendSticker(
+            groupId: groupId,
+            packCoordinate: packCoordinate,
+            shortcode: sticker.shortcode,
+            plaintextSha256: sticker.sha256
+        )
+        return true
+    }
+
     private func mapPublic(_ m: BitchatMessage, via: SNVia) -> SNMessage {
         let time = Self.clock(m.timestamp)
         if m.sender == "system" || m.content.hasPrefix("* ") {
@@ -2005,7 +2018,7 @@ final class SonarAppStore: ObservableObject {
                 marmotRows.append(SNDMRow(
                     id: Self.marmotIDPrefix + group.id,
                     title: marmot.title(for: group),
-                    preview: last.map { Self.previewText($0.content) } ?? "Secure group · reaches anywhere",
+                    preview: last.map { Self.previewText($0.content, stickerRef: $0.stickerRef) } ?? "Secure group · reaches anywhere",
                     time: last.map { Self.listTime($0.createdAt) } ?? "",
                     unread: (marmot.unreadByGroup[group.id] ?? 0) > 0,
                     presence: false,
@@ -2041,7 +2054,7 @@ final class SonarAppStore: ObservableObject {
                     byKey[foldKey] = SNDMRow(
                         id: existing.id,
                         title: existing.title,
-                        preview: Self.previewText(last.content),
+                        preview: Self.previewText(last.content, stickerRef: last.stickerRef),
                         time: Self.listTime(last.createdAt),
                         unread: existing.unread,
                         presence: existing.presence,
@@ -2062,7 +2075,7 @@ final class SonarAppStore: ObservableObject {
                 byKey[foldKey] = SNDMRow(
                     id: rowId,
                     title: liveSonarPeerId == nil ? marmot.title(for: group) : peerDisplayName(rowId),
-                    preview: last.map { Self.previewText($0.content) } ?? networkLabel(forPeer: rowId),
+                    preview: last.map { Self.previewText($0.content, stickerRef: $0.stickerRef) } ?? networkLabel(forPeer: rowId),
                     time: last.map { Self.listTime($0.createdAt) } ?? "",
                     unread: (marmot.unreadByGroup[group.id] ?? 0) > 0,
                     presence: liveSonarPeerId != nil && meshReachable(rowId),
@@ -2079,7 +2092,7 @@ final class SonarAppStore: ObservableObject {
             marmotRows.append(SNDMRow(
                 id: Self.marmotIDPrefix + group.id,
                 title: marmot.title(for: group),
-                preview: last.map { Self.previewText($0.content) } ?? "Secure chat · reaches anywhere",
+                preview: last.map { Self.previewText($0.content, stickerRef: $0.stickerRef) } ?? "Secure chat · reaches anywhere",
                 time: last.map { Self.listTime($0.createdAt) } ?? "",
                 unread: (marmot.unreadByGroup[group.id] ?? 0) > 0,
                 presence: false,
@@ -2188,7 +2201,8 @@ final class SonarAppStore: ObservableObject {
                         time: Self.clock(m.createdAt),
                         via: .internet,
                         state: MarmotChatModel.stateText(for: m),
-                        media: Self.mediaItems(m, groupId: groupId)
+                        media: Self.mediaItems(m, groupId: groupId),
+                        stickerRef: m.stickerRef
                     ))
                 }
             }
@@ -2278,7 +2292,8 @@ final class SonarAppStore: ObservableObject {
                         time: Self.clock(m.createdAt),
                         via: .internet,
                         state: MarmotChatModel.stateText(for: m),
-                        media: Self.mediaItems(m, groupId: group.id)
+                        media: Self.mediaItems(m, groupId: group.id),
+                        stickerRef: m.stickerRef
                     ))
                 }
             }
@@ -2347,6 +2362,16 @@ final class SonarAppStore: ObservableObject {
         }
         for line in lines { chatViewModel.sendPrivateMessage(line, to: PeerID(str: id)) }
         return true
+    }
+
+    func sendSticker(_ id: String, sticker: StickerInfo, packCoordinate: String) {
+        guard let groupId = marmotGroupId(id) else { return }
+        marmot.sendSticker(
+            groupId: groupId,
+            packCoordinate: packCoordinate,
+            shortcode: sticker.shortcode,
+            plaintextSha256: sticker.sha256
+        )
     }
 
     private func sendOverMarmot(_ text: String, npub: String) {
@@ -2790,6 +2815,38 @@ final class SonarAppStore: ObservableObject {
         return data
     }
 
+    func stickerPack(
+        authorPubkeyHex: String,
+        identifier: String,
+        relayUrls: [String]
+    ) async -> StickerPackInfo? {
+        await marmot.fetchStickerPack(
+            authorPubkeyHex: authorPubkeyHex,
+            identifier: identifier,
+            relayUrls: relayUrls
+        )
+    }
+
+    func stickerImageData(url: String, expectedSha256: String) async -> Data? {
+        await marmot.fetchStickerImage(url: url, expectedSha256: expectedSha256)
+    }
+
+    func stickerImageData(for ref: MarmotService.MarmotStickerRef) async -> Data? {
+        await marmot.stickerData(for: ref)
+    }
+
+    func fetchInstalledPacks() async -> [String] {
+        await marmot.fetchInstalledPacks()
+    }
+
+    func installStickerPack(coordinate: String) async -> Bool {
+        await marmot.installStickerPack(coordinate: coordinate)
+    }
+
+    func uninstallStickerPack(coordinate: String) async -> Bool {
+        await marmot.uninstallStickerPack(coordinate: coordinate)
+    }
+
     private static func mediaLogId(for item: SNMediaItem) -> String {
         let key = item.localPath ?? item.url
         guard !key.isEmpty else { return "empty" }
@@ -3156,7 +3213,8 @@ final class SonarAppStore: ObservableObject {
     /// Maps a raw last-message content to the home-row preview ("₿ Payment"
     /// for any ⚡PAY line, "Voice call" for ☎CALL signaling, so codecs never
     /// leak into list rows).
-    static func previewText(_ content: String) -> String {
+    static func previewText(_ content: String, stickerRef: MarmotService.MarmotStickerRef? = nil) -> String {
+        if stickerRef != nil { return "Sticker" }
         if looksLikeCallControl(content), callParseControl(content: content) != nil {
             return "Voice call"
         }

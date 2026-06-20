@@ -56,7 +56,8 @@ data class MeshDmRow(val peerId: String, val name: String, val preview: String, 
 /** A local contact that can be invited into a Marmot group. */
 data class GroupContact(val id: String, val title: String, val subtitle: String, val npub: String)
 
-private fun messagePreview(content: String): String {
+private fun messagePreview(content: String, stickerRef: SonarStickerRef? = null): String {
+    if (stickerRef != null) return "Sticker"
     if (content.trimStart().startsWith("☎CALL") && SonarCore.callParseControl(content) != null) {
         return "Voice call"
     }
@@ -206,7 +207,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             walletState = WalletState.NotConfigured
             presenceByGeohash = emptyMap()
             payLedger = SonarPayLedger(); payVersion++
-            mediaCache.clear()
+            mediaCache.clear(); stickerPackCache.clear(); stickerImageCache.clear(); installedPackCoordinates.clear()
             callLogs.clear(); callVersion++
             resetCallState()
             pollJob?.cancel(); pollJob = null
@@ -242,7 +243,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             // ⚡PAY coins live inside the erased chats — reset the ledger. The
             // Lightning wallet seed/balance is separate and is NOT touched.
             payLedger = SonarPayLedger(); persistPay(); payVersion++
-            mediaCache.clear()
+            mediaCache.clear(); stickerPackCache.clear(); stickerImageCache.clear(); installedPackCoordinates.clear()
             callLogs.clear(); callVersion++
             // White Noise / Marmot DB: wipe + reconnect with the SAME identity.
             runCatching { SonarCore.eraseChats() }
@@ -1313,7 +1314,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 chats = emptyList(); messages = emptyList(); channelMsgs = emptyList()
                 lastWnGroups = -1; lastWnMsgs = -1
                 payLedger = SonarPayLedger(); persistPay(); payVersion++
-                mediaCache.clear()
+                mediaCache.clear(); stickerPackCache.clear(); stickerImageCache.clear(); installedPackCoordinates.clear()
                 callLogs.clear(); callVersion++
 
                 npub = restoredNpub
@@ -1812,6 +1813,9 @@ class SonarAppState(private val scope: CoroutineScope) {
     // ── Media (White Noise / Marmot MIP-04) ──
     /** Decrypted-media cache (raw bytes), keyed by the ciphertext's Blossom URL. */
     private val mediaCache = mutableMapOf<String, ByteArray>()
+    private val stickerPackCache = linkedMapOf<String, SonarStickerPack>()
+    private val stickerImageCache = linkedMapOf<String, ByteArray>()
+    private val installedPackCoordinates = mutableSetOf<String>()
     private val pendingMediaUrlPrefix = "pending-media-"
 
     private data class PendingMediaUpload(
@@ -2072,6 +2076,87 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun sendGifItem(chatId: String, item: SonarGifItem) {
         send(chatId, item.mediaUrl)
+    }
+
+    fun sendStickerItem(chatId: String, sticker: SonarStickerItem, packCoordinate: String) {
+        scope.launch {
+            val groupId = resolveMarmotGroupId(chatId)
+            if (groupId == null) {
+                toast = "Stickers require an encrypted chat"
+                return@launch
+            }
+            try {
+                SonarCore.sendSticker(groupId, packCoordinate, sticker.shortcode, sticker.sha256)
+            } catch (e: Throwable) {
+                toast = "send failed: ${e.message}"
+            }
+        }
+    }
+
+    suspend fun stickerPack(
+        authorPubkeyHex: String,
+        identifier: String,
+        relayUrls: List<String> = emptyList(),
+    ): SonarStickerPack? {
+        val cacheKey = "30030:${authorPubkeyHex.lowercase()}:$identifier"
+        stickerPackCache.remove(cacheKey)?.let { stickerPackCache[cacheKey] = it; return it }
+        return try {
+            SonarCore.fetchStickerPack(authorPubkeyHex, identifier, relayUrls).also {
+                if (stickerPackCache.size >= 20) stickerPackCache.remove(stickerPackCache.keys.first())
+                stickerPackCache[cacheKey] = it
+            }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    suspend fun stickerImage(url: String, expectedSha256: String): ByteArray? {
+        val cacheKey = "${expectedSha256.lowercase()}|$url"
+        stickerImageCache.remove(cacheKey)?.let { stickerImageCache[cacheKey] = it; return it }
+        return try {
+            SonarCore.fetchStickerImage(url, expectedSha256).also {
+                if (stickerImageCache.size >= 500) stickerImageCache.remove(stickerImageCache.keys.first())
+                stickerImageCache[cacheKey] = it
+            }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    suspend fun stickerImage(ref: SonarStickerRef): ByteArray? {
+        val (author, identifier) = ref.packAddressParts() ?: return null
+        val pack = stickerPack(author, identifier) ?: return null
+        val sticker = pack.stickerMatching(ref) ?: return null
+        return stickerImage(sticker.url, ref.plaintextSha256)
+    }
+
+    fun isPackInstalled(coordinate: String): Boolean =
+        installedPackCoordinates.contains(coordinate.lowercase())
+
+    suspend fun refreshInstalledPacks() {
+        val coords = try { SonarCore.fetchInstalledPacks() } catch (_: Throwable) { emptyList() }
+        installedPackCoordinates.clear()
+        installedPackCoordinates.addAll(coords.map { it.lowercase() })
+    }
+
+    suspend fun installStickerPack(coordinate: String): Boolean {
+        return try {
+            SonarCore.installStickerPack(coordinate)
+            installedPackCoordinates.add(coordinate.lowercase())
+            true
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    suspend fun uninstallStickerPack(coordinate: String): Boolean {
+        return try {
+            SonarCore.uninstallStickerPack(coordinate)
+            installedPackCoordinates.remove(coordinate.lowercase())
+            true
+        } catch (_: Throwable) {
+            false
+        }
     }
 
     /** Download + decrypt a media attachment, cached by URL. */
@@ -2814,7 +2899,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 groups.forEach { folded += it.id }
                 latestMarmotMessage(groups)?.let { if (it.tsSecs > last.tsSecs) last = it }
             }
-            upsert(peerId, MeshDmRow(peerId, foldedPeerName(peerId, groups.firstOrNull()), messagePreview(last.content), last.tsSecs))
+            upsert(peerId, MeshDmRow(peerId, foldedPeerName(peerId, groups.firstOrNull()), messagePreview(last.content, last.stickerRef), last.tsSecs))
         }
         val groupPeers = LinkedHashMap<String, String>()
         for (group in chats) {
@@ -2828,7 +2913,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 MeshDmRow(
                     peerId,
                     foldedPeerName(peerId, group),
-                    last?.let { messagePreview(it.content) } ?: "Secure chat · reaches anywhere",
+                    last?.let { messagePreview(it.content, it.stickerRef) } ?: "Secure chat · reaches anywhere",
                     last?.tsSecs ?: 0L,
                 )
             )

@@ -18,6 +18,11 @@ use nostr_blossom::prelude::*;
 use nostr_sdk::{Client, RelayPoolNotification};
 use serde::{Deserialize, Serialize};
 
+use sonar_stickers::{
+    build_installed_packs_tags, parse_installed_pack_list, parse_pack_event, InstalledPackList,
+    PackAddress, StickerPack, StickerRef, STICKER_PACK_KIND, USER_STICKER_PACKS_KIND,
+};
+
 use crate::conversation_index::{
     index_db_path_for_db, wipe_index_for_db, ConversationChangeListener, ConversationIndex,
     ConversationSummary,
@@ -97,6 +102,11 @@ async fn http_get(url: &str) -> Result<Vec<u8>> {
         out.extend_from_slice(&chunk);
     }
     Ok(out)
+}
+
+/// Download public bytes from an HTTPS URL (for plaintext sticker images).
+pub async fn http_get_public(url: &str) -> Result<Vec<u8>> {
+    http_get_with_retries(url).await
 }
 
 async fn http_get_with_retries(url: &str) -> Result<Vec<u8>> {
@@ -1261,6 +1271,110 @@ impl SonarClient {
         self.spawn_outbox_publish(message.id.to_hex(), event);
         self.notify_conversation_changed(&group_id_hex);
         Ok(())
+    }
+
+    /// Send a sticker message to a group. Follows the same Signal-style
+    /// local-first sequencing as `send_text`.
+    pub async fn send_sticker(
+        &self,
+        group_id: &GroupId,
+        sticker_ref: &StickerRef,
+    ) -> Result<()> {
+        let event = self.engine.create_sticker_message(group_id, sticker_ref)?;
+        let incoming = self.engine.process_incoming(&event).await?;
+        let Incoming::Message(message) = incoming else {
+            return Err(Error::Storage(
+                "created sticker message did not produce a local transcript row".into(),
+            ));
+        };
+        let group_name = self.resolve_group_name(group_id);
+        self.upsert_index_for_message(&message, group_name.as_deref());
+        let group_id_hex = hex::encode(group_id.as_slice());
+        self.mark_local_event_processed(&event.id);
+        self.mark_outbox_pending(group_id, &message, &event)?;
+        self.spawn_outbox_publish(message.id.to_hex(), event);
+        self.notify_conversation_changed(&group_id_hex);
+        Ok(())
+    }
+
+    /// Fetch a sticker pack from relays by its pack address coordinate.
+    pub async fn fetch_sticker_pack(
+        &self,
+        author_pubkey_hex: &str,
+        identifier: &str,
+        relay_urls: &[String],
+    ) -> Result<StickerPack> {
+        let author = PublicKey::from_hex(author_pubkey_hex)
+            .map_err(|e| Error::InvalidInput(format!("invalid pack author pubkey: {e}")))?;
+        let filter = Filter::new()
+            .kind(Kind::Custom(STICKER_PACK_KIND))
+            .author(author)
+            .custom_tag(
+                SingleLetterTag::lowercase(Alphabet::D),
+                identifier.to_string(),
+            )
+            .limit(1);
+
+        let relays: Vec<String> = if relay_urls.is_empty() {
+            self.relays.iter().map(|u| u.to_string()).collect()
+        } else {
+            relay_urls.to_vec()
+        };
+        let timeout = Duration::from_secs(10);
+        let events = self
+            .nostr
+            .fetch_events_from(relays, filter, timeout)
+            .await?;
+        let event = events
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Http("sticker pack not found on relays".into()))?;
+        parse_pack_event(&event)
+            .map_err(|e| Error::Http(format!("invalid sticker pack: {e}")))
+    }
+
+    pub async fn fetch_installed_packs(&self) -> Result<Vec<PackAddress>> {
+        let filter = Filter::new()
+            .kind(Kind::Custom(USER_STICKER_PACKS_KIND))
+            .author(self.identity().public_key())
+            .limit(1);
+        let relays: Vec<String> = self.relays.iter().map(|u| u.to_string()).collect();
+        let timeout = Duration::from_secs(10);
+        let events = self.nostr.fetch_events_from(relays, filter, timeout).await?;
+        match events.into_iter().next() {
+            Some(event) => {
+                let list = parse_installed_pack_list(&event)
+                    .map_err(|e| Error::Http(format!("invalid installed pack list: {e}")))?;
+                Ok(list.packs)
+            }
+            None => Ok(Vec::new()),
+        }
+    }
+
+    async fn publish_installed_packs(&self, packs: Vec<PackAddress>) -> Result<()> {
+        let list = InstalledPackList::new(packs);
+        let tags = build_installed_packs_tags(&list);
+        let builder = EventBuilder::new(Kind::Custom(USER_STICKER_PACKS_KIND), "").tags(tags);
+        self.nostr.send_event_builder(builder).await?;
+        Ok(())
+    }
+
+    pub async fn install_sticker_pack(&self, coordinate: &str) -> Result<()> {
+        let address = PackAddress::parse(coordinate)
+            .map_err(|e| Error::Http(format!("invalid pack coordinate: {e}")))?;
+        let mut packs = self.fetch_installed_packs().await?;
+        if !packs.iter().any(|p| p.coordinate() == address.coordinate()) {
+            packs.push(address);
+        }
+        self.publish_installed_packs(packs).await
+    }
+
+    pub async fn uninstall_sticker_pack(&self, coordinate: &str) -> Result<()> {
+        let address = PackAddress::parse(coordinate)
+            .map_err(|e| Error::Http(format!("invalid pack coordinate: {e}")))?;
+        let mut packs = self.fetch_installed_packs().await?;
+        packs.retain(|p| p.coordinate() != address.coordinate());
+        self.publish_installed_packs(packs).await
     }
 
     fn mark_outbox_pending(

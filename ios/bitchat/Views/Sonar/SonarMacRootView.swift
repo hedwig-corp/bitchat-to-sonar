@@ -507,6 +507,7 @@ private struct MacConversationPane: View {
     @State private var importFile = false
     @State private var authorSheet: SonarAppStore.SNChannelAuthor?
     @State private var toast: String?
+    @State private var previewPackCoordinate: String?
 
     private var walletReady: Bool {
         if case .ready = store.walletState { return true }
@@ -538,6 +539,24 @@ private struct MacConversationPane: View {
             composer
         }
         .background(SonarTheme.bg.ignoresSafeArea())
+        .overlay {
+            if let coord = previewPackCoordinate {
+                StickerPackPreviewSheet(
+                    coordinate: coord,
+                    loadPack: { author, identifier, relays in
+                        await store.stickerPack(authorPubkeyHex: author, identifier: identifier, relayUrls: relays)
+                    },
+                    loadImage: { await store.stickerImageData(url: $0, expectedSha256: $1) },
+                    installPack: { await store.installStickerPack(coordinate: $0) },
+                    uninstallPack: { await store.uninstallStickerPack(coordinate: $0) },
+                    isInstalled: { packCoord in
+                        let installed = await store.fetchInstalledPacks()
+                        return installed.contains(where: { $0.lowercased() == packCoord.lowercased() })
+                    },
+                    onClose: { previewPackCoordinate = nil }
+                )
+            }
+        }
         .overlay(alignment: .bottom) { toastView }
         .animation(.easeOut(duration: 0.2), value: toast)
         .onAppear(perform: appeared)
@@ -731,7 +750,9 @@ private struct MacConversationPane: View {
                         } else {
                             showToast("\(message.author ?? "This person") is no longer in the channel")
                         }
-                    }
+                    },
+                    loadSticker: { await store.stickerImageData(for: $0) },
+                    onTapPack: { previewPackCoordinate = $0 }
                 )
             }
         } else {
@@ -752,7 +773,9 @@ private struct MacConversationPane: View {
                     peerName: peer.name,
                     money: { store.money($0) },
                     fiatText: { store.moneySatsLine($0) },
-                    loadMedia: { await store.mediaData($0) }
+                    loadMedia: { await store.mediaData($0) },
+                    loadSticker: { await store.stickerImageData(for: $0) },
+                    onTapPack: { previewPackCoordinate = $0 }
                 )
             }
         }
@@ -780,6 +803,20 @@ private struct MacConversationPane: View {
                     command
                 )
             },
+            onSticker: { sticker, coord in
+                if isChannel {
+                    if !store.sendStickerToChannel(id, sticker: sticker, packCoordinate: coord) {
+                        showToast("Stickers aren't supported in public channels yet")
+                    }
+                } else {
+                    store.sendSticker(id, sticker: sticker, packCoordinate: coord)
+                }
+            },
+            loadStickerPack: { author, identifier, relays in
+                await store.stickerPack(authorPubkeyHex: author, identifier: identifier, relayUrls: relays)
+            },
+            loadStickerImage: { await store.stickerImageData(url: $0, expectedSha256: $1) },
+            fetchInstalledPacks: { await store.fetchInstalledPacks() },
             voiceEnabled: !isChannel && store.canSendMedia(id),
             onVoice: { store.sendVoiceNote(id, url: $0) }
         )

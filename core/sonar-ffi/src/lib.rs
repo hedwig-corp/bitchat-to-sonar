@@ -183,6 +183,39 @@ pub struct MessageInfo {
     pub delivery_state: String,
     /// Encrypted media attachments (Marmot MIP-04), empty for a plain text message.
     pub media: Vec<MediaInfo>,
+    /// Sticker reference if this message is a sticker send (nil for text/media).
+    pub sticker_ref: Option<StickerRefInfo>,
+}
+
+/// FFI-friendly sticker reference carried on a chat message.
+#[derive(uniffi::Record)]
+pub struct StickerRefInfo {
+    pub pack_coordinate: String,
+    pub shortcode: String,
+    pub plaintext_sha256: String,
+}
+
+/// FFI-friendly single sticker inside a pack.
+#[derive(uniffi::Record)]
+pub struct StickerInfo {
+    pub shortcode: String,
+    pub url: String,
+    pub sha256: String,
+    pub mime: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub alt: Option<String>,
+    pub emoji: Option<String>,
+}
+
+/// FFI-friendly sticker pack fetched from relays.
+#[derive(uniffi::Record)]
+pub struct StickerPackInfo {
+    pub pack_coordinate: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub cover_url: Option<String>,
+    pub stickers: Vec<StickerInfo>,
 }
 
 /// FFI-friendly transcript window for one recent group.
@@ -545,6 +578,79 @@ impl SonarNode {
         let group_id = parse_group_id(&group_id_hex)?;
         self.runtime
             .block_on(self.client.send_text(&group_id, &text))?;
+        Ok(())
+    }
+
+    /// Encrypt + publish a sticker message to the group.
+    pub fn send_sticker(
+        &self,
+        group_id_hex: String,
+        pack_coordinate: String,
+        shortcode: String,
+        plaintext_sha256: String,
+    ) -> FfiResult<()> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        let pack = sonar_stickers::PackAddress::parse(&pack_coordinate)
+            .map_err(|e| SonarFfiError::InvalidInput(format!("bad pack coordinate: {e}")))?;
+        let sticker_ref = sonar_stickers::StickerRef::new(pack, shortcode, plaintext_sha256)
+            .map_err(|e| SonarFfiError::InvalidInput(format!("bad sticker ref: {e}")))?;
+        self.runtime
+            .block_on(self.client.send_sticker(&group_id, &sticker_ref))?;
+        Ok(())
+    }
+
+    /// Fetch a sticker pack from relays by its pack address.
+    pub fn fetch_sticker_pack(
+        &self,
+        author_pubkey_hex: String,
+        identifier: String,
+        relay_urls: Vec<String>,
+    ) -> FfiResult<StickerPackInfo> {
+        let pack = self.runtime.block_on(self.client.fetch_sticker_pack(
+            &author_pubkey_hex,
+            &identifier,
+            &relay_urls,
+        ))?;
+        Ok(sticker_pack_info(pack))
+    }
+
+    /// Download a public sticker image by its plaintext HTTPS URL and verify
+    /// the bytes match the sticker ref / pack hash before returning them.
+    pub fn fetch_sticker_image(&self, url: String, expected_sha256: String) -> FfiResult<Vec<u8>> {
+        if !url.starts_with("https://") {
+            return Err(SonarFfiError::InvalidInput(
+                "sticker URL must be HTTPS".into(),
+            ));
+        }
+        let expected_sha256 = expected_sha256.to_ascii_lowercase();
+        sonar_stickers::validate_sha256_hex(&expected_sha256)
+            .map_err(|e| SonarFfiError::InvalidInput(format!("bad sticker sha256: {e}")))?;
+        let bytes = self
+            .runtime
+            .block_on(sonar_core::client::http_get_public(&url))?;
+        let actual_sha256 = sonar_stickers::sha256_hex(&bytes);
+        if actual_sha256 != expected_sha256 {
+            return Err(SonarFfiError::InvalidInput(format!(
+                "sticker image sha256 mismatch: expected {expected_sha256}, got {actual_sha256}"
+            )));
+        }
+        Ok(bytes)
+    }
+
+    pub fn fetch_installed_packs(&self) -> FfiResult<Vec<String>> {
+        let packs = self.runtime.block_on(self.client.fetch_installed_packs())?;
+        Ok(packs.iter().map(|p| p.coordinate()).collect())
+    }
+
+    pub fn install_sticker_pack(&self, coordinate: String) -> FfiResult<()> {
+        self.runtime
+            .block_on(self.client.install_sticker_pack(&coordinate))?;
+        Ok(())
+    }
+
+    pub fn uninstall_sticker_pack(&self, coordinate: String) -> FfiResult<()> {
+        self.runtime
+            .block_on(self.client.uninstall_sticker_pack(&coordinate))?;
         Ok(())
     }
 
@@ -1707,6 +1813,34 @@ fn message_info(m: sonar_core::marmot::ChatMessage) -> MessageInfo {
                 width: r.width,
                 height: r.height,
                 duration_ms: r.duration_ms,
+            })
+            .collect(),
+        sticker_ref: m.sticker_ref.map(|s| StickerRefInfo {
+            pack_coordinate: s.pack.coordinate(),
+            shortcode: s.shortcode,
+            plaintext_sha256: s.plaintext_sha256,
+        }),
+    }
+}
+
+fn sticker_pack_info(pack: sonar_stickers::StickerPack) -> StickerPackInfo {
+    StickerPackInfo {
+        pack_coordinate: pack.address.coordinate(),
+        title: pack.title,
+        description: pack.description,
+        cover_url: pack.cover.as_ref().map(|c| c.url.clone()),
+        stickers: pack
+            .stickers
+            .into_iter()
+            .map(|s| StickerInfo {
+                shortcode: s.shortcode,
+                url: s.url,
+                sha256: s.sha256,
+                mime: s.mime,
+                width: s.width,
+                height: s.height,
+                alt: s.alt,
+                emoji: s.emoji,
             })
             .collect(),
     }

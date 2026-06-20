@@ -152,6 +152,7 @@ final class MarmotChatModel: ObservableObject {
     private var startupLocalSummaryTask: Task<Void, Never>?
     private var relayConnectTask: Task<Void, Never>?
     private var relayBusy = false
+    private var installedPackCoordinates: Set<String> = []
     /// npubs whose profile fetch is in flight or done, to fetch each once per session.
     private var profileFetches: Set<String> = []
     /// npubs whose Sonar descriptor fetch is currently in flight.
@@ -162,6 +163,8 @@ final class MarmotChatModel: ObservableObject {
     /// Optimistically-echoed outgoing messages per group, kept visible until
     /// the relay round-trip brings the real copy back (then reconciled away).
     private var pendingOptimistic: [String: [MarmotService.MarmotMessage]] = [:]
+    private var stickerPacksByCoordinate: [String: StickerPackInfo] = [:]
+    private var stickerImagesByURL: [String: Data] = [:]
     /// Last desired payment offer metadata for our public descriptor. Reused
     /// when other descriptor refreshes publish capabilities without changing
     /// payment state.
@@ -889,6 +892,141 @@ final class MarmotChatModel: ObservableObject {
         }
     }
 
+    func sendSticker(
+        groupId: String,
+        packCoordinate: String,
+        shortcode: String,
+        plaintextSha256: String
+    ) {
+        Task {
+            do {
+                guard await ensureConnected() else {
+                    throw MarmotService.ServiceError.notConnected
+                }
+                await loadLocalPage(groupId: groupId)
+                try await service.sendSticker(
+                    groupId: groupId,
+                    packCoordinate: packCoordinate,
+                    shortcode: shortcode,
+                    plaintextSha256: plaintextSha256
+                )
+                await loadLocalPage(groupId: groupId)
+                await refreshWhenConnected(groupId: groupId, hydrateBeforeSync: false)
+            } catch {
+                self.errorText = Self.describe(error)
+            }
+        }
+    }
+
+    func fetchStickerPack(
+        authorPubkeyHex: String,
+        identifier: String,
+        relayUrls: [String]
+    ) async -> StickerPackInfo? {
+        let cacheKey = "30030:\(authorPubkeyHex.lowercased()):\(identifier)"
+        if let cached = stickerPacksByCoordinate.removeValue(forKey: cacheKey) {
+            stickerPacksByCoordinate[cacheKey] = cached
+            return cached
+        }
+        do {
+            guard await ensureRelayConnected() else {
+                throw MarmotService.ServiceError.notConnected
+            }
+            let pack = try await service.fetchStickerPack(
+                authorPubkeyHex: authorPubkeyHex,
+                identifier: identifier,
+                relayUrls: relayUrls
+            )
+            if stickerPacksByCoordinate.count >= 20, let oldest = stickerPacksByCoordinate.keys.first {
+                stickerPacksByCoordinate.removeValue(forKey: oldest)
+            }
+            stickerPacksByCoordinate[cacheKey] = pack
+            return pack
+        } catch {
+            self.errorText = Self.describe(error)
+            return nil
+        }
+    }
+
+    func fetchStickerImage(url: String, expectedSha256: String) async -> Data? {
+        let cacheKey = "\(expectedSha256.lowercased())|\(url)"
+        if let cached = stickerImagesByURL.removeValue(forKey: cacheKey) {
+            stickerImagesByURL[cacheKey] = cached
+            return cached
+        }
+        do {
+            let data = try await service.fetchStickerImage(url: url, expectedSha256: expectedSha256)
+            if stickerImagesByURL.count >= 500, let oldest = stickerImagesByURL.keys.first {
+                stickerImagesByURL.removeValue(forKey: oldest)
+            }
+            stickerImagesByURL[cacheKey] = data
+            return data
+        } catch {
+            self.errorText = Self.describe(error)
+            return nil
+        }
+    }
+
+    func stickerData(for ref: MarmotService.MarmotStickerRef) async -> Data? {
+        guard let parts = Self.stickerPackParts(ref.packCoordinate),
+              let pack = await fetchStickerPack(
+                  authorPubkeyHex: parts.author,
+                  identifier: parts.identifier,
+                  relayUrls: []
+              ),
+              let sticker = pack.stickers.first(where: {
+                  $0.shortcode == ref.shortcode &&
+                      $0.sha256.caseInsensitiveCompare(ref.plaintextSha256) == .orderedSame
+              })
+        else { return nil }
+        return await fetchStickerImage(url: sticker.url, expectedSha256: ref.plaintextSha256)
+    }
+
+    func fetchInstalledPacks() async -> [String] {
+        if !installedPackCoordinates.isEmpty {
+            return Array(installedPackCoordinates)
+        }
+        do {
+            let coords = try await service.fetchInstalledPacks()
+            installedPackCoordinates = Set(coords.map { $0.lowercased() })
+            return coords
+        } catch {
+            self.errorText = Self.describe(error)
+            return []
+        }
+    }
+
+    func refreshInstalledPacks() async {
+        do {
+            let coords = try await service.fetchInstalledPacks()
+            installedPackCoordinates = Set(coords.map { $0.lowercased() })
+        } catch {
+            self.errorText = Self.describe(error)
+        }
+    }
+
+    func installStickerPack(coordinate: String) async -> Bool {
+        do {
+            try await service.installStickerPack(coordinate: coordinate)
+            installedPackCoordinates.insert(coordinate.lowercased())
+            return true
+        } catch {
+            self.errorText = Self.describe(error)
+            return false
+        }
+    }
+
+    func uninstallStickerPack(coordinate: String) async -> Bool {
+        do {
+            try await service.uninstallStickerPack(coordinate: coordinate)
+            installedPackCoordinates.remove(coordinate.lowercased())
+            return true
+        } catch {
+            self.errorText = Self.describe(error)
+            return false
+        }
+    }
+
     /// Download + decrypt a media blob. The store caches the decoded image.
     func fetchMedia(groupId: String, url: String) async -> Data? {
         do {
@@ -906,6 +1044,12 @@ final class MarmotChatModel: ObservableObject {
             .prefix(8)
             .map { String(format: "%02x", $0) }
             .joined()
+    }
+
+    private static func stickerPackParts(_ coordinate: String) -> (author: String, identifier: String)? {
+        let parts = coordinate.split(separator: ":", maxSplits: 2, omittingEmptySubsequences: false)
+        guard parts.count == 3, parts[0] == "30030" else { return nil }
+        return (String(parts[1]), String(parts[2]))
     }
 
     /// Drive LIVE updates off the core's relay subscriptions: park on
@@ -970,6 +1114,7 @@ final class MarmotChatModel: ObservableObject {
         messagesByGroup[groupId] = nil
         pendingOptimistic[groupId] = nil
         profileFetches = []
+        installedPackCoordinates = []
         SNMarmotChatSnapshotCache.save(groups: groups, messagesByGroup: messagesByGroup, to: defaults)
     }
 
@@ -985,6 +1130,7 @@ final class MarmotChatModel: ObservableObject {
         messagesByGroup[groupId] = nil
         pendingOptimistic[groupId] = nil
         profileFetches = []
+        installedPackCoordinates = []
         SNMarmotChatSnapshotCache.save(groups: groups, messagesByGroup: messagesByGroup, to: defaults)
     }
 
@@ -1003,6 +1149,7 @@ final class MarmotChatModel: ObservableObject {
         descriptorBolt12Offer = nil
         profilesByNpub = [:]
         profileFetches = []
+        installedPackCoordinates = []
         SNMarmotProfileCache.clear(from: defaults)
         SNMarmotChatSnapshotCache.clear(from: defaults)
     }
@@ -1024,6 +1171,7 @@ final class MarmotChatModel: ObservableObject {
         pendingOptimistic = [:]
         profilesByNpub = [:]
         profileFetches = []
+        installedPackCoordinates = []
         SNMarmotProfileCache.clear(from: defaults)
         SNMarmotChatSnapshotCache.clear(from: defaults)
         errorText = nil

@@ -141,6 +141,35 @@ actual object SonarCore {
         requireNode().sendMedia(chatId, data, filename, mime, caption, serverUrl)
     }
 
+    actual suspend fun sendSticker(
+        chatId: String,
+        packCoordinate: String,
+        shortcode: String,
+        plaintextSha256: String,
+    ) = withContext(Dispatchers.IO) {
+        requireNode().sendSticker(chatId, packCoordinate, shortcode, plaintextSha256)
+    }
+
+    actual suspend fun fetchStickerPack(
+        authorPubkeyHex: String,
+        identifier: String,
+        relayUrls: List<String>,
+    ): SonarStickerPack = withContext(Dispatchers.IO) {
+        requireNode().fetchStickerPack(authorPubkeyHex, identifier, relayUrls).toCommon()
+    }
+
+    actual suspend fun fetchStickerImage(url: String, expectedSha256: String): ByteArray =
+        withContext(Dispatchers.IO) { requireNode().fetchStickerImage(url, expectedSha256) }
+
+    actual suspend fun fetchInstalledPacks(): List<String> =
+        withContext(Dispatchers.IO) { requireNode().fetchInstalledPacks() }
+
+    actual suspend fun installStickerPack(coordinate: String) =
+        withContext(Dispatchers.IO) { requireNode().installStickerPack(coordinate) }
+
+    actual suspend fun uninstallStickerPack(coordinate: String) =
+        withContext(Dispatchers.IO) { requireNode().uninstallStickerPack(coordinate) }
+
     actual suspend fun fetchMedia(chatId: String, url: String): ByteArray =
         withContext(Dispatchers.IO) { requireNode().fetchMedia(chatId, url) }
 
@@ -224,6 +253,28 @@ actual object SonarCore {
             )
         },
         state = deliveryState.toUiState(mine),
+        stickerRef = stickerRef?.let {
+            SonarStickerRef(it.packCoordinate, it.shortcode, it.plaintextSha256)
+        },
+    )
+
+    private fun uniffi.sonar_ffi.StickerPackInfo.toCommon(): SonarStickerPack = SonarStickerPack(
+        packCoordinate = packCoordinate,
+        title = title,
+        description = description,
+        coverUrl = coverUrl,
+        stickers = stickers.map { s ->
+            SonarStickerItem(
+                shortcode = s.shortcode,
+                url = s.url,
+                sha256 = s.sha256,
+                mime = s.mime,
+                width = s.width?.toInt(),
+                height = s.height?.toInt(),
+                alt = s.alt,
+                emoji = s.emoji,
+            )
+        },
     )
 
     private fun String.toUiState(mine: Boolean): String? {

@@ -44,6 +44,7 @@ bytes = { version = "1", optional = true }
 # Serialize Sonar Nostr descriptors and, behind `calls`, the iroh `EndpointAddr`
 # into the `nodeAddrB64` field of the ☎CALL signaling.
 base64 = { version = "0.22", optional = true }
+sonar-stickers = { path = "../sonar-stickers" }
 serde_json.workspace = true
 mdk-core.workspace = true
 mdk-storage-traits.workspace = true

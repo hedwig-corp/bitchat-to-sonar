@@ -24,6 +24,7 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -35,7 +36,11 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import chat.bitchat.sonar.SonarCore
 import chat.bitchat.sonar.SonarGifItem
+import chat.bitchat.sonar.SonarStickerItem
+import chat.bitchat.sonar.SonarStickerPack
+import chat.bitchat.sonar.decodeImageBitmap
 import chat.bitchat.sonar.ui.SNEmptyState
 import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconName
@@ -112,10 +117,26 @@ private val emojiCategories = listOf(
     )),
 )
 
+/** Test sticker pack loaded on first Sticker tab open. */
+private const val TEST_PACK_AUTHOR = "b653c822dfbec71697d379658a58909c3bef59d71b1cf5c1f7035451cde2e9f7"
+private const val TEST_PACK_ID = "signal-8fa42aa13ec8f0efebe4b038f41afbd1"
+private val TEST_PACK_RELAYS = listOf(
+    "wss://relay.damus.io",
+    "wss://nos.lol",
+    "wss://relay.primal.net",
+)
+
 @Composable
 fun SonarEmojiPicker(
     onEmoji: (String) -> Unit,
     onGif: (SonarGifItem) -> Unit,
+    onSticker: (SonarStickerItem, String) -> Unit,
+    loadStickerPack: suspend (String, String, List<String>) -> SonarStickerPack? = { author, identifier, relays ->
+        runCatching { SonarCore.fetchStickerPack(author, identifier, relays) }.getOrNull()
+    },
+    loadStickerImage: suspend (String, String) -> ByteArray? = { url, expectedSha256 ->
+        runCatching { SonarCore.fetchStickerImage(url, expectedSha256) }.getOrNull()
+    },
     onClose: () -> Unit,
 ) {
     val s = sonar
@@ -153,7 +174,7 @@ fun SonarEmojiPicker(
         when (tab) {
             PickerTab.Emoji -> EmojiTabContent(onEmoji)
             PickerTab.Gif -> GifTabContent()
-            PickerTab.Sticker -> StickerTabContent()
+            PickerTab.Sticker -> StickerTabContent(onSticker, loadStickerPack, loadStickerImage)
         }
     }
 }
@@ -340,81 +361,112 @@ private fun ColumnScope.GifTabContent() {
 }
 
 @Composable
-private fun ColumnScope.StickerTabContent() {
+private fun ColumnScope.StickerTabContent(
+    onSticker: (SonarStickerItem, String) -> Unit,
+    loadStickerPack: suspend (String, String, List<String>) -> SonarStickerPack?,
+    loadStickerImage: suspend (String, String) -> ByteArray?,
+) {
     val s = sonar
+    var packs by remember { mutableStateOf<List<SonarStickerPack>>(emptyList()) }
+    var loading by remember { mutableStateOf(true) }
+    var error by remember { mutableStateOf<String?>(null) }
 
-    Column(
-        Modifier
-            .fillMaxWidth()
-            .weight(1f)
-            .verticalScroll(rememberScrollState())
-    ) {
-        SNSectionLabel("Your stickers")
+    LaunchedEffect(Unit) {
+        val coordinates = try { SonarCore.fetchInstalledPacks() } catch (_: Throwable) { emptyList() }
+        val toFetch = coordinates.ifEmpty { listOf("30030:$TEST_PACK_AUTHOR:$TEST_PACK_ID") }
+        val loaded = mutableListOf<SonarStickerPack>()
+        for (coord in toFetch) {
+            val parts = coord.split(":", limit = 3)
+            if (parts.size != 3) continue
+            val relays = if (coord.contains(TEST_PACK_AUTHOR)) TEST_PACK_RELAYS else emptyList()
+            loadStickerPack(parts[1], parts[2], relays)?.takeIf { it.stickers.isNotEmpty() }?.let { loaded += it }
+        }
+        if (loaded.isEmpty()) {
+            loadStickerPack(TEST_PACK_AUTHOR, TEST_PACK_ID, TEST_PACK_RELAYS)?.let { loaded += it }
+        }
+        packs = loaded
+        if (loaded.isEmpty()) error = "Failed to load sticker packs"
+        loading = false
+    }
 
+    if (loading) {
+        Column(
+            Modifier.fillMaxWidth().weight(1f),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+        ) {
+            androidx.compose.material3.CircularProgressIndicator(
+                color = s.accent,
+                strokeWidth = 2.dp,
+                modifier = Modifier.size(24.dp),
+            )
+            Spacer(Modifier.height(8.dp))
+            Text("Loading stickers…", color = s.text3, fontSize = 13.sp)
+        }
+    } else if (error != null || packs.isEmpty()) {
         SNEmptyState(
             icon = SNIconName.Sticker,
-            title = "No sticker packs yet",
-            desc = "Add sticker packs to express yourself"
+            title = "Couldn't load stickers",
+            desc = error ?: "Try again later",
         )
-
-        Spacer(Modifier.height(16.dp))
-
-        Row(
-            Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 14.dp)
-                .clip(RoundedCornerShape(14.dp))
-                .background(s.surface2)
-                .clickable { }
-                .padding(horizontal = 14.dp, vertical = 12.dp),
-            verticalAlignment = Alignment.CenterVertically
+        Spacer(Modifier.weight(1f))
+    } else {
+        LazyVerticalGrid(
+            columns = GridCells.Fixed(4),
+            modifier = Modifier.fillMaxWidth().weight(1f).padding(horizontal = 8.dp),
         ) {
-            Box(
-                Modifier
-                    .size(34.dp)
-                    .clip(RoundedCornerShape(10.dp))
-                    .background(s.accentSoft),
-                contentAlignment = Alignment.Center
-            ) {
-                SNIcon(SNIconName.Sticker, 18.dp, s.accentDeep)
-            }
-            Spacer(Modifier.width(12.dp))
-            Column(Modifier.weight(1f)) {
-                Text(
-                    "Add sticker pack",
-                    color = s.text,
-                    fontSize = 16.sp,
-                    fontWeight = FontWeight.Medium
-                )
-                Text(
-                    "Browse and install sticker packs",
-                    color = s.text3,
-                    fontSize = 12.5.sp
-                )
-            }
-            SNIcon(SNIconName.Chevron, 14.dp, s.text3, weight = 2.2f)
-        }
-
-        SNSectionLabel("Popular stickers")
-
-        Row(
-            Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 14.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            repeat(4) {
-                Box(
-                    Modifier
-                        .weight(1f)
-                        .height(72.dp)
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(s.surface2)
-                )
+            for (p in packs) {
+                item(span = { GridItemSpan(maxLineSpan) }) {
+                    SNSectionLabel(p.title)
+                }
+                items(p.stickers) { sticker ->
+                    StickerCell(sticker, loadStickerImage) { onSticker(sticker, p.packCoordinate) }
+                }
             }
         }
+    }
+}
 
-        Spacer(Modifier.height(16.dp))
+@Composable
+private fun StickerCell(
+    sticker: SonarStickerItem,
+    loadStickerImage: suspend (String, String) -> ByteArray?,
+    onClick: () -> Unit,
+) {
+    var imageBytes by remember(sticker.url) { mutableStateOf<ByteArray?>(null) }
+    var failed by remember(sticker.url) { mutableStateOf(false) }
+    LaunchedEffect(sticker.url) {
+        failed = false
+        imageBytes = loadStickerImage(sticker.url, sticker.sha256)
+        failed = imageBytes == null
+    }
+    Box(
+        Modifier
+            .size(72.dp)
+            .clip(RoundedCornerShape(10.dp))
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        val image = remember(imageBytes) {
+            imageBytes?.let { runCatching { decodeImageBitmap(it) }.getOrNull() }
+        }
+        val displayFailed = failed || (imageBytes != null && image == null)
+        if (image != null) {
+            androidx.compose.foundation.Image(
+                bitmap = image,
+                contentDescription = sticker.alt ?: sticker.shortcode,
+                modifier = Modifier.size(60.dp),
+            )
+        } else if (displayFailed) {
+            Text(
+                sticker.emoji ?: sticker.shortcode,
+                color = sonar.text3,
+                fontSize = 11.sp,
+                modifier = Modifier.padding(6.dp),
+            )
+        } else {
+            Box(Modifier.size(60.dp).clip(RoundedCornerShape(8.dp)).background(sonar.surface2))
+        }
     }
 }
 
