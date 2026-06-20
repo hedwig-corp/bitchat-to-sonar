@@ -665,6 +665,7 @@ struct SNMsgList: View {
     /// Download + decrypt a media attachment to raw bytes (cached by the store).
     var loadMedia: ((SNMediaItem) async -> Data?)? = nil
     var loadSticker: ((MarmotService.MarmotStickerRef) async -> Data?)? = nil
+    var onTapPack: ((String) -> Void)? = nil
 
     var body: some View {
         GeometryReader { geo in
@@ -698,7 +699,8 @@ struct SNMsgList: View {
                                     m: m,
                                     showAuthor: showAuthors && !m.mine,
                                     showState: m.mine && i == msgs.count - 1,
-                                    load: loadSticker
+                                    load: loadSticker,
+                                    onTapPack: onTapPack
                                 )
                             } else if m.action {
                                 Text(verbatim: m.text)
@@ -855,6 +857,7 @@ struct SNStickerBubble: View {
     var showAuthor: Bool = false
     var showState: Bool = false
     var load: ((MarmotService.MarmotStickerRef) async -> Data?)? = nil
+    var onTapPack: ((String) -> Void)? = nil
 
     @State private var image: PlatformImage?
     @State private var failed = false
@@ -869,34 +872,41 @@ struct SNStickerBubble: View {
                     .foregroundColor(SonarTheme.authorColor(author))
                     .padding(.leading, 6)
             }
-            if let image {
-                #if os(iOS)
-                Image(uiImage: image)
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .frame(width: 120, height: 120)
-                #else
-                Image(nsImage: image)
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .frame(width: 120, height: 120)
-                #endif
-            } else if failed {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .fill(SonarTheme.surface2)
+            Group {
+                if let image {
+                    #if os(iOS)
+                    Image(uiImage: image)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
                         .frame(width: 120, height: 120)
-                    Text(verbatim: m.stickerRef?.shortcode ?? "sticker")
-                        .font(SonarTheme.uiFont(size: 12))
-                        .foregroundColor(SonarTheme.text3)
+                    #else
+                    Image(nsImage: image)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 120, height: 120)
+                    #endif
+                } else if failed {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .fill(SonarTheme.surface2)
+                            .frame(width: 120, height: 120)
+                        Text(verbatim: m.stickerRef?.shortcode ?? "sticker")
+                            .font(SonarTheme.uiFont(size: 12))
+                            .foregroundColor(SonarTheme.text3)
+                    }
+                } else {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .fill(SonarTheme.surface2)
+                            .frame(width: 120, height: 120)
+                        ProgressView()
+                            .tint(SonarTheme.text3)
+                    }
                 }
-            } else {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .fill(SonarTheme.surface2)
-                        .frame(width: 120, height: 120)
-                    ProgressView()
-                        .tint(SonarTheme.text3)
+            }
+            .onTapGesture {
+                if let coord = m.stickerRef?.packCoordinate {
+                    onTapPack?(coord)
                 }
             }
             if showState, let stateText = m.state {

@@ -164,6 +164,12 @@ actual object SonarCore {
     actual suspend fun fetchInstalledPacks(): List<String> =
         withContext(Dispatchers.IO) { requireNode().fetchInstalledPacks() }
 
+    actual suspend fun installStickerPack(coordinate: String) =
+        withContext(Dispatchers.IO) { requireNode().installStickerPack(coordinate) }
+
+    actual suspend fun uninstallStickerPack(coordinate: String) =
+        withContext(Dispatchers.IO) { requireNode().uninstallStickerPack(coordinate) }
+
     actual suspend fun fetchMedia(chatId: String, url: String): ByteArray =
         withContext(Dispatchers.IO) { requireNode().fetchMedia(chatId, url) }
 

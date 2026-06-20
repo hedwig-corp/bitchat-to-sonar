@@ -609,6 +609,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     var addPeopleSheet by remember { mutableStateOf(false) }
     var removePeopleSheet by remember { mutableStateOf(false) }
     var mediaViewer by remember { mutableStateOf<SonarMedia?>(null) }
+    var previewPackCoordinate by remember { mutableStateOf<String?>(null) }
     val mediaActions = rememberMediaActions()
     val pickPhoto = rememberPhotoPicker { bytes, name, mime ->
         state.sendImage(screen.id, bytes, name, mime)
@@ -796,6 +797,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                                 mesh = msgMesh,
                                 author = state.groupAuthorName(m, isGroup),
                                 showState = m.mine && i == feed.lastIndex,
+                                onTap = { coord -> previewPackCoordinate = coord },
                             )
                         } else MessageBubble(
                             m,
@@ -980,6 +982,9 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         onVerify = { state.markVerified(screen.id); verifySheet = false },
         onDismiss = { verifySheet = false }
     )
+    previewPackCoordinate?.let { coord ->
+        StickerPackPreviewSheet(state, coord) { previewPackCoordinate = null }
+    }
     state.toast?.let { ToastBar(it) { state.toast = null } }
 }
 
@@ -1366,6 +1371,7 @@ private fun StickerBubble(
     mesh: Boolean = false,
     author: String? = null,
     showState: Boolean = false,
+    onTap: ((String) -> Unit)? = null,
 ) {
     val ref = m.stickerRef ?: return
     var imageBytes by remember(ref) { mutableStateOf<ByteArray?>(null) }
@@ -1375,6 +1381,9 @@ private fun StickerBubble(
         imageBytes = state.stickerImage(ref)
         failed = imageBytes == null
     }
+    val tapModifier = if (onTap != null) {
+        Modifier.clickable { onTap(ref.packCoordinate) }
+    } else Modifier
     Column(
         Modifier.fillMaxWidth().padding(vertical = 3.dp),
         horizontalAlignment = if (m.mine) Alignment.End else Alignment.Start
@@ -1395,11 +1404,11 @@ private fun StickerBubble(
             androidx.compose.foundation.Image(
                 bitmap = image,
                 contentDescription = ref.shortcode,
-                modifier = Modifier.size(120.dp).padding(4.dp),
+                modifier = tapModifier.size(120.dp).padding(4.dp),
             )
         } else if (displayFailed) {
             Box(
-                Modifier.size(120.dp).padding(4.dp).clip(RoundedCornerShape(12.dp)).background(sonar.surface2),
+                tapModifier.size(120.dp).padding(4.dp).clip(RoundedCornerShape(12.dp)).background(sonar.surface2),
                 contentAlignment = Alignment.Center,
             ) {
                 Text(ref.shortcode, color = sonar.text3, fontSize = 12.sp)
@@ -1415,6 +1424,130 @@ private fun StickerBubble(
             }
         }
         if (showState) MessageStatusFooter(m, mesh)
+    }
+}
+
+@Composable
+private fun StickerPackPreviewSheet(state: SonarAppState, coordinate: String, onClose: () -> Unit) {
+    val s = sonar
+    val scope = rememberCoroutineScope()
+    val parts = remember(coordinate) { coordinate.split(":", limit = 3) }
+    var pack by remember(coordinate) { mutableStateOf<SonarStickerPack?>(null) }
+    var loading by remember(coordinate) { mutableStateOf(true) }
+    var installed by remember(coordinate) { mutableStateOf(state.isPackInstalled(coordinate)) }
+    var busy by remember { mutableStateOf(false) }
+    LaunchedEffect(coordinate) {
+        loading = true
+        state.refreshInstalledPacks()
+        installed = state.isPackInstalled(coordinate)
+        if (parts.size == 3) {
+            pack = state.stickerPack(parts[1], parts[2])
+        }
+        loading = false
+    }
+    Box(
+        Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
+        contentAlignment = Alignment.BottomCenter
+    ) {
+        Surface(
+            color = s.surface,
+            shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp),
+            modifier = Modifier.clickable(enabled = false, onClick = {}),
+        ) {
+            Column(Modifier.fillMaxWidth().padding(20.dp)) {
+                val p = pack
+                if (loading) {
+                    Box(Modifier.fillMaxWidth().height(200.dp), contentAlignment = Alignment.Center) {
+                        androidx.compose.material3.CircularProgressIndicator(
+                            color = s.text3, strokeWidth = 2.dp, modifier = Modifier.size(24.dp),
+                        )
+                    }
+                } else if (p == null) {
+                    Text("Could not load sticker pack", color = s.text2, fontSize = 14.sp)
+                    Spacer(Modifier.height(16.dp))
+                    Box(Modifier.fillMaxWidth().height(44.dp).clickable(onClick = onClose), contentAlignment = Alignment.Center) {
+                        Text("Close", color = s.text2, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                    }
+                } else {
+                    Text(p.title, color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                    if (!p.description.isNullOrBlank()) {
+                        Spacer(Modifier.height(4.dp))
+                        Text(p.description, color = s.text2, fontSize = 13.sp, maxLines = 2)
+                    }
+                    Spacer(Modifier.height(4.dp))
+                    Text("${p.stickers.size} stickers", color = s.text3, fontSize = 12.sp)
+                    Spacer(Modifier.height(12.dp))
+                    androidx.compose.foundation.lazy.grid.LazyVerticalGrid(
+                        columns = androidx.compose.foundation.lazy.grid.GridCells.Fixed(5),
+                        modifier = Modifier.fillMaxWidth().heightIn(max = 280.dp),
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        items(p.stickers.size) { i ->
+                            val sticker = p.stickers[i]
+                            var imageBytes by remember(sticker.url) { mutableStateOf<ByteArray?>(null) }
+                            LaunchedEffect(sticker.url) {
+                                imageBytes = state.stickerImage(sticker.url, sticker.sha256)
+                            }
+                            val image = remember(imageBytes) {
+                                imageBytes?.let { runCatching { decodeImageBitmap(it) }.getOrNull() }
+                            }
+                            Box(
+                                Modifier.aspectRatio(1f).clip(RoundedCornerShape(8.dp)).background(s.surface2),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                if (image != null) {
+                                    androidx.compose.foundation.Image(
+                                        bitmap = image,
+                                        contentDescription = sticker.shortcode,
+                                        modifier = Modifier.fillMaxSize().padding(4.dp),
+                                    )
+                                } else {
+                                    Text(
+                                        sticker.emoji ?: sticker.shortcode,
+                                        color = s.text3, fontSize = 11.sp, textAlign = TextAlign.Center,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    Spacer(Modifier.height(16.dp))
+                    if (installed) {
+                        SNPrimaryButton(
+                            if (busy) "Removing..." else "Remove pack",
+                            net = false,
+                            disabled = busy,
+                        ) {
+                            scope.launch {
+                                busy = true
+                                if (state.uninstallStickerPack(coordinate)) {
+                                    installed = false
+                                }
+                                busy = false
+                            }
+                        }
+                    } else {
+                        SNPrimaryButton(
+                            if (busy) "Installing..." else "Install pack",
+                            net = false,
+                            disabled = busy,
+                        ) {
+                            scope.launch {
+                                busy = true
+                                if (state.installStickerPack(coordinate)) {
+                                    installed = true
+                                }
+                                busy = false
+                            }
+                        }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    Box(Modifier.fillMaxWidth().height(44.dp).clickable(onClick = onClose), contentAlignment = Alignment.Center) {
+                        Text("Close", color = s.text2, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                    }
+                }
+            }
+        }
     }
 }
 

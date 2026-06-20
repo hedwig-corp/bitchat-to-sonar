@@ -642,6 +642,18 @@ impl SonarNode {
         Ok(packs.iter().map(|p| p.coordinate()).collect())
     }
 
+    pub fn install_sticker_pack(&self, coordinate: String) -> FfiResult<()> {
+        self.runtime
+            .block_on(self.client.install_sticker_pack(&coordinate))?;
+        Ok(())
+    }
+
+    pub fn uninstall_sticker_pack(&self, coordinate: String) -> FfiResult<()> {
+        self.runtime
+            .block_on(self.client.uninstall_sticker_pack(&coordinate))?;
+        Ok(())
+    }
+
     /// Delete a single chat's local Marmot state (messages + MLS keys). Local-
     /// only — the peer is NOT notified. Idempotent (deleting an unknown group is
     /// a no-op). Used by per-chat "delete this conversation".

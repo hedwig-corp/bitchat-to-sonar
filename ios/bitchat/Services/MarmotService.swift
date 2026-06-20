@@ -574,6 +574,14 @@ final class MarmotService: @unchecked Sendable {
         try await run { try $0.requireNode().fetchInstalledPacks() }
     }
 
+    func installStickerPack(coordinate: String) async throws {
+        try await run { try $0.requireNode().installStickerPack(coordinate: coordinate) }
+    }
+
+    func uninstallStickerPack(coordinate: String) async throws {
+        try await run { try $0.requireNode().uninstallStickerPack(coordinate: coordinate) }
+    }
+
     /// Download + decrypt the media blob at `url` for the group. Returns plaintext.
     func fetchMedia(groupId: String, url: String) async throws -> Data {
         try await run { try $0.requireNode().fetchMedia(groupIdHex: groupId, url: url) }

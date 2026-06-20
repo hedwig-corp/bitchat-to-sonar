@@ -427,6 +427,12 @@ expect object SonarCore {
     /** Fetch the user's installed sticker pack list (kind 10030) from relays. */
     suspend fun fetchInstalledPacks(): List<String>
 
+    /** Add a sticker pack to the user's installed list and publish kind 10030. */
+    suspend fun installStickerPack(coordinate: String)
+
+    /** Remove a sticker pack from the user's installed list and publish kind 10030. */
+    suspend fun uninstallStickerPack(coordinate: String)
+
     /** Download + decrypt the media blob at [url] for the chat. Returns plaintext. */
     suspend fun fetchMedia(chatId: String, url: String): ByteArray
 

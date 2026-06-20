@@ -975,6 +975,35 @@ final class MarmotChatModel: ObservableObject {
         return await fetchStickerImage(url: sticker.url, expectedSha256: ref.plaintextSha256)
     }
 
+    func fetchInstalledPacks() async -> [String] {
+        do {
+            return try await service.fetchInstalledPacks()
+        } catch {
+            self.errorText = Self.describe(error)
+            return []
+        }
+    }
+
+    func installStickerPack(coordinate: String) async -> Bool {
+        do {
+            try await service.installStickerPack(coordinate: coordinate)
+            return true
+        } catch {
+            self.errorText = Self.describe(error)
+            return false
+        }
+    }
+
+    func uninstallStickerPack(coordinate: String) async -> Bool {
+        do {
+            try await service.uninstallStickerPack(coordinate: coordinate)
+            return true
+        } catch {
+            self.errorText = Self.describe(error)
+            return false
+        }
+    }
+
     /// Download + decrypt a media blob. The store caches the decoded image.
     func fetchMedia(groupId: String, url: String) async -> Data? {
         do {

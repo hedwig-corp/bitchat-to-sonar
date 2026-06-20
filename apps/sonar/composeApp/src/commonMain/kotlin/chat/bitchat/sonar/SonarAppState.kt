@@ -205,7 +205,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             walletState = WalletState.NotConfigured
             presenceByGeohash = emptyMap()
             payLedger = SonarPayLedger(); payVersion++
-            mediaCache.clear(); stickerPackCache.clear(); stickerImageCache.clear()
+            mediaCache.clear(); stickerPackCache.clear(); stickerImageCache.clear(); installedPackCoordinates.clear()
             callLogs.clear(); callVersion++
             resetCallState()
             pollJob?.cancel(); pollJob = null
@@ -241,7 +241,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             // ⚡PAY coins live inside the erased chats — reset the ledger. The
             // Lightning wallet seed/balance is separate and is NOT touched.
             payLedger = SonarPayLedger(); persistPay(); payVersion++
-            mediaCache.clear(); stickerPackCache.clear(); stickerImageCache.clear()
+            mediaCache.clear(); stickerPackCache.clear(); stickerImageCache.clear(); installedPackCoordinates.clear()
             callLogs.clear(); callVersion++
             // White Noise / Marmot DB: wipe + reconnect with the SAME identity.
             runCatching { SonarCore.eraseChats() }
@@ -1307,7 +1307,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 chats = emptyList(); messages = emptyList(); channelMsgs = emptyList()
                 lastWnGroups = -1; lastWnMsgs = -1
                 payLedger = SonarPayLedger(); persistPay(); payVersion++
-                mediaCache.clear(); stickerPackCache.clear(); stickerImageCache.clear()
+                mediaCache.clear(); stickerPackCache.clear(); stickerImageCache.clear(); installedPackCoordinates.clear()
                 callLogs.clear(); callVersion++
 
                 npub = restoredNpub
@@ -1801,6 +1801,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     private val mediaCache = mutableMapOf<String, ByteArray>()
     private val stickerPackCache = linkedMapOf<String, SonarStickerPack>()
     private val stickerImageCache = linkedMapOf<String, ByteArray>()
+    private val installedPackCoordinates = mutableSetOf<String>()
     private val pendingMediaUrlPrefix = "pending-media-"
 
     private data class PendingMediaUpload(
@@ -2109,6 +2110,35 @@ class SonarAppState(private val scope: CoroutineScope) {
         val pack = stickerPack(author, identifier) ?: return null
         val sticker = pack.stickerMatching(ref) ?: return null
         return stickerImage(sticker.url, ref.plaintextSha256)
+    }
+
+    fun isPackInstalled(coordinate: String): Boolean =
+        installedPackCoordinates.contains(coordinate.lowercase())
+
+    suspend fun refreshInstalledPacks() {
+        val coords = try { SonarCore.fetchInstalledPacks() } catch (_: Throwable) { emptyList() }
+        installedPackCoordinates.clear()
+        installedPackCoordinates.addAll(coords.map { it.lowercase() })
+    }
+
+    suspend fun installStickerPack(coordinate: String): Boolean {
+        return try {
+            SonarCore.installStickerPack(coordinate)
+            installedPackCoordinates.add(coordinate.lowercase())
+            true
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    suspend fun uninstallStickerPack(coordinate: String): Boolean {
+        return try {
+            SonarCore.uninstallStickerPack(coordinate)
+            installedPackCoordinates.remove(coordinate.lowercase())
+            true
+        } catch (_: Throwable) {
+            false
+        }
     }
 
     /** Download + decrypt a media attachment, cached by URL. */

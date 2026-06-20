@@ -23,6 +23,7 @@ struct SonarChannelScreen: View {
     @State private var sheet = false
     @State private var authorSheet: SonarAppStore.SNChannelAuthor?
     @State private var toast: String?
+    @State private var previewPackCoordinate: String?
 
     private var ch: SNChannelItem { store.channelItem(chId) }
 
@@ -98,7 +99,8 @@ struct SonarChannelScreen: View {
                         // we can't open a DM right now (honest "offline" signal).
                         showToast("\(m.author ?? "Questa persona") non \u{00E8} pi\u{00F9} nel canale")
                     }
-                }, loadSticker: { await store.stickerImageData(for: $0) })
+                }, loadSticker: { await store.stickerImageData(for: $0) },
+                    onTapPack: { previewPackCoordinate = $0 })
             }
 
             SNComposer(
@@ -122,6 +124,24 @@ struct SonarChannelScreen: View {
             )
         }
         .background(SonarTheme.bg.ignoresSafeArea())
+        .overlay {
+            if let coord = previewPackCoordinate {
+                StickerPackPreviewSheet(
+                    coordinate: coord,
+                    loadPack: { author, identifier, relays in
+                        await store.stickerPack(authorPubkeyHex: author, identifier: identifier, relayUrls: relays)
+                    },
+                    loadImage: { await store.stickerImageData(url: $0, expectedSha256: $1) },
+                    installPack: { await store.installStickerPack(coordinate: $0) },
+                    uninstallPack: { await store.uninstallStickerPack(coordinate: $0) },
+                    isInstalled: { coord in
+                        let installed = await store.fetchInstalledPacks()
+                        return installed.contains(where: { $0.lowercased() == coord.lowercased() })
+                    },
+                    onClose: { previewPackCoordinate = nil }
+                )
+            }
+        }
         .overlay(alignment: .bottom) { toastView }
         .animation(.easeOut(duration: 0.2), value: toast)
         .onAppear { store.ensureChannelSelected(chId) }

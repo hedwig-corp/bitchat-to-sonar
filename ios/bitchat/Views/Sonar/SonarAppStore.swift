@@ -2834,6 +2834,18 @@ final class SonarAppStore: ObservableObject {
         await marmot.stickerData(for: ref)
     }
 
+    func fetchInstalledPacks() async -> [String] {
+        await marmot.fetchInstalledPacks()
+    }
+
+    func installStickerPack(coordinate: String) async -> Bool {
+        await marmot.installStickerPack(coordinate: coordinate)
+    }
+
+    func uninstallStickerPack(coordinate: String) async -> Bool {
+        await marmot.uninstallStickerPack(coordinate: coordinate)
+    }
+
     private static func mediaLogId(for item: SNMediaItem) -> String {
         let key = item.localPath ?? item.url
         guard !key.isEmpty else { return "empty" }

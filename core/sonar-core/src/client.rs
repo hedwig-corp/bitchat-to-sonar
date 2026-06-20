@@ -19,7 +19,8 @@ use nostr_sdk::{Client, RelayPoolNotification};
 use serde::{Deserialize, Serialize};
 
 use sonar_stickers::{
-    parse_installed_pack_list, parse_pack_event, StickerPack, StickerRef, STICKER_PACK_KIND,
+    build_installed_packs_tags, parse_installed_pack_list, parse_pack_event, InstalledPackList,
+    PackAddress, StickerPack, StickerRef, STICKER_PACK_KIND, USER_STICKER_PACKS_KIND,
 };
 
 use crate::conversation_index::{
@@ -1332,9 +1333,9 @@ impl SonarClient {
             .map_err(|e| Error::Http(format!("invalid sticker pack: {e}")))
     }
 
-    pub async fn fetch_installed_packs(&self) -> Result<Vec<sonar_stickers::PackAddress>> {
+    pub async fn fetch_installed_packs(&self) -> Result<Vec<PackAddress>> {
         let filter = Filter::new()
-            .kind(Kind::Custom(sonar_stickers::USER_STICKER_PACKS_KIND))
+            .kind(Kind::Custom(USER_STICKER_PACKS_KIND))
             .author(self.identity().public_key())
             .limit(1);
         let relays: Vec<String> = self.relays.iter().map(|u| u.to_string()).collect();
@@ -1348,6 +1349,32 @@ impl SonarClient {
             }
             None => Ok(Vec::new()),
         }
+    }
+
+    async fn publish_installed_packs(&self, packs: Vec<PackAddress>) -> Result<()> {
+        let list = InstalledPackList::new(packs);
+        let tags = build_installed_packs_tags(&list);
+        let builder = EventBuilder::new(Kind::Custom(USER_STICKER_PACKS_KIND), "").tags(tags);
+        self.nostr.send_event_builder(builder).await?;
+        Ok(())
+    }
+
+    pub async fn install_sticker_pack(&self, coordinate: &str) -> Result<()> {
+        let address = PackAddress::parse(coordinate)
+            .map_err(|e| Error::Http(format!("invalid pack coordinate: {e}")))?;
+        let mut packs = self.fetch_installed_packs().await?;
+        if !packs.iter().any(|p| p.coordinate() == address.coordinate()) {
+            packs.push(address);
+        }
+        self.publish_installed_packs(packs).await
+    }
+
+    pub async fn uninstall_sticker_pack(&self, coordinate: &str) -> Result<()> {
+        let address = PackAddress::parse(coordinate)
+            .map_err(|e| Error::Http(format!("invalid pack coordinate: {e}")))?;
+        let mut packs = self.fetch_installed_packs().await?;
+        packs.retain(|p| p.coordinate() != address.coordinate());
+        self.publish_installed_packs(packs).await
     }
 
     fn mark_outbox_pending(

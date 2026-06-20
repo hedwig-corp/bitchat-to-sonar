@@ -987,6 +987,8 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      */
     func drainPendingMarmot() throws  -> Bool
 
+    func fetchInstalledPacks() throws  -> [String]
+
     /**
      * Download + decrypt the media blob at `url` for `group_id`. Returns plaintext.
      */
@@ -1035,6 +1037,8 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * All groups this identity belongs to.
      */
     func groups() throws  -> [GroupInfo]
+
+    func installStickerPack(coordinate: String) throws
 
     /**
      * Leave a group and delete its local state after the leave proposal is sent.
@@ -1157,6 +1161,8 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * Poll the relays once: welcomes addressed to us, then group messages.
      */
     func syncOnce() throws
+
+    func uninstallStickerPack(coordinate: String) throws
 
     /**
      * Block until a live Marmot event (welcome or group message) has been pushed
@@ -1482,6 +1488,14 @@ open func drainPendingMarmot()throws  -> Bool  {
 })
 }
 
+open func fetchInstalledPacks()throws  -> [String]  {
+    return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_fetch_installed_packs(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+
     /**
      * Download + decrypt the media blob at `url` for `group_id`. Returns plaintext.
      */
@@ -1597,6 +1611,14 @@ open func groups()throws  -> [GroupInfo]  {
             self.uniffiCloneHandle(),$0
     )
 })
+}
+
+open func installStickerPack(coordinate: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_install_sticker_pack(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(coordinate),$0
+    )
+}
 }
 
     /**
@@ -1897,6 +1919,14 @@ open func startGroup(members: [String], name: String)throws  -> String  {
 open func syncOnce()throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_sync_once(
             self.uniffiCloneHandle(),$0
+    )
+}
+}
+
+open func uninstallStickerPack(coordinate: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_uninstall_sticker_pack(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(coordinate),$0
     )
 }
 }

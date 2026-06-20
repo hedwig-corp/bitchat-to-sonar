@@ -30,6 +30,7 @@ struct SonarDMScreen: View {
     @State private var selectedAddNpubs: Set<String> = []
     @State private var pickPhoto = false
     @State private var photoItem: PhotosPickerItem?
+    @State private var previewPackCoordinate: String?
 
     private var peer: SNPeerItem { store.peerItem(peerId) }
     private var isMarmot: Bool { store.marmotGroupId(peerId) != nil }
@@ -101,7 +102,8 @@ struct SonarDMScreen: View {
                     money: { store.money($0) },
                     fiatText: { store.moneySatsLine($0) },
                     loadMedia: { await store.mediaData($0) },
-                    loadSticker: { await store.stickerImageData(for: $0) }
+                    loadSticker: { await store.stickerImageData(for: $0) },
+                    onTapPack: { previewPackCoordinate = $0 }
                 )
             }
 
@@ -125,6 +127,24 @@ struct SonarDMScreen: View {
             )
         }
         .background(SonarTheme.bg.ignoresSafeArea())
+        .overlay {
+            if let coord = previewPackCoordinate {
+                StickerPackPreviewSheet(
+                    coordinate: coord,
+                    loadPack: { author, identifier, relays in
+                        await store.stickerPack(authorPubkeyHex: author, identifier: identifier, relayUrls: relays)
+                    },
+                    loadImage: { await store.stickerImageData(url: $0, expectedSha256: $1) },
+                    installPack: { await store.installStickerPack(coordinate: $0) },
+                    uninstallPack: { await store.uninstallStickerPack(coordinate: $0) },
+                    isInstalled: { coord in
+                        let installed = await store.fetchInstalledPacks()
+                        return installed.contains(where: { $0.lowercased() == coord.lowercased() })
+                    },
+                    onClose: { previewPackCoordinate = nil }
+                )
+            }
+        }
         .overlay(alignment: .bottom) { toastView }
         .animation(.easeOut(duration: 0.2), value: toast)
         .onAppear {

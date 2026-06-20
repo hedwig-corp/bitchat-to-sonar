@@ -330,6 +330,166 @@ private struct StickerCell: View {
     }
 }
 
+// MARK: - Sticker Pack Preview
+
+struct StickerPackPreviewSheet: View {
+    let coordinate: String
+    let loadPack: (String, String, [String]) async -> StickerPackInfo?
+    let loadImage: (String, String) async -> Data?
+    let installPack: (String) async -> Bool
+    let uninstallPack: (String) async -> Bool
+    let isInstalled: (String) async -> Bool
+    let onClose: () -> Void
+
+    @State private var pack: StickerPackInfo?
+    @State private var loading = true
+    @State private var installed = false
+    @State private var busy = false
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.4)
+                .ignoresSafeArea()
+                .onTapGesture { onClose() }
+            VStack(spacing: 0) {
+                Spacer()
+                VStack(spacing: 0) {
+                    if loading {
+                        ProgressView()
+                            .tint(SonarTheme.text3)
+                            .frame(height: 200)
+                            .frame(maxWidth: .infinity)
+                    } else if let pack {
+                        VStack(alignment: .leading, spacing: 0) {
+                            Text(verbatim: pack.title)
+                                .font(SonarTheme.uiFont(size: 18, weight: .bold))
+                                .foregroundColor(SonarTheme.text)
+                                .padding(.bottom, 4)
+                            if let desc = pack.description, !desc.isEmpty {
+                                Text(verbatim: desc)
+                                    .font(SonarTheme.uiFont(size: 13))
+                                    .foregroundColor(SonarTheme.text2)
+                                    .lineLimit(2)
+                                    .padding(.bottom, 4)
+                            }
+                            Text(verbatim: "\(pack.stickers.count) stickers")
+                                .font(SonarTheme.uiFont(size: 12))
+                                .foregroundColor(SonarTheme.text3)
+                                .padding(.bottom, 12)
+                            ScrollView {
+                                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 4), count: 5), spacing: 4) {
+                                    ForEach(pack.stickers.indices, id: \.self) { i in
+                                        PreviewStickerCell(
+                                            sticker: pack.stickers[i],
+                                            loadImage: loadImage
+                                        )
+                                    }
+                                }
+                            }
+                            .frame(maxHeight: 280)
+                            .padding(.bottom, 16)
+                            Button(action: {
+                                Task {
+                                    busy = true
+                                    if installed {
+                                        if await uninstallPack(coordinate) {
+                                            installed = false
+                                        }
+                                    } else {
+                                        if await installPack(coordinate) {
+                                            installed = true
+                                        }
+                                    }
+                                    busy = false
+                                }
+                            }) {
+                                Text(verbatim: busy ? (installed ? "Removing..." : "Installing...") : (installed ? "Remove pack" : "Install pack"))
+                                    .font(SonarTheme.uiFont(size: 16, weight: .semibold))
+                                    .foregroundColor(installed ? .white : SonarTheme.onAccent)
+                                    .frame(maxWidth: .infinity)
+                                    .frame(height: 48)
+                                    .background(installed ? Color.red.opacity(0.8) : SonarTheme.accent)
+                                    .cornerRadius(12)
+                            }
+                            .disabled(busy)
+                            .padding(.bottom, 8)
+                            Button(action: onClose) {
+                                Text("Close")
+                                    .font(SonarTheme.uiFont(size: 15, weight: .semibold))
+                                    .foregroundColor(SonarTheme.text2)
+                                    .frame(maxWidth: .infinity)
+                                    .frame(height: 44)
+                            }
+                        }
+                        .padding(20)
+                    } else {
+                        VStack(spacing: 16) {
+                            Text("Could not load sticker pack")
+                                .font(SonarTheme.uiFont(size: 14))
+                                .foregroundColor(SonarTheme.text2)
+                            Button(action: onClose) {
+                                Text("Close")
+                                    .font(SonarTheme.uiFont(size: 15, weight: .semibold))
+                                    .foregroundColor(SonarTheme.text2)
+                            }
+                        }
+                        .padding(20)
+                    }
+                }
+                .background(SonarTheme.surface)
+                .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+            }
+        }
+        .task {
+            loading = true
+            installed = await isInstalled(coordinate)
+            let parts = coordinate.split(separator: ":", maxSplits: 2).map(String.init)
+            if parts.count == 3 {
+                pack = await loadPack(parts[1], parts[2], [])
+            }
+            loading = false
+        }
+    }
+}
+
+private struct PreviewStickerCell: View {
+    let sticker: StickerInfo
+    let loadImage: (String, String) async -> Data?
+
+    @State private var image: StickerImage?
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(SonarTheme.surface2)
+            if let image {
+                #if os(iOS)
+                Image(uiImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .padding(4)
+                #else
+                Image(nsImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .padding(4)
+                #endif
+            } else {
+                Text(verbatim: sticker.emoji ?? sticker.shortcode)
+                    .font(SonarTheme.uiFont(size: 11))
+                    .foregroundColor(SonarTheme.text3)
+            }
+        }
+        .aspectRatio(1, contentMode: .fit)
+        .task {
+            if let data = await loadImage(sticker.url, sticker.sha256),
+               let decoded = StickerImage(data: data) {
+                image = decoded
+            }
+        }
+    }
+}
+
 // MARK: - Emoji data
 
 private struct EmojiCategory {
