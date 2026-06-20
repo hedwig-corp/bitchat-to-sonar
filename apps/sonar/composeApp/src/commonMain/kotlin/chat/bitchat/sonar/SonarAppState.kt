@@ -2482,10 +2482,17 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     var sharedText: String? by mutableStateOf(null)
+        private set
 
     fun handleSharedText(text: String) {
         sharedText = text
         push(Screen.Search)
+    }
+
+    fun consumeSharedText(): String? {
+        val text = sharedText
+        sharedText = null
+        return text
     }
 
     fun acceptGroupInvite(inviteId: String) {

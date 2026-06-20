@@ -446,10 +446,10 @@ private fun DmDetailRail(state: SonarAppState, scr: Screen.Chat) {
         Spacer(Modifier.weight(1f))
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp, Alignment.CenterHorizontally)) {
             SNIconButton(SNIconName.Phone, size = 18.dp, tint = s.text2) {
-                state.push(Screen.Call(peerId = scr.id, name = scr.name, video = false))
+                state.placeCall(scr.id, scr.name, video = false)
             }
             SNIconButton(SNIconName.Videocam, size = 18.dp, tint = s.text2) {
-                state.push(Screen.Call(peerId = scr.id, name = scr.name, video = true))
+                state.placeCall(scr.id, scr.name, video = true)
             }
         }
     }
