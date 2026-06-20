@@ -1525,12 +1525,17 @@ class SonarAppState(private val scope: CoroutineScope) {
                 profilesByNpub = normalizedProfileCache(profilesByNpub + (key to p) - otherNpub)
                 profileFetchedAt[key] = SonarClock.nowSecs()
                 persistProfileCache()
-                recomputeConversations()
+                if (isMeshRelevantNpub(key)) recomputeConversations()
             } else {
                 if (!hadCachedProfile) profileFetches.remove(key)
             }
         }
     }
+
+    private fun isMeshRelevantNpub(npubKey: String): Boolean =
+        (meshChats.keys.asSequence() + foldedGroupPeerIds.values.asSequence()).any { pid ->
+            npubStringForPeer(pid)?.let { canonicalProfileKey(it) } == npubKey
+        }
 
     private fun canonicalNpubHex(value: String): String? {
         val t = value.trim()
