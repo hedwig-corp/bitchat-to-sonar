@@ -845,22 +845,14 @@ final class MarmotChatModel: ObservableObject {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
         guard !trimmed.isEmpty else { return true }
-        do {
-            guard await ensureConnected(timeoutSeconds: 2) else {
-                throw MarmotService.ServiceError.notConnected
-            }
-            for text in trimmed {
-                try await service.sendText(groupId: groupId, text: text)
-            }
-            await loadLocalPage(groupId: groupId)
-            Task { [weak self] in
-                try? await self?.service.ensureSubscriptions()
-            }
-            return true
-        } catch {
-            self.errorText = Self.describe(error)
-            return false
+        for text in trimmed {
+            send(text, to: groupId)
         }
+        // Wait for the chain to finish so the caller knows success/failure.
+        if let chain = sendChain {
+            _ = await chain.result
+        }
+        return errorText == nil
     }
 
     /// Send a media attachment (encrypt with the group key, upload the ciphertext

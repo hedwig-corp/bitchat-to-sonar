@@ -1353,11 +1353,12 @@ impl SonarClient {
         let group_id_hex = hex::encode(group_id.as_slice());
         let group_name = self.resolve_group_name(group_id);
         self.mark_outbox_pending(group_id, &message, &event)?;
-        self.spawn_outbox_publish(message.id.to_hex(), event.clone());
+        let event_id = event.id;
+        self.spawn_outbox_publish(message.id.to_hex(), event);
         self.notify_conversation_changed(&group_id_hex);
         // Deferred bookkeeping: index + sync-state disk writes don't block
         // the caller so the next send can start immediately.
-        self.spawn_send_bookkeeping(group_name, message, event.id);
+        self.spawn_send_bookkeeping(group_name, message, event_id);
         Ok(())
     }
 
@@ -1412,9 +1413,10 @@ impl SonarClient {
         let group_id_hex = hex::encode(group_id.as_slice());
         let group_name = self.resolve_group_name(group_id);
         self.mark_outbox_pending(group_id, &message, &event)?;
-        self.spawn_outbox_publish(message.id.to_hex(), event.clone());
+        let event_id = event.id;
+        self.spawn_outbox_publish(message.id.to_hex(), event);
         self.notify_conversation_changed(&group_id_hex);
-        self.spawn_send_bookkeeping(group_name, message, event.id);
+        self.spawn_send_bookkeeping(group_name, message, event_id);
         Ok(())
     }
 

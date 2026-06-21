@@ -282,8 +282,8 @@ final class MarmotService: @unchecked Sendable {
             service.identity = identity
             service.nodeLock.lock()
             service.node = node
-            service.nodeLock.unlock()
             service.relayConnected = true
+            service.nodeLock.unlock()
             service.installConversationListener(on: node)
             return true
         }
@@ -318,8 +318,8 @@ final class MarmotService: @unchecked Sendable {
             service.identity = identity
             service.nodeLock.lock()
             service.node = node
-            service.nodeLock.unlock()
             service.relayConnected = false
+            service.nodeLock.unlock()
             service.installConversationListener(on: node)
             service.sessionGeneration = service.sessionGeneration &+ 1
             return identity.npub()
@@ -808,9 +808,9 @@ final class MarmotService: @unchecked Sendable {
             service.sessionGeneration = service.sessionGeneration &+ 1
             service.nodeLock.lock()
             service.node = nil
+            service.relayConnected = false
             service.nodeLock.unlock()
             service.identity = nil
-            service.relayConnected = false
             if let url = try? Self.databaseURL() {
                 try? wipeMarmotDatabase(dbPath: url.path)
             }
