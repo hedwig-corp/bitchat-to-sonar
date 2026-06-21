@@ -2442,17 +2442,11 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  conversation: immediate BLE when the Noise link is live, otherwise the
      *  folded White Noise group learned during discovery. */
     private suspend fun sendCallControl(chatId: String, text: String): Boolean {
-        if (isMeshChat(chatId)) {
-            val peerId = meshPeerId(chatId)
-            if (hasLiveMeshRoute(peerId)) {
-                val ok = MeshRadio.sendMeshDmNow(peerId, randomMeshId(), text)
-                if (!ok) {
-                    toast = "Call route dropped — try again in a moment."
-                    sonarLog("SonarCall", "failed to send call control on live mesh route chatId=$chatId")
-                }
-                return ok
-            }
-        }
+        // Call signaling ALWAYS rides the internet (Marmot/NIP-17), never BLE mesh.
+        // The BLE link flaps so its Noise route often isn't established when we try
+        // to send, silently dropping the ☎CALL control — so the callee never gets
+        // the OFFER. The internet path doesn't depend on a local BLE Noise session.
+        // See docs/VOICE-CALLS.md (§3).
         val groupId = resolveMarmotGroupId(chatId)
         if (groupId != null) {
             return sendCallOverMarmot(groupId, text)
@@ -2463,7 +2457,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (raw != null) return sendCallOverMarmot(peerId, raw, text)
         }
         toast = "No call route to this Sonar peer yet."
-        sonarLog("SonarCall", "refusing call control without BLE or White Noise route chatId=$chatId")
+        sonarLog("SonarCall", "refusing call control without White Noise route chatId=$chatId")
         return false
     }
 
@@ -3020,13 +3014,13 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun hasWhiteNoiseAccount(peerId: String): Boolean = npubRawFor(peerId) != null
 
     /** True if [chatId]'s peer can be voice/video called: calls are Sonar-only
-     *  (CAP_CALLS from 0x53) and require either live BLE or the npub needed to
-     *  create/reuse White Noise signaling for that same discovered peer. */
+     *  (CAP_CALLS from 0x53) and — since signaling always rides the internet
+     *  (Marmot/NIP-17), never BLE mesh — require the peer's npub (White Noise
+     *  account) to carry the ☎CALL signaling. See docs/VOICE-CALLS.md (§3). */
     fun canCall(chatId: String): Boolean {
         val peerId = if (isMeshChat(chatId)) meshPeerId(chatId) else peerIdForMarmotGroup(chatId)
         if (peerId == null) return marmotChatCallCapable(chatId)
-        return callCapablePeer(peerId) &&
-            (hasLiveMeshRoute(peerId) || npubRawFor(peerId) != null)
+        return callCapablePeer(peerId) && npubRawFor(peerId) != null
     }
 
     private fun marmotChatCallCapable(chatId: String): Boolean {

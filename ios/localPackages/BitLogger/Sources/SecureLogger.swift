@@ -228,13 +228,21 @@ public extension SecureLogger {
 // MARK: - Private Helpers
 
 private extension SecureLogger {
+    /// When `BITCHAT_LOG_STDERR=1`, mirror every emitted log line to stderr.
+    /// `os_log` is only visible in Console.app / the unified log; mirroring to
+    /// stderr makes the Swift logs show up in `devicectl --console` and
+    /// `open --stderr` captures alongside the Rust `tracing` bridge — so a call's
+    /// full signaling path (placeCall / sendCallControl / processIncomingCallLines
+    /// / handleCallControl) is observable without root or Console.app.
+    static let mirrorToStderr = ProcessInfo.processInfo.environment["BITCHAT_LOG_STDERR"] == "1"
+
     /// Log general messages with automatic sensitive data filtering
     static func log(_ message: @autoclosure () -> String, category: OSLog, level: LogLevel,
                     file: String, line: Int, function: String) {
         guard shouldLog(level) else { return }
         let location = formatLocation(file: file, line: line, function: function)
         let sanitized = "\(location) \(message())".sanitized()
-        
+
         #if DEBUG
         os_log("%{public}@", log: category, type: level.osLogType, sanitized)
         #else
@@ -243,6 +251,9 @@ private extension SecureLogger {
             os_log("%{private}@", log: category, type: level.osLogType, sanitized)
         }
         #endif
+        if mirrorToStderr {
+            FileHandle.standardError.write(Data(("[\(level)] " + sanitized + "\n").utf8))
+        }
     }
     
     /// Log a security event

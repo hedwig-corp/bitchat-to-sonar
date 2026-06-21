@@ -2269,7 +2269,13 @@ final class SonarAppStore: ObservableObject {
     }
 
     private func callSignalingVia(_ id: String) -> SNVia? {
-        if meshReachable(id) { return .mesh }
+        // Call signaling ALWAYS rides the internet (Marmot/NIP-17), never BLE mesh.
+        // BLE mesh signaling needs an established Noise session, but the BLE link
+        // flaps so the handshake often isn't ready: `meshReachable(id)` can be true
+        // while the encrypted route isn't, and the ☎CALL control is dropped at send
+        // ("dropping control without established Noise route") — so the callee
+        // never gets the OFFER. The internet path doesn't depend on a local BLE
+        // Noise session. See docs/VOICE-CALLS.md (§3).
         if callMarmotGroupId(id) != nil { return .internet }
         if resolvedSonarProfile(id) != nil { return .internet }
         return nil
@@ -4143,11 +4149,14 @@ final class SonarAppStore: ObservableObject {
             let sent = chatViewModel.meshService.sendPrivateMessageNow(line, to: PeerID(str: convId), messageID: UUID().uuidString)
             if !sent {
                 SecureLogger.debug("SonarCall: dropping control without established Noise route convId=\(convId.prefix(16))", category: .session)
+            } else {
+                SecureLogger.debug("SonarCall: SENT control over mesh convId=\(convId.prefix(16)) line=\(line.prefix(24))", category: .session)
             }
             return sent
         case .internet:
             if let groupId = callMarmotGroupId(convId) {
                 marmot.send(line, to: groupId)
+                SecureLogger.debug("SonarCall: SENT control over internet (marmot group=\(groupId.prefix(16))) line=\(line.prefix(24))", category: .session)
                 return true
             }
             guard let profile = resolvedSonarProfile(convId) else {
@@ -4155,12 +4164,14 @@ final class SonarAppStore: ObservableObject {
                 return false
             }
             sendOverMarmot(line, npub: profile.npub)
+            SecureLogger.debug("SonarCall: SENT control over internet (npub=\(profile.npub.prefix(12))) line=\(line.prefix(24))", category: .session)
             return true
         }
     }
 
     @discardableResult
     private func handleCallControl(_ ctrl: CallControlInfo, convId: String, via: SNVia, messageId: String) -> Bool {
+        SecureLogger.debug("SonarCall: RX control convId=\(convId.prefix(16)) via=\(via)", category: .session)
         let conversationId = callConversationId(convId)
         if case let .offer(callId, _, _, _) = ctrl, !canCall(conversationId) {
             if shouldDeferOfferForSonarDescriptor(conversationId) {
