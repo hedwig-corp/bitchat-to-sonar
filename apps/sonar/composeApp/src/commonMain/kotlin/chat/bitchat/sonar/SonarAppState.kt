@@ -35,6 +35,7 @@ private const val PROFILE_REFRESH_TTL_SECS = 30 * 60L
 private const val LOCAL_TRANSCRIPT_PAGE_LIMIT = 100
 private const val LOCAL_SUMMARY_PAGE_LIMIT = 20
 private const val LOCAL_SUMMARY_CHAT_LIMIT = 5
+private const val GROUP_FOLDS_BLOB_KEY = "sonar.groupFolds"
 
 sealed interface Screen {
     data object Home : Screen
@@ -85,6 +86,15 @@ internal fun inferUniquePeerByTitle(
         .map { it.key }
         .singleOrNull()
 }
+
+private fun decodeGroupFoldMap(blob: String): Map<String, String> =
+    blob.lineSequence()
+        .mapNotNull { line ->
+            val i = line.indexOf('=')
+            if (i <= 0) null else line.substring(0, i) to line.substring(i + 1).trim()
+        }
+        .filter { (groupId, peerId) -> groupId.isNotBlank() && peerId.isNotBlank() }
+        .toMap()
 
 internal const val CAPABILITY_SETTLE_MS = 1_500L
 
@@ -149,6 +159,10 @@ data class SonarVerify(val safety: List<String>, val verified: Boolean, val note
 class SonarAppState(private val scope: CoroutineScope) {
     private val initialChatSnapshotBlob = SonarCore.loadBlob(CHAT_SNAPSHOT_BLOB_KEY)
     private val initialChatSnapshot = decodeChatSnapshot(initialChatSnapshotBlob)
+    private val initialGroupFoldMap = decodeGroupFoldMap(SonarCore.loadBlob(GROUP_FOLDS_BLOB_KEY))
+    private val initialFoldedGroupIds: Set<String> = initialChatSnapshot.first
+        .mapTo(hashSetOf()) { it.id }
+        .let { activeChatIds -> initialGroupFoldMap.keys.filterTo(hashSetOf()) { it in activeChatIds } }
     var npub by mutableStateOf("")
         private set
     var started by mutableStateOf(false)
@@ -208,7 +222,9 @@ class SonarAppState(private val scope: CoroutineScope) {
             unifyOffer = null; unifyPeers = emptyList()
             MeshRadio.setMeshNickname("")
             MeshRadio.setLocalSonarAnnounce(null); sonarPeerProfiles = emptyMap()
-            linkByFp.clear(); linkCapsByFp.clear(); foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
+            linkByFp.clear(); linkCapsByFp.clear(); groupFoldMap.clear()
+            persistLinks(); persistLinkCaps(); persistGroupFolds()
+            foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
             sonarDescriptorsByNpubHex = emptyMap()
             sonarDescriptorFetches.clear(); sonarDescriptorFetchedAt.clear(); sonarDescriptorMissedAt.clear()
             publishedSonarDescriptor = false; publishedSonarDescriptorBolt12Offer = null; publishingSonarDescriptor = false
@@ -252,7 +268,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             MessageStore.wipe()
             // In-memory conversation state.
             meshChats.clear(); meshChatNames.clear(); pendingMarmotSends.clear(); outbox.clear()
-            linkByFp.clear(); linkCapsByFp.clear(); persistLinks(); persistLinkCaps()
+            linkByFp.clear(); linkCapsByFp.clear(); groupFoldMap.clear()
+            persistLinks(); persistLinkCaps(); persistGroupFolds()
             profilesByNpub = emptyMap(); profileFetches.clear(); persistProfileCache()
             foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
             meshBroadcast = emptyList(); meshDmRows = emptyList()
@@ -693,11 +710,19 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Marmot groups currently FOLDED into a BLE-mesh DM row (same person via
      *  [linkByFp]) — hidden from the standalone White Noise list so a person never
      *  shows up twice. Display-only: the group still lives in [chats]. */
-    private var foldedGroupIds by mutableStateOf<Set<String>>(emptySet())
+    private var foldedGroupIds by mutableStateOf<Set<String>>(initialFoldedGroupIds)
     /** Folded Marmot group id → mesh peer fingerprint. Kept with [foldedGroupIds]
      *  so openChat/refreshOpenDm can route a White Noise group back to the
      *  canonical mesh conversation even while BLE is unavailable. */
-    private var foldedGroupPeerIds: Map<String, String> = emptyMap()
+    private var foldedGroupPeerIds: Map<String, String> =
+        initialGroupFoldMap.filterKeys { it in initialFoldedGroupIds }
+    /** Persisted Marmot group id → mesh peer fingerprint. Unlike the ephemeral
+     *  [foldedGroupPeerIds] (recomputed each cycle), this map survives BLE state
+     *  changes and app restarts — matching iOS's `marmotGroupIdsByConversationId`.
+     *  It acts as a durable fallback in [peerIdForMarmotGroup] so a conversation
+     *  that was folded once stays folded even when BLE is off and the live profile
+     *  lookup chain fails. */
+    private val groupFoldMap = initialGroupFoldMap.toMutableMap()
 
     /** White Noise chats to render on their own row: every Marmot group EXCEPT the
      *  ones folded into a mesh DM. The Messages list uses this instead of [chats]. */
@@ -819,6 +844,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             val i = line.indexOf('=')
             if (i > 0) linkCapsByFp[line.substring(0, i)] = line.substring(i + 1).trim().toIntOrNull() ?: 0
         }
+        groupFoldMap.clear()
+        groupFoldMap.putAll(decodeGroupFoldMap(SonarCore.loadBlob(GROUP_FOLDS_BLOB_KEY)))
     }
 
     private fun persistLinks() {
@@ -827,6 +854,10 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private fun persistLinkCaps() {
         SonarCore.saveBlob("sonar.linkCaps", linkCapsByFp.entries.joinToString("\n") { "${it.key}=${it.value}" })
+    }
+
+    private fun persistGroupFolds() {
+        SonarCore.saveBlob(GROUP_FOLDS_BLOB_KEY, groupFoldMap.entries.joinToString("\n") { "${it.key}=${it.value}" })
     }
 
     /** Record fingerprint→npub from a 0x53 (persisted on change). When a new
@@ -1344,7 +1375,8 @@ class SonarAppState(private val scope: CoroutineScope) {
 
                 MessageStore.wipe()
                 meshChats.clear(); meshChatNames.clear(); pendingMarmotSends.clear(); outbox.clear()
-                linkByFp.clear(); linkCapsByFp.clear(); persistLinks(); persistLinkCaps()
+                linkByFp.clear(); linkCapsByFp.clear(); groupFoldMap.clear()
+                persistLinks(); persistLinkCaps(); persistGroupFolds()
                 foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
                 sonarPeerProfiles = emptyMap()
                 sonarDescriptorsByNpubHex = emptyMap()
@@ -2835,6 +2867,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private fun peerIdForMarmotGroup(groupId: String): String? =
         foldedGroupPeerIds[groupId]
+            ?: groupFoldMap[groupId]
             ?: chats.firstOrNull { it.id == groupId }?.let { peerIdForMarmotGroup(it) }
 
     private fun peerIdForMarmotGroup(group: SonarChat): String? {
@@ -3122,17 +3155,17 @@ class SonarAppState(private val scope: CoroutineScope) {
             val existing = rowsByPeer[peerId]
             if (existing == null || row.tsSecs >= existing.tsSecs) rowsByPeer[peerId] = row
         }
+        val groupPeers = LinkedHashMap<String, String>()
         for ((peerId, msgs) in meshChats) {
             if (msgs.isEmpty()) continue
             var last = msgs.last()
             val groups = npubRawFor(peerId)?.let { marmotGroupsForNpub(it) }.orEmpty()
             if (groups.isNotEmpty()) {
-                groups.forEach { folded += it.id }
+                groups.forEach { g -> folded += g.id; groupPeers[g.id] = peerId }
                 latestMarmotMessage(groups)?.let { if (it.tsSecs > last.tsSecs) last = it }
             }
             upsert(peerId, MeshDmRow(peerId, foldedPeerName(peerId, groups.firstOrNull()), messagePreview(last.content, last.stickerRef), last.tsSecs))
         }
-        val groupPeers = LinkedHashMap<String, String>()
         for (group in chats) {
             if (!isDirectMarmotChat(group)) continue
             val peerId = peerIdForMarmotGroup(group) ?: continue
@@ -3151,6 +3184,17 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         foldedGroupIds = folded
         foldedGroupPeerIds = groupPeers
+        // Merge discovered folds into the persisted map (parity with iOS
+        // marmotGroupIdsByConversationId). Prune entries for groups that no
+        // longer exist so stale mappings don't accumulate.
+        val activeGroupIds = chats.mapTo(hashSetOf()) { it.id }
+        var foldMapChanged = false
+        for ((gid, pid) in groupPeers) {
+            if (groupFoldMap[gid] != pid) { groupFoldMap[gid] = pid; foldMapChanged = true }
+        }
+        val stale = groupFoldMap.keys.filter { it !in activeGroupIds }
+        if (stale.isNotEmpty()) { stale.forEach { groupFoldMap.remove(it) }; foldMapChanged = true }
+        if (foldMapChanged) persistGroupFolds()
         meshDmRows = rowsByPeer.values.sortedByDescending { it.tsSecs }
     }
 
