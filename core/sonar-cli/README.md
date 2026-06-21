@@ -51,6 +51,21 @@ in the published Nostr event.
 
 ## Agent Contract
 
+Every command prints newline-delimited JSON. The `type` field identifies the
+record: `identity`, `published`, `sent`, `message`, `group`, or
+`posted_sticker_pack`. The full command surface:
+
+| Command | Purpose |
+| --- | --- |
+| `init [--nsec-file p \| --nsec-env VAR \| --nsec s] [--force]` | Provision/replace the identity. |
+| `identity` | Print `{npub, pubkey_hex, home, config_path}`. |
+| `publish` | Publish the Marmot KeyPackage so peers can DM the agent. |
+| `send --to <npub\|hex> --text <s> [--group-name <s>]` | Send a direct message (find/create the 1:1 group). |
+| `listen [--once] [--timeout-secs n] [--poll-secs n] [--no-publish]` | Drain inbound messages as JSON lines. |
+| `groups` | List known Marmot groups `{id, name, members[]}`. |
+| `messages [--group <hex>]` | Print message history (includes the agent's own `mine:true` rows). |
+| `post <signal-link> [...]` | Import + publish a Signal sticker pack. |
+
 `listen` emits one JSON object per inbound message:
 
 ```json
@@ -58,5 +73,12 @@ in the published Nostr event.
 ```
 
 The command records seen message IDs before exiting, so rerunning `listen` only
-emits new messages. `listen --once` performs a single sync/drain cycle, which is
-useful in tests and cron-style agents.
+emits new messages, and it never emits the agent's own messages (`mine` is
+filtered out). A bare `listen` streams until interrupted; `listen --once`
+performs a single sync/drain cycle, which is what cron-style agents and tests
+should use. `send` is direct-message only (it targets an npub), and transport is
+Nostr-relay only — the CLI does not drive BLE mesh.
+
+To run this as an autonomous Hermes agent (terminal toolset + cron-polled
+`listen --once`), see [`docs/HERMES-AGENT.md`](../../docs/HERMES-AGENT.md) and
+the bundled skill at [`hermes/SKILL.md`](hermes/SKILL.md).
