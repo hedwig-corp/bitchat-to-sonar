@@ -2016,7 +2016,7 @@ final class SonarAppStore: ObservableObject {
     }
 
     static func shortNpub(_ value: String) -> String {
-        value.count > 16 ? "\(value.prefix(10))…\(value.suffix(4))" : value
+        snShortNpubLabel(value)
     }
 
     private func directOtherNpub(in group: MarmotService.MarmotGroup) -> String? {
@@ -2347,7 +2347,7 @@ final class SonarAppStore: ObservableObject {
                     return (m.createdAt, SNMessage(
                         id: m.id,
                         mine: m.isMine,
-                        author: String(m.senderNpub.prefix(12)),
+                        author: marmot.marmotAuthorName(m),
                         text: m.content,
                         time: Self.clock(m.createdAt),
                         via: .internet,

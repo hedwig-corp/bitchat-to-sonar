@@ -171,6 +171,78 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun profileCacheLookupResolvesGroupAuthorName() {
+        val senderNpub = "npub1vincent"
+        val profilesByNpub = decodeProfileCache(
+            encodeProfileCache(
+                mapOf(
+                    senderNpub to SonarProfile(
+                        name = "vincent",
+                        displayName = "Vincent P",
+                        about = null,
+                        picture = null,
+                        nip05 = null,
+                    ),
+                ),
+            ),
+        )
+        val fetched = mutableListOf<String>()
+        val message = SonarMsg(
+            id = "msg-1",
+            senderNpub = senderNpub,
+            content = "hello",
+            mine = false,
+            tsSecs = 42,
+        )
+
+        val resolved = resolveGroupAuthorName(
+            message = message,
+            isGroup = true,
+            profilesByNpub = profilesByNpub,
+            fetchMissingProfile = { fetched += it },
+        )
+
+        assertEquals("Vincent P", resolved)
+        assertEquals(emptyList(), fetched)
+    }
+
+    @Test
+    fun profileCacheMissFetchesGroupAuthorProfileAndFallsBack() {
+        val senderNpub = "npub1sender1234567890"
+        val profilesByNpub = decodeProfileCache(
+            encodeProfileCache(
+                mapOf(
+                    "npub1alice" to SonarProfile(
+                        name = "Alice",
+                        displayName = null,
+                        about = null,
+                        picture = null,
+                        nip05 = null,
+                    ),
+                ),
+            ),
+        )
+        val fetched = mutableListOf<String>()
+        val message = SonarMsg(
+            id = "msg-1",
+            senderNpub = senderNpub,
+            content = "hello",
+            mine = false,
+            tsSecs = 42,
+        )
+
+        val resolved = resolveGroupAuthorName(
+            message = message,
+            isGroup = true,
+            profilesByNpub = profilesByNpub,
+            fetchMissingProfile = { fetched += it },
+        )
+
+        assertEquals(shortNpubLabel(senderNpub), resolved)
+        assertEquals(listOf(senderNpub), fetched)
+    }
+
+    @Test
     fun malformedProfileCacheRowsAreIgnored() {
         val decoded = decodeProfileCache("not-a-valid-row\n")
 

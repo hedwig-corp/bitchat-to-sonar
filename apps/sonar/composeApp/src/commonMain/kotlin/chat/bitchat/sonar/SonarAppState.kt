@@ -37,6 +37,21 @@ private const val LOCAL_SUMMARY_PAGE_LIMIT = 20
 private const val LOCAL_SUMMARY_CHAT_LIMIT = 5
 private const val GROUP_FOLDS_BLOB_KEY = "sonar.groupFolds"
 
+internal fun shortNpubLabel(value: String): String =
+    if (value.length > 16) value.take(10) + "…" + value.takeLast(4) else value
+
+internal fun resolveGroupAuthorName(
+    message: SonarMsg,
+    isGroup: Boolean,
+    profilesByNpub: Map<String, SonarProfile>,
+    fetchMissingProfile: (String) -> Unit,
+): String? {
+    if (!isGroup || message.mine || message.senderNpub.isBlank()) return null
+    profilesByNpub[canonicalProfileKey(message.senderNpub)]?.bestName?.let { return it }
+    fetchMissingProfile(message.senderNpub)
+    return shortNpubLabel(message.senderNpub)
+}
+
 sealed interface Screen {
     data object Home : Screen
     data object Settings : Screen
@@ -1589,13 +1604,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         return shortNpub(other)
     }
 
-    private fun shortNpub(value: String): String =
-        if (value.length > 16) value.take(10) + "…" + value.takeLast(4) else value
+    private fun shortNpub(value: String): String = shortNpubLabel(value)
 
     fun groupAuthorName(message: SonarMsg, isGroup: Boolean): String? {
-        if (!isGroup || message.mine || message.senderNpub.isBlank()) return null
-        return profilesByNpub[canonicalProfileKey(message.senderNpub)]?.bestName
-            ?: shortNpub(message.senderNpub)
+        return resolveGroupAuthorName(message, isGroup, profilesByNpub, ::ensureProfile)
     }
 
     /** Fetch + cache a peer's kind-0 profile, so their name replaces the
@@ -1708,6 +1720,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             val local = withSendEchoes(chat.id, mergePendingMediaUploads(chat.id, marmotMessagesPage(chat.id)))
             messages = local
             processPayLines(chat.id, local)
+            for (m in local) if (!m.mine && m.senderNpub.isNotBlank()) ensureProfile(m.senderNpub)
             runCatching { refreshChats() }
             if ((screen as? Screen.Chat)?.id == chat.id) {
                 val fresh = withSendEchoes(chat.id, mergePendingMediaUploads(chat.id, marmotMessagesPage(chat.id)))
