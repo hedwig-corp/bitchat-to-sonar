@@ -1350,14 +1350,10 @@ impl SonarClient {
                 "created text message did not produce a local transcript row".into(),
             ));
         };
-        let group_id_hex = hex::encode(group_id.as_slice());
         let group_name = self.resolve_group_name(group_id);
         self.mark_outbox_pending(group_id, &message, &event)?;
         let event_id = event.id;
         self.spawn_outbox_publish(message.id.to_hex(), event);
-        self.notify_conversation_changed(&group_id_hex);
-        // Deferred bookkeeping: index + sync-state disk writes don't block
-        // the caller so the next send can start immediately.
         self.spawn_send_bookkeeping(group_name, message, event_id);
         Ok(())
     }
@@ -1370,10 +1366,11 @@ impl SonarClient {
     ) {
         let conversation_index = self.conversation_index.clone();
         let sync_state = self.sync_state.clone();
+        let change_listener = self.change_listener.clone();
         let event_id_hex = event_id.to_hex();
-        std::thread::spawn(move || {
+        tokio::task::spawn_blocking(move || {
+            let group_id_hex = hex::encode(message.group_id.as_slice());
             if let Some(ref idx) = conversation_index {
-                let group_id_hex = hex::encode(message.group_id.as_slice());
                 let name = group_name.as_deref().unwrap_or("");
                 if let Err(e) = idx.lock().unwrap().upsert_summary(
                     &group_id_hex,
@@ -1385,6 +1382,9 @@ impl SonarClient {
                 ) {
                     tracing::warn!(%e, "deferred index upsert failed");
                 }
+            }
+            if let Some(l) = change_listener.lock().unwrap().clone() {
+                l.on_conversation_changed(group_id_hex);
             }
             {
                 let mut state = sync_state.lock().unwrap();
@@ -1410,12 +1410,10 @@ impl SonarClient {
                 "created sticker message did not produce a local transcript row".into(),
             ));
         };
-        let group_id_hex = hex::encode(group_id.as_slice());
         let group_name = self.resolve_group_name(group_id);
         self.mark_outbox_pending(group_id, &message, &event)?;
         let event_id = event.id;
         self.spawn_outbox_publish(message.id.to_hex(), event);
-        self.notify_conversation_changed(&group_id_hex);
         self.spawn_send_bookkeeping(group_name, message, event_id);
         Ok(())
     }
@@ -1629,9 +1627,7 @@ impl SonarClient {
         self.nostr.send_event(&event).await?;
         let incoming = self.engine.process_incoming(&event).await?;
         if let Incoming::Message(message) = incoming {
-            let group_id_hex = hex::encode(group_id.as_slice());
             let group_name = self.resolve_group_name(group_id);
-            self.notify_conversation_changed(&group_id_hex);
             self.spawn_send_bookkeeping(group_name, message, event.id);
         }
         Ok(())
