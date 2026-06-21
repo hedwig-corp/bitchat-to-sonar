@@ -2257,7 +2257,7 @@ final class SonarAppStore: ObservableObject {
         return SNDMRow(
             id: peerID.id,
             title: peerDisplayName(peerID.id),
-            preview: last.map { Self.previewText($0.content) } ?? networkLabel(forPeer: peerID.id),
+            preview: last.map { Self.previewText($0.content, stickerRef: meshParseStickerContent(content: $0.content).map { MarmotService.MarmotStickerRef(packCoordinate: $0.packCoordinate, shortcode: $0.shortcode, plaintextSha256: $0.plaintextSha256) }) } ?? networkLabel(forPeer: peerID.id),
             time: last.map { Self.listTime($0.timestamp) } ?? "",
             unread: chatViewModel.unreadPrivateMessages.contains(peerID),
             presence: meshReachable(peerID.id),
@@ -2365,15 +2365,19 @@ final class SonarAppStore: ObservableObject {
                         ))
                     case .notPay:
                         let mediaItem = meshMediaItem(m.content)
+                        let meshSticker = meshParseStickerContent(content: m.content).map {
+                            MarmotService.MarmotStickerRef(packCoordinate: $0.packCoordinate, shortcode: $0.shortcode, plaintextSha256: $0.plaintextSha256)
+                        }
                         return (m.timestamp, SNMessage(
                             id: m.id,
                             mine: mine,
                             author: m.sender,
-                            text: mediaItem != nil ? "" : m.content,
+                            text: (mediaItem != nil || meshSticker != nil) ? "" : m.content,
                             time: Self.clock(m.timestamp),
                             via: via,
                             state: mine ? Self.stateText(m.deliveryStatus) : nil,
-                            media: mediaItem.map { [$0] } ?? []
+                            media: mediaItem.map { [$0] } ?? [],
+                            stickerRef: meshSticker
                         ))
                     }
                 }
@@ -2400,15 +2404,19 @@ final class SonarAppStore: ObservableObject {
                 // BLE-mesh media (bitchat file transfer) arrives as an
                 // "[image] <name>" marker with the file already on disk.
                 let mediaItem = meshMediaItem(m.content)
+                let meshSticker = meshParseStickerContent(content: m.content).map {
+                    MarmotService.MarmotStickerRef(packCoordinate: $0.packCoordinate, shortcode: $0.shortcode, plaintextSha256: $0.plaintextSha256)
+                }
                 return (m.timestamp, SNMessage(
                     id: m.id,
                     mine: mine,
                     author: m.sender,
-                    text: mediaItem != nil ? "" : m.content,
+                    text: (mediaItem != nil || meshSticker != nil) ? "" : m.content,
                     time: Self.clock(m.timestamp),
                     via: via,
                     state: mine ? Self.stateText(m.deliveryStatus) : nil,
-                    media: mediaItem.map { [$0] } ?? []
+                    media: mediaItem.map { [$0] } ?? [],
+                    stickerRef: meshSticker
                 ))
             }
         }
@@ -2508,13 +2516,47 @@ final class SonarAppStore: ObservableObject {
     }
 
     func sendSticker(_ id: String, sticker: StickerInfo, packCoordinate: String) {
-        guard let groupId = marmotGroupId(id) else { return }
-        marmot.sendSticker(
-            groupId: groupId,
+        if meshReachable(id) {
+            let content = meshStickerContent(
+                packCoordinate: packCoordinate,
+                shortcode: sticker.shortcode,
+                plaintextSha256: sticker.sha256
+            )
+            chatViewModel.sendPrivateMessage(content, to: PeerID(str: id))
+            return
+        }
+        if let groupId = marmotGroupId(id) {
+            marmot.sendSticker(
+                groupId: groupId,
+                packCoordinate: packCoordinate,
+                shortcode: sticker.shortcode,
+                plaintextSha256: sticker.sha256
+            )
+            return
+        }
+        if let profile = resolvedSonarProfile(id) {
+            sendOverMarmotSticker(npub: profile.npub, packCoordinate: packCoordinate, sticker: sticker)
+        }
+    }
+
+    private func sendOverMarmotSticker(npub: String, packCoordinate: String, sticker: StickerInfo) {
+        if let group = marmotGroup(forNpub: npub) {
+            marmot.sendSticker(
+                groupId: group.id,
+                packCoordinate: packCoordinate,
+                shortcode: sticker.shortcode,
+                plaintextSha256: sticker.sha256
+            )
+            return
+        }
+        let encoded = meshStickerContent(
             packCoordinate: packCoordinate,
             shortcode: sticker.shortcode,
             plaintextSha256: sticker.sha256
         )
+        pendingMarmotSends[npub, default: []].append(encoded)
+        marmot.connectIfNeeded()
+        marmot.startChat(with: npub)
     }
 
     private func sendOverMarmot(_ text: String, npub: String) {
@@ -2532,7 +2574,18 @@ final class SonarAppStore: ObservableObject {
         for (npub, texts) in pendingMarmotSends {
             guard let group = marmotGroup(forNpub: npub) else { continue }
             pendingMarmotSends[npub] = nil
-            for text in texts { marmot.send(text, to: group.id) }
+            for text in texts {
+                if let ref = meshParseStickerContent(content: text) {
+                    marmot.sendSticker(
+                        groupId: group.id,
+                        packCoordinate: ref.packCoordinate,
+                        shortcode: ref.shortcode,
+                        plaintextSha256: ref.plaintextSha256
+                    )
+                } else {
+                    marmot.send(text, to: group.id)
+                }
+            }
         }
     }
 

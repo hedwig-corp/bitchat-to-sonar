@@ -5025,12 +5025,37 @@ public func meshParsePublicMessage(packetBytes: Data) -> MeshPublicMessage?  {
 })
 }
 /**
+ * Try to parse a content string as a mesh-encoded sticker reference.
+ * Returns `None` for regular text messages.
+ */
+public func meshParseStickerContent(content: String) -> StickerRefInfo?  {
+    return try!  FfiConverterOptionTypeStickerRefInfo.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_func_mesh_parse_sticker_content(
+        FfiConverterString.lower(content),$0
+    )
+})
+}
+/**
  * Ed25519 mesh signing public key (hex) for a 32-byte seed (hex).
  */
 public func meshSigningPublicKey(seedHex: String)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_func_mesh_signing_public_key(
         FfiConverterString.lower(seedHex),$0
+    )
+})
+}
+/**
+ * Encode a sticker reference as a content string suitable for a BLE mesh
+ * private message.  The wire uses ASCII Unit Separator (\x1F) delimiters so
+ * the encoded string is unambiguous against regular chat text.
+ */
+public func meshStickerContent(packCoordinate: String, shortcode: String, plaintextSha256: String) -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_func_mesh_sticker_content(
+        FfiConverterString.lower(packCoordinate),
+        FfiConverterString.lower(shortcode),
+        FfiConverterString.lower(plaintextSha256),$0
     )
 })
 }
@@ -5121,7 +5146,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_func_mesh_parse_public_message() != 41596) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_func_mesh_parse_sticker_content() != 19934) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_func_mesh_signing_public_key() != 29933) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_mesh_sticker_content() != 11157) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_func_noise_generate_keypair() != 35056) {

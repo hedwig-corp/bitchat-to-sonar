@@ -527,8 +527,13 @@ impl PrivateMessage {
         Some(())
     }
 
-    /// Decode the TLV. Swift's decoder rejects unknown TLV types here (unlike the
-    /// tolerant announce decoder), so we mirror that.
+    /// Decode the TLV. Tolerant of unknown TLV types (forward-compat, like
+    /// Announce) so older clients can receive messages from newer senders that
+    /// add optional fields. Requires both messageID and content.
+    ///
+    /// Known long types (2-byte length) are matched explicitly. Unknown types
+    /// are assumed short (1-byte length, max 255 bytes) — any future field
+    /// that needs a longer payload must be added to the match below.
     pub fn decode(data: &[u8]) -> Option<PrivateMessage> {
         let mut o = 0usize;
         let mut message_id: Option<String> = None;
@@ -536,24 +541,21 @@ impl PrivateMessage {
         while o < data.len() {
             let t = data[o];
             o += 1;
-            let len = match t {
-                PM_TLV_MESSAGE_ID | PM_TLV_CONTENT => {
-                    if o + 1 > data.len() {
-                        return None;
-                    }
-                    let len = data[o] as usize;
-                    o += 1;
-                    len
+            let is_long = t == PM_TLV_MESSAGE_ID_LONG || t == PM_TLV_CONTENT_LONG;
+            let len = if is_long {
+                if o + 2 > data.len() {
+                    return None;
                 }
-                PM_TLV_MESSAGE_ID_LONG | PM_TLV_CONTENT_LONG => {
-                    if o + 2 > data.len() {
-                        return None;
-                    }
-                    let len = u16::from_be_bytes([data[o], data[o + 1]]) as usize;
-                    o += 2;
-                    len
+                let len = u16::from_be_bytes([data[o], data[o + 1]]) as usize;
+                o += 2;
+                len
+            } else {
+                if o + 1 > data.len() {
+                    return None;
                 }
-                _ => return None,
+                let len = data[o] as usize;
+                o += 1;
+                len
             };
             if o + len > data.len() {
                 return None;
@@ -567,7 +569,7 @@ impl PrivateMessage {
                 PM_TLV_CONTENT | PM_TLV_CONTENT_LONG => {
                     content = String::from_utf8(value.to_vec()).ok()
                 }
-                _ => unreachable!(),
+                _ => {} // unknown TLV: skip (forward-compat)
             }
         }
         Some(PrivateMessage {
@@ -1118,6 +1120,24 @@ mod tests {
         assert_eq!(enc[0], PM_TLV_MESSAGE_ID);
         assert_eq!(enc[2 + "call-offer".len()], PM_TLV_CONTENT_LONG);
         assert_eq!(PrivateMessage::decode(&enc).unwrap(), pm);
+    }
+
+    #[test]
+    fn private_message_tolerant_of_unknown_tlv() {
+        let pm = PrivateMessage {
+            message_id: "m1".into(),
+            content: "hello".into(),
+        };
+        let mut data = pm.encode().unwrap();
+        // Append two unknown short TLVs (1-byte length): decoder skips both.
+        data.push(0x10);
+        data.push(3);
+        data.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+        data.push(0x11);
+        data.push(2);
+        data.extend_from_slice(&[0xDD, 0xEE]);
+        let decoded = PrivateMessage::decode(&data).unwrap();
+        assert_eq!(decoded, pm);
     }
 
     #[test]
