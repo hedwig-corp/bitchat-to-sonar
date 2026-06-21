@@ -80,5 +80,8 @@ build.log
 # Local configs
 Local.xcconfig
 
+# Local deployment secrets (APNs keys, signing material) — never commit
+deploy/secrets/
+
 # Android Rust core build outputs (regenerate with core/build-android.sh)
 core/android-out/
