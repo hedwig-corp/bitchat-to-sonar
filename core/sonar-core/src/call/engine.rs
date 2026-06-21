@@ -343,6 +343,15 @@ impl CallEngine {
         }
     }
 
+    /// Gracefully shut the engine down: stop the accept loop and close the iroh
+    /// endpoint (iroh expects `Endpoint::close().await` before drop — otherwise it
+    /// logs "Endpoint dropped … Aborting ungracefully"). Call on identity change
+    /// or app shutdown. After this the engine must not be reused.
+    pub async fn close(&self) {
+        self.accept_task.abort();
+        self.inner.transport.close().await;
+    }
+
     fn set_state(&self, call_id: &str, state: CallStateKind) {
         if let Some(slot) = self.inner.calls.lock().unwrap().get_mut(call_id) {
             slot.state = state;

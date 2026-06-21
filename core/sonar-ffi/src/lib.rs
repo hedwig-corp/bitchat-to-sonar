@@ -440,10 +440,9 @@ pub struct ConversationSummaryInfo {
 pub struct SonarNode {
     runtime: tokio::runtime::Runtime,
     client: SonarClient,
-    /// Lazily-started P2P call engine (iroh + cpal/opus). Cloned out under a short
-    /// lock so a long `call_wait_event` park never blocks `call_hangup` etc.
-    #[cfg(feature = "calls-audio")]
-    call: Mutex<Option<Arc<sonar_core::call::engine::CallEngine>>>,
+    // NOTE: the P2P call engine is NOT stored here. It lives in [`call_session`]
+    // as a process-lived singleton so the iroh endpoint survives this node being
+    // replaced on a Marmot reconnect (iroh wants one long-lived Endpoint).
 }
 
 #[uniffi::export]
@@ -485,12 +484,7 @@ impl SonarNode {
             &db_path,
             db_key,
         ))?;
-        Ok(Arc::new(Self {
-            runtime,
-            client,
-            #[cfg(feature = "calls-audio")]
-            call: Mutex::new(None),
-        }))
+        Ok(Arc::new(Self { runtime, client }))
     }
 
     /// Publish our kind-30443 KeyPackage so others can start groups with us.
@@ -1116,12 +1110,78 @@ impl SonarNode {
 
 // ── P2P voice calls (iroh transport + cpal/opus media) ──────────────────────
 //
-// The CallEngine is started lazily (`call_start`) and stored in the SonarNode.
+// The CallEngine is a PROCESS-LIVED singleton ([`call_session`]), NOT a field on
+// SonarNode. iroh wants ONE long-lived Endpoint per app ("creating and dropping
+// endpoints repeatedly … breaks peer reconnection"); tying it to SonarNode meant
+// every Marmot reconnect (which recreates the node) dropped the endpoint, so a
+// call placed afterwards had no live transport and rang forever. The engine +
+// its own runtime now outlive every SonarNode and survive reconnects.
+//
 // The engine never sends ☎CALL lines itself: the host serializes OFFER/ANSWER/
 // END (built via the `call_encode_*` helpers, carrying `call_local_address`)
 // over the existing Marmot/NIP-17 transports and feeds inbound control lines
 // (parsed via `call_parse_control`) back in. All call methods are BLOCKING like
 // the rest of SonarNode; the host polls `call_wait_event` on a dedicated thread.
+
+/// Process-lived home for the P2P call engine + the runtime that owns its iroh
+/// endpoint tasks. Independent of any `SonarNode` (and its runtime) so the
+/// endpoint survives node recreation. Keyed by the derived iroh secret so an
+/// identity change rebinds; same identity is idempotent.
+#[cfg(feature = "calls-audio")]
+mod call_session {
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    use sonar_core::call::engine::CallEngine;
+
+    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    static ENGINE: Mutex<Option<([u8; 32], Arc<CallEngine>)>> = Mutex::new(None);
+
+    /// The long-lived multi-thread runtime that drives the call endpoint. Its
+    /// tasks (accept loop, media sessions) must NOT run on a SonarNode runtime,
+    /// which dies when the node is replaced. One per process, built on first use.
+    pub fn runtime() -> &'static tokio::runtime::Runtime {
+        RUNTIME.get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .worker_threads(2)
+                .thread_name("sonar-call")
+                .build()
+                .expect("build call runtime")
+        })
+    }
+
+    /// The current engine, if bound. Cloned out under a short lock.
+    pub fn engine() -> Option<Arc<CallEngine>> {
+        ENGINE
+            .lock()
+            .expect("call engine lock not poisoned")
+            .as_ref()
+            .map(|(_, engine)| engine.clone())
+    }
+
+    /// True if an engine is already bound for exactly this iroh secret (so
+    /// `call_start` is a no-op for the same identity — one long-lived endpoint).
+    pub fn matches_secret(secret: &[u8; 32]) -> bool {
+        ENGINE
+            .lock()
+            .expect("call engine lock not poisoned")
+            .as_ref()
+            .is_some_and(|(s, _)| s == secret)
+    }
+
+    pub fn install(secret: [u8; 32], engine: Arc<CallEngine>) {
+        *ENGINE.lock().expect("call engine lock not poisoned") = Some((secret, engine));
+    }
+
+    /// Gracefully close + drop any existing engine (identity change / shutdown),
+    /// awaiting `Endpoint::close` so iroh tears down cleanly.
+    pub fn shutdown_existing() {
+        let prev = ENGINE.lock().expect("call engine lock not poisoned").take();
+        if let Some((_, engine)) = prev {
+            runtime().block_on(engine.close());
+        }
+    }
+}
 
 /// Public call state for the host UI (mirrors `sonar_core::call::engine::CallStateKind`).
 #[cfg(feature = "calls-audio")]
@@ -1242,20 +1302,23 @@ impl SonarNode {
     /// the host passes nothing and never reimplements the derivation; the NodeId
     /// is stable across launches. Idempotent-ish: a second call rebinds.
     pub fn call_start(&self) -> FfiResult<()> {
-        // Idempotent: bind the iroh endpoint ONCE per session. A second
-        // CallEngine::start binds a fresh endpoint (presets::N0 → a network
-        // round-trip that can block) AND drops the active engine — which made a
-        // call placed after boot's ensureCallStarted "take forever".
-        if self.call.lock().expect("call engine lock not poisoned").is_some() {
-            return Ok(());
-        }
         let nostr_secret = self.client.identity().keys().secret_key().to_secret_bytes();
         let iroh_secret = sonar_core::call::identity::derive_iroh_secret(&nostr_secret);
-        let engine = self
-            .runtime
+        // Idempotent for THIS identity: the engine is a process-lived singleton
+        // ([`call_session`]) — bound ONCE and reused across every SonarNode, so it
+        // survives Marmot reconnects (iroh wants one long-lived Endpoint). A second
+        // bind would drop the active endpoint + do another network round-trip.
+        if call_session::matches_secret(&iroh_secret) {
+            return Ok(());
+        }
+        // Different identity (or first run): gracefully close any stale endpoint,
+        // then bind a fresh one on the long-lived call runtime (NOT this node's
+        // runtime, which dies when the node is replaced).
+        call_session::shutdown_existing();
+        let engine = call_session::runtime()
             .block_on(sonar_core::call::engine::CallEngine::start(iroh_secret))
             .map_err(|e| SonarFfiError::Core(format!("call start: {e}")))?;
-        *self.call.lock().expect("call engine lock not poisoned") = Some(Arc::new(engine));
+        call_session::install(iroh_secret, Arc::new(engine));
         Ok(())
     }
 
@@ -1303,7 +1366,9 @@ impl SonarNode {
     /// and starts media. Blocks on the QUIC connect.
     pub fn call_accept(&self, call_id: String) -> FfiResult<()> {
         let engine = self.call_engine()?;
-        self.runtime
+        // Drive on the long-lived call runtime so the media tasks spawned during
+        // connect survive a SonarNode swap.
+        call_session::runtime()
             .block_on(engine.accept(&call_id))
             .map_err(|e| SonarFfiError::Core(format!("call accept: {e}")))
     }
@@ -1333,23 +1398,19 @@ impl SonarNode {
     /// MainActor-isolated → the UI freezes). Mirrors `wait_for_marmot_event`,
     /// which also blocks the timeout when there is nothing yet to wait on.
     pub fn call_wait_event(&self, timeout_secs: u64) -> Option<CallEventInfo> {
-        // Snapshot the engine under a SHORT lock: bind it to a `let` so the
-        // guard drops at the `;`, never held across the block_on park below
-        // (so a long wait can't block `call_hangup`/`call_start`).
-        let engine = self.call.lock().expect("call engine lock not poisoned").clone();
-        let Some(engine) = engine else {
-            // No engine: park the node's runtime for the (capped) timeout, then
-            // report "nothing happened". `.max(1)` floors a 0 timeout so we can
-            // never spin; capping at 30s bounds a bogus/hostile huge value.
+        // Snapshot the process-lived engine (short lock inside `engine()`); never
+        // held across the park below, so a long wait can't block other call ops.
+        let Some(engine) = call_session::engine() else {
+            // No engine yet: park (off any node runtime) for the capped timeout,
+            // then report "nothing happened". Floor at 1s so we can never spin;
+            // cap at 30s to bound a bogus/hostile huge value.
             let secs = timeout_secs.clamp(1, 30);
-            self.runtime.block_on(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
-            });
+            std::thread::sleep(std::time::Duration::from_secs(secs));
             return None;
         };
         // Engine present: `next_event` already honors the timeout internally
         // (tokio::time::timeout over an mpsc recv → None on elapse).
-        let ev = self.runtime.block_on(engine.next_event(timeout_secs))?;
+        let ev = call_session::runtime().block_on(engine.next_event(timeout_secs))?;
         Some(CallEventInfo {
             call_id: ev.call_id,
             state: ev.state.into(),
@@ -1361,13 +1422,10 @@ impl SonarNode {
 
 #[cfg(feature = "calls-audio")]
 impl SonarNode {
-    /// Clone the started engine out under a short lock (so a parked
-    /// `call_wait_event` never blocks another call method).
+    /// The process-lived call engine, or an error if `call_start` hasn't bound it
+    /// yet. Independent of `self` — every SonarNode shares the one engine.
     fn call_engine(&self) -> FfiResult<Arc<sonar_core::call::engine::CallEngine>> {
-        self.call
-            .lock()
-            .expect("call engine lock not poisoned")
-            .clone()
+        call_session::engine()
             .ok_or_else(|| SonarFfiError::Core("call engine not started (call_start first)".into()))
     }
 }
