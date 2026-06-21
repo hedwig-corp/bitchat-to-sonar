@@ -124,6 +124,7 @@ private val TEST_PACK_RELAYS = listOf(
     "wss://relay.damus.io",
     "wss://nos.lol",
     "wss://relay.primal.net",
+    "wss://nostr.relay.hedwig.sh",
 )
 
 @Composable

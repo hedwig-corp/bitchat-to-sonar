@@ -50,4 +50,7 @@ pub enum Error {
 
     #[error("http error: {0}")]
     Http(String),
+
+    #[error("no relay connected within timeout")]
+    NoRelayConnected,
 }

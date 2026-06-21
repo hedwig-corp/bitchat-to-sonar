@@ -15,7 +15,7 @@ use std::time::Duration;
 use mdk_core::prelude::*;
 use nostr::prelude::*;
 use nostr_blossom::prelude::*;
-use nostr_sdk::{Client, RelayPoolNotification};
+use nostr_sdk::{Client, RelayPoolNotification, RelayStatus};
 use serde::{Deserialize, Serialize};
 
 use sonar_stickers::{
@@ -167,6 +167,26 @@ const SUB_MARMOT_GROUPS: &str = "sonar-marmot-groups";
 /// loses a message permanently. When full, the oldest half is dropped (amortizes
 /// the shift cost vs dropping one-at-a-time).
 const MARMOT_BUFFER_CAP: usize = 1024;
+
+/// Minimum number of relays that must be connected before `connect()` returns.
+/// Modeled after whitenoise-rs `min_connected_relays = 2`. A quorum of 2
+/// means the client can send and fetch immediately; the remaining relays
+/// finish connecting in the background.
+const MIN_CONNECTED_RELAYS: usize = 2;
+
+/// Per-relay connection timeout used by the quorum-connect loop. If no relay
+/// connects within this window the client errors with `NoRelayConnections`.
+const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Shorter timeout for backfill fetches (new group from welcome, empty
+/// transcript repair). These are less critical than the main sync fetch — the
+/// live tail covers new events, so a short timeout is acceptable.
+const BACKFILL_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Cap the number of groups backfilled per sync cycle. Prevents pathological
+/// cases with dozens of empty-transcript groups from stacking serial timeouts.
+/// Excess groups are re-queued for the next sync.
+const MAX_BACKFILLS_PER_SYNC: usize = 8;
 
 const SYNC_STATE_VERSION: u32 = 1;
 const SYNC_STATE_PROCESSED_EVENT_CAP: usize = 20_000;
@@ -485,11 +505,70 @@ impl SonarClient {
         invite_link_state_path: Option<PathBuf>,
         conversation_index: Option<Arc<Mutex<ConversationIndex>>>,
     ) -> Result<Self> {
+        let boot_start = std::time::Instant::now();
         let nostr = Client::new(identity.keys().clone());
         for relay in &relays {
             nostr.add_relay(relay.clone()).await?;
         }
+        tracing::info!(
+            elapsed_ms = boot_start.elapsed().as_millis() as u64,
+            relay_count = relays.len(),
+            "relays added"
+        );
+
+        // Quorum-connect: spawn background tasks for all relays, then race
+        // their connection futures and return once MIN_CONNECTED_RELAYS are
+        // live. Mirrors whitenoise-rs `prepare_relay_urls` which uses
+        // FuturesUnordered and returns at the quorum threshold.
         nostr.connect().await;
+        let quorum = MIN_CONNECTED_RELAYS.min(relays.len());
+        if quorum > 0 {
+            let relay_handles: Vec<_> = {
+                let map = nostr.relays().await;
+                relays
+                    .iter()
+                    .filter_map(|url| map.get(url).cloned())
+                    .collect()
+            };
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(relay_handles.len().max(1));
+            for handle in relay_handles {
+                let tx = tx.clone();
+                let timeout = RELAY_CONNECT_TIMEOUT;
+                tokio::spawn(async move {
+                    handle.wait_for_connection(timeout).await;
+                    if handle.status() == RelayStatus::Connected {
+                        let _ = tx.send(()).await;
+                    }
+                });
+            }
+            drop(tx);
+            let mut connected = 0usize;
+            let deadline = tokio::time::Instant::now() + RELAY_CONNECT_TIMEOUT;
+            loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match tokio::time::timeout(remaining, rx.recv()).await {
+                    Ok(Some(())) => {
+                        connected += 1;
+                        if connected >= quorum {
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            if connected == 0 {
+                return Err(crate::Error::NoRelayConnected);
+            }
+            tracing::info!(
+                connected,
+                total = relays.len(),
+                elapsed_ms = boot_start.elapsed().as_millis() as u64,
+                "relay quorum reached"
+            );
+        }
 
         // Background collector for geohash channel events (kind-20000, public,
         // ephemeral) and geohash 1:1 DMs (kind-1059 NIP-17 gift wraps). Both are
@@ -713,7 +792,15 @@ impl SonarClient {
             if let Err(err) = client.subscribe_marmot().await {
                 tracing::debug!(%err, "marmot live subscribe failed (sync() still covers it)");
             }
+            tracing::info!(
+                elapsed_ms = boot_start.elapsed().as_millis() as u64,
+                "subscribe_marmot done"
+            );
             client.retry_outbox().await;
+            tracing::info!(
+                elapsed_ms = boot_start.elapsed().as_millis() as u64,
+                "with_engine complete"
+            );
         }
         Ok(client)
     }
@@ -1263,14 +1350,50 @@ impl SonarClient {
                 "created text message did not produce a local transcript row".into(),
             ));
         };
-        let group_name = self.resolve_group_name(group_id);
-        self.upsert_index_for_message(&message, group_name.as_deref());
         let group_id_hex = hex::encode(group_id.as_slice());
-        self.mark_local_event_processed(&event.id);
+        let group_name = self.resolve_group_name(group_id);
         self.mark_outbox_pending(group_id, &message, &event)?;
+        let event_id = event.id;
         self.spawn_outbox_publish(message.id.to_hex(), event);
         self.notify_conversation_changed(&group_id_hex);
+        // Deferred bookkeeping: index + sync-state disk writes don't block
+        // the caller so the next send can start immediately.
+        self.spawn_send_bookkeeping(group_name, message, event_id);
         Ok(())
+    }
+
+    fn spawn_send_bookkeeping(
+        &self,
+        group_name: Option<String>,
+        message: ChatMessage,
+        event_id: EventId,
+    ) {
+        let conversation_index = self.conversation_index.clone();
+        let sync_state = self.sync_state.clone();
+        let event_id_hex = event_id.to_hex();
+        std::thread::spawn(move || {
+            if let Some(ref idx) = conversation_index {
+                let group_id_hex = hex::encode(message.group_id.as_slice());
+                let name = group_name.as_deref().unwrap_or("");
+                if let Err(e) = idx.lock().unwrap().upsert_summary(
+                    &group_id_hex,
+                    name,
+                    &message.content,
+                    &message.sender.to_string(),
+                    message.created_at.as_secs(),
+                    message.mine,
+                ) {
+                    tracing::warn!(%e, "deferred index upsert failed");
+                }
+            }
+            {
+                let mut state = sync_state.lock().unwrap();
+                state.mark_processed_id(event_id_hex);
+                if let Err(e) = state.save_if_dirty() {
+                    tracing::debug!(%e, "deferred sync-state persist failed");
+                }
+            }
+        });
     }
 
     /// Send a sticker message to a group. Follows the same Signal-style
@@ -1287,13 +1410,13 @@ impl SonarClient {
                 "created sticker message did not produce a local transcript row".into(),
             ));
         };
-        let group_name = self.resolve_group_name(group_id);
-        self.upsert_index_for_message(&message, group_name.as_deref());
         let group_id_hex = hex::encode(group_id.as_slice());
-        self.mark_local_event_processed(&event.id);
+        let group_name = self.resolve_group_name(group_id);
         self.mark_outbox_pending(group_id, &message, &event)?;
+        let event_id = event.id;
         self.spawn_outbox_publish(message.id.to_hex(), event);
         self.notify_conversation_changed(&group_id_hex);
+        self.spawn_send_bookkeeping(group_name, message, event_id);
         Ok(())
     }
 
@@ -1505,12 +1628,11 @@ impl SonarClient {
             .create_media_event(group_id, &upload, &url, caption)?;
         self.nostr.send_event(&event).await?;
         let incoming = self.engine.process_incoming(&event).await?;
-        if let Incoming::Message(ref message) = incoming {
-            let group_name = self.resolve_group_name(group_id);
-            self.upsert_index_for_message(message, group_name.as_deref());
+        if let Incoming::Message(message) = incoming {
             let group_id_hex = hex::encode(group_id.as_slice());
-            self.mark_local_event_processed(&event.id);
+            let group_name = self.resolve_group_name(group_id);
             self.notify_conversation_changed(&group_id_hex);
+            self.spawn_send_bookkeeping(group_name, message, event.id);
         }
         Ok(())
     }
@@ -1590,6 +1712,24 @@ impl SonarClient {
         // Watermark from the previous successful sync (0 on the first poll of a
         // session → an unbounded backfill, bounded only by the `#p`/`#h` scope).
         let since_secs = self.sync_watermark_secs();
+
+        // When watermarked persistent subscriptions are active, sync() is
+        // redundant — subscribe_marmot() already opened subscriptions with
+        // `since=watermark` so the relay's EOSE burst covers the gap. The only
+        // exception is the very first session (watermark==0), where we need at
+        // least one full fetch to bootstrap the watermark.
+        let is_live = *self.live_marmot_enabled.lock().unwrap();
+        tracing::info!(
+            is_live,
+            since_secs,
+            "sync() called"
+        );
+        if is_live && since_secs > 0 {
+            tracing::info!("sync() short-circuited — live subscriptions active");
+            self.retry_outbox().await;
+            return Ok(());
+        }
+
         // Capture the start time as the next watermark BEFORE fetching, so any
         // event that lands mid-sync is re-covered by the overlap next poll.
         let started = Timestamp::now().as_secs();
@@ -1617,18 +1757,18 @@ impl SonarClient {
             .await?;
         process_report.absorb(self.process_marmot_events(wraps, "gift wrap").await);
 
-        // A welcome processed during sync can add group(s). Backfill each new
-        // group's full history once, then widen the live tail if it is enabled.
+        // A welcome processed during sync can add group(s). Backfill all new
+        // groups in ONE batched fetch, then widen the live tail if it is enabled.
         let new_group_ids: Vec<String> = self
             .current_group_ids()?
             .into_iter()
             .filter(|id| !ids_before.contains(id))
             .collect();
-        for id in &new_group_ids {
-            match self.backfill_group(id).await {
+        if !new_group_ids.is_empty() {
+            match self.backfill_groups(&new_group_ids).await {
                 Ok(report) => process_report.absorb(report),
                 Err(err) => {
-                    tracing::debug!(%err, "group backfill failed during sync");
+                    tracing::debug!(%err, "batched new-group backfill failed during sync");
                     process_report.record_retryable(Timestamp::now().as_secs());
                 }
             }
@@ -1639,12 +1779,23 @@ impl SonarClient {
         // delay local-only first paint.
         self.populate_empty_transcript_backfills_once();
         let empty_transcript_group_ids = self.take_initial_empty_transcript_backfills();
-        for id in &empty_transcript_group_ids {
-            match self.backfill_group(id).await {
+        if !empty_transcript_group_ids.is_empty() {
+            // Cap per-sync to avoid stacking timeouts when many groups need repair.
+            let (batch, overflow): (Vec<_>, Vec<_>) = empty_transcript_group_ids
+                .into_iter()
+                .enumerate()
+                .partition(|(i, _)| *i < MAX_BACKFILLS_PER_SYNC);
+            for (_, id) in &overflow {
+                self.requeue_initial_empty_transcript_backfill(id);
+            }
+            let batch_ids: Vec<String> = batch.into_iter().map(|(_, id)| id).collect();
+            match self.backfill_groups(&batch_ids).await {
                 Ok(report) => process_report.absorb(report),
                 Err(err) => {
-                    tracing::debug!(%err, "empty transcript backfill failed during sync");
-                    self.requeue_initial_empty_transcript_backfill(id);
+                    tracing::debug!(%err, "batched empty transcript backfill failed");
+                    for id in &batch_ids {
+                        self.requeue_initial_empty_transcript_backfill(id);
+                    }
                     process_report.record_retryable(Timestamp::now().as_secs());
                 }
             }
@@ -1654,9 +1805,12 @@ impl SonarClient {
         }
 
         // Fetch kind-445 for ALL known groups in one request (batched `#h`),
-        // including any group a welcome just added above.
+        // including any group a welcome just added above. Skip when the live
+        // subscription tail is active — it already delivers these events, and
+        // the watermarked fetch is redundant work that stacks a 10s timeout.
+        let is_live = *self.live_marmot_enabled.lock().unwrap();
         let group_ids: Vec<String> = self.current_group_ids()?.into_iter().collect();
-        if !group_ids.is_empty() {
+        if !group_ids.is_empty() && !is_live {
             let mut filter = Filter::new()
                 .kind(Kind::MlsGroupMessage)
                 .custom_tags(SingleLetterTag::lowercase(Alphabet::H), group_ids);
@@ -1683,17 +1837,25 @@ impl SonarClient {
         Ok(())
     }
 
-    /// Open the persistent LIVE Marmot subscriptions: welcomes (1059 → us) and
-    /// group messages (445 on our groups' `#h`). The relay pushes new events to
-    /// the notification handler → buffer → `drain_pending_marmot`. Both subs are
-    /// a since-now LIVE TAIL; pre-session history stays with `sync()` (watermark)
-    /// and a freshly-joined group's history is backfilled explicitly in
-    /// `drain_pending_marmot` (its messages predate the watermark).
+    /// Open persistent Marmot subscriptions with watermark-based `since`:
+    /// welcomes (kind-1059 → us) and group messages (kind-445 on our `#h`).
+    /// The relay delivers historical events (EOSE burst) then pushes new ones.
+    /// Events flow to the notification handler → buffer → `drain_pending_marmot`.
+    ///
+    /// When the watermark is 0 (first session), no `since` filter is applied —
+    /// the relay delivers full history via EOSE, same as the first `sync()`.
+    /// For returning users, the watermark-based `since` catches up missed events
+    /// without a blocking `fetch_events_from` call.
     pub async fn subscribe_marmot(&self) -> Result<()> {
-        let wraps = Filter::new()
+        let since_secs = self.sync_watermark_secs();
+        let mut wraps = Filter::new()
             .kind(Kind::GiftWrap)
-            .pubkey(self.identity().public_key())
-            .since(Timestamp::now());
+            .pubkey(self.identity().public_key());
+        if since_secs > 0 {
+            wraps = wraps.since(Timestamp::from_secs(
+                since_secs.saturating_sub(GIFTWRAP_LOOKBACK_SECS),
+            ));
+        }
         self.nostr
             .subscribe_with_id(SubscriptionId::new(SUB_MARMOT_WELCOMES), wraps, None)
             .await?;
@@ -1701,10 +1863,11 @@ impl SonarClient {
         self.subscribe_group_messages().await
     }
 
-    /// (Re)subscribe the kind-445 live tail (`since = now`) to the CURRENT group
-    /// set. Re-running with the same id REPLACES the filter, so calling this
-    /// after a welcome adds a group widens the live subscription. History for a
-    /// newly-added group is fetched separately by `backfill_group`.
+    /// (Re)subscribe the kind-445 tail to the CURRENT group set, using the
+    /// sync watermark as `since` (not `now`). Re-running with the same id
+    /// REPLACES the filter, so calling this after a welcome adds a group widens
+    /// the subscription. History for a newly-added group is fetched separately
+    /// by `backfill_group`.
     async fn subscribe_group_messages(&self) -> Result<()> {
         let group_ids = self.current_group_ids()?;
         let sub_id = SubscriptionId::new(SUB_MARMOT_GROUPS);
@@ -1728,12 +1891,17 @@ impl SonarClient {
             }
         }
 
+        let since_secs = self.sync_watermark_secs();
         let mut group_id_list: Vec<String> = group_ids.iter().cloned().collect();
         group_id_list.sort();
-        let filter = Filter::new()
+        let mut filter = Filter::new()
             .kind(Kind::MlsGroupMessage)
-            .custom_tags(SingleLetterTag::lowercase(Alphabet::H), group_id_list)
-            .since(Timestamp::now());
+            .custom_tags(SingleLetterTag::lowercase(Alphabet::H), group_id_list);
+        if since_secs > 0 {
+            filter = filter.since(Timestamp::from_secs(
+                since_secs.saturating_sub(SYNC_OVERLAP_SECS),
+            ));
+        }
         self.nostr.subscribe_with_id(sub_id, filter, None).await?;
         *self.marmot_group_subscriptions.lock().unwrap() = group_ids;
         Ok(())
@@ -1794,6 +1962,17 @@ impl SonarClient {
         self.subscribe_group_messages().await
     }
 
+    /// Re-subscribe with the current watermark and group set. Idempotent:
+    /// `subscribe_with_id` replaces existing filters. Hosts call this
+    /// periodically (every 25-60s) to self-heal after relay disconnects,
+    /// replacing the heavy `sync()` poll on the idle path.
+    pub async fn ensure_subscriptions(&self) -> Result<()> {
+        if !*self.live_marmot_enabled.lock().unwrap() {
+            return Ok(());
+        }
+        self.subscribe_marmot().await
+    }
+
     fn sync_watermark_secs(&self) -> u64 {
         self.sync_state.lock().unwrap().watermark_secs()
     }
@@ -1807,13 +1986,6 @@ impl SonarClient {
 
     fn mark_sync_event_processed(&self, event_id: &EventId) {
         self.sync_state.lock().unwrap().mark_processed(event_id);
-    }
-
-    fn mark_local_event_processed(&self, event_id: &EventId) {
-        self.mark_sync_event_processed(event_id);
-        if let Err(err) = self.save_sync_state() {
-            tracing::debug!(%err, "failed to persist locally created Marmot event marker");
-        }
     }
 
     fn save_sync_state(&self) -> Result<()> {
@@ -1943,10 +2115,32 @@ impl SonarClient {
             .custom_tag(SingleLetterTag::lowercase(Alphabet::H), group_id_hex);
         let events = self
             .nostr
-            .fetch_events_from(self.relays.clone(), filter, FETCH_TIMEOUT)
+            .fetch_events_from(self.relays.clone(), filter, BACKFILL_TIMEOUT)
             .await?;
         Ok(self
             .process_marmot_events(events, "backfilled group message")
+            .await)
+    }
+
+    /// Batched variant: fetches kind-445 history for multiple groups in ONE
+    /// request using a combined `#h` filter. Same as `backfill_group` but
+    /// avoids serial timeouts when multiple groups need backfill.
+    async fn backfill_groups(&self, group_id_hexes: &[String]) -> Result<MarmotProcessReport> {
+        if group_id_hexes.is_empty() {
+            return Ok(MarmotProcessReport::default());
+        }
+        let filter = Filter::new()
+            .kind(Kind::MlsGroupMessage)
+            .custom_tags(
+                SingleLetterTag::lowercase(Alphabet::H),
+                group_id_hexes.to_vec(),
+            );
+        let events = self
+            .nostr
+            .fetch_events_from(self.relays.clone(), filter, BACKFILL_TIMEOUT)
+            .await?;
+        Ok(self
+            .process_marmot_events(events, "batched backfill group message")
             .await)
     }
 
@@ -1991,19 +2185,19 @@ impl SonarClient {
             .filter(|id| !ids_before.contains(id))
             .collect();
         if !new_ids.is_empty() {
-            for id in &new_ids {
-                match self.backfill_group(id).await {
-                    Ok(report) => process_report.absorb(report),
-                    Err(err) => {
-                        tracing::debug!(%err, "group backfill failed (sync will retry)");
-                        process_report.record_retryable(Timestamp::now().as_secs());
-                    }
+            match self.backfill_groups(&new_ids).await {
+                Ok(report) => process_report.absorb(report),
+                Err(err) => {
+                    tracing::debug!(%err, "batched group backfill failed (sync will retry)");
+                    process_report.record_retryable(Timestamp::now().as_secs());
                 }
             }
             let _ = self.resubscribe_marmot_groups_if_live().await;
         }
         if let Some(secs) = process_report.oldest_retryable_secs {
             self.rewind_sync_watermark_for_retry(secs)?;
+        } else if process_report.processed > 0 {
+            self.advance_sync_watermark(Timestamp::now().as_secs())?;
         } else {
             self.save_sync_state()?;
         }

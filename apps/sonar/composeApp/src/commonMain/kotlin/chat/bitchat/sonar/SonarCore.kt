@@ -490,6 +490,10 @@ expect object SonarCore {
     /** Poll the relays once (welcomes + group messages). */
     suspend fun sync()
 
+    /** Re-subscribe with current watermark + group set to self-heal after
+     *  relay disconnects. Lighter than sync() — no blocking fetch. */
+    suspend fun ensureSubscriptions()
+
     /** Publish our kind-0 profile (NIP-01) so peers see our nickname, not npub. */
     suspend fun publishProfile(name: String, about: String? = null, picture: String? = null)
 

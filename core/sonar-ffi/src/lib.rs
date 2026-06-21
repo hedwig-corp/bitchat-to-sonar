@@ -677,6 +677,15 @@ impl SonarNode {
         Ok(())
     }
 
+    /// Re-subscribe with the current watermark and group set to self-heal
+    /// after relay disconnects. Hosts call this on the idle timeout path
+    /// instead of `sync_once()`.
+    pub fn ensure_subscriptions(&self) -> FfiResult<()> {
+        self.runtime
+            .block_on(self.client.ensure_subscriptions())?;
+        Ok(())
+    }
+
     /// Block until a live Marmot event (welcome or group message) has been pushed
     /// by the relay subscriptions, or `timeout_secs` elapses. Returns true if
     /// there is something to drain. Touches NO MLS state, so the host may call it

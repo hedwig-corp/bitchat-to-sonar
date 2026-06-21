@@ -987,6 +987,13 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      */
     func drainPendingMarmot() throws  -> Bool
     
+    /**
+     * Re-subscribe with the current watermark and group set to self-heal
+     * after relay disconnects. Hosts call this on the idle timeout path
+     * instead of `sync_once()`.
+     */
+    func ensureSubscriptions() throws 
+    
     func fetchInstalledPacks() throws  -> [String]
     
     /**
@@ -1486,6 +1493,18 @@ open func drainPendingMarmot()throws  -> Bool  {
             self.uniffiCloneHandle(),$0
     )
 })
+}
+    
+    /**
+     * Re-subscribe with the current watermark and group set to self-heal
+     * after relay disconnects. Hosts call this on the idle timeout path
+     * instead of `sync_once()`.
+     */
+open func ensureSubscriptions()throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_ensure_subscriptions(
+            self.uniffiCloneHandle(),$0
+    )
+}
 }
     
 open func fetchInstalledPacks()throws  -> [String]  {
@@ -5231,6 +5250,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_drain_pending_marmot() != 32220) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_ensure_subscriptions() != 56185) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_fetch_installed_packs() != 62453) {

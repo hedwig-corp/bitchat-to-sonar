@@ -27,6 +27,7 @@ actual object SonarCore {
         "wss://nos.lol",
         "wss://relay.primal.net",
         "wss://relay.kaleidoswap.com",
+        "wss://nostr.relay.hedwig.sh",
     )
 
     private val lock = Mutex()
@@ -327,6 +328,11 @@ actual object SonarCore {
 
     actual suspend fun sync() = withContext(Dispatchers.IO) {
         runCatching { node?.syncOnce() }
+        Unit
+    }
+
+    actual suspend fun ensureSubscriptions() = withContext(Dispatchers.IO) {
+        runCatching { node?.ensureSubscriptions() }
         Unit
     }
 

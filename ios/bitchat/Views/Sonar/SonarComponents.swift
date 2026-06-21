@@ -667,6 +667,8 @@ struct SNMsgList: View {
     var loadSticker: ((MarmotService.MarmotStickerRef) async -> Data?)? = nil
     var onTapPack: ((String) -> Void)? = nil
 
+    @State private var isNearBottom = true
+
     var body: some View {
         GeometryReader { geo in
             ScrollViewReader { proxy in
@@ -724,11 +726,14 @@ struct SNMsgList: View {
                             }
                         }
                         Color.clear.frame(height: 1).id("sn-bottom")
+                            .onAppear { isNearBottom = true }
+                            .onDisappear { isNearBottom = false }
                     }
                     .padding(EdgeInsets(top: 6, leading: 14, bottom: 10, trailing: 14))
                 }
                 .onAppear { proxy.scrollTo("sn-bottom", anchor: .bottom) }
                 .onChange(of: msgs.count) { _ in
+                    guard isNearBottom else { return }
                     withAnimation { proxy.scrollTo("sn-bottom", anchor: .bottom) }
                 }
             }
