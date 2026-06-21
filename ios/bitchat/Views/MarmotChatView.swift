@@ -189,25 +189,18 @@ final class MarmotChatModel: ObservableObject {
     /// payment state.
     private var descriptorBolt12Offer: String?
     private var conversationChangeSub: AnyCancellable?
+    /// Serializes outgoing sends so rapid-fire messages arrive in order.
+    private var sendChain: Task<Void, Never>?
     private static let optimisticIDPrefix = "optimistic-"
     private static let failedOptimisticIDPrefix = "failed-"
 
     static func stateText(for message: MarmotService.MarmotMessage) -> String? {
         guard message.isMine else { return nil }
-        switch message.deliveryState {
-        case "pending":
-            return message.media.isEmpty ? "Sending" : "Uploading"
-        case "failed":
-            return "Couldn't send"
-        case "sent":
-            return "Sent"
-        default:
-            break
-        }
         if message.id.hasPrefix(failedOptimisticIDPrefix) { return "Couldn't send" }
         if message.id.hasPrefix(optimisticIDPrefix) {
             return message.media.isEmpty ? "Sending" : "Uploading"
         }
+        if message.deliveryState == "failed" { return "Couldn't send" }
         return "Sent"
     }
 
@@ -324,14 +317,14 @@ final class MarmotChatModel: ObservableObject {
     /// reconnect window (e.g. right after "erase all chats" or a cold launch)
     /// instead of immediately surfacing "not connected yet".
     func ensureConnected(timeoutSeconds: Double = 10) async -> Bool {
-        if await service.isConnected() { return true }
+        if service.isConnected() { return true }
         if !busy { connectIfNeeded() }
         let start = Date()
         while Date().timeIntervalSince(start) < timeoutSeconds {
-            if await service.isConnected() { return true }
+            if service.isConnected() { return true }
             try? await Task.sleep(nanoseconds: 250_000_000)
         }
-        return await service.isConnected()
+        return service.isConnected()
     }
 
     private func scheduleRelayConnect(delaySeconds: Double = 2) {
@@ -390,21 +383,21 @@ final class MarmotChatModel: ObservableObject {
     }
 
     func ensureRelayConnected(timeoutSeconds: Double = 10) async -> Bool {
-        if await service.isRelayConnected() { return true }
+        if service.isRelayConnected() { return true }
         connectRelaysIfNeeded()
         let start = Date()
         while Date().timeIntervalSince(start) < timeoutSeconds {
-            if await service.isRelayConnected() { return true }
+            if service.isRelayConnected() { return true }
             try? await Task.sleep(nanoseconds: 250_000_000)
         }
-        return await service.isRelayConnected()
+        return service.isRelayConnected()
     }
 
     /// Best-effort local hydration for screen open paths. This never waits for
     /// relay connect/sync; if the encrypted DB is not open yet, connectIfNeeded()
     /// continues opening it in the background.
     func loadLocalIfConnected(groupId: String? = nil) async {
-        guard await service.isConnected() else {
+        guard service.isConnected() else {
             connectIfNeeded()
             return
         }
@@ -493,7 +486,7 @@ final class MarmotChatModel: ObservableObject {
                 to: defaults
             )
             if let group = groups.first(where: { $0.id == groupId }) {
-                let relayReady = await service.isRelayConnected()
+                let relayReady = service.isRelayConnected()
                 for member in group.memberNpubs where member != npub {
                     ensureProfile(member)
                     if relayReady {
@@ -540,7 +533,7 @@ final class MarmotChatModel: ObservableObject {
                 to: defaults
             )
             if resolveMembers {
-                let relayReady = await service.isRelayConnected()
+                let relayReady = service.isRelayConnected()
                 for group in groups {
                     for member in group.memberNpubs where member != npub {
                         ensureProfile(member)
@@ -569,7 +562,7 @@ final class MarmotChatModel: ObservableObject {
     /// Local chats are loaded even when the relay sync fails, so a relay outage
     /// never hides already-persisted conversations.
     func refresh() async {
-        if await service.isRelayConnected() {
+        if service.isRelayConnected() {
             do {
                 try await service.syncOnce()
                 self.errorText = nil
@@ -823,20 +816,26 @@ final class MarmotChatModel: ObservableObject {
         )
         pendingOptimistic[groupId, default: []].append(echo)
         messagesByGroup[groupId, default: []].append(echo)
-        Task {
+        let prev = sendChain
+        sendChain = Task { [weak self] in
+            _ = await prev?.result
+            guard let self else { return }
             do {
-                guard await ensureConnected(timeoutSeconds: 2) else {
+                guard await self.ensureConnected(timeoutSeconds: 2) else {
                     throw MarmotService.ServiceError.notConnected
                 }
-                try await service.sendText(groupId: groupId, text: trimmed)
-                await loadLocalPage(groupId: groupId)
-                Task { [weak self] in
-                    try? await self?.service.ensureSubscriptions()
-                }
+                try await self.service.sendText(groupId: groupId, text: trimmed)
             } catch {
-                pendingOptimistic[groupId]?.removeAll { $0.id == echo.id }
-                messagesByGroup[groupId, default: []].removeAll { $0.id == echo.id }
+                self.pendingOptimistic[groupId]?.removeAll { $0.id == echo.id }
+                self.messagesByGroup[groupId, default: []].removeAll { $0.id == echo.id }
                 self.errorText = Self.describe(error)
+                return
+            }
+            // UI refresh + subscriptions run outside the send chain so the
+            // next queued message doesn't wait for them.
+            Task { [weak self] in
+                await self?.loadLocalPage(groupId: groupId)
+                try? await self?.service.ensureSubscriptions()
             }
         }
     }
@@ -1480,6 +1479,7 @@ struct MarmotConversationView: View {
     let group: MarmotService.MarmotGroup
     @ObservedObject var model: MarmotChatModel
     @State private var draft = ""
+    @State private var isNearBottom = true
 
     private var messages: [MarmotService.MarmotMessage] {
         model.messagesByGroup[group.id] ?? []
@@ -1494,14 +1494,18 @@ struct MarmotConversationView: View {
                             bubble(for: message)
                                 .id(message.id)
                         }
+                        Color.clear
+                            .frame(height: 1)
+                            .id("bottom-anchor")
+                            .onAppear { isNearBottom = true }
+                            .onDisappear { isNearBottom = false }
                     }
                     .padding(.horizontal, 14)
                     .padding(.vertical, 8)
                 }
                 .onChange(of: messages.count) { _ in
-                    if let last = messages.last {
-                        withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
-                    }
+                    guard isNearBottom, let last = messages.last else { return }
+                    withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
                 }
             }
             composer

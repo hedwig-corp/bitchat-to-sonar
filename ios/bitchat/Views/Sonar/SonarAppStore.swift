@@ -3967,29 +3967,24 @@ final class SonarAppStore: ObservableObject {
 
         switch ctrl {
         case let .offer(callId, video, nodeAddrB64, unixSecs):
+            let stale = Date().timeIntervalSince1970 - Double(unixSecs) > 60
+            if stale {
+                return true
+            }
             if activeCall != nil { // busy: auto-decline
                 _ = sendCallControl(conversationId, callEncodeAnswer(callId: callId, answer: .busy, nodeAddrB64: ""), via: signalingVia)
                 return true
             }
-            let stale = Date().timeIntervalSince1970 - Double(unixSecs) > 60
             let name = callDisplayName(conversationId)
             let alreadyStarted = callStarted
             Task { [weak self] in
                 guard let self else { return }
                 do {
-                    // The endpoint is already bound at boot — do NOT call callStart()
-                    // again (a second bind blocks, so the incoming OFFER would never
-                    // ring). Only bind if boot's ensureCallStarted actually failed.
                     if !alreadyStarted {
                         try await self.marmot.callStart()
                         await MainActor.run { self.callStarted = true; self.startCallLoop() }
                     }
                     try await self.marmot.callIncomingOffer(callId: callId, addrB64: nodeAddrB64, video: video)
-                    if stale {
-                        try? await self.marmot.callHangup(callId: callId)
-                        await MainActor.run { self.recordCall(convId: conversationId, video: video, mine: false, seconds: 0) }
-                        return
-                    }
                     await MainActor.run {
                         self.activeCall = SNActiveCall(callId: callId, convId: conversationId, signalingVia: signalingVia, peerName: name, video: video, incoming: true, phase: .ringing, speakerOn: video)
                         self.push(.call(conversationId, video: video))

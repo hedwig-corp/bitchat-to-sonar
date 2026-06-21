@@ -354,13 +354,19 @@ final class MarmotService: @unchecked Sendable {
 
     /// True once `connect` has opened the node (relays + encrypted DB). False
     /// before the first connect and during a reconnect (e.g. after erase).
-    func isConnected() async -> Bool {
-        await runNonThrowing { $0.node != nil }
+    func isConnected() -> Bool {
+        nodeLock.lock()
+        let connected = node != nil
+        nodeLock.unlock()
+        return connected
     }
 
     /// True when the current node was opened with the real relay set.
-    func isRelayConnected() async -> Bool {
-        await runNonThrowing { $0.node != nil && $0.relayConnected }
+    func isRelayConnected() -> Bool {
+        nodeLock.lock()
+        let connected = node != nil && relayConnected
+        nodeLock.unlock()
+        return connected
     }
 
     /// `nsec1...` backup export of the connected identity (nil before `connect`).

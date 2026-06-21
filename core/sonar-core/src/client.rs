@@ -1350,14 +1350,49 @@ impl SonarClient {
                 "created text message did not produce a local transcript row".into(),
             ));
         };
-        let group_name = self.resolve_group_name(group_id);
-        self.upsert_index_for_message(&message, group_name.as_deref());
         let group_id_hex = hex::encode(group_id.as_slice());
-        self.mark_local_event_processed(&event.id);
+        let group_name = self.resolve_group_name(group_id);
         self.mark_outbox_pending(group_id, &message, &event)?;
-        self.spawn_outbox_publish(message.id.to_hex(), event);
+        self.spawn_outbox_publish(message.id.to_hex(), event.clone());
         self.notify_conversation_changed(&group_id_hex);
+        // Deferred bookkeeping: index + sync-state disk writes don't block
+        // the caller so the next send can start immediately.
+        self.spawn_send_bookkeeping(group_name, message, event.id);
         Ok(())
+    }
+
+    fn spawn_send_bookkeeping(
+        &self,
+        group_name: Option<String>,
+        message: ChatMessage,
+        event_id: EventId,
+    ) {
+        let conversation_index = self.conversation_index.clone();
+        let sync_state = self.sync_state.clone();
+        let event_id_hex = event_id.to_hex();
+        std::thread::spawn(move || {
+            if let Some(ref idx) = conversation_index {
+                let group_id_hex = hex::encode(message.group_id.as_slice());
+                let name = group_name.as_deref().unwrap_or("");
+                if let Err(e) = idx.lock().unwrap().upsert_summary(
+                    &group_id_hex,
+                    name,
+                    &message.content,
+                    &message.sender.to_string(),
+                    message.created_at.as_secs(),
+                    message.mine,
+                ) {
+                    tracing::warn!(%e, "deferred index upsert failed");
+                }
+            }
+            {
+                let mut state = sync_state.lock().unwrap();
+                state.mark_processed_id(event_id_hex);
+                if let Err(e) = state.save_if_dirty() {
+                    tracing::debug!(%e, "deferred sync-state persist failed");
+                }
+            }
+        });
     }
 
     /// Send a sticker message to a group. Follows the same Signal-style
@@ -1374,13 +1409,12 @@ impl SonarClient {
                 "created sticker message did not produce a local transcript row".into(),
             ));
         };
-        let group_name = self.resolve_group_name(group_id);
-        self.upsert_index_for_message(&message, group_name.as_deref());
         let group_id_hex = hex::encode(group_id.as_slice());
-        self.mark_local_event_processed(&event.id);
+        let group_name = self.resolve_group_name(group_id);
         self.mark_outbox_pending(group_id, &message, &event)?;
-        self.spawn_outbox_publish(message.id.to_hex(), event);
+        self.spawn_outbox_publish(message.id.to_hex(), event.clone());
         self.notify_conversation_changed(&group_id_hex);
+        self.spawn_send_bookkeeping(group_name, message, event.id);
         Ok(())
     }
 
@@ -1592,12 +1626,11 @@ impl SonarClient {
             .create_media_event(group_id, &upload, &url, caption)?;
         self.nostr.send_event(&event).await?;
         let incoming = self.engine.process_incoming(&event).await?;
-        if let Incoming::Message(ref message) = incoming {
-            let group_name = self.resolve_group_name(group_id);
-            self.upsert_index_for_message(message, group_name.as_deref());
+        if let Incoming::Message(message) = incoming {
             let group_id_hex = hex::encode(group_id.as_slice());
-            self.mark_local_event_processed(&event.id);
+            let group_name = self.resolve_group_name(group_id);
             self.notify_conversation_changed(&group_id_hex);
+            self.spawn_send_bookkeeping(group_name, message, event.id);
         }
         Ok(())
     }
@@ -1951,13 +1984,6 @@ impl SonarClient {
 
     fn mark_sync_event_processed(&self, event_id: &EventId) {
         self.sync_state.lock().unwrap().mark_processed(event_id);
-    }
-
-    fn mark_local_event_processed(&self, event_id: &EventId) {
-        self.mark_sync_event_processed(event_id);
-        if let Err(err) = self.save_sync_state() {
-            tracing::debug!(%err, "failed to persist locally created Marmot event marker");
-        }
     }
 
     fn save_sync_state(&self) -> Result<()> {
