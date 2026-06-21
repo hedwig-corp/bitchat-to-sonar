@@ -162,9 +162,12 @@ fun CallScreen(state: SonarAppState, screen: Screen.Call) {
                     CallBtn(SNIconName.PhoneDown, "Decline", active = false, end = true) { state.declineCall() }
                     CallBtn(SNIconName.Phone, "Accept", active = false, accept = true) { state.acceptCall() }
                 } else {
-                    CallBtn(SNIconName.MicOff, if (muted) "Muted" else "Mute", active = muted) { state.toggleCallMute() }
-                    if (video) CallBtn(SNIconName.Videocam, if (camOn) "Cam on" else "Cam off", active = camOn) { state.toggleCallCam() }
-                    CallBtn(SNIconName.Speaker, "Speaker", active = speakerOn) { state.toggleCallSpeaker() }
+                    CallBtn(if (muted) SNIconName.MicOff else SNIconName.Mic, if (muted) "Unmute" else "Mute", active = muted) { state.toggleCallMute() }
+                    if (video) {
+                        CallBtn(if (camOn) SNIconName.Videocam else SNIconName.VideoOff, if (camOn) "Stop video" else "Start video", active = !camOn) { state.toggleCallCam() }
+                    } else {
+                        CallBtn(SNIconName.Speaker, "Speaker", active = speakerOn) { state.toggleCallSpeaker() }
+                    }
                     CallBtn(SNIconName.PhoneDown, "End", active = false, end = true) { state.hangupCall() }
                 }
             }

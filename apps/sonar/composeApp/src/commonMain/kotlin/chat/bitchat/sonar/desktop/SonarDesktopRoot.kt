@@ -45,6 +45,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import chat.bitchat.sonar.CallScreen
 import chat.bitchat.sonar.Screen
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.SonarChat
@@ -70,7 +71,7 @@ import chat.bitchat.sonar.ui.sonar
 @Composable
 fun DesktopApp() {
     val scope = rememberCoroutineScope()
-    val state = remember { SonarAppState(scope) }
+    val state = remember { SonarAppState(scope).also { it.callOverlay = true } }
     LaunchedEffect(state) { SonarLifecycle.onForeground = { state.setForeground(it) } }
     LaunchedEffect(Unit) { state.boot() }
     // Start the BLE radio (desktop: native CoreBluetooth/BlueZ scan via the
@@ -108,34 +109,40 @@ fun SonarDesktopRoot(state: SonarAppState) {
     var detailRailOpen by remember { mutableStateOf(false) }
     val hasDetail = state.screen is Screen.Chat || state.screen is Screen.Channel
     Surface(Modifier.fillMaxSize(), color = s.bg) {
-        Row(Modifier.fillMaxSize()) {
-            DesktopSidebar(state)
-            Box(Modifier.fillMaxHeight().width(1.dp).background(s.hairline))
-            Box(Modifier.weight(1f).fillMaxHeight()) {
-                if (state.isHome) {
-                    DesktopWelcome()
-                } else {
-                    Box(Modifier.fillMaxSize()) {
-                        SonarScreenHost(state)
-                        if (hasDetail) {
-                            Box(Modifier.align(Alignment.TopEnd).padding(top = 10.dp, end = 12.dp)) {
-                                SNIconButton(SNIconName.Info, size = 16.dp, tint = s.text2) {
-                                    detailRailOpen = !detailRailOpen
+        Box(Modifier.fillMaxSize()) {
+            Row(Modifier.fillMaxSize()) {
+                DesktopSidebar(state)
+                Box(Modifier.fillMaxHeight().width(1.dp).background(s.hairline))
+                Box(Modifier.weight(1f).fillMaxHeight()) {
+                    if (state.isHome) {
+                        DesktopWelcome()
+                    } else {
+                        Box(Modifier.fillMaxSize()) {
+                            SonarScreenHost(state)
+                            if (hasDetail) {
+                                Box(Modifier.align(Alignment.TopEnd).padding(top = 10.dp, end = 12.dp)) {
+                                    SNIconButton(SNIconName.Info, size = 16.dp, tint = s.text2) {
+                                        detailRailOpen = !detailRailOpen
+                                    }
                                 }
                             }
                         }
                     }
                 }
-            }
-            AnimatedVisibility(
-                visible = hasDetail && detailRailOpen,
-                enter = slideInHorizontally(initialOffsetX = { it }) + fadeIn(),
-                exit = slideOutHorizontally(targetOffsetX = { it }) + fadeOut(),
-            ) {
-                Row {
-                    Box(Modifier.fillMaxHeight().width(1.dp).background(s.hairline))
-                    DesktopDetailRail(state)
+                AnimatedVisibility(
+                    visible = hasDetail && detailRailOpen,
+                    enter = slideInHorizontally(initialOffsetX = { it }) + fadeIn(),
+                    exit = slideOutHorizontally(targetOffsetX = { it }) + fadeOut(),
+                ) {
+                    Row {
+                        Box(Modifier.fillMaxHeight().width(1.dp).background(s.hairline))
+                        DesktopDetailRail(state)
+                    }
                 }
+            }
+            val call = state.activeCall
+            if (call != null) {
+                CallScreen(state, Screen.Call(call.chatId, call.peerName, call.video))
             }
         }
     }

@@ -235,7 +235,7 @@ struct SonarCallScreen: View {
                 SNCallButton(icon: .phoneDown, label: "Decline", end: true) { store.declineCall() }
                 SNCallButton(icon: .phone, label: "Accept", accept: true) { store.acceptCall() }
             } else {
-                SNCallButton(icon: .micOff, label: muted ? "Muted" : "Mute", active: muted) { store.toggleCallMute() }
+                SNCallButton(icon: muted ? .micOff : .mic, label: muted ? "Unmute" : "Mute", active: muted) { store.toggleCallMute() }
                 if video {
                     SNCallButton(icon: camOn ? .videocam : .videoOff, label: camOn ? "Stop video" : "Start video", active: !camOn) {
                         camOn.toggle()
