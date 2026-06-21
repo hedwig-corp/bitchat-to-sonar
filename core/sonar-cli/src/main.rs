@@ -20,6 +20,10 @@ use sonar_stickers::{
     build_pack_tags, PackAddress, Sticker, StickerError, StickerPack, STICKER_PACK_KIND,
 };
 
+/// Direct P2P call debugging harness (iroh + cpal/opus); needs `calls-audio`.
+#[cfg(feature = "calls-audio")]
+mod call;
+
 const CONFIG_VERSION: u32 = 1;
 const CONFIG_FILE: &str = "config.json";
 const SEEN_FILE: &str = "seen.json";
@@ -84,6 +88,30 @@ enum Command {
     Groups,
     /// Print messages for all groups or one group.
     Messages(MessagesArgs),
+    /// Debug the P2P call transport directly between two terminals (iroh).
+    #[cfg(feature = "calls-audio")]
+    Call(CallArgs),
+}
+
+#[cfg(feature = "calls-audio")]
+#[derive(Args, Debug)]
+struct CallArgs {
+    /// Offerer's dialable address (from the other terminal's stdout). Omit to be
+    /// the offerer; provide it to be the answerer.
+    #[arg(long)]
+    offer: Option<String>,
+    /// Place a video call (the audio path is identical; this sets the kind).
+    #[arg(long)]
+    video: bool,
+    /// Shared call id; override only when running multiple pairs at once.
+    #[arg(long, default_value = "sonar-cli-call")]
+    call_id: String,
+    /// 32-byte iroh secret as 64 hex chars (stable endpoint id). Omit for random.
+    #[arg(long)]
+    seed: Option<String>,
+    /// Seconds between "still trying" status lines while connecting.
+    #[arg(long, default_value_t = 30)]
+    connect_timeout_secs: u64,
 }
 
 #[derive(Args, Debug)]
@@ -214,10 +242,24 @@ enum Output {
 
 #[tokio::main]
 async fn main() {
+    init_tracing();
     if let Err(err) = run(Cli::parse()).await {
         eprintln!("sonar-cli: {err}");
         std::process::exit(1);
     }
+}
+
+/// Route `tracing` to stderr (stdout carries the JSON output). `RUST_LOG`
+/// overrides the default verbosity, e.g. `RUST_LOG=info,iroh=debug`.
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,sonar_cli=debug,sonar_core=info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .try_init();
 }
 
 async fn run(cli: Cli) -> Result<()> {
@@ -284,6 +326,17 @@ async fn run(cli: Cli) -> Result<()> {
             client.sync().await?;
             print_messages(&client, args.group.as_deref())?;
             Ok(())
+        }
+        #[cfg(feature = "calls-audio")]
+        Command::Call(args) => {
+            call::run_call(call::CallOpts {
+                offer: args.offer,
+                video: args.video,
+                call_id: args.call_id,
+                seed: args.seed,
+                connect_timeout_secs: args.connect_timeout_secs,
+            })
+            .await
         }
     }
 }

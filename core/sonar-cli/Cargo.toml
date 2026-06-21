@@ -6,6 +6,12 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+# Real-time P2P call debugging via the `call` subcommand: pulls sonar-core's
+# iroh + cpal/opus engine. Off by default so the lean agent build needs no audio
+# system libs. Build with: `cargo build -p sonar-cli --features calls-audio`.
+calls-audio = ["sonar-core/calls-audio"]
+
 [dependencies]
 sonar-core = { path = "../sonar-core" }
 sonar-stickers = { path = "../sonar-stickers", features = ["signal-import"] }
@@ -19,6 +25,10 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+# Tracing to stderr (logs never touch stdout, which carries JSON output). Lets
+# `RUST_LOG=...` surface sonar-core / iroh diagnostics from any command.
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile.workspace = true

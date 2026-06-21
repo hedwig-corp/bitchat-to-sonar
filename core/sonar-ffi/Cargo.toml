@@ -34,6 +34,12 @@ nostr.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 hex.workspace = true
+# Logging bridge (init_logging): the call transport/media live in sonar-core and
+# log via `tracing`, but no shipped build ever installed a subscriber, so iroh /
+# call diagnostics were silently dropped. `env-filter` lets hosts raise verbosity
+# via RUST_LOG without a recompile (all its deps are already in the lock).
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 # Android-only: the JNI shim in src/android_jni.rs publishes the JavaVM +
 # Application Context to `ndk_context` so the crates that reach Android system

@@ -18,6 +18,10 @@ import java.awt.event.WindowFocusListener
 fun main() {
     // Make UniFFI's JNA loader find the bundled libsonar_ffi before any FFI call.
     SonarNativeLoader.ensureLoaded()
+    // Bridge the Rust core's `tracing` logs (iroh/call/media) to stderr so call
+    // diagnostics are visible. No-op after the first call. (Android wires this
+    // through NdkContext.nativeInit; iOS through BitchatApp.init.)
+    uniffi.sonar_ffi.initLogging()
 
     application {
         val windowState = rememberWindowState(width = 1240.dp, height = 820.dp)

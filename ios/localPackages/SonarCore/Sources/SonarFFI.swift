@@ -5017,6 +5017,35 @@ public func callParseControl(content: String) -> CallControlInfo?  {
 })
 }
 /**
+ * Initialize process-wide logging for the Rust core, bridging `tracing` to the
+ * platform's native log sink so the otherwise-invisible call/iroh/media
+ * diagnostics become observable:
+ *
+ * * iOS / macOS / desktop: formatted lines to **stderr** — captured by Xcode,
+ * `xcrun devicectl device process launch --console`, and Console.app.
+ * * Android: each event to **logcat** (tag `SonarCore`) via liblog.
+ *
+ * WHY this exists: the P2P call transport + media pipeline live in `sonar-core`
+ * and log through `tracing` at every failure point (iroh connect/relay,
+ * `mic capture unavailable`, `inbound media setup failed`,
+ * `dropping inbound call from unpinned peer`, ...). But no shipped build ever
+ * installed a `tracing` subscriber (`tracing-subscriber` was a `sonar-core`
+ * dev-dependency only), so all of it was silently discarded — making "the call
+ * rings but never connects" impossible to diagnose from logs.
+ *
+ * Default verbosity is `info` with the Sonar crates at `debug`; override with
+ * the `RUST_LOG` env var (e.g. `RUST_LOG=iroh=debug,sonar_core=trace`).
+ *
+ * Idempotent — only the first call installs the subscriber, so every app entry
+ * point can call it. Hosts should call it once at startup, before the first
+ * other FFI call, so early `bind`/`connect` logs are captured.
+ */
+public func initLogging()  {try! rustCall() {
+    uniffi_sonar_ffi_fn_func_init_logging($0
+    )
+}
+}
+/**
  * Build a signed identity announce as wire bytes (padded 0x01 packet).
  */
 public func meshBuildAnnounce(seedHex: String, senderIdHex: String, nickname: String, noisePublicKeyHex: String, ttl: UInt8, timestampMs: UInt64)throws  -> Data  {
@@ -5261,6 +5290,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_func_call_parse_control() != 41480) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_init_logging() != 55538) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_func_mesh_build_announce() != 52908) {

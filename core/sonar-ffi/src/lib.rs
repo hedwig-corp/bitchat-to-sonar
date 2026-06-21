@@ -24,6 +24,132 @@ uniffi::setup_scaffolding!();
 #[cfg(target_os = "android")]
 mod android_jni;
 
+/// Initialize process-wide logging for the Rust core, bridging `tracing` to the
+/// platform's native log sink so the otherwise-invisible call/iroh/media
+/// diagnostics become observable:
+///
+/// * iOS / macOS / desktop: formatted lines to **stderr** — captured by Xcode,
+///   `xcrun devicectl device process launch --console`, and Console.app.
+/// * Android: each event to **logcat** (tag `SonarCore`) via liblog.
+///
+/// WHY this exists: the P2P call transport + media pipeline live in `sonar-core`
+/// and log through `tracing` at every failure point (iroh connect/relay,
+/// `mic capture unavailable`, `inbound media setup failed`,
+/// `dropping inbound call from unpinned peer`, ...). But no shipped build ever
+/// installed a `tracing` subscriber (`tracing-subscriber` was a `sonar-core`
+/// dev-dependency only), so all of it was silently discarded — making "the call
+/// rings but never connects" impossible to diagnose from logs.
+///
+/// Default verbosity is `info` with the Sonar crates at `debug`; override with
+/// the `RUST_LOG` env var (e.g. `RUST_LOG=iroh=debug,sonar_core=trace`).
+///
+/// Idempotent — only the first call installs the subscriber, so every app entry
+/// point can call it. Hosts should call it once at startup, before the first
+/// other FFI call, so early `bind`/`connect` logs are captured.
+#[uniffi::export]
+pub fn init_logging() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        use tracing_subscriber::prelude::*;
+        use tracing_subscriber::{fmt, EnvFilter};
+
+        // RUST_LOG wins; otherwise a default that surfaces the call path without
+        // drowning in iroh's per-packet trace spam.
+        let filter = EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("info,sonar_core=debug,sonar_ffi=debug"));
+
+        #[cfg(target_os = "android")]
+        let writer_layer = fmt::layer()
+            .with_ansi(false)
+            .with_target(true)
+            .with_writer(android_log::MakeLogcatWriter);
+
+        #[cfg(not(target_os = "android"))]
+        let writer_layer = fmt::layer()
+            .with_ansi(false)
+            .with_target(true)
+            .with_writer(std::io::stderr);
+
+        // `try_init` (not `init`): if a host or another in-process crate already
+        // installed a global subscriber, don't panic — just skip.
+        let _ = tracing_subscriber::registry()
+            .with(filter)
+            .with(writer_layer)
+            .try_init();
+
+        tracing::info!("sonar-ffi logging initialized");
+    });
+}
+
+/// liblog (logcat) sink for the `tracing` fmt layer on Android. Dependency-free:
+/// `__android_log_write` is in liblog, always linked into the `.so`.
+#[cfg(target_os = "android")]
+mod android_log {
+    use std::ffi::CString;
+    use std::io;
+    use std::os::raw::{c_char, c_int};
+
+    /// `ANDROID_LOG_DEBUG` from `<android/log.h>`.
+    const ANDROID_LOG_DEBUG: c_int = 3;
+    const TAG: &[u8] = b"SonarCore\0";
+
+    extern "C" {
+        fn __android_log_write(prio: c_int, tag: *const c_char, text: *const c_char) -> c_int;
+    }
+
+    /// One formatted event, flushed to logcat on drop. The fmt layer builds a
+    /// fresh writer per event, writes the whole line into it, then drops it.
+    pub struct LogcatWriter {
+        buf: Vec<u8>,
+    }
+
+    impl io::Write for LogcatWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.buf.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Drop for LogcatWriter {
+        fn drop(&mut self) {
+            // The fmt layer appends a trailing newline; logcat adds its own.
+            while matches!(self.buf.last(), Some(b'\n') | Some(b'\r')) {
+                self.buf.pop();
+            }
+            if self.buf.is_empty() {
+                return;
+            }
+            // CString rejects interior NULs — replace them so the line survives.
+            for b in &mut self.buf {
+                if *b == 0 {
+                    *b = b' ';
+                }
+            }
+            if let Ok(msg) = CString::new(std::mem::take(&mut self.buf)) {
+                // SAFETY: TAG is NUL-terminated and `msg` is a valid C string;
+                // `__android_log_write` copies both. liblog is linked on Android.
+                unsafe {
+                    __android_log_write(ANDROID_LOG_DEBUG, TAG.as_ptr() as *const c_char, msg.as_ptr());
+                }
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Default)]
+    pub struct MakeLogcatWriter;
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for MakeLogcatWriter {
+        type Writer = LogcatWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            LogcatWriter { buf: Vec::new() }
+        }
+    }
+}
+
 /// Flat error: only the rendered message crosses the FFI boundary
 /// (`SonarFfiError.InvalidInput(message:)` / `.Core(message:)` in Swift).
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -1949,6 +2075,16 @@ mod tests {
         let hex_id = hex::encode(gid.as_slice());
         assert_eq!(parse_group_id(&hex_id).unwrap(), gid);
         assert!(parse_group_id("zz").is_err());
+    }
+
+    #[test]
+    fn init_logging_is_idempotent() {
+        // Hosts call this from every app entry point and on every relaunch path;
+        // the `Once` + `try_init` must make repeated calls a no-op, never a panic
+        // (a second `tracing` global-subscriber install would otherwise abort).
+        init_logging();
+        init_logging();
+        init_logging();
     }
 
     #[test]

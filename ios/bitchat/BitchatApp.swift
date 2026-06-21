@@ -10,6 +10,7 @@ import Tor
 import SwiftUI
 import os
 import UserNotifications
+import SonarCore
 
 @main
 struct BitchatApp: App {
@@ -32,6 +33,10 @@ struct BitchatApp: App {
     #endif
 
     init() {
+        // Bridge the Rust core's `tracing` logs (iroh/call/media) to stderr so
+        // call diagnostics are visible in Xcode / `devicectl --console` / Console.
+        // No-op after the first call. Must run before any SonarCore FFI call.
+        initLogging()
         UNUserNotificationCenter.current().delegate = NotificationDelegate.shared
         // Warm up georelay directory and refresh if stale (once/day)
         GeoRelayDirectory.shared.prefetchIfNeeded()

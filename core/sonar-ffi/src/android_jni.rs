@@ -36,6 +36,9 @@ pub extern "system" fn Java_chat_bitchat_sonar_NdkContext_nativeInit(
     context: JObject,
 ) {
     INIT.call_once(|| {
+        // Bring up the tracing→logcat bridge before any bind/FFI so the call
+        // path's diagnostics are captured from the very first event.
+        crate::init_logging();
         let vm = match env.get_java_vm() {
             Ok(vm) => vm,
             Err(e) => {
