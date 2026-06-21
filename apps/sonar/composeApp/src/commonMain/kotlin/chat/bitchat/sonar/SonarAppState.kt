@@ -212,6 +212,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             MeshRadio.setMeshNickname("")
             MeshRadio.setLocalSonarAnnounce(null); sonarPeerProfiles = emptyMap()
             linkByFp.clear(); linkCapsByFp.clear(); groupFoldMap.clear()
+            persistLinks(); persistLinkCaps(); persistGroupFolds()
             foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
             sonarDescriptorsByNpubHex = emptyMap()
             sonarDescriptorFetches.clear(); sonarDescriptorFetchedAt.clear(); sonarDescriptorMissedAt.clear()
