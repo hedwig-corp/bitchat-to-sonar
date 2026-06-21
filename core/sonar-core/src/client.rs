@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
@@ -447,6 +447,12 @@ pub struct SonarClient {
     change_listener: Arc<Mutex<Option<Arc<dyn ConversationChangeListener>>>>,
     /// In-memory store for invite link secrets and pending join requests.
     invite_links: Arc<crate::invite_link::InviteLinkStore>,
+    /// Highest Marmot protocol version this build advertises in its Sonar meta
+    /// descriptor (`sonar_protocol`). Defaults to MDK (1); a Darkmatter-capable
+    /// build flips it to 2 via [`SonarClient::set_advertised_sonar_protocol`]
+    /// when the experimental dev toggle is on. Peers read it to choose the engine
+    /// for a NEW conversation (see `sonar_descriptor::negotiate`).
+    advertised_sonar_protocol: Arc<AtomicU8>,
 }
 
 impl SonarClient {
@@ -784,6 +790,9 @@ impl SonarClient {
             invite_links: Arc::new(crate::invite_link::InviteLinkStore::load(
                 invite_link_state_path,
             )),
+            advertised_sonar_protocol: Arc::new(AtomicU8::new(
+                crate::sonar_descriptor::SONAR_PROTOCOL_MDK,
+            )),
         };
         // Open the live Marmot subscriptions for real sessions. In-memory test
         // sessions (allow_geo_relays=false) stay on the explicit `sync()` path so
@@ -947,11 +956,31 @@ impl SonarClient {
             .tags(descriptor_tags(SONAR_CALL_DESCRIPTOR_D_TAG));
         self.nostr.send_event_builder(call_builder).await?;
 
-        let meta_content = meta_descriptor_content_json(calls_enabled, signaling, bolt12_offer)?;
+        let meta_content = meta_descriptor_content_json(
+            calls_enabled,
+            signaling,
+            bolt12_offer,
+            self.advertised_sonar_protocol.load(Ordering::Relaxed),
+        )?;
         let meta_builder = EventBuilder::new(Kind::Custom(SONAR_DESCRIPTOR_KIND), meta_content)
             .tags(descriptor_tags(SONAR_META_DESCRIPTOR_D_TAG));
         self.nostr.send_event_builder(meta_builder).await?;
         Ok(())
+    }
+
+    /// Highest Marmot protocol version this build advertises (1 = MDK,
+    /// 2 = Darkmatter). The next `publish_sonar_descriptor` carries it.
+    pub fn advertised_sonar_protocol(&self) -> u8 {
+        self.advertised_sonar_protocol.load(Ordering::Relaxed)
+    }
+
+    /// Set the advertised Marmot protocol capability. A Darkmatter-capable build
+    /// calls this with [`crate::sonar_descriptor::SONAR_PROTOCOL_DARKMATTER`] when
+    /// the experimental dev toggle is on, then republishes the descriptor so peers
+    /// can negotiate v2 for NEW conversations. Existing conversations are unaffected.
+    pub fn set_advertised_sonar_protocol(&self, protocol: u8) {
+        self.advertised_sonar_protocol
+            .store(protocol, Ordering::Relaxed);
     }
 
     /// Fetch a peer's freshest valid Sonar descriptor from our account relays.
@@ -2854,6 +2883,7 @@ mod tests {
                 true,
                 vec!["marmot".to_string()],
                 Some(stale_offer.to_string()),
+                crate::sonar_descriptor::SONAR_PROTOCOL_MDK,
             )
             .expect("meta descriptor json"),
         );
