@@ -15,14 +15,18 @@ import chat.bitchat.sonar.wallet.Money
 import chat.bitchat.sonar.wallet.SendResult
 import chat.bitchat.sonar.wallet.WalletBridge
 import chat.bitchat.sonar.wallet.WalletState
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 private const val SONAR_DESCRIPTOR_TTL_SECS = 15 * 60L
@@ -252,6 +256,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             payLedger = SonarPayLedger(); persistPay(); payVersion++
             mediaCache.clear(); stickerPackCache.clear(); stickerImageCache.clear(); installedPackCoordinates.clear()
             callLogs.clear(); callVersion++
+            lastSeenTs.clear(); lastNotifiedTs.clear(); seededSeen = false
             // White Noise / Marmot DB: wipe + reconnect with the SAME identity.
             runCatching { SonarCore.eraseChats() }
             // The node is recreated → re-bind the iroh call endpoint on next use.
@@ -288,6 +293,10 @@ class SonarAppState(private val scope: CoroutineScope) {
     private var callTicker: kotlinx.coroutines.Job? = null
     private var meshRealtimeLoopRunning = false
     private var pollJob: Job? = null
+    private val refreshMutex = Mutex()
+    private var refreshRunning = false
+    private var refreshPending = false
+    private var refreshCompletion: CompletableDeferred<Unit>? = null
     /** Ids of ☎CALL control messages already routed to the engine (dedup). */
     private val scannedCall = mutableSetOf<String>()
 
@@ -1350,6 +1359,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     // ── Local notifications (fire on new incoming message while backgrounded) ──
     private var foreground = true
     private val lastSeenTs = HashMap<String, Long>()
+    private val lastNotifiedTs = HashMap<String, Long>()
     private var seededSeen = false
 
     // ── App lock ──
@@ -1422,26 +1432,47 @@ class SonarAppState(private val scope: CoroutineScope) {
         scope.launch { updateUnifyReceiver() }
     }
 
+    fun requestImmediateSync() {
+        if (!started) return
+        scope.launch {
+            runCatching { SonarCore.sync() }
+            refreshChats()
+            recomputeConversations()
+            (screen as? Screen.Chat)?.let { sc ->
+                if (isMeshChat(sc.id)) refreshOpenDm(meshPeerId(sc.id))
+                else {
+                    messages = withSendEchoes(sc.id, mergePendingMediaUploads(sc.id, marmotMessagesPage(sc.id)))
+                }
+            }
+        }
+    }
+
     private fun notifPreview(content: String): String =
         if (PayLine.decode(content) != null) "₿ Payment"
         else content.replace("\n", " ").let { if (it.length > 80) it.take(80) + "…" else it }
 
-    /** Notify for any chat whose newest incoming message is newer than last seen. */
+    /** Notify for any chat whose newest incoming message is newer than last seen.
+     *  Uses [lastNotifiedTs] to prevent double-fire when the conversationChanged
+     *  flow and poll loop both process the same message within one cycle. */
     private suspend fun maybeNotify() {
-        val enabled = prefBool("notifs", true) // master switch (Settings → Notifications)
+        val enabled = prefBool("notifs", true)
         val showNames = prefBool("notifNames", true)
         val showPreview = prefBool("notifPreview", true)
         val openChatId = (screen as? Screen.Chat)?.id
-        for (c in chats) {
+        val snapshot = chats
+        for (c in snapshot) {
             val msgs = SonarCore.messagesPage(c.id, 1)
             val newestIncoming = msgs.lastOrNull { !it.mine }
             val prev = lastSeenTs[c.id]
+            val alreadyNotified = lastNotifiedTs[c.id] ?: 0L
             if (enabled && seededSeen && prev != null && newestIncoming != null &&
-                newestIncoming.tsSecs > prev && !foreground && c.id != openChatId
+                newestIncoming.tsSecs > prev && newestIncoming.tsSecs > alreadyNotified &&
+                !foreground && c.id != openChatId
             ) {
                 val title = if (showNames) chatTitle(c) else "New message"
                 val body = if (showPreview) notifPreview(newestIncoming.content) else "Tap to open"
                 Notifier.notify(c.id.hashCode(), title, body)
+                lastNotifiedTs[c.id] = newestIncoming.tsSecs
             }
             lastSeenTs[c.id] = msgs.lastOrNull()?.tsSecs ?: (prev ?: 0L)
         }
@@ -1678,6 +1709,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         val wasOpen = (stack.lastOrNull() as? Screen.Chat)?.id == chatId
         val isGroup = chats.firstOrNull { it.id == chatId }?.let { !isDirectMarmotChat(it) } == true
         chats = chats.filterNot { it.id == chatId }
+        lastSeenTs.remove(chatId); lastNotifiedTs.remove(chatId)
         if (wasOpen && stack.size > 1) stack = stack.dropLast(1) // pop WITHOUT refresh
         scope.launch {
             try {
@@ -3108,7 +3140,70 @@ class SonarAppState(private val scope: CoroutineScope) {
         SonarCore.saveBlob(CHAT_SNAPSHOT_BLOB_KEY, "")
     }
 
+    /** Coalesce concurrent refresh requests: one owner refreshes, other callers
+     *  await the same completion, and burst arrivals become one trailing pass. */
     private suspend fun refreshChats() {
+        var owner = false
+        var completion: CompletableDeferred<Unit>? = null
+        refreshMutex.withLock {
+            if (refreshRunning) {
+                refreshPending = true
+                completion = refreshCompletion ?: CompletableDeferred<Unit>().also { refreshCompletion = it }
+            } else {
+                refreshRunning = true
+                completion = CompletableDeferred()
+                refreshCompletion = completion
+                owner = true
+            }
+        }
+        val currentCompletion = completion ?: return
+        if (!owner) {
+            currentCompletion.await()
+            return
+        }
+
+        var completed = false
+        var failure: Throwable? = null
+        try {
+            while (true) {
+                refreshChatsInner()
+                val finishedCompletion = refreshMutex.withLock {
+                    if (refreshPending) {
+                        refreshPending = false
+                        null
+                    } else {
+                        refreshRunning = false
+                        refreshCompletion.also { refreshCompletion = null }
+                    }
+                }
+                if (finishedCompletion != null) {
+                    finishedCompletion.complete(Unit)
+                    completed = true
+                    return
+                }
+            }
+        } catch (t: Throwable) {
+            failure = t
+            throw t
+        } finally {
+            if (!completed) {
+                withContext(NonCancellable) {
+                    val failedCompletion = refreshMutex.withLock {
+                        refreshRunning = false
+                        refreshPending = false
+                        refreshCompletion.also { refreshCompletion = null }
+                    }
+                    if (failedCompletion != null) {
+                        val error = failure
+                        if (error == null) failedCompletion.complete(Unit)
+                        else failedCompletion.completeExceptionally(error)
+                    }
+                }
+            }
+        }
+    }
+
+    private suspend fun refreshChatsInner() {
         val loadedChats = SonarCore.chats()
         if (started || loadedChats.isNotEmpty()) {
             chats = loadedChats

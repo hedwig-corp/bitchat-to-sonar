@@ -521,7 +521,7 @@ actual object SonarCore {
     actual fun callParseControl(content: String): SonarCallControl? =
         uniffi.sonar_ffi.callParseControl(content)?.toCommon()
 
-    private val _conversationChanged = MutableSharedFlow<String>(extraBufferCapacity = 64)
+    private val _conversationChanged = MutableSharedFlow<String>(extraBufferCapacity = 256)
     actual val conversationChanged: SharedFlow<String> = _conversationChanged.asSharedFlow()
 
     actual fun installConversationListener() {
