@@ -3,6 +3,9 @@ package chat.bitchat.sonar
 import android.content.Context
 import android.media.AudioManager
 
+// TODO(android): proximity monitoring — iOS uses UIDevice.isProximityMonitoringEnabled
+// + proximityStateDidChangeNotification to auto-disable speaker when phone is at ear
+// during voice calls. Android equivalent: PowerManager.PROXIMITY_SCREEN_OFF_WAKE_LOCK.
 actual object CallAudioRoute {
     private val audio: AudioManager
         get() = AppContextHolder.ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager

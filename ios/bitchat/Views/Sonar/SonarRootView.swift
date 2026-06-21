@@ -53,6 +53,8 @@ struct SonarRootView: View {
                 SonarCallScreen(peerId: call.convId, video: call.video)
                     .environmentObject(store)
                     .environment(\.colorScheme, .dark)
+            } else {
+                Color.clear.ignoresSafeArea()
             }
         }
         #endif

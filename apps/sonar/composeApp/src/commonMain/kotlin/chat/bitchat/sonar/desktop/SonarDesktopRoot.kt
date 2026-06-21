@@ -71,7 +71,7 @@ import chat.bitchat.sonar.ui.sonar
 @Composable
 fun DesktopApp() {
     val scope = rememberCoroutineScope()
-    val state = remember { SonarAppState(scope) }
+    val state = remember { SonarAppState(scope).also { it.callOverlay = true } }
     LaunchedEffect(state) { SonarLifecycle.onForeground = { state.setForeground(it) } }
     LaunchedEffect(Unit) { state.boot() }
     // Start the BLE radio (desktop: native CoreBluetooth/BlueZ scan via the

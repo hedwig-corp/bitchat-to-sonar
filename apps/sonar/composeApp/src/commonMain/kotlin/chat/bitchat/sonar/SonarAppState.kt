@@ -181,11 +181,18 @@ class SonarAppState(private val scope: CoroutineScope) {
     var dark by mutableStateOf(SonarCore.isDark())
         private set
 
+    var callOverlay = false
+
     fun push(s: Screen) {
         if (s is Screen.Chat && (screen as? Screen.Chat)?.id != s.id) {
             cleanupPreviewTempFiles()
         }
+        if (callOverlay && s is Screen.Call) return
         stack = stack + s
+    }
+
+    private fun popCallScreenIfNeeded() {
+        if (screen is Screen.Call && stack.size > 1) stack = stack.dropLast(1)
     }
     fun toggleDark() { dark = !dark; SonarCore.setDark(dark) }
 
@@ -319,7 +326,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 toast = "Calling isn’t available right now"
                 CallAudioRoute.configure(active = false, speakerOn = false)
                 activeCall = null
-                back()
+                popCallScreenIfNeeded()
                 return@launch
             }
             try {
@@ -336,7 +343,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                         if (activeCall?.callId == callId) {
                             CallAudioRoute.configure(active = false, speakerOn = false)
                             activeCall = null
-                            back()
+                            popCallScreenIfNeeded()
                         }
                     }
                 }
@@ -345,7 +352,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 if (activeCall?.callId == callId) {
                     CallAudioRoute.configure(active = false, speakerOn = false)
                     activeCall = null
-                    back()
+                    popCallScreenIfNeeded()
                 }
             }
         }
@@ -379,13 +386,14 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  cleanup in the background. */
     fun declineCall() {
         val c = activeCall ?: return
+        callTicker?.cancel(); callTicker = null
         CallAudioRoute.configure(active = false, speakerOn = false)
         callLogs.getOrPut(c.chatId) { mutableListOf() }.add(
             CallRecord(video = c.video, mine = false, durSecs = 0, tsSecs = SonarClock.nowSecs())
         )
         callVersion++
         activeCall = null
-        if (screen is Screen.Call && stack.size > 1) stack = stack.dropLast(1)
+        popCallScreenIfNeeded()
         scope.launch {
             runCatching { sendCallControl(c.chatId, SonarCore.callEncodeAnswer(c.callId, SonarAnswer.Decline, "")) }
             runCatching { SonarCore.callHangup(c.callId) }
@@ -403,7 +411,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         )
         callVersion++
         activeCall = null
-        if (screen is Screen.Call && stack.size > 1) stack = stack.dropLast(1)
+        popCallScreenIfNeeded()
         scope.launch {
             runCatching { SonarCore.callHangup(c.callId) }
             runCatching { sendCallControl(c.chatId, SonarCore.callEncodeEnd(c.callId, "hangup")) }
@@ -473,7 +481,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         )
         callVersion++
         activeCall = null
-        if (screen is Screen.Call && stack.size > 1) stack = stack.dropLast(1)
+        popCallScreenIfNeeded()
     }
 
     /** Scan [msgs] for ☎CALL control lines (deduped by message id) and route them

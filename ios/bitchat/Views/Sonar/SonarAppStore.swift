@@ -38,9 +38,9 @@ private enum SonarCallAudioRoute {
                 try session.overrideOutputAudioPort(speakerOn ? .speaker : .none)
                 UIDevice.current.isProximityMonitoringEnabled = proximityEnabled
             } else {
+                UIDevice.current.isProximityMonitoringEnabled = false
                 try? session.overrideOutputAudioPort(.none)
                 try session.setActive(false, options: .notifyOthersOnDeactivation)
-                UIDevice.current.isProximityMonitoringEnabled = false
             }
         } catch {
             SecureLogger.error("call audio route failed: \(error)", category: .session)
@@ -3688,6 +3688,7 @@ final class SonarAppStore: ObservableObject {
     /// and dismiss the call screen immediately (don't wait for the engine event).
     func declineCall() {
         guard let c = activeCall else { return }
+        callTickerTask?.cancel(); callTickerTask = nil
         let line = callEncodeAnswer(callId: c.callId, answer: .decline, nodeAddrB64: "")
         _ = sendCallControl(c.convId, line, via: c.signalingVia)
         SonarCallAudioRoute.configure(active: false, speakerOn: false)
