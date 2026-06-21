@@ -116,6 +116,8 @@ kotlin {
             // as proper jniLibs (the plain jar hides it as a classpath resource
             // and you get UnsatisfiedLinkError).
             implementation("net.java.dev.jna:jna:5.14.0@aar")
+            // QR encoding for shareable group invite links.
+            implementation("com.google.zxing:core:3.5.3")
         }
         val jvmMain by getting {
             // The desktop Breez API key is written here by `generateBreezKeyResource`
@@ -135,6 +137,8 @@ kotlin {
                 // Plain jar (the @aar variant is Android-only); the bundled
                 // libjnidispatch ships in the jna jar for the desktop OS.
                 implementation(libs.jna)
+                // QR encoding for shareable group invite links.
+                implementation("com.google.zxing:core:3.5.3")
             }
         }
     }

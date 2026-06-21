@@ -68,6 +68,12 @@ struct BitchatApp: App {
                 .onOpenURL { url in
                     handleURL(url)
                 }
+                // Universal Links (https invite) arrive as a browsing activity,
+                // not via onOpenURL. Dormant until the associated-domains
+                // entitlement + hosted AASA file activate the domain.
+                .onContinueUserActivity(NSUserActivityTypeBrowsingWeb) { activity in
+                    if let url = activity.webpageURL { handleURL(url) }
+                }
                 #if os(iOS)
                 .onChange(of: scenePhase) { newPhase in
                     switch newPhase {
@@ -175,8 +181,8 @@ struct BitchatApp: App {
     private func handleURL(_ url: URL) {
         if url.scheme == "bitchat" && url.host == "share" {
             checkForSharedContent()
-        } else if url.scheme == "sonar" && url.host == "invite",
-                  let token = url.pathComponents.last, token.hasPrefix("sinvite1") {
+        } else if let token = InviteShare.token(from: url) {
+            // Covers both sonar://invite/sinvite1… and https://<host>/join#sinvite1…
             sonarStore.submitInviteLink(token)
         }
     }
@@ -204,6 +210,11 @@ struct BitchatApp: App {
 
             // Send the shared content immediately on the main queue
             DispatchQueue.main.async {
+                // An invite link shared into Sonar means "join", not "send".
+                if let token = InviteShare.token(fromText: sharedContent) {
+                    self.sonarStore.submitInviteLink(token)
+                    return
+                }
                 if contentType == "url" {
                     // Try to parse as JSON first
                     if let data = sharedContent.data(using: .utf8),

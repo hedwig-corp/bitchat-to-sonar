@@ -86,11 +86,16 @@ class MainActivity : ComponentActivity() {
 
     private fun handleInviteIntent(intent: Intent?) {
         val uri = intent?.data ?: return
-        if (uri.scheme == "sonar" && uri.host == "invite") {
-            val token = uri.lastPathSegment ?: return
-            if (!token.startsWith("sinvite1")) return
-            SonarLifecycle.submitInviteLink(token)
-        }
+        // Custom scheme carries the token in the last path segment; the https
+        // universal link carries it in the fragment (kept off the server). The
+        // core normalizes either form, so we just forward the candidate string.
+        val candidate = when {
+            uri.scheme == "sonar" && uri.host == "invite" -> uri.lastPathSegment
+            uri.scheme == "https" && uri.host == JOIN_LINK_HOST -> uri.fragment
+            else -> null
+        } ?: return
+        if (!candidate.contains("sinvite1")) return
+        SonarLifecycle.submitInviteLink(candidate)
     }
 
     private fun handleShareIntent(intent: Intent?) {

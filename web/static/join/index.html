@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Join a group on Sonar</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: -apple-system, system-ui, sans-serif; margin: 0;
+           display: grid; place-items: center; min-height: 100vh;
+           background: #0e1116; color: #e6e9ef; text-align: center; padding: 24px; }
+    .card { max-width: 360px; }
+    h1 { font-size: 22px; margin: 0 0 8px; }
+    p { color: #97a0b0; line-height: 1.5; margin: 0 0 20px; }
+    a.btn { display: block; padding: 13px 18px; border-radius: 14px;
+            text-decoration: none; font-weight: 700; margin: 10px 0; }
+    .primary { background: #3a82f7; color: #fff; }
+    .ghost { background: #1b212b; color: #e6e9ef; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Join a group on Sonar</h1>
+    <p>Open this invite in the Sonar app to send a join request. If you don't have
+       Sonar yet, install it first, then tap the link again.</p>
+    <a class="btn primary" id="open" href="#">Open in Sonar</a>
+    <a class="btn ghost" href="https://github.com/vincenzopalazzo/bitchat">Get Sonar</a>
+  </div>
+  <script>
+    // The invite payload lives in the URL fragment and never reaches this server.
+    // Fall back to the custom scheme so the app opens even before Universal/App
+    // Links are verified for this domain.
+    var token = (location.hash || "").replace(/^#/, "");
+    if (token.indexOf("sinvite1") !== -1) {
+      document.getElementById("open").setAttribute("href", "sonar://invite/" + token);
+    }
+  </script>
+</body>
+</html>

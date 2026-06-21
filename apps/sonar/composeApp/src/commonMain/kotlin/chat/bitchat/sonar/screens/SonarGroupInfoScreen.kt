@@ -37,9 +37,13 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import chat.bitchat.sonar.SNQrCode
 import chat.bitchat.sonar.Screen
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.SonarJoinRequest
+import chat.bitchat.sonar.inviteLinkPreview
+import chat.bitchat.sonar.inviteUniversalLink
+import chat.bitchat.sonar.shareInviteText
 import chat.bitchat.sonar.ui.SNBanner
 import chat.bitchat.sonar.ui.SNBannerTone
 import chat.bitchat.sonar.ui.SNGhostButton
@@ -114,24 +118,58 @@ fun SonarGroupInfoScreen(state: SonarAppState, screen: Screen.GroupInfo) {
 
                 // ── Invite link section ──
                 SNSectionLabel("Invite link")
-                SNSettingsCard {
-                    SNSettingsRow(
-                        icon = SNIconName.Link,
-                        tone = SNTone.Cyan,
-                        label = if (inviteLink != null) "Copy invite link" else "Create invite link",
-                        sub = if (inviteLink != null) "sonar://invite/sinvite1…${inviteLink!!.takeLast(8)}" else "Share a link to let people request to join",
-                        trail = SNTrail.Chevron,
-                        divider = false
-                    ) {
-                        if (inviteLink != null) {
-                            clipboard.setText(AnnotatedString(inviteDeepLink(inviteLink!!)))
-                            state.toast = "Invite link copied"
-                        } else {
+                val link = inviteLink
+                if (link == null) {
+                    SNSettingsCard {
+                        SNSettingsRow(
+                            icon = SNIconName.Link,
+                            tone = SNTone.Cyan,
+                            label = "Create invite link",
+                            sub = "Share a link or QR code to let people request to join",
+                            trail = SNTrail.Chevron,
+                            divider = false
+                        ) {
                             state.createInviteLink(chatId, groupName) { token ->
                                 inviteLink = token
-                                clipboard.setText(AnnotatedString(inviteDeepLink(token)))
+                                clipboard.setText(AnnotatedString(inviteUniversalLink(token)))
                                 state.toast = "Invite link created and copied"
                             }
+                        }
+                    }
+                } else {
+                    // QR of the universal link — scan in person to request to join.
+                    SNSettingsCard {
+                        Column(
+                            Modifier.fillMaxWidth().padding(vertical = 16.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            SNQrCode(inviteUniversalLink(link), size = 196.dp)
+                            Spacer(Modifier.height(10.dp))
+                            Text(inviteLinkPreview(link), color = s.text3, fontSize = 12.5.sp)
+                        }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    SNSettingsCard {
+                        SNSettingsRow(
+                            icon = SNIconName.Link,
+                            tone = SNTone.Cyan,
+                            label = "Share invite link",
+                            sub = "Send via another app",
+                            trail = SNTrail.Chevron,
+                            divider = true
+                        ) {
+                            shareInviteText(inviteUniversalLink(link))
+                        }
+                        SNSettingsRow(
+                            icon = SNIconName.Link,
+                            tone = SNTone.Cyan,
+                            label = "Copy link",
+                            sub = "Anyone with the link can request to join",
+                            trail = SNTrail.Chevron,
+                            divider = false
+                        ) {
+                            clipboard.setText(AnnotatedString(inviteUniversalLink(link)))
+                            state.toast = "Invite link copied"
                         }
                     }
                 }
@@ -341,8 +379,6 @@ private fun parsedNpubs(input: String): List<String> =
         .map { it.trim() }
         .filter { it.startsWith("npub1") && it.length > 10 }
         .distinct()
-
-private fun inviteDeepLink(token: String): String = "sonar://invite/$token"
 
 private fun shortJoinRequester(value: String): String =
     if (value.length <= 16) value else "${value.take(10)}…${value.takeLast(6)}"

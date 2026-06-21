@@ -334,8 +334,38 @@ pub fn encode_invite_token(token: &InviteToken) -> Result<String> {
     Ok(format!("sinvite1{}", hex::encode(&json)))
 }
 
+/// Max length of the hex payload following the `sinvite1` prefix (~4 KB JSON).
+/// Guards `hex::decode` / `serde_json` against hostile or accidental giant input.
+const MAX_INVITE_HEX_LEN: usize = 8192;
+
+/// Normalize any shareable invite representation into a bare `sinvite1…` token.
+///
+/// Accepts the universal link (`https://<host>/join#sinvite1…`), the custom
+/// scheme (`sonar://invite/sinvite1…`), or a bare token. Surrounding whitespace
+/// (e.g. a trailing newline from the clipboard) and any text after the token are
+/// tolerated: the token is the `sinvite1` prefix plus its run of hex characters.
+/// Keeping this the single normalization point means every entry point — deep
+/// link, App Link / Universal Link, QR scan, and clipboard paste — behaves the
+/// same across iOS and Android.
+pub fn normalize_invite_token(input: &str) -> Result<String> {
+    let trimmed = input.trim();
+    let start = trimmed
+        .rfind("sinvite1")
+        .ok_or_else(|| Error::InvalidInput("no sinvite1 token found".into()))?;
+    let after = &trimmed[start + "sinvite1".len()..];
+    let hex_len = after.bytes().take_while(u8::is_ascii_hexdigit).count();
+    if hex_len == 0 {
+        return Err(Error::InvalidInput("empty invite token payload".into()));
+    }
+    if hex_len > MAX_INVITE_HEX_LEN {
+        return Err(Error::InvalidInput("invite token too long".into()));
+    }
+    Ok(format!("sinvite1{}", &after[..hex_len]))
+}
+
 pub fn decode_invite_token(encoded: &str) -> Result<InviteToken> {
-    let hex_str = encoded
+    let normalized = normalize_invite_token(encoded)?;
+    let hex_str = normalized
         .strip_prefix("sinvite1")
         .ok_or_else(|| Error::InvalidInput("not a sinvite1 token".into()))?;
     let json = hex::decode(hex_str).map_err(|e| Error::InvalidInput(e.to_string()))?;
@@ -435,5 +465,50 @@ mod tests {
         assert_eq!(reloaded.active_links(&group_id).len(), 1);
         assert_eq!(reloaded.pending_join_requests(&group_id).len(), 1);
         assert!(reloaded.validate_secret(&group_id, &sha256(&decoded.invite_secret)));
+    }
+
+    fn sample_token() -> String {
+        encode_invite_token(&InviteToken {
+            group_id: vec![1u8; 32],
+            group_name: "field team".into(),
+            admin_npub: vec![2u8; 32],
+            relays: vec!["wss://relay.example".into()],
+            invite_secret: vec![3u8; 32],
+            created_at: 1,
+        })
+        .expect("encode")
+    }
+
+    #[test]
+    fn normalize_accepts_every_share_form() {
+        let token = sample_token();
+        // Bare token, custom scheme, and universal link (payload in fragment)
+        // all normalize back to the same bare token.
+        let universal = format!("https://sonarprivacy.xyz/join#{token}");
+        let scheme = format!("sonar://invite/{token}");
+        assert_eq!(normalize_invite_token(&token).unwrap(), token);
+        assert_eq!(normalize_invite_token(&scheme).unwrap(), token);
+        assert_eq!(normalize_invite_token(&universal).unwrap(), token);
+        // And each still decodes to the original token contents.
+        assert_eq!(decode_invite_token(&universal).unwrap().group_name, "field team");
+    }
+
+    #[test]
+    fn normalize_tolerates_clipboard_whitespace_and_trailing_text() {
+        let token = sample_token();
+        let pasted = format!("  https://sonarprivacy.xyz/join#{token}\n");
+        assert_eq!(normalize_invite_token(&pasted).unwrap(), token);
+        // Trailing prose after the token (e.g. "<link> join us!") is dropped.
+        let with_tail = format!("{token} join us!");
+        assert_eq!(normalize_invite_token(&with_tail).unwrap(), token);
+    }
+
+    #[test]
+    fn normalize_rejects_garbage_and_oversized_input() {
+        assert!(normalize_invite_token("https://example.com/hello").is_err());
+        assert!(normalize_invite_token("sinvite1").is_err()); // empty payload
+        assert!(normalize_invite_token("  ").is_err());
+        let huge = format!("sinvite1{}", "a".repeat(MAX_INVITE_HEX_LEN + 2));
+        assert!(normalize_invite_token(&huge).is_err());
     }
 }

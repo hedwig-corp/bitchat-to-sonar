@@ -55,6 +55,17 @@
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="sonar" android:host="invite" />
             </intent-filter>
+            <!-- Universal/App Link for group invites. autoVerify opens Sonar
+                 directly once https://sonarprivacy.xyz/.well-known/assetlinks.json
+                 is hosted (see web/README.md); until then the link still opens in
+                 a browser and the sonar:// scheme + QR + paste paths all work. -->
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https" android:host="sonarprivacy.xyz"
+                    android:pathPrefix="/join" />
+            </intent-filter>
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />
                 <category android:name="android.intent.category.DEFAULT" />

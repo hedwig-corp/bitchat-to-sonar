@@ -73,3 +73,44 @@ repo name for the production build.
   project repository until a hosted interactive demo exists. The `#download`
   links are placeholders pending real App Store URLs (see the chat log).
 - Radar sweeps and pulses respect `prefers-reduced-motion`.
+
+## Group invite links (App Links / Universal Links)
+
+Group invites are shared as a Signal-style universal link with the payload in the
+URL **fragment** (never sent to the server):
+
+```
+https://sonarprivacy.xyz/join#sinvite1<hex>
+```
+
+The host (`JOIN_LINK_HOST`) is set in both clients — `InviteShare.kt`
+(`apps/sonar/...`) and `InviteShare.swift` (`ios/...`). **Every client surface
+works before the host is live**: QR codes, copy, share, paste/share-to-join, and
+the legacy `sonar://invite/…` scheme all function offline. Hosting only adds the
+convenience of the https link auto-opening the app.
+
+Three static files ship under `static/` so they deploy to the site root (the
+`.nojekyll` marker lets GitHub Pages serve the dot-folder):
+
+| URL | File |
+|-----|------|
+| `/.well-known/apple-app-site-association` | `static/.well-known/apple-app-site-association` |
+| `/.well-known/assetlinks.json` | `static/.well-known/assetlinks.json` |
+| `/join` | `static/join/index.html` (landing + `sonar://` fallback) |
+
+These require the site to be served at the **domain root** (`sonarprivacy.xyz`),
+not the GitHub Pages project subpath. Activation steps, gated on the live domain:
+
+1. **iOS — AASA**: replace `TEAMID.BUNDLEID` with the real
+   `<DEVELOPMENT_TEAM>.<bundle id>` from the iOS xcconfig.
+2. **iOS — entitlement** (intentionally not committed, so device builds keep
+   signing without the live domain): add to `ios/bitchat/bitchat.entitlements`
+   ```xml
+   <key>com.apple.developer.associated-domains</key>
+   <array><string>applinks:sonarprivacy.xyz</string></array>
+   ```
+   The `.onContinueUserActivity` handler in `BitchatApp.swift` is already wired
+   and dormant until this is added.
+3. **Android — assetlinks**: replace `REPLACE_WITH_RELEASE_SIGNING_SHA256` with
+   the release keystore SHA-256 (`keytool -list -v -keystore … | grep SHA256`).
+   The `autoVerify` intent-filter is already in `AndroidManifest.xml`.
