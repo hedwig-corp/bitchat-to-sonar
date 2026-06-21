@@ -813,21 +813,29 @@ final class MarmotChatModel: ObservableObject {
     func send(_ text: String, to groupId: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        let echo = MarmotService.MarmotMessage(
+            id: Self.optimisticIDPrefix + UUID().uuidString,
+            senderNpub: npub ?? "",
+            content: trimmed,
+            createdAt: Date(),
+            isMine: true,
+            media: []
+        )
+        pendingOptimistic[groupId, default: []].append(echo)
+        messagesByGroup[groupId, default: []].append(echo)
         Task {
             do {
-                // Wait through the connect/reconnect window so a send right after
-                // erase / cold launch doesn't fail with "not connected yet".
-                guard await ensureConnected() else {
+                guard await ensureConnected(timeoutSeconds: 2) else {
                     throw MarmotService.ServiceError.notConnected
                 }
-                // A row-only startup snapshot may know the group before the local
-                // SQLCipher transcript is hydrated. Load it before sending so
-                // a local-first pending row is merged into the existing page.
-                await loadLocalPage(groupId: groupId)
                 try await service.sendText(groupId: groupId, text: trimmed)
                 await loadLocalPage(groupId: groupId)
-                await refreshWhenConnected(groupId: groupId, hydrateBeforeSync: false)
+                Task { [weak self] in
+                    try? await self?.service.ensureSubscriptions()
+                }
             } catch {
+                pendingOptimistic[groupId]?.removeAll { $0.id == echo.id }
+                messagesByGroup[groupId, default: []].removeAll { $0.id == echo.id }
                 self.errorText = Self.describe(error)
             }
         }
@@ -839,15 +847,16 @@ final class MarmotChatModel: ObservableObject {
             .filter { !$0.isEmpty }
         guard !trimmed.isEmpty else { return true }
         do {
-            guard await ensureConnected() else {
+            guard await ensureConnected(timeoutSeconds: 2) else {
                 throw MarmotService.ServiceError.notConnected
             }
-            await loadLocalPage(groupId: groupId)
             for text in trimmed {
                 try await service.sendText(groupId: groupId, text: text)
             }
             await loadLocalPage(groupId: groupId)
-            await refreshWhenConnected(groupId: groupId, hydrateBeforeSync: false)
+            Task { [weak self] in
+                try? await self?.service.ensureSubscriptions()
+            }
             return true
         } catch {
             self.errorText = Self.describe(error)
@@ -1083,11 +1092,12 @@ final class MarmotChatModel: ObservableObject {
         return (String(parts[1]), String(parts[2]))
     }
 
-    /// Drive LIVE updates off the core's relay subscriptions: park on
-    /// `waitForMarmotEvent` and, the instant a welcome/message is pushed, drain +
-    /// process it and reload the UI from the local DB. On the idle timeout (no
-    /// push), run one `refresh()` as a safety reconciliation that also catches any
-    /// subscription event the relay dropped/lagged. Replaces the old 5s poll.
+    /// Drive LIVE updates off the core's watermarked relay subscriptions: park
+    /// on `waitForMarmotEvent` and, the instant a welcome/message is pushed,
+    /// drain + process it and reload the UI from the local DB. On the idle
+    /// timeout (no push), re-subscribe with the current watermark to self-heal
+    /// after relay disconnects — much lighter than the old `refresh()`/`sync()`
+    /// poll that did a full blocking fetch.
     func startPolling() {
         guard syncTask == nil else { return }
         syncTask = Task { [weak self] in
@@ -1099,7 +1109,7 @@ final class MarmotChatModel: ObservableObject {
                     let drained = (try? await self.service.drainPending()) ?? false
                     if drained { await self.loadLocalSummaries() }
                 } else {
-                    await self.refresh() // idle safety reconciliation
+                    try? await self.service.ensureSubscriptions()
                 }
             }
         }

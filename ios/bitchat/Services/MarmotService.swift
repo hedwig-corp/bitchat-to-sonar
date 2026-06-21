@@ -207,14 +207,23 @@ final class MarmotService: @unchecked Sendable {
         "wss://nos.lol",
         "wss://relay.primal.net",
         "wss://relay.kaleidoswap.com",
+        "wss://nostr.relay.hedwig.sh",
     ]
 
     private let relayUrls: [String]
 
-    /// Serial queue: serializes access to `node`/`identity` AND keeps the
+    /// Serial queue: serializes MLS-mutating operations (send, connect, sync,
+    /// drain, group management) and `node`/`identity` writes. Keeps the
     /// blocking Rust calls off the main thread and off the Swift concurrency
     /// cooperative pool.
     private let workQueue = DispatchQueue(label: "chat.bitchat.marmot-service", qos: .userInitiated)
+
+    /// Concurrent queue for read-only FFI calls (groups, messages, summaries).
+    /// SQLCipher supports concurrent readers; these never touch MLS state, so
+    /// they are safe to run in parallel with each other (and alongside writes
+    /// that are serialized on `workQueue`). Modeled after WhiteNoise's
+    /// concurrent `ffiQueue`.
+    private let readQueue = DispatchQueue(label: "chat.bitchat.marmot-ffi-read", qos: .userInitiated, attributes: .concurrent)
 
     /// Relay connection setup can be slow and must not block local transcript
     /// reads on `workQueue`. Build the relay-backed node here, then swap it in
@@ -271,7 +280,9 @@ final class MarmotService: @unchecked Sendable {
                 return false
             }
             service.identity = identity
+            service.nodeLock.lock()
             service.node = node
+            service.nodeLock.unlock()
             service.relayConnected = true
             service.installConversationListener(on: node)
             return true
@@ -305,7 +316,9 @@ final class MarmotService: @unchecked Sendable {
                 dbKeyHex: dbKeyHex
             )
             service.identity = identity
+            service.nodeLock.lock()
             service.node = node
+            service.nodeLock.unlock()
             service.relayConnected = false
             service.installConversationListener(on: node)
             service.sessionGeneration = service.sessionGeneration &+ 1
@@ -429,8 +442,8 @@ final class MarmotService: @unchecked Sendable {
 
     /// Pending multi-member group invites awaiting explicit user action.
     func pendingGroupInvites() async throws -> [GroupInvite] {
-        try await run {
-            try $0.requireNode().pendingGroupInvites().map {
+        try await readOnly {
+            try $0.pendingGroupInvites().map {
                 GroupInvite(
                     id: $0.idHex,
                     groupId: $0.groupIdHex,
@@ -486,7 +499,7 @@ final class MarmotService: @unchecked Sendable {
 
     /// Pending join requests for a group.
     func pendingJoinRequests(groupId: String) async throws -> [JoinRequestInfo] {
-        try await run { try $0.requireNode().pendingJoinRequests(groupIdHex: groupId) }
+        try await readOnly { try $0.pendingJoinRequests(groupIdHex: groupId) }
     }
 
     /// Approve a pending join request.
@@ -573,7 +586,7 @@ final class MarmotService: @unchecked Sendable {
     }
 
     func fetchInstalledPacks() async throws -> [String] {
-        try await run { try $0.requireNode().fetchInstalledPacks() }
+        try await readOnly { try $0.fetchInstalledPacks() }
     }
 
     func installStickerPack(coordinate: String) async throws {
@@ -591,7 +604,7 @@ final class MarmotService: @unchecked Sendable {
 
     /// The user's Blossom server list (kind-10063). Empty if unset.
     func blossomServers() async throws -> [String] {
-        try await run { try $0.requireNode().blossomServers() }
+        try await readOnly { try $0.blossomServers() }
     }
 
     /// Publish the user's Blossom server list (kind-10063).
@@ -604,6 +617,12 @@ final class MarmotService: @unchecked Sendable {
     /// subscriptions land in the core.
     func syncOnce() async throws {
         try await run { try $0.requireNode().syncOnce() }
+    }
+
+    /// Re-subscribe with current watermark + group set to self-heal after
+    /// relay disconnects. Lighter than `syncOnce()` — no blocking fetch.
+    func ensureSubscriptions() async throws {
+        try await run { try $0.requireNode().ensureSubscriptions() }
     }
 
     /// Delete a single Marmot chat's local state (messages + MLS keys). Local-
@@ -644,8 +663,8 @@ final class MarmotService: @unchecked Sendable {
 
     /// All Marmot groups the identity belongs to.
     func groups() async throws -> [MarmotGroup] {
-        try await run {
-            try $0.requireNode().groups().map {
+        try await readOnly {
+            try $0.groups().map {
                 MarmotGroup(id: $0.idHex, name: $0.name, memberNpubs: $0.memberNpubs)
             }
         }
@@ -653,16 +672,15 @@ final class MarmotService: @unchecked Sendable {
 
     /// Decrypted message history for a group, oldest first.
     func messages(groupId: String) async throws -> [MarmotMessage] {
-        try await run {
-            try $0.requireNode().messages(groupIdHex: groupId).map(Self.marmotMessage)
+        try await readOnly {
+            try $0.messages(groupIdHex: groupId).map(Self.marmotMessage)
         }
     }
 
     /// Bounded local message window for a group, oldest first within the page.
     func messagesPage(groupId: String, limit: UInt32, offset: UInt32 = 0) async throws -> [MarmotMessage] {
-        try await run {
-            try $0.requireNode()
-                .messagesPage(groupIdHex: groupId, limit: limit, offset: offset)
+        try await readOnly {
+            try $0.messagesPage(groupIdHex: groupId, limit: limit, offset: offset)
                 .map(Self.marmotMessage)
         }
     }
@@ -670,9 +688,8 @@ final class MarmotService: @unchecked Sendable {
     /// Local transcript windows for the most recent groups, newest conversation
     /// first. Used by home list hydration before any relay-aware sync.
     func recentMessagePages(groupLimit: UInt32, pageLimit: UInt32) async throws -> [RecentMessagePage] {
-        try await run {
-            try $0.requireNode()
-                .recentMessagePages(groupLimit: groupLimit, pageLimit: pageLimit)
+        try await readOnly {
+            try $0.recentMessagePages(groupLimit: groupLimit, pageLimit: pageLimit)
                 .map {
                     RecentMessagePage(
                         groupId: $0.groupIdHex,
@@ -783,7 +800,9 @@ final class MarmotService: @unchecked Sendable {
     func wipeDatabase() async {
         await runNonThrowing { service in
             service.sessionGeneration = service.sessionGeneration &+ 1
+            service.nodeLock.lock()
             service.node = nil
+            service.nodeLock.unlock()
             service.identity = nil
             service.relayConnected = false
             if let url = try? Self.databaseURL() {
@@ -894,9 +913,8 @@ final class MarmotService: @unchecked Sendable {
     // MARK: - Conversation index (Signal-style summary table)
 
     func conversationSummaries() async -> [ConversationSummary] {
-        await runNonThrowing { service in
-            guard let node = service.node else { return [] }
-            return node.conversationSummaries().map {
+        await readOnlyNonThrowing({ node in
+            node.conversationSummaries().map {
                 ConversationSummary(
                     groupIdHex: $0.groupIdHex,
                     name: $0.name,
@@ -908,7 +926,7 @@ final class MarmotService: @unchecked Sendable {
                     unreadCount: $0.unreadCount
                 )
             }
-        }
+        }, default: [])
     }
 
     func markConversationRead(groupId: String) async {
@@ -924,9 +942,8 @@ final class MarmotService: @unchecked Sendable {
         beforeIdHex: String? = nil,
         limit: UInt32
     ) async throws -> [MarmotMessage] {
-        try await run {
-            try $0.requireNode()
-                .messagesCursorPage(
+        try await readOnly {
+            try $0.messagesCursorPage(
                     groupIdHex: groupId,
                     beforeSecs: beforeSecs,
                     beforeIdHex: beforeIdHex,
@@ -972,6 +989,47 @@ final class MarmotService: @unchecked Sendable {
         await withCheckedContinuation { continuation in
             workQueue.async { [self] in
                 continuation.resume(returning: body(self))
+            }
+        }
+    }
+
+    /// Read-only FFI calls on the concurrent queue. Never use for MLS-mutating
+    /// operations. The node is an Arc (thread-safe ref-counted pointer from
+    /// Rust via UniFFI), so reading it under a lock and calling methods on it
+    /// from the concurrent queue is safe. This never blocks behind serial
+    /// workQueue tasks.
+    private let nodeLock = NSLock()
+    private func readOnly<T: Sendable>(_ body: @escaping @Sendable (SonarNode) throws -> T) async throws -> T {
+        nodeLock.lock()
+        let nodeRef = self.node
+        nodeLock.unlock()
+        guard let nodeRef else { throw ServiceError.notConnected }
+        return try await withCheckedThrowingContinuation { continuation in
+            readQueue.async {
+                do {
+                    continuation.resume(returning: try body(nodeRef))
+                } catch let error as SonarFfiError {
+                    switch error {
+                    case .InvalidInput(let message):
+                        continuation.resume(throwing: ServiceError.invalidInput(message))
+                    case .Core(let message):
+                        continuation.resume(throwing: ServiceError.core(message))
+                    }
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    private func readOnlyNonThrowing<T: Sendable>(_ body: @escaping @Sendable (SonarNode) -> T, default defaultValue: T) async -> T {
+        nodeLock.lock()
+        let nodeRef = self.node
+        nodeLock.unlock()
+        guard let nodeRef else { return defaultValue }
+        return await withCheckedContinuation { continuation in
+            readQueue.async {
+                continuation.resume(returning: body(nodeRef))
             }
         }
     }
