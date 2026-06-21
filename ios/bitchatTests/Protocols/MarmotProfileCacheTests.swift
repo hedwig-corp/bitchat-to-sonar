@@ -77,6 +77,61 @@ struct MarmotProfileCacheTests {
     }
 
     @Test
+    func authorNameResolvesCachedProfileWithoutFetch() {
+        let senderNpub = "npub1vincent"
+        let profile = MarmotService.Profile(
+            name: "vincent",
+            displayName: "Vincent P",
+            about: nil,
+            picture: nil,
+            nip05: nil
+        )
+        let message = MarmotService.MarmotMessage(
+            id: "msg-1",
+            senderNpub: senderNpub,
+            content: "hello",
+            createdAt: Date(timeIntervalSince1970: 42),
+            isMine: false,
+            media: []
+        )
+        var fetched: [String] = []
+
+        let resolved = snResolvedMarmotAuthorName(
+            message,
+            profilesByNpub: [senderNpub: profile],
+            fetchMissingProfile: { fetched.append($0) },
+            shortNpub: snShortNpubLabel
+        )
+
+        #expect(resolved == "Vincent P")
+        #expect(fetched.isEmpty)
+    }
+
+    @Test
+    func authorNameCacheMissFetchesProfileAndFallsBack() {
+        let senderNpub = "npub1sender1234567890"
+        let message = MarmotService.MarmotMessage(
+            id: "msg-1",
+            senderNpub: senderNpub,
+            content: "hello",
+            createdAt: Date(timeIntervalSince1970: 42),
+            isMine: false,
+            media: []
+        )
+        var fetched: [String] = []
+
+        let resolved = snResolvedMarmotAuthorName(
+            message,
+            profilesByNpub: [:],
+            fetchMissingProfile: { fetched.append($0) },
+            shortNpub: snShortNpubLabel
+        )
+
+        #expect(resolved == snShortNpubLabel(senderNpub))
+        #expect(fetched == [senderNpub])
+    }
+
+    @Test
     func chatSnapshotKeepsRowsWithoutPersistingMessages() {
         let suiteName = "MarmotProfileCacheTests-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!

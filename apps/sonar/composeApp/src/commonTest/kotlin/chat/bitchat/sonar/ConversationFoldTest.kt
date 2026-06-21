@@ -173,7 +173,7 @@ class ConversationFoldTest {
     @Test
     fun profileCacheLookupResolvesGroupAuthorName() {
         val senderNpub = "npub1vincent"
-        val cache = decodeProfileCache(
+        val profilesByNpub = decodeProfileCache(
             encodeProfileCache(
                 mapOf(
                     senderNpub to SonarProfile(
@@ -186,14 +186,30 @@ class ConversationFoldTest {
                 ),
             ),
         )
+        val fetched = mutableListOf<String>()
+        val message = SonarMsg(
+            id = "msg-1",
+            senderNpub = senderNpub,
+            content = "hello",
+            mine = false,
+            tsSecs = 42,
+        )
 
-        val resolved = cache[canonicalProfileKey(senderNpub)]?.bestName
+        val resolved = resolveGroupAuthorName(
+            message = message,
+            isGroup = true,
+            profilesByNpub = profilesByNpub,
+            fetchMissingProfile = { fetched += it },
+        )
+
         assertEquals("Vincent P", resolved)
+        assertEquals(emptyList(), fetched)
     }
 
     @Test
-    fun profileCacheMissYieldsNullForGroupAuthor() {
-        val cache = decodeProfileCache(
+    fun profileCacheMissFetchesGroupAuthorProfileAndFallsBack() {
+        val senderNpub = "npub1sender1234567890"
+        val profilesByNpub = decodeProfileCache(
             encodeProfileCache(
                 mapOf(
                     "npub1alice" to SonarProfile(
@@ -206,9 +222,24 @@ class ConversationFoldTest {
                 ),
             ),
         )
+        val fetched = mutableListOf<String>()
+        val message = SonarMsg(
+            id = "msg-1",
+            senderNpub = senderNpub,
+            content = "hello",
+            mine = false,
+            tsSecs = 42,
+        )
 
-        val resolved = cache[canonicalProfileKey("npub1unknown")]?.bestName
-        assertNull(resolved)
+        val resolved = resolveGroupAuthorName(
+            message = message,
+            isGroup = true,
+            profilesByNpub = profilesByNpub,
+            fetchMissingProfile = { fetched += it },
+        )
+
+        assertEquals(shortNpubLabel(senderNpub), resolved)
+        assertEquals(listOf(senderNpub), fetched)
     }
 
     @Test

@@ -80,6 +80,25 @@ enum SNMarmotProfileCache {
     }
 }
 
+func snShortNpubLabel(_ value: String) -> String {
+    value.count > 16 ? "\(value.prefix(10))…\(value.suffix(4))" : value
+}
+
+func snResolvedMarmotAuthorName(
+    _ message: MarmotService.MarmotMessage,
+    profilesByNpub: [String: MarmotService.Profile],
+    fetchMissingProfile: (String) -> Void,
+    shortNpub: (String) -> String
+) -> String? {
+    guard !message.isMine, !message.senderNpub.isEmpty else { return nil }
+    let canonical = SNMarmotProfileCache.canonicalKey(message.senderNpub)
+    if let name = profilesByNpub[canonical]?.bestName ?? profilesByNpub[message.senderNpub]?.bestName {
+        return name
+    }
+    fetchMissingProfile(message.senderNpub)
+    return shortNpub(message.senderNpub)
+}
+
 enum SNMarmotChatSnapshotCache {
     private static let defaultsKey = "marmot.chatSnapshot.v1"
 
@@ -707,10 +726,12 @@ final class MarmotChatModel: ObservableObject {
     /// or short npub with an async fetch kicked off so it resolves on the next
     /// SwiftUI invalidation cycle.
     func marmotAuthorName(_ m: MarmotService.MarmotMessage) -> String? {
-        guard !m.isMine, !m.senderNpub.isEmpty else { return nil }
-        if let name = displayName(forNpub: m.senderNpub) { return name }
-        ensureProfile(m.senderNpub)
-        return SonarAppStore.shortNpub(m.senderNpub)
+        snResolvedMarmotAuthorName(
+            m,
+            profilesByNpub: profilesByNpub,
+            fetchMissingProfile: ensureProfile,
+            shortNpub: snShortNpubLabel
+        )
     }
 
     /// Merge still-pending optimistic echoes into the freshly-synced

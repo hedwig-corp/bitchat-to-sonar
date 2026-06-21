@@ -32,6 +32,21 @@ private const val LOCAL_TRANSCRIPT_PAGE_LIMIT = 100
 private const val LOCAL_SUMMARY_PAGE_LIMIT = 20
 private const val LOCAL_SUMMARY_CHAT_LIMIT = 5
 
+internal fun shortNpubLabel(value: String): String =
+    if (value.length > 16) value.take(10) + "…" + value.takeLast(4) else value
+
+internal fun resolveGroupAuthorName(
+    message: SonarMsg,
+    isGroup: Boolean,
+    profilesByNpub: Map<String, SonarProfile>,
+    fetchMissingProfile: (String) -> Unit,
+): String? {
+    if (!isGroup || message.mine || message.senderNpub.isBlank()) return null
+    profilesByNpub[canonicalProfileKey(message.senderNpub)]?.bestName?.let { return it }
+    fetchMissingProfile(message.senderNpub)
+    return shortNpubLabel(message.senderNpub)
+}
+
 sealed interface Screen {
     data object Home : Screen
     data object Settings : Screen
@@ -1503,14 +1518,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         return shortNpub(other)
     }
 
-    private fun shortNpub(value: String): String =
-        if (value.length > 16) value.take(10) + "…" + value.takeLast(4) else value
+    private fun shortNpub(value: String): String = shortNpubLabel(value)
 
     fun groupAuthorName(message: SonarMsg, isGroup: Boolean): String? {
-        if (!isGroup || message.mine || message.senderNpub.isBlank()) return null
-        profilesByNpub[canonicalProfileKey(message.senderNpub)]?.bestName?.let { return it }
-        ensureProfile(message.senderNpub)
-        return shortNpub(message.senderNpub)
+        return resolveGroupAuthorName(message, isGroup, profilesByNpub, ::ensureProfile)
     }
 
     /** Fetch + cache a peer's kind-0 profile, so their name replaces the

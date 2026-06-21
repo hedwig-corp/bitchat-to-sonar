@@ -2008,7 +2008,7 @@ final class SonarAppStore: ObservableObject {
     }
 
     static func shortNpub(_ value: String) -> String {
-        value.count > 16 ? "\(value.prefix(10))…\(value.suffix(4))" : value
+        snShortNpubLabel(value)
     }
 
     private func directOtherNpub(in group: MarmotService.MarmotGroup) -> String? {
