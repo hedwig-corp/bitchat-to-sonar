@@ -99,18 +99,21 @@ Three static files ship under `static/` so they deploy to the site root (the
 | `/join` | `static/join/index.html` (landing + `sonar://` fallback) |
 
 These require the site to be served at the **domain root** (`sonarprivacy.xyz`),
-not the GitHub Pages project subpath. Activation steps, gated on the live domain:
+not the GitHub Pages project subpath — `sonarprivacy.xyz` already points at this
+Pages site, so the files go live at the root once this branch lands on `main` and
+Pages redeploys.
 
-1. **iOS — AASA**: replace `TEAMID.BUNDLEID` with the real
-   `<DEVELOPMENT_TEAM>.<bundle id>` from the iOS xcconfig.
-2. **iOS — entitlement** (intentionally not committed, so device builds keep
-   signing without the live domain): add to `ios/bitchat/bitchat.entitlements`
-   ```xml
-   <key>com.apple.developer.associated-domains</key>
-   <array><string>applinks:sonarprivacy.xyz</string></array>
-   ```
-   The `.onContinueUserActivity` handler in `BitchatApp.swift` is already wired
-   and dormant until this is added.
-3. **Android — assetlinks**: replace `REPLACE_WITH_RELEASE_SIGNING_SHA256` with
-   the release keystore SHA-256 (`keytool -list -v -keystore … | grep SHA256`).
-   The `autoVerify` intent-filter is already in `AndroidManifest.xml`.
+Status of the three activation inputs:
+
+1. **iOS — AASA**: filled with `ZQB239SHCM.sh.hedwig.sonar`
+   (`<DEVELOPMENT_TEAM>.<bundle id>`). Apple's CDN fetches AASA tolerantly, so the
+   extensionless file served by GitHub Pages works without a custom content-type.
+2. **iOS — entitlement**: committed — `applinks:sonarprivacy.xyz` is in
+   `ios/bitchat/bitchat.entitlements`, and the `.onContinueUserActivity` handler in
+   `BitchatApp.swift` consumes it. Verified: device builds still sign (Xcode
+   auto-provisions the Associated Domains capability under automatic signing).
+3. **Android — assetlinks**: filled with the **debug** keystore SHA-256 so App
+   Links verify for the current alpha/debug installs. **Before a Play release, add
+   the release / Play App Signing fingerprint** to the `sha256_cert_fingerprints`
+   array (`keytool -list -v -keystore <release.keystore> | grep SHA256`). The
+   `autoVerify` intent-filter is already in `AndroidManifest.xml`.
