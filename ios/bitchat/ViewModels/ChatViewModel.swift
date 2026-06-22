@@ -540,10 +540,17 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
             }
         self.cancellables.insert(peersCancellable)
 
-        // Resubscribe geohash on relay reconnect
+        // Resubscribe geohash on relay reconnect.
+        // Debounced + de-duplicated: a foreground reconnect flips $isConnected many
+        // times in a burst (one flap per relay socket), and resubscribeCurrentGeohash()
+        // does unsubscribe()+subscribe() which clears the relay manager's coalescer, so
+        // every flap previously produced a full resubscribe (observed ~35/sec). That
+        // thrashed the shared relay sockets the Marmot gift-wrap stream rides on and
+        // delayed sync. Coalesce the burst and resubscribe once connections settle.
         if let relayMgr = self.nostrRelayManager {
             relayMgr.$isConnected
-                .receive(on: DispatchQueue.main)
+                .removeDuplicates()
+                .debounce(for: .milliseconds(400), scheduler: DispatchQueue.main)
                 .sink { [weak self] connected in
                     guard let self = self else { return }
                     if connected {

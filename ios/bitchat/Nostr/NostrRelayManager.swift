@@ -288,8 +288,10 @@ final class NostrRelayManager: ObservableObject {
             
             // SecureLogger.debug("📋 Subscription filter JSON: \(messageString.prefix(200))...", category: .session)
             
-            // Target specific relays if provided; else default. Filter permanently failed relays.
-            let baseUrls = relayUrls ?? Self.defaultRelays
+            // Target specific relays if provided; else default. Canonicalize first so
+            // pendingSubscriptions/relays keys match the connection keys, then filter
+            // permanently failed relays.
+            let baseUrls = (relayUrls ?? Self.defaultRelays).map { Self.canonicalRelayURL($0) }
             let candidateUrls = baseUrls.filter { !isPermanentlyFailed($0) }
             let urls = allowedRelayList(from: candidateUrls)
             // Always queue subscriptions; sending happens when a relay reports connected
@@ -297,7 +299,7 @@ final class NostrRelayManager: ObservableObject {
             for url in urls where !existingSet.contains(url) {
                 relays.append(Relay(url: url))
             }
-            for url in candidateUrls {
+            for url in urls {
                 var map = self.pendingSubscriptions[url] ?? [:]
                 map[id] = messageString
                 self.pendingSubscriptions[url] = map
@@ -373,10 +375,35 @@ final class NostrRelayManager: ObservableObject {
         }
     }
 
+    /// Canonicalize a relay URL so the same relay isn't tracked or connected twice under
+    /// different spellings — explicit default port, trailing slash, or host case. e.g.
+    /// "wss://Relay.Example.com:443/" and "wss://relay.example.com" collapse to one key.
+    /// All relay dictionaries (connections, subscriptions, pendingSubscriptions, relays)
+    /// are keyed by this canonical form, so normalize at every ingress point.
+    nonisolated static func canonicalRelayURL(_ raw: String) -> String {
+        var trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        while trimmed.hasSuffix("/") { trimmed.removeLast() }
+        guard let comps = URLComponents(string: trimmed),
+              let scheme = comps.scheme?.lowercased(),
+              let host = comps.host?.lowercased() else {
+            return trimmed
+        }
+        var port = comps.port
+        if (scheme == "wss" && port == 443) || (scheme == "ws" && port == 80) {
+            port = nil
+        }
+        var result = "\(scheme)://\(host)"
+        if let port { result += ":\(port)" }
+        let path = comps.path
+        if !path.isEmpty && path != "/" { result += path }
+        return result
+    }
+
     private func allowedRelayList(from urls: [String]) -> [String] {
         var seen = Set<String>()
         var result: [String] = []
-        for url in urls {
+        for raw in urls {
+            let url = Self.canonicalRelayURL(raw)
             if !allowDefaultRelays && Self.defaultRelaySet.contains(url) { continue }
             if seen.insert(url).inserted {
                 result.append(url)

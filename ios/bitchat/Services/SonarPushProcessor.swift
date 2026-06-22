@@ -66,7 +66,7 @@ enum SonarPushProcessor {
 
         Task {
             do {
-                let notifications: [DrainNotificationInfo] = try await withTimeout(seconds: 20) {
+                let notifications: [DrainNotificationInfo] = try await withTimeout(seconds: TransportConfig.marmotPushSyncTimeoutSeconds) {
                     await marmot.refresh()
                 }
                 if notifications.isEmpty {
