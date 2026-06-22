@@ -349,6 +349,10 @@ const MAX_INVITE_HEX_LEN: usize = 8192;
 /// same across iOS and Android.
 pub fn normalize_invite_token(input: &str) -> Result<String> {
     let trimmed = input.trim();
+    // `rfind` (last occurrence) is deliberate: it tolerates leading text around a
+    // pasted link (e.g. "join me: https://…/join#sinvite1…"). The extracted token
+    // is still re-validated downstream by `decode_invite_token` (hex + serde), so
+    // a crafted prefix cannot smuggle a differently-sourced token past the decode.
     let start = trimmed
         .rfind("sinvite1")
         .ok_or_else(|| Error::InvalidInput("no sinvite1 token found".into()))?;

@@ -20,10 +20,13 @@ import Foundation
 /// association file) opens Sonar directly. The Rust core re-normalizes any of
 /// these forms, so parsing here only needs to extract the candidate string.
 enum InviteShare {
-    /// Host backing the universal link. Single switch for the domain — every
-    /// client surface works before it is live; only browser auto-open waits on
-    /// hosting `.well-known/apple-app-site-association` and adding the
+    /// Host backing the universal link. Single switch for the domain in code —
+    /// every client surface works before it is live; only browser auto-open waits
+    /// on hosting `.well-known/apple-app-site-association` and adding the
     /// `applinks:` associated-domains entitlement. See `web/README.md`.
+    ///
+    /// NOTE: `bitchat.entitlements` (`applinks:…`) and the Android manifest
+    /// hardcode this same host and must be kept in sync if it changes.
     static let joinLinkHost = "sonarprivacy.xyz"
 
     /// Shareable universal link — preferred form (linkifies, travels across apps).

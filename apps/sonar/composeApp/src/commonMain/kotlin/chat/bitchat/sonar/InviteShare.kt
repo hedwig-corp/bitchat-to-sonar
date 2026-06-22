@@ -28,9 +28,15 @@ import kotlinx.coroutines.withContext
  * https URL linkifies in other apps and (once the domain serves the App Links /
  * Universal Links association files) opens Sonar directly.
  *
- * This is the single switch for the domain: every client surface works before it
- * is live; only browser auto-open waits on hosting `.well-known/assetlinks.json`
- * and `.well-known/apple-app-site-association`. See `web/README.md`.
+ * This is the single switch for the domain in code: every client surface works
+ * before it is live; only browser auto-open waits on hosting
+ * `.well-known/assetlinks.json` and `.well-known/apple-app-site-association`.
+ * See `web/README.md`.
+ *
+ * NOTE: two manifest files hardcode this same host (they cannot reference this
+ * const) and must be kept in sync if it changes:
+ *   - androidMain/AndroidManifest.xml — the App Links `<data android:host=…>`
+ *   - ios/bitchat/bitchat.entitlements — the `applinks:…` associated domain
  */
 const val JOIN_LINK_HOST = "sonarprivacy.xyz"
 

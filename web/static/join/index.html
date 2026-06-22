@@ -30,9 +30,11 @@
     // The invite payload lives in the URL fragment and never reaches this server.
     // Fall back to the custom scheme so the app opens even before Universal/App
     // Links are verified for this domain.
-    var token = (location.hash || "").replace(/^#/, "");
-    if (token.indexOf("sinvite1") !== -1) {
-      document.getElementById("open").setAttribute("href", "sonar://invite/" + token);
+    // Extract only a well-formed sinvite1<hex> token from the fragment (mirrors
+    // the Rust normalize_invite_token) before building the scheme URL.
+    var match = /sinvite1[0-9a-fA-F]+/.exec(location.hash || "");
+    if (match) {
+      document.getElementById("open").setAttribute("href", "sonar://invite/" + match[0]);
     }
   </script>
 </body>

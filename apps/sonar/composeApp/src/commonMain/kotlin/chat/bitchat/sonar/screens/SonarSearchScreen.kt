@@ -41,6 +41,9 @@ import chat.bitchat.sonar.ui.SNPrimaryButton
 import chat.bitchat.sonar.ui.SonarAvatar
 import chat.bitchat.sonar.ui.sonar
 
+/** A `sinvite1` token followed by its hex payload, anywhere in the input. */
+private val INVITE_TOKEN_RE = Regex("sinvite1[0-9a-fA-F]{2,}")
+
 /**
  * Search screen behind the home Search bar (the prototype's `sn-search`).
  * Filters the user's channels + secure chats by query, and — since there's no
@@ -73,8 +76,9 @@ fun SonarSearchScreen(state: SonarAppState) {
 
     // An invite link/token pasted (or shared) into search → request to join.
     // Matches the bare token, the sonar:// scheme, and the https universal link;
-    // the core normalizes whichever form before sending the join request.
-    val looksLikeInvite = query.contains("sinvite1")
+    // the core normalizes whichever form before sending the join request. Require
+    // a hex payload so ordinary text mentioning "sinvite1" doesn't offer to join.
+    val looksLikeInvite = INVITE_TOKEN_RE.containsMatchIn(query)
     val looksLikeNpub = !looksLikeInvite && ql.startsWith("npub1") && query.length > 8
     val looksLikeGeohash = !looksLikeInvite && ql.isNotEmpty() && ql.length in 2..9 &&
         ql.all { it in "0123456789bcdefghjkmnpqrstuvwxyz" } &&
