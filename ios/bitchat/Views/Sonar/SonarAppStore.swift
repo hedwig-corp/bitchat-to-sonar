@@ -59,7 +59,7 @@ private enum SonarCallAudioRoute {
     }
 }
 
-private enum SonarLocalNotificationKind {
+enum SonarLocalNotificationKind {
     case message
     case payment
     case call
@@ -69,20 +69,20 @@ private enum SonarLocalNotificationKind {
     case network
 }
 
-private struct SonarLocalNotificationPrefs {
+struct SonarLocalNotificationPrefs {
     var enabled = true
     var showNames = false
     var showPreview = false
 }
 
-private struct SonarLocalNotification {
+struct SonarLocalNotification {
     let title: String
     let body: String
     let identifier: String
     let userInfo: [String: Any]
 }
 
-private enum SonarLocalNotificationRouter {
+enum SonarLocalNotificationRouter {
     static func make(
         idKey: String,
         kind: SonarLocalNotificationKind,

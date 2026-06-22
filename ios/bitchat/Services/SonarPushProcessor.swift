@@ -73,14 +73,25 @@ enum SonarPushProcessor {
                     log.info("Marmot sync completed from push, no new messages")
                 } else {
                     log.info("Marmot sync completed from push, \(notifications.count) new message(s)")
+                    let prefs = SonarLocalNotificationPrefs(
+                        enabled: true,
+                        showNames: UserDefaults.standard.object(forKey: "sonar.notifications.showNames") as? Bool ?? false,
+                        showPreview: UserDefaults.standard.object(forKey: "sonar.notifications.showPreview") as? Bool ?? false
+                    )
                     for notif in notifications {
                         let senderName = await marmot.resolveSenderName(npub: notif.senderNpub)
-                        let title = notif.groupName.isEmpty ? senderName : "\(senderName) in \(notif.groupName)"
-                        let body = notif.contentPreview.isEmpty ? "Sent a message" : notif.contentPreview
+                        let conversationTitle = notif.groupName.isEmpty ? senderName : "\(senderName) in \(notif.groupName)"
+                        guard let routed = SonarLocalNotificationRouter.make(
+                            idKey: UUID().uuidString,
+                            kind: .message,
+                            conversationTitle: conversationTitle,
+                            preview: notif.contentPreview.isEmpty ? nil : notif.contentPreview,
+                            prefs: prefs
+                        ) else { continue }
                         NotificationService.shared.sendLocalNotification(
-                            title: title,
-                            body: body,
-                            identifier: "marmot-push-\(UUID().uuidString)"
+                            title: routed.title,
+                            body: routed.body,
+                            identifier: routed.identifier
                         )
                     }
                 }

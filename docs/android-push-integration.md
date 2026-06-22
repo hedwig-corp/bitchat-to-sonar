@@ -1,5 +1,11 @@
 # Android Remote Push Integration Guide
 
+> **Note:** This was a planning document written before implementation. The
+> actual code differs — MIP-05 crypto and token registration are handled
+> entirely in Rust core via FFI, not in Kotlin. Code blocks with `// TODO`
+> comments reflect the original plan, not the shipped implementation. See the
+> actual source in `apps/sonar/composeApp/src/androidMain/` for current code.
+
 Step-by-step guide for wiring the Compose Multiplatform Sonar app to both
 notification servers (transponder for chat/calls, Breez NDS for wallet
 wakeups).

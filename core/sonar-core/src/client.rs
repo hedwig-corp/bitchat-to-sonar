@@ -2211,7 +2211,11 @@ impl SonarClient {
                     changed_groups.insert(hex::encode(message.group_id.as_slice()));
                     if !message.mine {
                         let preview = if message.content.len() > 100 {
-                            format!("{}…", &message.content[..100])
+                            let mut end = 100;
+                            while !message.content.is_char_boundary(end) {
+                                end -= 1;
+                            }
+                            format!("{}…", &message.content[..end])
                         } else {
                             message.content.clone()
                         };

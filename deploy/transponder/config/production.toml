@@ -26,6 +26,8 @@ private_key_path = "/run/secrets/apns.p8"
 key_id = "PX84KR34WH"
 team_id = "ZQB239SHCM"
 bundle_id = "sh.hedwig.sonar"
+# "production" matches App Store / TestFlight builds. Debug builds use sandbox
+# APNs tokens — use a separate sandbox.toml for dev testing.
 environment = "production"
 
 [fcm]
