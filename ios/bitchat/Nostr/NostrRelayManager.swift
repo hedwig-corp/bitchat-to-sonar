@@ -441,6 +441,10 @@ final class NostrRelayManager: ObservableObject {
     // MARK: - Private Methods
     
     private func connectToRelay(_ urlString: String) {
+        // Canonicalize at this ingress too, so connections/subscriptions/pendingSubscriptions
+        // stay keyed by the same form as every other entry point (see canonicalRelayURL).
+        // Self-enforcing here rather than trusting every caller to pre-normalize.
+        let urlString = Self.canonicalRelayURL(urlString)
         // Global network policy gate
         guard networkService.activationAllowed else { return }
         guard let url = URL(string: urlString) else { 
