@@ -954,6 +954,37 @@ impl SonarClient {
         Ok(())
     }
 
+    /// Register a push token with a MIP-05 transponder server.
+    ///
+    /// Encrypts the device token to the server's secp256k1 public key and
+    /// publishes a NIP-59 gift-wrapped kind:446 event to our relays.
+    pub async fn register_push_token(
+        &self,
+        platform: &str,
+        token: &[u8],
+        server_pubkey: &PublicKey,
+    ) -> Result<()> {
+        let plat = match platform {
+            "ios" => crate::push::PushPlatform::Apns,
+            "android" => crate::push::PushPlatform::Fcm,
+            other => {
+                return Err(Error::InvalidInput(format!(
+                    "unknown push platform: {other}"
+                )))
+            }
+        };
+        let gift = crate::push::build_push_registration_event(
+            self.identity().keys(),
+            plat,
+            token,
+            server_pubkey,
+        )
+        .await?;
+        self.nostr.send_event(&gift).await?;
+        tracing::info!(platform, "push token registered with transponder");
+        Ok(())
+    }
+
     /// Fetch a peer's freshest valid Sonar descriptor from our account relays.
     /// Returns `None` for White Noise-only peers, old Sonar clients, privacy-off
     /// clients, relay misses, or malformed descriptors.

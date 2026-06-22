@@ -364,6 +364,25 @@ impl SonarNode {
         Ok(())
     }
 
+    /// Register a push token with a MIP-05 transponder server.
+    ///
+    /// `platform`: `"ios"` or `"android"`.
+    /// `token`: the raw device token bytes (APNS `Data` / FCM `ByteArray`).
+    /// `server_npub`: the transponder's npub (e.g. `npub1...`).
+    pub fn register_push_token(
+        &self,
+        platform: String,
+        token: Vec<u8>,
+        server_npub: String,
+    ) -> FfiResult<()> {
+        let server_pk = PublicKey::parse(&server_npub).map_err(invalid("server npub"))?;
+        self.runtime.block_on(
+            self.client
+                .register_push_token(&platform, &token, &server_pk),
+        )?;
+        Ok(())
+    }
+
     /// Publish our kind-0 profile (NIP-01 metadata) so peers can show our name +
     /// avatar instead of a raw npub. `name` is used for both name + display_name.
     pub fn publish_profile(

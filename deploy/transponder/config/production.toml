@@ -1,0 +1,25 @@
+# Sonar push notification server (transponder)
+# https://github.com/marmot-protocol/transponder
+
+[server]
+private_key_file = "/run/secrets/server.key"
+
+[relays]
+clearnet = [
+    "wss://relay.damus.io",
+    "wss://nos.lol",
+    "wss://nostr.relay.hedwig.sh",
+]
+
+[apns]
+enabled = true
+key_id = "PX84KR34WH"
+team_id = "L3N5LHJD5Y"
+private_key_path = "/run/secrets/apns.p8"
+bundle_id = "sh.hedwig.sonar"
+environment = "production"
+
+[fcm]
+enabled = true
+service_account_path = "/run/secrets/firebase.json"
+project_id = ""   # REQUIRED: paste your Firebase project ID here
