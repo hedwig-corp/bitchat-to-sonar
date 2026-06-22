@@ -380,6 +380,8 @@ final class NostrRelayManager: ObservableObject {
     /// "wss://Relay.Example.com:443/" and "wss://relay.example.com" collapse to one key.
     /// All relay dictionaries (connections, subscriptions, pendingSubscriptions, relays)
     /// are keyed by this canonical form, so normalize at every ingress point.
+    /// Note: query/fragment are intentionally dropped — Nostr relay URLs don't use them.
+    /// If a relay ever needs query params, preserve them here before keying on the result.
     nonisolated static func canonicalRelayURL(_ raw: String) -> String {
         var trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         while trimmed.hasSuffix("/") { trimmed.removeLast() }
@@ -566,7 +568,12 @@ final class NostrRelayManager: ObservableObject {
             if let handler = self.messageHandlers[subId] {
                 handler(event)
             } else {
-                SecureLogger.warning("⚠️ No handler for subscription \(subId)", category: .session)
+                // subscribe() always registers a handler synchronously, so a missing one
+                // means we already called unsubscribe(id:) and this is an in-flight event
+                // that arrived before the relay processed our CLOSE. Expected and benign
+                // (e.g. a late geohash-sample presence event after we stopped sampling),
+                // so log at debug — not a warning.
+                SecureLogger.debug("Ignoring event for closed subscription \(subId)", category: .session)
             }
         case .eose(let subId):
             if var tracker = eoseTrackers[subId] {
