@@ -133,6 +133,14 @@ enum TransportConfig {
     static let nostrGeohashSampleLimit: Int = 100
     static let nostrDMSubscribeLookbackSeconds: TimeInterval = 86400
 
+    // Marmot push-triggered background sync.
+    // iOS grants ~30s for didReceiveRemoteNotification; on a cold wake the core must
+    // connect relays and reach EOSE inside this budget. 20s was too tight (observed
+    // SonarPushTimeoutError on real device); 25s uses more of the window while leaving
+    // headroom to render the local notif. (Tor is disabled today — torEnforced=false; if
+    // it is re-enabled, bootstrap latency must also fit inside this budget.)
+    static let marmotPushSyncTimeoutSeconds: TimeInterval = 25
+
     // Nostr helpers
     static let nostrShortKeyDisplayLength: Int = 8
     static let nostrConvKeyPrefixLength: Int = 16
