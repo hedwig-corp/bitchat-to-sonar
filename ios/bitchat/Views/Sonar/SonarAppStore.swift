@@ -59,6 +59,124 @@ private enum SonarCallAudioRoute {
     }
 }
 
+enum SonarLocalNotificationKind {
+    case message
+    case payment
+    case call
+    case invite
+    case mention
+    case geohash
+    case network
+}
+
+struct SonarLocalNotificationPrefs {
+    var enabled = true
+    var showNames = false
+    var showPreview = false
+}
+
+struct SonarLocalNotification {
+    let title: String
+    let body: String
+    let identifier: String
+    let userInfo: [String: Any]
+}
+
+enum SonarLocalNotificationRouter {
+    static func make(
+        idKey: String,
+        kind: SonarLocalNotificationKind,
+        conversationTitle: String?,
+        preview: String?,
+        prefs: SonarLocalNotificationPrefs,
+        userInfo: [String: Any] = [:]
+    ) -> SonarLocalNotification? {
+        guard prefs.enabled else { return nil }
+        return SonarLocalNotification(
+            title: title(kind: kind, conversationTitle: conversationTitle, prefs: prefs),
+            body: body(kind: kind, preview: preview, prefs: prefs),
+            identifier: "sonar-\(identifierSegment(kind))-\(idKey)",
+            userInfo: userInfo
+        )
+    }
+
+    private static func title(
+        kind: SonarLocalNotificationKind,
+        conversationTitle: String?,
+        prefs: SonarLocalNotificationPrefs
+    ) -> String {
+        switch kind {
+        case .message:
+            if prefs.showNames, let name = conversationTitle?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty {
+                return name
+            }
+            return "New Sonar message"
+        case .payment:
+            return "Payment received"
+        case .call:
+            return "Incoming Sonar call"
+        case .invite:
+            return "New Sonar invite"
+        case .mention:
+            return "You were mentioned"
+        case .geohash:
+            if let title = conversationTitle?.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty {
+                return title
+            }
+            return "New channel activity"
+        case .network:
+            return "People nearby on Sonar"
+        }
+    }
+
+    private static func body(
+        kind: SonarLocalNotificationKind,
+        preview: String?,
+        prefs: SonarLocalNotificationPrefs
+    ) -> String {
+        switch kind {
+        case .message:
+            if prefs.showPreview {
+                let sanitized = sanitizePreview(preview)
+                if !sanitized.isEmpty { return sanitized }
+            }
+            return "Open Sonar to read it."
+        case .payment:
+            return "Open Sonar to view the payment."
+        case .call:
+            return "Open Sonar to answer."
+        case .invite:
+            return "Open Sonar to review the invite."
+        case .mention:
+            return "Open Sonar to read it."
+        case .geohash:
+            return "Open Sonar to view the channel."
+        case .network:
+            return "Open Sonar to see who is nearby."
+        }
+    }
+
+    private static func sanitizePreview(_ value: String?) -> String {
+        let collapsed = (value ?? "")
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        return collapsed.count > 80 ? String(collapsed.prefix(80)) + "..." : collapsed
+    }
+
+    private static func identifierSegment(_ kind: SonarLocalNotificationKind) -> String {
+        switch kind {
+        case .message: return "message"
+        case .payment: return "payment"
+        case .call: return "call"
+        case .invite: return "invite"
+        case .mention: return "mention"
+        case .geohash: return "geohash"
+        case .network: return "network"
+        }
+    }
+}
+
 // MARK: - Routes (stack entries below home)
 
 enum SonarRoute: Hashable {
@@ -330,6 +448,9 @@ final class SonarAppStore: ObservableObject {
         static let marmotConversationGroups = "sonar.marmotConversationGroups.v1"
         /// Persisted local call-log rows ([conversation id: call records] JSON).
         static let callLogs = "sonar.callLogs.v1"
+        static let notificationsEnabled = "sonar.notifications.enabled"
+        static let notificationShowNames = "sonar.notifications.showNames"
+        static let notificationShowPreview = "sonar.notifications.showPreview"
     }
 
     private static let maxStoredCallsPerConversation = 100
@@ -564,6 +685,9 @@ final class SonarAppStore: ObservableObject {
     private var refreshingDMTasks: [String: Task<Void, Never>] = [:]
     /// Chat-message ids whose ⚡PAY control lines were already processed.
     private var scannedPayMessageIDs = Set<String>()
+    private let localNotificationStartedAt = Date()
+    private var seenMarmotNotificationMessageIDs = Set<String>()
+    private var seenMeshPaymentNotificationMessageIDs = Set<String>()
     /// Stable mesh peer key -> first sighting time. We briefly hold unresolved
     /// fresh peers so their 0x53 Sonar capabilities can arrive before the UI
     /// commits to a plain Bitchat row.
@@ -725,6 +849,11 @@ final class SonarAppStore: ObservableObject {
                 self.updateReceiverAdvertising()
                 self.publishPaymentMetadataIfNeeded()
                 self.updateWalletPaymentObservation()
+                #if os(iOS)
+                if configured, let bridged = self.wallet as? BridgedWallet {
+                    SonarPushRegistration.shared.retryBreezWebhookIfNeeded(wallet: bridged.walletService)
+                }
+                #endif
             }
             .store(in: &cancellables)
         // Seed the flag from the current state so the first announce is correct.
@@ -746,6 +875,7 @@ final class SonarAppStore: ObservableObject {
             .sink { [weak self] _ in
                 guard let self else { return }
                 self.cachePublishedUploadMedia()
+                self.processIncomingMarmotNotifications()
                 self.processIncomingPayLines()
                 self.processIncomingCallLines()
                 self.objectWillChange.send()
@@ -1029,6 +1159,7 @@ final class SonarAppStore: ObservableObject {
             publishedCallDescriptor = false
             publishedBolt12Offer = nil
             publishPaymentMetadataIfNeeded(force: true)
+            marmot.refreshAfterForeground()
         }
     }
 
@@ -1145,6 +1276,71 @@ final class SonarAppStore: ObservableObject {
     func speaks(_ id: String) -> String {
         if resolvedSonarProfile(id) != nil { return "Sonar mesh + White Noise" }
         return marmotGroupId(id) != nil ? "White Noise" : "bitchat mesh"
+    }
+
+    // MARK: Local notification routing
+
+    private var notificationPrefs: SonarLocalNotificationPrefs {
+        SonarLocalNotificationPrefs(
+            enabled: defaults.object(forKey: Keys.notificationsEnabled) as? Bool ?? true,
+            showNames: defaults.object(forKey: Keys.notificationShowNames) as? Bool ?? false,
+            showPreview: defaults.object(forKey: Keys.notificationShowPreview) as? Bool ?? false
+        )
+    }
+
+    private func localNotificationKind(for content: String) -> SonarLocalNotificationKind {
+        if Self.looksLikeCallControl(content), callParseControl(content: content) != nil {
+            return .call
+        }
+        return SonarPayMessage.decode(content) != nil ? .payment : .message
+    }
+
+    private func sendSonarNotification(
+        kind: SonarLocalNotificationKind,
+        idKey: String,
+        conversationId: String?,
+        conversationTitle: String?,
+        preview: String? = nil
+    ) {
+        guard !isForeground else { return }
+        let userInfo: [String: Any] = conversationId.map { ["sonarConversationId": $0] } ?? [:]
+        guard let notification = SonarLocalNotificationRouter.make(
+            idKey: idKey,
+            kind: kind,
+            conversationTitle: conversationTitle,
+            preview: preview,
+            prefs: notificationPrefs,
+            userInfo: userInfo
+        ) else { return }
+        NotificationService.shared.sendLocalNotification(
+            title: notification.title,
+            body: notification.body,
+            identifier: notification.identifier,
+            userInfo: notification.userInfo
+        )
+    }
+
+    private func processIncomingMarmotNotifications() {
+        for group in marmot.groups {
+            let convId = marmotConvId(forGroup: group.id)
+            let title = marmot.title(for: group)
+            for message in marmot.messagesByGroup[group.id] ?? [] where !message.isMine {
+                if message.createdAt <= localNotificationStartedAt {
+                    seenMarmotNotificationMessageIDs.insert(message.id)
+                    continue
+                }
+                guard seenMarmotNotificationMessageIDs.insert(message.id).inserted else { continue }
+                let kind = localNotificationKind(for: message.content)
+                guard kind != .call else { continue }
+                sendSonarNotification(
+                    kind: kind,
+                    idKey: message.id,
+                    conversationId: convId,
+                    conversationTitle: title,
+                    preview: message.content
+                )
+            }
+        }
     }
 
     // MARK: Favorites (out-of-range internet delivery for bitchat peers)
@@ -3375,6 +3571,18 @@ final class SonarAppStore: ObservableObject {
                 guard !scannedPayMessageIDs.contains(m.id) else { continue }
                 scannedPayMessageIDs.insert(m.id)
                 if let line = SonarPayMessage.decode(m.content) {
+                    if m.timestamp <= localNotificationStartedAt {
+                        seenMeshPaymentNotificationMessageIDs.insert(m.id)
+                    } else if case .pay = line,
+                              seenMeshPaymentNotificationMessageIDs.insert(m.id).inserted {
+                        sendSonarNotification(
+                            kind: .payment,
+                            idKey: m.id,
+                            conversationId: peerID.id,
+                            conversationTitle: peerDisplayName(peerID.id),
+                            preview: m.content
+                        )
+                    }
                     handlePayLine(line, convId: peerID.id, via: dmTransport(peerID.id))
                 }
             }
@@ -3901,7 +4109,7 @@ final class SonarAppStore: ObservableObject {
                     scannedCallMessageIDs.insert(m.id)
                     continue
                 }
-                if handleCallControl(ctrl, convId: peerID.id, via: .mesh) {
+                if handleCallControl(ctrl, convId: peerID.id, via: .mesh, messageId: m.id) {
                     scannedCallMessageIDs.insert(m.id)
                 }
             }
@@ -3917,7 +4125,7 @@ final class SonarAppStore: ObservableObject {
                     scannedCallMessageIDs.insert(m.id)
                     continue
                 }
-                if handleCallControl(ctrl, convId: Self.marmotIDPrefix + groupId, via: .internet) {
+                if handleCallControl(ctrl, convId: Self.marmotIDPrefix + groupId, via: .internet, messageId: m.id) {
                     scannedCallMessageIDs.insert(m.id)
                 }
             }
@@ -3952,7 +4160,7 @@ final class SonarAppStore: ObservableObject {
     }
 
     @discardableResult
-    private func handleCallControl(_ ctrl: CallControlInfo, convId: String, via: SNVia) -> Bool {
+    private func handleCallControl(_ ctrl: CallControlInfo, convId: String, via: SNVia, messageId: String) -> Bool {
         let conversationId = callConversationId(convId)
         if case let .offer(callId, _, _, _) = ctrl, !canCall(conversationId) {
             if shouldDeferOfferForSonarDescriptor(conversationId) {
@@ -3987,6 +4195,12 @@ final class SonarAppStore: ObservableObject {
                     try await self.marmot.callIncomingOffer(callId: callId, addrB64: nodeAddrB64, video: video)
                     await MainActor.run {
                         self.activeCall = SNActiveCall(callId: callId, convId: conversationId, signalingVia: signalingVia, peerName: name, video: video, incoming: true, phase: .ringing, speakerOn: video)
+                        self.sendSonarNotification(
+                            kind: .call,
+                            idKey: "call-\(callId)-\(messageId)",
+                            conversationId: conversationId,
+                            conversationTitle: name
+                        )
                         self.push(.call(conversationId, video: video))
                     }
                 } catch {

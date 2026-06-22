@@ -68,19 +68,19 @@ final class NotificationService {
     }
     
     func sendMentionNotification(from sender: String, message: String) {
-        let title = "🫵 you were mentioned by \(sender)"
-        let body = message
+        let title = "You were mentioned"
+        let body = "Open Sonar to read it."
         let identifier = "mention-\(UUID().uuidString)"
-        
+
         sendLocalNotification(title: title, body: body, identifier: identifier)
     }
-    
+
     func sendPrivateMessageNotification(from sender: String, message: String, peerID: PeerID) {
-        let title = "🔒 DM from \(sender)"
-        let body = message
+        let title = "New Sonar message"
+        let body = "Open Sonar to read it."
         let identifier = "private-\(UUID().uuidString)"
         let userInfo = ["peerID": peerID.id, "senderName": sender]
-        
+
         sendLocalNotification(title: title, body: body, identifier: identifier, userInfo: userInfo)
     }
     

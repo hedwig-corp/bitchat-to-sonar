@@ -51,6 +51,18 @@ actual object Notifier {
         return true
     }
 
+    actual fun onWalletReady() {
+        chat.bitchat.sonar.push.SonarPushRegistration.retryBreezWebhookIfNeeded()
+    }
+
+    actual fun setPushEnabled(enabled: Boolean) {
+        if (enabled) {
+            chat.bitchat.sonar.push.SonarPushRegistration.ensureRegistered()
+        } else {
+            chat.bitchat.sonar.push.SonarPushRegistration.unregister()
+        }
+    }
+
     actual fun notify(id: Int, title: String, body: String) {
         if (!canNotify()) return
         val open = ctx.packageManager.getLaunchIntentForPackage(ctx.packageName)

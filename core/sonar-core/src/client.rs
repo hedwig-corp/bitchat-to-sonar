@@ -346,6 +346,15 @@ impl MarmotProcessReport {
     }
 }
 
+/// Info about an incoming message discovered during drain, used by hosts to
+/// fire rich local notifications (sender name + preview).
+#[derive(Clone, Debug)]
+pub struct DrainNotification {
+    pub sender_pubkey: String,
+    pub group_name: String,
+    pub content_preview: String,
+}
+
 /// One received geohash channel event (ephemeral kind-20000), buffered from the
 /// live subscription. Geohash channels are public ephemeral events — relays do
 /// NOT store them, so we accumulate them in memory as the subscription delivers.
@@ -447,6 +456,10 @@ pub struct SonarClient {
     change_listener: Arc<Mutex<Option<Arc<dyn ConversationChangeListener>>>>,
     /// In-memory store for invite link secrets and pending join requests.
     invite_links: Arc<crate::invite_link::InviteLinkStore>,
+    /// Cached push tokens for group members (pubkey hex → encrypted token).
+    push_token_cache: crate::push::PushTokenCache,
+    /// This device's own push registration (set after `register_push_token`).
+    own_push_registration: Arc<Mutex<Option<crate::push::OwnPushRegistration>>>,
 }
 
 impl SonarClient {
@@ -585,6 +598,7 @@ impl SonarClient {
         let marmot_group_subscriptions = Arc::new(Mutex::new(HashSet::new()));
         let initial_empty_transcript_backfills = Arc::new(Mutex::new(HashSet::new()));
         let initial_backfill_scanned = Arc::new(AtomicBool::new(false));
+        let push_token_cache = crate::push::new_push_token_cache();
 
         let handler_geo = geo.clone();
         let handler_dm = geo_dm.clone();
@@ -670,9 +684,10 @@ impl SonarClient {
                         let Some(p_hex) = tag_value(&event, Alphabet::P) else {
                             continue;
                         };
-                        // Addressed to our MAIN identity → a Marmot welcome.
-                        // Buffer it (do NOT touch the MLS engine here) and wake
-                        // the host to drain + process it on its engine thread.
+                        // Addressed to our MAIN identity → Marmot welcome,
+                        // MLS message, or push token share (kind 447).
+                        // Buffer everything; kind-447 is intercepted in
+                        // process_marmot_events before the MLS engine sees it.
                         if p_hex == my_pubkey_hex {
                             {
                                 let mut buf = handler_pending.lock().unwrap();
@@ -784,6 +799,8 @@ impl SonarClient {
             invite_links: Arc::new(crate::invite_link::InviteLinkStore::load(
                 invite_link_state_path,
             )),
+            push_token_cache,
+            own_push_registration: Arc::new(Mutex::new(None)),
         };
         // Open the live Marmot subscriptions for real sessions. In-memory test
         // sessions (allow_geo_relays=false) stay on the explicit `sync()` path so
@@ -1359,6 +1376,7 @@ impl SonarClient {
         // Deferred bookkeeping: index + sync-state disk writes don't block
         // the caller so the next send can start immediately.
         self.spawn_send_bookkeeping(group_name, message, event_id);
+        self.spawn_push_notification(group_id.clone());
         Ok(())
     }
 
@@ -1396,6 +1414,89 @@ impl SonarClient {
         });
     }
 
+    fn spawn_push_notification(&self, group_id: GroupId) {
+        let members = match self.engine.members(&group_id) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::debug!(%e, "push notify: failed to list members");
+                return;
+            }
+        };
+        let my_pubkey = self.engine.identity().public_key();
+        let identity_keys = self.engine.identity().keys().clone();
+        let nostr = self.nostr.clone();
+        let tokens = self.push_token_cache.lock().unwrap().clone();
+        tokio::spawn(async move {
+            for member in &members {
+                if member == &my_pubkey {
+                    continue;
+                }
+                let Some(info) = tokens.get(&member.to_hex()) else {
+                    continue;
+                };
+                let rumor = EventBuilder::new(
+                    Kind::Custom(crate::push::KIND_NOTIFICATION_REQUEST),
+                    &info.encrypted_token_b64,
+                )
+                .tags([
+                    Tag::custom(TagKind::custom("v"), ["mip05-v1"]),
+                    Tag::custom(TagKind::custom("encoding"), ["base64"]),
+                ])
+                .build(my_pubkey);
+
+                let seal_builder = match EventBuilder::seal(
+                    &identity_keys,
+                    &info.server_pubkey,
+                    rumor,
+                )
+                .await
+                {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::debug!(member = %member, %e, "push notify seal failed");
+                        continue;
+                    }
+                };
+                let seal = match seal_builder.sign(&identity_keys).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::debug!(member = %member, %e, "push notify sign seal failed");
+                        continue;
+                    }
+                };
+                let ephemeral = Keys::generate();
+                let content = match nip44::encrypt(
+                    ephemeral.secret_key(),
+                    &info.server_pubkey,
+                    seal.as_json(),
+                    nip44::Version::default(),
+                ) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::debug!(member = %member, %e, "push notify encrypt failed");
+                        continue;
+                    }
+                };
+                let wrapped = match EventBuilder::new(Kind::GiftWrap, content)
+                    .tags([Tag::public_key(info.server_pubkey)])
+                    .custom_created_at(Timestamp::now())
+                    .sign_with_keys(&ephemeral)
+                {
+                    Ok(w) => w,
+                    Err(e) => {
+                        tracing::debug!(member = %member, %e, "push notify sign failed");
+                        continue;
+                    }
+                };
+                if let Err(e) = nostr.send_event(&wrapped).await {
+                    tracing::debug!(member = %member, %e, "push notify send failed");
+                } else {
+                    tracing::info!(member = %member, "push notification sent to transponder");
+                }
+            }
+        });
+    }
+
     /// Send a sticker message to a group. Follows the same Signal-style
     /// local-first sequencing as `send_text`.
     pub async fn send_sticker(
@@ -1417,6 +1518,7 @@ impl SonarClient {
         self.spawn_outbox_publish(message.id.to_hex(), event);
         self.notify_conversation_changed(&group_id_hex);
         self.spawn_send_bookkeeping(group_name, message, event_id);
+        self.spawn_push_notification(group_id.clone());
         Ok(())
     }
 
@@ -1634,6 +1736,7 @@ impl SonarClient {
             self.notify_conversation_changed(&group_id_hex);
             self.spawn_send_bookkeeping(group_name, message, event.id);
         }
+        self.spawn_push_notification(group_id.clone());
         Ok(())
     }
 
@@ -1709,6 +1812,17 @@ impl SonarClient {
     /// the same `last_synced_at` + batched-subscription pattern the White Noise
     /// reference client uses. Duplicate/already-processed events are tolerated.
     pub async fn sync(&self) -> Result<()> {
+        self.sync_inner(false).await
+    }
+
+    /// Like `sync()` but bypasses the live-subscription short-circuit. Use after
+    /// a foreground resume or relay reconnect to catch events that arrived while
+    /// the subscription was dead.
+    pub async fn sync_force(&self) -> Result<()> {
+        self.sync_inner(true).await
+    }
+
+    async fn sync_inner(&self, force: bool) -> Result<()> {
         // Watermark from the previous successful sync (0 on the first poll of a
         // session → an unbounded backfill, bounded only by the `#p`/`#h` scope).
         let since_secs = self.sync_watermark_secs();
@@ -1722,11 +1836,13 @@ impl SonarClient {
         tracing::info!(
             is_live,
             since_secs,
+            force,
             "sync() called"
         );
-        if is_live && since_secs > 0 {
+        if is_live && since_secs > 0 && !force {
             tracing::info!("sync() short-circuited — live subscriptions active");
             self.retry_outbox().await;
+            self.share_push_token_with_groups().await;
             return Ok(());
         }
 
@@ -1755,7 +1871,8 @@ impl SonarClient {
             .nostr
             .fetch_events_from(self.relays.clone(), wraps, FETCH_TIMEOUT)
             .await?;
-        process_report.absorb(self.process_marmot_events(wraps, "gift wrap").await);
+        let (wrap_report, _) = self.process_marmot_events(wraps, "gift wrap").await;
+        process_report.absorb(wrap_report);
 
         // A welcome processed during sync can add group(s). Backfill all new
         // groups in ONE batched fetch, then widen the live tail if it is enabled.
@@ -1823,7 +1940,8 @@ impl SonarClient {
                 .nostr
                 .fetch_events_from(self.relays.clone(), filter, FETCH_TIMEOUT)
                 .await?;
-            process_report.absorb(self.process_marmot_events(events, "group message").await);
+            let (msg_report, _) = self.process_marmot_events(events, "group message").await;
+            process_report.absorb(msg_report);
         }
 
         if process_report.retryable_failures == 0 {
@@ -1834,6 +1952,7 @@ impl SonarClient {
             self.save_sync_state()?;
         }
         self.retry_outbox().await;
+        self.share_push_token_with_groups().await;
         Ok(())
     }
 
@@ -2012,8 +2131,9 @@ impl SonarClient {
         &self,
         events: impl IntoIterator<Item = Event>,
         context: &'static str,
-    ) -> MarmotProcessReport {
+    ) -> (MarmotProcessReport, Vec<DrainNotification>) {
         let mut report = MarmotProcessReport::default();
+        let mut notifications: Vec<DrainNotification> = Vec::new();
         let mut changed_groups: HashSet<String> = HashSet::new();
         let group_names: HashMap<Vec<u8>, String> = self
             .engine
@@ -2026,6 +2146,24 @@ impl SonarClient {
             if self.is_sync_event_processed(&event.id) {
                 report.record_processed();
                 continue;
+            }
+
+            // Intercept kind-1059 gift wraps that contain push token shares
+            // (kind 447) before they reach the MLS engine.
+            if event.kind == Kind::GiftWrap {
+                if let Ok(unwrapped) =
+                    UnwrappedGift::from_gift_wrap(self.engine.identity().keys(), &event).await
+                {
+                    if unwrapped.rumor.kind.as_u16() == crate::push::KIND_PUSH_TOKEN_SHARE {
+                        self.handle_push_token_share(
+                            &unwrapped.sender,
+                            &unwrapped.rumor.content,
+                        );
+                        self.mark_sync_event_processed(&event.id);
+                        report.record_processed();
+                        continue;
+                    }
+                }
             }
 
             match self.engine.process_incoming(&event).await {
@@ -2071,6 +2209,22 @@ impl SonarClient {
                         .map(|s| s.as_str());
                     self.upsert_index_for_message(message, cached_name);
                     changed_groups.insert(hex::encode(message.group_id.as_slice()));
+                    if !message.mine {
+                        let preview = if message.content.len() > 100 {
+                            let mut end = 100;
+                            while !message.content.is_char_boundary(end) {
+                                end -= 1;
+                            }
+                            format!("{}…", &message.content[..end])
+                        } else {
+                            message.content.clone()
+                        };
+                        notifications.push(DrainNotification {
+                            sender_pubkey: message.sender.to_string(),
+                            group_name: cached_name.unwrap_or("").to_string(),
+                            content_preview: preview,
+                        });
+                    }
                     self.mark_sync_event_processed(&event.id);
                     report.record_processed();
                 }
@@ -2102,7 +2256,7 @@ impl SonarClient {
             }
         }
         self.notify_conversations_changed(&changed_groups);
-        report
+        (report, notifications)
     }
 
     /// One-off fetch of a single group's full kind-445 history (no `since`),
@@ -2117,9 +2271,10 @@ impl SonarClient {
             .nostr
             .fetch_events_from(self.relays.clone(), filter, BACKFILL_TIMEOUT)
             .await?;
-        Ok(self
+        let (report, _) = self
             .process_marmot_events(events, "backfilled group message")
-            .await)
+            .await;
+        Ok(report)
     }
 
     /// Batched variant: fetches kind-445 history for multiple groups in ONE
@@ -2139,9 +2294,10 @@ impl SonarClient {
             .nostr
             .fetch_events_from(self.relays.clone(), filter, BACKFILL_TIMEOUT)
             .await?;
-        Ok(self
+        let (report, _) = self
             .process_marmot_events(events, "batched backfill group message")
-            .await)
+            .await;
+        Ok(report)
     }
 
     /// Park until a live Marmot event is buffered (or `timeout_secs` elapses).
@@ -2164,17 +2320,17 @@ impl SonarClient {
     /// widen the group subscription if a welcome just added a group. Returns true
     /// if anything was drained. MUST run on the host's serialized engine thread
     /// (it mutates MLS state); the notification handler only ever BUFFERS.
-    pub async fn drain_pending_marmot(&self) -> Result<bool> {
+    pub async fn drain_pending_marmot(&self) -> Result<Vec<DrainNotification>> {
         let mut events: Vec<Event> = {
             let mut buf = self.pending_marmot.lock().unwrap();
             if buf.is_empty() {
-                return Ok(false);
+                return Ok(Vec::new());
             }
             std::mem::take(&mut *buf)
         };
         sort_marmot_events_in_place(&mut events);
         let ids_before = self.current_group_ids()?;
-        let mut process_report = self
+        let (mut process_report, notifications) = self
             .process_marmot_events(events, "live marmot event")
             .await;
         // A welcome may have joined new group(s): backfill each one's history
@@ -2201,7 +2357,7 @@ impl SonarClient {
         } else {
             self.save_sync_state()?;
         }
-        Ok(true)
+        Ok(notifications)
     }
 
     pub fn groups(&self) -> Result<Vec<group_types::Group>> {
@@ -2675,6 +2831,144 @@ impl SonarClient {
         let index_result = wipe_index_for_db(db_path);
         db_result?;
         index_result
+    }
+
+    /// MIP-05: encrypt a device push token and publish it as a NIP-59 gift-wrapped
+    /// kind-446 notification request addressed to the transponder.
+    ///
+    /// After registration, the encrypted token is cached locally and shared with
+    /// all joined group members via NIP-44 DMs so they can send sender-side
+    /// push notifications on future messages.
+    pub async fn register_push_token(
+        &self,
+        platform: &str,
+        token: &[u8],
+        server_npub: &str,
+    ) -> Result<()> {
+        use crate::push;
+
+        let server_pubkey = PublicKey::parse(server_npub)?;
+        let plat = push::platform_byte(platform)?;
+        let (content, _) = push::encode_notification_request(plat, token, &server_pubkey)?;
+
+        let rumor = EventBuilder::new(
+            Kind::Custom(push::KIND_NOTIFICATION_REQUEST),
+            &content,
+        )
+        .tags([
+            Tag::custom(TagKind::custom("v"), ["mip05-v1"]),
+            Tag::custom(TagKind::custom("encoding"), ["base64"]),
+        ])
+        .build(self.engine.identity().public_key());
+
+        let wrapped = self.engine.gift_wrap_rumor(&server_pubkey, rumor).await?;
+        self.nostr.send_event(&wrapped).await?;
+
+        // Store our own registration so we can share it with group members.
+        let own_reg = push::OwnPushRegistration {
+            encrypted_token_b64: content.clone(),
+            server_pubkey,
+        };
+        *self.own_push_registration.lock().unwrap() = Some(own_reg);
+
+        // Share our encrypted push token with all group members.
+        self.share_push_token_with_groups().await;
+
+        Ok(())
+    }
+
+    /// Send our encrypted push token to every member of every joined group
+    /// via a NIP-44 encrypted DM (kind 447). Group members cache this to send
+    /// sender-side notifications to us.
+    async fn share_push_token_with_groups(&self) {
+        let own_reg = self.own_push_registration.lock().unwrap().clone();
+        let Some(reg) = own_reg else { return };
+
+        let groups = match self.engine.groups() {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!(%e, "push token share: failed to list groups");
+                return;
+            }
+        };
+
+        let my_pubkey = self.engine.identity().public_key();
+        let payload = crate::push::PushTokenSharePayload {
+            encrypted_token: reg.encrypted_token_b64.clone(),
+            server_pubkey: reg.server_pubkey.to_hex(),
+        };
+        let payload_json = match serde_json::to_string(&payload) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::warn!(%e, "push token share: JSON serialization failed");
+                return;
+            }
+        };
+
+        for group in &groups {
+            let members = match self.engine.members(&group.mls_group_id) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            for member in &members {
+                if member == &my_pubkey {
+                    continue;
+                }
+                if let Err(e) = self.send_push_token_dm(member, &payload_json).await {
+                    tracing::debug!(
+                        recipient = %member,
+                        %e,
+                        "push token share DM failed"
+                    );
+                }
+            }
+        }
+        tracing::info!("push token shared with group members");
+    }
+
+    /// NIP-44 encrypted DM carrying our push token info (kind 447).
+    async fn send_push_token_dm(
+        &self,
+        recipient: &PublicKey,
+        payload_json: &str,
+    ) -> Result<()> {
+        let rumor = EventBuilder::new(
+            Kind::Custom(crate::push::KIND_PUSH_TOKEN_SHARE),
+            payload_json,
+        )
+        .tags([Tag::public_key(*recipient)])
+        .build(self.engine.identity().public_key());
+
+        let wrapped = self.engine.gift_wrap_rumor(recipient, rumor).await?;
+        self.nostr.send_event(&wrapped).await?;
+        Ok(())
+    }
+
+    /// Process an incoming push token share DM (kind 447) from a group member.
+    fn handle_push_token_share(&self, sender: &PublicKey, content: &str) {
+        let payload: crate::push::PushTokenSharePayload = match serde_json::from_str(content) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::debug!(%e, "ignoring malformed push token share");
+                return;
+            }
+        };
+        let server_pubkey = match PublicKey::parse(&payload.server_pubkey) {
+            Ok(pk) => pk,
+            Err(e) => {
+                tracing::debug!(%e, "ignoring push token share with bad server pubkey");
+                return;
+            }
+        };
+        let cached = crate::push::CachedPushToken {
+            encrypted_token_b64: payload.encrypted_token,
+            server_pubkey,
+        };
+        self.push_token_cache
+            .lock()
+            .unwrap()
+            .insert(sender.to_hex(), cached);
+        tracing::info!(sender = %sender, "cached push token from group member");
     }
 }
 

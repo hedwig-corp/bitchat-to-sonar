@@ -276,6 +276,18 @@ public final class SonarWallet {
         ratesCache.first { $0.currencyCode == currency.uppercased() }?.rate
     }
 
+    public func registerWebhook(url: String) async throws {
+        try ensureConfigured()
+        guard let sdk else { throw WalletError.notConfigured }
+        try await run { try sdk.registerWebhook(webhookUrl: url) }
+    }
+
+    public func unregisterWebhook() async throws {
+        try ensureConfigured()
+        guard let sdk else { throw WalletError.notConfigured }
+        try await run { try sdk.unregisterWebhook() }
+    }
+
     private func ensureConfigured() throws {
         guard isConfigured else { throw WalletError.notConfigured }
     }

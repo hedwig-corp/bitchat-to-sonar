@@ -1,0 +1,79 @@
+# Sonar Notification Stack
+#
+# Two stateless servers that deliver silent pushes to mobile devices:
+#   transponder  — Marmot chat/call wakeups (MIP-05 privacy-preserving push)
+#   breez-nds    — Breez wallet wakeups (BOLT12 receive, swap updates)
+#
+# Usage:
+#   cp .env.example .env          # fill in credentials
+#   docker compose up -d          # start both servers
+#   docker compose logs -f        # tail logs
+#
+# Both servers share the same Firebase project (one firebase.json).
+# APNS credentials are only needed by the transponder.
+
+services:
+  transponder:
+    image: ghcr.io/marmot-protocol/transponder:0.1.0
+    container_name: sonar-transponder
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    env_file:
+      - .env
+    volumes:
+      - ./transponder/config/production.toml:/etc/transponder/config.toml:ro
+      - ./secrets/transponder-server.key:/run/secrets/server.key:ro
+      - ./secrets/apns.p8:/run/secrets/apns.p8:ro
+      - ./secrets/firebase.json:/run/secrets/firebase.json:ro
+    tmpfs:
+      - /tmp:size=64m
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 4G
+        reservations:
+          cpus: "1"
+          memory: 1G
+    healthcheck:
+      test: ["CMD", "transponder", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  breez-nds:
+    build:
+      context: ./breez-nds
+      dockerfile: Dockerfile
+    container_name: sonar-breez-nds
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    environment:
+      - NOTIFY_WORKERS_NUM=${NOTIFY_WORKERS_NUM:-4}
+      - NOTIFY_EXTERNAL_URL=${NOTIFY_EXTERNAL_URL}
+      - NOTIFY_HTTP_ADDRESS=0.0.0.0:8080
+      - GOOGLE_APPLICATION_CREDENTIALS=/run/secrets/firebase.json
+    volumes:
+      - ./secrets/firebase.json:/run/secrets/firebase.json:ro
+    tmpfs:
+      - /tmp:size=64m
+    ports:
+      - "${NDS_LISTEN_ADDRESS:-127.0.0.1:8080}:8080"
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/api/v1/notify"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

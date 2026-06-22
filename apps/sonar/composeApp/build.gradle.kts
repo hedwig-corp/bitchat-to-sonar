@@ -8,6 +8,7 @@ plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.compose)
     alias(libs.plugins.compose.compiler)
+    alias(libs.plugins.google.services)
 }
 
 // Breez API key from a gitignored secret — NEVER hardcode or commit it.
@@ -196,6 +197,14 @@ android {
         versionCode = 4
         versionName = "0.0.1-alpha.4"
         buildConfigField("String", "BREEZ_API_KEY", "\"$breezApiKey\"")
+        val lp = Properties().apply {
+            val f = rootProject.file("local.properties")
+            if (f.exists()) f.inputStream().use { load(it) }
+        }
+        buildConfigField("String", "TRANSPONDER_NPUB",
+            "\"${lp.getProperty("sonar.transponder.npub", "")}\"")
+        buildConfigField("String", "NDS_URL",
+            "\"${lp.getProperty("sonar.nds.url", "")}\"")
     }
 
     buildFeatures {
@@ -229,4 +238,12 @@ android {
             ndk { abiFilters += "arm64-v8a" }
         }
     }
+}
+
+dependencies {
+    // Firebase Cloud Messaging for push wakeups (transponder + Breez NDS).
+    // platform() BOM isn't supported inside KMP's androidMain.dependencies {},
+    // so Firebase goes through the standard Gradle dependencies block.
+    implementation(platform(libs.firebase.bom))
+    implementation(libs.firebase.messaging)
 }

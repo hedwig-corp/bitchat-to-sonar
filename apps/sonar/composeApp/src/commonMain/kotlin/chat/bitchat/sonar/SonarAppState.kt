@@ -579,6 +579,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 }
                 val name = callPeerName(callChatId)
                 activeCall = ActiveCall(ctrl.callId, callChatId, name, ctrl.video, incoming = true, phase = SonarCallState.Ringing)
+                notifyIncoming(callChatId, name, m.content, forcedKind = SonarNotificationKind.Call)
                 push(Screen.Call(callChatId, name, ctrl.video))
             }
             is SonarCallControl.Answer ->
@@ -957,6 +958,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             WalletBridge.fetchRates()
             rate = WalletBridge.cachedRate(currency)
             publishSonarDescriptorIfNeeded(force = true)
+            if (walletState is WalletState.Ready) Notifier.onWalletReady()
         }
     }
 
@@ -1517,17 +1519,38 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
-    private fun notifPreview(content: String): String =
-        if (PayLine.decode(content) != null) "₿ Payment"
-        else content.replace("\n", " ").let { if (it.length > 80) it.take(80) + "…" else it }
+    private fun notificationPrefs(): SonarNotificationPrefs =
+        SonarNotificationPrefs(
+            enabled = prefBool("notifs", true),
+            showNames = prefBool("notifNames", false),
+            showPreview = prefBool("notifPreview", false),
+        )
+
+    private fun isCallNotificationContent(content: String): Boolean =
+        content.trimStart().startsWith("☎CALL") && SonarCore.callParseControl(content) != null
+
+    private fun notifyIncoming(
+        idKey: String,
+        conversationTitle: String?,
+        content: String,
+        forcedKind: SonarNotificationKind? = null,
+    ) {
+        if (foreground) return
+        val kind = forcedKind ?: SonarNotificationRouter.classifyContent(content, ::isCallNotificationContent)
+        val notification = SonarNotificationRouter.build(
+            idKey = idKey,
+            kind = kind,
+            conversationTitle = conversationTitle,
+            preview = content,
+            prefs = notificationPrefs(),
+        ) ?: return
+        Notifier.notify(notification.id, notification.title, notification.body)
+    }
 
     /** Notify for any chat whose newest incoming message is newer than last seen.
      *  Uses [lastNotifiedTs] to prevent double-fire when the conversationChanged
      *  flow and poll loop both process the same message within one cycle. */
     private suspend fun maybeNotify() {
-        val enabled = prefBool("notifs", true)
-        val showNames = prefBool("notifNames", true)
-        val showPreview = prefBool("notifPreview", true)
         val openChatId = (screen as? Screen.Chat)?.id
         val snapshot = chats
         for (c in snapshot) {
@@ -1535,13 +1558,11 @@ class SonarAppState(private val scope: CoroutineScope) {
             val newestIncoming = msgs.lastOrNull { !it.mine }
             val prev = lastSeenTs[c.id]
             val alreadyNotified = lastNotifiedTs[c.id] ?: 0L
-            if (enabled && seededSeen && prev != null && newestIncoming != null &&
+            if (seededSeen && prev != null && newestIncoming != null &&
                 newestIncoming.tsSecs > prev && newestIncoming.tsSecs > alreadyNotified &&
-                !foreground && c.id != openChatId
+                c.id != openChatId
             ) {
-                val title = if (showNames) chatTitle(c) else "New message"
-                val body = if (showPreview) notifPreview(newestIncoming.content) else "Tap to open"
-                Notifier.notify(c.id.hashCode(), title, body)
+                notifyIncoming(c.id, chatTitle(c), newestIncoming.content)
                 lastNotifiedTs[c.id] = newestIncoming.tsSecs
             }
             lastSeenTs[c.id] = msgs.lastOrNull()?.tsSecs ?: (prev ?: 0L)
@@ -3052,8 +3073,6 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun drainMeshDms() {
         val incoming = MeshRadio.drainMeshDm()
         if (incoming.isEmpty()) return
-        val openChatId = (screen as? Screen.Chat)?.id
-        val notifsOn = prefBool("notifs", true)
         val touched = mutableSetOf<String>()
         for (m in incoming) {
             val stickerRef = meshParseStickerContent(m.text)?.let {
@@ -3072,10 +3091,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             meshChats[m.peerId] = meshChats[m.peerId].orEmpty() + msg
             processPayLines(chatId, listOf(msg))
             touched += m.peerId
-            if (notifsOn && !foreground && chatId != openChatId) {
-                val preview = if (stickerRef != null) "Sticker" else notifPreview(m.text)
-                Notifier.notify(chatId.hashCode(), meshPeerName(m.peerId), preview)
-            }
+            val preview = if (stickerRef != null) "Sticker" else m.text
+            notifyIncoming(chatId, meshPeerName(m.peerId), preview)
         }
         touched.forEach { persistMesh(it) } // write-through so received DMs survive restart
         refreshMeshDmRows()

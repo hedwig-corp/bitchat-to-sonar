@@ -48,6 +48,7 @@ import chat.bitchat.sonar.ui.SonarType
 import chat.bitchat.sonar.ui.SNTone
 import chat.bitchat.sonar.ui.SNTrail
 import chat.bitchat.sonar.ui.sonar
+import chat.bitchat.sonar.Notifier
 
 /**
  * Full Settings screen — 1:1 reproduction of design/handoff/project/sonar/
@@ -287,17 +288,30 @@ private fun NotifSheet(state: SonarAppState, onClose: () -> Unit) {
         SNSettingsRow(
             icon = SNIconName.Info, label = "Allow notifications",
             toggle = state.prefBool("notifs", true), trail = SNTrail.None,
-        ) { state.togglePref("notifs", true) }
+        ) {
+            state.togglePref("notifs", true)
+            Notifier.setPushEnabled(state.prefBool("notifs", true))
+        }
         SNSettingsRow(
             icon = SNIconName.People, label = "Show names",
             sub = "Hide to keep the lock screen private",
-            toggle = state.prefBool("notifNames", true) && state.prefBool("notifs", true), trail = SNTrail.None,
-        ) { state.togglePref("notifNames", true) }
+            toggle = state.prefBool("notifNames", false) && state.prefBool("notifs", true), trail = SNTrail.None,
+        ) { state.togglePref("notifNames", false) }
         SNSettingsRow(
             icon = SNIconName.Pin, label = "Show message preview",
-            toggle = state.prefBool("notifPreview", true) && state.prefBool("notifs", true),
+            toggle = state.prefBool("notifPreview", false) && state.prefBool("notifs", true),
+            trail = SNTrail.None,
+        ) { state.togglePref("notifPreview", false) }
+        SNSettingsRow(
+            icon = SNIconName.Bolt, label = "Background push",
+            sub = "Receive messages when Sonar is closed",
+            toggle = state.prefBool("pushEnabled", true) && state.prefBool("notifs", true),
             trail = SNTrail.None, divider = false,
-        ) { state.togglePref("notifPreview", true) }
+        ) {
+            val newValue = !state.prefBool("pushEnabled", true)
+            state.setPref("pushEnabled", newValue)
+            Notifier.setPushEnabled(newValue)
+        }
     }
 }
 

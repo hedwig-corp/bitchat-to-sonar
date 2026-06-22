@@ -54,6 +54,13 @@ expect object WalletBridge {
     fun currency(): FiatCurrency
     fun setCurrency(value: FiatCurrency)
 
+    /** Register a push notification webhook so wallet events (BOLT12
+     *  receive, swap update) fire a silent data-only push via Breez NDS. */
+    suspend fun registerWebhook(url: String)
+
+    /** Remove the push webhook (sign-out or push disable). */
+    suspend fun unregisterWebhook()
+
     /** Disconnect (on wipe). */
     suspend fun shutdown()
 }
