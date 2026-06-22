@@ -73,3 +73,47 @@ repo name for the production build.
   project repository until a hosted interactive demo exists. The `#download`
   links are placeholders pending real App Store URLs (see the chat log).
 - Radar sweeps and pulses respect `prefers-reduced-motion`.
+
+## Group invite links (App Links / Universal Links)
+
+Group invites are shared as a Signal-style universal link with the payload in the
+URL **fragment** (never sent to the server):
+
+```
+https://sonarprivacy.xyz/join#sinvite1<hex>
+```
+
+The host (`JOIN_LINK_HOST`) is set in both clients — `InviteShare.kt`
+(`apps/sonar/...`) and `InviteShare.swift` (`ios/...`). **Every client surface
+works before the host is live**: QR codes, copy, share, paste/share-to-join, and
+the legacy `sonar://invite/…` scheme all function offline. Hosting only adds the
+convenience of the https link auto-opening the app.
+
+Three static files ship under `static/` so they deploy to the site root (the
+`.nojekyll` marker lets GitHub Pages serve the dot-folder):
+
+| URL | File |
+|-----|------|
+| `/.well-known/apple-app-site-association` | `static/.well-known/apple-app-site-association` |
+| `/.well-known/assetlinks.json` | `static/.well-known/assetlinks.json` |
+| `/join` | `static/join/index.html` (landing + `sonar://` fallback) |
+
+These require the site to be served at the **domain root** (`sonarprivacy.xyz`),
+not the GitHub Pages project subpath — `sonarprivacy.xyz` already points at this
+Pages site, so the files go live at the root once this branch lands on `main` and
+Pages redeploys.
+
+Status of the three activation inputs:
+
+1. **iOS — AASA**: filled with `ZQB239SHCM.sh.hedwig.sonar`
+   (`<DEVELOPMENT_TEAM>.<bundle id>`). Apple's CDN fetches AASA tolerantly, so the
+   extensionless file served by GitHub Pages works without a custom content-type.
+2. **iOS — entitlement**: committed — `applinks:sonarprivacy.xyz` is in
+   `ios/bitchat/bitchat.entitlements`, and the `.onContinueUserActivity` handler in
+   `BitchatApp.swift` consumes it. Verified: device builds still sign (Xcode
+   auto-provisions the Associated Domains capability under automatic signing).
+3. **Android — assetlinks**: filled with the **debug** keystore SHA-256 so App
+   Links verify for the current alpha/debug installs. **Before a Play release, add
+   the release / Play App Signing fingerprint** to the `sha256_cert_fingerprints`
+   array (`keytool -list -v -keystore <release.keystore> | grep SHA256`). The
+   `autoVerify` intent-filter is already in `AndroidManifest.xml`.

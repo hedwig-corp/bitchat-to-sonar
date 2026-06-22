@@ -41,6 +41,9 @@ import chat.bitchat.sonar.ui.SNPrimaryButton
 import chat.bitchat.sonar.ui.SonarAvatar
 import chat.bitchat.sonar.ui.sonar
 
+/** A `sinvite1` token followed by its hex payload, anywhere in the input. */
+private val INVITE_TOKEN_RE = Regex("sinvite1[0-9a-fA-F]{2,}")
+
 /**
  * Search screen behind the home Search bar (the prototype's `sn-search`).
  * Filters the user's channels + secure chats by query, and — since there's no
@@ -71,8 +74,13 @@ fun SonarSearchScreen(state: SonarAppState) {
         if (ql.isEmpty()) state.chats else state.chats.filter { it.name.lowercase().contains(ql) }
     }
 
-    val looksLikeNpub = ql.startsWith("npub1") && query.length > 8
-    val looksLikeGeohash = ql.isNotEmpty() && ql.length in 2..9 &&
+    // An invite link/token pasted (or shared) into search → request to join.
+    // Matches the bare token, the sonar:// scheme, and the https universal link;
+    // the core normalizes whichever form before sending the join request. Require
+    // a hex payload so ordinary text mentioning "sinvite1" doesn't offer to join.
+    val looksLikeInvite = INVITE_TOKEN_RE.containsMatchIn(query)
+    val looksLikeNpub = !looksLikeInvite && ql.startsWith("npub1") && query.length > 8
+    val looksLikeGeohash = !looksLikeInvite && ql.isNotEmpty() && ql.length in 2..9 &&
         ql.all { it in "0123456789bcdefghjkmnpqrstuvwxyz" } &&
         channels.none { it.geohash == ql }
 
@@ -103,6 +111,12 @@ fun SonarSearchScreen(state: SonarAppState) {
         }
 
         LazyColumn(Modifier.fillMaxSize()) {
+            // Join-a-group action when an invite link/token is pasted or shared in.
+            if (looksLikeInvite) item {
+                ActionResult(SNIconName.Link, "Join group", "Request to join via invite link", net = true) {
+                    state.requestJoinViaLink(query); state.back()
+                }
+            }
             // Start-a-chat-by-npub / join-by-geohash actions when the query matches.
             if (looksLikeNpub) item {
                 ActionResult(SNIconName.Key, "Start secure chat", query, net = false) {
@@ -133,7 +147,7 @@ fun SonarSearchScreen(state: SonarAppState) {
                     ) { state.openChat(chat) }
                 }
             }
-            if (channels.isEmpty() && chats.isEmpty() && !looksLikeNpub && !looksLikeGeohash) {
+            if (channels.isEmpty() && chats.isEmpty() && !looksLikeNpub && !looksLikeGeohash && !looksLikeInvite) {
                 item {
                     Text(
                         if (query.isEmpty()) "Search your chats and channels, or paste an npub to start a secure chat."

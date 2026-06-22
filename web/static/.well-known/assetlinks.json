@@ -1,0 +1,12 @@
+[
+  {
+    "relation": ["delegate_permission/common.handle_all_urls"],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "chat.bitchat.sonar",
+      "sha256_cert_fingerprints": [
+        "04:D2:E1:B7:ED:2D:7D:F8:60:06:3F:46:F1:B2:36:67:91:05:C3:5C:66:CC:1F:CB:9B:B7:5F:7C:BD:60:DD:39"
+      ]
+    }
+  }
+]

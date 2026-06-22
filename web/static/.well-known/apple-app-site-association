@@ -1,0 +1,11 @@
+{
+  "applinks": {
+    "apps": [],
+    "details": [
+      {
+        "appID": "ZQB239SHCM.sh.hedwig.sonar",
+        "paths": ["/join", "/join*"]
+      }
+    ]
+  }
+}

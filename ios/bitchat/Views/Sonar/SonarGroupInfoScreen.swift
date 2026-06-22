@@ -65,19 +65,42 @@ struct SonarGroupInfoScreen: View {
 
                     // ── Invite link ──
                     SNSectionLabel("Invite link")
-                    SNSettingsCard {
-                        SNSettingsRow(
-                            icon: .link, tone: .cyan,
-                            label: inviteLink != nil ? "Copy invite link" : "Create invite link",
-                            sub: inviteLink != nil
-                                ? "sonar://invite/sinvite1…\(String(inviteLink!.suffix(8)))"
-                                : "Share a link to let people request to join",
-                            trail: .chevron, divider: false
-                        ) {
-                            if let link = inviteLink {
-                                copyInviteLink(link)
-                                showToast("Invite link copied")
-                            } else {
+                    if let link = inviteLink {
+                        // QR of the universal link — scan in person to request to join.
+                        SNSettingsCard {
+                            VStack(spacing: 12) {
+                                QRCodeImage(data: InviteShare.universalLink(link), size: 196)
+                                Text(verbatim: InviteShare.preview(link))
+                                    .font(SonarTheme.uiFont(size: 12.5))
+                                    .foregroundColor(SonarTheme.text3)
+                                HStack(spacing: 10) {
+                                    Button {
+                                        copyInviteLink(link)
+                                        showToast("Invite link copied")
+                                    } label: {
+                                        inviteActionLabel(icon: .copy, text: "Copy",
+                                                          fg: SonarTheme.text, bg: SonarTheme.surface2)
+                                    }
+                                    .buttonStyle(SNScaleStyle(scale: 0.97))
+
+                                    ShareLink(item: InviteShare.universalLink(link)) {
+                                        inviteActionLabel(icon: .share, text: "Share",
+                                                          fg: SonarTheme.onAccent, bg: SonarTheme.accentFill)
+                                    }
+                                    .buttonStyle(SNScaleStyle(scale: 0.97))
+                                }
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(EdgeInsets(top: 16, leading: 14, bottom: 14, trailing: 14))
+                        }
+                    } else {
+                        SNSettingsCard {
+                            SNSettingsRow(
+                                icon: .link, tone: .cyan,
+                                label: "Create invite link",
+                                sub: "Share a link or QR code to let people request to join",
+                                trail: .chevron, divider: false
+                            ) {
                                 guard let groupId = store.marmotGroupId(peerId) else { return }
                                 Task { @MainActor in
                                     do {
@@ -276,12 +299,20 @@ struct SonarGroupInfoScreen: View {
         }
     }
 
-    private func inviteDeepLink(_ token: String) -> String {
-        "sonar://invite/\(token)"
+    private func inviteActionLabel(icon: SNIconName, text: String, fg: Color, bg: Color) -> some View {
+        HStack(spacing: 7) {
+            SNIcon(name: icon, size: 17, weight: 2)
+            Text(verbatim: text)
+                .font(SonarTheme.uiFont(size: 14.5, weight: .bold))
+        }
+        .foregroundColor(fg)
+        .frame(maxWidth: .infinity)
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 13, style: .continuous).fill(bg))
     }
 
     private func copyInviteLink(_ token: String) {
-        let url = inviteDeepLink(token)
+        let url = InviteShare.universalLink(token)
         #if os(iOS)
         UIPasteboard.general.string = url
         #elseif os(macOS)
