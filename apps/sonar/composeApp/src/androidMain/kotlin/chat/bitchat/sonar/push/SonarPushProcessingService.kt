@@ -76,7 +76,7 @@ class SonarPushProcessingService : Service() {
 
     private suspend fun processMarmotWakeup() {
         try {
-            withTimeoutOrNull(20_000) {
+            withTimeoutOrNull(MARMOT_PUSH_SYNC_TIMEOUT_MS) {
                 SonarCore.start()
                 SonarCore.sync()
             } ?: run {
@@ -154,5 +154,16 @@ class SonarPushProcessingService : Service() {
         const val EXTRA_NOTIFICATION_TYPE = "notification_type"
         const val TYPE_MARMOT = "marmot"
         const val TYPE_BREEZ = "breez"
+
+        // Marmot push-triggered background sync budget.
+        // On a cold wake the core must start, connect relays, and reach EOSE
+        // inside this window before we render the local notification (otherwise
+        // the user gets the generic "New Sonar message" fallback). 20s was too
+        // tight on real devices; 25s uses more of the wakeup window while leaving
+        // headroom to render the notif. Kept in parity with iOS
+        // TransportConfig.marmotPushSyncTimeoutSeconds (PR #123 / F10 of #122).
+        // (Android has no Tor; if a bootstrap step is ever added, its latency
+        // must also fit inside this budget.)
+        private const val MARMOT_PUSH_SYNC_TIMEOUT_MS = 25_000L
     }
 }
