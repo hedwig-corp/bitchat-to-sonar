@@ -12,7 +12,7 @@ export const TESTFLIGHT_URL = 'https://testflight.apple.com/join/7pr7S9Me';
 export const TESTFLIGHT_MACOS_URL = TESTFLIGHT_URL;
 // Android alpha — APK attached to the GitHub release.
 export const ANDROID_APK_URL =
-  'https://github.com/hedwig-corp/bitchat-to-sonar/releases/download/v0.0.1-alpha.4/sonar-0.0.1-alpha.4-android-arm64-v8a.apk';
+  'https://github.com/hedwig-corp/bitchat-to-sonar/releases/download/v0.1-alpha.5/sonar-0.1-alpha.5-android-arm64-v8a.apk';
 
 // In-page anchor to the download section.
 export const DOWNLOAD_HREF = '#download';

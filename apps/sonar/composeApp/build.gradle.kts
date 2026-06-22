@@ -194,8 +194,8 @@ android {
         applicationId = "chat.bitchat.sonar"
         minSdk = libs.versions.android.minSdk.get().toInt()
         targetSdk = libs.versions.android.targetSdk.get().toInt()
-        versionCode = 4
-        versionName = "0.0.1-alpha.4"
+        versionCode = 5
+        versionName = "0.1-alpha.5"
         buildConfigField("String", "BREEZ_API_KEY", "\"$breezApiKey\"")
         val lp = Properties().apply {
             val f = rootProject.file("local.properties")
@@ -209,6 +209,15 @@ android {
 
     buildFeatures {
         buildConfig = true
+    }
+
+    lint {
+        // MainActivity is a ComponentActivity and calls registerForActivityResult
+        // directly (push-permission prompt + image picker). The fragment-version
+        // check fires anyway via the transitive androidx.fragment dependency, but
+        // we don't use the old FragmentActivity result path, so it's a false
+        // positive. Don't let it fail the release (lintVitalRelease) build.
+        disable += "InvalidFragmentVersionForActivityResult"
     }
 
     // The Rust core .so per ABI lives in src/androidMain/jniLibs (produced by
