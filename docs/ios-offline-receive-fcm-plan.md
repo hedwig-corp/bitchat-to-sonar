@@ -156,3 +156,25 @@ log of `listBolt12Offers().count` + the PATCH result and capture on-device SDK l
 Android already registers the Breez webhook with the FCM token (`AppComponent.registerPushWebhookIfReady`).
 Check whether it has the same re-subscribe/marker robustness; if not, mirror the unregister→register
 there. Tracked under #126.
+
+## Test results — 2026-06-24 (re-subscription fix `3cb8ea54`, osx payer → iPhone)
+
+The unregister→register fix did **not** move the server signal. Measured:
+
+| Receiver state | Result | Path |
+|---|---|---|
+| backgrounded, WS still alive (~mins) | receives (`PaymentSucceeded`, 1000 sat) | swap WebSocket |
+| backgrounded long enough to suspend / **force-quit** | `bolt12/fetch TimedOut` | needs webhook |
+
+`sonar-breez-nds` logged **zero** real `POST /api/v1/notify` for our offer throughout — so the offer
+still has `url=None` on Boltz and the webhook fallback never fired. Backgrounded success was the WS, not
+the fix. Unify's NDS (`nds.hedwig.sh`) *did* get a real Boltz `200` POST in the same window, confirming
+the infra works; the gap remains our offer not carrying the webhook.
+
+**Still blind on the device.** usbmuxd not connected (no `idevicesyslog`); `devicectl --console` is empty
+for os_log; and `devicectl device copy from --domain-type appGroupDataContainer --source breez-sdk`
+fails with `File paths cannot contain '..'` (CoreDeviceError 11007), so we can't read the SDK's local
+`bolt12_offers.webhook_url` either. Resolving this needs a USB+Trust connection to capture the Breez SDK
++ `SonarPush` logs and see which step fails (FCM token issued? `ensureBreezWebhook` ran? unregister→register
+executed? `update_bolt12_offer` PATCH emitted to Boltz?). New suspect: `FirebaseAppDelegateProxyEnabled=NO`
+may have broken FCM token issuance. Symptom-level tracking in #127; webhook root cause in #126.
