@@ -1,0 +1,24 @@
+
+==============================================================================
+  Sonar iOS cold-start + Marmot sync benchmark — 5 run(s)
+==============================================================================
+  run 1: t4 woke=1 notif=3
+  run 2: t4 woke=1 notif=3
+  run 3: t4 woke=1 notif=0
+  run 4: t4 woke=1 notif=0
+  run 5: t4 woke=1 notif=0
+------------------------------------------------------------------------------
+  phase                                     min      med      max   (ms)
+------------------------------------------------------------------------------
+  launch → t0  (process+SwiftUI init)          297      312      316
+  t0 → t1      (open DB, local paint)          184      194      199
+  t1 → t2      (pre-relay delay)               -15      -11       -8
+  t2 → t3      (relay quorum connect)          131      133      136
+  t3 → t4      (initial sync drain)            901      917      950
+  TOTAL launch → t4 (cold → synced)           1524     1549     1562
+  TOTAL t0 → t4     (in-app → synced)         1212     1233     1265
+==============================================================================
+  'synced' (t4) = first relay event burst applied to local DB.
+  woke=1 → relay replayed stored group events (real re-sync path);
+  woke=0 → nothing new to sync this run (empty subscription EOSE).
+==============================================================================
