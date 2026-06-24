@@ -145,6 +145,12 @@ final class MarmotChatModel: ObservableObject {
     private static let localSummaryGroupLimit: UInt32 = 50
 
     @Published var npub: String?
+    /// Supplies the local user's current nickname so the kind-0 profile can be
+    /// (re)published on every relay connect, alongside the KeyPackage. Set by
+    /// SonarAppStore. Without this the profile only published opportunistically
+    /// (on the npub signal / explicit rename) and could be lost to relay or
+    /// onboarding timing — leaving peers to see a raw npub instead of the name.
+    var profileNameProvider: (() -> String)?
     @Published var groups: [MarmotService.MarmotGroup] = []
     @Published var pendingGroupInvites: [MarmotService.GroupInvite] = []
     @Published var messagesByGroup: [String: [MarmotService.MarmotMessage]] = [:]
@@ -369,6 +375,15 @@ final class MarmotChatModel: ObservableObject {
                 self.errorText = nil
                 self.relayConnected = true
                 try? await self.service.publishKeyPackage()
+                // Republish our kind-0 profile here too (not just on the npub
+                // signal / rename): the KeyPackage lands reliably on every relay
+                // connect, but the profile previously did not, so peers saw our
+                // raw npub when the opportunistic publish lost the relay /
+                // onboarding race. Keep them in lockstep.
+                if let name = self.profileNameProvider?()
+                    .trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty {
+                    try? await self.service.publishProfile(name: name)
+                }
                 self.startPolling()
             } catch MarmotService.ServiceError.cancelled {
                 self.relayConnected = false

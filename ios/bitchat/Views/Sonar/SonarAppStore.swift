@@ -789,6 +789,10 @@ final class SonarAppStore: ObservableObject {
             .sink { [weak self] _ in self?.handleCallProximityChange() }
             .store(in: &cancellables)
         #endif
+        // Let Marmot republish our kind-0 profile on every relay connect (next to
+        // the KeyPackage) using the current nickname, so a peer never sees our raw
+        // npub because the opportunistic publish below lost the relay/onboarding race.
+        marmot.profileNameProvider = { [weak self] in self?.chatViewModel.nickname ?? "" }
         marmot.$npub
             .receive(on: DispatchQueue.main)
             .sink { [weak self] npub in
