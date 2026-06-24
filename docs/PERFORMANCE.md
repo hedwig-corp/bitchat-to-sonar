@@ -22,6 +22,8 @@ so the identity + Marmot groups persist — and diffs the marker timestamps.
 | `t1_local_paint` | `MarmotChatModel.performConnect` | local groups hydrated from the encrypted DB (first paint, no relays) |
 | `t2_relay_connect_begin` | `MarmotChatModel.connectRelaysIfNeeded` | relay attach begins |
 | `t3_relay_connected` | `MarmotChatModel.connectRelaysIfNeeded` | relays quorum-connected (`SonarNode.connect` returned) |
+| `t3a_published` | `MarmotChatModel.connectRelaysIfNeeded` | KeyPackage + profile published (splits publish cost out) |
+| `t3b_first_wake` | `MarmotChatModel.startPolling` | first `waitForMarmotEvent` returned (splits wait vs drain) |
 | `t4_first_drain` | `MarmotChatModel.startPolling` | first relay event burst applied to local storage (initial sync produced data) |
 
 Reported phases: `launch→t0` (process + SwiftUI init), `t0→t1` (open DB + local
@@ -44,6 +46,12 @@ cost.
   Uses `sonar-cli` as a headless counterparty to seed a real 1:1 Marmot group
   and push fresh messages before each run → `woke=1` real re-sync.
 - `_aggregate.py` — shared parser/aggregator.
+- `device-bench.sh` — the same benchmark on a PHYSICAL iPhone against the REAL
+  account (real chats). Properly signed → Keychain works, no env hooks. Installs
+  over the existing app (data preserved), cold-starts via `devicectl`, captures
+  markers via `idevicesyslog -m SONAR_BENCH`, and parses the device-local
+  `[HH:MM:SS.mmm]` BitLogger timestamps. Splits the post-connect window into
+  publish / wait / drain via the `t3a`/`t3b` markers.
 - `README.md` — usage + design notes.
 
 ## How to run
@@ -106,6 +114,48 @@ Marmot group · live relays · `woke=1` every run:
 | **TOTAL launch → t4 (cold → synced)** | **≈ 1.55 s** |
 
 (`t1→t2` is effectively zero here — see findings.)
+
+## Device result (real account — the real pain point)
+
+Median of 4–5 cold starts · iPhone 14 Pro Max · **real account with 24 Marmot
+groups** · live relays · every run `woke=1 notif=0`:
+
+| phase | median |
+|---|---|
+| t0 → t1 (open DB + local paint, 24 groups) | ~1.3 s |
+| t2 → t3 (relay quorum connect) | ~0.7 s |
+| **t3 → t3a (publish KeyPackage + profile)** | **~57 s** |
+| t3a → t3b (first event wait) | ~2.3 s |
+| t3b → t4 (`drainPending` MLS processing) | ~1.7 s |
+| **TOTAL t0 → t4 (cold → synced)** | **~52–66 s** |
+
+**Root cause — blocking relay publishes on the cold-start critical path.**
+`MarmotChatModel.connectRelaysIfNeeded` does `try? await publishKeyPackage()`
+then `try? await publishProfile()` **before** `startPolling()`. Both call the
+core `publish_key_package`/`publish_profile` → `nostr.send_event(...).await`,
+which **waits for relay acknowledgement** across all 5 relays (the core itself
+notes at `client.rs:2706` that `send_event()` awaits a relay OK and should be
+backgrounded). With a slow/unreachable relay this stalls ~28 s per publish, so
+the sync loop doesn't start for ~57 s. The actual sync/drain is **fast (~1.7 s)**
+— the time is almost entirely the two publishes, not message processing.
+
+This explains BOTH symptoms: incoming messages aren't drained until the publishes
+finish ("slow to sync"), and message sends use the same await-all-relays
+`send_event` path ("slow to send").
+
+## Where to speed up (highest impact first)
+
+1. **Don't block sync on the publishes.** Move `publishKeyPackage()` +
+   `publishProfile()` off the `connectRelaysIfNeeded` critical path into a
+   detached background task so `startPolling()` runs immediately. The codebase
+   already uses this "publish in the background" pattern elsewhere
+   (`client.rs:2706`). Expected: cold → synced ~66 s → ~6 s.
+2. **Bound `send_event` publish latency.** Cap the per-publish timeout / return
+   after the first relay OK so one slow/unreachable relay can't stall ~28 s.
+   Same path backs message sends, so this also speeds up sending.
+3. **Secondary:** opening the 24-group encrypted DB + local paint is ~1.3 s
+   (vs ~0.19 s for 1 group on the sim) — scales with group count; window it if
+   it grows.
 
 ## Findings / how to interpret
 

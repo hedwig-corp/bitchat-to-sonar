@@ -178,8 +178,9 @@ final class MarmotChatModel: ObservableObject {
     private var relayConnectTask: Task<Void, Never>?
     private var relayBusy = false
     #if DEBUG
-    /// SONAR_BENCH: one-shot guard so we emit the post-connect "first drain"
-    /// marker (T4) only once per relay session. DEBUG-only (benchmark harness).
+    /// SONAR_BENCH: one-shot guards for the post-connect "first wake" (T3b) and
+    /// "first drain" (T4) markers. DEBUG-only (benchmark harness).
+    private var benchFirstWakeLogged = false
     private var benchFirstDrainLogged = false
     #endif
     private var installedPackCoordinates: Set<String> = []
@@ -420,6 +421,11 @@ final class MarmotChatModel: ObservableObject {
                     .trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty {
                     try? await self.service.publishProfile(name: name)
                 }
+                #if DEBUG
+                // SONAR_BENCH: KeyPackage + profile published (T3a). Splits the
+                // publish cost out of the post-connect window.
+                SecureLogger.info("SONAR_BENCH t3a_published", category: .session)
+                #endif
                 self.startPolling()
             } catch MarmotService.ServiceError.cancelled {
                 self.relayConnected = false
@@ -1177,6 +1183,14 @@ final class MarmotChatModel: ObservableObject {
                 guard let self else { return }
                 let woke = await self.service.waitForMarmotEvent(timeoutSeconds: 25)
                 if Task.isCancelled { return }
+                #if DEBUG
+                // SONAR_BENCH: first waitForMarmotEvent returned (T3b). t3a→t3b is
+                // the wait; t3b→t4 is the drainPending() MLS processing cost.
+                if !self.benchFirstWakeLogged {
+                    self.benchFirstWakeLogged = true
+                    SecureLogger.info("SONAR_BENCH t3b_first_wake woke=\(woke ? 1 : 0)", category: .session)
+                }
+                #endif
                 if woke {
                     let notifications = (try? await self.service.drainPending()) ?? []
                     #if DEBUG
