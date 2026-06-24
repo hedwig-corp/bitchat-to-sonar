@@ -1701,6 +1701,14 @@ final class SonarAppStore: ObservableObject {
                 }
                 self.publishedCallDescriptor = true
                 self.publishedBolt12Offer = offer
+                // Re-subscribe the Breez NDS webhook onto the just-published offer so
+                // Boltz can POST it on an offline invoice_request (#126). Idempotent —
+                // only re-PATCHes when the offer / FCM token / NDS URL changed.
+                #if os(iOS)
+                if let offer, let bridged = self.wallet as? BridgedWallet {
+                    SonarPushRegistration.shared.ensureBreezWebhook(offer: offer, wallet: bridged.walletService)
+                }
+                #endif
             } catch {
                 SecureLogger.error("Sonar descriptor payment metadata publish failed: \(error)", category: .session)
             }

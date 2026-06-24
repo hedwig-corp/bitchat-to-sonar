@@ -118,11 +118,41 @@ write our webhook onto it. (SDK version 0.11.13 has the feature — BOLT12-recei
 it — so this is not a version gap; `createBolt12Offer` is internal, reached via
 `receivePayment(.bolt12Offer)`.)
 
-**Fix applied (hypothesis — needs a device retest):** after `registerWebhook(FCM)` succeeds, re-create
-the stable receive offer once per webhook URL (`SonarPushRegistration.registerBreezWebhook` →
-`wallet.createOffer()`), so Boltz captures the current webhook on the offer.
+## Implementation plan — force webhook re-subscription on the advertised offer (#126)
 
-**If that doesn't take:** (a) verify the offer's `url` on Boltz / the SDK's local `bolt12_offers.webhook_url`
-(my App-Group working-dir migration could have dropped the local offer row → `registerWebhook` can't
-PATCH it); (b) ensure `registerWebhook` runs *before* the offer is created; (c) consider bumping the
-SDK 0.11.13 → 0.12.4 (cross-platform — Android/desktop KMP pin must move too) for BOLT12 fixes.
+The earlier `createOffer()`-after-`registerWebhook` attempt was a no-op (`receivePayment(.bolt12Offer)`
+reuses the cached offer by description, never re-registers) and was removed in `1683a6a9`. The real fix
+is to **force the webhook PATCH onto the offer on every relevant launch**, self-healing, idempotent:
+
+1. **Force re-subscribe (misty-breez pattern):** `unregisterWebhook()` → `registerWebhook(url)`.
+   A plain `registerWebhook` no-ops when the local `bolt12_offers.webhook_url` already equals the URL
+   but Boltz still holds `url=None` (our desync). The unregister→register cycle clears local state then
+   re-PATCHes Boltz, forcing the `update_bolt12_offer` call. (Brief sub-second window where Boltz holds
+   no webhook for the offer — acceptable, matches the reference.)
+
+2. **Idempotency marker:** persist `sha256(offer | fcmToken | ndsUrl)` in `UserDefaults`. Re-subscribe
+   only when the offer, the FCM token, or the NDS URL changes — not on every launch.
+
+3. **Coordinate offer + token:** the offer comes from `SonarAppStore.publishPaymentMetadataIfNeeded`
+   (`wallet.createOffer()`), the FCM token from `AppDelegate.messaging(_:didReceiveRegistrationToken:)`.
+   They arrive async; whichever lands second triggers the subscribe. The advertised offer and the
+   webhook-registered offer are the **same** `createOffer()` string, so there is no offer mismatch.
+
+### Code
+- `SonarPushRegistration.swift`: add `cachedOffer`, a `breez_webhook_marker` key, and
+  `ensureBreezWebhook(offer:wallet:)` (guards FCM token + `.ready`; compares marker; on change does
+  `unregisterWebhook()` → `registerWebhook(url)` → stores marker). `didReceiveFCMToken` /
+  `retryBreezWebhookIfNeeded` call it with the cached offer.
+- `SonarAppStore.publishPaymentMetadataIfNeeded`: after publishing, call
+  `SonarPushRegistration.shared.ensureBreezWebhook(offer:wallet:)`.
+- Bridge already exposes `registerWebhook(url:)` + `unregisterWebhook()` (`WalletBridgeService`).
+
+### Verification
+Deploy → pay **backgrounded** from macOS → a `POST /api/v1/notify` on `sonar-breez-nds` = fixed.
+Still zero → the offer isn't in the SDK's local `bolt12_offers` table (deeper); add a `#if DEBUG`
+log of `listBolt12Offers().count` + the PATCH result and capture on-device SDK logs over USB.
+
+### Cross-platform
+Android already registers the Breez webhook with the FCM token (`AppComponent.registerPushWebhookIfReady`).
+Check whether it has the same re-subscribe/marker robustness; if not, mirror the unregister→register
+there. Tracked under #126.
