@@ -11,6 +11,29 @@
 import Foundation
 import Security
 import BreezSDKLiquid
+import os
+
+#if DEBUG
+/// DEBUG-only instrumentation: forwards the Breez SDK's internal Rust log lines
+/// into os_log so `idevicesyslog` can capture the *underlying* network error
+/// behind the SDK's opaque "Could not contact servers" wrapper. Filtered to
+/// network-relevant + warn/error lines. Never compiled into release builds — it
+/// would otherwise emit Breez internals (URLs, swap details) to the device log.
+private final class BreezLogForwarder: BreezSDKLiquid.Logger {
+    static let oslog = OSLog(subsystem: "sh.hedwig.sonar", category: "BreezSDK")
+    func log(l: LogEntry) {
+        let lvl = l.level.uppercased()
+        let isErr = (lvl == "ERROR" || lvl == "WARN")
+        let lower = l.line.lowercased()
+        let netRelevant = ["swap", "connect", "dns", "tls", "reqwest", "certificate",
+                           "timed out", "timeout", "refused", "breez.technology",
+                           "sending request", "io error", "tcp", "unreachable", "resolve"]
+            .contains { lower.contains($0) }
+        guard isErr || netRelevant else { return }
+        os_log("BREEZ[%{public}@] %{public}@", log: Self.oslog, type: isErr ? .error : .info, lvl, l.line)
+    }
+}
+#endif
 
 /// Swift façade over the OFFICIAL Breez SDK Liquid Swift bindings — the same SDK
 /// the Android/desktop app uses via the Breez KMP package, consumed directly
@@ -80,14 +103,92 @@ public final class SonarWallet {
     /// Store the API key + working directory (`Application Support/sonar-wallet`).
     /// Must be called once before any other method.
     public func configure(apiKey: String, mainnet: Bool) throws {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        let dir = appSupport.appendingPathComponent("sonar-wallet", isDirectory: true)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let dir = try Self.breezWorkingDir(mainnet: mainnet)
+        Self.migrateLegacyWorkingDirIfNeeded(to: dir)
         self.apiKey = apiKey
         self.mainnet = mainnet
         self.workingDir = dir.path
         self.isConfigured = true
+        #if DEBUG
+        Self.installBreezLoggerOnce()
+        #endif
     }
+
+    // MARK: - App Group sharing (offline receive via Notification Service Extension)
+
+    /// App Group shared with the Notification Service Extension. The NSE connects
+    /// the Breez SDK in its own process to answer offline BOLT12 invoice requests,
+    /// so it must use the SAME working dir + creds as the app. Keep in sync with
+    /// `ios/SonarNotificationService/NotificationService.swift` and `APP_GROUP_ID`.
+    public static let appGroupId = "group.sh.hedwig.sonar"
+
+    /// Breez working directory inside the shared App Group container (so the NSE
+    /// sees the same wallet state). Falls back to the per-app location only if the
+    /// App Group container is unavailable (e.g. entitlement missing in a dev build).
+    static func breezWorkingDir(mainnet: Bool) throws -> URL {
+        let fm = FileManager.default
+        if let group = fm.containerURL(forSecurityApplicationGroupIdentifier: appGroupId) {
+            let dir = group.appendingPathComponent("breez-sdk", isDirectory: true)
+                .appendingPathComponent(mainnet ? "mainnet" : "testnet", isDirectory: true)
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            return dir
+        }
+        let dir = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("sonar-wallet", isDirectory: true)
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    /// One-time move of the pre-App-Group working dir (`Application Support/sonar-wallet`)
+    /// into the shared container, so an existing wallet keeps its synced Breez state
+    /// instead of re-scanning from the seed.
+    private static func migrateLegacyWorkingDirIfNeeded(to dest: URL) {
+        let fm = FileManager.default
+        let legacy = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("sonar-wallet", isDirectory: true)
+        guard fm.fileExists(atPath: legacy.path), legacy.path != dest.path else { return }
+        let destEmpty = ((try? fm.contentsOfDirectory(atPath: dest.path)) ?? []).isEmpty
+        guard destEmpty else { return }
+        // Atomic move: drop the freshly-created empty dest and rename the whole legacy
+        // dir into place, so the Breez SQLite trio (.db / .db-wal / .db-shm) always
+        // travels together. A per-item move could half-complete (e.g. .db moves but
+        // .db-wal fails) and silently split the wallet DB across both dirs. Fall back
+        // to a best-effort copy only if the rename itself fails.
+        do {
+            try fm.removeItem(at: dest)
+            try fm.moveItem(at: legacy, to: dest)
+        } catch {
+            try? fm.createDirectory(at: dest, withIntermediateDirectories: true)
+            for item in (try? fm.contentsOfDirectory(atPath: legacy.path)) ?? [] {
+                try? fm.copyItem(at: legacy.appendingPathComponent(item),
+                                 to: dest.appendingPathComponent(item))
+            }
+        }
+    }
+
+    /// Mirror the connect creds into the App Group so the NSE can connect the SDK
+    /// while the app is backgrounded/terminated. Seed lives in the app Keychain;
+    /// we copy the hex into the shared defaults (matches Unify — hardening to a
+    /// shared Keychain access group is a tracked follow-up).
+    private func syncCredsToAppGroup(seedHex: String) {
+        guard let defaults = UserDefaults(suiteName: Self.appGroupId) else { return }
+        defaults.set(apiKey, forKey: "breez_api_key")
+        defaults.set(seedHex, forKey: "breez_seed_hex")
+        defaults.set(mainnet, forKey: "breez_mainnet")
+    }
+
+    #if DEBUG
+    // DEBUG-only: install the Breez SDK log forwarder exactly once per process
+    // (setLogger is global and rejects a second call).
+    private static let breezLogger = BreezLogForwarder()
+    private static var breezLoggerInstalled = false
+    private static func installBreezLoggerOnce() {
+        guard !breezLoggerInstalled else { return }
+        breezLoggerInstalled = true
+        do { try setLogger(logger: breezLogger) }
+        catch { /* already installed elsewhere — fine */ }
+    }
+    #endif
 
     // MARK: - Wallet lifecycle (seed-based; deterministic per identity)
 
@@ -132,6 +233,9 @@ public final class SonarWallet {
             throw WalletError.core("no wallet seed")
         }
         let seed = [UInt8](seedData)
+        // Mirror creds so the Notification Service Extension can connect the SDK
+        // and answer offline BOLT12 invoice requests while the app is closed.
+        syncCredsToAppGroup(seedHex: Self.hex(seed))
         let key = apiKey, dir = workingDir
         let net: LiquidNetwork = mainnet ? .mainnet : .testnet
         let node: BindingLiquidSdk = try await run {

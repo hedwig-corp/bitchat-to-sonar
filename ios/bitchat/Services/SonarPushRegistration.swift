@@ -25,6 +25,7 @@ final class SonarPushRegistration {
     )
 
     private var cachedAPNSToken: Data?
+    private var cachedFCMToken: String?
     private var sonarNode: SonarNode?
     private let queue = DispatchQueue(label: "chat.bitchat.sonar.push.registration")
 
@@ -44,13 +45,23 @@ final class SonarPushRegistration {
         let hex = deviceToken.map { String(format: "%02x", $0) }.joined()
         Self.log.info("APNS token collected (\(hex.prefix(8))...)")
         queue.async { self.cachedAPNSToken = deviceToken }
+        // Transponder (chat/calls) uses the raw APNs token. The Breez NDS uses the
+        // Firebase FCM token instead — registered via didReceiveFCMToken.
         registerTransponder(token: deviceToken)
-        registerBreezWebhook(token: deviceToken)
+    }
+
+    /// Firebase FCM token for the Breez NDS webhook. `breez/notify` is FCM-only;
+    /// Firebase bridges FCM → APNs on iOS (the APNs key lives in the Firebase
+    /// Console). Matches Sonar Android and Unify.
+    func didReceiveFCMToken(_ fcmToken: String, wallet: WalletBridgeService?) {
+        Self.log.info("FCM token collected (\(fcmToken.prefix(8))...)")
+        queue.async { self.cachedFCMToken = fcmToken }
+        registerBreezWebhook(fcmToken: fcmToken, wallet: wallet)
     }
 
     func retryBreezWebhookIfNeeded(wallet: WalletBridgeService) {
-        guard let token = cachedAPNSToken else { return }
-        registerBreezWebhook(token: token, wallet: wallet)
+        guard let fcmToken = cachedFCMToken else { return }
+        registerBreezWebhook(fcmToken: fcmToken, wallet: wallet)
     }
 
     func unregister(wallet: WalletBridgeService? = nil) {
@@ -105,14 +116,13 @@ final class SonarPushRegistration {
         }
     }
 
-    private func registerBreezWebhook(token: Data, wallet: WalletBridgeService? = nil) {
+    private func registerBreezWebhook(fcmToken: String, wallet: WalletBridgeService? = nil) {
         guard !ndsUrl.isEmpty else { return }
         guard let wallet else {
             Self.log.info("Breez NDS: wallet not ready, will retry after wallet setup")
             return
         }
-        let hex = token.map { String(format: "%02x", $0) }.joined()
-        let webhookUrl = "\(ndsUrl)/api/v1/notify?platform=ios&token=\(hex)"
+        let webhookUrl = "\(ndsUrl)/api/v1/notify?platform=ios&token=\(fcmToken)"
         Task { @MainActor in
             guard case .ready = wallet.state else {
                 Self.log.info("Breez NDS: wallet not ready, will retry after wallet setup")
@@ -120,7 +130,7 @@ final class SonarPushRegistration {
             }
             do {
                 try await wallet.registerWebhook(url: webhookUrl)
-                Self.log.info("Breez NDS webhook registered")
+                Self.log.info("Breez NDS webhook registered (FCM)")
             } catch {
                 Self.log.warning("Breez NDS webhook registration failed: \(error)")
             }

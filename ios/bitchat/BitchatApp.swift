@@ -10,6 +10,10 @@ import Tor
 import SwiftUI
 import os
 import UserNotifications
+#if os(iOS)
+import FirebaseCore
+import FirebaseMessaging
+#endif
 
 @main
 struct BitchatApp: App {
@@ -239,17 +243,38 @@ struct BitchatApp: App {
 }
 
 #if os(iOS)
-final class AppDelegate: NSObject, UIApplicationDelegate {
+final class AppDelegate: NSObject, UIApplicationDelegate, MessagingDelegate {
     weak var chatViewModel: ChatViewModel?
     weak var sonarStore: SonarAppStore?
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey : Any]? = nil) -> Bool {
+        // Firebase powers the Breez wallet-wakeup push (breez/notify is FCM-only;
+        // Firebase bridges FCM → APNs on iOS). The Transponder chat/call push stays
+        // on the raw APNs token — see SonarPushRegistration. Guard on the (gitignored)
+        // GoogleService-Info.plist so a build without it still launches — FCM /
+        // offline-receive just stays disabled rather than crashing at startup.
+        if Bundle.main.path(forResource: "GoogleService-Info", ofType: "plist") != nil {
+            FirebaseApp.configure()
+            Messaging.messaging().delegate = self
+        }
         application.registerForRemoteNotifications()
         return true
     }
 
     func application(_ application: UIApplication, didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) {
+        // Transponder (chat/calls) uses the raw APNs token directly.
         SonarPushRegistration.shared.didRegisterForRemoteNotifications(deviceToken: deviceToken)
+        // Firebase needs the APNs token to mint an FCM token (used for the Breez webhook).
+        if FirebaseApp.app() != nil {
+            Messaging.messaging().apnsToken = deviceToken
+        }
+    }
+
+    // FCM token (re)issued — register it as the Breez NDS webhook target.
+    func messaging(_ messaging: Messaging, didReceiveRegistrationToken fcmToken: String?) {
+        guard let fcmToken else { return }
+        let wallet = (sonarStore?.wallet as? BridgedWallet)?.walletService
+        SonarPushRegistration.shared.didReceiveFCMToken(fcmToken, wallet: wallet)
     }
 
     func application(_ application: UIApplication, didFailToRegisterForRemoteNotificationsWithError error: Error) {
