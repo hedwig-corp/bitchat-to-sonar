@@ -177,6 +177,11 @@ final class MarmotChatModel: ObservableObject {
     private var startupLocalSummaryTask: Task<Void, Never>?
     private var relayConnectTask: Task<Void, Never>?
     private var relayBusy = false
+    #if DEBUG
+    /// SONAR_BENCH: one-shot guard so we emit the post-connect "first drain"
+    /// marker (T4) only once per relay session. DEBUG-only (benchmark harness).
+    private var benchFirstDrainLogged = false
+    #endif
     private var installedPackCoordinates: Set<String> = []
     /// npubs whose profile fetch is in flight or done, to fetch each once per session.
     private var profileFetches: Set<String> = []
@@ -256,18 +261,34 @@ final class MarmotChatModel: ObservableObject {
         // device LOCKED during a background BLE wake) do NOT generate — that
         // would overwrite the existing nsec and orphan its derived wallet +
         // chat DB forever. Defer instead; setup retries once accessible (#13).
-        let storedNsec: String?
-        switch keychain.getIdentityKeyWithResult(forKey: Self.nsecKeychainKey) {
-        case .success(let data):
-            storedNsec = String(data: data, encoding: .utf8)
-            // Migration: re-save to upgrade a legacy WhenUnlocked item to
-            // AfterFirstUnlockThisDeviceOnly (this read just succeeded).
-            if let s = storedNsec { _ = keychain.saveIdentityKey(Data(s.utf8), forKey: Self.nsecKeychainKey) }
-        case .itemNotFound:
-            storedNsec = nil
-        case .accessDenied, .deviceLocked, .authenticationFailed, .otherError:
-            SecureLogger.warning("⚠️ marmot-nsec not readable yet (device locked?) — deferring identity", category: .session)
-            return
+        var storedNsec: String?
+        #if DEBUG
+        let benchNsec = ProcessInfo.processInfo.environment["SONAR_BENCH_NSEC"]
+        #else
+        let benchNsec: String? = nil
+        #endif
+        if let benchNsec, !benchNsec.isEmpty {
+            // SONAR_BENCH: deterministic provisioning for the cold-start benchmark.
+            // Adopt the env identity WITHOUT depending on Keychain — unsigned
+            // simulator builds get errSecMissingEntitlement (-34018), which would
+            // otherwise early-return below and the relay-sync path would never run.
+            // Simulator only / throwaway data — never set this env in production.
+            storedNsec = benchNsec
+            _ = keychain.saveIdentityKey(Data(benchNsec.utf8), forKey: Self.nsecKeychainKey)
+            SecureLogger.info("SONAR_BENCH identity from env (keychain-independent)", category: .session)
+        } else {
+            switch keychain.getIdentityKeyWithResult(forKey: Self.nsecKeychainKey) {
+            case .success(let data):
+                storedNsec = String(data: data, encoding: .utf8)
+                // Migration: re-save to upgrade a legacy WhenUnlocked item to
+                // AfterFirstUnlockThisDeviceOnly (this read just succeeded).
+                if let s = storedNsec { _ = keychain.saveIdentityKey(Data(s.utf8), forKey: Self.nsecKeychainKey) }
+            case .itemNotFound:
+                storedNsec = nil
+            case .accessDenied, .deviceLocked, .authenticationFailed, .otherError:
+                SecureLogger.warning("⚠️ marmot-nsec not readable yet (device locked?) — deferring identity", category: .session)
+                return
+            }
         }
         // 1) Publish our npub IMMEDIATELY — the identity pubkey is offline-
         //    derivable, so Sonar discovery (0x53) can advertise it without
@@ -286,6 +307,11 @@ final class MarmotChatModel: ObservableObject {
             _ = try await service.connectLocal(nsec: storedNsec)
             relayConnected = false
             await loadLocalGroupMetadata()
+            #if DEBUG
+            // SONAR_BENCH: local-first paint ready — groups hydrated from the
+            // encrypted DB before any relay attach (T1).
+            SecureLogger.info("SONAR_BENCH t1_local_paint groups=\(groups.count)", category: .session)
+            #endif
             self.errorText = nil
             scheduleStartupLocalSummariesThenRelay()
         } catch {
@@ -371,7 +397,17 @@ final class MarmotChatModel: ObservableObject {
             defer { self.relayBusy = false }
             do {
                 self.relayConnected = false
+                #if DEBUG
+                // SONAR_BENCH: relay attach begins (T2). connect() returns once
+                // relays are quorum-connected (not after sync).
+                SecureLogger.info("SONAR_BENCH t2_relay_connect_begin", category: .session)
+                #endif
                 _ = try await self.service.connect(nsec: nil)
+                #if DEBUG
+                // SONAR_BENCH: relays quorum-connected (T3). Marmot events now
+                // flow into the background buffer and are applied by the drain loop.
+                SecureLogger.info("SONAR_BENCH t3_relay_connected", category: .session)
+                #endif
                 self.errorText = nil
                 self.relayConnected = true
                 try? await self.service.publishKeyPackage()
@@ -1143,10 +1179,26 @@ final class MarmotChatModel: ObservableObject {
                 if Task.isCancelled { return }
                 if woke {
                     let notifications = (try? await self.service.drainPending()) ?? []
+                    #if DEBUG
+                    // SONAR_BENCH: first post-connect event burst applied to local
+                    // storage (T4) — the cold-start relay sync has produced data.
+                    if !self.benchFirstDrainLogged {
+                        self.benchFirstDrainLogged = true
+                        SecureLogger.info("SONAR_BENCH t4_first_drain woke=1 notif=\(notifications.count)", category: .session)
+                    }
+                    #endif
                     if !notifications.isEmpty {
                         await self.loadLocalSummaries()
                     }
                 } else {
+                    #if DEBUG
+                    // SONAR_BENCH: first wait cycle resolved with no buffered events
+                    // (initial subscription EOSE was empty — nothing new to sync).
+                    if !self.benchFirstDrainLogged {
+                        self.benchFirstDrainLogged = true
+                        SecureLogger.info("SONAR_BENCH t4_first_drain woke=0 notif=0", category: .session)
+                    }
+                    #endif
                     try? await self.service.ensureSubscriptions()
                 }
             }

@@ -9,6 +9,9 @@
 import Tor
 import SwiftUI
 import os
+#if DEBUG
+import BitLogger
+#endif
 import UserNotifications
 #if os(iOS)
 import FirebaseCore
@@ -36,6 +39,18 @@ struct BitchatApp: App {
     #endif
 
     init() {
+        #if DEBUG
+        // SONAR_BENCH: earliest in-process cold-start marker (T0) + benchmark
+        // provisioning. DEBUG-only — the markers are only %{public}@ (visible in
+        // the unified log) in DEBUG anyway. See docs/PERFORMANCE.md, scripts/bench/.
+        SecureLogger.info("SONAR_BENCH t0_launch", category: .session)
+        // When provisioning the benchmark (SONAR_BENCH_NSEC set), skip the
+        // onboarding gate so the Marmot relay-sync path starts on cold launch
+        // without UI. Must run before SonarAppStore reads `onboarded`.
+        if let n = ProcessInfo.processInfo.environment["SONAR_BENCH_NSEC"], !n.isEmpty {
+            UserDefaults.standard.set(true, forKey: "sonar.onboarding.complete")
+        }
+        #endif
         UNUserNotificationCenter.current().delegate = NotificationDelegate.shared
         // Warm up georelay directory and refresh if stale (once/day)
         GeoRelayDirectory.shared.prefetchIfNeeded()
