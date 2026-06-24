@@ -8,6 +8,11 @@
 	<string>$(TRANSPONDER_NPUB)</string>
 	<key>NDS_URL</key>
 	<string>$(NDS_URL)</string>
+	<!-- We forward the APNs token to Firebase by hand (AppDelegate) and own the
+	     MessagingDelegate, so disable Firebase's method swizzling. This keeps the
+	     Transponder (chat/call) APNs push path independent of Firebase. -->
+	<key>FirebaseAppDelegateProxyEnabled</key>
+	<false/>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
