@@ -1,0 +1,14 @@
+Sonar iOS DEVICE cold-start + Marmot sync — iPhone 14 Pro Max, real account
+runs: 4   groups: groups=24
+  run 1: t4 woke=1 notif=0
+  run 2: t4 woke=1 notif=0
+  run 3: t4 woke=1 notif=0
+  run 4: t4 woke=1 notif=0
+  phase                                    min      med      max   (ms)
+  t0 -> t1   open DB + local paint           1059     1292     1551
+  t1 -> t2   (concurrent)                    -163     -105      -19
+  t2 -> t3   relay quorum connect             528      690     3257
+  t3 -> t3a  publish keypkg + profile       42771    56740    65149
+  t3a -> t3b first event wait                1767     2290     3212
+  t3b -> t4  drainPending (MLS sync)          611     1732    18346
+  TOTAL t0 -> t4  cold -> synced            49206    65596    82950

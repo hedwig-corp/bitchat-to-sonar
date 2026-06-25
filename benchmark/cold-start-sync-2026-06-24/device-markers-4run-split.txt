@@ -1,0 +1,28 @@
+Jun 24 16:22:50.982936 Sonar(Sonar.debug.dylib)[8684] <Info>: [16:22:50.910] [BitchatApp.swift:46 init()] SONAR_BENCH t0_launch
+Jun 24 16:22:52.303590 Sonar(Sonar.debug.dylib)[8684] <Info>: [16:22:52.298] [MarmotChatView.swift:404 connectRelaysIfNeeded()] SONAR_BENCH t2_relay_connect_begin
+Jun 24 16:22:52.466969 Sonar(Sonar.debug.dylib)[8684] <Info>: [16:22:52.461] [MarmotChatView.swift:314 performConnect()] SONAR_BENCH t1_local_paint groups=24
+Jun 24 16:22:53.144740 Sonar(Sonar.debug.dylib)[8684] <Info>: [16:22:53.139] [MarmotChatView.swift:410 connectRelaysIfNeeded()] SONAR_BENCH t3_relay_connected
+Jun 24 16:23:58.288860 Sonar(Sonar.debug.dylib)[8684] <Info>: [16:23:58.288] [MarmotChatView.swift:427 connectRelaysIfNeeded()] SONAR_BENCH t3a_published
+Jun 24 16:24:00.077002 Sonar(Sonar.debug.dylib)[8684] <Info>: [16:24:00.077] [MarmotChatView.swift:1191 startPolling()] SONAR_BENCH t3b_first_wake woke=1
+Jun 24 16:24:01.671131 Sonar(Sonar.debug.dylib)[8684] <Info>: [16:24:01.667] [MarmotChatView.swift:1201 startPolling()] SONAR_BENCH t4_first_drain woke=1 notif=0
+Jun 24 16:24:07.257471 Sonar(Sonar.debug.dylib)[8686] <Info>: [16:24:07.248] [BitchatApp.swift:46 init()] SONAR_BENCH t0_launch
+Jun 24 16:24:08.464537 Sonar(Sonar.debug.dylib)[8686] <Info>: [16:24:08.461] [MarmotChatView.swift:404 connectRelaysIfNeeded()] SONAR_BENCH t2_relay_connect_begin
+Jun 24 16:24:08.592741 Sonar(Sonar.debug.dylib)[8686] <Info>: [16:24:08.582] [MarmotChatView.swift:314 performConnect()] SONAR_BENCH t1_local_paint groups=24
+Jun 24 16:24:11.718608 Sonar(Sonar.debug.dylib)[8686] <Info>: [16:24:11.718] [MarmotChatView.swift:410 connectRelaysIfNeeded()] SONAR_BENCH t3_relay_connected
+Jun 24 16:25:08.642551 Sonar(Sonar.debug.dylib)[8686] <Info>: [16:25:08.640] [MarmotChatView.swift:427 connectRelaysIfNeeded()] SONAR_BENCH t3a_published
+Jun 24 16:25:11.854768 Sonar(Sonar.debug.dylib)[8686] <Info>: [16:25:11.852] [MarmotChatView.swift:1191 startPolling()] SONAR_BENCH t3b_first_wake woke=1
+Jun 24 16:25:30.198546 Sonar(Sonar.debug.dylib)[8686] <Info>: [16:25:30.198] [MarmotChatView.swift:1201 startPolling()] SONAR_BENCH t4_first_drain woke=1 notif=0
+Jun 24 16:25:35.972911 Sonar(Sonar.debug.dylib)[8687] <Info>: [16:25:35.963] [BitchatApp.swift:46 init()] SONAR_BENCH t0_launch
+Jun 24 16:25:36.936387 Sonar(Sonar.debug.dylib)[8687] <Info>: [16:25:36.933] [MarmotChatView.swift:404 connectRelaysIfNeeded()] SONAR_BENCH t2_relay_connect_begin
+Jun 24 16:25:37.031014 Sonar(Sonar.debug.dylib)[8687] <Info>: [16:25:37.022] [MarmotChatView.swift:314 performConnect()] SONAR_BENCH t1_local_paint groups=24
+Jun 24 16:25:37.463553 Sonar(Sonar.debug.dylib)[8687] <Info>: [16:25:37.461] [MarmotChatView.swift:410 connectRelaysIfNeeded()] SONAR_BENCH t3_relay_connected
+Jun 24 16:26:34.021430 Sonar(Sonar.debug.dylib)[8687] <Info>: [16:26:34.019] [MarmotChatView.swift:427 connectRelaysIfNeeded()] SONAR_BENCH t3a_published
+Jun 24 16:26:35.788103 Sonar(Sonar.debug.dylib)[8687] <Info>: [16:26:35.786] [MarmotChatView.swift:1191 startPolling()] SONAR_BENCH t3b_first_wake woke=1
+Jun 24 16:26:36.398315 Sonar(Sonar.debug.dylib)[8687] <Info>: [16:26:36.397] [MarmotChatView.swift:1201 startPolling()] SONAR_BENCH t4_first_drain woke=1 notif=0
+Jun 24 16:26:41.270162 Sonar(Sonar.debug.dylib)[8688] <Info>: [16:26:41.256] [BitchatApp.swift:46 init()] SONAR_BENCH t0_launch
+Jun 24 16:26:42.491221 Sonar(Sonar.debug.dylib)[8688] <Info>: [16:26:42.486] [MarmotChatView.swift:404 connectRelaysIfNeeded()] SONAR_BENCH t2_relay_connect_begin
+Jun 24 16:26:42.510200 Sonar(Sonar.debug.dylib)[8688] <Info>: [16:26:42.505] [MarmotChatView.swift:314 performConnect()] SONAR_BENCH t1_local_paint groups=24
+Jun 24 16:26:43.029026 Sonar(Sonar.debug.dylib)[8688] <Info>: [16:26:43.026] [MarmotChatView.swift:410 connectRelaysIfNeeded()] SONAR_BENCH t3_relay_connected
+Jun 24 16:27:25.800024 Sonar(Sonar.debug.dylib)[8688] <Info>: [16:27:25.797] [MarmotChatView.swift:427 connectRelaysIfNeeded()] SONAR_BENCH t3a_published
+Jun 24 16:27:28.590372 Sonar(Sonar.debug.dylib)[8688] <Info>: [16:27:28.589] [MarmotChatView.swift:1191 startPolling()] SONAR_BENCH t3b_first_wake woke=1
+Jun 24 16:27:30.464931 Sonar(Sonar.debug.dylib)[8688] <Info>: [16:27:30.462] [MarmotChatView.swift:1201 startPolling()] SONAR_BENCH t4_first_drain woke=1 notif=0

@@ -7,6 +7,7 @@
 //
 
 import Combine
+import CryptoKit
 import Foundation
 import SonarCore
 
@@ -776,6 +777,16 @@ final class MarmotService: @unchecked Sendable {
     /// (path, 64-char hex key). Generates and persists a fresh key the first time.
     private static func databaseConfig() throws -> (String, String) {
         let url = try databaseURL()
+        #if DEBUG
+        // SONAR_BENCH: derive a STABLE db key from the env identity so the
+        // encrypted DB persists across cold-start runs without Keychain. Unsigned
+        // simulator builds have no keychain entitlement (errSecMissingEntitlement),
+        // which would otherwise block the whole Marmot relay-sync path.
+        if let benchNsec = ProcessInfo.processInfo.environment["SONAR_BENCH_NSEC"], !benchNsec.isEmpty {
+            let keyHex = SHA256.hash(data: Data(benchNsec.utf8)).map { String(format: "%02x", $0) }.joined()
+            return (url.path, keyHex)
+        }
+        #endif
         let keychain = KeychainManager()
         let keyHex: String
         // Distinguish "no key yet" (safe to generate) from "key not readable

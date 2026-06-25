@@ -33,6 +33,22 @@ Concrete checklist for media features specifically (derived from Signal's `Attac
 4. **Multi-item ready**: use a list/collection for pending items, not a single nullable field, so multi-select doesn't require a model rewrite
 5. **Cleanup on all exit paths**: cancel, back gesture, navigation pop, app backgrounding — verify each one releases resources
 
+## Performance Analysis Rule
+
+Sonar startup and relay-sync performance is measured with the cold-start
+benchmark harness in `scripts/bench/` — see `docs/PERFORMANCE.md` for the full
+method, markers, and baseline numbers. Use it whenever a change touches the
+startup path or conversation open/send/sync, and when investigating "slow to
+sync / slow to send" reports.
+
+How to run the analysis:
+
+1. Build the dependencies once: `core/build-ios.sh` (Rust core → `sonarffi.xcframework`, incl. the simulator slice), `cargo build -p sonar-cli --release` (headless counterparty), then `APP=$(scripts/bench/build-sim.sh)` (Debug, arm64, unsigned `.app`).
+2. Faithful "existing account, cold process" run: `scripts/bench/provision-and-bench.sh --app "$APP" --runs 5 --msgs-per-run 3`. It seeds a real Marmot group via `sonar-cli` and pushes fresh messages before each run so every cold start exercises the real relay re-sync path (`woke=1`). For just the identity-independent phase breakdown, use `scripts/bench/cold-start-bench.sh --app "$APP" --runs 5`. To measure the REAL account on a physical iPhone (signed Debug build over the existing app, data preserved), use `scripts/bench/device-bench.sh` — this is where real pain points show up (e.g. the ~57 s blocking KeyPackage/profile publish on the cold-start critical path).
+3. Read the per-phase min/median/max table. The app emits `SONAR_BENCH` markers (`t0_launch` → `t1_local_paint` → `t2_relay_connect_begin` → `t3_relay_connected` → `t4_first_drain`) via `SecureLogger.info` (subsystem `chat.bitchat`, category `session`, DEBUG-only `%{public}@`); the harness parses them from the unified log.
+
+Constraints and gotchas (all detailed in `docs/PERFORMANCE.md`): the build must be **Debug** (markers are private in Release) and **arm64-only** (Arti/sonarffi sim slices are arm64). CLI sim builds are unsigned and cannot get a Keychain entitlement for the `sh.hedwig.sonar` bundle id, so the benchmark path is **Keychain-independent** — adopt the `SONAR_BENCH_NSEC` identity and derive the DB key from it. All such hooks are `#if DEBUG` and gated on `SONAR_BENCH_NSEC`; never add a benchmark hook that changes behavior in Release. When reporting, quote `launch→t4` (cold → synced) and the `t3→t4` sync drain against the baseline, and treat any regression that moves sync onto the critical path as a violation of the Signal-Comparable Performance Rule.
+
 ## Local Secrets Rule
 
 Do not commit payment, wallet, relay, signing, or API secrets. The Breez wallet key must stay in gitignored local configuration (`ios/Configs/Local.xcconfig` with `BREEZ_API_KEY = ...`) or an equivalent CI secret. When creating a new workspace/worktree or rebuilding for device testing, preserve the local secret by recreating/copying the gitignored config or passing the key through the build environment; verify presence without printing the value.
