@@ -779,10 +779,11 @@ final class MarmotService: @unchecked Sendable {
     /// `.sonar-index.db` set. The directory attribute sets the default for files
     /// SQLite creates later; the per-file pass heals installs whose files an
     /// older build wrote with `.complete`, in place and without a reinstall.
-    /// Best-effort: this runs from `databaseURL()` before the DB is opened, while
-    /// the keychain key is readable (i.e. data is accessible), so the rewrite
-    /// succeeds. On a locked cold-wake `databaseConfig()` defers the open before
-    /// we get here, so the DB is never mmap'd on that path.
+    /// Best-effort: the rewrite only lands while data is accessible (foreground,
+    /// or unlocked). On a locked background wake it silently no-ops, so the heal
+    /// alone is not enough — `databaseConfig()` gates the open on
+    /// `databaseIsBackgroundSafe(_:)` so a still-`.complete` store is never opened
+    /// while locked.
     private static func applyDatabaseProtection(to dir: URL) {
         let fm = FileManager.default
         let attrs: [FileAttributeKey: Any] = [.protectionKey: dbFileProtection]
@@ -791,6 +792,40 @@ final class MarmotService: @unchecked Sendable {
         for file in files {
             try? fm.setAttributes(attrs, ofItemAtPath: file.path)
         }
+    }
+
+    /// Whether the on-disk store is safe to open during locked background work —
+    /// i.e. no DB file is still `NSFileProtectionComplete`. Opening a `.complete`
+    /// WAL store while the device is locked is exactly what SIGBUSes (#132), so
+    /// when the heal in `applyDatabaseProtection(_:)` could not run (locked wake),
+    /// we must defer rather than open.
+    ///
+    /// - A fresh install (no DB file yet) is safe: the directory default pins the
+    ///   class on the files SQLite is about to create.
+    /// - An existing store we cannot even enumerate is unsafe — that only happens
+    ///   for a `.complete` directory while locked on a real device — so defer.
+    /// - Otherwise unsafe only if a file is explicitly a lock-while-locked class
+    ///   (`.complete`/`.completeUnlessOpen`). A nil/absent class means no Data
+    ///   Protection is in force (e.g. the Simulator, which reports no
+    ///   protectionKey, and the bench harness that runs there) — safe to open.
+    ///   The protection CLASS is file metadata and stays readable while locked, so
+    ///   a real-device pre-migration `.complete` store is still caught here.
+    private static func databaseIsBackgroundSafe(_ dbURL: URL) -> Bool {
+        let fm = FileManager.default
+        if !fm.fileExists(atPath: dbURL.path) { return true }
+        guard let files = try? fm.contentsOfDirectory(
+            at: dbURL.deletingLastPathComponent(), includingPropertiesForKeys: nil
+        ) else {
+            return false
+        }
+        let locksWhileLocked: [FileProtectionType] = [.complete, .completeUnlessOpen]
+        for file in files {
+            if let prot = (try? fm.attributesOfItem(atPath: file.path))?[.protectionKey] as? FileProtectionType,
+               locksWhileLocked.contains(prot) {
+                return false
+            }
+        }
+        return true
     }
     #endif
 
@@ -821,6 +856,17 @@ final class MarmotService: @unchecked Sendable {
         if let benchNsec = ProcessInfo.processInfo.environment["SONAR_BENCH_NSEC"], !benchNsec.isEmpty {
             let keyHex = SHA256.hash(data: Data(benchNsec.utf8)).map { String(format: "%02x", $0) }.joined()
             return (url.path, keyHex)
+        }
+        #endif
+        #if os(iOS)
+        // An older build may have left the store as NSFileProtectionComplete. The
+        // heal in databaseURL() only lands while data is accessible; on a locked
+        // background wake it no-ops, yet the AfterFirstUnlock DB key is still
+        // readable — so without this gate we would open the still-`.complete`
+        // WAL/`-shm` and hit the very SIGBUS this fixes (#132). Defer instead; a
+        // later foreground/unlocked launch migrates the files and proceeds.
+        guard Self.databaseIsBackgroundSafe(url) else {
+            throw ServiceError.core("Marmot DB still NSFileProtectionComplete (locked wake, pre-migration) — deferring open to avoid SIGBUS")
         }
         #endif
         let keychain = KeychainManager()
