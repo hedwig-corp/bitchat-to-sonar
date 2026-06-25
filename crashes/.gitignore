@@ -1,0 +1,6 @@
+# Raw crash reports dropped here for local analysis are PRIVATE — they can
+# contain device identifiers and tester emails (TestFlight feedback.json).
+# Ignore everything in this folder except the folder markers themselves.
+*
+!.gitignore
+!.gitkeep
