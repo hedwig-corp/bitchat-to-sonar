@@ -757,8 +757,46 @@ final class MarmotService: @unchecked Sendable {
     private static let dbDirName = "sonar-marmot"
     private static let dbFileName = "marmot.sqlite"
 
-    /// Absolute path of the encrypted Marmot database, parent dir created with
-    /// Data-Protection-Complete (at-rest encryption tied to the passcode).
+    #if os(iOS)
+    /// Data-Protection class for the SQLite store. Deliberately
+    /// `.completeUntilFirstUserAuthentication`, NOT `.complete`:
+    ///
+    /// The databases run in WAL mode, so SQLite memory-maps the `-shm` index
+    /// file. Under `.complete` that file is unreadable while the device is
+    /// locked, so any background DB access (BLE wake, push, background refresh)
+    /// page-faults the mmap'd page into an uncatchable
+    /// `EXC_BAD_ACCESS (SIGBUS) / FS pagein error: Operation not permitted` —
+    /// the top TestFlight crash (issue #132). `...UntilFirstUserAuthentication`
+    /// keeps the bytes encrypted at rest (protected until the first unlock after
+    /// boot) while staying readable for the rest of the session, including
+    /// locked background wakes. The DB is also independently SQLCipher-encrypted,
+    /// so confidentiality never relied on this class. Matches Signal-iOS's GRDB
+    /// store, which uses the same class for exactly this reason.
+    private static let dbFileProtection: FileProtectionType = .completeUntilFirstUserAuthentication
+
+    /// (Re)apply `dbFileProtection` to the DB directory and every file already in
+    /// it — the SQLite store plus its `-wal`/`-shm`/`-journal` sidecars and the
+    /// `.sonar-index.db` set. The directory attribute sets the default for files
+    /// SQLite creates later; the per-file pass heals installs whose files an
+    /// older build wrote with `.complete`, in place and without a reinstall.
+    /// Best-effort: this runs from `databaseURL()` before the DB is opened, while
+    /// the keychain key is readable (i.e. data is accessible), so the rewrite
+    /// succeeds. On a locked cold-wake `databaseConfig()` defers the open before
+    /// we get here, so the DB is never mmap'd on that path.
+    private static func applyDatabaseProtection(to dir: URL) {
+        let fm = FileManager.default
+        let attrs: [FileAttributeKey: Any] = [.protectionKey: dbFileProtection]
+        try? fm.setAttributes(attrs, ofItemAtPath: dir.path)
+        let files = (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
+        for file in files {
+            try? fm.setAttributes(attrs, ofItemAtPath: file.path)
+        }
+    }
+    #endif
+
+    /// Absolute path of the encrypted Marmot database. The parent dir and any
+    /// existing DB files are pinned to `dbFileProtection` so the store stays
+    /// readable during locked background work (see `dbFileProtection`).
     private static func databaseURL() throws -> URL {
         let base = try FileManager.default.url(
             for: .applicationSupportDirectory, in: .userDomainMask,
@@ -767,9 +805,7 @@ final class MarmotService: @unchecked Sendable {
         let dir = base.appendingPathComponent(dbDirName, isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         #if os(iOS)
-        try? FileManager.default.setAttributes(
-            [.protectionKey: FileProtectionType.complete], ofItemAtPath: dir.path
-        )
+        applyDatabaseProtection(to: dir)
         #endif
         return dir.appendingPathComponent(dbFileName)
     }
