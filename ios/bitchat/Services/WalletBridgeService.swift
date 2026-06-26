@@ -77,6 +77,9 @@ final class WalletBridgeService: ObservableObject {
     /// awaits it before rebuilding, so a fast background→foreground bounce can't
     /// reconnect before the disconnect (and its `state = .notConfigured`) completes.
     private var suspendTask: Task<Void, Never>?
+    /// Guards against stacking concurrent rebuilds if `resumeFromBackground()` is
+    /// called again (next foreground) while a previous retry loop is still running.
+    private var resumeInFlight = false
 
     // MARK: - Money display
 
@@ -229,23 +232,27 @@ final class WalletBridgeService: ObservableObject {
     /// Rebuild the node torn down by `suspendForBackground()`. Awaits the in-flight
     /// disconnect first (so a fast bounce can't reconnect mid-teardown), then
     /// retries with backoff so a transient failure on foreground (e.g. no network
-    /// yet) doesn't leave the wallet down until the next background→foreground
-    /// cycle. No-op unless we previously suspended a ready node.
+    /// yet) doesn't leave the wallet down. `suspendedForBackground` is cleared only
+    /// on success, so if all attempts fail the resume stays armed and the next
+    /// foreground retries — the wallet never gets stuck `.notConfigured` until a
+    /// fresh `BridgedWallet`. No-op unless we previously suspended.
     func resumeFromBackground() {
-        guard suspendedForBackground else { return }
-        suspendedForBackground = false
+        guard suspendedForBackground, !resumeInFlight else { return }
+        resumeInFlight = true
         let pendingSuspend = suspendTask
         Task { @MainActor in
+            defer { resumeInFlight = false }
             await pendingSuspend?.value
             suspendTask = nil
             for attempt in 0..<3 {
                 do {
                     try await setupIfNeeded()
+                    suspendedForBackground = false
                     return
                 } catch {
                     guard attempt < 2 else {
                         SecureLogger.warning(
-                            "Breez wallet reconnect failed after 3 attempts on foreground: \(error)",
+                            "Breez wallet reconnect failed after 3 attempts on foreground; staying armed for the next foreground: \(error)",
                             category: .session)
                         return
                     }

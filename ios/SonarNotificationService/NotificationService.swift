@@ -83,6 +83,19 @@ class NotificationService: SDKNotificationService {
             try? FileManager.default.setAttributes(dbProtection, ofItemAtPath: file.path)
         }
 
+        // The heal above is best-effort: on a locked device the `setAttributes`
+        // calls silently no-op, so a store an older build wrote as `.complete` can
+        // still be protected here. Connecting Breez against a `.complete` WAL store
+        // while locked is exactly what SIGBUSes / 0xdead10ccs. Detect an unhealed
+        // store and DEFER this push rather than crash — the next unlocked foreground
+        // heals the files in the app, and later pushes connect cleanly. (Mirrors
+        // MarmotService.databaseIsBackgroundSafe from #133.)
+        guard Self.databaseIsBackgroundSafe(workingDir) else {
+            os_log("NSE: Breez store still .complete (locked, pre-heal) — deferring connect to avoid SIGBUS/0xdead10cc",
+                   log: Self.log, type: .error)
+            return nil
+        }
+
         do {
             var config = try defaultConfig(network: network, breezApiKey: apiKey)
             config.workingDir = workingDir.path
@@ -93,6 +106,34 @@ class NotificationService: SDKNotificationService {
         } catch {
             return nil
         }
+    }
+
+    /// Whether the Breez store is safe to open during locked background work — i.e.
+    /// no file is still a lock-while-locked protection class. A `.complete` /
+    /// `.completeUnlessOpen` WAL store opened while the device is locked SIGBUSes on
+    /// the mmap'd `-shm` page (or 0xdead10ccs on a held lock), so when the in-place
+    /// heal couldn't run (locked wake) we must defer rather than connect.
+    ///
+    /// - A fresh/empty dir is safe: the dir default we just set pins the class on
+    ///   the files the SDK is about to create.
+    /// - A dir we cannot even enumerate is unsafe — that only happens for a
+    ///   `.complete` dir while locked on a real device — so defer.
+    /// - The protection CLASS is file metadata and stays readable while locked, so a
+    ///   pre-migration `.complete` store is still caught here. A nil/absent class
+    ///   means no Data Protection is in force (Simulator) — safe.
+    private static func databaseIsBackgroundSafe(_ dir: URL) -> Bool {
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) else {
+            return false
+        }
+        let locksWhileLocked: [FileProtectionType] = [.complete, .completeUnlessOpen]
+        for file in files {
+            if let prot = (try? fm.attributesOfItem(atPath: file.path))?[.protectionKey] as? FileProtectionType,
+               locksWhileLocked.contains(prot) {
+                return false
+            }
+        }
+        return true
     }
 
     private static func bytes(fromHex s: String) -> [UInt8]? {
