@@ -8,6 +8,7 @@
 
 #if os(iOS) || os(macOS)
 
+import BitLogger
 import Combine
 import Foundation
 import WalletKit
@@ -168,12 +169,21 @@ final class WalletBridgeService: ObservableObject {
     }
 
     /// Stop the Breez node (e.g. on scene teardown). Setup can run again.
+    ///
+    /// Awaits an in-flight `setup()` first so `stopNode()` never races a concurrent
+    /// `connect()` on the SDK, and so the balance/rates tasks are cancelled AFTER
+    /// `setup()` has created them (cancelling earlier would leave the fresh ones
+    /// running). This is what lets `suspendForBackground()` cleanly tear down a
+    /// reconnect that's still `.settingUp`.
     func shutdown() async {
+        if let running = setupTask {
+            _ = try? await running.value
+        }
+        setupTask = nil
         balanceTask?.cancel()
         balanceTask = nil
         ratesTask?.cancel()
         ratesTask = nil
-        setupTask = nil
         try? await wallet.stopNode()
         state = .notConfigured
     }
@@ -194,9 +204,13 @@ final class WalletBridgeService: ObservableObject {
     /// Group DB. `resumeFromBackground()` rebuilds the node on the next foreground.
     ///
     /// Wrapped in a background-task assertion so the disconnect runs to completion
-    /// before the OS suspends us. No-op unless a ready node is actually running.
+    /// before the OS suspends us. Tears down a ready node OR an in-flight reconnect
+    /// — a fast foreground→background bounce can land here while still `.settingUp`,
+    /// and leaving that connect running would let it hold a lock at suspension
+    /// (`shutdown()` waits for the connect to settle, then disconnects). No-op only
+    /// when the node was never brought up.
     func suspendForBackground() {
-        guard case .ready = state else { return }
+        if case .notConfigured = state { return }
         suspendedForBackground = true
         var bgTask: UIBackgroundTaskIdentifier = .invalid
         bgTask = UIApplication.shared.beginBackgroundTask(withName: "breez-suspend") {
@@ -229,7 +243,12 @@ final class WalletBridgeService: ObservableObject {
                     try await setupIfNeeded()
                     return
                 } catch {
-                    guard attempt < 2 else { return }
+                    guard attempt < 2 else {
+                        SecureLogger.warning(
+                            "Breez wallet reconnect failed after 3 attempts on foreground: \(error)",
+                            category: .session)
+                        return
+                    }
                     try? await Task.sleep(nanoseconds: UInt64(attempt + 1) * 2_000_000_000)
                 }
             }
