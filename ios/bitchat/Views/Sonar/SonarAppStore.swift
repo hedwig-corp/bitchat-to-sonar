@@ -840,6 +840,15 @@ final class SonarAppStore: ObservableObject {
         // stores for incoming ⚡PAY receipt control lines.
         republish(payLedger.objectWillChange)
         republish(paymentActivityLedger.objectWillChange)
+        #if os(iOS)
+        // When a webhook binding lands *after* an offer was already advertised
+        // (e.g. the FCM token arrived late), re-publish so a fresh offer is minted
+        // under the webhook. One-shot per binding — the marker is offer-independent
+        // so the offer rotation this causes can't re-trigger it (#126).
+        SonarPushRegistration.shared.onWebhookRegistered = { [weak self] in
+            self?.publishPaymentMetadataIfNeeded(force: true)
+        }
+        #endif
         wallet.statePublisher
             .receive(on: DispatchQueue.main)
             .sink { [weak self] state in
@@ -1765,6 +1774,15 @@ final class SonarAppStore: ObservableObject {
             switch self.walletState {
             case .ready:
                 do {
+                    #if os(iOS)
+                    // Register the Breez NDS webhook BEFORE minting the offer: the SDK
+                    // snapshots the webhook URL into the offer at creation time and
+                    // POSTs it to Boltz, so registering first is what makes Boltz store
+                    // url= instead of None (root cause of #126).
+                    if let bridged = self.wallet as? BridgedWallet {
+                        await SonarPushRegistration.shared.ensureWebhookRegisteredBeforeOffer(wallet: bridged.walletService)
+                    }
+                    #endif
                     offer = try await self.wallet.createOffer()
                     guard case .ready = self.walletState else { return }
                 } catch {
@@ -1787,14 +1805,9 @@ final class SonarAppStore: ObservableObject {
                 }
                 self.publishedCallDescriptor = true
                 self.publishedBolt12Offer = offer
-                // Re-subscribe the Breez NDS webhook onto the just-published offer so
-                // Boltz can POST it on an offline invoice_request (#126). Idempotent —
-                // only re-PATCHes when the offer / FCM token / NDS URL changed.
-                #if os(iOS)
-                if let offer, let bridged = self.wallet as? BridgedWallet {
-                    SonarPushRegistration.shared.ensureBreezWebhook(offer: offer, wallet: bridged.walletService)
-                }
-                #endif
+                // The Breez NDS webhook is registered *before* the mint above (see
+                // ensureWebhookRegisteredBeforeOffer), so the just-minted offer
+                // already carries it — nothing to re-subscribe here (#126).
             } catch {
                 SecureLogger.error("Sonar descriptor payment metadata publish failed: \(error)", category: .session)
             }

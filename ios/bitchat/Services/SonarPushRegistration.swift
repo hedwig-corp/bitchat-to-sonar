@@ -27,12 +27,19 @@ final class SonarPushRegistration {
 
     private var cachedAPNSToken: Data?
     private var cachedFCMToken: String?
-    private var cachedOffer: String?
     private var sonarNode: SonarNode?
     private let queue = DispatchQueue(label: "chat.bitchat.sonar.push.registration")
 
-    /// Persisted fingerprint of the last successful webhook subscription
-    /// (sha256 of offer|fcmToken|ndsUrl). Lets us skip redundant re-subscribes.
+    /// Fired (on the main actor) when a *fresh* Breez webhook registration lands —
+    /// i.e. the (fcmToken|ndsUrl) binding changed. The host uses it to re-publish a
+    /// fresh BOLT12 offer so the new offer is minted *after* the webhook is set and
+    /// therefore carries it (#126). One-shot per binding: the marker is offer-
+    /// independent, so the offer rotation a re-publish causes can't re-trigger it.
+    var onWebhookRegistered: (() -> Void)?
+
+    /// Persisted fingerprint of the last successful webhook registration
+    /// (sha256 of fcmToken|ndsUrl). Lets us skip redundant re-registration. Offer-
+    /// independent on purpose: the webhook URL doesn't depend on the offer (#126).
     private static let webhookMarkerKey = "breez_webhook_marker"
 
     private var transponderNpub: String {
@@ -61,44 +68,41 @@ final class SonarPushRegistration {
     /// Console). Matches Sonar Android and Unify.
     func didReceiveFCMToken(_ fcmToken: String, wallet: WalletBridgeService?) {
         Self.log.info("FCM token collected (\(fcmToken.prefix(8))...)")
-        // Coordinate offer + token on the serial queue: the webhook can only be
-        // (re)subscribed once both are known (the offer keys the idempotency
-        // marker). Whichever lands second on the queue triggers the subscribe.
-        queue.async {
-            self.cachedFCMToken = fcmToken
-            guard let offer = self.cachedOffer else {
-                Self.log.info("Breez NDS: FCM token ready, waiting for receive offer")
-                return
+        queue.sync { self.cachedFCMToken = fcmToken }
+        // The webhook URL is (ndsUrl + fcmToken) only — it does NOT depend on the
+        // receive offer. Bind it as soon as the token + wallet are ready; a fresh
+        // binding re-publishes the offer so it is (re)minted under the webhook (#126).
+        Task { @MainActor in
+            if await self.registerWebhookIfNeeded(wallet: wallet) {
+                self.onWebhookRegistered?()
             }
-            self.subscribeBreezWebhook(offer: offer, fcmToken: fcmToken, wallet: wallet)
         }
     }
 
-    /// Called from the receiver-advertising flow each time the BOLT12 receive
-    /// offer is (re)published. Coordinates the offer with the FCM token — whichever
-    /// arrives second triggers the subscribe.
-    func ensureBreezWebhook(offer: String, wallet: WalletBridgeService?) {
-        queue.async {
-            self.cachedOffer = offer
-            guard let fcmToken = self.cachedFCMToken else {
-                Self.log.info("Breez NDS: receive offer ready, waiting for FCM token")
-                return
-            }
-            self.subscribeBreezWebhook(offer: offer, fcmToken: fcmToken, wallet: wallet)
-        }
+    /// Ensure the Breez NDS webhook is registered with the SDK *before* the BOLT12
+    /// receive offer is minted. The SDK's `create_bolt12_offer` snapshots the
+    /// current webhook URL at creation time and POSTs the offer to Boltz with it,
+    /// so registering first is what makes Boltz store `url=` instead of `None` — the
+    /// confirmed root cause of offline-receive failing in #126. Awaited by the
+    /// publish flow so the mint that follows carries the webhook.
+    @MainActor
+    func ensureWebhookRegisteredBeforeOffer(wallet: WalletBridgeService?) async {
+        _ = await registerWebhookIfNeeded(wallet: wallet)
     }
 
+    /// Re-attempt registration after the wallet becomes ready (the FCM token is
+    /// usually already cached by then). A fresh binding re-publishes the offer.
     func retryBreezWebhookIfNeeded(wallet: WalletBridgeService) {
-        queue.async {
-            guard let fcmToken = self.cachedFCMToken, let offer = self.cachedOffer else { return }
-            self.subscribeBreezWebhook(offer: offer, fcmToken: fcmToken, wallet: wallet)
+        Task { @MainActor in
+            if await self.registerWebhookIfNeeded(wallet: wallet) {
+                self.onWebhookRegistered?()
+            }
         }
     }
 
     func unregister(wallet: WalletBridgeService? = nil) {
         queue.async {
             self.cachedAPNSToken = nil
-            self.cachedOffer = nil
         }
         // Force a fresh subscribe next time (e.g. after a wallet/seed change).
         UserDefaults.standard.removeObject(forKey: Self.webhookMarkerKey)
@@ -152,43 +156,55 @@ final class SonarPushRegistration {
         }
     }
 
-    private func subscribeBreezWebhook(offer: String, fcmToken: String, wallet: WalletBridgeService?) {
-        guard !ndsUrl.isEmpty else { return }
+    /// Register the Breez NDS webhook with the SDK, idempotent on (fcmToken|ndsUrl).
+    /// Returns true iff a *fresh* registration landed (the binding changed), so the
+    /// caller can re-publish a fresh offer that snapshots it.
+    ///
+    /// The webhook URL is offer-independent. Keying the marker on the offer (as the
+    /// old code did) forced a needless re-register on every offer rotation yet still
+    /// left a pre-webhook offer on Boltz with `url=None`, because the SDK's
+    /// `registerWebhook` only re-PATCHes offers already in its local `bolt12_offers`
+    /// table and no-ops on an empty list. Registering here, *before* the next
+    /// `createOffer`, is the actual fix for #126: the new offer snapshots this URL
+    /// at mint time and Boltz stores `url=`.
+    @MainActor
+    @discardableResult
+    private func registerWebhookIfNeeded(wallet: WalletBridgeService?) async -> Bool {
+        guard !ndsUrl.isEmpty else { return false }
         guard let wallet else {
             Self.log.info("Breez NDS: wallet not ready, will retry after wallet setup")
-            return
+            return false
+        }
+        guard let fcmToken = queue.sync(execute: { self.cachedFCMToken }) else {
+            Self.log.info("Breez NDS: FCM token not ready, will retry after token arrives")
+            return false
+        }
+        guard case .ready = wallet.state else {
+            Self.log.info("Breez NDS: wallet not ready, will retry after wallet setup")
+            return false
         }
         let webhookUrl = "\(ndsUrl)/api/v1/notify?platform=ios&token=\(fcmToken)"
-        let marker = Self.webhookMarker(offer: offer, fcmToken: fcmToken, ndsUrl: ndsUrl)
-        Task { @MainActor in
-            guard case .ready = wallet.state else {
-                Self.log.info("Breez NDS: wallet not ready, will retry after wallet setup")
-                return
-            }
-            // Idempotent: skip when offer + token + NDS are unchanged since the last
-            // successful subscription.
-            if UserDefaults.standard.string(forKey: Self.webhookMarkerKey) == marker {
-                return
-            }
-            do {
-                // Force a clean re-subscribe. A plain registerWebhook no-ops when the
-                // SDK's local `bolt12_offers.webhook_url` already equals this URL but
-                // Boltz still holds `url=None` — the desync that breaks offline receive.
-                // unregister clears the local webhook state, register re-PATCHes the
-                // offer on Boltz (`update_bolt12_offer`) with the current FCM URL.
-                // Matches the misty-breez reference's unregister→register flow.
-                try? await wallet.unregisterWebhook()
-                try await wallet.registerWebhook(url: webhookUrl)
-                UserDefaults.standard.set(marker, forKey: Self.webhookMarkerKey)
-                Self.log.info("Breez NDS webhook (re)subscribed for current offer (FCM)")
-            } catch {
-                Self.log.warning("Breez NDS webhook registration failed: \(error)")
-            }
+        let marker = Self.webhookMarker(fcmToken: fcmToken, ndsUrl: ndsUrl)
+        if UserDefaults.standard.string(forKey: Self.webhookMarkerKey) == marker {
+            return false
+        }
+        do {
+            // unregister→register forces a clean re-PATCH: a plain registerWebhook
+            // no-ops when the SDK's local webhook URL already matches. Matches the
+            // misty-breez reference flow. The mint that follows snapshots this URL.
+            try? await wallet.unregisterWebhook()
+            try await wallet.registerWebhook(url: webhookUrl)
+            UserDefaults.standard.set(marker, forKey: Self.webhookMarkerKey)
+            Self.log.info("Breez NDS webhook registered (FCM); next offer mint will carry it")
+            return true
+        } catch {
+            Self.log.warning("Breez NDS webhook registration failed: \(error)")
+            return false
         }
     }
 
-    private static func webhookMarker(offer: String, fcmToken: String, ndsUrl: String) -> String {
-        let digest = SHA256.hash(data: Data("\(offer)|\(fcmToken)|\(ndsUrl)".utf8))
+    private static func webhookMarker(fcmToken: String, ndsUrl: String) -> String {
+        let digest = SHA256.hash(data: Data("\(fcmToken)|\(ndsUrl)".utf8))
         return digest.map { String(format: "%02x", $0) }.joined()
     }
 }
