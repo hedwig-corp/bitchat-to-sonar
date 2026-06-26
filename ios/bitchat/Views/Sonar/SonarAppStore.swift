@@ -1158,6 +1158,19 @@ final class SonarAppStore: ObservableObject {
         let cameToForeground = foreground && !isForeground
         isForeground = foreground
         updateReceiverAdvertising()
+        #if canImport(UIKit)
+        // Tear the Breez node down before suspension so it never holds a SQLite
+        // lock while the process is suspended (the 0xdead10cc kill), and rebuild
+        // it on foreground. Offline receive is unaffected — it runs in the
+        // Notification Service Extension's own process.
+        if let walletService = (wallet as? BridgedWallet)?.walletService {
+            if foreground {
+                walletService.resumeFromBackground()
+            } else {
+                walletService.suspendForBackground()
+            }
+        }
+        #endif
         if cameToForeground {
             refreshKnownContactDescriptors()
             publishedCallDescriptor = false

@@ -11,6 +11,9 @@
 import Combine
 import Foundation
 import WalletKit
+#if canImport(UIKit)
+import UIKit
+#endif
 
 /// App-side facade over the Lightning wallet engine (Breez SDK Liquid via
 /// the local `WalletKit` Swift package).
@@ -66,6 +69,13 @@ final class WalletBridgeService: ObservableObject {
     private let mainnet: Bool
     private var balanceTask: Task<Void, Never>?
     private var setupTask: Task<Void, Error>?
+    /// True between `suspendForBackground()` and `resumeFromBackground()` so the
+    /// foreground rebuild only fires when we actually tore a ready node down.
+    private var suspendedForBackground = false
+    /// The in-flight `shutdown()` from `suspendForBackground()`. `resumeFromBackground()`
+    /// awaits it before rebuilding, so a fast background→foreground bounce can't
+    /// reconnect before the disconnect (and its `state = .notConfigured`) completes.
+    private var suspendTask: Task<Void, Never>?
 
     // MARK: - Money display
 
@@ -167,6 +177,65 @@ final class WalletBridgeService: ObservableObject {
         try? await wallet.stopNode()
         state = .notConfigured
     }
+
+    // MARK: - Background lifecycle
+
+    #if canImport(UIKit)
+    /// Tear the Breez node down before the app suspends, to avoid a `0xdead10cc`
+    /// kill.
+    ///
+    /// The Breez SDK runs a background task (`track_new_blocks`) that polls its
+    /// SQLite cache continuously. If iOS suspends the process while that task
+    /// holds a SQLite lock, RunningBoard terminates the app with `0xdead10cc`
+    /// ("held a file lock during suspension"). `disconnect()` (via `shutdown()`)
+    /// releases every lock so the suspend is clean. Offline receive is unaffected
+    /// — it runs in the Notification Service Extension's own process — and
+    /// dropping our connection also removes app↔NSE contention on the shared App
+    /// Group DB. `resumeFromBackground()` rebuilds the node on the next foreground.
+    ///
+    /// Wrapped in a background-task assertion so the disconnect runs to completion
+    /// before the OS suspends us. No-op unless a ready node is actually running.
+    func suspendForBackground() {
+        guard case .ready = state else { return }
+        suspendedForBackground = true
+        var bgTask: UIBackgroundTaskIdentifier = .invalid
+        bgTask = UIApplication.shared.beginBackgroundTask(withName: "breez-suspend") {
+            UIApplication.shared.endBackgroundTask(bgTask)
+            bgTask = .invalid
+        }
+        suspendTask = Task { @MainActor in
+            await shutdown()
+            if bgTask != .invalid {
+                UIApplication.shared.endBackgroundTask(bgTask)
+                bgTask = .invalid
+            }
+        }
+    }
+
+    /// Rebuild the node torn down by `suspendForBackground()`. Awaits the in-flight
+    /// disconnect first (so a fast bounce can't reconnect mid-teardown), then
+    /// retries with backoff so a transient failure on foreground (e.g. no network
+    /// yet) doesn't leave the wallet down until the next background→foreground
+    /// cycle. No-op unless we previously suspended a ready node.
+    func resumeFromBackground() {
+        guard suspendedForBackground else { return }
+        suspendedForBackground = false
+        let pendingSuspend = suspendTask
+        Task { @MainActor in
+            await pendingSuspend?.value
+            suspendTask = nil
+            for attempt in 0..<3 {
+                do {
+                    try await setupIfNeeded()
+                    return
+                } catch {
+                    guard attempt < 2 else { return }
+                    try? await Task.sleep(nanoseconds: UInt64(attempt + 1) * 2_000_000_000)
+                }
+            }
+        }
+    }
+    #endif
 
     // MARK: - Push webhook
 
