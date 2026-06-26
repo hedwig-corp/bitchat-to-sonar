@@ -70,18 +70,6 @@ class NotificationService: SDKNotificationService {
             .appendingPathComponent("breez-sdk", isDirectory: true)
             .appendingPathComponent(mainnet ? "mainnet" : "testnet", isDirectory: true)
         try? FileManager.default.createDirectory(at: workingDir, withIntermediateDirectories: true)
-        // Pin the Breez SQLite store to .completeUntilFirstUserAuthentication, NOT
-        // .complete: the NSE connects the SDK while the device is locked, so a
-        // .complete store would either SIGBUS on the mmap'd -shm page or get the
-        // process killed with 0xdead10cc for holding a lock on an unavailable file.
-        // Keep in sync with SonarWallet.applyDatabaseProtection (separate target —
-        // can't share the helper). Heals existing files in place; sets the dir
-        // default for files the SDK creates at connect.
-        let dbProtection: [FileAttributeKey: Any] = [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication]
-        try? FileManager.default.setAttributes(dbProtection, ofItemAtPath: workingDir.path)
-        for file in (try? FileManager.default.contentsOfDirectory(at: workingDir, includingPropertiesForKeys: nil)) ?? [] {
-            try? FileManager.default.setAttributes(dbProtection, ofItemAtPath: file.path)
-        }
 
         do {
             var config = try defaultConfig(network: network, breezApiKey: apiKey)
