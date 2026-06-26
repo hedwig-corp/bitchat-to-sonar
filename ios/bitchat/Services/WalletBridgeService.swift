@@ -80,6 +80,11 @@ final class WalletBridgeService: ObservableObject {
     /// Guards against stacking concurrent rebuilds if `resumeFromBackground()` is
     /// called again (next foreground) while a previous retry loop is still running.
     private var resumeInFlight = false
+    /// The in-flight `resumeFromBackground()` retry loop. `suspendForBackground()`
+    /// cancels it so a pending backoff retry can't wake and reconnect Breez while
+    /// the app is already backgrounded (which would hold a SQLite lock at
+    /// suspension with no matching teardown).
+    private var resumeTask: Task<Void, Never>?
 
     // MARK: - Money display
 
@@ -213,6 +218,13 @@ final class WalletBridgeService: ObservableObject {
     /// (`shutdown()` waits for the connect to settle, then disconnects). No-op only
     /// when the node was never brought up.
     func suspendForBackground() {
+        // Cancel any in-flight foreground reconnect retry first. If it's mid-backoff
+        // after a failed attempt (state is `.notConfigured`), it would otherwise wake
+        // and reconnect Breez while we're backgrounded, with no matching teardown —
+        // re-opening the lock-at-suspension path. It stays armed
+        // (`suspendedForBackground`) so the next foreground retries.
+        resumeTask?.cancel()
+        resumeTask = nil
         if case .notConfigured = state { return }
         suspendedForBackground = true
         var bgTask: UIBackgroundTaskIdentifier = .invalid
@@ -240,13 +252,17 @@ final class WalletBridgeService: ObservableObject {
         guard suspendedForBackground, !resumeInFlight else { return }
         resumeInFlight = true
         let pendingSuspend = suspendTask
-        Task { @MainActor in
+        resumeTask = Task { @MainActor in
             defer { resumeInFlight = false }
             await pendingSuspend?.value
             suspendTask = nil
             for attempt in 0..<3 {
+                // Backgrounded mid-loop (suspendForBackground cancelled us): stop
+                // before reconnecting, and stay armed so the next foreground retries.
+                if Task.isCancelled { return }
                 do {
                     try await setupIfNeeded()
+                    if Task.isCancelled { return }
                     suspendedForBackground = false
                     return
                 } catch {
@@ -256,7 +272,13 @@ final class WalletBridgeService: ObservableObject {
                             category: .session)
                         return
                     }
-                    try? await Task.sleep(nanoseconds: UInt64(attempt + 1) * 2_000_000_000)
+                    // `try await` (not `try?`) so cancellation during the backoff
+                    // aborts the loop instead of falling through to another connect.
+                    do {
+                        try await Task.sleep(nanoseconds: UInt64(attempt + 1) * 2_000_000_000)
+                    } catch {
+                        return
+                    }
                 }
             }
         }
