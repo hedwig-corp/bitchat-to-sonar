@@ -105,6 +105,12 @@ public final class SonarWallet {
     public func configure(apiKey: String, mainnet: Bool) throws {
         let dir = try Self.breezWorkingDir(mainnet: mainnet)
         Self.migrateLegacyWorkingDirIfNeeded(to: dir)
+        #if os(iOS)
+        // Heal data protection AFTER migration (so files moved in from the legacy
+        // pre-App-Group dir are repinned too) and BEFORE the SDK opens the store in
+        // `startNode()`, so the directory default lands on the files Breez creates.
+        Self.applyDatabaseProtection(to: dir)
+        #endif
         self.apiKey = apiKey
         self.mainnet = mainnet
         self.workingDir = dir.path
@@ -138,6 +144,40 @@ public final class SonarWallet {
         try fm.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }
+
+    #if os(iOS)
+    /// Data-Protection class for the Breez SQLite store. Deliberately
+    /// `.completeUntilFirstUserAuthentication`, NOT `.complete`.
+    ///
+    /// The Breez SDK runs a background task (`track_new_blocks`) that polls its
+    /// SQLite cache continuously. Under `.complete` the DB files are inaccessible
+    /// while the device is locked, so holding a SQLite lock while the process is
+    /// suspended-and-locked gets the app killed by RunningBoard with `0xdead10cc`
+    /// ("held a file lock during suspension") — observed on TestFlight 1.6.0 (15).
+    /// The same class also avoids the mmap'd `-shm` SIGBUS that #133 fixed for the
+    /// Marmot store. `...UntilFirstUserAuthentication` keeps the bytes encrypted at
+    /// rest (protected until the first unlock after boot) while staying accessible
+    /// for the rest of the session, including locked background wakes. Matches the
+    /// Marmot store (MarmotService) and Signal-iOS's GRDB store.
+    private static let dbFileProtection: FileProtectionType = .completeUntilFirstUserAuthentication
+
+    /// (Re)apply `dbFileProtection` to the working dir and every file already in
+    /// it — the Breez SQLite store plus its `-wal`/`-shm`/`-journal` sidecars. The
+    /// directory attribute sets the default for files the SDK creates later; the
+    /// per-file pass heals installs whose files an older build wrote with
+    /// `.complete`, in place and without a reinstall. Best-effort: the rewrite
+    /// only lands while data is accessible (foreground / unlocked), which is where
+    /// `configure()` runs.
+    static func applyDatabaseProtection(to dir: URL) {
+        let fm = FileManager.default
+        let attrs: [FileAttributeKey: Any] = [.protectionKey: dbFileProtection]
+        try? fm.setAttributes(attrs, ofItemAtPath: dir.path)
+        let files = (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
+        for file in files {
+            try? fm.setAttributes(attrs, ofItemAtPath: file.path)
+        }
+    }
+    #endif
 
     /// One-time move of the pre-App-Group working dir (`Application Support/sonar-wallet`)
     /// into the shared container, so an existing wallet keeps its synced Breez state
