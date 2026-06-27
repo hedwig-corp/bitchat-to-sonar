@@ -36,6 +36,8 @@ private const val LOCAL_TRANSCRIPT_PAGE_LIMIT = 100
 private const val LOCAL_SUMMARY_PAGE_LIMIT = 20
 private const val LOCAL_SUMMARY_CHAT_LIMIT = 5
 private const val GROUP_FOLDS_BLOB_KEY = "sonar.groupFolds"
+private const val FAVORITED_CONTROL = "[FAVORITED]"
+private const val UNFAVORITED_CONTROL = "[UNFAVORITED]"
 
 internal fun shortNpubLabel(value: String): String =
     if (value.length > 16) value.take(10) + "…" + value.takeLast(4) else value
@@ -193,6 +195,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Resolved kind-0 profiles by npub — fills human names for Marmot members. */
     var profilesByNpub by mutableStateOf(decodeProfileCache(SonarCore.loadBlob(PROFILE_CACHE_BLOB_KEY)))
         private set
+    private var socialState by mutableStateOf(decodeSonarSocialState(SonarCore.loadBlob(SOCIAL_STATE_BLOB_KEY)))
     private val profileFetches = mutableSetOf<String>()
     private val profileFetchedAt = mutableMapOf<String, Long>()
 
@@ -246,6 +249,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             needsSonarDescriptorPublish = false
             rawMeshPeerIds = emptySet(); meshPeerFirstSeenMs.clear(); pendingCapabilityRefreshPeers.clear()
             profilesByNpub = emptyMap(); profileFetches.clear()
+            socialState = SonarSocialState(); persistSocialState()
             outbox.clear()
             MessageStore.wipe()
             SonarCore.wipe()
@@ -353,6 +357,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun placeCall(chatId: String, peerName: String, video: Boolean) {
         if (activeCall != null) { toast = "Already in a call"; return }
         if (video) { toast = "Video calls are coming soon."; return }
+        if (isContactBlocked(chatId)) { toast = "Unblock this contact before calling."; return }
         if (!canCall(chatId)) { toast = "No call route to this Sonar peer yet."; return }
         val callId = randomMeshId()
         // Show the ringing screen IMMEDIATELY so the tap is responsive; the iroh
@@ -544,6 +549,10 @@ class SonarAppState(private val scope: CoroutineScope) {
     private suspend fun onCallControl(chatId: String, m: SonarMsg, ctrl: SonarCallControl) {
         val callChatId = callChatIdFor(chatId)
         sonarLog("SonarCall", "RX ${ctrl::class.simpleName} from $chatId as $callChatId (started=$callStarted)")
+        if (isContactBlocked(callChatId)) {
+            sonarLog("SonarCall", "ignoring blocked call control chatId=$callChatId")
+            return
+        }
         if (ctrl is SonarCallControl.Offer && !canCall(callChatId)) {
             sonarLog("SonarCall", "ignoring offer without Sonar call route chatId=$chatId folded=$callChatId")
             runCatching { sendCallControl(chatId, SonarCore.callEncodeAnswer(ctrl.callId, SonarAnswer.Decline, "")) }
@@ -651,6 +660,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         meshPeerFirstSeenMs.keys.retainAll(rawMeshPeerIds + meshChats.keys + linkByFp.keys)
         meshPeers = rawPeers.filter { peer ->
             val peerId = meshPeerId(peer.id)
+            if (socialState.isBlockedPeer(peerId)) return@filter false
             if (peer.name.isNotBlank()) meshChatNames[peerId] = peer.name
             val first = meshPeerFirstSeenMs.getOrPut(peerId) { nowMs }
             val hasProfile = peer.sonar || sonarPeerProfiles.containsKey(peerId) || linkByFp.containsKey(peerId)
@@ -743,7 +753,217 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** White Noise chats to render on their own row: every Marmot group EXCEPT the
      *  ones folded into a mesh DM. The Messages list uses this instead of [chats]. */
     val visibleChats: List<SonarChat> get() =
-        chats.filterNot { it.id in foldedGroupIds || shouldHoldStandaloneMarmotChat(it) }
+        chats.filterNot {
+            it.id in foldedGroupIds ||
+                shouldHoldStandaloneMarmotChat(it) ||
+                isBlockedMarmotChat(it.id)
+        }
+
+    private fun persistSocialState() {
+        SonarCore.saveBlob(SOCIAL_STATE_BLOB_KEY, encodeSonarSocialState(socialState))
+    }
+
+    fun isFavorite(peerId: String): Boolean =
+        socialState.isFavoritePeer(peerId)
+
+    fun isMutualFavorite(peerId: String): Boolean =
+        socialState.isMutualFavorite(peerId)
+
+    fun isBlockedPeer(peerId: String): Boolean =
+        socialState.isBlockedPeer(peerId)
+
+    fun isBlockedNostrPubkey(value: String): Boolean =
+        socialState.isBlockedNostr(value)
+
+    fun isContactFavorite(chatId: String): Boolean =
+        socialPeerIdForChat(chatId)?.let { isFavorite(it) } == true
+
+    fun isContactBlocked(chatId: String): Boolean {
+        socialPeerIdForChat(chatId)?.let { if (isBlockedPeer(it)) return true }
+        socialNpubHexForChat(chatId)?.let { if (isBlockedNostrPubkey(it)) return true }
+        return false
+    }
+
+    fun canFavoriteContact(chatId: String): Boolean =
+        socialPeerIdForChat(chatId) != null
+
+    fun toggleFavorite(peerId: String, name: String = "") {
+        val key = normalizeSocialPeerId(peerId)
+        setFavoritePeer(key, name, !socialState.isFavoritePeer(key))
+    }
+
+    fun setFavoritePeer(peerId: String, name: String = "", favorite: Boolean) {
+        val key = normalizeSocialPeerId(peerId)
+        if (favorite && socialState.isBlockedPeer(key)) {
+            toast = "Unblock ${name.ifBlank { "this contact" }} before favoriting."
+            return
+        }
+        socialState = socialState.withFavoritePeer(key, favorite)
+        persistSocialState()
+        sendFavoriteStatusNotification(key, favorite)
+        toast = if (favorite) {
+            "Added ${name.ifBlank { "contact" }} to favorites"
+        } else {
+            "Removed ${name.ifBlank { "contact" }} from favorites"
+        }
+        recomputeSociallyFilteredRows()
+    }
+
+    private fun sendFavoriteStatusNotification(peerId: String, favorite: Boolean) {
+        val payload = buildString {
+            append(if (favorite) FAVORITED_CONTROL else UNFAVORITED_CONTROL)
+            npub.takeIf { it.isNotBlank() }?.let {
+                append(":")
+                append(it)
+            }
+        }
+        MeshRadio.sendMeshDm(peerId, randomMeshId(), payload)
+    }
+
+    fun toggleFavoriteContact(chatId: String, name: String) {
+        val peerId = socialPeerIdForChat(chatId)
+        if (peerId == null) {
+            toast = "Favorite works after meeting this contact over Bluetooth."
+            return
+        }
+        toggleFavorite(peerId, name)
+    }
+
+    fun setContactBlocked(chatId: String, name: String, blocked: Boolean) {
+        val peerId = socialPeerIdForChat(chatId)
+        val npubHex = socialNpubHexForChat(chatId)
+        if (peerId == null && npubHex == null) {
+            toast = "No stable identity to block yet."
+            return
+        }
+        if (peerId != null) socialState = socialState.withBlockedPeer(peerId, blocked)
+        if (npubHex != null) socialState = socialState.withBlockedNostr(npubHex, blocked)
+        if (blocked && peerId != null) socialState = socialState.withFavoritePeer(peerId, false)
+        persistSocialState()
+        toast = if (blocked) "Blocked ${name.ifBlank { "contact" }}" else "Unblocked ${name.ifBlank { "contact" }}"
+        recomputeSociallyFilteredRows()
+        if ((screen as? Screen.Chat)?.id == chatId) {
+            if (blocked) {
+                messages = visibleMessagesForChat(chatId, messages)
+            } else if (peerId != null && isMeshChat(chatId)) {
+                scope.launch { refreshOpenDm(peerId) }
+            } else {
+                scope.launch {
+                    setCurrentVisibleMessages(
+                        chatId,
+                        withSendEchoes(chatId, mergePendingMediaUploads(chatId, marmotMessagesPage(chatId))),
+                        processCalls = true,
+                    )
+                }
+            }
+        }
+    }
+
+    fun setPeerBlocked(peerId: String, name: String, blocked: Boolean) {
+        val key = normalizeSocialPeerId(peerId)
+        socialState = socialState.withBlockedPeer(key, blocked)
+        npubRawFor(key)?.toHexLower()?.let {
+            socialState = socialState.withBlockedNostr(it, blocked)
+        }
+        if (blocked) socialState = socialState.withFavoritePeer(key, false)
+        persistSocialState()
+        toast = if (blocked) "Blocked ${name.ifBlank { "contact" }}" else "Unblocked ${name.ifBlank { "contact" }}"
+        recomputeSociallyFilteredRows()
+        channelMsgs = visibleChannelMessages(channelMsgs)
+        val chatId = meshChatId(key)
+        if ((screen as? Screen.Chat)?.id == chatId) {
+            if (blocked) {
+                messages = visibleMessagesForChat(chatId, messages)
+            } else {
+                scope.launch { refreshOpenDm(key) }
+            }
+        }
+    }
+
+    fun setChannelAuthorBlocked(senderKey: String, name: String, blocked: Boolean) {
+        val nostrKey = normalizeSocialNostrKey(senderKey)
+        if (nostrKey != null) {
+            socialState = socialState.withBlockedNostr(nostrKey, blocked)
+        } else {
+            val peerKey = normalizeSocialPeerId(senderKey)
+            if (peerKey.isBlank()) {
+                toast = "No stable key to block for ${name.ifBlank { "this author" }}."
+                return
+            }
+            socialState = socialState.withBlockedPeer(peerKey, blocked)
+            if (blocked) socialState = socialState.withFavoritePeer(peerKey, false)
+        }
+        persistSocialState()
+        toast = if (blocked) "Blocked ${name.ifBlank { "channel author" }}" else "Unblocked ${name.ifBlank { "channel author" }}"
+        recomputeSociallyFilteredRows()
+        channelMsgs = visibleChannelMessages(channelMsgs)
+        (screen as? Screen.GeoDm)?.let { geoDm ->
+            if (
+                geoDm.peerHex.equals(senderKey, ignoreCase = true) ||
+                normalizeSocialNostrKey(geoDm.peerHex) == nostrKey ||
+                normalizeSocialPeerId(geoDm.peerHex) == normalizeSocialPeerId(senderKey)
+            ) {
+                messages = visibleGeoDmMessages(geoDm.peerHex, messages)
+                if (!blocked) scope.launch { refreshGeoDm(geoDm.geohash, geoDm.peerHex) }
+            }
+        }
+    }
+
+    fun isChannelAuthorBlocked(senderKey: String): Boolean {
+        val nostrKey = normalizeSocialNostrKey(senderKey)
+        return if (nostrKey != null) {
+            socialState.isBlockedNostr(nostrKey)
+        } else {
+            socialState.isBlockedPeer(senderKey)
+        }
+    }
+
+    fun isGeoDmBlocked(peerHex: String): Boolean =
+        isChannelAuthorBlocked(peerHex)
+
+    fun unblockChannelAuthor(senderKey: String, name: String = "") {
+        if (normalizeSocialNostrKey(senderKey) == null && normalizeSocialPeerId(senderKey).isBlank()) {
+            toast = "No stable key to unblock."
+            return
+        }
+        setChannelAuthorBlocked(senderKey, name, blocked = false)
+    }
+
+    private fun recomputeSociallyFilteredRows() {
+        updateMeshPeersFromRadio()
+        refreshMeshDmRows()
+    }
+
+    private fun socialPeerIdForChat(chatId: String): String? =
+        when {
+            isMeshChat(chatId) -> meshPeerId(chatId)
+            else -> peerIdForMarmotGroup(chatId)
+        }
+
+    private fun socialNpubHexForChat(chatId: String): String? {
+        val peerId = socialPeerIdForChat(chatId)
+        if (peerId != null) npubRawFor(peerId)?.toHexLower()?.let { return it }
+        return marmotChatPeerNpubHex(chatId)
+    }
+
+    private fun isBlockedMarmotChat(chatId: String): Boolean =
+        socialNpubHexForChat(chatId)?.let { socialState.isBlockedNostr(it) } == true
+
+    private fun visibleMessagesForChat(chatId: String, source: List<SonarMsg>): List<SonarMsg> =
+        source.filter { msg -> socialState.allowsChatMessage(chatId, msg.senderNpub, msg.mine) }
+
+    private fun setCurrentVisibleMessages(chatId: String, source: List<SonarMsg>, processCalls: Boolean = false) {
+        val visible = visibleMessagesForChat(chatId, source)
+        messages = visible
+        processPayLines(chatId, visible)
+        if (processCalls) processCallLines(chatId, visible)
+    }
+
+    private fun visibleChannelMessages(source: List<SonarChannelMsg>): List<SonarChannelMsg> =
+        source.filter { msg -> socialState.allowsChannelSender(msg.senderPubkey, msg.mine) }
+
+    private fun visibleGeoDmMessages(peerHex: String, source: List<SonarMsg>): List<SonarMsg> =
+        if (isGeoDmBlocked(peerHex)) source.filter { it.mine } else source
 
     private fun otherMembers(chat: SonarChat): List<String> {
         val mine = canonicalProfileKey(npub)
@@ -1045,6 +1265,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     suspend fun sendPay(chatId: String, sats: Long): String? {
         if (sats <= 0) return null
+        if (isContactBlocked(chatId)) return "Unblock this contact before paying."
         if (!walletAvailable || walletState !is WalletState.Ready) {
             return "Set up the wallet first."
         }
@@ -1092,6 +1313,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     private suspend fun sendPaymentReceiptLines(chatId: String, lines: List<String>): Boolean {
         val clean = lines.map { it.trim() }.filter { it.isNotEmpty() }
         if (clean.isEmpty()) return true
+        if (isContactBlocked(chatId)) return false
         if (isMeshChat(chatId)) {
             val peerId = meshPeerId(chatId)
             if (hasLiveMeshRoute(peerId)) {
@@ -1118,8 +1340,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (refreshPeerId != null) {
             refreshOpenDm(refreshPeerId)
         } else if ((screen as? Screen.Chat)?.id == groupId) {
-            messages = withSendEchoes(groupId, mergePendingMediaUploads(groupId, marmotMessagesPage(groupId)))
-            processPayLines(groupId, messages)
+            setCurrentVisibleMessages(groupId, withSendEchoes(groupId, mergePendingMediaUploads(groupId, marmotMessagesPage(groupId))))
         }
         true
     } catch (_: Throwable) {
@@ -1231,10 +1452,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         // The "mesh" channel is the BLE Bluetooth mesh — NO geohash, NEVER Nostr
         // (bitchat's .mesh geohash is nil). It's driven by BLE broadcasts, so just
         // show what we have; new messages arrive via drainMeshBroadcasts().
-        if (geohash == "mesh") { channelMsgs = meshBroadcast; return }
+        if (geohash == "mesh") { channelMsgs = visibleChannelMessages(meshBroadcast); return }
         scope.launch {
             val disk = MessageStore.loadChannel(geohash) // disk hydrate (off-main), survives restart
-            if (isOpenChannel(geohash)) channelMsgs = disk
+            if (isOpenChannel(geohash)) channelMsgs = visibleChannelMessages(disk)
             refreshChannel(geohash)
             // Announce our presence right away and pull the current count so the
             // header shows "N here now" without waiting for the next poll tick.
@@ -1250,7 +1471,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         val merged = MessageMerge.channels(MessageStore.loadChannel(geohash), fresh)
         MessageStore.saveChannel(geohash, merged)
         // Only touch the visible list if THIS channel is still open.
-        if (isOpenChannel(geohash)) channelMsgs = merged
+        if (isOpenChannel(geohash)) channelMsgs = visibleChannelMessages(merged)
     }
 
     fun sendChannelMsg(geohash: String, text: String) {
@@ -1262,7 +1483,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             val reached = MeshRadio.sendMeshBroadcast(t)
             val msg = SonarChannelMsg(randomMeshId(), nick.ifBlank { "you" }, "", t, mine = true, MeshRadio.nowSecs())
             meshBroadcast = (meshBroadcast + msg).takeLast(200)
-            channelMsgs = meshBroadcast
+            channelMsgs = visibleChannelMessages(meshBroadcast)
             if (!reached) toast = "No one in Bluetooth range yet — your message will reach people as they connect."
             return
         }
@@ -1281,7 +1502,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         push(Screen.GeoDm(geohash, peerHex, name))
         messages = emptyList()
         scope.launch {
-            messages = MessageStore.loadGeoDm(geohash, peerHex) // disk hydrate (off-main)
+            messages = visibleGeoDmMessages(peerHex, MessageStore.loadGeoDm(geohash, peerHex)) // disk hydrate (off-main)
             refreshGeoDm(geohash, peerHex)
         }
     }
@@ -1290,12 +1511,16 @@ class SonarAppState(private val scope: CoroutineScope) {
         val fresh = SonarCore.geoDmMessages(geohash, peerHex)
         val merged = MessageMerge.dms(MessageStore.loadGeoDm(geohash, peerHex), fresh)
         MessageStore.saveGeoDm(geohash, peerHex, merged)
-        messages = merged
+        messages = visibleGeoDmMessages(peerHex, merged)
     }
 
     fun sendGeoDmMsg(geohash: String, peerHex: String, text: String) {
         val t = text.trim()
         if (t.isEmpty()) return
+        if (isGeoDmBlocked(peerHex)) {
+            toast = "Unblock this author before sending."
+            return
+        }
         scope.launch {
             try {
                 SonarCore.sendGeoDm(geohash, peerHex, t)
@@ -1513,7 +1738,11 @@ class SonarAppState(private val scope: CoroutineScope) {
             (screen as? Screen.Chat)?.let { sc ->
                 if (isMeshChat(sc.id)) refreshOpenDm(meshPeerId(sc.id))
                 else {
-                    messages = withSendEchoes(sc.id, mergePendingMediaUploads(sc.id, marmotMessagesPage(sc.id)))
+                    setCurrentVisibleMessages(
+                        sc.id,
+                        withSendEchoes(sc.id, mergePendingMediaUploads(sc.id, marmotMessagesPage(sc.id))),
+                        processCalls = true,
+                    )
                 }
             }
         }
@@ -1554,9 +1783,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         val openChatId = (screen as? Screen.Chat)?.id
         val snapshot = chats
         for (c in snapshot) {
-            val msgs = SonarCore.messagesPage(c.id, 1)
-            val newestIncoming = msgs.lastOrNull { !it.mine }
             val prev = lastSeenTs[c.id]
+            val msgs = SonarCore.messagesPage(c.id, 1)
+            val visibleMsgs = visibleMessagesForChat(c.id, msgs)
+            val newestIncoming = visibleMsgs.lastOrNull { !it.mine }
             val alreadyNotified = lastNotifiedTs[c.id] ?: 0L
             if (seededSeen && prev != null && newestIncoming != null &&
                 newestIncoming.tsSecs > prev && newestIncoming.tsSecs > alreadyNotified &&
@@ -1739,14 +1969,16 @@ class SonarAppState(private val scope: CoroutineScope) {
         scope.launch {
             runCatching { SonarCore.markConversationRead(chat.id) }
             val local = withSendEchoes(chat.id, mergePendingMediaUploads(chat.id, marmotMessagesPage(chat.id)))
-            messages = local
-            processPayLines(chat.id, local)
-            for (m in local) if (!m.mine && m.senderNpub.isNotBlank()) ensureProfile(m.senderNpub)
+            val visibleLocal = visibleMessagesForChat(chat.id, local)
+            messages = visibleLocal
+            processPayLines(chat.id, visibleLocal)
+            for (m in visibleLocal) if (!m.mine && m.senderNpub.isNotBlank()) ensureProfile(m.senderNpub)
             runCatching { refreshChats() }
             if ((screen as? Screen.Chat)?.id == chat.id) {
                 val fresh = withSendEchoes(chat.id, mergePendingMediaUploads(chat.id, marmotMessagesPage(chat.id)))
-                messages = fresh
-                processPayLines(chat.id, fresh)
+                val visibleFresh = visibleMessagesForChat(chat.id, fresh)
+                messages = visibleFresh
+                processPayLines(chat.id, visibleFresh)
             }
         }
     }
@@ -1759,7 +1991,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         val id = meshChatId(peerId)
         if (name.isNotBlank()) meshChatNames[peerId] = name
         push(Screen.Chat(id, name, pay))
-        messages = meshChats[peerId].orEmpty() // immediate mesh view; Marmot leg merges in async
+        messages = visibleMessagesForChat(id, meshChats[peerId].orEmpty()) // immediate mesh view; Marmot leg merges in async
         processPayLines(id, messages)
         scope.launch {
             refreshOpenDm(peerId) // hydrate local Marmot transcript before chat list refresh
@@ -1874,16 +2106,125 @@ class SonarAppState(private val scope: CoroutineScope) {
             }
             SonarSlashCommand.Block,
             SonarSlashCommand.Unblock -> {
-                val subject = commandSubject(parsed.args, target)
-                toast = "Block and unblock are tracked for the Android safety parity follow-up${subject?.let { ": $it" } ?: "."}"
+                handleBlockCommand(
+                    args = parsed.args,
+                    fallbackTarget = target,
+                    channelGeohash = channelGeohash,
+                    chatId = chatId,
+                    blocked = parsed.command == SonarSlashCommand.Block,
+                )
                 true
             }
             SonarSlashCommand.Favorite,
             SonarSlashCommand.Unfavorite -> {
-                val subject = commandSubject(parsed.args, target)
-                toast = "Favorites are tracked for the Android plain-bitchat fallback follow-up${subject?.let { ": $it" } ?: "."}"
+                handleFavoriteCommand(
+                    args = parsed.args,
+                    channelGeohash = channelGeohash,
+                    chatId = chatId,
+                    favorite = parsed.command == SonarSlashCommand.Favorite,
+                )
                 true
             }
+        }
+    }
+
+    private data class CommandMeshTarget(val peerId: String, val name: String)
+
+    private fun handleFavoriteCommand(args: String, channelGeohash: String?, chatId: String?, favorite: Boolean) {
+        if (chatId == null && channelGeohash != "mesh") {
+            toast = "Favorites are only for mesh peers."
+            return
+        }
+        val target = resolveMeshCommandTarget(args, chatId)
+        if (target == null) {
+            toast = "Favorites are only for mesh peers."
+            return
+        }
+        setFavoritePeer(target.peerId, target.name, favorite)
+    }
+
+    private fun handleBlockCommand(
+        args: String,
+        fallbackTarget: String,
+        channelGeohash: String?,
+        chatId: String?,
+        blocked: Boolean,
+    ) {
+        val subject = args.trim().substringBefore(' ').trimCommandSubject()
+        if (subject.isBlank()) {
+            if (chatId != null) {
+                setContactBlocked(chatId, fallbackTarget, blocked)
+            } else {
+                toast = blockedSummary()
+            }
+            return
+        }
+
+        resolveChannelAuthorTarget(subject)?.let {
+            setChannelAuthorBlocked(it.senderPubkey, it.author, blocked)
+            return
+        }
+        resolveMeshCommandTarget(subject, chatId)?.let {
+            setPeerBlocked(it.peerId, it.name, blocked)
+            return
+        }
+        if (normalizeSocialNostrKey(subject) != null) {
+            setChannelAuthorBlocked(subject, subject.take(10), blocked)
+            return
+        }
+        if (channelGeohash == "mesh") {
+            setChannelAuthorBlocked(subject, subject.take(10), blocked)
+            return
+        }
+        toast = "'$subject' not found"
+    }
+
+    private fun resolveMeshCommandTarget(args: String, chatId: String?): CommandMeshTarget? {
+        val subject = args.trim().substringBefore(' ').trimCommandSubject()
+        if (subject.isBlank()) {
+            if (chatId != null && isMeshChat(chatId)) {
+                val peerId = meshPeerId(chatId)
+                return CommandMeshTarget(peerId, meshPeerName(peerId))
+            }
+            return null
+        }
+        return meshCommandTargets().firstOrNull { target ->
+            target.name.equals(subject, ignoreCase = true) ||
+                target.peerId.equals(subject, ignoreCase = true) ||
+                target.peerId.startsWith(subject, ignoreCase = true)
+        }
+    }
+
+    private fun resolveChannelAuthorTarget(subject: String): SonarChannelMsg? =
+        channelMsgs.firstOrNull {
+            !it.mine && (
+                it.author.equals(subject, ignoreCase = true) ||
+                    it.senderPubkey.equals(subject, ignoreCase = true) ||
+                    it.senderPubkey.startsWith(subject, ignoreCase = true)
+                )
+        }
+
+    private fun meshCommandTargets(): List<CommandMeshTarget> {
+        val peerIds = linkedSetOf<String>()
+        meshPeers.forEach { peerIds += meshPeerId(it.id) }
+        peerIds += meshChatNames.keys
+        peerIds += meshChats.keys
+        peerIds += linkByFp.keys
+        return peerIds.map { peerId ->
+            val name = meshPeers.firstOrNull { meshPeerId(it.id) == peerId }?.name
+                ?: meshChatNames[peerId]
+                ?: ("mesh·" + peerId.take(6))
+            CommandMeshTarget(peerId, name)
+        }
+    }
+
+    private fun blockedSummary(): String {
+        val peerCount = socialState.blockedPeers.size
+        val nostrCount = socialState.blockedNostrPubkeys.size
+        return if (peerCount == 0 && nostrCount == 0) {
+            "No blocked contacts"
+        } else {
+            "Blocked: $peerCount mesh, $nostrCount channel"
         }
     }
 
@@ -1982,6 +2323,10 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun send(chatId: String, text: String) {
         val t = text.trim()
         if (t.isEmpty()) return
+        if (isContactBlocked(chatId)) {
+            toast = "Unblock this contact before sending."
+            return
+        }
         if (isMeshChat(chatId)) { sendDmAuto(meshPeerId(chatId), t); return }
         val echo = createSendEcho(chatId, t)
         messages = (messages + echo).sortedBy { it.tsSecs }
@@ -1989,7 +2334,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             try {
                 SonarCore.send(chatId, t)
                 clearSendEcho(chatId, echo.id)
-                messages = withSendEchoes(chatId, mergePendingMediaUploads(chatId, marmotMessagesPage(chatId)))
+                messages = visibleMessagesForChat(chatId, withSendEchoes(chatId, mergePendingMediaUploads(chatId, marmotMessagesPage(chatId))))
                 processPayLines(chatId, messages)
                 processCallLines(chatId, messages)
             } catch (e: Throwable) {
@@ -2257,10 +2602,12 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     /** True if [chatId] can carry media (an existing Marmot group backs it). */
-    fun canSendMedia(chatId: String): Boolean = resolveMarmotGroupId(chatId) != null
+    fun canSendMedia(chatId: String): Boolean =
+        !isContactBlocked(chatId) && resolveMarmotGroupId(chatId) != null
 
     /** Send an image to a White Noise chat: encrypt + Blossom upload + publish. */
     fun sendImage(chatId: String, data: ByteArray, filename: String, mime: String) {
+        if (isContactBlocked(chatId)) { toast = "Unblock this contact before sending."; return }
         scope.launch {
             val groupId = resolveMarmotGroupId(chatId)
             if (groupId == null) { toast = "Start the secure chat first, then send a photo."; return@launch }
@@ -2292,7 +2639,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             )
             mediaCache[pendingUrl] = data
             if ((screen as? Screen.Chat)?.id == chatId) {
-                messages = mergePendingMediaUploads(chatId, messages)
+                messages = visibleMessagesForChat(chatId, mergePendingMediaUploads(chatId, messages))
             }
             try {
                 SonarCore.sendMedia(groupId, data, filename, mime, "")
@@ -2305,19 +2652,17 @@ class SonarAppState(private val scope: CoroutineScope) {
                             val mesh = meshChats[peerId].orEmpty()
                             val wn = marmotMessagesForPeer(peerId)
                             val merged = withSendEchoes(chatId, mergePendingMediaUploads(chatId, mesh + wn))
-                            messages = merged
-                            processPayLines(chatId, merged)
+                            setCurrentVisibleMessages(chatId, merged)
                         } else {
                             val fresh = SonarCore.messagesPage(groupId, LOCAL_TRANSCRIPT_PAGE_LIMIT)
-                            messages = withSendEchoes(chatId, mergePendingMediaUploads(chatId, fresh))
-                            processPayLines(chatId, messages)
+                            setCurrentVisibleMessages(chatId, withSendEchoes(chatId, mergePendingMediaUploads(chatId, fresh)))
                         }
                     }
                 }
             } catch (e: Throwable) {
                 markPendingMediaFailed(chatId, pendingId)
                 if ((screen as? Screen.Chat)?.id == chatId) {
-                    messages = mergePendingMediaUploads(chatId, messages)
+                    messages = visibleMessagesForChat(chatId, mergePendingMediaUploads(chatId, messages))
                 }
                 toast = "couldn't send photo: ${e.message}"
             }
@@ -2360,6 +2705,7 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  media path as a photo, audio mime. (Android has no BLE file transfer yet,
      *  so voice notes ride White Noise / Marmot only.) */
     fun sendVoiceNote(chatId: String, bytes: ByteArray) {
+        if (isContactBlocked(chatId)) { toast = "Unblock this contact before sending."; return }
         scope.launch {
             val groupId = resolveMarmotGroupId(chatId)
             if (groupId == null) { toast = "Start the secure chat first to send a voice note."; return@launch }
@@ -2393,7 +2739,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             )
             mediaCache[pendingUrl] = bytes
             if ((screen as? Screen.Chat)?.id == chatId) {
-                messages = mergePendingMediaUploads(chatId, messages)
+                messages = visibleMessagesForChat(chatId, mergePendingMediaUploads(chatId, messages))
             }
             try {
                 SonarCore.sendMedia(groupId, bytes, filename, mime, "")
@@ -2405,19 +2751,17 @@ class SonarAppState(private val scope: CoroutineScope) {
                             val mesh = meshChats[peerId].orEmpty()
                             val wn = marmotMessagesForPeer(peerId)
                             val merged = withSendEchoes(chatId, mergePendingMediaUploads(chatId, mesh + wn))
-                            messages = merged
-                            processPayLines(chatId, merged)
+                            setCurrentVisibleMessages(chatId, merged)
                         } else {
                             val fresh = SonarCore.messagesPage(groupId, LOCAL_TRANSCRIPT_PAGE_LIMIT)
-                            messages = withSendEchoes(chatId, mergePendingMediaUploads(chatId, fresh))
-                            processPayLines(chatId, messages)
+                            setCurrentVisibleMessages(chatId, withSendEchoes(chatId, mergePendingMediaUploads(chatId, fresh)))
                         }
                     }
                 }
             } catch (e: Throwable) {
                 markPendingMediaFailed(chatId, pendingId)
                 if ((screen as? Screen.Chat)?.id == chatId) {
-                    messages = mergePendingMediaUploads(chatId, messages)
+                    messages = visibleMessagesForChat(chatId, mergePendingMediaUploads(chatId, messages))
                 }
                 toast = "couldn't send voice note: ${e.message}"
             }
@@ -2429,6 +2773,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     fun sendStickerItem(chatId: String, sticker: SonarStickerItem, packCoordinate: String) {
+        if (isContactBlocked(chatId)) { toast = "Unblock this contact before sending."; return }
         if (isMeshChat(chatId)) {
             val peerId = meshPeerId(chatId)
             val content = meshStickerContent(packCoordinate, sticker.shortcode, sticker.sha256)
@@ -2539,6 +2884,10 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  neither route is available the message is queued in the outbox (mirrors iOS
      *  MessageRouter) and auto-sent when the peer reconnects or their npub is learned. */
     private fun sendDmAuto(peerId: String, text: String) {
+        if (socialState.isBlockedPeer(peerId)) {
+            toast = "Unblock this contact before sending."
+            return
+        }
         if (outbox.contains(peerId)) {
             enqueueOutbox(peerId, text)
             flushOutbox(peerId)
@@ -2611,6 +2960,10 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /** Send a BLE-mesh DM over the Noise link + optimistically echo it. */
     private fun sendMesh(peerId: String, text: String): Boolean {
+        if (socialState.isBlockedPeer(peerId)) {
+            toast = "Unblock this contact before sending."
+            return false
+        }
         val mid = randomMeshId()
         val ok = MeshRadio.sendMeshDm(peerId, mid, text)
         if (!ok) { toast = "Not connected over Bluetooth yet — stay close and try again"; return false }
@@ -2712,6 +3065,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun flushPendingMarmot() {
         if (pendingMarmotSends.isEmpty()) return
         for ((npubHex, texts) in pendingMarmotSends.toMap()) {
+            if (socialState.isBlockedNostr(npubHex)) continue
             val group = marmotGroupForNpub(npubHex.hexToBytesOrEmpty()) ?: continue
             pendingMarmotSends.remove(npubHex)
             scope.launch {
@@ -2755,6 +3109,10 @@ class SonarAppState(private val scope: CoroutineScope) {
     private suspend fun flushOutboxNow(peerId: String) {
         val queue = outbox.snapshot(peerId)
         if (queue.isEmpty()) { outbox.finishFlush(peerId, 0, emptyList()); return }
+        if (socialState.isBlockedPeer(peerId)) {
+            sonarLog("SonarOutbox", "paused blocked outbox peer=${peerId.take(10)}…")
+            return
+        }
         val now = SonarClock.nowSecs()
         val remaining = mutableListOf<QueuedMessage>()
         var marmotGroupId: String? = null
@@ -2817,8 +3175,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
-    private suspend fun sendOutboxOverMarmot(peerId: String, groupId: String, text: String): Boolean =
-        try {
+    private suspend fun sendOutboxOverMarmot(peerId: String, groupId: String, text: String): Boolean {
+        if (socialState.isBlockedPeer(peerId)) return false
+        return try {
             SonarCore.send(groupId, text)
             refreshOpenDm(peerId)
             true
@@ -2827,6 +3186,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             sonarLog("SonarOutbox", "failed to send queued White Noise message for ${peerId.take(10)}… err=${e.message}")
             false
         }
+    }
 
     /** Flush outbox for ALL peers that now have a reachable transport. Called
      *  periodically and on transport-change events. */
@@ -2869,8 +3229,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 SonarCore.addGroupMembers(chatId, cleanMembers)
                 refreshChats()
                 if ((screen as? Screen.Chat)?.id == chatId) {
-                    messages = withSendEchoes(chatId, mergePendingMediaUploads(chatId, marmotMessagesPage(chatId)))
-                    processPayLines(chatId, messages)
+                    setCurrentVisibleMessages(chatId, withSendEchoes(chatId, mergePendingMediaUploads(chatId, marmotMessagesPage(chatId))))
                 }
             } catch (e: Throwable) {
                 toast = "couldn't add people: ${e.message}"
@@ -2888,8 +3247,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 SonarCore.removeGroupMembers(chatId, cleanMembers)
                 refreshChats()
                 if ((screen as? Screen.Chat)?.id == chatId) {
-                    messages = withSendEchoes(chatId, mergePendingMediaUploads(chatId, marmotMessagesPage(chatId)))
-                    processPayLines(chatId, messages)
+                    setCurrentVisibleMessages(chatId, withSendEchoes(chatId, mergePendingMediaUploads(chatId, marmotMessagesPage(chatId))))
                 }
             } catch (e: Throwable) {
                 toast = "couldn't remove people: ${e.message}"
@@ -3109,8 +3467,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         val mesh = meshChats[peerId].orEmpty()
         val wn = marmotMessagesForPeer(peerId)
         val merged = withSendEchoes(chatId, mergePendingMediaUploads(chatId, mesh + wn))
-        messages = merged
-        processPayLines(chatId, merged)
+        val visible = visibleMessagesForChat(chatId, merged)
+        messages = visible
+        processPayLines(chatId, visible)
         val groups = npubRawFor(peerId)?.let { marmotGroupsForNpub(it) }
             ?: chats.filter { peerIdForMarmotGroup(it) == peerId }
         for (group in groups) {
@@ -3183,6 +3542,26 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (length % 2 != 0) ByteArray(0)
         else runCatching { chunked(2).map { it.toInt(16).toByte() }.toByteArray() }.getOrDefault(ByteArray(0))
 
+    private fun handleFavoriteControl(peerId: String, text: String): Boolean {
+        val favorite = when {
+            text.startsWith(FAVORITED_CONTROL) -> true
+            text.startsWith(UNFAVORITED_CONTROL) -> false
+            else -> return false
+        }
+        val payloadNpub = text.substringAfter(':', missingDelimiterValue = "").trim()
+        canonicalNpubHex(payloadNpub)?.let { npubHex ->
+            if (!linkByFp[peerId].equals(npubHex, ignoreCase = true)) {
+                linkByFp[peerId] = npubHex
+                persistLinks()
+                refreshKnownContactDescriptors()
+            }
+        }
+        socialState = socialState.withRemoteFavoritePeer(peerId, favorite)
+        persistSocialState()
+        recomputeSociallyFilteredRows()
+        return true
+    }
+
     /** Drain mesh DMs received since last poll into the per-peer transcripts,
      *  surface them as Messages rows, and notify for ones we're not looking at. */
     private fun drainMeshDms() {
@@ -3190,6 +3569,8 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (incoming.isEmpty()) return
         val touched = mutableSetOf<String>()
         for (m in incoming) {
+            if (socialState.isBlockedPeer(m.peerId)) continue
+            if (handleFavoriteControl(m.peerId, m.text)) continue
             val stickerRef = meshParseStickerContent(m.text)?.let {
                 SonarStickerRef(it.packCoordinate, it.shortcode, it.plaintextSha256)
             }
@@ -3228,6 +3609,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (incoming.isEmpty()) return
         val seen = meshBroadcast.mapTo(HashSet()) { it.id }
         val add = incoming
+            .filter { socialState.allowsChannelSender(it.senderId, mine = false) }
             .map {
                 val id = "${it.senderId}-${it.tsSecs}"
                 SonarChannelMsg(id, meshPeerName(it.senderId), it.senderId, it.content, mine = false, it.tsSecs)
@@ -3235,7 +3617,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             .filter { it.id !in seen }
         if (add.isEmpty()) return
         meshBroadcast = (meshBroadcast + add).sortedBy { it.tsSecs }.takeLast(200)
-        if ((screen as? Screen.Channel)?.geohash == "mesh") channelMsgs = meshBroadcast
+        if ((screen as? Screen.Channel)?.geohash == "mesh") channelMsgs = visibleChannelMessages(meshBroadcast)
     }
 
     /** Display name for a mesh peer: prefer the live radar name, else a remembered
@@ -3280,6 +3662,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun refreshMeshDmRows() {
         meshDmRows = meshChats.entries
             .filter { it.value.isNotEmpty() }
+            .filterNot { (pid, _) -> socialState.isBlockedPeer(pid) }
             .map { (pid, msgs) ->
                 val last = msgs.last()
                 MeshDmRow(pid, meshPeerName(pid), messagePreview(last.content, last.stickerRef), last.tsSecs)
@@ -3303,6 +3686,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         val groupPeers = LinkedHashMap<String, String>()
         for ((peerId, msgs) in meshChats) {
             if (msgs.isEmpty()) continue
+            if (socialState.isBlockedPeer(peerId)) continue
             var last = msgs.last()
             val groups = npubRawFor(peerId)?.let { marmotGroupsForNpub(it) }.orEmpty()
             if (groups.isNotEmpty()) {
@@ -3313,7 +3697,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         for (group in chats) {
             if (!isDirectMarmotChat(group)) continue
+            if (isBlockedMarmotChat(group.id)) continue
             val peerId = peerIdForMarmotGroup(group) ?: continue
+            if (socialState.isBlockedPeer(peerId)) continue
             folded += group.id
             groupPeers[group.id] = peerId
             val last = latestMarmotMessage(listOf(group))
@@ -3466,11 +3852,16 @@ class SonarAppState(private val scope: CoroutineScope) {
             .onEach { groupIdHex ->
                 refreshChats()
                 val changedMessages = marmotMessagesPage(groupIdHex)
-                processPayLines(groupIdHex, changedMessages)
-                processCallLines(groupIdHex, changedMessages)
+                val visibleChangedMessages = visibleMessagesForChat(groupIdHex, changedMessages)
+                processPayLines(groupIdHex, visibleChangedMessages)
+                processCallLines(groupIdHex, visibleChangedMessages)
                 (screen as? Screen.Chat)?.let { sc ->
                     if (!isMeshChat(sc.id) && sc.id == groupIdHex) {
-                        messages = withSendEchoes(sc.id, mergePendingMediaUploads(sc.id, changedMessages))
+                        setCurrentVisibleMessages(
+                            sc.id,
+                            withSendEchoes(sc.id, mergePendingMediaUploads(sc.id, changedMessages)),
+                            processCalls = true,
+                        )
                     } else if (isMeshChat(sc.id)) {
                         val peerId = peerIdForMarmotGroup(groupIdHex)
                         if (peerId != null && sc.id == meshChatId(peerId)) {
@@ -3511,11 +3902,12 @@ class SonarAppState(private val scope: CoroutineScope) {
                 val senders = mutableSetOf<String>()
                 for (c in chats) {
                     val ms = runCatching { SonarCore.messagesPage(c.id, LOCAL_TRANSCRIPT_PAGE_LIMIT) }.getOrDefault(emptyList())
+                    val visibleMs = visibleMessagesForChat(c.id, ms)
                     wnMsgs += ms.size
-                    processCallLines(c.id, ms)
-                    processPayLines(c.id, ms)
+                    processCallLines(c.id, visibleMs)
+                    processPayLines(c.id, visibleMs)
                     if (c.members.size > 2) {
-                        for (m in ms) {
+                        for (m in visibleMs) {
                             if (!m.mine && m.senderNpub.isNotBlank()) senders.add(m.senderNpub)
                         }
                     }
@@ -3545,8 +3937,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 (screen as? Screen.Chat)?.let {
                     if (isMeshChat(it.id)) refreshOpenDm(meshPeerId(it.id))
                     else {
-                        messages = withSendEchoes(it.id, mergePendingMediaUploads(it.id, marmotMessagesPage(it.id)))
-                        processPayLines(it.id, messages)
+                        setCurrentVisibleMessages(it.id, withSendEchoes(it.id, mergePendingMediaUploads(it.id, marmotMessagesPage(it.id))))
                     }
                 }
                 (screen as? Screen.Channel)?.let { refreshChannel(it.geohash) }

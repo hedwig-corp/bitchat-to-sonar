@@ -58,6 +58,9 @@ Verification:
 
 ## Slice 2: Contact Safety and Favorites
 
+Status: implemented in the 2026-06-27 contact safety/favorites slice; manual
+two-device smoke is still recommended before release.
+
 Goal: match iOS block/unblock and favorite/unfavorite behavior for mesh peers and
 geohash authors.
 
@@ -70,6 +73,8 @@ Deliverables:
 - Add block/unblock persistence for mesh fingerprints and geohash Nostr pubkeys.
 - Wire contact-profile actions and slash commands to the same backing store.
 - Suppress blocked geohash authors and blocked mesh contacts in local UI.
+- Send and consume hidden mesh favorite/unfavorite notifications so mutual
+  favorite state can be observed when peers are in Bluetooth range.
 - Preserve the current outbox/White Noise behavior for known Sonar peers.
 
 Verification:
@@ -78,6 +83,7 @@ Verification:
 - Unit tests for blocked geohash filtering.
 - Manual two-device smoke for favorite notification/interoperability when the BLE
   route is available.
+- Full out-of-range NIP-17 delivery remains Slice 4.
 
 ## Slice 3: BLE Mesh Media
 

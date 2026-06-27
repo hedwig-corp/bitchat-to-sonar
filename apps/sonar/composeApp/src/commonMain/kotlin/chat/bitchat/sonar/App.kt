@@ -1270,6 +1270,7 @@ private fun VerifySheet(
 private fun GeoDmScreen(state: SonarAppState, screen: Screen.GeoDm) {
     val s = sonar
     var draft by remember { mutableStateOf("") }
+    val blocked = state.isGeoDmBlocked(screen.peerHex)
     val listState = rememberLazyListState()
     LaunchedEffect(state.messages.size) {
         if (state.messages.isNotEmpty()) listState.animateScrollToItem(state.messages.size - 1)
@@ -1282,18 +1283,25 @@ private fun GeoDmScreen(state: SonarAppState, screen: Screen.GeoDm) {
             SNIconButton(SNIconName.Back, onClick = { state.back() })
             SonarAvatar(screen.name, 36.dp, presence = false)
             Spacer(Modifier.width(10.dp))
-            Column {
+            Column(Modifier.weight(1f)) {
                 Text(screen.name, color = s.text, fontSize = 16.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     SNIcon(SNIconName.Lock, 11.dp, s.text2, weight = 2.4f)
                     Spacer(Modifier.width(4.dp))
-                    Text("Sonar · end-to-end encrypted", color = s.text3, fontSize = 11.5.sp)
+                    Text(if (blocked) "Blocked" else "Sonar · end-to-end encrypted", color = s.text3, fontSize = 11.5.sp)
                 }
             }
+            SNIconButton(
+                SNIconName.X,
+                tint = if (blocked) s.danger else s.text3,
+                onClick = { state.setChannelAuthorBlocked(screen.peerHex, screen.name, !blocked) }
+            )
         }
         chat.bitchat.sonar.ui.SNBanner(
-            icon = SNIconName.Lock, tone = chat.bitchat.sonar.ui.SNBannerTone.Enc,
-            bold = "End-to-end encrypted", rest = " — a private chat with ${screen.name} from the channel"
+            icon = if (blocked) SNIconName.X else SNIconName.Lock,
+            tone = if (blocked) chat.bitchat.sonar.ui.SNBannerTone.Neutral else chat.bitchat.sonar.ui.SNBannerTone.Enc,
+            bold = if (blocked) "Blocked" else "End-to-end encrypted",
+            rest = if (blocked) " — unblock ${screen.name} to send or receive messages" else " — a private chat with ${screen.name} from the channel"
         )
         if (state.messages.isEmpty()) {
             Box(Modifier.weight(1f).fillMaxWidth()) {

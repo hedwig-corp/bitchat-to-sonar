@@ -47,6 +47,7 @@ import androidx.compose.ui.unit.sp
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.ui.SNDot
 import chat.bitchat.sonar.ui.SNIcon
+import chat.bitchat.sonar.ui.SNIconButton
 import chat.bitchat.sonar.ui.SNIconName
 import chat.bitchat.sonar.ui.SNNavHeader
 import chat.bitchat.sonar.ui.SonarAvatar
@@ -111,7 +112,8 @@ fun SonarRadarScreen(state: SonarAppState) {
             if (state.meshPeers.isEmpty() && unify.isEmpty()) ListEmpty()
             else LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(vertical = 8.dp)) {
                 items(state.meshPeers, key = { it.id }) { p ->
-                    PeerRow(p, p.sonar) { card = p }
+                    val pid = p.id.removePrefix("mesh:")
+                    PeerRow(p, p.sonar, favorite = state.isFavorite(pid), mutual = state.isMutualFavorite(pid)) { card = p }
                 }
                 if (unify.isNotEmpty()) {
                     item { chat.bitchat.sonar.ui.SNSectionLabel("Unify users nearby") }
@@ -143,7 +145,10 @@ fun SonarRadarScreen(state: SonarAppState) {
         val pid = p.id.removePrefix("mesh:")
         PeerCard(
             p,
+            favorite = state.isFavorite(pid),
+            mutual = state.isMutualFavorite(pid),
             onMessage = { card = null; state.openDm(pid, p.name) },
+            onFavorite = { state.toggleFavorite(pid, p.name) },
             onSendSats = { card = null; state.openDm(pid, p.name, pay = true) },
             onClose = { card = null },
         )
@@ -164,7 +169,7 @@ fun SonarRadarScreen(state: SonarAppState) {
 }
 
 @Composable
-private fun PeerRow(p: chat.bitchat.sonar.MeshPeer, isSonar: Boolean, onClick: () -> Unit) {
+private fun PeerRow(p: chat.bitchat.sonar.MeshPeer, isSonar: Boolean, favorite: Boolean, mutual: Boolean, onClick: () -> Unit) {
     val s = sonar
     Row(
         Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 10.dp),
@@ -178,10 +183,15 @@ private fun PeerRow(p: chat.bitchat.sonar.MeshPeer, isSonar: Boolean, onClick: (
                 SNDot(s.accent, 6.dp)
                 Spacer(Modifier.width(5.dp))
                 Text(
-                    (if (isSonar) "Sonar" else "bitchat") + " · ${rssiLabel(p.rssi)}",
+                    (if (isSonar) "Sonar" else "bitchat") +
+                        (if (mutual) " · mutual favorite" else " · ${rssiLabel(p.rssi)}"),
                     color = s.text3, fontSize = 12.5.sp,
                 )
             }
+        }
+        if (favorite) {
+            SNIcon(SNIconName.Heart, 17.dp, s.goldFill, weight = 2f)
+            Spacer(Modifier.width(10.dp))
         }
         SignalBars(rssiBars(p.rssi), s.accent)
     }
@@ -207,7 +217,10 @@ private fun SignalBars(filled: Int, color: Color) {
 @Composable
 private fun PeerCard(
     p: chat.bitchat.sonar.MeshPeer,
+    favorite: Boolean,
+    mutual: Boolean,
     onMessage: () -> Unit,
+    onFavorite: () -> Unit,
     onSendSats: () -> Unit,
     onClose: () -> Unit,
 ) {
@@ -237,12 +250,19 @@ private fun PeerCard(
             Column(Modifier.weight(1f)) {
                 Text(p.name, color = s.text, fontSize = 15.5.sp, fontWeight = FontWeight.Bold, maxLines = 1)
                 Text(
-                    "${rssiLabel(p.rssi)} · over Bluetooth",
+                    if (mutual) "Mutual favorite · over Bluetooth" else "${rssiLabel(p.rssi)} · over Bluetooth",
                     color = s.text2, fontSize = 12.sp, maxLines = 1,
                     modifier = Modifier.padding(top = 1.dp),
                 )
             }
             Spacer(Modifier.width(12.dp))
+            SNIconButton(
+                SNIconName.Heart,
+                size = 18.dp,
+                tint = if (favorite) s.goldFill else s.text2,
+                onClick = onFavorite,
+            )
+            Spacer(Modifier.width(8.dp))
             SNPill("Message", primary = false, onClick = onMessage)
             // "Send sats" for peers we have a White Noise account for (a rich 0x53
             // announce ⇒ an npub we can pay). NOT a "Sonar-only" tier: the actual

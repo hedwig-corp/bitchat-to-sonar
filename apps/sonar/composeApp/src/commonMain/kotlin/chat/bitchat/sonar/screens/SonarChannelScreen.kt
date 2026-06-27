@@ -19,6 +19,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -32,6 +33,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import chat.bitchat.sonar.Screen
@@ -46,6 +48,8 @@ import chat.bitchat.sonar.ui.SNEmptyState
 import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconButton
 import chat.bitchat.sonar.ui.SNIconName
+import chat.bitchat.sonar.ui.SNPrimaryButton
+import chat.bitchat.sonar.ui.SNGhostButton
 import chat.bitchat.sonar.ui.authorColor
 import chat.bitchat.sonar.ui.sonar
 
@@ -53,6 +57,7 @@ import chat.bitchat.sonar.ui.sonar
 fun SonarChannelScreen(state: SonarAppState, screen: Screen.Channel) {
     val s = sonar
     var draft by remember { mutableStateOf("") }
+    var authorSheet by remember { mutableStateOf<SonarChannelMsg?>(null) }
     val listState = rememberLazyListState()
     LaunchedEffect(state.channelMsgs.size) {
         if (state.channelMsgs.isNotEmpty()) listState.animateScrollToItem(state.channelMsgs.size - 1)
@@ -129,7 +134,7 @@ fun SonarChannelScreen(state: SonarAppState, screen: Screen.Channel) {
             ) {
                 items(state.channelMsgs, key = { it.id }) { m ->
                     ChannelBubble(m) {
-                        if (!m.mine) state.openGeoDm(screen.geohash, m.senderPubkey, m.author)
+                        if (!m.mine) authorSheet = m
                     }
                 }
             }
@@ -168,7 +173,47 @@ fun SonarChannelScreen(state: SonarAppState, screen: Screen.Channel) {
             ) { Text("↑", color = s.onNet, fontSize = 20.sp, fontWeight = FontWeight.Bold) }
         }
     }
+    authorSheet?.let { author ->
+        ChannelAuthorSheet(
+            author = author,
+            blocked = state.isChannelAuthorBlocked(author.senderPubkey),
+            onPrivateChat = {
+                authorSheet = null
+                state.openGeoDm(screen.geohash, author.senderPubkey, author.author)
+            },
+            onBlock = {
+                authorSheet = null
+                state.setChannelAuthorBlocked(author.senderPubkey, author.author, blocked = true)
+            },
+            onClose = { authorSheet = null },
+        )
+    }
     state.toast?.let { ToastBar(it) { state.toast = null } }
+}
+
+@Composable
+private fun ChannelAuthorSheet(
+    author: SonarChannelMsg,
+    blocked: Boolean,
+    onPrivateChat: () -> Unit,
+    onBlock: () -> Unit,
+    onClose: () -> Unit,
+) {
+    val s = sonar
+    Box(
+        Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
+        contentAlignment = Alignment.BottomCenter
+    ) {
+        Surface(color = s.surface, shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)) {
+            Column(Modifier.fillMaxWidth().padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                Text(author.author, color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Spacer(Modifier.heightIn(min = 14.dp))
+                SNPrimaryButton("Open private chat", disabled = blocked) { onPrivateChat() }
+                Spacer(Modifier.heightIn(min = 8.dp))
+                SNGhostButton("Block author") { onBlock() }
+            }
+        }
+    }
 }
 
 @Composable
