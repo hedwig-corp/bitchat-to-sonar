@@ -176,7 +176,8 @@ pub fn meta_descriptor_content_json(
 ///
 /// The call descriptor (`sonar.call.v1`) is always emitted so calls stay
 /// discoverable even without a wallet. The meta descriptor (`sonar.meta.v1`),
-/// which carries the `bolt12_offer`, is emitted ONLY when an offer is present.
+/// which carries the `bolt12_offer`, is emitted ONLY when a valid offer is
+/// present.
 /// Both are replaceable events, so republishing the meta with `None` would
 /// CLOBBER a peer's previously-published offer and make them unpayable — a
 /// wallet-less / not-yet-ready publish must never wipe a known offer.
@@ -189,10 +190,10 @@ pub fn descriptor_events(
         SONAR_CALL_DESCRIPTOR_D_TAG,
         descriptor_content_json(calls_enabled, signaling.clone())?,
     )];
-    if bolt12_offer.is_some() {
+    if let Some(offer) = bolt12_offer.and_then(normalize_bolt12_offer) {
         events.push((
             SONAR_META_DESCRIPTOR_D_TAG,
-            meta_descriptor_content_json(calls_enabled, signaling, bolt12_offer)?,
+            meta_descriptor_content_json(calls_enabled, signaling, Some(offer))?,
         ));
     }
     Ok(events)
@@ -353,6 +354,25 @@ mod tests {
         let only_call = descriptor_events(true, default_signaling_routes(), None).expect("events");
         assert_eq!(only_call.len(), 1);
         assert_eq!(only_call[0].0, SONAR_CALL_DESCRIPTOR_D_TAG);
+
+        // Invalid offers must also stay call-only. The serializer normalizes
+        // offers before adding payment fields, so gating only on Option::Some
+        // would still publish an empty replaceable meta descriptor.
+        for invalid_offer in ["", "not-lno"] {
+            let events = descriptor_events(
+                true,
+                default_signaling_routes(),
+                Some(invalid_offer.to_string()),
+            )
+            .expect("events");
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].0, SONAR_CALL_DESCRIPTOR_D_TAG);
+        }
+        let oversized_offer = format!("lno{}", "q".repeat(MAX_BOLT12_OFFER_BYTES));
+        let events = descriptor_events(true, default_signaling_routes(), Some(oversized_offer))
+            .expect("events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, SONAR_CALL_DESCRIPTOR_D_TAG);
 
         // With an offer: both the call and meta descriptors are emitted, and the
         // meta carries the offer.
