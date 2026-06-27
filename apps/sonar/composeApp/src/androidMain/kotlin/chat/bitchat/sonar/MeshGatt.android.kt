@@ -25,6 +25,7 @@ import uniffi.sonar_ffi.SonarNoise
 import uniffi.sonar_ffi.meshBuildAnnounce
 import uniffi.sonar_ffi.meshBuildPacket
 import uniffi.sonar_ffi.meshBuildSignedPacket
+import uniffi.sonar_ffi.meshBuildSignedPacketV2
 import uniffi.sonar_ffi.meshBuildPublicMessage
 import uniffi.sonar_ffi.meshDecodeFilePacket
 import uniffi.sonar_ffi.meshDecodePacket
@@ -741,11 +742,16 @@ object MeshGatt {
             if (payload.size <= MAX_V1_FILE_PAYLOAD_BYTES) {
                 meshBuildSignedPacket(ed25519SeedHex, TYPE_FILE_TRANSFER, myPeerIdHex, peerId, DEFAULT_TTL, ts.toULong(), payload)
             } else {
-                // The current generated FFI has a v1 signed builder only. iOS accepts
-                // live file transfers from connected peers and uses v2 mainly for the
-                // 32-bit payload length, so emit a directed v2 frame here for larger
-                // files without expanding the UniFFI surface in this slice.
-                buildUnsignedV2Packet(TYPE_FILE_TRANSFER, myPeerIdHex, peerId, DEFAULT_TTL, ts, payload)
+                meshBuildSignedPacketV2(
+                    ed25519SeedHex,
+                    TYPE_FILE_TRANSFER,
+                    myPeerIdHex,
+                    peerId,
+                    emptyList<String>(),
+                    DEFAULT_TTL,
+                    ts.toULong(),
+                    payload,
+                )
             }
         }.getOrNull()
     }
@@ -1044,51 +1050,6 @@ private fun packetTimestampMs(packet: ByteArray): Long? {
     var ts = 0L
     for (i in 3 until 11) ts = (ts shl 8) or (packet[i].toLong() and 0xFF)
     return ts
-}
-
-private fun buildUnsignedV2Packet(
-    packetType: UByte,
-    senderIdHex: String,
-    recipientIdHex: String,
-    ttl: UByte,
-    timestampMs: Long,
-    payload: ByteArray,
-): ByteArray {
-    val sender = senderIdHex.hexToBytes()
-    require(sender.size == 8) { "sender id must be 8 bytes" }
-    val recipient = recipientIdHex.takeIf { it.isNotBlank() }?.hexToBytes()
-    require(recipient == null || recipient.size == 8) { "recipient id must be 8 bytes" }
-    val raw = ByteArray(16 + 8 + (recipient?.size ?: 0) + payload.size)
-    var o = 0
-    raw[o++] = 2
-    raw[o++] = packetType.toByte()
-    raw[o++] = ttl.toByte()
-    for (shift in 56 downTo 0 step 8) raw[o++] = ((timestampMs ushr shift) and 0xFF).toByte()
-    raw[o++] = (if (recipient != null) 0x01 else 0x00).toByte()
-    raw[o++] = ((payload.size ushr 24) and 0xFF).toByte()
-    raw[o++] = ((payload.size ushr 16) and 0xFF).toByte()
-    raw[o++] = ((payload.size ushr 8) and 0xFF).toByte()
-    raw[o++] = (payload.size and 0xFF).toByte()
-    sender.copyInto(raw, o); o += sender.size
-    if (recipient != null) { recipient.copyInto(raw, o); o += recipient.size }
-    payload.copyInto(raw, o)
-    return padMeshPacket(raw)
-}
-
-private fun padMeshPacket(raw: ByteArray): ByteArray {
-    val target = optimalMeshBlockSize(raw.size)
-    if (raw.size >= target) return raw
-    val needed = target - raw.size
-    if (needed <= 0 || needed > 255) return raw
-    return raw + ByteArray(needed) { needed.toByte() }
-}
-
-private fun optimalMeshBlockSize(dataSize: Int): Int {
-    val total = dataSize + 16
-    for (size in intArrayOf(256, 512, 1024, 2048)) {
-        if (total <= size) return size
-    }
-    return dataSize
 }
 
 private fun safeFileName(raw: String?, mime: String, timestampMs: Long): String {

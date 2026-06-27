@@ -87,11 +87,13 @@ Verification:
 
 ## Slice 3: BLE Mesh Media
 
-Status: implemented in the 2026-06-27 mesh media slice for Android source:
-Android can send and receive private BLE `0x22` file-transfer packets, persist
-local mesh media blobs, and render them through the existing media bubble path.
-Hardware smoke remains required for Android/iOS image and voice-note exchange
-after rebuilding native FFI artifacts from the updated Rust core.
+Status: implemented in the 2026-06-27 mesh media slice for Android source, with
+the signed-v2 large-media follow-up closed in this PR. Android can send and
+receive private BLE `0x22` file-transfer packets, persist local mesh media blobs,
+render them through the existing media bubble path, and build large outbound
+media packets through the Rust signed-v2 mesh encoder. Hardware smoke remains
+required for Android/iOS image and voice-note exchange after rebuilding native
+FFI artifacts from the updated Rust core.
 
 Goal: match iOS media behavior when two peers are physically nearby.
 
@@ -99,24 +101,24 @@ Deliverables:
 
 - Add a mesh file-transfer API to the common `MeshRadio` expect surface.
 - Implement Android BLE packet type `0x22` using the existing Rust interop
-  helpers: `mesh_encode_file_packet`, `mesh_decode_file_packet`, and
-  `mesh_fragment`.
+  helpers: `mesh_encode_file_packet`, `mesh_decode_file_packet`,
+  `mesh_build_signed_packet_v2`, and `mesh_fragment`.
 - Route images, voice notes, and files over live BLE Noise when available.
 - Keep Marmot MIP-04 as the fallback for White Noise groups and out-of-range
   Sonar peers.
 - Persist received BLE media metadata and blobs through the existing message
   store.
 
-Tracked gap:
+Closed gap:
 
-- Android emits large file-transfer frames as directed v2 packets from Kotlin
-  because the currently generated FFI exposes only the v1 signed packet builder.
-  The next native-FFI regeneration should add a signed v2 builder so large
+- Android now emits large file-transfer frames through a shared Rust signed-v2
+  packet builder instead of a local unsigned Kotlin frame builder, so large
   outbound media has the same signature shape as iOS.
 
 Verification:
 
-- Rust/FFI tests for file-packet wire format.
+- Rust/FFI tests for file-packet wire format, v2 route retention, and signed-v2
+  large file-transfer encode/verify.
 - Compose unit tests for packet reassembly boundaries and local store round-trip.
 - Hardware-gated smoke: two Android devices and Android/iOS interop for image and
   voice-note send/receive.
@@ -154,7 +156,9 @@ Verification:
 Status: partially implemented in the 2026-06-27 parity polish slice. Delivery
 state text is normalized through a shared helper with tests. Report/moderation
 actions remain product/backend-gated because neither platform has a completed
-report backend to call.
+report backend to call. A 2026-06-28 UI/UX parity audit also found several
+remaining user-visible gaps that should stay tracked instead of being treated as
+closed parity.
 
 Goal: close smaller parity gaps after command, safety, and transport-critical work.
 
@@ -164,6 +168,24 @@ Deliverables:
   product/backend report path exists on both app surfaces.
 - Tighten delivery status copy where Compose still differs from
   `SonarAppStore.stateText`.
+- Wire Compose start-chat nearby peer taps to the same DM-opening path that iOS
+  already uses, replacing the current toast-only action.
+- Decide one shared slash-command registry. Either port Compose's expanded
+  command set and argument handling to iOS or hide unsupported Compose-only
+  placeholders from parity claims.
+- Add the missing iOS contact-profile favorite/unfavorite action and wire the
+  iOS block/delete rows to real existing plumbing instead of "Coming soon".
+- Align call actions: iOS exposes audio and video call buttons, while Compose
+  currently exposes audio-only from the DM header.
+- Track the geo-DM/channel-author blocked-state UX gap: Compose has a blocked
+  state and unblock action; iOS needs a comparable channel-originated private
+  chat affordance or an explicit platform gap.
+- Align search/start affordances for pasted invite links, shared text, npubs,
+  and raw geohashes. iOS has app-level invite handling, but not the same
+  search-sheet paste flow as Compose.
+- Hide or implement Compose toast-only message actions such as share location
+  and reactions before declaring full UI parity with iOS, which currently hides
+  those rows until real message types exist.
 - Add Android instrumentation smoke coverage for secure-store migration when
   device CI is available; this remains device-CI gated.
 

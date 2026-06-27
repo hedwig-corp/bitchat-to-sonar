@@ -1710,6 +1710,50 @@ pub fn mesh_build_signed_packet(
         .ok_or_else(|| SonarFfiError::Core("signed packet encode failed".into()))
 }
 
+/// Build a protocol-v2 packet signed with the Ed25519 announce key. v2 uses a
+/// u32 payload length and can carry source-route hops; this is required for
+/// large Android file-transfer packets to match iOS' signed v2 shape.
+#[uniffi::export]
+pub fn mesh_build_signed_packet_v2(
+    seed_hex: String,
+    packet_type: u8,
+    sender_id_hex: String,
+    recipient_id_hex: String,
+    route_id_hexes: Vec<String>,
+    ttl: u8,
+    timestamp_ms: u64,
+    payload: Vec<u8>,
+) -> FfiResult<Vec<u8>> {
+    let seed = hex::decode(&seed_hex).map_err(invalid("mesh seed"))?;
+    if seed.len() != 32 {
+        return Err(SonarFfiError::InvalidInput(
+            "mesh seed must be 32 bytes".into(),
+        ));
+    }
+    let mut s = [0u8; 32];
+    s.copy_from_slice(&seed);
+    let signer = mesh::MeshSigner::from_seed(&s);
+    let sender = parse_id8(&sender_id_hex, "sender id")?;
+    let mut packet = mesh::Packet::new_v2(packet_type, ttl, timestamp_ms, sender);
+    if !recipient_id_hex.is_empty() {
+        packet.recipient_id = Some(parse_id8(&recipient_id_hex, "recipient id")?);
+    }
+    if !route_id_hexes.is_empty() {
+        let mut route = Vec::with_capacity(route_id_hexes.len());
+        for hop in &route_id_hexes {
+            route.push(parse_id8(hop, "route hop id")?);
+        }
+        packet.route = Some(route);
+    }
+    packet.payload = payload;
+    if !mesh::sign_packet(&mut packet, &signer) {
+        return Err(SonarFfiError::Core("signed v2 packet sign failed".into()));
+    }
+    packet
+        .encode()
+        .ok_or_else(|| SonarFfiError::Core("signed v2 packet encode failed".into()))
+}
+
 /// The inner noiseEncrypted plaintext for a private message: `[0x01][TLV]`.
 #[uniffi::export]
 pub fn mesh_encode_private_message(message_id: String, content: String) -> FfiResult<Vec<u8>> {
