@@ -90,6 +90,8 @@ expect object MeshRadio {
     /** True iff an encrypted Noise link to the peer with stable [peerId]
      *  (fingerprint) is established right now. */
     fun hasMeshLink(peerId: String): Boolean
+    /** This device's current 8-byte bitchat mesh peer id, lowercase hex. */
+    fun localPeerIdHex(): String
     /** Pull (and clear) all mesh DMs received since the last call. */
     fun drainMeshDm(): List<MeshDmIn>
     /** Send a private BLE file transfer to a live mesh peer. This does not queue:

@@ -827,6 +827,20 @@ class SonarAppState(private val scope: CoroutineScope) {
             }
         }
         MeshRadio.sendMeshDm(peerId, randomMeshId(), payload)
+        val raw = npubRawFor(peerId) ?: return
+        scope.launch {
+            runCatching {
+                SonarCore.sendDirectDm(
+                    recipientHex = raw.toHexLower(),
+                    senderPeerIdHex = MeshRadio.localPeerIdHex(),
+                    recipientPeerIdHex = "",
+                    messageId = randomMeshId(),
+                    text = payload,
+                )
+            }.onFailure {
+                sonarLog("SonarDirect", "favorite notify failed peer=${peerId.take(10)} err=${it.message}")
+            }
+        }
     }
 
     fun toggleFavoriteContact(chatId: String, name: String) {
@@ -1727,6 +1741,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 scope.launch {
                     publishSonarDescriptorIfNeeded(force = true)
                     SonarCore.sync()
+                    drainDirectDms()
                     refreshChats()
                     recomputeConversations()
                     (screen as? Screen.Channel)?.let { refreshChannel(it.geohash) }
@@ -1742,6 +1757,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (!started) return
         scope.launch {
             runCatching { SonarCore.sync() }
+            drainDirectDms()
             refreshChats()
             recomputeConversations()
             (screen as? Screen.Chat)?.let { sc ->
@@ -2362,10 +2378,10 @@ class SonarAppState(private val scope: CoroutineScope) {
     private val echoIdPrefix = "echo-"
 
     private fun createSendEcho(chatId: String, text: String, viaInternet: Boolean = true): SonarMsg {
-        val echo = SonarMsg(
+        val echo = privateDmMessage(
             id = "$echoIdPrefix${randomMeshId()}",
             senderNpub = npub,
-            content = text,
+            text = text,
             mine = true,
             tsSecs = SonarClock.nowSecs(),
             viaInternet = viaInternet,
@@ -2809,7 +2825,11 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (MeshRadio.hasMeshLink(peerId)) { sendMesh(peerId, content); return }
             val raw = npubRawFor(peerId)
             if (raw != null) {
-                sendStickerOverMarmot(peerId, raw, packCoordinate, sticker)
+                when {
+                    shouldUseMarmotRoute(peerId, raw) -> sendStickerOverMarmot(peerId, raw, packCoordinate, sticker)
+                    canUseDirectNip17(peerId, raw) -> sendDirectNip17(peerId, raw, content)
+                    else -> toast = "Out of range — add each other as favorites to continue over Nostr."
+                }
                 return
             }
             toast = "Not connected — stay close and try again"
@@ -2914,9 +2934,10 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     /** Auto-pick the transport for a radar-peer DM (mirrors iOS `sendDm`): a live
-     *  Noise link ⇒ BLE mesh; otherwise White Noise (Marmot) for a Sonar peer. When
-     *  neither route is available the message is queued in the outbox (mirrors iOS
-     *  MessageRouter) and auto-sent when the peer reconnects or their npub is learned. */
+     *  Noise link ⇒ BLE mesh; otherwise White Noise (Marmot) for a Sonar peer, or
+     *  account-level NIP-17 for a mutual-favorite plain bitchat peer. When neither
+     *  route is available the message is queued in the outbox (mirrors iOS
+     *  MessageRouter) and auto-sent when a route becomes available. */
     private fun sendDmAuto(peerId: String, text: String) {
         if (socialState.isBlockedPeer(peerId)) {
             toast = "Unblock this contact before sending."
@@ -2930,7 +2951,17 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         if (MeshRadio.hasMeshLink(peerId)) { sendMesh(peerId, text); return }
         val raw = npubRawFor(peerId)
-        if (raw != null) { sendOverMarmot(peerId, raw, text); return }
+        if (raw != null) {
+            when {
+                shouldUseMarmotRoute(peerId, raw) -> sendOverMarmot(peerId, raw, text)
+                canUseDirectNip17(peerId, raw) -> sendDirectNip17(peerId, raw, text)
+                else -> {
+                    enqueueOutbox(peerId, text)
+                    toast = "Out of range — add each other as favorites to continue over Nostr."
+                }
+            }
+            return
+        }
         // Neither BLE mesh link nor npub available — queue for later delivery.
         enqueueOutbox(peerId, text)
         toast = "Out of range — message queued and will send automatically."
@@ -3042,6 +3073,102 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun persistMesh(peerId: String) {
         val msgs = meshChats[peerId].orEmpty()
         scope.launch { MessageStore.saveMeshDm(peerId, msgs) }
+    }
+
+    private fun shouldUseMarmotRoute(peerId: String, npubRaw: ByteArray): Boolean {
+        val npubHex = npubRaw.toHexLower()
+        return marmotGroupForNpub(npubRaw) != null ||
+            sonarProfile(peerId) != null ||
+            ((linkCapsByFp[peerId] ?: 0) and SonarAnnounce.CAP_MARMOT) != 0 ||
+            sonarDescriptorsByNpubHex[npubHex] != null
+    }
+
+    private fun canUseDirectNip17(peerId: String, npubRaw: ByteArray): Boolean =
+        !socialState.isBlockedNostr(npubRaw.toHexLower()) && socialState.isMutualFavorite(peerId)
+
+    private suspend fun sendDirectNip17Now(
+        peerId: String,
+        npubRaw: ByteArray,
+        messageId: String,
+        text: String,
+    ): Boolean {
+        return try {
+            SonarCore.sendDirectDm(
+                recipientHex = npubRaw.toHexLower(),
+                senderPeerIdHex = MeshRadio.localPeerIdHex(),
+                recipientPeerIdHex = "",
+                messageId = messageId,
+                text = text,
+            )
+            true
+        } catch (e: Throwable) {
+            toast = "send failed: ${e.message}"
+            sonarLog("SonarDirect", "failed direct NIP-17 send peer=${peerId.take(10)} err=${e.message}")
+            false
+        }
+    }
+
+    private fun sendDirectNip17(peerId: String, npubRaw: ByteArray, text: String) {
+        if (socialState.isBlockedPeer(peerId)) {
+            toast = "Unblock this contact before sending."
+            return
+        }
+        val chatId = meshChatId(peerId)
+        val messageId = randomMeshId()
+        val echo = createSendEcho(chatId, text)
+        messages = (messages + echo).sortedBy { it.tsSecs }
+        scope.launch {
+            val delivered = sendDirectNip17Now(peerId, npubRaw, messageId, text)
+            if (delivered) {
+                clearSendEcho(chatId, echo.id)
+                val msg = privateDmMessage(
+                    id = messageId,
+                    senderNpub = npub,
+                    text = text,
+                    mine = true,
+                    tsSecs = SonarClock.nowSecs(),
+                    viaInternet = true,
+                )
+                appendMeshMessage(peerId, msg)
+                processPayLines(chatId, listOf(msg))
+                refreshOpenDm(peerId)
+            } else {
+                failSendEcho(chatId, echo.id)
+            }
+        }
+    }
+
+    private fun appendMeshMessage(peerId: String, msg: SonarMsg): Boolean {
+        val existing = meshChats[peerId].orEmpty()
+        if (existing.any { it.id == msg.id }) return false
+        meshChats[peerId] = (existing + msg).sortedBy { it.tsSecs }
+        persistMesh(peerId)
+        refreshMeshDmRows()
+        return true
+    }
+
+    private fun privateDmMessage(
+        id: String,
+        senderNpub: String,
+        text: String,
+        mine: Boolean,
+        tsSecs: Long,
+        viaInternet: Boolean,
+        state: String? = null,
+    ): SonarMsg {
+        val stickerRef = meshParseStickerContent(text)?.let {
+            SonarStickerRef(it.packCoordinate, it.shortcode, it.plaintextSha256)
+        }
+        return SonarMsg(
+            id = id,
+            senderNpub = senderNpub,
+            content = if (stickerRef != null) "" else text,
+            mine = mine,
+            tsSecs = tsSecs,
+            viaInternet = viaInternet,
+            state = state,
+            stickerRef = stickerRef,
+        )
     }
 
     /** Texts queued for a Sonar peer (keyed by npub hex) while their White Noise
@@ -3188,9 +3315,15 @@ class SonarAppState(private val scope: CoroutineScope) {
             } else {
                 val raw = npubRawFor(peerId)
                 if (raw != null) {
-                    val groupId = marmotGroupId ?: ensureMarmotGroupForOutbox(peerId, raw)
-                    marmotGroupId = groupId
-                    groupId != null && sendOutboxOverMarmot(peerId, groupId, msg.content)
+                    when {
+                        shouldUseMarmotRoute(peerId, raw) -> {
+                            val groupId = marmotGroupId ?: ensureMarmotGroupForOutbox(peerId, raw)
+                            marmotGroupId = groupId
+                            groupId != null && sendOutboxOverMarmot(peerId, groupId, msg.content)
+                        }
+                        canUseDirectNip17(peerId, raw) -> sendOutboxOverDirectNip17(peerId, raw, msg)
+                        else -> false
+                    }
                 } else {
                     false
                 }
@@ -3243,6 +3376,27 @@ class SonarAppState(private val scope: CoroutineScope) {
             sonarLog("SonarOutbox", "failed to send queued White Noise message for ${peerId.take(10)}… err=${e.message}")
             false
         }
+    }
+
+    private suspend fun sendOutboxOverDirectNip17(
+        peerId: String,
+        npubRaw: ByteArray,
+        queued: QueuedMessage,
+    ): Boolean {
+        if (socialState.isBlockedPeer(peerId)) return false
+        val delivered = sendDirectNip17Now(peerId, npubRaw, queued.messageId, queued.content)
+        if (!delivered) return false
+        val msg = privateDmMessage(
+            id = queued.messageId,
+            senderNpub = npub,
+            text = queued.content,
+            mine = true,
+            tsSecs = SonarClock.nowSecs(),
+            viaInternet = true,
+        )
+        appendMeshMessage(peerId, msg)
+        refreshOpenDm(peerId)
+        return true
     }
 
     /** Flush outbox for ALL peers that now have a reachable transport. Called
@@ -3616,6 +3770,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         socialState = socialState.withRemoteFavoritePeer(peerId, favorite)
         persistSocialState()
         recomputeSociallyFilteredRows()
+        if (favorite) flushOutbox(peerId)
         return true
     }
 
@@ -3655,6 +3810,48 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (isMeshChat(sc.id)) {
                 val pid = meshPeerId(sc.id)
                 if (incoming.any { it.peerId == pid }) scope.launch { refreshOpenDm(pid) }
+            }
+        }
+    }
+
+    private suspend fun drainDirectDms() {
+        val incoming = runCatching { SonarCore.drainDirectDms() }.getOrDefault(emptyList())
+        if (incoming.isEmpty()) return
+        val touched = mutableSetOf<String>()
+        for (m in incoming) {
+            val peerId = peerIdForNpubHex(m.senderPubkeyHex) ?: continue
+            if (socialState.isBlockedPeer(peerId) || socialState.isBlockedNostr(m.senderPubkeyHex)) continue
+            if (handleFavoriteControl(peerId, m.content)) continue
+            if (!socialState.isMutualFavorite(peerId)) continue
+            val id = m.id.ifBlank { randomMeshId() }
+            if (meshChats[peerId].orEmpty().any { it.id == id }) continue
+            val msg = privateDmMessage(
+                id = id,
+                senderNpub = m.senderPubkeyHex,
+                text = m.content,
+                mine = false,
+                tsSecs = m.tsSecs,
+                viaInternet = true,
+            )
+            val chatId = meshChatId(peerId)
+            if (msg.stickerRef == null && SonarCore.callParseControl(m.content) != null) {
+                processCallLines(chatId, listOf(msg))
+                continue
+            }
+            meshChats[peerId] = meshChats[peerId].orEmpty() + msg
+            processPayLines(chatId, listOf(msg))
+            touched += peerId
+            val preview = if (msg.stickerRef != null) "Sticker" else m.content
+            notifyIncoming(chatId, meshPeerName(peerId), preview)
+        }
+        if (touched.isEmpty()) return
+        touched.forEach { persistMesh(it) }
+        refreshMeshDmRows()
+        recomputeConversations()
+        (screen as? Screen.Chat)?.let { sc ->
+            if (isMeshChat(sc.id)) {
+                val pid = meshPeerId(sc.id)
+                if (pid in touched) refreshOpenDm(pid)
             }
         }
     }
@@ -3979,6 +4176,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 tick++
                 SonarCore.ensureSubscriptions()
                 refreshChats()
+                drainDirectDms()
                 // Observability for the BLE→White Noise fallback: a new Marmot
                 // group (a Welcome received over relays) or a grown transcript is
                 // the signal that White Noise delivery reached us. Logged only on

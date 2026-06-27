@@ -167,6 +167,7 @@ const SUB_MARMOT_GROUPS: &str = "sonar-marmot-groups";
 /// loses a message permanently. When full, the oldest half is dropped (amortizes
 /// the shift cost vs dropping one-at-a-time).
 const MARMOT_BUFFER_CAP: usize = 1024;
+const DIRECT_DM_BUFFER_CAP: usize = 1024;
 
 /// Minimum number of relays that must be connected before `connect()` returns.
 /// Modeled after whitenoise-rs `min_connected_relays = 2`. A quorum of 2
@@ -177,6 +178,25 @@ const MIN_CONNECTED_RELAYS: usize = 2;
 /// Per-relay connection timeout used by the quorum-connect loop. If no relay
 /// connects within this window the client errors with `NoRelayConnections`.
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn parse_mesh_id8_hex(value: &str, label: &'static str) -> Result<[u8; 8]> {
+    let bytes = hex::decode(value.trim())
+        .map_err(|e| Error::InvalidInput(format!("{label} must be 8-byte hex: {e}")))?;
+    if bytes.len() != 8 {
+        return Err(Error::InvalidInput(format!("{label} must be 8 bytes")));
+    }
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+fn parse_optional_mesh_id8_hex(value: &str, label: &'static str) -> Result<Option<[u8; 8]>> {
+    let clean = value.trim();
+    if clean.is_empty() {
+        return Ok(None);
+    }
+    parse_mesh_id8_hex(clean, label).map(Some)
+}
 
 /// Shorter timeout for backfill fetches (new group from welcome, empty
 /// transcript repair). These are less critical than the main sync fetch — the
@@ -377,6 +397,26 @@ struct RawGeoDm {
 
 type GeoDmBuf = Arc<Mutex<HashMap<(String, String), Vec<RawGeoDm>>>>;
 
+/// One received account-level 1:1 DM (NIP-17 over the main Sonar/bitchat
+/// identity). The rumor content is a `bitchat1:` embedded private-message
+/// packet, matching iOS plain bitchat fallback.
+struct RawDirectDm {
+    id: String,
+    sender: PublicKey,
+    content: String,
+    ts: u64,
+}
+
+type DirectDmBuf = Arc<Mutex<Vec<RawDirectDm>>>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectDm {
+    pub id: String,
+    pub sender_pubkey: String,
+    pub content: String,
+    pub created_at: u64,
+}
+
 /// Live presence (kind-20001) per geohash channel: participant pubkey hex →
 /// last-seen unix seconds. Presence events are ephemeral heartbeats, so we keep
 /// only the most recent timestamp per participant and count those still within
@@ -416,6 +456,7 @@ pub struct SonarClient {
     relays: Vec<RelayUrl>,
     geo: Arc<Mutex<HashMap<String, Vec<RawGeo>>>>,
     geo_dm: GeoDmBuf,
+    direct_dm: DirectDmBuf,
     geo_presence: GeoPresenceBuf,
     geo_subscribed: Arc<Mutex<HashSet<String>>>,
     identity_secret: [u8; 32],
@@ -588,6 +629,7 @@ impl SonarClient {
         // delivered live to active subscriptions; relays don't store them.
         let geo: Arc<Mutex<HashMap<String, Vec<RawGeo>>>> = Arc::new(Mutex::new(HashMap::new()));
         let geo_dm: GeoDmBuf = Arc::new(Mutex::new(HashMap::new()));
+        let direct_dm: DirectDmBuf = Arc::new(Mutex::new(Vec::new()));
         let geo_presence: GeoPresenceBuf = Arc::new(Mutex::new(HashMap::new()));
         let geo_subscribed: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let identity_secret = identity.keys().secret_key().to_secret_bytes();
@@ -782,6 +824,7 @@ impl SonarClient {
             relays,
             geo,
             geo_dm,
+            direct_dm,
             geo_presence,
             geo_subscribed,
             identity_secret,
@@ -2148,8 +2191,9 @@ impl SonarClient {
                 continue;
             }
 
-            // Intercept kind-1059 gift wraps that contain push token shares
-            // (kind 447) before they reach the MLS engine.
+            // Intercept account-level gift wraps that are not Marmot MLS input
+            // before they reach the MLS engine: push-token shares (kind 447)
+            // and plain bitchat fallback DMs (NIP-17 kind 14).
             if event.kind == Kind::GiftWrap {
                 if let Ok(unwrapped) =
                     UnwrappedGift::from_gift_wrap(self.engine.identity().keys(), &event).await
@@ -2159,6 +2203,34 @@ impl SonarClient {
                             &unwrapped.sender,
                             &unwrapped.rumor.content,
                         );
+                        self.mark_sync_event_processed(&event.id);
+                        report.record_processed();
+                        continue;
+                    }
+                    if unwrapped.rumor.kind.as_u16() == 14 {
+                        if let Some(dm) = crate::mesh::decode_nip17_private_message_content(
+                            &unwrapped.rumor.content,
+                        ) {
+                            let mut buf = self.direct_dm.lock().unwrap();
+                            if !buf.iter().any(|existing| {
+                                existing.id == dm.message_id && existing.sender == unwrapped.sender
+                            }) {
+                                if buf.len() >= DIRECT_DM_BUFFER_CAP {
+                                    buf.drain(0..DIRECT_DM_BUFFER_CAP / 2);
+                                }
+                                buf.push(RawDirectDm {
+                                    id: dm.message_id,
+                                    sender: unwrapped.sender,
+                                    content: dm.content,
+                                    ts: unwrapped.rumor.created_at.as_secs(),
+                                });
+                            }
+                        } else {
+                            tracing::debug!(
+                                event_id = %event.id,
+                                "ignoring non-bitchat account-level NIP-17 DM"
+                            );
+                        }
                         self.mark_sync_event_processed(&event.id);
                         report.record_processed();
                         continue;
@@ -2680,6 +2752,60 @@ impl SonarClient {
             .unwrap_or_default();
         out.sort_by_key(|m| m.created_at);
         Ok(out)
+    }
+
+    /// Send an account-level NIP-17 DM to a plain bitchat peer. The rumor
+    /// content is `bitchat1:` with an embedded private-message packet so iOS
+    /// bitchat can route it through the same private-chat handler as its own
+    /// Nostr fallback.
+    pub async fn send_direct_dm(
+        &self,
+        recipient_hex: &str,
+        sender_peer_id_hex: &str,
+        recipient_peer_id_hex: &str,
+        message_id: &str,
+        text: &str,
+    ) -> Result<()> {
+        let recipient = PublicKey::parse(recipient_hex)?;
+        let sender_peer_id = parse_mesh_id8_hex(sender_peer_id_hex, "sender peer id")?;
+        let recipient_peer_id =
+            parse_optional_mesh_id8_hex(recipient_peer_id_hex, "recipient peer id")?;
+        let msg = crate::mesh::PrivateMessage {
+            message_id: message_id.to_string(),
+            content: text.to_string(),
+        };
+        let timestamp_ms = Timestamp::now().as_secs().saturating_mul(1000);
+        let embedded = crate::mesh::encode_nip17_private_message_content(
+            sender_peer_id,
+            recipient_peer_id,
+            timestamp_ms,
+            &msg,
+        )
+        .ok_or_else(|| Error::InvalidInput("direct DM is too large to encode".into()))?;
+        let rumor = EventBuilder::new(Kind::Custom(14), embedded)
+            .tags([Tag::public_key(recipient)])
+            .build(self.engine.identity().public_key());
+        let gift =
+            EventBuilder::gift_wrap(self.engine.identity().keys(), &recipient, rumor, []).await?;
+        let output = self.nostr.send_event(&gift).await?;
+        require_relay_success(&output, "direct NIP-17 DM")
+    }
+
+    /// Drain account-level direct NIP-17 DMs buffered by sync/live gift-wrap
+    /// processing. Hosts persist these into their local conversation store.
+    pub fn drain_direct_dms(&self) -> Vec<DirectDm> {
+        let mut buf = self.direct_dm.lock().unwrap();
+        let mut out: Vec<DirectDm> = std::mem::take(&mut *buf)
+            .into_iter()
+            .map(|r| DirectDm {
+                id: r.id,
+                sender_pubkey: r.sender.to_hex(),
+                content: r.content,
+                created_at: r.ts,
+            })
+            .collect();
+        out.sort_by_key(|m| m.created_at);
+        out
     }
 
     /// Publish a public message to a geohash channel, signed with this

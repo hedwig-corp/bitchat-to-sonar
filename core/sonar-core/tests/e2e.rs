@@ -7,6 +7,7 @@
 use nostr_relay_builder::MockRelay;
 use sonar_core::client::SonarClient;
 use sonar_core::identity::Identity;
+use tokio::time::{timeout, Duration};
 
 #[tokio::test]
 async fn profile_publish_and_fetch_through_a_relay() {
@@ -433,4 +434,53 @@ async fn geohash_dm_between_channel_participants() {
         .expect("alice reads thread");
     assert_eq!(alice_thread.len(), 1);
     assert!(alice_thread[0].mine, "alice's own sent DM is mine");
+}
+
+#[tokio::test]
+async fn direct_nip17_bitchat_dm_drains_from_account_gift_wraps() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let url = relay.url().await;
+    let alice = SonarClient::connect_in_memory(Identity::generate(), vec![url.clone()])
+        .await
+        .expect("alice connects");
+    let bob = SonarClient::connect_in_memory(Identity::generate(), vec![url.clone()])
+        .await
+        .expect("bob connects");
+
+    timeout(
+        Duration::from_secs(5),
+        alice.send_direct_dm(
+            &bob.identity().public_key().to_hex(),
+            "0102030405060708",
+            "",
+            "direct-mid-1",
+            "plain bitchat fallback",
+        ),
+    )
+    .await
+    .expect("direct send completes")
+    .expect("alice sends direct nip17 dm");
+
+    timeout(Duration::from_secs(5), bob.sync())
+        .await
+        .expect("bob sync completes")
+        .expect("bob syncs");
+
+    let inbox = bob.drain_direct_dms();
+    assert_eq!(inbox.len(), 1, "bob received one direct DM");
+    assert_eq!(inbox[0].id, "direct-mid-1");
+    assert_eq!(
+        inbox[0].sender_pubkey,
+        alice.identity().public_key().to_hex()
+    );
+    assert_eq!(inbox[0].content, "plain bitchat fallback");
+
+    timeout(Duration::from_secs(5), bob.sync())
+        .await
+        .expect("bob re-sync completes")
+        .expect("bob re-syncs");
+    assert!(
+        bob.drain_direct_dms().is_empty(),
+        "processed direct DMs are not duplicated by the gift-wrap lookback"
+    );
 }

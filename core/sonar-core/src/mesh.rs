@@ -632,6 +632,74 @@ pub fn encode_private_message_plaintext(msg: &PrivateMessage) -> Option<Vec<u8>>
     Some(out)
 }
 
+pub const BITCHAT_NIP17_PREFIX: &str = "bitchat1:";
+const MAX_EMBEDDED_BITCHAT_PACKET_BYTES: usize = 2 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddedPrivateMessage {
+    pub sender_id: [u8; 8],
+    pub recipient_id: Option<[u8; 8]>,
+    pub message_id: String,
+    pub content: String,
+    pub timestamp: u64,
+}
+
+/// Encode a NIP-17 rumor content string compatible with iOS bitchat's
+/// `NostrEmbeddedBitChat.encodePMForNostr`.
+///
+/// The embedded packet uses the bitchat `noiseEncrypted` packet type (0x11), but
+/// the payload is the plaintext `[NoisePayloadType][PrivateMessagePacket]`.
+/// The NIP-17 seal/gift-wrap supplies the actual transport encryption.
+pub fn encode_nip17_private_message_content(
+    sender_id: [u8; 8],
+    recipient_id: Option<[u8; 8]>,
+    timestamp: u64,
+    msg: &PrivateMessage,
+) -> Option<String> {
+    let mut packet = Packet::new(msg_type::NOISE_ENCRYPTED, 7, timestamp, sender_id);
+    packet.recipient_id = recipient_id;
+    packet.payload = encode_private_message_plaintext(msg)?;
+    let raw = packet.encode()?;
+    use base64::Engine;
+    Some(format!(
+        "{BITCHAT_NIP17_PREFIX}{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)
+    ))
+}
+
+/// Decode a `bitchat1:` NIP-17 rumor content string into the private-message
+/// TLV it carries. Non-bitchat or unsupported embedded payloads return `None`.
+pub fn decode_nip17_private_message_content(content: &str) -> Option<EmbeddedPrivateMessage> {
+    let encoded = content.strip_prefix(BITCHAT_NIP17_PREFIX)?;
+    let max_encoded = ((MAX_EMBEDDED_BITCHAT_PACKET_BYTES + 2) / 3) * 4;
+    if encoded.len() > max_encoded {
+        return None;
+    }
+    use base64::Engine;
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .ok()?;
+    if raw.len() > MAX_EMBEDDED_BITCHAT_PACKET_BYTES {
+        return None;
+    }
+    let packet = Packet::decode(&raw)?;
+    if packet.type_ != msg_type::NOISE_ENCRYPTED {
+        return None;
+    }
+    let (payload_type, rest) = split_noise_plaintext(&packet.payload)?;
+    if payload_type != noise_payload::PRIVATE_MESSAGE {
+        return None;
+    }
+    let private = PrivateMessage::decode(rest)?;
+    Some(EmbeddedPrivateMessage {
+        sender_id: packet.sender_id,
+        recipient_id: packet.recipient_id,
+        message_id: private.message_id,
+        content: private.content,
+        timestamp: packet.timestamp,
+    })
+}
+
 /// Split a decrypted noiseEncrypted plaintext into its type byte and the rest.
 pub fn split_noise_plaintext(plain: &[u8]) -> Option<(u8, &[u8])> {
     plain.split_first().map(|(t, rest)| (*t, rest))

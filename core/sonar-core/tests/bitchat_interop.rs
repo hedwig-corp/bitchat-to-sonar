@@ -8,7 +8,10 @@
 
 use sonar_core::mesh::file_packet::{fragment, FilePacket};
 use sonar_core::mesh::fragment::{Fragment, Reassembler};
-use sonar_core::mesh::{msg_type, Packet};
+use sonar_core::mesh::{
+    decode_nip17_private_message_content, encode_nip17_private_message_content, msg_type, Packet,
+    PrivateMessage, BITCHAT_NIP17_PREFIX,
+};
 use sonar_core::noise::{NoiseHandshake, NoiseKeypair};
 
 /// Sonar's `FilePacket.encode()` must equal the bytes bitchat's
@@ -105,6 +108,29 @@ fn v2_file_transfer_packet_decodes_like_ios() {
     assert_eq!(file.file_name.as_deref(), Some("photo.jpg"));
     assert_eq!(file.mime_type.as_deref(), Some("image/jpeg"));
     assert_eq!(file.content, vec![1, 2, 3, 4, 5]);
+}
+
+#[test]
+fn nip17_bitchat_private_message_content_round_trips() {
+    let sender = [0x11; 8];
+    let recipient = [0x22; 8];
+    let msg = PrivateMessage {
+        message_id: "mid-123".to_string(),
+        content: "hello over nostr".to_string(),
+    };
+
+    let content =
+        encode_nip17_private_message_content(sender, Some(recipient), 1_700_000_001_000, &msg)
+            .expect("encode embedded private message");
+    assert!(content.starts_with(BITCHAT_NIP17_PREFIX));
+
+    let decoded =
+        decode_nip17_private_message_content(&content).expect("decode embedded private message");
+    assert_eq!(decoded.sender_id, sender);
+    assert_eq!(decoded.recipient_id, Some(recipient));
+    assert_eq!(decoded.timestamp, 1_700_000_001_000);
+    assert_eq!(decoded.message_id, "mid-123");
+    assert_eq!(decoded.content, "hello over nostr");
 }
 
 /// Mirrors bitchat's `testDecodeFallsBackToContentSizeWhenFileSizeMissing`.

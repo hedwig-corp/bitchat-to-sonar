@@ -256,6 +256,8 @@ actual object MeshRadio {
 
     actual fun hasMeshLink(peerId: String): Boolean = MeshGatt.hasLink(peerId)
 
+    actual fun localPeerIdHex(): String = MeshGatt.nodeId().toHexLower()
+
     actual fun drainMeshDm(): List<MeshDmIn> {
         val out = ArrayList<MeshDmIn>()
         while (true) { out.add(meshDmInbox.poll() ?: break) }
@@ -343,3 +345,6 @@ actual object MeshRadio {
         }
     }
 }
+
+private fun ByteArray.toHexLower(): String =
+    joinToString("") { (it.toInt() and 0xFF).toString(16).padStart(2, '0') }

@@ -123,11 +123,10 @@ Verification:
 
 ## Slice 4: Plain Bitchat Out-of-Range Fallback
 
-Status: not implemented in this PR. The explorer pass found this is a shared
-core API gap, not only an Android routing gap: `sonar-core` currently exposes
-geohash-scoped NIP-17 DMs and Marmot account gift-wrap processing, but no
-account-identity direct NIP-17 send/drain API for plain mutual-favorite bitchat
-peers.
+Status: implemented in this PR, pending manual device smoke. The Android path now
+has a shared-core account-identity direct NIP-17 send/drain API for
+mutual-favorite plain bitchat peers. The payload is iOS-compatible `bitchat1:`
+private-message content inside a NIP-17 gift wrap, not raw Marmot text.
 
 Goal: bring iOS favorite/NIP-17 delivery to Android for non-Sonar bitchat peers.
 
@@ -138,11 +137,15 @@ Deliverables:
   requiring a Sonar descriptor.
 - Queue sends while offline and flush when a relay route is available.
 - Keep Sonar peers on the existing White Noise/Marmot route.
+- Persist direct NIP-17 messages through the same bounded local mesh transcript
+  store so opening a conversation paints from local storage first.
 
 Verification:
 
 - Favorite persistence tests.
 - NIP-17 send/receive tests across two identities.
+- Kotlin MessageStore round-trip test for the internet transport marker used by
+  direct NIP-17 local transcript persistence.
 - Manual smoke for a plain mesh peer leaving range, receiving over relay, then
   returning to BLE.
 

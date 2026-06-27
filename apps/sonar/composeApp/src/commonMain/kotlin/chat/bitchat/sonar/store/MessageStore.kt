@@ -71,7 +71,7 @@ object MessageCodec {
             val base = row(m.id, m.senderNpub, if (m.mine) "1" else "0", m.tsSecs.toString(), m.content)
             val ref = m.stickerRef
             val media = m.media.firstOrNull()
-            if (ref != null || media != null) {
+            if (ref != null || media != null || m.viaInternet) {
                 base + "\t" +
                     hexEnc(ref?.packCoordinate.orEmpty()) + "\t" +
                     hexEnc(ref?.shortcode.orEmpty()) + "\t" +
@@ -81,7 +81,8 @@ object MessageCodec {
                     hexEnc(media?.filename.orEmpty()) + "\t" +
                     hexEnc(media?.width?.toString().orEmpty()) + "\t" +
                     hexEnc(media?.height?.toString().orEmpty()) + "\t" +
-                    hexEnc(media?.durationMs?.toString().orEmpty())
+                    hexEnc(media?.durationMs?.toString().orEmpty()) + "\t" +
+                    hexEnc(if (m.viaInternet) "1" else "")
             } else base
         }
 
@@ -107,6 +108,7 @@ object MessageCodec {
             SonarMsg(
                 id = f[0], senderNpub = f[1], content = f[4],
                 mine = f[2] == "1", tsSecs = f[3].toLongOrNull() ?: 0L,
+                viaInternet = f.size >= 15 && f[14] == "1",
                 media = media,
                 stickerRef = stickerRef,
             )

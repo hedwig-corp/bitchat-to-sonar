@@ -85,6 +85,12 @@ class MessageCodecTest {
         assertTrue(decoded[1].media.isEmpty())
     }
 
+    @Test fun dmRoundTripPreservesInternetTransportFlag() {
+        val msg = SonarMsg("a", "npub1xx", "plain direct", mine = false, tsSecs = 3, viaInternet = true)
+        val decoded = MessageCodec.decodeDm(MessageCodec.encodeDm(listOf(msg))).single()
+        assertEquals(msg, decoded)
+    }
+
     @Test fun dmRoundTripWithStickerAndMedia() {
         val ref = SonarStickerRef("30030:abc123:pack", "wave", "deadbeef")
         val media = SonarMedia("mesh-media:peer:message:voice.m4a", "audio/mp4", "voice.m4a", null, null, 1200)

@@ -402,6 +402,30 @@ actual object SonarCore {
         requireNode().sendGeoDm(geohash, peerHex, text)
     }
 
+    actual suspend fun sendDirectDm(
+        recipientHex: String,
+        senderPeerIdHex: String,
+        recipientPeerIdHex: String,
+        messageId: String,
+        text: String,
+    ) = withContext(Dispatchers.IO) {
+        requireNode().sendDirectDm(recipientHex, senderPeerIdHex, recipientPeerIdHex, messageId, text)
+    }
+
+    actual suspend fun drainDirectDms(): List<SonarDirectDm> = withContext(Dispatchers.IO) {
+        val n = node ?: return@withContext emptyList()
+        runCatching {
+            n.drainDirectDms().map {
+                SonarDirectDm(
+                    id = it.idHex,
+                    senderPubkeyHex = it.senderPubkeyHex,
+                    content = it.content,
+                    tsSecs = it.createdAtSecs.toLong(),
+                )
+            }
+        }.getOrDefault(emptyList())
+    }
+
     actual fun nickname(): String = prefs().getString("nickname", "") ?: ""
 
     actual fun setNickname(value: String) {
