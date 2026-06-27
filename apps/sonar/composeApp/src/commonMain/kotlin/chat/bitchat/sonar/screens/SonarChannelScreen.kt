@@ -35,8 +35,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import chat.bitchat.sonar.Screen
+import chat.bitchat.sonar.SlashHints
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.SonarChannelMsg
+import chat.bitchat.sonar.ToastBar
 import chat.bitchat.sonar.ui.SNBanner
 import chat.bitchat.sonar.ui.SNBannerTone
 import chat.bitchat.sonar.ui.SNDot
@@ -133,6 +135,8 @@ fun SonarChannelScreen(state: SonarAppState, screen: Screen.Channel) {
             }
         }
 
+        if (draft.startsWith("/")) SlashHints(draft) { draft = it }
+
         // composer
         Row(Modifier.fillMaxWidth().padding(10.dp), verticalAlignment = Alignment.Bottom) {
             Box(
@@ -153,11 +157,18 @@ fun SonarChannelScreen(state: SonarAppState, screen: Screen.Channel) {
             Spacer(Modifier.width(8.dp))
             Box(
                 Modifier.size(46.dp).clip(CircleShape).background(s.netFill)
-                    .clickable { state.sendChannelMsg(screen.geohash, draft); draft = "" },
+                    .clickable {
+                        val d = draft
+                        draft = ""
+                        if (!state.handleCommand(d, name, channelGeohash = screen.geohash, chatId = null)) {
+                            state.sendChannelMsg(screen.geohash, d)
+                        }
+                    },
                 contentAlignment = Alignment.Center
             ) { Text("↑", color = s.onNet, fontSize = 20.sp, fontWeight = FontWeight.Bold) }
         }
     }
+    state.toast?.let { ToastBar(it) { state.toast = null } }
 }
 
 @Composable

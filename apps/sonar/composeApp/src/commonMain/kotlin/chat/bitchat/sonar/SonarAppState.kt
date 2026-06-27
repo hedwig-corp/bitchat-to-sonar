@@ -1845,24 +1845,139 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     /**
-     * Handle a slash command (1:1 with iOS snCommands). Returns true if [text]
-     * was a recognized command and consumed; false ⇒ send as normal text.
-     * `target` is the channel/peer display name for the /slap action.
+     * Handle a slash command (mirrors the iOS command autocomplete surface).
+     * Returns true if [text] was recognized and consumed; false => send as text.
+     * `target` is the current channel/peer label used when an emote omits args.
      */
     fun handleCommand(text: String, target: String, channelGeohash: String?, chatId: String?): Boolean {
-        if (!text.startsWith("/")) return false
-        return when (text.drop(1).trim().substringBefore(' ').lowercase()) {
-            "who", "msg" -> { push(Screen.Nearby); true }
-            "slap" -> {
-                val who = nick.ifBlank { "you" }
-                val line = "* $who slaps $target around a bit with a large trout"
-                if (channelGeohash != null) sendChannelMsg(channelGeohash, line)
-                else if (chatId != null) send(chatId, line)
+        val parsed = SonarSlashCommands.parse(text) ?: return false
+        return when (parsed.command) {
+            SonarSlashCommand.Who -> {
+                push(Screen.Nearby)
                 true
             }
-            else -> false
+            SonarSlashCommand.Message -> {
+                handleMessageCommand(parsed.args)
+                true
+            }
+            SonarSlashCommand.Clear -> {
+                clearCurrentTimeline(channelGeohash, chatId)
+                true
+            }
+            SonarSlashCommand.Hug -> {
+                sendCommandEmote(parsed.args, target, channelGeohash, chatId, "hugs", "")
+                true
+            }
+            SonarSlashCommand.Slap -> {
+                sendCommandEmote(parsed.args, target, channelGeohash, chatId, "slaps", " around a bit with a large trout")
+                true
+            }
+            SonarSlashCommand.Block,
+            SonarSlashCommand.Unblock -> {
+                val subject = commandSubject(parsed.args, target)
+                toast = "Block and unblock are tracked for the Android safety parity follow-up${subject?.let { ": $it" } ?: "."}"
+                true
+            }
+            SonarSlashCommand.Favorite,
+            SonarSlashCommand.Unfavorite -> {
+                val subject = commandSubject(parsed.args, target)
+                toast = "Favorites are tracked for the Android plain-bitchat fallback follow-up${subject?.let { ": $it" } ?: "."}"
+                true
+            }
         }
     }
+
+    private fun handleMessageCommand(args: String) {
+        val parts = args.split(Regex("\\s+"), limit = 2).filter { it.isNotBlank() }
+        if (parts.isEmpty()) {
+            push(Screen.Nearby)
+            toast = SonarSlashCommands.usage(SonarSlashCommand.Message)
+            return
+        }
+        val name = parts[0].trimCommandSubject()
+        val body = parts.getOrNull(1).orEmpty().trim()
+        val peer = meshPeers.firstOrNull {
+            val peerId = meshPeerId(it.id)
+            it.name.equals(name, ignoreCase = true) ||
+                peerId.equals(name, ignoreCase = true) ||
+                peerId.startsWith(name, ignoreCase = true)
+        }
+        if (peer != null) {
+            val peerId = meshPeerId(peer.id)
+            openDm(peerId, peer.name)
+            if (body.isNotBlank()) sendDmAuto(peerId, body)
+            return
+        }
+        if (name.startsWith("npub1") || canonicalNpubHex(name) != null) {
+            startChat(name)
+            if (body.isNotBlank()) toast = "Opening chat. Send the message after the secure chat is ready."
+            return
+        }
+        toast = "'$name' not found"
+    }
+
+    private fun clearCurrentTimeline(channelGeohash: String?, chatId: String?) {
+        when {
+            channelGeohash != null -> {
+                if (channelGeohash == "mesh") {
+                    meshBroadcast = emptyList()
+                    channelMsgs = emptyList()
+                } else {
+                    channelMsgs = emptyList()
+                    scope.launch { MessageStore.saveChannel(channelGeohash, emptyList()) }
+                }
+                toast = "Cleared this channel on this device"
+            }
+            chatId != null && isMeshChat(chatId) -> {
+                val peerId = meshPeerId(chatId)
+                meshChats[peerId] = emptyList()
+                messages = emptyList()
+                persistMesh(peerId)
+                refreshMeshDmRows()
+                toast = "Cleared this chat on this device"
+            }
+            chatId != null -> {
+                toast = "Use Delete chat to remove White Noise history"
+            }
+            else -> {
+                toast = "Nothing to clear here"
+            }
+        }
+    }
+
+    private fun sendCommandEmote(
+        args: String,
+        fallbackTarget: String,
+        channelGeohash: String?,
+        chatId: String?,
+        action: String,
+        suffix: String,
+    ) {
+        val subject = commandSubject(args, fallbackTarget)
+        if (subject.isNullOrBlank()) {
+            toast = if (action == "hugs") {
+                SonarSlashCommands.usage(SonarSlashCommand.Hug)
+            } else {
+                SonarSlashCommands.usage(SonarSlashCommand.Slap)
+            }
+            return
+        }
+        val who = nick.ifBlank { "you" }
+        val line = "* $who $action $subject$suffix *"
+        when {
+            channelGeohash != null -> sendChannelMsg(channelGeohash, line)
+            chatId != null -> send(chatId, line)
+            else -> toast = "No active conversation for this command"
+        }
+    }
+
+    private fun commandSubject(args: String, fallbackTarget: String): String? =
+        args.trim().substringBefore(' ').trimCommandSubject()
+            .takeIf { it.isNotBlank() }
+            ?: fallbackTarget.trim().takeIf { it.isNotBlank() }
+
+    private fun String.trimCommandSubject(): String =
+        trim().removePrefix("@").trim()
 
     fun send(chatId: String, text: String) {
         val t = text.trim()

@@ -1170,24 +1170,24 @@ private fun LockScreen(onUnlock: () -> Unit) {
     }
 }
 
-/** Slash-command suggestions (1:1 with iOS snCommands). */
+/** Slash-command suggestions (mirrors the iOS command autocomplete surface). */
 @Composable
-private fun SlashHints(draft: String, onPick: (String) -> Unit) {
+internal fun SlashHints(draft: String, onPick: (String) -> Unit) {
     val s = sonar
-    val commands = listOf("who" to "See who's nearby", "msg" to "Message someone", "slap" to "Classic IRC slap")
-    val typed = draft.drop(1).lowercase()
-    val matches = commands.filter { it.first.startsWith(typed) }
+    val matches = SonarSlashCommands.matches(draft)
     if (matches.isEmpty()) return
     Column(Modifier.fillMaxWidth().padding(horizontal = 10.dp)) {
-        matches.forEach { (cmd, desc) ->
+        matches.forEach { command ->
             Row(
                 Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))
-                    .clickable { onPick("/$cmd") }.padding(horizontal = 12.dp, vertical = 9.dp),
+                    .clickable {
+                        onPick("/${command.canonical}${if (command.needsArgument) " " else ""}")
+                    }.padding(horizontal = 12.dp, vertical = 9.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text("/$cmd", color = s.accent, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                Text("/${command.canonical}", color = s.accent, fontSize = 14.sp, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.width(10.dp))
-                Text(desc, color = s.text3, fontSize = 13.sp)
+                Text(command.description, color = s.text3, fontSize = 13.sp)
             }
         }
     }
