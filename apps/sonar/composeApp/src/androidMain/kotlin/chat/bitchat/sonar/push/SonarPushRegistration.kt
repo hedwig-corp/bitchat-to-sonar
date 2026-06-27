@@ -24,7 +24,16 @@ object SonarPushRegistration {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private val transponderNpub: String get() = BuildConfig.TRANSPONDER_NPUB
-    private val ndsUrl: String get() = BuildConfig.NDS_URL
+
+    // Base URL of the Breez NDS. Tolerates a bare host (prepends https://) and
+    // rejects the truncated "https:"/"http:" sentinels, mirroring iOS, so a
+    // malformed webhook URL can never be registered (which breaks offline pay).
+    private val ndsUrl: String
+        get() {
+            val raw = BuildConfig.NDS_URL.trim()
+            if (raw.isEmpty() || raw == "https:" || raw == "http:") return ""
+            return if (raw.startsWith("http://") || raw.startsWith("https://")) raw else "https://$raw"
+        }
 
     @Volatile private var cachedFcmToken: String? = null
 

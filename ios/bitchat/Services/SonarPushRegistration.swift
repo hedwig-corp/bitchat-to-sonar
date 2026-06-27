@@ -39,8 +39,19 @@ final class SonarPushRegistration {
         Bundle.main.infoDictionary?["TRANSPONDER_NPUB"] as? String ?? ""
     }
 
+    /// Base URL of the Breez NDS, e.g. `https://nds.sonar.hedwig.sh`.
+    ///
+    /// The value is configured in `Local.xcconfig` as a BARE HOST (no scheme),
+    /// because xcconfig treats `//` as a comment and silently truncates
+    /// `https://host` to `https:`. We prepend the scheme here and reject the
+    /// truncated `https:`/`http:` sentinels so a malformed webhook URL can never
+    /// be registered with Boltz (which would leave offline receive broken).
     private var ndsUrl: String {
-        Bundle.main.infoDictionary?["NDS_URL"] as? String ?? ""
+        let raw = (Bundle.main.infoDictionary?["NDS_URL"] as? String ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty, raw != "https:", raw != "http:" else { return "" }
+        if raw.hasPrefix("http://") || raw.hasPrefix("https://") { return raw }
+        return "https://\(raw)"
     }
 
     private init() {}

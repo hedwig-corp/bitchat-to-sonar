@@ -4,6 +4,7 @@ DEVELOPMENT_TEAM = ABC123
 // Unique bundle id to be able to register and run locally
 PRODUCT_BUNDLE_IDENTIFIER = chat.bitchat.$(DEVELOPMENT_TEAM)
 
-// Push notification servers (silent wakeup)
-NDS_URL = https://nds.sonar.hedwig.sh
-TRANSPONDER_NPUB = npub1606vwj2ztjw8vc9n4ljqgk8phmmq24r8ckt7l42sy97tte0nscqqfdj406
+// Push notification endpoints (NDS_URL, TRANSPONDER_NPUB) are non-secret
+// committed defaults in Release.xcconfig — you do NOT need to set them here.
+// Add BREEZ_API_KEY below (the only real secret).
+// BREEZ_API_KEY = <your Breez API key>
