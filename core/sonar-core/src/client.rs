@@ -35,9 +35,8 @@ use crate::marmot::{
 };
 use crate::outbox::{outbox_state_path_for_db, OutboxState};
 use crate::sonar_descriptor::{
-    descriptor_content_json, descriptor_d_tags, descriptor_tags, meta_descriptor_content_json,
-    parse_descriptor_event, SonarDescriptor, SONAR_CALL_DESCRIPTOR_D_TAG, SONAR_DESCRIPTOR_KIND,
-    SONAR_META_DESCRIPTOR_D_TAG,
+    descriptor_d_tags, descriptor_events, descriptor_tags, parse_descriptor_event, SonarDescriptor,
+    SONAR_DESCRIPTOR_KIND, SONAR_META_DESCRIPTOR_D_TAG,
 };
 use crate::{Error, Result};
 
@@ -957,17 +956,17 @@ impl SonarClient {
         signaling: Vec<String>,
         bolt12_offer: Option<String>,
     ) -> Result<()> {
-        // Migration: publish the old call-only descriptor for old clients and
-        // the new unified metadata descriptor for direct BOLT12 payments.
-        let call_content = descriptor_content_json(calls_enabled, signaling.clone())?;
-        let call_builder = EventBuilder::new(Kind::Custom(SONAR_DESCRIPTOR_KIND), call_content)
-            .tags(descriptor_tags(SONAR_CALL_DESCRIPTOR_D_TAG));
-        self.nostr.send_event_builder(call_builder).await?;
-
-        let meta_content = meta_descriptor_content_json(calls_enabled, signaling, bolt12_offer)?;
-        let meta_builder = EventBuilder::new(Kind::Custom(SONAR_DESCRIPTOR_KIND), meta_content)
-            .tags(descriptor_tags(SONAR_META_DESCRIPTOR_D_TAG));
-        self.nostr.send_event_builder(meta_builder).await?;
+        // Publish the legacy call-only descriptor (old clients + call discovery
+        // without a wallet) and, ONLY when we actually have an offer, the unified
+        // meta descriptor that carries it. Both are replaceable events, so
+        // emitting the meta with `None` would clobber a previously-published
+        // offer on the relays and make us unpayable — an offer-less / not-yet-
+        // ready publish must never wipe a known offer. See `descriptor_events`.
+        for (d_tag, content) in descriptor_events(calls_enabled, signaling, bolt12_offer)? {
+            let builder = EventBuilder::new(Kind::Custom(SONAR_DESCRIPTOR_KIND), content)
+                .tags(descriptor_tags(d_tag));
+            self.nostr.send_event_builder(builder).await?;
+        }
         Ok(())
     }
 
@@ -3024,13 +3023,36 @@ fn newest_valid_sonar_descriptor(
     events: impl IntoIterator<Item = Event>,
     author: PublicKey,
 ) -> Option<SonarDescriptor> {
-    let mut descriptors: Vec<SonarDescriptor> = events
-        .into_iter()
-        .filter(|event| event.pubkey == author)
-        .filter_map(|event| parse_descriptor_event(&event))
-        .collect();
-    descriptors.sort_by_key(|descriptor| std::cmp::Reverse(descriptor.published_at_secs));
-    descriptors.into_iter().next()
+    let mut newest: Option<SonarDescriptor> = None;
+    let mut newest_meta: Option<SonarDescriptor> = None;
+    for event in events.into_iter().filter(|event| event.pubkey == author) {
+        let is_meta =
+            tag_value(&event, Alphabet::D).as_deref() == Some(SONAR_META_DESCRIPTOR_D_TAG);
+        let Some(descriptor) = parse_descriptor_event(&event) else {
+            continue;
+        };
+        if newest.as_ref().map_or(true, |current| {
+            descriptor.published_at_secs > current.published_at_secs
+        }) {
+            newest = Some(descriptor.clone());
+        }
+        if is_meta
+            && newest_meta.as_ref().map_or(true, |current| {
+                descriptor.published_at_secs > current.published_at_secs
+            })
+        {
+            newest_meta = Some(descriptor);
+        }
+    }
+
+    let mut descriptor = newest?;
+    if descriptor.bolt12_offer.is_none() {
+        if let Some(meta) = newest_meta {
+            descriptor.bolt12_offer = meta.bolt12_offer;
+            descriptor.payment_receipts = meta.payment_receipts;
+        }
+    }
+    Some(descriptor)
 }
 
 fn sort_marmot_events_in_place(events: &mut [Event]) {
@@ -3077,6 +3099,9 @@ fn require_relay_success(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sonar_descriptor::{
+        descriptor_content_json, meta_descriptor_content_json, SONAR_CALL_DESCRIPTOR_D_TAG,
+    };
     use std::collections::{HashMap, HashSet};
 
     fn signed_event(keys: &Keys, created_at_secs: u64, content: &str) -> Event {
@@ -3136,20 +3161,15 @@ mod tests {
     }
 
     #[test]
-    fn newest_valid_sonar_descriptor_uses_freshest_event_across_d_tags() {
+    fn newest_valid_sonar_descriptor_preserves_offer_from_freshest_meta() {
         let keys = Keys::generate();
-        let stale_offer =
-            "lno1qsgqmqvgm96frzdg8m0gc6nzeqffvzsqzrxqy32afmr3jn9ggl9g2s8sugfvxn4xqzqxqsq";
+        let offer = "lno1qsgqmqvgm96frzdg8m0gc6nzeqffvzsqzrxqy32afmr3jn9ggl9g2s8sugfvxn4xqzqxqsq";
         let old_meta = signed_descriptor_event(
             &keys,
             SONAR_META_DESCRIPTOR_D_TAG,
             10,
-            meta_descriptor_content_json(
-                true,
-                vec!["marmot".to_string()],
-                Some(stale_offer.to_string()),
-            )
-            .expect("meta descriptor json"),
+            meta_descriptor_content_json(true, vec!["marmot".to_string()], Some(offer.to_string()))
+                .expect("meta descriptor json"),
         );
         let new_call = signed_descriptor_event(
             &keys,
@@ -3163,7 +3183,46 @@ mod tests {
             .expect("freshest descriptor");
 
         assert_eq!(descriptor.published_at_secs, 20);
+        assert_eq!(descriptor.bolt12_offer, Some(offer.to_string()));
+        assert_eq!(
+            descriptor.payment_receipts,
+            vec!["sonar.payment.receipt.v1".to_string()]
+        );
+    }
+
+    #[test]
+    fn newest_valid_sonar_descriptor_respects_freshest_meta_without_offer() {
+        let keys = Keys::generate();
+        let offer = "lno1qsgqmqvgm96frzdg8m0gc6nzeqffvzsqzrxqy32afmr3jn9ggl9g2s8sugfvxn4xqzqxqsq";
+        let old_meta = signed_descriptor_event(
+            &keys,
+            SONAR_META_DESCRIPTOR_D_TAG,
+            10,
+            meta_descriptor_content_json(true, vec!["marmot".to_string()], Some(offer.to_string()))
+                .expect("meta descriptor json"),
+        );
+        let clear_meta = signed_descriptor_event(
+            &keys,
+            SONAR_META_DESCRIPTOR_D_TAG,
+            20,
+            meta_descriptor_content_json(true, vec!["marmot".to_string()], None)
+                .expect("meta descriptor json"),
+        );
+        let new_call = signed_descriptor_event(
+            &keys,
+            SONAR_CALL_DESCRIPTOR_D_TAG,
+            30,
+            descriptor_content_json(true, vec!["marmot".to_string()])
+                .expect("call descriptor json"),
+        );
+
+        let descriptor =
+            newest_valid_sonar_descriptor([old_meta, clear_meta, new_call], keys.public_key())
+                .expect("freshest descriptor");
+
+        assert_eq!(descriptor.published_at_secs, 30);
         assert!(descriptor.bolt12_offer.is_none());
+        assert!(descriptor.payment_receipts.is_empty());
     }
 
     #[test]

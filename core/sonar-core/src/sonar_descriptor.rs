@@ -171,6 +171,33 @@ pub fn meta_descriptor_content_json(
     ))
 }
 
+/// The descriptor events that should be (re)published for the current readiness
+/// state, as `(d_tag, content_json)` pairs.
+///
+/// The call descriptor (`sonar.call.v1`) is always emitted so calls stay
+/// discoverable even without a wallet. The meta descriptor (`sonar.meta.v1`),
+/// which carries the `bolt12_offer`, is emitted ONLY when an offer is present.
+/// Both are replaceable events, so republishing the meta with `None` would
+/// CLOBBER a peer's previously-published offer and make them unpayable — a
+/// wallet-less / not-yet-ready publish must never wipe a known offer.
+pub fn descriptor_events(
+    calls_enabled: bool,
+    signaling: Vec<String>,
+    bolt12_offer: Option<String>,
+) -> serde_json::Result<Vec<(&'static str, String)>> {
+    let mut events = vec![(
+        SONAR_CALL_DESCRIPTOR_D_TAG,
+        descriptor_content_json(calls_enabled, signaling.clone())?,
+    )];
+    if bolt12_offer.is_some() {
+        events.push((
+            SONAR_META_DESCRIPTOR_D_TAG,
+            meta_descriptor_content_json(calls_enabled, signaling, bolt12_offer)?,
+        ));
+    }
+    Ok(events)
+}
+
 pub fn descriptor_tags(d_tag: &str) -> Vec<Tag> {
     vec![
         Tag::custom(
@@ -317,6 +344,35 @@ mod tests {
         assert_eq!(parsed.schema, META_SCHEMA);
         assert!(parsed.bolt12_offer.is_none());
         assert!(parsed.payment_receipts.is_empty());
+    }
+
+    #[test]
+    fn descriptor_events_omit_meta_when_offer_absent() {
+        // No offer: only the call descriptor is emitted, so an offer-less /
+        // not-yet-ready publish can never clobber a previously-published offer.
+        let only_call = descriptor_events(true, default_signaling_routes(), None).expect("events");
+        assert_eq!(only_call.len(), 1);
+        assert_eq!(only_call[0].0, SONAR_CALL_DESCRIPTOR_D_TAG);
+
+        // With an offer: both the call and meta descriptors are emitted, and the
+        // meta carries the offer.
+        let offer = "lno1qsgqmqvgm96frzdg8m0gc6nzeqffvzsqzrxqy32afmr3jn9ggl9g2s8sugfvxn4xqzqxqsq"
+            .to_string();
+        let with_offer = descriptor_events(true, default_signaling_routes(), Some(offer.clone()))
+            .expect("events");
+        assert_eq!(with_offer.len(), 2);
+        assert!(with_offer
+            .iter()
+            .any(|(d, _)| *d == SONAR_CALL_DESCRIPTOR_D_TAG));
+        assert!(with_offer
+            .iter()
+            .any(|(d, _)| *d == SONAR_META_DESCRIPTOR_D_TAG));
+        let meta = with_offer
+            .iter()
+            .find(|(d, _)| *d == SONAR_META_DESCRIPTOR_D_TAG)
+            .map(|(_, c)| c)
+            .expect("meta event");
+        assert!(meta.contains(&offer));
     }
 
     #[test]
