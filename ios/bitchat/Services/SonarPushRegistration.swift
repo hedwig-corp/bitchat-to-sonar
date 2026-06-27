@@ -34,6 +34,7 @@ final class SonarPushRegistration {
     /// Persisted fingerprint of the last successful webhook subscription
     /// (sha256 of offer|fcmToken|ndsUrl). Lets us skip redundant re-subscribes.
     private static let webhookMarkerKey = "breez_webhook_marker"
+    private static let webhookMarkerVersion = "ios-fcm-explicit-token-v2"
 
     private var transponderNpub: String {
         Bundle.main.infoDictionary?["TRANSPONDER_NPUB"] as? String ?? ""
@@ -168,6 +169,7 @@ final class SonarPushRegistration {
             // Idempotent: skip when offer + token + NDS are unchanged since the last
             // successful subscription.
             if UserDefaults.standard.string(forKey: Self.webhookMarkerKey) == marker {
+                Self.log.info("Breez NDS webhook already current for receive offer")
                 return
             }
             do {
@@ -188,7 +190,7 @@ final class SonarPushRegistration {
     }
 
     private static func webhookMarker(offer: String, fcmToken: String, ndsUrl: String) -> String {
-        let digest = SHA256.hash(data: Data("\(offer)|\(fcmToken)|\(ndsUrl)".utf8))
+        let digest = SHA256.hash(data: Data("\(webhookMarkerVersion)|\(offer)|\(fcmToken)|\(ndsUrl)".utf8))
         return digest.map { String(format: "%02x", $0) }.joined()
     }
 }
