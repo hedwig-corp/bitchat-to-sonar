@@ -137,6 +137,11 @@ breez_sha256() {
     "0.11.13|linux-aarch64")  echo "38ffe3af352277bd6b9ef4f07e740d53133936a0c629060e9f5b76d22c58f54f" ;;
     "0.11.13|linux-amd64")    echo "656d228c168da625745d18ecd545c1ebee76db9e78ebd6b09937c3cc17eebc2c" ;;
     "0.11.13|windows-amd64")  echo "718a8305a03dfbc71fedd18c2566933f1b4dd1d25f92a1032c9d3c9ca2435c40" ;;
+    "0.12.4|darwin-aarch64")  echo "8600128aa5fb938c30e833b8b2006ec014e29a8cee814cbaa85816435047f891" ;;
+    "0.12.4|darwin-amd64")    echo "92598a6cdca5b5e88de94ddf2989f1c783152302258b804c22fd26572ff5c9c2" ;;
+    "0.12.4|linux-aarch64")   echo "12958a83eb857d7b42db993dee25446c53c1f53b35aaac4bb1be1d76796a2640" ;;
+    "0.12.4|linux-amd64")     echo "738ce9346f10abb39affa5d0c22e2d4c520a2a6afcfdfb620ad9ee8e2fdedccd" ;;
+    "0.12.4|windows-amd64")   echo "de85bb227d7d3a5c4b9de692dbea2a8a64ab984e8afb0a9d7e25e64a0d957957" ;;
     *) echo "" ;;
   esac
 }

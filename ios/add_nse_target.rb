@@ -10,7 +10,7 @@ NSE_NAME = 'SonarNotificationService'
 APP_TARGET = 'bitchat_iOS'
 TEAM = 'ZQB239SHCM'
 BREEZ_URL = 'https://github.com/breez/breez-sdk-liquid-swift'
-BREEZ_VER = '0.11.13'
+BREEZ_VER = '0.12.4'
 
 # 1) Make the objv90 array-form shellScript parseable by the gem (string form).
 text = File.read(PBX)
