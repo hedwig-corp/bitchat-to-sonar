@@ -19,6 +19,7 @@ import chat.bitchat.sonar.crypto.Bech32
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -106,13 +107,44 @@ actual object WalletBridge {
             try {
                 val amount: PayAmount? =
                     if (amountSats > 0) PayAmount.Bitcoin(amountSats.toULong()) else null
-                val prepared = node.prepareSendPayment(PrepareSendRequest(destination.trim(), amount))
+                // prepareSendPayment runs the swapper bolt12/fetch, which
+                // intermittently times out ("could not contact servers") when the
+                // direct connection to swap.breez.technology (Fly.io) stalls. Retry
+                // ONLY the prepare step — a read-only fetch, safe to repeat. Never
+                // retry sendPayment: a lost response after broadcast could double-pay.
+                val prepared = retryTransientConnectivity {
+                    node.prepareSendPayment(PrepareSendRequest(destination.trim(), amount))
+                }
                 val resp = node.sendPayment(SendPaymentRequest(prepared, null, note.ifBlank { null }))
                 val preimage = (resp.payment.details as? PaymentDetails.Lightning)?.preimage
                 refreshBalance()
                 SendResult(true, preimage)
             } catch (t: Throwable) { SendResult(false) }
         }
+
+    /** Retry a read-only SDK call on transient "could not contact servers" /
+     * timeout errors (the swapper bolt12/fetch flakiness). Non-connectivity
+     * errors (insufficient funds, invalid destination, …) rethrow immediately. */
+    private suspend fun <T> retryTransientConnectivity(maxAttempts: Int = 3, op: () -> T): T {
+        var attempt = 0
+        while (true) {
+            try {
+                return op()
+            } catch (t: Throwable) {
+                attempt++
+                if (attempt >= maxAttempts || !isTransientConnectivity(t)) throw t
+                delay(attempt * 1500L) // 1.5s, 3s
+            }
+        }
+    }
+
+    private fun isTransientConnectivity(t: Throwable): Boolean {
+        val s = (t.message ?: t.toString()).lowercase()
+        return s.contains("could not contact servers") ||
+            s.contains("timedout") || s.contains("timed out") ||
+            s.contains("error sending request") ||
+            s.contains("serviceconnectivity")
+    }
 
     actual suspend fun fetchRates(): List<ExchangeRate> = withContext(Dispatchers.IO) {
         val node = sdk ?: return@withContext emptyList()

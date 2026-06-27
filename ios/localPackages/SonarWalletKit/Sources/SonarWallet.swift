@@ -327,10 +327,47 @@ public final class SonarWallet {
         guard let node = sdk else { throw WalletError.notConfigured }
         return try await run {
             let amount: PayAmount? = amountSats > 0 ? .bitcoin(receiverAmountSat: UInt64(amountSats)) : nil
-            let prepared = try node.prepareSendPayment(req: PrepareSendRequest(destination: destination, amount: amount))
+            // `prepareSendPayment` performs the swapper bolt12/fetch
+            // (POST swap.breez.technology/v2/lightning/BTC/bolt12/fetch), which
+            // intermittently times out ("Could not contact servers") when the
+            // direct connection to that Fly.io host stalls. Retry ONLY the prepare
+            // step — it is a read-only fetch, so it is safe to repeat. The
+            // `sendPayment` step is NEVER retried here: a lost response after a
+            // broadcast could double-pay. Non-connectivity errors (insufficient
+            // funds, invalid destination, …) are rethrown immediately.
+            let prepared = try Self.retryingTransientConnectivity {
+                try node.prepareSendPayment(req: PrepareSendRequest(destination: destination, amount: amount))
+            }
             let resp = try node.sendPayment(req: SendPaymentRequest(prepareResponse: prepared, useAssetFees: nil, payerNote: note.isEmpty ? nil : note))
             return Self.map(resp.payment)
         }
+    }
+
+    /// Retry a read-only SDK call on transient "could not contact servers" /
+    /// timeout errors (the swapper `bolt12/fetch` flakiness). Best-effort: each
+    /// attempt re-races the connection, which sometimes warms up between tries.
+    /// Runs on the serial wallet queue, so the backoff sleep is synchronous.
+    private static func retryingTransientConnectivity<T>(maxAttempts: Int = 3, _ op: () throws -> T) throws -> T {
+        var attempt = 0
+        while true {
+            do { return try op() }
+            catch {
+                attempt += 1
+                guard attempt < maxAttempts, isTransientConnectivity(error) else { throw error }
+                Thread.sleep(forTimeInterval: Double(attempt) * 1.5) // 1.5s, 3s
+            }
+        }
+    }
+
+    /// Classify by the SDK error's text (robust across SDK versions / the
+    /// `WalletError.core("...")` wrapping). Matches only network-transport
+    /// failures — never funds/validation errors.
+    private static func isTransientConnectivity(_ error: Error) -> Bool {
+        let s = String(describing: error).lowercased()
+        return s.contains("could not contact servers")
+            || s.contains("timedout") || s.contains("timed out")
+            || s.contains("error sending request")
+            || s.contains("serviceconnectivity")
     }
 
     /// Lightweight classification (no node round-trip) so the composer can label a
