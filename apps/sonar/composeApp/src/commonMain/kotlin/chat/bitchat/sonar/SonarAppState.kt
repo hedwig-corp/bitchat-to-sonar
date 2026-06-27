@@ -994,6 +994,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (published) {
                 publishedSonarDescriptor = true
                 publishedSonarDescriptorBolt12Offer = offer
+                if (offer != null) Notifier.onPaymentOfferReady(offer)
             }
         } finally {
             publishingSonarDescriptor = false

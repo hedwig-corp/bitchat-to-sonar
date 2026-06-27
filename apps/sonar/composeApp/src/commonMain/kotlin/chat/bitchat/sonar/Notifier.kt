@@ -12,6 +12,9 @@ expect object Notifier {
     /** Called after the wallet reaches Ready — retries push webhook registration
      *  that was deferred because the wallet was not connected at startup. */
     fun onWalletReady()
+    /** Called after a BOLT12 receive offer is published so mobile push can bind
+     *  the Breez NDS webhook to the exact offer used by offline payers. */
+    fun onPaymentOfferReady(offer: String)
     /** Re-register or unregister push tokens when the user toggles push in settings. */
     fun setPushEnabled(enabled: Boolean)
 }

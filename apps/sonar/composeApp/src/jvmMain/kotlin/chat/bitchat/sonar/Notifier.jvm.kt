@@ -39,6 +39,8 @@ actual object Notifier {
 
     actual fun onWalletReady() { /* no push webhooks on desktop */ }
 
+    actual fun onPaymentOfferReady(offer: String) { /* no push webhooks on desktop */ }
+
     actual fun setPushEnabled(enabled: Boolean) { /* no push on desktop */ }
 
     actual fun notify(id: Int, title: String, body: String) {
