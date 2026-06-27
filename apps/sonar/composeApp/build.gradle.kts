@@ -201,10 +201,14 @@ android {
             val f = rootProject.file("local.properties")
             if (f.exists()) f.inputStream().use { load(it) }
         }
+        // Push endpoints are non-secret committed defaults (public DNS host +
+        // public npub) so every build registers a wakeup webhook. A peer with
+        // an empty NDS_URL never registers one and can never be woken to answer
+        // a payment. Override via local.properties for a private push stack.
         buildConfigField("String", "TRANSPONDER_NPUB",
-            "\"${lp.getProperty("sonar.transponder.npub", "")}\"")
+            "\"${lp.getProperty("sonar.transponder.npub", "npub1606vwj2ztjw8vc9n4ljqgk8phmmq24r8ckt7l42sy97tte0nscqqfdj406")}\"")
         buildConfigField("String", "NDS_URL",
-            "\"${lp.getProperty("sonar.nds.url", "")}\"")
+            "\"${lp.getProperty("sonar.nds.url", "https://nds.sonar.hedwig.sh")}\"")
     }
 
     buildFeatures {

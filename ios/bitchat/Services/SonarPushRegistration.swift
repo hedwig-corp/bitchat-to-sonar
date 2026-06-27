@@ -31,17 +31,30 @@ final class SonarPushRegistration {
     private var sonarNode: SonarNode?
     private let queue = DispatchQueue(label: "chat.bitchat.sonar.push.registration")
 
-    /// Persisted fingerprint of the last successful webhook subscription
-    /// (sha256 of offer|fcmToken|ndsUrl). Lets us skip redundant re-subscribes.
+    /// Persisted only for diagnostics; do not use it as a cross-launch skip.
+    /// Boltz owns the authoritative offer webhook state, and a stale local marker
+    /// can otherwise suppress the unregister -> register self-heal.
     private static let webhookMarkerKey = "breez_webhook_marker"
     private static let webhookMarkerVersion = "ios-fcm-explicit-token-v2"
+    private var sessionWebhookMarker: String?
 
     private var transponderNpub: String {
         Bundle.main.infoDictionary?["TRANSPONDER_NPUB"] as? String ?? ""
     }
 
+    /// Base URL of the Breez NDS, e.g. `https://nds.sonar.hedwig.sh`.
+    ///
+    /// The value is configured in `Local.xcconfig` as a BARE HOST (no scheme),
+    /// because xcconfig treats `//` as a comment and silently truncates
+    /// `https://host` to `https:`. We prepend the scheme here and reject the
+    /// truncated `https:`/`http:` sentinels so a malformed webhook URL can never
+    /// be registered with Boltz (which would leave offline receive broken).
     private var ndsUrl: String {
-        Bundle.main.infoDictionary?["NDS_URL"] as? String ?? ""
+        let raw = (Bundle.main.infoDictionary?["NDS_URL"] as? String ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty, raw != "https:", raw != "http:" else { return "" }
+        if raw.hasPrefix("http://") || raw.hasPrefix("https://") { return raw }
+        return "https://\(raw)"
     }
 
     private init() {}
@@ -100,6 +113,7 @@ final class SonarPushRegistration {
         queue.async {
             self.cachedAPNSToken = nil
             self.cachedOffer = nil
+            self.sessionWebhookMarker = nil
         }
         // Force a fresh subscribe next time (e.g. after a wallet/seed change).
         UserDefaults.standard.removeObject(forKey: Self.webhookMarkerKey)
@@ -154,22 +168,28 @@ final class SonarPushRegistration {
     }
 
     private func subscribeBreezWebhook(offer: String, fcmToken: String, wallet: WalletBridgeService?) {
-        guard !ndsUrl.isEmpty else { return }
+        guard let webhookUrl = Self.webhookUrl(ndsUrl: ndsUrl, platform: "ios", fcmToken: fcmToken) else {
+            Self.log.warning("Breez NDS disabled: invalid NDS_URL build setting")
+            return
+        }
         guard let wallet else {
             Self.log.info("Breez NDS: wallet not ready, will retry after wallet setup")
             return
         }
-        let webhookUrl = "\(ndsUrl)/api/v1/notify?platform=ios&token=\(fcmToken)"
-        let marker = Self.webhookMarker(offer: offer, fcmToken: fcmToken, ndsUrl: ndsUrl)
+        let marker = Self.webhookMarker(offer: offer, webhookUrl: webhookUrl)
+        if sessionWebhookMarker == marker {
+            Self.log.info("Breez NDS webhook re-subscribe already queued for current offer")
+            return
+        }
+        sessionWebhookMarker = marker
         Task { @MainActor in
             guard case .ready = wallet.state else {
                 Self.log.info("Breez NDS: wallet not ready, will retry after wallet setup")
-                return
-            }
-            // Idempotent: skip when offer + token + NDS are unchanged since the last
-            // successful subscription.
-            if UserDefaults.standard.string(forKey: Self.webhookMarkerKey) == marker {
-                Self.log.info("Breez NDS webhook already current for receive offer")
+                self.queue.async {
+                    if self.sessionWebhookMarker == marker {
+                        self.sessionWebhookMarker = nil
+                    }
+                }
                 return
             }
             do {
@@ -182,15 +202,40 @@ final class SonarPushRegistration {
                 try? await wallet.unregisterWebhook()
                 try await wallet.registerWebhook(url: webhookUrl)
                 UserDefaults.standard.set(marker, forKey: Self.webhookMarkerKey)
-                Self.log.info("Breez NDS webhook (re)subscribed for current offer (FCM)")
+                Self.log.info("Breez NDS webhook force re-subscribed for current offer (FCM)")
             } catch {
+                self.queue.async {
+                    if self.sessionWebhookMarker == marker {
+                        self.sessionWebhookMarker = nil
+                    }
+                }
                 Self.log.warning("Breez NDS webhook registration failed: \(error)")
             }
         }
     }
 
-    private static func webhookMarker(offer: String, fcmToken: String, ndsUrl: String) -> String {
-        let digest = SHA256.hash(data: Data("\(webhookMarkerVersion)|\(offer)|\(fcmToken)|\(ndsUrl)".utf8))
+    private static func webhookUrl(ndsUrl: String, platform: String, fcmToken: String) -> String? {
+        let raw = ndsUrl.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard var components = URLComponents(string: raw),
+              let scheme = components.scheme?.lowercased(),
+              scheme == "https" || scheme == "http",
+              components.host?.isEmpty == false
+        else { return nil }
+
+        var path = components.path
+        if path.hasSuffix("/") {
+            path.removeLast()
+        }
+        components.path = "\(path)/api/v1/notify"
+        var queryItems = components.queryItems ?? []
+        queryItems.append(URLQueryItem(name: "platform", value: platform))
+        queryItems.append(URLQueryItem(name: "token", value: fcmToken))
+        components.queryItems = queryItems
+        return components.url?.absoluteString
+    }
+
+    private static func webhookMarker(offer: String, webhookUrl: String) -> String {
+        let digest = SHA256.hash(data: Data("\(webhookMarkerVersion)|\(offer)|\(webhookUrl)".utf8))
         return digest.map { String(format: "%02x", $0) }.joined()
     }
 }

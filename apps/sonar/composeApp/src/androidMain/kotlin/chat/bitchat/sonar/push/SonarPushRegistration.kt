@@ -1,8 +1,7 @@
 package chat.bitchat.sonar.push
 
-import android.content.Context
+import android.net.Uri
 import android.util.Log
-import chat.bitchat.sonar.AppContextHolder
 import chat.bitchat.sonar.BuildConfig
 import chat.bitchat.sonar.SonarCore
 import chat.bitchat.sonar.wallet.WalletBridge
@@ -24,16 +23,23 @@ object SonarPushRegistration {
 
     private const val TAG = "SonarPush"
     private const val MAX_RETRIES = 3
-    private const val PREFS = "sonar_push"
-    private const val WEBHOOK_MARKER = "breez_webhook_marker"
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private val transponderNpub: String get() = BuildConfig.TRANSPONDER_NPUB
-    private val ndsUrl: String get() = BuildConfig.NDS_URL
-    private val prefs get() = AppContextHolder.ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+    // Base URL of the Breez NDS. Tolerates a bare host (prepends https://) and
+    // rejects the truncated "https:"/"http:" sentinels, mirroring iOS, so a
+    // malformed webhook URL can never be registered (which breaks offline pay).
+    private val ndsUrl: String
+        get() {
+            val raw = BuildConfig.NDS_URL.trim()
+            if (raw.isEmpty() || raw == "https:" || raw == "http:") return ""
+            return if (raw.startsWith("http://") || raw.startsWith("https://")) raw else "https://$raw"
+        }
 
     @Volatile private var cachedFcmToken: String? = null
     @Volatile private var cachedOffer: String? = null
+    @Volatile private var sessionWebhookMarker: String? = null
 
     fun ensureRegistered() {
         if (transponderNpub.isBlank() && ndsUrl.isBlank()) {
@@ -61,7 +67,8 @@ object SonarPushRegistration {
      * The Breez webhook is offer-scoped on the swap server. Registering only the
      * FCM token can leave an existing BOLT12 offer with a stale/missing webhook,
      * so coordinate token + current offer and force a re-subscribe when either
-     * changes. Mirrors the iOS `unregisterWebhook` -> `registerWebhook` path.
+     * changes. Mirrors the iOS `unregisterWebhook` -> `registerWebhook` path,
+     * without trusting a persisted local marker across app launches.
      */
     fun ensureBreezWebhook(offer: String) {
         cachedOffer = offer
@@ -114,16 +121,24 @@ object SonarPushRegistration {
             Log.d(TAG, "Breez NDS: wallet not ready, will retry after wallet setup")
             return
         }
-        val webhookUrl = "$ndsUrl/api/v1/notify?platform=android&token=$fcmToken"
-        val marker = webhookMarker(offer, fcmToken, ndsUrl)
-        if (prefs.getString(WEBHOOK_MARKER, null) == marker) return
+        val webhookUrl = webhookUrl(fcmToken)
+        if (webhookUrl == null) {
+            Log.w(TAG, "Breez NDS disabled: invalid NDS_URL build setting")
+            return
+        }
+        val marker = webhookMarker(offer, webhookUrl)
+        if (sessionWebhookMarker == marker) {
+            Log.d(TAG, "Breez NDS webhook re-subscribe already queued for current offer")
+            return
+        }
+        sessionWebhookMarker = marker
         scope.launch {
             try {
                 try { WalletBridge.unregisterWebhook() } catch (_: Exception) {}
                 WalletBridge.registerWebhook(webhookUrl)
-                prefs.edit().putString(WEBHOOK_MARKER, marker).apply()
-                Log.d(TAG, "Breez NDS webhook (re)subscribed for current offer")
+                Log.d(TAG, "Breez NDS webhook force re-subscribed for current offer")
             } catch (e: Exception) {
+                if (sessionWebhookMarker == marker) sessionWebhookMarker = null
                 Log.w(TAG, "Breez NDS webhook registration failed", e)
             }
         }
@@ -135,13 +150,27 @@ object SonarPushRegistration {
         }
         cachedFcmToken = null
         cachedOffer = null
-        prefs.edit().remove(WEBHOOK_MARKER).apply()
+        sessionWebhookMarker = null
         Log.d(TAG, "Unregistered from push servers")
     }
 
-    private fun webhookMarker(offer: String, fcmToken: String, ndsUrl: String): String {
+    private fun webhookUrl(fcmToken: String): String? {
+        val uri = runCatching { Uri.parse(ndsUrl.trim()) }.getOrNull() ?: return null
+        val scheme = uri.scheme?.lowercase()
+        if ((scheme != "https" && scheme != "http") || uri.host.isNullOrBlank()) return null
+        return uri.buildUpon()
+            .appendPath("api")
+            .appendPath("v1")
+            .appendPath("notify")
+            .appendQueryParameter("platform", "android")
+            .appendQueryParameter("token", fcmToken)
+            .build()
+            .toString()
+    }
+
+    private fun webhookMarker(offer: String, webhookUrl: String): String {
         val bytes = MessageDigest.getInstance("SHA-256")
-            .digest("$offer|$fcmToken|$ndsUrl".toByteArray(Charsets.UTF_8))
+            .digest("$offer|$webhookUrl".toByteArray(Charsets.UTF_8))
         return bytes.joinToString(separator = "") { "%02x".format(it.toInt() and 0xff) }
     }
 }
