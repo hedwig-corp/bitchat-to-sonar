@@ -87,6 +87,12 @@ Verification:
 
 ## Slice 3: BLE Mesh Media
 
+Status: implemented in the 2026-06-27 mesh media slice for Android source:
+Android can send and receive private BLE `0x22` file-transfer packets, persist
+local mesh media blobs, and render them through the existing media bubble path.
+Hardware smoke remains required for Android/iOS image and voice-note exchange
+after rebuilding native FFI artifacts from the updated Rust core.
+
 Goal: match iOS media behavior when two peers are physically nearby.
 
 Deliverables:
@@ -101,6 +107,13 @@ Deliverables:
 - Persist received BLE media metadata and blobs through the existing message
   store.
 
+Tracked gap:
+
+- Android emits large file-transfer frames as directed v2 packets from Kotlin
+  because the currently generated FFI exposes only the v1 signed packet builder.
+  The next native-FFI regeneration should add a signed v2 builder so large
+  outbound media has the same signature shape as iOS.
+
 Verification:
 
 - Rust/FFI tests for file-packet wire format.
@@ -109,6 +122,12 @@ Verification:
   voice-note send/receive.
 
 ## Slice 4: Plain Bitchat Out-of-Range Fallback
+
+Status: not implemented in this PR. The explorer pass found this is a shared
+core API gap, not only an Android routing gap: `sonar-core` currently exposes
+geohash-scoped NIP-17 DMs and Marmot account gift-wrap processing, but no
+account-identity direct NIP-17 send/drain API for plain mutual-favorite bitchat
+peers.
 
 Goal: bring iOS favorite/NIP-17 delivery to Android for non-Sonar bitchat peers.
 
@@ -129,16 +148,21 @@ Verification:
 
 ## Slice 5: Remaining UX and Safety Polish
 
+Status: partially implemented in the 2026-06-27 parity polish slice. Delivery
+state text is normalized through a shared helper with tests. Report/moderation
+actions remain product/backend-gated because neither platform has a completed
+report backend to call.
+
 Goal: close smaller parity gaps after command, safety, and transport-critical work.
 
 Deliverables:
 
-- Add geohash author block/report sheet parity if still present on iOS after
-  Slice 2.
+- Keep geohash author block parity; do not add a fake report action until a
+  product/backend report path exists on both app surfaces.
 - Tighten delivery status copy where Compose still differs from
   `SonarAppStore.stateText`.
 - Add Android instrumentation smoke coverage for secure-store migration when
-  device CI is available.
+  device CI is available; this remains device-CI gated.
 
 Verification:
 

@@ -1380,10 +1380,10 @@ private fun MessageBubble(m: SonarMsg, mesh: Boolean = false, author: String? = 
 
 @Composable
 private fun MessageStatusFooter(m: SonarMsg, mesh: Boolean) {
-    val state = m.state ?: return
+    val state = sonarDeliveryLabel(m.state) ?: return
     val s = sonar
-    val pending = state == "Sending" || state == "Uploading"
-    val failed = state == "Couldn't send"
+    val pending = sonarDeliveryPending(state)
+    val failed = sonarDeliveryFailed(state)
     Row(
         horizontalArrangement = Arrangement.spacedBy(3.dp),
         verticalAlignment = Alignment.CenterVertically,

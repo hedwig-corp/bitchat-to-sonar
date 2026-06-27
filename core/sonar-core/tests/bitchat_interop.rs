@@ -8,7 +8,7 @@
 
 use sonar_core::mesh::file_packet::{fragment, FilePacket};
 use sonar_core::mesh::fragment::{Fragment, Reassembler};
-use sonar_core::mesh::msg_type;
+use sonar_core::mesh::{msg_type, Packet};
 use sonar_core::noise::{NoiseHandshake, NoiseKeypair};
 
 /// Sonar's `FilePacket.encode()` must equal the bytes bitchat's
@@ -56,6 +56,55 @@ fn file_packet_round_trip_preserves_fields() {
     assert_eq!(decoded.file_size, Some(content.len() as u64));
     assert_eq!(decoded.mime_type.as_deref(), Some("image/jpeg"));
     assert_eq!(decoded.content, content);
+}
+
+/// iOS sends file-transfer packets as protocol v2 so payload length is u32
+/// and optional source-route bytes may appear before the payload. Android must
+/// decode these packets even though it still emits v1 for its own packets.
+#[test]
+fn v2_file_transfer_packet_decodes_like_ios() {
+    let payload = FilePacket {
+        file_name: Some("photo.jpg".to_string()),
+        file_size: None,
+        mime_type: Some("image/jpeg".to_string()),
+        content: vec![1, 2, 3, 4, 5],
+    }
+    .encode()
+    .expect("file payload");
+    let sender = [1, 2, 3, 4, 5, 6, 7, 8];
+    let recipient = [9, 10, 11, 12, 13, 14, 15, 16];
+    let route = [[0x21; 8], [0x22; 8]];
+
+    let mut raw = Vec::new();
+    raw.push(2); // version
+    raw.push(msg_type::FILE_TRANSFER);
+    raw.push(7); // ttl
+    raw.extend_from_slice(&1_234_567_890u64.to_be_bytes());
+    raw.push(0x01 | 0x02 | 0x08); // recipient + signature + route
+    raw.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    raw.extend_from_slice(&sender);
+    raw.extend_from_slice(&recipient);
+    raw.push(route.len() as u8);
+    for hop in route {
+        raw.extend_from_slice(&hop);
+    }
+    raw.extend_from_slice(&payload);
+    raw.extend_from_slice(&[0xAA; 64]);
+
+    let decoded = Packet::decode(&raw).expect("decode v2 packet");
+    assert_eq!(decoded.version, 2);
+    assert_eq!(decoded.type_, msg_type::FILE_TRANSFER);
+    assert_eq!(decoded.ttl, 7);
+    assert_eq!(decoded.timestamp, 1_234_567_890);
+    assert_eq!(decoded.sender_id, sender);
+    assert_eq!(decoded.recipient_id, Some(recipient));
+    assert_eq!(decoded.signature, Some([0xAA; 64]));
+    assert_eq!(decoded.payload, payload);
+
+    let file = FilePacket::decode(&decoded.payload).expect("decode file payload");
+    assert_eq!(file.file_name.as_deref(), Some("photo.jpg"));
+    assert_eq!(file.mime_type.as_deref(), Some("image/jpeg"));
+    assert_eq!(file.content, vec![1, 2, 3, 4, 5]);
 }
 
 /// Mirrors bitchat's `testDecodeFallsBackToContentSizeWhenFileSizeMissing`.

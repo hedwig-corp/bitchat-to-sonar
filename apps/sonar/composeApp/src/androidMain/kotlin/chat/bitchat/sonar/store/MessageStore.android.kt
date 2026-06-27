@@ -23,6 +23,10 @@ actual object MessageStore {
         return File(root(), "$name.txt")
     }
 
+    private fun hashName(input: String): String =
+        Sha256.hash(input.encodeToByteArray())
+            .joinToString("") { ((it.toInt() and 0xFF) + 0x100).toString(16).substring(1) }
+
     actual suspend fun loadChannel(geohash: String): List<SonarChannelMsg> = withContext(Dispatchers.IO) {
         val f = file("ch", geohash.lowercase())
         if (!f.exists()) return@withContext emptyList()
@@ -80,6 +84,22 @@ actual object MessageStore {
     actual suspend fun deleteMeshDm(peerKey: String): Unit = withContext(Dispatchers.IO) {
         runCatching { meshFile(peerKey).delete() }
         Unit
+    }
+
+    private fun meshMediaDir(): File = File(root(), "mesh-media").apply { mkdirs() }
+
+    private fun meshMediaFile(mediaUrl: String): File =
+        File(meshMediaDir(), "${hashName("mesh-media:$mediaUrl")}.bin")
+
+    actual suspend fun saveMeshMedia(mediaUrl: String, bytes: ByteArray): Unit = withContext(Dispatchers.IO) {
+        runCatching { meshMediaFile(mediaUrl).writeBytes(bytes) }
+        Unit
+    }
+
+    actual suspend fun loadMeshMedia(mediaUrl: String): ByteArray? = withContext(Dispatchers.IO) {
+        val f = meshMediaFile(mediaUrl)
+        if (!f.exists()) return@withContext null
+        runCatching { f.readBytes() }.getOrNull()
     }
 
     actual suspend fun wipe(): Unit = withContext(Dispatchers.IO) {

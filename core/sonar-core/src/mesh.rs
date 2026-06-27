@@ -8,10 +8,9 @@
 //! and the identity-announce TLV. Noise XX orchestration, fragmentation, and
 //! signing build on top of this in later modules.
 //!
-//! Scope of this layer: protocol **v1** (14-byte header), uncompressed, no
-//! source-route. That covers the two-phone interop path (announces + small
-//! DMs never trip the >256-byte compression threshold). v2/route/compression
-//! are additive and decode-reject for now (documented).
+//! Scope of this layer: protocol **v1** encode and protocol v1/v2 decode for
+//! uncompressed packets. v2 route bytes are skipped when present so current iOS
+//! file-transfer packets decode; compressed frames still decode-reject.
 
 /// bitchat packet types (`MessageType`, BitchatProtocol.swift). Only the ones
 /// the mesh foundation needs are named; others pass through as raw `u8`.
@@ -29,6 +28,7 @@ pub mod msg_type {
 }
 
 const V1_HEADER_SIZE: usize = 14;
+const V2_HEADER_SIZE: usize = 16;
 const SENDER_ID_SIZE: usize = 8;
 const RECIPIENT_ID_SIZE: usize = 8;
 const SIGNATURE_SIZE: usize = 64;
@@ -37,6 +37,7 @@ mod flags {
     pub const HAS_RECIPIENT: u8 = 0x01;
     pub const HAS_SIGNATURE: u8 = 0x02;
     pub const IS_COMPRESSED: u8 = 0x04;
+    pub const HAS_ROUTE: u8 = 0x08;
 }
 
 /// A decoded bitchat packet (v1). `sender_id`/`recipient_id` are the 8-byte
@@ -135,8 +136,16 @@ fn decode_core(raw: &[u8]) -> Option<Packet> {
     let mut o = 0usize;
     let version = raw[o];
     o += 1;
-    if version != 1 {
-        return None; // only v1 supported in this layer
+    if version != 1 && version != 2 {
+        return None;
+    }
+    let min_header = match version {
+        1 => V1_HEADER_SIZE + SENDER_ID_SIZE,
+        2 => V2_HEADER_SIZE + SENDER_ID_SIZE,
+        _ => return None,
+    };
+    if raw.len() < min_header {
+        return None;
     }
     let type_ = raw[o];
     o += 1;
@@ -152,12 +161,35 @@ fn decode_core(raw: &[u8]) -> Option<Packet> {
     let has_recipient = flags & flags::HAS_RECIPIENT != 0;
     let has_signature = flags & flags::HAS_SIGNATURE != 0;
     let is_compressed = flags & flags::IS_COMPRESSED != 0;
+    let has_route = version >= 2 && flags & flags::HAS_ROUTE != 0;
     if is_compressed {
         return None; // compression not handled in this foundation layer
     }
-    let payload_len = ((raw[o] as usize) << 8) | raw[o + 1] as usize;
-    o += 2;
+    let payload_len = if version == 2 {
+        if raw.len() < o + 4 {
+            return None;
+        }
+        let len = ((raw[o] as usize) << 24)
+            | ((raw[o + 1] as usize) << 16)
+            | ((raw[o + 2] as usize) << 8)
+            | raw[o + 3] as usize;
+        o += 4;
+        if len > file_packet::MAX_FRAMED_FILE_BYTES {
+            return None;
+        }
+        len
+    } else {
+        if raw.len() < o + 2 {
+            return None;
+        }
+        let len = ((raw[o] as usize) << 8) | raw[o + 1] as usize;
+        o += 2;
+        len
+    };
 
+    if raw.len() < o + SENDER_ID_SIZE {
+        return None;
+    }
     let mut sender_id = [0u8; 8];
     sender_id.copy_from_slice(&raw[o..o + SENDER_ID_SIZE]);
     o += SENDER_ID_SIZE;
@@ -173,6 +205,19 @@ fn decode_core(raw: &[u8]) -> Option<Packet> {
     } else {
         None
     };
+
+    if has_route {
+        if raw.len() < o + 1 {
+            return None;
+        }
+        let route_count = raw[o] as usize;
+        o += 1;
+        let route_bytes = route_count.checked_mul(SENDER_ID_SIZE)?;
+        if raw.len() < o + route_bytes {
+            return None;
+        }
+        o += route_bytes;
+    }
 
     if raw.len() < o + payload_len {
         return None;
@@ -748,6 +793,9 @@ pub mod file_packet {
 
     /// Max content size (bitchat `FileTransferLimits.maxPayloadBytes` = 1 MiB).
     pub const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
+    /// Conservative ceiling for an encoded v2 packet payload plus file metadata,
+    /// matching iOS `FileTransferLimits.maxFramedFileBytes` headroom.
+    pub const MAX_FRAMED_FILE_BYTES: usize = (2 * u16::MAX as usize) + 18 + MAX_PAYLOAD_BYTES + 128;
 
     // Canonical TLV tags (must match bitchat exactly).
     const T_FILE_NAME: u8 = 0x01;

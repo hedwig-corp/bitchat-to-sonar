@@ -22,6 +22,36 @@ data class MeshBroadcastIn(
     val tsSecs: Long,
 )
 
+/** An incoming BLE mesh file transfer from a private peer. [peerId] is the
+ * stable fingerprint, matching [MeshDmIn]. */
+data class MeshMediaIn(
+    val peerId: String,
+    val messageId: String,
+    val filename: String,
+    val mimeType: String,
+    val bytes: ByteArray,
+    val tsSecs: Long,
+) {
+    override fun equals(other: Any?): Boolean =
+        other is MeshMediaIn &&
+            peerId == other.peerId &&
+            messageId == other.messageId &&
+            filename == other.filename &&
+            mimeType == other.mimeType &&
+            bytes.contentEquals(other.bytes) &&
+            tsSecs == other.tsSecs
+
+    override fun hashCode(): Int {
+        var result = peerId.hashCode()
+        result = 31 * result + messageId.hashCode()
+        result = 31 * result + filename.hashCode()
+        result = 31 * result + mimeType.hashCode()
+        result = 31 * result + bytes.contentHashCode()
+        result = 31 * result + tsSecs.hashCode()
+        return result
+    }
+}
+
 /**
  * The BLE mesh radio: scans for and advertises the bitchat mesh service so
  * nearby Sonar/bitchat phones discover each other over Bluetooth. This is the
@@ -62,6 +92,11 @@ expect object MeshRadio {
     fun hasMeshLink(peerId: String): Boolean
     /** Pull (and clear) all mesh DMs received since the last call. */
     fun drainMeshDm(): List<MeshDmIn>
+    /** Send a private BLE file transfer to a live mesh peer. This does not queue:
+     * callers should fall back to White Noise or show a route error when false. */
+    fun sendMeshMedia(peerId: String, messageId: String, bytes: ByteArray, filename: String, mimeType: String): Boolean
+    /** Pull (and clear) mesh media transfers received since the last call. */
+    fun drainMeshMedia(): List<MeshMediaIn>
     /** Wall-clock seconds (platform clock) — for mesh message timestamps. */
     fun nowSecs(): Long
 
