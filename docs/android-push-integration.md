@@ -168,8 +168,8 @@ class SonarFirebaseMessagingService : FirebaseMessagingService() {
         //
         // IMPORTANT: Do NOT show a user-visible notification here.
         // The Breez NDS wakeup is infrastructure only. The user-visible
-        // "Payment received" fires when the sender's ⚡PAY control line
-        // arrives through the transponder/chat path.
+        // payment amount notification fires when the sender's ⚡PAY control
+        // line arrives through the transponder/chat path.
 
         // TODO: Start SonarPushProcessingService as foreground service.
         //       Initialize Breez SDK Notification Plugin.
@@ -407,7 +407,12 @@ onboarding or first message receipt.
 - [ ] `POST_NOTIFICATIONS` permission is requested on Android 13+.
 - [ ] Disabling push in settings unregisters from both servers.
 - [ ] Notification copy matches the local router output.
-- [ ] Privacy defaults hold: no names or previews in push-triggered notifications.
+- [ ] Provider payload privacy holds: FCM payloads contain no names, amounts,
+      or previews. Local rendering may show sender/group names and payment
+      amounts; message previews remain opt-in.
+- [ ] Android remote push group labels are enabled once the core conversation
+      summary exposes group/direct metadata; until then remote push shows the
+      latest sender and avoids guessing whether the summary name is a group.
 - [ ] App killed → DM sent → device wakes → notification appears.
 - [ ] App killed → BOLT12 payment sent → device wakes → wallet settles → no
       notification until `⚡PAY` arrives via transponder.

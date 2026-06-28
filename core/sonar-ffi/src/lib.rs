@@ -14,6 +14,10 @@ use nostr::prelude::*;
 use sonar_core::client::SonarClient;
 use sonar_core::identity::Identity;
 use sonar_core::noise::{NoiseHandshake, NoiseKeypair, NoiseSession};
+use sonar_core::notification::{
+    classify_content as core_notification_kind, payment_amount_sats as core_payment_amount_sats,
+    render_notification as core_render_notification, NotificationKind, NotificationRenderInput,
+};
 use sonar_core::GroupId;
 
 uniffi::setup_scaffolding!();
@@ -260,6 +264,39 @@ pub struct DrainNotificationInfo {
     pub content_preview: String,
 }
 
+#[derive(uniffi::Enum)]
+pub enum SonarNotificationKindInfo {
+    Message,
+    Payment,
+    Call,
+    Invite,
+    Mention,
+    Geohash,
+    Network,
+}
+
+#[derive(uniffi::Record)]
+pub struct SonarNotificationRenderInputInfo {
+    pub enabled: bool,
+    pub kind_hint: Option<SonarNotificationKindInfo>,
+    pub conversation_title: Option<String>,
+    pub sender_name: Option<String>,
+    pub group_name: Option<String>,
+    pub content_preview: Option<String>,
+    pub unread_count: u64,
+    pub show_names: bool,
+    pub show_preview: bool,
+    pub show_payment_amount: bool,
+}
+
+#[derive(uniffi::Record)]
+pub struct SonarNotificationEnvelopeInfo {
+    pub kind: SonarNotificationKindInfo,
+    pub title: String,
+    pub body: String,
+    pub payment_sats: Option<u64>,
+}
+
 /// FFI-friendly Sonar app descriptor published as a NIP-78-style kind-30078
 /// event. This is public capability metadata only; live call addresses are
 /// exchanged inside encrypted ☎CALL signaling.
@@ -306,6 +343,23 @@ pub struct ConversationSummaryInfo {
     pub latest_mine: bool,
     pub message_count: u64,
     pub unread_count: u64,
+}
+
+#[uniffi::export]
+pub fn sonar_notification_classify_content(content: String) -> SonarNotificationKindInfo {
+    notification_kind_info(core_notification_kind(&content))
+}
+
+#[uniffi::export]
+pub fn sonar_notification_payment_sats(content: String) -> Option<u64> {
+    core_payment_amount_sats(&content)
+}
+
+#[uniffi::export]
+pub fn sonar_render_notification(
+    input: SonarNotificationRenderInputInfo,
+) -> Option<SonarNotificationEnvelopeInfo> {
+    core_render_notification(notification_render_input(input)).map(notification_envelope_info)
 }
 
 /// A relay-connected Sonar node. Owns its own tokio runtime; every method is
@@ -1901,6 +1955,56 @@ fn message_info(m: sonar_core::marmot::ChatMessage) -> MessageInfo {
             shortcode: s.shortcode,
             plaintext_sha256: s.plaintext_sha256,
         }),
+    }
+}
+
+fn notification_kind_info(kind: NotificationKind) -> SonarNotificationKindInfo {
+    match kind {
+        NotificationKind::Message => SonarNotificationKindInfo::Message,
+        NotificationKind::Payment => SonarNotificationKindInfo::Payment,
+        NotificationKind::Call => SonarNotificationKindInfo::Call,
+        NotificationKind::Invite => SonarNotificationKindInfo::Invite,
+        NotificationKind::Mention => SonarNotificationKindInfo::Mention,
+        NotificationKind::Geohash => SonarNotificationKindInfo::Geohash,
+        NotificationKind::Network => SonarNotificationKindInfo::Network,
+    }
+}
+
+fn notification_kind(kind: SonarNotificationKindInfo) -> NotificationKind {
+    match kind {
+        SonarNotificationKindInfo::Message => NotificationKind::Message,
+        SonarNotificationKindInfo::Payment => NotificationKind::Payment,
+        SonarNotificationKindInfo::Call => NotificationKind::Call,
+        SonarNotificationKindInfo::Invite => NotificationKind::Invite,
+        SonarNotificationKindInfo::Mention => NotificationKind::Mention,
+        SonarNotificationKindInfo::Geohash => NotificationKind::Geohash,
+        SonarNotificationKindInfo::Network => NotificationKind::Network,
+    }
+}
+
+fn notification_render_input(input: SonarNotificationRenderInputInfo) -> NotificationRenderInput {
+    NotificationRenderInput {
+        enabled: input.enabled,
+        kind_hint: input.kind_hint.map(notification_kind),
+        conversation_title: input.conversation_title,
+        sender_name: input.sender_name,
+        group_name: input.group_name,
+        content_preview: input.content_preview,
+        unread_count: input.unread_count,
+        show_names: input.show_names,
+        show_preview: input.show_preview,
+        show_payment_amount: input.show_payment_amount,
+    }
+}
+
+fn notification_envelope_info(
+    envelope: sonar_core::notification::NotificationEnvelope,
+) -> SonarNotificationEnvelopeInfo {
+    SonarNotificationEnvelopeInfo {
+        kind: notification_kind_info(envelope.kind),
+        title: envelope.title,
+        body: envelope.body,
+        payment_sats: envelope.payment_sats,
     }
 }
 

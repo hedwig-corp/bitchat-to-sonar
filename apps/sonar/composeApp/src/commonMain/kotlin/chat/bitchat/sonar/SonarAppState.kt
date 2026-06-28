@@ -579,7 +579,13 @@ class SonarAppState(private val scope: CoroutineScope) {
                 }
                 val name = callPeerName(callChatId)
                 activeCall = ActiveCall(ctrl.callId, callChatId, name, ctrl.video, incoming = true, phase = SonarCallState.Ringing)
-                notifyIncoming(callChatId, name, m.content, forcedKind = SonarNotificationKind.Call)
+                notifyIncoming(
+                    idKey = callChatId,
+                    conversationTitle = name,
+                    content = m.content,
+                    forcedKind = SonarNotificationKind.Call,
+                    senderName = name,
+                )
                 push(Screen.Call(callChatId, name, ctrl.video))
             }
             is SonarCallControl.Answer ->
@@ -1522,8 +1528,9 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun notificationPrefs(): SonarNotificationPrefs =
         SonarNotificationPrefs(
             enabled = prefBool("notifs", true),
-            showNames = prefBool("notifNames", false),
+            showNames = prefBool("notifNames", true),
             showPreview = prefBool("notifPreview", false),
+            showPaymentAmount = true,
         )
 
     private fun isCallNotificationContent(content: String): Boolean =
@@ -1534,6 +1541,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         conversationTitle: String?,
         content: String,
         forcedKind: SonarNotificationKind? = null,
+        senderName: String? = null,
+        groupName: String? = null,
+        unreadCount: Long = 1,
     ) {
         if (foreground) return
         val kind = forcedKind ?: SonarNotificationRouter.classifyContent(content, ::isCallNotificationContent)
@@ -1541,7 +1551,10 @@ class SonarAppState(private val scope: CoroutineScope) {
             idKey = idKey,
             kind = kind,
             conversationTitle = conversationTitle,
+            senderName = senderName,
+            groupName = groupName,
             preview = content,
+            unreadCount = unreadCount,
             prefs = notificationPrefs(),
         ) ?: return
         Notifier.notify(notification.id, notification.title, notification.body)
@@ -1562,12 +1575,29 @@ class SonarAppState(private val scope: CoroutineScope) {
                 newestIncoming.tsSecs > prev && newestIncoming.tsSecs > alreadyNotified &&
                 c.id != openChatId
             ) {
-                notifyIncoming(c.id, chatTitle(c), newestIncoming.content)
+                val groupName = c.name.takeIf { c.members.size > 2 && it.isNotBlank() }
+                notifyIncoming(
+                    idKey = c.id,
+                    conversationTitle = chatTitle(c),
+                    content = newestIncoming.content,
+                    senderName = notificationSenderName(c, newestIncoming),
+                    groupName = groupName,
+                    unreadCount = (unreadByChat[c.id] ?: 1L).coerceAtLeast(1L),
+                )
                 lastNotifiedTs[c.id] = newestIncoming.tsSecs
             }
             lastSeenTs[c.id] = msgs.lastOrNull()?.tsSecs ?: (prev ?: 0L)
         }
         seededSeen = true
+    }
+
+    private fun notificationSenderName(chat: SonarChat, message: SonarMsg): String? {
+        if (message.senderNpub.isBlank()) return null
+        if (chat.members.size > 2) {
+            return resolveGroupAuthorName(message, isGroup = true, profilesByNpub, ::ensureProfile)
+        }
+        val key = canonicalProfileKey(message.senderNpub)
+        return profilesByNpub[key]?.bestName ?: chatTitle(chat)
     }
 
     fun boot() {
@@ -3092,7 +3122,13 @@ class SonarAppState(private val scope: CoroutineScope) {
             processPayLines(chatId, listOf(msg))
             touched += m.peerId
             val preview = if (stickerRef != null) "Sticker" else m.text
-            notifyIncoming(chatId, meshPeerName(m.peerId), preview)
+            val sender = meshPeerName(m.peerId)
+            notifyIncoming(
+                idKey = chatId,
+                conversationTitle = sender,
+                content = preview,
+                senderName = sender,
+            )
         }
         touched.forEach { persistMesh(it) } // write-through so received DMs survive restart
         refreshMeshDmRows()

@@ -22,15 +22,15 @@ the event locally. The two servers have **different notification roles**:
 
 - **Transponder** wakes are both infrastructure AND user-visible: the app
   fetches Marmot messages, and the local notification router renders
-  "New Sonar message", "Payment received", "Incoming Sonar call", etc.
+  sender/group-aware messages, payment amounts, call copy, etc.
 - **Breez NDS** wakes are **infrastructure only**: the push wakes the wallet
   to complete a BOLT12 receive or swap, but does NOT show a user-visible
-  notification. The user-visible "Payment received" notification fires
-  later, when the sender's `⚡PAY` control line arrives through the chat
-  path (via transponder) and the local notification router processes it.
+  notification. The user-visible payment notification fires later, when the
+  sender's `⚡PAY` control line arrives through the chat path (via
+  transponder) and the local notification router processes it.
 
 This avoids duplicate notifications: a single payment produces one
-user-visible "Payment received", not two. The local notification router
+user-visible payment notification, not two. The local notification router
 owns all user-facing copy.
 
 ## Implementation Phases
@@ -42,7 +42,8 @@ Cross-platform notification policy for process-alive delivery.
 - [x] Notification router on Compose that maps Sonar events to kinds:
       message, payment, call, invite, mention, geohash, network.
 - [x] Mirror router on iOS (`SonarLocalNotificationRouter`).
-- [x] Privacy-first defaults: names and previews hidden by default.
+- [x] Useful local copy: sender/group names and payment amounts are shown by
+      default; message previews remain opt-in.
 - [x] Distinct generic copy for payments and calls.
 - [x] Foreground suppression: no OS notifications while app is active.
 - [x] Unit tests for router classification and formatting.
@@ -142,7 +143,9 @@ Wire the Compose app to both servers. Full guide: [`docs/android-push-integratio
 - [ ] Verify killed-app DM wakeup on both platforms (transponder path).
 - [ ] Verify killed-app BOLT12 receive on both platforms (Breez NDS path).
 - [ ] Verify one payment = one user-visible notification (no duplicates).
-- [ ] Verify privacy defaults: no names or previews leak through push.
+- [ ] Verify plaintext-free push defaults: provider payloads carry no names,
+      payment amounts, or message previews; local rendering shows names/amounts
+      from decrypted/local data and keeps message previews opt-in.
 - [ ] Verify foreground suppression still works with remote pushes.
 - [ ] Verify token rotation: unregister old token, register new one.
 - [ ] Load test transponder with concurrent gift wraps.
@@ -214,9 +217,9 @@ POSTs from Breez swap/LNURL services and forwards them as FCM/APNS pushes.
    from the event template, and dispatches via FCM.
 4. The app wakes, the Breez SDK Notification Plugin processes the event
    (starts the wallet, completes the BOLT12 receive). **No user-visible
-   notification is shown.** The user-visible "Payment received" comes
-   later when the sender's `⚡PAY` control line arrives through the
-   transponder/chat path.
+   notification is shown.** The user-visible payment amount comes later
+   when the sender's `⚡PAY` control line arrives through the transponder/chat
+   path.
 
 ### NDS event templates
 
@@ -253,9 +256,9 @@ that configuration. Track this alternative under issue #65.
 
 | Feature | Server | User-visible? | Platform |
 | --- | --- | --- | --- |
-| Marmot DMs/groups/invites | Transponder | Yes -- "New Sonar message" | iOS, Android |
-| Marmot call offer | Transponder | Yes -- "Incoming Sonar call" | iOS, Android |
-| Marmot payment receipt (`⚡PAY`) | Transponder | Yes -- "Payment received" | iOS, Android |
+| Marmot DMs/groups/invites | Transponder | Yes -- sender/group-aware local router copy | iOS, Android |
+| Marmot call offer | Transponder | Yes -- "Incoming call from <sender>" | iOS, Android |
+| Marmot payment receipt (`⚡PAY`) | Transponder | Yes -- amount shown by default | iOS, Android |
 | BOLT12 receive (wallet settle) | Breez NDS | No -- silent wakeup | iOS, Android |
 | Swap updates | Breez NDS | No -- silent wakeup | iOS, Android |
 | LNURL-pay invoice | Breez NDS | No -- silent wakeup | iOS, Android |

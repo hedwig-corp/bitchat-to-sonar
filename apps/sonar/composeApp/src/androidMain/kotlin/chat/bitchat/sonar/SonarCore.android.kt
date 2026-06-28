@@ -59,6 +59,12 @@ actual object SonarCore {
 
     actual fun myNpub(): String = npub
 
+    actual fun classifyNotificationContent(content: String): SonarNotificationKind =
+        uniffi.sonar_ffi.sonarNotificationClassifyContent(content).toCommon()
+
+    actual fun renderNotification(input: SonarNotificationRenderInput): SonarNotificationEnvelope? =
+        uniffi.sonar_ffi.sonarRenderNotification(input.toFfi())?.toCommon()
+
     actual suspend fun chats(): List<SonarChat> = withContext(Dispatchers.IO) {
         val n = node ?: return@withContext emptyList()
         n.groups().map { SonarChat(id = it.idHex, name = it.name, members = it.memberNpubs) }
@@ -567,6 +573,50 @@ actual object SonarCore {
 }
 
 // ── Mapping between the generated UniFFI call types and the commonMain types ──
+
+private fun SonarNotificationKind.toFfi(): uniffi.sonar_ffi.SonarNotificationKindInfo =
+    when (this) {
+        SonarNotificationKind.Message -> uniffi.sonar_ffi.SonarNotificationKindInfo.MESSAGE
+        SonarNotificationKind.Payment -> uniffi.sonar_ffi.SonarNotificationKindInfo.PAYMENT
+        SonarNotificationKind.Call -> uniffi.sonar_ffi.SonarNotificationKindInfo.CALL
+        SonarNotificationKind.Invite -> uniffi.sonar_ffi.SonarNotificationKindInfo.INVITE
+        SonarNotificationKind.Mention -> uniffi.sonar_ffi.SonarNotificationKindInfo.MENTION
+        SonarNotificationKind.Geohash -> uniffi.sonar_ffi.SonarNotificationKindInfo.GEOHASH
+        SonarNotificationKind.Network -> uniffi.sonar_ffi.SonarNotificationKindInfo.NETWORK
+    }
+
+private fun uniffi.sonar_ffi.SonarNotificationKindInfo.toCommon(): SonarNotificationKind =
+    when (this) {
+        uniffi.sonar_ffi.SonarNotificationKindInfo.MESSAGE -> SonarNotificationKind.Message
+        uniffi.sonar_ffi.SonarNotificationKindInfo.PAYMENT -> SonarNotificationKind.Payment
+        uniffi.sonar_ffi.SonarNotificationKindInfo.CALL -> SonarNotificationKind.Call
+        uniffi.sonar_ffi.SonarNotificationKindInfo.INVITE -> SonarNotificationKind.Invite
+        uniffi.sonar_ffi.SonarNotificationKindInfo.MENTION -> SonarNotificationKind.Mention
+        uniffi.sonar_ffi.SonarNotificationKindInfo.GEOHASH -> SonarNotificationKind.Geohash
+        uniffi.sonar_ffi.SonarNotificationKindInfo.NETWORK -> SonarNotificationKind.Network
+    }
+
+private fun SonarNotificationRenderInput.toFfi(): uniffi.sonar_ffi.SonarNotificationRenderInputInfo =
+    uniffi.sonar_ffi.SonarNotificationRenderInputInfo(
+        enabled = enabled,
+        kindHint = kindHint?.toFfi(),
+        conversationTitle = conversationTitle,
+        senderName = senderName,
+        groupName = groupName,
+        contentPreview = contentPreview,
+        unreadCount = unreadCount.coerceAtLeast(1L).toULong(),
+        showNames = showNames,
+        showPreview = showPreview,
+        showPaymentAmount = showPaymentAmount,
+    )
+
+private fun uniffi.sonar_ffi.SonarNotificationEnvelopeInfo.toCommon(): SonarNotificationEnvelope =
+    SonarNotificationEnvelope(
+        kind = kind.toCommon(),
+        title = title,
+        body = body,
+        paymentSats = paymentSats?.toLong(),
+    )
 
 private fun SonarAnswer.toFfi(): uniffi.sonar_ffi.CallAnswerKind = when (this) {
     SonarAnswer.Accept -> uniffi.sonar_ffi.CallAnswerKind.ACCEPT

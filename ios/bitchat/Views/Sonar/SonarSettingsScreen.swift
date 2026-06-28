@@ -5,7 +5,7 @@
 // Settings screen ported from design/handoff/project/sonar/settings.jsx,
 // backed by real preferences and data only. Rows from the prototype that
 // have no real backend yet (App lock, Read receipts, Message requests,
-// App icon, Notifications, Data & storage, Help) are hidden — see
+// App icon, Data & storage, Help) are hidden — see
 // docs/MOCK-REMOVAL-PLAN.md for what is needed to unhide each.
 //
 // This is free and unencumbered software released into the public domain.
@@ -46,6 +46,35 @@ struct SonarSettingsScreen: View {
                             divider: false
                         ) {
                             store.toggleMode()
+                        }
+                    }
+
+                    SNSectionLabel("Notifications")
+                    SNSettingsCard {
+                        SNSettingsRow(
+                            icon: .bell,
+                            label: "Notifications",
+                            sub: "Show Sonar alerts on this device",
+                            trail: .toggle(store.notificationsEnabled)
+                        ) {
+                            store.toggleNotificationsEnabled()
+                        }
+                        SNSettingsRow(
+                            icon: .people,
+                            label: "Show names",
+                            sub: "Include sender and group names on the lock screen",
+                            trail: .toggle(store.notificationShowNames)
+                        ) {
+                            store.toggleNotificationShowNames()
+                        }
+                        SNSettingsRow(
+                            icon: .eye,
+                            label: "Message preview",
+                            sub: "Show message text in notifications",
+                            trail: .toggle(store.notificationShowPreview),
+                            divider: false
+                        ) {
+                            store.toggleNotificationShowPreview()
                         }
                     }
 

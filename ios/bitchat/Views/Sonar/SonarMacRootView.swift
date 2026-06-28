@@ -2402,6 +2402,7 @@ private struct MacSettingsModal: View {
                         profileHead
                         keySection
                         appSection
+                        notificationSection
                         networkSection
                         walletSection
                         safetySection
@@ -2551,6 +2552,39 @@ private struct MacSettingsModal: View {
                     divider: false
                 ) {
                     store.toggleMode()
+                }
+            }
+        }
+    }
+
+    private var notificationSection: some View {
+        VStack(spacing: 0) {
+            SNSectionLabel("Notifications")
+            SNSettingsCard {
+                SNSettingsRow(
+                    icon: .bell,
+                    label: "Notifications",
+                    sub: "Show Sonar alerts on this device",
+                    trail: .toggle(store.notificationsEnabled)
+                ) {
+                    store.toggleNotificationsEnabled()
+                }
+                SNSettingsRow(
+                    icon: .people,
+                    label: "Show names",
+                    sub: "Include sender and group names on the lock screen",
+                    trail: .toggle(store.notificationShowNames)
+                ) {
+                    store.toggleNotificationShowNames()
+                }
+                SNSettingsRow(
+                    icon: .eye,
+                    label: "Message preview",
+                    sub: "Show message text in notifications",
+                    trail: .toggle(store.notificationShowPreview),
+                    divider: false
+                ) {
+                    store.toggleNotificationShowPreview()
                 }
             }
         }
