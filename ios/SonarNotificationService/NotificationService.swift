@@ -26,7 +26,8 @@ import os
 
 class NotificationService: SDKNotificationService {
 
-    private let appGroupId = "group.sh.hedwig.sonar"
+    private static let appGroupId = "group.sh.hedwig.sonar"
+    private static let notificationsEnabledKey = "sonar.notifications.enabled"
     private static let log = OSLog(subsystem: "sh.hedwig.sonar", category: "NSE")
 
     override func didReceive(
@@ -36,8 +37,14 @@ class NotificationService: SDKNotificationService {
         if Self.isTransponderPush(request.content.userInfo) {
             os_log("NSE: handling Transponder Marmot push",
                    log: Self.log, type: .info)
-            let content = (request.content.mutableCopy() as? UNMutableNotificationContent)
-                ?? UNMutableNotificationContent()
+            let content = Self.mutableContent(for: request)
+            guard Self.transponderNotificationsEnabled() else {
+                os_log("NSE: suppressing Transponder notification by user preference",
+                       log: Self.log, type: .info)
+                Self.suppressTransponderNotification(content)
+                contentHandler(content)
+                return
+            }
             Self.configureTransponderNotification(content)
             contentHandler(content)
             return
@@ -52,7 +59,7 @@ class NotificationService: SDKNotificationService {
     }
 
     override func getConnectRequest() -> ConnectRequest? {
-        guard let defaults = UserDefaults(suiteName: appGroupId),
+        guard let defaults = UserDefaults(suiteName: Self.appGroupId),
               let apiKey = defaults.string(forKey: "breez_api_key"),
               let seedHex = defaults.string(forKey: "breez_seed_hex"),
               let seed = Self.bytes(fromHex: seedHex)
@@ -68,7 +75,7 @@ class NotificationService: SDKNotificationService {
         let network: LiquidNetwork = mainnet ? .mainnet : .testnet
 
         guard let container = FileManager.default
-            .containerURL(forSecurityApplicationGroupIdentifier: appGroupId)
+            .containerURL(forSecurityApplicationGroupIdentifier: Self.appGroupId)
         else {
             return nil
         }
@@ -188,6 +195,30 @@ class NotificationService: SDKNotificationService {
         content.categoryIdentifier = "sonar.message"
         if #available(iOS 15.0, *) {
             content.interruptionLevel = .active
+        }
+    }
+
+    private static func mutableContent(for request: UNNotificationRequest) -> UNMutableNotificationContent {
+        let content = (request.content.mutableCopy() as? UNMutableNotificationContent)
+            ?? UNMutableNotificationContent()
+        content.userInfo = request.content.userInfo
+        return content
+    }
+
+    private static func transponderNotificationsEnabled() -> Bool {
+        guard let defaults = UserDefaults(suiteName: Self.appGroupId) else { return true }
+        return defaults.object(forKey: notificationsEnabledKey) as? Bool ?? true
+    }
+
+    private static func suppressTransponderNotification(_ content: UNMutableNotificationContent) {
+        content.title = ""
+        content.subtitle = ""
+        content.body = ""
+        content.sound = nil
+        content.badge = nil
+        content.categoryIdentifier = ""
+        if #available(iOS 15.0, *) {
+            content.interruptionLevel = .passive
         }
     }
 }

@@ -419,6 +419,10 @@ final class SonarAppStore: ObservableObject {
         static let notificationShowPreview = "sonar.notifications.showPreview"
     }
 
+    #if os(iOS)
+    private static let appGroupId = "group.sh.hedwig.sonar"
+    #endif
+
     private static let maxStoredCallsPerConversation = 100
     private static let capabilitySettleWindow: TimeInterval = 1.5
 
@@ -729,6 +733,7 @@ final class SonarAppStore: ObservableObject {
         // Drop the old prototype demo blob if it is still around.
         defaults.removeObject(forKey: Keys.legacyDemoState)
         callLogs = Self.loadCallLogs(from: defaults)
+        syncNotificationPrefsToAppGroup()
 
         // The screens read computed properties off this store; republish
         // whenever any underlying service changes.
@@ -1089,17 +1094,29 @@ final class SonarAppStore: ObservableObject {
 
     func toggleNotificationsEnabled() {
         defaults.set(!notificationsEnabled, forKey: Keys.notificationsEnabled)
+        syncNotificationPrefsToAppGroup()
         objectWillChange.send()
     }
 
     func toggleNotificationShowNames() {
         defaults.set(!notificationShowNames, forKey: Keys.notificationShowNames)
+        syncNotificationPrefsToAppGroup()
         objectWillChange.send()
     }
 
     func toggleNotificationShowPreview() {
         defaults.set(!notificationShowPreview, forKey: Keys.notificationShowPreview)
+        syncNotificationPrefsToAppGroup()
         objectWillChange.send()
+    }
+
+    private func syncNotificationPrefsToAppGroup() {
+        #if os(iOS)
+        guard let shared = UserDefaults(suiteName: Self.appGroupId) else { return }
+        shared.set(notificationsEnabled, forKey: Keys.notificationsEnabled)
+        shared.set(notificationShowNames, forKey: Keys.notificationShowNames)
+        shared.set(notificationShowPreview, forKey: Keys.notificationShowPreview)
+        #endif
     }
 
     // MARK: Identity

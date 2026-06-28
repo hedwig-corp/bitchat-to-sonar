@@ -47,7 +47,7 @@ object SonarPushRegistration {
             return
         }
         FirebaseMessaging.getInstance().token.addOnSuccessListener { token ->
-            Log.d(TAG, "FCM token collected (${token.take(8)}...)")
+            Log.d(TAG, "FCM token collected")
             cachedFcmToken = token
             registerTransponder(token)
             retryBreezWebhookIfNeeded()
@@ -57,7 +57,7 @@ object SonarPushRegistration {
     }
 
     fun onTokenRefresh(token: String) {
-        Log.d(TAG, "FCM token refreshed (${token.take(8)}...)")
+        Log.d(TAG, "FCM token refreshed")
         cachedFcmToken = token
         registerTransponder(token)
         retryBreezWebhookIfNeeded()

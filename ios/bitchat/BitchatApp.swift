@@ -312,7 +312,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate, MessagingDelegate {
     }
 
     private func handleFCMToken(_ fcmToken: String, source: String) {
-        Self.pushLog.info("FCM token available from \(source, privacy: .public) (\(fcmToken.prefix(8))...)")
+        Self.pushLog.info("FCM token available from \(source, privacy: .public)")
         let wallet = (sonarStore?.wallet as? BridgedWallet)?.walletService
         SonarPushRegistration.shared.didReceiveFCMToken(fcmToken, wallet: wallet)
     }

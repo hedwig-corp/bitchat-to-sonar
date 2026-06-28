@@ -162,9 +162,7 @@ pub(crate) fn save_push_token_cache(
     fs::write(&tmp, bytes).map_err(|e| {
         crate::Error::Storage(format!("write push token cache {}: {e}", tmp.display()))
     })?;
-    fs::rename(&tmp, path).map_err(|e| {
-        crate::Error::Storage(format!("replace push token cache {}: {e}", path.display()))
-    })?;
+    replace_push_token_cache(&tmp, path)?;
     Ok(())
 }
 
@@ -194,6 +192,26 @@ fn push_token_cache_tmp_path(path: &Path) -> PathBuf {
         .and_then(|name| name.to_str())
         .unwrap_or("sonar-push-tokens.json");
     path.with_file_name(format!("{file_name}.tmp"))
+}
+
+fn replace_push_token_cache(tmp: &Path, path: &Path) -> crate::Result<()> {
+    #[cfg(windows)]
+    {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(crate::Error::Storage(format!(
+                    "remove existing push token cache {}: {e}",
+                    path.display()
+                )));
+            }
+        }
+    }
+
+    fs::rename(tmp, path).map_err(|e| {
+        crate::Error::Storage(format!("replace push token cache {}: {e}", path.display()))
+    })
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -268,6 +286,40 @@ mod tests {
         let entry = loaded.get(&member).expect("member token reloads");
 
         assert_eq!(entry.encrypted_token_b64, "encrypted-token");
+        assert_eq!(entry.server_pubkey, server);
+    }
+
+    #[test]
+    fn push_token_cache_replaces_existing_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("marmot.sqlite.sonar-push-tokens.json");
+        let member = Keys::generate().public_key().to_hex();
+        let server = Keys::generate().public_key();
+        let mut cache = HashMap::new();
+
+        cache.insert(
+            member.clone(),
+            CachedPushToken {
+                encrypted_token_b64: "first-token".to_string(),
+                server_pubkey: server,
+            },
+        );
+        save_push_token_cache(Some(&path), &cache).expect("initial cache saves");
+
+        cache.insert(
+            member.clone(),
+            CachedPushToken {
+                encrypted_token_b64: "updated-token".to_string(),
+                server_pubkey: server,
+            },
+        );
+        save_push_token_cache(Some(&path), &cache).expect("existing cache is replaced");
+
+        let loaded = load_push_token_cache(Some(&path));
+        let loaded = loaded.lock().unwrap();
+        let entry = loaded.get(&member).expect("member token reloads");
+
+        assert_eq!(entry.encrypted_token_b64, "updated-token");
         assert_eq!(entry.server_pubkey, server);
     }
 }
