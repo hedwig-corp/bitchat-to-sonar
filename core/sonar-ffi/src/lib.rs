@@ -324,6 +324,17 @@ pub struct GeoMessageInfo {
     pub mine: bool,
 }
 
+/// FFI-friendly account-level direct NIP-17 DM, decoded from a `bitchat1:`
+/// embedded private-message packet.
+#[derive(uniffi::Record)]
+pub struct DirectDmInfo {
+    pub event_id_hex: String,
+    pub id_hex: String,
+    pub sender_pubkey_hex: String,
+    pub content: String,
+    pub created_at_secs: u64,
+}
+
 /// Callback interface for conversation-summary changes. The host implements
 /// this to receive push notifications when a chat's summary row is updated
 /// (message sent/received, group created/deleted, unread count changed).
@@ -1020,6 +1031,42 @@ impl SonarNode {
             .runtime
             .block_on(self.client.fetch_geo_dm(&geohash, &peer_hex))?;
         Ok(msgs.into_iter().map(geo_message_info).collect())
+    }
+
+    /// Send an account-level direct NIP-17 DM to a plain bitchat peer. The
+    /// content is wrapped as `bitchat1:` so iOS/stock bitchat can decode it.
+    pub fn send_direct_dm(
+        &self,
+        recipient_hex: String,
+        sender_peer_id_hex: String,
+        recipient_peer_id_hex: String,
+        message_id: String,
+        text: String,
+    ) -> FfiResult<()> {
+        self.runtime.block_on(self.client.send_direct_dm(
+            &recipient_hex,
+            &sender_peer_id_hex,
+            &recipient_peer_id_hex,
+            &message_id,
+            &text,
+        ))?;
+        Ok(())
+    }
+
+    /// Drain account-level direct NIP-17 DMs received since the last drain.
+    pub fn drain_direct_dms(&self) -> Vec<DirectDmInfo> {
+        self.client
+            .drain_direct_dms()
+            .into_iter()
+            .map(direct_dm_info)
+            .collect()
+    }
+
+    /// Acknowledge direct NIP-17 DMs only after the host persisted or consumed
+    /// the drained records.
+    pub fn acknowledge_direct_dms(&self, event_id_hexes: Vec<String>) -> FfiResult<()> {
+        self.client.acknowledge_direct_dms(&event_id_hexes)?;
+        Ok(())
     }
 
     // ── Push token registration (MIP-05) ──
@@ -1725,6 +1772,50 @@ pub fn mesh_build_signed_packet(
         .ok_or_else(|| SonarFfiError::Core("signed packet encode failed".into()))
 }
 
+/// Build a protocol-v2 packet signed with the Ed25519 announce key. v2 uses a
+/// u32 payload length and can carry source-route hops; this is required for
+/// large Android file-transfer packets to match iOS' signed v2 shape.
+#[uniffi::export]
+pub fn mesh_build_signed_packet_v2(
+    seed_hex: String,
+    packet_type: u8,
+    sender_id_hex: String,
+    recipient_id_hex: String,
+    route_id_hexes: Vec<String>,
+    ttl: u8,
+    timestamp_ms: u64,
+    payload: Vec<u8>,
+) -> FfiResult<Vec<u8>> {
+    let seed = hex::decode(&seed_hex).map_err(invalid("mesh seed"))?;
+    if seed.len() != 32 {
+        return Err(SonarFfiError::InvalidInput(
+            "mesh seed must be 32 bytes".into(),
+        ));
+    }
+    let mut s = [0u8; 32];
+    s.copy_from_slice(&seed);
+    let signer = mesh::MeshSigner::from_seed(&s);
+    let sender = parse_id8(&sender_id_hex, "sender id")?;
+    let mut packet = mesh::Packet::new_v2(packet_type, ttl, timestamp_ms, sender);
+    if !recipient_id_hex.is_empty() {
+        packet.recipient_id = Some(parse_id8(&recipient_id_hex, "recipient id")?);
+    }
+    if !route_id_hexes.is_empty() {
+        let mut route = Vec::with_capacity(route_id_hexes.len());
+        for hop in &route_id_hexes {
+            route.push(parse_id8(hop, "route hop id")?);
+        }
+        packet.route = Some(route);
+    }
+    packet.payload = payload;
+    if !mesh::sign_packet(&mut packet, &signer) {
+        return Err(SonarFfiError::Core("signed v2 packet sign failed".into()));
+    }
+    packet
+        .encode()
+        .ok_or_else(|| SonarFfiError::Core("signed v2 packet encode failed".into()))
+}
+
 /// The inner noiseEncrypted plaintext for a private message: `[0x01][TLV]`.
 #[uniffi::export]
 pub fn mesh_encode_private_message(message_id: String, content: String) -> FfiResult<Vec<u8>> {
@@ -1927,6 +2018,16 @@ fn geo_message_info(m: sonar_core::geohash::GeoMessage) -> GeoMessageInfo {
         content: m.content,
         created_at_secs: m.created_at,
         mine: m.mine,
+    }
+}
+
+fn direct_dm_info(m: sonar_core::client::DirectDm) -> DirectDmInfo {
+    DirectDmInfo {
+        event_id_hex: m.event_id,
+        id_hex: m.id,
+        sender_pubkey_hex: m.sender_pubkey,
+        content: m.content,
+        created_at_secs: m.created_at,
     }
 }
 

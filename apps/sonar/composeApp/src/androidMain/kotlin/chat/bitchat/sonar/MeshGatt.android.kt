@@ -17,6 +17,7 @@ import java.security.SecureRandom
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import uniffi.sonar_ffi.MeshAnnounceInfo
+import uniffi.sonar_ffi.MeshPacketInfo
 import uniffi.sonar_ffi.MeshReassembler
 import uniffi.sonar_ffi.MeshPublicMessage
 import uniffi.sonar_ffi.NoiseKeypairHex
@@ -24,9 +25,12 @@ import uniffi.sonar_ffi.SonarNoise
 import uniffi.sonar_ffi.meshBuildAnnounce
 import uniffi.sonar_ffi.meshBuildPacket
 import uniffi.sonar_ffi.meshBuildSignedPacket
+import uniffi.sonar_ffi.meshBuildSignedPacketV2
 import uniffi.sonar_ffi.meshBuildPublicMessage
+import uniffi.sonar_ffi.meshDecodeFilePacket
 import uniffi.sonar_ffi.meshDecodePacket
 import uniffi.sonar_ffi.meshDecodePrivateMessage
+import uniffi.sonar_ffi.meshEncodeFilePacket
 import uniffi.sonar_ffi.meshEncodePrivateMessage
 import uniffi.sonar_ffi.meshFragment
 import uniffi.sonar_ffi.meshParseAnnounce
@@ -68,10 +72,13 @@ object MeshGatt {
     private const val TYPE_NOISE_HANDSHAKE: UByte = 0x10u
     private const val TYPE_NOISE_ENCRYPTED: UByte = 0x11u
     private const val TYPE_FRAGMENT: UByte = 0x20u
+    private const val TYPE_FILE_TRANSFER: UByte = 0x22u
     private const val TYPE_SONAR_0X53: UByte = 0x53u
     private const val DEFAULT_TTL: UByte = 7u
     private const val MAX_SINGLE_GATT_PACKET_BYTES = 480
     private const val FRAGMENT_CHUNK_SIZE: UInt = 350u
+    private const val MAX_FILE_TRANSFER_BYTES = 1024 * 1024
+    private const val MAX_V1_FILE_PAYLOAD_BYTES = 0xFFFF
 
     private val ctx: Context get() = AppContextHolder.ctx
     private fun manager() = ctx.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
@@ -138,8 +145,11 @@ object MeshGatt {
     private val onAnnounce = java.util.concurrent.CopyOnWriteArrayList<(String, MeshAnnounceInfo, String) -> Unit>()
     private val onLink = java.util.concurrent.CopyOnWriteArrayList<(String) -> Unit>()
     private val onBroadcast = java.util.concurrent.CopyOnWriteArrayList<(MeshPublicMessage) -> Unit>()
+    private val onFile = java.util.concurrent.CopyOnWriteArrayList<(String, String, String, String, ByteArray) -> Unit>()
     /** Dedup public broadcasts by message id (we receive from multiple links). */
     private val seenBroadcastIds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    /** Dedup file transfers by packet sender + packet timestamp. */
+    private val seenFileIds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
     fun addMessageListener(cb: (fingerprint: String, messageId: String, text: String) -> Unit) { onText.add(cb) }
     fun addSonarListener(cb: (fingerprint: String, payload: ByteArray) -> Unit) { onSonar.add(cb) }
@@ -153,6 +163,11 @@ object MeshGatt {
         runCatching { Sha256.hash(noisePublicKeyHex.hexToBytes()).toHex() }.getOrDefault("")
     /** Fired for an incoming public broadcast (Mesh channel) message. */
     fun addBroadcastListener(cb: (MeshPublicMessage) -> Unit) { onBroadcast.add(cb) }
+    /** Fired for an incoming private file transfer. The first arg is the peer's
+     * stable fingerprint, matching [addMessageListener]. */
+    fun addFileListener(cb: (fingerprint: String, messageId: String, filename: String, mime: String, bytes: ByteArray) -> Unit) {
+        onFile.add(cb)
+    }
 
     /** This device's 8-byte mesh node id (== bitchat peerID). MeshRadio puts it
      *  in the advert so two Sonar-Android peers can elect a single dialer. */
@@ -293,6 +308,7 @@ object MeshGatt {
         serverLinks.clear(); serverDevices.clear(); peerIdByAddr.clear(); fingerprintByAddr.clear(); recentDials.clear()
         pendingSonarByAddr.clear()
         pendingSends.clear()
+        seenFileIds.clear()
     }
 
     private val serverCallback = object : BluetoothGattServerCallback() {
@@ -554,6 +570,7 @@ object MeshGatt {
             TYPE_NOISE_HANDSHAKE -> handleHandshake(addr, info.payload, fromServer, device, gatt)
             TYPE_NOISE_ENCRYPTED -> handleEncrypted(addr, info.payload, fromServer)
             TYPE_FRAGMENT -> handleFragment(addr, info.senderIdHex, info.payload, fromServer, device, gatt)
+            TYPE_FILE_TRANSFER -> handleFileTransfer(addr, value, info)
             TYPE_SONAR_0X53 -> {
                 // Tag the 0x53 with the peer's STABLE fingerprint (from its 0x01
                 // announce) so its Sonar profile/npub stays correlated to the
@@ -666,6 +683,32 @@ object MeshGatt {
         }
     }
 
+    private fun handleFileTransfer(addr: String, packetBytes: ByteArray, info: MeshPacketInfo) {
+        val recipient = info.recipientIdHex.lowercase()
+        if (recipient != myPeerIdHex) return
+
+        val fp = fingerprintByAddr[addr] ?: peerIdByAddr[addr] ?: return
+        val tsMs = packetTimestampMs(packetBytes) ?: System.currentTimeMillis()
+        val payloadHash = Sha256.hash(info.payload).copyOf(8).toHex()
+        val transferKey = "${info.senderIdHex}-$tsMs-$payloadHash"
+        if (!seenFileIds.add(transferKey)) return
+        if (seenFileIds.size > 1024) seenFileIds.clear()
+
+        val file = runCatching { meshDecodeFilePacket(info.payload) }.getOrNull() ?: return
+        val bytes = file.content
+        if (bytes.isEmpty() || bytes.size > MAX_FILE_TRANSFER_BYTES) {
+            android.util.Log.w(TAG, "dropping file transfer size=${bytes.size} from $addr")
+            return
+        }
+        val mime = normalizedMime(file.mimeType, bytes) ?: run {
+            android.util.Log.w(TAG, "dropping file transfer mime=${file.mimeType} size=${bytes.size} from $addr")
+            return
+        }
+        val filename = safeFileName(file.fileName, mime, tsMs)
+        val messageId = "$transferKey-file"
+        onFile.forEach { it(fp, messageId, filename, mime, bytes) }
+    }
+
     private fun handshakePacket(peerIdHex: String, noiseMsg: ByteArray): ByteArray =
         meshBuildPacket(TYPE_NOISE_HANDSHAKE, myPeerIdHex, peerIdHex, DEFAULT_TTL, System.currentTimeMillis().toULong(), noiseMsg)
 
@@ -685,12 +728,40 @@ object MeshGatt {
         return meshBuildPacket(TYPE_NOISE_ENCRYPTED, myPeerIdHex, peerId, DEFAULT_TTL, System.currentTimeMillis().toULong(), ciphertext)
     }
 
+    private fun fileTransferPacket(peerAddress: String, bytes: ByteArray, filename: String, mimeType: String): ByteArray? {
+        if (bytes.isEmpty() || bytes.size > MAX_FILE_TRANSFER_BYTES) return null
+        val ts = System.currentTimeMillis()
+        val mime = normalizedMime(mimeType, bytes) ?: return null
+        val safeName = safeFileName(filename, mime, ts)
+        val payload = runCatching {
+            meshEncodeFilePacket(safeName, bytes.size.toULong(), mime, bytes)
+        }.getOrNull() ?: return null
+        val peerId = peerIdByAddr[peerAddress] ?: return null
+        return runCatching {
+            if (payload.size <= MAX_V1_FILE_PAYLOAD_BYTES) {
+                meshBuildSignedPacket(ed25519SeedHex, TYPE_FILE_TRANSFER, myPeerIdHex, peerId, DEFAULT_TTL, ts.toULong(), payload)
+            } else {
+                meshBuildSignedPacketV2(
+                    ed25519SeedHex,
+                    TYPE_FILE_TRANSFER,
+                    myPeerIdHex,
+                    peerId,
+                    emptyList<String>(),
+                    DEFAULT_TTL,
+                    ts.toULong(),
+                    payload,
+                )
+            }
+        }.getOrNull()
+    }
+
     private fun randomFragmentIdHex(): String =
         ByteArray(8).also { SecureRandom().nextBytes(it) }.toHex()
 
     private fun writePacketMaybeFragmented(
         peerAddress: String,
         packet: ByteArray,
+        originalType: UByte = TYPE_NOISE_ENCRYPTED,
         write: (ByteArray) -> Unit,
     ): Boolean = runCatching {
         if (packet.size <= MAX_SINGLE_GATT_PACKET_BYTES) {
@@ -699,8 +770,8 @@ object MeshGatt {
         }
 
         val peerId = peerIdByAddr[peerAddress] ?: ""
-        val fragments = meshFragment(packet, randomFragmentIdHex(), TYPE_NOISE_ENCRYPTED, FRAGMENT_CHUNK_SIZE)
-        android.util.Log.i(TAG, "fragmenting 0x11 packet ${packet.size}B into ${fragments.size} chunk(s) → $peerAddress")
+        val fragments = meshFragment(packet, randomFragmentIdHex(), originalType, FRAGMENT_CHUNK_SIZE)
+        android.util.Log.i(TAG, "fragmenting 0x${originalType.toString(16)} packet ${packet.size}B into ${fragments.size} chunk(s) → $peerAddress")
         fragments.forEach { payload ->
             val fragmentPacket = meshBuildPacket(
                 TYPE_FRAGMENT,
@@ -777,6 +848,32 @@ object MeshGatt {
         val addr = sendableAddrFor(fingerprint) ?: return false
         sendDiscoveryToAddr(addr, "pre-control")
         return sendText(addr, messageId, text)
+    }
+
+    /** Send a private file transfer to a live peer route. Binary media is not
+     * queued: large stale transfers after a BLE reconnect are worse than an
+     * immediate route failure, and Marmot remains the out-of-range fallback. */
+    fun sendFileToPeer(fingerprint: String, messageId: String, bytes: ByteArray, filename: String, mimeType: String): Boolean {
+        val addr = sendableAddrFor(fingerprint) ?: return false
+        sendDiscoveryToAddr(addr, "pre-file")
+        return sendFile(addr, bytes, filename, mimeType)
+    }
+
+    private fun sendFile(peerAddress: String, bytes: ByteArray, filename: String, mimeType: String): Boolean = runCatching {
+        val packet = fileTransferPacket(peerAddress, bytes, filename, mimeType) ?: return@runCatching false
+        val gatt = clientGatt[peerAddress]
+        val ch = clientChar[peerAddress]
+        if (gatt != null && ch != null) {
+            return@runCatching writePacketMaybeFragmented(peerAddress, packet, TYPE_FILE_TRANSFER) { writePacket(gatt, ch, it) }
+        }
+        val device = serverDevices[peerAddress]
+        if (device != null) {
+            return@runCatching writePacketMaybeFragmented(peerAddress, packet, TYPE_FILE_TRANSFER) { notify(device, it) }
+        }
+        false
+    }.getOrElse {
+        android.util.Log.w(TAG, "sendFile failed for $peerAddress: ${it.message}")
+        false
     }
 
     /** Flush any queued DMs to [fingerprint] now that an encrypted link is up. */
@@ -945,6 +1042,102 @@ object MeshGatt {
                 ch.value = packet; s.notifyCharacteristicChanged(device, ch, false)
             }
         }
+}
+
+private fun packetTimestampMs(packet: ByteArray): Long? {
+    if (packet.size < 11) return null
+    var ts = 0L
+    for (i in 3 until 11) ts = (ts shl 8) or (packet[i].toLong() and 0xFF)
+    return ts
+}
+
+private fun safeFileName(raw: String?, mime: String, timestampMs: Long): String {
+    val cleaned = raw.orEmpty()
+        .substringAfterLast('/')
+        .substringAfterLast('\\')
+        .replace(Regex("[\\u0000-\\u001F\\u007F]"), "_")
+        .trim()
+        .take(96)
+    val fallback = "file-$timestampMs.${defaultExtension(mime)}"
+    val name = cleaned.ifBlank { fallback }
+    return if (name.contains('.')) name else "$name.${defaultExtension(mime)}"
+}
+
+private fun normalizedMime(raw: String?, bytes: ByteArray): String? {
+    if (bytes.isEmpty()) return null
+    val declared = raw?.trim()?.lowercase()
+    val sniffed = sniffMime(bytes)
+    return when {
+        declared == null || declared.isBlank() -> sniffed ?: "application/octet-stream"
+        declared == "application/octet-stream" -> declared
+        declared in allowedMimes() && mimeMatches(declared, bytes) -> canonicalMime(declared)
+        sniffed != null -> sniffed
+        else -> null
+    }
+}
+
+private fun canonicalMime(mime: String): String = when (mime) {
+    "image/jpg" -> "image/jpeg"
+    else -> mime
+}
+
+private fun allowedMimes(): Set<String> = setOf(
+    "image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp",
+    "audio/mp4", "audio/m4a", "audio/aac", "audio/mpeg", "audio/mp3",
+    "audio/wav", "audio/x-wav", "audio/ogg",
+    "application/pdf", "application/octet-stream",
+)
+
+private fun sniffMime(bytes: ByteArray): String? = when {
+    mimeMatches("image/jpeg", bytes) -> "image/jpeg"
+    mimeMatches("image/png", bytes) -> "image/png"
+    mimeMatches("image/gif", bytes) -> "image/gif"
+    mimeMatches("image/webp", bytes) -> "image/webp"
+    mimeMatches("audio/mpeg", bytes) -> "audio/mpeg"
+    mimeMatches("audio/wav", bytes) -> "audio/wav"
+    mimeMatches("audio/ogg", bytes) -> "audio/ogg"
+    mimeMatches("application/pdf", bytes) -> "application/pdf"
+    else -> null
+}
+
+private fun mimeMatches(mime: String, bytes: ByteArray): Boolean {
+    fun b(i: Int) = bytes[i].toInt() and 0xFF
+    return when (mime) {
+        "image/jpeg", "image/jpg" -> bytes.size >= 3 && b(0) == 0xFF && b(1) == 0xD8 && b(2) == 0xFF
+        "image/png" -> bytes.size >= 8 &&
+            b(0) == 0x89 && b(1) == 0x50 && b(2) == 0x4E && b(3) == 0x47 &&
+            b(4) == 0x0D && b(5) == 0x0A && b(6) == 0x1A && b(7) == 0x0A
+        "image/gif" -> bytes.size >= 6 &&
+            b(0) == 0x47 && b(1) == 0x49 && b(2) == 0x46 &&
+            b(3) == 0x38 && (b(4) == 0x37 || b(4) == 0x39) && b(5) == 0x61
+        "image/webp" -> bytes.size >= 12 &&
+            b(0) == 0x52 && b(1) == 0x49 && b(2) == 0x46 && b(3) == 0x46 &&
+            b(8) == 0x57 && b(9) == 0x45 && b(10) == 0x42 && b(11) == 0x50
+        "audio/mp4", "audio/m4a", "audio/aac" -> bytes.size > 100
+        "audio/mpeg", "audio/mp3" ->
+            (bytes.size >= 3 && b(0) == 0x49 && b(1) == 0x44 && b(2) == 0x33) ||
+                (bytes.size >= 2 && b(0) == 0xFF && (b(1) and 0xE0) == 0xE0)
+        "audio/wav", "audio/x-wav" -> bytes.size >= 12 &&
+            b(0) == 0x52 && b(1) == 0x49 && b(2) == 0x46 && b(3) == 0x46 &&
+            b(8) == 0x57 && b(9) == 0x41 && b(10) == 0x56 && b(11) == 0x45
+        "audio/ogg" -> bytes.size >= 4 && b(0) == 0x4F && b(1) == 0x67 && b(2) == 0x67 && b(3) == 0x53
+        "application/pdf" -> bytes.size >= 4 && b(0) == 0x25 && b(1) == 0x50 && b(2) == 0x44 && b(3) == 0x46
+        "application/octet-stream" -> true
+        else -> false
+    }
+}
+
+private fun defaultExtension(mime: String): String = when (mime) {
+    "image/jpeg", "image/jpg" -> "jpg"
+    "image/png" -> "png"
+    "image/gif" -> "gif"
+    "image/webp" -> "webp"
+    "audio/mp4", "audio/m4a", "audio/aac" -> "m4a"
+    "audio/mpeg", "audio/mp3" -> "mp3"
+    "audio/wav", "audio/x-wav" -> "wav"
+    "audio/ogg" -> "ogg"
+    "application/pdf" -> "pdf"
+    else -> "bin"
 }
 
 private fun String.hexToBytes(): ByteArray =

@@ -46,6 +46,15 @@ data class SonarMsg(
     val stickerRef: SonarStickerRef? = null,
 )
 
+/** Account-level direct NIP-17 DM decoded from a `bitchat1:` embedded packet. */
+data class SonarDirectDm(
+    val eventId: String,
+    val id: String,
+    val senderPubkeyHex: String,
+    val content: String,
+    val tsSecs: Long,
+)
+
 /** A sticker reference carried on a chat message. */
 data class SonarStickerRef(
     val packCoordinate: String,
@@ -536,6 +545,17 @@ expect object SonarCore {
     /** 1:1 encrypted DM conversation with a channel participant (NIP-17). */
     suspend fun geoDmMessages(geohash: String, peerHex: String): List<SonarMsg>
     suspend fun sendGeoDm(geohash: String, peerHex: String, text: String)
+
+    /** Account-level direct NIP-17 DMs for plain mutual-favorite bitchat peers. */
+    suspend fun sendDirectDm(
+        recipientHex: String,
+        senderPeerIdHex: String,
+        recipientPeerIdHex: String,
+        messageId: String,
+        text: String,
+    )
+    suspend fun drainDirectDms(): List<SonarDirectDm>
+    suspend fun acknowledgeDirectDms(eventIds: List<String>)
 
     // ── Identity / profile (persisted on-device) ──
 

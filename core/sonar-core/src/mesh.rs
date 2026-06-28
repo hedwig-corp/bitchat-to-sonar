@@ -8,10 +8,8 @@
 //! and the identity-announce TLV. Noise XX orchestration, fragmentation, and
 //! signing build on top of this in later modules.
 //!
-//! Scope of this layer: protocol **v1** (14-byte header), uncompressed, no
-//! source-route. That covers the two-phone interop path (announces + small
-//! DMs never trip the >256-byte compression threshold). v2/route/compression
-//! are additive and decode-reject for now (documented).
+//! Scope of this layer: protocol **v1/v2** encode and protocol v1/v2 decode for
+//! uncompressed packets. Compressed frames still decode-reject.
 
 /// bitchat packet types (`MessageType`, BitchatProtocol.swift). Only the ones
 /// the mesh foundation needs are named; others pass through as raw `u8`.
@@ -29,6 +27,7 @@ pub mod msg_type {
 }
 
 const V1_HEADER_SIZE: usize = 14;
+const V2_HEADER_SIZE: usize = 16;
 const SENDER_ID_SIZE: usize = 8;
 const RECIPIENT_ID_SIZE: usize = 8;
 const SIGNATURE_SIZE: usize = 64;
@@ -37,9 +36,10 @@ mod flags {
     pub const HAS_RECIPIENT: u8 = 0x01;
     pub const HAS_SIGNATURE: u8 = 0x02;
     pub const IS_COMPRESSED: u8 = 0x04;
+    pub const HAS_ROUTE: u8 = 0x08;
 }
 
-/// A decoded bitchat packet (v1). `sender_id`/`recipient_id` are the 8-byte
+/// A decoded bitchat packet. `sender_id`/`recipient_id` are the 8-byte
 /// truncated peer IDs; broadcast recipient = `0xFF * 8`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Packet {
@@ -49,6 +49,7 @@ pub struct Packet {
     pub timestamp: u64,
     pub sender_id: [u8; 8],
     pub recipient_id: Option<[u8; 8]>,
+    pub route: Option<Vec<[u8; 8]>>,
     pub payload: Vec<u8>,
     pub signature: Option<[u8; 64]>,
 }
@@ -66,9 +67,18 @@ impl Packet {
             timestamp,
             sender_id,
             recipient_id: None,
+            route: None,
             payload: Vec::new(),
             signature: None,
         }
+    }
+
+    /// Build a v2 packet. Used for file-transfer payloads above the v1 u16
+    /// payload-length ceiling, and for route-carrying packets.
+    pub fn new_v2(type_: u8, ttl: u8, timestamp: u64, sender_id: [u8; 8]) -> Self {
+        let mut packet = Self::new(type_, ttl, timestamp, sender_id);
+        packet.version = 2;
+        packet
     }
 
     /// Encode to the wire format, PKCS#7-padded to the optimal block size
@@ -81,13 +91,43 @@ impl Packet {
 
     /// Encode without the trailing PKCS#7 padding (the signed/inner form).
     pub fn encode_unpadded(&self) -> Option<Vec<u8>> {
-        if self.version != 1 {
-            return None; // v2/route/compression not emitted by this layer
-        }
-        if self.payload.len() > u16::MAX as usize {
+        if self.version != 1 && self.version != 2 {
             return None;
         }
-        let mut out = Vec::with_capacity(V1_HEADER_SIZE + SENDER_ID_SIZE + self.payload.len());
+        if self.version == 1 && self.payload.len() > u16::MAX as usize {
+            return None;
+        }
+        if self.payload.len() > file_packet::MAX_FRAMED_FILE_BYTES {
+            return None;
+        }
+        let route = if self.version >= 2 {
+            self.route.as_deref().unwrap_or(&[])
+        } else {
+            &[]
+        };
+        if route.len() > u8::MAX as usize {
+            return None;
+        }
+        let header_size = if self.version == 2 {
+            V2_HEADER_SIZE
+        } else {
+            V1_HEADER_SIZE
+        };
+        let recipient_len = self.recipient_id.map(|_| RECIPIENT_ID_SIZE).unwrap_or(0);
+        let route_len = if route.is_empty() {
+            0
+        } else {
+            1 + route.len() * SENDER_ID_SIZE
+        };
+        let signature_len = self.signature.map(|_| SIGNATURE_SIZE).unwrap_or(0);
+        let mut out = Vec::with_capacity(
+            header_size
+                + SENDER_ID_SIZE
+                + recipient_len
+                + route_len
+                + self.payload.len()
+                + signature_len,
+        );
         out.push(self.version);
         out.push(self.type_);
         out.push(self.ttl);
@@ -100,12 +140,25 @@ impl Packet {
         if self.signature.is_some() {
             flags |= flags::HAS_SIGNATURE;
         }
+        if !route.is_empty() {
+            flags |= flags::HAS_ROUTE;
+        }
         out.push(flags);
 
-        out.extend_from_slice(&(self.payload.len() as u16).to_be_bytes());
+        if self.version == 2 {
+            out.extend_from_slice(&(self.payload.len() as u32).to_be_bytes());
+        } else {
+            out.extend_from_slice(&(self.payload.len() as u16).to_be_bytes());
+        }
         out.extend_from_slice(&self.sender_id);
         if let Some(rid) = self.recipient_id {
             out.extend_from_slice(&rid);
+        }
+        if !route.is_empty() {
+            out.push(route.len() as u8);
+            for hop in route {
+                out.extend_from_slice(hop);
+            }
         }
         out.extend_from_slice(&self.payload);
         if let Some(sig) = self.signature {
@@ -135,8 +188,16 @@ fn decode_core(raw: &[u8]) -> Option<Packet> {
     let mut o = 0usize;
     let version = raw[o];
     o += 1;
-    if version != 1 {
-        return None; // only v1 supported in this layer
+    if version != 1 && version != 2 {
+        return None;
+    }
+    let min_header = match version {
+        1 => V1_HEADER_SIZE + SENDER_ID_SIZE,
+        2 => V2_HEADER_SIZE + SENDER_ID_SIZE,
+        _ => return None,
+    };
+    if raw.len() < min_header {
+        return None;
     }
     let type_ = raw[o];
     o += 1;
@@ -152,12 +213,35 @@ fn decode_core(raw: &[u8]) -> Option<Packet> {
     let has_recipient = flags & flags::HAS_RECIPIENT != 0;
     let has_signature = flags & flags::HAS_SIGNATURE != 0;
     let is_compressed = flags & flags::IS_COMPRESSED != 0;
+    let has_route = version >= 2 && flags & flags::HAS_ROUTE != 0;
     if is_compressed {
         return None; // compression not handled in this foundation layer
     }
-    let payload_len = ((raw[o] as usize) << 8) | raw[o + 1] as usize;
-    o += 2;
+    let payload_len = if version == 2 {
+        if raw.len() < o + 4 {
+            return None;
+        }
+        let len = ((raw[o] as usize) << 24)
+            | ((raw[o + 1] as usize) << 16)
+            | ((raw[o + 2] as usize) << 8)
+            | raw[o + 3] as usize;
+        o += 4;
+        if len > file_packet::MAX_FRAMED_FILE_BYTES {
+            return None;
+        }
+        len
+    } else {
+        if raw.len() < o + 2 {
+            return None;
+        }
+        let len = ((raw[o] as usize) << 8) | raw[o + 1] as usize;
+        o += 2;
+        len
+    };
 
+    if raw.len() < o + SENDER_ID_SIZE {
+        return None;
+    }
     let mut sender_id = [0u8; 8];
     sender_id.copy_from_slice(&raw[o..o + SENDER_ID_SIZE]);
     o += SENDER_ID_SIZE;
@@ -170,6 +254,32 @@ fn decode_core(raw: &[u8]) -> Option<Packet> {
         rid.copy_from_slice(&raw[o..o + RECIPIENT_ID_SIZE]);
         o += RECIPIENT_ID_SIZE;
         Some(rid)
+    } else {
+        None
+    };
+
+    let route = if has_route {
+        if raw.len() < o + 1 {
+            return None;
+        }
+        let route_count = raw[o] as usize;
+        o += 1;
+        let route_bytes = route_count.checked_mul(SENDER_ID_SIZE)?;
+        if raw.len() < o + route_bytes {
+            return None;
+        }
+        let mut route = Vec::with_capacity(route_count);
+        for _ in 0..route_count {
+            let mut hop = [0u8; 8];
+            hop.copy_from_slice(&raw[o..o + SENDER_ID_SIZE]);
+            o += SENDER_ID_SIZE;
+            route.push(hop);
+        }
+        if route.is_empty() {
+            None
+        } else {
+            Some(route)
+        }
     } else {
         None
     };
@@ -200,6 +310,7 @@ fn decode_core(raw: &[u8]) -> Option<Packet> {
         timestamp,
         sender_id,
         recipient_id,
+        route,
         payload,
         signature,
     })
@@ -587,6 +698,74 @@ pub fn encode_private_message_plaintext(msg: &PrivateMessage) -> Option<Vec<u8>>
     Some(out)
 }
 
+pub const BITCHAT_NIP17_PREFIX: &str = "bitchat1:";
+const MAX_EMBEDDED_BITCHAT_PACKET_BYTES: usize = 2 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddedPrivateMessage {
+    pub sender_id: [u8; 8],
+    pub recipient_id: Option<[u8; 8]>,
+    pub message_id: String,
+    pub content: String,
+    pub timestamp: u64,
+}
+
+/// Encode a NIP-17 rumor content string compatible with iOS bitchat's
+/// `NostrEmbeddedBitChat.encodePMForNostr`.
+///
+/// The embedded packet uses the bitchat `noiseEncrypted` packet type (0x11), but
+/// the payload is the plaintext `[NoisePayloadType][PrivateMessagePacket]`.
+/// The NIP-17 seal/gift-wrap supplies the actual transport encryption.
+pub fn encode_nip17_private_message_content(
+    sender_id: [u8; 8],
+    recipient_id: Option<[u8; 8]>,
+    timestamp: u64,
+    msg: &PrivateMessage,
+) -> Option<String> {
+    let mut packet = Packet::new(msg_type::NOISE_ENCRYPTED, 7, timestamp, sender_id);
+    packet.recipient_id = recipient_id;
+    packet.payload = encode_private_message_plaintext(msg)?;
+    let raw = packet.encode()?;
+    use base64::Engine;
+    Some(format!(
+        "{BITCHAT_NIP17_PREFIX}{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)
+    ))
+}
+
+/// Decode a `bitchat1:` NIP-17 rumor content string into the private-message
+/// TLV it carries. Non-bitchat or unsupported embedded payloads return `None`.
+pub fn decode_nip17_private_message_content(content: &str) -> Option<EmbeddedPrivateMessage> {
+    let encoded = content.strip_prefix(BITCHAT_NIP17_PREFIX)?;
+    let max_encoded = ((MAX_EMBEDDED_BITCHAT_PACKET_BYTES + 2) / 3) * 4;
+    if encoded.len() > max_encoded {
+        return None;
+    }
+    use base64::Engine;
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .ok()?;
+    if raw.len() > MAX_EMBEDDED_BITCHAT_PACKET_BYTES {
+        return None;
+    }
+    let packet = Packet::decode(&raw)?;
+    if packet.type_ != msg_type::NOISE_ENCRYPTED {
+        return None;
+    }
+    let (payload_type, rest) = split_noise_plaintext(&packet.payload)?;
+    if payload_type != noise_payload::PRIVATE_MESSAGE {
+        return None;
+    }
+    let private = PrivateMessage::decode(rest)?;
+    Some(EmbeddedPrivateMessage {
+        sender_id: packet.sender_id,
+        recipient_id: packet.recipient_id,
+        message_id: private.message_id,
+        content: private.content,
+        timestamp: packet.timestamp,
+    })
+}
+
 /// Split a decrypted noiseEncrypted plaintext into its type byte and the rest.
 pub fn split_noise_plaintext(plain: &[u8]) -> Option<(u8, &[u8])> {
     plain.split_first().map(|(t, rest)| (*t, rest))
@@ -748,6 +927,9 @@ pub mod file_packet {
 
     /// Max content size (bitchat `FileTransferLimits.maxPayloadBytes` = 1 MiB).
     pub const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
+    /// Conservative ceiling for an encoded v2 packet payload plus file metadata,
+    /// matching iOS `FileTransferLimits.maxFramedFileBytes` headroom.
+    pub const MAX_FRAMED_FILE_BYTES: usize = (2 * u16::MAX as usize) + 18 + MAX_PAYLOAD_BYTES + 128;
 
     // Canonical TLV tags (must match bitchat exactly).
     const T_FILE_NAME: u8 = 0x01;

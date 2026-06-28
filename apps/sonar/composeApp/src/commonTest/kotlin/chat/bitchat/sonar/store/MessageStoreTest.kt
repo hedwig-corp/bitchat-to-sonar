@@ -1,6 +1,7 @@
 package chat.bitchat.sonar.store
 
 import chat.bitchat.sonar.SonarChannelMsg
+import chat.bitchat.sonar.SonarMedia
 import chat.bitchat.sonar.SonarMsg
 import chat.bitchat.sonar.SonarStickerRef
 import kotlin.test.Test
@@ -69,6 +70,34 @@ class MessageCodecTest {
         assertEquals(ref, decoded[0].stickerRef)
         assertNull(decoded[1].stickerRef)
         assertEquals("plain text", decoded[1].content)
+    }
+
+    @Test fun dmRoundTripWithMedia() {
+        val media = SonarMedia("mesh-media:peer:message:photo.jpg", "image/jpeg", "photo.jpg", 640, 480, null)
+        val msgs = listOf(
+            SonarMsg("a", "npub1xx", "", mine = true, tsSecs = 1, media = listOf(media)),
+            SonarMsg("b", "npub1yy", "plain text", mine = false, tsSecs = 2),
+        )
+        val decoded = MessageCodec.decodeDm(MessageCodec.encodeDm(msgs))
+        assertEquals(msgs.size, decoded.size)
+        assertEquals(media, decoded[0].media.single())
+        assertEquals("plain text", decoded[1].content)
+        assertTrue(decoded[1].media.isEmpty())
+    }
+
+    @Test fun dmRoundTripPreservesInternetTransportFlag() {
+        val msg = SonarMsg("a", "npub1xx", "plain direct", mine = false, tsSecs = 3, viaInternet = true)
+        val decoded = MessageCodec.decodeDm(MessageCodec.encodeDm(listOf(msg))).single()
+        assertEquals(msg, decoded)
+    }
+
+    @Test fun dmRoundTripWithStickerAndMedia() {
+        val ref = SonarStickerRef("30030:abc123:pack", "wave", "deadbeef")
+        val media = SonarMedia("mesh-media:peer:message:voice.m4a", "audio/mp4", "voice.m4a", null, null, 1200)
+        val msg = SonarMsg("a", "npub1xx", "", mine = false, tsSecs = 3, media = listOf(media), stickerRef = ref)
+        val decoded = MessageCodec.decodeDm(MessageCodec.encodeDm(listOf(msg))).single()
+        assertEquals(ref, decoded.stickerRef)
+        assertEquals(media, decoded.media.single())
     }
 
     @Test fun dmBackwardCompatOldFormatNoSticker() {

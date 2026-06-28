@@ -1,6 +1,7 @@
 package chat.bitchat.sonar.store
 
 import chat.bitchat.sonar.SonarChannelMsg
+import chat.bitchat.sonar.SonarMedia
 import chat.bitchat.sonar.SonarMsg
 import chat.bitchat.sonar.SonarStickerRef
 
@@ -34,6 +35,10 @@ expect object MessageStore {
     suspend fun saveMeshDm(peerKey: String, msgs: List<SonarMsg>)
     /** Delete a single peer's BLE-mesh transcript file (per-chat delete). */
     suspend fun deleteMeshDm(peerKey: String)
+    /** Save local bytes for a mesh media attachment referenced by `mesh-media:*`. */
+    suspend fun saveMeshMedia(mediaUrl: String, bytes: ByteArray)
+    /** Load local bytes for a mesh media attachment referenced by `mesh-media:*`. */
+    suspend fun loadMeshMedia(mediaUrl: String): ByteArray?
     suspend fun wipe()
 }
 
@@ -65,18 +70,46 @@ object MessageCodec {
         list.joinToString("\n") { m ->
             val base = row(m.id, m.senderNpub, if (m.mine) "1" else "0", m.tsSecs.toString(), m.content)
             val ref = m.stickerRef
-            if (ref != null) base + "\t" + hexEnc(ref.packCoordinate) + "\t" + hexEnc(ref.shortcode) + "\t" + hexEnc(ref.plaintextSha256)
-            else base
+            val media = m.media.firstOrNull()
+            if (ref != null || media != null || m.viaInternet) {
+                base + "\t" +
+                    hexEnc(ref?.packCoordinate.orEmpty()) + "\t" +
+                    hexEnc(ref?.shortcode.orEmpty()) + "\t" +
+                    hexEnc(ref?.plaintextSha256.orEmpty()) + "\t" +
+                    hexEnc(media?.url.orEmpty()) + "\t" +
+                    hexEnc(media?.mimeType.orEmpty()) + "\t" +
+                    hexEnc(media?.filename.orEmpty()) + "\t" +
+                    hexEnc(media?.width?.toString().orEmpty()) + "\t" +
+                    hexEnc(media?.height?.toString().orEmpty()) + "\t" +
+                    hexEnc(media?.durationMs?.toString().orEmpty()) + "\t" +
+                    hexEnc(if (m.viaInternet) "1" else "")
+            } else base
         }
 
     fun decodeDm(blob: String): List<SonarMsg> =
         blob.lineSequence().mapNotNull { line ->
             val f = unrow(line) ?: return@mapNotNull null
             if (f.size < 5) return@mapNotNull null
-            val stickerRef = if (f.size >= 8) SonarStickerRef(f[5], f[6], f[7]) else null
+            val stickerRef = if (f.size >= 8 && (f[5].isNotBlank() || f[6].isNotBlank() || f[7].isNotBlank())) {
+                SonarStickerRef(f[5], f[6], f[7])
+            } else null
+            val media = if (f.size >= 14 && f[8].isNotBlank()) {
+                listOf(
+                    SonarMedia(
+                        url = f[8],
+                        mimeType = f[9],
+                        filename = f[10],
+                        width = f[11].toIntOrNull(),
+                        height = f[12].toIntOrNull(),
+                        durationMs = f[13].toLongOrNull(),
+                    )
+                )
+            } else emptyList()
             SonarMsg(
                 id = f[0], senderNpub = f[1], content = f[4],
                 mine = f[2] == "1", tsSecs = f[3].toLongOrNull() ?: 0L,
+                viaInternet = f.size >= 15 && f[14] == "1",
+                media = media,
                 stickerRef = stickerRef,
             )
         }.toList()

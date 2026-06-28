@@ -1170,24 +1170,24 @@ private fun LockScreen(onUnlock: () -> Unit) {
     }
 }
 
-/** Slash-command suggestions (1:1 with iOS snCommands). */
+/** Slash-command suggestions (mirrors the iOS command autocomplete surface). */
 @Composable
-private fun SlashHints(draft: String, onPick: (String) -> Unit) {
+internal fun SlashHints(draft: String, onPick: (String) -> Unit) {
     val s = sonar
-    val commands = listOf("who" to "See who's nearby", "msg" to "Message someone", "slap" to "Classic IRC slap")
-    val typed = draft.drop(1).lowercase()
-    val matches = commands.filter { it.first.startsWith(typed) }
+    val matches = SonarSlashCommands.matches(draft)
     if (matches.isEmpty()) return
     Column(Modifier.fillMaxWidth().padding(horizontal = 10.dp)) {
-        matches.forEach { (cmd, desc) ->
+        matches.forEach { command ->
             Row(
                 Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))
-                    .clickable { onPick("/$cmd") }.padding(horizontal = 12.dp, vertical = 9.dp),
+                    .clickable {
+                        onPick("/${command.canonical}${if (command.needsArgument) " " else ""}")
+                    }.padding(horizontal = 12.dp, vertical = 9.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text("/$cmd", color = s.accent, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                Text("/${command.canonical}", color = s.accent, fontSize = 14.sp, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.width(10.dp))
-                Text(desc, color = s.text3, fontSize = 13.sp)
+                Text(command.description, color = s.text3, fontSize = 13.sp)
             }
         }
     }
@@ -1270,6 +1270,7 @@ private fun VerifySheet(
 private fun GeoDmScreen(state: SonarAppState, screen: Screen.GeoDm) {
     val s = sonar
     var draft by remember { mutableStateOf("") }
+    val blocked = state.isGeoDmBlocked(screen.peerHex)
     val listState = rememberLazyListState()
     LaunchedEffect(state.messages.size) {
         if (state.messages.isNotEmpty()) listState.animateScrollToItem(state.messages.size - 1)
@@ -1282,18 +1283,25 @@ private fun GeoDmScreen(state: SonarAppState, screen: Screen.GeoDm) {
             SNIconButton(SNIconName.Back, onClick = { state.back() })
             SonarAvatar(screen.name, 36.dp, presence = false)
             Spacer(Modifier.width(10.dp))
-            Column {
+            Column(Modifier.weight(1f)) {
                 Text(screen.name, color = s.text, fontSize = 16.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     SNIcon(SNIconName.Lock, 11.dp, s.text2, weight = 2.4f)
                     Spacer(Modifier.width(4.dp))
-                    Text("Sonar · end-to-end encrypted", color = s.text3, fontSize = 11.5.sp)
+                    Text(if (blocked) "Blocked" else "Sonar · end-to-end encrypted", color = s.text3, fontSize = 11.5.sp)
                 }
             }
+            SNIconButton(
+                SNIconName.X,
+                tint = if (blocked) s.danger else s.text3,
+                onClick = { state.setChannelAuthorBlocked(screen.peerHex, screen.name, !blocked) }
+            )
         }
         chat.bitchat.sonar.ui.SNBanner(
-            icon = SNIconName.Lock, tone = chat.bitchat.sonar.ui.SNBannerTone.Enc,
-            bold = "End-to-end encrypted", rest = " — a private chat with ${screen.name} from the channel"
+            icon = if (blocked) SNIconName.X else SNIconName.Lock,
+            tone = if (blocked) chat.bitchat.sonar.ui.SNBannerTone.Neutral else chat.bitchat.sonar.ui.SNBannerTone.Enc,
+            bold = if (blocked) "Blocked" else "End-to-end encrypted",
+            rest = if (blocked) " — unblock ${screen.name} to send or receive messages" else " — a private chat with ${screen.name} from the channel"
         )
         if (state.messages.isEmpty()) {
             Box(Modifier.weight(1f).fillMaxWidth()) {
@@ -1372,10 +1380,10 @@ private fun MessageBubble(m: SonarMsg, mesh: Boolean = false, author: String? = 
 
 @Composable
 private fun MessageStatusFooter(m: SonarMsg, mesh: Boolean) {
-    val state = m.state ?: return
+    val state = sonarDeliveryLabel(m.state) ?: return
     val s = sonar
-    val pending = state == "Sending" || state == "Uploading"
-    val failed = state == "Couldn't send"
+    val pending = sonarDeliveryPending(state)
+    val failed = sonarDeliveryFailed(state)
     Row(
         horizontalArrangement = Arrangement.spacedBy(3.dp),
         verticalAlignment = Alignment.CenterVertically,

@@ -97,8 +97,11 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
         state.verifyInfo(effectiveChatId)
     }
     val verified = state.isVerified(effectiveChatId)
-    val canCall = state.canCall(effectiveChatId)
-    val canPay = state.hasDirectPaymentRoute(effectiveChatId)
+    val blocked = state.isContactBlocked(effectiveChatId)
+    val canCall = state.canCall(effectiveChatId) && !blocked
+    val canPay = state.hasDirectPaymentRoute(effectiveChatId) && !blocked
+    val canFavorite = state.canFavoriteContact(effectiveChatId)
+    val favorite = state.isContactFavorite(effectiveChatId)
     LaunchedEffect(effectiveChatId) {
         state.refreshDescriptorForChat(effectiveChatId)
     }
@@ -166,6 +169,10 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
                     icon = SNIconName.Lock,
                     label = "Message",
                     onClick = {
+                        if (blocked) {
+                            state.toast = "Unblock ${screen.name} before messaging."
+                            return@ActionCircle
+                        }
                         if (effectiveChatId != screen.chatId) {
                             val dmChat = state.chats.firstOrNull { it.id == effectiveChatId }
                             if (dmChat != null) state.openChat(dmChat)
@@ -303,13 +310,23 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
             // ── Actions card ──
             SNSectionLabel("Actions")
             SNSettingsCard {
+                if (canFavorite) {
+                    SNSettingsRow(
+                        icon = SNIconName.Heart,
+                        tone = if (favorite) SNTone.Gold else SNTone.Default,
+                        label = if (favorite) "Remove favorite" else "Add favorite",
+                        sub = "Marks this trusted mesh peer for later relay delivery",
+                        trail = SNTrail.None
+                    ) { state.toggleFavoriteContact(effectiveChatId, screen.name) }
+                }
                 SNSettingsRow(
                     icon = SNIconName.X,
                     tone = SNTone.Red,
-                    label = "Block contact",
+                    label = if (blocked) "Unblock contact" else "Block contact",
+                    sub = if (blocked) "Allow messages and discovery again" else "Hide this contact and stop messages",
                     danger = true,
                     trail = SNTrail.None
-                ) { state.toast = "Coming soon" }
+                ) { state.setContactBlocked(effectiveChatId, screen.name, !blocked) }
                 SNSettingsRow(
                     icon = SNIconName.Trash,
                     tone = SNTone.Red,

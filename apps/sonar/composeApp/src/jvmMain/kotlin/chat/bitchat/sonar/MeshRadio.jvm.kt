@@ -63,7 +63,10 @@ actual object MeshRadio {
     actual fun sendMeshDmNow(peerId: String, messageId: String, text: String): Boolean =
         MeshLink.sendDmNow(peerId, messageId, text)
     actual fun hasMeshLink(peerId: String): Boolean = MeshLink.hasLink(peerId)
+    actual fun localPeerIdHex(): String = MeshIdentity.peerIdHex
     actual fun drainMeshDm(): List<MeshDmIn> = MeshLink.drainDms()
+    actual fun sendMeshMedia(peerId: String, messageId: String, bytes: ByteArray, filename: String, mimeType: String): Boolean = false
+    actual fun drainMeshMedia(): List<MeshMediaIn> = emptyList()
     actual fun nowSecs(): Long = System.currentTimeMillis() / 1000
 
     // Public Mesh-channel broadcast (0x02) — not wired on desktop yet.

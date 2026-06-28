@@ -8,7 +8,10 @@
 
 use sonar_core::mesh::file_packet::{fragment, FilePacket};
 use sonar_core::mesh::fragment::{Fragment, Reassembler};
-use sonar_core::mesh::msg_type;
+use sonar_core::mesh::{
+    decode_nip17_private_message_content, encode_nip17_private_message_content, msg_type,
+    verify_packet, MeshSigner, Packet, PrivateMessage, BITCHAT_NIP17_PREFIX,
+};
 use sonar_core::noise::{NoiseHandshake, NoiseKeypair};
 
 /// Sonar's `FilePacket.encode()` must equal the bytes bitchat's
@@ -56,6 +59,122 @@ fn file_packet_round_trip_preserves_fields() {
     assert_eq!(decoded.file_size, Some(content.len() as u64));
     assert_eq!(decoded.mime_type.as_deref(), Some("image/jpeg"));
     assert_eq!(decoded.content, content);
+}
+
+/// iOS sends file-transfer packets as protocol v2 so payload length is u32
+/// and optional source-route bytes may appear before the payload. Android must
+/// decode these packets even though it still emits v1 for its own packets.
+#[test]
+fn v2_file_transfer_packet_decodes_like_ios() {
+    let payload = FilePacket {
+        file_name: Some("photo.jpg".to_string()),
+        file_size: None,
+        mime_type: Some("image/jpeg".to_string()),
+        content: vec![1, 2, 3, 4, 5],
+    }
+    .encode()
+    .expect("file payload");
+    let sender = [1, 2, 3, 4, 5, 6, 7, 8];
+    let recipient = [9, 10, 11, 12, 13, 14, 15, 16];
+    let route = [[0x21; 8], [0x22; 8]];
+
+    let mut raw = Vec::new();
+    raw.push(2); // version
+    raw.push(msg_type::FILE_TRANSFER);
+    raw.push(7); // ttl
+    raw.extend_from_slice(&1_234_567_890u64.to_be_bytes());
+    raw.push(0x01 | 0x02 | 0x08); // recipient + signature + route
+    raw.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    raw.extend_from_slice(&sender);
+    raw.extend_from_slice(&recipient);
+    raw.push(route.len() as u8);
+    for hop in route {
+        raw.extend_from_slice(&hop);
+    }
+    raw.extend_from_slice(&payload);
+    raw.extend_from_slice(&[0xAA; 64]);
+
+    let decoded = Packet::decode(&raw).expect("decode v2 packet");
+    assert_eq!(decoded.version, 2);
+    assert_eq!(decoded.type_, msg_type::FILE_TRANSFER);
+    assert_eq!(decoded.ttl, 7);
+    assert_eq!(decoded.timestamp, 1_234_567_890);
+    assert_eq!(decoded.sender_id, sender);
+    assert_eq!(decoded.recipient_id, Some(recipient));
+    assert_eq!(decoded.route, Some(route.to_vec()));
+    assert_eq!(decoded.signature, Some([0xAA; 64]));
+    assert_eq!(decoded.payload, payload);
+
+    let file = FilePacket::decode(&decoded.payload).expect("decode file payload");
+    assert_eq!(file.file_name.as_deref(), Some("photo.jpg"));
+    assert_eq!(file.mime_type.as_deref(), Some("image/jpeg"));
+    assert_eq!(file.content, vec![1, 2, 3, 4, 5]);
+}
+
+#[test]
+fn signed_v2_file_transfer_packet_encodes_and_verifies() {
+    let content = vec![0x42; 70_000];
+    let payload = FilePacket {
+        file_name: Some("large.jpg".to_string()),
+        file_size: None,
+        mime_type: Some("image/jpeg".to_string()),
+        content: content.clone(),
+    }
+    .encode()
+    .expect("file payload");
+    assert!(payload.len() > u16::MAX as usize);
+
+    let signer = MeshSigner::generate();
+    let sender = [0x10; 8];
+    let recipient = [0x20; 8];
+    let route = vec![[0x31; 8], [0x32; 8]];
+    let mut packet = Packet::new_v2(msg_type::FILE_TRANSFER, 7, 1_800_000_000_000, sender);
+    packet.recipient_id = Some(recipient);
+    packet.route = Some(route.clone());
+    packet.payload = payload.clone();
+    assert!(sonar_core::mesh::sign_packet(&mut packet, &signer));
+
+    let wire = packet.encode().expect("encode signed v2");
+    let decoded = Packet::decode(&wire).expect("decode signed v2");
+    assert_eq!(decoded.version, 2);
+    assert_eq!(decoded.type_, msg_type::FILE_TRANSFER);
+    assert_eq!(decoded.recipient_id, Some(recipient));
+    assert_eq!(decoded.route, Some(route));
+    assert_eq!(decoded.payload, payload);
+    assert!(decoded.signature.is_some());
+    assert!(verify_packet(&decoded, &signer.public_key()));
+
+    let mut relayed = decoded.clone();
+    relayed.ttl = 3;
+    assert!(verify_packet(&relayed, &signer.public_key()));
+
+    let file = FilePacket::decode(&decoded.payload).expect("decode file payload");
+    assert_eq!(file.file_name.as_deref(), Some("large.jpg"));
+    assert_eq!(file.mime_type.as_deref(), Some("image/jpeg"));
+    assert_eq!(file.content, content);
+}
+
+#[test]
+fn nip17_bitchat_private_message_content_round_trips() {
+    let sender = [0x11; 8];
+    let recipient = [0x22; 8];
+    let msg = PrivateMessage {
+        message_id: "mid-123".to_string(),
+        content: "hello over nostr".to_string(),
+    };
+
+    let content =
+        encode_nip17_private_message_content(sender, Some(recipient), 1_700_000_001_000, &msg)
+            .expect("encode embedded private message");
+    assert!(content.starts_with(BITCHAT_NIP17_PREFIX));
+
+    let decoded =
+        decode_nip17_private_message_content(&content).expect("decode embedded private message");
+    assert_eq!(decoded.sender_id, sender);
+    assert_eq!(decoded.recipient_id, Some(recipient));
+    assert_eq!(decoded.timestamp, 1_700_000_001_000);
+    assert_eq!(decoded.message_id, "mid-123");
+    assert_eq!(decoded.content, "hello over nostr");
 }
 
 /// Mirrors bitchat's `testDecodeFallsBackToContentSizeWhenFileSizeMissing`.

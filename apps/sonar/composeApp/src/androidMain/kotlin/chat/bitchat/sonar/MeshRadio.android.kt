@@ -80,6 +80,8 @@ actual object MeshRadio {
 
     /** Incoming decrypted mesh DMs, buffered until the app drains them. */
     private val meshDmInbox = java.util.concurrent.ConcurrentLinkedQueue<MeshDmIn>()
+    /** Incoming private mesh file transfers, buffered until the app drains them. */
+    private val meshMediaInbox = java.util.concurrent.ConcurrentLinkedQueue<MeshMediaIn>()
     /** Incoming public Mesh-channel broadcasts, buffered until drained. */
     private val meshBroadcastInbox = java.util.concurrent.ConcurrentLinkedQueue<MeshBroadcastIn>()
 
@@ -90,6 +92,9 @@ actual object MeshRadio {
         // Buffer incoming Noise DMs (the listener fires on a BLE callback thread).
         MeshGatt.addMessageListener { fingerprint, messageId, text ->
             meshDmInbox.add(MeshDmIn(fingerprint, messageId, text, System.currentTimeMillis() / 1000))
+        }
+        MeshGatt.addFileListener { fingerprint, messageId, filename, mime, bytes ->
+            meshMediaInbox.add(MeshMediaIn(fingerprint, messageId, filename, mime, bytes, System.currentTimeMillis() / 1000))
         }
         // Buffer incoming public broadcasts (the BLE "Mesh" channel).
         MeshGatt.addBroadcastListener { pm ->
@@ -251,9 +256,20 @@ actual object MeshRadio {
 
     actual fun hasMeshLink(peerId: String): Boolean = MeshGatt.hasLink(peerId)
 
+    actual fun localPeerIdHex(): String = MeshGatt.nodeId().toHexLower()
+
     actual fun drainMeshDm(): List<MeshDmIn> {
         val out = ArrayList<MeshDmIn>()
         while (true) { out.add(meshDmInbox.poll() ?: break) }
+        return out
+    }
+
+    actual fun sendMeshMedia(peerId: String, messageId: String, bytes: ByteArray, filename: String, mimeType: String): Boolean =
+        MeshGatt.sendFileToPeer(peerId, messageId, bytes, filename, mimeType)
+
+    actual fun drainMeshMedia(): List<MeshMediaIn> {
+        val out = ArrayList<MeshMediaIn>()
+        while (true) { out.add(meshMediaInbox.poll() ?: break) }
         return out
     }
 
@@ -329,3 +345,6 @@ actual object MeshRadio {
         }
     }
 }
+
+private fun ByteArray.toHexLower(): String =
+    joinToString("") { (it.toInt() and 0xFF).toString(16).padStart(2, '0') }
