@@ -4640,6 +4640,7 @@ final class SonarAppStore: ObservableObject {
         marmot.messagesByGroup = [:]
         marmotVerified = [:]
         defaults.removeObject(forKey: Keys.marmotVerified)
+        defaults.removeObject(forKey: Keys.bleKnownChatKeys)
         // Stop Sonar discovery announces and forget discovered profiles (live +
         // the persisted npub↔peer link).
         if let ble = chatViewModel.meshService as? BLEService {
@@ -4651,7 +4652,6 @@ final class SonarAppStore: ObservableObject {
         meshPeerFirstSeenAt = [:]
         pendingCapabilityRefreshKeys = []
         defaults.removeObject(forKey: Keys.sonarProfiles)
-        defaults.removeObject(forKey: Keys.bleKnownChatKeys)
         openingDMTasks.values.forEach { $0.cancel() }
         openingDMTasks = [:]
         refreshingDMTasks.values.forEach { $0.cancel() }
