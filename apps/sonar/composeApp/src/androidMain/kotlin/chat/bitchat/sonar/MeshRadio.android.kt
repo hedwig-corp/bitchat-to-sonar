@@ -148,6 +148,7 @@ actual object MeshRadio {
     actual fun setDiscoveryMode(mode: BleDiscoveryMode) {
         if (discoveryMode == mode) return
         discoveryMode = mode
+        applyMeshGattPolicy()
         pruneForDiscoveryMode()
         if (scanning) {
             if (mode == BleDiscoveryMode.KnownOnly && knownPeerIds.isEmpty()) {
@@ -163,6 +164,7 @@ actual object MeshRadio {
     actual fun setKnownPeerIds(ids: Set<String>) {
         knownPeerIds.clear()
         ids.mapTo(knownPeerIds) { it.lowercase() }
+        applyMeshGattPolicy()
         pruneForDiscoveryMode()
         if (discoveryMode == BleDiscoveryMode.KnownOnly) {
             if (knownPeerIds.isEmpty()) stop()
@@ -179,6 +181,7 @@ actual object MeshRadio {
             android.util.Log.i(TAG, "start skipped: known-only discovery has no chat peers")
             return
         }
+        applyMeshGattPolicy()
         val a = adapter() ?: return
         scanning = true
         try {
@@ -255,6 +258,11 @@ actual object MeshRadio {
 
     private fun isKnownPeer(peerId: String): Boolean =
         discoveryMode == BleDiscoveryMode.Normal || knownPeerIds.contains(peerId.lowercase())
+
+    private fun applyMeshGattPolicy() {
+        val allowed = if (discoveryMode == BleDiscoveryMode.KnownOnly) knownPeerIds.toSet() else null
+        MeshGatt.setKnownOnlyPeerAllowlist(allowed)
+    }
 
     private fun pruneForDiscoveryMode() {
         if (discoveryMode == BleDiscoveryMode.Normal) return
