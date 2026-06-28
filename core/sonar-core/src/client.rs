@@ -2832,12 +2832,12 @@ impl SonarClient {
         index_result
     }
 
-    /// MIP-05: encrypt a device push token and publish it as a NIP-59 gift-wrapped
-    /// kind-446 notification request addressed to the transponder.
+    /// MIP-05: encrypt a device push token to the transponder's public key.
     ///
-    /// After registration, the encrypted token is cached locally and shared with
-    /// all joined group members via NIP-44 DMs so they can send sender-side
-    /// push notifications on future messages.
+    /// The transponder is stateless, so registration must not publish a kind-446
+    /// notification request. Instead, the encrypted token is cached locally and
+    /// shared with all joined group members via NIP-44 DMs so they can send
+    /// sender-side push notifications on future messages.
     pub async fn register_push_token(
         &self,
         platform: &str,
@@ -2849,19 +2849,6 @@ impl SonarClient {
         let server_pubkey = PublicKey::parse(server_npub)?;
         let plat = push::platform_byte(platform)?;
         let (content, _) = push::encode_notification_request(plat, token, &server_pubkey)?;
-
-        let rumor = EventBuilder::new(
-            Kind::Custom(push::KIND_NOTIFICATION_REQUEST),
-            &content,
-        )
-        .tags([
-            Tag::custom(TagKind::custom("v"), ["mip05-v1"]),
-            Tag::custom(TagKind::custom("encoding"), ["base64"]),
-        ])
-        .build(self.engine.identity().public_key());
-
-        let wrapped = self.engine.gift_wrap_rumor(&server_pubkey, rumor).await?;
-        self.nostr.send_event(&wrapped).await?;
 
         // Store our own registration so we can share it with group members.
         let own_reg = push::OwnPushRegistration {
@@ -3278,5 +3265,28 @@ mod tests {
         assert!(err
             .to_string()
             .contains("test publish: no relay accepted event"));
+    }
+
+    #[tokio::test]
+    async fn push_registration_does_not_require_transponder_publish() {
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client starts without relays");
+        let server_pubkey = Keys::generate().public_key();
+
+        client
+            .register_push_token("apns", b"device-token", &server_pubkey.to_hex())
+            .await
+            .expect("push registration should only cache and share the token");
+
+        let own = client
+            .own_push_registration
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("own push registration cached");
+
+        assert_eq!(own.server_pubkey, server_pubkey);
+        assert!(!own.encrypted_token_b64.is_empty());
     }
 }

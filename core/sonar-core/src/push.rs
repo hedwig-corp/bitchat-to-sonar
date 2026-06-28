@@ -2,7 +2,7 @@
 //!
 //! Three concerns:
 //! 1. **Registration**: encrypt a device push token to the transponder's public
-//!    key and publish as a NIP-59 gift-wrapped kind-446 event (done on app start).
+//!    key and cache it locally (done on app start).
 //! 2. **Token sharing**: publish the encrypted token as a NIP-44 DM to each group
 //!    member so they can cache it for sender-side notification.
 //! 3. **Sender notification**: after every send, gift-wrap a kind-446 containing

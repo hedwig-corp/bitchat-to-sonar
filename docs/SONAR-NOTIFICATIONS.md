@@ -172,8 +172,12 @@ Clients encrypt their APNS/FCM device tokens to the transponder's secp256k1
 public key using ECDH + HKDF-SHA256 (`salt=mip05-v1`, `info=mip05-token-encryption`)
 + ChaCha20-Poly1305. The 1024-byte plaintext is: platform byte (`0x01` APNS,
 `0x02` FCM) + 2-byte token length + token bytes + random padding. The
-encrypted 1084-byte blobs are concatenated, base64-encoded, and published
-inside a NIP-59 gift wrap addressed to the server's npub.
+encrypted 1084-byte blobs are base64-encoded, cached locally, and shared with
+group members via encrypted token-share DMs. Senders place one or more of those
+encrypted blobs inside a `kind:446` notification request only when they need the
+transponder to wake a recipient. App startup/registration does not publish a
+`kind:446` request because the transponder is stateless and treats every valid
+request as an immediate push dispatch.
 
 ### Deployment
 
