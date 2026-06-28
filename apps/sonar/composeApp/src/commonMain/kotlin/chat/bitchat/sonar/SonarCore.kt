@@ -377,6 +377,12 @@ expect object SonarCore {
     /** Our npub (empty until [start]). */
     fun myNpub(): String
 
+    /** Classify notification content through the Rust core renderer model. */
+    fun classifyNotificationContent(content: String): SonarNotificationKind
+
+    /** Render the user-visible notification envelope through the Rust core. */
+    fun renderNotification(input: SonarNotificationRenderInput): SonarNotificationEnvelope?
+
     /** All active Marmot chats we belong to. */
     suspend fun chats(): List<SonarChat>
 

@@ -14,6 +14,7 @@ pub mod invite_link;
 pub mod marmot;
 pub mod mesh;
 pub mod noise;
+pub mod notification;
 pub mod outbox;
 pub mod push;
 pub mod relay_directory;

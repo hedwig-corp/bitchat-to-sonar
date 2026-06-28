@@ -6,7 +6,7 @@ import kotlin.test.assertNull
 
 class SonarNotificationRouterTest {
     @Test
-    fun ordinaryMessagesAreGenericByDefault() {
+    fun ordinaryMessagesShowSenderByDefault() {
         val n = SonarNotificationRouter.build(
             idKey = "chat-1",
             kind = SonarNotificationKind.Message,
@@ -14,16 +14,31 @@ class SonarNotificationRouterTest {
             preview = "secret text",
         )
 
-        assertEquals("New Sonar message", n?.title)
+        assertEquals("Alice", n?.title)
         assertEquals("Open Sonar to read it.", n?.body)
     }
 
     @Test
-    fun namesAndPreviewsRequireOptIn() {
+    fun groupMessagesShowSenderAndGroup() {
         val n = SonarNotificationRouter.build(
             idKey = "chat-1",
             kind = SonarNotificationKind.Message,
             conversationTitle = "Alice",
+            senderName = "Alice",
+            groupName = "Signal Room",
+            preview = "secret text",
+        )
+
+        assertEquals("Alice in Signal Room", n?.title)
+        assertEquals("Open Sonar to read it.", n?.body)
+    }
+
+    @Test
+    fun previewsRequireOptIn() {
+        val n = SonarNotificationRouter.build(
+            idKey = "chat-1",
+            kind = SonarNotificationKind.Message,
+            senderName = "Alice",
             preview = "hello\nthere",
             prefs = SonarNotificationPrefs(showNames = true, showPreview = true),
         )
@@ -44,25 +59,34 @@ class SonarNotificationRouterTest {
     }
 
     @Test
-    fun paymentAndCallUseDistinctGenericCopy() {
-        val payment = SonarNotificationRouter.build("chat-1", SonarNotificationKind.Payment)
-        val call = SonarNotificationRouter.build("chat-1", SonarNotificationKind.Call)
+    fun paymentShowsAmountAndCallShowsSender() {
+        val payment = SonarNotificationRouter.build(
+            idKey = "chat-1",
+            kind = SonarNotificationKind.Payment,
+            senderName = "Alice",
+            preview = "⚡PAY|1|abc-123|2100",
+        )
+        val call = SonarNotificationRouter.build(
+            idKey = "chat-1",
+            kind = SonarNotificationKind.Call,
+            senderName = "Alice",
+        )
 
-        assertEquals("Payment received", payment?.title)
-        assertEquals("Open Sonar to view the payment.", payment?.body)
-        assertEquals("Incoming Sonar call", call?.title)
-        assertEquals("Open Sonar to answer.", call?.body)
+        assertEquals("Payment from Alice", payment?.title)
+        assertEquals("2,100 sats received from Alice.", payment?.body)
+        assertEquals("Incoming call from Alice", call?.title)
+        assertEquals("Tap to answer.", call?.body)
     }
 
     @Test
     fun contentClassificationFindsPaymentsAndCalls() {
         assertEquals(
             SonarNotificationKind.Payment,
-            SonarNotificationRouter.classifyContent("⚡PAY|1|u1|2100"),
+            SonarNotificationRouter.classifyContent("⚡PAY|1|abc-123|2100"),
         )
         assertEquals(
             SonarNotificationKind.Call,
-            SonarNotificationRouter.classifyContent("☎CALL|1|offer") { it.startsWith("☎CALL") },
+            SonarNotificationRouter.classifyContent("☎CALL|1|OFFER|c|voice|addr|1"),
         )
         assertEquals(
             SonarNotificationKind.Message,

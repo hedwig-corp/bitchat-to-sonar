@@ -295,8 +295,8 @@ private fun NotifSheet(state: SonarAppState, onClose: () -> Unit) {
         SNSettingsRow(
             icon = SNIconName.People, label = "Show names",
             sub = "Hide to keep the lock screen private",
-            toggle = state.prefBool("notifNames", false) && state.prefBool("notifs", true), trail = SNTrail.None,
-        ) { state.togglePref("notifNames", false) }
+            toggle = state.prefBool("notifNames", true) && state.prefBool("notifs", true), trail = SNTrail.None,
+        ) { state.togglePref("notifNames", true) }
         SNSettingsRow(
             icon = SNIconName.Pin, label = "Show message preview",
             toggle = state.prefBool("notifPreview", false) && state.prefBool("notifs", true),

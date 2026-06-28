@@ -269,9 +269,9 @@ class NotificationService: UNNotificationServiceExtension {
         // shared keychain access group.
         //
         // IMPORTANT: Do NOT render a user-visible notification here.
-        // The Breez NDS wakeup is infrastructure only.  The user-visible
-        // "Payment received" fires when the sender's ⚡PAY control line
-        // arrives through the transponder/chat path.
+        // The Breez NDS wakeup is infrastructure only. The user-visible
+        // payment amount notification fires when the sender's ⚡PAY control
+        // line arrives through the transponder/chat path.
         //
         // The extension has ~30 seconds to complete.
 
@@ -315,7 +315,8 @@ What to move to App Group:
 - Nostr relay URLs and connection config
 - The user's Nostr identity (for relay authentication)
 - Marmot decryption keys needed to process incoming messages
-- The notification router preferences (enabled, showNames, showPreview)
+- The notification router preferences (enabled, showNames, showPreview,
+  showPaymentAmount)
 
 What NOT to move:
 - Wallet private keys (use shared Keychain instead)
@@ -358,4 +359,6 @@ When push is disabled:
 - [ ] Disabling push in settings unregisters from both servers.
 - [ ] Token refresh re-registers with both servers.
 - [ ] Notification copy matches the local router output.
-- [ ] Privacy defaults hold: no names or previews in push-triggered notifications.
+- [ ] Provider payload privacy holds: APNS/FCM payloads contain no names,
+      amounts, or previews. Local rendering may show sender/group names and
+      payment amounts; message previews remain opt-in.

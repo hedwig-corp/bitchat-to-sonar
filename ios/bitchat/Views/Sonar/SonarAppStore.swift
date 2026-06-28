@@ -71,8 +71,9 @@ enum SonarLocalNotificationKind {
 
 struct SonarLocalNotificationPrefs {
     var enabled = true
-    var showNames = false
+    var showNames = true
     var showPreview = false
+    var showPaymentAmount = true
 }
 
 struct SonarLocalNotification {
@@ -85,86 +86,37 @@ struct SonarLocalNotification {
 enum SonarLocalNotificationRouter {
     static func make(
         idKey: String,
-        kind: SonarLocalNotificationKind,
+        kind: SonarLocalNotificationKind? = nil,
         conversationTitle: String?,
+        senderName: String? = nil,
+        groupName: String? = nil,
         preview: String?,
         prefs: SonarLocalNotificationPrefs,
+        unreadCount: UInt64 = 1,
         userInfo: [String: Any] = [:]
     ) -> SonarLocalNotification? {
-        guard prefs.enabled else { return nil }
+        let input = SonarNotificationRenderInputInfo(
+            enabled: prefs.enabled,
+            kindHint: kind?.ffiKind,
+            conversationTitle: conversationTitle,
+            senderName: senderName,
+            groupName: groupName,
+            contentPreview: preview,
+            unreadCount: max(1, unreadCount),
+            showNames: prefs.showNames,
+            showPreview: prefs.showPreview,
+            showPaymentAmount: prefs.showPaymentAmount
+        )
+        guard let envelope = sonarRenderNotification(input: input) else { return nil }
         return SonarLocalNotification(
-            title: title(kind: kind, conversationTitle: conversationTitle, prefs: prefs),
-            body: body(kind: kind, preview: preview, prefs: prefs),
-            identifier: "sonar-\(identifierSegment(kind))-\(idKey)",
+            title: envelope.title,
+            body: envelope.body,
+            identifier: "sonar-\(identifierSegment(envelope.kind))-\(idKey)",
             userInfo: userInfo
         )
     }
 
-    private static func title(
-        kind: SonarLocalNotificationKind,
-        conversationTitle: String?,
-        prefs: SonarLocalNotificationPrefs
-    ) -> String {
-        switch kind {
-        case .message:
-            if prefs.showNames, let name = conversationTitle?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty {
-                return name
-            }
-            return "New Sonar message"
-        case .payment:
-            return "Payment received"
-        case .call:
-            return "Incoming Sonar call"
-        case .invite:
-            return "New Sonar invite"
-        case .mention:
-            return "You were mentioned"
-        case .geohash:
-            if let title = conversationTitle?.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty {
-                return title
-            }
-            return "New channel activity"
-        case .network:
-            return "People nearby on Sonar"
-        }
-    }
-
-    private static func body(
-        kind: SonarLocalNotificationKind,
-        preview: String?,
-        prefs: SonarLocalNotificationPrefs
-    ) -> String {
-        switch kind {
-        case .message:
-            if prefs.showPreview {
-                let sanitized = sanitizePreview(preview)
-                if !sanitized.isEmpty { return sanitized }
-            }
-            return "Open Sonar to read it."
-        case .payment:
-            return "Open Sonar to view the payment."
-        case .call:
-            return "Open Sonar to answer."
-        case .invite:
-            return "Open Sonar to review the invite."
-        case .mention:
-            return "Open Sonar to read it."
-        case .geohash:
-            return "Open Sonar to view the channel."
-        case .network:
-            return "Open Sonar to see who is nearby."
-        }
-    }
-
-    private static func sanitizePreview(_ value: String?) -> String {
-        let collapsed = (value ?? "")
-            .components(separatedBy: .whitespacesAndNewlines)
-            .filter { !$0.isEmpty }
-            .joined(separator: " ")
-        return collapsed.count > 80 ? String(collapsed.prefix(80)) + "..." : collapsed
-    }
-
-    private static func identifierSegment(_ kind: SonarLocalNotificationKind) -> String {
+    private static func identifierSegment(_ kind: SonarNotificationKindInfo) -> String {
         switch kind {
         case .message: return "message"
         case .payment: return "payment"
@@ -173,6 +125,20 @@ enum SonarLocalNotificationRouter {
         case .mention: return "mention"
         case .geohash: return "geohash"
         case .network: return "network"
+        }
+    }
+}
+
+private extension SonarLocalNotificationKind {
+    var ffiKind: SonarNotificationKindInfo {
+        switch self {
+        case .message: return .message
+        case .payment: return .payment
+        case .call: return .call
+        case .invite: return .invite
+        case .mention: return .mention
+        case .geohash: return .geohash
+        case .network: return .network
         }
     }
 }
@@ -1327,16 +1293,18 @@ final class SonarAppStore: ObservableObject {
     private var notificationPrefs: SonarLocalNotificationPrefs {
         SonarLocalNotificationPrefs(
             enabled: defaults.object(forKey: Keys.notificationsEnabled) as? Bool ?? true,
-            showNames: defaults.object(forKey: Keys.notificationShowNames) as? Bool ?? false,
-            showPreview: defaults.object(forKey: Keys.notificationShowPreview) as? Bool ?? false
+            showNames: defaults.object(forKey: Keys.notificationShowNames) as? Bool ?? true,
+            showPreview: defaults.object(forKey: Keys.notificationShowPreview) as? Bool ?? false,
+            showPaymentAmount: true
         )
     }
 
     private func localNotificationKind(for content: String) -> SonarLocalNotificationKind {
-        if Self.looksLikeCallControl(content), callParseControl(content: content) != nil {
-            return .call
+        switch sonarNotificationClassifyContent(content: content) {
+        case .call: return .call
+        case .payment: return .payment
+        default: return .message
         }
-        return SonarPayMessage.decode(content) != nil ? .payment : .message
     }
 
     private func sendSonarNotification(
@@ -1344,7 +1312,10 @@ final class SonarAppStore: ObservableObject {
         idKey: String,
         conversationId: String?,
         conversationTitle: String?,
-        preview: String? = nil
+        senderName: String? = nil,
+        groupName: String? = nil,
+        preview: String? = nil,
+        unreadCount: UInt64 = 1
     ) {
         guard !isForeground else { return }
         let userInfo: [String: Any] = conversationId.map { ["sonarConversationId": $0] } ?? [:]
@@ -1352,8 +1323,11 @@ final class SonarAppStore: ObservableObject {
             idKey: idKey,
             kind: kind,
             conversationTitle: conversationTitle,
+            senderName: senderName,
+            groupName: groupName,
             preview: preview,
             prefs: notificationPrefs,
+            unreadCount: unreadCount,
             userInfo: userInfo
         ) else { return }
         NotificationService.shared.sendLocalNotification(
@@ -1376,11 +1350,15 @@ final class SonarAppStore: ObservableObject {
                 guard seenMarmotNotificationMessageIDs.insert(message.id).inserted else { continue }
                 let kind = localNotificationKind(for: message.content)
                 guard kind != .call else { continue }
+                let senderName = marmot.displayName(forNpub: message.senderNpub) ?? snShortNpubLabel(message.senderNpub)
+                let groupName = group.memberNpubs.count > 2 ? title : nil
                 sendSonarNotification(
                     kind: kind,
                     idKey: message.id,
                     conversationId: convId,
                     conversationTitle: title,
+                    senderName: senderName,
+                    groupName: groupName,
                     preview: message.content
                 )
             }
@@ -3677,6 +3655,7 @@ final class SonarAppStore: ObservableObject {
                             idKey: m.id,
                             conversationId: peerID.id,
                             conversationTitle: peerDisplayName(peerID.id),
+                            senderName: peerDisplayName(peerID.id),
                             preview: m.content
                         )
                     }
@@ -4296,7 +4275,8 @@ final class SonarAppStore: ObservableObject {
                             kind: .call,
                             idKey: "call-\(callId)-\(messageId)",
                             conversationId: conversationId,
-                            conversationTitle: name
+                            conversationTitle: name,
+                            senderName: name
                         )
                         self.push(.call(conversationId, video: video))
                     }

@@ -13,6 +13,7 @@ import chat.bitchat.sonar.Notifier
 import chat.bitchat.sonar.SonarCore
 import chat.bitchat.sonar.SonarNotificationKind
 import chat.bitchat.sonar.SonarNotificationRouter
+import chat.bitchat.sonar.shortNpubLabel
 import chat.bitchat.sonar.wallet.WalletBridge
 import chat.bitchat.sonar.wallet.WalletState
 import kotlinx.coroutines.CoroutineScope
@@ -104,7 +105,11 @@ class SonarPushProcessingService : Service() {
                     idKey = summary.groupIdHex,
                     kind = kind,
                     conversationTitle = summary.name.ifBlank { null },
+                    senderName = summary.latestSenderNpub
+                        .takeIf { it.isNotBlank() }
+                        ?.let(::shortNpubLabel),
                     preview = summary.latestContent,
+                    unreadCount = summary.unreadCount,
                 )
                 if (notif != null) {
                     Notifier.notify(notif.id, notif.title, notif.body)
@@ -122,9 +127,9 @@ class SonarPushProcessingService : Service() {
     }
 
     private suspend fun processBreezWakeup(notificationType: String) {
-        // Silent — no user-visible notification. The "Payment received"
-        // notification fires later through the transponder/chat path
-        // when the ⚡PAY control line arrives.
+        // Silent -- no user-visible notification. The payment amount
+        // notification fires later through the transponder/chat path when the
+        // ⚡PAY control line arrives.
         try {
             if (WalletBridge.state() !is WalletState.Ready) {
                 val nsec = SonarCore.identityNsec()

@@ -3594,6 +3594,154 @@ public func FfiConverterTypeSonarDescriptorInfo_lower(_ value: SonarDescriptorIn
 }
 
 
+public struct SonarNotificationEnvelopeInfo: Equatable, Hashable {
+    public var kind: SonarNotificationKindInfo
+    public var title: String
+    public var body: String
+    public var paymentSats: UInt64?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(kind: SonarNotificationKindInfo, title: String, body: String, paymentSats: UInt64?) {
+        self.kind = kind
+        self.title = title
+        self.body = body
+        self.paymentSats = paymentSats
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension SonarNotificationEnvelopeInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSonarNotificationEnvelopeInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SonarNotificationEnvelopeInfo {
+        return
+            try SonarNotificationEnvelopeInfo(
+                kind: FfiConverterTypeSonarNotificationKindInfo.read(from: &buf),
+                title: FfiConverterString.read(from: &buf),
+                body: FfiConverterString.read(from: &buf),
+                paymentSats: FfiConverterOptionUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SonarNotificationEnvelopeInfo, into buf: inout [UInt8]) {
+        FfiConverterTypeSonarNotificationKindInfo.write(value.kind, into: &buf)
+        FfiConverterString.write(value.title, into: &buf)
+        FfiConverterString.write(value.body, into: &buf)
+        FfiConverterOptionUInt64.write(value.paymentSats, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSonarNotificationEnvelopeInfo_lift(_ buf: RustBuffer) throws -> SonarNotificationEnvelopeInfo {
+    return try FfiConverterTypeSonarNotificationEnvelopeInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSonarNotificationEnvelopeInfo_lower(_ value: SonarNotificationEnvelopeInfo) -> RustBuffer {
+    return FfiConverterTypeSonarNotificationEnvelopeInfo.lower(value)
+}
+
+
+public struct SonarNotificationRenderInputInfo: Equatable, Hashable {
+    public var enabled: Bool
+    public var kindHint: SonarNotificationKindInfo?
+    public var conversationTitle: String?
+    public var senderName: String?
+    public var groupName: String?
+    public var contentPreview: String?
+    public var unreadCount: UInt64
+    public var showNames: Bool
+    public var showPreview: Bool
+    public var showPaymentAmount: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(enabled: Bool, kindHint: SonarNotificationKindInfo?, conversationTitle: String?, senderName: String?, groupName: String?, contentPreview: String?, unreadCount: UInt64, showNames: Bool, showPreview: Bool, showPaymentAmount: Bool) {
+        self.enabled = enabled
+        self.kindHint = kindHint
+        self.conversationTitle = conversationTitle
+        self.senderName = senderName
+        self.groupName = groupName
+        self.contentPreview = contentPreview
+        self.unreadCount = unreadCount
+        self.showNames = showNames
+        self.showPreview = showPreview
+        self.showPaymentAmount = showPaymentAmount
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension SonarNotificationRenderInputInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSonarNotificationRenderInputInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SonarNotificationRenderInputInfo {
+        return
+            try SonarNotificationRenderInputInfo(
+                enabled: FfiConverterBool.read(from: &buf),
+                kindHint: FfiConverterOptionTypeSonarNotificationKindInfo.read(from: &buf),
+                conversationTitle: FfiConverterOptionString.read(from: &buf),
+                senderName: FfiConverterOptionString.read(from: &buf),
+                groupName: FfiConverterOptionString.read(from: &buf),
+                contentPreview: FfiConverterOptionString.read(from: &buf),
+                unreadCount: FfiConverterUInt64.read(from: &buf),
+                showNames: FfiConverterBool.read(from: &buf),
+                showPreview: FfiConverterBool.read(from: &buf),
+                showPaymentAmount: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SonarNotificationRenderInputInfo, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.enabled, into: &buf)
+        FfiConverterOptionTypeSonarNotificationKindInfo.write(value.kindHint, into: &buf)
+        FfiConverterOptionString.write(value.conversationTitle, into: &buf)
+        FfiConverterOptionString.write(value.senderName, into: &buf)
+        FfiConverterOptionString.write(value.groupName, into: &buf)
+        FfiConverterOptionString.write(value.contentPreview, into: &buf)
+        FfiConverterUInt64.write(value.unreadCount, into: &buf)
+        FfiConverterBool.write(value.showNames, into: &buf)
+        FfiConverterBool.write(value.showPreview, into: &buf)
+        FfiConverterBool.write(value.showPaymentAmount, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSonarNotificationRenderInputInfo_lift(_ buf: RustBuffer) throws -> SonarNotificationRenderInputInfo {
+    return try FfiConverterTypeSonarNotificationRenderInputInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSonarNotificationRenderInputInfo_lower(_ value: SonarNotificationRenderInputInfo) -> RustBuffer {
+    return FfiConverterTypeSonarNotificationRenderInputInfo.lower(value)
+}
+
+
 /**
  * FFI-friendly single sticker inside a pack.
  */
@@ -4188,6 +4336,108 @@ public func FfiConverterTypeSonarFfiError_lower(_ value: SonarFfiError) -> RustB
     return FfiConverterTypeSonarFfiError.lower(value)
 }
 
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum SonarNotificationKindInfo: Equatable, Hashable {
+
+    case message
+    case payment
+    case call
+    case invite
+    case mention
+    case geohash
+    case network
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension SonarNotificationKindInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSonarNotificationKindInfo: FfiConverterRustBuffer {
+    typealias SwiftType = SonarNotificationKindInfo
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SonarNotificationKindInfo {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .message
+
+        case 2: return .payment
+
+        case 3: return .call
+
+        case 4: return .invite
+
+        case 5: return .mention
+
+        case 6: return .geohash
+
+        case 7: return .network
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: SonarNotificationKindInfo, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .message:
+            writeInt(&buf, Int32(1))
+
+
+        case .payment:
+            writeInt(&buf, Int32(2))
+
+
+        case .call:
+            writeInt(&buf, Int32(3))
+
+
+        case .invite:
+            writeInt(&buf, Int32(4))
+
+
+        case .mention:
+            writeInt(&buf, Int32(5))
+
+
+        case .geohash:
+            writeInt(&buf, Int32(6))
+
+
+        case .network:
+            writeInt(&buf, Int32(7))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSonarNotificationKindInfo_lift(_ buf: RustBuffer) throws -> SonarNotificationKindInfo {
+    return try FfiConverterTypeSonarNotificationKindInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSonarNotificationKindInfo_lower(_ value: SonarNotificationKindInfo) -> RustBuffer {
+    return FfiConverterTypeSonarNotificationKindInfo.lower(value)
+}
+
+
 
 
 
@@ -4615,6 +4865,30 @@ fileprivate struct FfiConverterOptionTypeSonarDescriptorInfo: FfiConverterRustBu
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeSonarNotificationEnvelopeInfo: FfiConverterRustBuffer {
+    typealias SwiftType = SonarNotificationEnvelopeInfo?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeSonarNotificationEnvelopeInfo.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeSonarNotificationEnvelopeInfo.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeStickerRefInfo: FfiConverterRustBuffer {
     typealias SwiftType = StickerRefInfo?
 
@@ -4655,6 +4929,30 @@ fileprivate struct FfiConverterOptionTypeCallControlInfo: FfiConverterRustBuffer
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeCallControlInfo.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeSonarNotificationKindInfo: FfiConverterRustBuffer {
+    typealias SwiftType = SonarNotificationKindInfo?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeSonarNotificationKindInfo.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeSonarNotificationKindInfo.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -5218,6 +5516,27 @@ public func noiseGenerateKeypair()throws  -> NoiseKeypairHex  {
     )
 })
 }
+public func sonarNotificationClassifyContent(content: String) -> SonarNotificationKindInfo  {
+    return try!  FfiConverterTypeSonarNotificationKindInfo_lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_func_sonar_notification_classify_content(
+        FfiConverterString.lower(content),$0
+    )
+})
+}
+public func sonarNotificationPaymentSats(content: String) -> UInt64?  {
+    return try!  FfiConverterOptionUInt64.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_func_sonar_notification_payment_sats(
+        FfiConverterString.lower(content),$0
+    )
+})
+}
+public func sonarRenderNotification(input: SonarNotificationRenderInputInfo) -> SonarNotificationEnvelopeInfo?  {
+    return try!  FfiConverterOptionTypeSonarNotificationEnvelopeInfo.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_func_sonar_render_notification(
+        FfiConverterTypeSonarNotificationRenderInputInfo_lower(input),$0
+    )
+})
+}
 /**
  * Erase the persistent Marmot database at `db_path`, its SQLite sidecars
  * (`-wal`, `-shm`, `-journal`), and the conversation-index sidecar database.
@@ -5309,6 +5628,15 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_func_noise_generate_keypair() != 35056) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_sonar_notification_classify_content() != 59219) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_sonar_notification_payment_sats() != 9687) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_sonar_render_notification() != 13744) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_func_wipe_marmot_database() != 46581) {
