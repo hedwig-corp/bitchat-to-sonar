@@ -10,7 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mdk_core::prelude::*;
 use nostr::prelude::*;
@@ -168,6 +168,8 @@ const SUB_MARMOT_GROUPS: &str = "sonar-marmot-groups";
 /// the shift cost vs dropping one-at-a-time).
 const MARMOT_BUFFER_CAP: usize = 1024;
 const DIRECT_DM_BUFFER_CAP: usize = 1024;
+const LIVE_EVENT_DEDUP_TTL: Duration = Duration::from_secs(60);
+const LIVE_EVENT_DEDUP_CAP: usize = 4096;
 
 /// Minimum number of relays that must be connected before `connect()` returns.
 /// Modeled after whitenoise-rs `min_connected_relays = 2`. A quorum of 2
@@ -178,6 +180,18 @@ const MIN_CONNECTED_RELAYS: usize = 2;
 /// Per-relay connection timeout used by the quorum-connect loop. If no relay
 /// connects within this window the client errors with `NoRelayConnections`.
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Relay EOSE/fetch completion quorum. Keep this aligned with the connection
+/// quorum so slow relays do not hold background sync or push processing open.
+const RELAY_FETCH_QUORUM: usize = MIN_CONNECTED_RELAYS;
+
+fn relay_fetch_quorum(total_relays: usize) -> usize {
+    if total_relays == 0 {
+        0
+    } else {
+        RELAY_FETCH_QUORUM.min(total_relays).max(1)
+    }
+}
 
 fn parse_mesh_id8_hex(value: &str, label: &'static str) -> Result<[u8; 8]> {
     let bytes = hex::decode(value.trim())
@@ -210,6 +224,65 @@ const MAX_BACKFILLS_PER_SYNC: usize = 8;
 
 const SYNC_STATE_VERSION: u32 = 1;
 const SYNC_STATE_PROCESSED_EVENT_CAP: usize = 20_000;
+
+#[derive(Debug)]
+struct LiveEventDeduper {
+    ttl: Duration,
+    capacity: usize,
+    seen_at: HashMap<EventId, Instant>,
+    order: VecDeque<EventId>,
+}
+
+impl LiveEventDeduper {
+    fn new(ttl: Duration, capacity: usize) -> Self {
+        Self {
+            ttl,
+            capacity: capacity.max(1),
+            seen_at: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn should_accept(&mut self, event_id: &EventId, now: Instant) -> bool {
+        self.prune_expired(now);
+
+        if self.seen_at.contains_key(event_id) {
+            return false;
+        }
+
+        let event_id = *event_id;
+        self.seen_at.insert(event_id, now);
+        self.order.push_back(event_id);
+        self.prune_overflow();
+        true
+    }
+
+    fn prune_expired(&mut self, now: Instant) {
+        loop {
+            let Some(event_id) = self.order.front() else {
+                return;
+            };
+            let Some(first_seen) = self.seen_at.get(event_id).copied() else {
+                self.order.pop_front();
+                continue;
+            };
+            if now.duration_since(first_seen) < self.ttl {
+                return;
+            }
+            let event_id = self.order.pop_front().expect("front exists");
+            self.seen_at.remove(&event_id);
+        }
+    }
+
+    fn prune_overflow(&mut self) {
+        while self.seen_at.len() > self.capacity {
+            let Some(event_id) = self.order.pop_front() else {
+                return;
+            };
+            self.seen_at.remove(&event_id);
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct SyncStateDisk {
@@ -363,6 +436,19 @@ impl MarmotProcessReport {
                     .map_or(secs, |oldest| oldest.min(secs)),
             );
         }
+    }
+}
+
+#[derive(Debug)]
+struct RelayFetchOutcome {
+    events: Vec<Event>,
+    completed_relays: usize,
+    total_relays: usize,
+}
+
+impl RelayFetchOutcome {
+    fn completed_all_relays(&self) -> bool {
+        self.completed_relays >= self.total_relays
     }
 }
 
@@ -662,6 +748,7 @@ impl SonarClient {
         let my_pubkey_hex = identity.keys().public_key().to_hex();
         let mut notifications = nostr.notifications();
         tokio::spawn(async move {
+            let mut live_dedup = LiveEventDeduper::new(LIVE_EVENT_DEDUP_TTL, LIVE_EVENT_DEDUP_CAP);
             loop {
                 let notification = match notifications.recv().await {
                     Ok(n) => n,
@@ -679,7 +766,15 @@ impl SonarClient {
                 let RelayPoolNotification::Event { event, .. } = notification else {
                     continue;
                 };
-                match event.kind.as_u16() {
+                let kind = event.kind.as_u16();
+                if !matches!(kind, 20000 | 20001 | 1059 | 445) {
+                    continue;
+                }
+                if !live_dedup.should_accept(&event.id, Instant::now()) {
+                    continue;
+                }
+
+                match kind {
                     20000 => {
                         let Some(geohash) = tag_value(&event, Alphabet::G) else {
                             continue;
@@ -1921,10 +2016,12 @@ impl SonarClient {
         let mut process_report = MarmotProcessReport::default();
         let ids_before = self.current_group_ids()?;
         let wraps = self
-            .nostr
-            .fetch_events_from(self.relays.clone(), wraps, FETCH_TIMEOUT)
+            .fetch_marmot_events_from_relay_quorum(wraps, FETCH_TIMEOUT, "gift wrap sync")
             .await?;
-        let (wrap_report, _) = self.process_marmot_events(wraps, "gift wrap").await;
+        if !wraps.completed_all_relays() {
+            process_report.record_retryable(started);
+        }
+        let (wrap_report, _) = self.process_marmot_events(wraps.events, "gift wrap").await;
         process_report.absorb(wrap_report);
 
         // A welcome processed during sync can add group(s). Backfill all new
@@ -1990,10 +2087,14 @@ impl SonarClient {
                 ));
             }
             let events = self
-                .nostr
-                .fetch_events_from(self.relays.clone(), filter, FETCH_TIMEOUT)
+                .fetch_marmot_events_from_relay_quorum(filter, FETCH_TIMEOUT, "group message sync")
                 .await?;
-            let (msg_report, _) = self.process_marmot_events(events, "group message").await;
+            if !events.completed_all_relays() {
+                process_report.record_retryable(started);
+            }
+            let (msg_report, _) = self
+                .process_marmot_events(events.events, "group message")
+                .await;
             process_report.absorb(msg_report);
         }
 
@@ -2178,6 +2279,176 @@ impl SonarClient {
             state.rewind_for_retry(event_secs);
         }
         self.save_sync_state()
+    }
+
+    async fn fetch_marmot_events_from_relay_quorum(
+        &self,
+        filter: Filter,
+        timeout: Duration,
+        context: &'static str,
+    ) -> Result<RelayFetchOutcome> {
+        let total_relays = self.relays.len();
+        if total_relays == 0 {
+            return Ok(RelayFetchOutcome {
+                events: Vec::new(),
+                completed_relays: 0,
+                total_relays: 0,
+            });
+        }
+
+        let quorum = relay_fetch_quorum(total_relays);
+        let mut tasks = tokio::task::JoinSet::new();
+        for relay in self.relays.clone() {
+            let nostr = self.nostr.clone();
+            let filter = filter.clone();
+            tasks.spawn(async move {
+                let relay_label = relay.to_string();
+                let result = nostr.fetch_events_from(vec![relay], filter, timeout).await;
+                (relay_label, result)
+            });
+        }
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut completed_relays = 0usize;
+        let mut failed_relays = 0usize;
+        let mut events = Vec::new();
+        let mut seen = HashSet::new();
+        let mut last_error: Option<String> = None;
+
+        while completed_relays < quorum && completed_relays + failed_relays < total_relays {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+
+            match tokio::time::timeout(remaining, tasks.join_next()).await {
+                Ok(Some(Ok((relay, Ok(relay_events))))) => {
+                    completed_relays += 1;
+                    let mut accepted = 0usize;
+                    for event in relay_events {
+                        if seen.insert(event.id.to_hex()) {
+                            events.push(event);
+                            accepted += 1;
+                        }
+                    }
+                    tracing::debug!(
+                        relay,
+                        accepted,
+                        completed_relays,
+                        quorum,
+                        total_relays,
+                        context,
+                        "relay fetch completed"
+                    );
+                }
+                Ok(Some(Ok((relay, Err(err))))) => {
+                    failed_relays += 1;
+                    last_error = Some(err.to_string());
+                    tracing::debug!(
+                        relay,
+                        %err,
+                        failed_relays,
+                        total_relays,
+                        context,
+                        "relay fetch failed"
+                    );
+                }
+                Ok(Some(Err(err))) => {
+                    failed_relays += 1;
+                    last_error = Some(err.to_string());
+                    tracing::debug!(
+                        %err,
+                        failed_relays,
+                        total_relays,
+                        context,
+                        "relay fetch task failed"
+                    );
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+
+        if completed_relays == 0 {
+            tasks.abort_all();
+            return Err(Error::RelayFetch(format!(
+                "{context}: no relay fetch completed before quorum/timeout{}",
+                last_error
+                    .as_deref()
+                    .map(|err| format!("; last error: {err}"))
+                    .unwrap_or_default()
+            )));
+        }
+
+        if completed_relays < total_relays {
+            tracing::debug!(
+                completed_relays,
+                failed_relays,
+                total_relays,
+                quorum,
+                context,
+                "relay fetch returned before all relays completed"
+            );
+            let pending = self.pending_marmot.clone();
+            let notify = self.marmot_notify.clone();
+            let mut late_seen = seen.clone();
+            tokio::spawn(async move {
+                let mut late_events = 0usize;
+                while let Some(joined) = tasks.join_next().await {
+                    match joined {
+                        Ok((relay, Ok(relay_events))) => {
+                            let mut accepted = 0usize;
+                            for event in relay_events {
+                                if !late_seen.insert(event.id.to_hex()) {
+                                    continue;
+                                }
+                                {
+                                    let mut buf = pending.lock().unwrap();
+                                    if buf.len() >= MARMOT_BUFFER_CAP {
+                                        buf.drain(0..MARMOT_BUFFER_CAP / 2);
+                                    }
+                                    buf.push(event);
+                                }
+                                accepted += 1;
+                                late_events += 1;
+                            }
+                            tracing::debug!(
+                                relay,
+                                accepted,
+                                context,
+                                "late relay fetch buffered events"
+                            );
+                        }
+                        Ok((relay, Err(err))) => {
+                            tracing::debug!(
+                                relay,
+                                %err,
+                                context,
+                                "late relay fetch failed"
+                            );
+                        }
+                        Err(err) => {
+                            tracing::debug!(
+                                %err,
+                                context,
+                                "late relay fetch task failed"
+                            );
+                        }
+                    }
+                }
+                if late_events > 0 {
+                    notify.notify_one();
+                }
+            });
+        } else {
+            tasks.abort_all();
+        }
+
+        Ok(RelayFetchOutcome {
+            events,
+            completed_relays,
+            total_relays,
+        })
     }
 
     async fn process_marmot_events(
@@ -2367,12 +2638,15 @@ impl SonarClient {
             .kind(Kind::MlsGroupMessage)
             .custom_tag(SingleLetterTag::lowercase(Alphabet::H), group_id_hex);
         let events = self
-            .nostr
-            .fetch_events_from(self.relays.clone(), filter, BACKFILL_TIMEOUT)
+            .fetch_marmot_events_from_relay_quorum(filter, BACKFILL_TIMEOUT, "group backfill")
             .await?;
-        let (report, _) = self
-            .process_marmot_events(events, "backfilled group message")
+        let partial = !events.completed_all_relays();
+        let (mut report, _) = self
+            .process_marmot_events(events.events, "backfilled group message")
             .await;
+        if partial {
+            report.record_retryable(Timestamp::now().as_secs());
+        }
         Ok(report)
     }
 
@@ -2383,19 +2657,24 @@ impl SonarClient {
         if group_id_hexes.is_empty() {
             return Ok(MarmotProcessReport::default());
         }
-        let filter = Filter::new()
-            .kind(Kind::MlsGroupMessage)
-            .custom_tags(
-                SingleLetterTag::lowercase(Alphabet::H),
-                group_id_hexes.to_vec(),
-            );
+        let filter = Filter::new().kind(Kind::MlsGroupMessage).custom_tags(
+            SingleLetterTag::lowercase(Alphabet::H),
+            group_id_hexes.to_vec(),
+        );
         let events = self
-            .nostr
-            .fetch_events_from(self.relays.clone(), filter, BACKFILL_TIMEOUT)
+            .fetch_marmot_events_from_relay_quorum(
+                filter,
+                BACKFILL_TIMEOUT,
+                "batched group backfill",
+            )
             .await?;
-        let (report, _) = self
-            .process_marmot_events(events, "batched backfill group message")
+        let partial = !events.completed_all_relays();
+        let (mut report, _) = self
+            .process_marmot_events(events.events, "batched backfill group message")
             .await;
+        if partial {
+            report.record_retryable(Timestamp::now().as_secs());
+        }
         Ok(report)
     }
 
@@ -3274,6 +3553,10 @@ mod tests {
     };
     use std::collections::{HashMap, HashSet};
 
+    fn test_event_id(seed: u8) -> EventId {
+        EventId::from_slice(&[seed; 32]).expect("event id")
+    }
+
     fn signed_event(keys: &Keys, created_at_secs: u64, content: &str) -> Event {
         EventBuilder::new(Kind::MlsGroupMessage, content)
             .custom_created_at(Timestamp::from_secs(created_at_secs))
@@ -3292,6 +3575,32 @@ mod tests {
             .custom_created_at(Timestamp::from_secs(created_at_secs))
             .sign_with_keys(keys)
             .expect("descriptor signs")
+    }
+
+    #[test]
+    fn relay_fetch_quorum_matches_connection_quorum() {
+        assert_eq!(relay_fetch_quorum(0), 0);
+        assert_eq!(relay_fetch_quorum(1), 1);
+        assert_eq!(relay_fetch_quorum(2), 2);
+        assert_eq!(relay_fetch_quorum(3), 2);
+        assert_eq!(relay_fetch_quorum(5), 2);
+    }
+
+    #[test]
+    fn relay_fetch_outcome_reports_partial_completion() {
+        let partial = RelayFetchOutcome {
+            events: Vec::new(),
+            completed_relays: relay_fetch_quorum(4),
+            total_relays: 4,
+        };
+        let complete = RelayFetchOutcome {
+            events: Vec::new(),
+            completed_relays: 4,
+            total_relays: 4,
+        };
+
+        assert!(!partial.completed_all_relays());
+        assert!(complete.completed_all_relays());
     }
 
     #[test]
@@ -3328,6 +3637,40 @@ mod tests {
         let contents: Vec<&str> = sorted.iter().map(|event| event.content.as_str()).collect();
 
         assert_eq!(contents, ["oldest", "middle", "newer"]);
+    }
+
+    #[test]
+    fn live_event_deduper_suppresses_duplicates_inside_ttl() {
+        let mut deduper = LiveEventDeduper::new(Duration::from_secs(60), 16);
+        let now = Instant::now();
+        let event_id = test_event_id(1);
+
+        assert!(deduper.should_accept(&event_id, now));
+        assert!(!deduper.should_accept(&event_id, now + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn live_event_deduper_allows_event_after_ttl() {
+        let mut deduper = LiveEventDeduper::new(Duration::from_secs(5), 16);
+        let now = Instant::now();
+        let event_id = test_event_id(1);
+
+        assert!(deduper.should_accept(&event_id, now));
+        assert!(deduper.should_accept(&event_id, now + Duration::from_secs(6)));
+    }
+
+    #[test]
+    fn live_event_deduper_evicts_oldest_entry_at_capacity() {
+        let mut deduper = LiveEventDeduper::new(Duration::from_secs(60), 2);
+        let now = Instant::now();
+        let first = test_event_id(1);
+        let second = test_event_id(2);
+        let third = test_event_id(3);
+
+        assert!(deduper.should_accept(&first, now));
+        assert!(deduper.should_accept(&second, now));
+        assert!(deduper.should_accept(&third, now));
+        assert!(deduper.should_accept(&first, now + Duration::from_secs(1)));
     }
 
     #[test]

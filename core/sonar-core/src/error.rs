@@ -39,6 +39,9 @@ pub enum Error {
     #[error("nostr publish error: {0}")]
     NostrPublish(String),
 
+    #[error("relay fetch error: {0}")]
+    RelayFetch(String),
+
     #[error("no key package found on relays for {0}")]
     KeyPackageNotFound(PublicKey),
 
