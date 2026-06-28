@@ -34,6 +34,7 @@ use crate::marmot::{
     MarmotEngine, RecentMessagePage, KEY_PACKAGE_KIND, SYNC_STATE_FILE_SUFFIX,
 };
 use crate::outbox::{outbox_state_path_for_db, OutboxState};
+use crate::push::{push_token_cache_path_for_db, wipe_push_token_cache_for_db, PushTokenCache};
 use crate::sonar_descriptor::{
     descriptor_d_tags, descriptor_events, descriptor_tags, parse_descriptor_event, SonarDescriptor,
     SONAR_DESCRIPTOR_KIND, SONAR_META_DESCRIPTOR_D_TAG,
@@ -456,7 +457,9 @@ pub struct SonarClient {
     /// In-memory store for invite link secrets and pending join requests.
     invite_links: Arc<crate::invite_link::InviteLinkStore>,
     /// Cached push tokens for group members (pubkey hex → encrypted token).
-    push_token_cache: crate::push::PushTokenCache,
+    push_token_cache: PushTokenCache,
+    /// Durable path for cached member push tokens (None for in-memory tests).
+    push_token_cache_path: Option<PathBuf>,
     /// This device's own push registration (set after `register_push_token`).
     own_push_registration: Arc<Mutex<Option<crate::push::OwnPushRegistration>>>,
 }
@@ -493,6 +496,7 @@ impl SonarClient {
             Some(sync_state_path_for_db(db_path)),
             Some(outbox_state_path_for_db(db_path)),
             Some(invite_link_state_path_for_db(db_path)),
+            Some(push_token_cache_path_for_db(db_path)),
             index.map(|idx| Arc::new(Mutex::new(idx))),
         )
         .await?;
@@ -504,7 +508,10 @@ impl SonarClient {
     /// dropped. Intended for tests and ephemeral/anonymous sessions.
     pub async fn connect_in_memory(identity: Identity, relays: Vec<RelayUrl>) -> Result<Self> {
         let engine = MarmotEngine::in_memory(identity.clone());
-        Self::with_engine(identity, relays, engine, false, None, None, None, None).await
+        Self::with_engine(
+            identity, relays, engine, false, None, None, None, None, None,
+        )
+        .await
     }
 
     async fn with_engine(
@@ -515,6 +522,7 @@ impl SonarClient {
         sync_state_path: Option<PathBuf>,
         outbox_state_path: Option<PathBuf>,
         invite_link_state_path: Option<PathBuf>,
+        push_token_cache_path: Option<PathBuf>,
         conversation_index: Option<Arc<Mutex<ConversationIndex>>>,
     ) -> Result<Self> {
         let boot_start = std::time::Instant::now();
@@ -597,7 +605,7 @@ impl SonarClient {
         let marmot_group_subscriptions = Arc::new(Mutex::new(HashSet::new()));
         let initial_empty_transcript_backfills = Arc::new(Mutex::new(HashSet::new()));
         let initial_backfill_scanned = Arc::new(AtomicBool::new(false));
-        let push_token_cache = crate::push::new_push_token_cache();
+        let push_token_cache = crate::push::load_push_token_cache(push_token_cache_path.as_deref());
 
         let handler_geo = geo.clone();
         let handler_dm = geo_dm.clone();
@@ -799,6 +807,7 @@ impl SonarClient {
                 invite_link_state_path,
             )),
             push_token_cache,
+            push_token_cache_path,
             own_push_registration: Arc::new(Mutex::new(None)),
         };
         // Open the live Marmot subscriptions for real sessions. In-memory test
@@ -2154,12 +2163,24 @@ impl SonarClient {
                     UnwrappedGift::from_gift_wrap(self.engine.identity().keys(), &event).await
                 {
                     if unwrapped.rumor.kind.as_u16() == crate::push::KIND_PUSH_TOKEN_SHARE {
-                        self.handle_push_token_share(
-                            &unwrapped.sender,
-                            &unwrapped.rumor.content,
-                        );
-                        self.mark_sync_event_processed(&event.id);
-                        report.record_processed();
+                        match self
+                            .handle_push_token_share(&unwrapped.sender, &unwrapped.rumor.content)
+                        {
+                            Ok(()) => {
+                                self.mark_sync_event_processed(&event.id);
+                                report.record_processed();
+                            }
+                            Err(err) => {
+                                tracing::debug!(
+                                    %err,
+                                    event_id = %event.id,
+                                    event_created_at = event.created_at.as_secs(),
+                                    context,
+                                    "push token share needs retry"
+                                );
+                                report.record_retryable(event.created_at.as_secs());
+                            }
+                        }
                         continue;
                     }
                 }
@@ -2828,8 +2849,10 @@ impl SonarClient {
         let db_path = db_path.as_ref();
         let db_result = MarmotEngine::wipe(db_path);
         let index_result = wipe_index_for_db(db_path);
+        let push_result = wipe_push_token_cache_for_db(db_path);
         db_result?;
-        index_result
+        index_result?;
+        push_result
     }
 
     /// MIP-05: encrypt a device push token to the transponder's public key.
@@ -2931,30 +2954,32 @@ impl SonarClient {
     }
 
     /// Process an incoming push token share DM (kind 447) from a group member.
-    fn handle_push_token_share(&self, sender: &PublicKey, content: &str) {
+    fn handle_push_token_share(&self, sender: &PublicKey, content: &str) -> Result<()> {
         let payload: crate::push::PushTokenSharePayload = match serde_json::from_str(content) {
             Ok(p) => p,
             Err(e) => {
                 tracing::debug!(%e, "ignoring malformed push token share");
-                return;
+                return Ok(());
             }
         };
         let server_pubkey = match PublicKey::parse(&payload.server_pubkey) {
             Ok(pk) => pk,
             Err(e) => {
                 tracing::debug!(%e, "ignoring push token share with bad server pubkey");
-                return;
+                return Ok(());
             }
         };
         let cached = crate::push::CachedPushToken {
             encrypted_token_b64: payload.encrypted_token,
             server_pubkey,
         };
-        self.push_token_cache
-            .lock()
-            .unwrap()
-            .insert(sender.to_hex(), cached);
+        {
+            let mut cache = self.push_token_cache.lock().unwrap();
+            cache.insert(sender.to_hex(), cached);
+            crate::push::save_push_token_cache(self.push_token_cache_path.as_deref(), &cache)?;
+        }
         tracing::info!(sender = %sender, "cached push token from group member");
+        Ok(())
     }
 }
 
