@@ -68,6 +68,28 @@ archive or device test, verify `ios/bitchat/GoogleService-Info.plist` exists
 commit it. This affects ONLY the Breez/payment path — Marmot chat/call wakeups
 go over the Transponder raw-APNs path and do not depend on Firebase.
 
+## Release URL Build Setting Check
+
+Before any TestFlight/App Store archive, verify release-resolved URL build
+settings are not malformed. In `.xcconfig` files, `//` starts a comment, so a
+value like `NDS_URL = https://nds.sonar.hedwig.sh` resolves to the broken
+sentinel `https:`. `NDS_URL` should normally come from the committed Release
+default as the bare host `nds.sonar.hedwig.sh`; do not override it in
+`Local.xcconfig` unless you are pointing at a private push stack. Check the
+resolved Release setting without printing secrets:
+
+```sh
+xcodebuild -project ios/bitchat.xcodeproj \
+  -scheme 'bitchat (iOS)' \
+  -configuration Release \
+  -showBuildSettings \
+  | awk '/^[[:space:]]+NDS_URL = /{print}'
+```
+
+The value must never be empty, `https:`, `http:`, or anything without a host.
+If this check fails, fix the build setting before archiving; otherwise the app
+can launch successfully while silently disabling Breez offline payment wakeups.
+
 ## Fix What We Break Rule
 
 When a change breaks existing behavior, fix the broken behavior directly before considering the work complete. Do not leave regressions for users to route around, and do not hide them with UI-only workarounds.
