@@ -29,21 +29,27 @@ class NotificationService: SDKNotificationService {
     private let appGroupId = "group.sh.hedwig.sonar"
     private static let log = OSLog(subsystem: "sh.hedwig.sonar", category: "NSE")
 
-    #if DEBUG
-    /// DEBUG-only: log entry + forward Breez's internal logs so the offline-receive
-    /// path is observable via idevicesyslog (process `SonarNotificationService`).
-    /// Never compiled into release — it logs the full push payload, which carries
-    /// the BOLT12 offer / invoice-request data.
     override func didReceive(
         _ request: UNNotificationRequest,
         withContentHandler contentHandler: @escaping (UNNotificationContent) -> Void
     ) {
+        if Self.isTransponderPush(request.content.userInfo) {
+            os_log("NSE: handling Transponder Marmot push",
+                   log: Self.log, type: .info)
+            let content = (request.content.mutableCopy() as? UNMutableNotificationContent)
+                ?? UNMutableNotificationContent()
+            Self.configureTransponderNotification(content)
+            contentHandler(content)
+            return
+        }
+
+        #if DEBUG
         os_log("NSE: didReceive push, userInfo=%{public}@",
                log: Self.log, type: .info, String(describing: request.content.userInfo))
         setServiceLogger(logger: NSEBreezLogger())
+        #endif
         super.didReceive(request, withContentHandler: contentHandler)
     }
-    #endif
 
     override func getConnectRequest() -> ConnectRequest? {
         guard let defaults = UserDefaults(suiteName: appGroupId),
@@ -148,6 +154,41 @@ class NotificationService: SDKNotificationService {
             idx = next
         }
         return out
+    }
+
+    private static func isTransponderPush(_ userInfo: [AnyHashable: Any]) -> Bool {
+        if isBreezPush(userInfo) { return false }
+
+        let source = (userInfo["source"] as? String)?.lowercased()
+        if source == "transponder" || source == "marmot" { return true }
+
+        if userInfo["mip05"] != nil
+            || userInfo["transponder"] != nil
+            || userInfo["wn_nse_prototype"] != nil {
+            return true
+        }
+
+        if let kind = userInfo["kind"] as? Int, kind == 446 { return true }
+        if let kind = userInfo["kind"] as? String, kind == "446" { return true }
+
+        return false
+    }
+
+    private static func isBreezPush(_ userInfo: [AnyHashable: Any]) -> Bool {
+        let source = (userInfo["source"] as? String)?.lowercased()
+        return source == "breez" || userInfo["notification_type"] != nil
+    }
+
+    private static func configureTransponderNotification(_ content: UNMutableNotificationContent) {
+        // Never trust provider payload copy for user-visible text. Transponder
+        // pushes are plaintext-free wakeups; the app renders precise copy after open.
+        content.title = "New Sonar message"
+        content.body = "Open Sonar to read it."
+        content.sound = .default
+        content.categoryIdentifier = "sonar.message"
+        if #available(iOS 15.0, *) {
+            content.interruptionLevel = .active
+        }
     }
 }
 

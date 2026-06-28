@@ -208,8 +208,10 @@ Wire into `Info.plist`:
 
 ## 5. Notification Service Extension
 
-The extension handles two types of silent pushes and decides what to do
-with each.
+The extension handles two push classes and decides what to do with each.
+Transponder pushes must be visible APNS notifications with `mutable-content: 1`
+so iOS invokes the extension after the app has been force-quit. Breez NDS pushes
+remain infrastructure-only and should not produce user-visible copy.
 
 ```swift
 import UserNotifications
@@ -243,15 +245,8 @@ class NotificationService: UNNotificationServiceExtension {
     private func handleMarmotWakeup(
         contentHandler: @escaping (UNNotificationContent) -> Void
     ) {
-        // 1. Connect to Marmot via App Group shared data
-        // 2. Fetch pending messages from Nostr relays
-        // 3. Decrypt and process new messages
-        // 4. Classify via the local notification router
-        // 5. Render user-visible notification
-
-        // TODO: Access Marmot state from App Group container.
-        //       Use SonarLocalNotificationRouter to classify and format.
-
+        // Privacy-first killed-app fallback. Precise copy is rendered locally
+        // when Sonar opens and can fetch/decrypt Marmot state.
         let content = UNMutableNotificationContent()
         content.title = "New Sonar message"
         content.body = "Open Sonar to read it."
@@ -350,7 +345,12 @@ When push is disabled:
 - [ ] APNS token is collected on first launch after permission grant.
 - [ ] MIP-05 encrypted token share is cached and shared with peers.
 - [ ] Breez webhook is registered with correct URL and token.
-- [ ] Transponder push wakes extension and shows user-visible notification.
+- [ ] Transponder APNS payload includes an alert, `mutable-content: 1`, and a
+      marker (`wn_nse_prototype`, `source=transponder`, `source=marmot`,
+      `mip05`, `transponder`, or `kind=446`). With upstream Transponder, set
+      `[apns].payload_mode = "nse_prototype_alert"`.
+- [ ] Transponder push wakes extension and shows generic user-visible
+      notification while Sonar is force-quit.
 - [ ] Breez NDS push wakes extension and completes BOLT12 receive silently.
 - [ ] No user-visible notification from the Breez NDS path.
 - [ ] App Group data is accessible from the extension.
