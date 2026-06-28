@@ -370,6 +370,8 @@ impl MarmotProcessReport {
 /// fire rich local notifications (sender name + preview).
 #[derive(Clone, Debug)]
 pub struct DrainNotification {
+    /// Sender as a bech32 `npub` — hosts resolve this against the profile cache
+    /// (FFI exposes it as `sender_npub`). Must NOT be hex.
     pub sender_pubkey: String,
     pub group_name: String,
     pub content_preview: String,
@@ -2319,7 +2321,14 @@ impl SonarClient {
                             message.content.clone()
                         };
                         notifications.push(DrainNotification {
-                            sender_pubkey: message.sender.to_string(),
+                            // Hosts treat this as an npub (FFI exposes it as
+                            // `sender_npub`, iOS feeds it to resolveSenderName).
+                            // `to_string()` yields hex, which never matches the
+                            // profile cache — encode bech32 like the chat path.
+                            sender_pubkey: message
+                                .sender
+                                .to_bech32()
+                                .expect("npub encoding cannot fail"),
                             group_name: cached_name.unwrap_or("").to_string(),
                             content_preview: preview,
                         });
