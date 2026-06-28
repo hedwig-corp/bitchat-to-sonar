@@ -63,6 +63,10 @@ object SonarPushRegistration {
     @Volatile private var inFlightWebhookGeneration: Long = 0L
 
     fun ensureRegistered() {
+        if (!SonarPushPrefs.effectivePushEnabled(AppContextHolder.ctx)) {
+            Log.d(TAG, "Push not registered: disabled by user preference")
+            return
+        }
         if (transponderNpub.isBlank() && ndsUrl.isBlank()) {
             Log.d(TAG, "Push not configured (no TRANSPONDER_NPUB or NDS_URL)")
             return
@@ -78,6 +82,11 @@ object SonarPushRegistration {
     }
 
     fun onTokenRefresh(token: String) {
+        if (!SonarPushPrefs.effectivePushEnabled(AppContextHolder.ctx)) {
+            Log.d(TAG, "FCM token refreshed while push disabled")
+            cachedFcmToken = null
+            return
+        }
         Log.d(TAG, "FCM token refreshed")
         cachedFcmToken = token
         registerTransponder(token)

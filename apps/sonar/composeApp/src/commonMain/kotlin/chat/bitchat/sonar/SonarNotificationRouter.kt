@@ -48,9 +48,16 @@ object SonarNotificationRouter {
     fun classifyContent(
         content: String,
         isCallControl: (String) -> Boolean = { false },
-    ): SonarNotificationKind =
-        runCatching { SonarCore.classifyNotificationContent(content) }
-            .getOrElse { classifyContentLocal(content, isCallControl) }
+    ): SonarNotificationKind {
+        val local = classifyContentLocal(content, isCallControl)
+        return runCatching { SonarCore.classifyNotificationContent(content) }
+            .getOrElse { local }
+            .let { classified ->
+                if (classified == SonarNotificationKind.Message &&
+                    local != SonarNotificationKind.Message
+                ) local else classified
+            }
+    }
 
     fun build(
         idKey: String,
@@ -91,7 +98,8 @@ object SonarNotificationRouter {
         isCallControl: (String) -> Boolean,
     ): SonarNotificationKind =
         when {
-            isCallControl(content) -> SonarNotificationKind.Call
+            isCallControl(content) ||
+                content.trimStart().startsWith("\u260eCALL|") -> SonarNotificationKind.Call
             PayLine.decode(content) != null -> SonarNotificationKind.Payment
             else -> SonarNotificationKind.Message
         }

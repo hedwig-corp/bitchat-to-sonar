@@ -2,7 +2,6 @@ package chat.bitchat.sonar.push
 
 import android.content.Intent
 import android.util.Log
-import chat.bitchat.sonar.Notifier
 import com.google.firebase.messaging.FirebaseMessagingService
 import com.google.firebase.messaging.RemoteMessage
 
@@ -21,6 +20,11 @@ class SonarFirebaseMessagingService : FirebaseMessagingService() {
         val data = message.data
         Log.d(TAG, "Push received: keys=${data.keys}")
 
+        if (!SonarPushPrefs.effectivePushEnabled(this)) {
+            Log.d(TAG, "Push ignored: disabled by user preference")
+            return
+        }
+
         when {
             isTransponderPush(data) -> handleMarmotWakeup(data)
             isBreezPush(data) -> handleBreezWakeup(data)
@@ -28,8 +32,17 @@ class SonarFirebaseMessagingService : FirebaseMessagingService() {
         }
     }
 
-    private fun isTransponderPush(data: Map<String, String>): Boolean =
-        data.containsKey("mip05") || data.containsKey("transponder")
+    private fun isTransponderPush(data: Map<String, String>): Boolean {
+        if (isBreezPush(data)) return false
+
+        val source = data["source"]?.lowercase()
+        if (source == "transponder" || source == "marmot") return true
+
+        return data.containsKey("mip05") ||
+            data.containsKey("transponder") ||
+            data.containsKey("wn_nse_prototype") ||
+            data["kind"] == "446"
+    }
 
     private fun isBreezPush(data: Map<String, String>): Boolean =
         data.containsKey("notification_type")
