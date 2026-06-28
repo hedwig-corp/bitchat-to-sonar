@@ -4598,6 +4598,7 @@ final class SonarAppStore: ObservableObject {
         pendingPayPeer = nil
         localHydratingDMs = []
         clearMarmotConversationGroups()
+        marmot.groups = []
         defaults.removeObject(forKey: Keys.bleKnownChatKeys)
         applyBLEDiscoveryPolicy()
         publishedBolt12Offer = nil

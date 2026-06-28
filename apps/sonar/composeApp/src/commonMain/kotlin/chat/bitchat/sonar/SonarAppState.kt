@@ -318,10 +318,10 @@ class SonarAppState(private val scope: CoroutineScope) {
             meshChats.clear(); meshChatNames.clear(); pendingMarmotSends.clear(); outbox.clear()
             linkByFp.clear(); linkCapsByFp.clear(); groupFoldMap.clear()
             persistLinks(); persistLinkCaps(); persistGroupFolds()
-            updateBleDiscoveryPolicy()
             profilesByNpub = emptyMap(); profileFetches.clear(); persistProfileCache()
             foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
             meshBroadcast = emptyList(); meshDmRows = emptyList()
+            updateBleDiscoveryPolicy()
             messages = emptyList(); channelMsgs = emptyList(); chats = emptyList(); clearChatSnapshot()
             lastWnGroups = -1; lastWnMsgs = -1
             // ⚡PAY coins live inside the erased chats — reset the ledger. The
