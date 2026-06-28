@@ -352,7 +352,7 @@ public final class SonarWallet {
         guard let node = sdk else { throw WalletError.notConfigured }
         return try await run {
             let prepared = try node.prepareReceivePayment(req: PrepareReceiveRequest(paymentMethod: .bolt12Offer, amount: nil))
-            let resp = try node.receivePayment(req: ReceivePaymentRequest(prepareResponse: prepared, description: "Sonar", useDescriptionHash: nil, payerNote: nil))
+            let resp = try node.receivePayment(req: ReceivePaymentRequest(prepareResponse: prepared, description: "Sonar", descriptionHash: nil, payerNote: nil))
             return resp.destination
         }
     }
@@ -448,7 +448,23 @@ public final class SonarWallet {
 
     private static func map(_ p: BreezSDKLiquid.Payment) -> Payment {
         var preimage: String?
-        if case .lightning(_, _, _, let pi, _, _, _, _, _, _, _, _, _, _) = p.details {
+        if case let .lightning(
+            swapId: _,
+            description: _,
+            liquidExpirationBlockheight: _,
+            preimage: pi,
+            invoice: _,
+            bolt12Offer: _,
+            paymentHash: _,
+            destinationPubkey: _,
+            lnurlInfo: _,
+            bip353Address: _,
+            payerNote: _,
+            claimTxId: _,
+            refundTxId: _,
+            refundTxAmountSat: _,
+            settledAt: _
+        ) = p.details {
             preimage = pi
         }
         return Payment(

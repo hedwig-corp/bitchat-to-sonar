@@ -21,6 +21,9 @@ clearnet = [
 [apns]
 # Apple Push Notification Service credentials for Sonar's iOS bundle ID.
 # The .p8 key file, key ID, and team ID come from the Apple Developer portal.
+# For killed-app chat/call wakeups, Transponder's iOS payload must be a visible
+# notification with mutable-content=1 and a marker the NSE recognizes. Silent
+# content-available-only APNS will not relaunch a user-force-quit app.
 enabled = true
 private_key_path = "/run/secrets/apns.p8"
 key_id = "PX84KR34WH"
@@ -29,6 +32,9 @@ bundle_id = "sh.hedwig.sonar"
 # "production" matches App Store / TestFlight builds. Debug builds use sandbox
 # APNs tokens — use a separate sandbox.toml for dev testing.
 environment = "production"
+# Upstream Transponder mode that sends alert APNS with mutable-content=1 and
+# the wn_nse_prototype marker for the iOS Notification Service Extension.
+payload_mode = "nse_prototype_alert"
 
 [fcm]
 # Firebase Cloud Messaging credentials for Sonar's Android package.

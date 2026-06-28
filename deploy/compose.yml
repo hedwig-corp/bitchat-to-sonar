@@ -1,6 +1,6 @@
 # Sonar Notification Stack
 #
-# Two stateless servers that deliver silent pushes to mobile devices:
+# Two stateless servers that deliver plaintext-free pushes to mobile devices:
 #   transponder  — Marmot chat/call wakeups (MIP-05 privacy-preserving push)
 #   breez-nds    — Breez wallet wakeups (BOLT12 receive, swap updates)
 #

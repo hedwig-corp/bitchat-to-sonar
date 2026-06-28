@@ -259,6 +259,8 @@ struct BitchatApp: App {
 
 #if os(iOS)
 final class AppDelegate: NSObject, UIApplicationDelegate, MessagingDelegate {
+    private static let pushLog = Logger(subsystem: "sh.hedwig.sonar", category: "push")
+
     weak var chatViewModel: ChatViewModel?
     weak var sonarStore: SonarAppStore?
 
@@ -271,6 +273,9 @@ final class AppDelegate: NSObject, UIApplicationDelegate, MessagingDelegate {
         if Bundle.main.path(forResource: "GoogleService-Info", ofType: "plist") != nil {
             FirebaseApp.configure()
             Messaging.messaging().delegate = self
+            Self.pushLog.info("Firebase configured for Breez NDS")
+        } else {
+            Self.pushLog.warning("GoogleService-Info.plist missing; Breez NDS offline receive disabled")
         }
         application.registerForRemoteNotifications()
         return true
@@ -282,12 +287,32 @@ final class AppDelegate: NSObject, UIApplicationDelegate, MessagingDelegate {
         // Firebase needs the APNs token to mint an FCM token (used for the Breez webhook).
         if FirebaseApp.app() != nil {
             Messaging.messaging().apnsToken = deviceToken
+            refreshFCMToken(reason: "apns-token")
         }
     }
 
     // FCM token (re)issued — register it as the Breez NDS webhook target.
     func messaging(_ messaging: Messaging, didReceiveRegistrationToken fcmToken: String?) {
         guard let fcmToken else { return }
+        handleFCMToken(fcmToken, source: "delegate")
+    }
+
+    private func refreshFCMToken(reason: String) {
+        Messaging.messaging().token { [weak self] token, error in
+            if let error {
+                Self.pushLog.warning("FCM token fetch failed after \(reason, privacy: .public): \(String(describing: error), privacy: .public)")
+                return
+            }
+            guard let token else {
+                Self.pushLog.warning("FCM token fetch returned nil after \(reason, privacy: .public)")
+                return
+            }
+            self?.handleFCMToken(token, source: reason)
+        }
+    }
+
+    private func handleFCMToken(_ fcmToken: String, source: String) {
+        Self.pushLog.info("FCM token available from \(source, privacy: .public)")
         let wallet = (sonarStore?.wallet as? BridgedWallet)?.walletService
         SonarPushRegistration.shared.didReceiveFCMToken(fcmToken, wallet: wallet)
     }

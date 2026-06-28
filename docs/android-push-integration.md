@@ -212,7 +212,7 @@ object SonarPushRegistration {
         registerBreezWebhook(token)
     }
 
-    /** Encrypt FCM token via MIP-05 and publish as NIP-59 gift wrap. */
+    /** Encrypt FCM token via Rust core and share it with peers. */
     private fun registerTransponder(fcmToken: String) {
         // MIP-05 plaintext: platform(1) + tokenLen(2) + token + padding = 1024 bytes
         val tokenBytes = fcmToken.toByteArray(Charsets.UTF_8)
@@ -231,8 +231,10 @@ object SonarPushRegistration {
         // TODO: Implement using a secp256k1 library.
         //       The encrypted blob is 1084 bytes (1024 + 12 nonce + 16 tag + 32 ephemeral pubkey).
         //
-        // val encrypted = MIP05.encrypt(plaintext, transponderNpub)
-        // NostrPublisher.publishGiftWrap(to = transponderNpub, content = encrypted)
+        // TODO: Call SonarCore.registerPushToken("fcm", tokenBytes, transponderNpub).
+        //       Rust core stores the encrypted token and shares it with peers.
+        //       Do not publish kind-446 here; the transponder treats kind-446 as
+        //       an immediate wakeup request.
     }
 
     /** Register webhook with Breez SDK. */
@@ -245,7 +247,8 @@ object SonarPushRegistration {
 
     /** Unregister from both servers. */
     fun unregister() {
-        // TODO: Delete the NIP-59 gift wrap from relays (or publish a deletion event).
+        // TODO: Clear cached token-share state and notify peers on rotation/disable.
+        //       There is no transponder-side registration to delete.
         // TODO: Call breezSDK.unregisterWebhook()
     }
 }
@@ -397,7 +400,7 @@ onboarding or first message receipt.
 ## 10. Testing Checklist
 
 - [ ] FCM token is collected on app startup.
-- [ ] MIP-05 encrypted gift wrap is published to relays.
+- [ ] MIP-05 encrypted token share is cached and shared with peers.
 - [ ] Breez webhook is registered with correct URL and token.
 - [ ] Token refresh re-registers with both servers.
 - [ ] Transponder push wakes the service and shows user-visible notification.

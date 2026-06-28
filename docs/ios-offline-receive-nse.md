@@ -40,7 +40,7 @@ payload — **no server change needed**.
    can connect in its own process. (Seed in App Group defaults matches Unify; hardening to a
    shared Keychain access group is a tracked follow-up.)
 3. **NSE target** `SonarNotificationService` (`ios/SonarNotificationService/`): standalone,
-   links `BreezSDKLiquid` (0.11.13), subclasses `SDKNotificationService`, builds a
+   links `BreezSDKLiquid` (0.12.4), subclasses `SDKNotificationService`, builds a
    `ConnectRequest(config:, mnemonic: nil, seed:)`, `config.syncServiceUrl = nil`.
 4. **Entitlements/capabilities:** App Group on app + NSE; `aps-environment`. Added to the
    project via the `xcodeproj` gem (objv90-safe round-trip verified).

@@ -152,7 +152,7 @@ screenshot). **[HW]** needs 2 BLE phones. **[⚡]** needs real Lightning funds t
 The API key unblocks this and ⚡PAY depends on it. Highest value.
 - 1a. Inspect Breez SDK Liquid KMP API (`BindingLiquidSdk`, `connect`,
   `ConnectRequest`, `defaultConfig`, `getInfo`, `prepareSendPayment`/`sendPayment`,
-  `receivePayment`/BOLT12 offer, `fetchFiatRates`). Pin the exact 0.11.13 surface.
+  `receivePayment`/BOLT12 offer, `fetchFiatRates`). Pin the exact 0.12.4 surface.
 - 1b. `WalletBridge` (`androidMain`): `expect`/`actual` façade —
   `setupIfNeeded()`, `state` (NotConfigured/SettingUp/Ready(balanceSats)),
   `createOffer(): String`, `send(destination, amountSats, note)`,

@@ -114,7 +114,7 @@ it only re-PATCHes offers already in the SDK's **local `bolt12_offers` DB** whos
 So for Sonar the offer the payer hits has **`url=None` (or stale)** on Boltz → Boltz only tries the
 dead WS path when the wallet is offline → no POST → `bolt12/fetch` times out. Confirmed by the iPhone
 SDK logs showing the offer being *prepared/subscribed* but **no `update_bolt12_offer` / PATCH** to
-write our webhook onto it. (SDK version 0.11.13 has the feature — BOLT12-receive commit #882 predates
+write our webhook onto it. (SDK version 0.12.4 has the feature — BOLT12-receive commit #882 predates
 it — so this is not a version gap; `createBolt12Offer` is internal, reached via
 `receivePayment(.bolt12Offer)`.)
 

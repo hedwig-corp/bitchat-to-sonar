@@ -1,18 +1,20 @@
 # Sonar Notification Stack
 
-Two stateless servers that deliver silent pushes to iOS and Android devices
-so the killed app can wake up and process events locally.
+Two stateless servers that deliver plaintext-free pushes to iOS and Android
+devices so the killed app can wake up and process events locally.
 
 | Server | Purpose | Source |
 | --- | --- | --- |
 | **Transponder** | Marmot chat/call wakeups (MIP-05 privacy-preserving push) | [marmot-protocol/transponder](https://github.com/marmot-protocol/transponder) |
 | **Breez NDS** | Wallet wakeups for BOLT12 receive, swap updates, LNURL-pay | [breez/notify](https://github.com/breez/notify) |
 
-Transponder pushes trigger user-visible notifications (the client renders
-the copy locally). Breez NDS pushes are **silent infrastructure only** — they
-wake the wallet to settle a payment, but the user-visible "Payment received"
-notification comes from the transponder/chat path when the sender's `⚡PAY`
-control line arrives. This prevents duplicate notifications.
+Transponder pushes trigger user-visible notifications. On iOS, the APNS
+payload must be visible and include `mutable-content: 1` so the Notification
+Service Extension can render generic privacy-preserving copy after the user
+force-quits the app. Breez NDS pushes are **silent infrastructure only** —
+they wake the wallet to settle a payment, but the user-visible "Payment
+received" notification comes from the transponder/chat path when the sender's
+`⚡PAY` control line arrives. This prevents duplicate notifications.
 
 ## Prerequisites
 
@@ -101,6 +103,13 @@ to subscribe to, and which APNS/FCM credentials to use. Fields marked
 | `project_id` | `[fcm]` | Firebase project ID |
 | `urls` | `[relays]` | Nostr relay WebSocket URLs the transponder subscribes to |
 
+For iOS killed-app chat/call wakeups, the transponder image/config must emit
+APNS with an alert, `mutable-content: 1`, and a marker Sonar's extension
+recognizes. With upstream Transponder, set `[apns].payload_mode =
+"nse_prototype_alert"`; this sends `wn_nse_prototype`. Sonar also recognizes
+`source=transponder`, `source=marmot`, `mip05`, `transponder`, and `kind=446`.
+Silent `content-available`-only APNS will not relaunch a user-force-quit app.
+
 ### Relay selection
 
 The transponder subscribes to the same Nostr relays Sonar clients publish
@@ -160,7 +169,8 @@ rotate:
 ## Security Notes
 
 - Push payloads are **plaintext-free**. The transponder never sees message
-  content — it dispatches silent pushes and the client renders copy locally.
+  content. On iOS it dispatches visible generic APNS to invoke the extension;
+  on Android/FCM it can remain data-only and the client renders copy locally.
 - The Breez NDS never sees wallet keys or payment details — it only forwards
   FCM push tokens received via webhook query parameters.
 - Device tokens are encrypted end-to-end to the transponder's public key

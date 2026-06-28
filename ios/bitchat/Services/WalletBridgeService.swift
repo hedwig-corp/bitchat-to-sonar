@@ -133,6 +133,9 @@ final class WalletBridgeService: ObservableObject {
         do {
             try await task.value
         } catch {
+            #if DEBUG
+            SecureLogger.error("Wallet setup failed: \(error)", category: .session)
+            #endif
             // Allow a later retry (e.g. key added, transient node failure).
             setupTask = nil
             state = .notConfigured
@@ -142,34 +145,60 @@ final class WalletBridgeService: ObservableObject {
 
     private func setup() async throws {
         guard let apiKey = Self.configuredAPIKey() else {
+            #if DEBUG
+            SecureLogger.error("Wallet setup blocked: BREEZ_API_KEY missing", category: .session)
+            #endif
             throw WalletBridgeError.missingAPIKey
         }
+        #if DEBUG
+        SecureLogger.info("Wallet setup: BREEZ_API_KEY present", category: .session)
+        #endif
         state = .settingUp
         do {
             try wallet.configure(apiKey: apiKey, mainnet: mainnet)
-            if try await !wallet.hasWallet() {
-                if let entropyHex = entropyProvider?() {
+            let hasExistingWallet = try await wallet.hasWallet()
+            #if DEBUG
+            SecureLogger.info("Wallet setup: existing wallet=\(hasExistingWallet)", category: .session)
+            #endif
+            if !hasExistingWallet {
+                let entropyHex = entropyProvider?()
+                if let entropyHex {
                     // Deterministic: wallet is reconstructable from the chat
                     // identity (one identity = one wallet).
+                    #if DEBUG
+                    SecureLogger.info("Wallet setup: identity entropy ready; creating deterministic wallet", category: .session)
+                    #endif
                     try await wallet.createWalletFromEntropy(entropyHex: entropyHex)
                 } else if entropyProvider != nil {
                     // Identity not ready yet — defer; setupIfNeeded retries
                     // once the identity exists (so we never create a random,
                     // non-derivable wallet for a derived-wallet host).
+                    #if DEBUG
+                    SecureLogger.warning("Wallet setup deferred: identity entropy not ready", category: .session)
+                    #endif
                     state = .notConfigured
                     throw WalletBridgeError.core("identity not ready for wallet derivation")
                 } else {
                     // No derivation source configured: random wallet (the
                     // standalone/back-compat path).
+                    #if DEBUG
+                    SecureLogger.warning("Wallet setup: no entropy provider; creating random wallet", category: .session)
+                    #endif
                     try await wallet.createWallet()
                 }
             }
+            #if DEBUG
+            SecureLogger.info("Wallet setup: starting Breez node", category: .session)
+            #endif
             try await wallet.startNode()
         } catch let error as SonarWallet.WalletError {
             throw Self.map(error)
         }
         startObservingBalance()
         state = .ready(balanceSats: 0)
+        #if DEBUG
+        SecureLogger.info("Wallet setup: ready", category: .session)
+        #endif
         // Money display: apply first-run defaults (fiat + locale currency) then
         // fetch live rates and keep them fresh while ready.
         applyFirstRunMoneyDefaults()

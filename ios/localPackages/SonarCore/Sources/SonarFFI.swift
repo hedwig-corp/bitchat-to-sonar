@@ -1106,8 +1106,8 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func recentMessagePages(groupLimit: UInt32, pageLimit: UInt32) throws  -> [RecentMessagePageInfo]
     
     /**
-     * Encrypt a device push token and publish it to the transponder via a
-     * NIP-59 gift-wrapped kind-446 event.
+     * Encrypt a device push token to the transponder and cache/share it with
+     * peers. Sender-side wakeups publish kind-446 requests later.
      *
      * `platform`: `"apns"` or `"fcm"`.
      * `token`: raw device token bytes (APNS) or UTF-8 FCM token string.
@@ -1802,8 +1802,8 @@ open func recentMessagePages(groupLimit: UInt32, pageLimit: UInt32)throws  -> [R
 }
     
     /**
-     * Encrypt a device push token and publish it to the transponder via a
-     * NIP-59 gift-wrapped kind-446 event.
+     * Encrypt a device push token to the transponder and cache/share it with
+     * peers. Sender-side wakeups publish kind-446 requests later.
      *
      * `platform`: `"apns"` or `"fcm"`.
      * `token`: raw device token bytes (APNS) or UTF-8 FCM token string.
@@ -5786,7 +5786,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_recent_message_pages() != 17660) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_register_push_token() != 41081) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_register_push_token() != 63602) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_remove_group_members() != 5580) {

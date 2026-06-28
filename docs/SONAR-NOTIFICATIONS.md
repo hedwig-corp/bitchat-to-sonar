@@ -17,12 +17,17 @@ Sonar uses **two** notification servers plus local processing:
 | Wallet wakeup | Breez NDS | BOLT12 receive, swap updates, LNURL-pay | No -- silent infrastructure only |
 | Process-alive | (none) | BLE mesh, foreground events | Yes -- local router renders copy |
 
-Both servers send silent/data-only pushes. The client wakes and processes
-the event locally. The two servers have **different notification roles**:
+Both servers send plaintext-free pushes. On iOS, the Transponder chat/call
+push must be a visible APNS notification with `mutable-content: 1` so the
+Notification Service Extension runs even when the app was force-quit. Breez
+NDS remains a silent/infrastructure push. The two servers have **different
+notification roles**:
 
-- **Transponder** wakes are both infrastructure AND user-visible: the app
-  fetches Marmot messages, and the local notification router renders
-  sender/group-aware messages, payment amounts, call copy, etc.
+- **Transponder** wakes are both infrastructure AND user-visible: the iOS
+  extension renders generic privacy-preserving copy while the app is killed;
+  when the app is running, the app fetches Marmot messages and the local
+  notification router renders sender/group-aware messages, payment amounts,
+  call copy, etc.
 - **Breez NDS** wakes are **infrastructure only**: the push wakes the wallet
   to complete a BOLT12 receive or swap, but does NOT show a user-visible
   notification. The user-visible payment notification fires later, when the
@@ -71,7 +76,8 @@ Deploy both notification servers. Full setup guide: [`deploy/README.md`](../depl
 - [ ] Place secrets in `deploy/secrets/`.
 - [ ] `cd deploy && docker compose up -d` — starts both servers.
 - [ ] Verify transponder subscribes to Sonar's Nostr relays and dispatches
-      silent pushes.
+      plaintext-free pushes: visible/mutable APNS for iOS and data-only FCM
+      for Android.
 - [ ] Verify NDS receives webhook POSTs and dispatches silent pushes.
 
 ### Phase 3: iOS Remote Push
@@ -81,17 +87,18 @@ Wire the iOS app to both servers. Full guide: [`docs/ios-push-integration.md`](i
 - [x] Enable Push Notifications and Background Modes (remote-notification)
       entitlements in the app target. Added `aps-environment` to entitlements,
       `remote-notification` to UIBackgroundModes in Info.plist.
-- [ ] Add a Notification Service Extension target that shares an App Group
-      and keychain access group with the main app. **Deferred**: requires
-      Xcode target creation; current implementation uses AppDelegate
-      `didReceiveRemoteNotification` with background fetch for the 30s window.
+- [x] Add a Notification Service Extension target that shares an App Group
+      with the main app. It handles Transponder pushes with generic killed-app
+      notification copy and delegates Breez NDS pushes to the Breez SDK plugin.
 - [ ] Move encrypted Marmot data needed by the extension into the App Group
       container without destructive migrations.
 - [x] Register for APNS in `AppDelegate`, collect the raw device token.
       `SonarPushRegistration` receives and caches the APNS token.
-- [ ] Implement MIP-05 token encryption: ECDH + HKDF-SHA256
-      (`salt=mip05-v1`, `info=mip05-token-encryption`) + ChaCha20-Poly1305.
-      **Blocked on core FFI** (same as Android).
+- [x] Implement MIP-05 token encryption in Rust core via UniFFI:
+      ECDH + HKDF-SHA256 (`salt=mip05-v1`,
+      `info=mip05-token-encryption`) + ChaCha20-Poly1305. Registration caches
+      the encrypted token and shares it with peers; it does not publish a
+      transponder wakeup request.
 - [x] Register Breez SDK webhook on startup. Added `registerWebhook(url:)`
       and `unregisterWebhook()` to `SonarWallet` and `WalletBridgeService`.
       `SonarPushRegistration` registers the webhook, `SonarAppStore` retries
@@ -130,10 +137,10 @@ Wire the Compose app to both servers. Full guide: [`docs/android-push-integratio
       notifications. Falls back to generic notification on error.
 - [x] Breez wakeup path starts wallet SDK if needed, refreshes balance,
       stays silent (no user-visible notification).
-- [ ] Implement MIP-05 token encryption for transponder registration.
-      **Blocked on core FFI**: needs `SonarNode::register_push_token(token,
-      server_npub)` exposed via UniFFI — the ECDH + NIP-59 gift-wrap is
-      best done in Rust where the Nostr crypto already lives.
+- [x] Implement MIP-05 token encryption for transponder registration through
+      `SonarNode::register_push_token(token, server_npub)`. The Rust core
+      caches the encrypted token and shares it with peers; sender-side wakeups
+      publish `kind:446` requests only when notifying recipients.
 - [x] Push registration disable in settings: "Background push" toggle in
       Compose NotifSheet calls `Notifier.setPushEnabled()` which
       registers/unregisters push tokens via `SonarPushRegistration`.
@@ -162,9 +169,14 @@ Transponder is stateless: no database, no stored tokens or user data. It
 subscribes to Nostr relays for `kind:1059` gift-wrapped events addressed to
 its public key, unwraps them to extract `kind:446` notification requests
 containing encrypted provider tokens (MIP-05 spec), and dispatches silent
-pushes to APNS/FCM. Push payloads are plaintext-free -- the client wakes,
-fetches messages from relays, and builds notifications locally through the
-notification router.
+pushes to FCM and visible/mutable notifications to APNS. Push payloads are
+plaintext-free -- the client wakes, fetches messages from relays, and builds
+notifications locally through the notification router. On iOS APNS, the
+Transponder payload must include an alert, `mutable-content: 1`, and a marker
+such as upstream `wn_nse_prototype`, `source=transponder`, `source=marmot`,
+`mip05`, `transponder`, or `kind=446`; otherwise iOS will not invoke the
+extension after the user force-quits the app. In the upstream Transponder
+image, set `[apns].payload_mode = "nse_prototype_alert"`.
 
 ### MIP-05 Token Encryption
 
@@ -172,8 +184,12 @@ Clients encrypt their APNS/FCM device tokens to the transponder's secp256k1
 public key using ECDH + HKDF-SHA256 (`salt=mip05-v1`, `info=mip05-token-encryption`)
 + ChaCha20-Poly1305. The 1024-byte plaintext is: platform byte (`0x01` APNS,
 `0x02` FCM) + 2-byte token length + token bytes + random padding. The
-encrypted 1084-byte blobs are concatenated, base64-encoded, and published
-inside a NIP-59 gift wrap addressed to the server's npub.
+encrypted 1084-byte blobs are base64-encoded, cached locally, and shared with
+group members via encrypted token-share DMs. Senders place one or more of those
+encrypted blobs inside a `kind:446` notification request only when they need the
+transponder to wake a recipient. App startup/registration does not publish a
+`kind:446` request because the transponder is stateless and treats every valid
+request as an immediate push dispatch.
 
 ### Deployment
 

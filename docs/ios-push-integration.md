@@ -91,7 +91,7 @@ class AppDelegate: NSObject, UIApplicationDelegate {
     ) {
         let token = deviceToken.map { String(format: "%02x", $0) }.joined()
 
-        // 1. Register with transponder (MIP-05 encrypted gift wrap)
+        // 1. Register with transponder (MIP-05 encrypted token share)
         SonarPushRegistration.registerTransponder(apnsToken: deviceToken)
 
         // 2. Register with Breez NDS (webhook URL with token in query)
@@ -115,9 +115,11 @@ Wire into the SwiftUI lifecycle (in `BitchatApp.swift`):
 
 ## 4. Implement MIP-05 Token Encryption
 
-Create `SonarPushRegistration.swift`. This encrypts the APNS device token
-to the transponder's secp256k1 public key and publishes it as a NIP-59
-gift wrap.
+Create `SonarPushRegistration.swift`. The shipped app delegates MIP-05
+encryption to Rust core via UniFFI. Registration encrypts the APNS device
+token to the transponder's secp256k1 public key, caches it locally, and shares
+the encrypted blob with peers. It does not publish a `kind:446` request during
+registration; senders publish `kind:446` only when waking recipients.
 
 ```swift
 import CryptoKit
@@ -131,7 +133,7 @@ enum SonarPushRegistration {
         Bundle.main.infoDictionary?["SONAR_TRANSPONDER_NPUB"] as? String ?? ""
     }
 
-    /// Encrypt APNS token and publish as NIP-59 gift wrap to transponder.
+    /// Encrypt APNS token in Rust core and share it with peers.
     static func registerTransponder(apnsToken: Data) {
         // MIP-05 plaintext: platform(1) + tokenLen(2) + token + padding = 1024 bytes
         var plaintext = Data(capacity: 1024)
@@ -158,13 +160,10 @@ enum SonarPushRegistration {
         //
         // let encrypted = MIP05.encrypt(plaintext, to: transponderNpub)
 
-        // Publish as NIP-59 gift wrap addressed to the transponder's npub.
-        // Use the app's Nostr identity to sign the inner event.
-        //
-        // TODO: Wire into the existing Nostr event publishing path.
-        //       The gift wrap contains the encrypted token blob as content.
-        //
-        // NostrPublisher.publishGiftWrap(to: transponderNpub, content: encrypted)
+        // TODO: Call the existing SonarNode.registerPushToken FFI path.
+        //       Rust core stores the encrypted token and shares it with peers.
+        //       Do not publish kind-446 here; the transponder treats kind-446 as
+        //       an immediate wakeup request.
     }
 
     /// Register webhook with Breez SDK so the NDS can push wallet events.
@@ -182,7 +181,8 @@ enum SonarPushRegistration {
 
     /// Unregister from both servers (called when user disables push in settings).
     static func unregister() {
-        // TODO: Delete the NIP-59 gift wrap from relays (or publish a deletion event).
+        // TODO: Clear cached token-share state and notify peers on rotation/disable.
+        //       There is no transponder-side registration to delete.
         // TODO: Call breezSDK.unregisterWebhook()
     }
 }
@@ -208,8 +208,10 @@ Wire into `Info.plist`:
 
 ## 5. Notification Service Extension
 
-The extension handles two types of silent pushes and decides what to do
-with each.
+The extension handles two push classes and decides what to do with each.
+Transponder pushes must be visible APNS notifications with `mutable-content: 1`
+so iOS invokes the extension after the app has been force-quit. Breez NDS pushes
+remain infrastructure-only and should not produce user-visible copy.
 
 ```swift
 import UserNotifications
@@ -243,15 +245,8 @@ class NotificationService: UNNotificationServiceExtension {
     private func handleMarmotWakeup(
         contentHandler: @escaping (UNNotificationContent) -> Void
     ) {
-        // 1. Connect to Marmot via App Group shared data
-        // 2. Fetch pending messages from Nostr relays
-        // 3. Decrypt and process new messages
-        // 4. Classify via the local notification router
-        // 5. Render user-visible notification
-
-        // TODO: Access Marmot state from App Group container.
-        //       Use SonarLocalNotificationRouter to classify and format.
-
+        // Privacy-first killed-app fallback. Precise copy is rendered locally
+        // when Sonar opens and can fetch/decrypt Marmot state.
         let content = UNMutableNotificationContent()
         content.title = "New Sonar message"
         content.body = "Open Sonar to read it."
@@ -348,9 +343,14 @@ When push is disabled:
 ## 8. Testing Checklist
 
 - [ ] APNS token is collected on first launch after permission grant.
-- [ ] MIP-05 encrypted gift wrap is published to relays.
+- [ ] MIP-05 encrypted token share is cached and shared with peers.
 - [ ] Breez webhook is registered with correct URL and token.
-- [ ] Transponder push wakes extension and shows user-visible notification.
+- [ ] Transponder APNS payload includes an alert, `mutable-content: 1`, and a
+      marker (`wn_nse_prototype`, `source=transponder`, `source=marmot`,
+      `mip05`, `transponder`, or `kind=446`). With upstream Transponder, set
+      `[apns].payload_mode = "nse_prototype_alert"`.
+- [ ] Transponder push wakes extension and shows generic user-visible
+      notification while Sonar is force-quit.
 - [ ] Breez NDS push wakes extension and completes BOLT12 receive silently.
 - [ ] No user-visible notification from the Breez NDS path.
 - [ ] App Group data is accessible from the extension.
