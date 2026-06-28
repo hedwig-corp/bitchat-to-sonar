@@ -94,6 +94,7 @@ actual object MeshRadio {
         // conversation across peerID + BLE-address rotation (issue #12).
         // Buffer incoming Noise DMs (the listener fires on a BLE callback thread).
         MeshGatt.addMessageListener { fingerprint, messageId, text ->
+            if (!isKnownPeer(fingerprint)) return@addMessageListener
             meshDmInbox.add(MeshDmIn(fingerprint, messageId, text, System.currentTimeMillis() / 1000))
         }
         MeshGatt.addFileListener { fingerprint, messageId, filename, mime, bytes ->
@@ -320,7 +321,10 @@ actual object MeshRadio {
 
     actual fun drainMeshDm(): List<MeshDmIn> {
         val out = ArrayList<MeshDmIn>()
-        while (true) { out.add(meshDmInbox.poll() ?: break) }
+        while (true) {
+            val dm = meshDmInbox.poll() ?: break
+            if (isKnownPeer(dm.peerId)) out.add(dm)
+        }
         return out
     }
 
