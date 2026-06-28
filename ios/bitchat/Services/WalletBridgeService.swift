@@ -16,6 +16,39 @@ import WalletKit
 import UIKit
 #endif
 
+#if canImport(UIKit)
+@MainActor
+private final class WalletBackgroundTaskLease {
+    private var identifier: UIBackgroundTaskIdentifier = .invalid
+    private var expirationInProgress = false
+
+    init(
+        name: String,
+        onExpiration: @escaping @MainActor @Sendable () async -> Void
+    ) {
+        identifier = UIApplication.shared.beginBackgroundTask(withName: name) { [weak self] in
+            Task { @MainActor in
+                guard let self, !self.expirationInProgress else { return }
+                self.expirationInProgress = true
+                await onExpiration()
+                self.end()
+            }
+        }
+    }
+
+    func endIfNotExpiring() {
+        guard !expirationInProgress else { return }
+        end()
+    }
+
+    private func end() {
+        guard identifier != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(identifier)
+        identifier = .invalid
+    }
+}
+#endif
+
 /// App-side facade over the Lightning wallet engine (Breez SDK Liquid via
 /// the local `WalletKit` Swift package).
 ///
@@ -278,17 +311,12 @@ final class WalletBridgeService: ObservableObject {
         }
         if case .notConfigured = state { return }
         suspendedForBackground = true
-        var bgTask: UIBackgroundTaskIdentifier = .invalid
-        bgTask = UIApplication.shared.beginBackgroundTask(withName: "breez-suspend") {
-            UIApplication.shared.endBackgroundTask(bgTask)
-            bgTask = .invalid
+        let lease = WalletBackgroundTaskLease(name: "breez-suspend") { [weak self] in
+            await self?.expireSuspendBackgroundTask()
         }
         suspendTask = Task { @MainActor in
             await shutdown()
-            if bgTask != .invalid {
-                UIApplication.shared.endBackgroundTask(bgTask)
-                bgTask = .invalid
-            }
+            lease.endIfNotExpiring()
         }
     }
 
@@ -396,20 +424,34 @@ final class WalletBridgeService: ObservableObject {
         named name: String,
         operation: () async throws -> T
     ) async throws -> T {
-        var bgTask: UIBackgroundTaskIdentifier = .invalid
-        bgTask = UIApplication.shared.beginBackgroundTask(withName: name) {
-            if bgTask != .invalid {
-                UIApplication.shared.endBackgroundTask(bgTask)
-                bgTask = .invalid
-            }
+        let lease = WalletBackgroundTaskLease(name: name) { [weak self] in
+            await self?.expireActiveSendForBackgroundTask()
         }
         defer {
-            if bgTask != .invalid {
-                UIApplication.shared.endBackgroundTask(bgTask)
-                bgTask = .invalid
-            }
+            lease.endIfNotExpiring()
         }
         return try await operation()
+    }
+
+    private func expireActiveSendForBackgroundTask() async {
+        resumeTask?.cancel()
+        resumeTask = nil
+        activeSendCount = 0
+        suspendWhenActiveSendsFinish = false
+        suspendedForBackground = true
+        let cleanup = Task { @MainActor in
+            await shutdown()
+        }
+        suspendTask = cleanup
+        await cleanup.value
+    }
+
+    private func expireSuspendBackgroundTask() async {
+        if let suspendTask {
+            await suspendTask.value
+        } else {
+            await shutdown()
+        }
     }
     #endif
 

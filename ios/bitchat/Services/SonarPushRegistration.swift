@@ -67,10 +67,12 @@ final class SonarPushRegistration: @unchecked Sendable {
     func didRegisterForRemoteNotifications(deviceToken: Data) {
         let hex = deviceToken.map { String(format: "%02x", $0) }.joined()
         Self.log.info("APNS token collected (\(hex.prefix(8))...)")
-        queue.async { self.cachedAPNSToken = deviceToken }
         // Transponder (chat/calls) uses the raw APNs token. The Breez NDS uses the
         // Firebase FCM token instead — registered via didReceiveFCMToken.
-        registerTransponder(token: deviceToken)
+        queue.async {
+            self.cachedAPNSToken = deviceToken
+            self.registerTransponderIfReady(token: deviceToken)
+        }
     }
 
     /// Firebase FCM token for the Breez NDS webhook. `breez/notify` is FCM-only;
@@ -136,7 +138,7 @@ final class SonarPushRegistration: @unchecked Sendable {
         queue.async {
             self.sonarNode = node
             if let token = self.cachedAPNSToken {
-                self.registerTransponder(token: token)
+                self.registerTransponderIfReady(token: token)
             }
         }
     }
@@ -145,7 +147,7 @@ final class SonarPushRegistration: @unchecked Sendable {
 
     private static let maxRetries = 3
 
-    private func registerTransponder(token: Data) {
+    private func registerTransponderIfReady(token: Data) {
         guard !transponderNpub.isEmpty else { return }
         guard let node = sonarNode else {
             Self.log.info("Transponder: SonarNode not ready, will retry after setSonarNode")
