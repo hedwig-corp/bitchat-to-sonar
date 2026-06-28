@@ -56,10 +56,15 @@ enum SonarPushProcessor {
         completionHandler: @escaping (UIBackgroundFetchResult) -> Void
     ) {
         log.info("Processing Marmot push wakeup")
+        let prefs = notificationPrefs()
 
         guard let marmot else {
-            log.warning("Marmot not available, showing fallback notification")
-            showFallbackNotification()
+            if prefs.enabled {
+                log.warning("Marmot not available, showing fallback notification")
+            } else {
+                log.info("Marmot not available, notifications disabled")
+            }
+            showFallbackNotification(prefs: prefs)
             completionHandler(.newData)
             return
         }
@@ -73,12 +78,11 @@ enum SonarPushProcessor {
                     log.info("Marmot sync completed from push, no new messages")
                 } else {
                     log.info("Marmot sync completed from push, \(notifications.count) new message(s)")
-                    let prefs = SonarLocalNotificationPrefs(
-                        enabled: true,
-                        showNames: UserDefaults.standard.object(forKey: "sonar.notifications.showNames") as? Bool ?? true,
-                        showPreview: UserDefaults.standard.object(forKey: "sonar.notifications.showPreview") as? Bool ?? false,
-                        showPaymentAmount: true
-                    )
+                    guard prefs.enabled else {
+                        log.info("Marmot sync completed from push, notifications disabled")
+                        completionHandler(.newData)
+                        return
+                    }
                     for notif in notifications {
                         let senderName = await marmot.resolveSenderName(npub: notif.senderNpub)
                         let groupName = notif.groupName.isEmpty ? nil : notif.groupName
@@ -101,7 +105,7 @@ enum SonarPushProcessor {
                 completionHandler(.newData)
             } catch {
                 log.warning("Marmot sync from push failed: \(error)")
-                showFallbackNotification()
+                showFallbackNotification(prefs: prefs)
                 completionHandler(.failed)
             }
         }
@@ -134,11 +138,27 @@ enum SonarPushProcessor {
 
     // MARK: - Helpers
 
-    private static func showFallbackNotification() {
+    private static func notificationPrefs() -> SonarLocalNotificationPrefs {
+        SonarLocalNotificationPrefs(
+            enabled: UserDefaults.standard.object(forKey: "sonar.notifications.enabled") as? Bool ?? true,
+            showNames: UserDefaults.standard.object(forKey: "sonar.notifications.showNames") as? Bool ?? true,
+            showPreview: UserDefaults.standard.object(forKey: "sonar.notifications.showPreview") as? Bool ?? false,
+            showPaymentAmount: true
+        )
+    }
+
+    private static func showFallbackNotification(prefs: SonarLocalNotificationPrefs) {
+        guard let routed = SonarLocalNotificationRouter.make(
+            idKey: UUID().uuidString,
+            kind: .message,
+            conversationTitle: nil,
+            preview: nil,
+            prefs: prefs
+        ) else { return }
         NotificationService.shared.sendLocalNotification(
-            title: "New Sonar message",
-            body: "Open Sonar to read it.",
-            identifier: "marmot-push-\(UUID().uuidString)"
+            title: routed.title,
+            body: routed.body,
+            identifier: routed.identifier
         )
     }
 
