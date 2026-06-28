@@ -1315,7 +1315,14 @@ final class SonarAppStore: ObservableObject {
     private func applyBLEDiscoveryPolicy() {
         refreshBleKnownContactSnapshot()
         guard let ble = chatViewModel.meshService as? BLEService else { return }
-        ble.discoveryMode = effectiveBLEDiscoveryMode
+        let nextMode = effectiveBLEDiscoveryMode
+        if ble.discoveryMode == nextMode {
+            if isBLEDiscoveryRestricted {
+                ble.reapplyDiscoveryModePolicy()
+            }
+        } else {
+            ble.discoveryMode = nextMode
+        }
     }
 
     private func refreshBleKnownContactSnapshot() {

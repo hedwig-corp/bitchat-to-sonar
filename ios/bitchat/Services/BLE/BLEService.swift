@@ -129,6 +129,13 @@ final class BLEService: NSObject {
             }
         }
     }
+
+    func reapplyDiscoveryModePolicy() {
+        bleQueue.async { [weak self] in
+            self?.applyDiscoveryModeOnQueue()
+        }
+    }
+
     // 0x53 can beat the corresponding 0x01 announce on a fresh BLE link.
     // Cache it briefly by peerID, then verify it after the announce installs
     // the peer's signing key.
