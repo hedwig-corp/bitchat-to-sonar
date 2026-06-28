@@ -1,4 +1,6 @@
 #include "Release.xcconfig"
 
+APS_ENVIRONMENT = development
+
 // Optional include of local configs
 #include? "Local.xcconfig"
