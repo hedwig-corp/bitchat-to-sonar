@@ -421,6 +421,7 @@ final class BLEService: NSObject {
             centralManager?.stopScan()
             peripheralManager?.stopAdvertising()
             connectionCandidates.removeAll()
+            disconnectAllLinksForDiscoveryOff()
         } else {
             if centralManager?.state == .poweredOn {
                 if centralManager?.isScanning == true {
@@ -464,6 +465,21 @@ final class BLEService: NSObject {
             }
             self.requestPeerDataPublish()
             self.delegate?.didUpdatePeerList(currentPeerIDs)
+        }
+    }
+
+    private func disconnectAllLinksForDiscoveryOff() {
+        assert(DispatchQueue.getSpecific(key: bleQueueKey) != nil, "disconnectAllLinksForDiscoveryOff must run on bleQueue")
+
+        let states = Array(peripherals.values)
+        peripherals.removeAll()
+        peerToPeripheralUUID.removeAll()
+        subscribedCentrals.removeAll()
+        centralToPeerID.removeAll()
+        pendingWriteBuffers.removeAll()
+
+        for state in states {
+            centralManager?.cancelPeripheralConnection(state.peripheral)
         }
     }
 
