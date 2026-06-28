@@ -4,7 +4,6 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
-import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
@@ -132,19 +131,7 @@ class SonarPushProcessingService : Service() {
     }
 
     private fun notificationPrefs(): SonarNotificationPrefs =
-        SonarNotificationPrefs(
-            enabled = prefBool("notifs", true),
-            showNames = prefBool("notifNames", true),
-            showPreview = prefBool("notifPreview", false),
-            showPaymentAmount = true,
-        )
-
-    private fun prefBool(key: String, default: Boolean): Boolean {
-        val value = getSharedPreferences("sonar", Context.MODE_PRIVATE)
-            .getString("blob.pref.$key", "")
-            .orEmpty()
-        return if (value.isEmpty()) default else value == "1"
-    }
+        SonarPushPrefs.notificationPrefs(this)
 
     private fun notifyFallback(prefs: SonarNotificationPrefs) {
         val notif = SonarNotificationRouter.build(

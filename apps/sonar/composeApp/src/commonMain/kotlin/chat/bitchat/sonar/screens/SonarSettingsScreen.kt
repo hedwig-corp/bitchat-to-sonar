@@ -290,7 +290,7 @@ private fun NotifSheet(state: SonarAppState, onClose: () -> Unit) {
             toggle = state.prefBool("notifs", true), trail = SNTrail.None,
         ) {
             state.togglePref("notifs", true)
-            Notifier.setPushEnabled(state.prefBool("notifs", true))
+            syncPushEnabled(state)
         }
         SNSettingsRow(
             icon = SNIconName.People, label = "Show names",
@@ -310,9 +310,15 @@ private fun NotifSheet(state: SonarAppState, onClose: () -> Unit) {
         ) {
             val newValue = !state.prefBool("pushEnabled", true)
             state.setPref("pushEnabled", newValue)
-            Notifier.setPushEnabled(newValue)
+            syncPushEnabled(state)
         }
     }
+}
+
+private fun syncPushEnabled(state: SonarAppState) {
+    Notifier.setPushEnabled(
+        state.prefBool("notifs", true) && state.prefBool("pushEnabled", true)
+    )
 }
 
 @Composable

@@ -2,6 +2,7 @@ package chat.bitchat.sonar.push
 
 import android.net.Uri
 import android.util.Log
+import chat.bitchat.sonar.AppContextHolder
 import chat.bitchat.sonar.BuildConfig
 import chat.bitchat.sonar.SonarCore
 import chat.bitchat.sonar.wallet.WalletBridge
@@ -42,6 +43,10 @@ object SonarPushRegistration {
     @Volatile private var sessionWebhookMarker: String? = null
 
     fun ensureRegistered() {
+        if (!SonarPushPrefs.effectivePushEnabled(AppContextHolder.ctx)) {
+            Log.d(TAG, "Push not registered: disabled by user preference")
+            return
+        }
         if (transponderNpub.isBlank() && ndsUrl.isBlank()) {
             Log.d(TAG, "Push not configured (no TRANSPONDER_NPUB or NDS_URL)")
             return
@@ -57,6 +62,11 @@ object SonarPushRegistration {
     }
 
     fun onTokenRefresh(token: String) {
+        if (!SonarPushPrefs.effectivePushEnabled(AppContextHolder.ctx)) {
+            Log.d(TAG, "FCM token refreshed while push disabled")
+            cachedFcmToken = null
+            return
+        }
         Log.d(TAG, "FCM token refreshed")
         cachedFcmToken = token
         registerTransponder(token)
