@@ -17,7 +17,9 @@ import os
 import CryptoKit
 import SonarCore
 
-final class SonarPushRegistration {
+/// Mutable registration state is confined to `queue`; async wallet work hops
+/// back to that queue before reading or writing those fields.
+final class SonarPushRegistration: @unchecked Sendable {
     static let shared = SonarPushRegistration()
 
     private static let log = Logger(
@@ -37,7 +39,11 @@ final class SonarPushRegistration {
     private static let webhookMarkerKey = "breez_webhook_marker"
     private static let webhookMarkerVersion = "ios-fcm-explicit-token-v2"
     private static let defaultNdsHost = "nds.sonar.hedwig.sh"
-    private var sessionWebhookMarker: String?
+    private static let webhookInFlightTimeout: TimeInterval = 30
+    private static let webhookRegistrationAttempts = 3
+    private var completedSessionWebhookMarker: String?
+    private var inFlightWebhookMarker: String?
+    private var inFlightWebhookStartedAt: Date?
 
     private var transponderNpub: String {
         Bundle.main.infoDictionary?["TRANSPONDER_NPUB"] as? String ?? ""
@@ -51,13 +57,7 @@ final class SonarPushRegistration {
     /// the production NDS host for missing/truncated settings so a malformed
     /// build setting does not disable offline receive in TestFlight/Release.
     private var ndsUrl: String {
-        let raw = (Bundle.main.infoDictionary?["NDS_URL"] as? String ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !raw.isEmpty, raw != "https:", raw != "http:" else {
-            return "https://\(Self.defaultNdsHost)"
-        }
-        if raw.hasPrefix("http://") || raw.hasPrefix("https://") { return raw }
-        return "https://\(raw)"
+        Self.normalizedNdsUrl(Bundle.main.infoDictionary?["NDS_URL"] as? String)
     }
 
     private init() {}
@@ -116,7 +116,9 @@ final class SonarPushRegistration {
         queue.async {
             self.cachedAPNSToken = nil
             self.cachedOffer = nil
-            self.sessionWebhookMarker = nil
+            self.completedSessionWebhookMarker = nil
+            self.inFlightWebhookMarker = nil
+            self.inFlightWebhookStartedAt = nil
         }
         // Force a fresh subscribe next time (e.g. after a wallet/seed change).
         UserDefaults.standard.removeObject(forKey: Self.webhookMarkerKey)
@@ -180,36 +182,47 @@ final class SonarPushRegistration {
             return
         }
         let marker = Self.webhookMarker(offer: offer, webhookUrl: webhookUrl)
-        if sessionWebhookMarker == marker {
-            Self.log.info("Breez NDS webhook re-subscribe already queued for current offer")
+        if completedSessionWebhookMarker == marker {
+            Self.log.info("Breez NDS webhook already re-subscribed for current offer this launch")
             return
         }
-        sessionWebhookMarker = marker
+        if inFlightWebhookMarker == marker {
+            if let started = inFlightWebhookStartedAt,
+               Date().timeIntervalSince(started) < Self.webhookInFlightTimeout {
+                Self.log.info("Breez NDS webhook re-subscribe already in flight for current offer")
+                return
+            }
+            Self.log.warning("Breez NDS webhook re-subscribe timed out; retrying current offer")
+        }
+        inFlightWebhookMarker = marker
+        inFlightWebhookStartedAt = Date()
         Task { @MainActor in
             guard case .ready = wallet.state else {
                 Self.log.info("Breez NDS: wallet not ready, will retry after wallet setup")
                 self.queue.async {
-                    if self.sessionWebhookMarker == marker {
-                        self.sessionWebhookMarker = nil
+                    if self.inFlightWebhookMarker == marker {
+                        self.inFlightWebhookMarker = nil
+                        self.inFlightWebhookStartedAt = nil
                     }
                 }
                 return
             }
             do {
-                // Force a clean re-subscribe. A plain registerWebhook no-ops when the
-                // SDK's local `bolt12_offers.webhook_url` already equals this URL but
-                // Boltz still holds `url=None` — the desync that breaks offline receive.
-                // unregister clears the local webhook state, register re-PATCHes the
-                // offer on Boltz (`update_bolt12_offer`) with the current FCM URL.
-                // Matches the misty-breez reference's unregister→register flow.
-                try? await wallet.unregisterWebhook()
-                try await wallet.registerWebhook(url: webhookUrl)
+                try await Self.forceRegisterWebhook(wallet: wallet, url: webhookUrl)
                 UserDefaults.standard.set(marker, forKey: Self.webhookMarkerKey)
+                self.queue.async {
+                    if self.inFlightWebhookMarker == marker {
+                        self.inFlightWebhookMarker = nil
+                        self.inFlightWebhookStartedAt = nil
+                    }
+                    self.completedSessionWebhookMarker = marker
+                }
                 Self.log.info("Breez NDS webhook force re-subscribed for current offer (FCM)")
             } catch {
                 self.queue.async {
-                    if self.sessionWebhookMarker == marker {
-                        self.sessionWebhookMarker = nil
+                    if self.inFlightWebhookMarker == marker {
+                        self.inFlightWebhookMarker = nil
+                        self.inFlightWebhookStartedAt = nil
                     }
                 }
                 Self.log.warning("Breez NDS webhook registration failed: \(error)")
@@ -217,11 +230,30 @@ final class SonarPushRegistration {
         }
     }
 
-    private static func webhookUrl(ndsUrl: String, platform: String, fcmToken: String) -> String? {
+    static func normalizedNdsUrl(_ rawValue: String?) -> String {
+        let raw = (rawValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty, raw != "https:", raw != "http:" else {
+            return "https://\(defaultNdsHost)"
+        }
+        if raw.hasPrefix("http://") || raw.hasPrefix("https://") {
+            guard var components = URLComponents(string: raw),
+                  components.host?.isEmpty == false
+            else {
+                return "https://\(defaultNdsHost)"
+            }
+            // Breez/Boltz requires HTTPS webhook URLs. Normalize any old
+            // TestFlight/public `http://` setting instead of propagating it.
+            components.scheme = "https"
+            return components.url?.absoluteString ?? "https://\(defaultNdsHost)"
+        }
+        return "https://\(raw)"
+    }
+
+    static func webhookUrl(ndsUrl: String, platform: String, fcmToken: String) -> String? {
         let raw = ndsUrl.trimmingCharacters(in: .whitespacesAndNewlines)
         guard var components = URLComponents(string: raw),
               let scheme = components.scheme?.lowercased(),
-              scheme == "https" || scheme == "http",
+              scheme == "https",
               components.host?.isEmpty == false
         else { return nil }
 
@@ -240,6 +272,29 @@ final class SonarPushRegistration {
     private static func webhookMarker(offer: String, webhookUrl: String) -> String {
         let digest = SHA256.hash(data: Data("\(webhookMarkerVersion)|\(offer)|\(webhookUrl)".utf8))
         return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    @MainActor
+    private static func forceRegisterWebhook(wallet: WalletBridgeService, url: String) async throws {
+        var lastError: Error?
+        for attempt in 1...webhookRegistrationAttempts {
+            do {
+                // Force a clean re-subscribe. A plain registerWebhook no-ops when the
+                // SDK's local `bolt12_offers.webhook_url` already equals this URL but
+                // Boltz still holds `url=None` — the desync that breaks offline receive.
+                // unregister clears the local webhook state, register re-PATCHes the
+                // offer on Boltz (`update_bolt12_offer`) with the current FCM URL.
+                // Matches the misty-breez reference's unregister→register flow.
+                try? await wallet.unregisterWebhook()
+                try await wallet.registerWebhook(url: url)
+                return
+            } catch {
+                lastError = error
+                guard attempt < webhookRegistrationAttempts else { break }
+                try? await Task.sleep(nanoseconds: UInt64(attempt) * 2_000_000_000)
+            }
+        }
+        throw lastError ?? WalletBridgeService.WalletBridgeError.core("webhook registration failed")
     }
 }
 
