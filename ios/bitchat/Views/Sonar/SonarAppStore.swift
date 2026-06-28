@@ -1274,7 +1274,12 @@ final class SonarAppStore: ObservableObject {
     }
 
     private var effectiveBLEDiscoveryMode: BLEDiscoveryMode {
-        isBLEDiscoveryRestricted ? .knownOnly : .normal
+        guard isBLEDiscoveryRestricted else { return .normal }
+        return hasKnownBleContacts ? .knownOnly : .off
+    }
+
+    private var hasKnownBleContacts: Bool {
+        !(defaults.stringArray(forKey: Keys.bleKnownChatKeys) ?? []).isEmpty
     }
 
     private func refreshBatterySavingState() {

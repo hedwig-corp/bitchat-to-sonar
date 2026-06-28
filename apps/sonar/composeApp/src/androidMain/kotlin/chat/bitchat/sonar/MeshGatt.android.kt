@@ -133,18 +133,20 @@ object MeshGatt {
      *  by BLE address. This is what the app keys conversations/radar by, so a peer
      *  stays one identity across peerID + MAC rotation (issue #12). */
     private val fingerprintByAddr = ConcurrentHashMap<String, String>()
+    private val fingerprintByPeerId = ConcurrentHashMap<String, String>()
     /** A 0x53 can arrive before the 0x01 announce on a fresh GATT link. Keep the
      *  raw payload until the announce supplies the stable fingerprint. */
     private val pendingSonarByAddr = ConcurrentHashMap<String, ByteArray>()
     private val reassembler = MeshReassembler()
 
     // Listeners (fired from BLE callback threads → concurrent lists). The String
-    // identity passed to onText/onSonar/onLink is the stable FINGERPRINT.
+    // identity passed to onText/onSonar/onLink/onBroadcast/onFile is the stable
+    // FINGERPRINT.
     private val onText = java.util.concurrent.CopyOnWriteArrayList<(String, String, String) -> Unit>()
     private val onSonar = java.util.concurrent.CopyOnWriteArrayList<(String, ByteArray) -> Unit>()
     private val onAnnounce = java.util.concurrent.CopyOnWriteArrayList<(String, MeshAnnounceInfo, String) -> Unit>()
     private val onLink = java.util.concurrent.CopyOnWriteArrayList<(String) -> Unit>()
-    private val onBroadcast = java.util.concurrent.CopyOnWriteArrayList<(MeshPublicMessage) -> Unit>()
+    private val onBroadcast = java.util.concurrent.CopyOnWriteArrayList<(String, MeshPublicMessage) -> Unit>()
     private val onFile = java.util.concurrent.CopyOnWriteArrayList<(String, String, String, String, ByteArray) -> Unit>()
     /** Dedup public broadcasts by message id (we receive from multiple links). */
     private val seenBroadcastIds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
@@ -162,7 +164,7 @@ object MeshGatt {
     private fun fingerprintOf(noisePublicKeyHex: String): String =
         runCatching { Sha256.hash(noisePublicKeyHex.hexToBytes()).toHex() }.getOrDefault("")
     /** Fired for an incoming public broadcast (Mesh channel) message. */
-    fun addBroadcastListener(cb: (MeshPublicMessage) -> Unit) { onBroadcast.add(cb) }
+    fun addBroadcastListener(cb: (senderFingerprint: String, message: MeshPublicMessage) -> Unit) { onBroadcast.add(cb) }
     /** Fired for an incoming private file transfer. The first arg is the peer's
      * stable fingerprint, matching [addMessageListener]. */
     fun addFileListener(cb: (fingerprint: String, messageId: String, filename: String, mime: String, bytes: ByteArray) -> Unit) {
@@ -305,7 +307,8 @@ object MeshGatt {
         server = null; characteristic = null
         clientGatt.values.forEach { runCatching { it.disconnect(); it.close() } }
         clientGatt.clear(); clientChar.clear(); clientLinks.clear(); clientPending.clear(); clientConnected.clear()
-        serverLinks.clear(); serverDevices.clear(); peerIdByAddr.clear(); fingerprintByAddr.clear(); recentDials.clear()
+        serverLinks.clear(); serverDevices.clear(); peerIdByAddr.clear(); fingerprintByAddr.clear()
+        fingerprintByPeerId.clear(); recentDials.clear()
         pendingSonarByAddr.clear()
         pendingSends.clear()
         seenFileIds.clear()
@@ -530,7 +533,10 @@ object MeshGatt {
                 val fp = fingerprintOf(ann.noisePublicKeyHex)
                 android.util.Log.i(TAG, "ANNOUNCE from $addr → '${ann.nickname}' peerId=${ann.senderIdHex} fp=${fp.take(8)}…")
                 peerIdByAddr[addr] = ann.senderIdHex
-                if (fp.isNotEmpty()) fingerprintByAddr[addr] = fp
+                if (fp.isNotEmpty()) {
+                    fingerprintByAddr[addr] = fp
+                    fingerprintByPeerId[ann.senderIdHex] = fp
+                }
                 clientPending.remove(addr) // a real peer answered — keep this link
                 onAnnounce.forEach { it(addr, ann, fp) }
                 pendingSonarByAddr.remove(addr)?.let { pending ->
@@ -559,8 +565,9 @@ object MeshGatt {
                 val pm = runCatching { meshParsePublicMessage(value) }.getOrNull() ?: return
                 if (seenBroadcastIds.add("${pm.senderIdHex}-${pm.timestampMs}")) {
                     if (seenBroadcastIds.size > 1024) seenBroadcastIds.clear()
+                    val senderFingerprint = fingerprintByPeerId[pm.senderIdHex] ?: pm.senderIdHex
                     android.util.Log.i(TAG, "rx broadcast from ${pm.senderIdHex}: ${pm.content.take(40)}")
-                    onBroadcast.forEach { it(pm) }
+                    onBroadcast.forEach { it(senderFingerprint, pm) }
                     // Multi-hop: flood the packet onward so the mesh extends past
                     // our direct neighbours (this is how a message crosses A↔relay↔B
                     // when A and B aren't directly connected).

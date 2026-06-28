@@ -98,11 +98,13 @@ actual object MeshRadio {
             meshDmInbox.add(MeshDmIn(fingerprint, messageId, text, System.currentTimeMillis() / 1000))
         }
         MeshGatt.addFileListener { fingerprint, messageId, filename, mime, bytes ->
+            if (!isKnownPeer(fingerprint)) return@addFileListener
             meshMediaInbox.add(MeshMediaIn(fingerprint, messageId, filename, mime, bytes, System.currentTimeMillis() / 1000))
         }
         // Buffer incoming public broadcasts (the BLE "Mesh" channel).
-        MeshGatt.addBroadcastListener { pm ->
-            meshBroadcastInbox.add(MeshBroadcastIn(pm.senderIdHex, pm.content, (pm.timestampMs / 1000u).toLong()))
+        MeshGatt.addBroadcastListener { senderFingerprint, pm ->
+            if (!isKnownPeer(senderFingerprint)) return@addBroadcastListener
+            meshBroadcastInbox.add(MeshBroadcastIn(senderFingerprint, pm.content, (pm.timestampMs / 1000u).toLong()))
         }
         // Stash peers' 0x53 payloads + register named, verified announce peers,
         // keyed by stable fingerprint.
@@ -333,7 +335,10 @@ actual object MeshRadio {
 
     actual fun drainMeshMedia(): List<MeshMediaIn> {
         val out = ArrayList<MeshMediaIn>()
-        while (true) { out.add(meshMediaInbox.poll() ?: break) }
+        while (true) {
+            val media = meshMediaInbox.poll() ?: break
+            if (isKnownPeer(media.peerId)) out.add(media)
+        }
         return out
     }
 
@@ -343,7 +348,10 @@ actual object MeshRadio {
 
     actual fun drainMeshBroadcast(): List<MeshBroadcastIn> {
         val out = ArrayList<MeshBroadcastIn>()
-        while (true) { out.add(meshBroadcastInbox.poll() ?: break) }
+        while (true) {
+            val msg = meshBroadcastInbox.poll() ?: break
+            if (isKnownPeer(msg.senderId)) out.add(msg)
+        }
         return out
     }
 
