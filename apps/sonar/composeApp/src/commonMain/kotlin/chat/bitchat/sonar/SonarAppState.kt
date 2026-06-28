@@ -39,7 +39,7 @@ private const val GROUP_FOLDS_BLOB_KEY = "sonar.groupFolds"
 private const val FAVORITED_CONTROL = "[FAVORITED]"
 private const val UNFAVORITED_CONTROL = "[UNFAVORITED]"
 private const val MESH_MEDIA_URL_PREFIX = "mesh-media:"
-private const val BLE_DISCOVER_NEW_PEOPLE_PREF = "bleDiscoverNewPeople"
+internal const val BLE_DISCOVER_NEW_PEOPLE_PREF = "bleDiscoverNewPeople"
 
 internal fun shortNpubLabel(value: String): String =
     if (value.length > 16) value.take(10) + "…" + value.takeLast(4) else value
