@@ -116,8 +116,18 @@ fun SonarSettingsScreen(state: SonarAppState) {
                     icon = SNIconName.Mesh, tone = SNTone.Cyan, label = "Connection",
                     sub = if (state.started) "Bluetooth + internet" else "Nearby only, no internet",
                     value = if (state.started) "Online" else "Bluetooth only",
-                    trail = SNTrail.None, divider = false,
+                    trail = SNTrail.None,
                 ) {}
+                SNSettingsRow(
+                    icon = SNIconName.Mesh, tone = SNTone.Cyan, label = "Discover new people",
+                    sub = if (state.batterySaving) "Battery saving is limiting Bluetooth to existing chats" else "Allow nearby people without a chat to appear",
+                    value = state.bleDiscoveryStatusLine,
+                    toggle = state.discoverNewPeople && !state.batterySaving,
+                    trail = SNTrail.None, divider = false,
+                ) {
+                    if (state.batterySaving) state.toast = "Battery saving keeps Bluetooth on chats only"
+                    else state.setBleDiscoverNewPeople(!state.discoverNewPeople)
+                }
             }
 
             SNSectionLabel("Wallet")

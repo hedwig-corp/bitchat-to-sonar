@@ -417,6 +417,8 @@ final class SonarAppStore: ObservableObject {
         static let notificationsEnabled = "sonar.notifications.enabled"
         static let notificationShowNames = "sonar.notifications.showNames"
         static let notificationShowPreview = "sonar.notifications.showPreview"
+        static let discoverNewPeople = "sonar.ble.discoverNewPeople"
+        static let bleKnownChatKeys = "sonar.ble.knownChatKeys.v1"
     }
 
     #if os(iOS)
@@ -462,6 +464,8 @@ final class SonarAppStore: ObservableObject {
     @Published var toast: String? = nil
     @Published private(set) var onboarded: Bool
     @Published private(set) var mode: String
+    @Published private(set) var discoverNewPeople: Bool
+    @Published private(set) var batterySavingEnabled: Bool
     @Published private(set) var marmotVerified: [String: Bool]
     /// Sonar discovery profiles received from nearby peers, keyed by PeerID.id.
     /// LIVE only (the short PeerID rotates) — see `sonarProfilesByFingerprint`
@@ -728,6 +732,16 @@ final class SonarAppStore: ObservableObject {
         }
         onboarded = UserDefaults.standard.bool(forKey: Keys.onboarded)
         mode = UserDefaults.standard.string(forKey: Keys.mode) ?? "dark"
+        if UserDefaults.standard.object(forKey: Keys.discoverNewPeople) == nil {
+            discoverNewPeople = true
+        } else {
+            discoverNewPeople = UserDefaults.standard.bool(forKey: Keys.discoverNewPeople)
+        }
+        #if os(iOS)
+        batterySavingEnabled = ProcessInfo.processInfo.isLowPowerModeEnabled
+        #else
+        batterySavingEnabled = false
+        #endif
         marmotVerified = (UserDefaults.standard.dictionary(forKey: Keys.marmotVerified) as? [String: Bool]) ?? [:]
         bip353 = UserDefaults.standard.string(forKey: Keys.bip353) ?? ""
         // Drop the old prototype demo blob if it is still around.
@@ -759,7 +773,14 @@ final class SonarAppStore: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.handleCallProximityChange() }
             .store(in: &cancellables)
+        NotificationCenter.default.publisher(for: Notification.Name.NSProcessInfoPowerStateDidChange)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.refreshBatterySavingState() }
+            .store(in: &cancellables)
         #endif
+        wireBLEDiscoveryPolicy()
+        refreshBleKnownContactSnapshot()
+        applyBLEDiscoveryPolicy()
         // Let Marmot republish our kind-0 profile on every relay connect (next to
         // the KeyPackage) using the current nickname, so a peer never sees our raw
         // npub because the opportunistic publish below lost the relay/onboarding race.
@@ -800,6 +821,8 @@ final class SonarAppStore: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
                 guard let self else { return }
+                self.refreshBleKnownContactSnapshot()
+                self.applyBLEDiscoveryPolicy()
                 self.objectWillChange.send()
                 DispatchQueue.main.async { [weak self] in
                     self?.flushPendingMarmotSends()
@@ -843,7 +866,15 @@ final class SonarAppStore: ObservableObject {
         updateWalletPaymentObservation()
         chatViewModel.objectWillChange
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in self?.processIncomingPayLines(); self?.processIncomingCallLines() }
+            .sink { [weak self] _ in
+                guard let self else { return }
+                DispatchQueue.main.async { [weak self] in
+                    self?.refreshBleKnownContactSnapshot()
+                    self?.applyBLEDiscoveryPolicy()
+                }
+                self.processIncomingPayLines()
+                self.processIncomingCallLines()
+            }
             .store(in: &cancellables)
         marmot.$messagesByGroup
             .receive(on: DispatchQueue.main)
@@ -861,6 +892,8 @@ final class SonarAppStore: ObservableObject {
         // stay folded into one conversation across restarts (before dmRows runs).
         hydrateSonarProfiles()
         hydrateMarmotConversationGroups()
+        refreshBleKnownContactSnapshot()
+        applyBLEDiscoveryPolicy()
 
         if onboarded {
             marmot.connectIfNeeded()
@@ -1157,7 +1190,13 @@ final class SonarAppStore: ObservableObject {
     /// Start Unify scanning while the Nearby/radar screen is visible; stop it
     /// when it goes away. Keeps the extra BLE scan off except when the user is
     /// actually looking for someone nearby to pay.
-    func nearbyAppeared() { unify.start() }
+    func nearbyAppeared() {
+        if isBLEDiscoveryRestricted {
+            unify.stop()
+        } else {
+            unify.start()
+        }
+    }
     func nearbyDisappeared() { unify.stop() }
 
     // MARK: Unify receiver (mirror role: a Unify user can pay us)
@@ -1198,11 +1237,125 @@ final class SonarAppStore: ObservableObject {
     private func updateReceiverAdvertising() {
         let ready: Bool
         if case .ready = walletState { ready = true } else { ready = false }
-        if ready && isForeground {
+        if ready && isForeground && !isBLEDiscoveryRestricted {
             unifyReceiver.start()
         } else {
             unifyReceiver.stop()
         }
+    }
+
+    var isBLEDiscoveryRestricted: Bool {
+        batterySavingEnabled || !discoverNewPeople
+    }
+
+    var bleDiscoveryStatusLine: String {
+        if batterySavingEnabled {
+            return "Battery saving · chats only"
+        }
+        return discoverNewPeople ? "Discovering nearby people" : "Chats only"
+    }
+
+    var radarDiscoveryStatusLine: String {
+        if isBLEDiscoveryRestricted {
+            return "\(nearbyPeers.filter(\.inRange).count) in range · chats only"
+        }
+        return "\(nearbyPeers.filter(\.inRange).count) in range · scanning"
+    }
+
+    func setDiscoverNewPeople(_ enabled: Bool) {
+        guard discoverNewPeople != enabled else { return }
+        discoverNewPeople = enabled
+        defaults.set(enabled, forKey: Keys.discoverNewPeople)
+        applyBLEDiscoveryPolicy()
+        if isBLEDiscoveryRestricted {
+            unify.stop()
+        }
+        updateReceiverAdvertising()
+    }
+
+    private var effectiveBLEDiscoveryMode: BLEDiscoveryMode {
+        guard isBLEDiscoveryRestricted else { return .normal }
+        return hasKnownBleContacts ? .knownOnly : .off
+    }
+
+    private var hasKnownBleContacts: Bool {
+        !(defaults.stringArray(forKey: Keys.bleKnownChatKeys) ?? []).isEmpty
+    }
+
+    private func refreshBatterySavingState() {
+        #if os(iOS)
+        let enabled = ProcessInfo.processInfo.isLowPowerModeEnabled
+        guard batterySavingEnabled != enabled else { return }
+        batterySavingEnabled = enabled
+        applyBLEDiscoveryPolicy()
+        if isBLEDiscoveryRestricted {
+            unify.stop()
+        }
+        updateReceiverAdvertising()
+        #endif
+    }
+
+    private func wireBLEDiscoveryPolicy() {
+        guard let ble = chatViewModel.meshService as? BLEService else { return }
+        let knownKey = Keys.bleKnownChatKeys
+        ble.knownPeerProvider = { peerID, noisePublicKey in
+            let stored = Set((UserDefaults.standard.stringArray(forKey: knownKey) ?? []).map { $0.lowercased() })
+            guard !stored.isEmpty else { return false }
+            var candidates: Set<String> = [peerID.id.lowercased(), peerID.bare.lowercased()]
+            if let noisePublicKey {
+                let fingerprint = noisePublicKey.sha256Fingerprint().lowercased()
+                candidates.insert(fingerprint)
+                candidates.insert(String(fingerprint.prefix(16)))
+                candidates.insert(PeerID(publicKey: noisePublicKey).bare.lowercased())
+            }
+            return !candidates.isDisjoint(with: stored)
+        }
+    }
+
+    private func applyBLEDiscoveryPolicy() {
+        refreshBleKnownContactSnapshot()
+        guard let ble = chatViewModel.meshService as? BLEService else { return }
+        let nextMode = effectiveBLEDiscoveryMode
+        if ble.discoveryMode == nextMode {
+            if isBLEDiscoveryRestricted {
+                ble.reapplyDiscoveryModePolicy()
+            }
+        } else {
+            ble.discoveryMode = nextMode
+        }
+    }
+
+    private func refreshBleKnownContactSnapshot() {
+        var keys = Set<String>()
+        func insert(_ raw: String) {
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !trimmed.isEmpty else { return }
+            keys.insert(trimmed)
+            let peer = PeerID(str: trimmed)
+            keys.insert(peer.bare)
+            if let noiseKey = peer.noiseKey {
+                let fingerprint = noiseKey.sha256Fingerprint().lowercased()
+                keys.insert(fingerprint)
+                keys.insert(String(fingerprint.prefix(16)))
+                keys.insert(PeerID(publicKey: noiseKey).bare.lowercased())
+            }
+        }
+
+        for (peerID, messages) in chatViewModel.privateChats where !messages.isEmpty {
+            insert(peerID.id)
+            insert(canonicalPeerKey(peerID))
+        }
+        for id in marmotGroupIdsByConversationId.keys {
+            insert(id)
+        }
+        for group in marmot.groups where marmot.isDirectGroup(group) {
+            if let other = directOtherNpub(in: group),
+               let peerKey = sonarPeerKey(forNpub: other) {
+                insert(peerKey)
+            }
+        }
+
+        defaults.set(Array(keys), forKey: Keys.bleKnownChatKeys)
     }
 
     func submitInviteLink(_ token: String) {
@@ -1476,6 +1629,8 @@ final class SonarAppStore: ObservableObject {
             rememberMarmotGroup(group.id, forConversationId: peerID)
             rememberMarmotGroup(group.id, forConversationId: key)
         }
+        refreshBleKnownContactSnapshot()
+        applyBLEDiscoveryPolicy()
         meshPeerFirstSeenAt[key] = nil
         pendingCapabilityRefreshKeys.remove(key)
         // Proactively fetch the Nostr descriptor so the BOLT12 offer is ready
@@ -4444,6 +4599,9 @@ final class SonarAppStore: ObservableObject {
         pendingPayPeer = nil
         localHydratingDMs = []
         clearMarmotConversationGroups()
+        marmot.groups = []
+        defaults.removeObject(forKey: Keys.bleKnownChatKeys)
+        applyBLEDiscoveryPolicy()
         publishedBolt12Offer = nil
         publishedCallDescriptor = false
         publishingPaymentMetadata = false
@@ -4484,9 +4642,13 @@ final class SonarAppStore: ObservableObject {
         marmot.messagesByGroup = [:]
         marmotVerified = [:]
         defaults.removeObject(forKey: Keys.marmotVerified)
+        defaults.removeObject(forKey: Keys.bleKnownChatKeys)
         // Stop Sonar discovery announces and forget discovered profiles (live +
         // the persisted npub↔peer link).
-        (chatViewModel.meshService as? BLEService)?.sonarProfileProvider = nil
+        if let ble = chatViewModel.meshService as? BLEService {
+            ble.sonarProfileProvider = nil
+            ble.discoveryMode = effectiveBLEDiscoveryMode
+        }
         sonarProfiles = [:]
         sonarProfilesByFingerprint = [:]
         meshPeerFirstSeenAt = [:]

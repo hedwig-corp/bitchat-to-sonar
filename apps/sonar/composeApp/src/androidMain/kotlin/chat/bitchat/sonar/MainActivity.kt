@@ -37,6 +37,10 @@ class MainActivity : ComponentActivity() {
 
     private fun startMeshRadio() {
         MeshRadio.setMeshNickname(SonarCore.nickname())
+        val pref = SonarCore.loadBlob("pref.$BLE_DISCOVER_NEW_PEOPLE_PREF")
+        val discoverNewPeople = pref.isEmpty() || pref == "1"
+        val restricted = BatterySaver.enabled() || !discoverNewPeople
+        MeshRadio.setDiscoveryMode(if (restricted) BleDiscoveryMode.KnownOnly else BleDiscoveryMode.Normal)
         MeshRadio.start()
     }
 

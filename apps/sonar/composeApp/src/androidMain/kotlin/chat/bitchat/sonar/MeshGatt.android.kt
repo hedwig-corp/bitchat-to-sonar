@@ -133,18 +133,21 @@ object MeshGatt {
      *  by BLE address. This is what the app keys conversations/radar by, so a peer
      *  stays one identity across peerID + MAC rotation (issue #12). */
     private val fingerprintByAddr = ConcurrentHashMap<String, String>()
+    private val fingerprintByPeerId = ConcurrentHashMap<String, String>()
     /** A 0x53 can arrive before the 0x01 announce on a fresh GATT link. Keep the
      *  raw payload until the announce supplies the stable fingerprint. */
     private val pendingSonarByAddr = ConcurrentHashMap<String, ByteArray>()
     private val reassembler = MeshReassembler()
+    @Volatile private var knownOnlyPeerAllowlist: Set<String>? = null
 
     // Listeners (fired from BLE callback threads → concurrent lists). The String
-    // identity passed to onText/onSonar/onLink is the stable FINGERPRINT.
+    // identity passed to onText/onSonar/onLink/onBroadcast/onFile is the stable
+    // FINGERPRINT.
     private val onText = java.util.concurrent.CopyOnWriteArrayList<(String, String, String) -> Unit>()
     private val onSonar = java.util.concurrent.CopyOnWriteArrayList<(String, ByteArray) -> Unit>()
     private val onAnnounce = java.util.concurrent.CopyOnWriteArrayList<(String, MeshAnnounceInfo, String) -> Unit>()
     private val onLink = java.util.concurrent.CopyOnWriteArrayList<(String) -> Unit>()
-    private val onBroadcast = java.util.concurrent.CopyOnWriteArrayList<(MeshPublicMessage) -> Unit>()
+    private val onBroadcast = java.util.concurrent.CopyOnWriteArrayList<(String, MeshPublicMessage) -> Unit>()
     private val onFile = java.util.concurrent.CopyOnWriteArrayList<(String, String, String, String, ByteArray) -> Unit>()
     /** Dedup public broadcasts by message id (we receive from multiple links). */
     private val seenBroadcastIds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
@@ -162,7 +165,7 @@ object MeshGatt {
     private fun fingerprintOf(noisePublicKeyHex: String): String =
         runCatching { Sha256.hash(noisePublicKeyHex.hexToBytes()).toHex() }.getOrDefault("")
     /** Fired for an incoming public broadcast (Mesh channel) message. */
-    fun addBroadcastListener(cb: (MeshPublicMessage) -> Unit) { onBroadcast.add(cb) }
+    fun addBroadcastListener(cb: (senderFingerprint: String, message: MeshPublicMessage) -> Unit) { onBroadcast.add(cb) }
     /** Fired for an incoming private file transfer. The first arg is the peer's
      * stable fingerprint, matching [addMessageListener]. */
     fun addFileListener(cb: (fingerprint: String, messageId: String, filename: String, mime: String, bytes: ByteArray) -> Unit) {
@@ -172,6 +175,11 @@ object MeshGatt {
     /** This device's 8-byte mesh node id (== bitchat peerID). MeshRadio puts it
      *  in the advert so two Sonar-Android peers can elect a single dialer. */
     fun nodeId(): ByteArray = myPeerIdHex.hexToBytes().copyOf(8)
+
+    fun setKnownOnlyPeerAllowlist(allowedFingerprints: Set<String>?) {
+        knownOnlyPeerAllowlist = allowedFingerprints?.mapTo(HashSet<String>()) { it.lowercase() }
+        pruneDisallowedLinksForPolicy()
+    }
 
     fun updateNickname(value: String) {
         val next = value.trim()
@@ -305,10 +313,55 @@ object MeshGatt {
         server = null; characteristic = null
         clientGatt.values.forEach { runCatching { it.disconnect(); it.close() } }
         clientGatt.clear(); clientChar.clear(); clientLinks.clear(); clientPending.clear(); clientConnected.clear()
-        serverLinks.clear(); serverDevices.clear(); peerIdByAddr.clear(); fingerprintByAddr.clear(); recentDials.clear()
+        serverLinks.clear(); serverDevices.clear(); peerIdByAddr.clear(); fingerprintByAddr.clear()
+        fingerprintByPeerId.clear(); recentDials.clear()
         pendingSonarByAddr.clear()
         pendingSends.clear()
         seenFileIds.clear()
+    }
+
+    private fun peerAllowedByPolicy(fingerprint: String): Boolean {
+        val allowlist = knownOnlyPeerAllowlist ?: return true
+        return fingerprint.isNotEmpty() && allowlist.contains(fingerprint.lowercase())
+    }
+
+    private fun addrAllowedByPolicy(addr: String): Boolean {
+        val allowlist = knownOnlyPeerAllowlist ?: return true
+        val fp = fingerprintByAddr[addr] ?: return false
+        return allowlist.contains(fp.lowercase())
+    }
+
+    private fun pruneDisallowedLinksForPolicy() {
+        if (knownOnlyPeerAllowlist == null) return
+        val addrs = HashSet<String>()
+        addrs.addAll(clientGatt.keys)
+        addrs.addAll(clientPending)
+        addrs.addAll(clientLinks.keys)
+        addrs.addAll(serverDevices.keys)
+        addrs.addAll(serverLinks.keys)
+        addrs.forEach { addr ->
+            if (!addrAllowedByPolicy(addr)) {
+                val fp = fingerprintByAddr[addr]
+                android.util.Log.i(TAG, "disconnecting non-allowlisted mesh link $addr fp=${fp?.take(8) ?: "unknown"}")
+                disconnectAddr(addr)
+            }
+        }
+    }
+
+    private fun disconnectAddr(addr: String) {
+        cleanupServer(addr)
+        cleanupClient(addr)
+    }
+
+    private fun cleanupServer(addr: String) {
+        val device = serverDevices.remove(addr)
+        if (device != null) runCatching { server?.cancelConnection(device) }
+        serverLinks.remove(addr)
+        peerIdByAddr.remove(addr)
+        fingerprintByAddr.remove(addr)
+        pendingSonarByAddr.remove(addr)
+        serverNotifyQueue.remove(addr)
+        serverNotifying.remove(addr)
     }
 
     private val serverCallback = object : BluetoothGattServerCallback() {
@@ -316,10 +369,7 @@ object MeshGatt {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 serverDevices[device.address] = device
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                serverLinks.remove(device.address); serverDevices.remove(device.address)
-                peerIdByAddr.remove(device.address); fingerprintByAddr.remove(device.address)
-                pendingSonarByAddr.remove(device.address)
-                serverNotifyQueue.remove(device.address); serverNotifying.remove(device.address)
+                cleanupServer(device.address)
             }
         }
 
@@ -530,7 +580,15 @@ object MeshGatt {
                 val fp = fingerprintOf(ann.noisePublicKeyHex)
                 android.util.Log.i(TAG, "ANNOUNCE from $addr → '${ann.nickname}' peerId=${ann.senderIdHex} fp=${fp.take(8)}…")
                 peerIdByAddr[addr] = ann.senderIdHex
-                if (fp.isNotEmpty()) fingerprintByAddr[addr] = fp
+                if (fp.isNotEmpty()) {
+                    fingerprintByAddr[addr] = fp
+                    fingerprintByPeerId[ann.senderIdHex] = fp
+                }
+                if (!peerAllowedByPolicy(fp)) {
+                    android.util.Log.i(TAG, "dropping non-allowlisted announce from $addr fp=${fp.take(8)}")
+                    disconnectAddr(addr)
+                    return
+                }
                 clientPending.remove(addr) // a real peer answered — keep this link
                 onAnnounce.forEach { it(addr, ann, fp) }
                 pendingSonarByAddr.remove(addr)?.let { pending ->
@@ -559,8 +617,13 @@ object MeshGatt {
                 val pm = runCatching { meshParsePublicMessage(value) }.getOrNull() ?: return
                 if (seenBroadcastIds.add("${pm.senderIdHex}-${pm.timestampMs}")) {
                     if (seenBroadcastIds.size > 1024) seenBroadcastIds.clear()
+                    val senderFingerprint = fingerprintByPeerId[pm.senderIdHex] ?: pm.senderIdHex
+                    if (!peerAllowedByPolicy(senderFingerprint)) {
+                        android.util.Log.i(TAG, "drop non-allowlisted broadcast from ${pm.senderIdHex}")
+                        return
+                    }
                     android.util.Log.i(TAG, "rx broadcast from ${pm.senderIdHex}: ${pm.content.take(40)}")
-                    onBroadcast.forEach { it(pm) }
+                    onBroadcast.forEach { it(senderFingerprint, pm) }
                     // Multi-hop: flood the packet onward so the mesh extends past
                     // our direct neighbours (this is how a message crosses A↔relay↔B
                     // when A and B aren't directly connected).
@@ -581,6 +644,7 @@ object MeshGatt {
                     pendingSonarByAddr[addr] = info.payload
                     return
                 }
+                if (!peerAllowedByPolicy(fp)) return
                 onSonar.forEach { it(fp, info.payload) }
             }
             else -> android.util.Log.i(TAG, "ignoring mesh packet type=${info.packetType} from $addr")
@@ -664,6 +728,10 @@ object MeshGatt {
 
     private fun handleEncrypted(addr: String, ciphertext: ByteArray, fromServer: Boolean) {
         val fp = fingerprintByAddr[addr]
+        if (knownOnlyPeerAllowlist != null && (fp == null || !peerAllowedByPolicy(fp))) {
+            disconnectAddr(addr)
+            return
+        }
         // Prefer this connection's own session; fall back to the peer's session on
         // its OTHER connection (snow does not advance the nonce on a failed decrypt,
         // so this fallback can't desync a healthy session).
@@ -716,6 +784,10 @@ object MeshGatt {
         // Resolve the stable fingerprint so listeners + the pending-send flush key
         // by peer identity, not the rotating peerID/address (issue #12).
         val fp = fingerprintByAddr[addr] ?: peerIdByAddr[addr] ?: addr
+        if (!peerAllowedByPolicy(fp)) {
+            disconnectAddr(addr)
+            return
+        }
         android.util.Log.i(TAG, "✅ Noise link ESTABLISHED with $addr (peerId=${peerIdByAddr[addr]} fp=${fp.take(8)}…)")
         onLink.forEach { it(fp) }
         flushPending(fp)
@@ -827,16 +899,21 @@ object MeshGatt {
     /** The BLE address with an established, writable Noise route to [fingerprint].
      *  Resolves the current address after peerID/MAC rotation. */
     private fun sendableAddrFor(fingerprint: String): String? =
-        fingerprintByAddr.entries.firstOrNull { (a, fp) ->
-            fp == fingerprint && canSendOnAddr(a)
-        }?.key
+        if (!peerAllowedByPolicy(fingerprint)) {
+            null
+        } else {
+            fingerprintByAddr.entries.firstOrNull { (a, fp) ->
+                fp == fingerprint && canSendOnAddr(a)
+            }?.key
+        }
 
     /** Send a DM addressed by the peer's stable fingerprint (the radar/UI key).
      *  Sends immediately over a live Noise link, else QUEUES it to deliver when a
-     *  link (re)establishes. Always returns true — the message is accepted (the
-     *  UI echoes it optimistically); "false" used to surface a scary "not
-     *  connected" toast even though the peer was right there. */
+     *  link (re)establishes. Returns true for policy-allowed peers because the
+     *  UI echoes optimistically; policy-rejected peers fail instead of creating
+     *  pending work. */
     fun sendTextToPeer(fingerprint: String, messageId: String, text: String): Boolean {
+        if (!peerAllowedByPolicy(fingerprint)) return false
         val addr = sendableAddrFor(fingerprint)
         if (addr != null && sendText(addr, messageId, text)) return true
         pendingSends.getOrPut(fingerprint) { java.util.concurrent.ConcurrentLinkedQueue() }.add(messageId to text)
@@ -909,15 +986,20 @@ object MeshGatt {
         seenBroadcastIds.add("$myPeerIdHex-$ts") // skip our own echo if it loops back
         var peers = 0
         clientGatt.forEach { (addr, gatt) ->
+            if (!addrAllowedByPolicy(addr)) return@forEach
             clientChar[addr]?.let { ch -> writePacket(gatt, ch, packet); peers++ }
         }
-        serverDevices.forEach { (_, device) -> notify(device, packet); peers++ }
+        serverDevices.forEach { (addr, device) ->
+            if (!addrAllowedByPolicy(addr)) return@forEach
+            notify(device, packet)
+            peers++
+        }
         android.util.Log.i(TAG, "broadcast '${text.take(40)}' to $peers peer(s)")
         peers > 0
     }.getOrDefault(false)
 
     /** Number of mesh peers we can currently reach with a broadcast. */
-    fun connectedPeerCount(): Int = (clientChar.keys + serverDevices.keys).size
+    fun connectedPeerCount(): Int = (clientChar.keys + serverDevices.keys).count { addrAllowedByPolicy(it) }
 
     /** Flood a received broadcast packet onward (TTL gossip), so messages cross
      *  the mesh past our direct neighbours. TTL lives at header byte 2 and is NOT
@@ -930,10 +1012,10 @@ object MeshGatt {
         val relayed = packet.copyOf()
         relayed[2] = (ttl - 1).toByte()
         clientGatt.forEach { (addr, gatt) ->
-            if (addr != fromAddr) clientChar[addr]?.let { ch -> writePacket(gatt, ch, relayed) }
+            if (addr != fromAddr && addrAllowedByPolicy(addr)) clientChar[addr]?.let { ch -> writePacket(gatt, ch, relayed) }
         }
         serverDevices.forEach { (addr, device) ->
-            if (addr != fromAddr) notify(device, relayed)
+            if (addr != fromAddr && addrAllowedByPolicy(addr)) notify(device, relayed)
         }
     }
 

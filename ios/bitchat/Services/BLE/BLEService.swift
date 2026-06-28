@@ -7,6 +7,12 @@ import CryptoKit
 import UIKit
 #endif
 
+enum BLEDiscoveryMode: String {
+    case normal
+    case knownOnly
+    case off
+}
+
 /// BLEService — Bluetooth Mesh Transport
 /// - Emits events exclusively via `BitchatDelegate` for UI.
 /// - ChatViewModel must consume delegate callbacks (`didReceivePublicMessage`, `didReceiveNoisePayload`).
@@ -114,6 +120,22 @@ final class BLEService: NSObject {
     // invoked from the message queue, so it must be thread-safe and must not
     // touch main-actor state.
     var sonarProfileProvider: (() -> SonarLocalProfile?)?
+    var knownPeerProvider: ((PeerID, Data?) -> Bool)?
+    var discoveryMode: BLEDiscoveryMode = .normal {
+        didSet {
+            guard oldValue != discoveryMode else { return }
+            bleQueue.async { [weak self] in
+                self?.applyDiscoveryModeOnQueue()
+            }
+        }
+    }
+
+    func reapplyDiscoveryModePolicy() {
+        bleQueue.async { [weak self] in
+            self?.applyDiscoveryModeOnQueue()
+        }
+    }
+
     // 0x53 can beat the corresponding 0x01 announce on a fresh BLE link.
     // Cache it briefly by peerID, then verify it after the announce installs
     // the peer's signing key.
@@ -375,6 +397,115 @@ final class BLEService: NSObject {
     }
 
     // No advertising policy to set; we never include Local Name in adverts.
+
+    private var allowsBLERadio: Bool { discoveryMode != .off }
+
+    private func shouldAcceptPeer(_ peerID: PeerID, noisePublicKey: Data?) -> Bool {
+        switch discoveryMode {
+        case .normal:
+            return true
+        case .knownOnly:
+            return knownPeerProvider?(peerID, noisePublicKey) ?? false
+        case .off:
+            return false
+        }
+    }
+
+    private func applyDiscoveryModeOnQueue() {
+        assert(DispatchQueue.getSpecific(key: bleQueueKey) != nil, "applyDiscoveryModeOnQueue must run on bleQueue")
+
+        if discoveryMode == .off {
+            scanDutyTimer?.cancel()
+            scanDutyTimer = nil
+            dutyActive = false
+            centralManager?.stopScan()
+            peripheralManager?.stopAdvertising()
+            connectionCandidates.removeAll()
+            disconnectAllLinksForDiscoveryOff()
+        } else {
+            if centralManager?.state == .poweredOn {
+                if centralManager?.isScanning == true {
+                    centralManager?.stopScan()
+                }
+                startScanning()
+            }
+            startAdvertisingIfAllowed()
+        }
+
+        prunePeersForDiscoveryMode()
+    }
+
+    private func prunePeersForDiscoveryMode() {
+        guard discoveryMode != .normal else {
+            requestPeerDataPublish()
+            return
+        }
+
+        let removed: [PeerID] = collectionsQueue.sync(flags: .barrier) {
+            let stale = peers.values
+                .filter { !shouldAcceptPeer($0.peerID, noisePublicKey: $0.noisePublicKey) }
+                .map(\.peerID)
+            for peerID in stale {
+                peers.removeValue(forKey: peerID)
+                gossipSyncManager?.removeAnnouncementForPeer(peerID)
+            }
+            return stale
+        }
+
+        for peerID in removed {
+            disconnectPeerLinks(peerID)
+        }
+
+        guard !removed.isEmpty else { return }
+        notifyUI { [weak self] in
+            guard let self else { return }
+            let currentPeerIDs = self.collectionsQueue.sync { self.currentPeerIDs }
+            for peerID in removed {
+                self.notifyPeerDisconnectedDebounced(peerID)
+            }
+            self.requestPeerDataPublish()
+            self.delegate?.didUpdatePeerList(currentPeerIDs)
+        }
+    }
+
+    private func disconnectAllLinksForDiscoveryOff() {
+        assert(DispatchQueue.getSpecific(key: bleQueueKey) != nil, "disconnectAllLinksForDiscoveryOff must run on bleQueue")
+
+        let states = Array(peripherals.values)
+        peripherals.removeAll()
+        peerToPeripheralUUID.removeAll()
+        subscribedCentrals.removeAll()
+        centralToPeerID.removeAll()
+        pendingWriteBuffers.removeAll()
+
+        for state in states {
+            centralManager?.cancelPeripheralConnection(state.peripheral)
+        }
+    }
+
+    private func disconnectPeerLinks(_ peerID: PeerID) {
+        bleQueue.async { [weak self] in
+            guard let self else { return }
+            if let peripheralUUID = self.peerToPeripheralUUID.removeValue(forKey: peerID),
+               let state = self.peripherals.removeValue(forKey: peripheralUUID) {
+                self.centralManager?.cancelPeripheralConnection(state.peripheral)
+            }
+            for (centralUUID, boundPeerID) in self.centralToPeerID where boundPeerID == peerID {
+                self.centralToPeerID.removeValue(forKey: centralUUID)
+                self.pendingWriteBuffers.removeValue(forKey: centralUUID)
+                self.subscribedCentrals.removeAll { $0.identifier.uuidString == centralUUID }
+            }
+        }
+    }
+
+    private func startAdvertisingIfAllowed() {
+        guard allowsBLERadio,
+              let peripheralManager,
+              peripheralManager.state == .poweredOn,
+              characteristic != nil,
+              !peripheralManager.isAdvertising else { return }
+        peripheralManager.startAdvertising(buildAdvertisementData())
+    }
     
     deinit {
         maintenanceTimer?.cancel()
@@ -527,12 +658,10 @@ final class BLEService: NSObject {
     // MARK: Lifecycle
     
     func startServices() {
+        guard allowsBLERadio else { return }
         // Start BLE services if not already running
         if centralManager?.state == .poweredOn {
-            centralManager?.scanForPeripherals(
-                withServices: [BLEService.serviceUUID],
-                options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
-            )
+            startScanning()
         }
         
         // Send initial announce after services are ready
@@ -1593,6 +1722,8 @@ final class BLEService: NSObject {
     }
 
     private func sendAnnounce(forceSend: Bool = false) {
+        guard allowsBLERadio else { return }
+
         // Throttle announces to prevent flooding
         let now = Date()
         let timeSinceLastAnnounce = now.timeIntervalSince(lastAnnounceSent)
@@ -1836,6 +1967,7 @@ extension BLEService: CBCentralManagerDelegate {
     }
     
     private func startScanning() {
+        guard allowsBLERadio else { return }
         guard let central = centralManager,
               central.state == .poweredOn,
               !central.isScanning else { return }
@@ -1855,6 +1987,8 @@ extension BLEService: CBCentralManagerDelegate {
     }
     
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String: Any], rssi RSSI: NSNumber) {
+        guard allowsBLERadio else { return }
+
         let peripheralID = peripheral.identifier.uuidString
         let advertisedName = advertisementData[CBAdvertisementDataLocalNameKey] as? String ?? (peripheralID.prefix(6) + "…")
         let isConnectable = (advertisementData[CBAdvertisementDataIsConnectable] as? NSNumber)?.boolValue ?? true
@@ -2092,6 +2226,10 @@ func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeriph
 // MARK: - Connection scheduling helpers
 extension BLEService {
     private func tryConnectFromQueue() {
+        guard allowsBLERadio else {
+            connectionCandidates.removeAll()
+            return
+        }
         guard let central = centralManager, central.state == .poweredOn else { return }
         // Check budget and rate limit
         let current = peripherals.values.filter { $0.isConnected || $0.isConnecting }.count
@@ -2521,9 +2659,7 @@ extension BLEService: CBPeripheralManagerDelegate {
 
         captureBluetoothStatus(context: "peripheral-restore")
 
-        if peripheral.state == .poweredOn && !peripheral.isAdvertising {
-            peripheral.startAdvertising(buildAdvertisementData())
-        }
+        startAdvertisingIfAllowed()
     }
     #endif
     
@@ -2537,7 +2673,9 @@ extension BLEService: CBPeripheralManagerDelegate {
         
         // Start advertising after service is confirmed added
         let adData = buildAdvertisementData()
-        peripheral.startAdvertising(adData)
+        if allowsBLERadio {
+            peripheral.startAdvertising(adData)
+        }
         
         SecureLogger.debug("📡 Started advertising (LocalName: \((adData[CBAdvertisementDataLocalNameKey] as? String) != nil ? "on" : "off"), ID: \(myPeerID.id.prefix(8))…)", category: .session)
     }
@@ -2627,7 +2765,7 @@ extension BLEService: CBPeripheralManagerDelegate {
         subscribedCentrals.removeAll { $0.identifier == central.identifier }
         
         // Ensure we're still advertising for other devices to find us
-        if peripheral.isAdvertising == false {
+        if peripheral.isAdvertising == false && allowsBLERadio {
             SecureLogger.debug("📡 Restarting advertising after central unsubscribed", category: .session)
             peripheral.startAdvertising(buildAdvertisementData())
         }
@@ -3978,7 +4116,21 @@ extension BLEService {
         // Sonar nodes flood it exactly like stock bitchat nodes do for
         // unknown types.
         if packet.type == SonarAnnouncePacket.packetType {
+            let knownInSession = collectionsQueue.sync { peers[senderID] != nil }
+            if !knownInSession && !shouldAcceptPeer(senderID, noisePublicKey: nil) {
+                SecureLogger.debug("🔋 Ignoring Sonar profile from non-chat peer in restricted BLE discovery: \(senderID.id.prefix(8))…", category: .session)
+                return
+            }
             handleSonarAnnounce(packet, from: senderID)
+        }
+
+        if packet.type != MessageType.announce.rawValue,
+           packet.type != SonarAnnouncePacket.packetType {
+            let knownInSession = collectionsQueue.sync { peers[senderID] != nil }
+            if !knownInSession && !shouldAcceptPeer(senderID, noisePublicKey: nil) {
+                SecureLogger.debug("🔋 Ignoring packet from non-chat peer in restricted BLE discovery: \(senderID.id.prefix(8))…", category: .session)
+                return
+            }
         }
 
         // Process by type
@@ -4101,6 +4253,17 @@ extension BLEService {
             verifiedAnnounce = false
         }
 
+        guard verifiedAnnounce else {
+            SecureLogger.warning("❌ Ignoring unverified announce from \(peerID.id.prefix(8))…", category: .security)
+            return
+        }
+
+        guard shouldAcceptPeer(peerID, noisePublicKey: announcement.noisePublicKey) else {
+            SecureLogger.debug("🔋 Ignoring non-chat peer in restricted BLE discovery: \(peerID.id.prefix(8))…", category: .session)
+            disconnectPeerLinks(peerID)
+            return
+        }
+
         // Track if this is a new or reconnected peer
         var isNewPeer = false
         var isReconnectedPeer = false
@@ -4125,18 +4288,6 @@ extension BLEService {
             isNewPeer = (existingPeer == nil)
             isReconnectedPeer = wasDisconnected
             
-            // Use precomputed verification result
-            let verified = verifiedAnnounce
-
-            // Require verified announce; ignore otherwise (no backward compatibility)
-            if !verified {
-                SecureLogger.warning("❌ Ignoring unverified announce from \(peerID.id.prefix(8))…", category: .security)
-                // Reset flags to prevent post-barrier code from acting on unverified announces
-                isNewPeer = false
-                isReconnectedPeer = false
-                return
-            }
-
             // Update or create peer info
             if let existing = existingPeer, existing.isConnected {
                 // Update lastSeen and identity info
@@ -4585,7 +4736,9 @@ extension BLEService {
             var counts: [String: Int] = [:]
             for p in connected { counts[p.nickname, default: 0] += 1 }
             counts[myNickname, default: 0] += 1
-            return peers.values.map { info in
+            return peers.values.filter { info in
+                shouldAcceptPeer(info.peerID, noisePublicKey: info.noisePublicKey)
+            }.map { info in
                 var display = info.nickname
                 if info.isConnected, (counts[info.nickname] ?? 0) > 1 {
                     display += "#" + String(info.peerID.id.prefix(4))
@@ -4640,11 +4793,9 @@ extension BLEService {
         }
         
         // If we have no peers, ensure we're scanning and advertising
-        if peers.isEmpty {
+        if peers.isEmpty && allowsBLERadio {
             // Ensure we're advertising as peripheral
-            if let pm = peripheralManager, pm.state == .poweredOn && !pm.isAdvertising {
-                pm.startAdvertising(buildAdvertisementData())
-            }
+            startAdvertisingIfAllowed()
         }
         
         // Update scanning duty-cycle based on connectivity

@@ -143,6 +143,47 @@ struct BLEServiceCoreTests {
         #expect(didReceive)
         #expect(capture.profile?.npub == npub)
     }
+
+    @Test
+    func restrictedDiscoveryReapply_prunesPeerAfterAllowlistChange() async throws {
+        let ble = makeService()
+
+        let signer = NoiseEncryptionService(keychain: MockKeychain())
+        let announcement = AnnouncementPacket(
+            nickname: "Known Then Removed",
+            noisePublicKey: signer.getStaticPublicKeyData(),
+            signingPublicKey: signer.getSigningPublicKeyData(),
+            directNeighbors: nil
+        )
+        let peerID = PeerID(publicKey: announcement.noisePublicKey)
+        let announcePayload = try #require(announcement.encode(), "Failed to encode announcement")
+        let announcePacket = try #require(signer.signPacket(BitchatPacket(
+            type: MessageType.announce.rawValue,
+            senderID: Data(hexString: peerID.id) ?? Data(),
+            recipientID: nil,
+            timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+            payload: announcePayload,
+            signature: nil,
+            ttl: 7
+        )), "Failed to sign announce packet")
+
+        ble.knownPeerProvider = { candidate, _ in candidate == peerID }
+        ble.discoveryMode = .knownOnly
+        ble._test_handlePacket(announcePacket, fromPeerID: peerID, preseedPeer: false)
+
+        let didAdd = await TestHelpers.waitUntil({
+            ble.currentPeerSnapshots().contains { $0.peerID == peerID }
+        }, timeout: TestConstants.shortTimeout)
+        #expect(didAdd)
+
+        ble.knownPeerProvider = { _, _ in false }
+        ble.reapplyDiscoveryModePolicy()
+
+        let didPrune = await TestHelpers.waitUntil({
+            !ble.currentPeerSnapshots().contains { $0.peerID == peerID }
+        }, timeout: TestConstants.shortTimeout)
+        #expect(didPrune)
+    }
 }
 
 private func makeService() -> BLEService {

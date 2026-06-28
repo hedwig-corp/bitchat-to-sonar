@@ -52,6 +52,11 @@ data class MeshMediaIn(
     }
 }
 
+enum class BleDiscoveryMode {
+    Normal,
+    KnownOnly,
+}
+
 /**
  * The BLE mesh radio: scans for and advertises the bitchat mesh service so
  * nearby Sonar/bitchat phones discover each other over Bluetooth. This is the
@@ -63,6 +68,10 @@ data class MeshMediaIn(
 expect object MeshRadio {
     /** True when BLE hardware + runtime permissions are available. */
     fun available(): Boolean
+    /** Restrict open discovery while keeping known chat peers reachable. */
+    fun setDiscoveryMode(mode: BleDiscoveryMode)
+    /** Stable mesh peer ids/fingerprints that already have a local chat. */
+    fun setKnownPeerIds(ids: Set<String>)
     /** Begin scanning + advertising (no-op if unavailable). */
     fun start()
     /** Stop the radio. */

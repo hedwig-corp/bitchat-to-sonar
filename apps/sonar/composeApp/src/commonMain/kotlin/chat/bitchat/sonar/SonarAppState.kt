@@ -39,6 +39,7 @@ private const val GROUP_FOLDS_BLOB_KEY = "sonar.groupFolds"
 private const val FAVORITED_CONTROL = "[FAVORITED]"
 private const val UNFAVORITED_CONTROL = "[UNFAVORITED]"
 private const val MESH_MEDIA_URL_PREFIX = "mesh-media:"
+internal const val BLE_DISCOVER_NEW_PEOPLE_PREF = "bleDiscoverNewPeople"
 
 internal fun shortNpubLabel(value: String): String =
     if (value.length > 16) value.take(10) + "…" + value.takeLast(4) else value
@@ -147,6 +148,19 @@ internal fun hasRecentMarmotActivityForCapabilitySettle(
     return ageMs > -settleMs && ageMs < settleMs
 }
 
+/** Peers allowed through restricted BLE discovery must already be backed by
+ *  local conversation state. Passive Sonar 0x53 links are intentionally omitted:
+ *  they can include people who were only seen during discovery. */
+internal fun knownBlePeerIdsForPolicy(
+    meshChatPeerIds: Iterable<String>,
+    persistedFoldPeerIds: Iterable<String>,
+    liveFoldPeerIds: Iterable<String>,
+): Set<String> = buildSet {
+    meshChatPeerIds.forEach { add(it.lowercase()) }
+    persistedFoldPeerIds.forEach { add(it.lowercase()) }
+    liveFoldPeerIds.forEach { add(it.lowercase()) }
+}
+
 /** A call-log record appended to a DM transcript when a call ends. Lives in
  *  memory only (no MessageStore/SonarCore/Marmot write). [durSecs] == 0 ⇒ the call never connected
  *  (rendered as "Missed"); otherwise it's the connected duration. */
@@ -225,6 +239,10 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     var dark by mutableStateOf(SonarCore.isDark())
         private set
+    var discoverNewPeople by mutableStateOf(SonarCore.loadBlob("pref.$BLE_DISCOVER_NEW_PEOPLE_PREF").let { it.isEmpty() || it == "1" })
+        private set
+    var batterySaving by mutableStateOf(BatterySaver.enabled())
+        private set
 
     var callOverlay = false
 
@@ -250,8 +268,10 @@ class SonarAppState(private val scope: CoroutineScope) {
             MeshRadio.setMeshNickname("")
             MeshRadio.setLocalSonarAnnounce(null); sonarPeerProfiles = emptyMap()
             linkByFp.clear(); linkCapsByFp.clear(); groupFoldMap.clear()
-            persistLinks(); persistLinkCaps(); persistGroupFolds()
+            meshChats.clear(); meshChatNames.clear(); meshDmRows = emptyList(); meshBroadcast = emptyList()
             foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
+            persistLinks(); persistLinkCaps(); persistGroupFolds()
+            updateBleDiscoveryPolicy()
             sonarDescriptorsByNpubHex = emptyMap()
             sonarDescriptorFetches.clear(); sonarDescriptorFetchedAt.clear(); sonarDescriptorMissedAt.clear()
             publishedSonarDescriptor = false; publishedSonarDescriptorBolt12Offer = null; publishingSonarDescriptor = false
@@ -301,6 +321,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             profilesByNpub = emptyMap(); profileFetches.clear(); persistProfileCache()
             foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
             meshBroadcast = emptyList(); meshDmRows = emptyList()
+            updateBleDiscoveryPolicy()
             messages = emptyList(); channelMsgs = emptyList(); chats = emptyList(); clearChatSnapshot()
             lastWnGroups = -1; lastWnMsgs = -1
             // ⚡PAY coins live inside the erased chats — reset the ledger. The
@@ -1142,6 +1163,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             linkCapsByFp[peerId] = ann.capabilities
             persistLinkCaps()
         }
+        updateBleDiscoveryPolicy()
         ensureSonarDescriptorHex(npubHex)
         // A new or updated link means we can now reach this peer via White Noise
         // — flush any queued messages that were waiting for this route.
@@ -1399,6 +1421,8 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Start the BLE mesh radio (call once permissions are granted). */
     fun startMesh() {
         refreshMeshIdentity()
+        refreshBatterySaving()
+        updateBleDiscoveryPolicy()
         MeshRadio.start()
         refreshSonarDiscoveryProfiles()
         updateMeshPeersFromRadio()
@@ -1412,13 +1436,18 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  onboarded or while BLE permissions are missing. */
     private fun startUnify() {
         if (!onboarded) return
+        if (bleDiscoveryRestricted) {
+            UnifyRadio.stopScanning()
+            unifyPeers = emptyList()
+            return
+        }
         UnifyRadio.startScanning()
     }
 
     /** Advertise our receivable BOLT12 offer iff the wallet is ready AND we are
      *  in the foreground — mirrors the iOS receiver policy (foreground-only). */
     private suspend fun updateUnifyReceiver() {
-        val shouldServe = walletAvailable && onboarded && foreground &&
+        val shouldServe = walletAvailable && onboarded && foreground && !bleDiscoveryRestricted &&
             walletState is WalletState.Ready
         if (shouldServe) {
             if (unifyOffer == null) unifyOffer = runCatching { WalletBridge.createOffer() }.getOrNull()
@@ -1655,6 +1684,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 meshChats.clear(); meshChatNames.clear(); pendingMarmotSends.clear(); outbox.clear()
                 linkByFp.clear(); linkCapsByFp.clear(); groupFoldMap.clear()
                 persistLinks(); persistLinkCaps(); persistGroupFolds()
+                updateBleDiscoveryPolicy()
                 foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
                 sonarPeerProfiles = emptyMap()
                 sonarDescriptorsByNpubHex = emptyMap()
@@ -1738,6 +1768,58 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun setPrefStr(key: String, value: String) {
         SonarCore.saveBlob("pref.$key", value)
         prefsVersion++
+    }
+
+    val bleDiscoveryRestricted: Boolean
+        get() = batterySaving || !discoverNewPeople
+
+    val bleDiscoveryStatusLine: String
+        get() = when {
+            batterySaving -> "Battery saving · chats only"
+            discoverNewPeople -> "Discovering nearby people"
+            else -> "Chats only"
+        }
+
+    val radarDiscoveryStatusLine: String
+        get() = if (bleDiscoveryRestricted) {
+            "${meshPeers.size} in range · chats only"
+        } else {
+            "${meshPeers.size} in range · scanning"
+        }
+
+    fun setBleDiscoverNewPeople(enabled: Boolean) {
+        if (discoverNewPeople == enabled) return
+        discoverNewPeople = enabled
+        setPref(BLE_DISCOVER_NEW_PEOPLE_PREF, enabled)
+        updateBleDiscoveryPolicy()
+        if (bleDiscoveryRestricted) {
+            UnifyRadio.stopScanning()
+            unifyPeers = emptyList()
+        }
+    }
+
+    private fun refreshBatterySaving() {
+        val enabled = BatterySaver.enabled()
+        if (batterySaving == enabled) return
+        batterySaving = enabled
+        updateBleDiscoveryPolicy()
+        if (bleDiscoveryRestricted) {
+            UnifyRadio.stopScanning()
+            unifyPeers = emptyList()
+        }
+    }
+
+    private fun knownBlePeerIds(): Set<String> =
+        knownBlePeerIdsForPolicy(
+            meshChatPeerIds = meshChats.keys,
+            persistedFoldPeerIds = groupFoldMap.values,
+            liveFoldPeerIds = foldedGroupPeerIds.values,
+        )
+
+    private fun updateBleDiscoveryPolicy() {
+        val known = knownBlePeerIds()
+        MeshRadio.setKnownPeerIds(known)
+        MeshRadio.setDiscoveryMode(if (bleDiscoveryRestricted) BleDiscoveryMode.KnownOnly else BleDiscoveryMode.Normal)
     }
 
     /** Count of chats the user has marked verified (for the Settings row). */
@@ -1882,6 +1964,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // refreshMeshDmRows so the Messages list is populated at launch.
                 meshChats.putAll(MessageStore.loadAllMeshDms())
                 loadLinks() // durable fingerprint↔npub so BLE chats stay unified after restart
+                updateBleDiscoveryPolicy()
                 refreshKnownContactDescriptors(clearMisses = true)
                 refreshMeshDmRows()
                 setupWallet()
@@ -2133,6 +2216,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             persistGroupFolds()
             clearChatSnapshot()
         }
+        updateBleDiscoveryPolicy()
         if (wasOpen && stack.size > 1) stack = stack.dropLast(1)
         scope.launch {
             MessageStore.deleteMeshDm(peerId)
@@ -3165,6 +3249,7 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  here — they already persist in the encrypted SQLCipher DB. */
     private fun persistMesh(peerId: String) {
         val msgs = meshChats[peerId].orEmpty()
+        updateBleDiscoveryPolicy()
         scope.launch { MessageStore.saveMeshDm(peerId, msgs) }
     }
 
@@ -3702,6 +3787,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         val peerId = inferUniquePeerByTitle(groupTitle, peerTitles, groupTitles) ?: return null
         linkByFp[peerId] = npubHex
         persistLinks()
+        updateBleDiscoveryPolicy()
         sonarLog("SonarWN", "Recovered BLE↔White Noise link by unique title peer=${peerId.take(10)} group=${group.id.take(10)} title=$groupTitle")
         return peerId
     }
@@ -4134,7 +4220,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         val stale = groupFoldMap.keys.filter { it !in activeGroupIds }
         if (stale.isNotEmpty()) { stale.forEach { groupFoldMap.remove(it) }; foldMapChanged = true }
-        if (foldMapChanged) persistGroupFolds()
+        if (foldMapChanged) {
+            persistGroupFolds()
+            updateBleDiscoveryPolicy()
+        }
         meshDmRows = rowsByPeer.values.sortedByDescending { it.tsSecs }
     }
 
@@ -4354,7 +4443,9 @@ class SonarAppState(private val scope: CoroutineScope) {
                 (screen as? Screen.GeoDm)?.let { refreshGeoDm(it.geohash, it.peerHex) }
                 // Sonar Discovery (0x53): keep our announce current for outgoing
                 // links and decode any peers' announces received over the mesh.
+                refreshBatterySaving()
                 refreshMeshIdentity()
+                updateBleDiscoveryPolicy()
                 // Persist each peer's fingerprint→npub so its conversation stays
                 // unified after it leaves range / after a restart, then re-fold the
                 // White Noise legs into the mesh rows (one row per person).

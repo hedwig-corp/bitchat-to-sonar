@@ -71,6 +71,36 @@ The normal bitchat announce remains untouched. `0x53` is deliberately not added
 to bitchat's `MessageType` enum; stock bitchat clients hit the unknown-type
 branch, ignore the payload, and continue relaying by TTL.
 
+### Discovery Power Policy
+
+Sonar has two BLE discovery modes:
+
+- **Normal:** scan/advertise for nearby Sonar and bitchat peers, show new nearby
+  people in Radar, and run Unify nearby-payment discovery while the Radar screen
+  is visible.
+- **Known contacts only:** keep existing local chats reachable over BLE, but do
+  not surface newly discovered people. A peer is considered known only when it
+  maps to local conversation state: a persisted mesh DM, a persisted
+  fingerprint-to-npub Sonar link with a folded Marmot conversation, or a folded
+  Marmot group mapping.
+
+Users can manually turn off "Discover new people" from settings. iOS Low Power
+Mode and Android Battery Saver force known-contacts-only behavior until the OS
+mode is disabled. Compose Desktop currently has no portable OS battery-saver
+signal wired into the app, so desktop honors only the manual setting; the
+follow-up path is a platform-specific power-state detector for macOS, Windows,
+and Linux.
+
+Known-contacts-only mode keeps BLE advertisements protocol-compatible and does
+not add stable identifiers to advertisements. On iOS/macOS, CoreBluetooth
+advertisements remain intentionally anonymous, so the app cannot pre-filter a
+nearby device before a short verification connection. Instead, the receiver
+verifies the signed bitchat announce, compares the stable Noise fingerprint
+against the local known-chat allowlist, and drops unknown peers before they
+enter the peer list, Radar, announce-back path, or Sonar profile cache. Android
+uses lower-power scan and advertising settings in this mode, but still applies
+the same verified-announce allowlist before showing a peer.
+
 ### BLE Packet
 
 Standard `BitchatPacket` framing, version 1:

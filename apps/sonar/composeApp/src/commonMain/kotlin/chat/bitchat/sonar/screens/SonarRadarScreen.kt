@@ -94,7 +94,7 @@ fun SonarRadarScreen(state: SonarAppState) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     SNDot(s.green, 6.dp)
                     Spacer(Modifier.width(5.dp))
-                    Text("${state.meshPeers.size} in range · scanning", color = s.text2, fontSize = 12.sp)
+                    Text(state.radarDiscoveryStatusLine, color = s.text2, fontSize = 12.sp)
                 }
             }
         }
