@@ -1,7 +1,7 @@
 # Performance: cold-start + relay-sync benchmark
 
-Status: harness implemented under `scripts/bench/`; iOS Simulator only.
-Date: 2026-06-24.
+Status: harness implemented under `scripts/bench/`; simulator and physical iPhone supported.
+Last updated: 2026-06-29.
 
 Reproducible measurement of how long a **cold start** of the iOS Sonar app takes
 to become usable and to finish its first **Nostr/Marmot relay sync**, broken down
@@ -75,6 +75,10 @@ Raw per-run logs land in `/tmp/sonar-bench/runs/run_*.ndjson`.
 
 - **Debug build required** — `SecureLogger` only logs `%{public}@` (readable in
   the unified log) in DEBUG; Release renders the markers as `<private>`.
+  Physical-device builds must also compile the local `BitLogger` Swift package
+  with the DEBUG conditional. If `idevicesyslog -m SONAR_BENCH` sees no markers
+  while the strings are present in the app binary, rebuild with
+  `OTHER_SWIFT_FLAGS='-DDEBUG'`.
 - **arm64-only** — the Arti (`libarti_bitchat.a`) and `sonarffi` simulator slices
   are arm64 (Apple Silicon); `generic/platform=iOS Simulator` also tries x86_64
   and fails to link. The build pins `ARCHS=arm64`.
@@ -143,25 +147,75 @@ This explains BOTH symptoms: incoming messages aren't drained until the publishe
 finish ("slow to sync"), and message sends use the same await-all-relays
 `send_event` path ("slow to send").
 
+## Issue #122 PR result (physical iPhone, after relay fixes)
+
+Run on 2026-06-29 with `scripts/bench/device-bench.sh`, `RUNS=5`,
+`TIMEOUT=180`, signed Debug build installed over the existing app so real account
+data was preserved. All 5 runs reached `t4_first_drain`; every run had
+`woke=1 notif=0`.
+
+This is not a perfectly controlled hardware/account comparison: the old device
+baseline used 24 Marmot groups and this run used 28 groups. It is still the
+right comparison for the reported pain point because both measurements use the
+physical-device real-account path and preserve local app data.
+
+![Issue #122 relay sync benchmark](assets/issue-122-relay-sync-device.svg)
+
+Median of 5 cold starts · physical iPhone · **real account with 28 Marmot
+groups** · live relays:
+
+| phase | before PR median | after PR median | delta |
+|---|---:|---:|---:|
+| t0 → t1 (open DB + local paint) | ~1.3 s | 2.440 s | +1.140 s |
+| t2 → t3 (relay quorum connect) | ~0.7 s | 1.711 s | +1.011 s |
+| **t3 → t3a (publish KeyPackage + profile)** | **~57 s** | **18.327 s** | **~38.7 s faster** |
+| t3a → t3b (first event wait) | ~2.3 s | 0.613 s | ~1.7 s faster |
+| t3b → t4 (`drainPending` MLS processing) | ~1.7 s | 0.229 s | ~1.5 s faster |
+| **relay path t2 → t4** | **~61.7 s** | **20.880 s** | **~40.8 s faster** |
+| **TOTAL t0 → t4 (cold → synced)** | **~52–66 s** | **23.958 s** | **~28–42 s faster** |
+
+Full after-PR min/median/max table:
+
+| phase | min | median | max |
+|---|---:|---:|---:|
+| t0 → t1 (open DB + local paint) | 1.859 s | 2.440 s | 3.737 s |
+| t1 → t2 (pre-relay window) | -0.160 s | -0.114 s | -0.025 s |
+| t2 → t3 (relay quorum connect) | 1.132 s | 1.711 s | 1.993 s |
+| t3 → t3a (publish KeyPackage + profile) | 13.608 s | 18.327 s | 21.206 s |
+| t3a → t3b (first event wait) | 0.201 s | 0.613 s | 0.753 s |
+| t3b → t4 (`drainPending` MLS processing) | 0.012 s | 0.229 s | 0.705 s |
+| **TOTAL t0 → t4 (in-app → synced)** | **18.957 s** | **23.958 s** | **25.759 s** |
+
+The PR materially improves the real-device pain point: the relay path drops from
+roughly 62 s to 21 s median, and total in-app cold-start-to-synced drops to
+about 24 s. The remaining dominant cost is still `t3 → t3a`: publishing the
+KeyPackage and profile takes ~18.3 s median and accounts for about 88% of the
+post-connect relay path after the PR.
+
 ## Where to speed up (highest impact first)
 
 1. **Don't block sync on the publishes.** Move `publishKeyPackage()` +
    `publishProfile()` off the `connectRelaysIfNeeded` critical path into a
    detached background task so `startPolling()` runs immediately. The codebase
    already uses this "publish in the background" pattern elsewhere
-   (`client.rs:2706`). Expected: cold → synced ~66 s → ~6 s.
+   (`client.rs:2706`). After the issue #122 relay fixes, `t3→t3a` is still the
+   dominant remaining device cost at ~18.3 s median, so this remains the next
+   highest-impact target.
 2. **Bound `send_event` publish latency.** Cap the per-publish timeout / return
    after the first relay OK so one slow/unreachable relay can't stall ~28 s.
    Same path backs message sends, so this also speeds up sending.
-3. **Secondary:** opening the 24-group encrypted DB + local paint is ~1.3 s
-   (vs ~0.19 s for 1 group on the sim) — scales with group count; window it if
-   it grows.
+3. **Secondary:** opening the encrypted DB + local paint scales with group
+   count: ~0.19 s for 1 group on the sim, ~1.3 s for the old 24-group device
+   baseline, and 2.44 s median for the 28-group after-PR run. Window it if it
+   grows.
 
 ## Findings / how to interpret
 
-- **The sync drain (~0.9 s) dominates** and is the network-bound part. At small
-  scale it was near-constant whether the run drained 3 messages or 0 — i.e. a
-  fixed `subscribe → EOSE → drain` round-trip, not proportional to message count.
+- **For the small simulator account, the sync drain (~0.9 s) was the
+  network-bound part.** At small scale it was near-constant whether the run
+  drained 3 messages or 0 — i.e. a fixed `subscribe → EOSE → drain` round-trip,
+  not proportional to message count. On the 2026-06-29 physical-device run,
+  `drainPending` is not the bottleneck anymore (~0.23 s median); publish time is.
 - **On a small account + fast network, sync is not slow (~0.9 s).** Real-world
   slowness more likely comes from: large history / many groups (backfill scales
   with that — provision more to reproduce), poor network or Tor enabled (inflates
@@ -173,5 +227,6 @@ finish ("slow to sync"), and message sends use the same await-all-relays
   of each other. Worth confirming whether that staging still applies.
 
 When a change touches conversation open/send/sync or the startup path, re-run the
-faithful benchmark and compare `launch→t4` and the `t3→t4` drain against this
-baseline; a regression there means sync moved onto the critical path.
+faithful benchmark and compare `launch→t4`/`t0→t4`, `t2→t4`, `t3→t3a`, and
+`t3b→t4` against this baseline; a regression there means sync moved onto the
+critical path.
