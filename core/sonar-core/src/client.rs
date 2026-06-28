@@ -181,6 +181,18 @@ const MIN_CONNECTED_RELAYS: usize = 2;
 /// connects within this window the client errors with `NoRelayConnections`.
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Relay EOSE/fetch completion quorum. Keep this aligned with the connection
+/// quorum so slow relays do not hold background sync or push processing open.
+const RELAY_FETCH_QUORUM: usize = MIN_CONNECTED_RELAYS;
+
+fn relay_fetch_quorum(total_relays: usize) -> usize {
+    if total_relays == 0 {
+        0
+    } else {
+        RELAY_FETCH_QUORUM.min(total_relays).max(1)
+    }
+}
+
 fn parse_mesh_id8_hex(value: &str, label: &'static str) -> Result<[u8; 8]> {
     let bytes = hex::decode(value.trim())
         .map_err(|e| Error::InvalidInput(format!("{label} must be 8-byte hex: {e}")))?;
@@ -424,6 +436,19 @@ impl MarmotProcessReport {
                     .map_or(secs, |oldest| oldest.min(secs)),
             );
         }
+    }
+}
+
+#[derive(Debug)]
+struct RelayFetchOutcome {
+    events: Vec<Event>,
+    completed_relays: usize,
+    total_relays: usize,
+}
+
+impl RelayFetchOutcome {
+    fn completed_all_relays(&self) -> bool {
+        self.completed_relays >= self.total_relays
     }
 }
 
@@ -1998,10 +2023,12 @@ impl SonarClient {
         let mut process_report = MarmotProcessReport::default();
         let ids_before = self.current_group_ids()?;
         let wraps = self
-            .nostr
-            .fetch_events_from(self.relays.clone(), wraps, FETCH_TIMEOUT)
+            .fetch_marmot_events_from_relay_quorum(wraps, FETCH_TIMEOUT, "gift wrap sync")
             .await?;
-        let (wrap_report, _) = self.process_marmot_events(wraps, "gift wrap").await;
+        if !wraps.completed_all_relays() {
+            process_report.record_retryable(started);
+        }
+        let (wrap_report, _) = self.process_marmot_events(wraps.events, "gift wrap").await;
         process_report.absorb(wrap_report);
 
         // A welcome processed during sync can add group(s). Backfill all new
@@ -2067,10 +2094,14 @@ impl SonarClient {
                 ));
             }
             let events = self
-                .nostr
-                .fetch_events_from(self.relays.clone(), filter, FETCH_TIMEOUT)
+                .fetch_marmot_events_from_relay_quorum(filter, FETCH_TIMEOUT, "group message sync")
                 .await?;
-            let (msg_report, _) = self.process_marmot_events(events, "group message").await;
+            if !events.completed_all_relays() {
+                process_report.record_retryable(started);
+            }
+            let (msg_report, _) = self
+                .process_marmot_events(events.events, "group message")
+                .await;
             process_report.absorb(msg_report);
         }
 
@@ -2255,6 +2286,124 @@ impl SonarClient {
             state.rewind_for_retry(event_secs);
         }
         self.save_sync_state()
+    }
+
+    async fn fetch_marmot_events_from_relay_quorum(
+        &self,
+        filter: Filter,
+        timeout: Duration,
+        context: &'static str,
+    ) -> Result<RelayFetchOutcome> {
+        let total_relays = self.relays.len();
+        if total_relays == 0 {
+            return Ok(RelayFetchOutcome {
+                events: Vec::new(),
+                completed_relays: 0,
+                total_relays: 0,
+            });
+        }
+
+        let quorum = relay_fetch_quorum(total_relays);
+        let mut tasks = tokio::task::JoinSet::new();
+        for relay in self.relays.clone() {
+            let nostr = self.nostr.clone();
+            let filter = filter.clone();
+            tasks.spawn(async move {
+                let relay_label = relay.to_string();
+                let result = nostr.fetch_events_from(vec![relay], filter, timeout).await;
+                (relay_label, result)
+            });
+        }
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut completed_relays = 0usize;
+        let mut failed_relays = 0usize;
+        let mut events = Vec::new();
+        let mut seen = HashSet::new();
+        let mut last_error: Option<String> = None;
+
+        while completed_relays < quorum && completed_relays + failed_relays < total_relays {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+
+            match tokio::time::timeout(remaining, tasks.join_next()).await {
+                Ok(Some(Ok((relay, Ok(relay_events))))) => {
+                    completed_relays += 1;
+                    let mut accepted = 0usize;
+                    for event in relay_events {
+                        if seen.insert(event.id.to_hex()) {
+                            events.push(event);
+                            accepted += 1;
+                        }
+                    }
+                    tracing::debug!(
+                        relay,
+                        accepted,
+                        completed_relays,
+                        quorum,
+                        total_relays,
+                        context,
+                        "relay fetch completed"
+                    );
+                }
+                Ok(Some(Ok((relay, Err(err))))) => {
+                    failed_relays += 1;
+                    last_error = Some(err.to_string());
+                    tracing::debug!(
+                        relay,
+                        %err,
+                        failed_relays,
+                        total_relays,
+                        context,
+                        "relay fetch failed"
+                    );
+                }
+                Ok(Some(Err(err))) => {
+                    failed_relays += 1;
+                    last_error = Some(err.to_string());
+                    tracing::debug!(
+                        %err,
+                        failed_relays,
+                        total_relays,
+                        context,
+                        "relay fetch task failed"
+                    );
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+
+        tasks.abort_all();
+
+        if completed_relays == 0 {
+            return Err(Error::RelayFetch(format!(
+                "{context}: no relay fetch completed before quorum/timeout{}",
+                last_error
+                    .as_deref()
+                    .map(|err| format!("; last error: {err}"))
+                    .unwrap_or_default()
+            )));
+        }
+
+        if completed_relays < total_relays {
+            tracing::debug!(
+                completed_relays,
+                failed_relays,
+                total_relays,
+                quorum,
+                context,
+                "relay fetch returned before all relays completed"
+            );
+        }
+
+        Ok(RelayFetchOutcome {
+            events,
+            completed_relays,
+            total_relays,
+        })
     }
 
     async fn process_marmot_events(
@@ -2444,12 +2593,15 @@ impl SonarClient {
             .kind(Kind::MlsGroupMessage)
             .custom_tag(SingleLetterTag::lowercase(Alphabet::H), group_id_hex);
         let events = self
-            .nostr
-            .fetch_events_from(self.relays.clone(), filter, BACKFILL_TIMEOUT)
+            .fetch_marmot_events_from_relay_quorum(filter, BACKFILL_TIMEOUT, "group backfill")
             .await?;
-        let (report, _) = self
-            .process_marmot_events(events, "backfilled group message")
+        let partial = !events.completed_all_relays();
+        let (mut report, _) = self
+            .process_marmot_events(events.events, "backfilled group message")
             .await;
+        if partial {
+            report.record_retryable(Timestamp::now().as_secs());
+        }
         Ok(report)
     }
 
@@ -2460,19 +2612,24 @@ impl SonarClient {
         if group_id_hexes.is_empty() {
             return Ok(MarmotProcessReport::default());
         }
-        let filter = Filter::new()
-            .kind(Kind::MlsGroupMessage)
-            .custom_tags(
-                SingleLetterTag::lowercase(Alphabet::H),
-                group_id_hexes.to_vec(),
-            );
+        let filter = Filter::new().kind(Kind::MlsGroupMessage).custom_tags(
+            SingleLetterTag::lowercase(Alphabet::H),
+            group_id_hexes.to_vec(),
+        );
         let events = self
-            .nostr
-            .fetch_events_from(self.relays.clone(), filter, BACKFILL_TIMEOUT)
+            .fetch_marmot_events_from_relay_quorum(
+                filter,
+                BACKFILL_TIMEOUT,
+                "batched group backfill",
+            )
             .await?;
-        let (report, _) = self
-            .process_marmot_events(events, "batched backfill group message")
+        let partial = !events.completed_all_relays();
+        let (mut report, _) = self
+            .process_marmot_events(events.events, "batched backfill group message")
             .await;
+        if partial {
+            report.record_retryable(Timestamp::now().as_secs());
+        }
         Ok(report)
     }
 
@@ -3369,6 +3526,32 @@ mod tests {
             .custom_created_at(Timestamp::from_secs(created_at_secs))
             .sign_with_keys(keys)
             .expect("descriptor signs")
+    }
+
+    #[test]
+    fn relay_fetch_quorum_matches_connection_quorum() {
+        assert_eq!(relay_fetch_quorum(0), 0);
+        assert_eq!(relay_fetch_quorum(1), 1);
+        assert_eq!(relay_fetch_quorum(2), 2);
+        assert_eq!(relay_fetch_quorum(3), 2);
+        assert_eq!(relay_fetch_quorum(5), 2);
+    }
+
+    #[test]
+    fn relay_fetch_outcome_reports_partial_completion() {
+        let partial = RelayFetchOutcome {
+            events: Vec::new(),
+            completed_relays: relay_fetch_quorum(4),
+            total_relays: 4,
+        };
+        let complete = RelayFetchOutcome {
+            events: Vec::new(),
+            completed_relays: 4,
+            total_relays: 4,
+        };
+
+        assert!(!partial.completed_all_relays());
+        assert!(complete.completed_all_relays());
     }
 
     #[test]

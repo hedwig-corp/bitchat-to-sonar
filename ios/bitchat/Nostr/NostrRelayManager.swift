@@ -55,7 +55,7 @@ final class NostrRelayManager: ObservableObject {
 
     // Track EOSE per subscription to signal when initial stored events are done
     private struct EOSETracker {
-        var pendingRelays: Set<String>
+        var completion: NostrEOSECompletionTracker
         var callback: () -> Void
         var timer: Timer?
     }
@@ -310,7 +310,7 @@ final class NostrRelayManager: ObservableObject {
                 if urls.isEmpty {
                     onEOSE()
                 } else {
-                    var tracker = EOSETracker(pendingRelays: Set(urls), callback: onEOSE, timer: nil)
+                    var tracker = EOSETracker(completion: NostrEOSECompletionTracker(relays: urls), callback: onEOSE, timer: nil)
                     // Fallback timeout to avoid hanging if a relay never sends EOSE
                     tracker.timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: false) { [weak self] _ in
                         Task { @MainActor in
@@ -584,8 +584,7 @@ final class NostrRelayManager: ObservableObject {
             handler(event)
         case .eose(let subId):
             if var tracker = eoseTrackers[subId] {
-                tracker.pendingRelays.remove(relayUrl)
-                if tracker.pendingRelays.isEmpty {
+                if tracker.completion.recordEOSE(from: relayUrl) {
                     tracker.timer?.invalidate()
                     eoseTrackers.removeValue(forKey: subId)
                     tracker.callback()
@@ -855,6 +854,36 @@ struct NostrEventDispatchDeduper {
             order.removeFirst(orderHead)
             orderHead = 0
         }
+    }
+}
+
+struct NostrEOSECompletionTracker {
+    private(set) var pendingRelays: Set<String>
+    private(set) var completedRelayCount = 0
+    let requiredRelayCount: Int
+
+    init(relays: [String], requiredRelayCount: Int? = nil) {
+        let uniqueRelays = Set(relays)
+        self.pendingRelays = uniqueRelays
+        self.requiredRelayCount = requiredRelayCount.map {
+            min(max(0, $0), uniqueRelays.count)
+        } ?? Self.defaultRequiredRelayCount(totalRelays: uniqueRelays.count)
+    }
+
+    static func defaultRequiredRelayCount(totalRelays: Int) -> Int {
+        min(2, max(0, totalRelays))
+    }
+
+    var isComplete: Bool {
+        completedRelayCount >= requiredRelayCount
+    }
+
+    mutating func recordEOSE(from relayUrl: String) -> Bool {
+        guard pendingRelays.remove(relayUrl) != nil else {
+            return isComplete
+        }
+        completedRelayCount += 1
+        return isComplete
     }
 }
 
