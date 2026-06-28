@@ -1,8 +1,17 @@
-# Sonar push notification server (transponder)
+# Sonar push notification server (transponder) — PRODUCTION instance.
 # https://github.com/marmot-protocol/transponder
 #
 # This config is Sonar-specific. The server keypair, APNS credentials, and
 # FCM credentials must be provisioned separately — see deploy/README.md.
+#
+# Sonar runs TWO transponder instances (this one + sandbox.toml) that share the
+# same server key (npub) and relays. APNs has two separate gateways and a device
+# token is bound to one of them (TestFlight/App Store builds = production,
+# Xcode/Debug builds = sandbox); a token sent to the wrong gateway is dropped
+# with BadDeviceToken. Each instance pushes every request to its own gateway, so
+# only the matching one delivers. This (production) instance also owns FCM, so
+# Android keeps working even if the sandbox instance is turned off.
+# See transponder/APNS-ENVIRONMENTS.md for the full rationale + live state.
 
 [server]
 # Path to the secp256k1 private key file (hex-encoded).
@@ -39,6 +48,9 @@ payload_mode = "nse_prototype_alert"
 [fcm]
 # Firebase Cloud Messaging credentials for Sonar's Android package.
 # The service account JSON comes from the Firebase Console.
+# FCM is environment-agnostic (Firebase bridges to APNs and Android), so it is
+# enabled on EXACTLY ONE instance — this one. The sandbox instance keeps FCM
+# disabled to avoid sending every Android push twice.
 enabled = true
 service_account_path = "/run/secrets/firebase.json"
 project_id = "sonarchat-11566"

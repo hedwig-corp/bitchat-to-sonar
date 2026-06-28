@@ -1,16 +1,24 @@
 # Sonar Notification Stack
 #
-# Two stateless servers that deliver plaintext-free pushes to mobile devices:
-#   transponder  — Marmot chat/call wakeups (MIP-05 privacy-preserving push)
-#   breez-nds    — Breez wallet wakeups (BOLT12 receive, swap updates)
+# Stateless servers that deliver plaintext-free pushes to mobile devices:
+#   transponder          — Marmot chat/call wakeups, PRODUCTION APNs gateway
+#                          (TestFlight/App Store builds) + FCM (Android)
+#   transponder-sandbox  — same, but the SANDBOX APNs gateway (Xcode/Debug builds)
+#   breez-nds            — Breez wallet wakeups (BOLT12 receive, swap updates)
+#
+# Why two transponders: APNs has separate sandbox/production gateways and a
+# device token only works on the gateway matching the build's aps-environment.
+# Both instances share one server key (npub) + relays and each pushes to its own
+# gateway, so dev and TestFlight/App Store builds both receive. FCM lives on the
+# production instance only (see transponder/APNS-ENVIRONMENTS.md).
 #
 # Usage:
 #   cp .env.example .env          # fill in credentials
-#   docker compose up -d          # start both servers
+#   docker compose up -d          # start all servers
 #   docker compose logs -f        # tail logs
 #
-# Both servers share the same Firebase project (one firebase.json).
-# APNS credentials are only needed by the transponder.
+# All servers share the same Firebase project (one firebase.json).
+# APNS credentials are only needed by the transponders.
 
 services:
   transponder:
@@ -26,6 +34,40 @@ services:
       - .env
     volumes:
       - ./transponder/config/production.toml:/etc/transponder/config.toml:ro
+      - ./secrets/transponder-server.key:/run/secrets/server.key:ro
+      - ./secrets/apns.p8:/run/secrets/apns.p8:ro
+      - ./secrets/firebase.json:/run/secrets/firebase.json:ro
+    tmpfs:
+      - /tmp:size=64m
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 4G
+        reservations:
+          cpus: "1"
+          memory: 1G
+    healthcheck:
+      test: ["CMD", "transponder", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # SANDBOX APNs transponder for Xcode/Debug builds. Same key + relays as the
+  # production instance; FCM disabled (production owns it). See sandbox.toml.
+  transponder-sandbox:
+    image: ghcr.io/marmot-protocol/transponder:0.1.0
+    container_name: sonar-transponder-sandbox
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    env_file:
+      - .env
+    volumes:
+      - ./transponder/config/sandbox.toml:/etc/transponder/config.toml:ro
       - ./secrets/transponder-server.key:/run/secrets/server.key:ro
       - ./secrets/apns.p8:/run/secrets/apns.p8:ro
       - ./secrets/firebase.json:/run/secrets/firebase.json:ro
@@ -73,7 +115,11 @@ services:
           cpus: "1"
           memory: 512M
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/api/v1/notify"]
+      # Liveness only: /api/v1/notify is POST-only, so any request returns an
+      # HTTP response (404 for HEAD, 400 for an empty POST) — all of which prove
+      # the server is up. Do NOT use `wget --spider` here: it does a HEAD, gets
+      # 404, and exits non-zero, marking a perfectly healthy NDS as unhealthy.
+      test: ["CMD-SHELL", "wget -q -S -O /dev/null http://localhost:8080/api/v1/notify 2>&1 | grep -q 'HTTP/'"]
       interval: 30s
       timeout: 5s
       retries: 3

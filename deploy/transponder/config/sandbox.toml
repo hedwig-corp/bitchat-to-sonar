@@ -1,0 +1,36 @@
+# Sonar push notification server (transponder) — SANDBOX instance.
+# https://github.com/marmot-protocol/transponder
+#
+# Runs ALONGSIDE production.toml, sharing the same server key (npub) and relays.
+# This instance pushes to Apple's SANDBOX APNs gateway, which is the only gateway
+# that accepts tokens minted by Debug/Xcode builds (aps-environment=development).
+# Production (TestFlight/App Store) tokens it receives are rejected with
+# BadDeviceToken and harmlessly dropped — those are delivered by production.toml.
+#
+# FCM is DISABLED here: FCM is environment-agnostic and is owned by the
+# production instance, so leaving it on here would double every Android push.
+# See transponder/APNS-ENVIRONMENTS.md for the full rationale.
+
+[server]
+private_key_file = "/run/secrets/server.key"
+
+[relays]
+clearnet = [
+    "wss://relay.damus.io",
+    "wss://nos.lol",
+    "wss://nostr.relay.hedwig.sh",
+]
+
+[apns]
+enabled = true
+private_key_path = "/run/secrets/apns.p8"
+key_id = "PX84KR34WH"
+team_id = "ZQB239SHCM"
+bundle_id = "sh.hedwig.sonar"
+environment = "sandbox"
+payload_mode = "nse_prototype_alert"
+
+[fcm]
+enabled = false
+service_account_path = "/run/secrets/firebase.json"
+project_id = "sonarchat-11566"

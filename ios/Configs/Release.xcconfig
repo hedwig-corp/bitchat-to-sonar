@@ -18,6 +18,7 @@ CODE_SIGN_STYLE = Automatic
 PRODUCT_BUNDLE_IDENTIFIER = sh.hedwig.sonar
 
 APP_GROUP_ID = group.sh.hedwig.sonar
+APS_ENVIRONMENT = production
 
 // Push notification endpoints. These are NOT secrets — the NDS host is public
 // DNS and the transponder npub is a public key — so they ship as committed

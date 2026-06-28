@@ -11,7 +11,15 @@ devices so the killed app can wake up and process events locally.
 Transponder pushes trigger user-visible notifications. On iOS, the APNS
 payload must be visible and include `mutable-content: 1` so the Notification
 Service Extension can render generic privacy-preserving copy after the user
-force-quits the app. Breez NDS pushes are **silent infrastructure only** —
+force-quits the app.
+
+> **iOS killed-app pushes require TWO transponder instances** (a sandbox and a
+> production APNs sender), because a device token only works on the APNs gateway
+> matching the build's `aps-environment`. See
+> [`transponder/APNS-ENVIRONMENTS.md`](transponder/APNS-ENVIRONMENTS.md) for the
+> full rationale, the live deployment state, and verification steps.
+
+Breez NDS pushes are **silent infrastructure only** —
 they wake the wallet to settle a payment, but the user-visible "Payment
 received" notification comes from the transponder/chat path when the sender's
 `⚡PAY` control line arrives. This prevents duplicate notifications.
