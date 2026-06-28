@@ -3421,6 +3421,9 @@ class SonarAppState(private val scope: CoroutineScope) {
                 delay(4000)
                 tick++
                 SonarCore.ensureSubscriptions()
+                if (tick == 1 || tick % 15 == 0) {
+                    runCatching { SonarCore.sync() }
+                }
                 refreshChats()
                 // Observability for the BLE→White Noise fallback: a new Marmot
                 // group (a Welcome received over relays) or a grown transcript is
