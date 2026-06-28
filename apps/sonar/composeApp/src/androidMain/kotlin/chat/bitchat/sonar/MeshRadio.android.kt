@@ -152,6 +152,8 @@ actual object MeshRadio {
             } else {
                 restartRadioForPolicy()
             }
+        } else if (mode == BleDiscoveryMode.Normal) {
+            start()
         }
     }
 
