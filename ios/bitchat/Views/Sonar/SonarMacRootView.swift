@@ -1271,7 +1271,7 @@ private struct MacRadarPane: View {
                     .foregroundColor(SonarTheme.text)
                 HStack(spacing: 5) {
                     SNDot(color: SonarTheme.green, small: true)
-                    Text("\(inRange.count) in range - scanning")
+                    Text(store.radarDiscoveryStatusLine)
                 }
                 .font(SonarTheme.uiFont(size: 12))
                 .foregroundColor(SonarTheme.text2)

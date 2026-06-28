@@ -1,6 +1,7 @@
 package chat.bitchat.sonar
 
 import android.Manifest
+import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
 import android.bluetooth.le.AdvertiseData
 import android.bluetooth.le.AdvertiseSettings
@@ -37,8 +38,10 @@ actual object MeshRadio {
     private val seen = ConcurrentHashMap<String, MeshPeer>()
     private val lastSeen = ConcurrentHashMap<String, Long>()
     @Volatile private var scanning = false
+    @Volatile private var discoveryMode: BleDiscoveryMode = BleDiscoveryMode.Normal
     private var scanner: BluetoothLeScanner? = null
     private var advertiser: BluetoothLeAdvertiser? = null
+    private val knownPeerIds = ConcurrentHashMap.newKeySet<String>()
 
     // ── Scan watchdog ──
     // On some controllers (seen on Pixel 10 Pro) a `connectGatt` dial starves the
@@ -102,9 +105,12 @@ actual object MeshRadio {
         }
         // Stash peers' 0x53 payloads + register named, verified announce peers,
         // keyed by stable fingerprint.
-        MeshGatt.addSonarListener { fingerprint, payload -> sonarProfiles[fingerprint] = payload }
+        MeshGatt.addSonarListener { fingerprint, payload ->
+            if (isKnownPeer(fingerprint)) sonarProfiles[fingerprint] = payload
+        }
         MeshGatt.addAnnounceListener { _, info, fingerprint ->
             if (fingerprint.isEmpty()) return@addAnnounceListener
+            if (!isKnownPeer(fingerprint)) return@addAnnounceListener
             announcedPeers[fingerprint] = MeshPeer(
                 id = "mesh:" + fingerprint,
                 name = info.nickname,
@@ -136,9 +142,36 @@ actual object MeshRadio {
         return a.isEnabled && permitted()
     }
 
+    actual fun setDiscoveryMode(mode: BleDiscoveryMode) {
+        if (discoveryMode == mode) return
+        discoveryMode = mode
+        pruneForDiscoveryMode()
+        if (scanning) {
+            if (mode == BleDiscoveryMode.KnownOnly && knownPeerIds.isEmpty()) {
+                stop()
+            } else {
+                restartRadioForPolicy()
+            }
+        }
+    }
+
+    actual fun setKnownPeerIds(ids: Set<String>) {
+        knownPeerIds.clear()
+        ids.mapTo(knownPeerIds) { it.lowercase() }
+        pruneForDiscoveryMode()
+        if (discoveryMode == BleDiscoveryMode.KnownOnly) {
+            if (knownPeerIds.isEmpty()) stop()
+            else if (!scanning) start()
+        }
+    }
+
     actual fun start() {
         if (scanning || !available()) {
             android.util.Log.i(TAG, "start skipped: scanning=$scanning available=${available()}")
+            return
+        }
+        if (discoveryMode == BleDiscoveryMode.KnownOnly && knownPeerIds.isEmpty()) {
+            android.util.Log.i(TAG, "start skipped: known-only discovery has no chat peers")
             return
         }
         val a = adapter() ?: return
@@ -149,23 +182,7 @@ actual object MeshRadio {
             lastNewDiscoveryMs = System.currentTimeMillis()
             handler.postDelayed(scanWatchdog, WATCHDOG_TICK_MS)
 
-            advertiser = a.bluetoothLeAdvertiser
-            val advSettings = AdvertiseSettings.Builder()
-                .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
-                .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
-                .setConnectable(true)
-                .build()
-            val advData = AdvertiseData.Builder()
-                .addServiceUuid(ParcelUuid(SERVICE_UUID))
-                .build()
-            // Scan response carries our 8-byte node id (== peerID) in manufacturer
-            // data, so a peer Sonar-Android can elect a single dialer (the actual
-            // display name comes from the signed announce, not the advert). iOS /
-            // stock bitchat ignore this manufacturer data.
-            val scanResponse = AdvertiseData.Builder()
-                .addManufacturerData(NODE_ID_COMPANY, MeshGatt.nodeId())
-                .build()
-            advertiser?.startAdvertising(advSettings, advData, scanResponse, advCallback)
+            startAdvertisingInternal(a)
             MeshGatt.startServer()
             android.util.Log.i(TAG, "scanning + advertising $SERVICE_UUID (advertiser=${advertiser != null})")
         } catch (e: SecurityException) {
@@ -186,11 +203,19 @@ actual object MeshRadio {
         seen.clear(); lastSeen.clear(); announcedPeers.clear(); announcedSeen.clear()
     }
 
+    private fun restartRadioForPolicy() {
+        val a = adapter() ?: return
+        runCatching { scanner?.stopScan(scanCallback) }
+        runCatching { advertiser?.stopAdvertising(advCallback) }
+        runCatching { startScanInternal() }
+        runCatching { startAdvertisingInternal(a) }
+    }
+
     /** (Re)start the LE scan with the mesh filters/settings. */
     private fun startScanInternal() {
         val filters = listOf(ScanFilter.Builder().setServiceUuid(ParcelUuid(SERVICE_UUID)).build())
         val settings = ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .setScanMode(if (discoveryMode == BleDiscoveryMode.KnownOnly) ScanSettings.SCAN_MODE_LOW_POWER else ScanSettings.SCAN_MODE_LOW_LATENCY)
             // Aggressive matching reports even weak/intermittent advertisers,
             // and ALL_MATCHES keeps reporting them so they don't time out.
             .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
@@ -200,6 +225,37 @@ actual object MeshRadio {
             .build()
         scanner?.startScan(filters, settings, scanCallback)
         lastScanStartMs = System.currentTimeMillis()
+    }
+
+    private fun startAdvertisingInternal(adapter: BluetoothAdapter) {
+        advertiser = adapter.bluetoothLeAdvertiser
+        val restricted = discoveryMode == BleDiscoveryMode.KnownOnly
+        val advSettings = AdvertiseSettings.Builder()
+            .setAdvertiseMode(if (restricted) AdvertiseSettings.ADVERTISE_MODE_LOW_POWER else AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
+            .setTxPowerLevel(if (restricted) AdvertiseSettings.ADVERTISE_TX_POWER_LOW else AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
+            .setConnectable(true)
+            .build()
+        val advData = AdvertiseData.Builder()
+            .addServiceUuid(ParcelUuid(SERVICE_UUID))
+            .build()
+        // Scan response carries our 8-byte node id (== peerID) in manufacturer
+        // data, so a peer Sonar-Android can elect a single dialer (the actual
+        // display name comes from the signed announce, not the advert). iOS /
+        // stock bitchat ignore this manufacturer data.
+        val scanResponse = AdvertiseData.Builder()
+            .addManufacturerData(NODE_ID_COMPANY, MeshGatt.nodeId())
+            .build()
+        advertiser?.startAdvertising(advSettings, advData, scanResponse, advCallback)
+    }
+
+    private fun isKnownPeer(peerId: String): Boolean =
+        discoveryMode == BleDiscoveryMode.Normal || knownPeerIds.contains(peerId.lowercase())
+
+    private fun pruneForDiscoveryMode() {
+        if (discoveryMode == BleDiscoveryMode.Normal) return
+        announcedPeers.keys.removeIf { !isKnownPeer(it) }
+        announcedSeen.keys.removeIf { !isKnownPeer(it) }
+        sonarProfiles.keys.removeIf { !isKnownPeer(it) }
     }
 
     /** Revive a scanner that a `connectGatt` dial has starved (no results for a
@@ -238,6 +294,7 @@ actual object MeshRadio {
         // Classify by richest protocol: a peer that also sent a 0x53 Sonar
         // announce is a full Sonar user, else a plain bitchat peer.
         return announcedPeers.entries
+            .filter { (peerId, _) -> isKnownPeer(peerId) }
             .map { (peerId, p) -> p.copy(sonar = sonarProfiles.containsKey(peerId)) }
             .sortedByDescending { it.rssi }
     }
@@ -247,7 +304,8 @@ actual object MeshRadio {
     /** Push the display nickname carried in our bitchat announce. */
     actual fun setMeshNickname(nick: String) { MeshGatt.updateNickname(nick) }
 
-    actual fun sonarPeers(): Map<String, ByteArray> = HashMap(sonarProfiles)
+    actual fun sonarPeers(): Map<String, ByteArray> =
+        sonarProfiles.filterKeys { isKnownPeer(it) }
 
     actual fun sendMeshDm(peerId: String, messageId: String, text: String): Boolean =
         MeshGatt.sendTextToPeer(peerId, messageId, text)
@@ -289,6 +347,7 @@ actual object MeshRadio {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             scanResultCount++
             val id = result.device.address
+            if (discoveryMode == BleDiscoveryMode.KnownOnly && knownPeerIds.isEmpty()) return
             val name = runCatching { result.scanRecord?.deviceName }.getOrNull()
                 ?: ("mesh·" + id.takeLast(5).replace(":", ""))
             val isNew = !seen.containsKey(id)

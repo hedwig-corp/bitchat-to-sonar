@@ -84,9 +84,22 @@ struct SonarSettingsScreen: View {
                             icon: .mesh, tone: .cyan, label: "Connection",
                             sub: store.online ? "Bluetooth + internet" : "Nearby only, no internet",
                             value: store.online ? "Online" : "Bluetooth only",
-                            divider: false
+                            divider: true
                         ) {
                             connSheet = true
+                        }
+                        SNSettingsRow(
+                            icon: .mesh, tone: .cyan, label: "Discover new people",
+                            sub: store.batterySavingEnabled ? "Battery saving is limiting Bluetooth to existing chats" : "Allow nearby people without a chat to appear",
+                            value: store.bleDiscoveryStatusLine,
+                            trail: .toggle(store.discoverNewPeople && !store.batterySavingEnabled),
+                            divider: false
+                        ) {
+                            if store.batterySavingEnabled {
+                                store.toast = "Battery saving keeps Bluetooth on chats only"
+                            } else {
+                                store.setDiscoverNewPeople(!store.discoverNewPeople)
+                            }
                         }
                     }
 

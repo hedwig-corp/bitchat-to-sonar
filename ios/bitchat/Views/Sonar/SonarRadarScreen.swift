@@ -32,7 +32,7 @@ struct SonarRadarScreen: View {
                 SNNavHeader(hairline: false, onBack: { store.pop() }) {
                     SNHeaderTitle(name: "Sonar") {
                         SNDot(color: SonarTheme.green, small: true)
-                        Text(verbatim: "\(inRange.count) in range · scanning")
+                        Text(verbatim: store.radarDiscoveryStatusLine)
                     }
                 }
 

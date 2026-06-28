@@ -37,6 +37,7 @@ class MainActivity : ComponentActivity() {
 
     private fun startMeshRadio() {
         MeshRadio.setMeshNickname(SonarCore.nickname())
+        MeshRadio.setDiscoveryMode(if (BatterySaver.enabled()) BleDiscoveryMode.KnownOnly else BleDiscoveryMode.Normal)
         MeshRadio.start()
     }
 
