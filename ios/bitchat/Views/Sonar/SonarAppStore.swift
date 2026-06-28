@@ -1073,6 +1073,35 @@ final class SonarAppStore: ObservableObject {
         defaults.set(mode, forKey: Keys.mode)
     }
 
+    // MARK: Notifications
+
+    var notificationsEnabled: Bool {
+        defaults.object(forKey: Keys.notificationsEnabled) as? Bool ?? true
+    }
+
+    var notificationShowNames: Bool {
+        defaults.object(forKey: Keys.notificationShowNames) as? Bool ?? true
+    }
+
+    var notificationShowPreview: Bool {
+        defaults.object(forKey: Keys.notificationShowPreview) as? Bool ?? false
+    }
+
+    func toggleNotificationsEnabled() {
+        defaults.set(!notificationsEnabled, forKey: Keys.notificationsEnabled)
+        objectWillChange.send()
+    }
+
+    func toggleNotificationShowNames() {
+        defaults.set(!notificationShowNames, forKey: Keys.notificationShowNames)
+        objectWillChange.send()
+    }
+
+    func toggleNotificationShowPreview() {
+        defaults.set(!notificationShowPreview, forKey: Keys.notificationShowPreview)
+        objectWillChange.send()
+    }
+
     // MARK: Identity
 
     var nick: String { chatViewModel.nickname }
@@ -1292,9 +1321,9 @@ final class SonarAppStore: ObservableObject {
 
     private var notificationPrefs: SonarLocalNotificationPrefs {
         SonarLocalNotificationPrefs(
-            enabled: defaults.object(forKey: Keys.notificationsEnabled) as? Bool ?? true,
-            showNames: defaults.object(forKey: Keys.notificationShowNames) as? Bool ?? true,
-            showPreview: defaults.object(forKey: Keys.notificationShowPreview) as? Bool ?? false,
+            enabled: notificationsEnabled,
+            showNames: notificationShowNames,
+            showPreview: notificationShowPreview,
             showPaymentAmount: true
         )
     }
