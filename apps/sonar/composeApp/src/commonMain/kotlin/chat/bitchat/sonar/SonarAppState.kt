@@ -1232,6 +1232,11 @@ class SonarAppState(private val scope: CoroutineScope) {
                     null
                 }
             }
+            // Keep the Breez webhook registration independent from descriptor
+            // publishing. The descriptor may already be current, but the swap
+            // server's offer-scoped webhook can still need a per-launch
+            // unregister -> register refresh.
+            if (offer != null) Notifier.onPaymentOfferReady(offer)
             if (!force && publishedSonarDescriptor && publishedSonarDescriptorBolt12Offer == offer) return
             val published = runCatching {
                 SonarCore.publishSonarDescriptor(callsEnabled = true, bolt12Offer = offer)
@@ -1239,7 +1244,6 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (published) {
                 publishedSonarDescriptor = true
                 publishedSonarDescriptorBolt12Offer = offer
-                if (offer != null) Notifier.onPaymentOfferReady(offer)
             }
         } finally {
             publishingSonarDescriptor = false
