@@ -2,6 +2,7 @@ package chat.bitchat.sonar
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
 
 class ConversationFoldTest {
@@ -36,6 +37,19 @@ class ConversationFoldTest {
         )
 
         assertNull(peer)
+    }
+
+    @Test
+    fun restrictedBlePolicyIgnoresDiscoveryOnlyLinks() {
+        val discoveryOnlyPeerIds = setOf("STRANGER")
+        val allowed = knownBlePeerIdsForPolicy(
+            meshChatPeerIds = listOf("KNOWN"),
+            persistedFoldPeerIds = listOf("FOLDED"),
+            liveFoldPeerIds = listOf("LIVE"),
+        )
+
+        assertEquals(setOf("known", "folded", "live"), allowed)
+        discoveryOnlyPeerIds.forEach { assertFalse(it.lowercase() in allowed) }
     }
 
     @Test

@@ -148,6 +148,19 @@ internal fun hasRecentMarmotActivityForCapabilitySettle(
     return ageMs > -settleMs && ageMs < settleMs
 }
 
+/** Peers allowed through restricted BLE discovery must already be backed by
+ *  local conversation state. Passive Sonar 0x53 links are intentionally omitted:
+ *  they can include people who were only seen during discovery. */
+internal fun knownBlePeerIdsForPolicy(
+    meshChatPeerIds: Iterable<String>,
+    persistedFoldPeerIds: Iterable<String>,
+    liveFoldPeerIds: Iterable<String>,
+): Set<String> = buildSet {
+    meshChatPeerIds.forEach { add(it.lowercase()) }
+    persistedFoldPeerIds.forEach { add(it.lowercase()) }
+    liveFoldPeerIds.forEach { add(it.lowercase()) }
+}
+
 /** A call-log record appended to a DM transcript when a call ends. Lives in
  *  memory only (no MessageStore/SonarCore/Marmot write). [durSecs] == 0 ⇒ the call never connected
  *  (rendered as "Missed"); otherwise it's the connected duration. */
@@ -1791,12 +1804,12 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
-    private fun knownBlePeerIds(): Set<String> = buildSet {
-        meshChats.keys.forEach { add(it.lowercase()) }
-        linkByFp.keys.forEach { add(it.lowercase()) }
-        groupFoldMap.values.forEach { add(it.lowercase()) }
-        foldedGroupPeerIds.values.forEach { add(it.lowercase()) }
-    }
+    private fun knownBlePeerIds(): Set<String> =
+        knownBlePeerIdsForPolicy(
+            meshChatPeerIds = meshChats.keys,
+            persistedFoldPeerIds = groupFoldMap.values,
+            liveFoldPeerIds = foldedGroupPeerIds.values,
+        )
 
     private fun updateBleDiscoveryPolicy() {
         val known = knownBlePeerIds()
