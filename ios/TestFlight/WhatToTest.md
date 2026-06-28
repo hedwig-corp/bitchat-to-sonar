@@ -1,55 +1,74 @@
 # TestFlight — What to Test
 
-Build scope: everything new on `main` since `v0.0.1-alpha.3`, plus the iOS/macOS
-archive-packaging fix that produces this build (`Sonar.app` scheme + rebuilt
-`sonarffi.xcframework`).
+Build: **Sonar 1.6.0 (3)**
 
-Focus your testing on the three new features below. If something crashes on
-launch or right after sending money, that is the highest-priority report.
+This build is mostly about **stability and offline payments**. It fixes the two
+top TestFlight crashes (app getting killed while locked/backgrounded) and makes
+paying a peer who is currently offline actually work. The payment, media, and
+GIF features from the previous build are still here — please give them a quick
+regression pass too.
 
-## 1. Direct Sonar wallet payments (new send path)
+If something crashes on launch, while locked, or right after sending money,
+that is the highest-priority report.
 
-You now pay a peer's published wallet destination directly — no "tap to claim"
-step for new-client sends.
+## 1. Background / locked stability (top crash fixes)
 
-- Set up your wallet, then open Settings and add a **Payment address (BIP-353 /
-  BOLT12)**. Confirm it announces to nearby Sonar peers, and that leaving it
-  empty announces nothing.
-- Open a chat with a peer who has a payment address and send an amount.
-  - Verify a **gold payment bubble** appears immediately in the chat.
-  - Verify the bubble state line moves through **sending → paid** (or
-    **failed**, with a readable reason — not a stack trace).
-- Open the wallet sheet and confirm the payment shows in **activity, newest
-  first**, with amount, peer name, rail, fee, and status.
-- Try paying a peer who has **no** payment address — sending should be
-  unavailable/blocked, not crash.
-- Currency: confirm "Set up your wallet to choose a currency" appears before
-  setup and that the chosen currency renders amounts correctly.
-- Confirm there is no "tap to claim" state. Incoming payments should appear as
-  pending/paid receipt bubbles after the sender's wallet settles them.
+Previous builds were killed by iOS when the screen locked or the app went to
+the background during chat or wallet activity. This should no longer happen.
 
-## 2. Interactive media attachments
+- Open a chat, then **lock the phone** for 30–60s and unlock — confirm the app
+  is still running (not relaunched) and the chat is intact.
+- Send or receive a **payment**, then immediately **lock the phone** or switch
+  to another app for a minute. Come back and confirm no crash and the payment
+  state is correct.
+- Leave the app **backgrounded for several minutes** with the phone locked,
+  then reopen — confirm it resumes instead of cold-launching/crashing.
+- After updating to this build, confirm your **identity, nickname, contacts,
+  and wallet balance survive** the upgrade.
 
-- Send and receive a photo in a chat. **Tap it** to open the fullscreen viewer.
-- In the viewer, **save** the media and confirm the file lands in Photos/Files
-  intact (open it again to confirm bytes are preserved, not blank/corrupt).
-- Dismiss the fullscreen viewer and confirm you return to the chat cleanly.
+## 2. Offline payments (pay a peer who isn't online)
 
-## 3. Animated GIF previews + emoji tray
+You can now pay a peer even when their app is closed/backgrounded — they get
+woken via push to receive.
 
-- Send/receive an animated **GIF** and confirm the preview **animates** in the
-  chat (not a frozen first frame).
-- Send a regular **photo** and confirm it is NOT mislabeled/animated as a GIF.
-- Open the **emoji tray** and confirm picking emoji works in the composer.
+- Pay a peer who has a **payment address** set but whose app is **closed or
+  backgrounded**. Confirm your bubble moves **sending → paid** and does not get
+  stuck or fail with a raw error.
+- On the **receiving** device (the offline one), confirm a notification/wake
+  arrives and the incoming payment shows up as pending/paid after settling.
+- Try a normal **both-online** payment too and confirm it still works.
 
-## Build/install smoke test (because this build fixed packaging)
+## 3. Notifications
 
-- App installs and launches from TestFlight without an immediate crash.
-- Existing identity, nickname, contacts, and wallet balance survive the update.
-- Bluetooth nearby presence and an existing DM still work after upgrading.
+Notifications are now generated with useful content.
 
-## Known gaps / not-yet-translated
+- With the app **backgrounded**, receive a **message** and a **payment** and
+  confirm the notifications are **meaningful** (who it's from / what it is), not
+  generic placeholders.
+- Check **Settings** for the notification **privacy** option and confirm
+  toggling it changes how much detail appears on the lock screen.
 
-- The new payment/onboarding/safety-number strings ship **English-only**; other
-  languages fall back to English. Non-English UI showing English here is
-  expected, not a bug.
+## 4. Your payment address stays payable
+
+Your published payment address (BOLT12 offer) should no longer get wiped when
+your profile/presence republishes.
+
+- Set a **Payment address (BIP-353 / BOLT12)** in Settings.
+- Change your **nickname** / reconnect / move in and out of range so your
+  profile republishes, then have **another peer pay you**. Confirm you are
+  still payable (the address wasn't cleared).
+
+## Regression pass (from the previous build)
+
+- **Direct wallet payments**: gold payment bubble appears immediately; activity
+  list shows newest first with amount, peer, rail, fee, status. Paying a peer
+  with **no** payment address is blocked, not a crash.
+- **Media**: send/receive a photo, tap to open fullscreen, **save** it, and
+  confirm the file opens intact.
+- **GIFs / emoji**: an animated GIF **animates** in the chat (not a frozen
+  frame); a regular photo is not mislabeled as a GIF; the emoji tray works.
+
+## Known gaps
+
+- New payment/onboarding/safety-number strings are **English-only**; other
+  languages fall back to English. That is expected, not a bug.
