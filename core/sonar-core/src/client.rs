@@ -229,8 +229,8 @@ const SYNC_STATE_PROCESSED_EVENT_CAP: usize = 20_000;
 struct LiveEventDeduper {
     ttl: Duration,
     capacity: usize,
-    seen_at: HashMap<String, Instant>,
-    order: VecDeque<String>,
+    seen_at: HashMap<EventId, Instant>,
+    order: VecDeque<EventId>,
 }
 
 impl LiveEventDeduper {
@@ -243,15 +243,15 @@ impl LiveEventDeduper {
         }
     }
 
-    fn should_accept(&mut self, event_id: &str, now: Instant) -> bool {
+    fn should_accept(&mut self, event_id: &EventId, now: Instant) -> bool {
         self.prune_expired(now);
 
         if self.seen_at.contains_key(event_id) {
             return false;
         }
 
-        let event_id = event_id.to_string();
-        self.seen_at.insert(event_id.clone(), now);
+        let event_id = *event_id;
+        self.seen_at.insert(event_id, now);
         self.order.push_back(event_id);
         self.prune_overflow();
         true
@@ -743,15 +743,12 @@ impl SonarClient {
         let handler_subs = geo_subscribed.clone();
         let handler_pending = pending_marmot.clone();
         let handler_notify = marmot_notify.clone();
-        let handler_live_dedup = Arc::new(Mutex::new(LiveEventDeduper::new(
-            LIVE_EVENT_DEDUP_TTL,
-            LIVE_EVENT_DEDUP_CAP,
-        )));
         // Our MAIN identity pubkey hex: a kind-1059 with this `p` tag is a Marmot
         // welcome (vs a geohash DM, whose `p` is a per-geohash ephemeral key).
         let my_pubkey_hex = identity.keys().public_key().to_hex();
         let mut notifications = nostr.notifications();
         tokio::spawn(async move {
+            let mut live_dedup = LiveEventDeduper::new(LIVE_EVENT_DEDUP_TTL, LIVE_EVENT_DEDUP_CAP);
             loop {
                 let notification = match notifications.recv().await {
                     Ok(n) => n,
@@ -773,11 +770,7 @@ impl SonarClient {
                 if !matches!(kind, 20000 | 20001 | 1059 | 445) {
                     continue;
                 }
-                if !handler_live_dedup
-                    .lock()
-                    .unwrap()
-                    .should_accept(&event.id.to_hex(), Instant::now())
-                {
+                if !live_dedup.should_accept(&event.id, Instant::now()) {
                     continue;
                 }
 
@@ -3560,6 +3553,10 @@ mod tests {
     };
     use std::collections::{HashMap, HashSet};
 
+    fn test_event_id(seed: u8) -> EventId {
+        EventId::from_slice(&[seed; 32]).expect("event id")
+    }
+
     fn signed_event(keys: &Keys, created_at_secs: u64, content: &str) -> Event {
         EventBuilder::new(Kind::MlsGroupMessage, content)
             .custom_created_at(Timestamp::from_secs(created_at_secs))
@@ -3646,29 +3643,34 @@ mod tests {
     fn live_event_deduper_suppresses_duplicates_inside_ttl() {
         let mut deduper = LiveEventDeduper::new(Duration::from_secs(60), 16);
         let now = Instant::now();
+        let event_id = test_event_id(1);
 
-        assert!(deduper.should_accept("evt-1", now));
-        assert!(!deduper.should_accept("evt-1", now + Duration::from_secs(1)));
+        assert!(deduper.should_accept(&event_id, now));
+        assert!(!deduper.should_accept(&event_id, now + Duration::from_secs(1)));
     }
 
     #[test]
     fn live_event_deduper_allows_event_after_ttl() {
         let mut deduper = LiveEventDeduper::new(Duration::from_secs(5), 16);
         let now = Instant::now();
+        let event_id = test_event_id(1);
 
-        assert!(deduper.should_accept("evt-1", now));
-        assert!(deduper.should_accept("evt-1", now + Duration::from_secs(6)));
+        assert!(deduper.should_accept(&event_id, now));
+        assert!(deduper.should_accept(&event_id, now + Duration::from_secs(6)));
     }
 
     #[test]
     fn live_event_deduper_evicts_oldest_entry_at_capacity() {
         let mut deduper = LiveEventDeduper::new(Duration::from_secs(60), 2);
         let now = Instant::now();
+        let first = test_event_id(1);
+        let second = test_event_id(2);
+        let third = test_event_id(3);
 
-        assert!(deduper.should_accept("evt-1", now));
-        assert!(deduper.should_accept("evt-2", now));
-        assert!(deduper.should_accept("evt-3", now));
-        assert!(deduper.should_accept("evt-1", now + Duration::from_secs(1)));
+        assert!(deduper.should_accept(&first, now));
+        assert!(deduper.should_accept(&second, now));
+        assert!(deduper.should_accept(&third, now));
+        assert!(deduper.should_accept(&first, now + Duration::from_secs(1)));
     }
 
     #[test]

@@ -792,6 +792,7 @@ struct NostrEventDispatchDeduper {
     private let ttl: TimeInterval
     private let capacity: Int
     private var seenAt: [Key: Date] = [:]
+    private var keysBySubscription: [String: Set<Key>] = [:]
     private var order: [Key] = []
     private var orderHead = 0
 
@@ -809,13 +810,16 @@ struct NostrEventDispatchDeduper {
         }
 
         seenAt[key] = now
+        keysBySubscription[subscriptionId, default: []].insert(key)
         order.append(key)
         pruneOverflow()
         return true
     }
 
     mutating func removeSubscription(_ subscriptionId: String) {
-        let removedKeys = seenAt.keys.filter { $0.subscriptionId == subscriptionId }
+        guard let removedKeys = keysBySubscription.removeValue(forKey: subscriptionId) else {
+            return
+        }
         for key in removedKeys {
             seenAt.removeValue(forKey: key)
         }
@@ -830,7 +834,7 @@ struct NostrEventDispatchDeduper {
                 continue
             }
             guard now.timeIntervalSince(firstSeen) >= ttl else { break }
-            seenAt.removeValue(forKey: key)
+            removeKey(key)
             orderHead += 1
         }
         compactOrderIfNeeded()
@@ -840,9 +844,20 @@ struct NostrEventDispatchDeduper {
         while seenAt.count > capacity, orderHead < order.count {
             let oldest = order[orderHead]
             orderHead += 1
-            seenAt.removeValue(forKey: oldest)
+            removeKey(oldest)
         }
         compactOrderIfNeeded()
+    }
+
+    private mutating func removeKey(_ key: Key) {
+        guard seenAt.removeValue(forKey: key) != nil else { return }
+        guard var keys = keysBySubscription[key.subscriptionId] else { return }
+        keys.remove(key)
+        if keys.isEmpty {
+            keysBySubscription.removeValue(forKey: key.subscriptionId)
+        } else {
+            keysBySubscription[key.subscriptionId] = keys
+        }
     }
 
     private mutating func compactOrderIfNeeded() {

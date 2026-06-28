@@ -54,6 +54,22 @@ struct NostrEventDispatchDeduperTests {
         #expect(afterClear)
     }
 
+    @Test func clearingSubscriptionPreservesOtherSubscriptions() {
+        var deduper = NostrEventDispatchDeduper(ttl: 60, capacity: 16)
+        let now = Date(timeIntervalSince1970: 1_000)
+        let firstActive = deduper.shouldDispatch(subscriptionId: "geo-u0", eventId: "evt-1", now: now)
+        let firstSample = deduper.shouldDispatch(subscriptionId: "geo-sample-u0", eventId: "evt-1", now: now)
+
+        deduper.removeSubscription("geo-u0")
+        let activeAfterClear = deduper.shouldDispatch(subscriptionId: "geo-u0", eventId: "evt-1", now: now.addingTimeInterval(1))
+        let sampleAfterClear = deduper.shouldDispatch(subscriptionId: "geo-sample-u0", eventId: "evt-1", now: now.addingTimeInterval(1))
+
+        #expect(firstActive)
+        #expect(firstSample)
+        #expect(activeAfterClear)
+        #expect(!sampleAfterClear)
+    }
+
     @Test func evictsOldestEntryAtCapacity() {
         var deduper = NostrEventDispatchDeduper(ttl: 60, capacity: 2)
         let now = Date(timeIntervalSince1970: 1_000)
