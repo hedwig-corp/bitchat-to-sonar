@@ -44,6 +44,7 @@ final class SonarPushRegistration: @unchecked Sendable {
     private var completedSessionWebhookMarker: String?
     private var inFlightWebhookMarker: String?
     private var inFlightWebhookStartedAt: Date?
+    private var inFlightWebhookGeneration: UInt64 = 0
 
     private var transponderNpub: String {
         Bundle.main.infoDictionary?["TRANSPONDER_NPUB"] as? String ?? ""
@@ -121,6 +122,7 @@ final class SonarPushRegistration: @unchecked Sendable {
             self.completedSessionWebhookMarker = nil
             self.inFlightWebhookMarker = nil
             self.inFlightWebhookStartedAt = nil
+            self.inFlightWebhookGeneration &+= 1
         }
         // Force a fresh subscribe next time (e.g. after a wallet/seed change).
         UserDefaults.standard.removeObject(forKey: Self.webhookMarkerKey)
@@ -198,36 +200,49 @@ final class SonarPushRegistration: @unchecked Sendable {
         }
         inFlightWebhookMarker = marker
         inFlightWebhookStartedAt = Date()
+        inFlightWebhookGeneration &+= 1
+        let attemptGeneration = inFlightWebhookGeneration
         Task { @MainActor in
             guard case .ready = wallet.state else {
                 Self.log.info("Breez NDS: wallet not ready, will retry after wallet setup")
-                self.queue.async {
-                    if self.inFlightWebhookMarker == marker {
-                        self.inFlightWebhookMarker = nil
-                        self.inFlightWebhookStartedAt = nil
-                    }
-                }
+                self.finishWebhookAttempt(marker: marker, generation: attemptGeneration, completed: false)
                 return
             }
             do {
                 try await Self.forceRegisterWebhook(wallet: wallet, url: webhookUrl)
-                UserDefaults.standard.set(marker, forKey: Self.webhookMarkerKey)
-                self.queue.async {
-                    if self.inFlightWebhookMarker == marker {
-                        self.inFlightWebhookMarker = nil
-                        self.inFlightWebhookStartedAt = nil
-                    }
-                    self.completedSessionWebhookMarker = marker
-                }
-                Self.log.info("Breez NDS webhook force re-subscribed for current offer (FCM)")
+                self.finishWebhookAttempt(marker: marker, generation: attemptGeneration, completed: true)
             } catch {
-                self.queue.async {
-                    if self.inFlightWebhookMarker == marker {
-                        self.inFlightWebhookMarker = nil
-                        self.inFlightWebhookStartedAt = nil
-                    }
-                }
-                Self.log.warning("Breez NDS webhook registration failed: \(error)")
+                self.finishWebhookAttempt(
+                    marker: marker,
+                    generation: attemptGeneration,
+                    completed: false,
+                    failureMessage: "\(error)"
+                )
+            }
+        }
+    }
+
+    private func finishWebhookAttempt(
+        marker: String,
+        generation: UInt64,
+        completed: Bool,
+        failureMessage: String? = nil
+    ) {
+        queue.async {
+            guard self.inFlightWebhookMarker == marker,
+                  self.inFlightWebhookGeneration == generation
+            else {
+                Self.log.info("Breez NDS webhook ignoring stale re-subscribe attempt")
+                return
+            }
+            self.inFlightWebhookMarker = nil
+            self.inFlightWebhookStartedAt = nil
+            if completed {
+                UserDefaults.standard.set(marker, forKey: Self.webhookMarkerKey)
+                self.completedSessionWebhookMarker = marker
+                Self.log.info("Breez NDS webhook force re-subscribed for current offer (FCM)")
+            } else if let failureMessage {
+                Self.log.warning("Breez NDS webhook registration failed: \(failureMessage)")
             }
         }
     }

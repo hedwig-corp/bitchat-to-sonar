@@ -30,6 +30,7 @@ object SonarPushRegistration {
     private const val WEBHOOK_IN_FLIGHT_TIMEOUT_MS = 30_000L
     private const val WEBHOOK_REGISTRATION_TIMEOUT_MS = 20_000L
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val webhookLock = Any()
 
     private val transponderNpub: String get() = BuildConfig.TRANSPONDER_NPUB
 
@@ -46,6 +47,7 @@ object SonarPushRegistration {
     @Volatile private var completedSessionWebhookMarker: String? = null
     @Volatile private var inFlightWebhookMarker: String? = null
     @Volatile private var inFlightWebhookStartedAtMs: Long = 0L
+    @Volatile private var inFlightWebhookGeneration: Long = 0L
 
     fun ensureRegistered() {
         if (transponderNpub.isBlank() && ndsUrl.isBlank()) {
@@ -133,33 +135,54 @@ object SonarPushRegistration {
             return
         }
         val marker = webhookMarker(offer, webhookUrl)
-        if (completedSessionWebhookMarker == marker) {
-            Log.d(TAG, "Breez NDS webhook already re-subscribed for current offer this launch")
-            return
-        }
-        val now = SystemClock.elapsedRealtime()
-        if (inFlightWebhookMarker == marker) {
-            if (now - inFlightWebhookStartedAtMs < WEBHOOK_IN_FLIGHT_TIMEOUT_MS) {
-                Log.d(TAG, "Breez NDS webhook re-subscribe already in flight for current offer")
+        val attemptGeneration = synchronized(webhookLock) {
+            if (completedSessionWebhookMarker == marker) {
+                Log.d(TAG, "Breez NDS webhook already re-subscribed for current offer this launch")
                 return
             }
-            Log.w(TAG, "Breez NDS webhook re-subscribe timed out; retrying current offer")
+            val now = SystemClock.elapsedRealtime()
+            if (inFlightWebhookMarker == marker) {
+                if (now - inFlightWebhookStartedAtMs < WEBHOOK_IN_FLIGHT_TIMEOUT_MS) {
+                    Log.d(TAG, "Breez NDS webhook re-subscribe already in flight for current offer")
+                    return
+                }
+                Log.w(TAG, "Breez NDS webhook re-subscribe timed out; retrying current offer")
+            }
+            inFlightWebhookMarker = marker
+            inFlightWebhookStartedAtMs = now
+            inFlightWebhookGeneration += 1
+            inFlightWebhookGeneration
         }
-        inFlightWebhookMarker = marker
-        inFlightWebhookStartedAtMs = now
         scope.launch {
             try {
                 forceRegisterWebhook(webhookUrl)
-                completedSessionWebhookMarker = marker
-                Log.d(TAG, "Breez NDS webhook force re-subscribed for current offer")
+                if (finishWebhookAttempt(marker, attemptGeneration, completed = true)) {
+                    Log.d(TAG, "Breez NDS webhook force re-subscribed for current offer")
+                }
             } catch (e: Exception) {
-                Log.w(TAG, "Breez NDS webhook registration failed", e)
-            } finally {
-                if (inFlightWebhookMarker == marker) {
-                    inFlightWebhookMarker = null
-                    inFlightWebhookStartedAtMs = 0L
+                if (finishWebhookAttempt(marker, attemptGeneration, completed = false)) {
+                    Log.w(TAG, "Breez NDS webhook registration failed", e)
                 }
             }
+        }
+    }
+
+    private fun finishWebhookAttempt(
+        marker: String,
+        generation: Long,
+        completed: Boolean,
+    ): Boolean {
+        return synchronized(webhookLock) {
+            if (inFlightWebhookMarker != marker || inFlightWebhookGeneration != generation) {
+                Log.d(TAG, "Breez NDS webhook ignoring stale re-subscribe attempt")
+                return@synchronized false
+            }
+            inFlightWebhookMarker = null
+            inFlightWebhookStartedAtMs = 0L
+            if (completed) {
+                completedSessionWebhookMarker = marker
+            }
+            true
         }
     }
 
@@ -169,9 +192,12 @@ object SonarPushRegistration {
         }
         cachedFcmToken = null
         cachedOffer = null
-        completedSessionWebhookMarker = null
-        inFlightWebhookMarker = null
-        inFlightWebhookStartedAtMs = 0L
+        synchronized(webhookLock) {
+            completedSessionWebhookMarker = null
+            inFlightWebhookMarker = null
+            inFlightWebhookStartedAtMs = 0L
+            inFlightWebhookGeneration += 1
+        }
         Log.d(TAG, "Unregistered from push servers")
     }
 
