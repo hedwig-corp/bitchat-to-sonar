@@ -53,6 +53,21 @@ Constraints and gotchas (all detailed in `docs/PERFORMANCE.md`): the build must 
 
 Do not commit payment, wallet, relay, signing, or API secrets. The Breez wallet key must stay in gitignored local configuration (`ios/Configs/Local.xcconfig` with `BREEZ_API_KEY = ...`) or an equivalent CI secret. When creating a new workspace/worktree or rebuilding for device testing, preserve the local secret by recreating/copying the gitignored config or passing the key through the build environment; verify presence without printing the value.
 
+## Push Notifications Build Requirement (Firebase / GoogleService-Info.plist)
+
+Offline wallet/payment wakeups (the Breez NDS push path) require the Firebase
+config file `ios/bitchat/GoogleService-Info.plist`. It is **gitignored** and
+**auto-bundled** by the Xcode 16 synchronized folder group (no pbxproj entry):
+if the file is physically present in `ios/bitchat/` it ships in `Sonar.app`; if
+it is missing, `FirebaseApp.configure()` is skipped (it is guarded on the file
+in `BitchatApp.swift`), no FCM token is minted, the Breez webhook is never
+registered, and **the build launches fine but silently has no offline payment
+notifications** — only a warning is logged. Before any TestFlight/App Store
+archive or device test, verify `ios/bitchat/GoogleService-Info.plist` exists
+(copy it from another worktree / CI secret if creating a fresh checkout); never
+commit it. This affects ONLY the Breez/payment path — Marmot chat/call wakeups
+go over the Transponder raw-APNs path and do not depend on Firebase.
+
 ## Fix What We Break Rule
 
 When a change breaks existing behavior, fix the broken behavior directly before considering the work complete. Do not leave regressions for users to route around, and do not hide them with UI-only workarounds.
