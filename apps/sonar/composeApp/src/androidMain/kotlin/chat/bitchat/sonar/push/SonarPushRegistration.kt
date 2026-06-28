@@ -23,17 +23,18 @@ object SonarPushRegistration {
 
     private const val TAG = "SonarPush"
     private const val MAX_RETRIES = 3
+    private const val DEFAULT_NDS_HOST = "nds.sonar.hedwig.sh"
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private val transponderNpub: String get() = BuildConfig.TRANSPONDER_NPUB
 
     // Base URL of the Breez NDS. Tolerates a bare host (prepends https://) and
-    // rejects the truncated "https:"/"http:" sentinels, mirroring iOS, so a
-    // malformed webhook URL can never be registered (which breaks offline pay).
+    // falls back to the production NDS host for missing/truncated settings so a
+    // malformed build setting cannot disable offline pay.
     private val ndsUrl: String
         get() {
             val raw = BuildConfig.NDS_URL.trim()
-            if (raw.isEmpty() || raw == "https:" || raw == "http:") return ""
+            if (raw.isEmpty() || raw == "https:" || raw == "http:") return "https://$DEFAULT_NDS_HOST"
             return if (raw.startsWith("http://") || raw.startsWith("https://")) raw else "https://$raw"
         }
 

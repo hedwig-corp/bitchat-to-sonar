@@ -50,11 +50,21 @@ final class WalletBridgeService: ObservableObject {
         case ready(balanceSats: Int64)
     }
 
-    enum WalletBridgeError: Error, Equatable {
+    enum WalletBridgeError: Error, Equatable, LocalizedError {
         /// `BREEZ_API_KEY` is missing/empty — see docs/WALLET-INTEGRATION.md.
         case missingAPIKey
         /// Failure inside the wallet engine (Breez SDK, storage...).
         case core(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .missingAPIKey:
+                return "Breez API key is missing from this app build."
+            case .core(let message):
+                let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+                return trimmed.isEmpty ? "Wallet operation failed." : trimmed
+            }
+        }
     }
 
     // MARK: - State
@@ -85,6 +95,13 @@ final class WalletBridgeService: ObservableObject {
     /// the app is already backgrounded (which would hold a SQLite lock at
     /// suspension with no matching teardown).
     private var resumeTask: Task<Void, Never>?
+    #if canImport(UIKit)
+    /// Active foreground-initiated payments. If iOS backgrounds us while one is
+    /// running, keep the Breez node alive until the send completes, then run the
+    /// normal clean suspend path.
+    private var activeSendCount = 0
+    private var suspendWhenActiveSendsFinish = false
+    #endif
 
     // MARK: - Money display
 
@@ -254,6 +271,11 @@ final class WalletBridgeService: ObservableObject {
         // (`suspendedForBackground`) so the next foreground retries.
         resumeTask?.cancel()
         resumeTask = nil
+        if activeSendCount > 0 {
+            suspendedForBackground = true
+            suspendWhenActiveSendsFinish = true
+            return
+        }
         if case .notConfigured = state { return }
         suspendedForBackground = true
         var bgTask: UIBackgroundTaskIdentifier = .invalid
@@ -278,6 +300,7 @@ final class WalletBridgeService: ObservableObject {
     /// foreground retries — the wallet never gets stuck `.notConfigured` until a
     /// fresh `BridgedWallet`. No-op unless we previously suspended.
     func resumeFromBackground() {
+        suspendWhenActiveSendsFinish = false
         guard suspendedForBackground, !resumeInFlight else { return }
         resumeInFlight = true
         let pendingSuspend = suspendTask
@@ -340,12 +363,55 @@ final class WalletBridgeService: ObservableObject {
     /// the destination embeds the amount.
     @discardableResult
     func send(destination: String, amountSats: Int64 = 0, note: String = "") async throws -> Payment {
+        #if canImport(UIKit)
+        beginActiveSend()
+        defer { finishActiveSend() }
+        #endif
         do {
+            #if canImport(UIKit)
+            return try await withBackgroundTask(named: "breez-send") {
+                try await wallet.send(destination: destination, amountSats: amountSats, note: note)
+            }
+            #else
             return try await wallet.send(destination: destination, amountSats: amountSats, note: note)
+            #endif
         } catch let error as SonarWallet.WalletError {
             throw Self.map(error)
         }
     }
+
+    #if canImport(UIKit)
+    private func beginActiveSend() {
+        activeSendCount += 1
+    }
+
+    private func finishActiveSend() {
+        activeSendCount = max(0, activeSendCount - 1)
+        guard activeSendCount == 0, suspendWhenActiveSendsFinish else { return }
+        suspendWhenActiveSendsFinish = false
+        suspendForBackground()
+    }
+
+    private func withBackgroundTask<T>(
+        named name: String,
+        operation: () async throws -> T
+    ) async throws -> T {
+        var bgTask: UIBackgroundTaskIdentifier = .invalid
+        bgTask = UIApplication.shared.beginBackgroundTask(withName: name) {
+            if bgTask != .invalid {
+                UIApplication.shared.endBackgroundTask(bgTask)
+                bgTask = .invalid
+            }
+        }
+        defer {
+            if bgTask != .invalid {
+                UIApplication.shared.endBackgroundTask(bgTask)
+                bgTask = .invalid
+            }
+        }
+        return try await operation()
+    }
+    #endif
 
     /// Create a reusable BOLT12 offer for receiving payments (the string
     /// behind the user's BIP-353 `user@domain` address).

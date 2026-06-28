@@ -36,6 +36,7 @@ final class SonarPushRegistration {
     /// can otherwise suppress the unregister -> register self-heal.
     private static let webhookMarkerKey = "breez_webhook_marker"
     private static let webhookMarkerVersion = "ios-fcm-explicit-token-v2"
+    private static let defaultNdsHost = "nds.sonar.hedwig.sh"
     private var sessionWebhookMarker: String?
 
     private var transponderNpub: String {
@@ -46,13 +47,15 @@ final class SonarPushRegistration {
     ///
     /// The value is configured in `Local.xcconfig` as a BARE HOST (no scheme),
     /// because xcconfig treats `//` as a comment and silently truncates
-    /// `https://host` to `https:`. We prepend the scheme here and reject the
-    /// truncated `https:`/`http:` sentinels so a malformed webhook URL can never
-    /// be registered with Boltz (which would leave offline receive broken).
+    /// `https://host` to `https:`. We prepend the scheme here and fall back to
+    /// the production NDS host for missing/truncated settings so a malformed
+    /// build setting does not disable offline receive in TestFlight/Release.
     private var ndsUrl: String {
         let raw = (Bundle.main.infoDictionary?["NDS_URL"] as? String ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !raw.isEmpty, raw != "https:", raw != "http:" else { return "" }
+        guard !raw.isEmpty, raw != "https:", raw != "http:" else {
+            return "https://\(Self.defaultNdsHost)"
+        }
         if raw.hasPrefix("http://") || raw.hasPrefix("https://") { return raw }
         return "https://\(raw)"
     }

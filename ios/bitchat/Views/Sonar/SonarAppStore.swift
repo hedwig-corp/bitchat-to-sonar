@@ -1770,7 +1770,6 @@ final class SonarAppStore: ObservableObject {
     }
 
     private func publishPaymentMetadataIfNeeded(force: Bool = false) {
-        guard marmot.npub != nil, marmot.relayConnected else { return }
         guard !publishingPaymentMetadata else {
             needsPaymentMetadataPublish = true
             return
@@ -1803,6 +1802,16 @@ final class SonarAppStore: ObservableObject {
                 guard self.publishedBolt12Offer == nil else { return }
                 offer = nil
             }
+            // Re-subscribe the Breez NDS webhook as soon as the local receive
+            // offer is available. Descriptor publishing can be skipped when the
+            // offer is unchanged or the relay is offline, but Boltz webhook
+            // state still needs this per-launch unregister -> register self-heal.
+            #if os(iOS)
+            if let offer, let bridged = self.wallet as? BridgedWallet {
+                SonarPushRegistration.shared.ensureBreezWebhook(offer: offer, wallet: bridged.walletService)
+            }
+            #endif
+            guard self.marmot.npub != nil, self.marmot.relayConnected else { return }
             guard force || !self.publishedCallDescriptor || self.publishedBolt12Offer != offer else { return }
             do {
                 try await self.marmot.publishSonarDescriptor(bolt12Offer: offer)
@@ -1811,14 +1820,6 @@ final class SonarAppStore: ObservableObject {
                 }
                 self.publishedCallDescriptor = true
                 self.publishedBolt12Offer = offer
-                // Re-subscribe the Breez NDS webhook onto the just-published offer so
-                // Boltz can POST it on an offline invoice_request (#126). Idempotent —
-                // only re-PATCHes when the offer / FCM token / NDS URL changed.
-                #if os(iOS)
-                if let offer, let bridged = self.wallet as? BridgedWallet {
-                    SonarPushRegistration.shared.ensureBreezWebhook(offer: offer, wallet: bridged.walletService)
-                }
-                #endif
             } catch {
                 SecureLogger.error("Sonar descriptor payment metadata publish failed: \(error)", category: .session)
             }
