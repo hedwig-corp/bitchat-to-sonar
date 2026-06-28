@@ -2376,9 +2376,8 @@ impl SonarClient {
             }
         }
 
-        tasks.abort_all();
-
         if completed_relays == 0 {
+            tasks.abort_all();
             return Err(Error::RelayFetch(format!(
                 "{context}: no relay fetch completed before quorum/timeout{}",
                 last_error
@@ -2397,6 +2396,59 @@ impl SonarClient {
                 context,
                 "relay fetch returned before all relays completed"
             );
+            let pending = self.pending_marmot.clone();
+            let notify = self.marmot_notify.clone();
+            let mut late_seen = seen.clone();
+            tokio::spawn(async move {
+                let mut late_events = 0usize;
+                while let Some(joined) = tasks.join_next().await {
+                    match joined {
+                        Ok((relay, Ok(relay_events))) => {
+                            let mut accepted = 0usize;
+                            for event in relay_events {
+                                if !late_seen.insert(event.id.to_hex()) {
+                                    continue;
+                                }
+                                {
+                                    let mut buf = pending.lock().unwrap();
+                                    if buf.len() >= MARMOT_BUFFER_CAP {
+                                        buf.drain(0..MARMOT_BUFFER_CAP / 2);
+                                    }
+                                    buf.push(event);
+                                }
+                                accepted += 1;
+                                late_events += 1;
+                            }
+                            tracing::debug!(
+                                relay,
+                                accepted,
+                                context,
+                                "late relay fetch buffered events"
+                            );
+                        }
+                        Ok((relay, Err(err))) => {
+                            tracing::debug!(
+                                relay,
+                                %err,
+                                context,
+                                "late relay fetch failed"
+                            );
+                        }
+                        Err(err) => {
+                            tracing::debug!(
+                                %err,
+                                context,
+                                "late relay fetch task failed"
+                            );
+                        }
+                    }
+                }
+                if late_events > 0 {
+                    notify.notify_one();
+                }
+            });
+        } else {
+            tasks.abort_all();
         }
 
         Ok(RelayFetchOutcome {
