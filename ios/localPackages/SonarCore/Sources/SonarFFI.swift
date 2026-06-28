@@ -5786,7 +5786,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_recent_message_pages() != 17660) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_register_push_token() != 41081) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_register_push_token() != 63602) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_remove_group_members() != 5580) {
