@@ -37,7 +37,7 @@ pub fn classify_content(content: &str) -> NotificationKind {
     if CallControl::parse(content).is_some() {
         return NotificationKind::Call;
     }
-    if payment_amount_sats(content).is_some() {
+    if is_payment_control_line(content) {
         return NotificationKind::Payment;
     }
     NotificationKind::Message
@@ -60,6 +60,33 @@ pub fn payment_amount_sats(content: &str) -> Option<u64> {
         return None;
     }
     Some(sats)
+}
+
+fn is_payment_control_line(content: &str) -> bool {
+    payment_amount_sats(content).is_some() || is_payment_done_line(content)
+}
+
+fn is_payment_done_line(content: &str) -> bool {
+    let mut parts = content.split('|');
+    if parts.next() != Some("⚡PAYDONE") {
+        return false;
+    }
+    let version = match parts.next() {
+        Some(version) => version,
+        None => return false,
+    };
+    match parts.next() {
+        Some(id) if valid_payment_id(id) => {}
+        _ => return false,
+    }
+    match version {
+        "1" => parts.next().is_none(),
+        "2" => match parts.next() {
+            None => true,
+            Some(preimage) => valid_preimage(preimage) && parts.next().is_none(),
+        },
+        _ => false,
+    }
 }
 
 pub fn render_notification(input: NotificationRenderInput) -> Option<NotificationEnvelope> {
@@ -225,6 +252,10 @@ fn valid_payment_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
 }
 
+fn valid_preimage(preimage: &str) -> bool {
+    preimage.len() == 64 && preimage.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,6 +285,16 @@ mod tests {
             classify_content("⚡PAY|1|abc-123|2100"),
             NotificationKind::Payment
         );
+        assert_eq!(
+            classify_content(
+                "⚡PAYDONE|2|abc-123|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ),
+            NotificationKind::Payment
+        );
+        assert_eq!(
+            classify_content("⚡PAYDONE|1|abc-123"),
+            NotificationKind::Payment
+        );
         assert_eq!(classify_content("hello"), NotificationKind::Message);
     }
 
@@ -281,6 +322,19 @@ mod tests {
         assert_eq!(n.title, "Payment from Alice");
         assert_eq!(n.body, "21,000 sats received from Alice.");
         assert_eq!(n.payment_sats, Some(21_000));
+    }
+
+    #[test]
+    fn paydone_does_not_expose_raw_control_text() {
+        let mut req = input(
+            "⚡PAYDONE|2|abc-123|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+        req.show_preview = true;
+        let n = render_notification(req).unwrap();
+        assert_eq!(n.kind, NotificationKind::Payment);
+        assert_eq!(n.title, "Payment from Alice");
+        assert_eq!(n.body, "Open Sonar to view the payment.");
+        assert_eq!(n.payment_sats, None);
     }
 
     #[test]
