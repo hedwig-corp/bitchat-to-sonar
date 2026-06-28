@@ -109,6 +109,7 @@ object SonarPushRegistration {
             var backoff = 2_000L
             for (attempt in 1..MAX_RETRIES) {
                 try {
+                    SonarCore.start()
                     SonarCore.registerPushToken(
                         platform = "fcm",
                         token = fcmToken.toByteArray(Charsets.UTF_8),
