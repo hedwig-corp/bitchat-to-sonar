@@ -581,7 +581,7 @@ expect object SonarCore {
 
     // ── Push token registration (MIP-05) ──
 
-    /** Encrypt a device push token and publish it to the transponder. */
+    /** Encrypt a device push token to the transponder and share it with peers. */
     suspend fun registerPushToken(platform: String, token: ByteArray, serverNpub: String)
 
     // ── P2P voice calls (iroh transport; ☎CALL rides chat signaling) ──

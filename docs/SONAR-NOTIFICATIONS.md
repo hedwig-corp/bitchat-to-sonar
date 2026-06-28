@@ -89,9 +89,11 @@ Wire the iOS app to both servers. Full guide: [`docs/ios-push-integration.md`](i
       container without destructive migrations.
 - [x] Register for APNS in `AppDelegate`, collect the raw device token.
       `SonarPushRegistration` receives and caches the APNS token.
-- [ ] Implement MIP-05 token encryption: ECDH + HKDF-SHA256
-      (`salt=mip05-v1`, `info=mip05-token-encryption`) + ChaCha20-Poly1305.
-      **Blocked on core FFI** (same as Android).
+- [x] Implement MIP-05 token encryption in Rust core via UniFFI:
+      ECDH + HKDF-SHA256 (`salt=mip05-v1`,
+      `info=mip05-token-encryption`) + ChaCha20-Poly1305. Registration caches
+      the encrypted token and shares it with peers; it does not publish a
+      transponder wakeup request.
 - [x] Register Breez SDK webhook on startup. Added `registerWebhook(url:)`
       and `unregisterWebhook()` to `SonarWallet` and `WalletBridgeService`.
       `SonarPushRegistration` registers the webhook, `SonarAppStore` retries
@@ -130,10 +132,10 @@ Wire the Compose app to both servers. Full guide: [`docs/android-push-integratio
       notifications. Falls back to generic notification on error.
 - [x] Breez wakeup path starts wallet SDK if needed, refreshes balance,
       stays silent (no user-visible notification).
-- [ ] Implement MIP-05 token encryption for transponder registration.
-      **Blocked on core FFI**: needs `SonarNode::register_push_token(token,
-      server_npub)` exposed via UniFFI — the ECDH + NIP-59 gift-wrap is
-      best done in Rust where the Nostr crypto already lives.
+- [x] Implement MIP-05 token encryption for transponder registration through
+      `SonarNode::register_push_token(token, server_npub)`. The Rust core
+      caches the encrypted token and shares it with peers; sender-side wakeups
+      publish `kind:446` requests only when notifying recipients.
 - [x] Push registration disable in settings: "Background push" toggle in
       Compose NotifSheet calls `Notifier.setPushEnabled()` which
       registers/unregisters push tokens via `SonarPushRegistration`.

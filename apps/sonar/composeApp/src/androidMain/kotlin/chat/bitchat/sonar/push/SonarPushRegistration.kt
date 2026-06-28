@@ -16,7 +16,7 @@ import kotlinx.coroutines.launch
 
 /**
  * Registers the device's FCM token with both notification servers:
- *   1. Transponder — MIP-05 encrypted gift wrap (chat/call wakeups)
+ *   1. Transponder — MIP-05 encrypted token shares (chat/call wakeups)
  *   2. Breez NDS — webhook URL (wallet wakeups, silent only)
  */
 object SonarPushRegistration {

@@ -3,7 +3,7 @@
 // bitchat
 //
 // Registers the device's APNS token with both notification servers:
-//   1. Transponder — MIP-05 encrypted gift wrap (chat/call wakeups)
+//   1. Transponder — MIP-05 encrypted token shares (chat/call wakeups)
 //   2. Breez NDS   — webhook URL (wallet wakeups, silent only)
 //
 // This is free and unencumbered software released into the public domain.

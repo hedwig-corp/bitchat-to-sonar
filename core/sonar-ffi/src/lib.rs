@@ -1024,8 +1024,8 @@ impl SonarNode {
 
     // ── Push token registration (MIP-05) ──
 
-    /// Encrypt a device push token and publish it to the transponder via a
-    /// NIP-59 gift-wrapped kind-446 event.
+    /// Encrypt a device push token to the transponder and cache/share it with
+    /// peers. Sender-side wakeups publish kind-446 requests later.
     ///
     /// `platform`: `"apns"` or `"fcm"`.
     /// `token`: raw device token bytes (APNS) or UTF-8 FCM token string.
