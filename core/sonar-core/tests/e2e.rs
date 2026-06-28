@@ -468,6 +468,7 @@ async fn direct_nip17_bitchat_dm_drains_from_account_gift_wraps() {
 
     let inbox = bob.drain_direct_dms();
     assert_eq!(inbox.len(), 1, "bob received one direct DM");
+    assert!(!inbox[0].event_id.is_empty());
     assert_eq!(inbox[0].id, "direct-mid-1");
     assert_eq!(
         inbox[0].sender_pubkey,
@@ -479,8 +480,20 @@ async fn direct_nip17_bitchat_dm_drains_from_account_gift_wraps() {
         .await
         .expect("bob re-sync completes")
         .expect("bob re-syncs");
+    assert_eq!(
+        bob.drain_direct_dms().len(),
+        1,
+        "unacknowledged direct DMs remain retryable until the host persists them"
+    );
+
+    bob.acknowledge_direct_dms(&[inbox[0].event_id.clone()])
+        .expect("ack persisted direct dm");
+    timeout(Duration::from_secs(5), bob.sync())
+        .await
+        .expect("bob post-ack sync completes")
+        .expect("bob post-ack syncs");
     assert!(
         bob.drain_direct_dms().is_empty(),
-        "processed direct DMs are not duplicated by the gift-wrap lookback"
+        "acknowledged direct DMs are not duplicated by the gift-wrap lookback"
     );
 }

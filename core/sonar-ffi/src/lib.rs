@@ -291,6 +291,7 @@ pub struct GeoMessageInfo {
 /// embedded private-message packet.
 #[derive(uniffi::Record)]
 pub struct DirectDmInfo {
+    pub event_id_hex: String,
     pub id_hex: String,
     pub sender_pubkey_hex: String,
     pub content: String,
@@ -1005,6 +1006,13 @@ impl SonarNode {
             .into_iter()
             .map(direct_dm_info)
             .collect()
+    }
+
+    /// Acknowledge direct NIP-17 DMs only after the host persisted or consumed
+    /// the drained records.
+    pub fn acknowledge_direct_dms(&self, event_id_hexes: Vec<String>) -> FfiResult<()> {
+        self.client.acknowledge_direct_dms(&event_id_hexes)?;
+        Ok(())
     }
 
     // ── Push token registration (MIP-05) ──
@@ -1961,6 +1969,7 @@ fn geo_message_info(m: sonar_core::geohash::GeoMessage) -> GeoMessageInfo {
 
 fn direct_dm_info(m: sonar_core::client::DirectDm) -> DirectDmInfo {
     DirectDmInfo {
+        event_id_hex: m.event_id,
         id_hex: m.id,
         sender_pubkey_hex: m.sender_pubkey,
         content: m.content,

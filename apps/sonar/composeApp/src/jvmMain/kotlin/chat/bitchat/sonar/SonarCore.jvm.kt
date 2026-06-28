@@ -421,6 +421,7 @@ actual object SonarCore {
         runCatching {
             n.drainDirectDms().map {
                 SonarDirectDm(
+                    eventId = it.eventIdHex,
                     id = it.idHex,
                     senderPubkeyHex = it.senderPubkeyHex,
                     content = it.content,
@@ -428,6 +429,11 @@ actual object SonarCore {
                 )
             }
         }.getOrDefault(emptyList())
+    }
+
+    actual suspend fun acknowledgeDirectDms(eventIds: List<String>) = withContext(Dispatchers.IO) {
+        val n = node ?: return@withContext
+        n.acknowledgeDirectDms(eventIds)
     }
 
     actual fun nickname(): String = DesktopEnv.getString("nickname", "") ?: ""

@@ -685,8 +685,7 @@ object MeshGatt {
 
     private fun handleFileTransfer(addr: String, packetBytes: ByteArray, info: MeshPacketInfo) {
         val recipient = info.recipientIdHex.lowercase()
-        val broadcast = "ff".repeat(8)
-        if (recipient.isNotEmpty() && recipient != myPeerIdHex && recipient != broadcast) return
+        if (recipient != myPeerIdHex) return
 
         val fp = fingerprintByAddr[addr] ?: peerIdByAddr[addr] ?: return
         val tsMs = packetTimestampMs(packetBytes) ?: System.currentTimeMillis()

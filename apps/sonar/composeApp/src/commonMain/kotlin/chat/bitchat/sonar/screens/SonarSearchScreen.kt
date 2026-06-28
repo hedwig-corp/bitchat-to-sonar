@@ -70,8 +70,8 @@ fun SonarSearchScreen(state: SonarAppState) {
         if (ql.isEmpty()) out
         else out.filter { it.name.lowercase().contains(ql) || it.geohash.lowercase().contains(ql) }
     }
-    val chats: List<SonarChat> = remember(state.chats, query) {
-        if (ql.isEmpty()) state.chats else state.chats.filter { it.name.lowercase().contains(ql) }
+    val chats: List<SonarChat> = remember(state.visibleChats, query) {
+        if (ql.isEmpty()) state.visibleChats else state.visibleChats.filter { it.name.lowercase().contains(ql) }
     }
 
     // An invite link/token pasted (or shared) into search → request to join.

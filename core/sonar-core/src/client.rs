@@ -401,6 +401,7 @@ type GeoDmBuf = Arc<Mutex<HashMap<(String, String), Vec<RawGeoDm>>>>;
 /// identity). The rumor content is a `bitchat1:` embedded private-message
 /// packet, matching iOS plain bitchat fallback.
 struct RawDirectDm {
+    event_id: String,
     id: String,
     sender: PublicKey,
     content: String,
@@ -411,6 +412,7 @@ type DirectDmBuf = Arc<Mutex<Vec<RawDirectDm>>>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DirectDm {
+    pub event_id: String,
     pub id: String,
     pub sender_pubkey: String,
     pub content: String,
@@ -2211,28 +2213,33 @@ impl SonarClient {
                         if let Some(dm) = crate::mesh::decode_nip17_private_message_content(
                             &unwrapped.rumor.content,
                         ) {
+                            let event_id = event.id.to_hex();
                             let mut buf = self.direct_dm.lock().unwrap();
                             if !buf.iter().any(|existing| {
-                                existing.id == dm.message_id && existing.sender == unwrapped.sender
+                                existing.event_id == event_id
+                                    || (existing.id == dm.message_id
+                                        && existing.sender == unwrapped.sender)
                             }) {
                                 if buf.len() >= DIRECT_DM_BUFFER_CAP {
                                     buf.drain(0..DIRECT_DM_BUFFER_CAP / 2);
                                 }
                                 buf.push(RawDirectDm {
+                                    event_id,
                                     id: dm.message_id,
                                     sender: unwrapped.sender,
                                     content: dm.content,
                                     ts: unwrapped.rumor.created_at.as_secs(),
                                 });
                             }
+                            report.record_retryable(event.created_at.as_secs());
                         } else {
                             tracing::debug!(
                                 event_id = %event.id,
                                 "ignoring non-bitchat account-level NIP-17 DM"
                             );
+                            self.mark_sync_event_processed(&event.id);
+                            report.record_processed();
                         }
-                        self.mark_sync_event_processed(&event.id);
-                        report.record_processed();
                         continue;
                     }
                 }
@@ -2798,6 +2805,7 @@ impl SonarClient {
         let mut out: Vec<DirectDm> = std::mem::take(&mut *buf)
             .into_iter()
             .map(|r| DirectDm {
+                event_id: r.event_id,
                 id: r.id,
                 sender_pubkey: r.sender.to_hex(),
                 content: r.content,
@@ -2806,6 +2814,30 @@ impl SonarClient {
             .collect();
         out.sort_by_key(|m| m.created_at);
         out
+    }
+
+    /// Mark account-level direct NIP-17 gift wraps durable after the host has
+    /// persisted or intentionally consumed the drained message.
+    pub fn acknowledge_direct_dms(&self, event_ids: &[String]) -> Result<()> {
+        let ids: HashSet<String> = event_ids
+            .iter()
+            .map(|id| id.trim().to_lowercase())
+            .filter(|id| !id.is_empty())
+            .collect();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        self.direct_dm
+            .lock()
+            .unwrap()
+            .retain(|dm| !ids.contains(&dm.event_id));
+        {
+            let mut state = self.sync_state.lock().unwrap();
+            for id in ids {
+                state.mark_processed_id(id);
+            }
+        }
+        self.save_sync_state()
     }
 
     /// Publish a public message to a geohash channel, signed with this

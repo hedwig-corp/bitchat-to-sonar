@@ -48,6 +48,7 @@ data class SonarMsg(
 
 /** Account-level direct NIP-17 DM decoded from a `bitchat1:` embedded packet. */
 data class SonarDirectDm(
+    val eventId: String,
     val id: String,
     val senderPubkeyHex: String,
     val content: String,
@@ -548,6 +549,7 @@ expect object SonarCore {
         text: String,
     )
     suspend fun drainDirectDms(): List<SonarDirectDm>
+    suspend fun acknowledgeDirectDms(eventIds: List<String>)
 
     // ── Identity / profile (persisted on-device) ──
 
