@@ -10,7 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mdk_core::prelude::*;
 use nostr::prelude::*;
@@ -168,6 +168,8 @@ const SUB_MARMOT_GROUPS: &str = "sonar-marmot-groups";
 /// the shift cost vs dropping one-at-a-time).
 const MARMOT_BUFFER_CAP: usize = 1024;
 const DIRECT_DM_BUFFER_CAP: usize = 1024;
+const LIVE_EVENT_DEDUP_TTL: Duration = Duration::from_secs(60);
+const LIVE_EVENT_DEDUP_CAP: usize = 4096;
 
 /// Minimum number of relays that must be connected before `connect()` returns.
 /// Modeled after whitenoise-rs `min_connected_relays = 2`. A quorum of 2
@@ -210,6 +212,65 @@ const MAX_BACKFILLS_PER_SYNC: usize = 8;
 
 const SYNC_STATE_VERSION: u32 = 1;
 const SYNC_STATE_PROCESSED_EVENT_CAP: usize = 20_000;
+
+#[derive(Debug)]
+struct LiveEventDeduper {
+    ttl: Duration,
+    capacity: usize,
+    seen_at: HashMap<String, Instant>,
+    order: VecDeque<String>,
+}
+
+impl LiveEventDeduper {
+    fn new(ttl: Duration, capacity: usize) -> Self {
+        Self {
+            ttl,
+            capacity: capacity.max(1),
+            seen_at: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn should_accept(&mut self, event_id: &str, now: Instant) -> bool {
+        self.prune_expired(now);
+
+        if self.seen_at.contains_key(event_id) {
+            return false;
+        }
+
+        let event_id = event_id.to_string();
+        self.seen_at.insert(event_id.clone(), now);
+        self.order.push_back(event_id);
+        self.prune_overflow();
+        true
+    }
+
+    fn prune_expired(&mut self, now: Instant) {
+        loop {
+            let Some(event_id) = self.order.front() else {
+                return;
+            };
+            let Some(first_seen) = self.seen_at.get(event_id).copied() else {
+                self.order.pop_front();
+                continue;
+            };
+            if now.duration_since(first_seen) < self.ttl {
+                return;
+            }
+            let event_id = self.order.pop_front().expect("front exists");
+            self.seen_at.remove(&event_id);
+        }
+    }
+
+    fn prune_overflow(&mut self) {
+        while self.seen_at.len() > self.capacity {
+            let Some(event_id) = self.order.pop_front() else {
+                return;
+            };
+            self.seen_at.remove(&event_id);
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct SyncStateDisk {
@@ -657,6 +718,10 @@ impl SonarClient {
         let handler_subs = geo_subscribed.clone();
         let handler_pending = pending_marmot.clone();
         let handler_notify = marmot_notify.clone();
+        let handler_live_dedup = Arc::new(Mutex::new(LiveEventDeduper::new(
+            LIVE_EVENT_DEDUP_TTL,
+            LIVE_EVENT_DEDUP_CAP,
+        )));
         // Our MAIN identity pubkey hex: a kind-1059 with this `p` tag is a Marmot
         // welcome (vs a geohash DM, whose `p` is a per-geohash ephemeral key).
         let my_pubkey_hex = identity.keys().public_key().to_hex();
@@ -679,7 +744,19 @@ impl SonarClient {
                 let RelayPoolNotification::Event { event, .. } = notification else {
                     continue;
                 };
-                match event.kind.as_u16() {
+                let kind = event.kind.as_u16();
+                if !matches!(kind, 20000 | 20001 | 1059 | 445) {
+                    continue;
+                }
+                if !handler_live_dedup
+                    .lock()
+                    .unwrap()
+                    .should_accept(&event.id.to_hex(), Instant::now())
+                {
+                    continue;
+                }
+
+                match kind {
                     20000 => {
                         let Some(geohash) = tag_value(&event, Alphabet::G) else {
                             continue;
@@ -3328,6 +3405,35 @@ mod tests {
         let contents: Vec<&str> = sorted.iter().map(|event| event.content.as_str()).collect();
 
         assert_eq!(contents, ["oldest", "middle", "newer"]);
+    }
+
+    #[test]
+    fn live_event_deduper_suppresses_duplicates_inside_ttl() {
+        let mut deduper = LiveEventDeduper::new(Duration::from_secs(60), 16);
+        let now = Instant::now();
+
+        assert!(deduper.should_accept("evt-1", now));
+        assert!(!deduper.should_accept("evt-1", now + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn live_event_deduper_allows_event_after_ttl() {
+        let mut deduper = LiveEventDeduper::new(Duration::from_secs(5), 16);
+        let now = Instant::now();
+
+        assert!(deduper.should_accept("evt-1", now));
+        assert!(deduper.should_accept("evt-1", now + Duration::from_secs(6)));
+    }
+
+    #[test]
+    fn live_event_deduper_evicts_oldest_entry_at_capacity() {
+        let mut deduper = LiveEventDeduper::new(Duration::from_secs(60), 2);
+        let now = Instant::now();
+
+        assert!(deduper.should_accept("evt-1", now));
+        assert!(deduper.should_accept("evt-2", now));
+        assert!(deduper.should_accept("evt-3", now));
+        assert!(deduper.should_accept("evt-1", now + Duration::from_secs(1)));
     }
 
     #[test]

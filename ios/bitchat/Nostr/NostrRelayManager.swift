@@ -50,6 +50,7 @@ final class NostrRelayManager: ObservableObject {
     private var messageHandlers: [String: (NostrEvent) -> Void] = [:]
     // Coalesce duplicate subscribe requests for the same id within a short window
     private var subscribeCoalesce: [String: Date] = [:]
+    private var eventDispatchDeduper = NostrEventDispatchDeduper()
     private var cancellables = Set<AnyCancellable>()
 
     // Track EOSE per subscription to signal when initial stored events are done
@@ -419,6 +420,7 @@ final class NostrRelayManager: ObservableObject {
         messageHandlers.removeValue(forKey: id)
         // Allow immediate re-subscription by clearing coalescer timestamp
         subscribeCoalesce.removeValue(forKey: id)
+        eventDispatchDeduper.removeSubscription(id)
         
         let req = NostrRequest.close(id: id)
         let message = try? encoder.encode(req)
@@ -569,16 +571,17 @@ final class NostrRelayManager: ObservableObject {
             if let index = self.relays.firstIndex(where: { $0.url == relayUrl }) {
                 self.relays[index].messagesReceived += 1
             }
-            if let handler = self.messageHandlers[subId] {
-                handler(event)
-            } else {
+            guard let handler = self.messageHandlers[subId] else {
                 // subscribe() always registers a handler synchronously, so a missing one
                 // means we already called unsubscribe(id:) and this is an in-flight event
                 // that arrived before the relay processed our CLOSE. Expected and benign
                 // (e.g. a late geohash-sample presence event after we stopped sampling),
                 // so log at debug — not a warning.
                 SecureLogger.debug("Ignoring event for closed subscription \(subId)", category: .session)
+                return
             }
+            guard eventDispatchDeduper.shouldDispatch(subscriptionId: subId, eventId: event.id) else { return }
+            handler(event)
         case .eose(let subId):
             if var tracker = eoseTrackers[subId] {
                 tracker.pendingRelays.remove(relayUrl)
@@ -778,6 +781,80 @@ final class NostrRelayManager: ObservableObject {
             }
         }
         return false
+    }
+}
+
+struct NostrEventDispatchDeduper {
+    private struct Key: Hashable {
+        let subscriptionId: String
+        let eventId: String
+    }
+
+    private let ttl: TimeInterval
+    private let capacity: Int
+    private var seenAt: [Key: Date] = [:]
+    private var order: [Key] = []
+    private var orderHead = 0
+
+    init(ttl: TimeInterval = 60, capacity: Int = 4096) {
+        self.ttl = ttl
+        self.capacity = max(1, capacity)
+    }
+
+    mutating func shouldDispatch(subscriptionId: String, eventId: String, now: Date = Date()) -> Bool {
+        pruneExpired(now: now)
+
+        let key = Key(subscriptionId: subscriptionId, eventId: eventId)
+        if seenAt[key] != nil {
+            return false
+        }
+
+        seenAt[key] = now
+        order.append(key)
+        pruneOverflow()
+        return true
+    }
+
+    mutating func removeSubscription(_ subscriptionId: String) {
+        let removedKeys = seenAt.keys.filter { $0.subscriptionId == subscriptionId }
+        for key in removedKeys {
+            seenAt.removeValue(forKey: key)
+        }
+        compactOrderIfNeeded()
+    }
+
+    private mutating func pruneExpired(now: Date) {
+        while orderHead < order.count {
+            let key = order[orderHead]
+            guard let firstSeen = seenAt[key] else {
+                orderHead += 1
+                continue
+            }
+            guard now.timeIntervalSince(firstSeen) >= ttl else { break }
+            seenAt.removeValue(forKey: key)
+            orderHead += 1
+        }
+        compactOrderIfNeeded()
+    }
+
+    private mutating func pruneOverflow() {
+        while seenAt.count > capacity, orderHead < order.count {
+            let oldest = order[orderHead]
+            orderHead += 1
+            seenAt.removeValue(forKey: oldest)
+        }
+        compactOrderIfNeeded()
+    }
+
+    private mutating func compactOrderIfNeeded() {
+        guard orderHead > 0 else { return }
+        if orderHead == order.count {
+            order.removeAll(keepingCapacity: true)
+            orderHead = 0
+        } else if orderHead > 512 && orderHead * 2 >= order.count {
+            order.removeFirst(orderHead)
+            orderHead = 0
+        }
     }
 }
 
