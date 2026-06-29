@@ -53,6 +53,32 @@ Constraints and gotchas (all detailed in `docs/PERFORMANCE.md`): the build must 
 
 Do not commit payment, wallet, relay, signing, or API secrets. The Breez wallet key must stay in gitignored local configuration (`ios/Configs/Local.xcconfig` with `BREEZ_API_KEY = ...`) or an equivalent CI secret. When creating a new workspace/worktree or rebuilding for device testing, preserve the local secret by recreating/copying the gitignored config or passing the key through the build environment; verify presence without printing the value.
 
+## Account Key Durability Rule
+
+The user's account identity key (`nsec` / `marmot-nsec`) is the app account. It
+also controls wallet restore paths and encrypted chat database continuity, so the
+app must never silently delete, replace, or regenerate it after onboarding.
+
+Identity persistence changes must preserve these invariants on every supported
+surface (`ios/` and `apps/sonar/`):
+
+1. Never use delete-before-add for account keys. Save paths must update existing
+   secrets in place, then add only when the item is genuinely missing.
+2. Never treat keychain/keystore access errors, device-locked states, corrupt
+   stored values, or access-group migration misses as permission to create a new
+   account key after onboarding. Surface a restore/error path instead.
+3. Mark onboarding complete only after the account key has been durably
+   persisted. If persistence fails, keep the user on onboarding and do not set
+   the onboarding flag.
+4. If lightweight prefs such as onboarding flags are lost but a valid local
+   account key still exists, recover the prefs from the key instead of showing a
+   fresh-account path.
+5. Wipe/reset flows must clear every storage location that can contain the
+   account key, including legacy/plain fallback stores and OS-backed keychains.
+
+Any change that can violate these invariants is a blocking correctness bug and
+must be fixed before merge.
+
 ## Push Notifications Build Requirement (Firebase / GoogleService-Info.plist)
 
 Offline wallet/payment wakeups (the Breez NDS push path) require the Firebase

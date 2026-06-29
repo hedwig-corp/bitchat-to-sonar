@@ -220,22 +220,25 @@ final class KeychainManager: KeychainManagerProtocol {
             kSecMatchLimit as String: kSecMatchLimitOne
         ]
 
-        var result: AnyObject?
-        func attempt(withAccessGroup: Bool) -> OSStatus {
+        func attempt(withAccessGroup: Bool) -> (OSStatus, Data?) {
+            var result: AnyObject?
             var q = base
             if withAccessGroup { q[kSecAttrAccessGroup as String] = appGroup }
-            return SecItemCopyMatching(q as CFDictionary, &result)
+            let status = SecItemCopyMatching(q as CFDictionary, &result)
+            return (status, result as? Data)
         }
 
         #if os(iOS)
-        var status = attempt(withAccessGroup: true)
-        if status == -34018 { status = attempt(withAccessGroup: false) }
+        var (status, data) = attempt(withAccessGroup: true)
+        if status == -34018 || status == errSecItemNotFound {
+            (status, data) = attempt(withAccessGroup: false)
+        }
         #else
-        let status = attempt(withAccessGroup: false)
+        let (status, data) = attempt(withAccessGroup: false)
         #endif
 
         // Classify the result
-        let readResult = classifyReadStatus(status, data: result as? Data)
+        let readResult = classifyReadStatus(status, data: data)
 
         // Log all outcomes consistently
         switch readResult {
@@ -334,21 +337,24 @@ final class KeychainManager: KeychainManagerProtocol {
             kSecMatchLimit as String: kSecMatchLimitOne
         ]
 
-        var result: AnyObject?
-        func attempt(withAccessGroup: Bool) -> OSStatus {
+        func attempt(withAccessGroup: Bool) -> (OSStatus, Data?) {
+            var result: AnyObject?
             var q = base
             if withAccessGroup { q[kSecAttrAccessGroup as String] = appGroup }
-            return SecItemCopyMatching(q as CFDictionary, &result)
+            let status = SecItemCopyMatching(q as CFDictionary, &result)
+            return (status, result as? Data)
         }
 
         #if os(iOS)
-        var status = attempt(withAccessGroup: true)
-        if status == -34018 { status = attempt(withAccessGroup: false) }
+        var (status, data) = attempt(withAccessGroup: true)
+        if status == -34018 || status == errSecItemNotFound {
+            (status, data) = attempt(withAccessGroup: false)
+        }
         #else
-        let status = attempt(withAccessGroup: false)
+        let (status, data) = attempt(withAccessGroup: false)
         #endif
 
-        if status == errSecSuccess { return result as? Data }
+        if status == errSecSuccess { return data }
         if status == -34018 {
             SecureLogger.error(NSError(domain: "Keychain", code: -34018), context: "Missing keychain entitlement", category: .keychain)
         }
@@ -370,12 +376,15 @@ final class KeychainManager: KeychainManagerProtocol {
         }
 
         #if os(iOS)
-        var status = attempt(withAccessGroup: true)
-        if status == -34018 { status = attempt(withAccessGroup: false) }
+        let groupedStatus = attempt(withAccessGroup: true)
+        let plainStatus = attempt(withAccessGroup: false)
+        let groupedOK = groupedStatus == errSecSuccess || groupedStatus == errSecItemNotFound || groupedStatus == -34018
+        let plainOK = plainStatus == errSecSuccess || plainStatus == errSecItemNotFound
+        return groupedOK && plainOK
         #else
         let status = attempt(withAccessGroup: false)
-        #endif
         return status == errSecSuccess || status == errSecItemNotFound
+        #endif
     }
     
     // MARK: - Cleanup
