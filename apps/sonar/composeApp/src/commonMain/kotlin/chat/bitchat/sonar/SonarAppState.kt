@@ -39,6 +39,7 @@ private const val GROUP_FOLDS_BLOB_KEY = "sonar.groupFolds"
 private const val FAVORITED_CONTROL = "[FAVORITED]"
 private const val UNFAVORITED_CONTROL = "[UNFAVORITED]"
 private const val MESH_MEDIA_URL_PREFIX = "mesh-media:"
+private const val PENDING_MARMOT_CHAT_PREFIX = "npub:"
 internal const val BLE_DISCOVER_NEW_PEOPLE_PREF = "bleDiscoverNewPeople"
 
 internal fun shortNpubLabel(value: String): String =
@@ -212,6 +213,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     var chats by mutableStateOf<List<SonarChat>>(initialChatSnapshot.first)
         private set
     private var chatSnapshotMessagesByChat: Map<String, List<SonarMsg>> = initialChatSnapshot.second
+    private var pendingMarmotChatNpubs by mutableStateOf<Map<String, String>>(emptyMap())
     var groupInvites by mutableStateOf<List<SonarGroupInvite>>(emptyList())
         private set
     private val pendingInviteTokens = mutableListOf<String>()
@@ -279,11 +281,13 @@ class SonarAppState(private val scope: CoroutineScope) {
             rawMeshPeerIds = emptySet(); meshPeerFirstSeenMs.clear(); pendingCapabilityRefreshPeers.clear()
             profilesByNpub = emptyMap(); profileFetches.clear()
             socialState = SonarSocialState(); persistSocialState()
+            pendingMarmotChatNpubs = emptyMap()
+            pendingDirectMarmotSends.clear()
             outbox.clear()
             MessageStore.wipe()
             SonarCore.wipe()
             stack = listOf(Screen.Home)
-            chats = emptyList(); chatSnapshotMessagesByChat = emptyMap(); groupInvites = emptyList(); messages = emptyList()
+            chats = emptyList(); chatSnapshotMessagesByChat = emptyMap(); pendingMarmotChatNpubs = emptyMap(); groupInvites = emptyList(); messages = emptyList()
             clearChatSnapshot()
             onboarded = false; nick = ""; npub = ""; started = false
             walletState = WalletState.NotConfigured
@@ -315,14 +319,15 @@ class SonarAppState(private val scope: CoroutineScope) {
             // Local transcripts on disk (mesh DMs, channels, geo DMs).
             MessageStore.wipe()
             // In-memory conversation state.
-            meshChats.clear(); meshChatNames.clear(); pendingMarmotSends.clear(); outbox.clear()
+            meshChats.clear(); meshChatNames.clear(); pendingMarmotSends.clear(); pendingDirectMarmotSends.clear(); outbox.clear()
+            pendingMarmotChatNpubs = emptyMap()
             linkByFp.clear(); linkCapsByFp.clear(); groupFoldMap.clear()
             persistLinks(); persistLinkCaps(); persistGroupFolds()
             profilesByNpub = emptyMap(); profileFetches.clear(); persistProfileCache()
             foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
             meshBroadcast = emptyList(); meshDmRows = emptyList()
             updateBleDiscoveryPolicy()
-            messages = emptyList(); channelMsgs = emptyList(); chats = emptyList(); clearChatSnapshot()
+            messages = emptyList(); channelMsgs = emptyList(); chats = emptyList(); pendingMarmotChatNpubs = emptyMap(); clearChatSnapshot()
             lastWnGroups = -1; lastWnMsgs = -1
             // ⚡PAY coins live inside the erased chats — reset the ledger. The
             // Lightning wallet seed/balance is separate and is NOT touched.
@@ -789,11 +794,35 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** White Noise chats to render on their own row: every Marmot group EXCEPT the
      *  ones folded into a mesh DM. The Messages list uses this instead of [chats]. */
     val visibleChats: List<SonarChat> get() =
-        chats.filterNot {
+        pendingMarmotChats() + chats.filterNot {
             it.id in foldedGroupIds ||
                 shouldHoldStandaloneMarmotChat(it) ||
                 isBlockedMarmotChat(it)
         }
+
+    private fun pendingMarmotChats(): List<SonarChat> =
+        pendingMarmotChatNpubs.mapNotNull { (id, peerNpub) ->
+            val npubHex = canonicalNpubHex(peerNpub) ?: return@mapNotNull null
+            if (marmotGroupForNpub(npubHex.hexToBytesOrEmpty()) != null) return@mapNotNull null
+            if (socialState.isBlockedNostr(npubHex)) return@mapNotNull null
+            SonarChat(id = id, name = "", members = listOf(npub, peerNpub))
+        }
+
+    private fun pendingMarmotChatId(peer: String): String? {
+        val clean = canonicalProfileKey(peer)
+        return if (canonicalNpubHex(clean) != null) PENDING_MARMOT_CHAT_PREFIX + clean else null
+    }
+
+    private fun pendingMarmotNpub(chatId: String): String? =
+        chatId.takeIf { it.startsWith(PENDING_MARMOT_CHAT_PREFIX) }
+            ?.drop(PENDING_MARMOT_CHAT_PREFIX.length)
+            ?.takeIf { canonicalNpubHex(it) != null }
+
+    private fun isPendingMarmotChat(chatId: String): Boolean =
+        pendingMarmotNpub(chatId) != null
+
+    fun isPendingSecureChat(chatId: String): Boolean =
+        isPendingMarmotChat(chatId)
 
     private fun persistSocialState() {
         SonarCore.saveBlob(SOCIAL_STATE_BLOB_KEY, encodeSonarSocialState(socialState))
@@ -991,6 +1020,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
 
     private fun socialNpubHexForChat(chatId: String): String? {
+        pendingMarmotNpub(chatId)?.let { pending ->
+            canonicalNpubHex(pending)?.let { return it }
+        }
         val peerId = socialPeerIdForChat(chatId)
         if (peerId != null) npubRawFor(peerId)?.toHexLower()?.let { return it }
         marmotChatPeerNpubHex(chatId)?.let { return it }
@@ -1029,7 +1061,8 @@ class SonarAppState(private val scope: CoroutineScope) {
         otherMembers(chat).size == 1
 
     fun isMultiMemberChat(chatId: String): Boolean =
-        chats.firstOrNull { it.id == chatId }?.let { !isDirectMarmotChat(it) } == true
+        if (isPendingMarmotChat(chatId)) false
+        else chats.firstOrNull { it.id == chatId }?.let { !isDirectMarmotChat(it) } == true
 
     fun hasDirectPaymentRoute(chatId: String): Boolean {
         if (directPaymentOffer(chatId) != null) return true
@@ -1596,7 +1629,15 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
-    var onboarded by mutableStateOf(SonarCore.onboardingComplete())
+    private fun initialOnboardingComplete(): Boolean {
+        val stored = SonarCore.onboardingComplete()
+        if (stored) return true
+        if (!SonarCore.hasIdentity()) return false
+        SonarCore.setOnboardingComplete(true)
+        return true
+    }
+
+    var onboarded by mutableStateOf(initialOnboardingComplete())
         private set
     var nick by mutableStateOf(SonarCore.nickname())
         private set
@@ -1681,7 +1722,8 @@ class SonarAppState(private val scope: CoroutineScope) {
                 resetCallState()
 
                 MessageStore.wipe()
-                meshChats.clear(); meshChatNames.clear(); pendingMarmotSends.clear(); outbox.clear()
+                meshChats.clear(); meshChatNames.clear(); pendingMarmotSends.clear(); pendingDirectMarmotSends.clear(); outbox.clear()
+                pendingMarmotChatNpubs = emptyMap()
                 linkByFp.clear(); linkCapsByFp.clear(); groupFoldMap.clear()
                 persistLinks(); persistLinkCaps(); persistGroupFolds()
                 updateBleDiscoveryPolicy()
@@ -1690,7 +1732,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 sonarDescriptorsByNpubHex = emptyMap()
                 sonarDescriptorFetches.clear(); sonarDescriptorFetchedAt.clear(); sonarDescriptorMissedAt.clear()
                 meshBroadcast = emptyList(); meshDmRows = emptyList()
-                chats = emptyList(); messages = emptyList(); channelMsgs = emptyList()
+                chats = emptyList(); pendingMarmotChatNpubs = emptyMap(); messages = emptyList(); channelMsgs = emptyList()
                 lastWnGroups = -1; lastWnMsgs = -1
                 payLedger = SonarPayLedger(); persistPay(); payVersion++
                 mediaCache.clear(); stickerPackCache.clear(); stickerImageCache.clear(); installedPackCoordinates.clear()
@@ -1989,6 +2031,11 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  is blank, so fall back to the counterpart's short npub — never an empty
      *  title. Mirrors iOS `MarmotChatModel.title(for:)`. */
     fun chatTitle(chat: SonarChat): String {
+        pendingMarmotNpub(chat.id)?.let { pending ->
+            profilesByNpub[canonicalProfileKey(pending)]?.bestName?.let { return it }
+            ensureProfile(pending)
+            return shortNpub(pending)
+        }
         if (chat.name.isNotBlank()) return chat.name
         val others = otherMembers(chat)
         if (others.size != 1) return "Group chat"
@@ -2110,6 +2157,13 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun openChat(chat: SonarChat) {
         push(Screen.Chat(chat.id, chatTitle(chat)))
+        pendingMarmotNpub(chat.id)?.let { pendingNpub ->
+            messages = visibleMessagesForChat(chat.id, withSendEchoes(chat.id, emptyList()))
+            ensureProfile(pendingNpub)
+            ensureSonarDescriptor(pendingNpub)
+            startPendingMarmotChat(pendingNpub, chat.id)
+            return
+        }
         unreadByChat = unreadByChat - chat.id
         scope.launch {
             runCatching { SonarCore.markConversationRead(chat.id) }
@@ -2231,6 +2285,22 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun startChat(peer: String) {
         val p = peer.trim()
         if (p.isEmpty()) return
+        val pendingId = pendingMarmotChatId(p)
+        val canonicalPeer = canonicalProfileKey(p)
+        val npubHex = canonicalNpubHex(canonicalPeer)
+        if (pendingId != null && npubHex != null) {
+            marmotGroupForNpub(npubHex.hexToBytesOrEmpty())?.let { existing ->
+                openChat(existing)
+                return
+            }
+            pendingMarmotChatNpubs = pendingMarmotChatNpubs + (pendingId to canonicalPeer)
+            ensureProfile(canonicalPeer)
+            ensureSonarDescriptor(canonicalPeer)
+            push(Screen.Chat(pendingId, profilesByNpub[canonicalProfileKey(canonicalPeer)]?.bestName ?: shortNpub(canonicalPeer)))
+            messages = visibleMessagesForChat(pendingId, withSendEchoes(pendingId, emptyList()))
+            startPendingMarmotChat(canonicalPeer, pendingId)
+            return
+        }
         scope.launch {
             try {
                 val chatId = SonarCore.startChat(p)
@@ -2245,6 +2315,75 @@ class SonarAppState(private val scope: CoroutineScope) {
             } catch (t: Throwable) {
                 toast = "couldn't start: ${t.message}"
             }
+        }
+    }
+
+    private fun startPendingMarmotChat(peerNpub: String, pendingChatId: String) {
+        val canonicalPeer = canonicalProfileKey(peerNpub)
+        val npubHex = canonicalNpubHex(canonicalPeer) ?: return
+        pendingMarmotChatNpubs = pendingMarmotChatNpubs + (pendingChatId to canonicalPeer)
+        marmotGroupForNpub(npubHex.hexToBytesOrEmpty())?.let { existing ->
+            scope.launch { finishPendingMarmotChat(npubHex, canonicalPeer, pendingChatId, existing.id) }
+            return
+        }
+        if (!startingMarmotChats.add(npubHex)) return
+        scope.launch {
+            try {
+                val chatId = SonarCore.startChat(npubHex)
+                finishPendingMarmotChat(npubHex, canonicalPeer, pendingChatId, chatId)
+            } catch (t: Throwable) {
+                toast = "couldn't start secure chat: ${t.message}"
+            } finally {
+                startingMarmotChats.remove(npubHex)
+            }
+        }
+    }
+
+    private suspend fun finishPendingMarmotChat(
+        npubHex: String,
+        peerNpub: String,
+        pendingChatId: String,
+        chatId: String,
+    ) {
+        refreshChats()
+        val chat = chats.firstOrNull { it.id == chatId }
+            ?: SonarChat(id = chatId, name = "", members = listOf(npub, peerNpub))
+        pendingMarmotChatNpubs = pendingMarmotChatNpubs - pendingChatId
+        moveSendEchoes(pendingChatId, chatId)
+        stack = stack.map { screen ->
+            if (screen is Screen.Chat && screen.id == pendingChatId) {
+                screen.copy(id = chatId, name = chatTitle(chat))
+            } else {
+                screen
+            }
+        }
+        flushPendingDirectMarmot(npubHex, chatId)
+        val openChatId = (screen as? Screen.Chat)?.id
+        if (openChatId == chatId) {
+            messages = visibleMessagesForChat(chatId, withSendEchoes(chatId, mergePendingMediaUploads(chatId, marmotMessagesPage(chatId))))
+            processPayLines(chatId, messages)
+            processCallLines(chatId, messages)
+        }
+    }
+
+    private fun sendPendingMarmotChat(chatId: String, peerNpub: String, text: String) {
+        val npubHex = canonicalNpubHex(peerNpub) ?: return
+        val echo = createSendEcho(chatId, text)
+        messages = (messages + echo).sortedBy { it.tsSecs }
+        pendingDirectMarmotSends.getOrPut(npubHex) { mutableListOf() }
+            .add(PendingDirectMarmotSend(chatId, text, echo.id))
+        startPendingMarmotChat(peerNpub, chatId)
+    }
+
+    private suspend fun flushPendingDirectMarmot(npubHex: String, chatId: String) {
+        val queued = pendingDirectMarmotSends.remove(npubHex).orEmpty()
+        for (send in queued) {
+            runCatching { SonarCore.send(chatId, send.text) }
+                .onSuccess { clearSendEcho(chatId, send.echoId) }
+                .onFailure {
+                    failSendEcho(chatId, send.echoId)
+                    toast = "send failed: ${it.message}"
+                }
         }
     }
 
@@ -2530,6 +2669,10 @@ class SonarAppState(private val scope: CoroutineScope) {
             return
         }
         if (isMeshChat(chatId)) { sendDmAuto(meshPeerId(chatId), t); return }
+        pendingMarmotNpub(chatId)?.let { pendingNpub ->
+            sendPendingMarmotChat(chatId, pendingNpub, t)
+            return
+        }
         val echo = createSendEcho(chatId, t)
         messages = (messages + echo).sortedBy { it.tsSecs }
         scope.launch {
@@ -2578,6 +2721,12 @@ class SonarAppState(private val scope: CoroutineScope) {
         val idx = list.indexOfFirst { it.id == echoId }
         if (idx >= 0) list[idx] = list[idx].copy(state = "Couldn't send")
         messages = messages.map { if (it.id == echoId) it.copy(state = "Couldn't send") else it }
+    }
+
+    private fun moveSendEchoes(fromChatId: String, toChatId: String) {
+        val moving = pendingSendEchoes.remove(fromChatId).orEmpty()
+        if (moving.isEmpty()) return
+        pendingSendEchoes.getOrPut(toChatId) { mutableListOf() }.addAll(moving)
     }
 
     private fun withSendEchoes(chatId: String, published: List<SonarMsg>): List<SonarMsg> {
@@ -3354,6 +3503,12 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  [flushPendingMarmot] once the group appears in [chats]. */
     private val pendingMarmotSends = mutableMapOf<String, MutableList<String>>()
     private val startingMarmotChats = mutableSetOf<String>()
+    private data class PendingDirectMarmotSend(
+        val pendingChatId: String,
+        val text: String,
+        val echoId: String,
+    )
+    private val pendingDirectMarmotSends = mutableMapOf<String, MutableList<PendingDirectMarmotSend>>()
 
     // ── Outbox: per-peer message queue for offline/unreachable peers ──
     // Mirrors iOS MessageRouter outbox. When neither BLE mesh link nor npub is

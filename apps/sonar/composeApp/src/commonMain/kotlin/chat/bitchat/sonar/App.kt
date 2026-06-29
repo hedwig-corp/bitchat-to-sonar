@@ -141,7 +141,9 @@ fun App() {
         SonarLifecycle.installInviteLinkHandler { state.requestJoinViaLink(it) }
         SonarLifecycle.installSharedTextHandler { state.handleSharedText(it) }
     }
-    LaunchedEffect(Unit) { state.boot() }
+    LaunchedEffect(state.onboarded) {
+        if (state.onboarded) state.boot()
+    }
     SonarTheme(dark = state.dark) {
         val s = sonar
 
@@ -282,12 +284,15 @@ private fun HomeScreen(state: SonarAppState) {
                 }
                 items(state.visibleChats, key = { it.id }) { chat ->
                     val chatTitle = state.chatTitle(chat)
+                    val pending = state.isPendingSecureChat(chat.id)
                     ConvRow(
                         avatar = { SonarAvatar(chatTitle, 52.dp, presence = false) },
-                        title = chatTitle, sub = "Tap to open", lock = true,
+                        title = chatTitle, sub = if (pending) "Setting up secure chat…" else "Tap to open", lock = true,
                         verified = state.isVerified(chat.id),
                         unread = (state.unreadByChat[chat.id] ?: 0) > 0,
-                        onLongClick = { pendingDelete = DeleteTarget(chat.id, chatTitle, isMesh = false, isGroup = state.isMultiMemberChat(chat.id)) },
+                        onLongClick = if (pending) null else {
+                            { pendingDelete = DeleteTarget(chat.id, chatTitle, isMesh = false, isGroup = state.isMultiMemberChat(chat.id)) }
+                        },
                     ) { state.openChat(chat) }
                 }
             }

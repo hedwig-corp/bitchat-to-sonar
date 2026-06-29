@@ -222,8 +222,10 @@ struct SonarHomeScreen: View {
                         sub: { SNLockedPreview(preview: d.preview) }
                     )
                     .contextMenu {
-                        Button(role: .destructive) { pendingDelete = d } label: {
-                            Label(store.isMultiMemberMarmotGroupId(d.id) ? "Leave group" : "Delete chat", systemImage: "trash")
+                        if !store.isPendingSecureChat(d.id) {
+                            Button(role: .destructive) { pendingDelete = d } label: {
+                                Label(store.isMultiMemberMarmotGroupId(d.id) ? "Leave group" : "Delete chat", systemImage: "trash")
+                            }
                         }
                     }
                 }

@@ -457,6 +457,10 @@ actual object SonarCore {
 
     actual fun identityNsec(): String = AndroidSecrets.getMigrating("nsec") ?: ""
 
+    actual fun hasIdentity(): Boolean =
+        runCatching { AndroidSecrets.getMigrating("nsec")?.trim()?.startsWith("nsec1") == true }
+            .getOrDefault(false)
+
     actual suspend fun importIdentity(nsec: String): String = withContext(Dispatchers.IO) {
         val identity = SonarIdentity.import(nsec.trim())
         lock.withLock {
@@ -586,7 +590,7 @@ actual object SonarCore {
     private fun loadOrCreateIdentity(): SonarIdentity {
         val saved = AndroidSecrets.getMigrating("nsec")
         if (saved != null) {
-            runCatching { return SonarIdentity.import(saved) }
+            return SonarIdentity.import(saved)
         }
         val id = SonarIdentity.generate()
         AndroidSecrets.put("nsec", id.nsec())

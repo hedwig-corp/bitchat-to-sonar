@@ -464,6 +464,10 @@ actual object SonarCore {
 
     actual fun identityNsec(): String = DesktopSecrets.get("nsec") ?: ""
 
+    actual fun hasIdentity(): Boolean =
+        runCatching { DesktopSecrets.get("nsec")?.trim()?.startsWith("nsec1") == true }
+            .getOrDefault(false)
+
     actual suspend fun importIdentity(nsec: String): String = withContext(Dispatchers.IO) {
         SonarNativeLoader.ensureLoaded()
         val identity = SonarIdentity.import(nsec.trim())
@@ -500,6 +504,7 @@ actual object SonarCore {
             node = null
             npub = ""; pubkeyHex = ""
             marmotDir().deleteRecursively()
+            DesktopSecrets.clear("nsec", "dbKeyHex")
             DesktopEnv.clear()
         }
     }
@@ -531,7 +536,7 @@ actual object SonarCore {
         // plaintext nsec in transparently.
         val saved = DesktopSecrets.get("nsec")
         if (saved != null) {
-            runCatching { return SonarIdentity.import(saved) }
+            return SonarIdentity.import(saved)
         }
         val id = SonarIdentity.generate()
         DesktopSecrets.put("nsec", id.nsec())

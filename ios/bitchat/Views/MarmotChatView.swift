@@ -153,6 +153,7 @@ final class MarmotChatModel: ObservableObject {
     var profileNameProvider: (() -> String)?
     @Published var groups: [MarmotService.MarmotGroup] = []
     @Published var pendingGroupInvites: [MarmotService.GroupInvite] = []
+    @Published var pendingDirectChats: [String: Date] = [:]
     @Published var messagesByGroup: [String: [MarmotService.MarmotMessage]] = [:]
     @Published var busy = false
     @Published var errorText: String?
@@ -237,17 +238,26 @@ final class MarmotChatModel: ObservableObject {
             }
     }
 
-    /// Connect on first appearance: reuse the keychain identity if present,
-    /// otherwise generate one and persist it. Publishes our KeyPackage so
-    /// White Noise users can start chats with us. Lazy + idempotent: no-op once
-    /// connected (npub set) or while a connect is already in flight (busy).
-    func connectIfNeeded() {
+    /// Connect on first appearance: reuse the keychain identity if present.
+    /// A fresh identity may be created only by explicit onboarding completion.
+    /// Publishes our KeyPackage so White Noise users can start chats with us.
+    /// Lazy + idempotent: no-op once connected (npub set) or while a connect is
+    /// already in flight (busy).
+    func connectIfNeeded(allowCreateIdentity: Bool = false) {
         guard npub == nil, !busy else { return }
         busy = true
         Task {
             defer { busy = false }
-            await performConnect()
+            _ = await performConnect(allowCreateIdentity: allowCreateIdentity)
         }
+    }
+
+    func prepareIdentityForOnboarding() async -> Bool {
+        if npub != nil || service.isConnected() { return true }
+        guard !busy else { return false }
+        busy = true
+        defer { busy = false }
+        return await performConnect(allowCreateIdentity: true)
     }
 
     /// The actual connect sequence (awaitable, NOT guarded). Reuse the keychain
@@ -256,12 +266,11 @@ final class MarmotChatModel: ObservableObject {
     /// `connectIfNeeded()` and the erase-and-reconnect path —
     /// the latter must NOT be blocked by the `busy`/`npub` guard, which would
     /// silently leave the node disconnected ("not connected yet" until restart).
-    private func performConnect() async {
-        // Read the persisted nsec SAFELY: only a genuine .itemNotFound means
-        // "no identity yet" (→ generate). On a transient read failure (e.g.
-        // device LOCKED during a background BLE wake) do NOT generate — that
-        // would overwrite the existing nsec and orphan its derived wallet +
-        // chat DB forever. Defer instead; setup retries once accessible (#13).
+    private func performConnect(allowCreateIdentity: Bool = false) async -> Bool {
+        // Read the persisted nsec SAFELY: transient read failures (e.g. device
+        // LOCKED during a background BLE wake) must never generate a replacement
+        // key. Even a genuine miss only creates a key during explicit onboarding.
+        // Otherwise setup retries once the existing key is accessible (#13).
         var storedNsec: String?
         #if DEBUG
         let benchNsec = ProcessInfo.processInfo.environment["SONAR_BENCH_NSEC"]
@@ -285,21 +294,44 @@ final class MarmotChatModel: ObservableObject {
                 // AfterFirstUnlockThisDeviceOnly (this read just succeeded).
                 if let s = storedNsec { _ = keychain.saveIdentityKey(Data(s.utf8), forKey: Self.nsecKeychainKey) }
             case .itemNotFound:
+                guard allowCreateIdentity else {
+                    SecureLogger.warning("⚠️ marmot-nsec missing after onboarding — refusing to create a replacement identity", category: .session)
+                    self.errorText = "Account key missing. Restore from your backup key."
+                    return false
+                }
                 storedNsec = nil
             case .accessDenied, .deviceLocked, .authenticationFailed, .otherError:
                 SecureLogger.warning("⚠️ marmot-nsec not readable yet (device locked?) — deferring identity", category: .session)
-                return
+                return false
             }
         }
         // 1) Publish our npub IMMEDIATELY — the identity pubkey is offline-
         //    derivable, so Sonar discovery (0x53) can advertise it without
         //    waiting on (or being blocked by) the relay connect. Persist a
         //    freshly-generated nsec so `connect` below reuses the same identity.
-        if let np = try? await service.loadIdentityNpub(nsec: storedNsec) {
-            if storedNsec == nil, let fresh = await service.exportNsec() {
-                _ = keychain.saveIdentityKey(Data(fresh.utf8), forKey: Self.nsecKeychainKey)
+        do {
+            let np = try await service.loadIdentityNpub(nsec: storedNsec)
+            if storedNsec == nil {
+                guard let fresh = await service.exportNsec() else {
+                    self.errorText = "Couldn't create account key. Try again."
+                    SecureLogger.error("Generated identity could not export marmot-nsec", category: .keychain)
+                    self.npub = nil
+                    return false
+                }
+                guard keychain.saveIdentityKey(Data(fresh.utf8), forKey: Self.nsecKeychainKey) else {
+                    self.errorText = "Couldn't save account key. Try again."
+                    SecureLogger.error("Failed to persist newly generated marmot-nsec", category: .keychain)
+                    self.npub = nil
+                    return false
+                }
+                storedNsec = fresh
             }
             self.npub = np
+        } catch {
+            let desc = Self.describe(error)
+            SecureLogger.warning("⚠️ Marmot identity load failed: \(desc)", category: .session)
+            self.errorText = desc
+            return false
         }
         // 2) Open the encrypted DB with no relays first → load LOCAL chats right
         //    away → then attach real relays in the background. A relay publish
@@ -315,10 +347,12 @@ final class MarmotChatModel: ObservableObject {
             #endif
             self.errorText = nil
             scheduleStartupLocalSummariesThenRelay()
+            return true
         } catch {
             let desc = Self.describe(error)
             SecureLogger.warning("⚠️ Marmot local open failed: \(desc)", category: .session)
             self.errorText = desc
+            return false
         }
     }
 
@@ -336,13 +370,17 @@ final class MarmotChatModel: ObservableObject {
         // Validate by importing — throws on a malformed/!nsec key, so we never
         // persist garbage over a (possibly existing) identity.
         _ = try await service.loadIdentityNpub(nsec: nsec)
-        _ = keychain.saveIdentityKey(Data(nsec.utf8), forKey: Self.nsecKeychainKey)
+        guard keychain.saveIdentityKey(Data(nsec.utf8), forKey: Self.nsecKeychainKey) else {
+            throw MarmotService.ServiceError.core("failed to persist restored identity")
+        }
         // Drive the full connect sequence directly (performConnect reads the
         // nsec we just persisted); guard concurrent connectIfNeeded with busy.
         busy = true
         defer { busy = false }
         npub = nil
-        await performConnect()
+        guard await performConnect() else {
+            throw MarmotService.ServiceError.core(errorText ?? "failed to connect restored identity")
+        }
     }
 
     /// Await until the Marmot node is connected (or a short timeout), kicking
@@ -527,6 +565,7 @@ final class MarmotChatModel: ObservableObject {
             let groups = try await service.groups()
             let invites = try await service.pendingGroupInvites()
             self.groups = groups
+            dropResolvedPendingDirectChats()
             self.pendingGroupInvites = invites
             SNMarmotChatSnapshotCache.save(
                 groups: groups,
@@ -552,6 +591,7 @@ final class MarmotChatModel: ObservableObject {
             var byGroup = messagesByGroup
             byGroup[groupId] = page
             self.groups = groups
+            dropResolvedPendingDirectChats()
             self.pendingGroupInvites = invites
             self.messagesByGroup = reconcileOptimistic(into: byGroup)
             SNMarmotChatSnapshotCache.save(
@@ -599,6 +639,7 @@ final class MarmotChatModel: ObservableObject {
             }
             self.unreadByGroup = unread
             self.groups = groups
+            dropResolvedPendingDirectChats()
             self.pendingGroupInvites = invites
             self.messagesByGroup = reconcileOptimistic(into: byGroup)
             SNMarmotChatSnapshotCache.save(
@@ -864,15 +905,25 @@ final class MarmotChatModel: ObservableObject {
     func startChat(with peer: String) {
         let trimmed = peer.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        ensureSonarDescriptor(trimmed)
+        let clean = SNMarmotProfileCache.canonicalKey(trimmed)
+        guard !clean.isEmpty else { return }
+        if directGroup(forNpub: clean) != nil { return }
+        pendingDirectChats[clean] = pendingDirectChats[clean] ?? Date()
+        ensureProfile(clean)
+        ensureSonarDescriptor(clean)
         Task {
-            _ = await startChatReturningId(with: trimmed)
+            if await startChatReturningId(with: clean) != nil {
+                pendingDirectChats[clean] = nil
+            }
         }
     }
 
     func startChatReturningId(with peer: String) async -> String? {
         let trimmed = peer.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
+        if let existing = directGroup(forNpub: trimmed) {
+            return existing.id
+        }
         guard await ensureRelayConnected() else {
             self.errorText = "Not connected yet — try again in a moment."
             return nil
@@ -893,6 +944,7 @@ final class MarmotChatModel: ObservableObject {
     func send(_ text: String, to groupId: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        errorText = nil
         let echo = MarmotService.MarmotMessage(
             id: Self.optimisticIDPrefix + UUID().uuidString,
             senderNpub: npub ?? "",
@@ -932,6 +984,7 @@ final class MarmotChatModel: ObservableObject {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
         guard !trimmed.isEmpty else { return true }
+        errorText = nil
         for text in trimmed {
             send(text, to: groupId)
         }
@@ -1324,9 +1377,9 @@ final class MarmotChatModel: ObservableObject {
         // Await a FORCED reconnect (not `connectIfNeeded()`, whose busy/npub
         // guard could silently skip it and leave the node "not connected yet").
         busy = true
-        await performConnect()
+        let connected = await performConnect()
         busy = false
-        if wasPolling { startPolling() }
+        if wasPolling && connected { startPolling() }
     }
 
     /// Short label for a 1:1 group: the other member's npub prefix.
@@ -1352,6 +1405,21 @@ final class MarmotChatModel: ObservableObject {
 
     func isDirectGroup(_ group: MarmotService.MarmotGroup) -> Bool {
         otherMembers(in: group).count == 1
+    }
+
+    func directGroup(forNpub peerNpub: String) -> MarmotService.MarmotGroup? {
+        let target = SNMarmotProfileCache.canonicalKey(peerNpub)
+        return groups.first {
+            isDirectGroup($0) &&
+                $0.memberNpubs.map(SNMarmotProfileCache.canonicalKey).contains(target)
+        }
+    }
+
+    private func dropResolvedPendingDirectChats() {
+        guard !pendingDirectChats.isEmpty else { return }
+        for npub in pendingDirectChats.keys where directGroup(forNpub: npub) != nil {
+            pendingDirectChats[npub] = nil
+        }
     }
 
     func startGroup(name: String, members: [String]) async throws -> String {
@@ -1531,7 +1599,7 @@ struct MarmotChatsView: View {
 
     private var chatList: some View {
         Group {
-            if model.groups.isEmpty {
+            if model.groups.isEmpty && model.pendingDirectChats.isEmpty {
                 VStack(spacing: 6) {
                     Image(systemName: "lock.shield")
                         .font(.system(size: 26))
@@ -1551,25 +1619,45 @@ struct MarmotChatsView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                List(model.groups, id: \.id) { group in
-                    NavigationLink {
-                        MarmotConversationView(group: group, model: model)
-                    } label: {
+                List {
+                    ForEach(model.pendingDirectChats.sorted(by: { $0.value > $1.value }), id: \.key) { entry in
+                        let npub = entry.key
                         HStack(spacing: 12) {
-                            SonarAvatar(name: model.title(for: group), size: 44)
+                            let title = model.displayName(forNpub: npub) ?? String(npub.prefix(12)) + "…"
+                            SonarAvatar(name: title, size: 44)
                             VStack(alignment: .leading, spacing: 2) {
-                                Text(model.title(for: group))
+                                Text(title)
                                     .font(SonarTheme.uiFont(size: 16.5, weight: .semibold))
                                     .foregroundColor(SonarTheme.text)
-                                Text(model.messagesByGroup[group.id]?.last?.content ?? "Say hi 👋")
+                                Text("Setting up secure chat…")
                                     .font(SonarTheme.uiFont(size: 14))
                                     .foregroundColor(SonarTheme.text2)
                                     .lineLimit(1)
                             }
                         }
                         .padding(.vertical, 3)
+                        .listRowBackground(SonarTheme.bg)
                     }
-                    .listRowBackground(SonarTheme.bg)
+                    ForEach(model.groups, id: \.id) { group in
+                        NavigationLink {
+                            MarmotConversationView(group: group, model: model)
+                        } label: {
+                            HStack(spacing: 12) {
+                                SonarAvatar(name: model.title(for: group), size: 44)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(model.title(for: group))
+                                        .font(SonarTheme.uiFont(size: 16.5, weight: .semibold))
+                                        .foregroundColor(SonarTheme.text)
+                                    Text(model.messagesByGroup[group.id]?.last?.content ?? "Say hi 👋")
+                                        .font(SonarTheme.uiFont(size: 14))
+                                        .foregroundColor(SonarTheme.text2)
+                                        .lineLimit(1)
+                                }
+                            }
+                            .padding(.vertical, 3)
+                        }
+                        .listRowBackground(SonarTheme.bg)
+                    }
                 }
                 .listStyle(.plain)
                 .scrollContentBackground(.hidden)
