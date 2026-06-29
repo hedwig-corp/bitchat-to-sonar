@@ -143,6 +143,7 @@ final class MarmotChatModel: ObservableObject {
     private static let localTranscriptPageLimit: UInt32 = 100
     private static let localSummaryPageLimit: UInt32 = 20
     private static let localSummaryGroupLimit: UInt32 = 50
+    private static let relayReconnectRetryDelaySeconds: Double = 10
 
     @Published var npub: String?
     /// Supplies the local user's current nickname so the kind-0 profile can be
@@ -435,6 +436,7 @@ final class MarmotChatModel: ObservableObject {
                 let desc = Self.describe(error)
                 SecureLogger.warning("⚠️ Marmot relay connect failed: \(desc)", category: .session)
                 self.errorText = desc
+                self.scheduleRelayConnect(delaySeconds: Self.relayReconnectRetryDelaySeconds)
             }
         }
     }
