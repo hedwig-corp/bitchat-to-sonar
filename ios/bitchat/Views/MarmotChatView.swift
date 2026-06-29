@@ -237,17 +237,26 @@ final class MarmotChatModel: ObservableObject {
             }
     }
 
-    /// Connect on first appearance: reuse the keychain identity if present,
-    /// otherwise generate one and persist it. Publishes our KeyPackage so
-    /// White Noise users can start chats with us. Lazy + idempotent: no-op once
-    /// connected (npub set) or while a connect is already in flight (busy).
-    func connectIfNeeded() {
+    /// Connect on first appearance: reuse the keychain identity if present.
+    /// A fresh identity may be created only by explicit onboarding completion.
+    /// Publishes our KeyPackage so White Noise users can start chats with us.
+    /// Lazy + idempotent: no-op once connected (npub set) or while a connect is
+    /// already in flight (busy).
+    func connectIfNeeded(allowCreateIdentity: Bool = false) {
         guard npub == nil, !busy else { return }
         busy = true
         Task {
             defer { busy = false }
-            await performConnect()
+            _ = await performConnect(allowCreateIdentity: allowCreateIdentity)
         }
+    }
+
+    func prepareIdentityForOnboarding() async -> Bool {
+        if npub != nil || service.isConnected() { return true }
+        guard !busy else { return false }
+        busy = true
+        defer { busy = false }
+        return await performConnect(allowCreateIdentity: true)
     }
 
     /// The actual connect sequence (awaitable, NOT guarded). Reuse the keychain
@@ -256,12 +265,11 @@ final class MarmotChatModel: ObservableObject {
     /// `connectIfNeeded()` and the erase-and-reconnect path —
     /// the latter must NOT be blocked by the `busy`/`npub` guard, which would
     /// silently leave the node disconnected ("not connected yet" until restart).
-    private func performConnect() async {
-        // Read the persisted nsec SAFELY: only a genuine .itemNotFound means
-        // "no identity yet" (→ generate). On a transient read failure (e.g.
-        // device LOCKED during a background BLE wake) do NOT generate — that
-        // would overwrite the existing nsec and orphan its derived wallet +
-        // chat DB forever. Defer instead; setup retries once accessible (#13).
+    private func performConnect(allowCreateIdentity: Bool = false) async -> Bool {
+        // Read the persisted nsec SAFELY: transient read failures (e.g. device
+        // LOCKED during a background BLE wake) must never generate a replacement
+        // key. Even a genuine miss only creates a key during explicit onboarding.
+        // Otherwise setup retries once the existing key is accessible (#13).
         var storedNsec: String?
         #if DEBUG
         let benchNsec = ProcessInfo.processInfo.environment["SONAR_BENCH_NSEC"]
@@ -285,21 +293,44 @@ final class MarmotChatModel: ObservableObject {
                 // AfterFirstUnlockThisDeviceOnly (this read just succeeded).
                 if let s = storedNsec { _ = keychain.saveIdentityKey(Data(s.utf8), forKey: Self.nsecKeychainKey) }
             case .itemNotFound:
+                guard allowCreateIdentity else {
+                    SecureLogger.warning("⚠️ marmot-nsec missing after onboarding — refusing to create a replacement identity", category: .session)
+                    self.errorText = "Account key missing. Restore from your backup key."
+                    return false
+                }
                 storedNsec = nil
             case .accessDenied, .deviceLocked, .authenticationFailed, .otherError:
                 SecureLogger.warning("⚠️ marmot-nsec not readable yet (device locked?) — deferring identity", category: .session)
-                return
+                return false
             }
         }
         // 1) Publish our npub IMMEDIATELY — the identity pubkey is offline-
         //    derivable, so Sonar discovery (0x53) can advertise it without
         //    waiting on (or being blocked by) the relay connect. Persist a
         //    freshly-generated nsec so `connect` below reuses the same identity.
-        if let np = try? await service.loadIdentityNpub(nsec: storedNsec) {
-            if storedNsec == nil, let fresh = await service.exportNsec() {
-                _ = keychain.saveIdentityKey(Data(fresh.utf8), forKey: Self.nsecKeychainKey)
+        do {
+            let np = try await service.loadIdentityNpub(nsec: storedNsec)
+            if storedNsec == nil {
+                guard let fresh = await service.exportNsec() else {
+                    self.errorText = "Couldn't create account key. Try again."
+                    SecureLogger.error("Generated identity could not export marmot-nsec", category: .keychain)
+                    self.npub = nil
+                    return false
+                }
+                guard keychain.saveIdentityKey(Data(fresh.utf8), forKey: Self.nsecKeychainKey) else {
+                    self.errorText = "Couldn't save account key. Try again."
+                    SecureLogger.error("Failed to persist newly generated marmot-nsec", category: .keychain)
+                    self.npub = nil
+                    return false
+                }
+                storedNsec = fresh
             }
             self.npub = np
+        } catch {
+            let desc = Self.describe(error)
+            SecureLogger.warning("⚠️ Marmot identity load failed: \(desc)", category: .session)
+            self.errorText = desc
+            return false
         }
         // 2) Open the encrypted DB with no relays first → load LOCAL chats right
         //    away → then attach real relays in the background. A relay publish
@@ -315,10 +346,12 @@ final class MarmotChatModel: ObservableObject {
             #endif
             self.errorText = nil
             scheduleStartupLocalSummariesThenRelay()
+            return true
         } catch {
             let desc = Self.describe(error)
             SecureLogger.warning("⚠️ Marmot local open failed: \(desc)", category: .session)
             self.errorText = desc
+            return false
         }
     }
 
@@ -336,13 +369,17 @@ final class MarmotChatModel: ObservableObject {
         // Validate by importing — throws on a malformed/!nsec key, so we never
         // persist garbage over a (possibly existing) identity.
         _ = try await service.loadIdentityNpub(nsec: nsec)
-        _ = keychain.saveIdentityKey(Data(nsec.utf8), forKey: Self.nsecKeychainKey)
+        guard keychain.saveIdentityKey(Data(nsec.utf8), forKey: Self.nsecKeychainKey) else {
+            throw MarmotService.ServiceError.core("failed to persist restored identity")
+        }
         // Drive the full connect sequence directly (performConnect reads the
         // nsec we just persisted); guard concurrent connectIfNeeded with busy.
         busy = true
         defer { busy = false }
         npub = nil
-        await performConnect()
+        guard await performConnect() else {
+            throw MarmotService.ServiceError.core(errorText ?? "failed to connect restored identity")
+        }
     }
 
     /// Await until the Marmot node is connected (or a short timeout), kicking
@@ -1324,9 +1361,9 @@ final class MarmotChatModel: ObservableObject {
         // Await a FORCED reconnect (not `connectIfNeeded()`, whose busy/npub
         // guard could silently skip it and leave the node "not connected yet").
         busy = true
-        await performConnect()
+        let connected = await performConnect()
         busy = false
-        if wasPolling { startPolling() }
+        if wasPolling && connected { startPolling() }
     }
 
     /// Short label for a 1:1 group: the other member's npub prefix.

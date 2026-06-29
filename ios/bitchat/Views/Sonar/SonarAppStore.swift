@@ -419,6 +419,7 @@ final class SonarAppStore: ObservableObject {
         static let notificationShowPreview = "sonar.notifications.showPreview"
         static let discoverNewPeople = "sonar.ble.discoverNewPeople"
         static let bleKnownChatKeys = "sonar.ble.knownChatKeys.v1"
+        static let marmotNsecKeychainKey = "marmot-nsec"
     }
 
     #if os(iOS)
@@ -698,6 +699,28 @@ final class SonarAppStore: ObservableObject {
         #endif
     }
 
+    private static func recoverOnboardingState(
+        storedOnboarded: Bool,
+        keychain: KeychainManagerProtocol,
+        defaults: UserDefaults
+    ) -> Bool {
+        if storedOnboarded { return true }
+        switch keychain.getIdentityKeyWithResult(forKey: Keys.marmotNsecKeychainKey) {
+        case .success(let data):
+            let nsec = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard nsec.hasPrefix("nsec1") else { return false }
+            defaults.set(true, forKey: Keys.onboarded)
+            SecureLogger.warning("Recovered onboarding flag from persisted account key", category: .session)
+            return true
+        case .itemNotFound:
+            return false
+        case .accessDenied, .deviceLocked, .authenticationFailed, .otherError:
+            SecureLogger.warning("Account key not readable while checking onboarding state; leaving onboarding disabled", category: .session)
+            return false
+        }
+    }
+
     init(
         chatViewModel: ChatViewModel,
         marmot: MarmotChatModel,
@@ -730,7 +753,11 @@ final class SonarAppStore: ObservableObject {
             let nick = chatRef?.nickname.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             return nick.isEmpty ? nil : nick
         }
-        onboarded = UserDefaults.standard.bool(forKey: Keys.onboarded)
+        onboarded = Self.recoverOnboardingState(
+            storedOnboarded: defaults.bool(forKey: Keys.onboarded),
+            keychain: keychain,
+            defaults: defaults
+        )
         mode = UserDefaults.standard.string(forKey: Keys.mode) ?? "dark"
         if UserDefaults.standard.object(forKey: Keys.discoverNewPeople) == nil {
             discoverNewPeople = true
@@ -1164,11 +1191,16 @@ final class SonarAppStore: ObservableObject {
     }
 
     func completeOnboarding(nick: String) {
-        rename(nick)
-        onboarded = true
-        defaults.set(true, forKey: Keys.onboarded)
-        path = []
-        marmot.connectIfNeeded()
+        Task { @MainActor in
+            rename(nick)
+            guard await marmot.prepareIdentityForOnboarding() else {
+                toast = "Couldn't save your account key. Try again."
+                return
+            }
+            onboarded = true
+            defaults.set(true, forKey: Keys.onboarded)
+            path = []
+        }
     }
 
     /// `nsec1…` backup of the current identity for the "Export private key"
@@ -4633,7 +4665,7 @@ final class SonarAppStore: ObservableObject {
         // that ordering ever changes.
         chatViewModel.panicClearAllData()
         MessageStore.shared.wipeAll()
-        _ = keychain.deleteIdentityKey(forKey: "marmot-nsec")
+        _ = keychain.deleteIdentityKey(forKey: Keys.marmotNsecKeychainKey)
         // Erase the encrypted Marmot (White Noise) SQLCipher database + its
         // Keychain DB key; also resets in-memory Marmot state.
         marmot.wipeDatabase()

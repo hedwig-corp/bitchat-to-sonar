@@ -570,6 +570,12 @@ expect object SonarCore {
      *  Lightning wallet derives its deterministic seed from this. */
     fun identityNsec(): String
 
+    /** True when a persisted account key exists locally. */
+    fun hasIdentity(): Boolean
+
+    /** Ensure the local account key exists before first-run onboarding completes. */
+    suspend fun prepareIdentityForOnboarding(): String
+
     /** Validate and persist an existing identity. Returns the restored npub. */
     suspend fun importIdentity(nsec: String): String
 

@@ -40,7 +40,9 @@ internal object AndroidSecrets {
     }
 
     fun put(key: String, value: String) {
-        secretsPrefs().edit().putString(key, encrypt(value)).apply()
+        check(secretsPrefs().edit().putString(key, encrypt(value)).commit()) {
+            "Failed to persist Android secret: $key"
+        }
         legacyPrefs().edit().remove(key).apply()
     }
 
