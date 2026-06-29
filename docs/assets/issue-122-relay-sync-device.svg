@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="360" viewBox="0 0 920 360" role="img" aria-labelledby="title desc">
+  <title id="title">Issue 122 and PR 154 relay sync median time before and after the performance work</title>
+  <desc id="desc">Stacked bar chart comparing median relay path time from t2 to t4 before and after PR 154 for issue 122. Before totals about 61.7 seconds. After totals about 20.9 seconds.</desc>
+  <rect width="920" height="360" fill="#ffffff"/>
+  <text x="38" y="42" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="22" font-weight="700" fill="#1f2933">Issue #122 / PR #154 physical-device relay sync median</text>
+  <text x="38" y="70" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="13" fill="#52616b">PR #154 = reduce duplicate relay work and sync waits. Relay path is t2 relay connect begin to t4 first drain.</text>
+
+  <line x1="210" y1="278" x2="830" y2="278" stroke="#c8d1d9" stroke-width="1"/>
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="12" fill="#6b7785">
+    <text x="205" y="300" text-anchor="middle">0s</text>
+    <text x="305" y="300" text-anchor="middle">10s</text>
+    <text x="405" y="300" text-anchor="middle">20s</text>
+    <text x="505" y="300" text-anchor="middle">30s</text>
+    <text x="605" y="300" text-anchor="middle">40s</text>
+    <text x="705" y="300" text-anchor="middle">50s</text>
+    <text x="805" y="300" text-anchor="middle">60s</text>
+  </g>
+  <g stroke="#eef2f5" stroke-width="1">
+    <line x1="210" y1="92" x2="210" y2="278"/>
+    <line x1="310" y1="92" x2="310" y2="278"/>
+    <line x1="410" y1="92" x2="410" y2="278"/>
+    <line x1="510" y1="92" x2="510" y2="278"/>
+    <line x1="610" y1="92" x2="610" y2="278"/>
+    <line x1="710" y1="92" x2="710" y2="278"/>
+    <line x1="810" y1="92" x2="810" y2="278"/>
+  </g>
+
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
+    <text x="38" y="120" font-size="15" font-weight="700" fill="#1f2933">Before PR #154</text>
+    <text x="38" y="140" font-size="12" fill="#6b7785">24 groups, old baseline</text>
+    <rect x="210" y="104" width="7" height="38" fill="#287c8e"/>
+    <rect x="217" y="104" width="570" height="38" fill="#c65f3d"/>
+    <rect x="787" y="104" width="23" height="38" fill="#7c6fb0"/>
+    <rect x="810" y="104" width="17" height="38" fill="#4e8f5d"/>
+    <text x="840" y="129" font-size="14" font-weight="700" fill="#1f2933">~61.7s</text>
+
+    <text x="38" y="204" font-size="15" font-weight="700" fill="#1f2933">After PR #154</text>
+    <text x="38" y="224" font-size="12" fill="#6b7785">28 groups, 2026-06-29 run</text>
+    <rect x="210" y="188" width="17" height="38" fill="#287c8e"/>
+    <rect x="227" y="188" width="183" height="38" fill="#c65f3d"/>
+    <rect x="410" y="188" width="6" height="38" fill="#7c6fb0"/>
+    <rect x="416" y="188" width="2" height="38" fill="#4e8f5d"/>
+    <text x="431" y="213" font-size="14" font-weight="700" fill="#1f2933">20.9s</text>
+  </g>
+
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="12" fill="#2f3a45">
+    <rect x="38" y="320" width="12" height="12" fill="#287c8e"/>
+    <text x="58" y="330">connect</text>
+    <rect x="128" y="320" width="12" height="12" fill="#c65f3d"/>
+    <text x="148" y="330">publish keypkg + profile</text>
+    <rect x="306" y="320" width="12" height="12" fill="#7c6fb0"/>
+    <text x="326" y="330">first event wait</text>
+    <rect x="436" y="320" width="12" height="12" fill="#4e8f5d"/>
+    <text x="456" y="330">drainPending MLS</text>
+  </g>
+</svg>
