@@ -826,6 +826,10 @@ final class SonarAppStore: ObservableObject {
         // the KeyPackage) using the current nickname, so a peer never sees our raw
         // npub because the opportunistic publish below lost the relay/onboarding race.
         marmot.profileNameProvider = { [weak self] in self?.chatViewModel.nickname ?? "" }
+        marmot.$groups
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.resolvePendingSecureChats() }
+            .store(in: &cancellables)
         marmot.$npub
             .receive(on: DispatchQueue.main)
             .sink { [weak self] npub in
@@ -3197,6 +3201,15 @@ final class SonarAppStore: ObservableObject {
         }
         flushPendingDirectMarmot(npub: npub, groupId: groupId, realId: realId)
         openedDM(realId, marmotGroupId: groupId)
+    }
+
+    private func resolvePendingSecureChats() {
+        guard !pendingMarmotChats.isEmpty else { return }
+        for (pendingId, pending) in Array(pendingMarmotChats) {
+            if let group = marmotGroup(forNpub: pending.npub) {
+                finishPendingSecureChat(pendingId: pendingId, npub: pending.npub, groupId: group.id)
+            }
+        }
     }
 
     private func flushPendingDirectMarmot(npub: String, groupId: String, realId: String) {

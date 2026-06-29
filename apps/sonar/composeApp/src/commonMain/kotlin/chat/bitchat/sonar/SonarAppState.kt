@@ -2344,8 +2344,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         peerNpub: String,
         pendingChatId: String,
         chatId: String,
+        refreshFirst: Boolean = true,
     ) {
-        refreshChats()
+        if (refreshFirst) refreshChats()
         val chat = chats.firstOrNull { it.id == chatId }
             ?: SonarChat(id = chatId, name = "", members = listOf(npub, peerNpub))
         pendingMarmotChatNpubs = pendingMarmotChatNpubs - pendingChatId
@@ -2363,6 +2364,16 @@ class SonarAppState(private val scope: CoroutineScope) {
             messages = visibleMessagesForChat(chatId, withSendEchoes(chatId, mergePendingMediaUploads(chatId, marmotMessagesPage(chatId))))
             processPayLines(chatId, messages)
             processCallLines(chatId, messages)
+        }
+    }
+
+    private suspend fun resolvePendingMarmotChats() {
+        if (pendingMarmotChatNpubs.isEmpty()) return
+        for ((pendingChatId, peerNpub) in pendingMarmotChatNpubs.toMap()) {
+            val canonicalPeer = canonicalProfileKey(peerNpub)
+            val npubHex = canonicalNpubHex(canonicalPeer) ?: continue
+            val existing = marmotGroupForNpub(npubHex.hexToBytesOrEmpty()) ?: continue
+            finishPendingMarmotChat(npubHex, canonicalPeer, pendingChatId, existing.id, refreshFirst = false)
         }
     }
 
@@ -4469,6 +4480,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             }
         }
         groupInvites = runCatching { SonarCore.pendingGroupInvites() }.getOrDefault(emptyList())
+        resolvePendingMarmotChats()
     }
 
     private suspend fun refreshTopChatLocalSummaries() {
