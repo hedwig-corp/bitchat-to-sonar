@@ -1,6 +1,7 @@
 import Foundation
 import BitLogger
 import Combine
+import Network
 import Tor
 
 /// Coordinates when the app is allowed to start Tor and connect to Nostr relays.
@@ -11,6 +12,9 @@ final class NetworkActivationService: ObservableObject {
     static let shared = NetworkActivationService()
 
     @Published private(set) var activationAllowed: Bool = false
+    /// Current OS network reachability. Optimistic until NWPathMonitor delivers
+    /// its first update; relay connection state still gates user-visible Online.
+    @Published private(set) var internetPathSatisfied: Bool = true
     // Sonar decision (2026-06-13): Tor is opt-in and OFF by default for now —
     // public channels / Nostr go direct. The v2 key ignores any previously
     // stored "true" from older builds where Tor defaulted on.
@@ -18,6 +22,8 @@ final class NetworkActivationService: ObservableObject {
 
     private var cancellables = Set<AnyCancellable>()
     private var started = false
+    private let pathMonitor = NWPathMonitor()
+    private let pathQueue = DispatchQueue(label: "chat.bitchat.network-path")
     private let torPreferenceKey = "networkActivationService.userTorEnabled.v2"
     private var torAutoStartDesired: Bool = false
 
@@ -32,6 +38,16 @@ final class NetworkActivationService: ObservableObject {
         } else {
             userTorEnabled = false
         }
+
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            let satisfied = path.status == .satisfied
+            Task { @MainActor [weak self] in
+                guard let self, self.internetPathSatisfied != satisfied else { return }
+                self.internetPathSatisfied = satisfied
+                SecureLogger.info("NetworkActivationService: internetPathSatisfied -> \(satisfied)", category: .session)
+            }
+        }
+        pathMonitor.start(queue: pathQueue)
 
         // Initial compute
         let allowed = basePolicyAllowed()

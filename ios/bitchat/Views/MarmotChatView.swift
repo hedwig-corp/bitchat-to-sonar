@@ -1213,7 +1213,16 @@ final class MarmotChatModel: ObservableObject {
                         SecureLogger.info("SONAR_BENCH t4_first_drain woke=0 notif=0", category: .session)
                     }
                     #endif
-                    try? await self.service.ensureSubscriptions()
+                    do {
+                        try await self.service.ensureSubscriptions()
+                    } catch {
+                        self.relayConnected = false
+                        self.errorText = Self.describe(error)
+                        SecureLogger.warning("⚠️ Marmot relay subscription lost: \(self.errorText ?? "unknown error")", category: .session)
+                        self.syncTask = nil
+                        self.scheduleRelayConnect(delaySeconds: 2)
+                        return
+                    }
                 }
             }
         }
