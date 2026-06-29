@@ -723,9 +723,7 @@ struct SNConnectivitySheetContent: View {
                 icon: .globe,
                 tone: store.online ? .cyan : .neutral,
                 label: "Internet",
-                sub: store.online
-                    ? "Connected · \(store.connectedRelayCount) Nostr relays"
-                    : "Offline — messages wait or travel over Bluetooth",
+                sub: store.connectedRelaySummary,
                 value: store.online ? "Online" : "Offline",
                 trail: .none
             ) {}

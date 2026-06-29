@@ -2019,10 +2019,21 @@ final class SonarAppStore: ObservableObject {
 
     // MARK: Connectivity (status chip + connection sheet)
 
-    /// Online = Nostr relay sockets are up (internet reach), independent of mesh.
-    var online: Bool { relayManager.isConnected }
+    /// Online = either Nostr relay stack has internet reach, independent of mesh.
+    var online: Bool { relayManager.isConnected || marmot.relayConnected }
 
     var connectedRelayCount: Int { relayManager.relays.filter(\.isConnected).count }
+
+    var connectedRelaySummary: String {
+        let count = connectedRelayCount
+        if count > 0 {
+            return "Connected · \(count) Nostr relays"
+        }
+        if marmot.relayConnected {
+            return "Connected · Nostr relays"
+        }
+        return "Offline — messages wait or travel over Bluetooth"
+    }
 
     /// Peers currently reachable over the Bluetooth mesh (direct or relayed).
     var meshCount: Int {
