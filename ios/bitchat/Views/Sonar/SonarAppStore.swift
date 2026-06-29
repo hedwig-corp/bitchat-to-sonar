@@ -457,6 +457,7 @@ final class SonarAppStore: ObservableObject {
     private let keychain: KeychainManagerProtocol
     private let locationManager = LocationChannelManager.shared
     private let relayManager = NostrRelayManager.shared
+    private let networkService = NetworkActivationService.shared
     private let defaults = UserDefaults.standard
 
     /// Navigation stack below the home root.
@@ -756,6 +757,7 @@ final class SonarAppStore: ObservableObject {
         republish(marmot.objectWillChange)
         republish(locationManager.objectWillChange)
         republish(relayManager.objectWillChange)
+        republish(networkService.objectWillChange)
         // Unify nearby payments: republish discovered-peer changes into the radar.
         republish(unify.objectWillChange)
         // Money display: re-render every amount when the mode/currency/rate
@@ -2019,10 +2021,26 @@ final class SonarAppStore: ObservableObject {
 
     // MARK: Connectivity (status chip + connection sheet)
 
-    /// Online = Nostr relay sockets are up (internet reach), independent of mesh.
-    var online: Bool { relayManager.isConnected }
+    /// Online = a live network path plus at least one relay-backed transport.
+    var online: Bool {
+        networkService.internetPathSatisfied && (relayManager.isConnected || marmot.relayConnected)
+    }
 
     var connectedRelayCount: Int { relayManager.relays.filter(\.isConnected).count }
+
+    var connectedRelaySummary: String {
+        guard networkService.internetPathSatisfied else {
+            return "Offline — messages wait or travel over Bluetooth"
+        }
+        let count = connectedRelayCount
+        if count > 0 {
+            return "Connected · \(count) Nostr relays"
+        }
+        if marmot.relayConnected {
+            return "Connected · Nostr relays"
+        }
+        return "Offline — messages wait or travel over Bluetooth"
+    }
 
     /// Peers currently reachable over the Bluetooth mesh (direct or relayed).
     var meshCount: Int {
