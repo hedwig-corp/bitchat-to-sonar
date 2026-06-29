@@ -138,6 +138,9 @@ final class KeychainManager: KeychainManagerProtocol {
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
             kSecAttrLabel as String: "bitchat-\(key)"
         ]
+        let updateAttributes: [String: Any] = [
+            kSecValueData as String: data
+        ]
 
         func query(addAccessGroup: Bool) -> [String: Any] {
             var q = queryBase
@@ -146,7 +149,7 @@ final class KeychainManager: KeychainManagerProtocol {
         }
 
         func update(addAccessGroup: Bool) -> OSStatus {
-            SecItemUpdate(query(addAccessGroup: addAccessGroup) as CFDictionary, valueAttributes as CFDictionary)
+            SecItemUpdate(query(addAccessGroup: addAccessGroup) as CFDictionary, updateAttributes as CFDictionary)
         }
 
         func add(addAccessGroup: Bool) -> OSStatus {

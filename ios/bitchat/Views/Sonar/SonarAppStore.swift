@@ -300,6 +300,7 @@ struct SNMessage: Identifiable, Equatable {
     var author: String?
     var text: String
     var time: String
+    var sortDate: Date?
     var via: SNVia?
     var state: String?
     /// Non-nil = render as a PayBubble instead of a text bubble.
@@ -2962,14 +2963,14 @@ final class SonarAppStore: ObservableObject {
             }
             let echoIds = [id, Self.marmotIDPrefix + groupId]
             for echoId in echoIds {
-                dated += (pendingMarmotMessagesByChat[echoId] ?? []).map { (Date(), $0) }
+                dated += (pendingMarmotMessagesByChat[echoId] ?? []).map { ($0.sortDate ?? Date(), $0) }
             }
             let transcriptPayIDs = Set(dated.compactMap { $0.1.pay?.id })
             dated += paymentActivityRows(for: id, transcriptPayIDs: transcriptPayIDs)
             return mergeCallLogs(into: dated, id: id)
         }
         if pendingMarmotNpub(for: id) != nil {
-            let dated = (pendingMarmotMessagesByChat[id] ?? []).map { (Date(), $0) }
+            let dated = (pendingMarmotMessagesByChat[id] ?? []).map { ($0.sortDate ?? Date(), $0) }
             return mergeCallLogs(into: dated, id: id)
         }
         let peerID = PeerID(str: id)
@@ -3160,11 +3161,13 @@ final class SonarAppStore: ObservableObject {
 
     private func sendPendingMarmot(_ text: String, chatId: String, npub: String) {
         let clean = SNMarmotProfileCache.canonicalKey(npub)
+        let createdAt = Date()
         let message = SNMessage(
             id: "echo-\(UUID().uuidString)",
             mine: true,
             text: text,
-            time: Self.clock(Date()),
+            time: Self.clock(createdAt),
+            sortDate: createdAt,
             via: .internet,
             state: "Sending"
         )
@@ -3184,7 +3187,10 @@ final class SonarAppStore: ObservableObject {
         guard startingMarmotChats.insert(clean).inserted else { return }
         Task { @MainActor in
             defer { startingMarmotChats.remove(clean) }
-            guard let groupId = await marmot.startChatReturningId(with: clean) else { return }
+            guard let groupId = await marmot.startChatReturningId(with: clean) else {
+                failPendingSecureChat(pendingId: pendingId, npub: clean)
+                return
+            }
             finishPendingSecureChat(pendingId: pendingId, npub: clean, groupId: groupId)
         }
     }
@@ -3212,16 +3218,62 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
+    private func failPendingSecureChat(pendingId: String, npub: String) {
+        pendingMarmotChats[pendingId] = nil
+        let queued = pendingDirectMarmotSends.removeValue(forKey: npub) ?? []
+        let queuedIds = Set(queued.map(\.messageId))
+        var messages = (pendingMarmotMessagesByChat[pendingId] ?? []).map {
+            queuedIds.contains($0.id) ? failedPendingMessage($0) : $0
+        }
+        for item in queued where !messages.contains(where: { $0.id == item.messageId }) {
+            let createdAt = Date()
+            messages.append(SNMessage(
+                id: item.messageId,
+                mine: true,
+                text: item.text,
+                time: Self.clock(createdAt),
+                sortDate: createdAt,
+                via: .internet,
+                state: "Couldn't send"
+            ))
+        }
+        if messages.isEmpty {
+            pendingMarmotMessagesByChat[pendingId] = nil
+        } else {
+            pendingMarmotMessagesByChat[pendingId] = messages
+        }
+    }
+
+    private func failedPendingMessage(_ message: SNMessage) -> SNMessage {
+        SNMessage(
+            id: message.id,
+            mine: message.mine,
+            action: message.action,
+            author: message.author,
+            text: message.text,
+            time: message.time,
+            sortDate: message.sortDate,
+            via: message.via,
+            state: "Couldn't send",
+            pay: message.pay,
+            call: message.call,
+            media: message.media,
+            stickerRef: message.stickerRef
+        )
+    }
+
     private func flushPendingDirectMarmot(npub: String, groupId: String, realId: String) {
         let queued = pendingDirectMarmotSends.removeValue(forKey: npub) ?? []
         guard !queued.isEmpty else { return }
         Task { @MainActor in
             for item in queued {
+                let fallbackDate = Date()
                 let echo = pendingMarmotMessagesByChat[realId]?.first { $0.id == item.messageId } ?? SNMessage(
                     id: item.messageId,
                     mine: true,
                     text: item.text,
-                    time: Self.clock(Date()),
+                    time: Self.clock(fallbackDate),
+                    sortDate: fallbackDate,
                     via: .internet,
                     state: "Sending"
                 )
@@ -3229,20 +3281,7 @@ final class SonarAppStore: ObservableObject {
                 let ok = await marmot.send([item.text], to: groupId)
                 if !ok {
                     pendingMarmotMessagesByChat[realId, default: []].append(
-                        SNMessage(
-                            id: echo.id,
-                            mine: echo.mine,
-                            action: echo.action,
-                            author: echo.author,
-                            text: echo.text,
-                            time: echo.time,
-                            via: echo.via,
-                            state: "Couldn't send",
-                            pay: echo.pay,
-                            call: echo.call,
-                            media: echo.media,
-                            stickerRef: echo.stickerRef
-                        )
+                        failedPendingMessage(echo)
                     )
                 }
             }

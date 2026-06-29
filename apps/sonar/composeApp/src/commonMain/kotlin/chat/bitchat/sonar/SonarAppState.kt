@@ -2332,6 +2332,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 val chatId = SonarCore.startChat(npubHex)
                 finishPendingMarmotChat(npubHex, canonicalPeer, pendingChatId, chatId)
             } catch (t: Throwable) {
+                failPendingMarmotChat(npubHex, pendingChatId)
                 toast = "couldn't start secure chat: ${t.message}"
             } finally {
                 startingMarmotChats.remove(npubHex)
@@ -2374,6 +2375,14 @@ class SonarAppState(private val scope: CoroutineScope) {
             val npubHex = canonicalNpubHex(canonicalPeer) ?: continue
             val existing = marmotGroupForNpub(npubHex.hexToBytesOrEmpty()) ?: continue
             finishPendingMarmotChat(npubHex, canonicalPeer, pendingChatId, existing.id, refreshFirst = false)
+        }
+    }
+
+    private fun failPendingMarmotChat(npubHex: String, pendingChatId: String) {
+        pendingMarmotChatNpubs = pendingMarmotChatNpubs - pendingChatId
+        pendingDirectMarmotSends.remove(npubHex)
+        pendingSendEchoes[pendingChatId].orEmpty().map { it.id }.forEach { echoId ->
+            failSendEcho(pendingChatId, echoId)
         }
     }
 
