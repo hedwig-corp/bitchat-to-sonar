@@ -147,19 +147,20 @@ This explains BOTH symptoms: incoming messages aren't drained until the publishe
 finish ("slow to sync"), and message sends use the same await-all-relays
 `send_event` path ("slow to send").
 
-## Issue #122 PR result (physical iPhone, after relay fixes)
+## Issue #122 / PR #154 result (physical iPhone, after relay fixes)
 
 Run on 2026-06-29 with `scripts/bench/device-bench.sh`, `RUNS=5`,
-`TIMEOUT=180`, signed Debug build installed over the existing app so real account
-data was preserved. All 5 runs reached `t4_first_drain`; every run had
-`woke=1 notif=0`.
+`TIMEOUT=180`, after PR #154 ("reduce duplicate relay work and sync waits"),
+with a signed Debug build installed over the existing app so real account data
+was preserved. All 5 runs reached `t4_first_drain`; every run had `woke=1
+notif=0`.
 
 This is not a perfectly controlled hardware/account comparison: the old device
 baseline used 24 Marmot groups and this run used 28 groups. It is still the
 right comparison for the reported pain point because both measurements use the
 physical-device real-account path and preserve local app data.
 
-![Issue #122 relay sync benchmark](assets/issue-122-relay-sync-device.svg)
+![Issue #122 / PR #154 relay sync benchmark](assets/issue-122-relay-sync-device.svg)
 
 Median of 5 cold starts · physical iPhone · **real account with 28 Marmot
 groups** · live relays:

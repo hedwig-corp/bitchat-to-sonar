@@ -1,9 +1,9 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="920" height="360" viewBox="0 0 920 360" role="img" aria-labelledby="title desc">
-  <title id="title">Issue 122 relay sync median time before and after the performance PR</title>
-  <desc id="desc">Stacked bar chart comparing median relay path time from t2 to t4 before and after issue 122. Before totals about 61.7 seconds. After totals about 20.9 seconds.</desc>
+  <title id="title">Issue 122 and PR 154 relay sync median time before and after the performance work</title>
+  <desc id="desc">Stacked bar chart comparing median relay path time from t2 to t4 before and after PR 154 for issue 122. Before totals about 61.7 seconds. After totals about 20.9 seconds.</desc>
   <rect width="920" height="360" fill="#ffffff"/>
-  <text x="38" y="42" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="22" font-weight="700" fill="#1f2933">Issue #122 physical-device relay sync median</text>
-  <text x="38" y="70" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="13" fill="#52616b">Relay path = t2 relay connect begin to t4 first drain. Values are seconds; old device result uses approximate medians from the documented baseline.</text>
+  <text x="38" y="42" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="22" font-weight="700" fill="#1f2933">Issue #122 / PR #154 physical-device relay sync median</text>
+  <text x="38" y="70" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="13" fill="#52616b">PR #154 = reduce duplicate relay work and sync waits. Relay path is t2 relay connect begin to t4 first drain.</text>
 
   <line x1="210" y1="278" x2="830" y2="278" stroke="#c8d1d9" stroke-width="1"/>
   <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="12" fill="#6b7785">
@@ -26,7 +26,7 @@
   </g>
 
   <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
-    <text x="38" y="120" font-size="15" font-weight="700" fill="#1f2933">Before PR</text>
+    <text x="38" y="120" font-size="15" font-weight="700" fill="#1f2933">Before PR #154</text>
     <text x="38" y="140" font-size="12" fill="#6b7785">24 groups, old baseline</text>
     <rect x="210" y="104" width="7" height="38" fill="#287c8e"/>
     <rect x="217" y="104" width="570" height="38" fill="#c65f3d"/>
@@ -34,7 +34,7 @@
     <rect x="810" y="104" width="17" height="38" fill="#4e8f5d"/>
     <text x="840" y="129" font-size="14" font-weight="700" fill="#1f2933">~61.7s</text>
 
-    <text x="38" y="204" font-size="15" font-weight="700" fill="#1f2933">After PR</text>
+    <text x="38" y="204" font-size="15" font-weight="700" fill="#1f2933">After PR #154</text>
     <text x="38" y="224" font-size="12" fill="#6b7785">28 groups, 2026-06-29 run</text>
     <rect x="210" y="188" width="17" height="38" fill="#287c8e"/>
     <rect x="227" y="188" width="183" height="38" fill="#c65f3d"/>
