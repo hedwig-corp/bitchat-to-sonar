@@ -124,7 +124,10 @@ final class KeychainManager: KeychainManagerProtocol {
             kSecAttrAccount as String: key,
             kSecAttrService as String: service
         ]
-        let valueAttributes: [String: Any] = [
+        let updateAttributes: [String: Any] = [
+            kSecValueData as String: data
+        ]
+        let addAttributes: [String: Any] = [
             kSecValueData as String: data,
             // AfterFirstUnlock (not WhenUnlocked): the app is woken in the
             // BACKGROUND with the screen LOCKED via BLE state restoration
@@ -146,12 +149,12 @@ final class KeychainManager: KeychainManagerProtocol {
         }
 
         func update(addAccessGroup: Bool) -> OSStatus {
-            SecItemUpdate(query(addAccessGroup: addAccessGroup) as CFDictionary, valueAttributes as CFDictionary)
+            SecItemUpdate(query(addAccessGroup: addAccessGroup) as CFDictionary, updateAttributes as CFDictionary)
         }
 
         func add(addAccessGroup: Bool) -> OSStatus {
             var q = query(addAccessGroup: addAccessGroup)
-            valueAttributes.forEach { q[$0.key] = $0.value }
+            addAttributes.forEach { q[$0.key] = $0.value }
             #if os(macOS)
             q[kSecAttrSynchronizable as String] = false
             #endif

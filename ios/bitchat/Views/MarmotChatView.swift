@@ -289,8 +289,9 @@ final class MarmotChatModel: ObservableObject {
             switch keychain.getIdentityKeyWithResult(forKey: Self.nsecKeychainKey) {
             case .success(let data):
                 storedNsec = String(data: data, encoding: .utf8)
-                // Migration: re-save to upgrade a legacy WhenUnlocked item to
-                // AfterFirstUnlockThisDeviceOnly (this read just succeeded).
+                // Refresh data through the non-destructive save path. Existing
+                // Keychain accessibility is immutable via SecItemUpdate; new
+                // items use AfterFirstUnlockThisDeviceOnly.
                 if let s = storedNsec { _ = keychain.saveIdentityKey(Data(s.utf8), forKey: Self.nsecKeychainKey) }
             case .itemNotFound:
                 guard allowCreateIdentity else {

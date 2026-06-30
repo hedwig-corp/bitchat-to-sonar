@@ -709,7 +709,7 @@ final class SonarAppStore: ObservableObject {
         case .success(let data):
             let nsec = String(data: data, encoding: .utf8)?
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            guard nsec.hasPrefix("nsec1") else { return false }
+            guard SonarWalletDerivation.secret(fromNsec: nsec) != nil else { return false }
             defaults.set(true, forKey: Keys.onboarded)
             SecureLogger.warning("Recovered onboarding flag from persisted account key", category: .session)
             return true

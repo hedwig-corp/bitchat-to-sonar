@@ -465,7 +465,12 @@ actual object SonarCore {
     actual fun identityNsec(): String = DesktopSecrets.get("nsec") ?: ""
 
     actual fun hasIdentity(): Boolean =
-        runCatching { DesktopSecrets.get("nsec")?.trim()?.startsWith("nsec1") == true }
+        runCatching {
+            SonarNativeLoader.ensureLoaded()
+            val saved = DesktopSecrets.get("nsec")?.trim() ?: return@runCatching false
+            SonarIdentity.import(saved)
+            true
+        }
             .getOrDefault(false)
 
     actual suspend fun prepareIdentityForOnboarding(): String = withContext(Dispatchers.IO) {
