@@ -36,7 +36,7 @@ struct SonarDMScreen: View {
     @State private var previewPackCoordinate: String?
 
     private var peer: SNPeerItem { store.peerItem(peerId) }
-    private var isMarmot: Bool { store.marmotGroupId(peerId) != nil }
+    private var isMarmot: Bool { store.marmotGroupId(peerId) != nil || store.isPendingSecureChat(peerId) }
     private var isMultiMemberMarmot: Bool { store.isMultiMemberMarmotGroupId(peerId) }
     private var isSonar: Bool { store.sonarProfile(peerId) != nil }
     private var verified: Bool { !isMultiMemberMarmot && store.isVerified(peerId) }
@@ -55,9 +55,9 @@ struct SonarDMScreen: View {
         VStack(spacing: 0) {
             SNNavHeader(onBack: { store.pop() }, content: {
                 Button {
-                    if isMultiMemberMarmot {
+                    if isMultiMemberMarmot, store.marmotGroupId(peerId) != nil {
                         store.push(.groupInfo(peerId))
-                    } else {
+                    } else if !isMultiMemberMarmot {
                         store.push(.contactProfile(peerId, peer.name))
                     }
                 } label: {
@@ -176,7 +176,7 @@ struct SonarDMScreen: View {
                         pickPhoto = true
                     }
                 }
-                if isMultiMemberMarmot {
+                if isMultiMemberMarmot && store.marmotGroupId(peerId) != nil {
                     SNActionRow(icon: .people, label: "Add people", desc: "Invite local contacts or paste npubs") {
                         sheet = false
                         addPeopleSheet = true
