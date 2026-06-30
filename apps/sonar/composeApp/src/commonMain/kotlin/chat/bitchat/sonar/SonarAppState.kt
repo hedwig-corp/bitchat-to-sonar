@@ -263,6 +263,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun wipe() {
         scope.launch {
+            cancelPendingMarmotSetups()
             WalletBridge.shutdown()
             UnifyRadio.stopScanning()
             UnifyRadio.stopAdvertising()
@@ -316,6 +317,7 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  Marmot group) without re-running onboarding. Mirrors iOS `eraseAllChats`. */
     fun eraseAllChats() {
         scope.launch {
+            cancelPendingMarmotSetups()
             // Local transcripts on disk (mesh DMs, channels, geo DMs).
             MessageStore.wipe()
             // In-memory conversation state.
@@ -1720,6 +1722,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 unifyOffer = null; unifyPeers = emptyList()
                 pollJob?.cancel(); pollJob = null
                 resetCallState()
+                cancelPendingMarmotSetups()
 
                 MessageStore.wipe()
                 meshChats.clear(); meshChatNames.clear(); pendingMarmotSends.clear(); pendingDirectMarmotSends.clear(); outbox.clear()
@@ -2327,17 +2330,20 @@ class SonarAppState(private val scope: CoroutineScope) {
             return
         }
         if (!startingMarmotChats.add(npubHex)) return
-        scope.launch {
+        val setupToken = nextPendingMarmotSetupToken(pendingChatId)
+        val setupJob = scope.launch {
             try {
                 val chatId = SonarCore.startChat(npubHex)
-                finishPendingMarmotChat(npubHex, canonicalPeer, pendingChatId, chatId)
+                finishPendingMarmotChat(npubHex, canonicalPeer, pendingChatId, chatId, setupToken = setupToken)
             } catch (t: Throwable) {
-                failPendingMarmotChat(npubHex, pendingChatId)
-                toast = "couldn't start secure chat: ${t.message}"
+                if (failPendingMarmotChat(npubHex, pendingChatId, setupToken)) {
+                    toast = "couldn't start secure chat: ${t.message}"
+                }
             } finally {
-                startingMarmotChats.remove(npubHex)
+                clearPendingMarmotSetup(pendingChatId, npubHex, setupToken)
             }
         }
+        pendingMarmotSetupJobs[pendingChatId] = setupJob
     }
 
     private suspend fun finishPendingMarmotChat(
@@ -2346,7 +2352,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         pendingChatId: String,
         chatId: String,
         refreshFirst: Boolean = true,
+        setupToken: Long? = null,
     ) {
+        if (!isActivePendingMarmotSetup(pendingChatId, peerNpub, setupToken)) return
+        if (setupToken == null) cancelPendingMarmotSetup(pendingChatId, npubHex)
         if (refreshFirst) refreshChats()
         val chat = chats.firstOrNull { it.id == chatId }
             ?: SonarChat(id = chatId, name = "", members = listOf(npub, peerNpub))
@@ -2378,12 +2387,14 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
-    private fun failPendingMarmotChat(npubHex: String, pendingChatId: String) {
+    private fun failPendingMarmotChat(npubHex: String, pendingChatId: String, setupToken: Long? = null): Boolean {
+        if (!isActivePendingMarmotSetup(pendingChatId, pendingMarmotChatNpubs[pendingChatId], setupToken)) return false
         pendingMarmotChatNpubs = pendingMarmotChatNpubs - pendingChatId
         pendingDirectMarmotSends.remove(npubHex)
         pendingSendEchoes[pendingChatId].orEmpty().map { it.id }.forEach { echoId ->
             failSendEcho(pendingChatId, echoId)
         }
+        return true
     }
 
     private fun sendPendingMarmotChat(chatId: String, peerNpub: String, text: String) {
@@ -2967,6 +2978,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** The Marmot group id backing [chatId]: the chat id itself for a White Noise
      *  chat, or the Sonar peer's group for a mesh-routed DM. null ⇒ no group yet. */
     private fun resolveMarmotGroupId(chatId: String): String? {
+        if (chatId.startsWith(PENDING_MARMOT_CHAT_PREFIX)) return null
         if (!isMeshChat(chatId)) return chatId
         val raw = npubRawFor(meshPeerId(chatId)) ?: return null
         return marmotGroupForNpub(raw)?.id
@@ -3523,12 +3535,51 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  [flushPendingMarmot] once the group appears in [chats]. */
     private val pendingMarmotSends = mutableMapOf<String, MutableList<String>>()
     private val startingMarmotChats = mutableSetOf<String>()
+    private val pendingMarmotSetupJobs = mutableMapOf<String, Job>()
+    private val pendingMarmotSetupTokens = mutableMapOf<String, Long>()
+    private var pendingMarmotSetupNonce = 0L
     private data class PendingDirectMarmotSend(
         val pendingChatId: String,
         val text: String,
         val echoId: String,
     )
     private val pendingDirectMarmotSends = mutableMapOf<String, MutableList<PendingDirectMarmotSend>>()
+
+    private fun nextPendingMarmotSetupToken(pendingChatId: String): Long {
+        val token = ++pendingMarmotSetupNonce
+        pendingMarmotSetupTokens[pendingChatId] = token
+        return token
+    }
+
+    private fun isActivePendingMarmotSetup(
+        pendingChatId: String,
+        peerNpub: String?,
+        setupToken: Long?,
+    ): Boolean {
+        val activePeer = pendingMarmotChatNpubs[pendingChatId] ?: return false
+        if (activePeer != peerNpub) return false
+        return setupToken == null || pendingMarmotSetupTokens[pendingChatId] == setupToken
+    }
+
+    private fun clearPendingMarmotSetup(pendingChatId: String, npubHex: String, setupToken: Long) {
+        if (pendingMarmotSetupTokens[pendingChatId] != setupToken) return
+        pendingMarmotSetupTokens.remove(pendingChatId)
+        pendingMarmotSetupJobs.remove(pendingChatId)
+        startingMarmotChats.remove(npubHex)
+    }
+
+    private fun cancelPendingMarmotSetup(pendingChatId: String, npubHex: String) {
+        pendingMarmotSetupJobs.remove(pendingChatId)?.cancel()
+        pendingMarmotSetupTokens.remove(pendingChatId)
+        startingMarmotChats.remove(npubHex)
+    }
+
+    private fun cancelPendingMarmotSetups() {
+        pendingMarmotSetupJobs.values.forEach { it.cancel() }
+        pendingMarmotSetupJobs.clear()
+        pendingMarmotSetupTokens.clear()
+        startingMarmotChats.clear()
+    }
 
     // ── Outbox: per-peer message queue for offline/unreachable peers ──
     // Mirrors iOS MessageRouter outbox. When neither BLE mesh link nor npub is

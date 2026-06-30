@@ -141,6 +141,7 @@ final class KeychainManager: KeychainManagerProtocol {
         let updateAttributes: [String: Any] = [
             kSecValueData as String: data
         ]
+        let desiredAccessible = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly as String
 
         func query(addAccessGroup: Bool) -> [String: Any] {
             var q = queryBase
@@ -161,7 +162,39 @@ final class KeychainManager: KeychainManagerProtocol {
             return SecItemAdd(q as CFDictionary, nil)
         }
 
+        func delete(addAccessGroup: Bool) -> OSStatus {
+            SecItemDelete(query(addAccessGroup: addAccessGroup) as CFDictionary)
+        }
+
+        func needsAccessibilityMigration(addAccessGroup: Bool) -> Bool {
+            var q = query(addAccessGroup: addAccessGroup)
+            q[kSecReturnAttributes as String] = true
+            q[kSecMatchLimit as String] = kSecMatchLimitOne
+
+            var result: CFTypeRef?
+            let status = SecItemCopyMatching(q as CFDictionary, &result)
+            guard status == errSecSuccess,
+                  let attributes = result as? [String: Any],
+                  let accessible = attributes[kSecAttrAccessible as String] as? String else {
+                return false
+            }
+            return accessible != desiredAccessible
+        }
+
+        func replaceForAccessibilityMigration(addAccessGroup: Bool) -> OSStatus {
+            let deleteStatus = delete(addAccessGroup: addAccessGroup)
+            guard deleteStatus == errSecSuccess || deleteStatus == errSecItemNotFound else { return deleteStatus }
+            let addStatus = add(addAccessGroup: addAccessGroup)
+            if addStatus == errSecDuplicateItem {
+                return update(addAccessGroup: addAccessGroup)
+            }
+            return addStatus
+        }
+
         func updateThenAdd(addAccessGroup: Bool) -> OSStatus {
+            if needsAccessibilityMigration(addAccessGroup: addAccessGroup) {
+                return replaceForAccessibilityMigration(addAccessGroup: addAccessGroup)
+            }
             let updateStatus = update(addAccessGroup: addAccessGroup)
             guard updateStatus == errSecItemNotFound else { return updateStatus }
             let addStatus = add(addAccessGroup: addAccessGroup)

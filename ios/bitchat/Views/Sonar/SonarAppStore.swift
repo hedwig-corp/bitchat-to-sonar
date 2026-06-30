@@ -664,6 +664,8 @@ final class SonarAppStore: ObservableObject {
     @Published private var pendingMarmotMessagesByChat: [String: [SNMessage]] = [:]
     private var pendingDirectMarmotSends: [String: [SNPendingMarmotSend]] = [:]
     private var startingMarmotChats = Set<String>()
+    private var pendingMarmotSetupTasks: [String: Task<Void, Never>] = [:]
+    private var pendingMarmotSetupTokens: [String: UUID] = [:]
     /// Texts queued for a Sonar peer (keyed by npub) while their White
     /// Noise group is being created on first out-of-range send.
     private var pendingMarmotSends: [String: [String]] = [:]
@@ -3185,17 +3187,24 @@ final class SonarAppStore: ObservableObject {
             return
         }
         guard startingMarmotChats.insert(clean).inserted else { return }
-        Task { @MainActor in
-            defer { startingMarmotChats.remove(clean) }
+        let setupToken = UUID()
+        pendingMarmotSetupTokens[pendingId] = setupToken
+        let setupTask = Task { @MainActor in
+            defer { clearPendingSecureChatSetup(pendingId: pendingId, npub: clean, token: setupToken) }
             guard let groupId = await marmot.startChatReturningId(with: clean) else {
-                failPendingSecureChat(pendingId: pendingId, npub: clean)
+                failPendingSecureChat(pendingId: pendingId, npub: clean, setupToken: setupToken)
                 return
             }
-            finishPendingSecureChat(pendingId: pendingId, npub: clean, groupId: groupId)
+            finishPendingSecureChat(pendingId: pendingId, npub: clean, groupId: groupId, setupToken: setupToken)
         }
+        pendingMarmotSetupTasks[pendingId] = setupTask
     }
 
-    private func finishPendingSecureChat(pendingId: String, npub: String, groupId: String) {
+    private func finishPendingSecureChat(pendingId: String, npub: String, groupId: String, setupToken: UUID? = nil) {
+        guard isActivePendingSecureChatSetup(pendingId: pendingId, npub: npub, token: setupToken) else { return }
+        if setupToken == nil {
+            cancelPendingSecureChatSetup(pendingId: pendingId, npub: npub)
+        }
         pendingMarmotChats[pendingId] = nil
         let realId = Self.marmotIDPrefix + groupId
         if currentDMId == pendingId {
@@ -3218,7 +3227,8 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
-    private func failPendingSecureChat(pendingId: String, npub: String) {
+    private func failPendingSecureChat(pendingId: String, npub: String, setupToken: UUID? = nil) {
+        guard isActivePendingSecureChatSetup(pendingId: pendingId, npub: npub, token: setupToken) else { return }
         pendingMarmotChats[pendingId] = nil
         let queued = pendingDirectMarmotSends.removeValue(forKey: npub) ?? []
         let queuedIds = Set(queued.map(\.messageId))
@@ -3242,6 +3252,32 @@ final class SonarAppStore: ObservableObject {
         } else {
             pendingMarmotMessagesByChat[pendingId] = messages
         }
+    }
+
+    private func isActivePendingSecureChatSetup(pendingId: String, npub: String, token: UUID?) -> Bool {
+        guard pendingMarmotChats[pendingId]?.npub == npub else { return false }
+        return token == nil || pendingMarmotSetupTokens[pendingId] == token
+    }
+
+    private func clearPendingSecureChatSetup(pendingId: String, npub: String, token: UUID) {
+        guard pendingMarmotSetupTokens[pendingId] == token else { return }
+        pendingMarmotSetupTokens[pendingId] = nil
+        pendingMarmotSetupTasks[pendingId] = nil
+        startingMarmotChats.remove(npub)
+    }
+
+    private func cancelPendingSecureChatSetup(pendingId: String, npub: String) {
+        pendingMarmotSetupTasks[pendingId]?.cancel()
+        pendingMarmotSetupTasks[pendingId] = nil
+        pendingMarmotSetupTokens[pendingId] = nil
+        startingMarmotChats.remove(npub)
+    }
+
+    private func cancelPendingSecureChatSetups() {
+        pendingMarmotSetupTasks.values.forEach { $0.cancel() }
+        pendingMarmotSetupTasks = [:]
+        pendingMarmotSetupTokens = [:]
+        startingMarmotChats = []
     }
 
     private func failedPendingMessage(_ message: SNMessage) -> SNMessage {
@@ -4858,7 +4894,7 @@ final class SonarAppStore: ObservableObject {
         pendingMarmotChats = [:]
         pendingMarmotMessagesByChat = [:]
         pendingDirectMarmotSends = [:]
-        startingMarmotChats = []
+        cancelPendingSecureChatSetups()
         scannedPayMessageIDs = []
         pendingPayPeer = nil
         localHydratingDMs = []
@@ -4941,7 +4977,7 @@ final class SonarAppStore: ObservableObject {
         pendingMarmotChats = [:]
         pendingMarmotMessagesByChat = [:]
         pendingDirectMarmotSends = [:]
-        startingMarmotChats = []
+        cancelPendingSecureChatSetups()
         // Forget every ⚡PAY coin and the Lightning wallet seed (separate
         // keychain service owned by SonarWalletKit).
         #if os(iOS) || os(macOS)
