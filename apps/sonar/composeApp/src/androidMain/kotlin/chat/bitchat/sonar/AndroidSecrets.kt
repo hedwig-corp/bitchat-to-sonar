@@ -28,19 +28,24 @@ internal object AndroidSecrets {
     fun get(key: String): String? =
         secretsPrefs().getString(key, null)?.let { decrypt(it) }
 
-    fun getMigrating(key: String): String? {
+    fun getMigrating(key: String, durable: Boolean = false): String? {
         secretsPrefs().getString(key, null)?.let {
             val value = decrypt(it)
             legacyPrefs().edit().remove(key).apply()
             return value
         }
         val legacy = legacyPrefs().getString(key, null) ?: return null
-        put(key, legacy)
+        put(key, legacy, durable = durable)
         return legacy
     }
 
-    fun put(key: String, value: String) {
-        secretsPrefs().edit().putString(key, encrypt(value)).apply()
+    fun put(key: String, value: String, durable: Boolean = false) {
+        val edit = secretsPrefs().edit().putString(key, encrypt(value))
+        if (durable) {
+            check(edit.commit()) { "Failed to persist Android secret: $key" }
+        } else {
+            edit.apply()
+        }
         legacyPrefs().edit().remove(key).apply()
     }
 

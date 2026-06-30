@@ -46,6 +46,16 @@ object DesktopSecrets {
         DesktopEnv.putString(key, value)
     }
 
+    fun clear(vararg keys: String) {
+        keys.forEach { key ->
+            when {
+                isMac -> keychainDelete(key)
+                isLinux -> secretToolDelete(key)
+            }
+            DesktopEnv.remove(key)
+        }
+    }
+
     private fun osPut(key: String, value: String): Boolean = when {
         isMac -> keychainPut(key, value)
         isLinux -> secretToolPut(key, value)
@@ -66,6 +76,11 @@ object DesktopSecrets {
             .redirectErrorStream(true).start().waitFor() == 0
     }.getOrDefault(false)
 
+    private fun keychainDelete(key: String): Boolean = runCatching {
+        ProcessBuilder("security", "delete-generic-password", "-s", SERVICE, "-a", key)
+            .redirectErrorStream(true).start().waitFor() == 0
+    }.getOrDefault(false)
+
     // ---- Linux Secret Service (via secret-tool CLI) ----
 
     private fun secretToolGet(key: String): String? = runCatching {
@@ -80,5 +95,10 @@ object DesktopSecrets {
             .redirectErrorStream(true).start()
         p.outputStream.bufferedWriter().use { it.write(value) }
         p.waitFor() == 0
+    }.getOrDefault(false)
+
+    private fun secretToolDelete(key: String): Boolean = runCatching {
+        ProcessBuilder("secret-tool", "clear", "service", SERVICE, "key", key)
+            .redirectErrorStream(true).start().waitFor() == 0
     }.getOrDefault(false)
 }

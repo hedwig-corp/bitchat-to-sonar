@@ -1596,7 +1596,15 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
-    var onboarded by mutableStateOf(SonarCore.onboardingComplete())
+    private fun initialOnboardingComplete(): Boolean {
+        val stored = SonarCore.onboardingComplete()
+        if (stored) return true
+        if (!SonarCore.hasIdentity()) return false
+        SonarCore.setOnboardingComplete(true)
+        return true
+    }
+
+    var onboarded by mutableStateOf(initialOnboardingComplete())
         private set
     var nick by mutableStateOf(SonarCore.nickname())
         private set
@@ -1659,11 +1667,19 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     fun completeOnboarding(nickname: String) {
-        SonarCore.setNickname(nickname)
-        SonarCore.setOnboardingComplete(true)
-        nick = nickname
-        onboarded = true
-        refreshMeshIdentity()
+        scope.launch {
+            val result = runCatching {
+                SonarCore.setNickname(nickname)
+                npub = SonarCore.prepareIdentityForOnboarding()
+                SonarCore.setOnboardingComplete(true)
+                nick = nickname
+                onboarded = true
+                refreshMeshIdentity()
+            }
+            result.exceptionOrNull()?.let {
+                toast = "Couldn't save your account key. Try again."
+            }
+        }
     }
 
     fun exportNsec(): String = SonarCore.identityNsec()

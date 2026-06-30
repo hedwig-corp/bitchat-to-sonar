@@ -447,7 +447,7 @@ actual object SonarCore {
     actual fun fingerprint(): String {
         var hex = pubkeyHex
         if (hex.isEmpty()) {
-            val saved = AndroidSecrets.getMigrating("nsec")
+            val saved = AndroidSecrets.getMigrating("nsec", durable = true)
             if (saved != null) hex = runCatching { SonarIdentity.import(saved).pubkeyHex() }.getOrDefault("")
         }
         if (hex.isEmpty()) return ""
@@ -455,7 +455,27 @@ actual object SonarCore {
         return hex.take(32).uppercase().chunked(4).joinToString(" ")
     }
 
-    actual fun identityNsec(): String = AndroidSecrets.getMigrating("nsec") ?: ""
+    actual fun identityNsec(): String = AndroidSecrets.getMigrating("nsec", durable = true) ?: ""
+
+    actual fun hasIdentity(): Boolean =
+        runCatching {
+            val saved = AndroidSecrets.getMigrating("nsec", durable = true)?.trim()
+                ?: return@runCatching false
+            SonarIdentity.import(saved)
+            true
+        }
+            .getOrDefault(false)
+
+    actual suspend fun prepareIdentityForOnboarding(): String = withContext(Dispatchers.IO) {
+        lock.withLock {
+            if (npub.isNotBlank()) return@withLock npub
+            val saved = AndroidSecrets.getMigrating("nsec", durable = true)
+            if (saved != null) return@withLock SonarIdentity.import(saved).npub()
+            val identity = SonarIdentity.generate()
+            AndroidSecrets.put("nsec", identity.nsec(), durable = true)
+            identity.npub()
+        }
+    }
 
     actual suspend fun importIdentity(nsec: String): String = withContext(Dispatchers.IO) {
         val identity = SonarIdentity.import(nsec.trim())
@@ -464,7 +484,7 @@ actual object SonarCore {
             npub = identity.npub()
             pubkeyHex = identity.pubkeyHex()
             File(ctx.filesDir, "sonar-marmot").deleteRecursively()
-            AndroidSecrets.put("nsec", identity.nsec())
+            AndroidSecrets.put("nsec", identity.nsec(), durable = true)
             npub
         }
     }
@@ -584,20 +604,23 @@ actual object SonarCore {
         node ?: error("SonarCore not started — call start() first")
 
     private fun loadOrCreateIdentity(): SonarIdentity {
-        val saved = AndroidSecrets.getMigrating("nsec")
+        val saved = AndroidSecrets.getMigrating("nsec", durable = true)
         if (saved != null) {
-            runCatching { return SonarIdentity.import(saved) }
+            return SonarIdentity.import(saved)
+        }
+        if (onboardingComplete()) {
+            throw IllegalStateException("Account key missing. Restore from your backup key.")
         }
         val id = SonarIdentity.generate()
-        AndroidSecrets.put("nsec", id.nsec())
+        AndroidSecrets.put("nsec", id.nsec(), durable = true)
         return id
     }
 
     private fun loadOrCreateDbKey(): String {
-        AndroidSecrets.getMigrating("dbKeyHex")?.let { return it }
+        AndroidSecrets.getMigrating("dbKeyHex", durable = true)?.let { return it }
         val bytes = ByteArray(32).also { SecureRandom().nextBytes(it) }
         val hex = bytes.joinToString("") { b -> "%02x".format(b) }
-        AndroidSecrets.put("dbKeyHex", hex)
+        AndroidSecrets.put("dbKeyHex", hex, durable = true)
         return hex
     }
 }

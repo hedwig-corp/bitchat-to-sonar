@@ -141,7 +141,9 @@ fun App() {
         SonarLifecycle.installInviteLinkHandler { state.requestJoinViaLink(it) }
         SonarLifecycle.installSharedTextHandler { state.handleSharedText(it) }
     }
-    LaunchedEffect(Unit) { state.boot() }
+    LaunchedEffect(state.onboarded) {
+        if (state.onboarded) state.boot()
+    }
     SonarTheme(dark = state.dark) {
         val s = sonar
 

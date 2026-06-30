@@ -464,6 +464,27 @@ actual object SonarCore {
 
     actual fun identityNsec(): String = DesktopSecrets.get("nsec") ?: ""
 
+    actual fun hasIdentity(): Boolean =
+        runCatching {
+            SonarNativeLoader.ensureLoaded()
+            val saved = DesktopSecrets.get("nsec")?.trim() ?: return@runCatching false
+            SonarIdentity.import(saved)
+            true
+        }
+            .getOrDefault(false)
+
+    actual suspend fun prepareIdentityForOnboarding(): String = withContext(Dispatchers.IO) {
+        SonarNativeLoader.ensureLoaded()
+        lock.withLock {
+            if (npub.isNotBlank()) return@withLock npub
+            val saved = DesktopSecrets.get("nsec")
+            if (saved != null) return@withLock SonarIdentity.import(saved).npub()
+            val identity = SonarIdentity.generate()
+            DesktopSecrets.put("nsec", identity.nsec())
+            identity.npub()
+        }
+    }
+
     actual suspend fun importIdentity(nsec: String): String = withContext(Dispatchers.IO) {
         SonarNativeLoader.ensureLoaded()
         val identity = SonarIdentity.import(nsec.trim())
@@ -500,6 +521,7 @@ actual object SonarCore {
             node = null
             npub = ""; pubkeyHex = ""
             marmotDir().deleteRecursively()
+            DesktopSecrets.clear("nsec", "dbKeyHex")
             DesktopEnv.clear()
         }
     }
@@ -531,7 +553,10 @@ actual object SonarCore {
         // plaintext nsec in transparently.
         val saved = DesktopSecrets.get("nsec")
         if (saved != null) {
-            runCatching { return SonarIdentity.import(saved) }
+            return SonarIdentity.import(saved)
+        }
+        if (onboardingComplete()) {
+            throw IllegalStateException("Account key missing. Restore from your backup key.")
         }
         val id = SonarIdentity.generate()
         DesktopSecrets.put("nsec", id.nsec())

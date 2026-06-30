@@ -119,15 +119,16 @@ final class KeychainManager: KeychainManagerProtocol {
 
     /// Internal method to save data with detailed result and retry for transient errors
     private func saveDataWithResult(_ data: Data, forKey key: String, retryCount: Int = 2) -> KeychainSaveResult {
-        // Delete any existing item first to ensure clean state
-        _ = delete(forKey: key)
-
-        // Build base query
-        var base: [String: Any] = [
+        let queryBase: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrAccount as String: key,
+            kSecAttrService as String: service
+        ]
+        let updateAttributes: [String: Any] = [
+            kSecValueData as String: data
+        ]
+        let addAttributes: [String: Any] = [
             kSecValueData as String: data,
-            kSecAttrService as String: service,
             // AfterFirstUnlock (not WhenUnlocked): the app is woken in the
             // BACKGROUND with the screen LOCKED via BLE state restoration
             // (CBCentralManagerOptionRestoreIdentifierKey). A WhenUnlocked item is
@@ -140,23 +141,43 @@ final class KeychainManager: KeychainManagerProtocol {
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
             kSecAttrLabel as String: "bitchat-\(key)"
         ]
-        #if os(macOS)
-        base[kSecAttrSynchronizable as String] = false
-        #endif
 
-        func attempt(addAccessGroup: Bool) -> OSStatus {
-            var query = base
-            if addAccessGroup { query[kSecAttrAccessGroup as String] = appGroup }
-            return SecItemAdd(query as CFDictionary, nil)
+        func query(addAccessGroup: Bool) -> [String: Any] {
+            var q = queryBase
+            if addAccessGroup { q[kSecAttrAccessGroup as String] = appGroup }
+            return q
+        }
+
+        func update(addAccessGroup: Bool) -> OSStatus {
+            SecItemUpdate(query(addAccessGroup: addAccessGroup) as CFDictionary, updateAttributes as CFDictionary)
+        }
+
+        func add(addAccessGroup: Bool) -> OSStatus {
+            var q = query(addAccessGroup: addAccessGroup)
+            addAttributes.forEach { q[$0.key] = $0.value }
+            #if os(macOS)
+            q[kSecAttrSynchronizable as String] = false
+            #endif
+            return SecItemAdd(q as CFDictionary, nil)
+        }
+
+        func updateThenAdd(addAccessGroup: Bool) -> OSStatus {
+            let updateStatus = update(addAccessGroup: addAccessGroup)
+            guard updateStatus == errSecItemNotFound else { return updateStatus }
+            let addStatus = add(addAccessGroup: addAccessGroup)
+            if addStatus == errSecDuplicateItem {
+                return update(addAccessGroup: addAccessGroup)
+            }
+            return addStatus
         }
 
         #if os(iOS)
-        var status = attempt(addAccessGroup: true)
+        var status = updateThenAdd(addAccessGroup: true)
         if status == -34018 { // Missing entitlement, retry without access group
-            status = attempt(addAccessGroup: false)
+            status = updateThenAdd(addAccessGroup: false)
         }
         #else
-        let status = attempt(addAccessGroup: false)
+        let status = updateThenAdd(addAccessGroup: false)
         #endif
 
         // Classify the result
@@ -202,22 +223,25 @@ final class KeychainManager: KeychainManagerProtocol {
             kSecMatchLimit as String: kSecMatchLimitOne
         ]
 
-        var result: AnyObject?
-        func attempt(withAccessGroup: Bool) -> OSStatus {
+        func attempt(withAccessGroup: Bool) -> (OSStatus, Data?) {
+            var result: AnyObject?
             var q = base
             if withAccessGroup { q[kSecAttrAccessGroup as String] = appGroup }
-            return SecItemCopyMatching(q as CFDictionary, &result)
+            let status = SecItemCopyMatching(q as CFDictionary, &result)
+            return (status, result as? Data)
         }
 
         #if os(iOS)
-        var status = attempt(withAccessGroup: true)
-        if status == -34018 { status = attempt(withAccessGroup: false) }
+        var (status, data) = attempt(withAccessGroup: true)
+        if status == -34018 || status == errSecItemNotFound {
+            (status, data) = attempt(withAccessGroup: false)
+        }
         #else
-        let status = attempt(withAccessGroup: false)
+        let (status, data) = attempt(withAccessGroup: false)
         #endif
 
         // Classify the result
-        let readResult = classifyReadStatus(status, data: result as? Data)
+        let readResult = classifyReadStatus(status, data: data)
 
         // Log all outcomes consistently
         switch readResult {
@@ -293,57 +317,12 @@ final class KeychainManager: KeychainManagerProtocol {
     }
     
     private func saveData(_ data: Data, forKey key: String) -> Bool {
-        // Delete any existing item first to ensure clean state
-        _ = delete(forKey: key)
-        
-        // Build base query
-        var base: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrAccount as String: key,
-            kSecValueData as String: data,
-            kSecAttrService as String: service,
-            // AfterFirstUnlock (not WhenUnlocked): the app is woken in the
-            // BACKGROUND with the screen LOCKED via BLE state restoration
-            // (CBCentralManagerOptionRestoreIdentifierKey). A WhenUnlocked item is
-            // unreadable then, so NoiseEncryptionService fell back to an EPHEMERAL
-            // key → the static Noise key / signing key / marmot-nsec regenerated on
-            // every locked wake (peerID + npub churn, and the derived wallet became
-            // unreachable). AfterFirstUnlockThisDeviceOnly stays readable in the
-            // background after the first unlock since boot — matching the wallet
-            // keychain (KeychainWalletStorage). Fixes #13.
-            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
-            kSecAttrLabel as String: "bitchat-\(key)"
-        ]
-        #if os(macOS)
-        base[kSecAttrSynchronizable as String] = false
-        #endif
-
-        // Try with access group where it is expected to work (iOS app builds)
-        var triedWithoutGroup = false
-        func attempt(addAccessGroup: Bool) -> OSStatus {
-            var query = base
-            if addAccessGroup { query[kSecAttrAccessGroup as String] = appGroup }
-            return SecItemAdd(query as CFDictionary, nil)
+        switch saveDataWithResult(data, forKey: key) {
+        case .success:
+            return true
+        default:
+            return false
         }
-
-        #if os(iOS)
-        var status = attempt(addAccessGroup: true)
-        if status == -34018 { // Missing entitlement, retry without access group
-            triedWithoutGroup = true
-            status = attempt(addAccessGroup: false)
-        }
-        #else
-        // On macOS dev/simulator default to no access group to avoid -34018
-        let status = attempt(addAccessGroup: false)
-        #endif
-
-        if status == errSecSuccess { return true }
-        if status == -34018 && !triedWithoutGroup {
-            SecureLogger.error(NSError(domain: "Keychain", code: -34018), context: "Missing keychain entitlement", category: .keychain)
-        } else if status != errSecDuplicateItem {
-            SecureLogger.error(NSError(domain: "Keychain", code: Int(status)), context: "Error saving to keychain", category: .keychain)
-        }
-        return false
     }
     
     private func retrieve(forKey key: String) -> String? {
@@ -361,21 +340,24 @@ final class KeychainManager: KeychainManagerProtocol {
             kSecMatchLimit as String: kSecMatchLimitOne
         ]
 
-        var result: AnyObject?
-        func attempt(withAccessGroup: Bool) -> OSStatus {
+        func attempt(withAccessGroup: Bool) -> (OSStatus, Data?) {
+            var result: AnyObject?
             var q = base
             if withAccessGroup { q[kSecAttrAccessGroup as String] = appGroup }
-            return SecItemCopyMatching(q as CFDictionary, &result)
+            let status = SecItemCopyMatching(q as CFDictionary, &result)
+            return (status, result as? Data)
         }
 
         #if os(iOS)
-        var status = attempt(withAccessGroup: true)
-        if status == -34018 { status = attempt(withAccessGroup: false) }
+        var (status, data) = attempt(withAccessGroup: true)
+        if status == -34018 || status == errSecItemNotFound {
+            (status, data) = attempt(withAccessGroup: false)
+        }
         #else
-        let status = attempt(withAccessGroup: false)
+        let (status, data) = attempt(withAccessGroup: false)
         #endif
 
-        if status == errSecSuccess { return result as? Data }
+        if status == errSecSuccess { return data }
         if status == -34018 {
             SecureLogger.error(NSError(domain: "Keychain", code: -34018), context: "Missing keychain entitlement", category: .keychain)
         }
@@ -397,12 +379,15 @@ final class KeychainManager: KeychainManagerProtocol {
         }
 
         #if os(iOS)
-        var status = attempt(withAccessGroup: true)
-        if status == -34018 { status = attempt(withAccessGroup: false) }
+        let groupedStatus = attempt(withAccessGroup: true)
+        let plainStatus = attempt(withAccessGroup: false)
+        let groupedOK = groupedStatus == errSecSuccess || groupedStatus == errSecItemNotFound || groupedStatus == -34018
+        let plainOK = plainStatus == errSecSuccess || plainStatus == errSecItemNotFound
+        return groupedOK && plainOK
         #else
         let status = attempt(withAccessGroup: false)
-        #endif
         return status == errSecSuccess || status == errSecItemNotFound
+        #endif
     }
     
     // MARK: - Cleanup
