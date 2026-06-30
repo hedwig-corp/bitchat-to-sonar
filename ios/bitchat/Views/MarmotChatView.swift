@@ -908,13 +908,13 @@ final class MarmotChatModel: ObservableObject {
         let clean = SNMarmotProfileCache.canonicalKey(trimmed)
         guard !clean.isEmpty else { return }
         if directGroup(forNpub: clean) != nil { return }
-        pendingDirectChats[clean] = pendingDirectChats[clean] ?? Date()
+        if pendingDirectChats[clean] != nil { return }
+        pendingDirectChats[clean] = Date()
         ensureProfile(clean)
         ensureSonarDescriptor(clean)
         Task {
-            if await startChatReturningId(with: clean) != nil {
-                pendingDirectChats[clean] = nil
-            }
+            _ = await startChatReturningId(with: clean)
+            pendingDirectChats[clean] = nil
         }
     }
 
