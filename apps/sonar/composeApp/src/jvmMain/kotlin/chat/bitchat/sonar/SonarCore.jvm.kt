@@ -465,8 +465,25 @@ actual object SonarCore {
     actual fun identityNsec(): String = DesktopSecrets.get("nsec") ?: ""
 
     actual fun hasIdentity(): Boolean =
-        runCatching { DesktopSecrets.get("nsec")?.trim()?.startsWith("nsec1") == true }
+        runCatching {
+            SonarNativeLoader.ensureLoaded()
+            val saved = DesktopSecrets.get("nsec")?.trim() ?: return@runCatching false
+            SonarIdentity.import(saved)
+            true
+        }
             .getOrDefault(false)
+
+    actual suspend fun prepareIdentityForOnboarding(): String = withContext(Dispatchers.IO) {
+        SonarNativeLoader.ensureLoaded()
+        lock.withLock {
+            if (npub.isNotBlank()) return@withLock npub
+            val saved = DesktopSecrets.get("nsec")
+            if (saved != null) return@withLock SonarIdentity.import(saved).npub()
+            val identity = SonarIdentity.generate()
+            DesktopSecrets.put("nsec", identity.nsec())
+            identity.npub()
+        }
+    }
 
     actual suspend fun importIdentity(nsec: String): String = withContext(Dispatchers.IO) {
         SonarNativeLoader.ensureLoaded()
@@ -537,6 +554,9 @@ actual object SonarCore {
         val saved = DesktopSecrets.get("nsec")
         if (saved != null) {
             return SonarIdentity.import(saved)
+        }
+        if (onboardingComplete()) {
+            throw IllegalStateException("Account key missing. Restore from your backup key.")
         }
         val id = SonarIdentity.generate()
         DesktopSecrets.put("nsec", id.nsec())
