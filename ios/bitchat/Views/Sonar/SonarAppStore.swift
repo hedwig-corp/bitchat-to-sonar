@@ -461,6 +461,7 @@ final class SonarAppStore: ObservableObject {
 
     private static let maxStoredCallsPerConversation = 100
     private static let capabilitySettleWindow: TimeInterval = 1.5
+    private static let pendingMarmotDirectSendQueueLimit = 100
     private static let pendingMarmotGroupSendQueueLimit = 100
 
     static let marmotIDPrefix = "marmot:"
@@ -3282,9 +3283,16 @@ final class SonarAppStore: ObservableObject {
             state: "Sending"
         )
         pendingMarmotMessagesByChat[chatId, default: []].append(message)
-        pendingDirectMarmotSends[clean, default: []].append(
-            SNPendingMarmotSend(chatId: chatId, text: text, messageId: message.id)
-        )
+        var queue = pendingDirectMarmotSends[clean, default: []]
+        queue.append(SNPendingMarmotSend(chatId: chatId, text: text, messageId: message.id))
+        if queue.count > Self.pendingMarmotDirectSendQueueLimit {
+            let dropped = queue.removeFirst()
+            pendingMarmotMessagesByChat[dropped.chatId] = pendingMarmotMessagesByChat[dropped.chatId]?.map {
+                $0.id == dropped.messageId ? failedPendingMessage($0) : $0
+            }
+            showToast("Still setting up this chat - wait before sending more.")
+        }
+        pendingDirectMarmotSends[clean] = queue
         startSecureChatInBackground(npub: clean, pendingId: chatId)
     }
 

@@ -41,6 +41,7 @@ private const val UNFAVORITED_CONTROL = "[UNFAVORITED]"
 private const val MESH_MEDIA_URL_PREFIX = "mesh-media:"
 private const val PENDING_MARMOT_CHAT_PREFIX = "npub:"
 private const val PENDING_MARMOT_GROUP_PREFIX = "group-pending:"
+private const val PENDING_MARMOT_DIRECT_SEND_QUEUE_LIMIT = 100
 private const val PENDING_MARMOT_GROUP_SEND_QUEUE_LIMIT = 100
 internal const val BLE_DISCOVER_NEW_PEOPLE_PREF = "bleDiscoverNewPeople"
 
@@ -2437,8 +2438,13 @@ class SonarAppState(private val scope: CoroutineScope) {
         val npubHex = canonicalNpubHex(peerNpub) ?: return
         val echo = createSendEcho(chatId, text)
         messages = (messages + echo).sortedBy { it.tsSecs }
-        pendingDirectMarmotSends.getOrPut(npubHex) { mutableListOf() }
-            .add(PendingDirectMarmotSend(chatId, text, echo.id))
+        val queue = pendingDirectMarmotSends.getOrPut(npubHex) { mutableListOf() }
+        queue.add(PendingDirectMarmotSend(chatId, text, echo.id))
+        if (queue.size > PENDING_MARMOT_DIRECT_SEND_QUEUE_LIMIT) {
+            val dropped = queue.removeAt(0)
+            failSendEcho(dropped.pendingChatId, dropped.echoId)
+            toast = "Still setting up this chat — wait before sending more."
+        }
         startPendingMarmotChat(peerNpub, chatId)
     }
 
