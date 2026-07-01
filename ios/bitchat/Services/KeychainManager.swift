@@ -162,10 +162,6 @@ final class KeychainManager: KeychainManagerProtocol {
             return SecItemAdd(q as CFDictionary, nil)
         }
 
-        func delete(addAccessGroup: Bool) -> OSStatus {
-            SecItemDelete(query(addAccessGroup: addAccessGroup) as CFDictionary)
-        }
-
         func needsAccessibilityMigration(addAccessGroup: Bool) -> Bool {
             var q = query(addAccessGroup: addAccessGroup)
             q[kSecReturnAttributes as String] = true
@@ -181,9 +177,11 @@ final class KeychainManager: KeychainManagerProtocol {
             return accessible != desiredAccessible
         }
 
-        func replaceForAccessibilityMigration(addAccessGroup: Bool) -> OSStatus {
-            let deleteStatus = delete(addAccessGroup: addAccessGroup)
-            guard deleteStatus == errSecSuccess || deleteStatus == errSecItemNotFound else { return deleteStatus }
+        func updateForAccessibilityMigration(addAccessGroup: Bool) -> OSStatus {
+            var attributes = updateAttributes
+            attributes[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+            let updateStatus = SecItemUpdate(query(addAccessGroup: addAccessGroup) as CFDictionary, attributes as CFDictionary)
+            guard updateStatus == errSecItemNotFound else { return updateStatus }
             let addStatus = add(addAccessGroup: addAccessGroup)
             if addStatus == errSecDuplicateItem {
                 return update(addAccessGroup: addAccessGroup)
@@ -193,7 +191,7 @@ final class KeychainManager: KeychainManagerProtocol {
 
         func updateThenAdd(addAccessGroup: Bool) -> OSStatus {
             if needsAccessibilityMigration(addAccessGroup: addAccessGroup) {
-                return replaceForAccessibilityMigration(addAccessGroup: addAccessGroup)
+                return updateForAccessibilityMigration(addAccessGroup: addAccessGroup)
             }
             let updateStatus = update(addAccessGroup: addAccessGroup)
             guard updateStatus == errSecItemNotFound else { return updateStatus }

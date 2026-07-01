@@ -2066,7 +2066,6 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun chatTitle(chat: SonarChat): String {
         pendingMarmotNpub(chat.id)?.let { pending ->
             profilesByNpub[canonicalProfileKey(pending)]?.bestName?.let { return it }
-            ensureProfile(pending)
             return shortNpub(pending)
         }
         pendingMarmotGroups[chat.id]?.let { return it.name }
@@ -2359,6 +2358,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun startPendingMarmotChat(peerNpub: String, pendingChatId: String) {
         val canonicalPeer = canonicalProfileKey(peerNpub)
         val npubHex = canonicalNpubHex(canonicalPeer) ?: return
+        ensureProfile(canonicalPeer)
         pendingMarmotChatNpubs = pendingMarmotChatNpubs + (pendingChatId to canonicalPeer)
         marmotGroupForNpub(npubHex.hexToBytesOrEmpty())?.let { existing ->
             scope.launch { finishPendingMarmotChat(npubHex, canonicalPeer, pendingChatId, existing.id) }
@@ -2520,11 +2520,6 @@ class SonarAppState(private val scope: CoroutineScope) {
             } else {
                 screen
             }
-        }
-        if ((screen as? Screen.Chat)?.id == chatId) {
-            messages = visibleMessagesForChat(chatId, withSendEchoes(chatId, mergePendingMediaUploads(chatId, marmotMessagesPage(chatId))))
-            processPayLines(chatId, messages)
-            processCallLines(chatId, messages)
         }
         flushPendingMarmotGroupSends(pendingChatId, chatId)
         if ((screen as? Screen.Chat)?.id == chatId) {
