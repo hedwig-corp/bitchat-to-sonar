@@ -3263,6 +3263,9 @@ final class SonarAppStore: ObservableObject {
     private func sendPendingMarmot(_ text: String, chatId: String, npub: String) {
         let clean = SNMarmotProfileCache.canonicalKey(npub)
         let createdAt = Date()
+        if pendingMarmotChats[chatId] == nil, pendingMarmotNpub(for: chatId) == clean {
+            pendingMarmotChats[chatId] = SNPendingMarmotChat(npub: clean, createdAt: createdAt)
+        }
         let message = SNMessage(
             id: "echo-\(UUID().uuidString)",
             mine: true,
