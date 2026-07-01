@@ -154,6 +154,7 @@ final class MarmotChatModel: ObservableObject {
     var profileNameProvider: (() -> String)?
     @Published var groups: [MarmotService.MarmotGroup] = []
     @Published var pendingGroupInvites: [MarmotService.GroupInvite] = []
+    @Published var pendingDirectChats: [String: Date] = [:]
     @Published var messagesByGroup: [String: [MarmotService.MarmotMessage]] = [:]
     @Published var busy = false
     @Published var errorText: String?
@@ -567,6 +568,7 @@ final class MarmotChatModel: ObservableObject {
             let groups = try await service.groups()
             let invites = try await service.pendingGroupInvites()
             self.groups = groups
+            dropResolvedPendingDirectChats()
             self.pendingGroupInvites = invites
             SNMarmotChatSnapshotCache.save(
                 groups: groups,
@@ -592,6 +594,7 @@ final class MarmotChatModel: ObservableObject {
             var byGroup = messagesByGroup
             byGroup[groupId] = page
             self.groups = groups
+            dropResolvedPendingDirectChats()
             self.pendingGroupInvites = invites
             self.messagesByGroup = reconcileOptimistic(into: byGroup)
             SNMarmotChatSnapshotCache.save(
@@ -639,6 +642,7 @@ final class MarmotChatModel: ObservableObject {
             }
             self.unreadByGroup = unread
             self.groups = groups
+            dropResolvedPendingDirectChats()
             self.pendingGroupInvites = invites
             self.messagesByGroup = reconcileOptimistic(into: byGroup)
             SNMarmotChatSnapshotCache.save(
@@ -904,15 +908,25 @@ final class MarmotChatModel: ObservableObject {
     func startChat(with peer: String) {
         let trimmed = peer.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        ensureSonarDescriptor(trimmed)
+        let clean = SNMarmotProfileCache.canonicalKey(trimmed)
+        guard !clean.isEmpty else { return }
+        if directGroup(forNpub: clean) != nil { return }
+        if pendingDirectChats[clean] != nil { return }
+        pendingDirectChats[clean] = Date()
+        ensureProfile(clean)
+        ensureSonarDescriptor(clean)
         Task {
-            _ = await startChatReturningId(with: trimmed)
+            _ = await startChatReturningId(with: clean)
+            pendingDirectChats[clean] = nil
         }
     }
 
     func startChatReturningId(with peer: String) async -> String? {
         let trimmed = peer.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
+        if let existing = directGroup(forNpub: trimmed) {
+            return existing.id
+        }
         guard await ensureRelayConnected() else {
             self.errorText = "Not connected yet — try again in a moment."
             return nil
@@ -933,6 +947,7 @@ final class MarmotChatModel: ObservableObject {
     func send(_ text: String, to groupId: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        errorText = nil
         let echo = MarmotService.MarmotMessage(
             id: Self.optimisticIDPrefix + UUID().uuidString,
             senderNpub: npub ?? "",
@@ -972,6 +987,7 @@ final class MarmotChatModel: ObservableObject {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
         guard !trimmed.isEmpty else { return true }
+        errorText = nil
         for text in trimmed {
             send(text, to: groupId)
         }
@@ -1403,6 +1419,21 @@ final class MarmotChatModel: ObservableObject {
         otherMembers(in: group).count == 1
     }
 
+    func directGroup(forNpub peerNpub: String) -> MarmotService.MarmotGroup? {
+        let target = SNMarmotProfileCache.canonicalKey(peerNpub)
+        return groups.first {
+            isDirectGroup($0) &&
+                $0.memberNpubs.map(SNMarmotProfileCache.canonicalKey).contains(target)
+        }
+    }
+
+    private func dropResolvedPendingDirectChats() {
+        guard !pendingDirectChats.isEmpty else { return }
+        for npub in pendingDirectChats.keys where directGroup(forNpub: npub) != nil {
+            pendingDirectChats[npub] = nil
+        }
+    }
+
     func startGroup(name: String, members: [String]) async throws -> String {
         let cleanMembers = Array(Set(members.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty })).sorted()
         guard cleanMembers.count >= 2 else {
@@ -1580,7 +1611,7 @@ struct MarmotChatsView: View {
 
     private var chatList: some View {
         Group {
-            if model.groups.isEmpty {
+            if model.groups.isEmpty && model.pendingDirectChats.isEmpty {
                 VStack(spacing: 6) {
                     Image(systemName: "lock.shield")
                         .font(.system(size: 26))
@@ -1600,25 +1631,45 @@ struct MarmotChatsView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                List(model.groups, id: \.id) { group in
-                    NavigationLink {
-                        MarmotConversationView(group: group, model: model)
-                    } label: {
+                List {
+                    ForEach(model.pendingDirectChats.sorted(by: { $0.value > $1.value }), id: \.key) { entry in
+                        let npub = entry.key
                         HStack(spacing: 12) {
-                            SonarAvatar(name: model.title(for: group), size: 44)
+                            let title = model.displayName(forNpub: npub) ?? String(npub.prefix(12)) + "…"
+                            SonarAvatar(name: title, size: 44)
                             VStack(alignment: .leading, spacing: 2) {
-                                Text(model.title(for: group))
+                                Text(title)
                                     .font(SonarTheme.uiFont(size: 16.5, weight: .semibold))
                                     .foregroundColor(SonarTheme.text)
-                                Text(model.messagesByGroup[group.id]?.last?.content ?? "Say hi 👋")
+                                Text("Setting up secure chat…")
                                     .font(SonarTheme.uiFont(size: 14))
                                     .foregroundColor(SonarTheme.text2)
                                     .lineLimit(1)
                             }
                         }
                         .padding(.vertical, 3)
+                        .listRowBackground(SonarTheme.bg)
                     }
-                    .listRowBackground(SonarTheme.bg)
+                    ForEach(model.groups, id: \.id) { group in
+                        NavigationLink {
+                            MarmotConversationView(group: group, model: model)
+                        } label: {
+                            HStack(spacing: 12) {
+                                SonarAvatar(name: model.title(for: group), size: 44)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(model.title(for: group))
+                                        .font(SonarTheme.uiFont(size: 16.5, weight: .semibold))
+                                        .foregroundColor(SonarTheme.text)
+                                    Text(model.messagesByGroup[group.id]?.last?.content ?? "Say hi 👋")
+                                        .font(SonarTheme.uiFont(size: 14))
+                                        .foregroundColor(SonarTheme.text2)
+                                        .lineLimit(1)
+                                }
+                            }
+                            .padding(.vertical, 3)
+                        }
+                        .listRowBackground(SonarTheme.bg)
+                    }
                 }
                 .listStyle(.plain)
                 .scrollContentBackground(.hidden)

@@ -222,8 +222,10 @@ struct SonarHomeScreen: View {
                         sub: { SNLockedPreview(preview: d.preview) }
                     )
                     .contextMenu {
-                        Button(role: .destructive) { pendingDelete = d } label: {
-                            Label(store.isMultiMemberMarmotGroupId(d.id) ? "Leave group" : "Delete chat", systemImage: "trash")
+                        if !store.isPendingSecureChat(d.id) {
+                            Button(role: .destructive) { pendingDelete = d } label: {
+                                Label(store.isMultiMemberMarmotGroupId(d.id) ? "Leave group" : "Delete chat", systemImage: "trash")
+                            }
                         }
                     }
                 }
@@ -431,12 +433,8 @@ struct SonarHomeScreen: View {
                     let name = groupNameDraft
                     guard members.count >= 2 else { return }
                     composeSheet = false
-                    Task {
-                        if let groupId = try? await store.marmot.startGroup(name: name, members: members) {
-                            let id = SonarAppStore.marmotIDPrefix + groupId
-                            store.openedDM(id)
-                            store.push(.dm(id))
-                        }
+                    if let id = store.startGroup(name: name, members: members) {
+                        store.push(.dm(id))
                     }
                 }
             }
@@ -467,12 +465,8 @@ struct SonarHomeScreen: View {
             SNPrimaryButton(label: "Accept") {
                 let invite = invite
                 pendingInvite = nil
-                Task {
-                    if let groupId = try? await store.marmot.acceptGroupInvite(invite) {
-                        store.openedDM(SonarAppStore.marmotIDPrefix + groupId)
-                        store.push(.dm(SonarAppStore.marmotIDPrefix + groupId))
-                    }
-                }
+                let id = store.acceptGroupInvite(invite)
+                store.push(.dm(id))
             }
             Button {
                 let invite = invite

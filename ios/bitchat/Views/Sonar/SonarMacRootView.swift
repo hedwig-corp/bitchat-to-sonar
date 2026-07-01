@@ -141,6 +141,15 @@ struct SonarMacRootView: View {
         .onChange(of: store.path) { newPath in
             syncSelection(with: newPath.last)
         }
+        .onChange(of: store.pendingMarmotRouteReplacement) { replacement in
+            guard let replacement, selection == .dm(replacement.pendingId) else { return }
+            selection = .dm(replacement.realId)
+        }
+        .onChange(of: store.pendingMarmotRouteFailure) { failure in
+            guard let failure, selection == .dm(failure.pendingId) else { return }
+            selection = .radar
+            store.path.removeAll()
+        }
         .onReceive(NotificationCenter.default.publisher(for: .sonarMacOpenSearch)) { _ in
             searchOpen = true
         }
@@ -260,13 +269,8 @@ private struct SonarMacSidebar: View {
                         ForEach(store.marmot.pendingGroupInvites, id: \.id) { invite in
                             let title = invite.groupName.isEmpty ? "Group chat" : invite.groupName
                             MacPaletteRow(icon: .people, title: title, sub: "\(invite.memberCount) members · invite") {
-                                Task {
-                                    if let groupId = try? await store.marmot.acceptGroupInvite(invite) {
-                                        let id = SonarAppStore.marmotIDPrefix + groupId
-                                        store.openedDM(id)
-                                        selection = .dm(id)
-                                    }
-                                }
+                                let id = store.acceptGroupInvite(invite)
+                                selection = .dm(id)
                             }
                             .contextMenu {
                                 Button(role: .destructive) {
@@ -847,7 +851,7 @@ private struct MacConversationPane: View {
                     importFile = true
                 }
             }
-            if !isChannel && isMultiMemberMarmot {
+            if !isChannel && isMultiMemberMarmot && store.marmotGroupId(id) != nil {
                 SNActionRow(icon: .people, label: "Add people", desc: "Invite local contacts or paste npubs") {
                     actionSheet = false
                     addPeopleSheet = true
@@ -1916,13 +1920,9 @@ private struct MacCommandPalette: View {
         let name = groupNameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         let members = mergedNpubs(pasted: parsedNpubs(from: groupMembersDraft), selected: selectedGroupNpubs)
         guard !name.isEmpty, members.count >= 2 else { return }
-        Task {
-            if let groupId = try? await store.marmot.startGroup(name: name, members: members) {
-                let id = SonarAppStore.marmotIDPrefix + groupId
-                store.openedDM(id)
-                selection = .dm(id)
-                isPresented = false
-            }
+        if let id = store.startGroup(name: name, members: members) {
+            selection = .dm(id)
+            isPresented = false
         }
     }
 

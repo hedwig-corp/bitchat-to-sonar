@@ -282,6 +282,38 @@ struct SNActiveCall: Equatable {
     var speakerOn: Bool = false
 }
 
+private struct SNPendingMarmotChat {
+    let npub: String
+    let createdAt: Date
+}
+
+private struct SNPendingMarmotGroup {
+    let name: String
+    let members: [String]
+    let createdAt: Date
+}
+
+private struct SNPendingMarmotSend {
+    let chatId: String
+    let text: String
+    let messageId: String
+}
+
+private struct SNPendingMarmotGroupSend {
+    let text: String
+    let messageId: String
+}
+
+struct SNMarmotRouteReplacement: Equatable {
+    let pendingId: String
+    let realId: String
+}
+
+struct SNMarmotRouteFailure: Equatable {
+    let pendingId: String
+    let nonce = UUID()
+}
+
 struct SNMessage: Identifiable, Equatable {
     var id: String = UUID().uuidString
     var mine: Bool = false
@@ -289,6 +321,7 @@ struct SNMessage: Identifiable, Equatable {
     var author: String?
     var text: String
     var time: String
+    var sortDate: Date?
     var via: SNVia?
     var state: String?
     /// Non-nil = render as a PayBubble instead of a text bubble.
@@ -428,8 +461,12 @@ final class SonarAppStore: ObservableObject {
 
     private static let maxStoredCallsPerConversation = 100
     private static let capabilitySettleWindow: TimeInterval = 1.5
+    private static let pendingMarmotDirectSendQueueLimit = 100
+    private static let pendingMarmotGroupSendQueueLimit = 100
 
     static let marmotIDPrefix = "marmot:"
+    static let pendingMarmotIDPrefix = "marmot-pending:"
+    static let pendingMarmotGroupIDPrefix = "marmot-group-pending:"
     /// SNPeerItem id prefix for a Unify Wallet peer discovered over Bluetooth.
     /// The remainder is the Unify peripheral identifier (UnifyPeer.id).
     static let unifyIDPrefix = "unify:"
@@ -648,6 +685,18 @@ final class SonarAppStore: ObservableObject {
     private var scannedCallMessageIDs = Set<String>()
 
     private var cancellables = Set<AnyCancellable>()
+    @Published private var pendingMarmotChats: [String: SNPendingMarmotChat] = [:]
+    @Published private var pendingMarmotGroups: [String: SNPendingMarmotGroup] = [:]
+    @Published private var pendingMarmotMessagesByChat: [String: [SNMessage]] = [:]
+    @Published private(set) var pendingMarmotRouteReplacement: SNMarmotRouteReplacement?
+    @Published private(set) var pendingMarmotRouteFailure: SNMarmotRouteFailure?
+    private var pendingDirectMarmotSends: [String: [SNPendingMarmotSend]] = [:]
+    private var pendingMarmotGroupSends: [String: [SNPendingMarmotGroupSend]] = [:]
+    private var startingMarmotChats = Set<String>()
+    private var pendingMarmotSetupTasks: [String: Task<Void, Never>] = [:]
+    private var pendingMarmotSetupTokens: [String: UUID] = [:]
+    private var pendingMarmotGroupSetupTasks: [String: Task<Void, Never>] = [:]
+    private var pendingMarmotGroupSetupTokens: [String: UUID] = [:]
     /// Texts queued for a Sonar peer (keyed by npub) while their White
     /// Noise group is being created on first out-of-range send.
     private var pendingMarmotSends: [String: [String]] = [:]
@@ -814,6 +863,10 @@ final class SonarAppStore: ObservableObject {
         // the KeyPackage) using the current nickname, so a peer never sees our raw
         // npub because the opportunistic publish below lost the relay/onboarding race.
         marmot.profileNameProvider = { [weak self] in self?.chatViewModel.nickname ?? "" }
+        marmot.$groups
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.resolvePendingSecureChats() }
+            .store(in: &cancellables)
         marmot.$npub
             .receive(on: DispatchQueue.main)
             .sink { [weak self] npub in
@@ -1518,6 +1571,7 @@ final class SonarAppStore: ObservableObject {
     /// sheet's "Speaks" line; everywhere else uses plain-language labels.
     func speaks(_ id: String) -> String {
         if resolvedSonarProfile(id) != nil { return "Sonar mesh + White Noise" }
+        if isPendingSecureChat(id) { return "White Noise" }
         return marmotGroupId(id) != nil ? "White Noise" : "bitchat mesh"
     }
 
@@ -2366,6 +2420,25 @@ final class SonarAppStore: ObservableObject {
 
     func peerItem(_ id: String) -> SNPeerItem {
         if let item = nearbyPeerItem(forConversationId: id) { return item }
+        if let pendingNpub = pendingMarmotNpub(for: id) {
+            marmot.ensureProfile(pendingNpub)
+            return SNPeerItem(
+                id: id,
+                name: marmot.displayName(forNpub: pendingNpub) ?? Self.shortNpub(pendingNpub),
+                inRange: false, bars: 0,
+                hint: "Secure chat", detail: "Setting up White Noise",
+                angle: 0, r: 0
+            )
+        }
+        if let pendingGroup = pendingMarmotGroups[id] {
+            return SNPeerItem(
+                id: id,
+                name: pendingGroup.name,
+                inRange: false, bars: 0,
+                hint: "Secure group", detail: "Setting up White Noise",
+                angle: 0, r: 0
+            )
+        }
         if id.hasPrefix(Self.marmotIDPrefix), let groupId = marmotGroupId(id) {
             let group = marmot.groups.first { $0.id == groupId }
             return SNPeerItem(
@@ -2443,7 +2516,36 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
+    private func pendingMarmotChatId(for npub: String) -> String? {
+        let clean = SNMarmotProfileCache.canonicalKey(npub)
+        guard clean.hasPrefix("npub1") else { return nil }
+        return Self.pendingMarmotIDPrefix + clean
+    }
+
+    private func pendingMarmotNpub(for id: String) -> String? {
+        guard id.hasPrefix(Self.pendingMarmotIDPrefix) else { return nil }
+        let npub = String(id.dropFirst(Self.pendingMarmotIDPrefix.count))
+        return npub.hasPrefix("npub1") ? npub : nil
+    }
+
+    private func pendingMarmotGroupId(seed: String = UUID().uuidString) -> String {
+        Self.pendingMarmotGroupIDPrefix + seed
+    }
+
+    private func isPendingMarmotGroup(_ id: String) -> Bool {
+        id.hasPrefix(Self.pendingMarmotGroupIDPrefix) && pendingMarmotGroups[id] != nil
+    }
+
+    func isPendingSecureChat(_ id: String) -> Bool {
+        (pendingMarmotNpub(for: id) != nil && marmotGroupId(id) == nil) || isPendingMarmotGroup(id)
+    }
+
     func marmotGroupId(_ id: String) -> String? {
+        if isPendingMarmotGroup(id) { return nil }
+        if let pendingNpub = pendingMarmotNpub(for: id),
+           let group = marmotGroup(forNpub: pendingNpub) {
+            return group.id
+        }
         if id.hasPrefix(Self.marmotIDPrefix) {
             return String(id.dropFirst(Self.marmotIDPrefix.count))
         }
@@ -2474,6 +2576,7 @@ final class SonarAppStore: ObservableObject {
     }
 
     func isMultiMemberMarmotGroupId(_ id: String) -> Bool {
+        if isPendingMarmotGroup(id) { return true }
         guard let groupId = marmotGroupId(id),
               let group = marmotGroup(byId: groupId)
         else { return false }
@@ -2525,6 +2628,18 @@ final class SonarAppStore: ObservableObject {
     }
 
     func groupMemberContacts(forConversationId id: String) -> [SNGroupContact] {
+        if let pending = pendingMarmotGroups[id] {
+            return pending.members.map { npub in
+                marmot.ensureProfile(npub)
+                let title = marmot.displayName(forNpub: npub) ?? Self.shortNpub(npub)
+                return SNGroupContact(
+                    id: npub,
+                    title: title,
+                    subtitle: Self.shortNpub(npub),
+                    npub: npub
+                )
+            }
+        }
         guard let group = marmotGroup(forConversationId: id) else { return [] }
         return marmot.otherMembers(in: group).map { npub in
             marmot.ensureProfile(npub)
@@ -2776,7 +2891,37 @@ final class SonarAppStore: ObservableObject {
                 marmotGroupId: group.id
             ))
         }
-        let rows = Array(byKey.values) + marmotRows
+        let pendingRows = pendingMarmotChats.compactMap { id, pending -> SNDMRow? in
+            guard marmotGroup(forNpub: pending.npub) == nil else { return nil }
+            marmot.ensureProfile(pending.npub)
+            return SNDMRow(
+                id: id,
+                title: marmot.displayName(forNpub: pending.npub) ?? Self.shortNpub(pending.npub),
+                preview: "Setting up secure chat…",
+                time: Self.listTime(pending.createdAt),
+                unread: false,
+                presence: false,
+                verified: false,
+                isMarmot: true,
+                lastDate: pending.createdAt,
+                marmotGroupId: nil
+            )
+        }
+        let pendingGroupRows = pendingMarmotGroups.map { id, pending in
+            SNDMRow(
+                id: id,
+                title: pending.name,
+                preview: "Setting up group…",
+                time: Self.listTime(pending.createdAt),
+                unread: false,
+                presence: false,
+                verified: false,
+                isMarmot: true,
+                lastDate: pending.createdAt,
+                marmotGroupId: nil
+            )
+        }
+        let rows = Array(byKey.values) + pendingRows + pendingGroupRows + marmotRows
         return rows.sorted {
             let l = $0.lastDate ?? .distantPast
             let r = $1.lastDate ?? .distantPast
@@ -2880,7 +3025,7 @@ final class SonarAppStore: ObservableObject {
                     ))
                 }
             }
-            if !id.hasPrefix(Self.marmotIDPrefix) {
+            if !id.hasPrefix(Self.marmotIDPrefix), pendingMarmotNpub(for: id) == nil {
                 let peerID = PeerID(str: id)
                 let via: SNVia = .mesh
                 let my = chatViewModel.meshService.myPeerID
@@ -2914,8 +3059,22 @@ final class SonarAppStore: ObservableObject {
                 }
                 dated.sort { $0.0 < $1.0 }
             }
+            let echoIds = [id, Self.marmotIDPrefix + groupId].reduce(into: [String]()) { ids, echoId in
+                if !ids.contains(echoId) { ids.append(echoId) }
+            }
+            for echoId in echoIds {
+                dated += (pendingMarmotMessagesByChat[echoId] ?? []).map { ($0.sortDate ?? Date(), $0) }
+            }
             let transcriptPayIDs = Set(dated.compactMap { $0.1.pay?.id })
             dated += paymentActivityRows(for: id, transcriptPayIDs: transcriptPayIDs)
+            return mergeCallLogs(into: dated, id: id)
+        }
+        if pendingMarmotNpub(for: id) != nil {
+            let dated = (pendingMarmotMessagesByChat[id] ?? []).map { ($0.sortDate ?? Date(), $0) }
+            return mergeCallLogs(into: dated, id: id)
+        }
+        if isPendingMarmotGroup(id) {
+            let dated = (pendingMarmotMessagesByChat[id] ?? []).map { ($0.sortDate ?? Date(), $0) }
             return mergeCallLogs(into: dated, id: id)
         }
         let peerID = PeerID(str: id)
@@ -3018,6 +3177,14 @@ final class SonarAppStore: ObservableObject {
             marmot.send(text, to: groupId)
             return
         }
+        if let pendingNpub = pendingMarmotNpub(for: id) {
+            sendPendingMarmot(text, chatId: id, npub: pendingNpub)
+            return
+        }
+        if isPendingMarmotGroup(id) {
+            sendPendingMarmotGroup(text, chatId: id)
+            return
+        }
         if let profile = resolvedSonarProfile(id) {
             sendOverMarmot(text, npub: profile.npub)
             return
@@ -3098,6 +3265,322 @@ final class SonarAppStore: ObservableObject {
         pendingMarmotSends[npub, default: []].append(text)
         marmot.connectIfNeeded()
         marmot.startChat(with: npub)
+    }
+
+    private func sendPendingMarmot(_ text: String, chatId: String, npub: String) {
+        let clean = SNMarmotProfileCache.canonicalKey(npub)
+        let createdAt = Date()
+        if pendingMarmotChats[chatId] == nil, pendingMarmotNpub(for: chatId) == clean {
+            pendingMarmotChats[chatId] = SNPendingMarmotChat(npub: clean, createdAt: createdAt)
+        }
+        let message = SNMessage(
+            id: "echo-\(UUID().uuidString)",
+            mine: true,
+            text: text,
+            time: Self.clock(createdAt),
+            sortDate: createdAt,
+            via: .internet,
+            state: "Sending"
+        )
+        pendingMarmotMessagesByChat[chatId, default: []].append(message)
+        var queue = pendingDirectMarmotSends[clean, default: []]
+        queue.append(SNPendingMarmotSend(chatId: chatId, text: text, messageId: message.id))
+        if queue.count > Self.pendingMarmotDirectSendQueueLimit {
+            let dropped = queue.removeFirst()
+            pendingMarmotMessagesByChat[dropped.chatId] = pendingMarmotMessagesByChat[dropped.chatId]?.map {
+                $0.id == dropped.messageId ? failedPendingMessage($0) : $0
+            }
+            showToast("Still setting up this chat - wait before sending more.")
+        }
+        pendingDirectMarmotSends[clean] = queue
+        startSecureChatInBackground(npub: clean, pendingId: chatId)
+    }
+
+    private func sendPendingMarmotGroup(_ text: String, chatId: String) {
+        guard isPendingMarmotGroup(chatId) else { return }
+        let createdAt = Date()
+        let message = SNMessage(
+            id: "echo-\(UUID().uuidString)",
+            mine: true,
+            text: text,
+            time: Self.clock(createdAt),
+            sortDate: createdAt,
+            via: .internet,
+            state: "Sending"
+        )
+        pendingMarmotMessagesByChat[chatId, default: []].append(message)
+        var queue = pendingMarmotGroupSends[chatId, default: []]
+        queue.append(SNPendingMarmotGroupSend(text: text, messageId: message.id))
+        if queue.count > Self.pendingMarmotGroupSendQueueLimit {
+            let dropped = queue.removeFirst()
+            pendingMarmotMessagesByChat[chatId] = pendingMarmotMessagesByChat[chatId]?.map {
+                $0.id == dropped.messageId ? failedPendingMessage($0) : $0
+            }
+            showToast("Still setting up this group - wait before sending more.")
+        }
+        pendingMarmotGroupSends[chatId] = queue
+    }
+
+    private func startSecureChatInBackground(npub: String, pendingId: String) {
+        let clean = SNMarmotProfileCache.canonicalKey(npub)
+        if let group = marmotGroup(forNpub: clean) {
+            finishPendingSecureChat(pendingId: pendingId, npub: clean, groupId: group.id)
+            return
+        }
+        guard startingMarmotChats.insert(clean).inserted else { return }
+        let setupToken = UUID()
+        pendingMarmotSetupTokens[pendingId] = setupToken
+        let setupTask = Task { @MainActor in
+            defer { clearPendingSecureChatSetup(pendingId: pendingId, npub: clean, token: setupToken) }
+            guard let groupId = await marmot.startChatReturningId(with: clean) else {
+                failPendingSecureChat(pendingId: pendingId, npub: clean, setupToken: setupToken)
+                return
+            }
+            finishPendingSecureChat(pendingId: pendingId, npub: clean, groupId: groupId, setupToken: setupToken)
+        }
+        pendingMarmotSetupTasks[pendingId] = setupTask
+    }
+
+    private func finishPendingSecureChat(pendingId: String, npub: String, groupId: String, setupToken: UUID? = nil) {
+        guard isActivePendingSecureChatSetup(pendingId: pendingId, npub: npub, token: setupToken) else { return }
+        if setupToken == nil {
+            cancelPendingSecureChatSetup(pendingId: pendingId, npub: npub)
+        }
+        pendingMarmotChats[pendingId] = nil
+        let realId = Self.marmotIDPrefix + groupId
+        pendingMarmotRouteReplacement = SNMarmotRouteReplacement(pendingId: pendingId, realId: realId)
+        if currentDMId == pendingId {
+            path.removeLast()
+            push(.dm(realId))
+        }
+        if let echoes = pendingMarmotMessagesByChat.removeValue(forKey: pendingId), !echoes.isEmpty {
+            pendingMarmotMessagesByChat[realId, default: []].append(contentsOf: echoes)
+        }
+        flushPendingDirectMarmot(npub: npub, groupId: groupId, realId: realId)
+        openedDM(realId, marmotGroupId: groupId)
+    }
+
+    private func resolvePendingSecureChats() {
+        guard !pendingMarmotChats.isEmpty else { return }
+        for (pendingId, pending) in Array(pendingMarmotChats) {
+            if let group = marmotGroup(forNpub: pending.npub) {
+                finishPendingSecureChat(pendingId: pendingId, npub: pending.npub, groupId: group.id)
+            }
+        }
+    }
+
+    private func failPendingSecureChat(pendingId: String, npub: String, setupToken: UUID? = nil) {
+        guard isActivePendingSecureChatSetup(pendingId: pendingId, npub: npub, token: setupToken) else { return }
+        pendingMarmotChats[pendingId] = nil
+        pendingMarmotRouteFailure = SNMarmotRouteFailure(pendingId: pendingId)
+        let queued = pendingDirectMarmotSends.removeValue(forKey: npub) ?? []
+        let queuedIds = Set(queued.map(\.messageId))
+        var messages = (pendingMarmotMessagesByChat[pendingId] ?? []).map {
+            queuedIds.contains($0.id) ? failedPendingMessage($0) : $0
+        }
+        for item in queued where !messages.contains(where: { $0.id == item.messageId }) {
+            let createdAt = Date()
+            messages.append(SNMessage(
+                id: item.messageId,
+                mine: true,
+                text: item.text,
+                time: Self.clock(createdAt),
+                sortDate: createdAt,
+                via: .internet,
+                state: "Couldn't send"
+            ))
+        }
+        if currentDMId == pendingId && !messages.isEmpty {
+            pendingMarmotMessagesByChat[pendingId] = messages
+        } else {
+            pendingMarmotMessagesByChat[pendingId] = nil
+        }
+    }
+
+    private func isActivePendingSecureChatSetup(pendingId: String, npub: String, token: UUID?) -> Bool {
+        guard pendingMarmotChats[pendingId]?.npub == npub else { return false }
+        return token == nil || pendingMarmotSetupTokens[pendingId] == token
+    }
+
+    private func clearPendingSecureChatSetup(pendingId: String, npub: String, token: UUID) {
+        guard pendingMarmotSetupTokens[pendingId] == token else { return }
+        pendingMarmotSetupTokens[pendingId] = nil
+        pendingMarmotSetupTasks[pendingId] = nil
+        startingMarmotChats.remove(npub)
+    }
+
+    private func cancelPendingSecureChatSetup(pendingId: String, npub: String) {
+        pendingMarmotSetupTasks[pendingId]?.cancel()
+        pendingMarmotSetupTasks[pendingId] = nil
+        pendingMarmotSetupTokens[pendingId] = nil
+        startingMarmotChats.remove(npub)
+    }
+
+    private func cancelPendingSecureChatSetups() {
+        pendingMarmotSetupTasks.values.forEach { $0.cancel() }
+        pendingMarmotSetupTasks = [:]
+        pendingMarmotSetupTokens = [:]
+        startingMarmotChats = []
+    }
+
+    private func startPendingMarmotGroupCreation(pendingId: String) {
+        guard let pending = pendingMarmotGroups[pendingId],
+              pendingMarmotGroupSetupTasks[pendingId] == nil
+        else { return }
+        let setupToken = UUID()
+        pendingMarmotGroupSetupTokens[pendingId] = setupToken
+        let setupTask = Task { @MainActor in
+            defer { clearPendingMarmotGroupSetup(pendingId: pendingId, token: setupToken) }
+            do {
+                let groupId = try await marmot.startGroup(name: pending.name, members: pending.members)
+                finishPendingMarmotGroup(pendingId: pendingId, groupId: groupId, setupToken: setupToken)
+            } catch {
+                failPendingMarmotGroup(pendingId: pendingId, setupToken: setupToken)
+                showToast("Couldn't create group: \(error.localizedDescription)")
+            }
+        }
+        pendingMarmotGroupSetupTasks[pendingId] = setupTask
+    }
+
+    private func startPendingMarmotGroupAccept(pendingId: String, invite: MarmotService.GroupInvite) {
+        guard pendingMarmotGroupSetupTasks[pendingId] == nil else { return }
+        let setupToken = UUID()
+        pendingMarmotGroupSetupTokens[pendingId] = setupToken
+        let setupTask = Task { @MainActor in
+            defer { clearPendingMarmotGroupSetup(pendingId: pendingId, token: setupToken) }
+            do {
+                let groupId = try await marmot.acceptGroupInvite(invite)
+                finishPendingMarmotGroup(pendingId: pendingId, groupId: groupId, setupToken: setupToken)
+            } catch {
+                failPendingMarmotGroup(pendingId: pendingId, setupToken: setupToken)
+                showToast("Couldn't accept invite: \(error.localizedDescription)")
+                await marmot.loadLocal()
+            }
+        }
+        pendingMarmotGroupSetupTasks[pendingId] = setupTask
+    }
+
+    private func finishPendingMarmotGroup(pendingId: String, groupId: String, setupToken: UUID? = nil) {
+        guard isActivePendingMarmotGroupSetup(pendingId: pendingId, token: setupToken) else { return }
+        if setupToken == nil {
+            cancelPendingMarmotGroupSetup(pendingId: pendingId)
+        }
+        pendingMarmotGroups[pendingId] = nil
+        let realId = Self.marmotIDPrefix + groupId
+        pendingMarmotRouteReplacement = SNMarmotRouteReplacement(pendingId: pendingId, realId: realId)
+        if currentDMId == pendingId {
+            path.removeLast()
+            push(.dm(realId))
+        }
+        if let echoes = pendingMarmotMessagesByChat.removeValue(forKey: pendingId), !echoes.isEmpty {
+            pendingMarmotMessagesByChat[realId, default: []].append(contentsOf: echoes)
+        }
+        flushPendingMarmotGroupSends(pendingId: pendingId, groupId: groupId, realId: realId)
+        openedDM(realId, marmotGroupId: groupId)
+    }
+
+    private func failPendingMarmotGroup(pendingId: String, setupToken: UUID? = nil) {
+        guard isActivePendingMarmotGroupSetup(pendingId: pendingId, token: setupToken) else { return }
+        pendingMarmotGroups[pendingId] = nil
+        pendingMarmotRouteFailure = SNMarmotRouteFailure(pendingId: pendingId)
+        pendingMarmotGroupSends[pendingId] = nil
+        pendingMarmotMessagesByChat[pendingId] = nil
+        if currentDMId == pendingId {
+            pop()
+        }
+    }
+
+    private func isActivePendingMarmotGroupSetup(pendingId: String, token: UUID?) -> Bool {
+        guard pendingMarmotGroups[pendingId] != nil else { return false }
+        return token == nil || pendingMarmotGroupSetupTokens[pendingId] == token
+    }
+
+    private func clearPendingMarmotGroupSetup(pendingId: String, token: UUID) {
+        guard pendingMarmotGroupSetupTokens[pendingId] == token else { return }
+        pendingMarmotGroupSetupTokens[pendingId] = nil
+        pendingMarmotGroupSetupTasks[pendingId] = nil
+    }
+
+    private func cancelPendingMarmotGroupSetup(pendingId: String) {
+        pendingMarmotGroupSetupTasks[pendingId]?.cancel()
+        pendingMarmotGroupSetupTasks[pendingId] = nil
+        pendingMarmotGroupSetupTokens[pendingId] = nil
+    }
+
+    private func cancelPendingMarmotGroupSetups() {
+        pendingMarmotGroupSetupTasks.values.forEach { $0.cancel() }
+        pendingMarmotGroupSetupTasks = [:]
+        pendingMarmotGroupSetupTokens = [:]
+    }
+
+    private func failedPendingMessage(_ message: SNMessage) -> SNMessage {
+        SNMessage(
+            id: message.id,
+            mine: message.mine,
+            action: message.action,
+            author: message.author,
+            text: message.text,
+            time: message.time,
+            sortDate: message.sortDate,
+            via: message.via,
+            state: "Couldn't send",
+            pay: message.pay,
+            call: message.call,
+            media: message.media,
+            stickerRef: message.stickerRef
+        )
+    }
+
+    private func flushPendingDirectMarmot(npub: String, groupId: String, realId: String) {
+        let queued = pendingDirectMarmotSends.removeValue(forKey: npub) ?? []
+        guard !queued.isEmpty else { return }
+        Task { @MainActor in
+            for item in queued {
+                let fallbackDate = Date()
+                let echo = pendingMarmotMessagesByChat[realId]?.first { $0.id == item.messageId } ?? SNMessage(
+                    id: item.messageId,
+                    mine: true,
+                    text: item.text,
+                    time: Self.clock(fallbackDate),
+                    sortDate: fallbackDate,
+                    via: .internet,
+                    state: "Sending"
+                )
+                pendingMarmotMessagesByChat[realId]?.removeAll { $0.id == item.messageId }
+                let ok = await marmot.send([item.text], to: groupId)
+                if !ok {
+                    pendingMarmotMessagesByChat[realId, default: []].append(
+                        failedPendingMessage(echo)
+                    )
+                }
+            }
+        }
+    }
+
+    private func flushPendingMarmotGroupSends(pendingId: String, groupId: String, realId: String) {
+        let queued = pendingMarmotGroupSends.removeValue(forKey: pendingId) ?? []
+        guard !queued.isEmpty else { return }
+        Task { @MainActor in
+            for item in queued {
+                let fallbackDate = Date()
+                let echo = pendingMarmotMessagesByChat[realId]?.first { $0.id == item.messageId } ?? SNMessage(
+                    id: item.messageId,
+                    mine: true,
+                    text: item.text,
+                    time: Self.clock(fallbackDate),
+                    sortDate: fallbackDate,
+                    via: .internet,
+                    state: "Sending"
+                )
+                pendingMarmotMessagesByChat[realId]?.removeAll { $0.id == item.messageId }
+                let ok = await marmot.send([item.text], to: groupId)
+                if !ok {
+                    pendingMarmotMessagesByChat[realId, default: []].append(
+                        failedPendingMessage(echo)
+                    )
+                }
+            }
+        }
     }
 
     private func flushPendingMarmotSends() {
@@ -3608,6 +4091,13 @@ final class SonarAppStore: ObservableObject {
             rememberMarmotGroup(knownMarmotGroupId, forConversationId: id)
             marmot.markConversationRead(groupId: knownMarmotGroupId)
         }
+        if let pendingNpub = pendingMarmotNpub(for: id) {
+            marmot.connectIfNeeded()
+            marmot.ensureProfile(pendingNpub)
+            startSecureChatInBackground(npub: pendingNpub, pendingId: id)
+            return
+        }
+        if isPendingMarmotGroup(id) { return }
         let sonarProfile = resolvedSonarProfile(id)
         let groupId = knownMarmotGroupId
             ?? marmotGroupId(id)
@@ -3712,6 +4202,15 @@ final class SonarAppStore: ObservableObject {
         // long as we're connected (started in performConnect) so welcomes +
         // messages keep arriving live in the background list, not only while a
         // chat is open. It is stopped only on wipe / erase.
+        if let pendingNpub = pendingMarmotNpub(for: id) {
+            if pendingMarmotChats[id] == nil {
+                pendingMarmotMessagesByChat[id] = nil
+                pendingDirectMarmotSends[pendingNpub] = nil
+                cancelPendingSecureChatSetup(pendingId: id, npub: pendingNpub)
+            }
+            return
+        }
+        if isPendingMarmotGroup(id) { return }
         if marmotGroupId(id) == nil {
             if chatViewModel.selectedPrivateChatPeer == PeerID(str: id) {
                 chatViewModel.endPrivateChat()
@@ -3720,14 +4219,67 @@ final class SonarAppStore: ObservableObject {
     }
 
     /// Start a Marmot (White Noise) secure chat by npub and navigate into it.
-    func startSecureChat(npub: String) {
-        marmot.connectIfNeeded()
-        marmot.ensureSonarDescriptor(npub)
-        Task { @MainActor in
-            if let groupId = await marmot.startChatReturningId(with: npub) {
-                push(.dm("\(Self.marmotIDPrefix)\(groupId)"))
-            }
+    @discardableResult
+    func startSecureChat(npub: String) -> String? {
+        let clean = SNMarmotProfileCache.canonicalKey(npub)
+        guard let pendingId = pendingMarmotChatId(for: clean) else { return nil }
+        if let group = marmotGroup(forNpub: clean) {
+            let id = Self.marmotIDPrefix + group.id
+            openedDM(id, marmotGroupId: group.id)
+            push(.dm(id))
+            return id
         }
+        pendingMarmotChats[pendingId] = pendingMarmotChats[pendingId] ?? SNPendingMarmotChat(npub: clean, createdAt: Date())
+        marmot.connectIfNeeded()
+        marmot.ensureProfile(clean)
+        marmot.ensureSonarDescriptor(clean)
+        push(.dm(pendingId))
+        startSecureChatInBackground(npub: clean, pendingId: pendingId)
+        return pendingId
+    }
+
+    @discardableResult
+    func startGroup(name: String, members: [String]) -> String? {
+        let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "Group chat"
+            : name.trimmingCharacters(in: .whitespacesAndNewlines)
+        var seenMembers = Set<String>()
+        let cleanMembers = members.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && seenMembers.insert($0).inserted }
+        guard cleanMembers.count >= 2 else {
+            showToast("Add at least two people")
+            return nil
+        }
+        let pendingId = pendingMarmotGroupId()
+        pendingMarmotGroups[pendingId] = SNPendingMarmotGroup(
+            name: cleanName,
+            members: cleanMembers,
+            createdAt: Date()
+        )
+        marmot.connectIfNeeded()
+        startPendingMarmotGroupCreation(pendingId: pendingId)
+        return pendingId
+    }
+
+    @discardableResult
+    func acceptGroupInvite(_ invite: MarmotService.GroupInvite) -> String {
+        if marmot.groups.contains(where: { $0.id == invite.groupId }) {
+            let id = Self.marmotIDPrefix + invite.groupId
+            openedDM(id, marmotGroupId: invite.groupId)
+            return id
+        }
+        let pendingId = pendingMarmotGroupId(seed: "invite:\(invite.id)")
+        if pendingMarmotGroups[pendingId] == nil {
+            pendingMarmotGroups[pendingId] = SNPendingMarmotGroup(
+                name: invite.groupName.isEmpty ? "Group chat" : invite.groupName,
+                members: [],
+                createdAt: Date()
+            )
+        }
+        marmot.pendingGroupInvites.removeAll { $0.id == invite.id }
+        marmot.connectIfNeeded()
+        startPendingMarmotGroupAccept(pendingId: pendingId, invite: invite)
+        return pendingId
     }
 
     // MARK: Payments (⚡PAY receipts — docs/SONAR-PAYMENTS.md)
@@ -4080,6 +4632,12 @@ final class SonarAppStore: ObservableObject {
     // MARK: Verification (real fingerprints)
 
     func verifyInfo(for id: String) -> SNVerifyInfo {
+        if isPendingMarmotGroup(id) {
+            return SNVerifyInfo(
+                available: false, safety: [], publicKey: "",
+                note: "Group setup is still finishing."
+            )
+        }
         if let groupId = marmotGroupId(id) {
             guard let group = marmotGroup(byId: groupId), marmot.isDirectGroup(group) else {
                 return SNVerifyInfo(
@@ -4597,6 +5155,19 @@ final class SonarAppStore: ObservableObject {
     /// Noise leg (delete both). Multi-member Marmot groups publish a leave
     /// proposal; other deletes are local-only.
     func deleteChat(_ id: String) {
+        if isPendingSecureChat(id) {
+            pendingMarmotChats[id] = nil
+            pendingMarmotGroups[id] = nil
+            pendingMarmotMessagesByChat[id] = nil
+            pendingMarmotGroupSends[id] = nil
+            cancelPendingMarmotGroupSetup(pendingId: id)
+            if let pendingNpub = pendingMarmotNpub(for: id) {
+                pendingDirectMarmotSends[pendingNpub] = nil
+                cancelPendingSecureChatSetup(pendingId: id, npub: pendingNpub)
+            }
+            if currentDMId == id { pop() }
+            return
+        }
         if let groupId = marmotGroupId(id) {
             forgetMarmotGroupMappings(forGroupId: groupId)
             let shouldLeave = isMultiMemberMarmotGroupId(id)
@@ -4645,6 +5216,15 @@ final class SonarAppStore: ObservableObject {
         refreshingDMTasks.values.forEach { $0.cancel() }
         refreshingDMTasks = [:]
         pendingMarmotSends = [:]
+        pendingMarmotChats = [:]
+        pendingMarmotGroups = [:]
+        pendingMarmotMessagesByChat = [:]
+        pendingMarmotRouteReplacement = nil
+        pendingMarmotRouteFailure = nil
+        pendingDirectMarmotSends = [:]
+        pendingMarmotGroupSends = [:]
+        cancelPendingSecureChatSetups()
+        cancelPendingMarmotGroupSetups()
         scannedPayMessageIDs = []
         pendingPayPeer = nil
         localHydratingDMs = []
@@ -4724,6 +5304,15 @@ final class SonarAppStore: ObservableObject {
         needsPaymentMetadataPublish = false
         refreshedKnownDescriptorsForRelaySession = false
         pendingMarmotSends = [:]
+        pendingMarmotChats = [:]
+        pendingMarmotGroups = [:]
+        pendingMarmotMessagesByChat = [:]
+        pendingMarmotRouteReplacement = nil
+        pendingMarmotRouteFailure = nil
+        pendingDirectMarmotSends = [:]
+        pendingMarmotGroupSends = [:]
+        cancelPendingSecureChatSetups()
+        cancelPendingMarmotGroupSetups()
         // Forget every ⚡PAY coin and the Lightning wallet seed (separate
         // keychain service owned by SonarWalletKit).
         #if os(iOS) || os(macOS)

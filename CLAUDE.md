@@ -14,6 +14,10 @@ Conversation and transcript changes must preserve Signal-comparable local-first 
 
 Signal treats the local database as the chat state. Network receive/send/sync paths write into local storage first, then the chat list and transcript UI react to local database invalidation. Android pages local conversation rows from `ThreadTable` through `ConversationListDataSource` with a small paging window; iOS builds chat-list render state from local thread IDs through `CLVLoader` and caches row view models/content. Sonar conversation work should follow that model: maintain core-owned local conversation summaries ordered by latest message, hydrate visible chat rows from bounded local pages, open transcripts from bounded local message windows, and run relay sync only as a background database updater.
 
+## XChat-Style Chat Startup Rule
+
+Starting or opening a chat by public key, creating a group, or accepting a group invite must never block on relay connect, key-package publish/fetch, profile/descriptor lookup, group creation, full-history sync, or any other network setup. Create a local pending conversation immediately, paint the transcript from local state, accept sends with local echoes and a bounded queue, and reconcile the pending row to the real White Noise/Marmot conversation when background setup completes. This should feel like xchat-style instant local chat creation: network work may update state later, but it must not gate first paint or basic typing/sending affordances.
+
 ## Signal-First Design Rule
 
 Before implementing any well-known chat feature (media sending, reactions, read receipts, typing indicators, group management, voice/video calls, stories, disappearing messages, link previews, contact sharing, location sharing, stickers, etc.), study how Signal implements it in their open-source clients:

@@ -284,12 +284,15 @@ private fun HomeScreen(state: SonarAppState) {
                 }
                 items(state.visibleChats, key = { it.id }) { chat ->
                     val chatTitle = state.chatTitle(chat)
+                    val pending = state.isPendingSecureChat(chat.id)
                     ConvRow(
                         avatar = { SonarAvatar(chatTitle, 52.dp, presence = false) },
-                        title = chatTitle, sub = "Tap to open", lock = true,
+                        title = chatTitle, sub = if (pending) "Setting up secure chat…" else "Tap to open", lock = true,
                         verified = state.isVerified(chat.id),
                         unread = (state.unreadByChat[chat.id] ?: 0) > 0,
-                        onLongClick = { pendingDelete = DeleteTarget(chat.id, chatTitle, isMesh = false, isGroup = state.isMultiMemberChat(chat.id)) },
+                        onLongClick = if (pending) null else {
+                            { pendingDelete = DeleteTarget(chat.id, chatTitle, isMesh = false, isGroup = state.isMultiMemberChat(chat.id)) }
+                        },
                     ) { state.openChat(chat) }
                 }
             }
@@ -677,6 +680,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     }
     val currentChat = state.chats.firstOrNull { it.id == screen.id }
     val isGroup = state.isMultiMemberChat(screen.id)
+    val canManageGroup = state.canManageGroup(screen.id)
     // Resolve a human name for the peer or group (Marmot names can be blank).
     val peerName = screen.name.ifBlank {
         currentChat?.let { state.chatTitle(it) } ?: "secure chat"
@@ -707,8 +711,8 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             SNIconButton(SNIconName.Back, onClick = { state.back() })
             SonarAvatar(peerName, 36.dp, presence = false)
             Spacer(Modifier.width(10.dp))
-            Column(Modifier.weight(1f).clip(RoundedCornerShape(8.dp)).clickable {
-                if (isGroup) state.push(Screen.GroupInfo(screen.id))
+            Column(Modifier.weight(1f).clip(RoundedCornerShape(8.dp)).clickable(enabled = canManageGroup || !isGroup) {
+                if (canManageGroup) state.push(Screen.GroupInfo(screen.id))
                 else state.push(Screen.ContactProfile(screen.id, peerName))
             }) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -989,7 +993,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         canSendPayment = state.hasDirectPaymentRoute(screen.id),
         canVerify = !state.isMultiMemberChat(screen.id),
         canShareLocation = !state.isMultiMemberChat(screen.id),
-        canManageGroup = isGroup,
+        canManageGroup = canManageGroup,
         onPhoto = { addSheet = false; pickPhoto() }
     )
     if (addPeopleSheet) GroupAddPeopleSheet(
