@@ -580,9 +580,9 @@ pub struct SonarClient {
     /// rows. Each entry is the per-group relay fetch floor derived from the
     /// latest locally stored peer-authored chat message, so one chat's newer
     /// activity cannot hide another chat's missing Marmot messages. The queue is
-    /// drained one group per background sync/self-heal pass to keep repair work
-    /// bounded and avoid one old chat widening every other chat's relay window.
-    initial_group_message_catchups: Arc<Mutex<HashMap<String, u64>>>,
+    /// drained FIFO, one group per background sync/self-heal pass, to keep
+    /// repair work bounded and avoid one flaky chat starving the rest.
+    initial_group_message_catchups: Arc<Mutex<VecDeque<(String, u64)>>>,
     initial_group_message_catchup_scanned: Arc<AtomicBool>,
     /// Whether to join geohash-nearest relays on subscribe (real sessions); off
     /// for in-memory/test sessions so they stay network-free against a MockRelay.
@@ -743,7 +743,7 @@ impl SonarClient {
         let marmot_group_subscriptions = Arc::new(Mutex::new(HashSet::new()));
         let initial_empty_transcript_backfills = Arc::new(Mutex::new(HashSet::new()));
         let initial_backfill_scanned = Arc::new(AtomicBool::new(false));
-        let initial_group_message_catchups = Arc::new(Mutex::new(HashMap::new()));
+        let initial_group_message_catchups = Arc::new(Mutex::new(VecDeque::new()));
         let initial_group_message_catchup_scanned = Arc::new(AtomicBool::new(false));
         let push_token_cache = crate::push::load_push_token_cache(push_token_cache_path.as_deref());
 
@@ -2271,19 +2271,37 @@ impl SonarClient {
         {
             return;
         }
-        let mut map = self.initial_group_message_catchups.lock().unwrap();
-        *map = Self::group_message_catchup_floors(&self.engine);
+        let mut queue = self.initial_group_message_catchups.lock().unwrap();
+        *queue = Self::group_message_catchup_queue(Self::group_message_catchup_floors(
+            &self.engine,
+        ));
     }
 
     fn take_initial_group_message_catchup(&self) -> Option<(String, u64)> {
-        let mut map = self.initial_group_message_catchups.lock().unwrap();
-        let key = map.keys().min().cloned()?;
-        map.remove(&key).map(|floor| (key, floor))
+        self.initial_group_message_catchups
+            .lock()
+            .unwrap()
+            .pop_front()
     }
 
     fn requeue_initial_group_message_catchup(&self, group_id: String, floor: u64) {
-        let mut map = self.initial_group_message_catchups.lock().unwrap();
-        map.insert(group_id, floor);
+        let mut queue = self.initial_group_message_catchups.lock().unwrap();
+        Self::push_group_message_catchup_back(&mut queue, group_id, floor);
+    }
+
+    fn group_message_catchup_queue(floors: HashMap<String, u64>) -> VecDeque<(String, u64)> {
+        let mut entries: Vec<_> = floors.into_iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries.into()
+    }
+
+    fn push_group_message_catchup_back(
+        queue: &mut VecDeque<(String, u64)>,
+        group_id: String,
+        floor: u64,
+    ) {
+        queue.retain(|(queued_id, _)| queued_id != &group_id);
+        queue.push_back((group_id, floor));
     }
 
     async fn run_initial_group_message_catchup(&self) -> Result<MarmotProcessReport> {
@@ -3663,7 +3681,7 @@ mod tests {
     use crate::sonar_descriptor::{
         descriptor_content_json, meta_descriptor_content_json, SONAR_CALL_DESCRIPTOR_D_TAG,
     };
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{HashMap, HashSet, VecDeque};
 
     fn test_event_id(seed: u8) -> EventId {
         EventId::from_slice(&[seed; 32]).expect("event id")
@@ -3812,6 +3830,28 @@ mod tests {
         assert_eq!(
             floors.get(&nostr_group_id_hex).copied(),
             Some(bob_message_secs)
+        );
+    }
+
+    #[test]
+    fn group_message_catchup_retry_rotates_failed_group_to_back() {
+        let mut queue = VecDeque::from([
+            ("aaa".to_string(), 100),
+            ("bbb".to_string(), 200),
+            ("ccc".to_string(), 300),
+        ]);
+
+        let (group_id, floor) = queue.pop_front().expect("first queued group");
+        SonarClient::push_group_message_catchup_back(&mut queue, group_id, floor);
+
+        let queued: Vec<_> = queue.into_iter().collect();
+        assert_eq!(
+            queued,
+            vec![
+                ("bbb".to_string(), 200),
+                ("ccc".to_string(), 300),
+                ("aaa".to_string(), 100),
+            ]
         );
     }
 
