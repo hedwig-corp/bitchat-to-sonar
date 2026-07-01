@@ -3052,7 +3052,9 @@ final class SonarAppStore: ObservableObject {
                 }
                 dated.sort { $0.0 < $1.0 }
             }
-            let echoIds = [id, Self.marmotIDPrefix + groupId]
+            let echoIds = [id, Self.marmotIDPrefix + groupId].reduce(into: [String]()) { ids, echoId in
+                if !ids.contains(echoId) { ids.append(echoId) }
+            }
             for echoId in echoIds {
                 dated += (pendingMarmotMessagesByChat[echoId] ?? []).map { ($0.sortDate ?? Date(), $0) }
             }

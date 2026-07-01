@@ -2391,10 +2391,10 @@ class SonarAppState(private val scope: CoroutineScope) {
     ) {
         if (!isActivePendingMarmotSetup(pendingChatId, peerNpub, setupToken)) return
         if (setupToken == null) cancelPendingMarmotSetup(pendingChatId, npubHex)
+        pendingMarmotChatNpubs = pendingMarmotChatNpubs - pendingChatId
         if (refreshFirst) refreshChats()
         val chat = chats.firstOrNull { it.id == chatId }
             ?: SonarChat(id = chatId, name = "", members = listOf(npub, peerNpub))
-        pendingMarmotChatNpubs = pendingMarmotChatNpubs - pendingChatId
         moveSendEchoes(pendingChatId, chatId)
         stack = stack.map { screen ->
             if (screen is Screen.Chat && screen.id == pendingChatId) {
@@ -2508,10 +2508,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         val pending = pendingMarmotGroups[pendingChatId] ?: return
         if (!isActivePendingMarmotGroupSetup(pendingChatId, setupToken)) return
         if (setupToken == null) cancelPendingMarmotGroupSetup(pendingChatId)
+        pendingMarmotGroups = pendingMarmotGroups - pendingChatId
         refreshChats()
         val chat = chats.firstOrNull { it.id == chatId }
             ?: SonarChat(id = chatId, name = pending.name, members = listOf(npub) + pending.members)
-        pendingMarmotGroups = pendingMarmotGroups - pendingChatId
         moveSendEchoes(pendingChatId, chatId)
         stack = stack.map { screen ->
             if (screen is Screen.Chat && screen.id == pendingChatId) {

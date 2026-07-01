@@ -16,7 +16,7 @@ Signal treats the local database as the chat state. Network receive/send/sync pa
 
 ## XChat-Style Chat Startup Rule
 
-Starting or opening a chat by public key must never block on relay connect, key-package publish/fetch, profile/descriptor lookup, group creation, full-history sync, or any other network setup. Create a local pending conversation immediately, paint the transcript from local state, accept sends with local echoes and a bounded queue, and reconcile the pending row to the real White Noise/Marmot conversation when background setup completes. This should feel like xchat-style instant local chat creation: network work may update state later, but it must not gate first paint or basic typing/sending affordances.
+Starting or opening a chat by public key, creating a group, or accepting a group invite must never block on relay connect, key-package publish/fetch, profile/descriptor lookup, group creation, full-history sync, or any other network setup. Create a local pending conversation immediately, paint the transcript from local state, accept sends with local echoes and a bounded queue, and reconcile the pending row to the real White Noise/Marmot conversation when background setup completes. This should feel like xchat-style instant local chat creation: network work may update state later, but it must not gate first paint or basic typing/sending affordances.
 
 ## Signal-First Design Rule
 
