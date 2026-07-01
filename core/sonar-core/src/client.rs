@@ -576,6 +576,14 @@ pub struct SonarClient {
     /// transcript body was locally populated.
     initial_empty_transcript_backfills: Arc<Mutex<HashSet<String>>>,
     initial_backfill_scanned: Arc<AtomicBool>,
+    /// Startup repair queue for existing groups that already have transcript
+    /// rows. Each entry is the per-group relay fetch floor derived from the
+    /// latest locally stored peer-authored chat message, so one chat's newer
+    /// activity cannot hide another chat's missing Marmot messages. The queue is
+    /// drained one group per background sync/self-heal pass to keep repair work
+    /// bounded and avoid one old chat widening every other chat's relay window.
+    initial_group_message_catchups: Arc<Mutex<HashMap<String, u64>>>,
+    initial_group_message_catchup_scanned: Arc<AtomicBool>,
     /// Whether to join geohash-nearest relays on subscribe (real sessions); off
     /// for in-memory/test sessions so they stay network-free against a MockRelay.
     allow_geo_relays: bool,
@@ -735,6 +743,8 @@ impl SonarClient {
         let marmot_group_subscriptions = Arc::new(Mutex::new(HashSet::new()));
         let initial_empty_transcript_backfills = Arc::new(Mutex::new(HashSet::new()));
         let initial_backfill_scanned = Arc::new(AtomicBool::new(false));
+        let initial_group_message_catchups = Arc::new(Mutex::new(HashMap::new()));
+        let initial_group_message_catchup_scanned = Arc::new(AtomicBool::new(false));
         let push_token_cache = crate::push::load_push_token_cache(push_token_cache_path.as_deref());
 
         let handler_geo = geo.clone();
@@ -905,17 +915,17 @@ impl SonarClient {
             }
         });
 
-        // Resume incremental sync across restarts: start the watermark at the
-        // newest event already in the store (see `latest_message_secs`), so a
-        // relaunch fetches only what is new instead of re-downloading the entire
-        // White Noise history every time. The gift-wrap fetch still applies its
-        // 7-day NIP-59 lookback on top of this.
-        let resume_watermark = engine.latest_message_secs();
-        let storage_empty = resume_watermark == 0
-            && engine
-                .groups()
-                .map(|groups| groups.is_empty())
-                .unwrap_or(true);
+        // Resume incremental sync across restarts from the newest REMOTE event
+        // already in the store. Local sends and local-only bookkeeping can be
+        // newer than peer messages missed while offline; they must not seed the
+        // relay cursor or a restart can subscribe from beyond the missing peer
+        // messages. The gift-wrap fetch still applies its 7-day NIP-59 lookback.
+        let resume_watermark = engine.latest_remote_event_secs();
+        let groups_empty = engine
+            .groups()
+            .map(|groups| groups.is_empty())
+            .unwrap_or(true);
+        let storage_empty = groups_empty && engine.latest_message_secs() == 0;
         let sync_state = Arc::new(Mutex::new(SyncState::load(
             sync_state_path,
             resume_watermark,
@@ -940,6 +950,8 @@ impl SonarClient {
             marmot_group_subscriptions,
             initial_empty_transcript_backfills,
             initial_backfill_scanned,
+            initial_group_message_catchups,
+            initial_group_message_catchup_scanned,
             allow_geo_relays,
             conversation_index,
             change_listener: Arc::new(Mutex::new(None)),
@@ -1975,20 +1987,24 @@ impl SonarClient {
         // session → an unbounded backfill, bounded only by the `#p`/`#h` scope).
         let since_secs = self.sync_watermark_secs();
 
+        let mut process_report = match self.run_initial_group_message_catchup().await {
+            Ok(report) => report,
+            Err(err) => {
+                tracing::debug!(%err, "initial Marmot per-group catch-up failed");
+                MarmotProcessReport::default()
+            }
+        };
+
         // When watermarked persistent subscriptions are active, sync() is
         // redundant — subscribe_marmot() already opened subscriptions with
         // `since=watermark` so the relay's EOSE burst covers the gap. The only
         // exception is the very first session (watermark==0), where we need at
         // least one full fetch to bootstrap the watermark.
         let is_live = *self.live_marmot_enabled.lock().unwrap();
-        tracing::info!(
-            is_live,
-            since_secs,
-            force,
-            "sync() called"
-        );
+        tracing::info!(is_live, since_secs, force, "sync() called");
         if is_live && since_secs > 0 && !force {
             tracing::info!("sync() short-circuited — live subscriptions active");
+            self.save_or_rewind_without_advancing_watermark(process_report)?;
             self.retry_outbox().await;
             self.share_push_token_with_groups().await;
             return Ok(());
@@ -2013,7 +2029,6 @@ impl SonarClient {
         // which carry our 1059/445 events — fetching from them only makes the
         // sync wait on their EOSE. The MLS group + KeyPackage relay lists are
         // built from `self.relays`, so conformant peers publish welcomes there.
-        let mut process_report = MarmotProcessReport::default();
         let ids_before = self.current_group_ids()?;
         let wraps = self
             .fetch_marmot_events_from_relay_quorum(wraps, FETCH_TIMEOUT, "gift wrap sync")
@@ -2227,6 +2242,81 @@ impl SonarClient {
             .insert(group_id_hex.to_string());
     }
 
+    fn group_message_catchup_floors(engine: &MarmotEngine) -> HashMap<String, u64> {
+        let Ok(groups) = engine.groups() else {
+            return HashMap::new();
+        };
+        groups
+            .into_iter()
+            .filter_map(|group| {
+                let has_local_chat = engine
+                    .messages_page(&group.mls_group_id, 1, 0)
+                    .map(|page| !page.is_empty())
+                    .unwrap_or(false);
+                if !has_local_chat {
+                    return None;
+                }
+                let floor = engine
+                    .latest_remote_chat_message_secs(&group.mls_group_id)
+                    .unwrap_or(0);
+                Some((hex::encode(group.nostr_group_id), floor))
+            })
+            .collect()
+    }
+
+    fn populate_initial_group_message_catchups_once(&self) {
+        if self
+            .initial_group_message_catchup_scanned
+            .swap(true, Ordering::Relaxed)
+        {
+            return;
+        }
+        let mut map = self.initial_group_message_catchups.lock().unwrap();
+        *map = Self::group_message_catchup_floors(&self.engine);
+    }
+
+    fn take_initial_group_message_catchup(&self) -> Option<(String, u64)> {
+        let mut map = self.initial_group_message_catchups.lock().unwrap();
+        let key = map.keys().min().cloned()?;
+        map.remove(&key).map(|floor| (key, floor))
+    }
+
+    fn requeue_initial_group_message_catchup(&self, group_id: String, floor: u64) {
+        let mut map = self.initial_group_message_catchups.lock().unwrap();
+        map.insert(group_id, floor);
+    }
+
+    async fn run_initial_group_message_catchup(&self) -> Result<MarmotProcessReport> {
+        if self.relays.is_empty() {
+            return Ok(MarmotProcessReport::default());
+        }
+        self.populate_initial_group_message_catchups_once();
+        let Some((group_id, floor)) = self.take_initial_group_message_catchup() else {
+            return Ok(MarmotProcessReport::default());
+        };
+
+        let group_ids = vec![group_id.clone()];
+        match self
+            .backfill_groups_since(
+                &group_ids,
+                Some(floor),
+                "initial per-group message catch-up",
+            )
+            .await
+        {
+            Ok(report) => {
+                if report.retryable_failures > 0 {
+                    self.requeue_initial_group_message_catchup(group_id, floor);
+                }
+                Ok(report)
+            }
+            Err(err) => {
+                self.requeue_initial_group_message_catchup(group_id, floor);
+                Err(err)
+            }
+        }
+    }
+
     async fn resubscribe_marmot_groups_if_live(&self) -> Result<()> {
         let is_live = *self.live_marmot_enabled.lock().unwrap();
         if !is_live {
@@ -2238,12 +2328,19 @@ impl SonarClient {
     /// Re-subscribe with the current watermark and group set. Idempotent:
     /// `subscribe_with_id` replaces existing filters. Hosts call this
     /// periodically (every 25-60s) to self-heal after relay disconnects,
-    /// replacing the heavy `sync()` poll on the idle path.
+    /// replacing the heavy `sync()` poll on the idle path. It may also run one
+    /// bounded per-chat repair fetch for existing installs, so callers must keep
+    /// it on a background/IO queue and never in the local-first chat-open path.
     pub async fn ensure_subscriptions(&self) -> Result<()> {
         if !*self.live_marmot_enabled.lock().unwrap() {
             return Ok(());
         }
-        self.subscribe_marmot().await
+        self.subscribe_marmot().await?;
+        match self.run_initial_group_message_catchup().await {
+            Ok(report) => self.save_or_rewind_without_advancing_watermark(report)?,
+            Err(err) => tracing::debug!(%err, "initial Marmot per-group catch-up failed"),
+        }
+        Ok(())
     }
 
     fn sync_watermark_secs(&self) -> u64 {
@@ -2279,6 +2376,17 @@ impl SonarClient {
             state.rewind_for_retry(event_secs);
         }
         self.save_sync_state()
+    }
+
+    fn save_or_rewind_without_advancing_watermark(
+        &self,
+        report: MarmotProcessReport,
+    ) -> Result<()> {
+        if let Some(secs) = report.oldest_retryable_secs {
+            self.rewind_sync_watermark_for_retry(secs)
+        } else {
+            self.save_sync_state()
+        }
     }
 
     async fn fetch_marmot_events_from_relay_quorum(
@@ -2634,43 +2742,41 @@ impl SonarClient {
     /// messages predate the sync watermark, so they'd be missed by both the
     /// watermarked `sync()` and the since-now live subscription.
     async fn backfill_group(&self, group_id_hex: &str) -> Result<MarmotProcessReport> {
-        let filter = Filter::new()
-            .kind(Kind::MlsGroupMessage)
-            .custom_tag(SingleLetterTag::lowercase(Alphabet::H), group_id_hex);
-        let events = self
-            .fetch_marmot_events_from_relay_quorum(filter, BACKFILL_TIMEOUT, "group backfill")
-            .await?;
-        let partial = !events.completed_all_relays();
-        let (mut report, _) = self
-            .process_marmot_events(events.events, "backfilled group message")
-            .await;
-        if partial {
-            report.record_retryable(Timestamp::now().as_secs());
-        }
-        Ok(report)
+        let group_ids = vec![group_id_hex.to_string()];
+        self.backfill_groups_since(&group_ids, None, "group backfill")
+            .await
     }
 
     /// Batched variant: fetches kind-445 history for multiple groups in ONE
     /// request using a combined `#h` filter. Same as `backfill_group` but
     /// avoids serial timeouts when multiple groups need backfill.
     async fn backfill_groups(&self, group_id_hexes: &[String]) -> Result<MarmotProcessReport> {
+        self.backfill_groups_since(group_id_hexes, None, "batched group backfill")
+            .await
+    }
+
+    async fn backfill_groups_since(
+        &self,
+        group_id_hexes: &[String],
+        since_secs: Option<u64>,
+        context: &'static str,
+    ) -> Result<MarmotProcessReport> {
         if group_id_hexes.is_empty() {
             return Ok(MarmotProcessReport::default());
         }
-        let filter = Filter::new().kind(Kind::MlsGroupMessage).custom_tags(
+        let mut filter = Filter::new().kind(Kind::MlsGroupMessage).custom_tags(
             SingleLetterTag::lowercase(Alphabet::H),
             group_id_hexes.to_vec(),
         );
+        if let Some(secs) = since_secs.filter(|secs| *secs > 0) {
+            filter = filter.since(Timestamp::from_secs(secs.saturating_sub(SYNC_OVERLAP_SECS)));
+        }
         let events = self
-            .fetch_marmot_events_from_relay_quorum(
-                filter,
-                BACKFILL_TIMEOUT,
-                "batched group backfill",
-            )
+            .fetch_marmot_events_from_relay_quorum(filter, BACKFILL_TIMEOUT, context)
             .await?;
         let partial = !events.completed_all_relays();
         let (mut report, _) = self
-            .process_marmot_events(events.events, "batched backfill group message")
+            .process_marmot_events(events.events, "backfilled group message")
             .await;
         if partial {
             report.record_retryable(Timestamp::now().as_secs());
@@ -2731,7 +2837,13 @@ impl SonarClient {
         if let Some(secs) = process_report.oldest_retryable_secs {
             self.rewind_sync_watermark_for_retry(secs)?;
         } else if process_report.processed > 0 {
-            self.advance_sync_watermark(Timestamp::now().as_secs())?;
+            // Live subscriptions prove only that these buffered events were
+            // processed. They do not provide a relay EOSE/completeness signal,
+            // so advancing the durable cursor to "now" can skip older live
+            // events dropped by the bounded buffer or by a flaky connection.
+            // Persist processed IDs, but leave the watermark for the next
+            // complete sync/subscription catch-up window.
+            self.save_sync_state()?;
         } else {
             self.save_sync_state()?;
         }
@@ -3637,6 +3749,70 @@ mod tests {
         let contents: Vec<&str> = sorted.iter().map(|event| event.content.as_str()).collect();
 
         assert_eq!(contents, ["oldest", "middle", "newer"]);
+    }
+
+    #[tokio::test]
+    async fn group_message_catchup_floor_uses_peer_message_not_later_local_send() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let bob = MarmotEngine::in_memory(Identity::generate());
+        let bob_kp = bob.key_package_event(relays.clone()).expect("bob kp");
+
+        let creation = alice
+            .create_group("alice & bob", vec![bob_kp], relays)
+            .expect("alice creates group");
+        let group_id = creation.group.mls_group_id.clone();
+        let nostr_group_id_hex = hex::encode(creation.group.nostr_group_id);
+        let (bob_pubkey, bob_welcome) = creation
+            .welcomes
+            .into_iter()
+            .find(|(pubkey, _)| *pubkey == bob.identity().public_key())
+            .expect("bob welcome");
+        let bob_wrapped = alice
+            .gift_wrap_welcome(&bob_pubkey, bob_welcome)
+            .await
+            .expect("wrap bob welcome");
+        assert!(matches!(
+            bob.process_incoming(&bob_wrapped)
+                .await
+                .expect("bob processes welcome"),
+            Incoming::GroupUpdated(_)
+        ));
+        alice
+            .merge_pending_commit(&group_id)
+            .expect("alice merges pending commit");
+
+        let bob_group_id = bob.groups().expect("bob groups")[0].mls_group_id.clone();
+        let bob_event = bob
+            .create_text_message(&bob_group_id, "remote first")
+            .expect("bob creates message");
+        let bob_message_secs = bob_event.created_at.as_secs();
+        assert!(matches!(
+            alice
+                .process_incoming(&bob_event)
+                .await
+                .expect("alice processes remote message"),
+            Incoming::Message(_)
+        ));
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let alice_event = alice
+            .create_text_message(&group_id, "local later")
+            .expect("alice creates local message");
+        assert!(alice_event.created_at.as_secs() > bob_message_secs);
+        assert!(matches!(
+            alice
+                .process_incoming(&alice_event)
+                .await
+                .expect("alice processes local message"),
+            Incoming::Message(_)
+        ));
+
+        let floors = SonarClient::group_message_catchup_floors(&alice);
+        assert_eq!(
+            floors.get(&nostr_group_id_hex).copied(),
+            Some(bob_message_secs)
+        );
     }
 
     #[test]

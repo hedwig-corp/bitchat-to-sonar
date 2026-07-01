@@ -181,6 +181,91 @@ async fn local_first_send_persists_pending_message_before_relay_publish() {
 }
 
 #[tokio::test]
+async fn restart_watermark_ignores_later_local_messages() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+
+    let bob = MarmotEngine::in_memory(Identity::generate());
+    let bob_kp = bob.key_package_event(relays()).expect("bob key package");
+
+    let alice_identity = Identity::generate();
+    let (bob_message_secs, alice_later_secs) = {
+        let alice = MarmotEngine::persistent(alice_identity.clone(), &db_path, DB_KEY)
+            .expect("open persistent engine");
+        let creation = alice
+            .create_group("alice & bob", vec![bob_kp], relays())
+            .expect("create group");
+        let group_id = creation.group.mls_group_id.clone();
+
+        let (bob_pubkey, bob_welcome) = creation
+            .welcomes
+            .into_iter()
+            .find(|(pubkey, _)| *pubkey == bob.identity().public_key())
+            .expect("bob welcome");
+        let bob_wrapped = alice
+            .gift_wrap_welcome(&bob_pubkey, bob_welcome)
+            .await
+            .expect("wrap bob welcome");
+        assert!(matches!(
+            bob.process_incoming(&bob_wrapped)
+                .await
+                .expect("bob processes welcome"),
+            Incoming::GroupUpdated(_)
+        ));
+        alice
+            .merge_pending_commit(&group_id)
+            .expect("merge after simulated welcome delivery");
+
+        let bob_group_id = bob.groups().expect("bob groups")[0].mls_group_id.clone();
+        let bob_event = bob
+            .create_text_message(&bob_group_id, "peer message while alice was offline")
+            .expect("bob creates message");
+        let bob_message_secs = bob_event.created_at.as_secs();
+        assert!(matches!(
+            alice
+                .process_incoming(&bob_event)
+                .await
+                .expect("alice processes bob message"),
+            Incoming::Message(_)
+        ));
+
+        sleep(Duration::from_secs(1)).await;
+        let alice_event = alice
+            .create_text_message(&group_id, "later local message")
+            .expect("alice creates later local message");
+        let alice_later_secs = alice_event.created_at.as_secs();
+        assert!(alice_later_secs > bob_message_secs);
+        assert!(matches!(
+            alice
+                .process_incoming(&alice_event)
+                .await
+                .expect("alice processes own message"),
+            Incoming::Message(_)
+        ));
+        assert_eq!(alice.latest_remote_event_secs(), bob_message_secs);
+        assert!(
+            alice.latest_message_secs() >= alice_later_secs,
+            "newest local event is the later outgoing message"
+        );
+
+        (bob_message_secs, alice_later_secs)
+    };
+
+    let reopened = MarmotEngine::persistent(alice_identity, &db_path, DB_KEY)
+        .expect("reopen persistent engine");
+
+    assert_eq!(
+        reopened.latest_remote_event_secs(),
+        bob_message_secs,
+        "restart catch-up must resume from peer history, not later local sends"
+    );
+    assert!(
+        reopened.latest_message_secs() >= alice_later_secs,
+        "the full local latest timestamp still includes local outgoing rows"
+    );
+}
+
+#[tokio::test]
 async fn recent_message_pages_returns_newest_groups_with_bounded_windows() {
     let alice = MarmotEngine::in_memory(Identity::generate());
     let mut created = Vec::new();

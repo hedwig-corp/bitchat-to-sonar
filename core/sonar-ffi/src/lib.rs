@@ -760,7 +760,8 @@ impl SonarNode {
 
     /// Re-subscribe with the current watermark and group set to self-heal
     /// after relay disconnects. Hosts call this on the idle timeout path
-    /// instead of `sync_once()`.
+    /// instead of `sync_once()`. It may run one bounded per-chat repair fetch,
+    /// so hosts must keep it off the local-first chat-open path.
     pub fn ensure_subscriptions(&self) -> FfiResult<()> {
         self.runtime
             .block_on(self.client.ensure_subscriptions())?;

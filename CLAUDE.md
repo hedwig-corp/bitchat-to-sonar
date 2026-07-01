@@ -10,6 +10,16 @@ When adding or changing a feature, cover the native Apple app (`ios/`) and the C
 
 Conversation and transcript changes must preserve Signal-comparable local-first performance. Opening an existing chat must paint from local storage first and must not wait on relay/server sync, full-history scans, or unrelated groups before first paint. If a change can make chat opening, sending, or scrolling meaningfully slower than Signal-style local database windowing, design a bounded local page/window path, move sync to the background, and document any platform gap with a follow-up path.
 
+Marmot relay repair and missing-message resync must follow the same local-first
+shape used by apps like XChat: never block chat open, chat list paint, sending,
+or scrolling on relay connection, subscription repair, EOSE, full-history scans,
+or watermark reconciliation. Load the locally stored transcript first, schedule
+bounded repair on a background/IO path, write recovered events into local
+storage, and let the UI update from database invalidation. For existing installs
+that need missing-message recovery, derive the resync floor from the local
+conversation transcript per chat, not from one global latest timestamp; a newer
+local send in one chat must not advance another chat past missing peer messages.
+
 ## Signal-Style Conversation Design Notes
 
 Signal treats the local database as the chat state. Network receive/send/sync paths write into local storage first, then the chat list and transcript UI react to local database invalidation. Android pages local conversation rows from `ThreadTable` through `ConversationListDataSource` with a small paging window; iOS builds chat-list render state from local thread IDs through `CLVLoader` and caches row view models/content. Sonar conversation work should follow that model: maintain core-owned local conversation summaries ordered by latest message, hydrate visible chat rows from bounded local pages, open transcripts from bounded local message windows, and run relay sync only as a background database updater.
