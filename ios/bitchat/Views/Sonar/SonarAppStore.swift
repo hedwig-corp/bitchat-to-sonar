@@ -309,6 +309,11 @@ struct SNMarmotRouteReplacement: Equatable {
     let realId: String
 }
 
+struct SNMarmotRouteFailure: Equatable {
+    let pendingId: String
+    let nonce = UUID()
+}
+
 struct SNMessage: Identifiable, Equatable {
     var id: String = UUID().uuidString
     var mine: Bool = false
@@ -683,6 +688,7 @@ final class SonarAppStore: ObservableObject {
     @Published private var pendingMarmotGroups: [String: SNPendingMarmotGroup] = [:]
     @Published private var pendingMarmotMessagesByChat: [String: [SNMessage]] = [:]
     @Published private(set) var pendingMarmotRouteReplacement: SNMarmotRouteReplacement?
+    @Published private(set) var pendingMarmotRouteFailure: SNMarmotRouteFailure?
     private var pendingDirectMarmotSends: [String: [SNPendingMarmotSend]] = [:]
     private var pendingMarmotGroupSends: [String: [SNPendingMarmotGroupSend]] = [:]
     private var startingMarmotChats = Set<String>()
@@ -3358,6 +3364,7 @@ final class SonarAppStore: ObservableObject {
     private func failPendingSecureChat(pendingId: String, npub: String, setupToken: UUID? = nil) {
         guard isActivePendingSecureChatSetup(pendingId: pendingId, npub: npub, token: setupToken) else { return }
         pendingMarmotChats[pendingId] = nil
+        pendingMarmotRouteFailure = SNMarmotRouteFailure(pendingId: pendingId)
         let queued = pendingDirectMarmotSends.removeValue(forKey: npub) ?? []
         let queuedIds = Set(queued.map(\.messageId))
         var messages = (pendingMarmotMessagesByChat[pendingId] ?? []).map {
@@ -3467,6 +3474,7 @@ final class SonarAppStore: ObservableObject {
     private func failPendingMarmotGroup(pendingId: String, setupToken: UUID? = nil) {
         guard isActivePendingMarmotGroupSetup(pendingId: pendingId, token: setupToken) else { return }
         pendingMarmotGroups[pendingId] = nil
+        pendingMarmotRouteFailure = SNMarmotRouteFailure(pendingId: pendingId)
         pendingMarmotGroupSends[pendingId] = nil
         pendingMarmotMessagesByChat[pendingId] = nil
         if currentDMId == pendingId {
@@ -5204,6 +5212,7 @@ final class SonarAppStore: ObservableObject {
         pendingMarmotGroups = [:]
         pendingMarmotMessagesByChat = [:]
         pendingMarmotRouteReplacement = nil
+        pendingMarmotRouteFailure = nil
         pendingDirectMarmotSends = [:]
         pendingMarmotGroupSends = [:]
         cancelPendingSecureChatSetups()
@@ -5291,6 +5300,7 @@ final class SonarAppStore: ObservableObject {
         pendingMarmotGroups = [:]
         pendingMarmotMessagesByChat = [:]
         pendingMarmotRouteReplacement = nil
+        pendingMarmotRouteFailure = nil
         pendingDirectMarmotSends = [:]
         pendingMarmotGroupSends = [:]
         cancelPendingSecureChatSetups()

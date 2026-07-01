@@ -145,6 +145,11 @@ struct SonarMacRootView: View {
             guard let replacement, selection == .dm(replacement.pendingId) else { return }
             selection = .dm(replacement.realId)
         }
+        .onChange(of: store.pendingMarmotRouteFailure) { failure in
+            guard let failure, selection == .dm(failure.pendingId) else { return }
+            selection = .radar
+            store.path.removeAll()
+        }
         .onReceive(NotificationCenter.default.publisher(for: .sonarMacOpenSearch)) { _ in
             searchOpen = true
         }
