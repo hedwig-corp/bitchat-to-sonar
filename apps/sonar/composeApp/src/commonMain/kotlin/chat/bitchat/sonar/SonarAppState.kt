@@ -1085,6 +1085,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         else if (isPendingMarmotGroup(chatId)) true
         else chats.firstOrNull { it.id == chatId }?.let { !isDirectMarmotChat(it) } == true
 
+    fun canManageGroup(chatId: String): Boolean =
+        !isPendingMarmotGroup(chatId) &&
+            chats.firstOrNull { it.id == chatId }?.let { !isDirectMarmotChat(it) } == true
+
     fun hasDirectPaymentRoute(chatId: String): Boolean {
         if (directPaymentOffer(chatId) != null) return true
         if (isMeshChat(chatId)) {
@@ -2264,6 +2268,10 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /** Delete a 1:1 Marmot chat locally, or leave a multi-member Marmot group. */
     fun deleteMarmotChat(chatId: String) {
+        if (isPendingMarmotGroup(chatId)) {
+            toast = "Group is still setting up."
+            return
+        }
         val wasOpen = (stack.lastOrNull() as? Screen.Chat)?.id == chatId
         val isGroup = chats.firstOrNull { it.id == chatId }?.let { !isDirectMarmotChat(it) } == true
         chats = chats.filterNot { it.id == chatId }
@@ -4031,6 +4039,10 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     fun addGroupMembers(chatId: String, members: List<String>) {
+        if (!canManageGroup(chatId)) {
+            toast = "Group is still setting up."
+            return
+        }
         val existing = groupMemberNpubs(chatId)
         val cleanMembers = members.map { it.trim() }
             .filter { it.isNotEmpty() && it !in existing }
@@ -4053,6 +4065,10 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     fun removeGroupMembers(chatId: String, members: List<String>) {
+        if (!canManageGroup(chatId)) {
+            toast = "Group is still setting up."
+            return
+        }
         val cleanMembers = members.map { it.trim() }
             .filter { it.isNotEmpty() && it != npub }
             .distinct()
@@ -4071,6 +4087,10 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     fun createInviteLink(chatId: String, groupName: String, onResult: (String) -> Unit) {
+        if (!canManageGroup(chatId)) {
+            toast = "Group is still setting up."
+            return
+        }
         scope.launch {
             try {
                 val token = SonarCore.createInviteLink(chatId, groupName)
@@ -4082,6 +4102,10 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     fun loadPendingJoinRequests(chatId: String, onResult: (List<SonarJoinRequest>) -> Unit) {
+        if (!canManageGroup(chatId)) {
+            onResult(emptyList())
+            return
+        }
         scope.launch {
             try {
                 onResult(SonarCore.pendingJoinRequests(chatId))
@@ -4093,6 +4117,10 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     fun approveJoinRequest(chatId: String, requesterNpub: String, onDone: () -> Unit = {}) {
+        if (!canManageGroup(chatId)) {
+            toast = "Group is still setting up."
+            return
+        }
         scope.launch {
             try {
                 SonarCore.approveJoinRequest(chatId, requesterNpub)
@@ -4106,6 +4134,10 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     fun declineJoinRequest(chatId: String, requesterNpub: String, onDone: () -> Unit = {}) {
+        if (!canManageGroup(chatId)) {
+            toast = "Group is still setting up."
+            return
+        }
         scope.launch {
             try {
                 SonarCore.declineJoinRequest(chatId, requesterNpub)
