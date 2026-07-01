@@ -2429,6 +2429,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         pendingSendEchoes[pendingChatId].orEmpty().map { it.id }.forEach { echoId ->
             failSendEcho(pendingChatId, echoId)
         }
+        pendingSendEchoes.remove(pendingChatId)
         return true
     }
 
@@ -2540,6 +2541,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         pendingSendEchoes[pendingChatId].orEmpty().map { it.id }.forEach { echoId ->
             failSendEcho(pendingChatId, echoId)
         }
+        pendingSendEchoes.remove(pendingChatId)
         if ((screen as? Screen.Chat)?.id == pendingChatId && stack.size > 1) {
             stack = stack.dropLast(1)
         }

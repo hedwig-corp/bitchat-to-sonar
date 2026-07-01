@@ -3375,10 +3375,10 @@ final class SonarAppStore: ObservableObject {
                 state: "Couldn't send"
             ))
         }
-        if messages.isEmpty {
-            pendingMarmotMessagesByChat[pendingId] = nil
-        } else {
+        if currentDMId == pendingId && !messages.isEmpty {
             pendingMarmotMessagesByChat[pendingId] = messages
+        } else {
+            pendingMarmotMessagesByChat[pendingId] = nil
         }
     }
 
@@ -3467,28 +3467,8 @@ final class SonarAppStore: ObservableObject {
     private func failPendingMarmotGroup(pendingId: String, setupToken: UUID? = nil) {
         guard isActivePendingMarmotGroupSetup(pendingId: pendingId, token: setupToken) else { return }
         pendingMarmotGroups[pendingId] = nil
-        let queued = pendingMarmotGroupSends.removeValue(forKey: pendingId) ?? []
-        let queuedIds = Set(queued.map(\.messageId))
-        var messages = (pendingMarmotMessagesByChat[pendingId] ?? []).map {
-            queuedIds.contains($0.id) ? failedPendingMessage($0) : $0
-        }
-        for item in queued where !messages.contains(where: { $0.id == item.messageId }) {
-            let createdAt = Date()
-            messages.append(SNMessage(
-                id: item.messageId,
-                mine: true,
-                text: item.text,
-                time: Self.clock(createdAt),
-                sortDate: createdAt,
-                via: .internet,
-                state: "Couldn't send"
-            ))
-        }
-        if messages.isEmpty {
-            pendingMarmotMessagesByChat[pendingId] = nil
-        } else {
-            pendingMarmotMessagesByChat[pendingId] = messages
-        }
+        pendingMarmotGroupSends[pendingId] = nil
+        pendingMarmotMessagesByChat[pendingId] = nil
         if currentDMId == pendingId {
             pop()
         }
@@ -4206,7 +4186,14 @@ final class SonarAppStore: ObservableObject {
         // long as we're connected (started in performConnect) so welcomes +
         // messages keep arriving live in the background list, not only while a
         // chat is open. It is stopped only on wipe / erase.
-        if pendingMarmotNpub(for: id) != nil { return }
+        if let pendingNpub = pendingMarmotNpub(for: id) {
+            if pendingMarmotChats[id] == nil {
+                pendingMarmotMessagesByChat[id] = nil
+                pendingDirectMarmotSends[pendingNpub] = nil
+                cancelPendingSecureChatSetup(pendingId: id, npub: pendingNpub)
+            }
+            return
+        }
         if isPendingMarmotGroup(id) { return }
         if marmotGroupId(id) == nil {
             if chatViewModel.selectedPrivateChatPeer == PeerID(str: id) {
@@ -5159,6 +5146,7 @@ final class SonarAppStore: ObservableObject {
             pendingMarmotGroupSends[id] = nil
             cancelPendingMarmotGroupSetup(pendingId: id)
             if let pendingNpub = pendingMarmotNpub(for: id) {
+                pendingDirectMarmotSends[pendingNpub] = nil
                 cancelPendingSecureChatSetup(pendingId: id, npub: pendingNpub)
             }
             if currentDMId == id { pop() }
