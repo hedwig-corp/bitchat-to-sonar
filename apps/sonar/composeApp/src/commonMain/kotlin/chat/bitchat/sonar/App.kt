@@ -289,7 +289,7 @@ private fun HomeScreen(state: SonarAppState) {
                         avatar = { SonarAvatar(chatTitle, 52.dp, presence = false) },
                         title = chatTitle, sub = if (pending) "Setting up secure chat…" else "Tap to open", lock = true,
                         verified = state.isVerified(chat.id),
-                        unread = (state.unreadByChat[chat.id] ?: 0) > 0,
+                        unread = state.unreadForChat(chat.id) > 0,
                         onLongClick = if (pending) null else {
                             { pendingDelete = DeleteTarget(chat.id, chatTitle, isMesh = false, isGroup = state.isMultiMemberChat(chat.id)) }
                         },
