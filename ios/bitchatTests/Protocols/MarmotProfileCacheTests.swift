@@ -132,6 +132,23 @@ struct MarmotProfileCacheTests {
     }
 
     @Test
+    func directMarmotPeerKeyCanonicalizesHexAndGroupsDuplicates() throws {
+        let ownRaw = Data(repeating: 1, count: 32)
+        let peerRaw = Data(repeating: 2, count: 32)
+        let ownNpub = try Bech32.encode(hrp: "npub", data: ownRaw)
+        let peerNpub = try Bech32.encode(hrp: "npub", data: peerRaw)
+        let peerHex = peerRaw.map { String(format: "%02x", $0) }.joined()
+        let first = MarmotService.MarmotGroup(id: "group-a", name: "", memberNpubs: [ownNpub, peerHex])
+        let second = MarmotService.MarmotGroup(id: "group-b", name: "", memberNpubs: [ownNpub, peerNpub])
+        let room = MarmotService.MarmotGroup(id: "room", name: "", memberNpubs: [ownNpub, peerNpub, "npub1third"])
+
+        let grouped = snCanonicalDirectMarmotGroups([first, second, room], ownNpub: ownNpub)
+
+        #expect(snDirectMarmotPeerKey(for: first, ownNpub: ownNpub) == peerNpub)
+        #expect(grouped[peerNpub]?.map(\.id) == ["group-a", "group-b"])
+    }
+
+    @Test
     func chatSnapshotKeepsRowsWithoutPersistingMessages() {
         let suiteName = "MarmotProfileCacheTests-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!

@@ -2510,10 +2510,12 @@ final class SonarAppStore: ObservableObject {
     /// The White Noise (Marmot) 1:1 group whose counterpart is `npub`.
     func marmotGroup(forNpub npub: String) -> MarmotService.MarmotGroup? {
         let target = SNMarmotProfileCache.canonicalKey(npub)
-        return marmot.groups.first {
-            marmot.isDirectGroup($0) &&
-                $0.memberNpubs.map(SNMarmotProfileCache.canonicalKey).contains(target)
-        }
+        return preferredDirectMarmotGroup(in: marmotGroups(forNpub: target))
+    }
+
+    private func marmotGroups(forNpub npub: String) -> [MarmotService.MarmotGroup] {
+        let target = SNMarmotProfileCache.canonicalKey(npub)
+        return marmot.groups.filter { directMarmotPeerKey(in: $0) == target }
     }
 
     private func pendingMarmotChatId(for npub: String) -> String? {
@@ -2568,6 +2570,65 @@ final class SonarAppStore: ObservableObject {
 
     private func marmotGroup(byId groupId: String) -> MarmotService.MarmotGroup? {
         marmot.groups.first { $0.id == groupId }
+    }
+
+    private func directMarmotPeerKey(in group: MarmotService.MarmotGroup) -> String? {
+        snDirectMarmotPeerKey(for: group, ownNpub: marmot.npub)
+    }
+
+    private func directMarmotGroups(matching group: MarmotService.MarmotGroup) -> [MarmotService.MarmotGroup] {
+        guard let peerKey = directMarmotPeerKey(in: group) else { return [group] }
+        let groups = marmot.groups.filter { directMarmotPeerKey(in: $0) == peerKey }
+        return groups.isEmpty ? [group] : groups
+    }
+
+    private func directMarmotGroups(matchingGroupId groupId: String) -> [MarmotService.MarmotGroup] {
+        guard let group = marmotGroup(byId: groupId) else { return [] }
+        return directMarmotGroups(matching: group)
+    }
+
+    private func latestMarmotMessage(
+        in groups: [MarmotService.MarmotGroup]
+    ) -> (groupId: String, message: MarmotService.MarmotMessage)? {
+        var latest: (groupId: String, message: MarmotService.MarmotMessage)?
+        for group in groups {
+            guard let message = marmot.messagesByGroup[group.id]?.last else { continue }
+            if latest == nil || message.createdAt > latest!.message.createdAt {
+                latest = (group.id, message)
+            }
+        }
+        return latest
+    }
+
+    private func preferredDirectMarmotGroup(
+        in groups: [MarmotService.MarmotGroup]
+    ) -> MarmotService.MarmotGroup? {
+        groups.sorted { lhs, rhs in
+            let lhsDate = marmot.messagesByGroup[lhs.id]?.last?.createdAt ?? .distantPast
+            let rhsDate = marmot.messagesByGroup[rhs.id]?.last?.createdAt ?? .distantPast
+            if lhsDate != rhsDate { return lhsDate > rhsDate }
+            let lhsVerified = marmotVerified[lhs.id] ?? false
+            let rhsVerified = marmotVerified[rhs.id] ?? false
+            if lhsVerified != rhsVerified { return lhsVerified && !rhsVerified }
+            return lhs.id < rhs.id
+        }.first
+    }
+
+    private func hasUnreadMarmotMessage(in groups: [MarmotService.MarmotGroup]) -> Bool {
+        groups.contains { (marmot.unreadByGroup[$0.id] ?? 0) > 0 }
+    }
+
+    private func hasVerifiedMarmotGroup(in groups: [MarmotService.MarmotGroup]) -> Bool {
+        groups.contains { marmotVerified[$0.id] ?? false }
+    }
+
+    private func markMarmotGroupsRead(matchingGroupId groupId: String) {
+        let groups = directMarmotGroups(matchingGroupId: groupId)
+        if groups.isEmpty {
+            marmot.markConversationRead(groupId: groupId)
+        } else {
+            for group in groups { marmot.markConversationRead(groupId: group.id) }
+        }
     }
 
     func marmotGroup(forConversationId id: String) -> MarmotService.MarmotGroup? {
@@ -2658,8 +2719,7 @@ final class SonarAppStore: ObservableObject {
     }
 
     private func directOtherNpub(in group: MarmotService.MarmotGroup) -> String? {
-        guard marmot.isDirectGroup(group) else { return nil }
-        return marmot.otherMembers(in: group).first
+        directMarmotPeerKey(in: group)
     }
 
     private func callMarmotGroupId(_ id: String) -> String? {
@@ -2800,6 +2860,8 @@ final class SonarAppStore: ObservableObject {
         // (the DM screen renders both transcripts merged) instead of
         // showing a second row.
         var marmotRows: [SNDMRow] = []
+        let directGroupsByPeer = snCanonicalDirectMarmotGroups(marmot.groups, ownNpub: marmot.npub)
+        var renderedDirectPeerKeys = Set<String>()
         for group in marmot.groups {
             let msgs = marmot.messagesByGroup[group.id] ?? []
             let last = msgs.last
@@ -2818,7 +2880,20 @@ final class SonarAppStore: ObservableObject {
                 ))
                 continue
             }
-            let otherNpub = directOtherNpub(in: group)
+            let peerKey = directMarmotPeerKey(in: group)
+            let groupSet: [MarmotService.MarmotGroup]
+            if let peerKey {
+                if renderedDirectPeerKeys.contains(peerKey) { continue }
+                renderedDirectPeerKeys.insert(peerKey)
+                groupSet = directGroupsByPeer[peerKey] ?? [group]
+            } else {
+                groupSet = [group]
+            }
+            let latest = latestMarmotMessage(in: groupSet)
+            let rowGroup = preferredDirectMarmotGroup(in: groupSet) ?? group
+            let rowGroupId = latest?.groupId ?? rowGroup.id
+            let rowLast = latest?.message
+            let otherNpub = directOtherNpub(in: rowGroup) ?? peerKey
             // Live peer id (when currently discovered over 0x53) gives us mesh
             // presence; the persisted fingerprint still lets us build the SAME
             // Sonar row when BLE is down / after restart.
@@ -2827,30 +2902,30 @@ final class SonarAppStore: ObservableObject {
             }
             let foldKey = otherNpub.flatMap { npub in
                 sonarPeerKey(forNpub: npub)
-                    ?? inferFoldKeyByUniqueTitle(for: group, otherNpub: npub, rowsByKey: byKey)
+                    ?? inferFoldKeyByUniqueTitle(for: rowGroup, otherNpub: npub, rowsByKey: byKey)
             }
             if let liveSonarPeerId {
-                rememberMarmotGroup(group.id, forConversationId: liveSonarPeerId)
+                rememberMarmotGroup(rowGroupId, forConversationId: liveSonarPeerId)
             }
             if let foldKey {
-                rememberMarmotGroup(group.id, forConversationId: foldKey)
+                rememberMarmotGroup(rowGroupId, forConversationId: foldKey)
             }
             if let foldKey, let existing = byKey[foldKey] {
                 // Same person as a mesh/bitchat chat → merge the White Noise leg
                 // into that one row instead of showing a duplicate conversation.
-                rememberMarmotGroup(group.id, forConversationId: existing.id)
-                if let last, last.createdAt > (existing.lastDate ?? .distantPast) {
+                rememberMarmotGroup(rowGroupId, forConversationId: existing.id)
+                if let rowLast, rowLast.createdAt > (existing.lastDate ?? .distantPast) {
                     byKey[foldKey] = SNDMRow(
                         id: existing.id,
                         title: existing.title,
-                        preview: Self.previewText(last.content, stickerRef: last.stickerRef),
-                        time: Self.listTime(last.createdAt),
-                        unread: existing.unread,
+                        preview: Self.previewText(rowLast.content, stickerRef: rowLast.stickerRef),
+                        time: Self.listTime(rowLast.createdAt),
+                        unread: existing.unread || hasUnreadMarmotMessage(in: groupSet),
                         presence: existing.presence,
-                        verified: existing.verified,
+                        verified: existing.verified || hasVerifiedMarmotGroup(in: groupSet),
                         isMarmot: false,
-                        lastDate: last.createdAt,
-                        marmotGroupId: group.id
+                        lastDate: rowLast.createdAt,
+                        marmotGroupId: rowGroupId
                     )
                 }
                 continue
@@ -2860,35 +2935,35 @@ final class SonarAppStore: ObservableObject {
                 // Sonar peer now out of range → one folded row, not a White Noise
                 // duplicate.
                 let rowId = liveSonarPeerId ?? foldKey
-                rememberMarmotGroup(group.id, forConversationId: rowId)
+                rememberMarmotGroup(rowGroupId, forConversationId: rowId)
                 byKey[foldKey] = SNDMRow(
                     id: rowId,
-                    title: liveSonarPeerId == nil ? marmot.title(for: group) : peerDisplayName(rowId),
-                    preview: last.map { Self.previewText($0.content, stickerRef: $0.stickerRef) } ?? networkLabel(forPeer: rowId),
-                    time: last.map { Self.listTime($0.createdAt) } ?? "",
-                    unread: (marmot.unreadByGroup[group.id] ?? 0) > 0,
+                    title: liveSonarPeerId == nil ? marmot.title(for: rowGroup) : peerDisplayName(rowId),
+                    preview: rowLast.map { Self.previewText($0.content, stickerRef: $0.stickerRef) } ?? networkLabel(forPeer: rowId),
+                    time: rowLast.map { Self.listTime($0.createdAt) } ?? "",
+                    unread: hasUnreadMarmotMessage(in: groupSet),
                     presence: liveSonarPeerId != nil && meshReachable(rowId),
-                    verified: isVerified(rowId) || (marmotVerified[group.id] ?? false),
+                    verified: isVerified(rowId) || hasVerifiedMarmotGroup(in: groupSet),
                     isMarmot: false,
-                    lastDate: last?.createdAt,
-                    marmotGroupId: group.id
+                    lastDate: rowLast?.createdAt,
+                    marmotGroupId: rowGroupId
                 )
                 continue
             }
-            if shouldHoldStandaloneMarmotGroup(group, latestMessage: last, now: now) {
+            if shouldHoldStandaloneMarmotGroup(rowGroup, latestMessage: rowLast, now: now) {
                 continue
             }
             marmotRows.append(SNDMRow(
-                id: Self.marmotIDPrefix + group.id,
-                title: marmot.title(for: group),
-                preview: last.map { Self.previewText($0.content, stickerRef: $0.stickerRef) } ?? "Secure chat · reaches anywhere",
-                time: last.map { Self.listTime($0.createdAt) } ?? "",
-                unread: (marmot.unreadByGroup[group.id] ?? 0) > 0,
+                id: Self.marmotIDPrefix + rowGroupId,
+                title: marmot.title(for: rowGroup),
+                preview: rowLast.map { Self.previewText($0.content, stickerRef: $0.stickerRef) } ?? "Secure chat · reaches anywhere",
+                time: rowLast.map { Self.listTime($0.createdAt) } ?? "",
+                unread: hasUnreadMarmotMessage(in: groupSet),
                 presence: false,
-                verified: marmotVerified[group.id] ?? false,
+                verified: hasVerifiedMarmotGroup(in: groupSet),
                 isMarmot: true,
-                lastDate: last?.createdAt,
-                marmotGroupId: group.id
+                lastDate: rowLast?.createdAt,
+                marmotGroupId: rowGroupId
             ))
         }
         let pendingRows = pendingMarmotChats.compactMap { id, pending -> SNDMRow? in
@@ -3002,27 +3077,34 @@ final class SonarAppStore: ObservableObject {
 
     func dmMsgs(_ id: String) -> [SNMessage] {
         if let groupId = marmotGroupId(id) {
-            var dated: [(Date, SNMessage)] = (marmot.messagesByGroup[groupId] ?? []).compactMap { m in
-                switch payMapping(m.content, fallbackVia: .internet) {
-                case .hidden:
-                    return nil
-                case .bubble(let pay, let payVia):
-                    return (m.createdAt, SNMessage(
-                        id: m.id, mine: m.isMine, text: m.content,
-                        time: Self.clock(m.createdAt), via: payVia, pay: pay
-                    ))
-                case .notPay:
-                    return (m.createdAt, SNMessage(
-                        id: m.id,
-                        mine: m.isMine,
-                        author: marmot.marmotAuthorName(m),
-                        text: m.content,
-                        time: Self.clock(m.createdAt),
-                        via: .internet,
-                        state: MarmotChatModel.stateText(for: m),
-                        media: Self.mediaItems(m, groupId: groupId),
-                        stickerRef: m.stickerRef
-                    ))
+            let groups = directMarmotGroups(matchingGroupId: groupId)
+            let sourceGroups = groups.isEmpty
+                ? [MarmotService.MarmotGroup(id: groupId, name: "", memberNpubs: [])]
+                : groups
+            var dated: [(Date, SNMessage)] = []
+            for group in sourceGroups {
+                dated += (marmot.messagesByGroup[group.id] ?? []).compactMap { m in
+                    switch payMapping(m.content, fallbackVia: .internet) {
+                    case .hidden:
+                        return nil
+                    case .bubble(let pay, let payVia):
+                        return (m.createdAt, SNMessage(
+                            id: m.id, mine: m.isMine, text: m.content,
+                            time: Self.clock(m.createdAt), via: payVia, pay: pay
+                        ))
+                    case .notPay:
+                        return (m.createdAt, SNMessage(
+                            id: m.id,
+                            mine: m.isMine,
+                            author: marmot.marmotAuthorName(m),
+                            text: m.content,
+                            time: Self.clock(m.createdAt),
+                            via: .internet,
+                            state: MarmotChatModel.stateText(for: m),
+                            media: Self.mediaItems(m, groupId: group.id),
+                            stickerRef: m.stickerRef
+                        ))
+                    }
                 }
             }
             if !id.hasPrefix(Self.marmotIDPrefix), pendingMarmotNpub(for: id) == nil {
@@ -3059,7 +3141,7 @@ final class SonarAppStore: ObservableObject {
                 }
                 dated.sort { $0.0 < $1.0 }
             }
-            let echoIds = [id, Self.marmotIDPrefix + groupId].reduce(into: [String]()) { ids, echoId in
+            let echoIds = ([id] + sourceGroups.map { Self.marmotIDPrefix + $0.id }).reduce(into: [String]()) { ids, echoId in
                 if !ids.contains(echoId) { ids.append(echoId) }
             }
             for echoId in echoIds {
@@ -4089,7 +4171,7 @@ final class SonarAppStore: ObservableObject {
     func openedDM(_ id: String, marmotGroupId knownMarmotGroupId: String? = nil) {
         if let knownMarmotGroupId {
             rememberMarmotGroup(knownMarmotGroupId, forConversationId: id)
-            marmot.markConversationRead(groupId: knownMarmotGroupId)
+            markMarmotGroupsRead(matchingGroupId: knownMarmotGroupId)
         }
         if let pendingNpub = pendingMarmotNpub(for: id) {
             marmot.connectIfNeeded()
@@ -4138,13 +4220,24 @@ final class SonarAppStore: ObservableObject {
             let hydratedGroupId = groupId
                 ?? sonarProfile.flatMap { self.marmotGroup(forNpub: $0.npub)?.id }
             if let hydratedGroupId {
-                await self.marmot.loadLocalPage(groupId: hydratedGroupId)
+                let groups = self.directMarmotGroups(matchingGroupId: hydratedGroupId)
+                let sourceGroups = groups.isEmpty
+                    ? [MarmotService.MarmotGroup(id: hydratedGroupId, name: "", memberNpubs: [])]
+                    : groups
+                for group in sourceGroups {
+                    await self.marmot.loadLocalPage(groupId: group.id)
+                    self.marmot.markConversationRead(groupId: group.id)
+                }
                 self.rememberMarmotGroup(hydratedGroupId, forConversationId: id)
                 let fp = self.chatViewModel.getFingerprint(for: PeerID(str: id)) ?? id
                 self.rememberMarmotGroup(hydratedGroupId, forConversationId: fp)
             }
             let needsHistoryBackfill = hydratedGroupId.map {
-                self.marmot.messagesByGroup[$0]?.isEmpty ?? true
+                let groups = self.directMarmotGroups(matchingGroupId: $0)
+                let sourceGroups = groups.isEmpty
+                    ? [MarmotService.MarmotGroup(id: $0, name: "", memberNpubs: [])]
+                    : groups
+                return sourceGroups.contains { self.marmot.messagesByGroup[$0.id]?.isEmpty ?? true }
             } ?? false
             if !needsHistoryBackfill {
                 self.localHydratingDMs.remove(id)
@@ -4682,14 +4775,23 @@ final class SonarAppStore: ObservableObject {
     }
 
     func isVerified(_ id: String) -> Bool {
-        if let groupId = marmotGroupId(id) { return marmotVerified[groupId] ?? false }
+        if let groupId = marmotGroupId(id) {
+            let groups = directMarmotGroups(matchingGroupId: groupId)
+            if groups.isEmpty { return marmotVerified[groupId] ?? false }
+            return hasVerifiedMarmotGroup(in: groups)
+        }
         guard let fingerprint = chatViewModel.getFingerprint(for: PeerID(str: id)) else { return false }
         return chatViewModel.verifiedFingerprints.contains(fingerprint)
     }
 
     func markVerified(_ id: String) {
         if let groupId = marmotGroupId(id) {
-            marmotVerified[groupId] = true
+            let groups = directMarmotGroups(matchingGroupId: groupId)
+            if groups.isEmpty {
+                marmotVerified[groupId] = true
+            } else {
+                for group in groups { marmotVerified[group.id] = true }
+            }
             defaults.set(marmotVerified, forKey: Keys.marmotVerified)
         } else {
             chatViewModel.verifyFingerprint(for: PeerID(str: id))
