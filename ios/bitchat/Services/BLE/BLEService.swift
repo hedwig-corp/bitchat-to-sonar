@@ -33,6 +33,11 @@ final class BLEService: NSObject {
     static let characteristicUUID = CBUUID(string: "A1B2C3D4-E5F6-4A5B-8C9D-0E1F2A3B4C5D")
     private static let centralRestorationID = "chat.bitchat.ble.central"
     private static let peripheralRestorationID = "chat.bitchat.ble.peripheral"
+    static var peerConnectionOptions: [String: Any]? {
+        // CoreBluetooth NotifyOn* options ask iOS to show system alerts while
+        // suspended. Normal mesh reconnects must stay silent.
+        nil
+    }
     
     // Default per-fragment chunk size when link limits are unknown
     private let defaultFragmentSize = TransportConfig.bleDefaultFragmentSize
@@ -2085,16 +2090,10 @@ extension BLEService: CBCentralManagerDelegate {
         )
         peripheral.delegate = self
         
-        // Connect to the peripheral with options for faster connection
+        // Connect to the peripheral.
         SecureLogger.debug("📱 Connect: \(advertisedName) [RSSI:\(rssiValue)]", category: .session)
-        
-        // Use connection options for faster reconnection
-        let options: [String: Any] = [
-            CBConnectPeripheralOptionNotifyOnConnectionKey: true,
-            CBConnectPeripheralOptionNotifyOnDisconnectionKey: true,
-            CBConnectPeripheralOptionNotifyOnNotificationKey: true
-        ]
-        central.connect(peripheral, options: options)
+
+        central.connect(peripheral, options: BLEService.peerConnectionOptions)
         lastGlobalConnectAttempt = Date()
         
         // Set a timeout for the connection attempt (slightly longer for reliability)
@@ -2287,12 +2286,7 @@ extension BLEService {
             assembler: NotificationStreamAssembler()
         )
         peripheral.delegate = self
-        let options: [String: Any] = [
-            CBConnectPeripheralOptionNotifyOnConnectionKey: true,
-            CBConnectPeripheralOptionNotifyOnDisconnectionKey: true,
-            CBConnectPeripheralOptionNotifyOnNotificationKey: true
-        ]
-        central.connect(peripheral, options: options)
+        central.connect(peripheral, options: BLEService.peerConnectionOptions)
         lastGlobalConnectAttempt = Date()
         SecureLogger.debug("⏩ Queue connect: \(candidate.name) [RSSI:\(candidate.rssi)]", category: .session)
     }

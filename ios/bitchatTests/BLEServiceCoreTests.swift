@@ -13,6 +13,15 @@ import CoreBluetooth
 struct BLEServiceCoreTests {
 
     @Test
+    func peerConnectionOptions_doNotRequestSystemAlerts() {
+        let options = BLEService.peerConnectionOptions ?? [:]
+
+        #expect((options[CBConnectPeripheralOptionNotifyOnConnectionKey] as? Bool) != true)
+        #expect((options[CBConnectPeripheralOptionNotifyOnDisconnectionKey] as? Bool) != true)
+        #expect((options[CBConnectPeripheralOptionNotifyOnNotificationKey] as? Bool) != true)
+    }
+
+    @Test
     func duplicatePacket_isDeduped() async {
         let ble = makeService()
         let delegate = PublicCaptureDelegate()
