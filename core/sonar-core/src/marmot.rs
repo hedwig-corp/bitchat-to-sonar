@@ -874,12 +874,10 @@ impl MarmotEngine {
     }
 
     /// Unix-seconds timestamp of the NEWEST event stored across all groups (any
-    /// kind — membership/commit/chat). Used to RESUME incremental relay sync
-    /// across restarts: a relaunch fetches only what arrived after this instead
-    /// of re-downloading the whole history (the reference White Noise client
-    /// persists a `last_synced_at` column for the same purpose; deriving it from
-    /// the store keeps it ALWAYS consistent with what is actually persisted — a
-    /// fresh or wiped DB has nothing → 0 → a full backfill). 0 if empty/on error.
+    /// kind — membership/commit/chat). Used to detect whether the local store is
+    /// empty; restart relay catch-up uses [`Self::latest_remote_event_secs`] so
+    /// later local-only rows do not hide missed peer messages. 0 if empty/on
+    /// error.
     pub fn latest_message_secs(&self) -> u64 {
         let groups = match self.groups() {
             Ok(g) => g,
@@ -900,6 +898,98 @@ impl MarmotEngine {
             }
         }
         newest
+    }
+
+    /// Unix-seconds timestamp of the newest recently stored event authored by
+    /// another participant. Relay catch-up uses this conservative local floor
+    /// so later local-only sends or status/bookkeeping rows cannot hide peer
+    /// messages that arrived while this device was offline. The scan is bounded
+    /// per group; if the only remote event is older than the bounded window,
+    /// this returns 0 and the background sync safely widens instead of blocking
+    /// startup on a full-history scan.
+    pub fn latest_remote_event_secs(&self) -> u64 {
+        let groups = match self.groups() {
+            Ok(g) => g,
+            Err(_) => return 0,
+        };
+        let mut newest = 0u64;
+        let me = self.identity.public_key();
+        for g in groups {
+            let mut raw_offset = 0usize;
+            let mut raw_scanned = 0usize;
+            while raw_scanned < MESSAGE_PAGE_RAW_SCAN_LIMIT {
+                let remaining_scan = MESSAGE_PAGE_RAW_SCAN_LIMIT - raw_scanned;
+                let batch_limit = 500.min(remaining_scan);
+                let page = Pagination::with_sort_order(
+                    Some(batch_limit),
+                    Some(raw_offset),
+                    MessageSortOrder::CreatedAtFirst,
+                );
+                let msgs = match dispatch!(&self.storage, |mdk| {
+                    mdk.get_messages(&g.mls_group_id, Some(page))
+                }) {
+                    Ok(m) => m,
+                    Err(_) => break,
+                };
+                if msgs.is_empty() {
+                    break;
+                }
+
+                let raw_len = msgs.len();
+                raw_scanned += raw_len;
+                raw_offset += raw_len;
+                for m in msgs {
+                    if m.pubkey == me {
+                        continue;
+                    }
+                    let t = m.created_at.as_secs();
+                    if t > newest {
+                        newest = t;
+                    }
+                }
+                if raw_len < batch_limit {
+                    break;
+                }
+            }
+        }
+        newest
+    }
+
+    /// Unix-seconds timestamp of the newest recently stored chat message in
+    /// `group_id` authored by another participant. Returns `None` when the
+    /// bounded scan finds no local remote chat rows; callers should treat that
+    /// as a conservative full-group repair floor.
+    pub fn latest_remote_chat_message_secs(&self, group_id: &GroupId) -> Option<u64> {
+        let me = self.identity.public_key();
+        let mut raw_offset = 0usize;
+        let mut raw_scanned = 0usize;
+        while raw_scanned < MESSAGE_PAGE_RAW_SCAN_LIMIT {
+            let remaining_scan = MESSAGE_PAGE_RAW_SCAN_LIMIT - raw_scanned;
+            let batch_limit = 500.min(remaining_scan);
+            let page = Pagination::with_sort_order(
+                Some(batch_limit),
+                Some(raw_offset),
+                MessageSortOrder::CreatedAtFirst,
+            );
+            let msgs =
+                dispatch!(&self.storage, |mdk| mdk.get_messages(group_id, Some(page))).ok()?;
+            if msgs.is_empty() {
+                return None;
+            }
+
+            let raw_len = msgs.len();
+            raw_scanned += raw_len;
+            raw_offset += raw_len;
+            for m in msgs {
+                if m.kind.as_u16() == CHAT_RUMOR_KIND && m.pubkey != me {
+                    return Some(m.created_at.as_secs());
+                }
+            }
+            if raw_len < batch_limit {
+                return None;
+            }
+        }
+        None
     }
 
     /// Delete ALL local state for a group: messages, processed-message records,

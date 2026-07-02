@@ -506,7 +506,8 @@ expect object SonarCore {
     suspend fun sync()
 
     /** Re-subscribe with current watermark + group set to self-heal after
-     *  relay disconnects. Lighter than sync() — no blocking fetch. */
+     *  relay disconnects. May perform one bounded chat repair fetch; call from
+     *  background/IO work and never before local chat paint. */
     suspend fun ensureSubscriptions()
 
     /** Publish our kind-0 profile (NIP-01) so peers see our nickname, not npub. */
