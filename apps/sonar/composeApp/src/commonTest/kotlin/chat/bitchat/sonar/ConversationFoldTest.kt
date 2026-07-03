@@ -284,4 +284,36 @@ class ConversationFoldTest {
         assertEquals(listOf(chat), decoded.first)
         assertEquals(emptyMap(), decoded.second)
     }
+
+    @Test
+    fun directMarmotPeerKeyCanonicalizesHexAndNpub() {
+        val ownRaw = ByteArray(32) { 1 }
+        val peerRaw = ByteArray(32) { 2 }
+        val ownNpub = chat.bitchat.sonar.crypto.Bech32.encode("npub", ownRaw)!!
+        val peerNpub = chat.bitchat.sonar.crypto.Bech32.encode("npub", peerRaw)!!
+        val peerHex = peerRaw.joinToString("") { (it.toInt() and 0xFF).toString(16).padStart(2, '0') }
+        val chat = SonarChat(id = "group-a", name = "", members = listOf(ownNpub, peerHex))
+
+        assertEquals(peerNpub, directMarmotPeerKey(chat, ownNpub))
+    }
+
+    @Test
+    fun duplicateDirectMarmotChatsRenderOnceByCanonicalPeer() {
+        val ownRaw = ByteArray(32) { 1 }
+        val peerRaw = ByteArray(32) { 2 }
+        val ownNpub = chat.bitchat.sonar.crypto.Bech32.encode("npub", ownRaw)!!
+        val peerNpub = chat.bitchat.sonar.crypto.Bech32.encode("npub", peerRaw)!!
+        val peerHex = peerRaw.joinToString("") { (it.toInt() and 0xFF).toString(16).padStart(2, '0') }
+        val older = SonarChat(id = "group-old", name = "", members = listOf(ownNpub, peerNpub))
+        val newer = SonarChat(id = "group-new", name = "", members = listOf(ownNpub, peerHex))
+        val room = SonarChat(id = "group-room", name = "room", members = listOf(ownNpub, peerNpub, "npub1third"))
+
+        val visible = dedupeDirectMarmotChats(
+            chats = listOf(older, newer, room),
+            ownNpub = ownNpub,
+            latestSecs = { if (it == newer.id) 2L else 1L },
+        )
+
+        assertEquals(listOf(newer, room), visible)
+    }
 }

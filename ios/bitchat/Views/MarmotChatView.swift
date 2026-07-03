@@ -84,6 +84,26 @@ func snShortNpubLabel(_ value: String) -> String {
     value.count > 16 ? "\(value.prefix(10))…\(value.suffix(4))" : value
 }
 
+func snDirectMarmotPeerKey(for group: MarmotService.MarmotGroup, ownNpub: String?) -> String? {
+    let ownKey = ownNpub.map(SNMarmotProfileCache.canonicalKey)
+    let others = Array(Set(group.memberNpubs.map(SNMarmotProfileCache.canonicalKey).filter {
+        guard !$0.isEmpty else { return false }
+        guard let ownKey else { return true }
+        return $0 != ownKey
+    })).sorted()
+    return others.count == 1 ? others.first : nil
+}
+
+func snCanonicalDirectMarmotGroups(
+    _ groups: [MarmotService.MarmotGroup],
+    ownNpub: String?
+) -> [String: [MarmotService.MarmotGroup]] {
+    groups.reduce(into: [:]) { result, group in
+        guard let key = snDirectMarmotPeerKey(for: group, ownNpub: ownNpub) else { return }
+        result[key, default: []].append(group)
+    }
+}
+
 func snResolvedMarmotAuthorName(
     _ message: MarmotService.MarmotMessage,
     profilesByNpub: [String: MarmotService.Profile],
@@ -1416,15 +1436,12 @@ final class MarmotChatModel: ObservableObject {
     }
 
     func isDirectGroup(_ group: MarmotService.MarmotGroup) -> Bool {
-        otherMembers(in: group).count == 1
+        snDirectMarmotPeerKey(for: group, ownNpub: npub) != nil
     }
 
     func directGroup(forNpub peerNpub: String) -> MarmotService.MarmotGroup? {
         let target = SNMarmotProfileCache.canonicalKey(peerNpub)
-        return groups.first {
-            isDirectGroup($0) &&
-                $0.memberNpubs.map(SNMarmotProfileCache.canonicalKey).contains(target)
-        }
+        return groups.first { snDirectMarmotPeerKey(for: $0, ownNpub: npub) == target }
     }
 
     private func dropResolvedPendingDirectChats() {
