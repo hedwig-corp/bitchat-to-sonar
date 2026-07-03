@@ -2075,7 +2075,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             }
             if (seededSeen && prev != null && newestIncoming != null &&
                 newestIncoming.tsSecs > prev && newestIncoming.tsSecs > alreadyNotified &&
-                c.id != openChatId
+                (openChatId == null || openChatId !in chatIds)
             ) {
                 val groupName = c.name.takeIf { c.members.size > 2 && it.isNotBlank() }
                 notifyIncoming(
