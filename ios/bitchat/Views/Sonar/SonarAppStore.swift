@@ -5271,22 +5271,30 @@ final class SonarAppStore: ObservableObject {
             return
         }
         if let groupId = marmotGroupId(id) {
-            forgetMarmotGroupMappings(forGroupId: groupId)
             let shouldLeave = isMultiMemberMarmotGroupId(id)
+            // A deduped direct row can represent several duplicate Marmot groups
+            // for the same peer; delete the whole set so hidden duplicates don't
+            // resurface after the next refresh.
+            let matching = shouldLeave ? [] : directMarmotGroups(matchingGroupId: groupId).map(\.id)
+            let groupIds = matching.isEmpty ? [groupId] : matching
+            for gid in groupIds { forgetMarmotGroupMappings(forGroupId: gid) }
             Task {
                 if shouldLeave {
                     await marmot.leaveGroup(groupId)
                 } else {
-                    await marmot.deleteGroup(groupId)
+                    for gid in groupIds { await marmot.deleteGroup(gid) }
                 }
             }
         } else {
             // Mesh / Sonar peer: delete the mesh transcript...
             chatViewModel.deleteConversation(with: PeerID(str: id))
-            // ...and the folded White Noise leg, if this peer has one.
-            if let profile = resolvedSonarProfile(id), let g = marmotGroup(forNpub: profile.npub) {
-                forgetMarmotGroupMappings(forGroupId: g.id)
-                Task { await marmot.deleteGroup(g.id) }
+            // ...and every folded White Noise leg, if this peer has any.
+            if let profile = resolvedSonarProfile(id) {
+                let groups = marmotGroups(forNpub: profile.npub)
+                for g in groups { forgetMarmotGroupMappings(forGroupId: g.id) }
+                if !groups.isEmpty {
+                    Task { for g in groups { await marmot.deleteGroup(g.id) } }
+                }
             }
         }
         // If we're currently viewing this chat, return to the Messages list.

@@ -2356,15 +2356,19 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         val wasOpen = (stack.lastOrNull() as? Screen.Chat)?.id == chatId
         val isGroup = chats.firstOrNull { it.id == chatId }?.let { !isDirectMarmotChat(it) } == true
-        chats = chats.filterNot { it.id == chatId }
-        lastSeenTs.remove(chatId); lastNotifiedTs.remove(chatId)
+        // A deduped direct row can represent several duplicate Marmot groups for
+        // the same peer; delete the whole set so hidden duplicates don't resurface.
+        val deleteIds = if (isGroup) listOf(chatId) else directMarmotChatIds(chatId)
+        val deleteIdSet = deleteIds.toSet()
+        chats = chats.filterNot { it.id in deleteIdSet }
+        for (id in deleteIds) { lastSeenTs.remove(id); lastNotifiedTs.remove(id) }
         if (wasOpen && stack.size > 1) stack = stack.dropLast(1) // pop WITHOUT refresh
         scope.launch {
             try {
                 if (isGroup) {
                     SonarCore.leaveGroup(chatId)
                 } else {
-                    SonarCore.deleteChat(chatId)
+                    for (id in deleteIds) SonarCore.deleteChat(id)
                 }
             } catch (t: Throwable) {
                 toast = if (isGroup) "couldn't leave group: ${t.message}" else "couldn't delete chat: ${t.message}"
