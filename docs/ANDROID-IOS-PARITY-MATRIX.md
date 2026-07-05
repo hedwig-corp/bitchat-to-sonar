@@ -15,6 +15,18 @@ Line numbers are point-in-time (2026-07-05); verify before editing. Regenerate
 (or amend the affected rows) on each parity PR so this stays the single source
 of truth for gap status.
 
+## Status update (2026-07-05, PR #168 second batch)
+
+The gap rows below marked **GAP** in §2–§4 were closed on the PR #168 branch:
+payment activity ledger + wallet-incoming events, offline-push cherry-picks
+(#148 commits), video call enable + camera flip + voice proximity, iOS
+contact-profile favorite/block/delete + blocked gating, media caption field
+(both models). Still open after this batch: partial-delivery producer (mesh
+tracker), Android local camera frames + remote video frames (core gap, same
+as iOS), iOS Marmot transcript re-filtering on block (pre-existing),
+CallKit/ConnectionService (both platforms, tracked follow-up), and all
+hardware-gated device smoke.
+
 ## Verdict summary
 
 - **iOS drift since 2026-06-27:** clean — every user-facing commit is mirrored
