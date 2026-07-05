@@ -203,4 +203,46 @@ struct MarmotProfileCacheTests {
         #expect(loaded.0.isEmpty)
         #expect(loaded.1.isEmpty)
     }
+
+    // MARK: - Stale profile key computation
+
+    @Test
+    func staleKeysReturnsEmptyWhenAllFresh() {
+        let now = Date()
+        let fetchedAt: [String: Date] = [
+            "npub1alice": now,
+            "npub1bob": now.addingTimeInterval(-60),
+        ]
+        let cutoff = now.addingTimeInterval(-30 * 60)
+        let stale = MarmotChatModel.staleKeys(from: fetchedAt, cutoff: cutoff)
+        #expect(stale.isEmpty)
+    }
+
+    @Test
+    func staleKeysReturnsEntriesOlderThanCutoff() {
+        let now = Date()
+        let fetchedAt: [String: Date] = [
+            "npub1alice": now,
+            "npub1bob": now.addingTimeInterval(-31 * 60),
+            "npub1carol": now.addingTimeInterval(-45 * 60),
+        ]
+        let cutoff = now.addingTimeInterval(-30 * 60)
+        let stale = Set(MarmotChatModel.staleKeys(from: fetchedAt, cutoff: cutoff))
+        #expect(stale == ["npub1bob", "npub1carol"])
+    }
+
+    @Test
+    func staleKeysReturnsEmptyForEmptyMap() {
+        let stale = MarmotChatModel.staleKeys(from: [:], cutoff: Date())
+        #expect(stale.isEmpty)
+    }
+
+    @Test
+    func staleKeysBoundaryExactlyAtCutoffIsNotStale() {
+        let cutoff = Date()
+        let fetchedAt: [String: Date] = ["npub1alice": cutoff]
+        // Entry exactly at cutoff is NOT stale (filter uses strict <).
+        let stale = MarmotChatModel.staleKeys(from: fetchedAt, cutoff: cutoff)
+        #expect(stale.isEmpty)
+    }
 }

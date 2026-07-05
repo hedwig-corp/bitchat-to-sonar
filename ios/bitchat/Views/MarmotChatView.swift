@@ -160,6 +160,9 @@ final class MarmotChatModel: ObservableObject {
     private static let nsecKeychainKey = "marmot-nsec"
     private static let sonarDescriptorRefreshInterval: TimeInterval = 15 * 60
     private static let sonarDescriptorMissRetryInterval: TimeInterval = 60
+    /// Re-fetch kind-0 profiles older than this so alias/name updates are
+    /// noticed during long sessions (mirrors Android PROFILE_REFRESH_TTL_SECS).
+    private static let profileRefreshTTL: TimeInterval = 30 * 60
     private static let localTranscriptPageLimit: UInt32 = 100
     private static let localSummaryPageLimit: UInt32 = 20
     private static let localSummaryGroupLimit: UInt32 = 50
@@ -206,8 +209,12 @@ final class MarmotChatModel: ObservableObject {
     private var benchFirstDrainLogged = false
     #endif
     private var installedPackCoordinates: Set<String> = []
-    /// npubs whose profile fetch is in flight or done, to fetch each once per session.
+    /// npubs whose profile fetch is in flight or done. Entries older than
+    /// `profileRefreshTTL` are cleared by `refreshStaleProfiles()` so updated
+    /// aliases/names get re-fetched during long sessions.
     private var profileFetches: Set<String> = []
+    /// Last successful kind-0 profile fetch time per npub.
+    private var profileFetchedAt: [String: Date] = [:]
     /// npubs whose Sonar descriptor fetch is currently in flight.
     private var descriptorFetches: Set<String> = []
     /// Last successful relay lookup time per npub. A successful nil response is
@@ -759,6 +766,7 @@ final class MarmotChatModel: ObservableObject {
             await MainActor.run {
                 if let profile, profile.bestName != nil {
                     self.profilesByNpub[key] = profile
+                    self.profileFetchedAt[key] = Date()
                     if key != npubToFetch {
                         self.profilesByNpub.removeValue(forKey: npubToFetch)
                     }
@@ -766,10 +774,39 @@ final class MarmotChatModel: ObservableObject {
                 } else {
                     if !hadCachedProfile {
                         self.profileFetches.remove(key) // not published yet — allow retry
+                    } else {
+                        // Previously cached but the relay returned nothing useful.
+                        // Stamp the attempt so refreshStaleProfiles() retries
+                        // after TTL instead of leaving the entry stuck forever.
+                        self.profileFetchedAt[key] = Date()
                     }
                 }
             }
         }
+    }
+
+    /// Clear stale profile fetch guards so updated aliases/names get re-fetched
+    /// during long sessions. Returns true when any profiles were marked stale,
+    /// so the caller can trigger member re-resolution.
+    @discardableResult
+    func refreshStaleProfiles() -> Bool {
+        let stale = Self.staleKeys(
+            from: profileFetchedAt,
+            cutoff: Date().addingTimeInterval(-Self.profileRefreshTTL)
+        )
+        guard !stale.isEmpty else { return false }
+        for key in stale {
+            profileFetches.remove(key)
+            profileFetchedAt.removeValue(forKey: key)
+        }
+        return true
+    }
+
+    /// Pure computation of npub keys whose last fetch is older than the TTL
+    /// cutoff. Extracted so the staleness logic is unit-testable without a
+    /// `MarmotService` or `@MainActor` instance.
+    nonisolated static func staleKeys(from fetchedAt: [String: Date], cutoff: Date) -> [String] {
+        fetchedAt.filter { $0.value < cutoff }.map { $0.key }
     }
 
     /// Fetch + cache a peer's public Sonar descriptor. Not finding one keeps the
@@ -1257,6 +1294,9 @@ final class MarmotChatModel: ObservableObject {
         syncTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
+                if self.refreshStaleProfiles() {
+                    await self.loadLocalSummaries()
+                }
                 let woke = await self.service.waitForMarmotEvent(timeoutSeconds: 25)
                 if Task.isCancelled { return }
                 #if DEBUG
@@ -1344,6 +1384,7 @@ final class MarmotChatModel: ObservableObject {
         messagesByGroup[groupId] = nil
         pendingOptimistic[groupId] = nil
         profileFetches = []
+        profileFetchedAt = [:]
         installedPackCoordinates = []
         SNMarmotChatSnapshotCache.save(groups: groups, messagesByGroup: messagesByGroup, to: defaults)
     }
@@ -1360,6 +1401,7 @@ final class MarmotChatModel: ObservableObject {
         messagesByGroup[groupId] = nil
         pendingOptimistic[groupId] = nil
         profileFetches = []
+        profileFetchedAt = [:]
         installedPackCoordinates = []
         SNMarmotChatSnapshotCache.save(groups: groups, messagesByGroup: messagesByGroup, to: defaults)
     }
@@ -1379,6 +1421,7 @@ final class MarmotChatModel: ObservableObject {
         descriptorBolt12Offer = nil
         profilesByNpub = [:]
         profileFetches = []
+        profileFetchedAt = [:]
         installedPackCoordinates = []
         SNMarmotProfileCache.clear(from: defaults)
         SNMarmotChatSnapshotCache.clear(from: defaults)
@@ -1401,6 +1444,7 @@ final class MarmotChatModel: ObservableObject {
         pendingOptimistic = [:]
         profilesByNpub = [:]
         profileFetches = []
+        profileFetchedAt = [:]
         installedPackCoordinates = []
         SNMarmotProfileCache.clear(from: defaults)
         SNMarmotChatSnapshotCache.clear(from: defaults)
