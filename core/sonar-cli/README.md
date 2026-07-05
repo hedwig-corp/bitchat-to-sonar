@@ -23,6 +23,95 @@ To import an existing agent identity, prefer `init --nsec-file <path>` or
 `init --nsec-env <VAR>` over `--nsec`, because command-line arguments are often
 captured in shell history and process listings.
 
+## Media (voice, image, video)
+
+`send` can transmit encrypted media — voice notes, images, and video — over the
+same E2E Marmot 1:1 group path used for text. Media is encrypted in-process
+(MIP-04 `imeta`), uploaded to a Blossom server as a ciphertext blob, and the
+`imeta` rides inside the encrypted message, so the Sonar app (and any peer using
+`sonar-core`) can decrypt it. This is the same core code path the iOS/Android
+apps use, so a CLI-sent image renders in the app without any extra plumbing.
+
+```bash
+# voice note (defaults to audio/ogg)
+sonar-cli send --to npub1... --file ./voice.ogg --kind voice --caption "transcript below"
+
+# image
+sonar-cli send --to npub1... --file ./diagram.png --kind image
+
+# video
+sonar-cli send --to npub1... --file ./clip.mp4 --kind video --caption "demo"
+
+# pipe bytes from another tool (mime required for a pipe)
+ffmpeg -f lavfi -i sine=frequency=440:duration=2 -f ogg - 2>/dev/null \
+  | sonar-cli send --to npub1... --stdin --mime audio/ogg --kind voice
+```
+
+`--text` and `--file`/`--stdin` are mutually exclusive: pass exactly one. MIME is
+resolved as explicit `--mime` > file extension > the `--kind` default.
+
+| `--kind` | Default MIME | Common extensions |
+| --- | --- | --- |
+| `voice` | `audio/ogg` (Opus) | `.ogg`, `.opus` |
+| `audio` | `audio/mpeg` | `.mp3`, `.m4a`, `.aac`, `.wav`, `.flac` |
+| `image` | `image/png` | `.png`, `.jpg`/`.jpeg`, `.webp`, `.gif` |
+| `video` | `video/mp4` | `.mp4`, `.m4v`, `.webm`, `.mov` |
+
+A successful send prints a `sent_media` record:
+
+```json
+{"type":"sent_media","to":"npub1...","group_id":"...","kind":"voice","mime":"audio/ogg","filename":"voice.ogg","size_bytes":45678,"blossom_server":"https://blossom.primal.net"}
+```
+
+### Receiving media
+
+`listen` and `messages` now include a `media[]` array on each message (omitted
+for plain text, so existing parsers keep working). Each entry carries the
+encrypted blob `url`, `mime`, a derived `kind`, `filename`, and optional
+`width`/`height`/`duration_ms`:
+
+```json
+{
+  "type": "message",
+  "id": "...",
+  "sender": "npub1...",
+  "content": "see attached",
+  "created_at_secs": 123,
+  "mine": false,
+  "media": [
+    {"url":"https://blossom.x/abc.ogg","mime":"audio/ogg","kind":"voice","filename":"voice.ogg","duration_ms":12000}
+  ]
+}
+```
+
+Download and decrypt a blob with `fetch` (local-first: it uses the group's stored
+message key, no relay round-trip beyond fetching the ciphertext):
+
+```bash
+# to a file (filename derived from the URL in the cwd)
+sonar-cli fetch --group <hex> --url https://blossom.x/abc.ogg
+
+# explicit path
+sonar-cli fetch --group <hex> --url https://blossom.x/abc.ogg --out ./voice.ogg
+
+# pipe straight into another tool (bytes to stdout, JSON summary to stderr)
+sonar-cli fetch --group <hex> --url https://blossom.x/abc.ogg --stdout | ffplay -
+```
+
+### Limits and errors
+
+Blossom servers enforce their own maximum blob size (commonly ~100 MB). Keep
+voice/image sends modest; for large video, prefer a compressed `video/mp4`. Clear
+errors are raised for: an unsupported/unknown MIME with `--stdin` (use `--mime`),
+an empty payload, a missing `--kind` on a media send, and a decryption failure
+(no stored `imeta` for the requested URL — run `listen --once` first so the
+message is persisted locally).
+
+**Tracked gap:** outbound `duration_ms`/dimensions are not yet attached by the
+core send path, so a CLI-sent voice clip arrives without a duration field (apps
+that send media do attach it, and `listen` surfaces it when present). Extending
+`sonar-core::send_media` to accept optional metadata is a follow-up.
+
 ## Sticker Packs
 
 `post` imports a Signal sticker pack, uploads the plaintext sticker images to a
@@ -52,8 +141,8 @@ in the published Nostr event.
 ## Agent Contract
 
 Every command prints newline-delimited JSON. The `type` field identifies the
-record: `identity`, `published`, `sent`, `message`, `group`, or
-`posted_sticker_pack`. The full command surface:
+record: `identity`, `published`, `sent`, `sent_media`, `fetched`, `message`,
+`group`, or `posted_sticker_pack`. The full command surface:
 
 | Command | Purpose |
 | --- | --- |
@@ -61,7 +150,9 @@ record: `identity`, `published`, `sent`, `message`, `group`, or
 | `identity` | Print `{npub, pubkey_hex, home, config_path}`. |
 | `publish` | Publish the Marmot KeyPackage so peers can DM the agent. |
 | `send --to <npub\|hex> --text <s> [--group-name <s>]` | Send a direct message (find/create the 1:1 group). |
-| `listen [--once] [--timeout-secs n] [--poll-secs n] [--no-publish]` | Drain inbound messages as JSON lines. |
+| `send --to <npub\|hex> --file <p> --kind {voice\|audio\|image\|video} [--caption s] [--mime m] [--blossom url]` | Send encrypted media (MIP-04). |
+| `fetch --group <hex> --url <url> [--out <p> \| --stdout]` | Download + decrypt an inbound media blob. |
+| `listen [--once] [--timeout-secs n] [--poll-secs n] [--no-publish]` | Drain inbound messages (text + media) as JSON lines. |
 | `groups` | List known Marmot groups `{id, name, members[]}`. |
 | `messages [--group <hex>]` | Print message history (includes the agent's own `mine:true` rows). |
 | `post <signal-link> [...]` | Import + publish a Signal sticker pack. |
