@@ -1899,8 +1899,10 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
             }
         }
 
-        // Return chronologically sorted, de-duplicated list
-        return bestByID.values.sorted { $0.timestamp < $1.timestamp }
+        // Return chronologically sorted and de-duplicated, with ⚡REACT control
+        // lines folded into each target message's reaction aggregate.
+        let sorted = bestByID.values.sorted { $0.timestamp < $1.timestamp }
+        return SonarReactionMessage.fold(sorted, myPeerID: meshService.myPeerID)
     }
     
     @MainActor

@@ -25,8 +25,19 @@ struct SonarMessageBubbleView: View {
     let showAuthor: Bool
     @Binding var expandedMessageIDs: Set<String>
 
+    /// Long-press tapback bar visibility (Signal-style quick reactions).
+    @State private var showReactionBar = false
+    /// Full emoji picker, opened from the tapback bar's "+".
+    @State private var showReactionPicker = false
+
     private var isSelf: Bool {
         viewModel.isSelfMessage(message)
+    }
+
+    /// Reactions are private-chat only (they ride the DM path as ⚡REACT
+    /// control lines); the open private chat identifies the peer.
+    private var reactionPeer: PeerID? {
+        message.isPrivate ? viewModel.selectedPrivateChatPeer : nil
     }
 
     private var bubbleTextColor: Color {
@@ -82,7 +93,17 @@ struct SonarMessageBubbleView: View {
                         .lineLimit(1)
                 }
 
+                if showReactionBar, reactionPeer != nil {
+                    reactionQuickBar
+                }
+
                 bubbleBody(isExpanded: isExpanded)
+
+                if !message.reactions.isEmpty {
+                    SNReactionChips(reactions: message.reactions, mine: isSelf) { emoji in
+                        toggleReaction(emoji)
+                    }
+                }
 
                 if isLongMessage {
                     Button(isExpanded
@@ -124,6 +145,65 @@ struct SonarMessageBubbleView: View {
             if !isSelf { Spacer(minLength: 56) }
         }
         .padding(.vertical, 3)
+        .sheet(isPresented: $showReactionPicker) {
+            SonarEmojiPickerView(
+                onEmoji: { emoji in
+                    showReactionPicker = false
+                    toggleReaction(emoji)
+                },
+                onSticker: { _, _ in showReactionPicker = false },
+                loadStickerPack: { _, _, _ in nil },
+                loadStickerImage: { _, _ in nil },
+                fetchInstalledPacks: { [] },
+                onClose: { showReactionPicker = false }
+            )
+            #if os(iOS)
+            .presentationDetents([.height(360)])
+            #endif
+        }
+    }
+
+    /// Horizontal Signal-style tapback bar shown by long-pressing the bubble:
+    /// quick emoji plus "+" for the full picker.
+    private var reactionQuickBar: some View {
+        HStack(spacing: 2) {
+            ForEach(snQuickReactions, id: \.self) { emoji in
+                Button {
+                    toggleReaction(emoji)
+                } label: {
+                    Text(verbatim: emoji)
+                        .font(.system(size: 22))
+                        .frame(width: 34, height: 34)
+                }
+                .buttonStyle(.plain)
+            }
+            Button {
+                showReactionBar = false
+                showReactionPicker = true
+            } label: {
+                Image(systemName: "plus.circle.fill")
+                    .font(.system(size: 20))
+                    .foregroundColor(SonarTheme.text3)
+                    .frame(width: 34, height: 34)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("More reactions")
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 2)
+        .background(
+            Capsule()
+                .fill(SonarTheme.surface)
+                .shadow(color: Color.black.opacity(0.12), radius: 6, y: 2)
+        )
+        .transition(.scale(scale: 0.9).combined(with: .opacity))
+    }
+
+    /// Route the toggle to the view model (mesh ⚡REACT over the DM path).
+    private func toggleReaction(_ emoji: String) {
+        guard let peer = reactionPeer else { return }
+        viewModel.toggleReaction(peerID: peer, messageId: message.id, emoji: emoji)
+        withAnimation(.easeOut(duration: 0.15)) { showReactionBar = false }
     }
 
     private func bubbleBody(isExpanded: Bool) -> some View {
@@ -161,6 +241,13 @@ struct SonarMessageBubbleView: View {
                 radius: 1, y: 1
             )
         )
+        // Long-press opens the tapback bar. A plain onLongPressGesture composes
+        // with the AttributedString link taps inside the bubble (taps still
+        // resolve normally; only a sustained press triggers the bar).
+        .onLongPressGesture(minimumDuration: 0.35) {
+            guard reactionPeer != nil else { return }
+            withAnimation(.easeOut(duration: 0.15)) { showReactionBar.toggle() }
+        }
     }
 
     // MARK: - Content formatting

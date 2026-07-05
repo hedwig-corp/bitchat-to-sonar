@@ -374,7 +374,9 @@ impl ConversationIndex {
         let groups = engine.groups()?;
         for group in &groups {
             let group_id_hex = hex::encode(group.mls_group_id.as_slice());
-            let page = engine.messages_page(&group.mls_group_id, 1, 0)?;
+            // Raw page: the preview only needs content/sender/timestamp, so
+            // never pay the per-group reaction aggregation scan here.
+            let page = engine.messages_page_raw(&group.mls_group_id, 1, 0)?;
             if let Some(msg) = page.first() {
                 let sender = msg.sender.to_string();
                 self.upsert_summary(

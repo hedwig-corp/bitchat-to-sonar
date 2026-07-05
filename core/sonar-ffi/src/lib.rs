@@ -387,6 +387,18 @@ pub struct MessageInfo {
     pub sticker_ref: Option<StickerRefInfo>,
     /// Precomputed content classification (pay/call control vs plain text).
     pub classification: MessageClassInfo,
+    /// Aggregated emoji reactions on this message, sorted by
+    /// (count desc, emoji asc). Empty when nobody reacted.
+    pub reactions: Vec<ReactionInfo>,
+}
+
+/// FFI-friendly aggregated reaction state for one emoji on one message.
+#[derive(uniffi::Record)]
+pub struct ReactionInfo {
+    pub emoji: String,
+    pub count: u32,
+    /// True when the local identity's current reaction is this emoji.
+    pub mine: bool,
 }
 
 /// FFI-friendly sticker reference carried on a chat message.
@@ -993,6 +1005,23 @@ impl SonarNode {
         let group_id = parse_group_id(&group_id_hex)?;
         self.runtime
             .block_on(self.client.send_text(&group_id, &text))?;
+        Ok(())
+    }
+
+    /// Toggle the local user's emoji reaction on a message (Signal tapback
+    /// semantics): reacting with the same emoji again clears it, a different
+    /// emoji replaces it. Aggregated state comes back on
+    /// `MessageInfo.reactions` from the message read paths.
+    pub fn toggle_reaction(
+        &self,
+        group_id_hex: String,
+        target_message_id_hex: String,
+        emoji: String,
+    ) -> FfiResult<()> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        let target = parse_event_id(&target_message_id_hex)?;
+        self.runtime
+            .block_on(self.client.toggle_reaction(&group_id, &target, &emoji))?;
         Ok(())
     }
 
@@ -2682,6 +2711,15 @@ fn message_info(m: sonar_core::marmot::ChatMessage) -> MessageInfo {
             shortcode: s.shortcode,
             plaintext_sha256: s.plaintext_sha256,
         }),
+        reactions: m
+            .reactions
+            .into_iter()
+            .map(|r| ReactionInfo {
+                emoji: r.emoji,
+                count: r.count,
+                mine: r.mine,
+            })
+            .collect(),
     }
 }
 

@@ -124,6 +124,11 @@ const STICKER_REF_PREFETCH_CONCURRENCY: usize = 2;
 const STICKER_PREFETCH_CANCEL_POLL: Duration = Duration::from_millis(25);
 const SONAR_DIRECT_DM_DESCRIPTION: &str = "sonar.direct-dm.v1";
 
+/// App-layer mesh reaction control line (`⚡REACT|1|<meshMsgId>|<emoji>|<verb>`).
+/// It rides the Marmot fallback leg as normal kind-9 content when the peer is
+/// out of BLE range; the drain path must treat it as a reaction, not a message.
+const MESH_REACTION_LINE_PREFIX: &str = "⚡REACT|";
+
 /// Shared HTTP client for Blossom media downloads. Built once so every blob
 /// reuses keep-alive connections + the TLS session cache instead of paying a
 /// fresh connect + handshake per download (the White Noise reference client
@@ -4458,8 +4463,9 @@ impl SonarClient {
     }
 
     fn record_delivery_for_incoming(&self, incoming: &Incoming) {
-        let Incoming::Message(message) = incoming else {
-            return;
+        let message = match incoming {
+            Incoming::Message(message) | Incoming::Reaction(message) => message,
+            _ => return,
         };
         if !message.mine {
             return;
@@ -6455,10 +6461,34 @@ impl SonarClient {
                     self.mark_sync_event_processed(&event.id);
                     report.record_processed();
                 }
+                Ok(ref incoming @ Incoming::Reaction(ref message)) => {
+                    // Reactions update the transcript aggregates only: refresh
+                    // the conversation so open UIs refetch, but never index
+                    // (chat-list preview) or notify.
+                    self.record_delivery_for_incoming(incoming);
+                    changed_groups.insert(hex::encode(message.group_id.as_slice()));
+                    self.mark_sync_event_processed(&event.id);
+                    report.record_processed();
+                }
                 Ok(ref incoming @ Incoming::Message(ref message)) => {
                     self.record_delivery_for_incoming(incoming);
                     if let Some(sticker_ref) = &message.sticker_ref {
                         sticker_refs.push(sticker_ref.clone());
+                    }
+                    // Mesh-referencing reactions ride the Marmot fallback leg
+                    // as `⚡REACT|…` control lines inside a normal kind-9 (a
+                    // kind-7 e-tag cannot reference a mesh message id). Treat
+                    // them like kind-7 reactions: refresh only — no chat-list
+                    // preview/unread churn and no notification. Trust note: a
+                    // peer could prefix ordinary text to skip their own
+                    // message's notification, which only suppresses their own
+                    // send (content is peer-controlled anyway) and the app
+                    // layers hide `⚡REACT|` lines from transcripts regardless.
+                    if message.content.starts_with(MESH_REACTION_LINE_PREFIX) {
+                        changed_groups.insert(hex::encode(message.group_id.as_slice()));
+                        self.mark_sync_event_processed(&event.id);
+                        report.record_processed();
+                        continue;
                     }
                     let cached_name = group_names
                         .get(message.group_id.as_slice())

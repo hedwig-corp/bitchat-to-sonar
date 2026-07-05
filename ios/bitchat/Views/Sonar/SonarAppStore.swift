@@ -368,6 +368,9 @@ struct SNMessage: Identifiable, Equatable {
     var media: [SNMediaItem] = []
     /// Non-nil = render as a sticker bubble instead of text.
     var stickerRef: MarmotService.MarmotStickerRef?
+    /// Aggregated emoji reactions (Marmot NIP-25 kind-7, or folded mesh
+    /// ⚡REACT lines). Non-empty ⇒ render a chip row under the bubble.
+    var reactions: [MessageReaction] = []
 }
 
 /// Internet and mesh failures use different resend pipelines. The retry
@@ -4382,7 +4385,8 @@ final class SonarAppStore: ObservableObject {
         let now = Date()
         var byKey: [String: SNDMRow] = [:]
         for (peerID, msgs) in chatViewModel.privateChats where !msgs.isEmpty {
-            let row = meshRow(peerID: peerID, last: msgs.last)
+            // ⚡REACT control lines never drive the row preview/time.
+            let row = meshRow(peerID: peerID, last: msgs.last { !SonarReactionMessage.isReactionLine($0.content) })
             let key = canonicalPeerKey(peerID)
             if let existing = byKey[key],
                (existing.lastDate ?? .distantPast) >= (row.lastDate ?? .distantPast) {
@@ -4951,6 +4955,10 @@ final class SonarAppStore: ObservableObject {
                 ? [MarmotService.MarmotGroup(id: groupId, name: "", memberNpubs: [])]
                 : groups
             var dated: [(Date, SNMessage)] = []
+            // Mesh reactions ride the Marmot fallback leg as ⚡REACT lines
+            // when the peer is out of BLE range: never render them as text —
+            // collect them and fold them into the mesh leg's aggregates.
+            var marmotReactionLines: [SonarReactionMessage.ExternalLine] = []
             for group in sourceGroups {
                 dated += Self.transcriptSource(
                     marmot.messagesByGroup[group.id] ?? [],
@@ -4959,6 +4967,17 @@ final class SonarAppStore: ObservableObject {
                     // Drop a blocked person's messages from the transcript, the
                     // same way the mesh inbound path drops them via `isNostrBlocked`.
                     if !m.isMine, isMarmotSenderBlocked(m.senderNpub) { return nil }
+                    if SonarReactionMessage.isReactionLine(m.content) {
+                        if let line = SonarReactionMessage.decode(m.content) {
+                            marmotReactionLines.append(.init(
+                                date: m.createdAt,
+                                line: line,
+                                mine: m.isMine,
+                                senderKey: m.senderNpub
+                            ))
+                        }
+                        return nil
+                    }
                     switch payMapping(m, fallbackVia: .internet) {
                     case .hidden:
                         return nil
@@ -4992,7 +5011,8 @@ final class SonarAppStore: ObservableObject {
                             state: MarmotChatModel.stateText(for: m),
                             uploadProgress: marmot.mediaUploadProgress[m.id],
                             media: Self.mediaItems(m, groupId: group.id),
-                            stickerRef: m.stickerRef
+                            stickerRef: m.stickerRef,
+                            reactions: m.reactions
                         ))
                     }
                 }
@@ -5042,7 +5062,8 @@ final class SonarAppStore: ObservableObject {
                             via: via,
                             state: mine ? Self.stateText(m.deliveryStatus) : nil,
                             media: mediaItem.map { [$0] } ?? [],
-                            stickerRef: meshSticker
+                            stickerRef: meshSticker,
+                            reactions: m.reactions
                         ))
                     }
                 }
@@ -5141,7 +5162,8 @@ final class SonarAppStore: ObservableObject {
                     via: via,
                     state: mine ? Self.stateText(m.deliveryStatus) : nil,
                     media: mediaItem.map { [$0] } ?? [],
-                    stickerRef: meshSticker
+                    stickerRef: meshSticker,
+                    reactions: m.reactions
                 ))
             }
         }
@@ -5149,7 +5171,7 @@ final class SonarAppStore: ObservableObject {
         // of Bluetooth range. v1 keeps the two transcripts in separate
         // stores but RENDERS them as one, merged chronologically; the
         // White Noise leg always renders as internet (indigo).
-        if let profile = resolvedSonarProfile(id), let group = marmotGroup(forNpub: profile.npub) {
+        if let group = sonarWnGroup {
             dated += Self.transcriptSource(
                 marmot.messagesByGroup[group.id] ?? [],
                 limit: limit
@@ -5157,6 +5179,8 @@ final class SonarAppStore: ObservableObject {
                 // Drop a blocked person's messages from the transcript, the
                 // same way the mesh inbound path drops them via `isNostrBlocked`.
                 if !m.isMine, isMarmotSenderBlocked(m.senderNpub) { return nil }
+                // ⚡REACT lines were folded onto the mesh transcript above.
+                if SonarReactionMessage.isReactionLine(m.content) { return nil }
                 switch payMapping(m, fallbackVia: .internet) {
                 case .hidden:
                     return nil
@@ -5190,7 +5214,8 @@ final class SonarAppStore: ObservableObject {
                         state: MarmotChatModel.stateText(for: m),
                         uploadProgress: marmot.mediaUploadProgress[m.id],
                         media: Self.mediaItems(m, groupId: group.id),
-                        stickerRef: m.stickerRef
+                        stickerRef: m.stickerRef,
+                        reactions: m.reactions
                     ))
                 }
             }
@@ -5427,6 +5452,35 @@ final class SonarAppStore: ObservableObject {
             return
         }
         pendingMarmotMessagesByChat[preferredKey, default: []].append(failedPendingMessage(message))
+    }
+
+    /// Toggle the local user's emoji reaction on a transcript message, routed
+    /// by which leg of the (possibly folded) conversation the message lives
+    /// in: a White Noise/Marmot message reacts with a real NIP-25 kind-7 event
+    /// through the core; a mesh/bitchat message reacts with a ⚡REACT control
+    /// line over the private-message path. Signal tapback semantics either way.
+    func toggleReaction(_ id: String, messageId: String, emoji: String) {
+        // Marmot legs: every group this chat can render (folded direct groups
+        // plus the Sonar-profile leg).
+        var candidateGroups: [MarmotService.MarmotGroup] = []
+        if let groupId = marmotGroupId(id) {
+            let groups = directMarmotGroups(matchingGroupId: groupId)
+            candidateGroups = groups.isEmpty
+                ? [MarmotService.MarmotGroup(id: groupId, name: "", memberNpubs: [])]
+                : groups
+        }
+        if let profile = resolvedSonarProfile(id),
+           let group = marmotGroup(forNpub: profile.npub),
+           !candidateGroups.contains(where: { $0.id == group.id }) {
+            candidateGroups.append(group)
+        }
+        for group in candidateGroups
+        where marmot.messagesByGroup[group.id]?.contains(where: { $0.id == messageId }) == true {
+            marmot.toggleReaction(groupId: group.id, messageId: messageId, emoji: emoji)
+            return
+        }
+        // Mesh leg (validated against the stored transcript inside).
+        chatViewModel.toggleReaction(peerID: PeerID(str: id), messageId: messageId, emoji: emoji)
     }
 
     private func sendPaymentReceiptLines(_ lines: [String], to id: String) async -> Bool {

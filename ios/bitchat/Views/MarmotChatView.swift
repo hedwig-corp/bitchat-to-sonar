@@ -2626,6 +2626,22 @@ final class MarmotChatModel: ObservableObject {
         }
     }
 
+    /// Toggle our NIP-25 emoji reaction on a message (Signal tapback semantics
+    /// in the core: same emoji clears, different emoji replaces). The core's
+    /// blocking call runs off-main inside MarmotService; the bounded page
+    /// reload paints the updated aggregates when it returns.
+    func toggleReaction(groupId: String, messageId: String, emoji: String) {
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await self.service.toggleReaction(groupId: groupId, messageId: messageId, emoji: emoji)
+                await self.loadLocalPage(groupId: groupId)
+            } catch {
+                SecureLogger.error("Marmot toggleReaction failed: \(error)", category: .session)
+            }
+        }
+    }
+
     func send(
         _ text: String,
         to groupId: String,

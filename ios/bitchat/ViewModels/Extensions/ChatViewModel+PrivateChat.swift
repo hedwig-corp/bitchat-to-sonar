@@ -119,6 +119,37 @@ extension ChatViewModel {
         }
     }
     
+    /// Toggle the local user's emoji reaction on a mesh/bitchat private
+    /// message (Signal tapback semantics: same emoji again clears, a different
+    /// emoji replaces). The reaction rides the chat as a ⚡REACT control line
+    /// over the normal private-message path with its own message ID; the local
+    /// echo folds into the aggregate immediately.
+    @MainActor
+    func toggleReaction(peerID: PeerID, messageId: String, emoji: String) {
+        guard let emoji = SonarReactionMessage.validatedEmoji(emoji[...]) else { return }
+        // Validate against the SAME merged view the transcript renders: the
+        // ephemeral bucket plus the stable-Noise-key bucket (Nostr path) — a
+        // message that arrived out-of-range lives only under the stable key.
+        var transcript = privateChats[peerID] ?? []
+        if let peer = unifiedPeerService.getPeer(by: peerID) {
+            let noiseKeyHex = PeerID(hexData: peer.noisePublicKey)
+            if noiseKeyHex != peerID, let nostrMessages = privateChats[noiseKeyHex] {
+                transcript.append(contentsOf: nostrMessages)
+            }
+        }
+        guard transcript.contains(where: { $0.id == messageId }) else {
+            SecureLogger.warning("toggleReaction: target \(messageId.prefix(8))… not in transcript for \(peerID)", category: .session)
+            return
+        }
+        let mine = SonarReactionMessage.myCurrentReaction(
+            in: transcript, targetId: messageId, myPeerID: meshService.myPeerID
+        )
+        let line: SonarReactionMessage = mine == emoji
+            ? .remove(targetId: messageId, emoji: emoji)
+            : .add(targetId: messageId, emoji: emoji)
+        sendPrivateMessage(line.encoded(), to: peerID)
+    }
+
     func sendGeohashDM(_ content: String, to peerID: PeerID) {
         guard case .location(let ch) = activeChannel else {
             addSystemMessage(
@@ -247,16 +278,19 @@ extension ChatViewModel {
         }
         privateChats[convKey]?.append(msg)
         
+        // ⚡REACT control lines fold into a reaction aggregate only: no unread
+        // badge, no notification, no read receipt.
+        let isReactionLine = SonarReactionMessage.isReactionLine(pm.content)
         let isViewing = selectedPrivateChatPeer == convKey
         let wasReadBefore = sentReadReceipts.contains(messageId)
         let isRecentMessage = Date().timeIntervalSince(messageTimestamp) < 30
-        let shouldMarkUnread = !wasReadBefore && !isViewing && isRecentMessage
+        let shouldMarkUnread = !wasReadBefore && !isViewing && isRecentMessage && !isReactionLine
         if shouldMarkUnread {
             unreadPrivateMessages.insert(convKey)
         }
-        
+
         // Send READ if viewing this conversation
-        if isViewing {
+        if isViewing && !isReactionLine {
             sendReadReceiptIfNeeded(to: messageId, senderPubKey: senderPubkey, from: id)
         }
         
@@ -811,9 +845,11 @@ extension ChatViewModel {
             isViewingThisChat = true
         }
 
-        // Recency check
+        // Recency check. ⚡REACT control lines never mark unread, notify, or
+        // trigger read receipts — they only fold into a reaction aggregate.
+        let isReactionLine = SonarReactionMessage.isReactionLine(messageContent)
         let isRecentMessage = Date().timeIntervalSince(messageTimestamp) < 30
-        let shouldMarkAsUnread = !wasReadBefore && !isViewingThisChat && isRecentMessage
+        let shouldMarkAsUnread = !wasReadBefore && !isViewingThisChat && isRecentMessage && !isReactionLine
 
         let message = BitchatMessage(
             id: messageId,
@@ -845,7 +881,7 @@ extension ChatViewModel {
             key: actualSenderNoiseKey
         )
 
-        if wasReadBefore {
+        if wasReadBefore || isReactionLine {
             // do nothing
         } else if isViewingThisChat {
             handleViewingThisChat(
@@ -937,10 +973,15 @@ extension ChatViewModel {
         let noiseKey = peerID.noiseKey ?? unifiedPeerService.getPeer(by: peerID)?.noisePublicKey
         mirrorToEphemeralIfNeeded(message, targetPeerID: peerID, key: noiseKey)
 
-        // Notifications and Read Receipts
+        // Notifications and Read Receipts. ⚡REACT control lines persist with
+        // the transcript above but only fold into a target message's reaction
+        // aggregate — never unread badges, previews, notifications, or read
+        // receipts (they are not readable content).
         let isViewing = selectedPrivateChatPeer == peerID
-        
-        if isViewing {
+
+        if SonarReactionMessage.isReactionLine(message.content) {
+            // Stored above; objectWillChange below repaints the folded aggregate.
+        } else if isViewing {
             // Mark read immediately if viewing
             // Use the incoming peerID directly - it has the established Noise session.
             // Don't use PeerID(hexData: noiseKey) as that creates a 64-hex ID without a session.
