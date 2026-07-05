@@ -21,6 +21,8 @@ use sonar_stickers::{
     build_pack_tags, PackAddress, Sticker, StickerError, StickerPack, STICKER_PACK_KIND,
 };
 
+mod notify;
+
 const CONFIG_VERSION: u32 = 1;
 const CONFIG_FILE: &str = "config.json";
 const SEEN_FILE: &str = "seen.json";
@@ -210,6 +212,13 @@ struct ListenArgs {
     /// Do not publish this agent's KeyPackage at startup.
     #[arg(long)]
     no_publish: bool,
+    /// Shell command run once per new inbound message. Runs through the
+    /// platform shell (`sh -c` / `cmd /C`) with `SONAR_*` env vars describing
+    /// the message. Best-effort: failures are reported on stderr and never
+    /// abort the listen loop. Lets a headless agent alert its operator in
+    /// near-real-time (e.g. `--notify-command 'curl -s -X POST ...'`).
+    #[arg(long)]
+    notify_command: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -778,12 +787,14 @@ async fn listen(loaded: LoadedConfig, args: ListenArgs) -> Result<()> {
     if !args.no_publish {
         client.publish_key_package().await?;
     }
+    let notify_cmd = args.notify_command;
     let seen_path = loaded.home.join(SEEN_FILE);
     let mut seen = load_seen(&seen_path)?;
     let start = Instant::now();
     loop {
         client.sync().await?;
-        emit_unseen_messages(&client, &seen_path, &mut seen)?;
+        let emitted = emit_unseen_messages(&client, &seen_path, &mut seen)?;
+        fire_notify(&notify_cmd, &emitted);
         if args.once {
             return Ok(());
         }
@@ -795,7 +806,8 @@ async fn listen(loaded: LoadedConfig, args: ListenArgs) -> Result<()> {
         let wait_secs = next_wait_secs(start, args.timeout_secs, args.poll_secs);
         if client.wait_for_marmot_event(wait_secs).await {
             client.drain_pending_marmot().await?;
-            emit_unseen_messages(&client, &seen_path, &mut seen)?;
+            let emitted = emit_unseen_messages(&client, &seen_path, &mut seen)?;
+            fire_notify(&notify_cmd, &emitted);
         }
     }
 }
@@ -842,9 +854,11 @@ fn emit_unseen_messages(
     client: &SonarClient,
     seen_path: &Path,
     seen: &mut SeenState,
-) -> Result<()> {
+) -> Result<Vec<(sonar_core::marmot::ChatMessage, String)>> {
+    let mut emitted = Vec::new();
     let mut changed = false;
     for group in client.groups()? {
+        let group_name = group.name;
         let mut messages = client.messages(&group.mls_group_id)?;
         messages.sort_by_key(|m| m.created_at);
         for msg in messages {
@@ -855,13 +869,27 @@ fn emit_unseen_messages(
             changed = true;
             if !msg.mine {
                 print_json(&message_output(&msg))?;
+                emitted.push((msg, group_name.clone()));
             }
         }
     }
     if changed {
         write_private_json(seen_path, seen)?;
     }
-    Ok(())
+    Ok(emitted)
+}
+
+/// Fire the operator's `--notify-command` for each newly-emitted inbound
+/// message. No-op when no notifier is configured. Best-effort: failures are
+/// reported to stderr by [`notify::run_command`] and never abort the loop.
+fn fire_notify(notify_cmd: &Option<String>, emitted: &[(sonar_core::marmot::ChatMessage, String)]) {
+    let Some(template) = notify_cmd else {
+        return;
+    };
+    for (msg, group_name) in emitted {
+        let ctx = notify::NotifyContext::from_message(msg, group_name);
+        notify::run_command(template, &ctx);
+    }
 }
 
 fn message_output(msg: &sonar_core::marmot::ChatMessage) -> Output {

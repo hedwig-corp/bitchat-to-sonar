@@ -186,6 +186,52 @@ events. Relay subscription `CLOSED` and `NOTICE` diagnostics are written to
 stderr. `send` is direct-message only (it targets an npub), and transport is
 Nostr-relay only — the CLI does not drive BLE mesh.
 
+## Notifications
+
+`listen` can alert an operator in near-real-time when a new message arrives,
+so a headless agent does not require anyone to poll a UI:
+
+```bash
+cargo run -p sonar-cli -- listen --once --notify-command 'notify-send "Sonar" "$SONAR_CONTENT"'
+```
+
+`--notify-command <cmd>` runs the command through the platform shell
+(`sh -c` on Unix, `cmd /C` on Windows) once per newly-drained inbound message,
+injecting these environment variables:
+
+| Variable | Meaning |
+| --- | --- |
+| `SONAR_MSG_ID` | Message id (Nostr event id hex). |
+| `SONAR_SENDER` | Sender npub. |
+| `SONAR_GROUP_ID` | Marmot group id hex. |
+| `SONAR_GROUP_NAME` | Group name (may be empty). |
+| `SONAR_CONTENT` | Plaintext message body. |
+| `SONAR_CREATED_AT` | Message timestamp, unix seconds. |
+
+The command is best-effort: a non-zero exit or spawn failure is reported on
+stderr and never aborts the listen loop. It runs synchronously per message so a
+cron `listen --once` cycle finishes its alert before the process exits — keep
+the command short, or background it inside the shell (`... &`) for a long-lived
+listener.
+
+HTTP/webhook alerting needs no special flag — point the command at `curl`:
+
+```bash
+cargo run -p sonar-cli -- listen --once \
+  --notify-command 'curl -s -X POST https://ntfy.example/topic -d "$SONAR_CONTENT"'
+```
+
+If the command embeds a secret (e.g. a bearer token), read it from an
+environment variable inside the shell rather than putting it on the command
+line — shell history and process listings capture `--notify-command` just like
+any other argument.
+
+> This is a *local* alert relay, not the MIP-05/transponder push system that
+> wakes the iOS/Android apps. A headless process has no APNs/FCM device token,
+> so it cannot receive those pushes directly; `--notify-command` is the
+> agent-side equivalent. The CLI's `send` already emits the transponder wakeup
+> for app-using peers via the shared `sonar-core` send path.
+
 To run this as an autonomous Hermes agent, see
 [`docs/HERMES-AGENT.md`](../../docs/HERMES-AGENT.md): **Mode A** (native
 `hermes gateway` + Sonar platform plugin, recommended) or **Mode C** (terminal
