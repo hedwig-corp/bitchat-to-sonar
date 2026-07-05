@@ -88,7 +88,7 @@ Download and decrypt a blob with `fetch` (local-first: it uses the group's store
 message key, no relay round-trip beyond fetching the ciphertext):
 
 ```bash
-# to a file (filename derived from the URL in the cwd)
+# to a file (name derived from the URL; prefer --out for a correct extension)
 sonar-cli fetch --group <hex> --url https://blossom.x/abc.ogg
 
 # explicit path
@@ -100,8 +100,9 @@ sonar-cli fetch --group <hex> --url https://blossom.x/abc.ogg --stdout | ffplay 
 
 ### Limits and errors
 
-Blossom servers enforce their own maximum blob size (commonly ~100 MB). Keep
-voice/image sends modest; for large video, prefer a compressed `video/mp4`. Clear
+Blossom servers enforce their own maximum blob size (which varies by operator).
+Keep voice/image sends modest; for large video, prefer a compressed `video/mp4`.
+Clear
 errors are raised for: an unsupported/unknown MIME with `--stdin` (use `--mime`),
 an empty payload, a missing `--kind` on a media send, and a decryption failure
 (no stored `imeta` for the requested URL — run `listen --once` first so the

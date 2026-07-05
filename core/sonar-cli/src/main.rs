@@ -158,8 +158,9 @@ struct FetchArgs {
     /// Encrypted blob URL (a message's media[].url).
     #[arg(long)]
     url: String,
-    /// Write decrypted bytes to this path. If omitted (and not --stdout), a
-    /// filename is derived from the URL in the current directory.
+    /// Write decrypted bytes to this path. If omitted (and not --stdout), a name
+    /// is derived from the URL in the current directory (often extension-less;
+    /// prefer `--out` for a usable file type).
     #[arg(long)]
     out: Option<PathBuf>,
     /// Write decrypted bytes to stdout (binary). The JSON summary goes to stderr.
@@ -340,6 +341,28 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Send(args) => {
+            // Validate all arguments before any network side effect: a usage
+            // mistake must not trigger relay connect, sync, or group creation.
+            let payload_sources = [args.text.is_some(), args.file.is_some(), args.stdin]
+                .iter()
+                .filter(|b| **b)
+                .count();
+            if payload_sources != 1 {
+                return Err(CliError::Message(
+                    "provide exactly one of --text, --file, or --stdin".to_owned(),
+                ));
+            }
+            if args.text.is_none() && args.kind.is_none() {
+                return Err(CliError::Message(
+                    "--kind is required for media sends".to_owned(),
+                ));
+            }
+            if args.stdin && args.mime.is_none() {
+                return Err(CliError::Message(
+                    "--stdin requires --mime (a pipe has no extension to sniff)".to_owned(),
+                ));
+            }
+
             let loaded = LoadedConfig::load(home, cli.relays)?;
             let client = loaded.connect().await?;
             client.sync().await?;
@@ -350,15 +373,6 @@ async fn run(cli: Cli) -> Result<()> {
                 None => client.start_dm(peer, &args.group_name).await?,
             };
             let to_npub = peer.to_bech32().expect("valid public key encodes as npub");
-            let payload_sources = [args.text.is_some(), args.file.is_some(), args.stdin]
-                .iter()
-                .filter(|b| **b)
-                .count();
-            if payload_sources != 1 {
-                return Err(CliError::Message(
-                    "provide exactly one of --text, --file, or --stdin".to_owned(),
-                ));
-            }
             if let Some(text) = args.text.as_deref() {
                 client.send_text(&group_id, text).await?;
                 print_json(&Output::Sent {
@@ -366,11 +380,7 @@ async fn run(cli: Cli) -> Result<()> {
                     group_id: hex::encode(group_id.as_slice()),
                 })?;
             } else {
-                let (data, filename, mime) = resolve_media_payload(&args)?;
-                let kind = args
-                    .kind
-                    .as_ref()
-                    .expect("kind is required for media sends (checked in resolve_media_payload)");
+                let (data, filename, mime, kind) = resolve_media_payload(&args)?;
                 let size = data.len();
                 client
                     .send_media(
@@ -385,7 +395,7 @@ async fn run(cli: Cli) -> Result<()> {
                 print_json(&Output::SentMedia {
                     to: to_npub,
                     group_id: hex::encode(group_id.as_slice()),
-                    kind: media_kind_label(kind).to_owned(),
+                    kind: media_kind_label(&kind).to_owned(),
                     mime,
                     filename,
                     size_bytes: size,
@@ -811,11 +821,12 @@ fn find_dm_group(client: &SonarClient, peer: PublicKey) -> Result<Option<GroupId
 ///
 /// MIME resolution order: explicit `--mime` > file extension sniff > the kind
 /// default. `--stdin` has no extension to sniff, so `--mime` is required there.
-fn resolve_media_payload(args: &SendArgs) -> Result<(Vec<u8>, String, String)> {
+fn resolve_media_payload(args: &SendArgs) -> Result<(Vec<u8>, String, String, MediaKind)> {
     let kind = args
         .kind
         .as_ref()
-        .ok_or_else(|| CliError::Message("--kind is required for media sends".to_owned()))?;
+        .ok_or_else(|| CliError::Message("--kind is required for media sends".to_owned()))?
+        .clone();
 
     if args.stdin {
         let mime = args.mime.as_deref().ok_or_else(|| {
@@ -831,7 +842,7 @@ fn resolve_media_payload(args: &SendArgs) -> Result<(Vec<u8>, String, String)> {
             return Err(CliError::Message("stdin was empty".to_owned()));
         }
         let filename = format!("stdin-media.{}", mime_extension(mime).unwrap_or("bin"));
-        return Ok((data, filename, mime.to_owned()));
+        return Ok((data, filename, mime.to_owned(), kind));
     }
 
     let path = args.file.as_ref().ok_or_else(|| {
@@ -854,8 +865,8 @@ fn resolve_media_payload(args: &SendArgs) -> Result<(Vec<u8>, String, String)> {
         .mime
         .clone()
         .or_else(|| sniff_mime(path).map(str::to_owned))
-        .unwrap_or_else(|| default_mime_for_kind(kind).to_owned());
-    Ok((data, filename, mime))
+        .unwrap_or_else(|| default_mime_for_kind(&kind).to_owned());
+    Ok((data, filename, mime, kind))
 }
 
 /// Default MIME for a media kind, used when neither `--mime` nor a known
@@ -1329,7 +1340,7 @@ mod tests {
         let png = temp.path().join("pic.png");
         fs::write(&png, b"not-a-real-png").expect("write");
         let args = media_send_args(Some(png.clone()), Some(MediaKind::Image), None);
-        let (data, filename, mime) = resolve_media_payload(&args).expect("resolve");
+        let (data, filename, mime, _kind) = resolve_media_payload(&args).expect("resolve");
         assert_eq!(data, b"not-a-real-png");
         assert_eq!(filename, "pic.png");
         assert_eq!(mime, "image/png");
@@ -1345,7 +1356,7 @@ mod tests {
             Some(MediaKind::Image),
             Some("image/webp".to_owned()),
         );
-        let (_, _, mime) = resolve_media_payload(&args).expect("resolve");
+        let (_, _, mime, _) = resolve_media_payload(&args).expect("resolve");
         assert_eq!(mime, "image/webp");
     }
 
@@ -1355,8 +1366,9 @@ mod tests {
         let clip = temp.path().join("voice");
         fs::write(&clip, b"y").expect("write");
         let args = media_send_args(Some(clip), Some(MediaKind::Voice), None);
-        let (_, _, mime) = resolve_media_payload(&args).expect("resolve");
+        let (_, _, mime, kind) = resolve_media_payload(&args).expect("resolve");
         assert_eq!(mime, "audio/ogg");
+        assert!(matches!(kind, MediaKind::Voice));
     }
 
     #[test]
