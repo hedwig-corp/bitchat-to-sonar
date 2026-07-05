@@ -139,6 +139,9 @@ data class SonarMedia(
     val width: Int?,
     val height: Int?,
     val durationMs: Long?,
+    /** Optional user caption attached to the media (Signal-first checklist:
+     *  the data model carries captions even before the UI exposes them). */
+    val caption: String? = null,
 ) {
     val isImage: Boolean get() = mimeType.startsWith("image/")
     val isGif: Boolean get() =

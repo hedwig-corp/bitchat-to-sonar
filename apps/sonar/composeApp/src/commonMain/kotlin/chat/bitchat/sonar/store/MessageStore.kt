@@ -82,7 +82,11 @@ object MessageCodec {
                     hexEnc(media?.width?.toString().orEmpty()) + "\t" +
                     hexEnc(media?.height?.toString().orEmpty()) + "\t" +
                     hexEnc(media?.durationMs?.toString().orEmpty()) + "\t" +
-                    hexEnc(if (m.viaInternet) "1" else "")
+                    hexEnc(if (m.viaInternet) "1" else "") + "\t" +
+                    // Field 15 (append-only versioning, like field 14 for
+                    // viaInternet): optional media caption. Old decoders
+                    // ignore trailing fields; old envelopes lack it.
+                    hexEnc(media?.caption.orEmpty())
             } else base
         }
 
@@ -102,6 +106,8 @@ object MessageCodec {
                         width = f[11].toIntOrNull(),
                         height = f[12].toIntOrNull(),
                         durationMs = f[13].toLongOrNull(),
+                        // Field 15: caption — tolerate old envelopes without it.
+                        caption = f.getOrNull(15)?.takeIf { it.isNotEmpty() },
                     )
                 )
             } else emptyList()

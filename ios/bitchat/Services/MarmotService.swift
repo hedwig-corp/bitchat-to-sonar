@@ -138,6 +138,11 @@ final class MarmotService: @unchecked Sendable {
         let width: UInt32?
         let height: UInt32?
         let durationMs: UInt64?
+        /// Optional user caption for this media item (Signal-style: part of
+        /// the media model from day one, even before the UI exposes it).
+        /// Synthesized Codable decodes optionals with decodeIfPresent, so
+        /// payloads written before this field existed decode with nil.
+        var caption: String? = nil
         var isImage: Bool { mimeType.hasPrefix("image/") }
         var isVideo: Bool { mimeType.hasPrefix("video/") }
         var isAudio: Bool { mimeType.hasPrefix("audio/") }
