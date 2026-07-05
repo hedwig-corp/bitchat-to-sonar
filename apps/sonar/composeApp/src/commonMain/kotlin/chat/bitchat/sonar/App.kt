@@ -1239,6 +1239,15 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         state.refreshDescriptorForChat(screen.id)
         if (screen.pay) openPaySheetOrRetry()
     }
+    // Typing indicator send side: observe the draft as an effect (never work
+    // in composition). Blank draft = composer cleared → stop immediately.
+    LaunchedEffect(draft) {
+        if (draft.isBlank()) state.onComposerIdle(screen.id)
+        else state.onComposerTyping(screen.id)
+    }
+    DisposableEffect(screen.id) {
+        onDispose { state.onComposerIdle(screen.id) }
+    }
     // Transcript feed = chat messages (pay control lines collapsed) + mocked
     // call-log records, merged chronologically. Memoized on its inputs: the
     // filter runs PayLine.decode per row (and an FFI call for ☎CALL rows) and
@@ -2019,6 +2028,18 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             )
         } else {
             ChatFeedList(Modifier.weight(1f).fillMaxWidth(), 10.dp)
+            // Ephemeral "is typing…" hint: named for DMs (the peer is the only
+            // other member), anonymous for groups (typing events carry no sender).
+            if (state.isPeerTyping(screen.id)) {
+                Text(
+                    if (isGroup) "Someone is typing…" else "$peerName is typing…",
+                    color = s.text3,
+                    fontSize = 12.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 2.dp)
+                )
+            }
             ChatBottomChrome()
         }
     }

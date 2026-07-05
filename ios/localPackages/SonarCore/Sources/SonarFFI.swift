@@ -1636,6 +1636,20 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func messagesPage(groupIdHex: String, limit: UInt32, offset: UInt32) throws  -> [MessageInfo]
 
     /**
+     * Local composer produced input for this chat. Cheap and non-blocking
+     * (a channel send into the core typing task); safe to call per keystroke.
+     * The core owns the Signal cadence: STARTED once, refresh every 10s,
+     * STOPPED after 3s idle or on send.
+     */
+    func notifyTyping(groupIdHex: String) throws 
+    
+    /**
+     * Local composer cleared / chat closed. Publishes STOPPED only if a
+     * STARTED is outstanding.
+     */
+    func notifyTypingStopped(groupIdHex: String) throws 
+    
+    /**
      * Pending multi-member group invites awaiting accept/decline.
      */
     func pendingGroupInvites() throws  -> [GroupInviteInfo]
@@ -1802,6 +1816,14 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      */
     func sendText(groupIdHex: String, text: String) throws
 
+    /**
+     * Lifecycle invariant (repeat installs are leak-free): each call spawns a
+     * fresh forwarder thread parked on `rx.recv()`. Installing a new listener
+     * replaces the core listener Arc, which drops the previous `tx`; that
+     * closes the old channel and the old thread exits its recv loop. Do NOT
+     * cache the core listener Arc anywhere else — a retained `tx` would keep
+     * the orphaned thread alive forever.
+     */
     func setConversationChangeListener(listener: ConversationChangeListener)
 
     /**
@@ -2497,6 +2519,32 @@ open func messagesPage(groupIdHex: String, limit: UInt32, offset: UInt32)throws 
 }
 
     /**
+     * Local composer produced input for this chat. Cheap and non-blocking
+     * (a channel send into the core typing task); safe to call per keystroke.
+     * The core owns the Signal cadence: STARTED once, refresh every 10s,
+     * STOPPED after 3s idle or on send.
+     */
+open func notifyTyping(groupIdHex: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_notify_typing(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(groupIdHex),$0
+    )
+}
+}
+    
+    /**
+     * Local composer cleared / chat closed. Publishes STOPPED only if a
+     * STARTED is outstanding.
+     */
+open func notifyTypingStopped(groupIdHex: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_notify_typing_stopped(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(groupIdHex),$0
+    )
+}
+}
+    
+    /**
      * Pending multi-member group invites awaiting accept/decline.
      */
 open func pendingGroupInvites()throws  -> [GroupInviteInfo]  {
@@ -2875,6 +2923,14 @@ open func sendText(groupIdHex: String, text: String)throws   {try rustCallWithEr
 }
 }
 
+    /**
+     * Lifecycle invariant (repeat installs are leak-free): each call spawns a
+     * fresh forwarder thread parked on `rx.recv()`. Installing a new listener
+     * replaces the core listener Arc, which drops the previous `tx`; that
+     * closes the old channel and the old thread exits its recv loop. Do NOT
+     * cache the core listener Arc anywhere else — a retained `tx` would keep
+     * the orphaned thread alive forever.
+     */
 open func setConversationChangeListener(listener: ConversationChangeListener)  {try! rustCall() {
     uniffi_sonar_ffi_fn_method_sonarnode_set_conversation_change_listener(
             self.uniffiCloneHandle(),
@@ -8320,6 +8376,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_messages_page() != 43697) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_notify_typing() != 37601) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_notify_typing_stopped() != 31471) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_pending_group_invites() != 31608) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -8404,7 +8466,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_send_text() != 23173) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_set_conversation_change_listener() != 62940) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_set_conversation_change_listener() != 6720) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_set_typing_change_listener() != 14877) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_set_sync_watermark_frozen() != 9593) {

@@ -872,4 +872,22 @@ expect object SonarCore {
     /** Install the core callback that feeds [conversationChanged]. Call once
      *  after [start]. */
     fun installConversationListener()
+
+    /** Flow of (groupIdHex, typing) ephemeral typing-indicator changes from the
+     *  core. `true` = a remote member is composing; `false` = they stopped,
+     *  sent, or the core-side 15s expiry lapsed. Never persisted anywhere. */
+    val typingChanged: SharedFlow<Pair<String, Boolean>>
+
+    /** Install the core callback that feeds [typingChanged]. Call once after
+     *  [start]. */
+    fun installTypingListener()
+
+    /** The local composer produced input for this Marmot chat. Cheap (a channel
+     *  send into the core typing task) — safe to call per keystroke; the core
+     *  owns the Signal cadence (STARTED once, 10s refresh, 3s-pause STOPPED). */
+    fun notifyTyping(groupIdHex: String)
+
+    /** The composer was cleared or the chat closed: publish STOPPED if a
+     *  STARTED is outstanding. */
+    fun notifyTypingStopped(groupIdHex: String)
 }

@@ -280,6 +280,10 @@ final class MarmotService: @unchecked Sendable {
     }
 
     let conversationChanged = PassthroughSubject<String, Never>()
+    /// Ephemeral typing indicators: (groupIdHex, typing). `true` when a remote
+    /// member starts composing, `false` on stop/send/15s core-side expiry.
+    /// Purely in-memory — never touches the transcript or unread counts.
+    let typingChanged = PassthroughSubject<(String, Bool), Never>()
 
     // MARK: - Configuration
 
@@ -1827,6 +1831,29 @@ final class MarmotService: @unchecked Sendable {
     private func installConversationListener(on node: SonarNode) {
         let subject = conversationChanged
         node.setConversationChangeListener(listener: MarmotConversationListener(subject: subject))
+        node.setTypingChangeListener(listener: MarmotTypingListener(subject: typingChanged))
+    }
+
+    // MARK: - Typing indicators (ephemeral)
+
+    /// The local composer produced input for this group. Fire-and-forget and
+    /// cheap in core (a channel send into the typing task) — safe to call per
+    /// keystroke; the core owns the Signal cadence (STARTED once, 10s refresh,
+    /// STOPPED after 3s idle or on send). No-op when not connected.
+    func notifyTyping(groupId: String) {
+        workQueue.async { [weak self] in
+            guard let node = self?.node else { return }
+            try? node.notifyTyping(groupIdHex: groupId)
+        }
+    }
+
+    /// The composer was cleared or the chat closed: publish STOPPED if a
+    /// STARTED is outstanding.
+    func notifyTypingStopped(groupId: String) {
+        workQueue.async { [weak self] in
+            guard let node = self?.node else { return }
+            try? node.notifyTypingStopped(groupIdHex: groupId)
+        }
     }
 
     // MARK: - Internals
@@ -1960,5 +1987,17 @@ private final class MarmotConversationListener: ConversationChangeListener, @unc
 
     func onConversationChanged(groupIdHex: String) {
         subject.send(groupIdHex)
+    }
+}
+
+private final class MarmotTypingListener: TypingChangeListener, @unchecked Sendable {
+    private let subject: PassthroughSubject<(String, Bool), Never>
+
+    init(subject: PassthroughSubject<(String, Bool), Never>) {
+        self.subject = subject
+    }
+
+    func onTypingChanged(groupIdHex: String, typing: Bool) {
+        subject.send((groupIdHex, typing))
     }
 }

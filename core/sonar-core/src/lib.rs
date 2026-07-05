@@ -24,6 +24,7 @@ pub mod push;
 pub mod relay_directory;
 pub mod sonar_descriptor;
 pub mod sticker_cache;
+pub mod typing;
 
 pub use error::Error;
 

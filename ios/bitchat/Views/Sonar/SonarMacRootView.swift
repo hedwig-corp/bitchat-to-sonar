@@ -866,6 +866,16 @@ private struct MacConversationPane: View {
                 isMultiMemberMarmot: isMultiMemberMarmot,
                 onTapPack: { previewPackCoordinate = $0 }
             )
+            // Ephemeral "is typing…" hint (named DM peer / anonymous group).
+            if store.isPeerTyping(id) {
+                Text(verbatim: (isMultiMemberMarmot ? "Someone" : peer.name) + " is typing…")
+                    .font(SonarTheme.uiFont(size: 12))
+                    .foregroundColor(SonarTheme.text3)
+                    .lineLimit(1)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 2)
+            }
         }
     }
 
@@ -919,7 +929,11 @@ private struct MacConversationPane: View {
             fetchInstalledPacks: { await store.fetchInstalledPacks() },
             cachedStickerPacks: { store.cachedStickerPacks() },
             voiceEnabled: !isChannel && store.canSendMedia(id),
-            onVoice: { store.sendVoiceNote(id, url: $0) }
+            onVoice: { store.sendVoiceNote(id, url: $0) },
+            onTyping: { text in
+                guard !isChannel else { return }
+                if text.isEmpty { store.composerIdle(id) } else { store.composerTyping(id) }
+            }
         )
     }
 

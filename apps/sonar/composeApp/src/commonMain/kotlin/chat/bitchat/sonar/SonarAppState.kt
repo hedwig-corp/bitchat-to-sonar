@@ -93,6 +93,10 @@ private const val MESH_NAMES_BLOB_KEY = "sonar.meshNames"
 private const val FAVORITED_CONTROL = "[FAVORITED]"
 private const val UNFAVORITED_CONTROL = "[UNFAVORITED]"
 private const val MESH_MEDIA_URL_PREFIX = "mesh-media:"
+
+/** Reciprocal opt-in for typing indicators (default OFF): gates both sending
+ *  local typing and displaying remote typing, Signal-style. */
+private const val PREF_TYPING_INDICATORS = "typingIndicators"
 private const val PENDING_MARMOT_CHAT_PREFIX = "npub:"
 private const val PENDING_MARMOT_GROUP_PREFIX = "group-pending:"
 private const val PENDING_MARMOT_DIRECT_SEND_QUEUE_LIMIT = 100
@@ -1271,6 +1275,15 @@ class SonarAppState(private val scope: CoroutineScope) {
                 .withoutSyntheticSummaryRows()
                 .map { it.copy(viaInternet = true) }
         }
+
+    // ── Ephemeral typing indicators (in-memory only; never persisted) ──
+    /** Marmot group ids with a remote member currently composing. Fed by the
+     *  core's typing listener; expiry (15s) is handled core-side. */
+    var typingChats by mutableStateOf<Set<String>>(emptySet())
+        private set
+    /** Per-chat throttle so per-keystroke composer callbacks cross the FFI at
+     *  most once a second (the core owns the real 10s/3s cadence). */
+    private val lastTypingSentAt = mutableMapOf<String, Long>()
 
     // ── Mocked voice/video call log (in-memory only) ──
     /** Call records per chat id, merged into that DM's transcript by timestamp. */
@@ -4271,6 +4284,8 @@ class SonarAppState(private val scope: CoroutineScope) {
         relayStartupCompleted = true
         SonarCore.installConversationListener()
         collectConversationChanges()
+        SonarCore.installTypingListener()
+        collectTypingChanges()
         startMarmotWakeLoop()
         // Fetch own kind-0 before any publish: after nsec restore the local
         // nick/handle sidecars are empty, and publishing blank/stale metadata
@@ -9708,6 +9723,59 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // housekeeping consumer instead of doing it inline per event.
                 requestHousekeeping()
     }
+
+    private fun collectTypingChanges() {
+        SonarCore.typingChanged
+            .onEach { (groupIdHex, typing) ->
+                // Display side of the reciprocal opt-in: with the pref off we
+                // drop additions (removals always apply so stale indicators
+                // clear if the user toggles the pref off mid-chat).
+                typingChats =
+                    if (typing && prefBool(PREF_TYPING_INDICATORS)) typingChats + groupIdHex
+                    else typingChats - groupIdHex
+            }
+            .launchIn(scope)
+    }
+
+    /** Is a remote member composing in [chatId]? Folds duplicate direct-chat
+     *  groups so a DM's indicator shows whichever leg the peer typed on. */
+    fun isPeerTyping(chatId: String): Boolean =
+        typingChats.any { it == chatId || isSameDirectMarmotChat(chatId, it) }
+
+    /** Drop all visible indicators now (used when the opt-in is toggled off,
+     *  so stale hints don't linger until the core expiry event). */
+    fun clearTypingIndicators() {
+        typingChats = emptySet()
+    }
+
+    /** Composer text changed in [chatId]. Send side of the reciprocal opt-in:
+     *  no-op unless the pref is on and this is a real Marmot chat. Throttled
+     *  here to ≤1 FFI call/s; the core owns the Signal cadence. The pref read
+     *  (a blob FFI call) runs on IO so keystrokes never touch the render path. */
+    fun onComposerTyping(chatId: String) {
+        if (!isEligibleTypingChat(chatId)) return
+        val now = SonarClock.nowMillis()
+        if (now - (lastTypingSentAt[chatId] ?: 0L) < 1_000L) return
+        lastTypingSentAt[chatId] = now
+        scope.launch(Dispatchers.IO) {
+            if (prefBool(PREF_TYPING_INDICATORS)) SonarCore.notifyTyping(chatId)
+        }
+    }
+
+    /** Composer cleared or the chat screen closed: stop immediately (STOPPED
+     *  goes out only if a STARTED is outstanding, so this is always safe). */
+    fun onComposerIdle(chatId: String) {
+        if (!isEligibleTypingChat(chatId)) return
+        lastTypingSentAt.remove(chatId)
+        scope.launch(Dispatchers.IO) { SonarCore.notifyTypingStopped(chatId) }
+    }
+
+    /** Typing rides the Marmot relay path only: mesh-routed and pending
+     *  (not-yet-created) chats have no group to publish into. BLE-mesh typing
+     *  is a tracked follow-up (see docs/plans/2026-07-05-typing-indicators.md). */
+    private fun isEligibleTypingChat(chatId: String): Boolean =
+        !isMeshChat(chatId) && !isPendingMarmotChat(chatId) && !isPendingMarmotGroup(chatId) &&
+            chats.any { it.id == chatId }
 
     private suspend fun refreshUnreadCounts() {
         // null = FFI failure — keep the current map (same guard as markGroupsRead).

@@ -105,6 +105,8 @@ cpal = { version = "0.15.3", features = ["oboe-shared-stdcxx"], optional = true 
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
+# Paused-clock timers for the typing-indicator state machine tests.
+tokio = { version = "1.47", features = ["test-util"] }
 nostr-relay-builder.workspace = true
 tracing-subscriber.workspace = true
 tempfile.workspace = true

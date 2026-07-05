@@ -3959,6 +3959,9 @@ struct SNComposer: View {
     var voiceEnabled: Bool = true
     /// Hold-to-record produced a voice note at this file URL (audio/mp4 .m4a).
     var onVoice: (URL) -> Void = { _ in }
+    /// Draft text changed (typing indicators). Empty text = composer cleared.
+    /// The store throttles core calls, so per-keystroke invocation is fine.
+    var onTyping: (String) -> Void = { _ in }
 
     @State private var showEmojiTray = false
     @State private var stickerPacks: [StickerPackInfo] = []
@@ -4137,6 +4140,7 @@ struct SNComposer: View {
                             showEmojiTray = false
                         }
                     }
+                    .onChange(of: text) { newValue in onTyping(newValue) }
                     .accessibilityIdentifier("sonar-message-composer")
                 Button(action: toggleEmojiTray) {
                     SNIcon(name: .smile, size: 19, weight: 2)

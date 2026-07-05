@@ -149,7 +149,10 @@ struct SonarDMScreenContent: View {
             fetchInstalledPacks: { await store.fetchInstalledPacks() },
             cachedStickerPacks: { store.cachedStickerPacks() },
             voiceEnabled: store.canSendMedia(peerId),
-            onVoice: { store.sendVoiceNote(peerId, url: $0) }
+            onVoice: { store.sendVoiceNote(peerId, url: $0) },
+            onTyping: { text in
+                if text.isEmpty { store.composerIdle(peerId) } else { store.composerTyping(peerId) }
+            }
         )
     }
 
@@ -259,6 +262,18 @@ struct SonarDMScreenContent: View {
                     unreadCountAtOpen: store.unreadCountAtOpenByDM[peerId],
                     expectedNewestDate: store.expectedNewestMessageDate(peerId)
                 )
+                // Ephemeral "is typing…" hint: named for DMs (the peer is the
+                // only other member), anonymous for groups (events carry no
+                // sender).
+                if store.isPeerTyping(peerId) {
+                    Text(verbatim: (isMultiMemberMarmot ? "Someone" : peer.name) + " is typing…")
+                        .font(SonarTheme.uiFont(size: 12))
+                        .foregroundColor(SonarTheme.text3)
+                        .lineLimit(1)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 20)
+                        .padding(.vertical, 2)
+                }
                 dmComposer
             }
         }
@@ -301,6 +316,7 @@ struct SonarDMScreenContent: View {
             ) {
                 attachmentImportGeneration += 1
             }
+            store.composerIdle(peerId)
             store.closedDM(peerId)
         }
         .snSheet(isPresented: $sheet, title: "Add to your message") {

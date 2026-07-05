@@ -1075,6 +1075,26 @@ actual object SonarCore {
             }
         })
     }
+
+    private val _typingChanged = MutableSharedFlow<Pair<String, Boolean>>(extraBufferCapacity = 64)
+    actual val typingChanged: SharedFlow<Pair<String, Boolean>> = _typingChanged.asSharedFlow()
+
+    actual fun installTypingListener() {
+        val n = node ?: return
+        n.setTypingChangeListener(object : uniffi.sonar_ffi.TypingChangeListener {
+            override fun onTypingChanged(groupIdHex: String, typing: Boolean) {
+                _typingChanged.tryEmit(groupIdHex to typing)
+            }
+        })
+    }
+
+    actual fun notifyTyping(groupIdHex: String) {
+        runCatching { node?.notifyTyping(groupIdHex) }
+    }
+
+    actual fun notifyTypingStopped(groupIdHex: String) {
+        runCatching { node?.notifyTypingStopped(groupIdHex) }
+    }
 }
 
 private fun SonarNotificationKind.toFfi(): uniffi.sonar_ffi.SonarNotificationKindInfo =
