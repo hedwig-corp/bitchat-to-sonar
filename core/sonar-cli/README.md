@@ -218,8 +218,13 @@ HTTP/webhook alerting needs no special flag — point the command at `curl`:
 
 ```bash
 cargo run -p sonar-cli -- listen --once \
-  --notify-command 'curl -s -X POST https://ntfy.example/topic -d "$SONAR_CONTENT"'
+  --notify-command 'curl -s -X POST https://ntfy.example/topic --data-raw "$SONAR_CONTENT"'
 ```
+
+Use `--data-raw` (not `-d`/`--data`): `$SONAR_CONTENT` is remote message text,
+and curl's `-d` treats a body beginning with `@/path` as data read from a local
+file — so a crafted message could exfiltrate a readable file to the webhook.
+`--data-raw` posts the literal bytes.
 
 If the command embeds a secret (e.g. a bearer token), read it from an
 environment variable inside the shell rather than putting it on the command
