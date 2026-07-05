@@ -341,7 +341,7 @@ actual object SonarCore {
     }
 
     actual suspend fun sync() = withContext(Dispatchers.IO) {
-        runCatching { node?.syncOnce() }
+        runCatching { node?.syncForce() }
         Unit
     }
 
