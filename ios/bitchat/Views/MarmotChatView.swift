@@ -774,6 +774,11 @@ final class MarmotChatModel: ObservableObject {
                 } else {
                     if !hadCachedProfile {
                         self.profileFetches.remove(key) // not published yet — allow retry
+                    } else {
+                        // Previously cached but the relay returned nothing useful.
+                        // Stamp the attempt so refreshStaleProfiles() retries
+                        // after TTL instead of leaving the entry stuck forever.
+                        self.profileFetchedAt[key] = Date()
                     }
                 }
             }
@@ -785,14 +790,23 @@ final class MarmotChatModel: ObservableObject {
     /// so the caller can trigger member re-resolution.
     @discardableResult
     func refreshStaleProfiles() -> Bool {
-        let cutoff = Date().addingTimeInterval(-Self.profileRefreshTTL)
-        let stale = profileFetchedAt.filter { $0.value < cutoff }.keys
+        let stale = Self.staleKeys(
+            from: profileFetchedAt,
+            cutoff: Date().addingTimeInterval(-Self.profileRefreshTTL)
+        )
         guard !stale.isEmpty else { return false }
         for key in stale {
             profileFetches.remove(key)
             profileFetchedAt.removeValue(forKey: key)
         }
         return true
+    }
+
+    /// Pure computation of npub keys whose last fetch is older than the TTL
+    /// cutoff. Extracted so the staleness logic is unit-testable without a
+    /// `MarmotService` or `@MainActor` instance.
+    nonisolated static func staleKeys(from fetchedAt: [String: Date], cutoff: Date) -> [String] {
+        fetchedAt.filter { $0.value < cutoff }.map { $0.key }
     }
 
     /// Fetch + cache a peer's public Sonar descriptor. Not finding one keeps the
