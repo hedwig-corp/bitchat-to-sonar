@@ -21,7 +21,8 @@
 //! sync watermark, no processed-event marks. Because payloads are not yet
 //! authenticated to group membership (MDK does not expose the MLS
 //! `exporter_secret`), a third party who knows a group's nostr id could spoof
-//! the anonymous indicator; see docs/plans/2026-07-05-typing-indicators.md.
+//! the anonymous indicator; authenticated payloads are a tracked follow-up
+//! (PR #167's deferred list).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -107,13 +108,27 @@ enum Command {
     RemoteStopped { mls_hex: String },
 }
 
+/// A group the typing manager routes for.
+#[derive(Clone)]
+pub struct TypingGroup {
+    pub mls_hex: String,
+    pub nostr_hex: String,
+    /// 2-member (direct) group? Direct chats honor remote STOPPED instantly
+    /// (Signal DM semantics). Multi-member groups IGNORE remote STOPPED and
+    /// rely on the 15s expiry: events are anonymous, so one member's STOPPED
+    /// must not clear the indicator while another member is still typing
+    /// (their refresh cadence keeps it alive). This also removes the forged
+    /// "0" vector for groups entirely.
+    pub direct: bool,
+}
+
 /// Cheap cloneable handle; the state machine runs on a dedicated tokio task.
 #[derive(Clone)]
 pub struct TypingManager {
     tx: mpsc::UnboundedSender<Command>,
-    /// nostr_group_id hex -> mls_group_id hex (and reverse), refreshed by the
+    /// nostr_group_id hex -> (mls_group_id hex, direct), refreshed by the
     /// client whenever it enumerates groups.
-    nostr_to_mls: Arc<Mutex<HashMap<String, String>>>,
+    nostr_to_mls: Arc<Mutex<HashMap<String, (String, bool)>>>,
     mls_to_nostr: Arc<Mutex<HashMap<String, String>>>,
     /// Ids of events we published: relays echo subscriptions back to the
     /// sender, and we must not render our own typing.
@@ -182,12 +197,15 @@ impl TypingManager {
     /// instead of accumulating stale pairs for the lifetime of the session.
     /// Called by the client whenever it enumerates groups (subscription
     /// updates, delete/leave, lazy send-side misses).
-    pub fn update_groups(&self, pairs: impl IntoIterator<Item = (String, String)>) {
+    pub fn update_groups(&self, groups: impl IntoIterator<Item = TypingGroup>) {
         let mut new_mls_to_nostr = HashMap::new();
         let mut new_nostr_to_mls = HashMap::new();
-        for (mls_hex, nostr_hex) in pairs {
-            new_nostr_to_mls.insert(nostr_hex.clone(), mls_hex.clone());
-            new_mls_to_nostr.insert(mls_hex, nostr_hex);
+        for group in groups {
+            new_nostr_to_mls.insert(
+                group.nostr_hex.clone(),
+                (group.mls_hex.clone(), group.direct),
+            );
+            new_mls_to_nostr.insert(group.mls_hex, group.nostr_hex);
         }
         *self.mls_to_nostr.lock().unwrap() = new_mls_to_nostr;
         *self.nostr_to_mls.lock().unwrap() = new_nostr_to_mls;
@@ -230,12 +248,17 @@ impl TypingManager {
         let Some(nostr_hex) = typing_group_tag(event) else {
             return;
         };
-        let Some(mls_hex) = self.nostr_to_mls.lock().unwrap().get(&nostr_hex).cloned() else {
+        let Some((mls_hex, direct)) = self.nostr_to_mls.lock().unwrap().get(&nostr_hex).cloned()
+        else {
             return; // not one of our groups
         };
         let cmd = match event.content.as_str() {
             CONTENT_STARTED => Command::RemoteStarted { mls_hex },
-            CONTENT_STOPPED => Command::RemoteStopped { mls_hex },
+            // Only direct chats honor an explicit STOPPED (see [`TypingGroup::direct`]):
+            // group events are anonymous, so one member's stop must not clear
+            // another member's still-active indicator — expiry handles groups.
+            CONTENT_STOPPED if direct => Command::RemoteStopped { mls_hex },
+            CONTENT_STOPPED => return,
             _ => return,
         };
         let _ = self.tx.send(cmd);
@@ -510,6 +533,14 @@ mod tests {
         TypingConfig::default()
     }
 
+    fn group(mls: &str, nostr: &str, direct: bool) -> TypingGroup {
+        TypingGroup {
+            mls_hex: mls.to_string(),
+            nostr_hex: nostr.to_string(),
+            direct,
+        }
+    }
+
     fn contents(events: &[Event]) -> Vec<&str> {
         events.iter().map(|e| e.content.as_str()).collect()
     }
@@ -600,7 +631,7 @@ mod tests {
         let listener = RecordingListener::new();
         let manager = TypingManager::spawn(publisher, test_config());
         manager.set_listener(Some(listener.clone()));
-        manager.update_groups([("mls1".to_string(), "nostr1".to_string())]);
+        manager.update_groups([group("mls1", "nostr1", true)]);
 
         manager.handle_remote_event(&remote_event("nostr1", "1"));
         settle().await;
@@ -623,7 +654,7 @@ mod tests {
         let listener = RecordingListener::new();
         let manager = TypingManager::spawn(publisher, test_config());
         manager.set_listener(Some(listener.clone()));
-        manager.update_groups([("mls1".to_string(), "nostr1".to_string())]);
+        manager.update_groups([group("mls1", "nostr1", true)]);
 
         manager.handle_remote_event(&remote_event("nostr1", "1"));
         settle().await;
@@ -657,7 +688,7 @@ mod tests {
         let listener = RecordingListener::new();
         let manager = TypingManager::spawn(publisher, test_config());
         manager.set_listener(Some(listener.clone()));
-        manager.update_groups([("mls1".to_string(), "nostr1".to_string())]);
+        manager.update_groups([group("mls1", "nostr1", true)]);
 
         // Attacker alternates 1/0 with fresh keys (unique event ids) far
         // faster than the legitimate cadence.
@@ -676,16 +707,48 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn multi_member_groups_ignore_remote_stopped() {
+        let publisher = RecordingPublisher::new();
+        let listener = RecordingListener::new();
+        let manager = TypingManager::spawn(publisher, test_config());
+        manager.set_listener(Some(listener.clone()));
+        manager.update_groups([group("mlsg", "nostrg", false)]);
+
+        // Alice starts typing in the group; Bob is typing too (anonymous —
+        // indistinguishable events). Alice sends → STOPPED.
+        manager.handle_remote_event(&remote_event("nostrg", "1"));
+        settle().await;
+        assert_eq!(listener.drain(), vec![("mlsg".to_string(), true)]);
+
+        manager.handle_remote_event(&remote_event("nostrg", "0"));
+        settle().await;
+        advance(Duration::from_secs(2)).await;
+        // STOPPED ignored: Bob's indicator survives Alice's stop...
+        assert!(listener.drain().is_empty(), "group STOPPED must be ignored");
+
+        // ...and Bob's refresh keeps it alive past the original expiry.
+        advance(Duration::from_secs(9)).await;
+        manager.handle_remote_event(&remote_event("nostrg", "1"));
+        settle().await;
+        advance(Duration::from_secs(10)).await;
+        assert!(listener.drain().is_empty(), "still typing, no flip");
+
+        // Silence: the 15s expiry finally clears it.
+        advance(Duration::from_secs(5)).await;
+        assert_eq!(listener.drain(), vec![("mlsg".to_string(), false)]);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn update_groups_replaces_and_prunes_stale_mappings() {
         let publisher = RecordingPublisher::new();
         let listener = RecordingListener::new();
         let manager = TypingManager::spawn(publisher, test_config());
         manager.set_listener(Some(listener.clone()));
-        manager.update_groups([("mls1".to_string(), "nostr1".to_string())]);
+        manager.update_groups([group("mls1", "nostr1", true)]);
         assert_eq!(manager.nostr_hex_for_mls("mls1").as_deref(), Some("nostr1"));
 
         // Authoritative replace: the deleted group's mapping is pruned...
-        manager.update_groups([("mls2".to_string(), "nostr2".to_string())]);
+        manager.update_groups([group("mls2", "nostr2", true)]);
         assert_eq!(manager.nostr_hex_for_mls("mls1"), None);
         assert_eq!(manager.nostr_hex_for_mls("mls2").as_deref(), Some("nostr2"));
 
@@ -701,7 +764,7 @@ mod tests {
         let listener = RecordingListener::new();
         let manager = TypingManager::spawn(publisher.clone(), test_config());
         manager.set_listener(Some(listener.clone()));
-        manager.update_groups([("mls1".to_string(), "nostr1".to_string())]);
+        manager.update_groups([group("mls1", "nostr1", true)]);
 
         // Publish locally, then feed the published event back (relay echo).
         manager.local_typing("mls1".into(), "nostr1".into());
@@ -724,7 +787,7 @@ mod tests {
         let listener = RecordingListener::new();
         let manager = TypingManager::spawn(publisher, test_config());
         manager.set_listener(Some(listener.clone()));
-        manager.update_groups([("mls1".to_string(), "nostr1".to_string())]);
+        manager.update_groups([group("mls1", "nostr1", true)]);
 
         let old = EventBuilder::new(Kind::Custom(TYPING_EVENT_KIND), CONTENT_STARTED)
             .tags([Tag::custom(

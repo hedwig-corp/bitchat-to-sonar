@@ -6841,12 +6841,28 @@ impl SonarClient {
     /// and after delete/leave.
     pub fn refresh_typing_groups(&self) {
         if let Ok(groups) = self.engine.groups() {
-            self.typing.update_groups(groups.into_iter().map(|g| {
-                (
-                    hex::encode(g.mls_group_id.as_slice()),
-                    hex::encode(g.nostr_group_id),
-                )
-            }));
+            let typing_groups: Vec<crate::typing::TypingGroup> = groups
+                .into_iter()
+                .map(|g| {
+                    // ≤2 members = direct chat (honors remote STOPPED,
+                    // Signal DM semantics); larger groups rely on expiry so
+                    // one anonymous member's stop can't clear another's
+                    // still-active indicator. Unknown counts default to
+                    // direct. Member reads happen only here — refreshes are
+                    // rare (subscription set changes, delete/leave).
+                    let direct = self
+                        .engine
+                        .members(&g.mls_group_id)
+                        .map(|m| m.len() <= 2)
+                        .unwrap_or(true);
+                    crate::typing::TypingGroup {
+                        mls_hex: hex::encode(g.mls_group_id.as_slice()),
+                        nostr_hex: hex::encode(g.nostr_group_id),
+                        direct,
+                    }
+                })
+                .collect();
+            self.typing.update_groups(typing_groups);
         }
     }
 
