@@ -50,6 +50,13 @@ actual object WalletBridge {
     private val balance = MutableStateFlow(0L)
     actual val balanceFlow: StateFlow<Long> get() = balance
     @Volatile private var balanceListenerId: String? = null
+    /** Bumped in [shutdown] (inside [lock]); [refreshBalance] drops its writes
+     *  if the epoch moved while `getInfo()` ran, so a listener-triggered
+     *  refresh can never resurrect a torn-down wallet's balance. */
+    @Volatile private var walletEpoch = 0
+    /** One refresh in flight, at most one trailing — conflates event bursts. */
+    private val refreshGate = Mutex()
+    @Volatile private var refreshPending = false
 
     private val ctx: Context get() = AppContextHolder.ctx
     private fun prefs() = ctx.getSharedPreferences("sonar", Context.MODE_PRIVATE)
@@ -101,10 +108,15 @@ actual object WalletBridge {
 
     actual suspend fun refreshBalance(): Long = withContext(Dispatchers.IO) {
         val node = sdk ?: return@withContext 0L
+        val epoch = walletEpoch
         try {
             val bal = node.getInfo().walletInfo.balanceSat.toLong()
-            current = WalletState.Ready(bal)
-            balance.value = bal
+            // Drop the writes if shutdown/re-setup won the race while the
+            // blocking getInfo() ran — never resurrect a torn-down wallet.
+            if (epoch == walletEpoch && sdk === node) {
+                current = WalletState.Ready(bal)
+                balance.value = bal
+            }
             bal
         } catch (t: Throwable) { (current as? WalletState.Ready)?.balanceSats ?: 0L }
     }
@@ -126,12 +138,27 @@ actual object WalletBridge {
                         is SdkEvent.PaymentWaitingConfirmation,
                         is SdkEvent.PaymentPending,
                         is SdkEvent.PaymentRefunded,
-                        is SdkEvent.PaymentFailed -> walletScope.launch { refreshBalance() }
+                        is SdkEvent.PaymentFailed -> requestBalanceRefresh()
                         else -> Unit
                     }
                 }
             })
         }.getOrNull()
+    }
+
+    /** Conflates SDK event bursts (initial sync, payment storms) into at most
+     *  one in-flight `getInfo()` plus one trailing refresh, instead of one
+     *  concurrent refresh per event. */
+    private fun requestBalanceRefresh() {
+        walletScope.launch {
+            if (!refreshGate.tryLock()) { refreshPending = true; return@launch }
+            try {
+                do {
+                    refreshPending = false
+                    refreshBalance()
+                } while (refreshPending)
+            } finally { refreshGate.unlock() }
+        }
     }
 
     actual suspend fun createOffer(): String = withContext(Dispatchers.IO) {
@@ -187,6 +214,7 @@ actual object WalletBridge {
 
     actual suspend fun shutdown(): Unit = withContext(Dispatchers.IO) {
         lock.withLock {
+            walletEpoch += 1 // invalidate in-flight refreshBalance() writes
             val node = sdk
             balanceListenerId?.let { id -> runCatching { node?.removeEventListener(id) } }
             balanceListenerId = null

@@ -11,7 +11,9 @@ Classification: PARITY (equivalent), PARTIAL (present but diverges), GAP
 (missing on one surface), PLATFORM-GAP (documented platform limitation, no fix
 required or possible).
 
-Line numbers are point-in-time (2026-07-05); verify before editing.
+Line numbers are point-in-time (2026-07-05); verify before editing. Regenerate
+(or amend the affected rows) on each parity PR so this stays the single source
+of truth for gap status.
 
 ## Verdict summary
 

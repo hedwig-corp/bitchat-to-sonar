@@ -29,7 +29,6 @@ import chat.bitchat.sonar.PayStatus
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.ToastBar
 import chat.bitchat.sonar.payFmt
-import chat.bitchat.sonar.wallet.WalletBridge
 import chat.bitchat.sonar.wallet.WalletState
 import chat.bitchat.sonar.ui.SNEmptyState
 import chat.bitchat.sonar.ui.SNIcon
@@ -45,10 +44,11 @@ fun SonarWalletActivityScreen(state: SonarAppState) {
     state.payVersion
 
     val balanceSats = state.walletBalanceSats()
-    // Explicit iOS `hasLiveRate` rule: the fiat subline renders ONLY when a live
-    // rate for the selected currency is cached; otherwise the card is sats-only
-    // (never a bundled/stale rate).
-    val fiat = if (WalletBridge.hasLiveRate()) state.fiatOrNull(balanceSats) else null
+    // iOS `hasLiveRate` rule: the fiat subline renders ONLY when a live rate
+    // exists — state.fiatOrNull already returns null otherwise (the
+    // Money.formatFiat live-rate predicate), from the same state.rate snapshot
+    // the rest of this screen uses.
+    val fiat = state.fiatOrNull(balanceSats)
     val entries = state.walletPayEntries()
 
     Column(Modifier.fillMaxSize().background(s.bg)) {

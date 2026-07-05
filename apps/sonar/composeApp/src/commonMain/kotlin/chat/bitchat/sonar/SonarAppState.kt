@@ -2095,8 +2095,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         // conversation identity (iOS folds the notification the same way).
         // Open-chat suppression must match BOTH the mesh row and the folded
         // group id so an open merged transcript never rings for itself.
+        val chatsById = chats.associateBy { it.id }
         for ((groupId, peerId) in foldedGroupPeerIds) {
-            val c = chats.firstOrNull { it.id == groupId } ?: continue
+            val c = chatsById[groupId] ?: continue
             val meshId = meshChatId(peerId)
             notifyChatIfNew(
                 c,
