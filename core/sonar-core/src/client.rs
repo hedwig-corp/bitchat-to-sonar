@@ -3833,6 +3833,88 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn media_roundtrip_decrypts_for_sender_and_peer() {
+        // Reproduction baseline for CLI/app media playback: proves the end-to-end
+        // MIP-04 crypto round-trip (encrypt -> imeta-in-encrypted-rumor -> store
+        // -> decrypt) works fully offline, with no relay/Blossom/app dependency.
+        // If a voice note "can't play", the failure is downstream of this path
+        // (codec, network, or app rendering) -- not the media crypto itself.
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let bob = MarmotEngine::in_memory(Identity::generate());
+        let bob_kp = bob.key_package_event(relays.clone()).expect("bob kp");
+        let creation = alice
+            .create_group("alice & bob", vec![bob_kp], relays)
+            .expect("alice creates group");
+        let group_id = creation.group.mls_group_id.clone();
+        let (bob_pubkey, bob_welcome) = creation
+            .welcomes
+            .into_iter()
+            .find(|(pk, _)| *pk == bob.identity().public_key())
+            .expect("bob welcome");
+        let bob_wrapped = alice
+            .gift_wrap_welcome(&bob_pubkey, bob_welcome)
+            .await
+            .expect("wrap bob welcome");
+        assert!(matches!(
+            bob.process_incoming(&bob_wrapped)
+                .await
+                .expect("bob welcome"),
+            Incoming::GroupUpdated(_)
+        ));
+        alice
+            .merge_pending_commit(&group_id)
+            .expect("alice merges pending commit");
+        let bob_group_id = bob.groups().expect("bob groups")[0].mls_group_id.clone();
+
+        // Alice sends a "voice note" -- arbitrary bytes stand in for AAC audio.
+        let original = b"fake-aac-audio-bytes".to_vec();
+        let url = "https://blossom.test/abcdef0123";
+        let upload = alice
+            .encrypt_media(&group_id, &original, "audio/mp4", "voice.m4a")
+            .expect("alice encrypts media");
+        let event = alice
+            .create_media_event(&group_id, &upload, url, "listen to this")
+            .expect("alice creates media event");
+
+        // Both sides store the message; the imeta rides inside the encrypted rumor.
+        assert!(matches!(
+            alice
+                .process_incoming(&event)
+                .await
+                .expect("alice stores own media"),
+            Incoming::Message(_)
+        ));
+        assert!(matches!(
+            bob.process_incoming(&event)
+                .await
+                .expect("bob receives media"),
+            Incoming::Message(_)
+        ));
+
+        // Bob's transcript surfaces a media reference pointing at the blob URL.
+        let bob_msg = bob
+            .messages(&bob_group_id)
+            .expect("bob messages")
+            .into_iter()
+            .find(|m| !m.media.is_empty())
+            .expect("bob has a media message");
+        assert_eq!(bob_msg.media[0].url, url);
+        assert_eq!(bob_msg.media[0].mime_type, "audio/mp4");
+
+        // The "downloaded" ciphertext decrypts back to the original bytes for
+        // BOTH sender and receiver, keyed off the locally stored imeta.
+        let alice_plain = alice
+            .decrypt_media_by_url(&group_id, url, &upload.encrypted_data)
+            .expect("alice decrypts own media");
+        let bob_plain = bob
+            .decrypt_media_by_url(&bob_group_id, url, &upload.encrypted_data)
+            .expect("bob decrypts received media");
+        assert_eq!(alice_plain, original);
+        assert_eq!(bob_plain, original);
+    }
+
     #[test]
     fn group_message_catchup_retry_rotates_failed_group_to_back() {
         let mut queue = VecDeque::from([

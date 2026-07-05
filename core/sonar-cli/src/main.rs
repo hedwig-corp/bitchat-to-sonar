@@ -1,11 +1,11 @@
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use nostr::prelude::*;
 use nostr_blossom::prelude::*;
 use nostr_sdk::Client as NostrClient;
@@ -76,8 +76,10 @@ enum Command {
     Publish,
     /// Import a Signal sticker pack, upload assets, and publish a Sonar sticker pack.
     Post(PostArgs),
-    /// Send an encrypted Sonar/Marmot text message to a public key.
+    /// Send an encrypted text or media message (voice/image/video) to a peer.
     Send(SendArgs),
+    /// Download and decrypt an inbound media blob to a file or stdout.
+    Fetch(FetchArgs),
     /// Poll for inbound encrypted messages and print JSON lines.
     Listen(ListenArgs),
     /// Print known Marmot groups.
@@ -107,12 +109,63 @@ struct SendArgs {
     /// Recipient npub1... or 64-char hex public key.
     #[arg(long)]
     to: String,
-    /// Plaintext message body.
+    /// Plaintext message body. Mutually exclusive with --file/--stdin.
     #[arg(long)]
-    text: String,
+    text: Option<String>,
+    /// Path to a media file to send (voice/image/video). Mutually exclusive
+    /// with --text/--stdin.
+    #[arg(long)]
+    file: Option<PathBuf>,
+    /// Read media bytes from stdin (requires --kind and --mime).
+    #[arg(long)]
+    stdin: bool,
+    /// Media kind: voice, audio, image, or video. Required with --file/--stdin.
+    #[arg(long, value_enum)]
+    kind: Option<MediaKind>,
+    /// Optional caption attached to a media send.
+    #[arg(long, default_value = "")]
+    caption: String,
+    /// Override the MIME type. Defaults to the file extension, then the kind.
+    /// Required with --stdin (a pipe has no extension to sniff).
+    #[arg(long)]
+    mime: Option<String>,
+    /// Blossom server that hosts the encrypted blob.
+    #[arg(long, default_value = DEFAULT_BLOSSOM_SERVER)]
+    blossom: String,
     /// Group name if a new 1:1 Marmot group must be created.
     #[arg(long, default_value = "Sonar agent DM")]
     group_name: String,
+}
+
+/// Media kind drives the default MIME type when none is given explicitly.
+#[derive(Clone, Debug, ValueEnum)]
+enum MediaKind {
+    /// Voice note (defaults to audio/mp4 / AAC — playable by iOS AVAudioPlayer).
+    Voice,
+    /// Generic audio clip (defaults to audio/mpeg).
+    Audio,
+    /// Still image (defaults to image/png).
+    Image,
+    /// Video clip (defaults to video/mp4).
+    Video,
+}
+
+#[derive(Args, Debug)]
+struct FetchArgs {
+    /// Group id hex whose media key decrypts the blob.
+    #[arg(long)]
+    group: String,
+    /// Encrypted blob URL (a message's media[].url).
+    #[arg(long)]
+    url: String,
+    /// Write decrypted bytes to this path. If omitted (and not --stdout), a name
+    /// is derived from the URL in the current directory (often extension-less;
+    /// prefer `--out` for a usable file type).
+    #[arg(long)]
+    out: Option<PathBuf>,
+    /// Write decrypted bytes to stdout (binary). The JSON summary goes to stderr.
+    #[arg(long)]
+    stdout: bool,
 }
 
 #[derive(Args, Debug)]
@@ -186,6 +239,21 @@ enum Output {
         to: String,
         group_id: String,
     },
+    SentMedia {
+        to: String,
+        group_id: String,
+        kind: String,
+        mime: String,
+        filename: String,
+        size_bytes: usize,
+        blossom_server: String,
+    },
+    Fetched {
+        group_id: String,
+        url: String,
+        bytes: usize,
+        out: String,
+    },
     PostedStickerPack {
         title: String,
         address: String,
@@ -206,10 +274,32 @@ enum Output {
         group_id: String,
         id: String,
         sender: String,
+        /// Caption or text body (may be empty for a pure media message).
         content: String,
         created_at_secs: u64,
         mine: bool,
+        /// Decrypted media references (MIP-04 imeta). Omitted when empty so
+        /// plain-text messages keep their pre-existing JSON shape.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        media: Vec<MediaRefOut>,
     },
+}
+
+/// A decrypted media attachment rendered in `listen`/`messages` JSON output.
+#[derive(Debug, Serialize)]
+struct MediaRefOut {
+    /// Encrypted blob URL (pass it to `fetch --url`).
+    url: String,
+    mime: String,
+    /// image | voice | audio | video | file (derived from the MIME type).
+    kind: String,
+    filename: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    width: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    height: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration_ms: Option<u64>,
 }
 
 #[tokio::main]
@@ -251,6 +341,28 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Send(args) => {
+            // Validate all arguments before any network side effect: a usage
+            // mistake must not trigger relay connect, sync, or group creation.
+            let payload_sources = [args.text.is_some(), args.file.is_some(), args.stdin]
+                .iter()
+                .filter(|b| **b)
+                .count();
+            if payload_sources != 1 {
+                return Err(CliError::Message(
+                    "provide exactly one of --text, --file, or --stdin".to_owned(),
+                ));
+            }
+            if args.text.is_none() && args.kind.is_none() {
+                return Err(CliError::Message(
+                    "--kind is required for media sends".to_owned(),
+                ));
+            }
+            if args.stdin && args.mime.is_none() {
+                return Err(CliError::Message(
+                    "--stdin requires --mime (a pipe has no extension to sniff)".to_owned(),
+                ));
+            }
+
             let loaded = LoadedConfig::load(home, cli.relays)?;
             let client = loaded.connect().await?;
             client.sync().await?;
@@ -260,11 +372,77 @@ async fn run(cli: Cli) -> Result<()> {
                 Some(group_id) => group_id,
                 None => client.start_dm(peer, &args.group_name).await?,
             };
-            client.send_text(&group_id, &args.text).await?;
-            print_json(&Output::Sent {
-                to: peer.to_bech32().expect("valid public key encodes as npub"),
-                group_id: hex::encode(group_id.as_slice()),
-            })?;
+            let to_npub = peer.to_bech32().expect("valid public key encodes as npub");
+            if let Some(text) = args.text.as_deref() {
+                client.send_text(&group_id, text).await?;
+                print_json(&Output::Sent {
+                    to: to_npub,
+                    group_id: hex::encode(group_id.as_slice()),
+                })?;
+            } else {
+                let (data, filename, mime, kind) = resolve_media_payload(&args)?;
+                let size = data.len();
+                client
+                    .send_media(
+                        &group_id,
+                        data,
+                        &filename,
+                        &mime,
+                        &args.caption,
+                        &args.blossom,
+                    )
+                    .await?;
+                print_json(&Output::SentMedia {
+                    to: to_npub,
+                    group_id: hex::encode(group_id.as_slice()),
+                    kind: media_kind_label(&kind).to_owned(),
+                    mime,
+                    filename,
+                    size_bytes: size,
+                    blossom_server: args.blossom.clone(),
+                })?;
+            }
+            Ok(())
+        }
+        Command::Fetch(args) => {
+            let loaded = LoadedConfig::load(home, cli.relays)?;
+            let client = loaded.connect().await?;
+            let group_id = parse_group_id_hex(&args.group)?;
+            let plaintext = client.fetch_media(&group_id, &args.url).await?;
+            if args.stdout {
+                io::stdout()
+                    .lock()
+                    .write_all(&plaintext)
+                    .map_err(CliError::Io)?;
+                let summary = Output::Fetched {
+                    group_id: args.group.clone(),
+                    url: args.url.clone(),
+                    bytes: plaintext.len(),
+                    out: "<stdout>".to_owned(),
+                };
+                serde_json::to_writer(io::stderr().lock(), &summary).map_err(CliError::Json)?;
+                writeln!(io::stderr().lock()).map_err(CliError::Io)?;
+            } else {
+                let out = args
+                    .out
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from(default_media_filename(&args.url)));
+                if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
+                    if !parent.exists() {
+                        fs::create_dir_all(parent).map_err(|e| {
+                            CliError::Message(format!("create {}: {e}", parent.display()))
+                        })?;
+                    }
+                }
+                fs::write(&out, &plaintext)
+                    .map_err(|e| CliError::Message(format!("write {}: {e}", out.display())))?;
+                print_json(&Output::Fetched {
+                    group_id: args.group.clone(),
+                    url: args.url.clone(),
+                    bytes: plaintext.len(),
+                    out: out.display().to_string(),
+                })?;
+            }
             Ok(())
         }
         Command::Listen(args) => {
@@ -600,6 +778,19 @@ fn emit_unseen_messages(
 }
 
 fn message_output(msg: &sonar_core::marmot::ChatMessage) -> Output {
+    let media = msg
+        .media
+        .iter()
+        .map(|m| MediaRefOut {
+            url: m.url.clone(),
+            mime: m.mime_type.clone(),
+            kind: media_kind_from_mime(&m.mime_type).to_owned(),
+            filename: m.filename.clone(),
+            width: m.width,
+            height: m.height,
+            duration_ms: m.duration_ms,
+        })
+        .collect();
     Output::Message {
         group_id: hex::encode(msg.group_id.as_slice()),
         id: msg.id.to_hex(),
@@ -610,6 +801,7 @@ fn message_output(msg: &sonar_core::marmot::ChatMessage) -> Output {
         content: msg.content.clone(),
         created_at_secs: msg.created_at.as_secs(),
         mine: msg.mine,
+        media,
     }
 }
 
@@ -623,6 +815,148 @@ fn find_dm_group(client: &SonarClient, peer: PublicKey) -> Result<Option<GroupId
         }
     }
     Ok(None)
+}
+
+/// Read + classify a media payload from `--file` or `--stdin`.
+///
+/// MIME resolution order: explicit `--mime` > file extension sniff > the kind
+/// default. `--stdin` has no extension to sniff, so `--mime` is required there.
+fn resolve_media_payload(args: &SendArgs) -> Result<(Vec<u8>, String, String, MediaKind)> {
+    let kind = args
+        .kind
+        .as_ref()
+        .ok_or_else(|| CliError::Message("--kind is required for media sends".to_owned()))?
+        .clone();
+
+    if args.stdin {
+        let mime = args.mime.as_deref().ok_or_else(|| {
+            CliError::Message(
+                "--stdin requires --mime (a pipe has no extension to sniff)".to_owned(),
+            )
+        })?;
+        let mut data = Vec::new();
+        io::stdin()
+            .read_to_end(&mut data)
+            .map_err(|e| CliError::Message(format!("read stdin: {e}")))?;
+        if data.is_empty() {
+            return Err(CliError::Message("stdin was empty".to_owned()));
+        }
+        let filename = format!("stdin-media.{}", mime_extension(mime).unwrap_or("bin"));
+        return Ok((data, filename, mime.to_owned(), kind));
+    }
+
+    let path = args.file.as_ref().ok_or_else(|| {
+        CliError::Message("internal: media send without --file/--stdin".to_owned())
+    })?;
+    let data =
+        fs::read(path).map_err(|e| CliError::Message(format!("read {}: {e}", path.display())))?;
+    if data.is_empty() {
+        return Err(CliError::Message(format!(
+            "file is empty: {}",
+            path.display()
+        )));
+    }
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("media")
+        .to_owned();
+    let mime = args
+        .mime
+        .clone()
+        .or_else(|| sniff_mime(path).map(str::to_owned))
+        .unwrap_or_else(|| default_mime_for_kind(&kind).to_owned());
+    Ok((data, filename, mime, kind))
+}
+
+/// Default MIME for a media kind, used when neither `--mime` nor a known
+/// extension is supplied.
+fn default_mime_for_kind(kind: &MediaKind) -> &'static str {
+    match kind {
+        MediaKind::Voice => "audio/mp4",
+        MediaKind::Audio => "audio/mpeg",
+        MediaKind::Image => "image/png",
+        MediaKind::Video => "video/mp4",
+    }
+}
+
+/// Lowercased label for a kind, used in send JSON output.
+fn media_kind_label(kind: &MediaKind) -> &'static str {
+    match kind {
+        MediaKind::Voice => "voice",
+        MediaKind::Audio => "audio",
+        MediaKind::Image => "image",
+        MediaKind::Video => "video",
+    }
+}
+
+/// Best-effort kind for an inbound MIME type. Audio/ogg & Opus are treated as
+/// voice notes (the canonical agent voice format); other audio is "audio".
+fn media_kind_from_mime(mime: &str) -> &'static str {
+    let lower = mime.to_ascii_lowercase();
+    if lower.starts_with("image/") {
+        "image"
+    } else if lower.starts_with("video/") {
+        "video"
+    } else if lower == "audio/ogg" || lower == "audio/opus" || lower.contains("opus") {
+        "voice"
+    } else if lower.starts_with("audio/") {
+        "audio"
+    } else {
+        "file"
+    }
+}
+
+/// Sniff a MIME type from a path extension. Returns `None` for unknown/absent.
+fn sniff_mime(path: &Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "ogg" | "opus" => "audio/ogg",
+        "mp3" => "audio/mpeg",
+        "m4a" => "audio/mp4",
+        "aac" => "audio/aac",
+        "wav" => "audio/wav",
+        "flac" => "audio/flac",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "mp4" | "m4v" => "video/mp4",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        _ => return None,
+    })
+}
+
+/// Inverse of [`sniff_mime`] for a couple of common types, used to name the
+/// `--stdin` output filename.
+fn mime_extension(mime: &str) -> Option<&'static str> {
+    Some(match mime.to_ascii_lowercase().as_str() {
+        "audio/ogg" | "audio/opus" => "ogg",
+        "audio/mpeg" => "mp3",
+        "audio/aac" | "audio/mp4" => "m4a",
+        "audio/wav" => "wav",
+        "audio/flac" => "flac",
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        "video/mp4" => "mp4",
+        "video/webm" => "webm",
+        "video/quicktime" => "mov",
+        _ => return None,
+    })
+}
+
+/// Derive a default output filename from a blob URL's last path segment.
+fn default_media_filename(url: &str) -> String {
+    let last = url.rsplit('/').next().unwrap_or("media");
+    let name = last
+        .split('?')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("media");
+    name.to_owned()
 }
 
 struct LoadedConfig {
@@ -953,6 +1287,122 @@ mod tests {
         let start = Instant::now() - Duration::from_secs(8);
         assert_eq!(next_wait_secs(start, Some(10), 30), 1);
         assert_eq!(next_wait_secs(Instant::now(), None, 0), 1);
+    }
+
+    fn media_send_args(
+        file: Option<PathBuf>,
+        kind: Option<MediaKind>,
+        mime: Option<String>,
+    ) -> SendArgs {
+        SendArgs {
+            to: "npub".to_owned(),
+            text: None,
+            file,
+            stdin: false,
+            kind,
+            caption: String::new(),
+            mime,
+            blossom: DEFAULT_BLOSSOM_SERVER.to_owned(),
+            group_name: "g".to_owned(),
+        }
+    }
+
+    #[test]
+    fn media_kind_defaults_and_sniff() {
+        assert_eq!(default_mime_for_kind(&MediaKind::Voice), "audio/mp4");
+        assert_eq!(default_mime_for_kind(&MediaKind::Audio), "audio/mpeg");
+        assert_eq!(default_mime_for_kind(&MediaKind::Image), "image/png");
+        assert_eq!(default_mime_for_kind(&MediaKind::Video), "video/mp4");
+        assert_eq!(media_kind_label(&MediaKind::Voice), "voice");
+        assert_eq!(media_kind_label(&MediaKind::Video), "video");
+        assert_eq!(sniff_mime(Path::new("a.png")), Some("image/png"));
+        assert_eq!(sniff_mime(Path::new("a.JPEG")), Some("image/jpeg"));
+        assert_eq!(sniff_mime(Path::new("clip.MP4")), Some("video/mp4"));
+        assert_eq!(sniff_mime(Path::new("a.unknown")), None);
+        assert_eq!(sniff_mime(Path::new("noext")), None);
+        assert_eq!(mime_extension("audio/ogg"), Some("ogg"));
+        assert_eq!(mime_extension("image/jpeg"), Some("jpg"));
+        assert_eq!(mime_extension("application/pdf"), None);
+    }
+
+    #[test]
+    fn media_kind_from_mime_classifies() {
+        assert_eq!(media_kind_from_mime("audio/ogg"), "voice");
+        assert_eq!(media_kind_from_mime("AUDIO/OPUS"), "voice");
+        assert_eq!(media_kind_from_mime("audio/mpeg"), "audio");
+        assert_eq!(media_kind_from_mime("image/png"), "image");
+        assert_eq!(media_kind_from_mime("video/mp4"), "video");
+        assert_eq!(media_kind_from_mime("application/pdf"), "file");
+    }
+
+    #[test]
+    fn resolve_media_from_file_sniffs_mime() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let png = temp.path().join("pic.png");
+        fs::write(&png, b"not-a-real-png").expect("write");
+        let args = media_send_args(Some(png.clone()), Some(MediaKind::Image), None);
+        let (data, filename, mime, _kind) = resolve_media_payload(&args).expect("resolve");
+        assert_eq!(data, b"not-a-real-png");
+        assert_eq!(filename, "pic.png");
+        assert_eq!(mime, "image/png");
+    }
+
+    #[test]
+    fn resolve_media_explicit_mime_overrides_sniff() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let png = temp.path().join("pic.png");
+        fs::write(&png, b"x").expect("write");
+        let args = media_send_args(
+            Some(png),
+            Some(MediaKind::Image),
+            Some("image/webp".to_owned()),
+        );
+        let (_, _, mime, _) = resolve_media_payload(&args).expect("resolve");
+        assert_eq!(mime, "image/webp");
+    }
+
+    #[test]
+    fn resolve_media_kind_default_when_extension_unknown() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let clip = temp.path().join("voice");
+        fs::write(&clip, b"y").expect("write");
+        let args = media_send_args(Some(clip), Some(MediaKind::Voice), None);
+        let (_, _, mime, kind) = resolve_media_payload(&args).expect("resolve");
+        assert_eq!(mime, "audio/mp4");
+        assert!(matches!(kind, MediaKind::Voice));
+    }
+
+    #[test]
+    fn resolve_media_requires_kind() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let png = temp.path().join("pic.png");
+        fs::write(&png, b"x").expect("write");
+        let args = media_send_args(Some(png), None, None);
+        let err = resolve_media_payload(&args).unwrap_err();
+        assert!(err.to_string().contains("--kind"));
+    }
+
+    #[test]
+    fn resolve_media_rejects_empty_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let empty = temp.path().join("empty.png");
+        fs::write(&empty, b"").expect("write");
+        let args = media_send_args(Some(empty), Some(MediaKind::Image), None);
+        let err = resolve_media_payload(&args).unwrap_err();
+        assert!(err.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn default_media_filename_from_url() {
+        assert_eq!(
+            default_media_filename("https://blossom.x/blobs/abc123.ogg"),
+            "abc123.ogg"
+        );
+        assert_eq!(
+            default_media_filename("https://blossom.x/blobs/abc?x=1"),
+            "abc"
+        );
+        assert_eq!(default_media_filename("https://blossom.x/"), "media");
     }
 
     #[test]
