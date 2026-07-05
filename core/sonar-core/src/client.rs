@@ -2422,9 +2422,10 @@ impl SonarClient {
             handle_state_path: None,
             group_catchup_gate: Arc::new(Mutex::new(GroupCatchupGate::default())),
         };
-        // Seed the typing manager's group-id mapping so incoming indicators
-        // resolve even before the first live (re)subscription.
-        client.refresh_typing_groups();
+        // No typing-mapping seed here: the connect path must not grow a DB
+        // scan (Performance Analysis Rule). Live sessions populate it in
+        // subscribe_group_messages below; send-side misses self-heal lazily
+        // in notify_typing.
         // Open the live Marmot subscriptions for real sessions. In-memory test
         // sessions (allow_geo_relays=false) stay on the explicit `sync()` path so
         // the e2e tests remain deterministic and network-shaped.
@@ -6812,24 +6813,32 @@ impl SonarClient {
 
     /// Local composer produced input for this group. Cheap and non-blocking
     /// (a channel send); the publish/refresh cadence runs on the typing
-    /// manager's own task, so callers can invoke this per keystroke.
+    /// manager's own task, so callers can invoke this per keystroke. On a
+    /// mapping miss this re-derives from the engine once — acceptable on the
+    /// composer path (hosts call it off-main), never done on the send path.
     pub fn notify_typing(&self, group_id: &GroupId) {
         if let Some((mls_hex, nostr_hex)) = self.typing_ids(group_id) {
             self.typing.local_typing(mls_hex, nostr_hex);
         }
     }
 
-    /// Local composer went idle/cleared or the chat closed. Publishes a
-    /// STOPPED only if a STARTED is outstanding.
+    /// Local composer went idle/cleared, the chat closed, or a message was
+    /// sent. Publishes a STOPPED only if a STARTED is outstanding. Cache-only
+    /// lookup: this sits on the send critical path (send_text/sticker/media)
+    /// and must never run a DB scan; a STOPPED for an unmapped group is
+    /// meaningless anyway — typing there would have mapped it first.
     pub fn notify_typing_stopped(&self, group_id: &GroupId) {
-        if let Some((mls_hex, nostr_hex)) = self.typing_ids(group_id) {
+        let mls_hex = hex::encode(group_id.as_slice());
+        if let Some(nostr_hex) = self.typing.nostr_hex_for_mls(&mls_hex) {
             self.typing.local_stopped(mls_hex, nostr_hex);
         }
     }
 
     /// Re-derive the mls↔nostr group-id mapping the typing manager uses to
-    /// route indicators. Cheap (one engine group enumeration); called on
-    /// connect and whenever the live group subscription set changes.
+    /// route indicators. Authoritative: replaces the mapping with the current
+    /// engine group set, pruning deleted/left groups. Cheap (one engine group
+    /// enumeration); called whenever the live group subscription set changes
+    /// and after delete/leave.
     pub fn refresh_typing_groups(&self) {
         if let Ok(groups) = self.engine.groups() {
             self.typing.update_groups(groups.into_iter().map(|g| {

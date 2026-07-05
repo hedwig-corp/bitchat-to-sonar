@@ -80,6 +80,13 @@ pub struct TypingConfig {
     pub pause: Duration,
     /// Receiver forgets a typist after this long without a refresh.
     pub expiry: Duration,
+    /// Once an indicator turns on it stays visible at least this long: a
+    /// remote STOPPED inside the window is deferred to the window end (and
+    /// cancelled by a new STARTED). This caps host-visible transitions at
+    /// ~1/min_display no matter how fast forged events arrive — typing events
+    /// carry fresh random ids by design, so the live-loop id dedup can never
+    /// suppress a flood.
+    pub min_display: Duration,
 }
 
 impl Default for TypingConfig {
@@ -88,6 +95,7 @@ impl Default for TypingConfig {
             refresh: Duration::from_secs(10),
             pause: Duration::from_secs(3),
             expiry: Duration::from_secs(15),
+            min_display: Duration::from_secs(1),
         }
     }
 }
@@ -169,15 +177,20 @@ impl TypingManager {
         *self.listener.lock().unwrap() = listener;
     }
 
-    /// Refresh the group id mapping. Called by the client whenever it
-    /// enumerates groups (connect, group subscription updates).
+    /// Replace the group id mapping with the CURRENT engine group set.
+    /// Authoritative (replace, not merge) so deleted/left groups are pruned
+    /// instead of accumulating stale pairs for the lifetime of the session.
+    /// Called by the client whenever it enumerates groups (subscription
+    /// updates, delete/leave, lazy send-side misses).
     pub fn update_groups(&self, pairs: impl IntoIterator<Item = (String, String)>) {
-        let mut mls_to_nostr = self.mls_to_nostr.lock().unwrap();
-        let mut nostr_to_mls = self.nostr_to_mls.lock().unwrap();
+        let mut new_mls_to_nostr = HashMap::new();
+        let mut new_nostr_to_mls = HashMap::new();
         for (mls_hex, nostr_hex) in pairs {
-            nostr_to_mls.insert(nostr_hex.clone(), mls_hex.clone());
-            mls_to_nostr.insert(mls_hex, nostr_hex);
+            new_nostr_to_mls.insert(nostr_hex.clone(), mls_hex.clone());
+            new_mls_to_nostr.insert(mls_hex, nostr_hex);
         }
+        *self.mls_to_nostr.lock().unwrap() = new_mls_to_nostr;
+        *self.nostr_to_mls.lock().unwrap() = new_nostr_to_mls;
     }
 
     pub fn nostr_hex_for_mls(&self, mls_hex: &str) -> Option<String> {
@@ -207,7 +220,11 @@ impl TypingManager {
         }
         let now = Timestamp::now().as_secs();
         let created = event.created_at.as_secs();
-        if created + STALE_SKEW_SECS < now || created > now + STALE_SKEW_SECS {
+        // saturating: created_at is attacker-controlled; a value near u64::MAX
+        // must not overflow (debug-build panic) before the bound check drops it.
+        if created.saturating_add(STALE_SKEW_SECS) < now
+            || created > now.saturating_add(STALE_SKEW_SECS)
+        {
             return;
         }
         let Some(nostr_hex) = typing_group_tag(event) else {
@@ -260,6 +277,17 @@ struct SendState {
     refresh_deadline: Instant,
 }
 
+struct RecvState {
+    /// The indicator auto-clears when this passes without a refresh.
+    expiry: Instant,
+    /// When the indicator turned on: the anchor for the min-display window.
+    shown_at: Instant,
+    /// A STOPPED arrived inside the min-display window; clear at window end
+    /// unless a STARTED lands first. This coalescing bounds host-visible
+    /// flips at ~1 per min_display even under a forged-event flood.
+    pending_stop: bool,
+}
+
 struct TypingTask {
     rx: mpsc::UnboundedReceiver<Command>,
     publisher: Arc<dyn TypingPublisher>,
@@ -268,8 +296,8 @@ struct TypingTask {
     listener: Arc<Mutex<Option<Arc<dyn TypingListener>>>>,
     /// mls_hex -> local outgoing typing state.
     sending: HashMap<String, SendState>,
-    /// mls_hex -> when the remote indicator expires.
-    receiving: HashMap<String, Instant>,
+    /// mls_hex -> remote indicator state.
+    receiving: HashMap<String, RecvState>,
 }
 
 impl TypingTask {
@@ -287,11 +315,15 @@ impl TypingTask {
     }
 
     fn next_deadline(&self) -> Option<Instant> {
+        let min_display = self.config.min_display;
         let send = self
             .sending
             .values()
             .flat_map(|s| [s.pause_deadline, s.refresh_deadline]);
-        let recv = self.receiving.values().copied();
+        let recv = self.receiving.values().flat_map(move |r| {
+            let stop = r.pending_stop.then(|| r.shown_at + min_display);
+            [Some(r.expiry), stop].into_iter().flatten()
+        });
         send.chain(recv).min()
     }
 
@@ -322,18 +354,35 @@ impl TypingTask {
                     self.publish(&nostr_hex, false);
                 }
             }
-            Command::RemoteStarted { mls_hex } => {
-                let fresh = self
-                    .receiving
-                    .insert(mls_hex.clone(), now + self.config.expiry)
-                    .is_none();
-                if fresh {
+            Command::RemoteStarted { mls_hex } => match self.receiving.get_mut(&mls_hex) {
+                Some(state) => {
+                    // Refresh: extend expiry and cancel any deferred STOPPED.
+                    // No re-notify — the indicator is already visible.
+                    state.expiry = now + self.config.expiry;
+                    state.pending_stop = false;
+                }
+                None => {
+                    self.receiving.insert(
+                        mls_hex.clone(),
+                        RecvState {
+                            expiry: now + self.config.expiry,
+                            shown_at: now,
+                            pending_stop: false,
+                        },
+                    );
                     self.notify(mls_hex, true);
                 }
-            }
+            },
             Command::RemoteStopped { mls_hex } => {
-                if self.receiving.remove(&mls_hex).is_some() {
-                    self.notify(mls_hex, false);
+                if let Some(state) = self.receiving.get_mut(&mls_hex) {
+                    if now >= state.shown_at + self.config.min_display {
+                        self.receiving.remove(&mls_hex);
+                        self.notify(mls_hex, false);
+                    } else {
+                        // Inside the min-display window: defer the clear so a
+                        // forged 1/0 flood can't flicker the host UI.
+                        state.pending_stop = true;
+                    }
                 }
             }
         }
@@ -368,11 +417,13 @@ impl TypingTask {
             }
         }
 
-        // Incoming: expire silent typists.
+        // Incoming: expire silent typists and flush deferred STOPPEDs whose
+        // min-display window has passed.
+        let min_display = self.config.min_display;
         let expired: Vec<String> = self
             .receiving
             .iter()
-            .filter(|(_, expiry)| **expiry <= now)
+            .filter(|(_, r)| r.expiry <= now || (r.pending_stop && r.shown_at + min_display <= now))
             .map(|(k, _)| k.clone())
             .collect();
         for mls_hex in expired {
@@ -567,7 +618,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn remote_stopped_clears_immediately() {
+    async fn remote_stopped_clears_after_min_display() {
         let publisher = RecordingPublisher::new();
         let listener = RecordingListener::new();
         let manager = TypingManager::spawn(publisher, test_config());
@@ -576,12 +627,72 @@ mod tests {
 
         manager.handle_remote_event(&remote_event("nostr1", "1"));
         settle().await;
+        assert_eq!(listener.drain(), vec![("mls1".to_string(), true)]);
+
+        // A STOPPED inside the 1s min-display window is deferred, not
+        // immediate (anti-flicker coalescing)...
+        manager.handle_remote_event(&remote_event("nostr1", "0"));
+        settle().await;
+        assert!(listener.drain().is_empty(), "stop deferred inside window");
+
+        // ...and fires at the window end.
+        advance(Duration::from_secs(1)).await;
+        assert_eq!(listener.drain(), vec![("mls1".to_string(), false)]);
+
+        // Past the window, a STOPPED clears immediately.
+        manager.handle_remote_event(&remote_event("nostr1", "1"));
+        settle().await;
+        advance(Duration::from_secs(2)).await;
         manager.handle_remote_event(&remote_event("nostr1", "0"));
         settle().await;
         assert_eq!(
             listener.drain(),
             vec![("mls1".to_string(), true), ("mls1".to_string(), false)]
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forged_flood_cannot_flicker_faster_than_min_display() {
+        let publisher = RecordingPublisher::new();
+        let listener = RecordingListener::new();
+        let manager = TypingManager::spawn(publisher, test_config());
+        manager.set_listener(Some(listener.clone()));
+        manager.update_groups([("mls1".to_string(), "nostr1".to_string())]);
+
+        // Attacker alternates 1/0 with fresh keys (unique event ids) far
+        // faster than the legitimate cadence.
+        for _ in 0..50 {
+            manager.handle_remote_event(&remote_event("nostr1", "1"));
+            manager.handle_remote_event(&remote_event("nostr1", "0"));
+        }
+        settle().await;
+        // Exactly one visible transition so far: ON. The stop is deferred.
+        assert_eq!(listener.drain(), vec![("mls1".to_string(), true)]);
+
+        // The trailing STARTEDs cancelled... last command was "0", so the
+        // deferred stop is armed; it fires once at the window end.
+        advance(Duration::from_secs(1)).await;
+        assert_eq!(listener.drain(), vec![("mls1".to_string(), false)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn update_groups_replaces_and_prunes_stale_mappings() {
+        let publisher = RecordingPublisher::new();
+        let listener = RecordingListener::new();
+        let manager = TypingManager::spawn(publisher, test_config());
+        manager.set_listener(Some(listener.clone()));
+        manager.update_groups([("mls1".to_string(), "nostr1".to_string())]);
+        assert_eq!(manager.nostr_hex_for_mls("mls1").as_deref(), Some("nostr1"));
+
+        // Authoritative replace: the deleted group's mapping is pruned...
+        manager.update_groups([("mls2".to_string(), "nostr2".to_string())]);
+        assert_eq!(manager.nostr_hex_for_mls("mls1"), None);
+        assert_eq!(manager.nostr_hex_for_mls("mls2").as_deref(), Some("nostr2"));
+
+        // ...and events for the pruned group are dropped.
+        manager.handle_remote_event(&remote_event("nostr1", "1"));
+        settle().await;
+        assert!(listener.drain().is_empty());
     }
 
     #[tokio::test(start_paused = true)]

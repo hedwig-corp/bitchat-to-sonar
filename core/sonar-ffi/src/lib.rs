@@ -1301,6 +1301,12 @@ impl SonarNode {
 
     // ── Conversation index (Signal-style summary table) ──────────────────
 
+    /// Lifecycle invariant (repeat installs are leak-free): each call spawns a
+    /// fresh forwarder thread parked on `rx.recv()`. Installing a new listener
+    /// replaces the core listener Arc, which drops the previous `tx`; that
+    /// closes the old channel and the old thread exits its recv loop. Do NOT
+    /// cache the core listener Arc anywhere else — a retained `tx` would keep
+    /// the orphaned thread alive forever.
     pub fn set_conversation_change_listener(&self, listener: Box<dyn ConversationChangeListener>) {
         let (tx, rx) = std::sync::mpsc::channel::<String>();
         std::thread::Builder::new()
@@ -1325,6 +1331,10 @@ impl SonarNode {
 
     // ── Typing indicators (ephemeral; never persisted) ────────────────────
 
+    /// Same forwarder-thread lifecycle invariant as
+    /// [`Self::set_conversation_change_listener`]: the old thread exits when
+    /// its `tx` drops on listener replacement — never retain the core
+    /// listener Arc outside the client.
     pub fn set_typing_change_listener(&self, listener: Box<dyn TypingChangeListener>) {
         let (tx, rx) = std::sync::mpsc::channel::<(String, bool)>();
         std::thread::Builder::new()

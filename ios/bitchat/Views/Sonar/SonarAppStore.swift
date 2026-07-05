@@ -2088,9 +2088,25 @@ final class SonarAppStore: ObservableObject {
     /// Is a remote member composing in this conversation? Named display is
     /// the DM peer (typing events carry no sender identity); groups render an
     /// anonymous indicator.
+    ///
+    /// PURE lookups only — this runs during SwiftUI `body` evaluation, so no
+    /// `marmotGroupId()` here (its fallback path mutates the conversation-id
+    /// cache via `rememberMarmotGroup`). Folds duplicate direct-Marmot legs so
+    /// one person reads as one conversation whichever leg they typed on
+    /// (Fix What We Break rule; parity with Compose's `isPeerTyping`).
     func isPeerTyping(_ chatId: String) -> Bool {
-        guard !typingGroups.isEmpty, let groupId = marmotGroupId(chatId) else { return false }
-        return typingGroups.contains(groupId)
+        guard !typingGroups.isEmpty else { return false }
+        let groupId: String
+        if chatId.hasPrefix(Self.marmotIDPrefix) {
+            groupId = String(chatId.dropFirst(Self.marmotIDPrefix.count))
+        } else if let mapped = marmotGroupIdsByConversationId[chatId] {
+            groupId = mapped
+        } else {
+            return false
+        }
+        if typingGroups.contains(groupId) { return true }
+        return directMarmotGroups(matchingGroupId: groupId)
+            .contains { typingGroups.contains($0.id) }
     }
 
     /// Composer text changed (send side of the reciprocal opt-in). Throttled

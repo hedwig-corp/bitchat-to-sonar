@@ -59,6 +59,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -2030,7 +2031,12 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             ChatFeedList(Modifier.weight(1f).fillMaxWidth(), 10.dp)
             // Ephemeral "is typing…" hint: named for DMs (the peer is the only
             // other member), anonymous for groups (typing events carry no sender).
-            if (state.isPeerTyping(screen.id)) {
+            // derivedStateOf: draft keystrokes recompose this screen; the fold
+            // over typingChats/chats must only re-run when those actually change.
+            val peerTyping by remember(screen.id) {
+                derivedStateOf { state.isPeerTyping(screen.id) }
+            }
+            if (peerTyping) {
                 Text(
                     if (isGroup) "Someone is typing…" else "$peerName is typing…",
                     color = s.text3,

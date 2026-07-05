@@ -9772,7 +9772,8 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /** Typing rides the Marmot relay path only: mesh-routed and pending
      *  (not-yet-created) chats have no group to publish into. BLE-mesh typing
-     *  is a tracked follow-up (see docs/plans/2026-07-05-typing-indicators.md). */
+     *  (NoisePayloadType 0x04, read-receipt path as template) is a tracked
+     *  follow-up — see PR #167's deferred list. */
     private fun isEligibleTypingChat(chatId: String): Boolean =
         !isMeshChat(chatId) && !isPendingMarmotChat(chatId) && !isPendingMarmotGroup(chatId) &&
             chats.any { it.id == chatId }
