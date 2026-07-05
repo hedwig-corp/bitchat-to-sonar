@@ -91,6 +91,25 @@ class MessageCodecTest {
         assertEquals(msg, decoded)
     }
 
+    @Test fun meshEnvelopeRoundTripPreservesInternetTransportFlag() {
+        // Slice 4: a merged mesh thread can hold both BLE legs and direct
+        // NIP-17 internet legs (viaInternet drives the bubble colour). The
+        // flag must survive the exact on-disk format saveMeshDm writes and
+        // loadAllMeshDms reads back after an app restart.
+        val peerKey = "7a60f087831cb56d0011223344556677"
+        val msgs = listOf(
+            SonarMsg("m1", "npub1peer", "over BLE", mine = false, tsSecs = 10),
+            SonarMsg("m2", "npub1peer", "over NIP-17", mine = false, tsSecs = 20, viaInternet = true),
+            SonarMsg("m3", "", "my reply via internet", mine = true, tsSecs = 30, viaInternet = true),
+        )
+        val (key, decoded) = MessageCodec.decodeMeshEnvelope(
+            MessageCodec.encodeMeshEnvelope(peerKey, msgs)
+        )!!
+        assertEquals(peerKey, key)
+        assertEquals(msgs, decoded)
+        assertEquals(listOf(false, true, true), decoded.map { it.viaInternet })
+    }
+
     @Test fun dmRoundTripWithStickerAndMedia() {
         val ref = SonarStickerRef("30030:abc123:pack", "wave", "deadbeef")
         val media = SonarMedia("mesh-media:peer:message:voice.m4a", "audio/mp4", "voice.m4a", null, null, 1200)

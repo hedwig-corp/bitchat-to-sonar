@@ -1,5 +1,7 @@
 package chat.bitchat.sonar.wallet
 
+import kotlinx.coroutines.flow.StateFlow
+
 /** Lightning wallet lifecycle state, mirrored from the iOS WalletBridgeService. */
 sealed interface WalletState {
     /** No API key, or not yet asked to set up. */
@@ -35,6 +37,15 @@ expect object WalletBridge {
     /** Refresh + return the spendable balance in sats (0 if not ready). */
     suspend fun refreshBalance(): Long
 
+    /**
+     * Live spendable balance in sats — the Compose twin of iOS
+     * `WalletBridgeService.startObservingBalance()` (`balanceTask` stream).
+     * Produced entirely from a background listener/refresh path in the actuals
+     * (never on the Compose render path); the UI only collects. Emits 0 until
+     * the wallet is Ready and again after [shutdown].
+     */
+    val balanceFlow: StateFlow<Long>
+
     /** A reusable BOLT12 offer string to receive payments. */
     suspend fun createOffer(): String
 
@@ -47,6 +58,13 @@ expect object WalletBridge {
 
     /** Cached rate for a currency (null until [fetchRates] succeeds). */
     fun cachedRate(currency: FiatCurrency): ExchangeRate?
+
+    /**
+     * True only when a usable live rate is cached for the selected [currency]
+     * (iOS `hasLiveRate`). The UI shows fiat ONLY when this is true; otherwise
+     * it must fall back to sats — never a bundled/stale rate.
+     */
+    fun hasLiveRate(): Boolean
 
     // ── Display preferences (persisted) ──
     fun showFiat(): Boolean

@@ -1,8 +1,10 @@
 package chat.bitchat.sonar.push
 
+import android.content.Context
 import android.net.Uri
 import android.os.SystemClock
 import android.util.Log
+import chat.bitchat.sonar.AppContextHolder
 import chat.bitchat.sonar.BuildConfig
 import chat.bitchat.sonar.SonarCore
 import chat.bitchat.sonar.wallet.WalletBridge
@@ -27,10 +29,21 @@ object SonarPushRegistration {
     private const val MAX_RETRIES = 3
     private const val DEFAULT_NDS_HOST = "nds.sonar.hedwig.sh"
     private const val WEBHOOK_MARKER_VERSION = "android-fcm-explicit-token-v2"
+    /**
+     * Persisted only for diagnostics (iOS `breez_webhook_marker` parity in
+     * `SonarPushRegistration.swift`); NEVER used as a cross-launch skip — Boltz
+     * owns the authoritative offer webhook state, and trusting a stale local
+     * marker would suppress the unregister -> register self-heal. Updated in
+     * place on success, removed on [unregister].
+     */
+    private const val WEBHOOK_MARKER_PREF_KEY = "breez_webhook_marker"
     private const val WEBHOOK_IN_FLIGHT_TIMEOUT_MS = 30_000L
     private const val WEBHOOK_REGISTRATION_TIMEOUT_MS = 20_000L
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val webhookLock = Any()
+
+    // Same app-private "sonar" prefs used by WalletBridge.android.kt.
+    private fun prefs() = AppContextHolder.ctx.getSharedPreferences("sonar", Context.MODE_PRIVATE)
 
     private val transponderNpub: String get() = BuildConfig.TRANSPONDER_NPUB
 
@@ -181,6 +194,9 @@ object SonarPushRegistration {
             inFlightWebhookStartedAtMs = 0L
             if (completed) {
                 completedSessionWebhookMarker = marker
+                // Diagnostics-only persistence (update-in-place), mirroring iOS.
+                // The in-memory session marker above stays the fast path.
+                runCatching { prefs().edit().putString(WEBHOOK_MARKER_PREF_KEY, marker).apply() }
             }
             true
         }
@@ -198,6 +214,9 @@ object SonarPushRegistration {
             inFlightWebhookStartedAtMs = 0L
             inFlightWebhookGeneration += 1
         }
+        // Force a fresh subscribe next time (e.g. after a wallet/seed change),
+        // matching iOS `UserDefaults.removeObject(forKey: webhookMarkerKey)`.
+        runCatching { prefs().edit().remove(WEBHOOK_MARKER_PREF_KEY).apply() }
         Log.d(TAG, "Unregistered from push servers")
     }
 

@@ -25,6 +25,13 @@ enum class FiatCurrency(val code: String, val symbol: String) {
 object Money {
     private const val SATS_PER_BTC = 100_000_000.0
 
+    /**
+     * iOS `hasLiveRate` predicate: a usable live rate exists for the selected
+     * currency. Backs `WalletBridge.hasLiveRate()` in both actuals so the rule
+     * stays testable without the Breez SDK.
+     */
+    fun isLiveRate(rate: ExchangeRate?): Boolean = rate != null && rate.perBtc > 0.0
+
     fun formatSats(sats: Long): String {
         val grouped = sats.toString().reversed().chunked(3).joinToString(",").reversed()
         return "$grouped sats"

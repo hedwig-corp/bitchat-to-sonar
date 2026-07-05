@@ -626,6 +626,11 @@ class SonarAppState(private val scope: CoroutineScope) {
             return
         }
         if (ctrl is SonarCallControl.Offer && !canCall(callChatId)) {
+            if (shouldDeferOfferForSonarDescriptor(callChatId)) {
+                sonarLog("SonarCall", "deferring offer until Sonar descriptor lookup completes chatId=$chatId folded=$callChatId")
+                scannedCall.remove(m.id) // retry on the next scan pass once the fetch lands
+                return
+            }
             sonarLog("SonarCall", "ignoring offer without Sonar call route chatId=$chatId folded=$callChatId")
             runCatching { sendCallControl(chatId, SonarCore.callEncodeAnswer(ctrl.callId, SonarAnswer.Decline, "")) }
             return
@@ -1338,10 +1343,25 @@ class SonarAppState(private val scope: CoroutineScope) {
         rate = WalletBridge.cachedRate(c)
     }
 
+    private var balanceFlowCollecting = false
+
     private fun setupWallet() {
         if (!walletAvailable) {
             scope.launch { publishSonarDescriptorIfNeeded(force = true) }
             return
+        }
+        if (!balanceFlowCollecting) {
+            balanceFlowCollecting = true
+            // Collect the background-produced balance stream (iOS balanceTask
+            // parity). WalletBridge.balanceFlow is fed from Breez SDK events on
+            // an IO scope — never the render path; we only collect state here.
+            scope.launch {
+                WalletBridge.balanceFlow.collect { sats ->
+                    if (WalletBridge.state() is WalletState.Ready) {
+                        walletState = WalletState.Ready(sats)
+                    }
+                }
+            }
         }
         scope.launch {
             WalletBridge.setupIfNeeded(SonarCore.identityNsec())
@@ -2061,37 +2081,72 @@ class SonarAppState(private val scope: CoroutineScope) {
         val snapshot = visibleChats.filter { it.id in knownChatIds }
         for (c in snapshot) {
             val chatIds = if (isDirectMarmotChat(c)) directMarmotChatIds(c.id) else listOf(c.id)
-            val prev = chatIds.mapNotNull { lastSeenTs[it] }.maxOrNull()
-            val alreadyNotified = chatIds.map { lastNotifiedTs[it] ?: 0L }.maxOrNull() ?: 0L
-            var newestIncoming: SonarMsg? = null
-            for (chatId in chatIds) {
-                val msgs = SonarCore.messagesPage(chatId, 1)
-                val visibleMsgs = visibleMessagesForChat(chatId, msgs)
-                val incoming = visibleMsgs.lastOrNull { !it.mine }
-                if (incoming != null && (newestIncoming == null || incoming.tsSecs > newestIncoming!!.tsSecs)) {
-                    newestIncoming = incoming
-                }
-                lastSeenTs[chatId] = msgs.lastOrNull()?.tsSecs ?: (lastSeenTs[chatId] ?: 0L)
-            }
-            if (seededSeen && prev != null && newestIncoming != null &&
-                newestIncoming.tsSecs > prev && newestIncoming.tsSecs > alreadyNotified &&
-                (openChatId == null || openChatId !in chatIds)
-            ) {
-                val groupName = c.name.takeIf { c.members.size > 2 && it.isNotBlank() }
-                notifyIncoming(
-                    idKey = c.id,
-                    conversationTitle = chatTitle(c),
-                    content = newestIncoming.content,
-                    senderName = notificationSenderName(c, newestIncoming),
-                    groupName = groupName,
-                    unreadCount = unreadForChat(c.id).coerceAtLeast(1L),
-                )
-                for (chatId in chatIds) {
-                    lastNotifiedTs[chatId] = newestIncoming.tsSecs
-                }
-            }
+            notifyChatIfNew(
+                c,
+                scanIds = chatIds,
+                suppressIds = chatIds,
+                openChatId = openChatId,
+                idKey = c.id,
+                title = chatTitle(c),
+            )
+        }
+        // A White Noise group folded into a mesh row is hidden from
+        // [visibleChats], so scan it here and notify under the mesh
+        // conversation identity (iOS folds the notification the same way).
+        // Open-chat suppression must match BOTH the mesh row and the folded
+        // group id so an open merged transcript never rings for itself.
+        for ((groupId, peerId) in foldedGroupPeerIds) {
+            val c = chats.firstOrNull { it.id == groupId } ?: continue
+            val meshId = meshChatId(peerId)
+            notifyChatIfNew(
+                c,
+                scanIds = listOf(groupId),
+                suppressIds = listOf(groupId, meshId),
+                openChatId = openChatId,
+                idKey = meshId,
+                title = meshPeerName(peerId),
+            )
         }
         seededSeen = true
+    }
+
+    private suspend fun notifyChatIfNew(
+        c: SonarChat,
+        scanIds: List<String>,
+        suppressIds: List<String>,
+        openChatId: String?,
+        idKey: String,
+        title: String?,
+    ) {
+        val prev = scanIds.mapNotNull { lastSeenTs[it] }.maxOrNull()
+        val alreadyNotified = scanIds.map { lastNotifiedTs[it] ?: 0L }.maxOrNull() ?: 0L
+        var newestIncoming: SonarMsg? = null
+        for (chatId in scanIds) {
+            val msgs = SonarCore.messagesPage(chatId, 1)
+            val visibleMsgs = visibleMessagesForChat(chatId, msgs)
+            val incoming = visibleMsgs.lastOrNull { !it.mine }
+            if (incoming != null && (newestIncoming == null || incoming.tsSecs > newestIncoming!!.tsSecs)) {
+                newestIncoming = incoming
+            }
+            lastSeenTs[chatId] = msgs.lastOrNull()?.tsSecs ?: (lastSeenTs[chatId] ?: 0L)
+        }
+        if (seededSeen && prev != null && newestIncoming != null &&
+            newestIncoming.tsSecs > prev && newestIncoming.tsSecs > alreadyNotified &&
+            (openChatId == null || openChatId !in suppressIds)
+        ) {
+            val groupName = c.name.takeIf { c.members.size > 2 && it.isNotBlank() }
+            notifyIncoming(
+                idKey = idKey,
+                conversationTitle = title,
+                content = newestIncoming.content,
+                senderName = notificationSenderName(c, newestIncoming),
+                groupName = groupName,
+                unreadCount = unreadForChat(idKey).coerceAtLeast(1L),
+            )
+            for (chatId in scanIds) {
+                lastNotifiedTs[chatId] = newestIncoming.tsSecs
+            }
+        }
     }
 
     private fun notificationSenderName(chat: SonarChat, message: SonarMsg): String? {
@@ -2287,6 +2342,13 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         val readChatIds = directMarmotChatIds(chat.id)
         unreadByChat = unreadByChat - readChatIds.toSet()
+        // Local-first paint (Signal-Comparable Performance Rule): show the
+        // cached snapshot synchronously so the transcript never opens empty;
+        // the bounded DB page + media/echo merge below replaces it async.
+        messages = visibleMessagesForChat(
+            chat.id,
+            withSendEchoes(chat.id, chatSnapshotMessagesByChat[chat.id].orEmpty()),
+        )
         scope.launch {
             for (readId in readChatIds) {
                 runCatching { SonarCore.markConversationRead(readId) }
@@ -2674,7 +2736,18 @@ class SonarAppState(private val scope: CoroutineScope) {
      * `target` is the current channel/peer label used when an emote omits args.
      */
     fun handleCommand(text: String, target: String, channelGeohash: String?, chatId: String?): Boolean {
-        val parsed = SonarSlashCommands.parse(text) ?: return false
+        val parsed = SonarSlashCommands.parse(text)
+        if (parsed == null) {
+            // iOS parity (CommandProcessor default case): any slash-prefixed
+            // draft is a command attempt — surface "unknown command" instead
+            // of leaking it to the timeline as plaintext.
+            val trimmed = text.trim()
+            if (trimmed.startsWith("/")) {
+                toast = "unknown command: /" + trimmed.drop(1).trimStart().substringBefore(' ')
+                return true
+            }
+            return false
+        }
         return when (parsed.command) {
             SonarSlashCommand.Who -> {
                 push(Screen.Nearby)
@@ -4466,6 +4539,21 @@ class SonarAppState(private val scope: CoroutineScope) {
         val npubHex = npubRawFor(peerId)?.toHexLower() ?: return false
         sonarDescriptorsByNpubHex[npubHex]?.let { if (it.supportsCurrentCalls) return true }
         return false
+    }
+
+    /** Mirrors iOS `shouldDeferOfferForSonarDescriptor`: BLE discovery is
+     *  authoritative when present; only defer for npub-only Marmot contacts
+     *  whose public Sonar descriptor is still unknown (and not recently
+     *  missed). Kicks the background fetch so a later scan pass can ring. */
+    private fun shouldDeferOfferForSonarDescriptor(chatId: String): Boolean {
+        val peerId = if (isMeshChat(chatId)) meshPeerId(chatId) else peerIdForMarmotGroup(chatId)
+        if (peerId != null && sonarProfile(peerId) != null) return false
+        val key = callDescriptorNpubHex(chatId)?.lowercase() ?: return false
+        if (sonarDescriptorsByNpubHex[key] != null) return false
+        val missedAt = sonarDescriptorMissedAt[key]
+        if (missedAt != null && SonarClock.nowSecs() - missedAt < SONAR_DESCRIPTOR_MISS_TTL_SECS) return false
+        ensureSonarDescriptorHex(key)
+        return true
     }
 
     private fun callDescriptorNpubHex(chatId: String): String? {
