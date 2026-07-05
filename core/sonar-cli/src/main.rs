@@ -3,6 +3,7 @@ use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -382,6 +383,10 @@ async fn run(cli: Cli) -> Result<()> {
             } else {
                 let (data, filename, mime, kind) = resolve_media_payload(&args)?;
                 let size = data.len();
+                let duration_ms = args
+                    .file
+                    .as_ref()
+                    .and_then(|p| probe_duration_ms(p));
                 client
                     .send_media(
                         &group_id,
@@ -390,6 +395,7 @@ async fn run(cli: Cli) -> Result<()> {
                         &mime,
                         &args.caption,
                         &args.blossom,
+                        duration_ms,
                     )
                     .await?;
                 print_json(&Output::SentMedia {
@@ -888,6 +894,59 @@ fn media_kind_label(kind: &MediaKind) -> &'static str {
         MediaKind::Image => "image",
         MediaKind::Video => "video",
     }
+}
+
+/// Best-effort audio/video duration for outbound imeta (Sonar app needs this for voice UI).
+fn probe_duration_ms(path: &Path) -> Option<u64> {
+    for probe in ["ffprobe"] {
+        let output = match ProcessCommand::new(probe)
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+            ])
+            .arg(path)
+            .output()
+        {
+            Ok(o) if o.status.success() => o,
+            _ => continue,
+        };
+        let text = String::from_utf8_lossy(&output.stdout);
+        if let Ok(secs) = text.trim().parse::<f64>() {
+            if secs > 0.0 {
+                return Some((secs * 1000.0).round() as u64);
+            }
+        }
+    }
+    for ffmpeg in ["ffmpeg"] {
+        let output = match ProcessCommand::new(ffmpeg)
+            .args(["-hide_banner", "-i"])
+            .arg(path)
+            .output()
+        {
+            Ok(o) => o,
+            Err(_) => continue,
+        };
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for line in stderr.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("Duration:") {
+                let part = rest.trim().split(',').next()?.trim();
+                let mut it = part.split(':');
+                let h: f64 = it.next()?.parse().ok()?;
+                let m: f64 = it.next()?.parse().ok()?;
+                let s: f64 = it.next()?.parse().ok()?;
+                let secs = h * 3600.0 + m * 60.0 + s;
+                if secs > 0.0 {
+                    return Some((secs * 1000.0).round() as u64);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Best-effort kind for an inbound MIME type. Audio/ogg & Opus are treated as
