@@ -33,7 +33,7 @@ same E2E Marmot 1:1 group path used for text. Media is encrypted in-process
 apps use, so a CLI-sent image renders in the app without any extra plumbing.
 
 ```bash
-# voice note (defaults to audio/ogg)
+# voice note (defaults to audio/mp4 / AAC)
 sonar-cli send --to npub1... --file ./voice.ogg --kind voice --caption "transcript below"
 
 # image
@@ -43,8 +43,8 @@ sonar-cli send --to npub1... --file ./diagram.png --kind image
 sonar-cli send --to npub1... --file ./clip.mp4 --kind video --caption "demo"
 
 # pipe bytes from another tool (mime required for a pipe)
-ffmpeg -f lavfi -i sine=frequency=440:duration=2 -f ogg - 2>/dev/null \
-  | sonar-cli send --to npub1... --stdin --mime audio/ogg --kind voice
+ffmpeg -f lavfi -i sine=frequency=440:duration=2 -f mp3 - 2>/dev/null \
+  | sonar-cli send --to npub1... --stdin --mime audio/mpeg --kind voice
 ```
 
 `--text` and `--file`/`--stdin` are mutually exclusive: pass exactly one. MIME is
@@ -52,7 +52,7 @@ resolved as explicit `--mime` > file extension > the `--kind` default.
 
 | `--kind` | Default MIME | Common extensions |
 | --- | --- | --- |
-| `voice` | `audio/ogg` (Opus) | `.ogg`, `.opus` |
+| `voice` | `audio/mp4` (AAC) | `.m4a`, `.mp4` |
 | `audio` | `audio/mpeg` | `.mp3`, `.m4a`, `.aac`, `.wav`, `.flac` |
 | `image` | `image/png` | `.png`, `.jpg`/`.jpeg`, `.webp`, `.gif` |
 | `video` | `video/mp4` | `.mp4`, `.m4v`, `.webm`, `.mov` |
@@ -60,7 +60,7 @@ resolved as explicit `--mime` > file extension > the `--kind` default.
 A successful send prints a `sent_media` record:
 
 ```json
-{"type":"sent_media","to":"npub1...","group_id":"...","kind":"voice","mime":"audio/ogg","filename":"voice.ogg","size_bytes":45678,"blossom_server":"https://blossom.primal.net"}
+{"type":"sent_media","to":"npub1...","group_id":"...","kind":"voice","mime":"audio/mp4","filename":"voice.m4a","size_bytes":45678,"blossom_server":"https://blossom.primal.net"}
 ```
 
 ### Receiving media
@@ -79,7 +79,7 @@ encrypted blob `url`, `mime`, a derived `kind`, `filename`, and optional
   "created_at_secs": 123,
   "mine": false,
   "media": [
-    {"url":"https://blossom.x/abc.ogg","mime":"audio/ogg","kind":"voice","filename":"voice.ogg","duration_ms":12000}
+    {"url":"https://blossom.x/abc.m4a","mime":"audio/mp4","kind":"voice","filename":"voice.m4a","duration_ms":12000}
   ]
 }
 ```
@@ -107,6 +107,11 @@ errors are raised for: an unsupported/unknown MIME with `--stdin` (use `--mime`)
 an empty payload, a missing `--kind` on a media send, and a decryption failure
 (no stored `imeta` for the requested URL — run `listen --once` first so the
 message is persisted locally).
+
+**iOS playback:** the default voice MIME is AAC (`audio/mp4`) so notes play in the
+Sonar app's `AVAudioPlayer`. OGG/Opus (`.ogg`/`.opus`) is not decoded by iOS —
+send those only if the receiver has an Opus decoder. An app-side Opus decoder
+is a tracked follow-up.
 
 **Tracked gap:** outbound `duration_ms`/dimensions are not yet attached by the
 core send path, so a CLI-sent voice clip arrives without a duration field (apps

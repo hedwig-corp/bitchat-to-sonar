@@ -140,7 +140,7 @@ struct SendArgs {
 /// Media kind drives the default MIME type when none is given explicitly.
 #[derive(Clone, Debug, ValueEnum)]
 enum MediaKind {
-    /// Voice note (defaults to audio/ogg, Opus).
+    /// Voice note (defaults to audio/mp4 / AAC — playable by iOS AVAudioPlayer).
     Voice,
     /// Generic audio clip (defaults to audio/mpeg).
     Audio,
@@ -873,7 +873,7 @@ fn resolve_media_payload(args: &SendArgs) -> Result<(Vec<u8>, String, String, Me
 /// extension is supplied.
 fn default_mime_for_kind(kind: &MediaKind) -> &'static str {
     match kind {
-        MediaKind::Voice => "audio/ogg",
+        MediaKind::Voice => "audio/mp4",
         MediaKind::Audio => "audio/mpeg",
         MediaKind::Image => "image/png",
         MediaKind::Video => "video/mp4",
@@ -913,7 +913,8 @@ fn sniff_mime(path: &Path) -> Option<&'static str> {
     Some(match ext.as_str() {
         "ogg" | "opus" => "audio/ogg",
         "mp3" => "audio/mpeg",
-        "m4a" | "aac" => "audio/aac",
+        "m4a" => "audio/mp4",
+        "aac" => "audio/aac",
         "wav" => "audio/wav",
         "flac" => "audio/flac",
         "png" => "image/png",
@@ -933,7 +934,7 @@ fn mime_extension(mime: &str) -> Option<&'static str> {
     Some(match mime.to_ascii_lowercase().as_str() {
         "audio/ogg" | "audio/opus" => "ogg",
         "audio/mpeg" => "mp3",
-        "audio/aac" => "m4a",
+        "audio/aac" | "audio/mp4" => "m4a",
         "audio/wav" => "wav",
         "audio/flac" => "flac",
         "image/png" => "png",
@@ -1308,7 +1309,7 @@ mod tests {
 
     #[test]
     fn media_kind_defaults_and_sniff() {
-        assert_eq!(default_mime_for_kind(&MediaKind::Voice), "audio/ogg");
+        assert_eq!(default_mime_for_kind(&MediaKind::Voice), "audio/mp4");
         assert_eq!(default_mime_for_kind(&MediaKind::Audio), "audio/mpeg");
         assert_eq!(default_mime_for_kind(&MediaKind::Image), "image/png");
         assert_eq!(default_mime_for_kind(&MediaKind::Video), "video/mp4");
@@ -1367,7 +1368,7 @@ mod tests {
         fs::write(&clip, b"y").expect("write");
         let args = media_send_args(Some(clip), Some(MediaKind::Voice), None);
         let (_, _, mime, kind) = resolve_media_payload(&args).expect("resolve");
-        assert_eq!(mime, "audio/ogg");
+        assert_eq!(mime, "audio/mp4");
         assert!(matches!(kind, MediaKind::Voice));
     }
 
