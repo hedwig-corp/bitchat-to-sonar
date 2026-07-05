@@ -171,7 +171,7 @@ def main():
             f"{tail}\n```\n</details>"
         )
         post_text(["pr", "comment", str(pr_number)], body)
-        return 0
+        return 1  # red: the review did not run
 
     findings, saw_clean = parse_findings(ndjson_path)
 
@@ -182,12 +182,13 @@ def main():
             post_text(["pr", "review", str(pr_number), "--approve"],
                       "Kimi review: no findings on this diff. LGTM.")
             print("approved (clean marker, no findings)")
-        else:
-            post_text(["pr", "comment", str(pr_number)],
-                      "Kimi review produced no parseable findings. "
-                      "Review the diff manually before merging.")
-            print("no findings and no clean marker (did not auto-approve)")
-        return 0
+            return 0
+        post_text(["pr", "comment", str(pr_number)],
+                  "Kimi review did not produce a result (no findings and no clean "
+                  "marker). The review likely did not run -- check the workflow "
+                  "logs and confirm MOONSHOT_API_KEY is set.")
+        print("no findings and no clean marker (review likely did not run)")
+        return 1  # red: no clean signal means the review did not actually run
 
     valid_lines = fetch_diff_lines(pr_number)
 
