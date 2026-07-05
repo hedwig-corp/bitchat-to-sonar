@@ -524,11 +524,11 @@ final class MarmotChatModel: ObservableObject {
     func refreshAfterForeground() {
         Task {
             guard await ensureConnected() else { return }
-            guard await ensureRelayConnected() else { return }
+            guard await ensureRelayConnected() else { await loadLocalSummaries() ; return }
             try? await service.ensureSubscriptions()
             try? await service.syncForce()
-            let notifications = (try? await service.drainPending()) ?? []
-            if !notifications.isEmpty { await loadLocalSummaries() }
+            try? await service.drainPending()
+            await loadLocalSummaries()
         }
     }
 
@@ -714,8 +714,8 @@ final class MarmotChatModel: ObservableObject {
     /// the pushed message is not fetched ("notification arrives, message
     /// doesn't"). Uses syncForce(): the missed-while-backgrounded gap must be
     /// fetched deterministically, not race the resubscribe EOSE burst into the
-    /// drain buffer. Android's push service (SonarCore.start()+sync() inside the
-    /// same 25s budget) already behaves this way.
+    /// drain buffer. Android's push service (SonarCore.start()+sync() inside
+    /// the same 25s budget) now behaves this way too.
     @discardableResult
     func refresh() async -> [DrainNotificationInfo] {
         guard await ensureConnected() else { return [] }
