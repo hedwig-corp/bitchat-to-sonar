@@ -516,9 +516,15 @@ final class MarmotChatModel: ObservableObject {
     /// nostr-sdk may auto-reconnect the sockets, but the Marmot subscription
     /// filters can be stale. This forces a resubscribe + a one-shot sync to
     /// bridge the gap.
+    ///
+    /// The socket is usually still down at the foreground transition (and always
+    /// on an open-from-notification-tap), so wait bounded for the reconnect
+    /// instead of skipping: bailing here left the pushed message unfetched until
+    /// some later sync happened to cover it.
     func refreshAfterForeground() {
-        guard service.isRelayConnected() else { return }
         Task {
+            guard await ensureConnected() else { return }
+            guard await ensureRelayConnected() else { return }
             try? await service.ensureSubscriptions()
             try? await service.syncForce()
             let notifications = (try? await service.drainPending()) ?? []
@@ -700,22 +706,32 @@ final class MarmotChatModel: ObservableObject {
     /// Local chats are loaded even when the relay sync fails, so a relay outage
     /// never hides already-persisted conversations. Returns notifications for
     /// incoming messages (empty if nothing new or relay offline).
+    ///
+    /// This is the push-wake sync (SonarPushProcessor) and the manual refresh
+    /// gesture. On a push wake the relay socket is almost always torn down, so
+    /// wait bounded for the reconnect inside the wake window instead of bailing
+    /// — otherwise the background window iOS granted for the push is wasted and
+    /// the pushed message is not fetched ("notification arrives, message
+    /// doesn't"). Uses syncForce(): the missed-while-backgrounded gap must be
+    /// fetched deterministically, not race the resubscribe EOSE burst into the
+    /// drain buffer. Android's push service (SonarCore.start()+sync() inside the
+    /// same 25s budget) already behaves this way.
     @discardableResult
     func refresh() async -> [DrainNotificationInfo] {
-        if service.isRelayConnected() {
-            do {
-                try await service.syncOnce()
-                self.errorText = nil
-            } catch {
-                self.errorText = Self.describe(error)
-            }
-            let notifications = (try? await service.drainPending()) ?? []
-            if !notifications.isEmpty { await loadLocalSummaries() ; return notifications }
-        } else {
-            connectRelaysIfNeeded()
+        guard await ensureConnected() else { return [] }
+        guard await ensureRelayConnected() else {
+            await loadLocalSummaries()
+            return []
         }
+        do {
+            try await service.syncForce()
+            self.errorText = nil
+        } catch {
+            self.errorText = Self.describe(error)
+        }
+        let notifications = (try? await service.drainPending()) ?? []
         await loadLocalSummaries()
-        return []
+        return notifications
     }
 
     func markConversationRead(groupId: String) {
