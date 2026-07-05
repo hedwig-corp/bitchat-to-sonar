@@ -83,29 +83,29 @@ hardware-gated device smoke.
 | Unify receiver advertise/serve | iOS receiver service | `UnifyRadio.android.kt:245-325` | PARITY | — | iOS stops in background (BLE limitation) — PLATFORM-GAP, documented |
 | Direct send flow (PaySheet → ⚡PAY) | `SonarPayViews.swift:29-78` | `SonarPayViews.kt:59-170` | PARITY | — | |
 | Chat receipt ledger (⚡PAY/⚡PAYDONE) | `SonarPayLedger.swift:137-222` | `SonarPay.kt:73-120` | PARITY | — | |
-| **Direct wallet payment activity ledger** | `SonarPayLedger.swift:295-366` `SonarPaymentActivityLedger` | **MISSING** | **GAP** | **L** | Compose wallet screen shows only chat receipts; direct/Unify/incoming sends vanish (no fees, settlement, failure reason) |
-| Wallet activity screen | `SonarWalletActivityScreen.swift:15-150` | `SonarWalletActivityScreen.kt:40-150` | **PARTIAL** | M | Layout parity; data source misses direct wallet activity (depends on ledger gap) |
+| **Direct wallet payment activity ledger** | `SonarPayLedger.swift:295-366` `SonarPaymentActivityLedger` | `wallet/SonarPaymentActivity.kt` + `WalletBridge.paymentEvents` | PARITY | — | Closed in PR #168 batch 2; Compose renders a merged receipts+activity superset (documented deviation) |
+| Wallet activity screen | `SonarWalletActivityScreen.swift:15-150` | `SonarWalletActivityScreen.kt` via `state.walletActivity()` | PARITY | — | Closed in PR #168 batch 2 |
 | `hasLiveRate` signal | `WalletBridgeService.swift:143-145` | MISSING | **PARTIAL** | S | Compose can render blank fiat instead of sats fallback |
 | Currency picker / fiat toggle | `WalletBridgeService.swift:486-505` | `WalletBridge.kt:52-56` | PARITY | — | |
 | Breez API key wiring | `Configs/Local.xcconfig` | `local.properties` → BuildConfig | PARITY | — | Both gitignored |
 | NDS host normalization | `SonarPushRegistration.swift:61` | `SonarPushRegistration.kt:40-43` | PARITY | — | |
-| Offline-push hardening (closed PR #148) | on main via #147 | `SonarPushPrefs.kt` + killed-app wakeup detection unmerged | **GAP** | M | Cherry-pick from `codex/android-offline-push-parity` |
+| Offline-push hardening (closed PR #148) | on main via #147 | `SonarPushPrefs.kt` + killed-app wakeup (cherry-picked) | PARITY | — | Closed in PR #168 batch 2 (3 cherry-picks) |
 
 ## 3. Calls
 
 | Feature | iOS (file:line) | Compose status | Classification | Size | Notes |
 |---------|-----------------|----------------|-----------------|------|-------|
 | DM header audio call button | `SonarDMScreen.swift:75` | `App.kt:737-738` | PARITY | — | |
-| DM header video call button | `SonarDMScreen.swift:78` | "coming soon" toast, `SonarAppState.kt:431` | **GAP** | M | iOS places real video call (local PiP preview; remote frames not exposed by core yet) |
+| DM header video call button | `SonarDMScreen.swift:78` | `App.kt` DM header (gate removed) | PARITY | — | Closed in PR #168 batch 2; remote/local camera frames remain the shared core gap on BOTH platforms |
 | Call screen states/controls (mute, speaker, end, pulse, E2E pill) | `SonarCallScreen.swift` | `CallScreen.kt` | PARITY | — | Verified control-by-control |
-| Camera flip | `SonarCallScreen.swift:243-244` | MISSING | **GAP** | S | Depends on video enable |
+| Camera flip | `SonarCallScreen.swift:243-244` | `CallScreen.kt` + `ActiveCall.frontCamera` | PARITY | — | Closed in PR #168 batch 2 |
 | `callStart`/`callPlace`/`callAccept`/`callHangup`/`callSetMuted`/`callWaitEvent` | `SonarAppStore.swift:4874-5053` | `SonarAppState.kt:417-566` | PARITY | — | |
 | `callIncomingOffer()` before accept | `SonarAppStore.swift:5193` | MISSING — jumps to `callAccept()` | **GAP** | M | Skips iroh peer-address setup for incoming leg |
 | Descriptor call gating on incoming offers | `SonarAppStore.swift:5153-5160` `canCall()` guard | MISSING | **GAP** | M | Compose accepts offers from peers without call capability |
 | Stale offer rejection (>60s) | `SonarAppStore.swift:5166-5168` | MISSING | **GAP** | S | |
 | Busy auto-decline (second incoming) | `SonarAppStore.swift:5170-5172` | MISSING | **GAP** | S | Race: user can accept 2nd call while connected |
 | Deferred offer pending descriptor lookup | `SonarAppStore.swift:5154-5156` | MISSING | **GAP** | M | Offers can fail on slow descriptor fetch |
-| Proximity sensor (voice calls) | `SonarAppStore.swift:4863,4979-4987` | `CallAudioRoute.android.kt:6` TODO | **GAP** | M | Speaker stays on at ear on Android |
+| Proximity sensor (voice calls) | `SonarAppStore.swift:4863,4979-4987` | `CallAudioRoute.android.kt` proximity wake lock | PARITY | — | Closed in PR #168 batch 2; released on speaker toggle like iOS |
 | Audio session/route setup | `SonarAppStore.swift:5098-5107` | `CallAudioRoute.android.kt:14-30` | PARITY | — | |
 | Immediate dismiss (Signal pattern) | decline/hangup pops instantly | same | PARITY | — | #104 |
 | `canCall()` capability check (outgoing) | `SonarAppStore.swift:4461-4468` | `SonarAppState.kt` equivalent | PARITY | — | |
@@ -118,13 +118,13 @@ Slice-5 verification against current code:
 | Feature | iOS | Compose | Classification | Size | Notes |
 |---------|-----|---------|-----------------|------|-------|
 | Radar peer tap → DM | single-action open | `SonarRadarScreen.kt:150` `openDm()` | PARITY | — | Closed by PR #140 (was toast) |
-| Contact-profile favorite action | **"Coming soon"** (`SonarContactProfileScreen.swift:223`) | real toggle `SonarContactProfileScreen.kt:313-320` | **GAP (iOS)** | S | iOS must mirror Compose `toggleFavoriteContact()` |
-| Contact-profile block/delete | **"Coming soon"** (`SonarContactProfileScreen.swift:221-227`) | real `setContactBlocked()` `SonarContactProfileScreen.kt:322-329` | **GAP (iOS)** | S/M | iOS has backing favorite/block stores; wire rows to them |
-| Blocked-contact unblock affordance | none | toast + unblock path `SonarContactProfileScreen.kt:172-174` | **GAP (iOS)** | M | |
+| Contact-profile favorite action | real toggle (`SonarAppStore.swift` social actions) | real toggle `SonarContactProfileScreen.kt:313-320` | PARITY | — | Closed in PR #168 batch 2 |
+| Contact-profile block/delete | real, wired to `SecureIdentityStateManager` + `deleteChat` cascade | real `setContactBlocked()` `SonarContactProfileScreen.kt:322-329` | PARITY | — | Closed in PR #168 batch 2; iOS store-level block guards on `sendPay`/`placeCall` too |
+| Blocked-contact unblock affordance | unblock row + gated actions | toast + unblock path `SonarContactProfileScreen.kt:172-174` | PARITY | — | Closed in PR #168 batch 2; open follow-up: iOS Marmot transcript re-filter on block (pre-existing) |
 | Reactions / share-location rows | hidden | "coming soon" toasts `App.kt:562-563` | PARITY | — | Both defer; acceptable |
 | Delivery status copy shared helper | `stateText()` | `SonarDeliveryText.kt` + tests | PARITY | — | Except partial-delivery label (§1) |
 | Media pipelines (image, voice, GIF, file), viewer, share/save | full | full (`App.kt:1632-2072`, `MediaViewer`) | PARITY | — | BLE 0x22 + MIP-04 both surfaces; hardware smoke pending |
-| Media caption field in model | absent | absent (`MessageStore.kt:96-106` `SonarMedia`) | **PARTIAL (both)** | S | Signal-first checklist item 3 — add optional caption to the model now |
+| Media caption field in model | `MarmotService.swift:121` `MarmotMedia.caption` | `SonarCore.kt` `SonarMedia.caption` + codec field 15 | PARITY | — | Closed in PR #168 batch 2 (model only, no UI yet — by design) |
 | Multi-item media model | single picker | `List<SonarMedia>` | PARITY | — | Compose structurally ahead |
 | Cleanup on exit paths | `onDisappear` chains | `cleanupPreviewTempFiles()` `App.kt:2333,2344` | PARITY | — | |
 | Stickers send/receive/pack install | composer + views | `StickerBubble`/`StickerPackPreviewSheet` | PARITY | — | |

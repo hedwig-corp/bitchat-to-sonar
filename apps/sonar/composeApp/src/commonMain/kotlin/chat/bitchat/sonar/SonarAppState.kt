@@ -15,8 +15,10 @@ import chat.bitchat.sonar.wallet.Money
 import chat.bitchat.sonar.wallet.PaymentActivityStore
 import chat.bitchat.sonar.wallet.SendResult
 import chat.bitchat.sonar.wallet.SonarPaymentActivity
+import chat.bitchat.sonar.wallet.WalletActivityItem
 import chat.bitchat.sonar.wallet.WalletBridge
 import chat.bitchat.sonar.wallet.WalletState
+import chat.bitchat.sonar.wallet.mergeWalletActivity
 import chat.bitchat.sonar.wallet.paymentDestinationHash
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -498,7 +500,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 val sent = sendCallControl(c.chatId, SonarCore.callEncodeAnswer(c.callId, SonarAnswer.Accept, addr))
                 if (!sent) {
                     runCatching { SonarCore.callHangup(c.callId) }
-                    CallAudioRoute.configure(active = false, speakerOn = false)
+                    failAccept(c)
                     return@launch
                 }
                 if (activeCall?.callId == c.callId && activeCall?.muted == true) {
@@ -507,8 +509,25 @@ class SonarAppState(private val scope: CoroutineScope) {
                 sonarLog("SonarCall", "TX ANSWER accept + dialing callId=${c.callId.take(8)}")
                 SonarCore.callAccept(c.callId)
                 sonarLog("SonarCall", "callAccept returned (dialed) callId=${c.callId.take(8)}")
-            } catch (e: Throwable) { sonarLog("SonarCall", "accept FAILED: ${e.message}"); toast = "couldn’t accept: ${e.message}" }
+            } catch (e: Throwable) {
+                sonarLog("SonarCall", "accept FAILED: ${e.message}")
+                toast = "couldn’t accept: ${e.message}"
+                // Mirror placeCall's failure teardown — without this a thrown
+                // callAccept() leaves MODE_IN_COMMUNICATION + the proximity
+                // lock held with the UI stuck in Connecting (no terminal
+                // engine event ever finalizes a call the engine never had).
+                runCatching { SonarCore.callHangup(c.callId) }
+                failAccept(c)
+            }
         }
+    }
+
+    /** Shared accept-failure teardown: release audio/proximity, drop the call. */
+    private fun failAccept(c: ActiveCall) {
+        if (activeCall?.callId != c.callId) return
+        CallAudioRoute.configure(active = false, speakerOn = false)
+        activeCall = null
+        popCallScreenIfNeeded()
     }
 
     /** Decline incoming call: dismiss immediately (Signal pattern), then engine
@@ -561,7 +580,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         val c = activeCall ?: return
         val next = !c.speakerOn
         activeCall = c.copy(speakerOn = next)
-        CallAudioRoute.setSpeaker(next)
+        // configure (not setSpeaker) so the proximity lock tracks earpiece
+        // use: iOS drops proximity monitoring while the speaker is on.
+        CallAudioRoute.configure(active = true, speakerOn = next, voiceProximity = !c.video && !next)
     }
 
     fun toggleCallCam() {
@@ -1468,6 +1489,18 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun payStatus(uuid: String): PayStatus? = payLedger.get(uuid)?.status
 
     fun walletPayEntries(): List<PayEntry> = payLedger.all()
+
+    /** Recomposition key for [walletActivity] (the direct-ledger leg; ⚡PAY
+     *  receipts bump [payVersion]). Screens read it through state so all
+     *  wallet-facing reads flow through app state. */
+    val paymentActivityVersion get() = PaymentActivityStore.version
+
+    /** Merged wallet activity for the Wallet screen: chat ⚡PAY receipts +
+     *  direct/Unify/incoming ledger rows, deduped, newest-first. The ONLY
+     *  read path for the activity ledger — the UI never touches
+     *  [PaymentActivityStore] directly. */
+    fun walletActivity(): List<WalletActivityItem> =
+        mergeWalletActivity(walletPayEntries(), PaymentActivityStore.sorted())
 
     private fun persistPay() { SonarCore.saveBlob("pay.ledger", payLedger.serialize()) }
 

@@ -4728,6 +4728,11 @@ final class SonarAppStore: ObservableObject {
     @discardableResult
     func sendPay(_ id: String, sats: Int64) async -> String? {
         guard sats > 0, case .ready = walletState else { return nil }
+        // Store-level block enforcement (Android parity): UI gating alone
+        // would let stale UI state or future callers pay a blocked contact.
+        if isContactBlocked(id, npub: callNpub(id) ?? "") {
+            return "Unblock this contact before paying."
+        }
         var offer: String?
         if let npub = callNpub(id) {
             let cached = marmot.sonarDescriptorsByNpub[npub]
@@ -5104,6 +5109,12 @@ final class SonarAppStore: ObservableObject {
     /// and send the ☎CALL OFFER (with our dialable address) over the chat.
     func placeCall(_ convId: String, video: Bool) {
         guard activeCall == nil else { return }
+        // Store-level block enforcement (Android parity) — the profile UI
+        // already hides the buttons, but the store must not trust the view.
+        if isContactBlocked(convId, npub: callNpub(convId) ?? "") {
+            SecureLogger.debug("SonarCall: refusing call to blocked contact convId=\(convId.prefix(16))", category: .session)
+            return
+        }
         guard canCall(convId), let via = callSignalingVia(convId) else {
             SecureLogger.debug("SonarCall: refusing call without BLE or White Noise route convId=\(convId.prefix(16))", category: .session)
             return

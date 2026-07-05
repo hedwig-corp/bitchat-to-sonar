@@ -27,11 +27,9 @@ import androidx.compose.ui.unit.sp
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.ToastBar
 import chat.bitchat.sonar.payFmt
-import chat.bitchat.sonar.wallet.PaymentActivityStore
 import chat.bitchat.sonar.wallet.SonarPaymentActivity
 import chat.bitchat.sonar.wallet.WalletActivityItem
 import chat.bitchat.sonar.wallet.WalletState
-import chat.bitchat.sonar.wallet.mergeWalletActivity
 import chat.bitchat.sonar.ui.SNEmptyState
 import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconName
@@ -44,9 +42,9 @@ fun SonarWalletActivityScreen(state: SonarAppState) {
     val s = sonar
     // Subscribe to ledger changes so the list recomposes on new entries:
     // chat ⚡PAY receipts (payVersion) and direct wallet payment activity
-    // (PaymentActivityStore.version, the iOS SonarPaymentActivityLedger port).
+    // (paymentActivityVersion) — both read through state, never the store.
     state.payVersion
-    PaymentActivityStore.version
+    state.paymentActivityVersion
 
     val balanceSats = state.walletBalanceSats()
     // iOS `hasLiveRate` rule: the fiat subline renders ONLY when a live rate
@@ -55,7 +53,7 @@ fun SonarWalletActivityScreen(state: SonarAppState) {
     // the rest of this screen uses.
     val fiat = state.fiatOrNull(balanceSats)
     // Chat receipts + direct wallet activity, deduped, newest first.
-    val entries = mergeWalletActivity(state.walletPayEntries(), PaymentActivityStore.sorted())
+    val entries = state.walletActivity()
 
     Column(Modifier.fillMaxSize().background(s.bg)) {
         SNNavHeader("Wallet", hairline = false, onBack = { state.back() })
