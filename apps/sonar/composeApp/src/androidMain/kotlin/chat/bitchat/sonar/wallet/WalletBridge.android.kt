@@ -6,7 +6,9 @@ import breez_sdk_liquid.ConnectRequest
 import breez_sdk_liquid.EventListener
 import breez_sdk_liquid.LiquidNetwork
 import breez_sdk_liquid.PayAmount
+import breez_sdk_liquid.Payment
 import breez_sdk_liquid.PaymentMethod
+import breez_sdk_liquid.PaymentType
 import breez_sdk_liquid.PrepareReceiveRequest
 import breez_sdk_liquid.PrepareSendRequest
 import breez_sdk_liquid.ReceivePaymentRequest
@@ -23,7 +25,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -49,6 +53,9 @@ actual object WalletBridge {
     private val walletScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val balance = MutableStateFlow(0L)
     actual val balanceFlow: StateFlow<Long> get() = balance
+    /** Buffered so the SDK callback thread can `tryEmit` without ever blocking. */
+    private val payments = MutableSharedFlow<WalletPaymentEvent>(extraBufferCapacity = 16)
+    actual val paymentEvents: SharedFlow<WalletPaymentEvent> get() = payments
     @Volatile private var balanceListenerId: String? = null
     /** Bumped in [shutdown] (inside [lock]); [refreshBalance] drops its writes
      *  if the epoch moved while `getInfo()` ran, so a listener-triggered
@@ -132,9 +139,12 @@ actual object WalletBridge {
             node.addEventListener(object : EventListener {
                 override fun onEvent(e: SdkEvent) {
                     when (e) {
+                        is SdkEvent.PaymentSucceeded -> {
+                            emitPaymentEvent(e.details)
+                            requestBalanceRefresh()
+                        }
                         is SdkEvent.Synced,
                         is SdkEvent.DataSynced,
-                        is SdkEvent.PaymentSucceeded,
                         is SdkEvent.PaymentWaitingConfirmation,
                         is SdkEvent.PaymentPending,
                         is SdkEvent.PaymentRefunded,
@@ -144,6 +154,25 @@ actual object WalletBridge {
                 }
             })
         }.getOrNull()
+    }
+
+    /** Surface a settled payment to [paymentEvents]. A stable wallet payment id
+     *  keeps `walletIncoming` recording idempotent across event replays (iOS
+     *  `SonarWallet.map`: txId ?? destination); with nothing stable we skip the
+     *  event rather than mint a random id that could duplicate ledger rows. */
+    private fun emitPaymentEvent(p: Payment) {
+        val lightning = p.details as? PaymentDetails.Lightning
+        val id = p.txId ?: lightning?.paymentHash ?: p.destination ?: return
+        payments.tryEmit(
+            WalletPaymentEvent(
+                paymentId = id,
+                incoming = p.paymentType == PaymentType.RECEIVE,
+                amountSats = p.amountSat.toLong(),
+                feesSats = p.feesSat.toLong(),
+                timestampSecs = p.timestamp.toLong(),
+                preimage = lightning?.preimage,
+            )
+        )
     }
 
     /** Conflates SDK event bursts (initial sync, payment storms) into at most
@@ -179,9 +208,16 @@ actual object WalletBridge {
                     if (amountSats > 0) PayAmount.Bitcoin(amountSats.toULong()) else null
                 val prepared = node.prepareSendPayment(PrepareSendRequest(destination.trim(), amount))
                 val resp = node.sendPayment(SendPaymentRequest(prepared, null, note.ifBlank { null }))
-                val preimage = (resp.payment.details as? PaymentDetails.Lightning)?.preimage
+                val payment = resp.payment
+                val lightning = payment.details as? PaymentDetails.Lightning
                 refreshBalance()
-                SendResult(true, preimage)
+                SendResult(
+                    ok = true,
+                    preimage = lightning?.preimage,
+                    paymentId = payment.txId ?: lightning?.paymentHash ?: payment.destination,
+                    feesSats = payment.feesSat.toLong(),
+                    settledAtSecs = payment.timestamp.toLong(),
+                )
             } catch (t: Throwable) { SendResult(false) }
         }
 

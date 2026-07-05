@@ -1,5 +1,6 @@
 package chat.bitchat.sonar.wallet
 
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 
 /** Lightning wallet lifecycle state, mirrored from the iOS WalletBridgeService. */
@@ -11,8 +12,32 @@ sealed interface WalletState {
     data class Failed(val message: String) : WalletState
 }
 
-/** Result of a wallet send: success flag plus the Lightning preimage when available. */
-data class SendResult(val ok: Boolean, val preimage: String? = null)
+/** Result of a wallet send: success flag plus the Lightning preimage and the
+ *  settlement details the payment-activity ledger records (iOS
+ *  `SonarWalletPayment`: id, feesSats, timestamp). */
+data class SendResult(
+    val ok: Boolean,
+    val preimage: String? = null,
+    /** Stable wallet payment id (txId, else payment hash, else destination). */
+    val paymentId: String? = null,
+    val feesSats: Long? = null,
+    val settledAtSecs: Long? = null,
+)
+
+/**
+ * One settled payment surfaced by the Breez SDK event listener — the Compose
+ * twin of iOS `SonarWallet.incomingPaymentsStream()`'s `Payment` element. Used
+ * to record `walletIncoming` rows in the payment-activity ledger.
+ */
+data class WalletPaymentEvent(
+    /** Stable wallet payment id (txId, else payment hash, else destination). */
+    val paymentId: String,
+    val incoming: Boolean,
+    val amountSats: Long,
+    val feesSats: Long?,
+    val timestampSecs: Long,
+    val preimage: String? = null,
+)
 
 /**
  * Thin Kotlin façade over the on-device Breez SDK Liquid wallet, the Android
@@ -45,6 +70,14 @@ expect object WalletBridge {
      * the wallet is Ready and again after [shutdown].
      */
     val balanceFlow: StateFlow<Long>
+
+    /**
+     * Settled wallet payments from the Breez SDK event listener (both
+     * directions; consumers filter). Fed from the SDK callback thread via
+     * `tryEmit` on a buffered flow — never blocks the SDK, never touches the
+     * render path. iOS parity: `WalletBridgeService.incomingPayments()`.
+     */
+    val paymentEvents: SharedFlow<WalletPaymentEvent>
 
     /** A reusable BOLT12 offer string to receive payments. */
     suspend fun createOffer(): String

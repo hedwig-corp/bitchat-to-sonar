@@ -60,8 +60,16 @@ internal fun randomPayId(): String =
  */
 enum class PayStatus { Sealed, Claiming, Settling, Claimed, Failed }
 
-/** One tracked coin. */
-data class PayEntry(val uuid: String, val sats: Long, val status: PayStatus, val mine: Boolean, val preimage: String? = null)
+/** One tracked coin. [tsSecs] is when the coin was first recorded (0 for rows
+ *  persisted by older builds) — used to order the merged wallet activity list. */
+data class PayEntry(
+    val uuid: String,
+    val sats: Long,
+    val status: PayStatus,
+    val mine: Boolean,
+    val preimage: String? = null,
+    val tsSecs: Long = 0L,
+)
 
 /**
  * The ⚡PAY ledger. States survive restart (the app persists [serialize] via
@@ -81,7 +89,8 @@ class SonarPayLedger(blob: String = "") {
             val sats = p[1].toLongOrNull() ?: continue
             val status = runCatching { PayStatus.valueOf(p[2]) }.getOrNull() ?: continue
             val preimage = p.getOrNull(4)?.ifEmpty { null }
-            entries[p[0]] = PayEntry(p[0], sats, status, p[3] == "1", preimage)
+            val tsSecs = p.getOrNull(5)?.toLongOrNull() ?: 0L
+            entries[p[0]] = PayEntry(p[0], sats, status, p[3] == "1", preimage, tsSecs)
         }
     }
 
@@ -89,15 +98,16 @@ class SonarPayLedger(blob: String = "") {
     fun get(uuid: String): PayEntry? = entries[uuid]
 
     fun serialize(): String =
-        entries.values.joinToString("\n") { "${it.uuid}|${it.sats}|${it.status}|${if (it.mine) 1 else 0}|${it.preimage.orEmpty()}" }
+        entries.values.joinToString("\n") { "${it.uuid}|${it.sats}|${it.status}|${if (it.mine) 1 else 0}|${it.preimage.orEmpty()}|${it.tsSecs}" }
 
-    /** Record a receipt (idempotent). Returns true if it changed. */
-    fun recordReceipt(uuid: String, sats: Long, mine: Boolean): Boolean {
+    /** Record a receipt (idempotent). Returns true if it changed. [tsSecs] is
+     *  the receipt's message/settlement time (0 keeps legacy behavior). */
+    fun recordReceipt(uuid: String, sats: Long, mine: Boolean, tsSecs: Long = 0L): Boolean {
         if (entries.containsKey(uuid)) return false
         val doneWasPending = pendingDone.containsKey(uuid)
         val pendingPreimage = if (doneWasPending) pendingDone.remove(uuid) else null
         val status = if (mine || doneWasPending) PayStatus.Claimed else PayStatus.Sealed
-        entries[uuid] = PayEntry(uuid, sats, status, mine, pendingPreimage)
+        entries[uuid] = PayEntry(uuid, sats, status, mine, pendingPreimage, tsSecs)
         return true
     }
 

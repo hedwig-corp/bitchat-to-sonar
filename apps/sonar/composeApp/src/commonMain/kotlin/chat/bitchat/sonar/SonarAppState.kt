@@ -12,9 +12,12 @@ import chat.bitchat.sonar.unify.UnifyRadio
 import chat.bitchat.sonar.wallet.ExchangeRate
 import chat.bitchat.sonar.wallet.FiatCurrency
 import chat.bitchat.sonar.wallet.Money
+import chat.bitchat.sonar.wallet.PaymentActivityStore
 import chat.bitchat.sonar.wallet.SendResult
+import chat.bitchat.sonar.wallet.SonarPaymentActivity
 import chat.bitchat.sonar.wallet.WalletBridge
 import chat.bitchat.sonar.wallet.WalletState
+import chat.bitchat.sonar.wallet.paymentDestinationHash
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
@@ -329,6 +332,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             walletState = WalletState.NotConfigured
             presenceByGeohash = emptyMap()
             payLedger = SonarPayLedger(); payVersion++
+            PaymentActivityStore.wipe() // iOS wipes both payment ledgers together
             mediaCache.clear(); stickerPackCache.clear(); stickerImageCache.clear(); installedPackCoordinates.clear()
             callLogs.clear(); callVersion++
             resetCallState()
@@ -370,7 +374,9 @@ class SonarAppState(private val scope: CoroutineScope) {
             lastWnGroups = -1; lastWnMsgs = -1
             // ⚡PAY coins live inside the erased chats — reset the ledger. The
             // Lightning wallet seed/balance is separate and is NOT touched.
+            // iOS eraseChatsKeepIdentity also wipes the activity ledger.
             payLedger = SonarPayLedger(); persistPay(); payVersion++
+            PaymentActivityStore.wipe()
             mediaCache.clear(); stickerPackCache.clear(); stickerImageCache.clear(); installedPackCoordinates.clear()
             callLogs.clear(); callVersion++
             lastSeenTs.clear(); lastNotifiedTs.clear(); seededSeen = false
@@ -1373,6 +1379,34 @@ class SonarAppState(private val scope: CoroutineScope) {
                     }
                 }
             }
+            // Record incoming external wallet payments (iOS
+            // recordIncomingWalletPayment): fed by the Breez event listener on
+            // an IO scope; we only collect + write the local ledger here. The
+            // merge layer folds chat ⚡PAY receipts by preimage so an incoming
+            // chat payment never appears twice.
+            scope.launch {
+                WalletBridge.paymentEvents.collect { ev ->
+                    if (!ev.incoming) return@collect
+                    PaymentActivityStore.recordPending(
+                        SonarPaymentActivity(
+                            id = "wallet-${ev.paymentId}",
+                            kind = SonarPaymentActivity.Kind.WalletIncoming,
+                            peerKey = "wallet",
+                            peerName = "External wallet",
+                            direction = SonarPaymentActivity.Direction.Incoming,
+                            sats = ev.amountSats,
+                            via = "internet",
+                            createdAtSecs = ev.timestampSecs,
+                            destinationHash = null,
+                            status = SonarPaymentActivity.Status.Paid,
+                            walletPaymentId = ev.paymentId,
+                            feesSats = ev.feesSats,
+                            settledAtSecs = ev.timestampSecs,
+                            preimage = ev.preimage,
+                        )
+                    )
+                }
+            }
         }
         scope.launch {
             WalletBridge.setupIfNeeded(SonarCore.identityNsec())
@@ -1487,6 +1521,23 @@ class SonarAppState(private val scope: CoroutineScope) {
         val offer = directPaymentOffer(chatId)
         if (offer == null) return "Fetching payment details — try again in a moment."
         val payId = randomPayId()
+        // iOS parity (SonarAppStore.sendPay → SonarPaymentActivityLedger):
+        // record a pending sonarDirect activity BEFORE the wallet send, then
+        // settle or fail it below so the Wallet screen shows direct sends.
+        PaymentActivityStore.recordPending(
+            SonarPaymentActivity(
+                id = payId,
+                kind = SonarPaymentActivity.Kind.SonarDirect,
+                peerKey = chatId,
+                peerName = callPeerName(chatId),
+                direction = SonarPaymentActivity.Direction.Outgoing,
+                sats = sats,
+                via = if (isMeshChat(chatId) && hasLiveMeshRoute(meshPeerId(chatId))) "mesh" else "internet",
+                createdAtSecs = SonarClock.nowSecs(),
+                destinationHash = paymentDestinationHash(offer),
+                status = SonarPaymentActivity.Status.Pending,
+            )
+        )
         scope.launch {
             var failureMessage: String? = null
             val result = runCatching { WalletBridge.send(offer, sats, "Sonar payment $payId") }
@@ -1496,7 +1547,13 @@ class SonarAppState(private val scope: CoroutineScope) {
                 }
             walletState = WalletBridge.state()
             if (result.ok) {
-                if (payLedger.recordReceipt(payId, sats, mine = true)) {
+                // Wallet settled — record locally before the receipt lines so
+                // the ledger stays consistent even if chat delivery fails.
+                PaymentActivityStore.markPaid(
+                    payId, result.paymentId, result.feesSats,
+                    result.settledAtSecs ?: SonarClock.nowSecs(),
+                )
+                if (payLedger.recordReceipt(payId, sats, mine = true, tsSecs = SonarClock.nowSecs())) {
                     persistPay()
                     payVersion++
                 }
@@ -1511,6 +1568,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                     toast = "Payment sent but receipt delivery failed"
                 }
             } else {
+                PaymentActivityStore.markFailed(payId, failureMessage ?: "Payment failed")
                 toast = failureMessage ?: "Payment failed"
             }
         }
@@ -1559,7 +1617,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         var changed = false
         for (m in msgs) {
             when (val line = PayLine.decode(m.content)) {
-                is PayLine.Pay -> if (payLedger.recordReceipt(line.uuid, line.sats, m.mine)) changed = true
+                is PayLine.Pay -> if (payLedger.recordReceipt(line.uuid, line.sats, m.mine, tsSecs = m.tsSecs)) changed = true
                 is PayLine.Done -> if (payLedger.markClaimedOrPending(line.uuid, line.preimage)) changed = true
                 null -> {}
             }
@@ -1620,8 +1678,34 @@ class SonarAppState(private val scope: CoroutineScope) {
             val raw = UnifyRadio.fetchOffer(peerId)
             val dest = raw?.let { UnifyBIP321.parse(it) }?.lightning
             if (dest == null) { toast = "Couldn't read that user's payment request"; return@launch }
+            // iOS parity (SonarAppStore.payUnify): a direct Lightning send —
+            // Unify peers don't chat, so this shows up ONLY in the wallet
+            // activity ledger, not as a ⚡PAY chat receipt.
+            val activityId = randomPayId()
+            PaymentActivityStore.recordPending(
+                SonarPaymentActivity(
+                    id = activityId,
+                    kind = SonarPaymentActivity.Kind.UnifyNearby,
+                    peerKey = peerId,
+                    peerName = unifyPeers.firstOrNull { it.id == peerId }?.name ?: "Nearby user",
+                    direction = SonarPaymentActivity.Direction.Outgoing,
+                    sats = amountSats,
+                    via = "internet",
+                    createdAtSecs = SonarClock.nowSecs(),
+                    destinationHash = paymentDestinationHash(dest),
+                    status = SonarPaymentActivity.Status.Pending,
+                )
+            )
             val result = WalletBridge.send(dest, amountSats, "Sonar nearby")
             walletState = WalletBridge.state()
+            if (result.ok) {
+                PaymentActivityStore.markPaid(
+                    activityId, result.paymentId, result.feesSats,
+                    result.settledAtSecs ?: SonarClock.nowSecs(),
+                )
+            } else {
+                PaymentActivityStore.markFailed(activityId, "Payment failed")
+            }
             toast = if (result.ok) "Sent ${amountSats} sats" else "Payment failed"
         }
     }
@@ -1865,6 +1949,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 chats = emptyList(); pendingMarmotChatNpubs = emptyMap(); pendingMarmotGroups = emptyMap(); messages = emptyList(); channelMsgs = emptyList()
                 lastWnGroups = -1; lastWnMsgs = -1
                 payLedger = SonarPayLedger(); persistPay(); payVersion++
+                PaymentActivityStore.wipe()
                 mediaCache.clear(); stickerPackCache.clear(); stickerImageCache.clear(); installedPackCoordinates.clear()
                 callLogs.clear(); callVersion++
 

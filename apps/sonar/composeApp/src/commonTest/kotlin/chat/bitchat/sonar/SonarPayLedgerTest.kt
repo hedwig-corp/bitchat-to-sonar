@@ -62,6 +62,19 @@ class SonarPayLedgerTest {
         val l = SonarPayLedger(blob)
         assertEquals(PayStatus.Claimed, l.get("u1")!!.status)
         assertNull(l.get("u1")!!.preimage)
+        assertEquals(0L, l.get("u1")!!.tsSecs)
+    }
+
+    @Test
+    fun receiptTimestampSurvivesRestart() {
+        val l = SonarPayLedger()
+        l.recordReceipt("t1", 700, mine = true, tsSecs = 1234)
+        val reloaded = SonarPayLedger(l.serialize())
+        assertEquals(1234L, reloaded.get("t1")!!.tsSecs)
+        // Pre-timestamp blobs (5 fields, ending at preimage) decode as 0.
+        val old = SonarPayLedger("u1|1000|Claimed|1|" + "a".repeat(64))
+        assertEquals(0L, old.get("u1")!!.tsSecs)
+        assertEquals("a".repeat(64), old.get("u1")!!.preimage)
     }
 
     @Test
