@@ -1,0 +1,81 @@
+name: Kimi PR Review
+
+# Automated code review on every PR and every push to a PR, powered by the Kimi
+# model via the Moonshot API. The review logic lives in-repo under `.agents/`
+# (REVIEW.md + checks/) so it also runs locally with `goose review`.
+#
+# Setup: add a repository Actions secret named MOONSHOT_API_KEY.
+# Optional repo Variables: KIMI_REVIEW_MODEL (default moonshot-v1-128k),
+# KIMI_REVIEW_SEVERITY (default low). See docs/KIMI-PR-REVIEW.md.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+# Cancel a stale review for the same PR when a new push lands.
+concurrency:
+  group: kimi-pr-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    # Skip obvious bots; they generate noise (generated bumps, lockfile updates).
+    if: github.actor != 'dependabot[bot]' && github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    env:
+      REVIEW_PROVIDER: moonshot
+      REVIEW_MODEL: ${{ vars.KIMI_REVIEW_MODEL || 'moonshot-v1-128k' }}
+      REVIEW_SEVERITY: ${{ vars.KIMI_REVIEW_SEVERITY || 'low' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Install goose
+        env:
+          # The installer runs `goose configure` (interactive) unless CONFIGURE
+          # is "false"; there is no TTY in CI, so disable it.
+          CONFIGURE: 'false'
+        run: |
+          curl -fsSL https://github.com/block/goose/releases/download/stable/download_cli.sh \
+            | GOOSE_BIN_DIR="$HOME/.local/bin" bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/goose" --version
+
+      - name: Configure Goose (Moonshot/Kimi provider)
+        run: |
+          mkdir -p "$HOME/.config/goose"
+          cp scripts/ci/goose-config.yaml "$HOME/.config/goose/config.yaml"
+
+      - name: Run goose review
+        id: review
+        env:
+          MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
+        run: |
+          set +e
+          BASE="origin/${{ github.base_ref }}"
+          git fetch origin "${{ github.base_ref }}" --quiet 2>/dev/null || true
+          goose review "${BASE}...HEAD" \
+            --provider "$REVIEW_PROVIDER" \
+            --override-model "$REVIEW_MODEL" \
+            --severity "$REVIEW_SEVERITY" \
+            --quiet > review.ndjson 2> review.err
+          status=$?
+          echo "exit=$status" >> "$GITHUB_OUTPUT"
+          echo "--- review.err (tail) ---"
+          tail -n 20 review.err || true
+          # Keep the workflow step green so the post step can always run.
+          exit 0
+
+      - name: Post review to PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python3 scripts/ci/post_kimi_review.py "$PR_NUMBER" "$HEAD_SHA" review.ndjson "${{ steps.review.outputs.exit }}"
