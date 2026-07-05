@@ -26,6 +26,8 @@ struct SonarContactProfileScreen: View {
     @State private var paySheet = false
     @State private var walletSheet = false
     @State private var toast: String?
+    @State private var confirmBlock = false
+    @State private var confirmDelete = false
 
     private var effectiveChatId: String {
         guard peerId.hasPrefix("npub1") else { return peerId }
@@ -53,7 +55,11 @@ struct SonarContactProfileScreen: View {
 
     private var verified: Bool { store.isVerified(effectiveChatId) }
     private var info: SNVerifyInfo { store.verifyInfo(for: effectiveChatId) }
-    private var canPay: Bool { store.paymentCapable(effectiveChatId) }
+    private var blocked: Bool { store.isContactBlocked(effectiveChatId, npub: resolvedNpub) }
+    private var canFavorite: Bool { store.canFavoriteContact(effectiveChatId) }
+    private var favorite: Bool { store.isContactFavorite(effectiveChatId) }
+    private var canCall: Bool { store.canCall(effectiveChatId) && !blocked }
+    private var canPay: Bool { store.paymentCapable(effectiveChatId) && !blocked }
     private var walletReady: Bool {
         if case .ready = store.walletState { return true }
         return false
@@ -110,14 +116,18 @@ struct SonarContactProfileScreen: View {
                     // ── Action buttons ──
                     HStack(spacing: 28) {
                         profileAction(icon: .lock, label: "Message") {
+                            if blocked {
+                                showToast("Unblock \(peerName) before messaging.")
+                                return
+                            }
                             if effectiveChatId != peerId {
                                 store.push(.dm(effectiveChatId))
                             } else {
                                 store.pop()
                             }
                         }
-                        profileAction(icon: .phone, label: "Call", enabled: store.canCall(effectiveChatId)) {
-                            if store.canCall(effectiveChatId) {
+                        profileAction(icon: .phone, label: "Call", enabled: canCall) {
+                            if canCall {
                                 store.placeCall(effectiveChatId, video: false)
                             }
                         }
@@ -217,14 +227,40 @@ struct SonarContactProfileScreen: View {
                     // ── Actions ──
                     SNSectionLabel("Actions")
                     SNSettingsCard {
+                        if canFavorite {
+                            SNSettingsRow(
+                                icon: .heart,
+                                tone: favorite ? .gold : .neutral,
+                                label: favorite ? "Remove favorite" : "Add favorite",
+                                sub: "Marks this trusted mesh peer for later relay delivery",
+                                trail: .none
+                            ) {
+                                showToast(store.toggleFavoriteContact(
+                                    effectiveChatId, npub: resolvedNpub, name: peerName
+                                ))
+                            }
+                        }
                         SNSettingsRow(
-                            icon: .x, tone: .red, label: "Block contact",
+                            icon: .x, tone: .red,
+                            label: blocked ? "Unblock contact" : "Block contact",
+                            sub: blocked
+                                ? "Allow messages and discovery again"
+                                : "Hide this contact and stop messages",
                             danger: true, trail: .none
-                        ) { showToast("Coming soon") }
+                        ) {
+                            if blocked {
+                                showToast(store.setContactBlocked(
+                                    effectiveChatId, npub: resolvedNpub,
+                                    name: peerName, blocked: false
+                                ))
+                            } else {
+                                confirmBlock = true
+                            }
+                        }
                         SNSettingsRow(
                             icon: .trash, tone: .red, label: "Delete chat",
                             danger: true, trail: .none, divider: false
-                        ) { showToast("Coming soon") }
+                        ) { confirmDelete = true }
                     }
 
                     Color.clear.frame(height: 40)
@@ -269,6 +305,34 @@ struct SonarContactProfileScreen: View {
             }
         }
         .animation(.easeOut(duration: 0.2), value: toast)
+        .confirmationDialog(
+            "Block \(peerName)?",
+            isPresented: $confirmBlock,
+            titleVisibility: .visible
+        ) {
+            Button("Block \(peerName)", role: .destructive) {
+                showToast(store.setContactBlocked(
+                    effectiveChatId, npub: resolvedNpub,
+                    name: peerName, blocked: true
+                ))
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Blocked people can't message or call you here. They won't be notified.")
+        }
+        .confirmationDialog(
+            "Delete this chat?",
+            isPresented: $confirmDelete,
+            titleVisibility: .visible
+        ) {
+            Button("Delete chat with \(peerName)", role: .destructive) {
+                store.deleteChat(effectiveChatId)
+                store.pop()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This removes the conversation from this device only. The other person isn't notified.")
+        }
     }
 
     private func copyKey() {

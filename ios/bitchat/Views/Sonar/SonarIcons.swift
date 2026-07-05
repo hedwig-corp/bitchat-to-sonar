@@ -28,6 +28,8 @@ enum SNIconName: String {
     case eye, eyeOff, importKey
     // Group invite links.
     case link
+    // Contact profile favorite toggle (Compose SNIconName.Heart, verbatim path).
+    case heart
 }
 
 private enum SNIconElement {
@@ -191,6 +193,9 @@ private let snIconTable: [SNIconName: [SNIconElement]] = [
         .path("M10.5 13.5l3-3"),
         .path("M14 10a3.5 3.5 0 0 1 0 5l-2 2a3.5 3.5 0 0 1-5 0 3.5 3.5 0 0 1 0-5l1-1"),
         .path("M10 14a3.5 3.5 0 0 1 0-5l2-2a3.5 3.5 0 0 1 5 0 3.5 3.5 0 0 1 0 5l-1 1"),
+    ],
+    .heart: [
+        .path("M12 20s-7-4.2-7-9.2a4.2 4.2 0 0 1 7-3.1 4.2 4.2 0 0 1 7 3.1c0 5-7 9.2-7 9.2z"),
     ],
 ]
 
