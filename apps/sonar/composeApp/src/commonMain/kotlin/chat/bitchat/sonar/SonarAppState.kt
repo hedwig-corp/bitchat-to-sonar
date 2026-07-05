@@ -216,6 +216,8 @@ data class ActiveCall(
     val muted: Boolean = false,
     val speakerOn: Boolean = true,
     val camOn: Boolean = false,
+    /** Which camera feeds the local PiP (iOS `frontCamera` parity). */
+    val frontCamera: Boolean = true,
 )
 
 /** Verify-sheet model: the safety groups (empty ⇒ show [note]) + verified flag. */
@@ -428,15 +430,18 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  otherwise over the folded White Noise group for the same Sonar peer. */
     fun placeCall(chatId: String, peerName: String, video: Boolean) {
         if (activeCall != null) { toast = "Already in a call"; return }
-        if (video) { toast = "Video calls are coming soon."; return }
         if (isContactBlocked(chatId)) { toast = "Unblock this contact before calling."; return }
         if (!canCall(chatId)) { toast = "No call route to this Sonar peer yet."; return }
         val callId = randomMeshId()
         // Show the ringing screen IMMEDIATELY so the tap is responsive; the iroh
         // setup (bind/offer) runs below. (ensureCallStarted is idempotent — it
         // guards on callStarted, so unlike the old iOS path it never re-binds.)
-        CallAudioRoute.configure(active = true, speakerOn = true)
-        activeCall = ActiveCall(callId, chatId, peerName, video, incoming = false, phase = SonarCallState.Ringing)
+        // iOS parity: video defaults to speaker, voice to earpiece (+ proximity).
+        CallAudioRoute.configure(active = true, speakerOn = video, voiceProximity = !video)
+        activeCall = ActiveCall(
+            callId, chatId, peerName, video, incoming = false, phase = SonarCallState.Ringing,
+            speakerOn = video, camOn = video,
+        )
         push(Screen.Call(chatId, peerName, video))
         scope.launch {
             ensureCallStarted()
@@ -480,7 +485,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun acceptCall() {
         val c = activeCall ?: return
         activeCall = c.copy(phase = SonarCallState.Connecting)
-        CallAudioRoute.configure(active = true, speakerOn = c.speakerOn)
+        CallAudioRoute.configure(active = true, speakerOn = c.speakerOn, voiceProximity = !c.video)
         scope.launch {
             try {
                 val addr = SonarCore.callLocalAddress()
@@ -556,6 +561,12 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun toggleCallCam() {
         val c = activeCall ?: return
         activeCall = c.copy(camOn = !c.camOn)
+    }
+
+    /** iOS parity (SonarCallScreen flip button): switch the local PiP camera. */
+    fun flipCallCamera() {
+        val c = activeCall ?: return
+        activeCall = c.copy(frontCamera = !c.frontCamera)
     }
 
     private fun startCallLoop() {
@@ -645,11 +656,6 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         when (ctrl) {
             is SonarCallControl.Offer -> {
-                if (ctrl.video) {
-                    runCatching { sendCallControl(callChatId, SonarCore.callEncodeAnswer(ctrl.callId, SonarAnswer.Decline, "")) }
-                    sonarLog("SonarCall", "declined unsupported video offer callId=${ctrl.callId.take(8)}")
-                    return
-                }
                 if (activeCall != null) { // busy: auto-decline
                     runCatching { sendCallControl(callChatId, SonarCore.callEncodeAnswer(ctrl.callId, SonarAnswer.Busy, "")) }
                     return
@@ -664,7 +670,12 @@ class SonarAppState(private val scope: CoroutineScope) {
                     return
                 }
                 val name = callPeerName(callChatId)
-                activeCall = ActiveCall(ctrl.callId, callChatId, name, ctrl.video, incoming = true, phase = SonarCallState.Ringing)
+                // iOS parity (SNActiveCall(speakerOn: video)): video rings on
+                // speaker with the camera armed; voice rings for the earpiece.
+                activeCall = ActiveCall(
+                    ctrl.callId, callChatId, name, ctrl.video, incoming = true, phase = SonarCallState.Ringing,
+                    speakerOn = ctrl.video, camOn = ctrl.video,
+                )
                 notifyIncoming(
                     idKey = callChatId,
                     conversationTitle = name,

@@ -165,6 +165,11 @@ fun CallScreen(state: SonarAppState, screen: Screen.Call) {
                     CallBtn(if (muted) SNIconName.MicOff else SNIconName.Mic, if (muted) "Unmute" else "Mute", active = muted) { state.toggleCallMute() }
                     if (video) {
                         CallBtn(if (camOn) SNIconName.Videocam else SNIconName.VideoOff, if (camOn) "Stop video" else "Start video", active = !camOn) { state.toggleCallCam() }
+                        // iOS parity (SonarCallScreen flip button): only while
+                        // the local camera is live.
+                        if (camOn) {
+                            CallBtn(SNIconName.CameraFlip, "Flip", active = false) { state.flipCallCamera() }
+                        }
                     } else {
                         CallBtn(SNIconName.Speaker, "Speaker", active = speakerOn) { state.toggleCallSpeaker() }
                     }
@@ -173,13 +178,17 @@ fun CallScreen(state: SonarAppState, screen: Screen.Call) {
             }
         }
 
-        // VIDEO PiP self-feed (bottom-right above the controls).
+        // VIDEO PiP self-feed (bottom-right above the controls). The hue shifts
+        // with the selected camera so the flip button has visible feedback
+        // until real camera frames land (remote frames are the same tracked
+        // core gap as iOS: "core doesn't expose peer frames yet").
         if (video && connected && camOn) {
+            val frontCamera = call?.frontCamera ?: true
             Box(
                 Modifier.align(Alignment.BottomEnd).padding(end = 16.dp, bottom = 168.dp)
                     .size(width = 104.dp, height = 150.dp).clip(RoundedCornerShape(18.dp))
             ) {
-                CallFeed(hue = bcHue(state.nick.ifBlank { "you" }), Modifier.fillMaxSize())
+                CallFeed(hue = bcHue(state.nick.ifBlank { "you" }) + (if (frontCamera) 0f else 70f), Modifier.fillMaxSize())
                 Text(
                     "you", color = Color(0xD9FFFFFF), fontSize = 11.sp, fontWeight = FontWeight.SemiBold,
                     modifier = Modifier.align(Alignment.BottomStart).padding(start = 8.dp, bottom = 7.dp)

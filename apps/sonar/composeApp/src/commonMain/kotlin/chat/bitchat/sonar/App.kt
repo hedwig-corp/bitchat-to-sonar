@@ -731,11 +731,15 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                     )
                 }
             }
-            // Audio call button. Calls are Sonar-only and use live BLE when
-            // available, otherwise White Noise signaling for that peer.
+            // Audio + video call buttons (iOS SonarDMScreen parity). Calls are
+            // Sonar-only and use live BLE when available, otherwise White
+            // Noise signaling for that peer.
             if (state.canCall(screen.id)) {
                 SNIconButton(SNIconName.Phone, size = 20.dp, weight = 2f, tint = s.text2) {
                     state.placeCall(screen.id, peerName, video = false)
+                }
+                SNIconButton(SNIconName.Videocam, size = 20.dp, weight = 2f, tint = s.text2) {
+                    state.placeCall(screen.id, peerName, video = true)
                 }
             }
         }
