@@ -5915,17 +5915,16 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (isPendingSecureChat(chatId)) return
         scope.launch {
             // A deduped direct row can back several duplicate Marmot groups —
-            // the target message lives in exactly one of them.
-            var lastError: Throwable? = null
-            for (groupId in directMarmotChatIds(chatId)) {
-                try {
-                    SonarCore.toggleReaction(groupId, messageId, e)
-                    return@launch
-                } catch (t: Throwable) {
-                    lastError = t
-                }
-            }
-            toast = "reaction failed: ${lastError?.message}"
+            // the target message lives in exactly one of them, and the core
+            // accepts any syntactically valid target id, so publish only into
+            // the group whose local page actually contains the message.
+            val groupIds = directMarmotChatIds(chatId)
+            val owner = groupIds.firstOrNull { groupId ->
+                runCatching { marmotMessages(groupId).any { it.id == messageId } }
+                    .getOrDefault(false)
+            } ?: groupIds.firstOrNull() ?: return@launch
+            runCatching { SonarCore.toggleReaction(owner, messageId, e) }
+                .onFailure { toast = "reaction failed: ${it.message}" }
         }
     }
 

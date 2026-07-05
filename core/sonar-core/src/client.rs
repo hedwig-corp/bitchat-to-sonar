@@ -3242,6 +3242,11 @@ impl SonarClient {
     /// state; it does not gate transcript visibility.
     pub async fn send_text(&self, group_id: &GroupId, text: &str) -> Result<()> {
         let local_started = Instant::now();
+        // A mesh-referencing reaction riding this leg as a ⚡REACT control
+        // line is a reaction, not user text: it must not clobber the sender's
+        // chat-list preview and must not fire a "new message" push wakeup
+        // (mirrors the receive-side drain special-case).
+        let is_mesh_reaction_line = text.starts_with(MESH_REACTION_LINE_PREFIX);
         // One MLS write guard covers encrypt + local-row write, so a
         // concurrently drained commit cannot land in between now that sends
         // no longer share the host's serialized engine queue with sync.
@@ -3269,6 +3274,10 @@ impl SonarClient {
         let publish_ack =
             self.spawn_outbox_publish(message.id.to_hex(), group_id_hex.clone(), event);
         self.notify_conversation_changed(&group_id_hex);
+        if is_mesh_reaction_line {
+            self.spawn_reaction_bookkeeping(event_id);
+            return Ok(());
+        }
         // Deferred bookkeeping: index + sync-state disk writes don't block
         // the caller so the next send can start immediately.
         self.spawn_send_bookkeeping(group_name, message, event_id);
