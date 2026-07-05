@@ -32,7 +32,9 @@ data class ReactionLine(val targetMessageId: String, val emoji: String, val add:
             // emoji for BOTH verbs) so the platforms accept and reject the
             // same lines and never diverge on a peer-crafted payload.
             if (target.isEmpty() || target.length > MAX_TARGET_ID_LENGTH) return null
-            if (!target.all { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' || it == '-' }) return null
+            // ASCII-only: Char.isDigit() accepts Unicode digits (e.g. ٩) that
+            // iOS Character.isHexDigit rejects — keep both validators identical.
+            if (!target.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' || it == '-' }) return null
             val add = when (parts[4]) { "add" -> true; "remove" -> false; else -> return null }
             val emoji = parts[3].trim()
             if (emoji.isEmpty()) return null
