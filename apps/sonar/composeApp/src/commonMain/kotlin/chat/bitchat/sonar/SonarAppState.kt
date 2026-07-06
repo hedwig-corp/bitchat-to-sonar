@@ -854,6 +854,11 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  restart paints names instead of key fallbacks — local-first parity with
      *  iOS, whose nickname cache survives relaunch. */
     private fun rememberMeshName(peerId: String, name: String) {
+        // Never remember a key-shaped fallback ("mesh·…", "npub1…") as a real
+        // name: callers pass through row labels that can themselves be
+        // fallbacks, and a persisted fallback MASKS later resolution (the
+        // remembered name short-circuits profile/announce lookups).
+        if (name.isKeyFallbackName()) return
         if (meshChatNames[peerId] == name) return
         meshChatNames[peerId] = name
         persistMeshNames()
@@ -869,7 +874,12 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun loadMeshNames() {
         SonarCore.loadBlob(MESH_NAMES_BLOB_KEY).lineSequence().forEach { line ->
             val i = line.indexOf('=')
-            if (i > 0) meshChatNames.putIfAbsent(line.substring(0, i), line.substring(i + 1).trim())
+            if (i > 0) {
+                val name = line.substring(i + 1).trim()
+                // Drop key-shaped fallbacks persisted by earlier builds — they
+                // mask real resolution.
+                if (!name.isKeyFallbackName()) meshChatNames.putIfAbsent(line.substring(0, i), name)
+            }
         }
     }
     /** Public BLE "Mesh" channel transcript (broadcast messages, not Nostr). */
@@ -2537,6 +2547,13 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // discoverable without racing a wallet-ready BOLT12 offer.
                 updateBleDiscoveryPolicy()
                 refreshKnownContactDescriptors(clearMisses = true)
+                // Kind-0 names: boot-time fetches raced the relay connect and
+                // missed — retry now, and once more after the sockets settle.
+                launch {
+                    refreshChatMemberProfiles(clearMisses = true)
+                    delay(6_000)
+                    refreshChatMemberProfiles(clearMisses = true)
+                }
                 setupWallet()
                 refreshLocationChannels()
                 refreshChats()
@@ -2585,6 +2602,26 @@ class SonarAppState(private val scope: CoroutineScope) {
         return resolveGroupAuthorName(message, isGroup, profilesByNpub, ::ensureProfile)
     }
 
+    /** Re-fetch kind-0 profiles for every conversation member, optionally
+     *  clearing the miss throttles first. Fetches fired while the relays were
+     *  still connecting MISS and get throttled — this gives them a prompt
+     *  second chance once connectivity arrives, instead of leaving npub
+     *  titles until the ~30min housekeeping sweep. Bounded: distinct members
+     *  of current chats + mesh links only. */
+    private fun refreshChatMemberProfiles(clearMisses: Boolean) {
+        if (clearMisses) {
+            profileMissedAt.clear()
+            profileFetches.clear()
+        }
+        val mine = canonicalProfileKey(npub)
+        (chats.asSequence().flatMap { it.members.asSequence() } +
+            meshChats.keys.asSequence().mapNotNull { npubStringForPeer(it) })
+            .map { canonicalProfileKey(it) }
+            .filter { it.isNotBlank() && it != mine }
+            .distinct()
+            .forEach { ensureProfile(it) }
+    }
+
     /** Fetch + cache a peer's kind-0 profile, so their name replaces the
      *  raw npub in the chat list/header. */
     fun ensureProfile(otherNpub: String) {
@@ -2599,8 +2636,17 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (!profileFetches.add(key)) return        // fetch already in flight
         scope.launch {
             val p = SonarCore.fetchProfile(key)
+            sonarLog("SonarProfile", "kind-0 fetch ${key.take(12)}… → ${p?.bestName ?: "MISS"}")
             if (p?.bestName != null) {
-                profilesByNpub = normalizedProfileCache(profilesByNpub + (key to p) - otherNpub)
+                // Drop a legacy entry under the caller's ORIGINAL key only when
+                // it differs from the canonical one — when the caller already
+                // passed the canonical npub, `- otherNpub` would remove the
+                // entry we just added (this kept the cache empty on every
+                // device: names re-fetched from relays on each launch).
+                val updated = profilesByNpub + (key to p)
+                profilesByNpub = normalizedProfileCache(
+                    if (otherNpub != key) updated - otherNpub else updated
+                )
                 profileFetchedAt[key] = SonarClock.nowSecs()
                 profileMissedAt.remove(key)
                 persistProfileCache()
@@ -2691,7 +2737,9 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private fun persistProfileCache() {
-        SonarCore.saveBlob(PROFILE_CACHE_BLOB_KEY, encodeProfileCache(profilesByNpub))
+        val encoded = encodeProfileCache(profilesByNpub)
+        sonarLog("SonarProfile", "persist cache: ${profilesByNpub.size} profiles → ${encoded.length} chars")
+        SonarCore.saveBlob(PROFILE_CACHE_BLOB_KEY, encoded)
     }
 
     fun openChat(chat: SonarChat) {
