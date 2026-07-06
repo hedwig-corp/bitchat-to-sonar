@@ -222,51 +222,50 @@ final class SecureIdentityStateManager: SecureIdentityStateManagerProtocol {
     private func performSave() {
         guard pendingSave else { return }
         pendingSave = false
-        persistCache(synchronously: false)
-    }
-
-    /// Snapshot + encrypt under the state queue (fast, memory-only), then
-    /// write to the Keychain OFF the caller's thread: `SecItem` calls are a
-    /// synchronous XPC round trip to securityd (measured 200-300ms main-thread
-    /// hangs at chat open, when BLE announces churn identity state while the
-    /// UI reads it). Only app-termination (`forceSave`) blocks for the write.
-    private func persistCache(synchronously: Bool) {
+        // Debounced save: snapshot + encrypt + write INLINE on the barrier
+        // queue. Inline keeps Keychain writes ordered — dispatching them to a
+        // concurrent queue let an older blob land after a newer one. The
+        // barrier queue is off the main thread, so securityd's synchronous XPC
+        // (measured 200-300ms hangs at chat open, when BLE announces churn
+        // identity state while the UI reads it) never stalls the UI.
         queue.async(flags: .barrier) { [weak self] in
-            guard let self else { return }
-            let blob: Data
-            do {
-                let data = try JSONEncoder().encode(self.cache)
-                guard let combined = try AES.GCM.seal(data, using: self.encryptionKey).combined else {
-                    SecureLogger.error("Identity cache seal produced no combined box", category: .security)
-                    return
-                }
-                blob = combined
-            } catch {
-                SecureLogger.error(error, context: "Failed to encode identity cache", category: .security)
-                return
-            }
-            let write = {
-                let saved = self.keychain.saveIdentityKey(blob, forKey: self.cacheKey)
-                if saved {
-                    SecureLogger.debug("Identity cache saved to keychain", category: .security)
-                }
-            }
-            if synchronously {
-                write()
-            } else {
-                DispatchQueue.global(qos: .utility).async(execute: write)
-            }
+            self?.encryptAndWriteCache()
         }
     }
 
-    // Force immediate save (for app termination). Blocks until the state
-    // queue has queued the write and the write itself runs inline, so a
-    // terminating app cannot lose the final state.
+    /// Encode + seal + write the cache to the Keychain. MUST run on `queue`
+    /// (serialized against reads/writes), so it snapshots a consistent cache
+    /// and its `SecItem` write is ordered against every other save.
+    private func encryptAndWriteCache() {
+        let blob: Data
+        do {
+            let data = try JSONEncoder().encode(cache)
+            guard let combined = try AES.GCM.seal(data, using: encryptionKey).combined else {
+                SecureLogger.error("Identity cache seal produced no combined box", category: .security)
+                return
+            }
+            blob = combined
+        } catch {
+            SecureLogger.error(error, context: "Failed to encode identity cache", category: .security)
+            return
+        }
+        let saved = keychain.saveIdentityKey(blob, forKey: cacheKey)
+        if saved {
+            SecureLogger.debug("Identity cache saved to keychain", category: .security)
+        }
+    }
+
+    // Force immediate save (app background / termination / deinit). Runs the
+    // encode + write synchronously under the barrier so the final state is
+    // persisted before returning — including on the deinit path, where a
+    // `[weak self]` async block would already resolve to nil and skip the
+    // write. `queue.sync` is safe here: no caller runs on `queue`.
     func forceSave() {
         saveTimer?.invalidate()
         pendingSave = false
-        persistCache(synchronously: true)
-        queue.sync(flags: .barrier) {}
+        queue.sync(flags: .barrier) {
+            self.encryptAndWriteCache()
+        }
     }
     
     // MARK: - Social Identity Management

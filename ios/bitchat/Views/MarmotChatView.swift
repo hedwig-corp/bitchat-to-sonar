@@ -973,10 +973,12 @@ final class MarmotChatModel: ObservableObject {
     }
 
     /// How far BEFORE the echo's creation a server row may be timestamped and
-    /// still count as this send's relay copy (clock skew + second-granularity
-    /// event timestamps). Anything older is a previous message that happens to
-    /// have the same text.
-    private static let optimisticMatchSlack: TimeInterval = 120
+    /// still count as this send's relay copy. The real copy is always stamped
+    /// at/after the echo (`send()` appends the echo, then `sendChain` runs
+    /// `sendText`), so only a few seconds of slack are needed for
+    /// second-granularity `created_at` + minor clock jitter. A wider window
+    /// would let a recent identical send consume this still-pending echo.
+    private static let optimisticMatchSlack: TimeInterval = 5
 
     private static func serverMessage(
         _ server: MarmotService.MarmotMessage,
