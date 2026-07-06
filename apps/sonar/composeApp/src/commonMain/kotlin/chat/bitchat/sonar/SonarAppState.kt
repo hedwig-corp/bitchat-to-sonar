@@ -26,7 +26,6 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.Dispatchers
@@ -296,6 +295,20 @@ data class ActiveCall(
 /** Verify-sheet model: the safety groups (empty ⇒ show [note]) + verified flag. */
 data class SonarVerify(val safety: List<String>, val verified: Boolean, val note: String?)
 
+/** Precomputed home chat-list row (Signal-style cached row view model): all the
+ *  fields the design ConvRow needs, resolved off the render path so the home
+ *  LazyColumn reads O(1) per row instead of walking `chats` + hitting disk. */
+data class MarmotRowModel(
+    val id: String,
+    val title: String,
+    val sub: String,
+    val tsSecs: Long,
+    val verified: Boolean,
+    val unread: Boolean,
+    val pending: Boolean,
+    val multiMember: Boolean,
+)
+
 /**
  * Shared (commonMain) UI state for the Sonar app. Drives White Noise (Marmot)
  * encrypted DMs through [SonarCore]; the same logic will back the iOS app once
@@ -344,7 +357,13 @@ class SonarAppState(private val scope: CoroutineScope) {
         normalizedProfileCache(decodeProfileCache(SonarCore.loadBlob(PROFILE_CACHE_BLOB_KEY)))
     )
         private set
-    private var socialState by mutableStateOf(decodeSonarSocialState(SonarCore.loadBlob(SOCIAL_STATE_BLOB_KEY)))
+    private var socialStateBacking by mutableStateOf(decodeSonarSocialState(SonarCore.loadBlob(SOCIAL_STATE_BLOB_KEY)))
+    /** Bumped on every [socialState] reassignment so memo keys can compare an
+     *  Int instead of hashing the four favorite/blocked Sets on every read. */
+    private var socialVersion = 0
+    private var socialState: SonarSocialState
+        get() = socialStateBacking
+        set(value) { socialStateBacking = value; socialVersion++ }
     private val profileFetches = mutableSetOf<String>()
     private val profileFetchedAt = mutableMapOf<String, Long>()
     /** Last kind-0 fetch MISS per npub — throttles per-render refetch spam. */
@@ -453,6 +472,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             MessageStore.wipe()
             // In-memory conversation state.
             meshChats.clear(); meshChatNames.clear(); pendingMarmotSends.clear(); pendingDirectMarmotSends.clear(); pendingMarmotGroupSends.clear(); outbox.clear()
+            persistMeshNames() // clear the on-disk name cache too, else boot resurrects erased names
             pendingMarmotChatNpubs = emptyMap()
             pendingMarmotGroups = emptyMap()
             linkByFp.clear(); linkCapsByFp.clear(); groupFoldMap.clear()
@@ -865,9 +885,14 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private fun persistMeshNames() {
+        // Value is hex-encoded (like the kind-0 profile cache): a peer's
+        // advertised nickname is arbitrary attacker-controlled unicode, so a
+        // raw newline would inject a fake `peerId=name` line on reload and
+        // poison a DIFFERENT peer's label. Hex framing makes that impossible
+        // and preserves emoji/whitespace byte-for-byte.
         SonarCore.saveBlob(
             MESH_NAMES_BLOB_KEY,
-            meshChatNames.entries.joinToString("\n") { "${it.key}=${it.value}" },
+            meshChatNames.entries.joinToString("\n") { "${it.key}=${hexEncodeUtf8(it.value)}" },
         )
     }
 
@@ -875,7 +900,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         SonarCore.loadBlob(MESH_NAMES_BLOB_KEY).lineSequence().forEach { line ->
             val i = line.indexOf('=')
             if (i > 0) {
-                val name = line.substring(i + 1).trim()
+                val raw = line.substring(i + 1)
+                // Tolerate legacy plain-text blobs (pre-hex builds): decode
+                // hex, fall back to the raw value if it isn't hex.
+                val name = hexDecodeUtf8(raw) ?: raw
                 // Drop key-shaped fallbacks persisted by earlier builds — they
                 // mask real resolution.
                 if (!name.isKeyFallbackName()) meshChatNames.putIfAbsent(line.substring(0, i), name)
@@ -1042,7 +1070,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             foldedGroupIds = foldedGroupIds,
             pendingChatNpubs = pendingMarmotChatNpubs,
             pendingGroupIds = pendingMarmotGroups.keys,
-            socialVersion = socialState.hashCode(),
+            socialVersion = socialVersion,
             snapshotVersion = snapshotVersion,
             ownNpub = npub,
             holdVersion = holdInputsVersion,
@@ -2107,13 +2135,34 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     // ── Verify safety numbers (1:1 with iOS) ──
+    /** Verified chat ids held in memory so [isVerified] (read per home row) is an
+     *  O(1) set lookup, not a synchronous per-id `loadBlob` on the render path.
+     *  Seeded from disk once in [boot]; the `verified.<id>` blobs stay the
+     *  source of truth. [verifiedVersion] keys the row-model memo. */
+    private val verifiedChatIds = mutableSetOf<String>()
+    private var verifiedVersion = 0
+
+    /** One-time boot seed: read the persisted verify flag for each known chat id
+     *  (off the render path). Blobs have no enumeration, so we probe the ids we
+     *  actually have from the restored snapshot. */
+    private fun seedVerifiedChatIds() {
+        for (chat in chats) {
+            for (id in directMarmotChatIds(chat.id)) {
+                if (SonarCore.loadBlob("verified.$id") == "1") verifiedChatIds += id
+            }
+        }
+        verifiedVersion++
+    }
+
     fun isVerified(chatId: String): Boolean =
-        directMarmotChatIds(chatId).any { SonarCore.loadBlob("verified.$it") == "1" }
+        directMarmotChatIds(chatId).any { it in verifiedChatIds }
 
     fun markVerified(chatId: String) {
         for (id in directMarmotChatIds(chatId)) {
             SonarCore.saveBlob("verified.$id", "1")
+            verifiedChatIds += id
         }
+        verifiedVersion++
         payVersion++ // recompose verify-dependent UI
         toast = "Marked as verified"
     }
@@ -2184,6 +2233,10 @@ class SonarAppState(private val scope: CoroutineScope) {
                 callLogs.clear(); callVersion++
 
                 npub = restoredNpub
+                // Keep the persisted npub consistent with the restored identity
+                // now, so a crash before start()'s re-save can't restore the OLD
+                // npub as "me" on the next launch's local-first paint.
+                SonarCore.saveBlob(NPUB_BLOB_KEY, restoredNpub)
                 started = false
                 connecting = false
                 SonarCore.setOnboardingComplete(true)
@@ -2333,6 +2386,69 @@ class SonarAppState(private val scope: CoroutineScope) {
             }
             .maxByOrNull { it.tsSecs }
             ?.let { messagePreview(it.content, it.stickerRef, it.media) to it.tsSecs }
+
+    // ── Home Marmot-row view models (Signal "cache row view models") ──
+    // The home LazyColumn used to call chatTitle + chatRowMeta + isVerified +
+    // unreadForChat PER ROW during composition; each walked `chats` (O(chats)),
+    // so a home paint was O(chats²) plus a per-row disk read for verify. These
+    // are now precomputed ONCE per input change (peer-key grouping built a
+    // single time) and read O(1) by the row via [marmotRow].
+    private var marmotRowsKey: VisibleChatsKey? = null
+    private var marmotRowsUnread: Map<String, Long>? = null
+    private var marmotRowsProfiles: Map<String, SonarProfile>? = null
+    private var marmotRowsVerified = -1
+    private var marmotRowsCache: Map<String, MarmotRowModel> = emptyMap()
+
+    private fun marmotRowModels(): Map<String, MarmotRowModel> {
+        val vkey = currentVisibleChatsKey()
+        val unread = unreadByChat
+        val profiles = profilesByNpub
+        // Reassigned-map identity (===) detects change without hashing entries.
+        if (marmotRowsKey == vkey && marmotRowsUnread === unread &&
+            marmotRowsProfiles === profiles && marmotRowsVerified == verifiedVersion
+        ) return marmotRowsCache
+        val models = computeMarmotRowModels(visibleChats)
+        marmotRowsKey = vkey; marmotRowsUnread = unread
+        marmotRowsProfiles = profiles; marmotRowsVerified = verifiedVersion
+        marmotRowsCache = models
+        return models
+    }
+
+    private fun computeMarmotRowModels(rows: List<SonarChat>): Map<String, MarmotRowModel> {
+        // Peer-key → all its chat ids, built ONCE (was recomputed per row).
+        val idsByPeerKey = HashMap<String, MutableList<String>>()
+        for (c in chats) {
+            val pk = directMarmotPeerKey(c) ?: continue
+            idsByPeerKey.getOrPut(pk) { mutableListOf() }.add(c.id)
+        }
+        fun groupedIds(chat: SonarChat): List<String> =
+            directMarmotPeerKey(chat)?.let { idsByPeerKey[it] } ?: listOf(chat.id)
+        return rows.associate { chat ->
+            val pending = isPendingSecureChat(chat.id)
+            val ids = if (pending) listOf(chat.id) else groupedIds(chat)
+            val newest = if (pending) null else ids
+                .mapNotNull { visibleMessagesForChat(it, chatSnapshotMessagesByChat[it].orEmpty()).lastOrNull() }
+                .maxByOrNull { it.tsSecs }
+            chat.id to MarmotRowModel(
+                id = chat.id,
+                title = chatTitle(chat),
+                sub = when {
+                    pending -> "Setting up secure chat…"
+                    newest != null -> messagePreview(newest.content, newest.stickerRef, newest.media)
+                    else -> "Tap to open"
+                },
+                tsSecs = newest?.tsSecs ?: 0L,
+                verified = ids.any { it in verifiedChatIds },
+                unread = ids.sumOf { unreadByChat[it] ?: 0L } > 0,
+                pending = pending,
+                multiMember = isMultiMemberChat(chat.id),
+            )
+        }
+    }
+
+    /** O(1) precomputed home-row view model for [chatId] (see [marmotRowModels]). */
+    fun marmotRow(chatId: String): MarmotRowModel =
+        marmotRowModels()[chatId] ?: MarmotRowModel(chatId, chatId, "Tap to open", 0L, false, false, false, false)
 
     fun setForeground(value: Boolean) {
         val cameToForeground = value && !foreground
@@ -2532,6 +2648,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             meshChats.putAll(MessageStore.loadAllMeshDms())
             loadLinks() // durable fingerprint↔npub so BLE chats stay unified after restart
             loadMeshNames() // announce nicknames survive restart — names, not keys
+            seedVerifiedChatIds() // in-memory verify set (off render path)
             refreshMeshDmRows()
             recomputeConversations() // fold White Noise legs into mesh rows pre-start
             try {
@@ -2636,7 +2753,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (!profileFetches.add(key)) return        // fetch already in flight
         scope.launch {
             val p = SonarCore.fetchProfile(key)
-            sonarLog("SonarProfile", "kind-0 fetch ${key.take(12)}… → ${p?.bestName ?: "MISS"}")
+            // Log the outcome only — a resolved display name is PII and this
+            // tees into the user-shareable diagnostics bundle.
+            sonarLog("SonarProfile", "kind-0 fetch ${key.take(12)}… → ${if (p?.bestName != null) "HIT" else "MISS"}")
             if (p?.bestName != null) {
                 // Drop a legacy entry under the caller's ORIGINAL key only when
                 // it differs from the canonical one — when the caller already
@@ -5215,8 +5334,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         return meshChatNames[peerId] ?: ("mesh·" + peerId.take(6))
     }
 
-    private fun String.isKeyFallbackName(): Boolean =
-        startsWith("mesh·") || startsWith("npub1")
+    private fun String.isKeyFallbackName(): Boolean = isKeyFallbackNameValue(this)
 
     /** Recompute the observable mesh DM rows (newest conversation first). Fast,
      *  BLE-leg only — for immediate feedback on send/receive. [recomputeConversations]
@@ -5413,10 +5531,26 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     @OptIn(kotlinx.coroutines.FlowPreview::class)
+    /** Per-key debounce jobs for [collectConversationChanges]: rapid changes to
+     *  the SAME chat coalesce, but a burst across DIFFERENT chats no longer
+     *  drops the losers (a stream-wide `debounce` kept only the last groupId,
+     *  deferring the others' call/pay ring to a housekeeping cycle). */
+    private val conversationChangeJobs = mutableMapOf<String, Job>()
+
     private fun collectConversationChanges() {
         SonarCore.conversationChanged
-            .debounce(50)
             .onEach { groupIdHex ->
+                conversationChangeJobs.remove(groupIdHex)?.cancel()
+                conversationChangeJobs[groupIdHex] = scope.launch {
+                    delay(50)
+                    handleConversationChange(groupIdHex)
+                    conversationChangeJobs.remove(groupIdHex)
+                }
+            }
+            .launchIn(scope)
+    }
+
+    private suspend fun handleConversationChange(groupIdHex: String) {
                 // PRIMARY delivery path: refresh + process the CHANGED chat
                 // immediately so a call rings / pay processes / the open
                 // transcript updates without waiting for the heartbeat.
@@ -5450,8 +5584,6 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // counts, profile/presence/mesh upkeep) to the conflated
                 // housekeeping consumer instead of doing it inline per event.
                 requestHousekeeping()
-            }
-            .launchIn(scope)
     }
 
     private suspend fun refreshUnreadCounts() {
@@ -5531,6 +5663,12 @@ class SonarAppState(private val scope: CoroutineScope) {
             .filter { now - it.value >= PROFILE_REFRESH_TTL_SECS }
             .map { it.key }
         stale.forEach { profileFetches.remove(it); profileFetchedAt.remove(it) }
+        // Prune expired MISS markers too (they only throttle re-fetch, but grew
+        // unbounded for npubs that came and went across a long-lived session).
+        profileMissedAt.entries
+            .filter { now - it.value >= PROFILE_MISS_TTL_SECS }
+            .map { it.key }
+            .forEach { profileMissedAt.remove(it) }
     }
 
     private fun startHousekeepingConsumer() {
@@ -5655,11 +5793,12 @@ class SonarAppState(private val scope: CoroutineScope) {
             // calls/sec burn CPU draining empty queues forever. Idle backs
             // off to 1s; any drain hit or in-range peer snaps back to 150ms.
             var lastActivityMs = 0L
-            var nowMs: Long
             while (true) {
                 val drained = drainMeshDms() or drainMeshMedia() or drainMeshBroadcasts()
-                nowMs = SonarClock.nowSecs() * 1000L
-                if (drained || MeshRadio.peers().any { it.rssi != 0 }) lastActivityMs = nowMs
+                val nowMs = SonarClock.nowMillis()
+                // hasActivePeer() is a cheap link/announce probe — unlike
+                // peers() it doesn't build+sort the whole list every tick.
+                if (drained || MeshRadio.hasActivePeer()) lastActivityMs = nowMs
                 val fast = nowMs - lastActivityMs < MESH_REALTIME_HOT_WINDOW_MS
                 delay(if (fast) 150 else 1000)
             }

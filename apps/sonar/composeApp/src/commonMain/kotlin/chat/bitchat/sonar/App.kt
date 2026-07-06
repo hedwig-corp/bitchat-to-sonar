@@ -323,26 +323,20 @@ private fun HomeScreen(state: SonarAppState) {
                     ) { state.openDm(row.peerId, row.name) }
                 }
                 items(chatRows, key = { it.id }) { chat ->
-                    val chatTitle = state.chatTitle(chat)
-                    val pending = state.isPendingSecureChat(chat.id)
-                    // Real transcript tail + time (design ConvRow), from the
-                    // in-memory snapshot; "Tap to open" only when empty.
-                    val meta = if (pending) null else state.chatRowMeta(chat.id)
+                    // O(1) precomputed row model — no per-row disk read or
+                    // O(chats) walk during composition (Signal cached row VM).
+                    val row = state.marmotRow(chat.id)
                     ConvRow(
-                        avatar = { SonarAvatar(chatTitle, 52.dp, presence = false) },
-                        title = chatTitle,
-                        sub = when {
-                            pending -> "Setting up secure chat…"
-                            meta != null -> meta.first
-                            else -> "Tap to open"
-                        },
+                        avatar = { SonarAvatar(row.title, 52.dp, presence = false) },
+                        title = row.title,
+                        sub = row.sub,
                         lock = true,
-                        time = meta?.second?.let { rowTimeLabel(it) } ?: "",
-                        verified = state.isVerified(chat.id),
-                        unread = state.unreadForChat(chat.id) > 0,
+                        time = if (row.tsSecs > 0L) rowTimeLabel(row.tsSecs) else "",
+                        verified = row.verified,
+                        unread = row.unread,
                         divider = chat.id != lastRowKey,
-                        onLongClick = if (pending) null else {
-                            { pendingDelete = DeleteTarget(chat.id, chatTitle, isMesh = false, isGroup = state.isMultiMemberChat(chat.id)) }
+                        onLongClick = if (row.pending) null else {
+                            { pendingDelete = DeleteTarget(chat.id, row.title, isMesh = false, isGroup = row.multiMember) }
                         },
                     ) { state.openChat(chat) }
                 }
