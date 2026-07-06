@@ -131,6 +131,10 @@ final class BridgedWallet: SonarWalletProviding {
         try await bridge.createOffer()
     }
 
+    func clearCachedReceiveOffer() {
+        bridge.clearCachedReceiveOffer()
+    }
+
     func incomingPayments() -> AsyncStream<SonarWalletPayment> {
         let stream = bridge.incomingPayments()
         return AsyncStream { continuation in

@@ -152,6 +152,50 @@ extension SonarWalletProviding {
     }
 }
 
+/// Coalesces receive-offer creation so repeated descriptor refreshes keep
+/// advertising one reachable BOLT12 offer instead of rotating offers on every
+/// wallet state tick.
+@MainActor
+final class SonarReceiveOfferCache {
+    private struct InFlight {
+        let id: UUID
+        let task: Task<String, Error>
+    }
+
+    private var cachedOffer: String?
+    private var inFlight: InFlight?
+
+    func offer(create: @escaping @MainActor () async throws -> String) async throws -> String {
+        if let cachedOffer { return cachedOffer }
+        if let inFlight { return try await inFlight.task.value }
+
+        let id = UUID()
+        let task = Task { @MainActor in
+            try await create()
+        }
+        inFlight = InFlight(id: id, task: task)
+
+        do {
+            let offer = try await task.value
+            guard inFlight?.id == id else { throw CancellationError() }
+            cachedOffer = offer
+            inFlight = nil
+            return offer
+        } catch {
+            if inFlight?.id == id {
+                inFlight = nil
+            }
+            throw error
+        }
+    }
+
+    func reset() {
+        inFlight?.task.cancel()
+        inFlight = nil
+        cachedOffer = nil
+    }
+}
+
 /// Default wallet: nothing is configured. Every operation fails loudly so
 /// no flow can pretend money moved. Money is always shown in sats (no rate,
 /// no currencies, fiat entry disabled).

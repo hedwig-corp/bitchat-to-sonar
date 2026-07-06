@@ -5573,6 +5573,7 @@ final class SonarAppStore: ObservableObject {
         // Forget every ⚡PAY coin and the Lightning wallet seed (separate
         // keychain service owned by SonarWalletKit).
         #if os(iOS) || os(macOS)
+        (wallet as? BridgedWallet)?.clearCachedReceiveOffer()
         BridgedWallet.wipeWalletStorage()
         #endif
         payLedger.wipe()

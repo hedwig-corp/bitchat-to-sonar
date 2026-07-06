@@ -111,6 +111,7 @@ final class WalletBridgeService: ObservableObject {
 
     private let wallet: SonarWallet
     private let mainnet: Bool
+    private let receiveOfferCache = SonarReceiveOfferCache()
     private var balanceTask: Task<Void, Never>?
     private var setupTask: Task<Void, Error>?
     /// True between `suspendForBackground()` and `resumeFromBackground()` so the
@@ -486,10 +487,16 @@ final class WalletBridgeService: ObservableObject {
     /// behind the user's BIP-353 `user@domain` address).
     func createOffer() async throws -> String {
         do {
-            return try await wallet.createOffer()
+            return try await receiveOfferCache.offer { [wallet] in
+                try await wallet.createOffer()
+            }
         } catch let error as SonarWallet.WalletError {
             throw Self.map(error)
         }
+    }
+
+    func clearCachedReceiveOffer() {
+        receiveOfferCache.reset()
     }
 
     /// Classify a destination string (invoice/offer/LNURL/BIP-353) and
