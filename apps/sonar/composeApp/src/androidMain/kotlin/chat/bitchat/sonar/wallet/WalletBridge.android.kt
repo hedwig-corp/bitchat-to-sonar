@@ -5,9 +5,11 @@ import breez_sdk_liquid.BindingLiquidSdk
 import breez_sdk_liquid.ConnectRequest
 import breez_sdk_liquid.EventListener
 import breez_sdk_liquid.LiquidNetwork
+import breez_sdk_liquid.ListPaymentsRequest
 import breez_sdk_liquid.PayAmount
 import breez_sdk_liquid.Payment
 import breez_sdk_liquid.PaymentMethod
+import breez_sdk_liquid.PaymentState
 import breez_sdk_liquid.PaymentType
 import breez_sdk_liquid.PrepareReceiveRequest
 import breez_sdk_liquid.PrepareSendRequest
@@ -157,14 +159,14 @@ actual object WalletBridge {
         }.getOrNull()
     }
 
-    /** Surface a settled payment to [paymentEvents]. A stable wallet payment id
-     *  keeps `walletIncoming` recording idempotent across event replays (iOS
+    /** Map an SDK [Payment] to the app event. A stable wallet payment id keeps
+     *  `walletIncoming` recording idempotent across event replays (iOS
      *  `SonarWallet.map`: txId ?? destination); with nothing stable we skip the
-     *  event rather than mint a random id that could duplicate ledger rows. */
-    private fun emitPaymentEvent(p: Payment) {
+     *  payment rather than mint a random id that could duplicate ledger rows. */
+    private fun paymentEventOf(p: Payment): WalletPaymentEvent? {
         val lightning = p.details as? PaymentDetails.Lightning
-        val id = p.txId ?: lightning?.paymentHash ?: p.destination ?: return
-        val ev = WalletPaymentEvent(
+        val id = p.txId ?: lightning?.paymentHash ?: p.destination ?: return null
+        return WalletPaymentEvent(
             paymentId = id,
             incoming = p.paymentType == PaymentType.RECEIVE,
             amountSats = p.amountSat.toLong(),
@@ -172,12 +174,40 @@ actual object WalletBridge {
             timestampSecs = p.timestamp.toLong(),
             preimage = lightning?.preimage,
         )
+    }
+
+    /** Surface a settled payment to [paymentEvents]. */
+    private fun emitPaymentEvent(p: Payment) {
+        val ev = paymentEventOf(p) ?: return
         // Record to the persistent ledger AT THE SOURCE so an incoming payment
         // during a headless/background FCM wakeup (no UI collector on the
         // replay-0 flow) is still captured. Idempotent by wallet payment id.
         PaymentActivityStore.recordIncomingWalletPayment(ev)
         payments.tryEmit(ev)
     }
+
+    /**
+     * Headless-wake support: settled receives at/after [sinceSecs], newest
+     * first. The push service polls this as a fallback for a payment that
+     * settled during `connect()` — before [startObservingBalance] attached the
+     * event listener — which would otherwise never reach [paymentEvents].
+     * Failures (and a torn-down wallet) surface as an empty list: the wake
+     * path treats "can't know" the same as "nothing settled".
+     */
+    suspend fun recentSettledReceives(sinceSecs: Long): List<WalletPaymentEvent> =
+        withContext(Dispatchers.IO) {
+            val node = sdk ?: return@withContext emptyList()
+            runCatching {
+                node.listPayments(
+                    ListPaymentsRequest(
+                        filters = listOf(PaymentType.RECEIVE),
+                        states = listOf(PaymentState.COMPLETE),
+                        fromTimestamp = sinceSecs,
+                        limit = 20u,
+                    )
+                )
+            }.getOrDefault(emptyList()).mapNotNull(::paymentEventOf)
+        }
 
     /** Conflates SDK event bursts (initial sync, payment storms) into at most
      *  one in-flight `getInfo()` plus one trailing refresh, instead of one
