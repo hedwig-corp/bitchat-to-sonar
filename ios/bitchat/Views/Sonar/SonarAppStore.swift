@@ -1694,6 +1694,12 @@ final class SonarAppStore: ObservableObject {
                     seenMarmotNotificationMessageIDs.insert(message.id)
                     continue
                 }
+                // A blocked person must not fire a notification — same rule the
+                // mesh inbound path applies via `isNostrBlocked`.
+                if isMarmotSenderBlocked(message.senderNpub) {
+                    seenMarmotNotificationMessageIDs.insert(message.id)
+                    continue
+                }
                 guard seenMarmotNotificationMessageIDs.insert(message.id).inserted else { continue }
                 let kind = localNotificationKind(for: message.content)
                 guard kind != .call else { continue }
@@ -1814,6 +1820,17 @@ final class SonarAppStore: ObservableObject {
             return true
         }
         return false
+    }
+
+    /// True when a Marmot (White Noise) message's sender npub is on the Nostr
+    /// block list. Mirrors the mesh inbound filter
+    /// (`ChatViewModel+PrivateChat` / `+Nostr`, `isNostrBlocked`): the block
+    /// list is keyed by the lowercased 32-byte pubkey hex, so map the sender
+    /// npub through `nostrBlockKey`. Used to drop a blocked person's messages
+    /// from both the transcript read path and the notification path.
+    private func isMarmotSenderBlocked(_ senderNpub: String) -> Bool {
+        guard let hex = Self.nostrBlockKey(senderNpub) else { return false }
+        return chatViewModel.identityManager.isNostrBlocked(pubkeyHexLowercased: hex)
     }
 
     /// Block/unblock BOTH identity legs so the person stays blocked whichever
@@ -3094,6 +3111,10 @@ final class SonarAppStore: ObservableObject {
             let rowGroupId = latest?.groupId ?? rowGroup.id
             let rowLast = latest?.message
             let otherNpub = directOtherNpub(in: rowGroup) ?? peerKey
+            // Whole counterpart blocked → suppress this 1:1 chat from the list,
+            // the same way a blocked mesh peer never surfaces a row. `peerKey`
+            // is already reserved above so no duplicate row can slip through.
+            if let otherNpub, isMarmotSenderBlocked(otherNpub) { continue }
             // Live peer id (when currently discovered over 0x53) gives us mesh
             // presence; the persisted fingerprint still lets us build the SAME
             // Sonar row when BLE is down / after restart.
@@ -3333,6 +3354,9 @@ final class SonarAppStore: ObservableObject {
             var dated: [(Date, SNMessage)] = []
             for group in sourceGroups {
                 dated += (marmot.messagesByGroup[group.id] ?? []).compactMap { m in
+                    // Drop a blocked person's messages from the transcript, the
+                    // same way the mesh inbound path drops them via `isNostrBlocked`.
+                    if !m.isMine, isMarmotSenderBlocked(m.senderNpub) { return nil }
                     switch payMapping(m, fallbackVia: .internet) {
                     case .hidden:
                         return nil
@@ -3447,6 +3471,9 @@ final class SonarAppStore: ObservableObject {
         // White Noise leg always renders as internet (indigo).
         if let profile = resolvedSonarProfile(id), let group = marmotGroup(forNpub: profile.npub) {
             dated += (marmot.messagesByGroup[group.id] ?? []).compactMap { m in
+                // Drop a blocked person's messages from the transcript, the
+                // same way the mesh inbound path drops them via `isNostrBlocked`.
+                if !m.isMine, isMarmotSenderBlocked(m.senderNpub) { return nil }
                 switch payMapping(m, fallbackVia: .internet) {
                 case .hidden:
                     return nil
