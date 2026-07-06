@@ -527,8 +527,6 @@ struct SNMsgBubble: View {
     /// Only other participants' names in a channel context are tappable.
     private var tappable: Bool { onTapAuthor != nil && !mine }
 
-    private static let linkDetector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
-
     /// Message text with detected URLs turned into tappable, underlined links.
     private var linkified: AttributedString {
         SonarMessageTextFormatter.attributedBubbleText(
@@ -543,7 +541,7 @@ struct SNMsgBubble: View {
     /// The first URL in the message, if any (drives the "Open link" action).
     private var firstURL: URL? {
         let ns = m.text as NSString
-        guard ns.length > 0, let detector = Self.linkDetector else { return nil }
+        guard ns.length > 0, let detector = MessageFormattingEngine.Patterns.linkDetector else { return nil }
         return detector.firstMatch(in: m.text, options: [], range: NSRange(location: 0, length: ns.length))?.url
     }
 

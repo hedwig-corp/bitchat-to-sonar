@@ -7,8 +7,6 @@ import Foundation
 import SwiftUI
 
 enum SonarMessageTextFormatter {
-    private static let linkDetector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
-
     private enum MatchKind {
         case link(URL?)
         case mention
@@ -63,7 +61,7 @@ enum SonarMessageTextFormatter {
 
         var matches: [TextMatch] = []
         if (detectBareDomains || text.contains("://") || text.localizedCaseInsensitiveContains("www.")),
-           let detector = linkDetector {
+           let detector = MessageFormattingEngine.Patterns.linkDetector {
             for match in detector.matches(in: text, options: [], range: fullRange) {
                 appendMatch(match.range, kind: .link(match.url), priority: 0, in: text, to: &matches)
             }
