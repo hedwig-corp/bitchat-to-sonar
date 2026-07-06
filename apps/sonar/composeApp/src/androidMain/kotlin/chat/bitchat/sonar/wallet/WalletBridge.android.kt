@@ -207,27 +207,49 @@ actual object WalletBridge {
     }
 
     /**
-     * Headless-wake support: settled receives at/after [sinceSecs], newest
-     * first. The push service polls this as a fallback for a payment that
-     * settled during `connect()` — before [startObservingBalance] attached the
-     * event listener — which would otherwise never reach [paymentEvents].
-     * Failures (and a torn-down wallet) surface as an empty list: the wake
-     * path treats "can't know" the same as "nothing settled".
+     * Headless-wake support: incoming receives at/after [sinceSecs], newest
+     * first. The push service polls this to detect a receive that the event
+     * listener missed — one that landed during `connect()`, before
+     * [startObservingBalance] attached the listener, which would otherwise
+     * never reach [paymentEvents].
+     *
+     * Includes BOTH `COMPLETE` and `PENDING`: a BOLT12/swap receive sits in
+     * `PENDING` (lockup seen, claim in flight) for most of the wake — the funds
+     * are already arriving — so waiting only for `COMPLETE` would burn the whole
+     * budget before the OS foreground-service window closes. Treating a claimed
+     * receive as wake-ending lets the SDK finish the confirm in the background.
+     * `sortAscending = false` guarantees the just-arrived payment is in the
+     * returned page even with many historical receives past the floor.
+     * Failures (and a torn-down wallet) surface as an empty list: the wake path
+     * treats "can't know" the same as "nothing arrived".
      */
-    suspend fun recentSettledReceives(sinceSecs: Long): List<WalletPaymentEvent> =
+    suspend fun recentIncomingReceives(sinceSecs: Long): List<WalletPaymentEvent> =
         withContext(Dispatchers.IO) {
             val node = sdk ?: return@withContext emptyList()
             runCatching {
                 node.listPayments(
                     ListPaymentsRequest(
                         filters = listOf(PaymentType.RECEIVE),
-                        states = listOf(PaymentState.COMPLETE),
+                        states = listOf(PaymentState.COMPLETE, PaymentState.PENDING),
                         fromTimestamp = sinceSecs,
+                        sortAscending = false,
                         limit = 20u,
                     )
                 )
             }.getOrDefault(emptyList()).mapNotNull(::paymentEventOf)
         }
+
+    /**
+     * Liveness probe for a reused connection: a wake may find `state()` Ready
+     * from a prior wake whose websocket has since died in Doze. `getInfo()`
+     * round-trips the SDK; false means the handle is stale and the caller
+     * should `shutdown()` + `setupIfNeeded()` rather than silently poll a dead
+     * node (which returns empty → "nothing arrived" → missed payment).
+     */
+    suspend fun isConnectionLive(): Boolean = withContext(Dispatchers.IO) {
+        val node = sdk ?: return@withContext false
+        runCatching { node.getInfo() }.isSuccess
+    }
 
     /** Conflates SDK event bursts (initial sync, payment storms) into at most
      *  one in-flight `getInfo()` plus one trailing refresh, instead of one
