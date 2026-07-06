@@ -75,13 +75,38 @@ enum SonarDiagnostics {
         LogFileSink.shared.configure(directory: dir, verbose: verboseEnabled)
     }
 
+    /// The OTHER process's log root — the NSE writes to `logs-nse` (a separate
+    /// process the main app's sink never opened), and vice-versa. Wipe must take
+    /// it too since verbose logs there can hold peer npubs.
+    private static func siblingLogsRootDirectory() -> URL? {
+        guard let base = try? FileManager.default.url(
+            for: .applicationSupportDirectory, in: .userDomainMask,
+            appropriateFor: nil, create: false
+        ) else { return nil }
+        let isExtension = Bundle.main.bundleURL.pathExtension == "appex"
+        return base
+            .appendingPathComponent("sonar-marmot", isDirectory: true)
+            .appendingPathComponent(isExtension ? "logs" : "logs-nse", isDirectory: true)
+    }
+
     /// Delete every on-device diagnostics log directory. Called from the
     /// emergency-wipe path: verbose logs can contain peer npubs, so a wipe must
-    /// leave nothing behind (Account Key Durability / privacy rule). The sinks
-    /// recreate their directories lazily on the next write.
+    /// leave nothing behind (Account Key Durability / privacy rule).
     static func clearLogs() {
-        guard let root = logsRootDirectory() else { return }
-        try? FileManager.default.removeItem(at: root)
+        // App (SecureLogger) sink: purge on its own writer queue so an in-flight
+        // write can't reopen the file mid-delete and strand a pre-wipe npub.
+        LogFileSink.shared.purge()
+        // The Rust core logs sit beside the app sink dir and are held open by
+        // tracing-appender, not LogFileSink — removing the dir unlinks their
+        // on-disk content (gone from the FS) with no queue race.
+        if let root = logsRootDirectory() {
+            try? FileManager.default.removeItem(at: root.appendingPathComponent("core", isDirectory: true))
+        }
+        // The other process's whole log tree (NSE ↔ main app), never opened by
+        // this process's sink, so a plain remove is race-free.
+        if let sibling = siblingLogsRootDirectory() {
+            try? FileManager.default.removeItem(at: sibling)
+        }
     }
 
     /// Install the Rust core file sink. Idempotent and cheap after the first
@@ -154,7 +179,7 @@ enum SonarDiagnostics {
         coordinator.coordinate(
             readingItemAt: staging, options: .forUploading, error: &coordinationError
         ) { tempZip in
-            let stamp = Int(Date().timeIntervalSince1970)
+            let stamp = "\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString.prefix(8))"
             let dest = fm.temporaryDirectory
                 .appendingPathComponent("sonar-diagnostics-\(stamp).zip")
             try? fm.removeItem(at: dest)

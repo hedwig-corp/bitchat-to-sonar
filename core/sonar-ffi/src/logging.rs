@@ -2,8 +2,9 @@
 //! log export feature (Settings → Diagnostics → "Share debug bundle").
 //!
 //! Design:
-//! - One rotating daily log file family under the host-provided directory,
-//!   capped at [`MAX_LOG_FILES`] files so disk use stays bounded.
+//! - A size-bounded rotating `sonar-core.log` family under the host-provided
+//!   directory (`MAX_FILE_BYTES` per file, `MAX_ROTATIONS` kept), so disk use
+//!   stays bounded regardless of log rate — matching the platform sinks.
 //! - Writes go through `tracing_appender::non_blocking`, so relay/sync hot
 //!   paths never block on disk I/O (lines are dropped under backpressure
 //!   rather than stalling the caller).
@@ -29,17 +30,93 @@
 //!   verbose filter as the file, so it never carries content or key material
 //!   at the default level.
 
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use tracing_appender::non_blocking::WorkerGuard;
-use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::reload;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer, Registry};
 
-/// Keep at most this many rotated daily files (`sonar-core.*.log`) on disk.
-const MAX_LOG_FILES: usize = 3;
+/// Per-file byte cap before rotation — matches the iOS/Android sinks so total
+/// disk use stays bounded regardless of log rate.
+const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+/// Rotations kept beside the live file (`sonar-core.log.1`, `.2`).
+const MAX_ROTATIONS: usize = 2;
+
+/// Size-bounded rotating file writer for `sonar-core.log`. `tracing-appender`
+/// only rotates by time (daily/hourly), which leaves a single busy or verbose
+/// day uncapped; this rolls `sonar-core.log` → `.1` → `.2` once it passes
+/// [`MAX_FILE_BYTES`], the same way the platform sinks do. It is fed by the
+/// `non_blocking` writer's single background thread, so no interior locking is
+/// needed.
+struct SizeRotatingFile {
+    dir: PathBuf,
+    file: File,
+    written: u64,
+}
+
+impl SizeRotatingFile {
+    fn open(dir: &str) -> Result<Self, String> {
+        let dir = PathBuf::from(dir);
+        fs::create_dir_all(&dir).map_err(|e| format!("create log dir {dir:?}: {e}"))?;
+        let base = dir.join("sonar-core.log");
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&base)
+            .map_err(|e| format!("open log file {base:?}: {e}"))?;
+        let written = file.metadata().map(|m| m.len()).unwrap_or(0);
+        Ok(Self { dir, file, written })
+    }
+
+    fn rotated_path(&self, n: usize) -> PathBuf {
+        self.dir.join(format!("sonar-core.log.{n}"))
+    }
+
+    fn rotate(&mut self) -> io::Result<()> {
+        // Shift .(n-1) → .n (oldest dropped), base → .1, then truncate base.
+        for n in (1..=MAX_ROTATIONS).rev() {
+            let src = if n == 1 {
+                self.dir.join("sonar-core.log")
+            } else {
+                self.rotated_path(n - 1)
+            };
+            let dst = self.rotated_path(n);
+            let _ = fs::remove_file(&dst);
+            if src.exists() {
+                let _ = fs::rename(&src, &dst);
+            }
+        }
+        self.file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(self.dir.join("sonar-core.log"))?;
+        self.written = 0;
+        Ok(())
+    }
+}
+
+impl Write for SizeRotatingFile {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.written >= MAX_FILE_BYTES {
+            // On rotation failure keep writing to the current file rather than
+            // dropping the line — bounded-ish beats lost diagnostics.
+            let _ = self.rotate();
+        }
+        let n = self.file.write(buf)?;
+        self.written += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
 
 struct LogSink {
     /// Flushes the non-blocking writer on process exit; must live as long as
@@ -63,17 +140,6 @@ enum LogState {
 }
 
 static LOG_SINK: Mutex<LogState> = Mutex::new(LogState::Uninit);
-
-fn build_appender(dir: &str) -> Result<RollingFileAppender, String> {
-    std::fs::create_dir_all(dir).map_err(|e| format!("create log dir {dir}: {e}"))?;
-    RollingFileAppender::builder()
-        .rotation(Rotation::DAILY)
-        .filename_prefix("sonar-core")
-        .filename_suffix("log")
-        .max_log_files(MAX_LOG_FILES)
-        .build(dir)
-        .map_err(|e| format!("open log file in {dir}: {e}"))
-}
 
 fn filter_for(verbose: bool) -> EnvFilter {
     // Default is the redaction boundary: `sonar_core` debug logs are where
@@ -108,7 +174,7 @@ pub(crate) fn install_file_logging(dir: &str, verbose: bool) -> Result<(), Strin
         LogState::Uninit => {}
     }
 
-    let appender = build_appender(dir)?;
+    let appender = SizeRotatingFile::open(dir)?;
     let (writer, guard) = tracing_appender::non_blocking(appender);
 
     let (filter_layer, filter_handle) = reload::Layer::new(filter_for(verbose));
@@ -249,12 +315,40 @@ mod tests {
 
     #[test]
     fn bad_directory_is_an_error_not_a_panic() {
-        // A path under a file (not a dir) cannot be created. Tests the
-        // appender builder directly — the global-sink path is exercised by
+        // A path under a file (not a dir) cannot be created. Tests the writer
+        // opener directly — the global-sink path is exercised by
         // `install_is_idempotent_and_toggles_verbose` and test order within
         // one process must not matter.
         let file = tempfile::NamedTempFile::new().expect("tempfile");
         let bad = format!("{}/nested", file.path().display());
-        assert!(build_appender(&bad).is_err());
+        assert!(SizeRotatingFile::open(&bad).is_err());
+    }
+
+    #[test]
+    fn size_rotating_file_rolls_and_bounds_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dir_str = dir.path().to_str().expect("utf8 tempdir");
+        let mut w = SizeRotatingFile::open(dir_str).expect("open");
+        // Force several rotations by writing well past MAX_FILE_BYTES.
+        let chunk = vec![b'x'; 256 * 1024];
+        for _ in 0..(MAX_FILE_BYTES / chunk.len() as u64 * 4 + 8) {
+            w.write_all(&chunk).expect("write");
+        }
+        w.flush().expect("flush");
+        // Never keeps more than base + MAX_ROTATIONS files.
+        let count = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("sonar-core.log")
+            })
+            .count();
+        assert!(
+            count <= 1 + MAX_ROTATIONS,
+            "expected <= {} files, got {count}",
+            1 + MAX_ROTATIONS
+        );
     }
 }

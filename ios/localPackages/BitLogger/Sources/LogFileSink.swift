@@ -60,6 +60,23 @@ public final class LogFileSink {
         queue.async { self.verbose = verbose }
     }
 
+    /// Close the file and delete this process's log directory, **serialized on
+    /// the writer queue** so an in-flight `write` can't reopen the file after
+    /// the delete and strand pre-wipe content. Used by the emergency-wipe path
+    /// (verbose logs can contain peer npubs, so a wipe must leave nothing).
+    /// The sink stays configured: a later write lazily recreates the file, so
+    /// post-wipe logging keeps working (with post-wipe content only).
+    public func purge() {
+        queue.sync {
+            try? self.handle?.close()
+            self.handle = nil
+            self.bytesWritten = 0
+            if let dir = self.directory {
+                try? FileManager.default.removeItem(at: dir)
+            }
+        }
+    }
+
     // MARK: - Writing (called by SecureLogger)
 
     /// Append one already-sanitized log line. `isDebug` lines are dropped

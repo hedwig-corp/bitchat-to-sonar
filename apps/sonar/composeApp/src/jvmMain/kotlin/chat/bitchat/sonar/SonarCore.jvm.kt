@@ -386,7 +386,8 @@ actual object SonarCore {
         if (logs.isEmpty() && snapshot == null) return@withContext false
 
         val exportDir = DesktopEnv.file("diagnostics").apply { mkdirs() }
-        val zip = File(exportDir, "sonar-diagnostics-${System.currentTimeMillis()}.zip")
+        val stamp = "${System.currentTimeMillis()}-${java.util.UUID.randomUUID().toString().take(8)}"
+        val zip = File(exportDir, "sonar-diagnostics-$stamp.zip")
         runCatching {
             java.util.zip.ZipOutputStream(zip.outputStream().buffered()).use { out ->
                 for (file in logs) {

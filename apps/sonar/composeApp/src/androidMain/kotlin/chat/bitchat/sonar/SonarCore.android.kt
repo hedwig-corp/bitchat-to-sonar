@@ -379,7 +379,8 @@ actual object SonarCore {
         // The media-share cache dir is already whitelisted for the app's
         // FileProvider (sonar_file_paths.xml), so the zip is shareable as-is.
         val shareDir = File(ctx.cacheDir, "media-share").apply { mkdirs() }
-        val zip = File(shareDir, "sonar-diagnostics-${System.currentTimeMillis()}.zip")
+        val stamp = "${System.currentTimeMillis()}-${java.util.UUID.randomUUID().toString().take(8)}"
+        val zip = File(shareDir, "sonar-diagnostics-$stamp.zip")
         runCatching {
             java.util.zip.ZipOutputStream(zip.outputStream().buffered()).use { out ->
                 for (file in logs) {
