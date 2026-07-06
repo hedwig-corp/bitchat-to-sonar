@@ -8,6 +8,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import android.os.SystemClock
 import android.util.Log
 import chat.bitchat.sonar.Notifier
 import chat.bitchat.sonar.SonarCore
@@ -15,12 +16,18 @@ import chat.bitchat.sonar.SonarNotificationKind
 import chat.bitchat.sonar.SonarNotificationPrefs
 import chat.bitchat.sonar.SonarNotificationRouter
 import chat.bitchat.sonar.shortNpubLabel
+import chat.bitchat.sonar.wallet.NotifiedPaymentIds
+import chat.bitchat.sonar.wallet.PaymentActivityStore
 import chat.bitchat.sonar.wallet.WalletBridge
+import chat.bitchat.sonar.wallet.WalletPaymentEvent
 import chat.bitchat.sonar.wallet.WalletState
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 
@@ -28,7 +35,8 @@ import kotlinx.coroutines.withTimeoutOrNull
  * Short-lived foreground service that processes push wakeups.
  *
  * Marmot pushes (transponder): sync messages → render user-visible notification.
- * Breez pushes (NDS): settle wallet event → NO user-visible notification.
+ * Breez pushes (NDS): stay alive until the SDK settles the incoming payment,
+ * then post one "Payment received" notification (nothing settled → silent).
  */
 class SonarPushProcessingService : Service() {
 
@@ -66,7 +74,8 @@ class SonarPushProcessingService : Service() {
             when (type) {
                 TYPE_MARMOT -> processMarmotWakeup()
                 TYPE_BREEZ -> processBreezWakeup(
-                    intent?.getStringExtra(EXTRA_NOTIFICATION_TYPE) ?: ""
+                    intent?.getStringExtra(EXTRA_NOTIFICATION_TYPE) ?: "",
+                    intent?.getStringExtra(EXTRA_NOTIFICATION_PAYLOAD) ?: "",
                 )
                 else -> Log.w(TAG, "Unknown push type: $type")
             }
@@ -143,22 +152,108 @@ class SonarPushProcessingService : Service() {
         Notifier.notify(notif.id, notif.title, notif.body)
     }
 
-    private suspend fun processBreezWakeup(notificationType: String) {
-        // Silent -- no user-visible notification. The payment amount
-        // notification fires later through the transponder/chat path when the
-        // ⚡PAY control line arrives.
+    /**
+     * A Breez offline receive is a swap the SDK claims only while connected —
+     * the Android bindings ship no notification plugin (unlike iOS, whose NSE
+     * extends `SDKNotificationService` and runs settlement jobs), so this
+     * service is the settlement orchestrator: stay alive until the payment
+     * reaches COMPLETE (event-first, poll fallback), then post one "Payment
+     * received" notification. Intermediate wakes (swap_updated fee bumps,
+     * refunds) settle nothing inside the budget and stay silent.
+     */
+    private suspend fun processBreezWakeup(notificationType: String, payload: String) {
         try {
-            if (WalletBridge.state() !is WalletState.Ready) {
-                val nsec = SonarCore.identityNsec()
-                if (nsec.isNotBlank()) {
-                    withTimeoutOrNull(15_000) { WalletBridge.setupIfNeeded(nsec) }
-                }
+            val prefs = notificationPrefs()
+            if (payload.isNotBlank()) {
+                // Swap id / payment hash for correlating against Boltz-side logs.
+                Log.d(TAG, "Breez payload: ${payload.take(200)}")
             }
-            WalletBridge.refreshBalance()
-            Log.d(TAG, "Breez wakeup processed (type=$notificationType, silent)")
+            val deadline = SystemClock.elapsedRealtime() + BREEZ_SETTLE_BUDGET_MS
+            // The poll fallback only exists for the seconds-wide race where a
+            // payment settles during connect(), before the event listener
+            // attaches. A tight floor keeps it from re-surfacing older receives
+            // the user already watched arrive in a foreground session.
+            val wakeFloorSecs =
+                System.currentTimeMillis() / 1000 - BREEZ_SETTLE_LOOKBACK_SECS
+            val settled = AtomicInteger(0)
+
+            coroutineScope {
+                // Subscribe BEFORE wallet setup so a payment settling right
+                // after connect() can't slip past the collector.
+                val events = launch {
+                    WalletBridge.paymentEvents.collect { ev ->
+                        if (ev.incoming && handleSettledReceive(ev, prefs)) {
+                            settled.incrementAndGet()
+                        }
+                    }
+                }
+
+                if (WalletBridge.state() !is WalletState.Ready) {
+                    // Account Key Durability: a push path must never mint an
+                    // identity — bail silently when none exists yet.
+                    val nsec = SonarCore.identityNsec()
+                    if (nsec.isBlank()) {
+                        Log.d(TAG, "Breez wakeup skipped: no identity")
+                        events.cancel()
+                        return@coroutineScope
+                    }
+                    withTimeoutOrNull(WALLET_SETUP_TIMEOUT_MS) {
+                        WalletBridge.setupIfNeeded(nsec)
+                    }
+                }
+                if (WalletBridge.state() !is WalletState.Ready) {
+                    // Setup failed/timed out: no SDK, so nothing can settle —
+                    // don't burn the budget polling a nil wallet.
+                    Log.w(TAG, "Breez wakeup: wallet not ready, giving up")
+                    events.cancel()
+                    return@coroutineScope
+                }
+                WalletBridge.refreshBalance()
+
+                // Await settlement: each new payment sends its own push, so the
+                // first settled receive ends this wake.
+                while (settled.get() == 0 &&
+                    SystemClock.elapsedRealtime() < deadline
+                ) {
+                    for (ev in WalletBridge.recentSettledReceives(wakeFloorSecs)) {
+                        if (handleSettledReceive(ev, prefs)) settled.incrementAndGet()
+                    }
+                    if (settled.get() > 0) break
+                    delay(BREEZ_SETTLE_POLL_MS)
+                }
+                events.cancel()
+            }
+            if (settled.get() > 0) WalletBridge.refreshBalance()
+            Log.d(TAG, "Breez wakeup done (type=$notificationType settled=${settled.get()})")
         } catch (e: Exception) {
             Log.w(TAG, "Breez wakeup failed (silent)", e)
         }
+    }
+
+    /**
+     * Notify-exactly-once gate for a settled incoming wallet payment. Returns
+     * true when this call newly handled the payment (whether or not prefs let
+     * the banner show — enabling notifications later must not back-notify).
+     * Synchronized: the event collector and the poll loop race on the
+     * persisted [NotifiedPaymentIds] read-modify-write.
+     */
+    @Synchronized
+    private fun handleSettledReceive(
+        ev: WalletPaymentEvent,
+        prefs: SonarNotificationPrefs,
+    ): Boolean {
+        // Ledger capture (idempotent) — normally already recorded at the event
+        // source; this covers poll-fallback payments the listener never saw.
+        PaymentActivityStore.recordIncomingWalletPayment(ev)
+        val notifiedIds = NotifiedPaymentIds(SonarCore.loadBlob(NOTIFIED_IDS_BLOB))
+        if (!notifiedIds.markNotified(ev.paymentId)) return false
+        SonarCore.saveBlob(NOTIFIED_IDS_BLOB, notifiedIds.encode())
+        SonarNotificationRouter.buildWalletReceive(
+            idKey = "wallet-${ev.paymentId}",
+            sats = ev.amountSats,
+            prefs = prefs,
+        )?.let { Notifier.notify(it.id, it.title, it.body) }
+        return true
     }
 
     override fun onDestroy() {
@@ -174,6 +269,7 @@ class SonarPushProcessingService : Service() {
         const val FOREGROUND_ID = 9001
         const val EXTRA_PUSH_TYPE = "push_type"
         const val EXTRA_NOTIFICATION_TYPE = "notification_type"
+        const val EXTRA_NOTIFICATION_PAYLOAD = "notification_payload"
         const val TYPE_MARMOT = "marmot"
         const val TYPE_BREEZ = "breez"
 
@@ -187,5 +283,18 @@ class SonarPushProcessingService : Service() {
         // (Android has no Tor; if a bootstrap step is ever added, its latency
         // must also fit inside this budget.)
         private const val MARMOT_PUSH_SYNC_TIMEOUT_MS = 25_000L
+
+        // Breez settlement budget: the SDK claims the swap only while we stay
+        // alive; 30s keeps the whole wake inside the FCM high-priority window
+        // while giving Boltz round-trips room on slow networks. Setup keeps its
+        // own 15s sub-budget so a hung connect() still leaves settle time.
+        private const val BREEZ_SETTLE_BUDGET_MS = 30_000L
+        private const val WALLET_SETUP_TIMEOUT_MS = 15_000L
+        private const val BREEZ_SETTLE_POLL_MS = 2_500L
+        // Poll floor: wide enough for the connect()-race and modest clock skew,
+        // tight enough not to re-surface receives from an earlier session.
+        private const val BREEZ_SETTLE_LOOKBACK_SECS = 120L
+        /** Blob key for the persisted notified-payment-ids ring. */
+        private const val NOTIFIED_IDS_BLOB = "wallet.notifiedPaymentIds"
     }
 }

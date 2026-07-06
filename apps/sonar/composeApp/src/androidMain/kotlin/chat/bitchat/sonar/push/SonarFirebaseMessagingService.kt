@@ -8,7 +8,8 @@ import com.google.firebase.messaging.RemoteMessage
 /**
  * Receives FCM data-only pushes from two sources:
  *   - Transponder → chat/call wakeup → user-visible notification
- *   - Breez NDS  → wallet wakeup   → silent (no user-visible notification)
+ *   - Breez NDS  → wallet wakeup → settle the incoming payment, then one
+ *     "Payment received" notification (nothing settled → silent)
  */
 class SonarFirebaseMessagingService : FirebaseMessagingService() {
 
@@ -61,11 +62,15 @@ class SonarFirebaseMessagingService : FirebaseMessagingService() {
     }
 
     private fun handleBreezWakeup(data: Map<String, String>) {
-        Log.d(TAG, "Breez NDS push — starting wallet sync (silent)")
+        Log.d(TAG, "Breez NDS push — starting wallet settlement")
         val intent = Intent(this, SonarPushProcessingService::class.java).apply {
             putExtra(SonarPushProcessingService.EXTRA_PUSH_TYPE, SonarPushProcessingService.TYPE_BREEZ)
             putExtra(SonarPushProcessingService.EXTRA_NOTIFICATION_TYPE,
                 data["notification_type"] ?: "")
+            // Swap id / payment hash payload — forwarded for diagnostics (and a
+            // future targeted getPayment) once a real payload shape is captured.
+            putExtra(SonarPushProcessingService.EXTRA_NOTIFICATION_PAYLOAD,
+                data["notification_payload"] ?: "")
         }
         startForegroundService(intent)
     }
