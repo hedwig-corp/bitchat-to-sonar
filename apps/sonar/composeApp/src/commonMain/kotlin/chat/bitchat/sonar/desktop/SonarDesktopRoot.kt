@@ -524,7 +524,7 @@ private fun DmDetailRail(state: SonarAppState, scr: Screen.Chat) {
     val s = sonar
     val isMesh = scr.id.startsWith("mesh:")
     val rawPeer = scr.id.removePrefix("mesh:")
-    val inRange = isMesh && state.dmInRange(rawPeer)
+    val inRange = run { state.meshLinkVersion; isMesh && state.dmInRange(rawPeer) }
     val verified = state.isVerified(scr.id)
     Column(
         Modifier.width(286.dp).fillMaxHeight().background(s.surface.copy(alpha = 0.4f))

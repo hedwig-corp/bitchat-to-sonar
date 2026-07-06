@@ -44,7 +44,6 @@ object MeshLink {
     private val sonarByPeerId = ConcurrentHashMap<String, ByteArray>() // peerId -> 0x53 payload
     private val sonarSeenAt = ConcurrentHashMap<String, Long>()        // peerId -> last 0x53 ms (for TTL)
     private val rxDms = ConcurrentLinkedQueue<MeshDmIn>()
-    private val pending = ConcurrentHashMap<String, ConcurrentLinkedQueue<Pair<String, String>>>()
 
     /** Our encoded SonarAnnounce (npub + caps) to broadcast as a signed 0x53, so
      *  phones treat us as a full Sonar peer and continue our chat over White Noise
@@ -165,7 +164,6 @@ object MeshLink {
             if (s.noise.isFinished()) {
                 s.noise.intoSession(); s.established = true
                 sonarLog("MeshLink", "Noise link ESTABLISHED with ${nameByFp[fp] ?: fp.take(8)}")
-                flushPending(fp)
             } else {
                 val m2 = s.noise.writeMessage()
                 BleBridge.notify(MeshIdentity.buildPacket(TYPE_NOISE_HANDSHAKE.toUByte(), senderPeerId, m2))
@@ -191,13 +189,9 @@ object MeshLink {
     fun hasLink(fp: String): Boolean = sessions[fp]?.established == true
 
     fun sendDm(fp: String, messageId: String, text: String): Boolean {
-        val s = sessions[fp]?.takeIf { it.established }
-        if (s == null) {
-            // No live link yet — the phone initiates the handshake, so queue and
-            // deliver on establish (mirrors Android's pending-send behavior).
-            pending.getOrPut(fp) { ConcurrentLinkedQueue() }.add(messageId to text)
-            return true
-        }
+        // No hidden queue: report failure honestly so the app-level outbox can
+        // retry or continue the conversation over White Noise (mirrors Android).
+        val s = sessions[fp]?.takeIf { it.established } ?: return false
         return encryptAndSend(fp, s, messageId, text)
     }
 
@@ -216,15 +210,6 @@ object MeshLink {
                 sonarLog("MeshLink", "TX DM to ${nameByFp[fp] ?: fp.take(8)} (${text.length} chars)")
                 true
             }.getOrDefault(false)
-        }
-    }
-
-    private fun flushPending(fp: String) {
-        val q = pending[fp] ?: return
-        val s = sessions[fp]?.takeIf { it.established } ?: return
-        while (true) {
-            val (mid, text) = q.poll() ?: break
-            encryptAndSend(fp, s, mid, text)
         }
     }
 

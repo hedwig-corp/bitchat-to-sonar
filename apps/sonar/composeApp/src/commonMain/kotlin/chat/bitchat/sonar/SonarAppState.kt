@@ -2734,6 +2734,12 @@ class SonarAppState(private val scope: CoroutineScope) {
     var payVersion by mutableStateOf(0)
         private set
 
+    /** Bumped when the open chat's BLE Noise link forms or drops, so the DM
+     *  header/banner/composer recompose promptly instead of waiting for an
+     *  unrelated state change ([dmInRange] reads non-snapshot radio state). */
+    var meshLinkVersion by mutableStateOf(0)
+        private set
+
     fun payStatus(uuid: String): PayStatus? = payLedger.get(uuid)?.status
 
     fun walletPayEntries(): List<PayEntry> = payLedger.all()
@@ -2864,10 +2870,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (isContactBlocked(chatId)) return false
         if (isMeshChat(chatId)) {
             val peerId = meshPeerId(chatId)
+            // Receipt lines are idempotent by pay uuid, so a partial mesh send
+            // can safely re-send the full set over White Noise below.
             val routePeerId = liveMeshRoutePeerId(peerId)
-            if (routePeerId != null) {
-                return clean.all { sendMesh(routePeerId, it) }
-            }
+            if (routePeerId != null && clean.all { sendMesh(routePeerId, it) }) return true
             val raw = npubRawFor(peerId) ?: return false
             return sendPaymentReceiptLinesOverMarmot(
                 ensureMarmotGroupForOutbox(peerId, raw) ?: return false,
@@ -6787,7 +6793,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         val mime = "audio/mp4"
         if (isMeshChat(chatId) && liveMeshRoutePeerId(meshPeerId(chatId)) != null) {
             if (sendMeshMedia(meshPeerId(chatId), bytes, filename, mime)) return
-            if (resolveMarmotGroupId(chatId) == null) return
+            if (resolveMarmotGroupId(chatId) == null) {
+                toast = "Not connected over Bluetooth yet — stay close and try again"
+                return
+            }
         }
         scope.launch {
             val groupId = resolveMarmotGroupId(chatId)
@@ -6886,7 +6895,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         reloadNewestAfterSendIfNeeded(chatId)
         if (isMeshChat(chatId)) {
             val peerId = meshPeerId(chatId)
-            liveMeshRoutePeerId(peerId)?.let { route -> sendMesh(route, encoded); return }
+            liveMeshRoutePeerId(peerId)?.let { route ->
+                if (sendMesh(route, encoded)) return
+            }
             val raw = npubRawFor(peerId)
             if (raw != null) {
                 when {
@@ -7478,7 +7489,12 @@ class SonarAppState(private val scope: CoroutineScope) {
             toast = "Message queued and will send in order."
             return
         }
-        liveMeshRoutePeerId(peerId)?.let { route -> sendMesh(route, text); return }
+        // The link can die between the gate and the actual GATT write — fall
+        // through to the White Noise / NIP-17 / outbox routing on failure
+        // instead of dropping the message.
+        liveMeshRoutePeerId(peerId)?.let { route ->
+            if (sendMesh(route, text)) return
+        }
         val raw = npubRawFor(peerId)
         if (raw != null) {
             when {
@@ -9055,11 +9071,16 @@ class SonarAppState(private val scope: CoroutineScope) {
         markGroupsRead(groups.map { it.id })
     }
 
-    private fun observedMeshPeer(peerId: String): Boolean =
-        meshPeerAliases(peerId).any { it in rawMeshPeerIds }
-
+    /** True while a live, writable Noise link to [peerId] exists — the exact
+     *  condition the send path uses, and iOS parity (`meshReachable` is
+     *  connection-based). It must NOT additionally require membership in the
+     *  announce-derived `rawMeshPeerIds` set: that set refreshes only on the
+     *  housekeeping cadence, and the mismatch made the chat header claim
+     *  "Out of Bluetooth range — encrypted over the internet instead" while
+     *  messages were actually flowing over BLE. Uses [liveMeshRoutePeerId] so
+     *  peer-id aliases resolve the same way the send path does. */
     private fun hasLiveMeshRoute(peerId: String): Boolean =
-        observedMeshPeer(peerId) && liveMeshRoutePeerId(peerId) != null
+        liveMeshRoutePeerId(peerId) != null
 
     /** True while a live Noise link to [peerId] exists (peer is in Bluetooth range). */
     fun dmInRange(peerId: String): Boolean = hasLiveMeshRoute(peerId)
@@ -10004,12 +10025,31 @@ class SonarAppState(private val scope: CoroutineScope) {
             // calls/sec burn CPU draining empty queues forever. Idle backs
             // off to 1s; any drain hit or in-range peer snaps back to 150ms.
             var lastActivityMs = 0L
+            // Open-chat link watch: peerId → last observed hasMeshLink, so a
+            // link forming/dropping mid-conversation updates the transport
+            // header/banner within a tick and flushes queued sends on re-link.
+            var watchedPeerId: String? = null
+            var watchedLinkUp = false
             while (true) {
                 val drained = drainMeshDms() or drainMeshMedia() or drainMeshBroadcasts()
                 val nowMs = SonarClock.nowMillis()
                 // hasActivePeer() is a cheap link/announce probe — unlike
                 // peers() it doesn't build+sort the whole list every tick.
                 if (drained || MeshRadio.hasActivePeer()) lastActivityMs = nowMs
+                val openPeerId = (screen as? Screen.Chat)?.id
+                    ?.takeIf { isMeshChat(it) }?.let { meshPeerId(it) }
+                val linkUp = openPeerId != null && MeshRadio.hasMeshLink(openPeerId)
+                if (openPeerId != watchedPeerId) {
+                    watchedPeerId = openPeerId
+                    watchedLinkUp = linkUp
+                } else if (openPeerId != null && linkUp != watchedLinkUp) {
+                    watchedLinkUp = linkUp
+                    meshLinkVersion++
+                    if (linkUp) {
+                        flushOutbox(openPeerId)
+                        lastActivityMs = nowMs
+                    }
+                }
                 val fast = nowMs - lastActivityMs < MESH_REALTIME_HOT_WINDOW_MS
                 delay(if (fast) 150 else 1000)
             }
