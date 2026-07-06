@@ -333,6 +333,7 @@ final class MarmotService: @unchecked Sendable {
                 identity = SonarIdentity.generate()
             }
             let (dbPath, dbKeyHex) = try Self.databaseConfig()
+            SonarDiagnostics.installCoreLoggingIfNeeded()
             let node = try SonarNode.connect(
                 identity: identity,
                 relayUrls: [],
@@ -400,6 +401,14 @@ final class MarmotService: @unchecked Sendable {
     /// Handle with care; intended for user-driven backup only.
     func exportNsec() async -> String? {
         await runNonThrowing { $0.identity?.nsec() }
+    }
+
+    /// JSON snapshot of relay/sync state (relay statuses, sync watermark,
+    /// per-group catch-up floors) for the Diagnostics screen and the exported
+    /// debug bundle. No message content or key material. Nil before `connect`.
+    /// Read-only — never queues behind serialized engine work.
+    func syncStateSnapshotJson() async -> String? {
+        await readOnlyNonThrowing({ try? $0.syncStateSnapshotJson() }, default: nil)
     }
 
     // MARK: - Marmot operations
@@ -983,6 +992,9 @@ final class MarmotService: @unchecked Sendable {
         try await withCheckedThrowingContinuation { continuation in
             relayConnectQueue.async {
                 do {
+                    // Diagnostics file sink must exist before the node spins
+                    // up so relay connect/EOSE/watermark events are captured.
+                    SonarDiagnostics.installCoreLoggingIfNeeded()
                     continuation.resume(returning: try SonarNode.connect(
                         identity: identity,
                         relayUrls: relayUrls,

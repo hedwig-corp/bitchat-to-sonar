@@ -49,6 +49,9 @@ actual object SonarCore {
                 val dbPath = File(dir, "marmot.sqlite").absolutePath
                 val dbKeyHex = loadOrCreateDbKey()
 
+                // Diagnostics file sink must exist before the node spins up so
+                // relay connect/EOSE/watermark events are captured. Non-fatal.
+                installCoreLogging(diagnosticsVerbose())
                 val n = SonarNode.connect(identity, relayUrls, dbPath, dbKeyHex)
                 runCatching { n.publishKeyPackage() }
                 node = n
@@ -347,6 +350,73 @@ actual object SonarCore {
         Unit
     }
 
+    // ── Diagnostics (Settings → Diagnostics) ──
+
+    private fun coreLogDirectory(): File =
+        File(ctx.filesDir, "sonar-marmot/logs/core").apply { mkdirs() }
+
+    private fun diagnosticsVerbose(): Boolean = loadBlob("pref.diagVerbose") == "1"
+
+    private fun installCoreLogging(verbose: Boolean) {
+        runCatching {
+            uniffi.sonar_ffi.setupLogging(coreLogDirectory().absolutePath, verbose)
+        }.onFailure { sonarLog("SonarDiag", "core log sink unavailable: $it") }
+    }
+
+    actual suspend fun syncStateSnapshotJson(): String? = withContext(Dispatchers.IO) {
+        runCatching { node?.syncStateSnapshotJson() }.getOrNull()
+    }
+
+    actual fun setDiagnosticsVerbose(verbose: Boolean) {
+        // Persist happens via the caller's pref blob; here we swap the core's
+        // level filter (setupLogging is idempotent — later calls only reload).
+        installCoreLogging(verbose)
+    }
+
+    actual suspend fun exportDiagnostics(): Boolean = withContext(Dispatchers.IO) {
+        val snapshot = runCatching { node?.syncStateSnapshotJson() }.getOrNull()
+        val coreLogs = coreLogDirectory()
+            .listFiles { file -> file.name.startsWith("sonar-core") }
+            ?.toList().orEmpty()
+        val logs = coreLogs + SonarFileLog.files()
+        if (logs.isEmpty() && snapshot == null) return@withContext false
+
+        // The media-share cache dir is already whitelisted for the app's
+        // FileProvider (sonar_file_paths.xml), so the zip is shareable as-is.
+        val shareDir = File(ctx.cacheDir, "media-share").apply { mkdirs() }
+        val stamp = "${System.currentTimeMillis()}-${java.util.UUID.randomUUID().toString().take(8)}"
+        val zip = File(shareDir, "sonar-diagnostics-$stamp.zip")
+        runCatching {
+            java.util.zip.ZipOutputStream(zip.outputStream().buffered()).use { out ->
+                for (file in logs) {
+                    out.putNextEntry(java.util.zip.ZipEntry(file.name))
+                    file.inputStream().use { it.copyTo(out) }
+                    out.closeEntry()
+                }
+                if (snapshot != null) {
+                    out.putNextEntry(java.util.zip.ZipEntry("snapshot.json"))
+                    out.write(snapshot.toByteArray())
+                    out.closeEntry()
+                }
+            }
+        }.onFailure {
+            zip.delete()
+            return@withContext false
+        }
+
+        val uri = androidx.core.content.FileProvider.getUriForFile(
+            ctx, "${ctx.packageName}.fileprovider", zip
+        )
+        val send = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+            type = "application/zip"
+            putExtra(android.content.Intent.EXTRA_STREAM, uri)
+            addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        val chooser = android.content.Intent.createChooser(send, "Share diagnostics")
+            .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+        runCatching { ctx.startActivity(chooser) }.isSuccess
+    }
+
     actual fun joinedChannels(): List<String> =
         prefs().getString("channels", "")?.split(",")?.filter { it.isNotBlank() } ?: emptyList()
 
@@ -516,8 +586,17 @@ actual object SonarCore {
         lock.withLock {
             node = null
             npub = ""; pubkeyHex = ""
-            // Drop the encrypted Marmot DB + all prefs.
+            // Drop the encrypted Marmot DB + all prefs. The diagnostics logs
+            // live under sonar-marmot/ (logs/), so this also removes them — at
+            // verbose level they can contain peer npubs and must not survive a
+            // wipe (Account Key Durability / privacy rule).
             File(ctx.filesDir, "sonar-marmot").deleteRecursively()
+            // Exported diagnostics bundles are staged in the FileProvider cache
+            // dir (not under sonar-marmot); drop them too — at verbose level
+            // they can contain peer npubs.
+            File(ctx.cacheDir, "media-share")
+                .listFiles { f -> f.name.startsWith("sonar-diagnostics") }
+                ?.forEach { it.delete() }
             AndroidSecrets.clear()
             prefs().edit().clear().apply()
         }

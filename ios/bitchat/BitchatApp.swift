@@ -52,6 +52,9 @@ struct BitchatApp: App {
         }
         #endif
         UNUserNotificationCenter.current().delegate = NotificationDelegate.shared
+        // Diagnostics: tee SecureLogger into the bounded on-device log file so
+        // "Share debug bundle" works on shipped builds (Settings → Diagnostics).
+        SonarDiagnostics.configureAppSink()
         // Warm up georelay directory and refresh if stale (once/day)
         GeoRelayDirectory.shared.prefetchIfNeeded()
     }

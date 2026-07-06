@@ -134,6 +134,15 @@ final class WalletBridgeService: ObservableObject {
     /// normal clean suspend path.
     private var activeSendCount = 0
     private var suspendWhenActiveSendsFinish = false
+
+    /// True until UIKit has confirmed an active foreground scene. Node startup
+    /// consults this so the Breez SDK's `track_new_blocks` SQLite writer never
+    /// comes up during silent-push/background launch or the inactive launch
+    /// window before suspension (`0xdead10cc`). `@MainActor` guarantees the
+    /// main-thread access `UIApplication.applicationState` requires.
+    private static var shouldDeferNodeStartup: Bool {
+        UIApplication.shared.applicationState != .active
+    }
     #endif
 
     // MARK: - Money display
@@ -237,6 +246,24 @@ final class WalletBridgeService: ObservableObject {
                     try await wallet.createWallet()
                 }
             }
+            #if canImport(UIKit)
+            // Never start the Breez node before UIKit confirms an active
+            // foreground scene. Its `track_new_blocks` task polls the SQLite
+            // cache continuously, and holding a SQLite lock at suspension gets
+            // the app killed by RunningBoard with `0xdead10cc`. A silent-push
+            // launch may be `.background`, and a cold launch may still be
+            // `.inactive` before the first scenePhase callback. Defer both:
+            // arm the resume so foreground (`resumeFromBackground()`) brings
+            // the node up, and throw so `setupIfNeeded()` clears `setupTask`
+            // for a clean retry.
+            if Self.shouldDeferNodeStartup {
+                #if DEBUG
+                SecureLogger.warning("Wallet setup deferred: app not active; not starting Breez node (0xdead10cc guard)", category: .session)
+                #endif
+                suspendedForBackground = true
+                throw WalletBridgeError.core("app not active; Breez node start deferred to foreground")
+            }
+            #endif
             #if DEBUG
             SecureLogger.info("Wallet setup: starting Breez node", category: .session)
             #endif

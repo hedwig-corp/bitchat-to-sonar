@@ -28,6 +28,7 @@ struct SonarSettingsScreen: View {
     @State private var walletSheet = false
     @State private var currencySheet = false
     @State private var exportKeySheet = false
+    @State private var diagnosticsSheet = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -165,6 +166,12 @@ struct SonarSettingsScreen: View {
                     SNSectionLabel("About")
                     SNSettingsCard {
                         SNSettingsRow(
+                            icon: .info, label: "Diagnostics",
+                            sub: "Relay sync status and shareable debug logs"
+                        ) {
+                            diagnosticsSheet = true
+                        }
+                        SNSettingsRow(
                             icon: .info, label: "About Sonar",
                             sub: "Open protocols — Bluetooth mesh + Nostr",
                             trail: .none, divider: false
@@ -213,6 +220,9 @@ struct SonarSettingsScreen: View {
         }
         .snSheet(isPresented: $exportKeySheet, title: "Export private key") {
             SNExportKeySheetContent()
+        }
+        .snSheet(isPresented: $diagnosticsSheet, title: "Diagnostics") {
+            SNDiagnosticsSheetContent()
         }
     }
 

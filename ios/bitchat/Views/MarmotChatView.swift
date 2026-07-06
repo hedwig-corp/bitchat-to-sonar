@@ -391,6 +391,12 @@ final class MarmotChatModel: ObservableObject {
         await service.exportNsec()
     }
 
+    /// Relay/sync diagnostics snapshot JSON for the Diagnostics screen and
+    /// debug bundle. Nil before the relay node is connected.
+    func syncStateSnapshotJson() async -> String? {
+        await service.syncStateSnapshotJson()
+    }
+
     /// Restore an existing identity from a pasted `nsec1…` backup (onboarding
     /// "I already have a key"): validate it, persist it as THE identity, then
     /// connect as it. Throws on an invalid key so the caller can surface it.

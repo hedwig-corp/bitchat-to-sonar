@@ -1220,6 +1220,14 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      */
     func syncOnce() throws 
     
+    /**
+     * Point-in-time JSON snapshot of relay/sync state for the Diagnostics
+     * screen and the exported debug bundle: per-relay connection status, the
+     * sync watermark, live-subscription state, and per-group catch-up floors.
+     * Contains NO message content and NO key material.
+     */
+    func syncStateSnapshotJson() throws  -> String
+    
     func uninstallStickerPack(coordinate: String) throws 
     
     /**
@@ -2090,6 +2098,20 @@ open func syncOnce()throws   {try rustCallWithError(FfiConverterTypeSonarFfiErro
             self.uniffiCloneHandle(),$0
     )
 }
+}
+    
+    /**
+     * Point-in-time JSON snapshot of relay/sync state for the Diagnostics
+     * screen and the exported debug bundle: per-relay connection status, the
+     * sync watermark, live-subscription state, and per-group catch-up floors.
+     * Contains NO message content and NO key material.
+     */
+open func syncStateSnapshotJson()throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_sync_state_snapshot_json(
+            self.uniffiCloneHandle(),$0
+    )
+})
 }
     
 open func uninstallStickerPack(coordinate: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
@@ -5862,6 +5884,24 @@ public func noiseGenerateKeypair()throws  -> NoiseKeypairHex  {
     )
 })
 }
+/**
+ * Install (or re-configure) the on-device diagnostics log sink: a bounded,
+ * rotating file family under `dir` fed by the core's `tracing` events
+ * (relay connects, EOSE, watermark moves, decrypt failures, ...).
+ *
+ * Call once at app start BEFORE connecting the node, with `dir` inside the
+ * app's private data directory. Idempotent — calling again only switches the
+ * level filter, so hosts re-invoke it when the user toggles verbose
+ * diagnostics. `verbose = false` (the default profile) keeps the sink at the
+ * redaction boundary: no message content, no key material, no peer npubs.
+ */
+public func setupLogging(dir: String, verbose: Bool)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_func_setup_logging(
+        FfiConverterString.lower(dir),
+        FfiConverterBool.lower(verbose),$0
+    )
+}
+}
 public func sonarNotificationClassifyContent(content: String) -> SonarNotificationKindInfo  {
     return try!  FfiConverterTypeSonarNotificationKindInfo_lift(try! rustCall() {
     uniffi_sonar_ffi_fn_func_sonar_notification_classify_content(
@@ -5977,6 +6017,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_func_noise_generate_keypair() != 35056) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_setup_logging() != 6013) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_func_sonar_notification_classify_content() != 59219) {
@@ -6193,6 +6236,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_sync_once() != 45718) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_sync_state_snapshot_json() != 50844) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_uninstall_sticker_pack() != 43475) {

@@ -291,6 +291,35 @@ struct SyncStateDisk {
     processed_event_ids: Vec<String>,
 }
 
+/// Point-in-time relay/sync diagnostics, serialized into the exported debug
+/// bundle (`snapshot.json`) and rendered on the Diagnostics screen. Must never
+/// carry message content or key material.
+#[derive(Clone, Debug, Serialize)]
+pub struct SyncStateSnapshot {
+    pub generated_at_secs: u64,
+    pub watermark_secs: u64,
+    pub live_marmot_enabled: bool,
+    pub subscribed_group_count: usize,
+    pub pending_marmot_buffered: usize,
+    pub relays: Vec<RelaySnapshot>,
+    pub group_floors: Vec<GroupFloorSnapshot>,
+}
+
+/// One relay's connection state as reported by the nostr-sdk pool.
+#[derive(Clone, Debug, Serialize)]
+pub struct RelaySnapshot {
+    pub url: String,
+    pub status: String,
+}
+
+/// Per-group relay catch-up floor: the newest peer-authored message stored
+/// locally, i.e. where a missing-message resync for that chat would start.
+#[derive(Clone, Debug, Serialize)]
+pub struct GroupFloorSnapshot {
+    pub group_id_hex: String,
+    pub floor_secs: u64,
+}
+
 #[derive(Debug)]
 struct SyncState {
     path: Option<PathBuf>,
@@ -362,6 +391,11 @@ impl SyncState {
 
     fn advance_watermark(&mut self, watermark_secs: u64) {
         if watermark_secs > self.watermark_secs {
+            tracing::info!(
+                from = self.watermark_secs,
+                to = watermark_secs,
+                "sync watermark advanced"
+            );
             self.watermark_secs = watermark_secs;
             self.dirty = true;
         }
@@ -373,6 +407,11 @@ impl SyncState {
         }
         let retry_from = event_secs.saturating_sub(SYNC_OVERLAP_SECS);
         if retry_from < self.watermark_secs {
+            tracing::warn!(
+                from = self.watermark_secs,
+                to = retry_from,
+                "sync watermark rewound for retry"
+            );
             self.watermark_secs = retry_from;
             self.dirty = true;
         }
@@ -692,17 +731,24 @@ impl SonarClient {
                 let map = nostr.relays().await;
                 relays
                     .iter()
-                    .filter_map(|url| map.get(url).cloned())
+                    .filter_map(|url| map.get(url).cloned().map(|handle| (url.clone(), handle)))
                     .collect()
             };
             let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(relay_handles.len().max(1));
-            for handle in relay_handles {
+            for (url, handle) in relay_handles {
                 let tx = tx.clone();
                 let timeout = RELAY_CONNECT_TIMEOUT;
                 tokio::spawn(async move {
                     handle.wait_for_connection(timeout).await;
                     if handle.status() == RelayStatus::Connected {
+                        tracing::info!(relay = %url, "relay connected");
                         let _ = tx.send(()).await;
+                    } else {
+                        tracing::warn!(
+                            relay = %url,
+                            status = ?handle.status(),
+                            "relay not connected after timeout"
+                        );
                     }
                 });
             }
@@ -726,6 +772,13 @@ impl SonarClient {
             }
             if connected == 0 {
                 return Err(crate::Error::NoRelayConnected);
+            }
+            if connected < quorum {
+                tracing::warn!(
+                    connected,
+                    quorum,
+                    "relay quorum NOT reached before timeout — continuing degraded"
+                );
             }
             tracing::info!(
                 connected,
@@ -781,8 +834,23 @@ impl SonarClient {
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 };
-                let RelayPoolNotification::Event { event, .. } = notification else {
-                    continue;
+                let event = match notification {
+                    RelayPoolNotification::Event { event, .. } => event,
+                    // EOSE marks the end of a subscription's stored-history
+                    // burst — the key signal when diagnosing "old messages
+                    // not syncing" from an exported debug bundle.
+                    RelayPoolNotification::Message {
+                        relay_url,
+                        message: RelayMessage::EndOfStoredEvents(subscription_id),
+                    } => {
+                        tracing::info!(
+                            relay = %relay_url,
+                            subscription = %subscription_id,
+                            "relay EOSE"
+                        );
+                        continue;
+                    }
+                    _ => continue,
                 };
                 let kind = event.kind.as_u16();
                 if !matches!(kind, 20000 | 20001 | 1059 | 445) {
@@ -856,6 +924,10 @@ impl SonarClient {
                             {
                                 let mut buf = handler_pending.lock().unwrap();
                                 if buf.len() >= MARMOT_BUFFER_CAP {
+                                    tracing::warn!(
+                                        dropped = MARMOT_BUFFER_CAP / 2,
+                                        "pending marmot buffer overflow — dropping oldest gift wraps"
+                                    );
                                     buf.drain(0..MARMOT_BUFFER_CAP / 2);
                                 }
                                 buf.push((*event).clone());
@@ -869,36 +941,49 @@ impl SonarClient {
                         let subs: Vec<String> =
                             handler_subs.lock().unwrap().iter().cloned().collect();
                         for geohash in subs {
-                            let Ok(keys) =
-                                crate::geohash::derive_geohash_keys(&identity_secret, &geohash)
-                            else {
-                                continue;
+                            let keys = match crate::geohash::derive_geohash_keys(
+                                &identity_secret,
+                                &geohash,
+                            ) {
+                                Ok(keys) => keys,
+                                Err(err) => {
+                                    tracing::warn!(%geohash, %err, "geohash key derivation failed");
+                                    continue;
+                                }
                             };
                             if keys.public_key().to_hex() != p_hex {
                                 continue;
                             }
-                            if let Ok(unwrapped) =
-                                UnwrappedGift::from_gift_wrap(&keys, &event).await
-                            {
-                                if unwrapped.rumor.kind.as_u16() != 14 {
-                                    break;
+                            match UnwrappedGift::from_gift_wrap(&keys, &event).await {
+                                Err(err) => {
+                                    tracing::warn!(
+                                        event_id = %event.id,
+                                        %err,
+                                        "geohash gift wrap unwrap failed"
+                                    );
                                 }
-                                let peer_hex = unwrapped.sender.to_hex();
-                                let id = unwrapped
-                                    .rumor
-                                    .id
-                                    .map(|i| i.to_hex())
-                                    .unwrap_or_else(|| event.id.to_hex());
-                                let mut map = handler_dm.lock().unwrap();
-                                let bucket = map.entry((geohash.clone(), peer_hex)).or_default();
-                                if !bucket.iter().any(|r| r.id == id) {
-                                    bucket.push(RawGeoDm {
-                                        id,
-                                        sender: unwrapped.sender,
-                                        content: unwrapped.rumor.content.clone(),
-                                        ts: unwrapped.rumor.created_at.as_secs(),
-                                        mine: false,
-                                    });
+                                Ok(unwrapped) => {
+                                    if unwrapped.rumor.kind.as_u16() != 14 {
+                                        break;
+                                    }
+                                    let peer_hex = unwrapped.sender.to_hex();
+                                    let id = unwrapped
+                                        .rumor
+                                        .id
+                                        .map(|i| i.to_hex())
+                                        .unwrap_or_else(|| event.id.to_hex());
+                                    let mut map = handler_dm.lock().unwrap();
+                                    let bucket =
+                                        map.entry((geohash.clone(), peer_hex)).or_default();
+                                    if !bucket.iter().any(|r| r.id == id) {
+                                        bucket.push(RawGeoDm {
+                                            id,
+                                            sender: unwrapped.sender,
+                                            content: unwrapped.rumor.content.clone(),
+                                            ts: unwrapped.rumor.created_at.as_secs(),
+                                            mine: false,
+                                        });
+                                    }
                                 }
                             }
                             break;
@@ -912,6 +997,10 @@ impl SonarClient {
                         {
                             let mut buf = handler_pending.lock().unwrap();
                             if buf.len() >= MARMOT_BUFFER_CAP {
+                                tracing::warn!(
+                                    dropped = MARMOT_BUFFER_CAP / 2,
+                                    "pending marmot buffer overflow — dropping oldest group messages"
+                                );
                                 buf.drain(0..MARMOT_BUFFER_CAP / 2);
                             }
                             buf.push((*event).clone());
@@ -1661,19 +1750,14 @@ impl SonarClient {
                 ])
                 .build(my_pubkey);
 
-                let seal_builder = match EventBuilder::seal(
-                    &identity_keys,
-                    &info.server_pubkey,
-                    rumor,
-                )
-                .await
-                {
-                    Ok(b) => b,
-                    Err(e) => {
-                        tracing::debug!(member = %member, %e, "push notify seal failed");
-                        continue;
-                    }
-                };
+                let seal_builder =
+                    match EventBuilder::seal(&identity_keys, &info.server_pubkey, rumor).await {
+                        Ok(b) => b,
+                        Err(e) => {
+                            tracing::debug!(member = %member, %e, "push notify seal failed");
+                            continue;
+                        }
+                    };
                 let seal = match seal_builder.sign(&identity_keys).await {
                     Ok(s) => s,
                     Err(e) => {
@@ -1708,7 +1792,11 @@ impl SonarClient {
                 if let Err(e) = nostr.send_event(&wrapped).await {
                     tracing::debug!(member = %member, %e, "push notify send failed");
                 } else {
-                    tracing::info!(member = %member, "push notification sent to transponder");
+                    // Keep the event at info for the default diagnostics export,
+                    // but the recipient npub only at debug (verbose) — the
+                    // default profile must stay free of peer identifiers.
+                    tracing::info!("push notification sent to transponder");
+                    tracing::debug!(member = %member, "push notification recipient");
                 }
             }
         });
@@ -1716,11 +1804,7 @@ impl SonarClient {
 
     /// Send a sticker message to a group. Follows the same Signal-style
     /// local-first sequencing as `send_text`.
-    pub async fn send_sticker(
-        &self,
-        group_id: &GroupId,
-        sticker_ref: &StickerRef,
-    ) -> Result<()> {
+    pub async fn send_sticker(&self, group_id: &GroupId, sticker_ref: &StickerRef) -> Result<()> {
         let event = self.engine.create_sticker_message(group_id, sticker_ref)?;
         let incoming = self.engine.process_incoming(&event).await?;
         let Incoming::Message(message) = incoming else {
@@ -1771,8 +1855,7 @@ impl SonarClient {
             .into_iter()
             .next()
             .ok_or_else(|| Error::Http("sticker pack not found on relays".into()))?;
-        parse_pack_event(&event)
-            .map_err(|e| Error::Http(format!("invalid sticker pack: {e}")))
+        parse_pack_event(&event).map_err(|e| Error::Http(format!("invalid sticker pack: {e}")))
     }
 
     pub async fn fetch_installed_packs(&self) -> Result<Vec<PackAddress>> {
@@ -1782,7 +1865,10 @@ impl SonarClient {
             .limit(1);
         let relays: Vec<String> = self.relays.iter().map(|u| u.to_string()).collect();
         let timeout = Duration::from_secs(10);
-        let events = self.nostr.fetch_events_from(relays, filter, timeout).await?;
+        let events = self
+            .nostr
+            .fetch_events_from(relays, filter, timeout)
+            .await?;
         match events.into_iter().next() {
             Some(event) => {
                 let list = parse_installed_pack_list(&event)
@@ -2204,6 +2290,7 @@ impl SonarClient {
         self.nostr
             .subscribe_with_id(SubscriptionId::new(SUB_MARMOT_WELCOMES), wraps, None)
             .await?;
+        tracing::info!(since_secs, "marmot welcomes subscription opened");
         *self.live_marmot_enabled.lock().unwrap() = true;
         self.subscribe_group_messages().await
     }
@@ -2225,6 +2312,7 @@ impl SonarClient {
             if had_subscription {
                 self.nostr.unsubscribe(&sub_id).await;
                 self.marmot_group_subscriptions.lock().unwrap().clear();
+                tracing::info!("marmot group subscription closed (no groups)");
             }
             return Ok(());
         }
@@ -2248,6 +2336,11 @@ impl SonarClient {
             ));
         }
         self.nostr.subscribe_with_id(sub_id, filter, None).await?;
+        tracing::info!(
+            since_secs,
+            groups = group_ids.len(),
+            "marmot group subscription opened"
+        );
         *self.marmot_group_subscriptions.lock().unwrap() = group_ids;
         Ok(())
     }
@@ -2329,9 +2422,12 @@ impl SonarClient {
             return;
         }
         let mut queue = self.initial_group_message_catchups.lock().unwrap();
-        *queue = Self::group_message_catchup_queue(Self::group_message_catchup_floors(
-            &self.engine,
-        ));
+        *queue =
+            Self::group_message_catchup_queue(Self::group_message_catchup_floors(&self.engine));
+        tracing::info!(
+            groups = queue.len(),
+            "initial group message catch-up queued"
+        );
     }
 
     fn take_initial_group_message_catchup(&self) -> Option<(String, u64)> {
@@ -2342,6 +2438,7 @@ impl SonarClient {
     }
 
     fn requeue_initial_group_message_catchup(&self, group_id: String, floor: u64) {
+        tracing::debug!(group = %group_id, floor, "group message catch-up requeued");
         let mut queue = self.initial_group_message_catchups.lock().unwrap();
         Self::push_group_message_catchup_back(&mut queue, group_id, floor);
     }
@@ -2420,6 +2517,48 @@ impl SonarClient {
 
     fn sync_watermark_secs(&self) -> u64 {
         self.sync_state.lock().unwrap().watermark_secs()
+    }
+
+    /// Point-in-time relay/sync diagnostics for the Diagnostics screen and
+    /// the exported debug bundle. Contains NO message content and NO key
+    /// material: relay URLs and statuses, the sync watermark, live
+    /// subscription state, and per-group catch-up floors (group ids are the
+    /// public nostr group ids already visible on relays as `#h` tags).
+    pub async fn sync_state_snapshot(&self) -> SyncStateSnapshot {
+        // Take the relay map from the `.await` BEFORE acquiring any std Mutex
+        // below, so no lock guard is ever held across an await point.
+        let relay_map = self.nostr.relays().await;
+        let relays = self
+            .relays
+            .iter()
+            .map(|url| RelaySnapshot {
+                url: url.to_string(),
+                // `RelayStatus` `Display` is the stable public string
+                // ("Connected", ...); avoid `Debug` for this serialized field.
+                status: relay_map
+                    .get(url)
+                    .map(|handle| handle.status().to_string())
+                    .unwrap_or_else(|| "unknown".into()),
+            })
+            .collect();
+        let mut group_floors: Vec<GroupFloorSnapshot> =
+            Self::group_message_catchup_floors(&self.engine)
+                .into_iter()
+                .map(|(group_id_hex, floor_secs)| GroupFloorSnapshot {
+                    group_id_hex,
+                    floor_secs,
+                })
+                .collect();
+        group_floors.sort_by(|a, b| a.group_id_hex.cmp(&b.group_id_hex));
+        SyncStateSnapshot {
+            generated_at_secs: Timestamp::now().as_secs(),
+            watermark_secs: self.sync_watermark_secs(),
+            live_marmot_enabled: *self.live_marmot_enabled.lock().unwrap(),
+            subscribed_group_count: self.marmot_group_subscriptions.lock().unwrap().len(),
+            pending_marmot_buffered: self.pending_marmot.lock().unwrap().len(),
+            relays,
+            group_floors,
+        }
     }
 
     fn is_sync_event_processed(&self, event_id: &EventId) -> bool {
@@ -3566,11 +3705,7 @@ impl SonarClient {
     }
 
     /// NIP-44 encrypted DM carrying our push token info (kind 447).
-    async fn send_push_token_dm(
-        &self,
-        recipient: &PublicKey,
-        payload_json: &str,
-    ) -> Result<()> {
+    async fn send_push_token_dm(&self, recipient: &PublicKey, payload_json: &str) -> Result<()> {
         let rumor = EventBuilder::new(
             Kind::Custom(crate::push::KIND_PUSH_TOKEN_SHARE),
             payload_json,
@@ -3608,7 +3743,10 @@ impl SonarClient {
             cache.insert(sender.to_hex(), cached);
             crate::push::save_push_token_cache(self.push_token_cache_path.as_deref(), &cache)?;
         }
-        tracing::info!(sender = %sender, "cached push token from group member");
+        // Event at info for the default export; sender npub only at debug so
+        // the default diagnostics profile carries no peer identifiers.
+        tracing::info!("cached push token from group member");
+        tracing::debug!(sender = %sender, "push token sender");
         Ok(())
     }
 }

@@ -2377,6 +2377,7 @@ private struct MacSettingsModal: View {
     @State private var walletSheet = false
     @State private var currencySheet = false
     @State private var exportKeySheet = false
+    @State private var diagnosticsSheet = false
     @FocusState private var nameFocused: Bool
 
     var body: some View {
@@ -2453,6 +2454,9 @@ private struct MacSettingsModal: View {
         }
         .snSheet(isPresented: $exportKeySheet, title: "Export private key") {
             SNExportKeySheetContent()
+        }
+        .snSheet(isPresented: $diagnosticsSheet, title: "Diagnostics") {
+            SNDiagnosticsSheetContent()
         }
     }
 
@@ -2702,6 +2706,13 @@ private struct MacSettingsModal: View {
         VStack(spacing: 0) {
             SNSectionLabel("About")
             SNSettingsCard {
+                SNSettingsRow(
+                    icon: .info,
+                    label: "Diagnostics",
+                    sub: "Relay sync status and shareable debug logs"
+                ) {
+                    diagnosticsSheet = true
+                }
                 SNSettingsRow(
                     icon: .info,
                     label: "About Sonar",
