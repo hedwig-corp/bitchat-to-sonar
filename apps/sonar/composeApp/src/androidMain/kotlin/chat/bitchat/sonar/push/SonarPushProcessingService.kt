@@ -28,11 +28,15 @@ import chat.bitchat.sonar.decodeProfileCache
 import chat.bitchat.sonar.isMutedAt
 import chat.bitchat.sonar.resolvePushSenderName
 import chat.bitchat.sonar.shortNpubLabel
+import chat.bitchat.sonar.wallet.InvoiceRequestPayload
+import chat.bitchat.sonar.wallet.JsonLite
 import chat.bitchat.sonar.wallet.NotifiedPaymentIds
 import chat.bitchat.sonar.wallet.PaymentActivityStore
 import chat.bitchat.sonar.wallet.WalletBridge
 import chat.bitchat.sonar.wallet.WalletPaymentEvent
 import chat.bitchat.sonar.wallet.WalletState
+import java.net.HttpURLConnection
+import java.net.URL
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
@@ -455,6 +459,15 @@ class SonarPushProcessingService : Service() {
                 }
                 WalletBridge.refreshBalance()
 
+                // BOLT12 invoice_request: the payer is blocked until we produce
+                // the invoice and POST it to the NDS reply URL (60s server
+                // window) — the step iOS's NSE does via InvoiceRequestTask and
+                // Android must do itself (no notification plugin in the KMP
+                // bindings). Answer FIRST, then await the resulting payment.
+                if (notificationType == NOTIF_TYPE_INVOICE_REQUEST) {
+                    answerInvoiceRequest(payload)
+                }
+
                 // Await a claimed receive: the first one ends this wake (each new
                 // payment gets its own push, so we don't need to drain many).
                 while (settled.get() == 0 &&
@@ -474,6 +487,58 @@ class SonarPushProcessingService : Service() {
             Log.w(TAG, "Breez wakeup failed (silent)", e)
         }
     }
+
+    /**
+     * Produce the BOLT12 invoice for an invoice_request push and POST it to
+     * the NDS reply URL — the Android analog of iOS `InvoiceRequestTask`:
+     * success → `{"invoice": ...}`, failure → `{"error": ...}` so the payer
+     * gets a real error instead of the NDS's 60s timeout. The NDS relays the
+     * body verbatim to the swap server.
+     */
+    private suspend fun answerInvoiceRequest(payload: String) {
+        val req = InvoiceRequestPayload.parse(payload) ?: run {
+            Log.w(TAG, "invoice_request: unparseable payload")
+            return
+        }
+        if (!req.replyUrl.startsWith("https://")) {
+            // The reply URL is server-injected; anything non-HTTPS is malformed
+            // or tampered — never post an invoice to it.
+            Log.w(TAG, "invoice_request: refusing non-https reply URL")
+            return
+        }
+        val body = WalletBridge.createBolt12Invoice(req.offer, req.invoiceRequest).fold(
+            onSuccess = { JsonLite.encodeObject("invoice", it) },
+            onFailure = {
+                Log.w(TAG, "invoice_request: createBolt12Invoice failed", it)
+                JsonLite.encodeObject("error", it.message ?: "failed to create invoice")
+            },
+        )
+        val posted = postReply(req.replyUrl, body)
+        Log.d(TAG, "invoice_request answered (posted=$posted)")
+    }
+
+    /** POST [body] as JSON to [url]; true on 2xx. Bounded timeouts — the whole
+     *  answer must beat the NDS's 60s callback window. */
+    private suspend fun postReply(url: String, body: String): Boolean =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val conn = URL(url).openConnection() as HttpURLConnection
+                try {
+                    conn.requestMethod = "POST"
+                    conn.connectTimeout = 10_000
+                    conn.readTimeout = 10_000
+                    conn.doOutput = true
+                    conn.setRequestProperty("Content-Type", "application/json")
+                    conn.outputStream.use { it.write(body.encodeToByteArray()) }
+                    conn.responseCode in 200..299
+                } finally {
+                    conn.disconnect()
+                }
+            }.getOrElse {
+                Log.w(TAG, "invoice_request reply POST failed", it)
+                false
+            }
+        }
 
     /**
      * Notify-exactly-once gate for a settled incoming wallet payment. Returns
@@ -517,6 +582,9 @@ class SonarPushProcessingService : Service() {
         const val EXTRA_NOTIFICATION_PAYLOAD = "notification_payload"
         const val TYPE_MARMOT = "marmot"
         const val TYPE_BREEZ = "breez"
+        /** NDS notification_type for a BOLT12 invoice_request (breez/notify
+         *  `NOTIFICATION_INVOICE_REQUEST`). */
+        private const val NOTIF_TYPE_INVOICE_REQUEST = "invoice_request"
 
         /** Guards the single-flight wake state below. Process-wide, because
          *  overlapping FCM deliveries each get their own service start and
