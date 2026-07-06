@@ -52,6 +52,10 @@ internal object JsonLite {
                 if (j >= json.length || json[j] != '"') return null // non-string value
                 return readString(json, j)?.first
             }
+            // A nested object/array value means this is not the flat shape the
+            // parser is specified for — descending into it could match an inner
+            // key and return a WRONG value, which is worse than null. Bail.
+            if (j < json.length && (json[j] == '{' || json[j] == '[')) return null
             // Skip a string value so its content can't be mistaken for a key.
             i = if (j < json.length && json[j] == '"') readString(json, j)?.second ?: return null else j
         }
