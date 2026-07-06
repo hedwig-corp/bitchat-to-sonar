@@ -1292,15 +1292,20 @@ final class SonarAppStore: ObservableObject {
     /// strips the BLE local name and restricts service-UUID advertising in the
     /// background, so we advertise the receiver only while foreground.
     func setForeground(_ foreground: Bool) {
-        guard isForeground != foreground else { return }
+        let changed = isForeground != foreground
         let cameToForeground = foreground && !isForeground
         isForeground = foreground
-        updateReceiverAdvertising()
         #if canImport(UIKit)
         // Tear the Breez node down before suspension so it never holds a SQLite
         // lock while the process is suspended (the 0xdead10cc kill), and rebuild
         // it on foreground. Offline receive is unaffected — it runs in the
         // Notification Service Extension's own process.
+        //
+        // Drive this on every foreground/background signal, even when our tracked
+        // flag didn't change: a silent-push background launch leaves `isForeground`
+        // at its `true` default, so the first real foreground would otherwise skip
+        // the resume and the node (deferred at launch) would never come up.
+        // suspend/resume are idempotent (guarded on node state / `suspendedForBackground`).
         if let walletService = (wallet as? BridgedWallet)?.walletService {
             if foreground {
                 walletService.resumeFromBackground()
@@ -1309,6 +1314,8 @@ final class SonarAppStore: ObservableObject {
             }
         }
         #endif
+        guard changed else { return }
+        updateReceiverAdvertising()
         if cameToForeground {
             refreshKnownContactDescriptors()
             publishedCallDescriptor = false
