@@ -193,6 +193,13 @@ about 24 s. The remaining dominant cost is still `t3 → t3a`: publishing the
 KeyPackage and profile takes ~18.3 s median and accounts for about 88% of the
 post-connect relay path after the PR.
 
+> **Baseline comparability note (2026-07):** `t3a_published` was REDEFINED when
+> the publishes moved to the background (`publish_*_background`): it now marks
+> publish enqueue (event created/persisted), not relay OK acks. `t3→t3a`
+> numbers in the tables above measure the OLD blocking semantics and are not
+> directly comparable with newer runs; `startPolling()` also no longer waits
+> for t3a, so first-drain timings improved independently of publish latency.
+
 ## Where to speed up (highest impact first)
 
 1. ~~**Don't block sync on the publishes.**~~ **DONE (2026-07):**

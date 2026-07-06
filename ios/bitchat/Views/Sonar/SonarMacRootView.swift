@@ -423,6 +423,11 @@ private struct SonarMacMainPane: View {
                 detailRailOpen: $detailRailOpen,
                 onSelect: { selection = $0 }
             )
+            // Identity per conversation: without this, switching .dm(A)→.dm(B)
+            // reuses the pane instance, .onDisappear never fires for A, and
+            // store.closedDM(A) is skipped — leaking A's ConversationViewState
+            // (it would keep rebuilding on every store invalidation forever).
+            .id(id)
         case .profile:
             MacProfilePane()
         }

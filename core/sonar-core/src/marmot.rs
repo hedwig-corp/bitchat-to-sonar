@@ -180,7 +180,7 @@ impl MessageClassification {
             }
             return Self::Text;
         }
-        if line.starts_with("☎CALL") && CallControl::parse(content).is_some() {
+        if line.starts_with("☎CALL") && CallControl::parse(line).is_some() {
             return Self::CallControl;
         }
         Self::Text
