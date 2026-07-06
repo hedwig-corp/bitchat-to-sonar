@@ -134,6 +134,14 @@ final class WalletBridgeService: ObservableObject {
     /// normal clean suspend path.
     private var activeSendCount = 0
     private var suspendWhenActiveSendsFinish = false
+
+    /// True when the process is running in the background. Node startup consults
+    /// this so the Breez SDK's `track_new_blocks` SQLite writer never comes up
+    /// while suspended (`0xdead10cc`). `@MainActor` guarantees the main-thread
+    /// access `UIApplication.applicationState` requires.
+    private static var isAppInBackground: Bool {
+        UIApplication.shared.applicationState == .background
+    }
     #endif
 
     // MARK: - Money display
@@ -237,6 +245,26 @@ final class WalletBridgeService: ObservableObject {
                     try await wallet.createWallet()
                 }
             }
+            #if canImport(UIKit)
+            // Never start the Breez node while the process is backgrounded. Its
+            // `track_new_blocks` task polls the SQLite cache continuously, and
+            // holding a SQLite lock at suspension gets the app killed by
+            // RunningBoard with `0xdead10cc`. `suspendForBackground()` only fires
+            // on the scenePhase `.background` *change*, so a node started while
+            // already backgrounded — a silent-push background launch
+            // (`BridgedWallet.init`) or `retrySetup()` off a background Marmot
+            // wake republishing `npub` — would run unguarded until the next
+            // suspend and crash. Defer instead: arm the resume so the next
+            // foreground (`resumeFromBackground()`) brings the node up, and throw
+            // so `setupIfNeeded()` clears `setupTask` for a clean retry.
+            if Self.isAppInBackground {
+                #if DEBUG
+                SecureLogger.warning("Wallet setup deferred: app backgrounded; not starting Breez node (0xdead10cc guard)", category: .session)
+                #endif
+                suspendedForBackground = true
+                throw WalletBridgeError.core("app backgrounded; Breez node start deferred to foreground")
+            }
+            #endif
             #if DEBUG
             SecureLogger.info("Wallet setup: starting Breez node", category: .session)
             #endif
