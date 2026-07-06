@@ -172,9 +172,12 @@ pub enum Incoming {
     /// Processing a proposal produced an auto-commit that the caller must
     /// publish and merge before the group converges.
     GroupProposal(GroupMembershipUpdate),
-    /// MDK saw the event but could not apply it yet or marked a prior attempt
-    /// failed. The relay sync layer must not advance past this event.
-    Retryable,
+    /// MDK recorded this event as failed and blocks reprocessing: re-delivery
+    /// returns this same result forever (only MDK's internal epoch-rollback
+    /// machinery can revive one). The relay sync layer must mark it processed
+    /// and move on — holding the sync cursor behind it refetches the same
+    /// history on every sync without ever succeeding.
+    Failed,
     /// A join request was received for a group we administer.
     JoinRequest(crate::invite_link::JoinRequest),
     /// The event was valid but produced nothing actionable (duplicates,
@@ -594,8 +597,11 @@ impl MarmotEngine {
                     MessageProcessingResult::Proposal(update) => Ok(Incoming::GroupProposal(
                         Self::to_membership_update(update, Vec::new(), true),
                     )),
+                    // MDK persists a Failed processing record on the first
+                    // failure and short-circuits every re-delivery with the
+                    // same result, so these are terminal for the sync layer.
                     MessageProcessingResult::Unprocessable { .. }
-                    | MessageProcessingResult::PreviouslyFailed => Ok(Incoming::Retryable),
+                    | MessageProcessingResult::PreviouslyFailed => Ok(Incoming::Failed),
                     _ => Ok(Incoming::None),
                 }
             }

@@ -447,8 +447,16 @@ struct RelayFetchOutcome {
 }
 
 impl RelayFetchOutcome {
-    fn completed_all_relays(&self) -> bool {
-        self.completed_relays >= self.total_relays
+    /// True when enough relays answered to treat the fetch as complete.
+    ///
+    /// The bar is the fetch quorum, NOT all relays: the fetch loop stops
+    /// waiting once the quorum answers (late relays stream into the pending
+    /// buffer), so with more relays than the quorum an all-relays bar can
+    /// never be met — every sync would be marked retryable, the watermark
+    /// would never advance, and one permanently-dead relay in the list would
+    /// requeue per-group catch-ups forever.
+    fn completed_quorum(&self) -> bool {
+        self.completed_relays >= relay_fetch_quorum(self.total_relays)
     }
 }
 
@@ -2033,7 +2041,7 @@ impl SonarClient {
         let wraps = self
             .fetch_marmot_events_from_relay_quorum(wraps, FETCH_TIMEOUT, "gift wrap sync")
             .await?;
-        if !wraps.completed_all_relays() {
+        if !wraps.completed_quorum() {
             process_report.record_retryable(started);
         }
         let (wrap_report, _) = self.process_marmot_events(wraps.events, "gift wrap").await;
@@ -2104,7 +2112,7 @@ impl SonarClient {
             let events = self
                 .fetch_marmot_events_from_relay_quorum(filter, FETCH_TIMEOUT, "group message sync")
                 .await?;
-            if !events.completed_all_relays() {
+            if !events.completed_quorum() {
                 process_report.record_retryable(started);
             }
             let (msg_report, _) = self
@@ -2663,14 +2671,20 @@ impl SonarClient {
             }
 
             match self.engine.process_incoming(&event).await {
-                Ok(Incoming::Retryable) => {
+                Ok(Incoming::Failed) => {
+                    // MDK blocks reprocessing of failed events, so retrying by
+                    // rewinding the sync watermark refetches the same history
+                    // forever without ever succeeding (observed pinning the
+                    // watermark weeks in the past, turning every sync into a
+                    // multi-day backfill). Mark processed and move on.
                     tracing::debug!(
                         event_id = %event.id,
                         event_created_at = event.created_at.as_secs(),
                         context,
-                        "marmot event needs retry; leaving sync cursor behind it"
+                        "marmot event permanently failed in MDK; marking processed"
                     );
-                    report.record_retryable(event.created_at.as_secs());
+                    self.mark_sync_event_processed(&event.id);
+                    report.record_processed();
                 }
                 Ok(Incoming::GroupProposal(update)) => {
                     match self.publish_membership_update(update).await {
@@ -2792,7 +2806,7 @@ impl SonarClient {
         let events = self
             .fetch_marmot_events_from_relay_quorum(filter, BACKFILL_TIMEOUT, context)
             .await?;
-        let partial = !events.completed_all_relays();
+        let partial = !events.completed_quorum();
         let (mut report, _) = self
             .process_marmot_events(events.events, "backfilled group message")
             .await;
@@ -3717,20 +3731,24 @@ mod tests {
     }
 
     #[test]
-    fn relay_fetch_outcome_reports_partial_completion() {
-        let partial = RelayFetchOutcome {
+    fn relay_fetch_outcome_quorum_is_the_completeness_bar() {
+        // Quorum answered (the most the fetch loop ever waits for): complete,
+        // even though 3 of 5 relays never responded — one dead relay in the
+        // list must not block watermark advancement forever.
+        let quorum_met = RelayFetchOutcome {
             events: Vec::new(),
-            completed_relays: relay_fetch_quorum(4),
-            total_relays: 4,
+            completed_relays: relay_fetch_quorum(5),
+            total_relays: 5,
         };
-        let complete = RelayFetchOutcome {
+        // Below quorum: retryable.
+        let below_quorum = RelayFetchOutcome {
             events: Vec::new(),
-            completed_relays: 4,
-            total_relays: 4,
+            completed_relays: 1,
+            total_relays: 5,
         };
 
-        assert!(!partial.completed_all_relays());
-        assert!(complete.completed_all_relays());
+        assert!(quorum_met.completed_quorum());
+        assert!(!below_quorum.completed_quorum());
     }
 
     #[test]
