@@ -296,6 +296,18 @@ private fun hexEnc(s: String): String =
         ((it.toInt() and 0xFF) + 0x100).toString(16).substring(1)
     }
 
+/** UTF-8 → lowercase hex, and hex → UTF-8 (null if not valid hex). Public,
+ *  testable wrappers used by the mesh-name blob so an attacker-controlled peer
+ *  nickname (arbitrary unicode incl. newlines) can't corrupt the line framing. */
+internal fun hexEncodeUtf8(s: String): String = hexEnc(s)
+internal fun hexDecodeUtf8(s: String): String? = hexDec(s)
+
+/** A display "name" that is actually a key-shaped fallback ("npub1…" or the
+ *  "mesh·<id>" placeholder) — must never be persisted or trusted as a real
+ *  name, since it would mask a later profile/announce resolution. */
+internal fun isKeyFallbackNameValue(name: String): Boolean =
+    name.startsWith("mesh·") || name.startsWith("npub1")
+
 private fun hexDec(s: String): String? {
     if (s.isEmpty()) return ""
     if (s.length % 2 != 0) return null
