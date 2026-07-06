@@ -484,7 +484,12 @@ final class MarmotChatModel: ObservableObject {
                 #endif
                 self.errorText = nil
                 self.relayConnected = true
-                try? await self.service.publishKeyPackage()
+                // Start the drain loop BEFORE any publish: message receive must
+                // never wait on identity publishes. The publishes below used to
+                // hold the serial engine queue for their per-relay OK waits and
+                // delayed the first drain by ~50s on device (t3→t3a).
+                self.startPolling()
+                try? await self.service.publishKeyPackageBackground()
                 // Republish our kind-0 profile here too (not just on the npub
                 // signal / rename): the KeyPackage lands reliably on every relay
                 // connect, but the profile previously did not, so peers saw our
@@ -492,14 +497,15 @@ final class MarmotChatModel: ObservableObject {
                 // onboarding race. Keep them in lockstep.
                 if let name = self.profileNameProvider?()
                     .trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty {
-                    try? await self.service.publishProfile(name: name)
+                    try? await self.service.publishProfileBackground(name: name)
                 }
                 #if DEBUG
-                // SONAR_BENCH: KeyPackage + profile published (T3a). Splits the
-                // publish cost out of the post-connect window.
+                // SONAR_BENCH: KeyPackage + profile publish ENQUEUED (T3a). The
+                // relay sends complete in the background inside the core; this
+                // marker now measures event creation, not relay OK acks (see
+                // docs/PERFORMANCE.md).
                 SecureLogger.info("SONAR_BENCH t3a_published", category: .session)
                 #endif
-                self.startPolling()
             } catch MarmotService.ServiceError.cancelled {
                 self.relayConnected = false
                 return
@@ -753,10 +759,12 @@ final class MarmotChatModel: ObservableObject {
     }
 
     /// Publish our own kind-0 profile so peers see our nickname, not our npub.
+    /// Background variant: the relay send must not hold the engine queue (a
+    /// rename can happen while a chat is open and sending).
     func publishProfile(name: String) {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        Task { try? await service.publishProfile(name: trimmed) }
+        Task { try? await service.publishProfileBackground(name: trimmed) }
     }
 
     /// Publish the app-level Sonar descriptor. This is separate from kind-0
@@ -970,12 +978,28 @@ final class MarmotChatModel: ObservableObject {
         return merged
     }
 
+    /// How far BEFORE the echo's creation a server row may be timestamped and
+    /// still count as this send's relay copy. The real copy is always stamped
+    /// at/after the echo (`send()` appends the echo, then `sendChain` runs
+    /// `sendText`), so only a few seconds of slack are needed for
+    /// second-granularity `created_at` + minor clock jitter. A wider window
+    /// would let a recent identical send consume this still-pending echo.
+    private static let optimisticMatchSlack: TimeInterval = 5
+
     private static func serverMessage(
         _ server: MarmotService.MarmotMessage,
         matchesOptimistic optimistic: MarmotService.MarmotMessage
     ) -> Bool {
         guard !optimistic.id.hasPrefix(failedOptimisticIDPrefix) else { return false }
         guard server.isMine, server.content == optimistic.content else { return false }
+        // Only a row created around/after the echo can be THIS send's copy.
+        // Without this, re-sending text identical to an OLDER own message
+        // matched that old row and dropped the still-pending echo on the next
+        // page load — leaving the chat and coming back made the in-flight
+        // message vanish until the real send landed.
+        guard server.createdAt >= optimistic.createdAt.addingTimeInterval(-Self.optimisticMatchSlack) else {
+            return false
+        }
         guard !optimistic.media.isEmpty else { return server.media.isEmpty }
         return optimistic.media.allSatisfy { pending in
             server.media.contains {

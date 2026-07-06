@@ -1099,10 +1099,26 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func publishKeyPackage() throws 
     
     /**
+     * Like `publish_key_package`, but the relay send happens in the
+     * background: returns as soon as the KeyPackage event is created and
+     * persisted, without waiting for relay OK acks. For the cold-start /
+     * relay-connect republish path, where the per-relay OK wait must not
+     * delay the first message drain. Failures are logged in core and
+     * self-heal on the next relay connect (replaceable event).
+     */
+    func publishKeyPackageBackground() throws 
+    
+    /**
      * Publish our kind-0 profile (NIP-01 metadata) so peers can show our name +
      * avatar instead of a raw npub. `name` is used for both name + display_name.
      */
     func publishProfile(name: String, about: String?, picture: String?) throws 
+    
+    /**
+     * Like `publish_profile`, but the relay send happens in the background —
+     * same contract as `publish_key_package_background`.
+     */
+    func publishProfileBackground(name: String, about: String?, picture: String?) 
     
     /**
      * Publish this identity's public Sonar descriptor. `signaling` should list
@@ -1809,11 +1825,40 @@ open func publishKeyPackage()throws   {try rustCallWithError(FfiConverterTypeSon
 }
     
     /**
+     * Like `publish_key_package`, but the relay send happens in the
+     * background: returns as soon as the KeyPackage event is created and
+     * persisted, without waiting for relay OK acks. For the cold-start /
+     * relay-connect republish path, where the per-relay OK wait must not
+     * delay the first message drain. Failures are logged in core and
+     * self-heal on the next relay connect (replaceable event).
+     */
+open func publishKeyPackageBackground()throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_publish_key_package_background(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
      * Publish our kind-0 profile (NIP-01 metadata) so peers can show our name +
      * avatar instead of a raw npub. `name` is used for both name + display_name.
      */
 open func publishProfile(name: String, about: String?, picture: String?)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_publish_profile(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(name),
+        FfiConverterOptionString.lower(about),
+        FfiConverterOptionString.lower(picture),$0
+    )
+}
+}
+    
+    /**
+     * Like `publish_profile`, but the relay send happens in the background —
+     * same contract as `publish_key_package_background`.
+     */
+open func publishProfileBackground(name: String, about: String?, picture: String?)  {try! rustCall() {
+    uniffi_sonar_ffi_fn_method_sonarnode_publish_profile_background(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(name),
         FfiConverterOptionString.lower(about),
@@ -2462,10 +2507,19 @@ public struct ConversationSummaryInfo: Equatable, Hashable {
     public var latestMine: Bool
     public var messageCount: UInt64
     public var unreadCount: UInt64
+    /**
+     * Monotonic per-conversation change counter — a cheap cache key: equal
+     * version ⇒ nothing about this conversation's summary/transcript changed.
+     */
+    public var version: UInt64
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(groupIdHex: String, name: String, latestContent: String, latestSenderNpub: String, latestAtSecs: UInt64, latestMine: Bool, messageCount: UInt64, unreadCount: UInt64) {
+    public init(groupIdHex: String, name: String, latestContent: String, latestSenderNpub: String, latestAtSecs: UInt64, latestMine: Bool, messageCount: UInt64, unreadCount: UInt64, 
+        /**
+         * Monotonic per-conversation change counter — a cheap cache key: equal
+         * version ⇒ nothing about this conversation's summary/transcript changed.
+         */version: UInt64) {
         self.groupIdHex = groupIdHex
         self.name = name
         self.latestContent = latestContent
@@ -2474,6 +2528,7 @@ public struct ConversationSummaryInfo: Equatable, Hashable {
         self.latestMine = latestMine
         self.messageCount = messageCount
         self.unreadCount = unreadCount
+        self.version = version
     }
 
     
@@ -2499,7 +2554,8 @@ public struct FfiConverterTypeConversationSummaryInfo: FfiConverterRustBuffer {
                 latestAtSecs: FfiConverterUInt64.read(from: &buf), 
                 latestMine: FfiConverterBool.read(from: &buf), 
                 messageCount: FfiConverterUInt64.read(from: &buf), 
-                unreadCount: FfiConverterUInt64.read(from: &buf)
+                unreadCount: FfiConverterUInt64.read(from: &buf), 
+                version: FfiConverterUInt64.read(from: &buf)
         )
     }
 
@@ -2512,6 +2568,7 @@ public struct FfiConverterTypeConversationSummaryInfo: FfiConverterRustBuffer {
         FfiConverterBool.write(value.latestMine, into: &buf)
         FfiConverterUInt64.write(value.messageCount, into: &buf)
         FfiConverterUInt64.write(value.unreadCount, into: &buf)
+        FfiConverterUInt64.write(value.version, into: &buf)
     }
 }
 
@@ -3376,6 +3433,10 @@ public struct MessageInfo: Equatable, Hashable {
      * Sticker reference if this message is a sticker send (nil for text/media).
      */
     public var stickerRef: StickerRefInfo?
+    /**
+     * Precomputed content classification (pay/call control vs plain text).
+     */
+    public var classification: MessageClassInfo
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -3391,7 +3452,10 @@ public struct MessageInfo: Equatable, Hashable {
          */media: [MediaInfo], 
         /**
          * Sticker reference if this message is a sticker send (nil for text/media).
-         */stickerRef: StickerRefInfo?) {
+         */stickerRef: StickerRefInfo?, 
+        /**
+         * Precomputed content classification (pay/call control vs plain text).
+         */classification: MessageClassInfo) {
         self.idHex = idHex
         self.senderNpub = senderNpub
         self.content = content
@@ -3400,6 +3464,7 @@ public struct MessageInfo: Equatable, Hashable {
         self.deliveryState = deliveryState
         self.media = media
         self.stickerRef = stickerRef
+        self.classification = classification
     }
 
     
@@ -3425,7 +3490,8 @@ public struct FfiConverterTypeMessageInfo: FfiConverterRustBuffer {
                 mine: FfiConverterBool.read(from: &buf), 
                 deliveryState: FfiConverterString.read(from: &buf), 
                 media: FfiConverterSequenceTypeMediaInfo.read(from: &buf), 
-                stickerRef: FfiConverterOptionTypeStickerRefInfo.read(from: &buf)
+                stickerRef: FfiConverterOptionTypeStickerRefInfo.read(from: &buf), 
+                classification: FfiConverterTypeMessageClassInfo.read(from: &buf)
         )
     }
 
@@ -3438,6 +3504,7 @@ public struct FfiConverterTypeMessageInfo: FfiConverterRustBuffer {
         FfiConverterString.write(value.deliveryState, into: &buf)
         FfiConverterSequenceTypeMediaInfo.write(value.media, into: &buf)
         FfiConverterOptionTypeStickerRefInfo.write(value.stickerRef, into: &buf)
+        FfiConverterTypeMessageClassInfo.write(value.classification, into: &buf)
     }
 }
 
@@ -4391,6 +4458,113 @@ public func FfiConverterTypeCallStateInfo_lift(_ buf: RustBuffer) throws -> Call
 #endif
 public func FfiConverterTypeCallStateInfo_lower(_ value: CallStateInfo) -> RustBuffer {
     return FfiConverterTypeCallStateInfo.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Transcript-level classification of a chat message, computed once in core
+ * so hosts never re-parse `content` on the UI render path. Malformed control
+ * lines classify as `Text` (a parse failure never hides a message).
+ */
+
+public enum MessageClassInfo: Equatable, Hashable {
+    
+    /**
+     * Plain chat text.
+     */
+    case text
+    /**
+     * `⚡PAY|1|<id>|<sats>` payment receipt — render a payment bubble.
+     */
+    case payReceipt(paymentId: String, amountSats: UInt64
+    )
+    /**
+     * `⚡PAYDONE|…` settlement — protocol control line, hidden from the
+     * transcript (still drives ledger state).
+     */
+    case payDone(paymentId: String, preimageHex: String?
+    )
+    /**
+     * `☎CALL|…` signaling line — hidden from the transcript.
+     */
+    case callControl
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension MessageClassInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMessageClassInfo: FfiConverterRustBuffer {
+    typealias SwiftType = MessageClassInfo
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MessageClassInfo {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .text
+        
+        case 2: return .payReceipt(paymentId: try FfiConverterString.read(from: &buf), amountSats: try FfiConverterUInt64.read(from: &buf)
+        )
+        
+        case 3: return .payDone(paymentId: try FfiConverterString.read(from: &buf), preimageHex: try FfiConverterOptionString.read(from: &buf)
+        )
+        
+        case 4: return .callControl
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: MessageClassInfo, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .text:
+            writeInt(&buf, Int32(1))
+        
+        
+        case let .payReceipt(paymentId,amountSats):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(paymentId, into: &buf)
+            FfiConverterUInt64.write(amountSats, into: &buf)
+            
+        
+        case let .payDone(paymentId,preimageHex):
+            writeInt(&buf, Int32(3))
+            FfiConverterString.write(paymentId, into: &buf)
+            FfiConverterOptionString.write(preimageHex, into: &buf)
+            
+        
+        case .callControl:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMessageClassInfo_lift(_ buf: RustBuffer) throws -> MessageClassInfo {
+    return try FfiConverterTypeMessageClassInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMessageClassInfo_lower(_ value: MessageClassInfo) -> RustBuffer {
+    return FfiConverterTypeMessageClassInfo.lower(value)
 }
 
 
@@ -6001,7 +6175,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_key_package() != 48211) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_key_package_background() != 41112) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_profile() != 42572) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_profile_background() != 18973) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_sonar_descriptor() != 7979) {

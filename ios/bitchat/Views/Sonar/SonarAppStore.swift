@@ -1169,8 +1169,16 @@ final class SonarAppStore: ObservableObject {
     #endif
 
     private func republish<P: Publisher>(_ publisher: P) where P.Output == Void, P.Failure == Never {
+        // Coalesce upstream invalidation bursts (BLE announce storms, relay
+        // EOSE bursts, presence heartbeats) into at most ~10 store-wide
+        // re-renders per second. Every screen reads computed properties off
+        // this store, so an unthrottled republish makes one chatty upstream
+        // service re-render the entire app at its event rate — measured as
+        // visible typing/sending lag in open conversations. Throttle keeps the
+        // first event immediate and delays followers by at most 100ms.
         publisher
             .receive(on: DispatchQueue.main)
+            .throttle(for: .milliseconds(100), scheduler: DispatchQueue.main, latest: true)
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &cancellables)
     }
@@ -1431,9 +1439,16 @@ final class SonarAppStore: ObservableObject {
     }
 
     private func applyBLEDiscoveryPolicy() {
-        refreshBleKnownContactSnapshot()
+        // Decide from the freshly-computed set, NOT from `defaults`: the
+        // snapshot mirror is written asynchronously, so reading it back here
+        // could see the stale (empty) list and wrongly pick `.off` right after
+        // the first known chat is added, leaving BLE disabled until an
+        // unrelated refresh.
+        let known = refreshBleKnownContactSnapshot()
         guard let ble = chatViewModel.meshService as? BLEService else { return }
-        let nextMode = effectiveBLEDiscoveryMode
+        let nextMode: BLEDiscoveryMode = isBLEDiscoveryRestricted
+            ? (known.isEmpty ? .off : .knownOnly)
+            : .normal
         if ble.discoveryMode == nextMode {
             if isBLEDiscoveryRestricted {
                 ble.reapplyDiscoveryModePolicy()
@@ -1443,7 +1458,12 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
-    private func refreshBleKnownContactSnapshot() {
+    /// Recompute the set of BLE-known chat keys and mirror it to `defaults`
+    /// for cross-launch use + the `knownPeerProvider`. Returns the freshly
+    /// computed set so callers can make a decision on it WITHOUT reading the
+    /// asynchronously-written `defaults` back (see `applyBLEDiscoveryPolicy`).
+    @discardableResult
+    private func refreshBleKnownContactSnapshot() -> Set<String> {
         var keys = Set<String>()
         func insert(_ raw: String) {
             let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -1473,7 +1493,16 @@ final class SonarAppStore: ObservableObject {
             }
         }
 
-        defaults.set(Array(keys), forKey: Keys.bleKnownChatKeys)
+        // Persist off the main thread: this runs on every `$groups` publish,
+        // and CFPreferences writes are an XPC round trip to cfprefsd that can
+        // stall the runloop (observed as chat-open microhangs). UserDefaults
+        // is thread-safe; last-writer-wins is fine for this mirror.
+        let snapshot = Array(keys)
+        let defaults = self.defaults
+        DispatchQueue.global(qos: .utility).async {
+            defaults.set(snapshot, forKey: Keys.bleKnownChatKeys)
+        }
+        return keys
     }
 
     func submitInviteLink(_ token: String) {
@@ -2001,19 +2030,49 @@ final class SonarAppStore: ObservableObject {
         return false
     }
 
+    /// Memoization for `nostrPubkeyData`: the same handful of npub/hex strings
+    /// get decoded over and over (per chat-list row, per BLE snapshot refresh,
+    /// per profile scan in `sonarPeerKey`). A device Time Profiler trace showed
+    /// repeated `Bech32.decode` from these paths as the single largest main
+    /// thread cost (~35% of all main-thread CPU), arriving in >100ms bursts
+    /// that starved the keyboard while typing. Lock-protected because the BLE
+    /// profile provider can resolve keys off the main actor; bounded so a
+    /// hostile flood of unique strings cannot grow it unbounded.
+    private static let pubkeyDataCacheLock = NSLock()
+    private static var pubkeyDataCache: [String: Data?] = [:]
+    private static let pubkeyDataCacheCap = 4096
+
     /// Canonical 32-byte Nostr pubkey from a bech32 `npub1…` OR a 64-char hex string.
     private static func nostrPubkeyData(_ s: String) -> Data? {
-        if s.hasPrefix("npub1") {
-            guard let d = try? Bech32.decode(s), d.hrp == "npub", d.data.count == 32 else { return nil }
-            return d.data
+        pubkeyDataCacheLock.lock()
+        if let cached = pubkeyDataCache[s] {
+            pubkeyDataCacheLock.unlock()
+            return cached
         }
-        return Data(hexString: s).flatMap { $0.count == 32 ? $0 : nil }
+        pubkeyDataCacheLock.unlock()
+
+        let decoded: Data?
+        if s.hasPrefix("npub1") {
+            if let d = try? Bech32.decode(s), d.hrp == "npub", d.data.count == 32 {
+                decoded = d.data
+            } else {
+                decoded = nil
+            }
+        } else {
+            decoded = Data(hexString: s).flatMap { $0.count == 32 ? $0 : nil }
+        }
+
+        pubkeyDataCacheLock.lock()
+        if pubkeyDataCache.count >= pubkeyDataCacheCap {
+            pubkeyDataCache.removeAll(keepingCapacity: true)
+        }
+        pubkeyDataCache[s] = decoded
+        pubkeyDataCacheLock.unlock()
+        return decoded
     }
 
     private static func sha256Hex(_ value: String) -> String {
-        SHA256.hash(data: Data(value.utf8))
-            .map { String(format: "%02x", $0) }
-            .joined()
+        Data(value.utf8).sha256Hex()
     }
 
     /// Inject our Sonar profile into BLEService once the Marmot identity is
@@ -3051,6 +3110,21 @@ final class SonarAppStore: ObservableObject {
 
     // MARK: DM transcript + send
 
+    /// Live per-conversation render states, keyed by conversation id. NOT
+    /// @Published on purpose: creating one during a SwiftUI body evaluation
+    /// must not invalidate the store. Entries are released on `closedDM`.
+    private var conversationViewStates: [String: ConversationViewState] = [:]
+
+    /// The precomputed transcript for one conversation. Returns the same
+    /// instance across body evaluations so `@ObservedObject` subscriptions
+    /// stay stable while the chat is open.
+    func conversationViewState(_ id: String) -> ConversationViewState {
+        if let existing = conversationViewStates[id] { return existing }
+        let state = ConversationViewState(conversationId: id, store: self)
+        conversationViewStates[id] = state
+        return state
+    }
+
     /// How one chat line renders: regular text, a ⚡PAY receipt bubble,
     /// or hidden (⚡PAYDONE is a protocol control line). Unknown
     /// ⚡PAY versions decode to nothing and fall through as plain text.
@@ -3068,13 +3142,44 @@ final class SonarAppStore: ObservableObject {
         }
         guard let line = SonarPayMessage.decode(content) else { return .notPay }
         guard case .pay(let pid, let sats) = line else { return .hidden }
+        return payBubble(paymentId: pid, wireSats: sats, fallbackVia: fallbackVia)
+    }
+
+    /// Marmot messages arrive with a core-computed classification, so the
+    /// transcript build does zero content parsing (and zero FFI calls) for
+    /// them. Optimistic local echoes default to `.text` and fall back to the
+    /// string decode so a just-sent ⚡PAY line still bubbles immediately.
+    private func payMapping(
+        _ m: MarmotService.MarmotMessage,
+        fallbackVia: SNVia
+    ) -> PayMapping {
+        switch m.classification {
+        case .callControl, .payDone:
+            return .hidden
+        case .payReceipt(let pid, let sats):
+            // `sats` is a core u64; the ledger/UI use Int64. `Int64(sats)`
+            // TRAPS above Int64.max, so a peer could crash the transcript
+            // rebuild with `⚡PAY|1|<id>|9223372036854775808`. Fall back to
+            // plain text on overflow — the same outcome the string decoder
+            // produced (its `Int64(String)` returned nil).
+            guard let wireSats = Int64(exactly: sats) else { return .notPay }
+            return payBubble(paymentId: pid, wireSats: wireSats, fallbackVia: fallbackVia)
+        case .text:
+            if m.content.hasPrefix("\u{26A1}PAY") || Self.looksLikeCallControl(m.content) {
+                return payMapping(m.content, fallbackVia: fallbackVia)
+            }
+            return .notPay
+        }
+    }
+
+    private func payBubble(paymentId pid: String, wireSats: Int64, fallbackVia: SNVia) -> PayMapping {
         let entry = payLedger.entry(for: pid)
         // The coin renders with the transport it traveled over (recorded in
         // the ledger), not the conversation's current reachability.
         let via = entry.flatMap { SNVia(rawValue: $0.via) } ?? fallbackVia
         let isDirect = paymentActivityLedger.entries[pid] != nil
         return .bubble(
-            SNPayInfo(id: pid, sats: entry?.sats ?? sats, state: entry?.state ?? .sealed, direct: isDirect),
+            SNPayInfo(id: pid, sats: entry?.sats ?? wireSats, state: entry?.state ?? .sealed, direct: isDirect),
             via
         )
     }
@@ -3106,6 +3211,9 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
+    /// Build the render-ready transcript for one conversation. O(page) with
+    /// parsing/sorting — call it from `ConversationViewState` (per data
+    /// change), NEVER from a SwiftUI `body` (per render).
     func dmMsgs(_ id: String) -> [SNMessage] {
         if let groupId = marmotGroupId(id) {
             let groups = directMarmotGroups(matchingGroupId: groupId)
@@ -3115,7 +3223,7 @@ final class SonarAppStore: ObservableObject {
             var dated: [(Date, SNMessage)] = []
             for group in sourceGroups {
                 dated += (marmot.messagesByGroup[group.id] ?? []).compactMap { m in
-                    switch payMapping(m.content, fallbackVia: .internet) {
+                    switch payMapping(m, fallbackVia: .internet) {
                     case .hidden:
                         return nil
                     case .bubble(let pay, let payVia):
@@ -3229,7 +3337,7 @@ final class SonarAppStore: ObservableObject {
         // White Noise leg always renders as internet (indigo).
         if let profile = resolvedSonarProfile(id), let group = marmotGroup(forNpub: profile.npub) {
             dated += (marmot.messagesByGroup[group.id] ?? []).compactMap { m in
-                switch payMapping(m.content, fallbackVia: .internet) {
+                switch payMapping(m, fallbackVia: .internet) {
                 case .hidden:
                     return nil
                 case .bubble(let pay, let payVia):
@@ -4322,6 +4430,11 @@ final class SonarAppStore: ObservableObject {
     }
 
     func closedDM(_ id: String) {
+        // Drop the precomputed render state: closed chats must not keep
+        // rebuilding on every store invalidation. A view still holding the
+        // object keeps working (it owns its subscription); this only stops
+        // caching it for reuse.
+        conversationViewStates[id] = nil
         // NB: do NOT stop the Marmot subscription loop here — it now runs for as
         // long as we're connected (started in performConnect) so welcomes +
         // messages keep arriving live in the background list, not only while a

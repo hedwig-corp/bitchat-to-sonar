@@ -5,7 +5,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use crate::marmot::MarmotEngine;
 use crate::Result;
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 pub struct ConversationIndex {
     db: Connection,
@@ -21,6 +21,10 @@ pub struct ConversationSummary {
     pub latest_mine: bool,
     pub message_count: u64,
     pub unread_count: u64,
+    /// Monotonic per-conversation change counter: bumped on every summary
+    /// mutation (new message, read-state change, rename). Hosts use it as a
+    /// cheap cache key to skip rebuilding render state for unchanged chats.
+    pub version: u64,
 }
 
 pub trait ConversationChangeListener: Send + Sync {
@@ -108,33 +112,78 @@ impl ConversationIndex {
             .optional()
             .map_err(|e| crate::Error::Storage(format!("index version read: {e}")))?;
 
-        if current.unwrap_or(0) < SCHEMA_VERSION {
-            self.db
-                .execute_batch(
-                    "CREATE TABLE IF NOT EXISTS conversation_summary (
-                        group_id_hex    TEXT PRIMARY KEY,
-                        name            TEXT NOT NULL DEFAULT '',
-                        latest_content  TEXT NOT NULL DEFAULT '',
-                        latest_sender   TEXT NOT NULL DEFAULT '',
-                        latest_at_secs  INTEGER NOT NULL DEFAULT 0,
-                        latest_mine     INTEGER NOT NULL DEFAULT 0,
-                        message_count   INTEGER NOT NULL DEFAULT 0,
-                        unread_count    INTEGER NOT NULL DEFAULT 0
-                    );
-                    CREATE INDEX IF NOT EXISTS idx_summary_recency
-                        ON conversation_summary(latest_at_secs DESC);",
-                )
-                .map_err(|e| crate::Error::Storage(format!("index create table: {e}")))?;
-
-            self.db
-                .execute(
-                    "INSERT OR REPLACE INTO schema_version(version) VALUES (?1)",
-                    params![SCHEMA_VERSION],
-                )
-                .map_err(|e| crate::Error::Storage(format!("index version write: {e}")))?;
+        let current = current.unwrap_or(0);
+        if current >= SCHEMA_VERSION {
+            return Ok(());
         }
 
+        // One transaction for ALL migration steps + the schema_version bump:
+        // SQLite DDL is transactional, and without this a process kill between
+        // an autocommitted ALTER and the version write leaves the db in a
+        // state where the next open re-runs the ALTER and fails forever
+        // ("duplicate column name"), silently degrading the index.
+        let tx = self
+            .db
+            .unchecked_transaction()
+            .map_err(|e| crate::Error::Storage(format!("index migrate begin: {e}")))?;
+
+        if current < 1 {
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS conversation_summary (
+                    group_id_hex    TEXT PRIMARY KEY,
+                    name            TEXT NOT NULL DEFAULT '',
+                    latest_content  TEXT NOT NULL DEFAULT '',
+                    latest_sender   TEXT NOT NULL DEFAULT '',
+                    latest_at_secs  INTEGER NOT NULL DEFAULT 0,
+                    latest_mine     INTEGER NOT NULL DEFAULT 0,
+                    message_count   INTEGER NOT NULL DEFAULT 0,
+                    unread_count    INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_summary_recency
+                    ON conversation_summary(latest_at_secs DESC);",
+            )
+            .map_err(|e| crate::Error::Storage(format!("index create table: {e}")))?;
+        }
+
+        if current < 2 && !Self::has_column(&tx, "conversation_summary", "version")? {
+            // Additive per-conversation change counter (see ConversationSummary
+            // docs). Existing rows start at 0; every mutation bumps it. The
+            // column-existence guard makes the step idempotent even against a
+            // db that somehow recorded the old schema version with the column
+            // already present.
+            tx.execute_batch(
+                "ALTER TABLE conversation_summary
+                    ADD COLUMN version INTEGER NOT NULL DEFAULT 0;",
+            )
+            .map_err(|e| crate::Error::Storage(format!("index add version column: {e}")))?;
+        }
+
+        tx.execute(
+            "INSERT OR REPLACE INTO schema_version(version) VALUES (?1)",
+            params![SCHEMA_VERSION],
+        )
+        .map_err(|e| crate::Error::Storage(format!("index version write: {e}")))?;
+
+        tx.commit()
+            .map_err(|e| crate::Error::Storage(format!("index migrate commit: {e}")))?;
+
         Ok(())
+    }
+
+    fn has_column(db: &Connection, table: &str, column: &str) -> Result<bool> {
+        let mut stmt = db
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .map_err(|e| crate::Error::Storage(format!("index table_info: {e}")))?;
+        let names = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| crate::Error::Storage(format!("index table_info query: {e}")))?;
+        for name in names {
+            let name = name.map_err(|e| crate::Error::Storage(format!("index table_info row: {e}")))?;
+            if name == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub fn upsert_summary(
@@ -149,8 +198,8 @@ impl ConversationIndex {
         self.db
             .execute(
                 "INSERT INTO conversation_summary
-                    (group_id_hex, name, latest_content, latest_sender, latest_at_secs, latest_mine, message_count, unread_count)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)
+                    (group_id_hex, name, latest_content, latest_sender, latest_at_secs, latest_mine, message_count, unread_count, version)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, 1)
                  ON CONFLICT(group_id_hex) DO UPDATE SET
                     name = CASE WHEN ?2 != '' THEN ?2 ELSE name END,
                     latest_content = CASE WHEN ?5 >= latest_at_secs THEN ?3 ELSE latest_content END,
@@ -158,7 +207,8 @@ impl ConversationIndex {
                     latest_at_secs = CASE WHEN ?5 >= latest_at_secs THEN ?5 ELSE latest_at_secs END,
                     latest_mine = CASE WHEN ?5 >= latest_at_secs THEN ?6 ELSE latest_mine END,
                     message_count = message_count + 1,
-                    unread_count = CASE WHEN ?6 = 0 THEN unread_count + 1 ELSE unread_count END",
+                    unread_count = CASE WHEN ?6 = 0 THEN unread_count + 1 ELSE unread_count END,
+                    version = version + 1",
                 params![
                     group_id_hex,
                     name,
@@ -186,7 +236,9 @@ impl ConversationIndex {
     pub fn mark_read(&self, group_id_hex: &str) -> Result<()> {
         self.db
             .execute(
-                "UPDATE conversation_summary SET unread_count = 0 WHERE group_id_hex = ?1",
+                "UPDATE conversation_summary
+                    SET unread_count = 0, version = version + 1
+                    WHERE group_id_hex = ?1 AND unread_count != 0",
                 params![group_id_hex],
             )
             .map_err(|e| crate::Error::Storage(format!("index mark_read: {e}")))?;
@@ -196,7 +248,9 @@ impl ConversationIndex {
     pub fn update_group_name(&self, group_id_hex: &str, name: &str) -> Result<()> {
         self.db
             .execute(
-                "UPDATE conversation_summary SET name = ?2 WHERE group_id_hex = ?1",
+                "UPDATE conversation_summary
+                    SET name = ?2, version = version + 1
+                    WHERE group_id_hex = ?1 AND name != ?2",
                 params![group_id_hex, name],
             )
             .map_err(|e| crate::Error::Storage(format!("index update_name: {e}")))?;
@@ -218,7 +272,7 @@ impl ConversationIndex {
             .db
             .prepare(
                 "SELECT group_id_hex, name, latest_content, latest_sender,
-                        latest_at_secs, latest_mine, message_count, unread_count
+                        latest_at_secs, latest_mine, message_count, unread_count, version
                  FROM conversation_summary
                  ORDER BY latest_at_secs DESC",
             )
@@ -235,6 +289,7 @@ impl ConversationIndex {
                     latest_mine: row.get::<_, i32>(5)? != 0,
                     message_count: row.get::<_, i64>(6)? as u64,
                     unread_count: row.get::<_, i64>(7)? as u64,
+                    version: row.get::<_, i64>(8)? as u64,
                 })
             })
             .map_err(|e| crate::Error::Storage(format!("index summaries query: {e}")))?;
@@ -247,7 +302,7 @@ impl ConversationIndex {
         self.db
             .query_row(
                 "SELECT group_id_hex, name, latest_content, latest_sender,
-                        latest_at_secs, latest_mine, message_count, unread_count
+                        latest_at_secs, latest_mine, message_count, unread_count, version
                  FROM conversation_summary
                  WHERE group_id_hex = ?1",
                 params![group_id_hex],
@@ -261,6 +316,7 @@ impl ConversationIndex {
                         latest_mine: row.get::<_, i32>(5)? != 0,
                         message_count: row.get::<_, i64>(6)? as u64,
                         unread_count: row.get::<_, i64>(7)? as u64,
+                        version: row.get::<_, i64>(8)? as u64,
                     })
                 },
             )
@@ -422,6 +478,118 @@ mod tests {
 
         let s = idx.summary("g1").unwrap().unwrap();
         assert_eq!(s.name, "New");
+    }
+
+    #[test]
+    fn version_bumps_on_every_visible_mutation() {
+        let idx = ConversationIndex::open_in_memory().unwrap();
+
+        idx.upsert_summary("g1", "Chat", "msg1", "peer", 100, false)
+            .unwrap();
+        assert_eq!(idx.summary("g1").unwrap().unwrap().version, 1);
+
+        idx.upsert_summary("g1", "Chat", "msg2", "peer", 200, false)
+            .unwrap();
+        assert_eq!(idx.summary("g1").unwrap().unwrap().version, 2);
+
+        idx.mark_read("g1").unwrap();
+        assert_eq!(idx.summary("g1").unwrap().unwrap().version, 3);
+
+        // No-op mutations must NOT bump: version is a cache key, and a bump
+        // with no visible change would force hosts to rebuild for nothing.
+        idx.mark_read("g1").unwrap();
+        assert_eq!(idx.summary("g1").unwrap().unwrap().version, 3);
+        idx.update_group_name("g1", "Chat").unwrap();
+        assert_eq!(idx.summary("g1").unwrap().unwrap().version, 3);
+
+        idx.update_group_name("g1", "Renamed").unwrap();
+        assert_eq!(idx.summary("g1").unwrap().unwrap().version, 4);
+    }
+
+    #[test]
+    fn migrates_v1_schema_adding_version_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let key = [0x11u8; 32];
+
+        // Hand-craft a v1 database: old schema, one existing summary row.
+        {
+            let db = Connection::open(&path).unwrap();
+            let hex_key = hex::encode(key);
+            db.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+                .unwrap();
+            db.execute_batch(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL);
+                 CREATE TABLE conversation_summary (
+                    group_id_hex    TEXT PRIMARY KEY,
+                    name            TEXT NOT NULL DEFAULT '',
+                    latest_content  TEXT NOT NULL DEFAULT '',
+                    latest_sender   TEXT NOT NULL DEFAULT '',
+                    latest_at_secs  INTEGER NOT NULL DEFAULT 0,
+                    latest_mine     INTEGER NOT NULL DEFAULT 0,
+                    message_count   INTEGER NOT NULL DEFAULT 0,
+                    unread_count    INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO schema_version(version) VALUES (1);
+                 INSERT INTO conversation_summary
+                    (group_id_hex, name, latest_content, latest_sender,
+                     latest_at_secs, latest_mine, message_count, unread_count)
+                    VALUES ('g1', 'Chat', 'old msg', 'peer', 100, 0, 3, 1);",
+            )
+            .unwrap();
+        }
+
+        let idx = ConversationIndex::open(&path, key).unwrap();
+        let s = idx.summary("g1").unwrap().unwrap();
+        assert_eq!(s.latest_content, "old msg");
+        assert_eq!(s.message_count, 3);
+        assert_eq!(s.version, 0, "pre-migration rows start at version 0");
+
+        idx.upsert_summary("g1", "Chat", "new msg", "peer", 200, false)
+            .unwrap();
+        assert_eq!(idx.summary("g1").unwrap().unwrap().version, 1);
+    }
+
+    #[test]
+    fn migration_is_idempotent_when_version_column_already_exists() {
+        // A db that already has the version column but still records schema
+        // version 1 (the state a non-atomic migration could have produced).
+        // Opening must not fail with "duplicate column name".
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let key = [0x22u8; 32];
+        {
+            let db = Connection::open(&path).unwrap();
+            let hex_key = hex::encode(key);
+            db.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+                .unwrap();
+            db.execute_batch(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL);
+                 CREATE TABLE conversation_summary (
+                    group_id_hex    TEXT PRIMARY KEY,
+                    name            TEXT NOT NULL DEFAULT '',
+                    latest_content  TEXT NOT NULL DEFAULT '',
+                    latest_sender   TEXT NOT NULL DEFAULT '',
+                    latest_at_secs  INTEGER NOT NULL DEFAULT 0,
+                    latest_mine     INTEGER NOT NULL DEFAULT 0,
+                    message_count   INTEGER NOT NULL DEFAULT 0,
+                    unread_count    INTEGER NOT NULL DEFAULT 0,
+                    version         INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO schema_version(version) VALUES (1);",
+            )
+            .unwrap();
+        }
+
+        let idx = ConversationIndex::open(&path, key).expect("open must not fail");
+        idx.upsert_summary("g1", "Chat", "msg", "peer", 100, false)
+            .unwrap();
+        assert_eq!(idx.summary("g1").unwrap().unwrap().version, 1);
+
+        // Reopen: schema_version is now 2, migration is a no-op.
+        drop(idx);
+        let idx = ConversationIndex::open(&path, key).expect("reopen must not fail");
+        assert_eq!(idx.summary("g1").unwrap().unwrap().version, 1);
     }
 
     #[test]

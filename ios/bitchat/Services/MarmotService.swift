@@ -45,6 +45,18 @@ final class MarmotService: @unchecked Sendable {
         let relays: [String]
     }
 
+    /// Core-computed content classification (mirrors FFI `MessageClassInfo`).
+    /// Hosts render from this instead of re-parsing `content` per render.
+    enum MarmotMessageClass: Sendable, Equatable, Codable {
+        case text
+        /// ⚡PAY receipt — render a payment bubble.
+        case payReceipt(paymentId: String, amountSats: UInt64)
+        /// ⚡PAYDONE settlement — control line, hidden from the transcript.
+        case payDone(paymentId: String, preimageHex: String?)
+        /// ☎CALL signaling — control line, hidden from the transcript.
+        case callControl
+    }
+
     struct MarmotMessage: Sendable, Equatable, Codable {
         let id: String
         let senderNpub: String
@@ -58,6 +70,9 @@ final class MarmotService: @unchecked Sendable {
         let media: [MarmotMedia]
         /// Sticker reference, if this message is a sticker.
         let stickerRef: MarmotStickerRef?
+        /// Core-computed classification; `.text` for local echoes and rows
+        /// decoded from older on-disk encodes.
+        let classification: MarmotMessageClass
 
         init(
             id: String,
@@ -67,7 +82,8 @@ final class MarmotService: @unchecked Sendable {
             isMine: Bool,
             deliveryState: String? = nil,
             media: [MarmotMedia],
-            stickerRef: MarmotStickerRef? = nil
+            stickerRef: MarmotStickerRef? = nil,
+            classification: MarmotMessageClass = .text
         ) {
             self.id = id
             self.senderNpub = senderNpub
@@ -77,6 +93,7 @@ final class MarmotService: @unchecked Sendable {
             self.deliveryState = deliveryState
             self.media = media
             self.stickerRef = stickerRef
+            self.classification = classification
         }
 
         enum CodingKeys: String, CodingKey {
@@ -88,6 +105,7 @@ final class MarmotService: @unchecked Sendable {
             case deliveryState
             case media
             case stickerRef
+            case classification
         }
 
         init(from decoder: Decoder) throws {
@@ -100,6 +118,8 @@ final class MarmotService: @unchecked Sendable {
             self.deliveryState = try container.decodeIfPresent(String.self, forKey: .deliveryState)
             self.media = try container.decode([MarmotMedia].self, forKey: .media)
             self.stickerRef = try container.decodeIfPresent(MarmotStickerRef.self, forKey: .stickerRef)
+            self.classification =
+                try container.decodeIfPresent(MarmotMessageClass.self, forKey: .classification) ?? .text
         }
     }
 
@@ -398,10 +418,25 @@ final class MarmotService: @unchecked Sendable {
         try await run { try $0.requireNode().publishKeyPackage() }
     }
 
+    /// Like `publishKeyPackage()`, but returns once the event is created and
+    /// persisted; the relay send (with its per-relay OK wait) runs inside the
+    /// core in the background. For the relay-connect republish path, where the
+    /// OK wait must not hold the serial engine queue ahead of the first drain.
+    func publishKeyPackageBackground() async throws {
+        try await run { try $0.requireNode().publishKeyPackageBackground() }
+    }
+
     /// Publish our kind-0 Nostr profile (NIP-01) so peers can show our name
     /// instead of a raw npub. `name` becomes both name + display_name.
     func publishProfile(name: String, about: String? = nil, picture: String? = nil) async throws {
         try await run { try $0.requireNode().publishProfile(name: name, about: about, picture: picture) }
+    }
+
+    /// Like `publishProfile(name:about:picture:)`, but the relay send runs in
+    /// the background inside the core — same contract as
+    /// `publishKeyPackageBackground()`.
+    func publishProfileBackground(name: String, about: String? = nil, picture: String? = nil) async throws {
+        try await run { try $0.requireNode().publishProfileBackground(name: name, about: about, picture: picture) }
     }
 
     /// Fetch a peer's kind-0 profile (npub or hex). nil if they have none.
@@ -753,8 +788,22 @@ final class MarmotService: @unchecked Sendable {
                     shortcode: $0.shortcode,
                     plaintextSha256: $0.plaintextSha256
                 )
-            }
+            },
+            classification: Self.marmotMessageClass(message.classification)
         )
+    }
+
+    private static func marmotMessageClass(_ c: MessageClassInfo) -> MarmotMessageClass {
+        switch c {
+        case .text:
+            return .text
+        case .payReceipt(let paymentId, let amountSats):
+            return .payReceipt(paymentId: paymentId, amountSats: amountSats)
+        case .payDone(let paymentId, let preimageHex):
+            return .payDone(paymentId: paymentId, preimageHex: preimageHex)
+        case .callControl:
+            return .callControl
+        }
     }
 
     // MARK: - Persistence (SQLCipher store for White Noise / Marmot)

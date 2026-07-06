@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 
 use sonar_stickers::{build_sticker_ref_tag, parse_sticker_ref_tag, StickerRef};
 
+use crate::call::signaling::CallControl;
 use crate::identity::Identity;
 use crate::outbox::OUTBOX_STATE_FILE_SUFFIX;
 use crate::{Error, Result};
@@ -134,6 +135,58 @@ impl From<&MediaReference> for MediaRef {
     }
 }
 
+/// Transcript-level classification of a message's content, computed once when
+/// the core maps a stored message so hosts never re-parse `content` on the UI
+/// render path (Signal-style: classify at load, render precomputed state).
+///
+/// Malformed or unknown-version control lines classify as `Text` — a parse
+/// failure must never hide a message from the transcript.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MessageClassification {
+    /// Plain chat text (also the fallback for malformed control lines).
+    Text,
+    /// `⚡PAY|1|<id>|<sats>` payment receipt — hosts render a payment bubble.
+    PayReceipt {
+        payment_id: String,
+        amount_sats: u64,
+    },
+    /// `⚡PAYDONE|…` settlement — protocol control line, hidden from the
+    /// transcript by hosts (still drives ledger state).
+    PayDone {
+        payment_id: String,
+        preimage_hex: Option<String>,
+    },
+    /// `☎CALL|…` signaling line — hidden from the transcript by hosts.
+    CallControl,
+}
+
+impl MessageClassification {
+    /// Classify a message body. Cheap prefix guards keep ordinary chat text on
+    /// a no-allocation fast path.
+    pub fn of(content: &str) -> Self {
+        let line = content.trim_start();
+        if line.starts_with("⚡PAY") {
+            if let Some(pay) = crate::notification::parse_pay_receipt_line(line) {
+                return Self::PayReceipt {
+                    payment_id: pay.payment_id,
+                    amount_sats: pay.amount_sats,
+                };
+            }
+            if let Some(done) = crate::notification::parse_pay_done_line(line) {
+                return Self::PayDone {
+                    payment_id: done.payment_id,
+                    preimage_hex: done.preimage_hex,
+                };
+            }
+            return Self::Text;
+        }
+        if line.starts_with("☎CALL") && CallControl::parse(line).is_some() {
+            return Self::CallControl;
+        }
+        Self::Text
+    }
+}
+
 /// A decrypted application message, mapped to a small FFI-friendly shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatMessage {
@@ -150,6 +203,9 @@ pub struct ChatMessage {
     pub media: Vec<MediaRef>,
     /// Sticker reference, if this message is a sticker send.
     pub sticker_ref: Option<StickerRef>,
+    /// Content classification (pay/call control vs plain text), precomputed so
+    /// hosts never parse `content` on the render path.
+    pub classification: MessageClassification,
 }
 
 /// Bounded transcript page for one recent group.
@@ -172,9 +228,12 @@ pub enum Incoming {
     /// Processing a proposal produced an auto-commit that the caller must
     /// publish and merge before the group converges.
     GroupProposal(GroupMembershipUpdate),
-    /// MDK saw the event but could not apply it yet or marked a prior attempt
-    /// failed. The relay sync layer must not advance past this event.
-    Retryable,
+    /// MDK recorded this event as failed and blocks reprocessing: re-delivery
+    /// returns this same result forever (only MDK's internal epoch-rollback
+    /// machinery can revive one). The relay sync layer must mark it processed
+    /// and move on — holding the sync cursor behind it refetches the same
+    /// history on every sync without ever succeeding.
+    Failed,
     /// A join request was received for a group we administer.
     JoinRequest(crate::invite_link::JoinRequest),
     /// The event was valid but produced nothing actionable (duplicates,
@@ -594,8 +653,11 @@ impl MarmotEngine {
                     MessageProcessingResult::Proposal(update) => Ok(Incoming::GroupProposal(
                         Self::to_membership_update(update, Vec::new(), true),
                     )),
+                    // MDK persists a Failed processing record on the first
+                    // failure and short-circuits every re-delivery with the
+                    // same result, so these are terminal for the sync layer.
                     MessageProcessingResult::Unprocessable { .. }
-                    | MessageProcessingResult::PreviouslyFailed => Ok(Incoming::Retryable),
+                    | MessageProcessingResult::PreviouslyFailed => Ok(Incoming::Failed),
                     _ => Ok(Incoming::None),
                 }
             }
@@ -1051,6 +1113,7 @@ impl MarmotEngine {
             id: m.id,
             group_id: m.mls_group_id.clone(),
             sender: m.pubkey,
+            classification: MessageClassification::of(&m.content),
             content: m.content.clone(),
             created_at: m.created_at,
             mine: m.pubkey == self.identity.public_key(),
@@ -1104,4 +1167,77 @@ fn sidecar_paths(base: &Path) -> Vec<std::path::PathBuf> {
     paths.push(base.with_file_name(format!("{name}{SYNC_STATE_FILE_SUFFIX}.tmp")));
     paths.push(base.with_file_name(format!("{name}{OUTBOX_STATE_FILE_SUFFIX}.tmp")));
     paths
+}
+
+#[cfg(test)]
+mod classification_tests {
+    use super::MessageClassification as C;
+
+    #[test]
+    fn plain_text_and_empty_classify_as_text() {
+        assert_eq!(C::of("hello"), C::Text);
+        assert_eq!(C::of(""), C::Text);
+        assert_eq!(C::of("⚡ not a control line"), C::Text);
+    }
+
+    #[test]
+    fn pay_receipt_v1_classifies_with_fields() {
+        assert_eq!(
+            C::of("⚡PAY|1|abc-123|2100"),
+            C::PayReceipt {
+                payment_id: "abc-123".into(),
+                amount_sats: 2100,
+            }
+        );
+    }
+
+    #[test]
+    fn malformed_pay_lines_fall_back_to_text() {
+        // Unknown version, zero sats, trailing field, bad id: all plain text —
+        // a parse failure must never hide a message.
+        assert_eq!(C::of("⚡PAY|2|abc|2100"), C::Text);
+        assert_eq!(C::of("⚡PAY|1|abc|0"), C::Text);
+        assert_eq!(C::of("⚡PAY|1|abc|21|extra"), C::Text);
+        assert_eq!(C::of("⚡PAY|1|not hex!|21"), C::Text);
+        assert_eq!(C::of("⚡PAYDONE|3|abc"), C::Text);
+    }
+
+    #[test]
+    fn pay_done_v1_and_v2_classify_with_optional_preimage() {
+        assert_eq!(
+            C::of("⚡PAYDONE|1|abc-123"),
+            C::PayDone {
+                payment_id: "abc-123".into(),
+                preimage_hex: None,
+            }
+        );
+        assert_eq!(
+            C::of("⚡PAYDONE|2|abc-123"),
+            C::PayDone {
+                payment_id: "abc-123".into(),
+                preimage_hex: None,
+            }
+        );
+        let preimage = "a".repeat(64);
+        assert_eq!(
+            C::of(&format!("⚡PAYDONE|2|abc-123|{preimage}")),
+            C::PayDone {
+                payment_id: "abc-123".into(),
+                preimage_hex: Some(preimage),
+            }
+        );
+        // Bad preimage → text, not a silently-dropped control line.
+        assert_eq!(C::of("⚡PAYDONE|2|abc-123|deadbeef"), C::Text);
+    }
+
+    #[test]
+    fn call_control_lines_classify_and_malformed_fall_back() {
+        assert_eq!(
+            C::of("☎CALL|1|END|c3a1|declined"),
+            C::CallControl,
+            "well-formed call control should classify"
+        );
+        assert_eq!(C::of("☎CALL|not-a-version|X|y"), C::Text);
+        assert_eq!(C::of("☎CALLING you later"), C::Text);
+    }
 }

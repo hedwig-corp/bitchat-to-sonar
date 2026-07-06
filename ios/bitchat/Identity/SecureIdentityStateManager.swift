@@ -222,23 +222,50 @@ final class SecureIdentityStateManager: SecureIdentityStateManagerProtocol {
     private func performSave() {
         guard pendingSave else { return }
         pendingSave = false
-        
-        do {
-            let data = try JSONEncoder().encode(cache)
-            let sealedBox = try AES.GCM.seal(data, using: encryptionKey)
-            let saved = keychain.saveIdentityKey(sealedBox.combined!, forKey: cacheKey)
-            if saved {
-                SecureLogger.debug("Identity cache saved to keychain", category: .security)
-            }
-        } catch {
-            SecureLogger.error(error, context: "Failed to save identity cache", category: .security)
+        // Debounced save: snapshot + encrypt + write INLINE on the barrier
+        // queue. Inline keeps Keychain writes ordered — dispatching them to a
+        // concurrent queue let an older blob land after a newer one. The
+        // barrier queue is off the main thread, so securityd's synchronous XPC
+        // (measured 200-300ms hangs at chat open, when BLE announces churn
+        // identity state while the UI reads it) never stalls the UI.
+        queue.async(flags: .barrier) { [weak self] in
+            self?.encryptAndWriteCache()
         }
     }
-    
-    // Force immediate save (for app termination)
+
+    /// Encode + seal + write the cache to the Keychain. MUST run on `queue`
+    /// (serialized against reads/writes), so it snapshots a consistent cache
+    /// and its `SecItem` write is ordered against every other save.
+    private func encryptAndWriteCache() {
+        let blob: Data
+        do {
+            let data = try JSONEncoder().encode(cache)
+            guard let combined = try AES.GCM.seal(data, using: encryptionKey).combined else {
+                SecureLogger.error("Identity cache seal produced no combined box", category: .security)
+                return
+            }
+            blob = combined
+        } catch {
+            SecureLogger.error(error, context: "Failed to encode identity cache", category: .security)
+            return
+        }
+        let saved = keychain.saveIdentityKey(blob, forKey: cacheKey)
+        if saved {
+            SecureLogger.debug("Identity cache saved to keychain", category: .security)
+        }
+    }
+
+    // Force immediate save (app background / termination / deinit). Runs the
+    // encode + write synchronously under the barrier so the final state is
+    // persisted before returning — including on the deinit path, where a
+    // `[weak self]` async block would already resolve to nil and skip the
+    // write. `queue.sync` is safe here: no caller runs on `queue`.
     func forceSave() {
         saveTimer?.invalidate()
-        performSave()
+        pendingSave = false
+        queue.sync(flags: .barrier) {
+            self.encryptAndWriteCache()
+        }
     }
     
     // MARK: - Social Identity Management

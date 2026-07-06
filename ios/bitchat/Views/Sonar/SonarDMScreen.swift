@@ -17,9 +17,31 @@ import PhotosUI
 import ImageIO
 #endif
 
+/// Thin wrapper that resolves the per-conversation render state from the
+/// store: `@ObservedObject` needs the object at init, and the environment
+/// store is only available in `body`. Navigation keeps constructing
+/// `SonarDMScreen(peerId:)` unchanged.
 struct SonarDMScreen: View {
     @EnvironmentObject private var store: SonarAppStore
     let peerId: String
+
+    var body: some View {
+        SonarDMScreenContent(peerId: peerId, convo: store.conversationViewState(peerId))
+    }
+}
+
+struct SonarDMScreenContent: View {
+    @EnvironmentObject private var store: SonarAppStore
+    let peerId: String
+    /// Precomputed transcript — the ONLY message source this view renders.
+    /// Built off the render path in ConversationViewState; reading it here is
+    /// O(1) and re-renders happen only when the transcript actually changed.
+    @ObservedObject private var convo: ConversationViewState
+
+    init(peerId: String, convo: ConversationViewState) {
+        self.peerId = peerId
+        self._convo = ObservedObject(wrappedValue: convo)
+    }
 
     @State private var sheet = false
     @State private var verifySheet = false
@@ -83,7 +105,7 @@ struct SonarDMScreen: View {
 
             banner
 
-            let msgs = store.dmMsgs(peerId)
+            let msgs = convo.messages
             if msgs.isEmpty && store.isLocallyHydratingDM(peerId) {
                 ProgressView()
                     .tint(SonarTheme.accent)

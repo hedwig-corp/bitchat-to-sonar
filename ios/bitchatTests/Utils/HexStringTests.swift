@@ -105,4 +105,38 @@ struct HexStringTests {
         let roundTripped = Data(hexString: hexString)
         #expect(roundTripped == original)
     }
+
+    // MARK: - Table-driven codec specifics
+
+    /// Every byte value encodes to lowercase two-digit hex and decodes back.
+    @Test func roundTripsAllByteValues() {
+        let original = Data((0...255).map { UInt8($0) })
+        let hex = original.hexEncodedString()
+        #expect(hex.count == 512)
+        #expect(hex == hex.lowercased())
+        #expect(Data(hexString: hex) == original)
+    }
+
+    @Test func encodesEmptyToEmpty() {
+        #expect(Data().hexEncodedString() == "")
+    }
+
+    /// The table-driven decoder rejects a leading sign inside a pair. The old
+    /// per-byte `UInt8(_, radix: 16)` path accepted "+b" as 0x0b because
+    /// integer parsing honors a sign prefix; treating a peer key like "+b..."
+    /// as valid hex is wrong, so the stricter behavior is intentional.
+    @Test func rejectsSignCharactersInsidePair() {
+        #expect(Data(hexString: "+b") == nil)
+        #expect(Data(hexString: "-b") == nil)
+        #expect(Data(hexString: "1+") == nil)
+    }
+
+    @Test func sha256HexMatchesKnownVector() {
+        // SHA-256("") well-known digest.
+        let empty = Data().sha256Hex()
+        #expect(empty == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+        // sha256Hex is lowercase and round-trips through the decoder.
+        #expect(empty == empty.lowercased())
+        #expect(Data(hexString: empty)?.count == 32)
+    }
 }

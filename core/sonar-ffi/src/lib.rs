@@ -195,6 +195,28 @@ pub struct JoinRequestInfo {
     pub received_at: u64,
 }
 
+/// Transcript-level classification of a chat message, computed once in core
+/// so hosts never re-parse `content` on the UI render path. Malformed control
+/// lines classify as `Text` (a parse failure never hides a message).
+#[derive(uniffi::Enum)]
+pub enum MessageClassInfo {
+    /// Plain chat text.
+    Text,
+    /// `⚡PAY|1|<id>|<sats>` payment receipt — render a payment bubble.
+    PayReceipt {
+        payment_id: String,
+        amount_sats: u64,
+    },
+    /// `⚡PAYDONE|…` settlement — protocol control line, hidden from the
+    /// transcript (still drives ledger state).
+    PayDone {
+        payment_id: String,
+        preimage_hex: Option<String>,
+    },
+    /// `☎CALL|…` signaling line — hidden from the transcript.
+    CallControl,
+}
+
 /// FFI-friendly decrypted chat message.
 #[derive(uniffi::Record)]
 pub struct MessageInfo {
@@ -210,6 +232,8 @@ pub struct MessageInfo {
     pub media: Vec<MediaInfo>,
     /// Sticker reference if this message is a sticker send (nil for text/media).
     pub sticker_ref: Option<StickerRefInfo>,
+    /// Precomputed content classification (pay/call control vs plain text).
+    pub classification: MessageClassInfo,
 }
 
 /// FFI-friendly sticker reference carried on a chat message.
@@ -375,6 +399,9 @@ pub struct ConversationSummaryInfo {
     pub latest_mine: bool,
     pub message_count: u64,
     pub unread_count: u64,
+    /// Monotonic per-conversation change counter — a cheap cache key: equal
+    /// version ⇒ nothing about this conversation's summary/transcript changed.
+    pub version: u64,
 }
 
 #[uniffi::export]
@@ -459,6 +486,18 @@ impl SonarNode {
         Ok(())
     }
 
+    /// Like `publish_key_package`, but the relay send happens in the
+    /// background: returns as soon as the KeyPackage event is created and
+    /// persisted, without waiting for relay OK acks. For the cold-start /
+    /// relay-connect republish path, where the per-relay OK wait must not
+    /// delay the first message drain. Failures are logged in core and
+    /// self-heal on the next relay connect (replaceable event).
+    pub fn publish_key_package_background(&self) -> FfiResult<()> {
+        self.runtime
+            .block_on(self.client.publish_key_package_background())?;
+        Ok(())
+    }
+
     /// Publish our kind-0 profile (NIP-01 metadata) so peers can show our name +
     /// avatar instead of a raw npub. `name` is used for both name + display_name.
     pub fn publish_profile(
@@ -473,6 +512,21 @@ impl SonarNode {
             picture.as_deref(),
         ))?;
         Ok(())
+    }
+
+    /// Like `publish_profile`, but the relay send happens in the background —
+    /// same contract as `publish_key_package_background`.
+    pub fn publish_profile_background(
+        &self,
+        name: String,
+        about: Option<String>,
+        picture: Option<String>,
+    ) {
+        self.runtime.block_on(self.client.publish_profile_background(
+            &name,
+            about.as_deref(),
+            picture.as_deref(),
+        ));
     }
 
     /// Fetch a peer's kind-0 profile (npub or hex pubkey). `None` if they have
@@ -935,6 +989,7 @@ impl SonarNode {
                 latest_mine: s.latest_mine,
                 message_count: s.message_count,
                 unread_count: s.unread_count,
+                version: s.version,
             })
             .collect()
     }
@@ -2076,10 +2131,33 @@ fn direct_dm_info(m: sonar_core::client::DirectDm) -> DirectDmInfo {
     }
 }
 
+fn message_class_info(c: sonar_core::marmot::MessageClassification) -> MessageClassInfo {
+    use sonar_core::marmot::MessageClassification as C;
+    match c {
+        C::Text => MessageClassInfo::Text,
+        C::PayReceipt {
+            payment_id,
+            amount_sats,
+        } => MessageClassInfo::PayReceipt {
+            payment_id,
+            amount_sats,
+        },
+        C::PayDone {
+            payment_id,
+            preimage_hex,
+        } => MessageClassInfo::PayDone {
+            payment_id,
+            preimage_hex,
+        },
+        C::CallControl => MessageClassInfo::CallControl,
+    }
+}
+
 fn message_info(m: sonar_core::marmot::ChatMessage) -> MessageInfo {
     MessageInfo {
         id_hex: m.id.to_hex(),
         sender_npub: m.sender.to_bech32().expect("npub encoding cannot fail"),
+        classification: message_class_info(m.classification),
         content: m.content,
         created_at_secs: m.created_at.as_secs(),
         mine: m.mine,
