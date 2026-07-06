@@ -206,6 +206,19 @@ struct MessageFormattingEngineTests {
         #expect(!attributed.runs.contains { $0.link != nil })
     }
 
+    @Test func attributedBubbleText_canDetectBareDomainsWhenRequested() {
+        let content = "Open example.org and wave to @alice"
+        let attributed = SonarMessageTextFormatter.attributedBubbleText(
+            content,
+            baseColor: .primary,
+            linkColor: .blue,
+            detectBareDomains: true
+        )
+
+        #expect(String(attributed.characters) == content)
+        #expect(attributed.runs.contains { $0.link?.absoluteString.contains("example.org") == true })
+    }
+
     // MARK: - String Extension Tests
 
     @Test func splitSuffix_withSuffix() {

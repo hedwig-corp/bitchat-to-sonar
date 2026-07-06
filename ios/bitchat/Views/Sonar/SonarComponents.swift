@@ -535,6 +535,7 @@ struct SNMsgBubble: View {
             m.text,
             baseColor: bubbleText,
             linkColor: mine ? bubbleText : SonarTheme.accentDeep,
+            detectBareDomains: true,
             includeLinkAttributes: false
         )
     }

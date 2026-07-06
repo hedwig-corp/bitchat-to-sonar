@@ -25,9 +25,10 @@ enum SonarMessageTextFormatter {
         baseColor: Color,
         linkColor: Color? = nil,
         mentionFont: Font? = nil,
+        detectBareDomains: Bool = false,
         includeLinkAttributes: Bool = true
     ) -> AttributedString {
-        let matches = textMatches(in: text, mentionFont: mentionFont)
+        let matches = textMatches(in: text, mentionFont: mentionFont, detectBareDomains: detectBareDomains)
         var result = AttributedString()
         var cursor = text.startIndex
 
@@ -55,13 +56,13 @@ enum SonarMessageTextFormatter {
         return result
     }
 
-    private static func textMatches(in text: String, mentionFont: Font?) -> [TextMatch] {
+    private static func textMatches(in text: String, mentionFont: Font?, detectBareDomains: Bool) -> [TextMatch] {
         let nsText = text as NSString
         let fullRange = NSRange(location: 0, length: nsText.length)
         guard nsText.length > 0 else { return [] }
 
         var matches: [TextMatch] = []
-        if (text.contains("://") || text.localizedCaseInsensitiveContains("www.")),
+        if (detectBareDomains || text.contains("://") || text.localizedCaseInsensitiveContains("www.")),
            let detector = linkDetector {
             for match in detector.matches(in: text, options: [], range: fullRange) {
                 appendMatch(match.range, kind: .link(match.url), priority: 0, in: text, to: &matches)
