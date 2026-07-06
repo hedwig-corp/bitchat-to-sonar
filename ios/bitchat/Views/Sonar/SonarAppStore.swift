@@ -1264,6 +1264,30 @@ final class SonarAppStore: ObservableObject {
         await marmot.exportNsec()
     }
 
+    // MARK: - Diagnostics (Settings → Diagnostics)
+
+    /// Relay/sync snapshot JSON for the Diagnostics sheet. Nil while the relay
+    /// node is still connecting.
+    func diagnosticsSnapshotJson() async -> String? {
+        await marmot.syncStateSnapshotJson()
+    }
+
+    var diagnosticsVerbose: Bool {
+        SonarDiagnostics.verboseEnabled
+    }
+
+    /// Explicit user opt-in to verbose (debug-level) diagnostics capture.
+    func setDiagnosticsVerbose(_ verbose: Bool) {
+        SonarDiagnostics.setVerbose(verbose)
+        objectWillChange.send()
+    }
+
+    /// Assemble the shareable diagnostics zip (logs + sync snapshot).
+    func buildDiagnosticsBundle() async -> URL? {
+        let snapshot = await marmot.syncStateSnapshotJson()
+        return await SonarDiagnostics.buildDebugBundle(snapshotJson: snapshot)
+    }
+
     /// Restore an existing account from a pasted `nsec1…` backup on the
     /// "I already have a key" onboarding path: import the identity, then finish
     /// onboarding. Throws on an invalid key.
@@ -5377,6 +5401,9 @@ final class SonarAppStore: ObservableObject {
         // Erase the encrypted Marmot (White Noise) SQLCipher database + its
         // Keychain DB key; also resets in-memory Marmot state.
         marmot.wipeDatabase()
+        // Drop diagnostics logs too: at verbose level they can contain peer
+        // npubs, so a panic wipe must not leave them on disk.
+        SonarDiagnostics.clearLogs()
         marmot.npub = nil
         marmot.groups = []
         marmot.messagesByGroup = [:]

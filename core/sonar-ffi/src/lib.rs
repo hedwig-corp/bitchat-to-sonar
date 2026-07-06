@@ -28,6 +28,8 @@ uniffi::setup_scaffolding!();
 #[cfg(target_os = "android")]
 mod android_jni;
 
+mod logging;
+
 /// Flat error: only the rendered message crosses the FFI boundary
 /// (`SonarFfiError.InvalidInput(message:)` / `.Core(message:)` in Swift).
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -60,7 +62,11 @@ struct ChannelChangeListener {
 
 impl sonar_core::conversation_index::ConversationChangeListener for ChannelChangeListener {
     fn on_conversation_changed(&self, group_id_hex: String) {
-        let _ = self.tx.lock().expect("conversation change tx not poisoned").send(group_id_hex);
+        let _ = self
+            .tx
+            .lock()
+            .expect("conversation change tx not poisoned")
+            .send(group_id_hex);
     }
 }
 
@@ -102,6 +108,21 @@ fn parse_db_key(db_key_hex: &str) -> FfiResult<[u8; 32]> {
 pub fn wipe_marmot_database(db_path: String) -> FfiResult<()> {
     SonarClient::wipe_database(&db_path)?;
     Ok(())
+}
+
+/// Install (or re-configure) the on-device diagnostics log sink: a bounded,
+/// rotating file family under `dir` fed by the core's `tracing` events
+/// (relay connects, EOSE, watermark moves, decrypt failures, ...).
+///
+/// Call once at app start BEFORE connecting the node, with `dir` inside the
+/// app's private data directory. Idempotent — calling again only switches the
+/// level filter, so hosts re-invoke it when the user toggles verbose
+/// diagnostics. `verbose = false` (the default profile) keeps the sink at the
+/// redaction boundary: no message content, no key material, no peer npubs.
+#[uniffi::export]
+pub fn setup_logging(dir: String, verbose: bool) -> FfiResult<()> {
+    logging::install_file_logging(&dir, verbose)
+        .map_err(|e| SonarFfiError::Core(format!("setup_logging: {e}")))
 }
 
 /// A Nostr identity (secp256k1 keypair). Wraps `sonar_core::identity::Identity`.
@@ -750,6 +771,15 @@ impl SonarNode {
         Ok(())
     }
 
+    /// Point-in-time JSON snapshot of relay/sync state for the Diagnostics
+    /// screen and the exported debug bundle: per-relay connection status, the
+    /// sync watermark, live-subscription state, and per-group catch-up floors.
+    /// Contains NO message content and NO key material.
+    pub fn sync_state_snapshot_json(&self) -> FfiResult<String> {
+        let snapshot = self.runtime.block_on(self.client.sync_state_snapshot());
+        serde_json::to_string_pretty(&snapshot).map_err(|e| SonarFfiError::Core(e.to_string()))
+    }
+
     /// Reload the durable outbox sidecar and retry pending sends. Hosts call this
     /// after replacing a local-only node with a relay-backed node so sends created
     /// during relay connect are not stranded until app restart.
@@ -763,8 +793,7 @@ impl SonarNode {
     /// instead of `sync_once()`. It may run one bounded per-chat repair fetch,
     /// so hosts must keep it off the local-first chat-open path.
     pub fn ensure_subscriptions(&self) -> FfiResult<()> {
-        self.runtime
-            .block_on(self.client.ensure_subscriptions())?;
+        self.runtime.block_on(self.client.ensure_subscriptions())?;
         Ok(())
     }
 
@@ -1084,8 +1113,10 @@ impl SonarNode {
         token: Vec<u8>,
         server_npub: String,
     ) -> FfiResult<()> {
-        self.runtime
-            .block_on(self.client.register_push_token(&platform, &token, &server_npub))?;
+        self.runtime.block_on(
+            self.client
+                .register_push_token(&platform, &token, &server_npub),
+        )?;
         Ok(())
     }
 }
@@ -1222,7 +1253,12 @@ impl SonarNode {
         // CallEngine::start binds a fresh endpoint (presets::N0 → a network
         // round-trip that can block) AND drops the active engine — which made a
         // call placed after boot's ensureCallStarted "take forever".
-        if self.call.lock().expect("call engine lock not poisoned").is_some() {
+        if self
+            .call
+            .lock()
+            .expect("call engine lock not poisoned")
+            .is_some()
+        {
             return Ok(());
         }
         let nostr_secret = self.client.identity().keys().secret_key().to_secret_bytes();
@@ -1312,7 +1348,11 @@ impl SonarNode {
         // Snapshot the engine under a SHORT lock: bind it to a `let` so the
         // guard drops at the `;`, never held across the block_on park below
         // (so a long wait can't block `call_hangup`/`call_start`).
-        let engine = self.call.lock().expect("call engine lock not poisoned").clone();
+        let engine = self
+            .call
+            .lock()
+            .expect("call engine lock not poisoned")
+            .clone();
         let Some(engine) = engine else {
             // No engine: park the node's runtime for the (capped) timeout, then
             // report "nothing happened". `.max(1)` floors a 0 timeout so we can
@@ -2007,7 +2047,11 @@ impl MeshReassembler {
             Some(f) => f,
             None => return Ok(None),
         };
-        Ok(self.inner.lock().expect("fragment assembler lock not poisoned").add(sender, &frag))
+        Ok(self
+            .inner
+            .lock()
+            .expect("fragment assembler lock not poisoned")
+            .add(sender, &frag))
     }
 }
 
