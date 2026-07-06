@@ -1408,9 +1408,16 @@ final class SonarAppStore: ObservableObject {
     }
 
     private func applyBLEDiscoveryPolicy() {
-        refreshBleKnownContactSnapshot()
+        // Decide from the freshly-computed set, NOT from `defaults`: the
+        // snapshot mirror is written asynchronously, so reading it back here
+        // could see the stale (empty) list and wrongly pick `.off` right after
+        // the first known chat is added, leaving BLE disabled until an
+        // unrelated refresh.
+        let known = refreshBleKnownContactSnapshot()
         guard let ble = chatViewModel.meshService as? BLEService else { return }
-        let nextMode = effectiveBLEDiscoveryMode
+        let nextMode: BLEDiscoveryMode = isBLEDiscoveryRestricted
+            ? (known.isEmpty ? .off : .knownOnly)
+            : .normal
         if ble.discoveryMode == nextMode {
             if isBLEDiscoveryRestricted {
                 ble.reapplyDiscoveryModePolicy()
@@ -1420,7 +1427,12 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
-    private func refreshBleKnownContactSnapshot() {
+    /// Recompute the set of BLE-known chat keys and mirror it to `defaults`
+    /// for cross-launch use + the `knownPeerProvider`. Returns the freshly
+    /// computed set so callers can make a decision on it WITHOUT reading the
+    /// asynchronously-written `defaults` back (see `applyBLEDiscoveryPolicy`).
+    @discardableResult
+    private func refreshBleKnownContactSnapshot() -> Set<String> {
         var keys = Set<String>()
         func insert(_ raw: String) {
             let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -1459,6 +1471,7 @@ final class SonarAppStore: ObservableObject {
         DispatchQueue.global(qos: .utility).async {
             defaults.set(snapshot, forKey: Keys.bleKnownChatKeys)
         }
+        return keys
     }
 
     func submitInviteLink(_ token: String) {
@@ -3113,7 +3126,13 @@ final class SonarAppStore: ObservableObject {
         case .callControl, .payDone:
             return .hidden
         case .payReceipt(let pid, let sats):
-            return payBubble(paymentId: pid, wireSats: Int64(sats), fallbackVia: fallbackVia)
+            // `sats` is a core u64; the ledger/UI use Int64. `Int64(sats)`
+            // TRAPS above Int64.max, so a peer could crash the transcript
+            // rebuild with `⚡PAY|1|<id>|9223372036854775808`. Fall back to
+            // plain text on overflow — the same outcome the string decoder
+            // produced (its `Int64(String)` returned nil).
+            guard let wireSats = Int64(exactly: sats) else { return .notPay }
+            return payBubble(paymentId: pid, wireSats: wireSats, fallbackVia: fallbackVia)
         case .text:
             if m.content.hasPrefix("\u{26A1}PAY") || Self.looksLikeCallControl(m.content) {
                 return payMapping(m.content, fallbackVia: fallbackVia)

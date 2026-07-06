@@ -111,6 +111,29 @@ description. Phase order: 1 (UI) → 2 (cold start/send) → 3 (parity). Compose
 gaps from Phases 1–2 are tracked issues with a follow-up path, per the
 cross-platform rule.
 
+## Tracked platform gaps (Compose — apps/sonar/), per the cross-platform rule
+PR #178 lands the core (Rust) and Apple (iOS) surfaces. The core changes are
+FFI-additive, so Android/desktop keep compiling, but two capabilities are
+iOS-only until a follow-up:
+
+1. **Background cold-start publishes.** `publish_key_package_background` /
+   `publish_profile_background` are only called from iOS
+   (`MarmotChatView.connectRelaysIfNeeded`). `SonarCore.android.kt` /
+   `SonarCore.jvm.kt` startup still call the blocking `publishKeyPackage()` /
+   `publishProfile()`, so Android/desktop keep blocking on relay OK acks that
+   iOS no longer waits for. Follow-up: switch the Compose startup + profile
+   publish to the `*_background` variants.
+2. **Core-owned message classification.** `MessageInfo.classification` is
+   consumed only by iOS; Kotlin's `MessageInfo.toCommon()` drops the field and
+   `App.kt` still classifies on the render path via the looser
+   `PayLine.decode(m.content)` (which, unlike core, would bubble a malformed
+   line like `⚡PAY|1|bad id|5|extra`). Follow-up: map `classification` in
+   `toCommon()` and render from it, retiring the Kotlin parser on the render
+   path.
+
+Both are tracked as spawned follow-up tasks; neither blocks the iOS/core
+correctness this PR delivers.
+
 ## Open questions
 - Is `messagesByGroup` already page-bounded? If not, Phase 1 includes
   Signal-style `loadInitialMapping` windowing.
