@@ -13,26 +13,45 @@ import kotlin.test.assertTrue
  */
 class EventDrivenRefreshTest {
 
-    // ── chatsNeedingPageScan: only chats whose latest ts advanced get fetched ──
+    // ── chatsNeedingPageScan: only chats whose latest ts/count advanced ──
+
+    private fun m(secs: Long, count: Long = 1L) = ScanMark(secs, count)
 
     @Test
     fun scanSkipsChatsWithUnchangedLatestTs() {
-        val latest = mapOf("a" to 100L, "b" to 200L, "c" to 300L)
-        val watermark = mutableMapOf("a" to 100L, "b" to 200L, "c" to 300L)
+        val latest = mapOf("a" to m(100), "b" to m(200), "c" to m(300))
+        val watermark = mapOf("a" to m(100), "b" to m(200), "c" to m(300))
         assertEquals(emptySet(), chatsNeedingPageScan(latest, watermark))
     }
 
     @Test
     fun scanIncludesChatWithAdvancedTs() {
-        val latest = mapOf("a" to 100L, "b" to 250L, "c" to 300L)
-        val watermark = mapOf("a" to 100L, "b" to 200L, "c" to 300L)
+        val latest = mapOf("a" to m(100), "b" to m(250), "c" to m(300))
+        val watermark = mapOf("a" to m(100), "b" to m(200), "c" to m(300))
         assertEquals(setOf("b"), chatsNeedingPageScan(latest, watermark))
     }
 
     @Test
+    fun scanIncludesSameSecondMessageViaCount() {
+        // The regression the composite watermark fixes: a message lands in the
+        // SAME second as the last scanned one (⚡PAY PAY/DONE pair, call control
+        // after a text). Timestamp is unchanged but the count grew.
+        val latest = mapOf("a" to m(200, count = 6))
+        val watermark = mapOf("a" to m(200, count = 5))
+        assertEquals(setOf("a"), chatsNeedingPageScan(latest, watermark))
+    }
+
+    @Test
+    fun scanSkipsSameSecondSameCount() {
+        val latest = mapOf("a" to m(200, count = 5))
+        val watermark = mapOf("a" to m(200, count = 5))
+        assertEquals(emptySet(), chatsNeedingPageScan(latest, watermark))
+    }
+
+    @Test
     fun scanIncludesNeverSeenChat() {
-        val latest = mapOf("a" to 100L, "new" to 1L)
-        val watermark = mapOf("a" to 100L)
+        val latest = mapOf("a" to m(100), "new" to m(1))
+        val watermark = mapOf("a" to m(100))
         // A brand-new chat (no watermark) must always be scanned once, even at
         // ts=0/1, so its first inbound ☎CALL / pay line is processed.
         assertEquals(setOf("new"), chatsNeedingPageScan(latest, watermark))
@@ -40,8 +59,8 @@ class EventDrivenRefreshTest {
 
     @Test
     fun scanTreatsZeroLatestAsScannableWhenUnseen() {
-        val latest = mapOf("empty" to 0L)
-        val watermark = emptyMap<String, Long>()
+        val latest = mapOf("empty" to m(0, count = 0))
+        val watermark = emptyMap<String, ScanMark>()
         assertEquals(setOf("empty"), chatsNeedingPageScan(latest, watermark))
     }
 
@@ -49,8 +68,8 @@ class EventDrivenRefreshTest {
     fun scanDoesNotRegressOnLowerLatest() {
         // A summary that somehow reports an older ts than the watermark must not
         // re-trigger a scan (idempotent watermark).
-        val latest = mapOf("a" to 50L)
-        val watermark = mapOf("a" to 100L)
+        val latest = mapOf("a" to m(50))
+        val watermark = mapOf("a" to m(100))
         assertEquals(emptySet(), chatsNeedingPageScan(latest, watermark))
     }
 

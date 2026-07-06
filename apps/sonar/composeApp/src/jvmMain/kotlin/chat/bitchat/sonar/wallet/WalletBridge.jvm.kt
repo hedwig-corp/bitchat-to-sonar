@@ -169,16 +169,17 @@ actual object WalletBridge {
     private fun emitPaymentEvent(p: Payment) {
         val lightning = p.details as? PaymentDetails.Lightning
         val id = p.txId ?: lightning?.paymentHash ?: p.destination ?: return
-        payments.tryEmit(
-            WalletPaymentEvent(
-                paymentId = id,
-                incoming = p.paymentType == PaymentType.RECEIVE,
-                amountSats = p.amountSat.toLong(),
-                feesSats = p.feesSat.toLong(),
-                timestampSecs = p.timestamp.toLong(),
-                preimage = lightning?.preimage,
-            )
+        val ev = WalletPaymentEvent(
+            paymentId = id,
+            incoming = p.paymentType == PaymentType.RECEIVE,
+            amountSats = p.amountSat.toLong(),
+            feesSats = p.feesSat.toLong(),
+            timestampSecs = p.timestamp.toLong(),
+            preimage = lightning?.preimage,
         )
+        // Record at the source (headless-safe, idempotent) — see the android actual.
+        PaymentActivityStore.recordIncomingWalletPayment(ev)
+        payments.tryEmit(ev)
     }
 
     /** Conflates SDK event bursts (initial sync, payment storms) into at most

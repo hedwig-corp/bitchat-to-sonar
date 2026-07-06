@@ -163,16 +163,19 @@ actual object WalletBridge {
     private fun emitPaymentEvent(p: Payment) {
         val lightning = p.details as? PaymentDetails.Lightning
         val id = p.txId ?: lightning?.paymentHash ?: p.destination ?: return
-        payments.tryEmit(
-            WalletPaymentEvent(
-                paymentId = id,
-                incoming = p.paymentType == PaymentType.RECEIVE,
-                amountSats = p.amountSat.toLong(),
-                feesSats = p.feesSat.toLong(),
-                timestampSecs = p.timestamp.toLong(),
-                preimage = lightning?.preimage,
-            )
+        val ev = WalletPaymentEvent(
+            paymentId = id,
+            incoming = p.paymentType == PaymentType.RECEIVE,
+            amountSats = p.amountSat.toLong(),
+            feesSats = p.feesSat.toLong(),
+            timestampSecs = p.timestamp.toLong(),
+            preimage = lightning?.preimage,
         )
+        // Record to the persistent ledger AT THE SOURCE so an incoming payment
+        // during a headless/background FCM wakeup (no UI collector on the
+        // replay-0 flow) is still captured. Idempotent by wallet payment id.
+        PaymentActivityStore.recordIncomingWalletPayment(ev)
+        payments.tryEmit(ev)
     }
 
     /** Conflates SDK event bursts (initial sync, payment storms) into at most

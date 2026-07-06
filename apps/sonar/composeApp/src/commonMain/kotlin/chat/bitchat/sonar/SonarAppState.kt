@@ -168,17 +168,27 @@ internal fun dedupeDirectMarmotChats(
     return chats.filter { it.id in selectedIds }
 }
 
+/** Composite scan watermark: the newest-message SECOND plus the message COUNT.
+ *  Timestamps are second-resolution, so a message landing in the SAME second as
+ *  the last scanned one (common for ⚡PAY PAY/DONE pairs or a call control sent
+ *  right after a text) leaves `secs` unchanged — the count catches it. */
+internal data class ScanMark(val secs: Long, val count: Long)
+
 /** Per-chat probe used to decide, from the single `conversationSummaries()` FFI
  *  call, which chats actually gained a newer message since the last scan. Only
  *  those chats need the expensive `messagesPage` fetch + re-parse for call/pay
  *  scanning; everything else is skipped. Pure so it can be unit-tested. */
 internal fun chatsNeedingPageScan(
-    latestByChat: Map<String, Long>,
-    scannedWatermark: Map<String, Long>,
+    latestByChat: Map<String, ScanMark>,
+    scannedWatermark: Map<String, ScanMark>,
 ): Set<String> = buildSet {
     for ((chatId, latest) in latestByChat) {
-        val seen = scannedWatermark[chatId] ?: Long.MIN_VALUE
-        if (latest > seen) add(chatId)
+        val seen = scannedWatermark[chatId] ?: ScanMark(Long.MIN_VALUE, Long.MIN_VALUE)
+        // A later second, OR the same second with more messages, means unseen
+        // content — either way the chat needs a rescan.
+        if (latest.secs > seen.secs || (latest.secs == seen.secs && latest.count > seen.count)) {
+            add(chatId)
+        }
     }
 }
 
@@ -546,7 +556,7 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  a page for and scanned for ☎CALL / pay lines. The cheap
      *  `conversationSummaries()` probe compares against this to skip the
      *  expensive `messagesPage` fetch for chats whose latest ts hasn't moved. */
-    private val scanWatermark = HashMap<String, Long>()
+    private val scanWatermark = HashMap<String, ScanMark>()
 
     /** Bind the iroh endpoint once + start the event loop (idempotent). */
     private suspend fun ensureCallStarted() {
@@ -1631,26 +1641,12 @@ class SonarAppState(private val scope: CoroutineScope) {
             // merge layer folds chat ⚡PAY receipts by preimage so an incoming
             // chat payment never appears twice.
             scope.launch {
+                // WalletBridge already records incoming payments at the event
+                // source (headless-safe). Collecting here is the live-UI path
+                // for events that arrive while the app is open; recordPending is
+                // idempotent by wallet payment id, so this never double-records.
                 WalletBridge.paymentEvents.collect { ev ->
-                    if (!ev.incoming) return@collect
-                    PaymentActivityStore.recordPending(
-                        SonarPaymentActivity(
-                            id = "wallet-${ev.paymentId}",
-                            kind = SonarPaymentActivity.Kind.WalletIncoming,
-                            peerKey = "wallet",
-                            peerName = "External wallet",
-                            direction = SonarPaymentActivity.Direction.Incoming,
-                            sats = ev.amountSats,
-                            via = "internet",
-                            createdAtSecs = ev.timestampSecs,
-                            destinationHash = null,
-                            status = SonarPaymentActivity.Status.Paid,
-                            walletPaymentId = ev.paymentId,
-                            feesSats = ev.feesSats,
-                            settledAtSecs = ev.timestampSecs,
-                            preimage = ev.preimage,
-                        )
-                    )
+                    PaymentActivityStore.recordIncomingWalletPayment(ev)
                 }
             }
         }
@@ -5560,10 +5556,14 @@ class SonarAppState(private val scope: CoroutineScope) {
                 processPayLines(groupIdHex, visibleChangedMessages)
                 processCallLines(groupIdHex, visibleChangedMessages)
                 // The changed chat's newest ts is now handled; advance its scan
-                // watermark so the housekeeping cycle won't re-fetch its page.
+                // watermark (secs + processed count) so the housekeeping cycle
+                // won't re-fetch its page for content we just processed.
                 changedMessages.lastOrNull()?.tsSecs?.let { ts ->
-                    val prev = scanWatermark[groupIdHex] ?: Long.MIN_VALUE
-                    if (ts > prev) scanWatermark[groupIdHex] = ts
+                    val mark = ScanMark(ts, changedMessages.size.toLong())
+                    val prev = scanWatermark[groupIdHex]
+                    if (prev == null || mark.secs > prev.secs ||
+                        (mark.secs == prev.secs && mark.count > prev.count)
+                    ) scanWatermark[groupIdHex] = mark
                 }
                 (screen as? Screen.Chat)?.let { sc ->
                     if (!isMeshChat(sc.id) && (sc.id == groupIdHex || isSameDirectMarmotChat(sc.id, groupIdHex))) {
@@ -5743,7 +5743,8 @@ class SonarAppState(private val scope: CoroutineScope) {
         summaryByChat: Map<String, SonarConversationSummary>,
     ) {
         val latestByChat = chats.associate { c ->
-            c.id to (summaryByChat[c.id]?.latestAtSecs ?: 0L)
+            val s = summaryByChat[c.id]
+            c.id to ScanMark(s?.latestAtSecs ?: 0L, s?.messageCount ?: 0L)
         }
         val toScan = chatsNeedingPageScan(latestByChat, scanWatermark)
         var wnMsgs = 0
@@ -5766,7 +5767,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                     if (!m.mine && m.senderNpub.isNotBlank()) senders.add(m.senderNpub)
                 }
             }
-            scanWatermark[c.id] = latestByChat[c.id] ?: 0L
+            scanWatermark[c.id] = latestByChat[c.id] ?: ScanMark(0L, 0L)
         }
         // Prune watermarks for chats that no longer exist.
         if (scanWatermark.size > latestByChat.size) {

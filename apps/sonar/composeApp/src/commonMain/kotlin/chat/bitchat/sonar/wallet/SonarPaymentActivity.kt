@@ -313,6 +313,34 @@ object PaymentActivityStore {
         return true
     }
 
+    /** Record a settled INCOMING external wallet payment. Called at the event
+     *  source (WalletBridge's Breez listener) so it lands even when there is no
+     *  live UI collector — e.g. a killed/background FCM Breez wakeup where no
+     *  SonarAppState exists. Idempotent on the stable wallet payment id, and
+     *  persisted via saveBlob, so it survives the wakeup and is not double-
+     *  recorded when the UI later observes the same event. No-op for outgoing. */
+    fun recordIncomingWalletPayment(ev: WalletPaymentEvent) {
+        if (!ev.incoming) return
+        recordPending(
+            SonarPaymentActivity(
+                id = "wallet-${ev.paymentId}",
+                kind = SonarPaymentActivity.Kind.WalletIncoming,
+                peerKey = "wallet",
+                peerName = "External wallet",
+                direction = SonarPaymentActivity.Direction.Incoming,
+                sats = ev.amountSats,
+                via = "internet",
+                createdAtSecs = ev.timestampSecs,
+                destinationHash = null,
+                status = SonarPaymentActivity.Status.Paid,
+                walletPaymentId = ev.paymentId,
+                feesSats = ev.feesSats,
+                settledAtSecs = ev.timestampSecs,
+                preimage = ev.preimage,
+            )
+        )
+    }
+
     fun markPaid(
         id: String,
         walletPaymentId: String?,
