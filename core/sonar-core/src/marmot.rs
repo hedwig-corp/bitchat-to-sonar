@@ -557,12 +557,35 @@ impl MarmotEngine {
         url: &str,
         caption: &str,
     ) -> Result<Event> {
+        self.create_media_event_multi(group_id, &[(upload, url)], caption)
+    }
+
+    /// Build a signed kind-445 media message carrying MULTIPLE attachments: one
+    /// kind-9 rumor with `caption` (may be empty) plus one `imeta` tag per
+    /// `(upload, url)` pair, in order. All imeta ride INSIDE the encrypted rumor,
+    /// so they are E2E-protected. This is the album path — a single message that
+    /// renders as N images. `uploads` must be non-empty.
+    pub fn create_media_event_multi(
+        &self,
+        group_id: &GroupId,
+        uploads: &[(&EncryptedMediaUpload, &str)],
+        caption: &str,
+    ) -> Result<Event> {
+        if uploads.is_empty() {
+            return Err(Error::Media("no media uploads for message".into()));
+        }
         let event = dispatch!(&self.storage, |mdk| {
-            let imeta = mdk
-                .media_manager(group_id.clone())
-                .create_imeta_tag(upload, url);
+            // One imeta tag per attachment, in send order. A fresh media_manager
+            // per item mirrors the single-item path exactly.
+            let mut imetas = Vec::with_capacity(uploads.len());
+            for &(upload, url) in uploads {
+                let tag = mdk
+                    .media_manager(group_id.clone())
+                    .create_imeta_tag(upload, url);
+                imetas.push(tag);
+            }
             let rumor = EventBuilder::new(Kind::Custom(CHAT_RUMOR_KIND), caption)
-                .tags([imeta])
+                .tags(imetas)
                 .build(self.identity.public_key());
             mdk.create_message(group_id, rumor, None)
         })?;

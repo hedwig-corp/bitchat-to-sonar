@@ -942,9 +942,12 @@ struct SNMediaBubble: View {
     @State private var bytes: Data?
     @State private var failed = false
     @State private var viewerOpen = false
+    @State private var viewerIndex = 0
     @State private var loadAttempt = 0
 
     private var item: SNMediaItem? { m.media.first }
+    /// Album = more than one attachment ⇒ render a swipeable card deck.
+    private var isDeck: Bool { m.media.count > 1 }
     private var loadKey: String {
         guard let item else { return "" }
         return [item.url, item.groupId, item.localPath ?? "", String(loadAttempt)].joined(separator: "|")
@@ -953,20 +956,21 @@ struct SNMediaBubble: View {
     var body: some View {
         #if os(iOS)
         bubble
-            .fullScreenCover(isPresented: $viewerOpen) {
-                if let item {
-                    SNMediaViewer(item: item, caption: m.text, initialBytes: bytes, load: load)
-                }
-            }
+            .fullScreenCover(isPresented: $viewerOpen) { viewer }
         #else
         bubble
             .sheet(isPresented: $viewerOpen) {
-                if let item {
-                    SNMediaViewer(item: item, caption: m.text, initialBytes: bytes, load: load)
-                        .frame(minWidth: 620, minHeight: 520)
-                }
+                viewer.frame(minWidth: 620, minHeight: 520)
             }
         #endif
+    }
+
+    @ViewBuilder private var viewer: some View {
+        if isDeck {
+            SNMediaGalleryViewer(items: m.media, startIndex: viewerIndex, caption: m.text, load: load)
+        } else if let item {
+            SNMediaViewer(item: item, caption: m.text, initialBytes: bytes, load: load)
+        }
     }
 
     private var bubble: some View {
@@ -994,7 +998,9 @@ struct SNMediaBubble: View {
         .task(id: loadKey) {
             bytes = nil
             failed = false
-            guard let item else { return }
+            // A deck loads each card's bytes itself (lazy, only visible pages),
+            // so the bubble skips the single-item load path.
+            guard !isDeck, let item else { return }
             guard let load else {
                 failed = true
                 return
@@ -1009,7 +1015,12 @@ struct SNMediaBubble: View {
     }
 
     @ViewBuilder private var content: some View {
-        if let item, item.isImage {
+        if isDeck {
+            SNMediaDeck(items: m.media, maxBubbleWidth: maxBubbleWidth, load: load) { idx in
+                viewerIndex = idx
+                viewerOpen = true
+            }
+        } else if let item, item.isImage {
             if let bytes, item.isGif, bytes.snLooksLikeGif {
                 SNGifView(data: bytes)
                     .frame(width: maxBubbleWidth, height: 220)
@@ -1095,6 +1106,232 @@ struct SNMediaBubble: View {
         .background(RoundedRectangle(cornerRadius: 14).fill(SonarTheme.surface2))
         .contentShape(RoundedRectangle(cornerRadius: 14))
         .onTapGesture { viewerOpen = true }
+    }
+}
+
+/// One image card in a media deck: loads + decodes its own bytes and renders the
+/// fitted image (matching the single media bubble), or a loading / retry
+/// placeholder. Non-image attachments fall back to a compact chip. Each card
+/// loads lazily so a deck only decodes the pages the user actually reaches.
+private struct SNMediaCardImage: View {
+    let item: SNMediaItem
+    let maxBubbleWidth: CGFloat
+    var load: ((SNMediaItem) async -> Data?)?
+
+    @State private var bytes: Data?
+    @State private var failed = false
+    @State private var loadAttempt = 0
+
+    private var loadKey: String {
+        [item.url, item.groupId, item.localPath ?? "", String(loadAttempt)].joined(separator: "|")
+    }
+
+    var body: some View {
+        cardContent
+            .task(id: loadKey) {
+                bytes = nil
+                failed = false
+                guard let load else {
+                    failed = true
+                    return
+                }
+                if let d = await load(item) {
+                    bytes = d
+                } else {
+                    failed = true
+                }
+            }
+    }
+
+    @ViewBuilder private var cardContent: some View {
+        if item.isImage, let bytes, item.isGif, bytes.snLooksLikeGif {
+            SNGifView(data: bytes)
+                .frame(width: maxBubbleWidth, height: 220)
+                .clipShape(RoundedRectangle(cornerRadius: 18))
+                .overlay(alignment: .topTrailing) { SNGifBadge().padding(8) }
+        } else if item.isImage, let bytes, let decoded = snDecodedPlatformImage(bytes) {
+            let size = snFittedMediaSize(decoded.size, maxWidth: maxBubbleWidth, maxHeight: 300)
+            decoded.image
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: size.width, height: size.height)
+                .background(SonarTheme.surface2)
+                .clipShape(RoundedRectangle(cornerRadius: 18))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 18)
+                        .stroke(Color.black.opacity(0.08), lineWidth: 1)
+                )
+        } else if item.isImage {
+            RoundedRectangle(cornerRadius: 18)
+                .fill(SonarTheme.surface2)
+                .frame(width: maxBubbleWidth * 0.72, height: 200)
+                .overlay {
+                    if failed {
+                        Button {
+                            loadAttempt += 1
+                        } label: {
+                            Text(verbatim: "Retry")
+                                .font(SonarTheme.uiFont(size: 12, weight: .semibold))
+                                .foregroundColor(SonarTheme.accent)
+                        }
+                        .buttonStyle(.plain)
+                    } else {
+                        ProgressView()
+                    }
+                }
+                .overlay(alignment: .topTrailing) {
+                    if item.isGif { SNGifBadge().padding(8) }
+                }
+        } else {
+            VStack(spacing: 6) {
+                Text(verbatim: item.filename)
+                    .font(SonarTheme.uiFont(size: 13, weight: .semibold))
+                    .foregroundColor(SonarTheme.text)
+                    .lineLimit(1)
+                Text(verbatim: item.mime)
+                    .font(SonarTheme.uiFont(size: 11))
+                    .foregroundColor(SonarTheme.text3)
+            }
+            .frame(width: maxBubbleWidth * 0.72, height: 200)
+            .background(RoundedRectangle(cornerRadius: 18).fill(SonarTheme.surface2))
+        }
+    }
+}
+
+/// xChat-style album deck: the front media card rests on a small pile of peek
+/// cards (offset + shadowed like stacked paper). Drag the front card left/right
+/// to page; tap to open the fullscreen gallery. Paints from the already-loaded
+/// local `media` list — no network on render beyond each card's own lazy fetch.
+private struct SNMediaDeck: View {
+    let items: [SNMediaItem]
+    let maxBubbleWidth: CGFloat
+    var load: ((SNMediaItem) async -> Data?)?
+    var onOpen: (Int) -> Void
+
+    @State private var index = 0
+    @GestureState private var dragX: CGFloat = 0
+
+    var body: some View {
+        let count = items.count
+        let current = min(max(index, 0), count - 1)
+        VStack(alignment: .leading, spacing: 8) {
+            ZStack(alignment: .topLeading) {
+                ForEach(peekDepths(count: count, current: current), id: \.self) { depth in
+                    RoundedRectangle(cornerRadius: 18)
+                        .fill(SonarTheme.surface2)
+                        .frame(width: maxBubbleWidth * 0.72, height: 220)
+                        .scaleEffect(1 - CGFloat(depth) * 0.04, anchor: .topLeading)
+                        .offset(x: CGFloat(depth) * 10, y: CGFloat(depth) * 8)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 18)
+                                .stroke(Color.black.opacity(0.06), lineWidth: 1)
+                                .scaleEffect(1 - CGFloat(depth) * 0.04, anchor: .topLeading)
+                                .offset(x: CGFloat(depth) * 10, y: CGFloat(depth) * 8)
+                        )
+                        .shadow(color: Color.black.opacity(0.10), radius: 4, x: 0, y: 2)
+                }
+                SNMediaCardImage(item: items[current], maxBubbleWidth: maxBubbleWidth, load: load)
+                    .id(current)
+                    .shadow(color: Color.black.opacity(0.12), radius: 5, x: 0, y: 2)
+                    .offset(x: dragX)
+                    .contentShape(RoundedRectangle(cornerRadius: 18))
+                    .onTapGesture { onOpen(current) }
+                    .gesture(
+                        DragGesture(minimumDistance: 12)
+                            .updating($dragX) { value, state, _ in state = value.translation.width }
+                            .onEnded { value in
+                                let threshold: CGFloat = 56
+                                if value.translation.width <= -threshold, current < count - 1 {
+                                    withAnimation(.spring(response: 0.3, dampingFraction: 0.82)) {
+                                        index = current + 1
+                                    }
+                                } else if value.translation.width >= threshold, current > 0 {
+                                    withAnimation(.spring(response: 0.3, dampingFraction: 0.82)) {
+                                        index = current - 1
+                                    }
+                                }
+                            }
+                    )
+            }
+            SNDeckDots(count: count, index: current)
+        }
+    }
+
+    /// Depths (1…2) of peek cards to draw behind the front card, capped by how
+    /// many items remain — so the pile visibly shrinks toward the last photo.
+    private func peekDepths(count: Int, current: Int) -> [Int] {
+        let remaining = count - 1 - current
+        let visible = min(2, max(0, remaining))
+        return visible == 0 ? [] : Array(1...visible)
+    }
+}
+
+/// Compact page-position dots under a media deck.
+private struct SNDeckDots: View {
+    let count: Int
+    let index: Int
+
+    var body: some View {
+        HStack(spacing: 5) {
+            ForEach(Array(0..<max(count, 0)), id: \.self) { i in
+                Circle()
+                    .fill(i == index ? SonarTheme.accent : SonarTheme.text3.opacity(0.4))
+                    .frame(width: 6, height: 6)
+            }
+        }
+        .padding(.leading, 4)
+    }
+}
+
+/// Fullscreen, swipeable gallery across a message's album. Each page is a full
+/// [SNMediaViewer] (lazy load, pinch-zoom, share, save); paging is native. Opens
+/// at the tapped card's index.
+struct SNMediaGalleryViewer: View {
+    let items: [SNMediaItem]
+    let startIndex: Int
+    let caption: String
+    var load: ((SNMediaItem) async -> Data?)? = nil
+
+    @State private var selection = 0
+
+    private var safeIndex: Int { min(max(selection, 0), max(items.count - 1, 0)) }
+
+    var body: some View {
+        #if os(iOS)
+        TabView(selection: $selection) {
+            ForEach(Array(items.enumerated()), id: \.offset) { idx, item in
+                SNMediaViewer(item: item, caption: caption, initialBytes: nil, load: load)
+                    .tag(idx)
+            }
+        }
+        .tabViewStyle(.page(indexDisplayMode: .always))
+        .background(Color.black.ignoresSafeArea())
+        .onAppear { selection = min(max(startIndex, 0), max(items.count - 1, 0)) }
+        #else
+        ZStack {
+            Color.black
+            SNMediaViewer(item: items[safeIndex], caption: caption, initialBytes: nil, load: load)
+            HStack {
+                Button { selection = max(safeIndex - 1, 0) } label: {
+                    Image(systemName: "chevron.left").font(.system(size: 22, weight: .semibold))
+                }
+                .disabled(safeIndex == 0)
+                Spacer()
+                Button { selection = min(safeIndex + 1, items.count - 1) } label: {
+                    Image(systemName: "chevron.right").font(.system(size: 22, weight: .semibold))
+                }
+                .disabled(safeIndex >= items.count - 1)
+            }
+            .padding(.horizontal, 18)
+            .buttonStyle(.plain)
+            .foregroundColor(.white)
+            VStack {
+                Spacer()
+                SNDeckDots(count: items.count, index: safeIndex).padding(.bottom, 12)
+            }
+        }
+        .onAppear { selection = min(max(startIndex, 0), max(items.count - 1, 0)) }
+        #endif
     }
 }
 

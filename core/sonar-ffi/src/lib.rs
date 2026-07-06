@@ -289,6 +289,16 @@ pub struct MediaInfo {
     pub duration_ms: Option<u64>,
 }
 
+/// One attachment for an album send (see `send_media_multi`). Raw plaintext
+/// `data` plus its source filename and MIME; the core encrypts + uploads each
+/// item independently before publishing the single album message.
+#[derive(uniffi::Record)]
+pub struct MediaUploadItem {
+    pub data: Vec<u8>,
+    pub filename: String,
+    pub mime: String,
+}
+
 /// FFI-friendly Nostr profile (kind-0 metadata, NIP-01). A Marmot member's
 /// identity is a Nostr pubkey, so this resolves their human name + avatar.
 #[derive(uniffi::Record)]
@@ -522,11 +532,12 @@ impl SonarNode {
         about: Option<String>,
         picture: Option<String>,
     ) {
-        self.runtime.block_on(self.client.publish_profile_background(
-            &name,
-            about.as_deref(),
-            picture.as_deref(),
-        ));
+        self.runtime
+            .block_on(self.client.publish_profile_background(
+                &name,
+                about.as_deref(),
+                picture.as_deref(),
+            ));
     }
 
     /// Fetch a peer's kind-0 profile (npub or hex pubkey). `None` if they have
@@ -1037,6 +1048,36 @@ impl SonarNode {
             data,
             &filename,
             &mime,
+            &caption,
+            &server_url,
+        ))?;
+        Ok(())
+    }
+
+    /// Encrypt + upload every `item`, then publish them as ONE album message
+    /// (a single kind-445 event with N `imeta` tags, in order) carrying the
+    /// optional `caption`. `server_url` empty → the core default. Blocks on the
+    /// uploads; if ANY upload fails nothing is published. `items` must be
+    /// non-empty.
+    pub fn send_media_multi(
+        &self,
+        group_id_hex: String,
+        items: Vec<MediaUploadItem>,
+        caption: String,
+        server_url: String,
+    ) -> FfiResult<()> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        let uploads = items
+            .into_iter()
+            .map(|i| sonar_core::client::MediaUpload {
+                data: i.data,
+                filename: i.filename,
+                mime: i.mime,
+            })
+            .collect();
+        self.runtime.block_on(self.client.send_media_multi(
+            &group_id,
+            uploads,
             &caption,
             &server_url,
         ))?;

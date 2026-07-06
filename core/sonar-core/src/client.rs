@@ -48,6 +48,16 @@ const BLOSSOM_SERVER_LIST_KIND: u16 = 10063;
 /// Fallback Blossom server when the user has published no kind-10063 list.
 pub const DEFAULT_BLOSSOM_SERVER: &str = "https://blossom.primal.net";
 
+/// One attachment for an album send (see [`SonarClient::send_media_multi`]).
+/// Raw plaintext bytes plus the source filename and MIME; each item is
+/// encrypted + uploaded independently before the single message is published.
+#[derive(Debug, Clone)]
+pub struct MediaUpload {
+    pub data: Vec<u8>,
+    pub filename: String,
+    pub mime: String,
+}
+
 /// Hard ceiling on a single downloaded media blob. The URL comes from the
 /// SENDER (untrusted), so this bounds memory use against a malicious/huge blob.
 /// Comfortably above any real image while well under MDK's 100 MB MIP-04 limit.
@@ -2024,13 +2034,52 @@ impl SonarClient {
         caption: &str,
         server_url: &str,
     ) -> Result<()> {
-        let upload = self.engine.encrypt_media(group_id, &data, mime, filename)?;
-        let url = self
-            .blossom_upload(server_url, upload.encrypted_data.clone(), &upload.mime_type)
-            .await?;
+        self.send_media_multi(
+            group_id,
+            vec![MediaUpload {
+                data,
+                filename: filename.to_string(),
+                mime: mime.to_string(),
+            }],
+            caption,
+            server_url,
+        )
+        .await
+    }
+
+    /// Send N media attachments as ONE message (album): encrypt each with the
+    /// group key (MIP-04), upload every ciphertext to Blossom, then publish a
+    /// single kind-445 event carrying all `imeta` tags in order plus the optional
+    /// `caption`. Every upload must succeed BEFORE the message is published, so a
+    /// failed upload never leaves a dangling reference and nothing partial hits
+    /// the wire. `items` must be non-empty. `server_url` empty →
+    /// [`DEFAULT_BLOSSOM_SERVER`].
+    pub async fn send_media_multi(
+        &self,
+        group_id: &GroupId,
+        items: Vec<MediaUpload>,
+        caption: &str,
+        server_url: &str,
+    ) -> Result<()> {
+        if items.is_empty() {
+            return Err(Error::Media("no media to send".into()));
+        }
+        // Encrypt + upload every attachment first; only then build + publish the
+        // single message. Any failure aborts the whole album with nothing sent.
+        let mut uploads = Vec::with_capacity(items.len());
+        for item in &items {
+            let upload =
+                self.engine
+                    .encrypt_media(group_id, &item.data, &item.mime, &item.filename)?;
+            let url = self
+                .blossom_upload(server_url, upload.encrypted_data.clone(), &upload.mime_type)
+                .await?;
+            uploads.push((upload, url));
+        }
+        let refs: Vec<_> = uploads.iter().map(|(u, url)| (u, url.as_str())).collect();
         let event = self
             .engine
-            .create_media_event(group_id, &upload, &url, caption)?;
+            .create_media_event_multi(group_id, &refs, caption)?;
         self.nostr.send_event(&event).await?;
         let incoming = self.engine.process_incoming(&event).await?;
         if let Incoming::Message(message) = incoming {

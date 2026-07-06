@@ -218,6 +218,109 @@ async fn media_sends_over_white_noise_end_to_end() {
     assert_eq!(dec2, reply, "Android→iOS media round-trips byte-for-byte");
 }
 
+/// Album path: MULTIPLE attachments in ONE message. Proves `create_media_event_multi`
+/// emits N `imeta` tags on a single kind-445 event, that `parse_media_refs`
+/// surfaces all N in send order, and that each decrypts to its own bytes with
+/// the shared group key. This is the wire foundation for the multi-photo card
+/// deck — one message, N images.
+#[tokio::test]
+async fn media_album_sends_n_attachments_in_one_message() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url.clone()])
+        .await
+        .expect("alice connects");
+    let bob = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url.clone()])
+        .await
+        .expect("bob connects");
+
+    bob.publish_key_package().await.expect("bob publishes kp");
+    let alice_group = alice
+        .start_dm(bob.identity().public_key(), "alice & bob")
+        .await
+        .expect("alice starts dm");
+    bob.sync().await.expect("bob joins via welcome");
+    let bob_group = bob.groups().expect("bob groups")[0].mls_group_id.clone();
+
+    // Three distinct "photos". Generic mime keeps the crypto path decoder-free
+    // (MDK sniffs real image bytes for image/* mimes); the imeta/album path is
+    // identical for any bytes, mirroring the single-item tests above.
+    let mime = "application/octet-stream";
+    let plaintexts: Vec<Vec<u8>> = (0u8..3)
+        .map(|i| format!("photo #{i} -- album attachment bytes").into_bytes())
+        .collect();
+
+    // Encrypt each independently (as the client's send_media_multi does), then
+    // build the URLs a Blossom server would return for each ciphertext.
+    let uploads: Vec<_> = plaintexts
+        .iter()
+        .enumerate()
+        .map(|(i, pt)| {
+            let filename = format!("photo{i}.bin");
+            let upload = alice
+                .engine()
+                .encrypt_media(&alice_group, pt, mime, &filename)
+                .expect("alice encrypts album item");
+            let url = format!(
+                "https://blossom.test/{}",
+                hex::encode(upload.encrypted_hash)
+            );
+            (upload, url, filename)
+        })
+        .collect();
+
+    let refs: Vec<_> = uploads
+        .iter()
+        .map(|(u, url, _)| (u, url.as_str()))
+        .collect();
+    let event = alice
+        .engine()
+        .create_media_event_multi(&alice_group, &refs, "three photos")
+        .expect("alice builds album event");
+
+    alice
+        .engine()
+        .process_incoming(&event)
+        .await
+        .expect("alice records her own album");
+    bob.engine()
+        .process_incoming(&event)
+        .await
+        .expect("bob decrypts the album msg");
+
+    // Bob sees ONE message carrying all three refs, in send order.
+    let bob_msgs = bob.messages(&bob_group).expect("bob messages");
+    let album = bob_msgs
+        .iter()
+        .find(|m| m.media.len() > 1)
+        .expect("bob sees a multi-attachment message");
+    assert!(!album.mine);
+    assert_eq!(album.content, "three photos");
+    assert_eq!(album.media.len(), 3, "all three imeta tags parsed");
+
+    for (i, (upload, url, filename)) in uploads.iter().enumerate() {
+        let r = &album.media[i];
+        assert_eq!(&r.url, url, "ref {i} url preserves send order");
+        assert_eq!(r.mime_type, mime);
+        assert_eq!(&r.filename, filename);
+        let decrypted = bob
+            .engine()
+            .decrypt_media_by_url(&bob_group, url, &upload.encrypted_data)
+            .expect("bob decrypts album item");
+        assert_eq!(decrypted, plaintexts[i], "album item {i} round-trips");
+    }
+
+    // An empty album is a clean error, never a message with no attachments.
+    assert!(
+        alice
+            .engine()
+            .create_media_event_multi(&alice_group, &[], "")
+            .is_err(),
+        "empty album must be rejected"
+    );
+}
+
 /// `http_get` (via `fetch_media`) must refuse non-https URLs — SSRF guard. Uses
 /// the mock (http) server: the download is rejected before any request.
 #[tokio::test]
