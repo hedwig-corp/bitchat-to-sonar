@@ -151,6 +151,20 @@ actual object SonarCore {
         requireNode().sendMedia(chatId, data, filename, mime, caption, serverUrl)
     }
 
+    actual suspend fun sendMediaMulti(
+        chatId: String,
+        items: List<AlbumUpload>,
+        caption: String,
+        serverUrl: String,
+    ) = withContext(Dispatchers.IO) {
+        requireNode().sendMediaMulti(
+            chatId,
+            items.map { uniffi.sonar_ffi.MediaUploadItem(it.bytes, it.filename, it.mime) },
+            caption,
+            serverUrl,
+        )
+    }
+
     actual suspend fun sendSticker(
         chatId: String,
         packCoordinate: String,

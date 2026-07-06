@@ -1186,6 +1186,15 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func sendMedia(groupIdHex: String, data: Data, filename: String, mime: String, caption: String, serverUrl: String) throws 
     
     /**
+     * Encrypt + upload every `item`, then publish them as ONE album message
+     * (a single kind-445 event with N `imeta` tags, in order) carrying the
+     * optional `caption`. `server_url` empty → the core default. Blocks on the
+     * uploads; if ANY upload fails nothing is published. `items` must be
+     * non-empty.
+     */
+    func sendMediaMulti(groupIdHex: String, items: [MediaUploadItem], caption: String, serverUrl: String) throws 
+    
+    /**
      * Encrypt + publish a sticker message to the group.
      */
     func sendSticker(groupIdHex: String, packCoordinate: String, shortcode: String, plaintextSha256: String) throws 
@@ -2011,6 +2020,24 @@ open func sendMedia(groupIdHex: String, data: Data, filename: String, mime: Stri
         FfiConverterData.lower(data),
         FfiConverterString.lower(filename),
         FfiConverterString.lower(mime),
+        FfiConverterString.lower(caption),
+        FfiConverterString.lower(serverUrl),$0
+    )
+}
+}
+    
+    /**
+     * Encrypt + upload every `item`, then publish them as ONE album message
+     * (a single kind-445 event with N `imeta` tags, in order) carrying the
+     * optional `caption`. `server_url` empty → the core default. Blocks on the
+     * uploads; if ANY upload fails nothing is published. `items` must be
+     * non-empty.
+     */
+open func sendMediaMulti(groupIdHex: String, items: [MediaUploadItem], caption: String, serverUrl: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_send_media_multi(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(groupIdHex),
+        FfiConverterSequenceTypeMediaUploadItem.lower(items),
         FfiConverterString.lower(caption),
         FfiConverterString.lower(serverUrl),$0
     )
@@ -3076,6 +3103,69 @@ public func FfiConverterTypeMediaInfo_lift(_ buf: RustBuffer) throws -> MediaInf
 #endif
 public func FfiConverterTypeMediaInfo_lower(_ value: MediaInfo) -> RustBuffer {
     return FfiConverterTypeMediaInfo.lower(value)
+}
+
+
+/**
+ * One attachment for an album send (see `send_media_multi`). Raw plaintext
+ * `data` plus its source filename and MIME; the core encrypts + uploads each
+ * item independently before publishing the single album message.
+ */
+public struct MediaUploadItem: Equatable, Hashable {
+    public var data: Data
+    public var filename: String
+    public var mime: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(data: Data, filename: String, mime: String) {
+        self.data = data
+        self.filename = filename
+        self.mime = mime
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension MediaUploadItem: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMediaUploadItem: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MediaUploadItem {
+        return
+            try MediaUploadItem(
+                data: FfiConverterData.read(from: &buf), 
+                filename: FfiConverterString.read(from: &buf), 
+                mime: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MediaUploadItem, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.data, into: &buf)
+        FfiConverterString.write(value.filename, into: &buf)
+        FfiConverterString.write(value.mime, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMediaUploadItem_lift(_ buf: RustBuffer) throws -> MediaUploadItem {
+    return try FfiConverterTypeMediaUploadItem.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMediaUploadItem_lower(_ value: MediaUploadItem) -> RustBuffer {
+    return FfiConverterTypeMediaUploadItem.lower(value)
 }
 
 
@@ -5535,6 +5625,31 @@ fileprivate struct FfiConverterSequenceTypeMediaInfo: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeMediaUploadItem: FfiConverterRustBuffer {
+    typealias SwiftType = [MediaUploadItem]
+
+    public static func write(_ value: [MediaUploadItem], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeMediaUploadItem.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [MediaUploadItem] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [MediaUploadItem]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeMediaUploadItem.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeMessageInfo: FfiConverterRustBuffer {
     typealias SwiftType = [MessageInfo]
 
@@ -6215,6 +6330,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_send_media() != 54267) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_send_media_multi() != 39384) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_send_sticker() != 28650) {

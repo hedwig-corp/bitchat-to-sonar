@@ -3681,19 +3681,30 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     fun stageMediaPreview(chatId: String, data: ByteArray, filename: String, mime: String) {
-        if ((screen as? Screen.Chat)?.id != chatId) return
+        stageMediaPreviews(chatId, listOf(PickedPhoto(data, filename, mime)))
+    }
+
+    /** Stage one or more picked photos for the pre-send preview. All items are
+     *  written to temp files off the UI thread (Signal-style: full quality
+     *  until send confirmation); the batch replaces prior staged previews. */
+    fun stageMediaPreviews(chatId: String, items: List<PickedPhoto>) {
+        if ((screen as? Screen.Chat)?.id != chatId || items.isEmpty()) return
         val generation = nextMediaPreviewGeneration()
         val previous = pendingMediaPreviews
         pendingMediaPreviews = emptyList()
         deletePreviewTempFilesAsync(previous)
         scope.launch {
-            val suffix = if (mime == "image/gif") ".gif" else ".img"
-            val path = withContext(Dispatchers.IO) { writeTempMediaFile(data, suffix) }
+            val written = withContext(Dispatchers.IO) {
+                items.map { item ->
+                    val suffix = if (item.mime == "image/gif") ".gif" else ".img"
+                    PendingMediaPreview(chatId, writeTempMediaFile(item.bytes, suffix), item.filename, item.mime)
+                }
+            }
             if (mediaPreviewGeneration != generation || (screen as? Screen.Chat)?.id != chatId) {
-                withContext(Dispatchers.IO) { deleteTempMediaFile(path) }
+                withContext(Dispatchers.IO) { for (p in written) deleteTempMediaFile(p.tempPath) }
                 return@launch
             }
-            pendingMediaPreviews = listOf(PendingMediaPreview(chatId, path, filename, mime))
+            pendingMediaPreviews = written
         }
     }
 
@@ -3710,23 +3721,51 @@ class SonarAppState(private val scope: CoroutineScope) {
         } else {
             pendingMediaPreviews.filterNot { it.chatId == chatId }
         }
-        for (preview in items) {
-            scope.launch {
+        scope.launch {
+            // Finalize every staged item IN ORDER (lazy jpeg re-encode happens
+            // here, on send confirmation — Signal-style).
+            val prepared = mutableListOf<Triple<String, PickedPhoto, Boolean>>()
+            var encodeFailed = false
+            for (preview in items) {
                 val raw = withContext(Dispatchers.IO) {
                     readTempMediaFile(preview.tempPath).also { deleteTempMediaFile(preview.tempPath) }
-                } ?: return@launch
+                } ?: continue
                 if (preview.mime == "image/gif") {
-                    sendImage(preview.chatId, raw, preview.filename, preview.mime)
+                    prepared += Triple(preview.chatId, PickedPhoto(raw, preview.filename, preview.mime), true)
                 } else {
                     val jpeg = withContext(Dispatchers.Default) { reencodeToJpeg(raw) }
                     if (jpeg == null) {
-                        toast = "Couldn't encode image."
-                        return@launch
+                        encodeFailed = true
+                    } else {
+                        prepared += Triple(preview.chatId, PickedPhoto(jpeg, "photo.jpg", "image/jpeg"), false)
                     }
-                    sendImage(preview.chatId, jpeg, "photo.jpg", "image/jpeg")
+                }
+            }
+            if (encodeFailed) toast = "Couldn't encode image."
+            // Group per chat: 2+ items send as ONE album message (card deck);
+            // a single item keeps the exact pre-album behavior.
+            val chatsInOrder = prepared.map { it.first }.distinct()
+            for (chat in chatsInOrder) {
+                val list = prepared.filter { it.first == chat }.map { it.second }
+                if (list.size > 1) {
+                    val numbered = list.mapIndexed { idx, p ->
+                        PickedPhoto(p.bytes, numberedFilename(p.filename, idx + 1), p.mime)
+                    }
+                    sendImageAlbum(chat, numbered)
+                } else {
+                    list.firstOrNull()?.let { sendImage(chat, it.bytes, it.filename, it.mime) }
                 }
             }
         }
+    }
+
+    /** "photo.jpg" + 2 → "photo-2.jpg". Distinct per-item filenames keep the
+     *  pending-upload echo reconciliation (matched by filename) deterministic
+     *  across an album's attachments. */
+    private fun numberedFilename(filename: String, index: Int): String {
+        val dot = filename.lastIndexOf('.')
+        return if (dot <= 0) "$filename-$index"
+        else "${filename.substring(0, dot)}-$index${filename.substring(dot)}"
     }
 
     fun cancelPreview(chatId: String? = null) {
@@ -3767,26 +3806,39 @@ class SonarAppState(private val scope: CoroutineScope) {
     private var pendingMediaCompletionOrder = 0L
 
     private fun rememberPendingMediaUpload(chatId: String, upload: PendingMediaUpload) {
+        rememberPendingMediaUploads(chatId, listOf(upload))
+    }
+
+    /** Track a batch of uploads that share one pending echo message (an album):
+     *  prior entries for the same message id are replaced once, then every
+     *  per-attachment entry is appended so each reconciles independently. */
+    private fun rememberPendingMediaUploads(chatId: String, uploads: List<PendingMediaUpload>) {
+        if (uploads.isEmpty()) return
         val pending = pendingMediaUploads.getOrPut(chatId) { mutableListOf() }
-        pending.removeAll { it.message.id == upload.message.id }
-        pending += upload
+        val ids = uploads.mapTo(mutableSetOf()) { it.message.id }
+        pending.removeAll { it.message.id in ids }
+        pending += uploads
     }
 
     private fun markPendingMediaCompleted(chatId: String, pendingId: String) {
         val pending = pendingMediaUploads[chatId] ?: return
-        val index = pending.indexOfFirst { it.message.id == pendingId }
-        if (index >= 0 && pending[index].completedOrder == null) {
-            pendingMediaCompletionOrder += 1
-            pending[index] = pending[index].copy(completedOrder = pendingMediaCompletionOrder)
+        // An album shares one echo message across N per-attachment entries —
+        // mark every entry so each reconciles against the canonical message.
+        for (index in pending.indices) {
+            if (pending[index].message.id == pendingId && pending[index].completedOrder == null) {
+                pendingMediaCompletionOrder += 1
+                pending[index] = pending[index].copy(completedOrder = pendingMediaCompletionOrder)
+            }
         }
     }
 
     private fun markPendingMediaFailed(chatId: String, pendingId: String) {
         val pending = pendingMediaUploads[chatId] ?: return
-        val index = pending.indexOfFirst { it.message.id == pendingId }
-        if (index >= 0) {
-            val upload = pending[index]
-            pending[index] = upload.copy(message = upload.message.copy(state = "Couldn't send"))
+        for (index in pending.indices) {
+            if (pending[index].message.id == pendingId) {
+                val upload = pending[index]
+                pending[index] = upload.copy(message = upload.message.copy(state = "Couldn't send"))
+            }
         }
     }
 
@@ -3922,6 +3974,91 @@ class SonarAppState(private val scope: CoroutineScope) {
                     messages = visibleMessagesForChat(chatId, mergePendingMediaUploads(chatId, messages))
                 }
                 toast = "couldn't send photo: ${e.message}"
+            }
+        }
+    }
+
+    /** Send N images to one chat as ONE album message (single event, N imeta
+     *  tags) that renders as the swipeable card deck. BLE mesh has no album
+     *  packet, so a mesh-linked peer gets N individual image sends. */
+    fun sendImageAlbum(chatId: String, items: List<PickedPhoto>) {
+        if (items.size <= 1) {
+            items.firstOrNull()?.let { sendImage(chatId, it.bytes, it.filename, it.mime) }
+            return
+        }
+        if (isContactBlocked(chatId)) { toast = "Unblock this contact before sending."; return }
+        if (isMeshChat(chatId) && MeshRadio.hasMeshLink(meshPeerId(chatId))) {
+            val allSent = items.all { sendMeshMedia(meshPeerId(chatId), it.bytes, it.filename, it.mime) }
+            if (allSent) return
+            if (resolveMarmotGroupId(chatId) == null) return
+        }
+        scope.launch {
+            val groupId = resolveMarmotGroupId(chatId)
+            if (groupId == null) { toast = "Start the secure chat first, then send a photo."; return@launch }
+            val pendingId = "pending-media-${randomMeshId()}"
+            val startedAtSecs = SonarClock.nowSecs()
+            val existingMediaUrls = existingPublishedMediaUrls(groupId)
+            // One echo message carrying every attachment (the card deck paints
+            // immediately); one per-attachment upload entry for reconciliation.
+            val pendingUrls = items.map { "$pendingMediaUrlPrefix${randomMeshId()}" }
+            val pending = SonarMsg(
+                id = pendingId,
+                senderNpub = npub,
+                content = "",
+                mine = true,
+                tsSecs = startedAtSecs,
+                viaInternet = true,
+                media = items.mapIndexed { idx, item ->
+                    SonarMedia(pendingUrls[idx], item.mime, item.filename, null, null, null)
+                },
+                state = "Uploading",
+            )
+            rememberPendingMediaUploads(
+                chatId,
+                items.mapIndexed { idx, item ->
+                    PendingMediaUpload(
+                        message = pending,
+                        data = item.bytes,
+                        filename = item.filename,
+                        mime = item.mime,
+                        startedAtSecs = startedAtSecs,
+                        pendingUrl = pendingUrls[idx],
+                        existingMediaUrls = existingMediaUrls,
+                    )
+                }
+            )
+            items.forEachIndexed { idx, item -> mediaCache[pendingUrls[idx]] = item.bytes }
+            if ((screen as? Screen.Chat)?.id == chatId) {
+                messages = visibleMessagesForChat(chatId, mergePendingMediaUploads(chatId, messages))
+            }
+            try {
+                SonarCore.sendMediaMulti(
+                    groupId,
+                    items.map { AlbumUpload(it.bytes, it.filename, it.mime) },
+                    "",
+                )
+                markPendingMediaCompleted(chatId, pendingId)
+                // Refresh the open conversation so the sent album shows.
+                (screen as? Screen.Chat)?.let { sc ->
+                    if (sc.id == chatId) {
+                        if (isMeshChat(chatId)) {
+                            val peerId = meshPeerId(chatId)
+                            val mesh = meshChats[peerId].orEmpty()
+                            val wn = marmotMessagesForPeer(peerId)
+                            val merged = withSendEchoes(chatId, mergePendingMediaUploads(chatId, mesh + wn))
+                            setCurrentVisibleMessages(chatId, merged)
+                        } else {
+                            val fresh = SonarCore.messagesPage(groupId, LOCAL_TRANSCRIPT_PAGE_LIMIT)
+                            setCurrentVisibleMessages(chatId, withSendEchoes(chatId, mergePendingMediaUploads(chatId, fresh)))
+                        }
+                    }
+                }
+            } catch (e: Throwable) {
+                markPendingMediaFailed(chatId, pendingId)
+                if ((screen as? Screen.Chat)?.id == chatId) {
+                    messages = visibleMessagesForChat(chatId, mergePendingMediaUploads(chatId, messages))
+                }
+                toast = "couldn't send photos: ${e.message}"
             }
         }
     }

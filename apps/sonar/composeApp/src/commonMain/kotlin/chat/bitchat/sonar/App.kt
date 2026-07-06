@@ -711,8 +711,8 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     var mediaGallery by remember { mutableStateOf<Pair<List<SonarMedia>, Int>?>(null) }
     var previewPackCoordinate by remember { mutableStateOf<String?>(null) }
     val mediaActions = rememberMediaActions()
-    val pickPhoto = rememberPhotoPicker { bytes, name, mime ->
-        state.stageMediaPreview(screen.id, bytes, name, mime)
+    val pickPhoto = rememberPhotoPicker { items ->
+        state.stageMediaPreviews(screen.id, items)
     }
     // Voice-note recorder (hold the mic to record; drag left to cancel).
     val recorder = remember { VoiceRecorder() }
@@ -1111,15 +1111,20 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             modifier = Modifier.matchParentSize()
         )
     }
-    state.pendingMediaPreviews.firstOrNull { it.chatId == screen.id }?.let { preview ->
-        val data by androidx.compose.runtime.produceState<ByteArray?>(null, preview.tempPath) {
-            value = withContext(Dispatchers.IO) { readTempMediaFile(preview.tempPath) }
+    val chatPreviews = state.pendingMediaPreviews.filter { it.chatId == screen.id }
+    if (chatPreviews.isNotEmpty()) {
+        val previewKey = chatPreviews.joinToString("|") { it.tempPath }
+        val loaded by androidx.compose.runtime.produceState<List<Pair<ByteArray, Boolean>>?>(null, previewKey) {
+            value = withContext(Dispatchers.IO) {
+                chatPreviews.mapNotNull { p ->
+                    readTempMediaFile(p.tempPath)?.let { it to (p.mime == "image/gif") }
+                }
+            }
         }
-        val previewData = data
-        if (previewData != null) {
+        val items = loaded
+        if (!items.isNullOrEmpty()) {
             MediaSendPreview(
-                data = previewData,
-                isGif = preview.mime == "image/gif",
+                items = items,
                 onSend = { state.confirmSendPreview(screen.id) },
                 onCancel = { state.cancelPreview(screen.id) },
                 modifier = Modifier.matchParentSize()
@@ -2276,23 +2281,29 @@ private fun MediaViewer(
 
 @Composable
 private fun MediaSendPreview(
-    data: ByteArray,
-    isGif: Boolean,
+    items: List<Pair<ByteArray, Boolean>>,
     onSend: () -> Unit,
     onCancel: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val s = sonar
-    val image = remember(data) { if (!isGif) decodeImageBitmap(data) else null }
+    val pagerState = androidx.compose.foundation.pager.rememberPagerState(pageCount = { items.size })
     Box(modifier.background(Color.Black)) {
-        when {
-            isGif || image != null -> MediaImage(
-                bytes = data,
-                isGif = isGif,
-                modifier = Modifier.fillMaxSize().padding(bottom = 80.dp)
-            )
-            else -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text("Couldn't decode image", color = Color.White.copy(alpha = 0.6f), fontSize = 14.sp)
+        androidx.compose.foundation.pager.HorizontalPager(
+            state = pagerState,
+            modifier = Modifier.fillMaxSize(),
+        ) { page ->
+            val (data, isGif) = items[page]
+            val image = remember(data) { if (!isGif) decodeImageBitmap(data) else null }
+            when {
+                isGif || image != null -> MediaImage(
+                    bytes = data,
+                    isGif = isGif,
+                    modifier = Modifier.fillMaxSize().padding(bottom = 80.dp)
+                )
+                else -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Text("Couldn't decode image", color = Color.White.copy(alpha = 0.6f), fontSize = 14.sp)
+                }
             }
         }
         Row(
@@ -2300,15 +2311,39 @@ private fun MediaSendPreview(
             verticalAlignment = Alignment.CenterVertically
         ) {
             SNIconButton(SNIconName.Back, tint = Color.White, onClick = onCancel)
+            if (items.size > 1) {
+                Spacer(Modifier.weight(1f))
+                Text(
+                    "${pagerState.currentPage + 1} of ${items.size}",
+                    color = Color.White.copy(alpha = 0.85f),
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.padding(end = 12.dp)
+                )
+            }
         }
         Row(
             Modifier.fillMaxWidth().align(Alignment.BottomCenter).padding(16.dp),
-            horizontalArrangement = Arrangement.End
+            horizontalArrangement = Arrangement.End,
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            Box(
-                Modifier.size(52.dp).clip(CircleShape).background(s.accent).clickable { onSend() },
-                contentAlignment = Alignment.Center
+            Row(
+                Modifier.height(52.dp).clip(RoundedCornerShape(999.dp)).background(s.accent)
+                    .clickable { onSend() }
+                    .padding(horizontal = if (items.size > 1) 18.dp else 0.dp)
+                    .widthIn(min = 52.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.Center
             ) {
+                if (items.size > 1) {
+                    Text(
+                        "${items.size}",
+                        color = Color.White,
+                        fontSize = 15.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(end = 6.dp)
+                    )
+                }
                 Text("↑", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold)
             }
         }

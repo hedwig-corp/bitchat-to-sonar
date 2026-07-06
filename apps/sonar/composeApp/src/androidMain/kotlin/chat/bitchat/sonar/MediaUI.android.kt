@@ -42,27 +42,33 @@ private const val MEDIA_SHARE_CACHE_MAX_AGE_MS = 24L * 60L * 60L * 1000L
 
 @Composable
 actual fun rememberPhotoPicker(
-    onPicked: (bytes: ByteArray, filename: String, mime: String) -> Unit
+    onPicked: (items: List<PickedPhoto>) -> Unit
 ): () -> Unit {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     val launcher = rememberLauncherForActivityResult(
-        ActivityResultContracts.PickVisualMedia()
-    ) { uri ->
-        uri ?: return@rememberLauncherForActivityResult
+        ActivityResultContracts.PickMultipleVisualMedia(MAX_ALBUM_PHOTOS)
+    ) { uris ->
+        if (uris.isEmpty()) return@rememberLauncherForActivityResult
         scope.launch(Dispatchers.IO) {
-            val raw = ctx.contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: return@launch
-            val sourceMime = ctx.contentResolver.getType(uri).orEmpty()
-            val sourceName = ctx.displayNameForUri(uri) ?: "photo"
-            if (sourceMime.equals("image/gif", ignoreCase = true) || raw.isGifBytes()) {
-                val filename = sourceName.takeIf { it.endsWith(".gif", ignoreCase = true) } ?: "animation.gif"
-                withContext(Dispatchers.Main) { onPicked(raw, filename, "image/gif") }
-                return@launch
+            // Load every pick in selection order; 2+ stage as one album.
+            val items = uris.mapNotNull { uri ->
+                val raw = ctx.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                    ?: return@mapNotNull null
+                val sourceMime = ctx.contentResolver.getType(uri).orEmpty()
+                val sourceName = ctx.displayNameForUri(uri) ?: "photo"
+                if (sourceMime.equals("image/gif", ignoreCase = true) || raw.isGifBytes()) {
+                    val filename = sourceName.takeIf { it.endsWith(".gif", ignoreCase = true) }
+                        ?: "animation.gif"
+                    PickedPhoto(raw, filename, "image/gif")
+                } else {
+                    // Raw bytes — JPEG re-encoding happens lazily on send confirmation.
+                    PickedPhoto(raw, sourceName.ifBlank { "photo" }, sourceMime.ifBlank { "image/jpeg" })
+                }
             }
-            // Pass raw bytes — JPEG re-encoding happens lazily on send confirmation.
-            val name = sourceName.ifBlank { "photo" }
-            val mime = sourceMime.ifBlank { "image/jpeg" }
-            withContext(Dispatchers.Main) { onPicked(raw, name, mime) }
+            if (items.isNotEmpty()) {
+                withContext(Dispatchers.Main) { onPicked(items) }
+            }
         }
     }
     return {

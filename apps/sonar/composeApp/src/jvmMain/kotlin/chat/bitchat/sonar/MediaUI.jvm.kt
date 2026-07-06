@@ -30,12 +30,12 @@ import javax.swing.SwingConstants
 
 /**
  * Desktop (JVM) `actual` photo picker: a native AWT [FileDialog] filtered to
- * images. Raw bytes are passed through — JPEG re-encoding is deferred to send
- * confirmation via [reencodeToJpeg].
+ * images, multi-select up to [MAX_ALBUM_PHOTOS]. Raw bytes are passed through —
+ * JPEG re-encoding is deferred to send confirmation via [reencodeToJpeg].
  */
 @Composable
 actual fun rememberPhotoPicker(
-    onPicked: (bytes: ByteArray, filename: String, mime: String) -> Unit
+    onPicked: (items: List<PickedPhoto>) -> Unit
 ): () -> Unit {
     val scope = rememberCoroutineScope()
     return {
@@ -43,25 +43,31 @@ actual fun rememberPhotoPicker(
             // FileDialog is a modal AWT dialog — open it on the EDT (Compose
             // Desktop runs composition, hence this scope, on the AWT event
             // thread). Decoding/re-encoding then hops to a background thread.
-            val picked = pickImageFile() ?: return@launch
-            val raw = withContext(Dispatchers.IO) { runCatching { picked.readBytes() }.getOrNull() }
-                ?: return@launch
-            // Pass raw bytes — JPEG re-encoding happens lazily on send confirmation.
-            val name = picked.name.ifBlank { "photo" }
-            val mime = if (picked.extension.equals("gif", ignoreCase = true) || raw.isGifBytes()) {
-                "image/gif"
-            } else {
-                "image/${picked.extension.lowercase().ifBlank { "jpeg" }}"
+            val picked = pickImageFiles()
+            if (picked.isEmpty()) return@launch
+            val items = withContext(Dispatchers.IO) {
+                picked.mapNotNull { file ->
+                    val raw = runCatching { file.readBytes() }.getOrNull() ?: return@mapNotNull null
+                    // Raw bytes — JPEG re-encoding happens lazily on send confirmation.
+                    val name = file.name.ifBlank { "photo" }
+                    val mime = if (file.extension.equals("gif", ignoreCase = true) || raw.isGifBytes()) {
+                        "image/gif"
+                    } else {
+                        "image/${file.extension.lowercase().ifBlank { "jpeg" }}"
+                    }
+                    PickedPhoto(raw, name, mime)
+                }
             }
-            onPicked(raw, name, mime)
+            if (items.isNotEmpty()) onPicked(items)
         }
     }
 }
 
-private fun pickImageFile(): File? {
+private fun pickImageFiles(): List<File> {
     // Limit to formats the stock JDK ImageIO can actually decode (no WebP reader),
     // so a picked file always re-encodes rather than silently failing.
-    val dialog = FileDialog(null as Frame?, "Choose an image", FileDialog.LOAD).apply {
+    val dialog = FileDialog(null as Frame?, "Choose images", FileDialog.LOAD).apply {
+        isMultipleMode = true
         setFilenameFilter { _, name ->
             name.lowercase().let {
                 it.endsWith(".jpg") || it.endsWith(".jpeg") || it.endsWith(".png") ||
@@ -71,9 +77,7 @@ private fun pickImageFile(): File? {
         isVisible = true
     }
     return try {
-        val dir = dialog.directory ?: return null
-        val name = dialog.file ?: return null
-        File(dir, name)
+        dialog.files.orEmpty().toList().take(MAX_ALBUM_PHOTOS)
     } finally {
         dialog.dispose() // release the native AWT peer
     }

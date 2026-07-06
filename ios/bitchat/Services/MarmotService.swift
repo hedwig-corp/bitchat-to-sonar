@@ -606,6 +606,35 @@ final class MarmotService: @unchecked Sendable {
         }
     }
 
+    /// One attachment of an album send (one message, N attachments).
+    struct MediaAlbumItem: Sendable {
+        let data: Data
+        let filename: String
+        let mime: String
+    }
+
+    /// Send N attachments as ONE album message: encrypt + upload every item,
+    /// then publish a single kind-445 event carrying all `imeta` tags (in
+    /// order) plus the optional `caption`. If ANY upload fails nothing is
+    /// published. `serverUrl` empty → the core default.
+    func sendMediaMulti(
+        groupId: String,
+        items: [MediaAlbumItem],
+        caption: String,
+        serverUrl: String = ""
+    ) async throws {
+        try await run {
+            try $0.requireNode().sendMediaMulti(
+                groupIdHex: groupId,
+                items: items.map {
+                    MediaUploadItem(data: $0.data, filename: $0.filename, mime: $0.mime)
+                },
+                caption: caption,
+                serverUrl: serverUrl
+            )
+        }
+    }
+
     /// Send a sticker message to the group.
     func sendSticker(
         groupId: String,
