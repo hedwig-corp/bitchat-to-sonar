@@ -17,6 +17,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -56,6 +57,7 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
     val scope = rememberCoroutineScope()
     var showVerify by remember { mutableStateOf(false) }
     var paySheet by remember { mutableStateOf(false) }
+    var confirmDelete by remember { mutableStateOf(false) }
 
     // Derive the peer npub from the chat members list, or accept a direct
     // npub when opened from a group member tap.
@@ -335,7 +337,7 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
                     danger = true,
                     trail = SNTrail.None,
                     divider = false
-                ) { state.toast = "Coming soon" }
+                ) { confirmDelete = true }
             }
 
             Spacer(Modifier.height(40.dp))
@@ -353,6 +355,53 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
             },
             onClose = { paySheet = false }
         )
+    }
+    if (confirmDelete) {
+        // Cross-platform parity with the iOS contact-profile Delete: confirm,
+        // then route to the correct local delete (mesh vs Marmot) and pop back.
+        DeleteContactChatSheet(
+            name = screen.name,
+            onDelete = {
+                confirmDelete = false
+                if (effectiveChatId.startsWith("mesh:")) {
+                    state.deleteMeshDm(effectiveChatId.removePrefix("mesh:"))
+                } else {
+                    state.deleteMarmotChat(effectiveChatId)
+                }
+                state.back()
+            },
+            onClose = { confirmDelete = false },
+        )
+    }
+}
+
+/** Confirmation sheet for deleting a conversation from the contact profile
+ *  (design bc-sheet shell; mirrors the home DeleteChatSheet copy). */
+@Composable
+private fun DeleteContactChatSheet(name: String, onDelete: () -> Unit, onClose: () -> Unit) {
+    val s = sonar
+    Box(
+        Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
+        contentAlignment = Alignment.BottomCenter,
+    ) {
+        Surface(color = s.surface, shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)) {
+            Column(Modifier.fillMaxWidth().padding(20.dp)) {
+                Text("Delete chat", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    "This removes your copy of the conversation with $name from this phone. " +
+                        "It does not delete their copy.",
+                    color = s.text2, fontSize = 13.5.sp, lineHeight = 18.sp,
+                )
+                Spacer(Modifier.height(16.dp))
+                SNPrimaryButton("Delete chat", net = false, onClick = onDelete)
+                Spacer(Modifier.height(8.dp))
+                Box(
+                    Modifier.fillMaxWidth().height(44.dp).clickable(onClick = onClose),
+                    contentAlignment = Alignment.Center,
+                ) { Text("Cancel", color = s.text2, fontSize = 15.sp, fontWeight = FontWeight.SemiBold) }
+            }
+        }
     }
 }
 
