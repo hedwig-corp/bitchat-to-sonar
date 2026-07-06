@@ -10,19 +10,43 @@ import CryptoKit
 
 // MARK: - Hex Encoding/Decoding
 
+/// Table-driven hex codec. The previous per-byte `String(format: "%02x", _)`
+/// ran CFString's format parser once PER BYTE; a device Time Profiler trace
+/// showed these conversions (peer keys, fingerprints, group ids — called in
+/// loops from chat-list and BLE-snapshot paths) as a visible main-thread cost.
+private enum HexTables {
+    static let lowercase: [UInt8] = Array("0123456789abcdef".utf8)
+    /// ASCII byte → nibble value; 0xFF marks an invalid hex character.
+    static let nibbles: [UInt8] = {
+        var table = [UInt8](repeating: 0xFF, count: 256)
+        for (value, char) in "0123456789abcdef".utf8.enumerated() {
+            table[Int(char)] = UInt8(value)
+        }
+        for (offset, char) in "ABCDEF".utf8.enumerated() {
+            table[Int(char)] = UInt8(offset + 10)
+        }
+        return table
+    }()
+}
+
 extension Data {
     func hexEncodedString() -> String {
         if self.isEmpty {
             return ""
         }
-        return self.map { String(format: "%02x", $0) }.joined()
+        var out = [UInt8]()
+        out.reserveCapacity(count * 2)
+        for byte in self {
+            out.append(HexTables.lowercase[Int(byte >> 4)])
+            out.append(HexTables.lowercase[Int(byte & 0x0F)])
+        }
+        return String(decoding: out, as: UTF8.self)
     }
 
     func sha256Hex() -> String {
-        let digest = SHA256.hash(data: self)
-        return digest.map { String(format: "%02x", $0) }.joined()
+        Data(SHA256.hash(data: self)).hexEncodedString()
     }
-    
+
     /// Initialize Data from a hex string.
     /// - Parameter hexString: A hex string, optionally prefixed with "0x" or "0X".
     ///   Whitespace is trimmed. Must have even length after prefix removal.
@@ -48,15 +72,17 @@ extension Data {
 
         let len = hex.count / 2
         var data = Data(capacity: len)
-        var index = hex.startIndex
+        let bytes = Array(hex.utf8)
+        var i = 0
 
         for _ in 0..<len {
-            let nextIndex = hex.index(index, offsetBy: 2)
-            guard let byte = UInt8(String(hex[index..<nextIndex]), radix: 16) else {
+            let hi = HexTables.nibbles[Int(bytes[i])]
+            let lo = HexTables.nibbles[Int(bytes[i + 1])]
+            guard hi != 0xFF, lo != 0xFF else {
                 return nil
             }
-            data.append(byte)
-            index = nextIndex
+            data.append((hi << 4) | lo)
+            i += 2
         }
 
         self = data

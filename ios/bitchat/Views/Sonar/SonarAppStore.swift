@@ -2020,9 +2020,7 @@ final class SonarAppStore: ObservableObject {
     }
 
     private static func sha256Hex(_ value: String) -> String {
-        SHA256.hash(data: Data(value.utf8))
-            .map { String(format: "%02x", $0) }
-            .joined()
+        Data(value.utf8).sha256Hex()
     }
 
     /// Inject our Sonar profile into BLEService once the Marmot identity is
