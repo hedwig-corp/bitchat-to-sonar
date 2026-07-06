@@ -135,12 +135,13 @@ final class WalletBridgeService: ObservableObject {
     private var activeSendCount = 0
     private var suspendWhenActiveSendsFinish = false
 
-    /// True when the process is running in the background. Node startup consults
-    /// this so the Breez SDK's `track_new_blocks` SQLite writer never comes up
-    /// while suspended (`0xdead10cc`). `@MainActor` guarantees the main-thread
-    /// access `UIApplication.applicationState` requires.
-    private static var isAppInBackground: Bool {
-        UIApplication.shared.applicationState == .background
+    /// True until UIKit has confirmed an active foreground scene. Node startup
+    /// consults this so the Breez SDK's `track_new_blocks` SQLite writer never
+    /// comes up during silent-push/background launch or the inactive launch
+    /// window before suspension (`0xdead10cc`). `@MainActor` guarantees the
+    /// main-thread access `UIApplication.applicationState` requires.
+    private static var shouldDeferNodeStartup: Bool {
+        UIApplication.shared.applicationState != .active
     }
     #endif
 
@@ -246,23 +247,21 @@ final class WalletBridgeService: ObservableObject {
                 }
             }
             #if canImport(UIKit)
-            // Never start the Breez node while the process is backgrounded. Its
-            // `track_new_blocks` task polls the SQLite cache continuously, and
-            // holding a SQLite lock at suspension gets the app killed by
-            // RunningBoard with `0xdead10cc`. `suspendForBackground()` only fires
-            // on the scenePhase `.background` *change*, so a node started while
-            // already backgrounded — a silent-push background launch
-            // (`BridgedWallet.init`) or `retrySetup()` off a background Marmot
-            // wake republishing `npub` — would run unguarded until the next
-            // suspend and crash. Defer instead: arm the resume so the next
-            // foreground (`resumeFromBackground()`) brings the node up, and throw
-            // so `setupIfNeeded()` clears `setupTask` for a clean retry.
-            if Self.isAppInBackground {
+            // Never start the Breez node before UIKit confirms an active
+            // foreground scene. Its `track_new_blocks` task polls the SQLite
+            // cache continuously, and holding a SQLite lock at suspension gets
+            // the app killed by RunningBoard with `0xdead10cc`. A silent-push
+            // launch may be `.background`, and a cold launch may still be
+            // `.inactive` before the first scenePhase callback. Defer both:
+            // arm the resume so foreground (`resumeFromBackground()`) brings
+            // the node up, and throw so `setupIfNeeded()` clears `setupTask`
+            // for a clean retry.
+            if Self.shouldDeferNodeStartup {
                 #if DEBUG
-                SecureLogger.warning("Wallet setup deferred: app backgrounded; not starting Breez node (0xdead10cc guard)", category: .session)
+                SecureLogger.warning("Wallet setup deferred: app not active; not starting Breez node (0xdead10cc guard)", category: .session)
                 #endif
                 suspendedForBackground = true
-                throw WalletBridgeError.core("app backgrounded; Breez node start deferred to foreground")
+                throw WalletBridgeError.core("app not active; Breez node start deferred to foreground")
             }
             #endif
             #if DEBUG
