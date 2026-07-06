@@ -972,12 +972,26 @@ final class MarmotChatModel: ObservableObject {
         return merged
     }
 
+    /// How far BEFORE the echo's creation a server row may be timestamped and
+    /// still count as this send's relay copy (clock skew + second-granularity
+    /// event timestamps). Anything older is a previous message that happens to
+    /// have the same text.
+    private static let optimisticMatchSlack: TimeInterval = 120
+
     private static func serverMessage(
         _ server: MarmotService.MarmotMessage,
         matchesOptimistic optimistic: MarmotService.MarmotMessage
     ) -> Bool {
         guard !optimistic.id.hasPrefix(failedOptimisticIDPrefix) else { return false }
         guard server.isMine, server.content == optimistic.content else { return false }
+        // Only a row created around/after the echo can be THIS send's copy.
+        // Without this, re-sending text identical to an OLDER own message
+        // matched that old row and dropped the still-pending echo on the next
+        // page load — leaving the chat and coming back made the in-flight
+        // message vanish until the real send landed.
+        guard server.createdAt >= optimistic.createdAt.addingTimeInterval(-Self.optimisticMatchSlack) else {
+            return false
+        }
         guard !optimistic.media.isEmpty else { return server.media.isEmpty }
         return optimistic.media.allSatisfy { pending in
             server.media.contains {
