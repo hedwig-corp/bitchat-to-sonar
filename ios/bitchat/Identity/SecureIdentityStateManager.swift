@@ -222,23 +222,51 @@ final class SecureIdentityStateManager: SecureIdentityStateManagerProtocol {
     private func performSave() {
         guard pendingSave else { return }
         pendingSave = false
-        
-        do {
-            let data = try JSONEncoder().encode(cache)
-            let sealedBox = try AES.GCM.seal(data, using: encryptionKey)
-            let saved = keychain.saveIdentityKey(sealedBox.combined!, forKey: cacheKey)
-            if saved {
-                SecureLogger.debug("Identity cache saved to keychain", category: .security)
+        persistCache(synchronously: false)
+    }
+
+    /// Snapshot + encrypt under the state queue (fast, memory-only), then
+    /// write to the Keychain OFF the caller's thread: `SecItem` calls are a
+    /// synchronous XPC round trip to securityd (measured 200-300ms main-thread
+    /// hangs at chat open, when BLE announces churn identity state while the
+    /// UI reads it). Only app-termination (`forceSave`) blocks for the write.
+    private func persistCache(synchronously: Bool) {
+        queue.async(flags: .barrier) { [weak self] in
+            guard let self else { return }
+            let blob: Data
+            do {
+                let data = try JSONEncoder().encode(self.cache)
+                guard let combined = try AES.GCM.seal(data, using: self.encryptionKey).combined else {
+                    SecureLogger.error("Identity cache seal produced no combined box", category: .security)
+                    return
+                }
+                blob = combined
+            } catch {
+                SecureLogger.error(error, context: "Failed to encode identity cache", category: .security)
+                return
             }
-        } catch {
-            SecureLogger.error(error, context: "Failed to save identity cache", category: .security)
+            let write = {
+                let saved = self.keychain.saveIdentityKey(blob, forKey: self.cacheKey)
+                if saved {
+                    SecureLogger.debug("Identity cache saved to keychain", category: .security)
+                }
+            }
+            if synchronously {
+                write()
+            } else {
+                DispatchQueue.global(qos: .utility).async(execute: write)
+            }
         }
     }
-    
-    // Force immediate save (for app termination)
+
+    // Force immediate save (for app termination). Blocks until the state
+    // queue has queued the write and the write itself runs inline, so a
+    // terminating app cannot lose the final state.
     func forceSave() {
         saveTimer?.invalidate()
-        performSave()
+        pendingSave = false
+        persistCache(synchronously: true)
+        queue.sync(flags: .barrier) {}
     }
     
     // MARK: - Social Identity Management

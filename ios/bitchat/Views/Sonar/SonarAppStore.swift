@@ -1450,7 +1450,15 @@ final class SonarAppStore: ObservableObject {
             }
         }
 
-        defaults.set(Array(keys), forKey: Keys.bleKnownChatKeys)
+        // Persist off the main thread: this runs on every `$groups` publish,
+        // and CFPreferences writes are an XPC round trip to cfprefsd that can
+        // stall the runloop (observed as chat-open microhangs). UserDefaults
+        // is thread-safe; last-writer-wins is fine for this mirror.
+        let snapshot = Array(keys)
+        let defaults = self.defaults
+        DispatchQueue.global(qos: .utility).async {
+            defaults.set(snapshot, forKey: Keys.bleKnownChatKeys)
+        }
     }
 
     func submitInviteLink(_ token: String) {
