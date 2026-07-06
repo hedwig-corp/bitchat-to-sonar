@@ -107,6 +107,16 @@ enum SonarDiagnostics {
         if let sibling = siblingLogsRootDirectory() {
             try? FileManager.default.removeItem(at: sibling)
         }
+        // Exported bundles staged for the share sheet live in the temp dir and
+        // can contain verbose peer npubs — drop any that haven't been evicted.
+        let tmp = FileManager.default.temporaryDirectory
+        if let staged = try? FileManager.default.contentsOfDirectory(
+            at: tmp, includingPropertiesForKeys: nil
+        ) {
+            for url in staged where url.lastPathComponent.hasPrefix("sonar-diagnostics") {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
     }
 
     /// Install the Rust core file sink. Idempotent and cheap after the first

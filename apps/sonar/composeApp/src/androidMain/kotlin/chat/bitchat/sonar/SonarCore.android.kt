@@ -586,6 +586,12 @@ actual object SonarCore {
             // verbose level they can contain peer npubs and must not survive a
             // wipe (Account Key Durability / privacy rule).
             File(ctx.filesDir, "sonar-marmot").deleteRecursively()
+            // Exported diagnostics bundles are staged in the FileProvider cache
+            // dir (not under sonar-marmot); drop them too — at verbose level
+            // they can contain peer npubs.
+            File(ctx.cacheDir, "media-share")
+                .listFiles { f -> f.name.startsWith("sonar-diagnostics") }
+                ?.forEach { it.delete() }
             AndroidSecrets.clear()
             prefs().edit().clear().apply()
         }

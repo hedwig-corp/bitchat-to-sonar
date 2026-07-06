@@ -1735,7 +1735,11 @@ impl SonarClient {
                 if let Err(e) = nostr.send_event(&wrapped).await {
                     tracing::debug!(member = %member, %e, "push notify send failed");
                 } else {
-                    tracing::info!(member = %member, "push notification sent to transponder");
+                    // Keep the event at info for the default diagnostics export,
+                    // but the recipient npub only at debug (verbose) — the
+                    // default profile must stay free of peer identifiers.
+                    tracing::info!("push notification sent to transponder");
+                    tracing::debug!(member = %member, "push notification recipient");
                 }
             }
         });
@@ -3676,7 +3680,10 @@ impl SonarClient {
             cache.insert(sender.to_hex(), cached);
             crate::push::save_push_token_cache(self.push_token_cache_path.as_deref(), &cache)?;
         }
-        tracing::info!(sender = %sender, "cached push token from group member");
+        // Event at info for the default export; sender npub only at debug so
+        // the default diagnostics profile carries no peer identifiers.
+        tracing::info!("cached push token from group member");
+        tracing::debug!(sender = %sender, "push token sender");
         Ok(())
     }
 }
