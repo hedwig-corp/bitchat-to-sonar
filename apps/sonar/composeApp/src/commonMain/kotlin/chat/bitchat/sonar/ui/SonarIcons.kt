@@ -29,7 +29,7 @@ import kotlin.math.sqrt
  * and filled sub-shapes are drawn from the same SVG path data.
  */
 enum class SNIconName {
-    Back, Chevron, Lock, Plus, Pin, People, Mesh, Globe, Check, Shield,
+    Back, Chevron, Lock, Plus, Pin, People, Mesh, Globe, Check, Shield, Send,
     ShieldCheck, X, Smile, NavArrow, Dice, Rings, Moon, Trash, Info, Coin, Bolt,
     Pencil, Key, Search, Mic, Play, Pause, Bookmark, BookmarkFill,
     // Call glyphs (design icons.jsx): voice/video buttons + in-call controls.
@@ -38,6 +38,10 @@ enum class SNIconName {
     Sticker, Gif, Activity, Camera, Heart, Leave, Crown,
     // Invite link.
     Link,
+    // Settings/profile glyphs (design icons.jsx): list, bell, copy, share, eye,
+    // eyeOff, importKey, inbox, faceid, drive, data, arrowOut.
+    ListGlyph, Bell, Copy, Share, Eye, EyeOff, ImportKey, Inbox, FaceId,
+    Drive, Data, ArrowOut,
 }
 
 private sealed interface Shape {
@@ -64,6 +68,8 @@ private val ICONS: Map<SNIconName, List<Shape>> = mapOf(
     SNIconName.Mesh to listOf(Shape.C(12f, 12f, 1.7f, fill = true), Shape.P("M8.7 8.7a4.7 4.7 0 0 0 0 6.6M15.3 8.7a4.7 4.7 0 0 1 0 6.6M6.2 6.2a8.2 8.2 0 0 0 0 11.6M17.8 6.2a8.2 8.2 0 0 1 0 11.6")),
     SNIconName.Globe to listOf(Shape.C(12f, 12f, 8.2f), Shape.P("M3.8 12h16.4M12 3.8c-2.7 2.5-4.1 5.2-4.1 8.2s1.4 5.7 4.1 8.2c2.7-2.5 4.1-5.2 4.1-8.2S14.7 6.3 12 3.8z")),
     SNIconName.Check to listOf(Shape.P("M5 12.8l4.3 4.3L19 7.4")),
+    // design icons.jsx `send` — the composer send arrow.
+    SNIconName.Send to listOf(Shape.P("M12 18.5v-13M6.5 11 12 5.5 17.5 11")),
     SNIconName.Shield to listOf(Shape.P("M12 3.4l7 2.7v5.2c0 4.4-2.9 7.4-7 9-4.1-1.6-7-4.6-7-9V6.1z")),
     SNIconName.ShieldCheck to listOf(Shape.P("M12 3.4l7 2.7v5.2c0 4.4-2.9 7.4-7 9-4.1-1.6-7-4.6-7-9V6.1z"), Shape.P("M8.8 12.1l2.3 2.3 4.3-4.6")),
     SNIconName.X to listOf(Shape.P("M6.5 6.5l11 11M17.5 6.5l-11 11")),
@@ -98,6 +104,62 @@ private val ICONS: Map<SNIconName, List<Shape>> = mapOf(
         Shape.P("M10.5 13.5l3-3"),
         Shape.P("M14 10a3.5 3.5 0 0 1 0 5l-2 2a3.5 3.5 0 0 1-5 0 3.5 3.5 0 0 1 0-5l1-1"),
         Shape.P("M10 14a3.5 3.5 0 0 1 0-5l2-2a3.5 3.5 0 0 1 5 0 3.5 3.5 0 0 1 0 5l-1 1"),
+    ),
+    // ── settings/profile glyphs (verbatim from design icons.jsx) ──
+    SNIconName.ListGlyph to listOf(
+        Shape.P("M9 6.5h11M9 12h11M9 17.5h11"),
+        Shape.C(4.6f, 6.5f, 1.2f, fill = true),
+        Shape.C(4.6f, 12f, 1.2f, fill = true),
+        Shape.C(4.6f, 17.5f, 1.2f, fill = true),
+    ),
+    SNIconName.Bell to listOf(
+        Shape.P("M12 4a5.5 5.5 0 0 1 5.5 5.5c0 3 .8 4.6 1.7 5.7H4.8c.9-1.1 1.7-2.7 1.7-5.7A5.5 5.5 0 0 1 12 4z"),
+        Shape.P("M10 18.8a2.1 2.1 0 0 0 4 0"),
+    ),
+    SNIconName.Copy to listOf(
+        Shape.P("M11.1 8.5h5.8a2.6 2.6 0 0 1 2.6 2.6v5.8a2.6 2.6 0 0 1-2.6 2.6h-5.8a2.6 2.6 0 0 1-2.6-2.6v-5.8a2.6 2.6 0 0 1 2.6-2.6z"),
+        Shape.P("M15.5 8.5V6a2 2 0 0 0-2-2h-7a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2.5"),
+    ),
+    SNIconName.Share to listOf(
+        Shape.C(6.5f, 12f, 2.4f),
+        Shape.C(17f, 6f, 2.4f),
+        Shape.C(17f, 18f, 2.4f),
+        Shape.P("M8.6 10.9 14.9 7.1M8.6 13.1l6.3 3.8"),
+    ),
+    SNIconName.Eye to listOf(
+        Shape.P("M2.5 12s3.5-6.5 9.5-6.5S21.5 12 21.5 12s-3.5 6.5-9.5 6.5S2.5 12 2.5 12z"),
+        Shape.C(12f, 12f, 2.8f),
+    ),
+    SNIconName.EyeOff to listOf(
+        Shape.P("M4.5 5 19.5 19"),
+        Shape.P("M9.5 5.7A9 9 0 0 1 12 5.5c6 0 9.5 6.5 9.5 6.5a16 16 0 0 1-2.9 3.6M6.4 7.6A16 16 0 0 0 2.5 12s3.5 6.5 9.5 6.5a8.8 8.8 0 0 0 3.1-.55"),
+        Shape.P("M9.8 10.2a2.8 2.8 0 0 0 3.9 4"),
+    ),
+    SNIconName.ImportKey to listOf(
+        Shape.C(8f, 12f, 3.2f),
+        Shape.P("M11.2 12h9M16.5 12v3M20.2 12v2.4"),
+        Shape.P("M14 5.5 11 8.5M14 5.5l-3-3M11 8.5l-2.4-2.4"),
+    ),
+    SNIconName.Inbox to listOf(
+        Shape.P("M7.5 5.5h9a3 3 0 0 1 3 3v8a3 3 0 0 1-3 3h-9a3 3 0 0 1-3-3v-8a3 3 0 0 1 3-3z"),
+        Shape.P("M4.5 13.5h4l1.5 2.5h4l1.5-2.5h4"),
+    ),
+    SNIconName.FaceId to listOf(
+        Shape.P("M4.5 8V6.5a2 2 0 0 1 2-2H8M16 4.5h1.5a2 2 0 0 1 2 2V8M19.5 16v1.5a2 2 0 0 1-2 2H16M8 19.5H6.5a2 2 0 0 1-2-2V16"),
+        Shape.C(9.2f, 10.4f, 0.9f, fill = true),
+        Shape.C(14.8f, 10.4f, 0.9f, fill = true),
+        Shape.P("M9.6 14.4a3.4 3.4 0 0 0 4.8 0"),
+    ),
+    SNIconName.Drive to listOf(
+        Shape.P("M7 7.5h10a2.5 2.5 0 0 1 2.5 2.5v4.5a2.5 2.5 0 0 1-2.5 2.5H7a2.5 2.5 0 0 1-2.5-2.5V10A2.5 2.5 0 0 1 7 7.5z"),
+        Shape.C(8f, 14f, 0.9f, fill = true),
+        Shape.P("M4.5 11.5h15"),
+    ),
+    SNIconName.Data to listOf(
+        Shape.P("M8 18.5V8.8M8 8.8 5.2 11.6M8 8.8l2.8 2.8M16 5.5v9.7M16 15.2l2.8-2.8M16 15.2l-2.8-2.8"),
+    ),
+    SNIconName.ArrowOut to listOf(
+        Shape.P("M8 16L16.5 7.5M9.5 7h7v7"),
     ),
 )
 
