@@ -2782,11 +2782,17 @@ impl SonarClient {
 
     /// Set the advertised Marmot protocol capability. A Darkmatter-capable build
     /// calls this with [`crate::sonar_descriptor::SONAR_PROTOCOL_DARKMATTER`] when
-    /// the experimental dev toggle is on, then republishes the descriptor so peers
-    /// can negotiate v2 for NEW conversations. Existing conversations are unaffected.
+    /// the experimental dev toggle is on. Existing conversations are unaffected.
+    ///
+    /// This does NOT republish anything: the value only reaches peers on the
+    /// next [`SonarClient::publish_sonar_descriptor`], so a toggle flow must be
+    /// set-then-publish. The value is floored to `SONAR_PROTOCOL_MDK` — every
+    /// build speaks at least MDK, and `negotiate` relies on inputs >= 1.
     pub fn set_advertised_sonar_protocol(&self, protocol: u8) {
-        self.advertised_sonar_protocol
-            .store(protocol, Ordering::Relaxed);
+        self.advertised_sonar_protocol.store(
+            protocol.max(crate::sonar_descriptor::SONAR_PROTOCOL_MDK),
+            Ordering::Relaxed,
+        );
     }
 
     /// Fetch a peer's freshest valid Sonar descriptor from our account relays.
@@ -8918,8 +8924,12 @@ mod tests {
             &keys,
             SONAR_CALL_DESCRIPTOR_D_TAG,
             20,
-            descriptor_content_json(true, vec!["marmot".to_string()])
-                .expect("call descriptor json"),
+            descriptor_content_json(
+                true,
+                vec!["marmot".to_string()],
+                crate::sonar_descriptor::SONAR_PROTOCOL_MDK,
+            )
+            .expect("call descriptor json"),
         );
 
         let descriptor = newest_valid_sonar_descriptor([old_meta, new_call], keys.public_key())
@@ -8965,8 +8975,12 @@ mod tests {
             &keys,
             SONAR_CALL_DESCRIPTOR_D_TAG,
             30,
-            descriptor_content_json(true, vec!["marmot".to_string()])
-                .expect("call descriptor json"),
+            descriptor_content_json(
+                true,
+                vec!["marmot".to_string()],
+                crate::sonar_descriptor::SONAR_PROTOCOL_MDK,
+            )
+            .expect("call descriptor json"),
         );
 
         let descriptor =
