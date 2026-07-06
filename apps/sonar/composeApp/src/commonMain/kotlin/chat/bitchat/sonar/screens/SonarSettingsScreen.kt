@@ -18,9 +18,11 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -33,7 +35,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import chat.bitchat.sonar.Screen
 import chat.bitchat.sonar.SonarAppState
+import chat.bitchat.sonar.SonarClock
+import chat.bitchat.sonar.SonarCore
 import chat.bitchat.sonar.ToastBar
+import kotlinx.coroutines.launch
 import chat.bitchat.sonar.wallet.FiatCurrency
 import chat.bitchat.sonar.wallet.WalletState
 import chat.bitchat.sonar.ui.SNIcon
@@ -67,6 +72,7 @@ fun SonarSettingsScreen(state: SonarAppState) {
     var notif by remember { mutableStateOf(false) }
     var appicon by remember { mutableStateOf(false) }
     var requests by remember { mutableStateOf(false) }
+    var diagnostics by remember { mutableStateOf(false) }
     state.prefsVersion // subscribe so toggles recompose
 
     val balance = (state.walletState as? WalletState.Ready)?.balanceSats ?: 0L
@@ -216,6 +222,10 @@ fun SonarSettingsScreen(state: SonarAppState) {
             SNSectionLabel("About")
             SNSettingsCard {
                 SNSettingsRow(
+                    icon = SNIconName.Info, label = "Diagnostics",
+                    sub = "Relay sync status and shareable debug logs",
+                ) { diagnostics = true }
+                SNSettingsRow(
                     icon = SNIconName.Info, label = "About Sonar",
                     sub = "Open protocols — Bluetooth mesh + Nostr", trail = SNTrail.None,
                 ) {}
@@ -238,6 +248,7 @@ fun SonarSettingsScreen(state: SonarAppState) {
     if (notif) NotifSheet(state) { notif = false }
     if (appicon) AppIconSheet(state) { appicon = false }
     if (requests) RequestsSheet { requests = false }
+    if (diagnostics) DiagnosticsSheet(state) { diagnostics = false }
 
     state.toast?.let { ToastBar(it) { state.toast = null } }
 }
@@ -372,6 +383,76 @@ private fun RequestsSheet(onClose: () -> Unit) {
                 Text("Decline", color = s.text2, fontSize = 15.sp, fontWeight = FontWeight.Bold)
             }
         }
+    }
+}
+
+@Composable
+private fun DiagnosticsSheet(state: SonarAppState, onClose: () -> Unit) {
+    val s = sonar
+    val scope = rememberCoroutineScope()
+    state.prefsVersion
+    var snapshot by remember { mutableStateOf<String?>(null) }
+    var loaded by remember { mutableStateOf(false) }
+    var exporting by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        snapshot = SonarCore.syncStateSnapshotJson()
+        loaded = true
+    }
+    Sheet("Diagnostics", onClose) {
+        // Relay/sync summary parsed from the snapshot JSON (format owned by
+        // the Rust core's SyncStateSnapshot; extraction kept intentionally
+        // tolerant — a missing field just hides that line).
+        val summary = snapshot?.let { json ->
+            val connected = Regex("\"status\": \"Connected\"").findAll(json).count()
+            val total = Regex("\"url\":").findAll(json).count()
+            val watermark = Regex("\"watermark_secs\": (\\d+)").find(json)
+                ?.groupValues?.get(1)?.toLongOrNull() ?: 0L
+            val ago = SonarClock.nowSecs() - watermark
+            val sync = when {
+                watermark == 0L -> "never"
+                ago < 60 -> "just now"
+                ago < 3600 -> "${ago / 60} min ago"
+                ago < 86400 -> "${ago / 3600} h ago"
+                else -> "${ago / 86400} d ago"
+            }
+            "$connected/$total relays connected · Last sync: $sync"
+        } ?: if (loaded) "Relay not connected yet" else "Loading…"
+        Text(summary, color = s.text2, fontSize = 13.5.sp, lineHeight = 18.sp)
+        Spacer(Modifier.height(12.dp))
+        SNSettingsRow(
+            icon = SNIconName.Search, label = "Verbose logs",
+            sub = "Adds debug detail to captured logs. Never includes your private key.",
+            toggle = state.prefBool("diagVerbose"), trail = SNTrail.None, divider = false,
+        ) {
+            state.togglePref("diagVerbose")
+            SonarCore.setDiagnosticsVerbose(state.prefBool("diagVerbose"))
+        }
+        Spacer(Modifier.height(12.dp))
+        Box(
+            Modifier.fillMaxWidth().height(46.dp).clip(RoundedCornerShape(13.dp))
+                .background(if (exporting) s.surface2 else s.accentFill)
+                .clickable(enabled = !exporting) {
+                    exporting = true
+                    scope.launch {
+                        val shared = SonarCore.exportDiagnostics()
+                        exporting = false
+                        if (!shared) state.toast = "Nothing to share yet — no logs captured"
+                    }
+                },
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                if (exporting) "Preparing…" else "Share debug bundle",
+                color = if (exporting) s.text3 else s.onAccent,
+                fontSize = 15.sp,
+                fontWeight = FontWeight.Bold,
+            )
+        }
+        Spacer(Modifier.height(10.dp))
+        Text(
+            "Logs stay on this device until you share them. They contain relay and sync events — no message text and no keys.",
+            color = s.text3, fontSize = 12.5.sp, lineHeight = 17.sp,
+        )
     }
 }
 

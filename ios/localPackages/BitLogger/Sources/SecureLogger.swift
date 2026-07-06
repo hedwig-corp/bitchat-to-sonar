@@ -10,7 +10,7 @@ import Foundation
 #if canImport(os.log)
 import os.log
 #else
-public struct OSLog {
+public struct OSLog: Equatable {
     public let subsystem: String
     public let category: String
 
@@ -234,15 +234,30 @@ private extension SecureLogger {
         guard shouldLog(level) else { return }
         let location = formatLocation(file: file, line: line, function: function)
         let sanitized = "\(location) \(message())".sanitized()
-        
+
         #if DEBUG
         os_log("%{public}@", log: category, type: level.osLogType, sanitized)
+        tee(sanitized, category: category, level: level)
         #else
         // In release builds, only log non-debug messages
         if level != .debug {
             os_log("%{private}@", log: category, type: level.osLogType, sanitized)
         }
+        // The file tee decides debug-line capture itself (verbose toggle), so
+        // exported diagnostics can include debug detail even in release.
+        tee(sanitized, category: category, level: level)
         #endif
+    }
+
+    /// Mirror the line into the bounded diagnostics file sink (async, never
+    /// blocks the caller; inert until `LogFileSink.configure` is called).
+    static func tee(_ sanitized: String, category: OSLog, level: LogLevel) {
+        LogFileSink.shared.write(
+            level: String(describing: level),
+            category: category.categoryName,
+            message: sanitized,
+            isDebug: level == .debug
+        )
     }
     
     /// Log a security event
@@ -258,6 +273,7 @@ private extension SecureLogger {
         // In release, use private logging to prevent sensitive data exposure
         os_log("%{private}@", log: .security, type: level.osLogType, message)
         #endif
+        tee(message, category: .security, level: level)
     }
     
     /// Format location information for logging

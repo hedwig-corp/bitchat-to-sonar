@@ -510,6 +510,20 @@ expect object SonarCore {
      *  background/IO work and never before local chat paint. */
     suspend fun ensureSubscriptions()
 
+    /** JSON snapshot of relay/sync state (relay statuses, sync watermark,
+     *  per-group catch-up floors) for the Diagnostics screen and the exported
+     *  debug bundle. No message content or key material. Null before [start]. */
+    suspend fun syncStateSnapshotJson(): String?
+
+    /** Explicit user opt-in: raise the core diagnostics log sink to debug
+     *  detail (never message content, never key material). */
+    fun setDiagnosticsVerbose(verbose: Boolean)
+
+    /** Zip the on-device diagnostics logs + sync snapshot and hand the file to
+     *  the platform share affordance (share sheet on Android, file manager
+     *  reveal on desktop). Returns false if there was nothing to share. */
+    suspend fun exportDiagnostics(): Boolean
+
     /** Publish our kind-0 profile (NIP-01) so peers see our nickname, not npub. */
     suspend fun publishProfile(name: String, about: String? = null, picture: String? = null)
 

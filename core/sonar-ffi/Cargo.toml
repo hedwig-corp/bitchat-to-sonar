@@ -34,6 +34,12 @@ nostr.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 hex.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+# `env-filter` for the level directives, `std` + `fmt` + `registry` for the
+# reload handle and layered file/console fmt layers.
+tracing-subscriber = { workspace = true, features = ["env-filter", "std", "fmt", "registry"] }
+tracing-appender.workspace = true
 
 # Android-only: the JNI shim in src/android_jni.rs publishes the JavaVM +
 # Application Context to `ndk_context` so the crates that reach Android system
@@ -43,3 +49,12 @@ hex.workspace = true
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
 ndk-context = "0.1.1"
+
+# Apple-only: tee the core `tracing` events to os_log (subsystem chat.bitchat,
+# category "core") so relay/sync diagnostics show up live in Console.app /
+# idevicesyslog during a repro, alongside the exported file bundle.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+tracing-oslog = "0.3"
+
+[dev-dependencies]
+tempfile.workspace = true

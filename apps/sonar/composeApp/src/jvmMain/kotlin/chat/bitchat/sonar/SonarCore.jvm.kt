@@ -54,6 +54,9 @@ actual object SonarCore {
                 val dbPath = File(marmotDir(), "marmot.sqlite").absolutePath
                 val dbKeyHex = loadOrCreateDbKey()
 
+                // Diagnostics file sink must exist before the node spins up so
+                // relay connect/EOSE/watermark events are captured. Non-fatal.
+                installCoreLogging(diagnosticsVerbose())
                 val n = SonarNode.connect(identity, relayUrls, dbPath, dbKeyHex)
                 runCatching { n.publishKeyPackage() }
                 node = n
@@ -350,6 +353,68 @@ actual object SonarCore {
         Unit
     }
 
+    // ── Diagnostics (Settings → Diagnostics) ──
+
+    private fun coreLogDirectory(): File =
+        DesktopEnv.file("sonar-marmot/logs/core").apply { mkdirs() }
+
+    private fun diagnosticsVerbose(): Boolean = loadBlob("pref.diagVerbose") == "1"
+
+    private fun installCoreLogging(verbose: Boolean) {
+        runCatching {
+            SonarNativeLoader.ensureLoaded()
+            uniffi.sonar_ffi.setupLogging(coreLogDirectory().absolutePath, verbose)
+        }.onFailure { sonarLog("SonarDiag", "core log sink unavailable: $it") }
+    }
+
+    actual suspend fun syncStateSnapshotJson(): String? = withContext(Dispatchers.IO) {
+        runCatching { node?.syncStateSnapshotJson() }.getOrNull()
+    }
+
+    actual fun setDiagnosticsVerbose(verbose: Boolean) {
+        // Persist happens via the caller's pref blob; here we swap the core's
+        // level filter (setupLogging is idempotent — later calls only reload).
+        installCoreLogging(verbose)
+    }
+
+    actual suspend fun exportDiagnostics(): Boolean = withContext(Dispatchers.IO) {
+        val snapshot = runCatching { node?.syncStateSnapshotJson() }.getOrNull()
+        val coreLogs = coreLogDirectory()
+            .listFiles { file -> file.name.startsWith("sonar-core") }
+            ?.toList().orEmpty()
+        val logs = coreLogs + SonarFileLog.files()
+        if (logs.isEmpty() && snapshot == null) return@withContext false
+
+        val exportDir = DesktopEnv.file("diagnostics").apply { mkdirs() }
+        val stamp = "${System.currentTimeMillis()}-${java.util.UUID.randomUUID().toString().take(8)}"
+        val zip = File(exportDir, "sonar-diagnostics-$stamp.zip")
+        runCatching {
+            java.util.zip.ZipOutputStream(zip.outputStream().buffered()).use { out ->
+                for (file in logs) {
+                    out.putNextEntry(java.util.zip.ZipEntry(file.name))
+                    file.inputStream().use { it.copyTo(out) }
+                    out.closeEntry()
+                }
+                if (snapshot != null) {
+                    out.putNextEntry(java.util.zip.ZipEntry("snapshot.json"))
+                    out.write(snapshot.toByteArray())
+                    out.closeEntry()
+                }
+            }
+        }.onFailure {
+            zip.delete()
+            return@withContext false
+        }
+
+        // No share sheet on desktop: reveal the zip in the file manager.
+        runCatching {
+            if (java.awt.Desktop.isDesktopSupported()) {
+                java.awt.Desktop.getDesktop().open(exportDir)
+            }
+        }
+        true
+    }
+
     actual fun joinedChannels(): List<String> =
         DesktopEnv.getString("channels", "")?.split(",")?.filter { it.isNotBlank() } ?: emptyList()
 
@@ -520,7 +585,12 @@ actual object SonarCore {
         lock.withLock {
             node = null
             npub = ""; pubkeyHex = ""
+            // marmotDir() covers the DB + diagnostics logs (sonar-marmot/logs);
+            // the exported diagnostics zips live in a sibling dir, so drop them
+            // too — at verbose level they can contain peer npubs and must not
+            // survive a wipe (Account Key Durability / privacy rule).
             marmotDir().deleteRecursively()
+            DesktopEnv.file("diagnostics").deleteRecursively()
             DesktopSecrets.clear("nsec", "dbKeyHex")
             DesktopEnv.clear()
         }
