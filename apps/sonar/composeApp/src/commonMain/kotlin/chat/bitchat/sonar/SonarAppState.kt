@@ -36,6 +36,7 @@ import kotlinx.coroutines.withContext
 
 private const val SONAR_DESCRIPTOR_TTL_SECS = 15 * 60L
 private const val SONAR_DESCRIPTOR_MISS_TTL_SECS = 60L
+private const val PROFILE_MISS_TTL_SECS = 60L
 private const val PROFILE_REFRESH_TTL_SECS = 30 * 60L
 private const val LOCAL_TRANSCRIPT_PAGE_LIMIT = 100
 private const val LOCAL_SUMMARY_PAGE_LIMIT = 20
@@ -260,6 +261,8 @@ class SonarAppState(private val scope: CoroutineScope) {
     private var socialState by mutableStateOf(decodeSonarSocialState(SonarCore.loadBlob(SOCIAL_STATE_BLOB_KEY)))
     private val profileFetches = mutableSetOf<String>()
     private val profileFetchedAt = mutableMapOf<String, Long>()
+    /** Last kind-0 fetch MISS per npub — throttles per-render refetch spam. */
+    private val profileMissedAt = mutableMapOf<String, Long>()
 
     init {
         if (initialChatSnapshotBlob.isNotEmpty()) {
@@ -2123,6 +2126,15 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun unreadForChat(chatId: String): Long =
         directMarmotChatIds(chatId).sumOf { unreadByChat[it] ?: 0L }
 
+    /** Last-message preview + timestamp for a chat-list row (design ConvRow):
+     *  replaces the static "Tap to open" with the real transcript tail, read
+     *  from the in-memory snapshot only (local-first, no DB/relay work). */
+    fun chatRowMeta(chatId: String): Pair<String, Long>? =
+        directMarmotChatIds(chatId)
+            .mapNotNull { chatSnapshotMessagesByChat[it]?.lastOrNull() }
+            .maxByOrNull { it.tsSecs }
+            ?.let { (if (it.media.isNotEmpty()) "Photo" else it.content) to it.tsSecs }
+
     fun setForeground(value: Boolean) {
         val cameToForeground = value && !foreground
         foreground = value
@@ -2360,6 +2372,11 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun ensureProfile(otherNpub: String) {
         val key = canonicalProfileKey(otherNpub)
         if (key.isBlank() || key == canonicalProfileKey(npub)) return
+        // Throttle re-fetches after a miss: chatTitle() calls this on every
+        // list render, so without a TTL a peer with no kind-0 profile (or an
+        // offline relay window) triggers a relay query per recomposition.
+        val missedAt = profileMissedAt[key]
+        if (missedAt != null && SonarClock.nowSecs() - missedAt < PROFILE_MISS_TTL_SECS) return
         val hadCachedProfile = profilesByNpub.containsKey(key) || profilesByNpub.containsKey(otherNpub)
         if (!profileFetches.add(key)) return        // fetch already in flight
         scope.launch {
@@ -2367,9 +2384,11 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (p?.bestName != null) {
                 profilesByNpub = normalizedProfileCache(profilesByNpub + (key to p) - otherNpub)
                 profileFetchedAt[key] = SonarClock.nowSecs()
+                profileMissedAt.remove(key)
                 persistProfileCache()
                 if (isMeshRelevantNpub(key)) recomputeConversations()
             } else {
+                profileMissedAt[key] = SonarClock.nowSecs()
                 if (!hadCachedProfile) profileFetches.remove(key)
             }
         }
