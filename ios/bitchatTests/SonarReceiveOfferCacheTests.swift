@@ -71,9 +71,10 @@ final class SonarReceiveOfferCacheTests: XCTestCase {
         XCTAssertEqual(createCount, 2)
     }
 
-    func testResetDuringInFlightDoesNotReturnStaleOffer() async throws {
+    func testResetDuringInFlightDoesNotReturnStaleOfferToAnyWaiter() async throws {
         let cache = SonarReceiveOfferCache()
         let started = expectation(description: "offer creation started")
+        let coalesced = expectation(description: "second caller coalesced")
         var release: CheckedContinuation<Void, Never>?
 
         let firstTask = Task { @MainActor in
@@ -87,18 +88,38 @@ final class SonarReceiveOfferCacheTests: XCTestCase {
         }
 
         await fulfillment(of: [started], timeout: 1)
+        let secondTask = Task { @MainActor in
+            coalesced.fulfill()
+            return try await cache.offer {
+                XCTFail("Second caller should wait on the first in-flight offer")
+                return "lno1unexpected"
+            }
+        }
+        await fulfillment(of: [coalesced], timeout: 1)
+
         cache.reset()
         release?.resume()
 
-        do {
-            _ = try await firstTask.value
-            XCTFail("Expected reset in-flight offer creation to be cancelled")
-        } catch is CancellationError {
-        }
+        await assertCancelled(firstTask)
+        await assertCancelled(secondTask)
 
         let fresh = try await cache.offer {
             "lno1fresh"
         }
         XCTAssertEqual(fresh, "lno1fresh")
+    }
+
+    private func assertCancelled(
+        _ task: Task<String, Error>,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        do {
+            _ = try await task.value
+            XCTFail("Expected reset in-flight offer creation to be cancelled", file: file, line: line)
+        } catch is CancellationError {
+        } catch {
+            XCTFail("Expected CancellationError, got \(error)", file: file, line: line)
+        }
     }
 }

@@ -159,30 +159,39 @@ extension SonarWalletProviding {
 final class SonarReceiveOfferCache {
     private struct InFlight {
         let id: UUID
+        let generation: UInt64
         let task: Task<String, Error>
     }
 
     private var cachedOffer: String?
     private var inFlight: InFlight?
+    private var resetGeneration: UInt64 = 0
 
     func offer(create: @escaping @MainActor () async throws -> String) async throws -> String {
         if let cachedOffer { return cachedOffer }
-        if let inFlight { return try await inFlight.task.value }
+        if let inFlight { return try await resolve(inFlight) }
 
-        let id = UUID()
         let task = Task { @MainActor in
             try await create()
         }
-        inFlight = InFlight(id: id, task: task)
+        let next = InFlight(id: UUID(), generation: resetGeneration, task: task)
+        inFlight = next
+        return try await resolve(next)
+    }
 
+    private func resolve(_ observed: InFlight) async throws -> String {
         do {
-            let offer = try await task.value
-            guard inFlight?.id == id else { throw CancellationError() }
-            cachedOffer = offer
-            inFlight = nil
+            let offer = try await observed.task.value
+            guard resetGeneration == observed.generation else { throw CancellationError() }
+            if inFlight?.id == observed.id {
+                cachedOffer = offer
+                inFlight = nil
+            } else if cachedOffer != offer {
+                throw CancellationError()
+            }
             return offer
         } catch {
-            if inFlight?.id == id {
+            if inFlight?.id == observed.id {
                 inFlight = nil
             }
             throw error
@@ -190,6 +199,7 @@ final class SonarReceiveOfferCache {
     }
 
     func reset() {
+        resetGeneration &+= 1
         inFlight?.task.cancel()
         inFlight = nil
         cachedOffer = nil
