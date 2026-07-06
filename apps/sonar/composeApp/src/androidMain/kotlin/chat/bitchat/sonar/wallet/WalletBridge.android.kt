@@ -3,6 +3,7 @@ package chat.bitchat.sonar.wallet
 import android.content.Context
 import breez_sdk_liquid.BindingLiquidSdk
 import breez_sdk_liquid.ConnectRequest
+import breez_sdk_liquid.CreateBolt12InvoiceRequest
 import breez_sdk_liquid.EventListener
 import breez_sdk_liquid.LiquidNetwork
 import breez_sdk_liquid.ListPaymentsRequest
@@ -237,6 +238,22 @@ actual object WalletBridge {
                     )
                 )
             }.getOrDefault(emptyList()).mapNotNull(::paymentEventOf)
+        }
+
+    /**
+     * Answer a BOLT12 invoice_request: produce the signed invoice for [offer]
+     * so the payer can pay it. The exact call iOS's `InvoiceRequestTask` makes
+     * in the NSE (`liquidSDK.createBolt12Invoice`); on Android the push service
+     * calls this headlessly and POSTs the result to the NDS reply URL itself,
+     * because the KMP bindings ship no notification plugin.
+     */
+    suspend fun createBolt12Invoice(offer: String, invoiceRequest: String): Result<String> =
+        withContext(Dispatchers.IO) {
+            val node = sdk
+                ?: return@withContext Result.failure(IllegalStateException("wallet not ready"))
+            runCatching {
+                node.createBolt12Invoice(CreateBolt12InvoiceRequest(offer, invoiceRequest)).invoice
+            }
         }
 
     /**
