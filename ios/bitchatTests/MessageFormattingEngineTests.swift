@@ -180,6 +180,45 @@ struct MessageFormattingEngineTests {
         #expect(matches.count == 2)
     }
 
+    @Test func attributedBubbleText_preservesUnicodeURLsAndMentions() {
+        let content = "👋 @日本語 see https://example.com/path?q=é and ping @émile#a1b2"
+        let attributed = SonarMessageTextFormatter.attributedBubbleText(
+            content,
+            baseColor: .primary,
+            linkColor: .blue,
+            mentionFont: .system(size: 16, weight: .semibold)
+        )
+
+        #expect(String(attributed.characters) == content)
+        #expect(attributed.runs.contains { $0.link?.absoluteString.contains("example.com") == true })
+    }
+
+    @Test func attributedBubbleText_canStyleLinksWithoutLinkAttributes() {
+        let content = "Open www.example.org and wave to @alice"
+        let attributed = SonarMessageTextFormatter.attributedBubbleText(
+            content,
+            baseColor: .primary,
+            linkColor: .blue,
+            includeLinkAttributes: false
+        )
+
+        #expect(String(attributed.characters) == content)
+        #expect(!attributed.runs.contains { $0.link != nil })
+    }
+
+    @Test func attributedBubbleText_canDetectBareDomainsWhenRequested() {
+        let content = "Open example.org and wave to @alice"
+        let attributed = SonarMessageTextFormatter.attributedBubbleText(
+            content,
+            baseColor: .primary,
+            linkColor: .blue,
+            detectBareDomains: true
+        )
+
+        #expect(String(attributed.characters) == content)
+        #expect(attributed.runs.contains { $0.link?.absoluteString.contains("example.org") == true })
+    }
+
     // MARK: - String Extension Tests
 
     @Test func splitSuffix_withSuffix() {

@@ -181,39 +181,11 @@ struct SonarMessageBubbleView: View {
     /// Lightweight rich formatting: tappable links and bold @mentions.
     /// Mono is reserved for technical bits elsewhere; chat text is humanist sans.
     private var formattedContent: AttributedString {
-        let content = message.content
-        var result = AttributedString(content)
-        result.foregroundColor = bubbleTextColor
-
-        // Linkify URLs (keep the bubble's foreground color for contrast on fills)
-        if content.contains("://") || content.lowercased().contains("www.") {
-            if let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue) {
-                let nsContent = content as NSString
-                let matches = detector.matches(in: content, options: [], range: NSRange(location: 0, length: nsContent.length))
-                for match in matches {
-                    guard let range = Range(match.range, in: content),
-                          let attrRange = Range(range, in: result),
-                          let url = match.url else { continue }
-                    result[attrRange].link = url
-                    result[attrRange].underlineStyle = .single
-                    result[attrRange].foregroundColor = isSelf ? bubbleTextColor : SonarTheme.accentDeep
-                }
-            }
-        }
-
-        // Bold @mentions; highlight when we are mentioned
-        if content.contains("@") {
-            let nsContent = content as NSString
-            let matches = MessageFormattingEngine.Patterns.mention.matches(
-                in: content, options: [], range: NSRange(location: 0, length: nsContent.length)
-            )
-            for match in matches {
-                guard let range = Range(match.range, in: content),
-                      let attrRange = Range(range, in: result) else { continue }
-                result[attrRange].font = SonarTheme.uiFont(size: 16, weight: .semibold)
-            }
-        }
-
-        return result
+        SonarMessageTextFormatter.attributedBubbleText(
+            message.content,
+            baseColor: bubbleTextColor,
+            linkColor: isSelf ? bubbleTextColor : SonarTheme.accentDeep,
+            mentionFont: SonarTheme.uiFont(size: 16, weight: .semibold)
+        )
     }
 }
