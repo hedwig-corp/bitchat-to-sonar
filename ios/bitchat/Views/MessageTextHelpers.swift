@@ -4,6 +4,119 @@
 //
 
 import Foundation
+import SwiftUI
+
+enum SonarMessageTextFormatter {
+    private static let linkDetector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
+
+    private enum MatchKind {
+        case link(URL?)
+        case mention
+    }
+
+    private struct TextMatch {
+        let range: Range<String.Index>
+        let kind: MatchKind
+        let priority: Int
+    }
+
+    static func attributedBubbleText(
+        _ text: String,
+        baseColor: Color,
+        linkColor: Color? = nil,
+        mentionFont: Font? = nil,
+        includeLinkAttributes: Bool = true
+    ) -> AttributedString {
+        let matches = textMatches(in: text, mentionFont: mentionFont)
+        var result = AttributedString()
+        var cursor = text.startIndex
+
+        for match in matches {
+            guard match.range.lowerBound >= cursor else { continue }
+            append(text[cursor..<match.range.lowerBound], to: &result, color: baseColor)
+            append(text[match.range], to: &result, color: baseColor) { segment in
+                switch match.kind {
+                case .link(let url):
+                    segment.underlineStyle = .single
+                    segment.foregroundColor = linkColor ?? baseColor
+                    if includeLinkAttributes {
+                        segment.link = url
+                    }
+                case .mention:
+                    if let mentionFont {
+                        segment.font = mentionFont
+                    }
+                }
+            }
+            cursor = match.range.upperBound
+        }
+
+        append(text[cursor..<text.endIndex], to: &result, color: baseColor)
+        return result
+    }
+
+    private static func textMatches(in text: String, mentionFont: Font?) -> [TextMatch] {
+        let nsText = text as NSString
+        let fullRange = NSRange(location: 0, length: nsText.length)
+        guard nsText.length > 0 else { return [] }
+
+        var matches: [TextMatch] = []
+        if (text.contains("://") || text.localizedCaseInsensitiveContains("www.")),
+           let detector = linkDetector {
+            for match in detector.matches(in: text, options: [], range: fullRange) {
+                appendMatch(match.range, kind: .link(match.url), priority: 0, in: text, to: &matches)
+            }
+        }
+
+        if mentionFont != nil, text.contains("@") {
+            for match in MessageFormattingEngine.Patterns.mention.matches(in: text, options: [], range: fullRange) {
+                appendMatch(match.range(at: 0), kind: .mention, priority: 1, in: text, to: &matches)
+            }
+        }
+
+        return matches.sorted {
+            if $0.range.lowerBound == $1.range.lowerBound {
+                return $0.priority < $1.priority
+            }
+            return $0.range.lowerBound < $1.range.lowerBound
+        }
+    }
+
+    private static func appendMatch(
+        _ nsRange: NSRange,
+        kind: MatchKind,
+        priority: Int,
+        in text: String,
+        to matches: inout [TextMatch]
+    ) {
+        let nsText = text as NSString
+        guard nsRange.location != NSNotFound,
+              nsRange.length > 0,
+              NSMaxRange(nsRange) <= nsText.length,
+              let range = Range(nsRange, in: text),
+              !matches.contains(where: { rangesOverlap($0.range, range) }) else {
+            return
+        }
+        matches.append(TextMatch(range: range, kind: kind, priority: priority))
+    }
+
+    private static func rangesOverlap(_ lhs: Range<String.Index>, _ rhs: Range<String.Index>) -> Bool {
+        lhs.lowerBound < rhs.upperBound && rhs.lowerBound < lhs.upperBound
+    }
+
+    private static func append(
+        _ text: Substring,
+        to result: inout AttributedString,
+        color: Color,
+        configure: ((inout AttributedString) -> Void)? = nil
+    ) {
+        guard !text.isEmpty else { return }
+        var segment = AttributedString(String(text))
+        segment.foregroundColor = color
+        configure?(&segment)
+        result.append(segment)
+    }
+}
 
 extension String {
     // Detect if there is an extremely long token (no whitespace/newlines) that could break layout

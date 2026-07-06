@@ -531,20 +531,12 @@ struct SNMsgBubble: View {
 
     /// Message text with detected URLs turned into tappable, underlined links.
     private var linkified: AttributedString {
-        var result = AttributedString(m.text)
-        result.foregroundColor = bubbleText
-        let ns = m.text as NSString
-        guard ns.length > 0, let detector = Self.linkDetector else { return result }
-        let matches = detector.matches(in: m.text, options: [], range: NSRange(location: 0, length: ns.length))
-        for match in matches {
-            guard let r = Range(match.range, in: m.text),
-                  let ar = Range(r, in: result) else { continue }
-            // Style only (underline + accent color); the tap is handled by the
-            // bubble's onTapGesture so opening is deterministic.
-            result[ar].underlineStyle = .single
-            if !mine { result[ar].foregroundColor = SonarTheme.accentDeep }
-        }
-        return result
+        SonarMessageTextFormatter.attributedBubbleText(
+            m.text,
+            baseColor: bubbleText,
+            linkColor: mine ? bubbleText : SonarTheme.accentDeep,
+            includeLinkAttributes: false
+        )
     }
 
     /// The first URL in the message, if any (drives the "Open link" action).
