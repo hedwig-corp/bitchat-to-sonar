@@ -215,6 +215,7 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
                     peerName = screen.name,
                     myName = state.nick.ifBlank { "you" },
                     info = verifyInfo,
+                    peerKey = peerNpub,
                     onVerify = { state.markVerified(effectiveChatId) },
                     onDismiss = { showVerify = false }
                 )
@@ -388,16 +389,19 @@ private fun ActionCircle(
     }
 }
 
-/** Inline verify section — shows safety numbers and verify button. */
+/** Inline verify section — the design's verify sheet: heads, copy, safety
+ *  numbers, primary verify button, and a Show/Hide public key ghost. */
 @Composable
 private fun VerifyInline(
     peerName: String,
     myName: String,
     info: chat.bitchat.sonar.SonarVerify,
+    peerKey: String?,
     onVerify: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     val s = sonar
+    var showKey by remember { mutableStateOf(false) }
     Column(
         Modifier.fillMaxWidth().padding(horizontal = 14.dp)
             .clip(RoundedCornerShape(18.dp)).background(s.surface)
@@ -440,16 +444,28 @@ private fun VerifyInline(
                 textAlign = TextAlign.Center
             )
             Spacer(Modifier.height(14.dp))
-            // 3 rows x 4 groups, monospace.
+            // bc-safety: 3 rows x 4 groups, monospace, en-space separated.
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 listOf(0, 4, 8).forEach { row ->
                     Text(
-                        info.safety.subList(row, row + 4).joinToString(" "),
+                        info.safety.subList(row, row + 4).joinToString(" "),
                         color = s.text,
                         style = SonarType.mono(15.0),
                         modifier = Modifier.padding(vertical = 3.dp)
                     )
                 }
+            }
+            // bc-pubkey: revealed by the "Show public key" ghost, like the design.
+            if (showKey && peerKey != null) {
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    peerKey,
+                    color = s.text3,
+                    style = SonarType.mono(11.0),
+                    lineHeight = 17.5.sp,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 18.dp)
+                )
             }
             Spacer(Modifier.height(18.dp))
             if (info.verified) {
@@ -465,6 +481,20 @@ private fun VerifyInline(
                 }
             } else {
                 SNPrimaryButton("They match — mark as verified") { onVerify() }
+            }
+            if (peerKey != null) {
+                Spacer(Modifier.height(6.dp))
+                Box(
+                    Modifier.fillMaxWidth().height(40.dp).clickable { showKey = !showKey },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        if (showKey) "Hide public key" else "Show public key",
+                        color = s.text2,
+                        fontSize = 15.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
             }
         }
         Spacer(Modifier.height(8.dp))

@@ -71,20 +71,22 @@ fun SonarWalletActivityScreen(state: SonarAppState) {
             ) {
                 SNIcon(SNIconName.Coin, 32.dp, s.goldDeep)
                 Spacer(Modifier.height(10.dp))
+                // pay-big: 42/800 amount with a small 15/700 text3 unit.
                 Row(verticalAlignment = Alignment.Bottom) {
                     Text(
                         payFmt(balanceSats),
                         color = s.text,
-                        fontSize = 36.sp,
+                        fontSize = 42.sp,
                         fontWeight = FontWeight.ExtraBold,
+                        letterSpacing = (-0.5).sp,
                     )
-                    Spacer(Modifier.width(6.dp))
+                    Spacer(Modifier.width(7.dp))
                     Text(
                         "sats",
                         color = s.text3,
                         fontSize = 15.sp,
                         fontWeight = FontWeight.Bold,
-                        modifier = Modifier.padding(bottom = 5.dp),
+                        modifier = Modifier.padding(bottom = 7.dp),
                     )
                 }
                 if (fiat != null) {

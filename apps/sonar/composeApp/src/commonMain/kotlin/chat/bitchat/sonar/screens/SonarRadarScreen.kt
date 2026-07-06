@@ -49,7 +49,6 @@ import chat.bitchat.sonar.ui.SNDot
 import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconButton
 import chat.bitchat.sonar.ui.SNIconName
-import chat.bitchat.sonar.ui.SNNavHeader
 import chat.bitchat.sonar.ui.SonarAvatar
 import chat.bitchat.sonar.ui.sonar
 import kotlin.math.PI
@@ -71,6 +70,14 @@ internal fun rssiLabel(rssi: Int): String = when (rssiBars(rssi)) {
     else -> "Far"
 }
 
+/** RSSI → radar ring radius. Design rings sit at r 66/112/158 in a 348 field:
+ *  a strong signal (~-40) lands on the inner ring, a weak one (~-95) near the
+ *  outer ring — the design's `p.r` placement, derived from live signal. */
+internal fun rssiRadius(rssi: Int): Float {
+    val t = ((-40f - rssi) / 55f).coerceIn(0f, 1f)
+    return 66f + t * (150f - 66f)
+}
+
 @Composable
 fun SonarRadarScreen(state: SonarAppState) {
     val s = sonar
@@ -81,60 +88,75 @@ fun SonarRadarScreen(state: SonarAppState) {
     val unify = state.unifyPeers
 
     Column(Modifier.fillMaxSize().background(s.bg)) {
-        // header (back + title + status)
+        // bc-header: back + "Sonar" + status subtitle (NavHeader, hairline=false)
         Row(
-            Modifier.fillMaxWidth().padding(start = 6.dp, end = 16.dp, top = 10.dp, bottom = 6.dp),
+            Modifier.fillMaxWidth().padding(start = 6.dp, end = 12.dp, top = 10.dp, bottom = 8.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            chat.bitchat.sonar.ui.SNIconButton(SNIconName.Back, onClick = { state.back() })
+            SNIconButton(SNIconName.Back, onClick = { state.back() })
             Column {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("Sonar", color = s.text, fontSize = 17.sp, fontWeight = FontWeight.Bold)
-                }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    SNDot(s.green, 6.dp)
+                Text("Sonar", color = s.text, fontSize = 17.sp, fontWeight = FontWeight.Bold)
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 1.dp)) {
+                    SNDot(s.green, 7.dp)
                     Spacer(Modifier.width(5.dp))
                     Text(state.radarDiscoveryStatusLine, color = s.text2, fontSize = 12.sp)
                 }
             }
         }
 
-        // segmented control
+        // sn-seg segmented control: Radar | List
         Row(
-            Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp)
+            Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, top = 6.dp, bottom = 4.dp)
                 .clip(RoundedCornerShape(11.dp)).background(s.surface2).padding(3.dp)
         ) {
-            SegButton("Radar", SNIconName.Rings, !listMode, Modifier.weight(1f)) { listMode = false }
-            SegButton("List", SNIconName.People, listMode, Modifier.weight(1f)) { listMode = true }
+            SegButton("Radar", !listMode, Modifier.weight(1f), icon = {
+                SNIcon(SNIconName.Rings, 15.dp, it, weight = 2f)
+            }) { listMode = false }
+            SegButton("List", listMode, Modifier.weight(1f), icon = {
+                SNXIcon(SNXIconName.ListGlyph, 15.dp, it, weight = 2f)
+            }) { listMode = true }
         }
 
         if (listMode) {
             if (state.meshPeers.isEmpty() && unify.isEmpty()) ListEmpty()
-            else LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(vertical = 8.dp)) {
+            else LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 40.dp)) {
+                if (state.meshPeers.isNotEmpty()) {
+                    item { chat.bitchat.sonar.ui.SNSectionLabel("In range · Bluetooth") }
+                }
                 items(state.meshPeers, key = { it.id }) { p ->
                     val pid = p.id.removePrefix("mesh:")
-                    PeerRow(p, p.sonar, favorite = state.isFavorite(pid), mutual = state.isMutualFavorite(pid)) { card = p }
+                    PeerRow(
+                        p, p.sonar,
+                        favorite = state.isFavorite(pid),
+                        mutual = state.isMutualFavorite(pid),
+                        divider = p !== state.meshPeers.last(),
+                    ) { card = p }
                 }
                 if (unify.isNotEmpty()) {
                     item { chat.bitchat.sonar.ui.SNSectionLabel("Unify users nearby") }
-                    items(unify, key = { it.id }) { p -> UnifyPeerRow(p) { unifyCard = p } }
+                    items(unify, key = { it.id }) { p ->
+                        UnifyPeerRow(p, divider = p !== unify.last()) { unifyCard = p }
+                    }
                 }
             }
         } else {
+            // sn-radarwrap
             Column(Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally) {
                 Spacer(Modifier.weight(1f))
                 RadarField(
                     state.nick.ifBlank { "you" }, state.meshPeers, unify,
                     onMeshTap = { card = it }, onUnifyTap = { unifyCard = it },
                 )
+                // sn-caption
                 Text(
                     if (state.meshPeers.isEmpty() && unify.isEmpty()) "Looking for people around you…" else "Tap someone to chat",
                     color = s.text3, fontSize = 12.5.sp, modifier = Modifier.padding(top = 4.dp)
                 )
-                Row(Modifier.padding(top = 12.dp), horizontalArrangement = Arrangement.spacedBy(18.dp)) {
+                // sn-legend
+                Row(Modifier.padding(top = 12.dp, bottom = 2.dp), horizontalArrangement = Arrangement.spacedBy(18.dp)) {
                     Legend(s.accent, "nearby · Bluetooth")
+                    Legend(s.net, "far · internet")
                     if (unify.isNotEmpty()) Legend(s.goldFill, "Unify · pay only")
-                    else Legend(s.net, "far · internet")
                 }
                 Spacer(Modifier.weight(1f))
             }
@@ -143,18 +165,46 @@ fun SonarRadarScreen(state: SonarAppState) {
 
     card?.let { p ->
         val pid = p.id.removePrefix("mesh:")
-        PeerCard(
-            p,
-            favorite = state.isFavorite(pid),
-            mutual = state.isMutualFavorite(pid),
-            onMessage = { card = null; state.openDm(pid, p.name) },
-            onFavorite = { state.toggleFavorite(pid, p.name) },
-            onSendSats = { card = null; state.openDm(pid, p.name, pay = true) },
-            onClose = { card = null },
-        )
+        // .sn-peercard: avatar · name · hint · Message [· Send sats]
+        PeerCardShell(onClose = { card = null }) {
+            SonarAvatar(p.name, 44.dp, presence = true)
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text(p.name, color = s.text, fontSize = 15.5.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+                Text(
+                    "${rssiLabel(p.rssi)} · over Bluetooth",
+                    color = s.text2, fontSize = 12.sp, maxLines = 1,
+                    modifier = Modifier.padding(top = 1.dp),
+                )
+            }
+            Spacer(Modifier.width(12.dp))
+            SNPill("Message", primary = false, onClick = { card = null; state.openDm(pid, p.name) })
+            // "Send sats" for peers we have a White Noise account for (a rich 0x53
+            // announce ⇒ an npub we can pay). NOT a "Sonar-only" tier: the actual
+            // ⚡PAY rides the chat (PayLine over Bluetooth in range, White Noise out
+            // of range), so paying a met contact later over the internet already
+            // works — this radar pill is just the in-range shortcut.
+            if (p.sonar) {
+                Spacer(Modifier.width(8.dp))
+                SNPill("Send sats", primary = true, onClick = { card = null; state.openDm(pid, p.name, pay = true) })
+            }
+        }
     }
     unifyCard?.let { p ->
-        UnifyPeerCard(p, onClose = { unifyCard = null }, onSend = { unifyCard = null; paySheet = p })
+        PeerCardShell(onClose = { unifyCard = null }) {
+            SonarAvatar(p.name, 44.dp, presence = true, seed = p.id)
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text(p.name, color = s.text, fontSize = 15.5.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+                Text(
+                    "${rssiLabel(p.rssi)} · Unify Wallet",
+                    color = s.text2, fontSize = 12.sp, maxLines = 1,
+                    modifier = Modifier.padding(top = 1.dp),
+                )
+            }
+            Spacer(Modifier.width(12.dp))
+            SNPill("Send sats", primary = true, gold = true, onClick = { unifyCard = null; paySheet = p })
+        }
     }
     paySheet?.let { p ->
         chat.bitchat.sonar.PaySheet(
@@ -168,62 +218,67 @@ fun SonarRadarScreen(state: SonarAppState) {
     }
 }
 
+/** ConvRow with a bc-signal sub line — design list rows: avatar 44 + title
+ *  16.5/650 (+heart extra) + bars-in-sub "hint · detail", hairline inset 72. */
 @Composable
-private fun PeerRow(p: chat.bitchat.sonar.MeshPeer, isSonar: Boolean, favorite: Boolean, mutual: Boolean, onClick: () -> Unit) {
+private fun PeerRow(
+    p: chat.bitchat.sonar.MeshPeer,
+    isSonar: Boolean,
+    favorite: Boolean,
+    mutual: Boolean,
+    divider: Boolean,
+    onClick: () -> Unit,
+) {
     val s = sonar
-    Row(
-        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 10.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        SonarAvatar(p.name, 44.dp, presence = true)
-        Spacer(Modifier.width(12.dp))
-        Column(Modifier.weight(1f)) {
-            Text(p.name, color = s.text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                SNDot(s.accent, 6.dp)
-                Spacer(Modifier.width(5.dp))
-                Text(
-                    (if (isSonar) "Sonar" else "bitchat") +
-                        (if (mutual) " · mutual favorite" else " · ${rssiLabel(p.rssi)}"),
-                    color = s.text3, fontSize = 12.5.sp,
-                )
+    Column {
+        Row(
+            Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 11.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            SonarAvatar(p.name, 44.dp, presence = true)
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(p.name, color = s.text, fontSize = 16.5.sp, fontWeight = FontWeight.SemiBold)
+                    if (favorite) {
+                        Spacer(Modifier.width(5.dp))
+                        SNIcon(SNIconName.Heart, 14.dp, s.goldFill, weight = 2.1f)
+                    }
+                }
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 2.dp)) {
+                    SignalBars((rssiBars(p.rssi) - 1).coerceAtLeast(1), s.green)
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        rssiLabel(p.rssi) + " · " +
+                            (if (mutual) "mutual favorite" else if (isSonar) "Sonar" else "bitchat"),
+                        color = s.text2, fontSize = 13.5.sp,
+                    )
+                }
             }
         }
-        if (favorite) {
-            SNIcon(SNIconName.Heart, 17.dp, s.goldFill, weight = 2f)
-            Spacer(Modifier.width(10.dp))
-        }
-        SignalBars(rssiBars(p.rssi), s.accent)
+        if (divider) Box(Modifier.fillMaxWidth().padding(start = 72.dp).height(1.dp).background(s.hairline))
     }
 }
 
-/** 4 stepped bars, [filled] of them in [color], the rest faint. */
+/** bc-bars: 3 stepped bars (4/7.5/11 × 3), [filled] in [color], rest hairline. */
 @Composable
 private fun SignalBars(filled: Int, color: Color) {
     val s = sonar
     Row(verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(2.dp)) {
-        for (i in 1..4) {
+        listOf(4.dp, 7.5.dp, 11.dp).forEachIndexed { i, h ->
             Box(
-                Modifier.width(3.dp).height((4 + i * 3).dp).clip(RoundedCornerShape(1.dp))
-                    .background(if (i <= filled) color else s.surface2)
+                Modifier.width(3.dp).height(h).clip(RoundedCornerShape(1.5.dp))
+                    .background(if (i < filled) color else s.hairline)
             )
         }
     }
 }
 
 /** The design's `.sn-peercard` — a compact card that floats over the bottom of
- *  the radar when you tap a peer: avatar · name · hint · Message [· Send sats].
- *  Tapping outside dismisses it; the radar stays visible (no scrim). */
+ *  the radar when you tap a peer. Tapping outside dismisses it; the radar stays
+ *  visible (no scrim). */
 @Composable
-private fun PeerCard(
-    p: chat.bitchat.sonar.MeshPeer,
-    favorite: Boolean,
-    mutual: Boolean,
-    onMessage: () -> Unit,
-    onFavorite: () -> Unit,
-    onSendSats: () -> Unit,
-    onClose: () -> Unit,
-) {
+private fun PeerCardShell(onClose: () -> Unit, content: @Composable androidx.compose.foundation.layout.RowScope.() -> Unit) {
     val s = sonar
     Box(
         Modifier.fillMaxSize().clickable(
@@ -244,117 +299,67 @@ private fun PeerCard(
                 )
                 .padding(12.dp),
             verticalAlignment = Alignment.CenterVertically,
-        ) {
-            SonarAvatar(p.name, 44.dp, presence = true)
-            Spacer(Modifier.width(12.dp))
-            Column(Modifier.weight(1f)) {
-                Text(p.name, color = s.text, fontSize = 15.5.sp, fontWeight = FontWeight.Bold, maxLines = 1)
-                Text(
-                    if (mutual) "Mutual favorite · over Bluetooth" else "${rssiLabel(p.rssi)} · over Bluetooth",
-                    color = s.text2, fontSize = 12.sp, maxLines = 1,
-                    modifier = Modifier.padding(top = 1.dp),
-                )
-            }
-            Spacer(Modifier.width(12.dp))
-            SNIconButton(
-                SNIconName.Heart,
-                size = 18.dp,
-                tint = if (favorite) s.goldFill else s.text2,
-                onClick = onFavorite,
-            )
-            Spacer(Modifier.width(8.dp))
-            SNPill("Message", primary = false, onClick = onMessage)
-            // "Send sats" for peers we have a White Noise account for (a rich 0x53
-            // announce ⇒ an npub we can pay). NOT a "Sonar-only" tier: the actual
-            // ⚡PAY rides the chat (PayLine over Bluetooth in range, White Noise out
-            // of range), so paying a met contact later over the internet already
-            // works — this radar pill is just the in-range shortcut.
-            if (p.sonar) {
-                Spacer(Modifier.width(8.dp))
-                SNPill("Send sats", primary = true, onClick = onSendSats)
-            }
-        }
+            content = content,
+        )
     }
 }
 
 /** Pill button matching the design `.pf-smallbtn` (and iOS `SNSmallButton`). */
 @Composable
-private fun SNPill(label: String, primary: Boolean, onClick: () -> Unit) {
+private fun SNPill(label: String, primary: Boolean, gold: Boolean = false, onClick: () -> Unit) {
     val s = sonar
+    val bg = when {
+        primary && gold -> s.goldFill
+        primary -> s.accentFill
+        else -> s.surface2
+    }
+    val fg = when {
+        primary && gold -> s.onGold
+        primary -> s.onAccent
+        else -> s.text
+    }
     Box(
         Modifier.clip(RoundedCornerShape(999.dp))
-            .background(if (primary) s.accentFill else s.surface2)
+            .background(bg)
             .clickable(onClick = onClick)
             .padding(horizontal = 14.dp, vertical = 11.dp),
         contentAlignment = Alignment.Center,
     ) {
-        Text(
-            label, color = if (primary) s.onAccent else s.text,
-            fontSize = 14.sp, fontWeight = FontWeight.Bold,
-        )
+        Text(label, color = fg, fontSize = 14.sp, fontWeight = FontWeight.Bold)
     }
 }
 
 @Composable
-private fun UnifyPeerRow(p: chat.bitchat.sonar.unify.UnifyPeer, onClick: () -> Unit) {
+private fun UnifyPeerRow(p: chat.bitchat.sonar.unify.UnifyPeer, divider: Boolean, onClick: () -> Unit) {
     val s = sonar
-    Row(
-        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 10.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        SonarAvatar(p.name, 44.dp, presence = true, seed = p.id)
-        Spacer(Modifier.width(12.dp))
-        Column(Modifier.weight(1f)) {
-            Text(p.name, color = s.text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                SNDot(s.goldFill, 6.dp)
-                Spacer(Modifier.width(5.dp))
-                Text("Unify · pay only", color = s.text3, fontSize = 12.5.sp)
+    Column {
+        Row(
+            Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 11.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            SonarAvatar(p.name, 44.dp, presence = true, seed = p.id)
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text(p.name, color = s.text, fontSize = 16.5.sp, fontWeight = FontWeight.SemiBold)
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 2.dp)) {
+                    SignalBars((rssiBars(p.rssi) - 1).coerceAtLeast(1), s.goldFill)
+                    Spacer(Modifier.width(6.dp))
+                    Text("${rssiLabel(p.rssi)} · Unify, pay only", color = s.text2, fontSize = 13.5.sp)
+                }
             }
         }
-        SignalBars(rssiBars(p.rssi), s.goldFill)
+        if (divider) Box(Modifier.fillMaxWidth().padding(start = 72.dp).height(1.dp).background(s.hairline))
     }
 }
 
 @Composable
-private fun UnifyPeerCard(
-    p: chat.bitchat.sonar.unify.UnifyPeer,
-    onClose: () -> Unit,
-    onSend: () -> Unit,
+private fun SegButton(
+    label: String,
+    selected: Boolean,
+    modifier: Modifier,
+    icon: @Composable (Color) -> Unit,
+    onClick: () -> Unit,
 ) {
-    val s = sonar
-    Box(
-        Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
-        contentAlignment = Alignment.BottomCenter
-    ) {
-        androidx.compose.material3.Surface(color = s.surface, shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)) {
-            Column(Modifier.fillMaxWidth().padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                SonarAvatar(p.name, 64.dp, presence = true, seed = p.id)
-                Spacer(Modifier.height(10.dp))
-                Text(p.name, color = s.text, fontSize = 19.sp, fontWeight = FontWeight.Bold)
-                Spacer(Modifier.height(4.dp))
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    SNDot(s.goldFill, 7.dp)
-                    Spacer(Modifier.width(7.dp))
-                    Text("Unify Wallet · ${rssiLabel(p.rssi)}", color = s.text2, fontSize = 13.sp)
-                }
-                Spacer(Modifier.height(18.dp))
-                Box(
-                    Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(s.goldFill)
-                        .clickable(onClick = onSend).padding(vertical = 13.dp),
-                    contentAlignment = Alignment.Center
-                ) { Text("Send sats", color = s.onGold, fontSize = 15.sp, fontWeight = FontWeight.Bold) }
-                Spacer(Modifier.height(8.dp))
-                Box(Modifier.fillMaxWidth().height(44.dp).clickable(onClick = onClose), contentAlignment = Alignment.Center) {
-                    Text("Close", color = s.text2, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun SegButton(label: String, icon: SNIconName, selected: Boolean, modifier: Modifier, onClick: () -> Unit) {
     val s = sonar
     Row(
         modifier.clip(RoundedCornerShape(8.5.dp))
@@ -363,7 +368,7 @@ private fun SegButton(label: String, icon: SNIconName, selected: Boolean, modifi
         horizontalArrangement = Arrangement.Center,
         verticalAlignment = Alignment.CenterVertically
     ) {
-        SNIcon(icon, 15.dp, if (selected) s.text else s.text2, weight = 2f)
+        icon(if (selected) s.text else s.text2)
         Spacer(Modifier.width(6.dp))
         Text(label, color = if (selected) s.text else s.text2, fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold)
     }
@@ -457,10 +462,11 @@ private fun RadarField(
                 )
             }
         }
-        // mesh peer nodes, placed on the inner ring by a deterministic angle
-        peers.forEachIndexed { i, p ->
+        // mesh peer nodes: angle deterministic per peer, radius from live RSSI
+        // (strong signal → inner ring, weak → outer ring, like the design's p.r).
+        peers.forEach { p ->
             val ang = (chat.bitchat.sonar.ui.snHash(p.id) % 360).toDouble() * PI / 180.0
-            val radius = 84f + (i % 2) * 34f
+            val radius = rssiRadius(p.rssi)
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 modifier = Modifier.align(Alignment.Center).offset(
@@ -469,10 +475,10 @@ private fun RadarField(
                     interactionSource = remember { MutableInteractionSource() }, indication = null,
                 ) { onMeshTap(p) }
             ) {
-                SonarAvatar(p.name, 40.dp, presence = true)
-                Spacer(Modifier.height(3.dp))
-                Box(Modifier.clip(RoundedCornerShape(8.dp)).background(s.bg).padding(horizontal = 6.dp, vertical = 1.dp)) {
-                    Text(p.name, color = s.text2, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+                SonarAvatar(p.name, 44.dp, presence = true)
+                Spacer(Modifier.height(4.dp))
+                Box(Modifier.clip(RoundedCornerShape(8.dp)).background(s.bg).padding(horizontal = 7.dp, vertical = 1.dp)) {
+                    Text(p.name, color = s.text2, fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
                 }
             }
         }
@@ -487,9 +493,9 @@ private fun RadarField(
                     .clickable { onUnifyTap(p) }
             ) {
                 SonarAvatar(p.name, 36.dp, presence = true, seed = p.id)
-                Spacer(Modifier.height(3.dp))
-                Box(Modifier.clip(RoundedCornerShape(8.dp)).background(s.goldSoft).padding(horizontal = 6.dp, vertical = 1.dp)) {
-                    Text(p.name, color = s.goldDeep, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+                Spacer(Modifier.height(4.dp))
+                Box(Modifier.clip(RoundedCornerShape(8.dp)).background(s.goldSoft).padding(horizontal = 7.dp, vertical = 1.dp)) {
+                    Text(p.name, color = s.goldDeep, fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
                 }
             }
         }
