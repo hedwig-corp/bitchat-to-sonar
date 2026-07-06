@@ -1845,8 +1845,10 @@ private fun MediaBubble(
                 modifier = Modifier.padding(start = 12.dp, bottom = 3.dp)
             )
         }
-        if (m.media.size > 1) {
-            // Album: render a swipeable stacked-card deck (xChat-style).
+        if (m.media.size > 1 && m.media.all { it.isImage }) {
+            // Photo album: render a swipeable stacked-card deck (xChat-style). A
+            // mixed image+audio/file message keeps the single-first rendering
+            // below (so audio still gets its player).
             MediaDeck(
                 media = m.media,
                 state = state,

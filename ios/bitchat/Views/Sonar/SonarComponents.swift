@@ -946,8 +946,10 @@ struct SNMediaBubble: View {
     @State private var loadAttempt = 0
 
     private var item: SNMediaItem? { m.media.first }
-    /// Album = more than one attachment ⇒ render a swipeable card deck.
-    private var isDeck: Bool { m.media.count > 1 }
+    /// Album = more than one attachment, all images ⇒ render a swipeable card
+    /// deck. A mixed image+audio/file message keeps the single-first rendering
+    /// (so audio still gets its player), matching pre-album behavior.
+    private var isDeck: Bool { m.media.count > 1 && m.media.allSatisfy { $0.isImage } }
     private var loadKey: String {
         guard let item else { return "" }
         return [item.url, item.groupId, item.localPath ?? "", String(loadAttempt)].joined(separator: "|")
@@ -1216,7 +1218,7 @@ private struct SNMediaDeck: View {
         let current = min(max(index, 0), count - 1)
         VStack(alignment: .leading, spacing: 8) {
             ZStack(alignment: .topLeading) {
-                ForEach(peekDepths(count: count, current: current), id: \.self) { depth in
+                ForEach(Array(peekDepths(count: count, current: current).reversed()), id: \.self) { depth in
                     RoundedRectangle(cornerRadius: 18)
                         .fill(SonarTheme.surface2)
                         .frame(width: maxBubbleWidth * 0.72, height: 220)
