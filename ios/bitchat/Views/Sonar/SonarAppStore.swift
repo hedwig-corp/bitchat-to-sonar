@@ -1978,13 +1978,45 @@ final class SonarAppStore: ObservableObject {
         return false
     }
 
+    /// Memoization for `nostrPubkeyData`: the same handful of npub/hex strings
+    /// get decoded over and over (per chat-list row, per BLE snapshot refresh,
+    /// per profile scan in `sonarPeerKey`). A device Time Profiler trace showed
+    /// repeated `Bech32.decode` from these paths as the single largest main
+    /// thread cost (~35% of all main-thread CPU), arriving in >100ms bursts
+    /// that starved the keyboard while typing. Lock-protected because the BLE
+    /// profile provider can resolve keys off the main actor; bounded so a
+    /// hostile flood of unique strings cannot grow it unbounded.
+    private static let pubkeyDataCacheLock = NSLock()
+    private static var pubkeyDataCache: [String: Data?] = [:]
+    private static let pubkeyDataCacheCap = 4096
+
     /// Canonical 32-byte Nostr pubkey from a bech32 `npub1…` OR a 64-char hex string.
     private static func nostrPubkeyData(_ s: String) -> Data? {
-        if s.hasPrefix("npub1") {
-            guard let d = try? Bech32.decode(s), d.hrp == "npub", d.data.count == 32 else { return nil }
-            return d.data
+        pubkeyDataCacheLock.lock()
+        if let cached = pubkeyDataCache[s] {
+            pubkeyDataCacheLock.unlock()
+            return cached
         }
-        return Data(hexString: s).flatMap { $0.count == 32 ? $0 : nil }
+        pubkeyDataCacheLock.unlock()
+
+        let decoded: Data?
+        if s.hasPrefix("npub1") {
+            if let d = try? Bech32.decode(s), d.hrp == "npub", d.data.count == 32 {
+                decoded = d.data
+            } else {
+                decoded = nil
+            }
+        } else {
+            decoded = Data(hexString: s).flatMap { $0.count == 32 ? $0 : nil }
+        }
+
+        pubkeyDataCacheLock.lock()
+        if pubkeyDataCache.count >= pubkeyDataCacheCap {
+            pubkeyDataCache.removeAll(keepingCapacity: true)
+        }
+        pubkeyDataCache[s] = decoded
+        pubkeyDataCacheLock.unlock()
+        return decoded
     }
 
     private static func sha256Hex(_ value: String) -> String {
