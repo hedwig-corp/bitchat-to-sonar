@@ -1001,9 +1001,30 @@ impl SonarClient {
     }
 
     /// Publish our kind-30443 KeyPackage so others can start groups with us.
+    /// Waits for the relay OK acks — callers that need durability (a peer is
+    /// about to fetch the KeyPackage) use this.
     pub async fn publish_key_package(&self) -> Result<()> {
         let event = self.engine.key_package_event(self.relays.clone())?;
         self.nostr.send_event(&event).await?;
+        Ok(())
+    }
+
+    /// Like [`Self::publish_key_package`], but the relay send is spawned, not
+    /// awaited: each `send_event` waits up to the per-relay OK timeout, and on
+    /// cold start that wait sat on the host's serialized engine queue ahead of
+    /// the first message drain (measured ~50s of `t3→t3a` on device). The
+    /// KeyPackage is a replaceable event republished on every relay connect,
+    /// so a lost send self-heals on the next connect; failures are logged,
+    /// not returned. Event creation (MLS key material persistence) still
+    /// happens synchronously before this returns.
+    pub async fn publish_key_package_background(&self) -> Result<()> {
+        let event = self.engine.key_package_event(self.relays.clone())?;
+        let nostr = self.nostr.clone();
+        tokio::spawn(async move {
+            if let Err(err) = nostr.send_event(&event).await {
+                tracing::warn!(%err, "background KeyPackage publish failed");
+            }
+        });
         Ok(())
     }
 
@@ -1100,6 +1121,34 @@ impl SonarClient {
         }
         self.nostr.set_metadata(&metadata).await?;
         Ok(())
+    }
+
+    /// Like [`Self::publish_profile`], but the relay send is spawned, not
+    /// awaited — see [`Self::publish_key_package_background`] for why. Kind-0
+    /// is a replaceable event republished on every relay connect and on
+    /// rename, so a lost send self-heals; failures are logged, not returned.
+    pub async fn publish_profile_background(
+        &self,
+        name: &str,
+        about: Option<&str>,
+        picture: Option<&str>,
+    ) {
+        let mut metadata = Metadata::new().name(name).display_name(name);
+        if let Some(about) = about.filter(|s| !s.is_empty()) {
+            metadata = metadata.about(about);
+        }
+        if let Some(url) = picture
+            .filter(|s| !s.is_empty())
+            .and_then(|p| Url::parse(p).ok())
+        {
+            metadata = metadata.picture(url);
+        }
+        let nostr = self.nostr.clone();
+        tokio::spawn(async move {
+            if let Err(err) = nostr.set_metadata(&metadata).await {
+                tracing::warn!(%err, "background profile publish failed");
+            }
+        });
     }
 
     /// Fetch a peer's kind-0 profile from the relays. Returns `None` if they have

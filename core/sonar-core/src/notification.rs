@@ -43,7 +43,23 @@ pub fn classify_content(content: &str) -> NotificationKind {
     NotificationKind::Message
 }
 
-pub fn payment_amount_sats(content: &str) -> Option<u64> {
+/// A parsed `⚡PAY|1|<id>|<sats>` receipt line (spec: docs/SONAR-PAYMENTS.md).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PayReceiptLine {
+    pub payment_id: String,
+    pub amount_sats: u64,
+}
+
+/// A parsed `⚡PAYDONE|1|<id>` / `⚡PAYDONE|2|<id>[|<preimage_hex>]` line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PayDoneLine {
+    pub payment_id: String,
+    pub preimage_hex: Option<String>,
+}
+
+/// Parse a `⚡PAY` receipt line. Version locked to 1, no trailing fields;
+/// anything else is not a pay line (renders as plain text on old clients).
+pub fn parse_pay_receipt_line(content: &str) -> Option<PayReceiptLine> {
     let mut parts = content.split('|');
     if parts.next()? != "⚡PAY" {
         return None;
@@ -59,34 +75,52 @@ pub fn payment_amount_sats(content: &str) -> Option<u64> {
     if sats == 0 || parts.next().is_some() {
         return None;
     }
-    Some(sats)
+    Some(PayReceiptLine {
+        payment_id: id.to_string(),
+        amount_sats: sats,
+    })
+}
+
+/// Parse a `⚡PAYDONE` settlement line. Accepts v1 (no preimage) from old
+/// peers and v2 with an optional 64-hex preimage.
+pub fn parse_pay_done_line(content: &str) -> Option<PayDoneLine> {
+    let mut parts = content.split('|');
+    if parts.next()? != "⚡PAYDONE" {
+        return None;
+    }
+    let version = parts.next()?;
+    let id = match parts.next() {
+        Some(id) if valid_payment_id(id) => id,
+        _ => return None,
+    };
+    let preimage_hex = match version {
+        "1" => {
+            if parts.next().is_some() {
+                return None;
+            }
+            None
+        }
+        "2" => match parts.next() {
+            None => None,
+            Some(preimage) if valid_preimage(preimage) && parts.next().is_none() => {
+                Some(preimage.to_string())
+            }
+            Some(_) => return None,
+        },
+        _ => return None,
+    };
+    Some(PayDoneLine {
+        payment_id: id.to_string(),
+        preimage_hex,
+    })
+}
+
+pub fn payment_amount_sats(content: &str) -> Option<u64> {
+    parse_pay_receipt_line(content).map(|line| line.amount_sats)
 }
 
 fn is_payment_control_line(content: &str) -> bool {
-    payment_amount_sats(content).is_some() || is_payment_done_line(content)
-}
-
-fn is_payment_done_line(content: &str) -> bool {
-    let mut parts = content.split('|');
-    if parts.next() != Some("⚡PAYDONE") {
-        return false;
-    }
-    let version = match parts.next() {
-        Some(version) => version,
-        None => return false,
-    };
-    match parts.next() {
-        Some(id) if valid_payment_id(id) => {}
-        _ => return false,
-    }
-    match version {
-        "1" => parts.next().is_none(),
-        "2" => match parts.next() {
-            None => true,
-            Some(preimage) => valid_preimage(preimage) && parts.next().is_none(),
-        },
-        _ => false,
-    }
+    parse_pay_receipt_line(content).is_some() || parse_pay_done_line(content).is_some()
 }
 
 pub fn render_notification(input: NotificationRenderInput) -> Option<NotificationEnvelope> {
