@@ -22,7 +22,7 @@ so the identity + Marmot groups persist — and diffs the marker timestamps.
 | `t1_local_paint` | `MarmotChatModel.performConnect` | local groups hydrated from the encrypted DB (first paint, no relays) |
 | `t2_relay_connect_begin` | `MarmotChatModel.connectRelaysIfNeeded` | relay attach begins |
 | `t3_relay_connected` | `MarmotChatModel.connectRelaysIfNeeded` | relays quorum-connected (`SonarNode.connect` returned) |
-| `t3a_published` | `MarmotChatModel.connectRelaysIfNeeded` | KeyPackage + profile published (splits publish cost out) |
+| `t3a_published` | `MarmotChatModel.connectRelaysIfNeeded` | KeyPackage + profile publish ENQUEUED: events are created/persisted and the relay sends run in the background inside the core (`publish_*_background`). Before 2026-07, this marker measured the blocking relay OK waits (~18-57 s on device); `startPolling()` now starts BEFORE the publishes, so t3a no longer gates the drain loop |
 | `t3b_first_wake` | `MarmotChatModel.startPolling` | first `waitForMarmotEvent` returned (splits wait vs drain) |
 | `t4_first_drain` | `MarmotChatModel.startPolling` | first relay event burst applied to local storage (initial sync produced data) |
 
@@ -195,13 +195,12 @@ post-connect relay path after the PR.
 
 ## Where to speed up (highest impact first)
 
-1. **Don't block sync on the publishes.** Move `publishKeyPackage()` +
-   `publishProfile()` off the `connectRelaysIfNeeded` critical path into a
-   detached background task so `startPolling()` runs immediately. The codebase
-   already uses this "publish in the background" pattern elsewhere
-   (`client.rs:2706`). After the issue #122 relay fixes, `t3→t3a` is still the
-   dominant remaining device cost at ~18.3 s median, so this remains the next
-   highest-impact target.
+1. ~~**Don't block sync on the publishes.**~~ **DONE (2026-07):**
+   `connectRelaysIfNeeded` now calls `startPolling()` right after `t3`, and the
+   KeyPackage/profile publishes use the core's `publish_key_package_background`
+   / `publish_profile_background` (event created synchronously, relay send
+   spawned). The drain loop no longer waits on relay OK acks; `t3→t3a` measures
+   event creation only.
 2. **Bound `send_event` publish latency.** Cap the per-publish timeout / return
    after the first relay OK so one slow/unreachable relay can't stall ~28 s.
    Same path backs message sends, so this also speeds up sending.

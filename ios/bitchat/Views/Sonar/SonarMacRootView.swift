@@ -760,28 +760,12 @@ private struct MacConversationPane: View {
                 )
             }
         } else {
-            let msgs = store.dmMsgs(id)
-            if msgs.isEmpty {
-                SNEmptyState(
-                    icon: .lock,
-                    iconSize: 24,
-                    title: "Say hi to \(peer.name)",
-                    desc: isMultiMemberMarmot
-                        ? "Messages here are end-to-end encrypted. Only group members can read them."
-                        : "Messages here are end-to-end encrypted. Only the two of you can read them."
-                )
-            } else {
-                SNMsgList(
-                    msgs: msgs,
-                    showAuthors: isMultiMemberMarmot,
-                    peerName: peer.name,
-                    money: { store.money($0) },
-                    fiatText: { store.moneySatsLine($0) },
-                    loadMedia: { await store.mediaData($0) },
-                    loadSticker: { await store.stickerImageData(for: $0) },
-                    onTapPack: { previewPackCoordinate = $0 }
-                )
-            }
+            MacDMTranscript(
+                convo: store.conversationViewState(id),
+                peerName: peer.name,
+                isMultiMemberMarmot: isMultiMemberMarmot,
+                onTapPack: { previewPackCoordinate = $0 }
+            )
         }
     }
 
@@ -3411,6 +3395,54 @@ private struct MacPrimaryRailButton: View {
         }
         .buttonStyle(SNScaleStyle(scale: 0.98))
         .padding(.top, 4)
+    }
+}
+
+/// DM transcript pane rendering the precomputed per-conversation state (see
+/// ConversationViewState): observes the state object so new messages repaint
+/// this pane without the parent re-running `dmMsgs` per render.
+private struct MacDMTranscript: View {
+    @EnvironmentObject private var store: SonarAppStore
+    @ObservedObject private var convo: ConversationViewState
+    let peerName: String
+    let isMultiMemberMarmot: Bool
+    let onTapPack: (String) -> Void
+
+    init(
+        convo: ConversationViewState,
+        peerName: String,
+        isMultiMemberMarmot: Bool,
+        onTapPack: @escaping (String) -> Void
+    ) {
+        self._convo = ObservedObject(wrappedValue: convo)
+        self.peerName = peerName
+        self.isMultiMemberMarmot = isMultiMemberMarmot
+        self.onTapPack = onTapPack
+    }
+
+    var body: some View {
+        let msgs = convo.messages
+        if msgs.isEmpty {
+            SNEmptyState(
+                icon: .lock,
+                iconSize: 24,
+                title: "Say hi to \(peerName)",
+                desc: isMultiMemberMarmot
+                    ? "Messages here are end-to-end encrypted. Only group members can read them."
+                    : "Messages here are end-to-end encrypted. Only the two of you can read them."
+            )
+        } else {
+            SNMsgList(
+                msgs: msgs,
+                showAuthors: isMultiMemberMarmot,
+                peerName: peerName,
+                money: { store.money($0) },
+                fiatText: { store.moneySatsLine($0) },
+                loadMedia: { await store.mediaData($0) },
+                loadSticker: { await store.stickerImageData(for: $0) },
+                onTapPack: onTapPack
+            )
+        }
     }
 }
 #endif

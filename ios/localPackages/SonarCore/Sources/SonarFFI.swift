@@ -352,7 +352,7 @@ private func uniffiTraitInterfaceCallWithError<T, E>(
         callStatus.pointee.errorBuf = FfiConverterString.lower(String(describing: error))
     }
 }
-// Initial value and increment amount for handles.
+// Initial value and increment amount for handles. 
 // These ensure that SWIFT handles always have the lowest bit set
 fileprivate let UNIFFI_HANDLEMAP_INITIAL: UInt64 = 1
 fileprivate let UNIFFI_HANDLEMAP_DELTA: UInt64 = 2
@@ -561,13 +561,13 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
  * (sender, fragmentID); `add` returns the full bytes once the last piece lands.
  */
 public protocol MeshReassemblerProtocol: AnyObject, Sendable {
-
+    
     /**
      * Feed one 0x20 fragment payload (with the carrying packet's sender id hex).
      * Returns the reassembled original bytes when complete, else nil.
      */
     func add(senderIdHex: String, fragmentPayload: Data) throws  -> Data?
-
+    
 }
 /**
  * Reassembles incoming 0x20 fragment payloads into the original bytes. Keyed by
@@ -630,9 +630,9 @@ public convenience init() {
         try! rustCall { uniffi_sonar_ffi_fn_free_meshreassembler(handle, $0) }
     }
 
+    
 
-
-
+    
     /**
      * Feed one 0x20 fragment payload (with the carrying packet's sender id hex).
      * Returns the reassembled original bytes when complete, else nil.
@@ -646,9 +646,9 @@ open func add(senderIdHex: String, fragmentPayload: Data)throws  -> Data?  {
     )
 })
 }
+    
 
-
-
+    
 }
 
 
@@ -701,22 +701,22 @@ public func FfiConverterTypeMeshReassembler_lower(_ value: MeshReassembler) -> U
  * A Nostr identity (secp256k1 keypair). Wraps `sonar_core::identity::Identity`.
  */
 public protocol SonarIdentityProtocol: AnyObject, Sendable {
-
+    
     /**
      * `npub1...` form of the public key.
      */
     func npub()  -> String
-
+    
     /**
      * `nsec1...` secret key export (user-driven backup only).
      */
     func nsec()  -> String
-
+    
     /**
      * 64-char lowercase hex public key.
      */
     func pubkeyHex()  -> String
-
+    
 }
 /**
  * A Nostr identity (secp256k1 keypair). Wraps `sonar_core::identity::Identity`.
@@ -771,7 +771,7 @@ open class SonarIdentity: SonarIdentityProtocol, @unchecked Sendable {
         try! rustCall { uniffi_sonar_ffi_fn_free_sonaridentity(handle, $0) }
     }
 
-
+    
     /**
      * Generate a brand-new identity (default onboarding path).
      */
@@ -781,7 +781,7 @@ public static func generate() -> SonarIdentity  {
     )
 })
 }
-
+    
     /**
      * Import from an `nsec1...` bech32 string or 64-char hex secret key.
      */
@@ -792,9 +792,9 @@ public static func `import`(nsec: String)throws  -> SonarIdentity  {
     )
 })
 }
+    
 
-
-
+    
     /**
      * `npub1...` form of the public key.
      */
@@ -805,7 +805,7 @@ open func npub() -> String  {
     )
 })
 }
-
+    
     /**
      * `nsec1...` secret key export (user-driven backup only).
      */
@@ -816,7 +816,7 @@ open func nsec() -> String  {
     )
 })
 }
-
+    
     /**
      * 64-char lowercase hex public key.
      */
@@ -827,9 +827,9 @@ open func pubkeyHex() -> String  {
     )
 })
 }
+    
 
-
-
+    
 }
 
 
@@ -883,77 +883,77 @@ public func FfiConverterTypeSonarIdentity_lower(_ value: SonarIdentity) -> UInt6
  * blocking — call from a background queue in Swift, never the main thread.
  */
 public protocol SonarNodeProtocol: AnyObject, Sendable {
-
+    
     /**
      * Accept a pending group invite by welcome event id.
      */
     func acceptGroupInvite(inviteIdHex: String) throws  -> String
-
+    
     /**
      * Acknowledge direct NIP-17 DMs only after the host persisted or consumed
      * the drained records.
      */
-    func acknowledgeDirectDms(eventIdHexes: [String]) throws
-
+    func acknowledgeDirectDms(eventIdHexes: [String]) throws 
+    
     /**
      * Add members to an existing group.
      */
-    func addGroupMembers(groupIdHex: String, members: [String]) throws
-
-    func approveJoinRequest(groupIdHex: String, requesterNpub: String) throws
-
+    func addGroupMembers(groupIdHex: String, members: [String]) throws 
+    
+    func approveJoinRequest(groupIdHex: String, requesterNpub: String) throws 
+    
     /**
      * The user's Blossom server list (kind-10063). Empty if unset.
      */
     func blossomServers() throws  -> [String]
-
+    
     /**
      * The user accepted an incoming call: we are the dialer. Dials the offerer
      * and starts media. Blocks on the QUIC connect.
      */
-    func callAccept(callId: String) throws
-
+    func callAccept(callId: String) throws 
+    
     /**
      * Hang up / cancel a call: tears down media + connection, emits `Ended`.
      */
-    func callHangup(callId: String) throws
-
+    func callHangup(callId: String) throws 
+    
     /**
      * Our dialable address as the `nodeAddrB64` token to embed in an OFFER/ANSWER.
      */
     func callLocalAddress() throws  -> String
-
+    
     /**
      * The offerer received the peer's ANSWER (host-parsed). On accept this pins
      * the answerer + goes Connecting (awaiting their dial); decline/busy ends it.
      */
-    func callOnAnswer(callId: String, answer: CallAnswerKind, remoteAddrB64: String) throws
-
+    func callOnAnswer(callId: String, answer: CallAnswerKind, remoteAddrB64: String) throws 
+    
     /**
      * Register an inbound OFFER the host parsed (`call_parse_control`).
      */
-    func callOnIncomingOffer(callId: String, remoteAddrB64: String, video: Bool) throws
-
+    func callOnIncomingOffer(callId: String, remoteAddrB64: String, video: Bool) throws 
+    
     /**
      * Begin an OUTGOING call (offerer). Returns immediately (Ringing); the host
      * then sends `call_encode_offer(call_id, video, call_local_address(), now)`.
      */
-    func callPlace(callId: String, video: Bool) throws
-
+    func callPlace(callId: String, video: Bool) throws 
+    
     /**
      * Toggle local microphone capture for an active or still-connecting call.
      * The RTP session keeps sending timed silence frames while muted.
      */
-    func callSetMuted(callId: String, muted: Bool) throws
-
+    func callSetMuted(callId: String, muted: Bool) throws 
+    
     /**
      * Bind the iroh call endpoint once for this session. The iroh Ed25519 key is
      * derived IN-CORE from this node's Nostr secret (HKDF, `call::identity`), so
      * the host passes nothing and never reimplements the derivation; the NodeId
      * is stable across launches. Idempotent-ish: a second call rebinds.
      */
-    func callStart() throws
-
+    func callStart() throws 
+    
     /**
      * Park up to `timeout_secs` for the next call state change. The host loops
      * this on a dedicated thread (like `wait_for_marmot_event`); it touches no
@@ -966,156 +966,173 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * which also blocks the timeout when there is nothing yet to wait on.
      */
     func callWaitEvent(timeoutSecs: UInt64)  -> CallEventInfo?
-
-    func clearConversationChangeListener()
-
+    
+    func clearConversationChangeListener() 
+    
     func conversationSummaries()  -> [ConversationSummaryInfo]
-
+    
     func createInviteLink(groupIdHex: String, groupName: String) throws  -> String
-
+    
     /**
      * Decline a pending group invite by welcome event id.
      */
-    func declineGroupInvite(inviteIdHex: String) throws
-
-    func declineJoinRequest(groupIdHex: String, requesterNpub: String) throws
-
+    func declineGroupInvite(inviteIdHex: String) throws 
+    
+    func declineJoinRequest(groupIdHex: String, requesterNpub: String) throws 
+    
     /**
      * Delete a single chat's local Marmot state (messages + MLS keys). Local-
      * only — the peer is NOT notified. Idempotent (deleting an unknown group is
      * a no-op). Used by per-chat "delete this conversation".
      */
-    func deleteGroup(groupIdHex: String) throws
-
+    func deleteGroup(groupIdHex: String) throws 
+    
     /**
      * Drain account-level direct NIP-17 DMs received since the last drain.
      */
     func drainDirectDms()  -> [DirectDmInfo]
-
+    
     /**
      * Process buffered live Marmot events through the MLS engine. Returns
      * notification info for each incoming message (empty vec = nothing drained).
      * MUST run on the host's serialized engine queue.
      */
     func drainPendingMarmot() throws  -> [DrainNotificationInfo]
-
+    
     /**
      * Re-subscribe with the current watermark and group set to self-heal
      * after relay disconnects. Hosts call this on the idle timeout path
-     * instead of `sync_once()`.
+     * instead of `sync_once()`. It may run one bounded per-chat repair fetch,
+     * so hosts must keep it off the local-first chat-open path.
      */
-    func ensureSubscriptions() throws
-
+    func ensureSubscriptions() throws 
+    
     func fetchInstalledPacks() throws  -> [String]
-
+    
     /**
      * Download + decrypt the media blob at `url` for `group_id`. Returns plaintext.
      */
     func fetchMedia(groupIdHex: String, url: String) throws  -> Data
-
+    
     /**
      * Fetch a peer's kind-0 profile (npub or hex pubkey). `None` if they have
      * not published one. Used to resolve a Marmot member's display name.
      */
     func fetchProfile(npub: String) throws  -> ProfileInfo?
-
+    
     /**
      * Fetch a peer's Sonar descriptor (npub or hex pubkey). `None` means the
      * peer is not confirmed Sonar-capable through this relay set.
      */
     func fetchSonarDescriptor(npub: String) throws  -> SonarDescriptorInfo?
-
+    
     /**
      * Download a public sticker image by its plaintext HTTPS URL and verify
      * the bytes match the sticker ref / pack hash before returning them.
      */
     func fetchStickerImage(url: String, expectedSha256: String) throws  -> Data
-
+    
     /**
      * Fetch a sticker pack from relays by its pack address.
      */
     func fetchStickerPack(authorPubkeyHex: String, identifier: String, relayUrls: [String]) throws  -> StickerPackInfo
-
+    
     /**
      * The 1:1 geohash DM conversation with a participant, oldest first.
      */
     func geoDmMessages(geohash: String, peerHex: String) throws  -> [GeoMessageInfo]
-
+    
     /**
      * Fetch recent messages for a geohash channel, oldest first.
      */
     func geohashMessages(geohash: String, limit: UInt32) throws  -> [GeoMessageInfo]
-
+    
     /**
      * Count of participants currently "here now" in a geohash channel
      * (distinct kind-20001 heartbeats within the presence TTL).
      */
     func geohashPresenceCount(geohash: String) throws  -> UInt32
-
+    
     /**
      * All groups this identity belongs to.
      */
     func groups() throws  -> [GroupInfo]
-
-    func installStickerPack(coordinate: String) throws
-
+    
+    func installStickerPack(coordinate: String) throws 
+    
     /**
      * Leave a group and delete its local state after the leave proposal is sent.
      */
-    func leaveGroup(groupIdHex: String) throws
-
-    func markConversationRead(groupIdHex: String)
-
+    func leaveGroup(groupIdHex: String) throws 
+    
+    func markConversationRead(groupIdHex: String) 
+    
     /**
      * Decrypted message history for a group, oldest first.
      */
     func messages(groupIdHex: String) throws  -> [MessageInfo]
-
+    
     func messagesCursorPage(groupIdHex: String, beforeSecs: UInt64?, beforeIdHex: String?, limit: UInt32) throws  -> [MessageInfo]
-
+    
     /**
      * Bounded local chat-message window for a group, oldest first within the
      * page. `offset` counts chat messages in newest-first order; non-chat MDK
      * rows such as commits/proposals are skipped by the core.
      */
     func messagesPage(groupIdHex: String, limit: UInt32, offset: UInt32) throws  -> [MessageInfo]
-
+    
     /**
      * Pending multi-member group invites awaiting accept/decline.
      */
     func pendingGroupInvites() throws  -> [GroupInviteInfo]
-
+    
     func pendingJoinRequests(groupIdHex: String) throws  -> [JoinRequestInfo]
-
+    
     /**
      * Publish the user's Blossom server list (kind-10063).
      */
-    func publishBlossomServers(servers: [String]) throws
-
+    func publishBlossomServers(servers: [String]) throws 
+    
     /**
      * Publish our kind-30443 KeyPackage so others can start groups with us.
      */
-    func publishKeyPackage() throws
-
+    func publishKeyPackage() throws 
+    
+    /**
+     * Like `publish_key_package`, but the relay send happens in the
+     * background: returns as soon as the KeyPackage event is created and
+     * persisted, without waiting for relay OK acks. For the cold-start /
+     * relay-connect republish path, where the per-relay OK wait must not
+     * delay the first message drain. Failures are logged in core and
+     * self-heal on the next relay connect (replaceable event).
+     */
+    func publishKeyPackageBackground() throws 
+    
     /**
      * Publish our kind-0 profile (NIP-01 metadata) so peers can show our name +
      * avatar instead of a raw npub. `name` is used for both name + display_name.
      */
-    func publishProfile(name: String, about: String?, picture: String?) throws
-
+    func publishProfile(name: String, about: String?, picture: String?) throws 
+    
+    /**
+     * Like `publish_profile`, but the relay send happens in the background —
+     * same contract as `publish_key_package_background`.
+     */
+    func publishProfileBackground(name: String, about: String?, picture: String?) 
+    
     /**
      * Publish this identity's public Sonar descriptor. `signaling` should list
      * only routes this app build can actually use, in preference order.
      */
-    func publishSonarDescriptor(callsEnabled: Bool, signaling: [String], bolt12Offer: String?) throws
-
+    func publishSonarDescriptor(callsEnabled: Bool, signaling: [String], bolt12Offer: String?) throws 
+    
     /**
      * Bounded local transcript windows for the most recent groups, newest
      * conversation first. Used by chat-list hydration so first paint is local
      * DB only and does not wait on relay sync or full-history scans.
      */
     func recentMessagePages(groupLimit: UInt32, pageLimit: UInt32) throws  -> [RecentMessagePageInfo]
-
+    
     /**
      * Encrypt a device push token to the transponder and cache/share it with
      * peers. Sender-side wakeups publish kind-446 requests later.
@@ -1124,87 +1141,87 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * `token`: raw device token bytes (APNS) or UTF-8 FCM token string.
      * `server_npub`: the transponder's npub (bech32 or hex).
      */
-    func registerPushToken(platform: String, token: Data, serverNpub: String) throws
-
+    func registerPushToken(platform: String, token: Data, serverNpub: String) throws 
+    
     /**
      * Remove members from an existing group.
      */
-    func removeGroupMembers(groupIdHex: String, members: [String]) throws
-
-    func requestJoinViaLink(inviteToken: String) throws
-
+    func removeGroupMembers(groupIdHex: String, members: [String]) throws 
+    
+    func requestJoinViaLink(inviteToken: String) throws 
+    
     /**
      * Reload the durable outbox sidecar and retry pending sends. Hosts call this
      * after replacing a local-only node with a relay-backed node so sends created
      * during relay connect are not stranded until app restart.
      */
-    func retryOutbox() throws
-
+    func retryOutbox() throws 
+    
     /**
      * Send an account-level direct NIP-17 DM to a plain bitchat peer. The
      * content is wrapped as `bitchat1:` so iOS/stock bitchat can decode it.
      */
-    func sendDirectDm(recipientHex: String, senderPeerIdHex: String, recipientPeerIdHex: String, messageId: String, text: String) throws
-
+    func sendDirectDm(recipientHex: String, senderPeerIdHex: String, recipientPeerIdHex: String, messageId: String, text: String) throws 
+    
     /**
      * Send a 1:1 encrypted DM to a geohash channel participant (NIP-17).
      */
-    func sendGeoDm(geohash: String, recipientHex: String, text: String) throws
-
+    func sendGeoDm(geohash: String, recipientHex: String, text: String) throws 
+    
     /**
      * Publish a public message to a geohash channel (kind-20000 over Nostr).
      */
-    func sendGeohash(geohash: String, text: String, nickname: String) throws
-
+    func sendGeohash(geohash: String, text: String, nickname: String) throws 
+    
     /**
      * Broadcast a presence heartbeat (kind-20001) for a geohash channel.
      * Call on channel open and on a ~60s heartbeat while it is active.
      */
-    func sendGeohashPresence(geohash: String) throws
-
+    func sendGeohashPresence(geohash: String) throws 
+    
     /**
      * Encrypt + upload `data` to a Blossom server, then publish a media message
      * to the group. `server_url` empty → the core default. Blocks on the upload.
      */
-    func sendMedia(groupIdHex: String, data: Data, filename: String, mime: String, caption: String, serverUrl: String) throws
-
+    func sendMedia(groupIdHex: String, data: Data, filename: String, mime: String, caption: String, serverUrl: String) throws 
+    
     /**
      * Encrypt + publish a sticker message to the group.
      */
-    func sendSticker(groupIdHex: String, packCoordinate: String, shortcode: String, plaintextSha256: String) throws
-
+    func sendSticker(groupIdHex: String, packCoordinate: String, shortcode: String, plaintextSha256: String) throws 
+    
     /**
      * Encrypt + publish a text message to the group.
      */
-    func sendText(groupIdHex: String, text: String) throws
-
-    func setConversationChangeListener(listener: ConversationChangeListener)
-
+    func sendText(groupIdHex: String, text: String) throws 
+    
+    func setConversationChangeListener(listener: ConversationChangeListener) 
+    
     /**
      * Start a 1:1 DM group with `peer` (npub or hex pubkey). Fetches their
      * KeyPackage from the relays and delivers the welcome. Returns the new
      * group id as hex.
      */
     func startDm(peer: String, name: String) throws  -> String
-
+    
     /**
      * Start a multi-member Marmot group. `members` accepts npub or hex pubkeys.
      */
     func startGroup(members: [String], name: String) throws  -> String
-
+    
     /**
      * Like `sync_once` but bypasses the live-subscription short-circuit.
      * Use after a foreground resume to catch events missed while backgrounded.
      */
-    func syncForce() throws
-
+    func syncForce() throws 
+    
     /**
      * Poll the relays once: welcomes addressed to us, then group messages.
      */
-    func syncOnce() throws
-
-    func uninstallStickerPack(coordinate: String) throws
-
+    func syncOnce() throws 
+    
+    func uninstallStickerPack(coordinate: String) throws 
+    
     /**
      * Block until a live Marmot event (welcome or group message) has been pushed
      * by the relay subscriptions, or `timeout_secs` elapses. Returns true if
@@ -1212,7 +1229,7 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * OFF its serialized engine queue (a parked "wait for push", not a poll).
      */
     func waitForMarmotEvent(timeoutSecs: UInt64)  -> Bool
-
+    
 }
 /**
  * A relay-connected Sonar node. Owns its own tokio runtime; every method is
@@ -1268,7 +1285,7 @@ open class SonarNode: SonarNodeProtocol, @unchecked Sendable {
         try! rustCall { uniffi_sonar_ffi_fn_free_sonarnode(handle, $0) }
     }
 
-
+    
     /**
      * Connect `identity` to the given relays (e.g. `wss://relay.damus.io`) with
      * a persistent, encrypted SQLCipher store. Passing an empty relay list opens
@@ -1292,9 +1309,9 @@ public static func connect(identity: SonarIdentity, relayUrls: [String], dbPath:
     )
 })
 }
+    
 
-
-
+    
     /**
      * Accept a pending group invite by welcome event id.
      */
@@ -1306,7 +1323,7 @@ open func acceptGroupInvite(inviteIdHex: String)throws  -> String  {
     )
 })
 }
-
+    
     /**
      * Acknowledge direct NIP-17 DMs only after the host persisted or consumed
      * the drained records.
@@ -1318,7 +1335,7 @@ open func acknowledgeDirectDms(eventIdHexes: [String])throws   {try rustCallWith
     )
 }
 }
-
+    
     /**
      * Add members to an existing group.
      */
@@ -1330,7 +1347,7 @@ open func addGroupMembers(groupIdHex: String, members: [String])throws   {try ru
     )
 }
 }
-
+    
 open func approveJoinRequest(groupIdHex: String, requesterNpub: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_approve_join_request(
             self.uniffiCloneHandle(),
@@ -1339,7 +1356,7 @@ open func approveJoinRequest(groupIdHex: String, requesterNpub: String)throws   
     )
 }
 }
-
+    
     /**
      * The user's Blossom server list (kind-10063). Empty if unset.
      */
@@ -1350,7 +1367,7 @@ open func blossomServers()throws  -> [String]  {
     )
 })
 }
-
+    
     /**
      * The user accepted an incoming call: we are the dialer. Dials the offerer
      * and starts media. Blocks on the QUIC connect.
@@ -1362,7 +1379,7 @@ open func callAccept(callId: String)throws   {try rustCallWithError(FfiConverter
     )
 }
 }
-
+    
     /**
      * Hang up / cancel a call: tears down media + connection, emits `Ended`.
      */
@@ -1373,7 +1390,7 @@ open func callHangup(callId: String)throws   {try rustCallWithError(FfiConverter
     )
 }
 }
-
+    
     /**
      * Our dialable address as the `nodeAddrB64` token to embed in an OFFER/ANSWER.
      */
@@ -1384,7 +1401,7 @@ open func callLocalAddress()throws  -> String  {
     )
 })
 }
-
+    
     /**
      * The offerer received the peer's ANSWER (host-parsed). On accept this pins
      * the answerer + goes Connecting (awaiting their dial); decline/busy ends it.
@@ -1398,7 +1415,7 @@ open func callOnAnswer(callId: String, answer: CallAnswerKind, remoteAddrB64: St
     )
 }
 }
-
+    
     /**
      * Register an inbound OFFER the host parsed (`call_parse_control`).
      */
@@ -1411,7 +1428,7 @@ open func callOnIncomingOffer(callId: String, remoteAddrB64: String, video: Bool
     )
 }
 }
-
+    
     /**
      * Begin an OUTGOING call (offerer). Returns immediately (Ringing); the host
      * then sends `call_encode_offer(call_id, video, call_local_address(), now)`.
@@ -1424,7 +1441,7 @@ open func callPlace(callId: String, video: Bool)throws   {try rustCallWithError(
     )
 }
 }
-
+    
     /**
      * Toggle local microphone capture for an active or still-connecting call.
      * The RTP session keeps sending timed silence frames while muted.
@@ -1437,7 +1454,7 @@ open func callSetMuted(callId: String, muted: Bool)throws   {try rustCallWithErr
     )
 }
 }
-
+    
     /**
      * Bind the iroh call endpoint once for this session. The iroh Ed25519 key is
      * derived IN-CORE from this node's Nostr secret (HKDF, `call::identity`), so
@@ -1450,7 +1467,7 @@ open func callStart()throws   {try rustCallWithError(FfiConverterTypeSonarFfiErr
     )
 }
 }
-
+    
     /**
      * Park up to `timeout_secs` for the next call state change. The host loops
      * this on a dedicated thread (like `wait_for_marmot_event`); it touches no
@@ -1470,14 +1487,14 @@ open func callWaitEvent(timeoutSecs: UInt64) -> CallEventInfo?  {
     )
 })
 }
-
+    
 open func clearConversationChangeListener()  {try! rustCall() {
     uniffi_sonar_ffi_fn_method_sonarnode_clear_conversation_change_listener(
             self.uniffiCloneHandle(),$0
     )
 }
 }
-
+    
 open func conversationSummaries() -> [ConversationSummaryInfo]  {
     return try!  FfiConverterSequenceTypeConversationSummaryInfo.lift(try! rustCall() {
     uniffi_sonar_ffi_fn_method_sonarnode_conversation_summaries(
@@ -1485,7 +1502,7 @@ open func conversationSummaries() -> [ConversationSummaryInfo]  {
     )
 })
 }
-
+    
 open func createInviteLink(groupIdHex: String, groupName: String)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_create_invite_link(
@@ -1495,7 +1512,7 @@ open func createInviteLink(groupIdHex: String, groupName: String)throws  -> Stri
     )
 })
 }
-
+    
     /**
      * Decline a pending group invite by welcome event id.
      */
@@ -1506,7 +1523,7 @@ open func declineGroupInvite(inviteIdHex: String)throws   {try rustCallWithError
     )
 }
 }
-
+    
 open func declineJoinRequest(groupIdHex: String, requesterNpub: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_decline_join_request(
             self.uniffiCloneHandle(),
@@ -1515,7 +1532,7 @@ open func declineJoinRequest(groupIdHex: String, requesterNpub: String)throws   
     )
 }
 }
-
+    
     /**
      * Delete a single chat's local Marmot state (messages + MLS keys). Local-
      * only — the peer is NOT notified. Idempotent (deleting an unknown group is
@@ -1528,7 +1545,7 @@ open func deleteGroup(groupIdHex: String)throws   {try rustCallWithError(FfiConv
     )
 }
 }
-
+    
     /**
      * Drain account-level direct NIP-17 DMs received since the last drain.
      */
@@ -1539,7 +1556,7 @@ open func drainDirectDms() -> [DirectDmInfo]  {
     )
 })
 }
-
+    
     /**
      * Process buffered live Marmot events through the MLS engine. Returns
      * notification info for each incoming message (empty vec = nothing drained).
@@ -1552,11 +1569,12 @@ open func drainPendingMarmot()throws  -> [DrainNotificationInfo]  {
     )
 })
 }
-
+    
     /**
      * Re-subscribe with the current watermark and group set to self-heal
      * after relay disconnects. Hosts call this on the idle timeout path
-     * instead of `sync_once()`.
+     * instead of `sync_once()`. It may run one bounded per-chat repair fetch,
+     * so hosts must keep it off the local-first chat-open path.
      */
 open func ensureSubscriptions()throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_ensure_subscriptions(
@@ -1564,7 +1582,7 @@ open func ensureSubscriptions()throws   {try rustCallWithError(FfiConverterTypeS
     )
 }
 }
-
+    
 open func fetchInstalledPacks()throws  -> [String]  {
     return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_fetch_installed_packs(
@@ -1572,7 +1590,7 @@ open func fetchInstalledPacks()throws  -> [String]  {
     )
 })
 }
-
+    
     /**
      * Download + decrypt the media blob at `url` for `group_id`. Returns plaintext.
      */
@@ -1585,7 +1603,7 @@ open func fetchMedia(groupIdHex: String, url: String)throws  -> Data  {
     )
 })
 }
-
+    
     /**
      * Fetch a peer's kind-0 profile (npub or hex pubkey). `None` if they have
      * not published one. Used to resolve a Marmot member's display name.
@@ -1598,7 +1616,7 @@ open func fetchProfile(npub: String)throws  -> ProfileInfo?  {
     )
 })
 }
-
+    
     /**
      * Fetch a peer's Sonar descriptor (npub or hex pubkey). `None` means the
      * peer is not confirmed Sonar-capable through this relay set.
@@ -1611,7 +1629,7 @@ open func fetchSonarDescriptor(npub: String)throws  -> SonarDescriptorInfo?  {
     )
 })
 }
-
+    
     /**
      * Download a public sticker image by its plaintext HTTPS URL and verify
      * the bytes match the sticker ref / pack hash before returning them.
@@ -1625,7 +1643,7 @@ open func fetchStickerImage(url: String, expectedSha256: String)throws  -> Data 
     )
 })
 }
-
+    
     /**
      * Fetch a sticker pack from relays by its pack address.
      */
@@ -1639,7 +1657,7 @@ open func fetchStickerPack(authorPubkeyHex: String, identifier: String, relayUrl
     )
 })
 }
-
+    
     /**
      * The 1:1 geohash DM conversation with a participant, oldest first.
      */
@@ -1652,7 +1670,7 @@ open func geoDmMessages(geohash: String, peerHex: String)throws  -> [GeoMessageI
     )
 })
 }
-
+    
     /**
      * Fetch recent messages for a geohash channel, oldest first.
      */
@@ -1665,7 +1683,7 @@ open func geohashMessages(geohash: String, limit: UInt32)throws  -> [GeoMessageI
     )
 })
 }
-
+    
     /**
      * Count of participants currently "here now" in a geohash channel
      * (distinct kind-20001 heartbeats within the presence TTL).
@@ -1678,7 +1696,7 @@ open func geohashPresenceCount(geohash: String)throws  -> UInt32  {
     )
 })
 }
-
+    
     /**
      * All groups this identity belongs to.
      */
@@ -1689,7 +1707,7 @@ open func groups()throws  -> [GroupInfo]  {
     )
 })
 }
-
+    
 open func installStickerPack(coordinate: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_install_sticker_pack(
             self.uniffiCloneHandle(),
@@ -1697,7 +1715,7 @@ open func installStickerPack(coordinate: String)throws   {try rustCallWithError(
     )
 }
 }
-
+    
     /**
      * Leave a group and delete its local state after the leave proposal is sent.
      */
@@ -1708,7 +1726,7 @@ open func leaveGroup(groupIdHex: String)throws   {try rustCallWithError(FfiConve
     )
 }
 }
-
+    
 open func markConversationRead(groupIdHex: String)  {try! rustCall() {
     uniffi_sonar_ffi_fn_method_sonarnode_mark_conversation_read(
             self.uniffiCloneHandle(),
@@ -1716,7 +1734,7 @@ open func markConversationRead(groupIdHex: String)  {try! rustCall() {
     )
 }
 }
-
+    
     /**
      * Decrypted message history for a group, oldest first.
      */
@@ -1728,7 +1746,7 @@ open func messages(groupIdHex: String)throws  -> [MessageInfo]  {
     )
 })
 }
-
+    
 open func messagesCursorPage(groupIdHex: String, beforeSecs: UInt64?, beforeIdHex: String?, limit: UInt32)throws  -> [MessageInfo]  {
     return try  FfiConverterSequenceTypeMessageInfo.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_messages_cursor_page(
@@ -1740,7 +1758,7 @@ open func messagesCursorPage(groupIdHex: String, beforeSecs: UInt64?, beforeIdHe
     )
 })
 }
-
+    
     /**
      * Bounded local chat-message window for a group, oldest first within the
      * page. `offset` counts chat messages in newest-first order; non-chat MDK
@@ -1756,7 +1774,7 @@ open func messagesPage(groupIdHex: String, limit: UInt32, offset: UInt32)throws 
     )
 })
 }
-
+    
     /**
      * Pending multi-member group invites awaiting accept/decline.
      */
@@ -1767,7 +1785,7 @@ open func pendingGroupInvites()throws  -> [GroupInviteInfo]  {
     )
 })
 }
-
+    
 open func pendingJoinRequests(groupIdHex: String)throws  -> [JoinRequestInfo]  {
     return try  FfiConverterSequenceTypeJoinRequestInfo.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_pending_join_requests(
@@ -1776,7 +1794,7 @@ open func pendingJoinRequests(groupIdHex: String)throws  -> [JoinRequestInfo]  {
     )
 })
 }
-
+    
     /**
      * Publish the user's Blossom server list (kind-10063).
      */
@@ -1787,7 +1805,7 @@ open func publishBlossomServers(servers: [String])throws   {try rustCallWithErro
     )
 }
 }
-
+    
     /**
      * Publish our kind-30443 KeyPackage so others can start groups with us.
      */
@@ -1797,7 +1815,22 @@ open func publishKeyPackage()throws   {try rustCallWithError(FfiConverterTypeSon
     )
 }
 }
-
+    
+    /**
+     * Like `publish_key_package`, but the relay send happens in the
+     * background: returns as soon as the KeyPackage event is created and
+     * persisted, without waiting for relay OK acks. For the cold-start /
+     * relay-connect republish path, where the per-relay OK wait must not
+     * delay the first message drain. Failures are logged in core and
+     * self-heal on the next relay connect (replaceable event).
+     */
+open func publishKeyPackageBackground()throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_publish_key_package_background(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
     /**
      * Publish our kind-0 profile (NIP-01 metadata) so peers can show our name +
      * avatar instead of a raw npub. `name` is used for both name + display_name.
@@ -1811,7 +1844,21 @@ open func publishProfile(name: String, about: String?, picture: String?)throws  
     )
 }
 }
-
+    
+    /**
+     * Like `publish_profile`, but the relay send happens in the background —
+     * same contract as `publish_key_package_background`.
+     */
+open func publishProfileBackground(name: String, about: String?, picture: String?)  {try! rustCall() {
+    uniffi_sonar_ffi_fn_method_sonarnode_publish_profile_background(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(name),
+        FfiConverterOptionString.lower(about),
+        FfiConverterOptionString.lower(picture),$0
+    )
+}
+}
+    
     /**
      * Publish this identity's public Sonar descriptor. `signaling` should list
      * only routes this app build can actually use, in preference order.
@@ -1825,7 +1872,7 @@ open func publishSonarDescriptor(callsEnabled: Bool, signaling: [String], bolt12
     )
 }
 }
-
+    
     /**
      * Bounded local transcript windows for the most recent groups, newest
      * conversation first. Used by chat-list hydration so first paint is local
@@ -1840,7 +1887,7 @@ open func recentMessagePages(groupLimit: UInt32, pageLimit: UInt32)throws  -> [R
     )
 })
 }
-
+    
     /**
      * Encrypt a device push token to the transponder and cache/share it with
      * peers. Sender-side wakeups publish kind-446 requests later.
@@ -1858,7 +1905,7 @@ open func registerPushToken(platform: String, token: Data, serverNpub: String)th
     )
 }
 }
-
+    
     /**
      * Remove members from an existing group.
      */
@@ -1870,7 +1917,7 @@ open func removeGroupMembers(groupIdHex: String, members: [String])throws   {try
     )
 }
 }
-
+    
 open func requestJoinViaLink(inviteToken: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_request_join_via_link(
             self.uniffiCloneHandle(),
@@ -1878,7 +1925,7 @@ open func requestJoinViaLink(inviteToken: String)throws   {try rustCallWithError
     )
 }
 }
-
+    
     /**
      * Reload the durable outbox sidecar and retry pending sends. Hosts call this
      * after replacing a local-only node with a relay-backed node so sends created
@@ -1890,7 +1937,7 @@ open func retryOutbox()throws   {try rustCallWithError(FfiConverterTypeSonarFfiE
     )
 }
 }
-
+    
     /**
      * Send an account-level direct NIP-17 DM to a plain bitchat peer. The
      * content is wrapped as `bitchat1:` so iOS/stock bitchat can decode it.
@@ -1906,7 +1953,7 @@ open func sendDirectDm(recipientHex: String, senderPeerIdHex: String, recipientP
     )
 }
 }
-
+    
     /**
      * Send a 1:1 encrypted DM to a geohash channel participant (NIP-17).
      */
@@ -1919,7 +1966,7 @@ open func sendGeoDm(geohash: String, recipientHex: String, text: String)throws  
     )
 }
 }
-
+    
     /**
      * Publish a public message to a geohash channel (kind-20000 over Nostr).
      */
@@ -1932,7 +1979,7 @@ open func sendGeohash(geohash: String, text: String, nickname: String)throws   {
     )
 }
 }
-
+    
     /**
      * Broadcast a presence heartbeat (kind-20001) for a geohash channel.
      * Call on channel open and on a ~60s heartbeat while it is active.
@@ -1944,7 +1991,7 @@ open func sendGeohashPresence(geohash: String)throws   {try rustCallWithError(Ff
     )
 }
 }
-
+    
     /**
      * Encrypt + upload `data` to a Blossom server, then publish a media message
      * to the group. `server_url` empty → the core default. Blocks on the upload.
@@ -1961,7 +2008,7 @@ open func sendMedia(groupIdHex: String, data: Data, filename: String, mime: Stri
     )
 }
 }
-
+    
     /**
      * Encrypt + publish a sticker message to the group.
      */
@@ -1975,7 +2022,7 @@ open func sendSticker(groupIdHex: String, packCoordinate: String, shortcode: Str
     )
 }
 }
-
+    
     /**
      * Encrypt + publish a text message to the group.
      */
@@ -1987,7 +2034,7 @@ open func sendText(groupIdHex: String, text: String)throws   {try rustCallWithEr
     )
 }
 }
-
+    
 open func setConversationChangeListener(listener: ConversationChangeListener)  {try! rustCall() {
     uniffi_sonar_ffi_fn_method_sonarnode_set_conversation_change_listener(
             self.uniffiCloneHandle(),
@@ -1995,7 +2042,7 @@ open func setConversationChangeListener(listener: ConversationChangeListener)  {
     )
 }
 }
-
+    
     /**
      * Start a 1:1 DM group with `peer` (npub or hex pubkey). Fetches their
      * KeyPackage from the relays and delivers the welcome. Returns the new
@@ -2010,7 +2057,7 @@ open func startDm(peer: String, name: String)throws  -> String  {
     )
 })
 }
-
+    
     /**
      * Start a multi-member Marmot group. `members` accepts npub or hex pubkeys.
      */
@@ -2023,7 +2070,7 @@ open func startGroup(members: [String], name: String)throws  -> String  {
     )
 })
 }
-
+    
     /**
      * Like `sync_once` but bypasses the live-subscription short-circuit.
      * Use after a foreground resume to catch events missed while backgrounded.
@@ -2034,7 +2081,7 @@ open func syncForce()throws   {try rustCallWithError(FfiConverterTypeSonarFfiErr
     )
 }
 }
-
+    
     /**
      * Poll the relays once: welcomes addressed to us, then group messages.
      */
@@ -2044,7 +2091,7 @@ open func syncOnce()throws   {try rustCallWithError(FfiConverterTypeSonarFfiErro
     )
 }
 }
-
+    
 open func uninstallStickerPack(coordinate: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_uninstall_sticker_pack(
             self.uniffiCloneHandle(),
@@ -2052,7 +2099,7 @@ open func uninstallStickerPack(coordinate: String)throws   {try rustCallWithErro
     )
 }
 }
-
+    
     /**
      * Block until a live Marmot event (welcome or group message) has been pushed
      * by the relay subscriptions, or `timeout_secs` elapses. Returns true if
@@ -2067,9 +2114,9 @@ open func waitForMarmotEvent(timeoutSecs: UInt64) -> Bool  {
     )
 })
 }
+    
 
-
-
+    
 }
 
 
@@ -2124,36 +2171,36 @@ public func FfiConverterTypeSonarNode_lower(_ value: SonarNode) -> UInt64 {
  * bitchat fingerprint), call `into_session`, then `encrypt`/`decrypt`.
  */
 public protocol SonarNoiseProtocol: AnyObject, Sendable {
-
+    
     func decrypt(data: Data) throws  -> Data
-
+    
     func encrypt(data: Data) throws  -> Data
-
+    
     /**
      * Transition from handshake to the encrypted transport phase.
      * NB: NOT named `finalize` — that collides with Java's `Object.finalize()`
      * in the generated Kotlin binding (the GC then re-invokes it on a spent
      * object and throws).
      */
-    func intoSession() throws
-
+    func intoSession() throws 
+    
     func isFinished()  -> Bool
-
+    
     /**
      * Consume a handshake message received from the peer.
      */
-    func readMessage(msg: Data) throws
-
+    func readMessage(msg: Data) throws 
+    
     /**
      * The peer's authenticated static key (hex), available after the handshake.
      */
     func remoteStaticHex()  -> String?
-
+    
     /**
      * Next handshake message to send to the peer.
      */
     func writeMessage() throws  -> Data
-
+    
 }
 /**
  * A Noise XX session driver for one mesh link. Feed handshake messages until
@@ -2210,7 +2257,7 @@ open class SonarNoise: SonarNoiseProtocol, @unchecked Sendable {
         try! rustCall { uniffi_sonar_ffi_fn_free_sonarnoise(handle, $0) }
     }
 
-
+    
 public static func initiator(privateHex: String)throws  -> SonarNoise  {
     return try  FfiConverterTypeSonarNoise_lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_constructor_sonarnoise_initiator(
@@ -2218,7 +2265,7 @@ public static func initiator(privateHex: String)throws  -> SonarNoise  {
     )
 })
 }
-
+    
 public static func responder(privateHex: String)throws  -> SonarNoise  {
     return try  FfiConverterTypeSonarNoise_lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_constructor_sonarnoise_responder(
@@ -2226,9 +2273,9 @@ public static func responder(privateHex: String)throws  -> SonarNoise  {
     )
 })
 }
+    
 
-
-
+    
 open func decrypt(data: Data)throws  -> Data  {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnoise_decrypt(
@@ -2237,7 +2284,7 @@ open func decrypt(data: Data)throws  -> Data  {
     )
 })
 }
-
+    
 open func encrypt(data: Data)throws  -> Data  {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnoise_encrypt(
@@ -2246,7 +2293,7 @@ open func encrypt(data: Data)throws  -> Data  {
     )
 })
 }
-
+    
     /**
      * Transition from handshake to the encrypted transport phase.
      * NB: NOT named `finalize` — that collides with Java's `Object.finalize()`
@@ -2259,7 +2306,7 @@ open func intoSession()throws   {try rustCallWithError(FfiConverterTypeSonarFfiE
     )
 }
 }
-
+    
 open func isFinished() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_sonar_ffi_fn_method_sonarnoise_is_finished(
@@ -2267,7 +2314,7 @@ open func isFinished() -> Bool  {
     )
 })
 }
-
+    
     /**
      * Consume a handshake message received from the peer.
      */
@@ -2278,7 +2325,7 @@ open func readMessage(msg: Data)throws   {try rustCallWithError(FfiConverterType
     )
 }
 }
-
+    
     /**
      * The peer's authenticated static key (hex), available after the handshake.
      */
@@ -2289,7 +2336,7 @@ open func remoteStaticHex() -> String?  {
     )
 })
 }
-
+    
     /**
      * Next handshake message to send to the peer.
      */
@@ -2300,9 +2347,9 @@ open func writeMessage()throws  -> Data  {
     )
 })
 }
+    
 
-
-
+    
 }
 
 
@@ -2366,10 +2413,10 @@ public struct CallEventInfo: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(callId: String, state: CallStateInfo,
+    public init(callId: String, state: CallStateInfo, 
         /**
          * Connected duration in seconds — only meaningful for `Ended`.
-         */durationSecs: UInt64,
+         */durationSecs: UInt64, 
         /**
          * Human reason for `Ended`/`Failed`/`Declined`/`Busy` (else empty).
          */reason: String) {
@@ -2379,9 +2426,9 @@ public struct CallEventInfo: Equatable, Hashable {
         self.reason = reason
     }
 
+    
 
-
-
+    
 }
 
 #if compiler(>=6)
@@ -2395,9 +2442,9 @@ public struct FfiConverterTypeCallEventInfo: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CallEventInfo {
         return
             try CallEventInfo(
-                callId: FfiConverterString.read(from: &buf),
-                state: FfiConverterTypeCallStateInfo.read(from: &buf),
-                durationSecs: FfiConverterUInt64.read(from: &buf),
+                callId: FfiConverterString.read(from: &buf), 
+                state: FfiConverterTypeCallStateInfo.read(from: &buf), 
+                durationSecs: FfiConverterUInt64.read(from: &buf), 
                 reason: FfiConverterString.read(from: &buf)
         )
     }
@@ -2438,10 +2485,19 @@ public struct ConversationSummaryInfo: Equatable, Hashable {
     public var latestMine: Bool
     public var messageCount: UInt64
     public var unreadCount: UInt64
+    /**
+     * Monotonic per-conversation change counter — a cheap cache key: equal
+     * version ⇒ nothing about this conversation's summary/transcript changed.
+     */
+    public var version: UInt64
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(groupIdHex: String, name: String, latestContent: String, latestSenderNpub: String, latestAtSecs: UInt64, latestMine: Bool, messageCount: UInt64, unreadCount: UInt64) {
+    public init(groupIdHex: String, name: String, latestContent: String, latestSenderNpub: String, latestAtSecs: UInt64, latestMine: Bool, messageCount: UInt64, unreadCount: UInt64, 
+        /**
+         * Monotonic per-conversation change counter — a cheap cache key: equal
+         * version ⇒ nothing about this conversation's summary/transcript changed.
+         */version: UInt64) {
         self.groupIdHex = groupIdHex
         self.name = name
         self.latestContent = latestContent
@@ -2450,11 +2506,12 @@ public struct ConversationSummaryInfo: Equatable, Hashable {
         self.latestMine = latestMine
         self.messageCount = messageCount
         self.unreadCount = unreadCount
+        self.version = version
     }
 
+    
 
-
-
+    
 }
 
 #if compiler(>=6)
@@ -2468,14 +2525,15 @@ public struct FfiConverterTypeConversationSummaryInfo: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ConversationSummaryInfo {
         return
             try ConversationSummaryInfo(
-                groupIdHex: FfiConverterString.read(from: &buf),
-                name: FfiConverterString.read(from: &buf),
-                latestContent: FfiConverterString.read(from: &buf),
-                latestSenderNpub: FfiConverterString.read(from: &buf),
-                latestAtSecs: FfiConverterUInt64.read(from: &buf),
-                latestMine: FfiConverterBool.read(from: &buf),
-                messageCount: FfiConverterUInt64.read(from: &buf),
-                unreadCount: FfiConverterUInt64.read(from: &buf)
+                groupIdHex: FfiConverterString.read(from: &buf), 
+                name: FfiConverterString.read(from: &buf), 
+                latestContent: FfiConverterString.read(from: &buf), 
+                latestSenderNpub: FfiConverterString.read(from: &buf), 
+                latestAtSecs: FfiConverterUInt64.read(from: &buf), 
+                latestMine: FfiConverterBool.read(from: &buf), 
+                messageCount: FfiConverterUInt64.read(from: &buf), 
+                unreadCount: FfiConverterUInt64.read(from: &buf), 
+                version: FfiConverterUInt64.read(from: &buf)
         )
     }
 
@@ -2488,6 +2546,7 @@ public struct FfiConverterTypeConversationSummaryInfo: FfiConverterRustBuffer {
         FfiConverterBool.write(value.latestMine, into: &buf)
         FfiConverterUInt64.write(value.messageCount, into: &buf)
         FfiConverterUInt64.write(value.unreadCount, into: &buf)
+        FfiConverterUInt64.write(value.version, into: &buf)
     }
 }
 
@@ -2528,9 +2587,9 @@ public struct DirectDmInfo: Equatable, Hashable {
         self.createdAtSecs = createdAtSecs
     }
 
+    
 
-
-
+    
 }
 
 #if compiler(>=6)
@@ -2544,10 +2603,10 @@ public struct FfiConverterTypeDirectDmInfo: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DirectDmInfo {
         return
             try DirectDmInfo(
-                eventIdHex: FfiConverterString.read(from: &buf),
-                idHex: FfiConverterString.read(from: &buf),
-                senderPubkeyHex: FfiConverterString.read(from: &buf),
-                content: FfiConverterString.read(from: &buf),
+                eventIdHex: FfiConverterString.read(from: &buf), 
+                idHex: FfiConverterString.read(from: &buf), 
+                senderPubkeyHex: FfiConverterString.read(from: &buf), 
+                content: FfiConverterString.read(from: &buf), 
                 createdAtSecs: FfiConverterUInt64.read(from: &buf)
         )
     }
@@ -2594,9 +2653,9 @@ public struct DrainNotificationInfo: Equatable, Hashable {
         self.contentPreview = contentPreview
     }
 
+    
 
-
-
+    
 }
 
 #if compiler(>=6)
@@ -2610,8 +2669,8 @@ public struct FfiConverterTypeDrainNotificationInfo: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DrainNotificationInfo {
         return
             try DrainNotificationInfo(
-                senderNpub: FfiConverterString.read(from: &buf),
-                groupName: FfiConverterString.read(from: &buf),
+                senderNpub: FfiConverterString.read(from: &buf), 
+                groupName: FfiConverterString.read(from: &buf), 
                 contentPreview: FfiConverterString.read(from: &buf)
         )
     }
@@ -2661,9 +2720,9 @@ public struct GeoMessageInfo: Equatable, Hashable {
         self.mine = mine
     }
 
+    
 
-
-
+    
 }
 
 #if compiler(>=6)
@@ -2677,11 +2736,11 @@ public struct FfiConverterTypeGeoMessageInfo: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> GeoMessageInfo {
         return
             try GeoMessageInfo(
-                idHex: FfiConverterString.read(from: &buf),
-                senderPubkeyHex: FfiConverterString.read(from: &buf),
-                nickname: FfiConverterString.read(from: &buf),
-                content: FfiConverterString.read(from: &buf),
-                createdAtSecs: FfiConverterUInt64.read(from: &buf),
+                idHex: FfiConverterString.read(from: &buf), 
+                senderPubkeyHex: FfiConverterString.read(from: &buf), 
+                nickname: FfiConverterString.read(from: &buf), 
+                content: FfiConverterString.read(from: &buf), 
+                createdAtSecs: FfiConverterUInt64.read(from: &buf), 
                 mine: FfiConverterBool.read(from: &buf)
         )
     }
@@ -2734,9 +2793,9 @@ public struct GroupInfo: Equatable, Hashable {
         self.memberNpubs = memberNpubs
     }
 
+    
 
-
-
+    
 }
 
 #if compiler(>=6)
@@ -2750,8 +2809,8 @@ public struct FfiConverterTypeGroupInfo: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> GroupInfo {
         return
             try GroupInfo(
-                idHex: FfiConverterString.read(from: &buf),
-                name: FfiConverterString.read(from: &buf),
+                idHex: FfiConverterString.read(from: &buf), 
+                name: FfiConverterString.read(from: &buf), 
                 memberNpubs: FfiConverterSequenceString.read(from: &buf)
         )
     }
@@ -2811,9 +2870,9 @@ public struct GroupInviteInfo: Equatable, Hashable {
         self.relayUrls = relayUrls
     }
 
+    
 
-
-
+    
 }
 
 #if compiler(>=6)
@@ -2827,13 +2886,13 @@ public struct FfiConverterTypeGroupInviteInfo: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> GroupInviteInfo {
         return
             try GroupInviteInfo(
-                idHex: FfiConverterString.read(from: &buf),
-                wrapperIdHex: FfiConverterString.read(from: &buf),
-                groupIdHex: FfiConverterString.read(from: &buf),
-                groupName: FfiConverterString.read(from: &buf),
-                groupDescription: FfiConverterString.read(from: &buf),
-                welcomerNpub: FfiConverterString.read(from: &buf),
-                memberCount: FfiConverterUInt32.read(from: &buf),
+                idHex: FfiConverterString.read(from: &buf), 
+                wrapperIdHex: FfiConverterString.read(from: &buf), 
+                groupIdHex: FfiConverterString.read(from: &buf), 
+                groupName: FfiConverterString.read(from: &buf), 
+                groupDescription: FfiConverterString.read(from: &buf), 
+                welcomerNpub: FfiConverterString.read(from: &buf), 
+                memberCount: FfiConverterUInt32.read(from: &buf), 
                 relayUrls: FfiConverterSequenceString.read(from: &buf)
         )
     }
@@ -2879,9 +2938,9 @@ public struct JoinRequestInfo: Equatable, Hashable {
         self.receivedAt = receivedAt
     }
 
+    
 
-
-
+    
 }
 
 #if compiler(>=6)
@@ -2895,8 +2954,8 @@ public struct FfiConverterTypeJoinRequestInfo: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> JoinRequestInfo {
         return
             try JoinRequestInfo(
-                requesterNpub: FfiConverterString.read(from: &buf),
-                groupIdHex: FfiConverterString.read(from: &buf),
+                requesterNpub: FfiConverterString.read(from: &buf), 
+                groupIdHex: FfiConverterString.read(from: &buf), 
                 receivedAt: FfiConverterUInt64.read(from: &buf)
         )
     }
@@ -2947,9 +3006,9 @@ public struct MediaInfo: Equatable, Hashable {
         self.durationMs = durationMs
     }
 
+    
 
-
-
+    
 }
 
 #if compiler(>=6)
@@ -2963,11 +3022,11 @@ public struct FfiConverterTypeMediaInfo: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MediaInfo {
         return
             try MediaInfo(
-                url: FfiConverterString.read(from: &buf),
-                mimeType: FfiConverterString.read(from: &buf),
-                filename: FfiConverterString.read(from: &buf),
-                width: FfiConverterOptionUInt32.read(from: &buf),
-                height: FfiConverterOptionUInt32.read(from: &buf),
+                url: FfiConverterString.read(from: &buf), 
+                mimeType: FfiConverterString.read(from: &buf), 
+                filename: FfiConverterString.read(from: &buf), 
+                width: FfiConverterOptionUInt32.read(from: &buf), 
+                height: FfiConverterOptionUInt32.read(from: &buf), 
                 durationMs: FfiConverterOptionUInt64.read(from: &buf)
         )
     }
@@ -3016,9 +3075,9 @@ public struct MeshAnnounceInfo: Equatable, Hashable {
         self.senderIdHex = senderIdHex
     }
 
+    
 
-
-
+    
 }
 
 #if compiler(>=6)
@@ -3032,9 +3091,9 @@ public struct FfiConverterTypeMeshAnnounceInfo: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MeshAnnounceInfo {
         return
             try MeshAnnounceInfo(
-                nickname: FfiConverterString.read(from: &buf),
-                noisePublicKeyHex: FfiConverterString.read(from: &buf),
-                signingPublicKeyHex: FfiConverterString.read(from: &buf),
+                nickname: FfiConverterString.read(from: &buf), 
+                noisePublicKeyHex: FfiConverterString.read(from: &buf), 
+                signingPublicKeyHex: FfiConverterString.read(from: &buf), 
                 senderIdHex: FfiConverterString.read(from: &buf)
         )
     }
@@ -3082,9 +3141,9 @@ public struct MeshFileInfo: Equatable, Hashable {
         self.content = content
     }
 
+    
 
-
-
+    
 }
 
 #if compiler(>=6)
@@ -3098,9 +3157,9 @@ public struct FfiConverterTypeMeshFileInfo: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MeshFileInfo {
         return
             try MeshFileInfo(
-                fileName: FfiConverterOptionString.read(from: &buf),
-                fileSize: FfiConverterOptionUInt64.read(from: &buf),
-                mimeType: FfiConverterOptionString.read(from: &buf),
+                fileName: FfiConverterOptionString.read(from: &buf), 
+                fileSize: FfiConverterOptionUInt64.read(from: &buf), 
+                mimeType: FfiConverterOptionString.read(from: &buf), 
                 content: FfiConverterData.read(from: &buf)
         )
     }
@@ -3145,7 +3204,7 @@ public struct MeshPacketInfo: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(packetType: UInt8, ttl: UInt8, senderIdHex: String,
+    public init(packetType: UInt8, ttl: UInt8, senderIdHex: String, 
         /**
          * Empty when the packet has no recipient (broadcast/undirected).
          */recipientIdHex: String, payload: Data, hasSignature: Bool) {
@@ -3157,9 +3216,9 @@ public struct MeshPacketInfo: Equatable, Hashable {
         self.hasSignature = hasSignature
     }
 
+    
 
-
-
+    
 }
 
 #if compiler(>=6)
@@ -3173,11 +3232,11 @@ public struct FfiConverterTypeMeshPacketInfo: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MeshPacketInfo {
         return
             try MeshPacketInfo(
-                packetType: FfiConverterUInt8.read(from: &buf),
-                ttl: FfiConverterUInt8.read(from: &buf),
-                senderIdHex: FfiConverterString.read(from: &buf),
-                recipientIdHex: FfiConverterString.read(from: &buf),
-                payload: FfiConverterData.read(from: &buf),
+                packetType: FfiConverterUInt8.read(from: &buf), 
+                ttl: FfiConverterUInt8.read(from: &buf), 
+                senderIdHex: FfiConverterString.read(from: &buf), 
+                recipientIdHex: FfiConverterString.read(from: &buf), 
+                payload: FfiConverterData.read(from: &buf), 
                 hasSignature: FfiConverterBool.read(from: &buf)
         )
     }
@@ -3222,9 +3281,9 @@ public struct MeshPrivateMessage: Equatable, Hashable {
         self.content = content
     }
 
+    
 
-
-
+    
 }
 
 #if compiler(>=6)
@@ -3238,7 +3297,7 @@ public struct FfiConverterTypeMeshPrivateMessage: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MeshPrivateMessage {
         return
             try MeshPrivateMessage(
-                messageId: FfiConverterString.read(from: &buf),
+                messageId: FfiConverterString.read(from: &buf), 
                 content: FfiConverterString.read(from: &buf)
         )
     }
@@ -3283,9 +3342,9 @@ public struct MeshPublicMessage: Equatable, Hashable {
         self.timestampMs = timestampMs
     }
 
+    
 
-
-
+    
 }
 
 #if compiler(>=6)
@@ -3299,8 +3358,8 @@ public struct FfiConverterTypeMeshPublicMessage: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MeshPublicMessage {
         return
             try MeshPublicMessage(
-                content: FfiConverterString.read(from: &buf),
-                senderIdHex: FfiConverterString.read(from: &buf),
+                content: FfiConverterString.read(from: &buf), 
+                senderIdHex: FfiConverterString.read(from: &buf), 
                 timestampMs: FfiConverterUInt64.read(from: &buf)
         )
     }
@@ -3352,22 +3411,29 @@ public struct MessageInfo: Equatable, Hashable {
      * Sticker reference if this message is a sticker send (nil for text/media).
      */
     public var stickerRef: StickerRefInfo?
+    /**
+     * Precomputed content classification (pay/call control vs plain text).
+     */
+    public var classification: MessageClassInfo
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(idHex: String, senderNpub: String, content: String, createdAtSecs: UInt64,
+    public init(idHex: String, senderNpub: String, content: String, createdAtSecs: UInt64, 
         /**
          * True when the local identity sent it.
-         */mine: Bool,
+         */mine: Bool, 
         /**
          * Local delivery state: received, pending, sent, or failed.
-         */deliveryState: String,
+         */deliveryState: String, 
         /**
          * Encrypted media attachments (Marmot MIP-04), empty for a plain text message.
-         */media: [MediaInfo],
+         */media: [MediaInfo], 
         /**
          * Sticker reference if this message is a sticker send (nil for text/media).
-         */stickerRef: StickerRefInfo?) {
+         */stickerRef: StickerRefInfo?, 
+        /**
+         * Precomputed content classification (pay/call control vs plain text).
+         */classification: MessageClassInfo) {
         self.idHex = idHex
         self.senderNpub = senderNpub
         self.content = content
@@ -3376,11 +3442,12 @@ public struct MessageInfo: Equatable, Hashable {
         self.deliveryState = deliveryState
         self.media = media
         self.stickerRef = stickerRef
+        self.classification = classification
     }
 
+    
 
-
-
+    
 }
 
 #if compiler(>=6)
@@ -3394,14 +3461,15 @@ public struct FfiConverterTypeMessageInfo: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MessageInfo {
         return
             try MessageInfo(
-                idHex: FfiConverterString.read(from: &buf),
-                senderNpub: FfiConverterString.read(from: &buf),
-                content: FfiConverterString.read(from: &buf),
-                createdAtSecs: FfiConverterUInt64.read(from: &buf),
-                mine: FfiConverterBool.read(from: &buf),
-                deliveryState: FfiConverterString.read(from: &buf),
-                media: FfiConverterSequenceTypeMediaInfo.read(from: &buf),
-                stickerRef: FfiConverterOptionTypeStickerRefInfo.read(from: &buf)
+                idHex: FfiConverterString.read(from: &buf), 
+                senderNpub: FfiConverterString.read(from: &buf), 
+                content: FfiConverterString.read(from: &buf), 
+                createdAtSecs: FfiConverterUInt64.read(from: &buf), 
+                mine: FfiConverterBool.read(from: &buf), 
+                deliveryState: FfiConverterString.read(from: &buf), 
+                media: FfiConverterSequenceTypeMediaInfo.read(from: &buf), 
+                stickerRef: FfiConverterOptionTypeStickerRefInfo.read(from: &buf), 
+                classification: FfiConverterTypeMessageClassInfo.read(from: &buf)
         )
     }
 
@@ -3414,6 +3482,7 @@ public struct FfiConverterTypeMessageInfo: FfiConverterRustBuffer {
         FfiConverterString.write(value.deliveryState, into: &buf)
         FfiConverterSequenceTypeMediaInfo.write(value.media, into: &buf)
         FfiConverterOptionTypeStickerRefInfo.write(value.stickerRef, into: &buf)
+        FfiConverterTypeMessageClassInfo.write(value.classification, into: &buf)
     }
 }
 
@@ -3447,9 +3516,9 @@ public struct NoiseKeypairHex: Equatable, Hashable {
         self.publicHex = publicHex
     }
 
+    
 
-
-
+    
 }
 
 #if compiler(>=6)
@@ -3463,7 +3532,7 @@ public struct FfiConverterTypeNoiseKeypairHex: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> NoiseKeypairHex {
         return
             try NoiseKeypairHex(
-                privateHex: FfiConverterString.read(from: &buf),
+                privateHex: FfiConverterString.read(from: &buf), 
                 publicHex: FfiConverterString.read(from: &buf)
         )
     }
@@ -3511,9 +3580,9 @@ public struct ProfileInfo: Equatable, Hashable {
         self.nip05 = nip05
     }
 
+    
 
-
-
+    
 }
 
 #if compiler(>=6)
@@ -3527,10 +3596,10 @@ public struct FfiConverterTypeProfileInfo: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ProfileInfo {
         return
             try ProfileInfo(
-                name: FfiConverterOptionString.read(from: &buf),
-                displayName: FfiConverterOptionString.read(from: &buf),
-                about: FfiConverterOptionString.read(from: &buf),
-                picture: FfiConverterOptionString.read(from: &buf),
+                name: FfiConverterOptionString.read(from: &buf), 
+                displayName: FfiConverterOptionString.read(from: &buf), 
+                about: FfiConverterOptionString.read(from: &buf), 
+                picture: FfiConverterOptionString.read(from: &buf), 
                 nip05: FfiConverterOptionString.read(from: &buf)
         )
     }
@@ -3576,10 +3645,10 @@ public struct RecentMessagePageInfo: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(groupIdHex: String,
+    public init(groupIdHex: String, 
         /**
          * Newest message timestamp in this page, for stable chat-list ordering.
-         */latestCreatedAtSecs: UInt64,
+         */latestCreatedAtSecs: UInt64, 
         /**
          * Oldest first within the bounded page.
          */messages: [MessageInfo]) {
@@ -3588,9 +3657,9 @@ public struct RecentMessagePageInfo: Equatable, Hashable {
         self.messages = messages
     }
 
+    
 
-
-
+    
 }
 
 #if compiler(>=6)
@@ -3604,8 +3673,8 @@ public struct FfiConverterTypeRecentMessagePageInfo: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RecentMessagePageInfo {
         return
             try RecentMessagePageInfo(
-                groupIdHex: FfiConverterString.read(from: &buf),
-                latestCreatedAtSecs: FfiConverterUInt64.read(from: &buf),
+                groupIdHex: FfiConverterString.read(from: &buf), 
+                latestCreatedAtSecs: FfiConverterUInt64.read(from: &buf), 
                 messages: FfiConverterSequenceTypeMessageInfo.read(from: &buf)
         )
     }
@@ -3663,9 +3732,9 @@ public struct SonarDescriptorInfo: Equatable, Hashable {
         self.publishedAtSecs = publishedAtSecs
     }
 
+    
 
-
-
+    
 }
 
 #if compiler(>=6)
@@ -3679,14 +3748,14 @@ public struct FfiConverterTypeSonarDescriptorInfo: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SonarDescriptorInfo {
         return
             try SonarDescriptorInfo(
-                schema: FfiConverterUInt32.read(from: &buf),
-                calls: FfiConverterBool.read(from: &buf),
-                media: FfiConverterSequenceString.read(from: &buf),
-                signaling: FfiConverterSequenceString.read(from: &buf),
-                transports: FfiConverterSequenceString.read(from: &buf),
-                callIdentity: FfiConverterString.read(from: &buf),
-                bolt12Offer: FfiConverterOptionString.read(from: &buf),
-                paymentReceipts: FfiConverterSequenceString.read(from: &buf),
+                schema: FfiConverterUInt32.read(from: &buf), 
+                calls: FfiConverterBool.read(from: &buf), 
+                media: FfiConverterSequenceString.read(from: &buf), 
+                signaling: FfiConverterSequenceString.read(from: &buf), 
+                transports: FfiConverterSequenceString.read(from: &buf), 
+                callIdentity: FfiConverterString.read(from: &buf), 
+                bolt12Offer: FfiConverterOptionString.read(from: &buf), 
+                paymentReceipts: FfiConverterSequenceString.read(from: &buf), 
                 publishedAtSecs: FfiConverterUInt64.read(from: &buf)
         )
     }
@@ -3735,9 +3804,9 @@ public struct SonarNotificationEnvelopeInfo: Equatable, Hashable {
         self.paymentSats = paymentSats
     }
 
+    
 
-
-
+    
 }
 
 #if compiler(>=6)
@@ -3751,9 +3820,9 @@ public struct FfiConverterTypeSonarNotificationEnvelopeInfo: FfiConverterRustBuf
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SonarNotificationEnvelopeInfo {
         return
             try SonarNotificationEnvelopeInfo(
-                kind: FfiConverterTypeSonarNotificationKindInfo.read(from: &buf),
-                title: FfiConverterString.read(from: &buf),
-                body: FfiConverterString.read(from: &buf),
+                kind: FfiConverterTypeSonarNotificationKindInfo.read(from: &buf), 
+                title: FfiConverterString.read(from: &buf), 
+                body: FfiConverterString.read(from: &buf), 
                 paymentSats: FfiConverterOptionUInt64.read(from: &buf)
         )
     }
@@ -3809,9 +3878,9 @@ public struct SonarNotificationRenderInputInfo: Equatable, Hashable {
         self.showPaymentAmount = showPaymentAmount
     }
 
+    
 
-
-
+    
 }
 
 #if compiler(>=6)
@@ -3825,15 +3894,15 @@ public struct FfiConverterTypeSonarNotificationRenderInputInfo: FfiConverterRust
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SonarNotificationRenderInputInfo {
         return
             try SonarNotificationRenderInputInfo(
-                enabled: FfiConverterBool.read(from: &buf),
-                kindHint: FfiConverterOptionTypeSonarNotificationKindInfo.read(from: &buf),
-                conversationTitle: FfiConverterOptionString.read(from: &buf),
-                senderName: FfiConverterOptionString.read(from: &buf),
-                groupName: FfiConverterOptionString.read(from: &buf),
-                contentPreview: FfiConverterOptionString.read(from: &buf),
-                unreadCount: FfiConverterUInt64.read(from: &buf),
-                showNames: FfiConverterBool.read(from: &buf),
-                showPreview: FfiConverterBool.read(from: &buf),
+                enabled: FfiConverterBool.read(from: &buf), 
+                kindHint: FfiConverterOptionTypeSonarNotificationKindInfo.read(from: &buf), 
+                conversationTitle: FfiConverterOptionString.read(from: &buf), 
+                senderName: FfiConverterOptionString.read(from: &buf), 
+                groupName: FfiConverterOptionString.read(from: &buf), 
+                contentPreview: FfiConverterOptionString.read(from: &buf), 
+                unreadCount: FfiConverterUInt64.read(from: &buf), 
+                showNames: FfiConverterBool.read(from: &buf), 
+                showPreview: FfiConverterBool.read(from: &buf), 
                 showPaymentAmount: FfiConverterBool.read(from: &buf)
         )
     }
@@ -3894,9 +3963,9 @@ public struct StickerInfo: Equatable, Hashable {
         self.emoji = emoji
     }
 
+    
 
-
-
+    
 }
 
 #if compiler(>=6)
@@ -3910,13 +3979,13 @@ public struct FfiConverterTypeStickerInfo: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> StickerInfo {
         return
             try StickerInfo(
-                shortcode: FfiConverterString.read(from: &buf),
-                url: FfiConverterString.read(from: &buf),
-                sha256: FfiConverterString.read(from: &buf),
-                mime: FfiConverterString.read(from: &buf),
-                width: FfiConverterOptionUInt32.read(from: &buf),
-                height: FfiConverterOptionUInt32.read(from: &buf),
-                alt: FfiConverterOptionString.read(from: &buf),
+                shortcode: FfiConverterString.read(from: &buf), 
+                url: FfiConverterString.read(from: &buf), 
+                sha256: FfiConverterString.read(from: &buf), 
+                mime: FfiConverterString.read(from: &buf), 
+                width: FfiConverterOptionUInt32.read(from: &buf), 
+                height: FfiConverterOptionUInt32.read(from: &buf), 
+                alt: FfiConverterOptionString.read(from: &buf), 
                 emoji: FfiConverterOptionString.read(from: &buf)
         )
     }
@@ -3969,9 +4038,9 @@ public struct StickerPackInfo: Equatable, Hashable {
         self.stickers = stickers
     }
 
+    
 
-
-
+    
 }
 
 #if compiler(>=6)
@@ -3985,10 +4054,10 @@ public struct FfiConverterTypeStickerPackInfo: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> StickerPackInfo {
         return
             try StickerPackInfo(
-                packCoordinate: FfiConverterString.read(from: &buf),
-                title: FfiConverterString.read(from: &buf),
-                description: FfiConverterOptionString.read(from: &buf),
-                coverUrl: FfiConverterOptionString.read(from: &buf),
+                packCoordinate: FfiConverterString.read(from: &buf), 
+                title: FfiConverterString.read(from: &buf), 
+                description: FfiConverterOptionString.read(from: &buf), 
+                coverUrl: FfiConverterOptionString.read(from: &buf), 
                 stickers: FfiConverterSequenceTypeStickerInfo.read(from: &buf)
         )
     }
@@ -4034,9 +4103,9 @@ public struct StickerRefInfo: Equatable, Hashable {
         self.plaintextSha256 = plaintextSha256
     }
 
+    
 
-
-
+    
 }
 
 #if compiler(>=6)
@@ -4050,8 +4119,8 @@ public struct FfiConverterTypeStickerRefInfo: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> StickerRefInfo {
         return
             try StickerRefInfo(
-                packCoordinate: FfiConverterString.read(from: &buf),
-                shortcode: FfiConverterString.read(from: &buf),
+                packCoordinate: FfiConverterString.read(from: &buf), 
+                shortcode: FfiConverterString.read(from: &buf), 
                 plaintextSha256: FfiConverterString.read(from: &buf)
         )
     }
@@ -4085,7 +4154,7 @@ public func FfiConverterTypeStickerRefInfo_lower(_ value: StickerRefInfo) -> Rus
  */
 
 public enum CallAnswerKind: Equatable, Hashable {
-
+    
     case accept
     case decline
     case busy
@@ -4109,32 +4178,32 @@ public struct FfiConverterTypeCallAnswerKind: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CallAnswerKind {
         let variant: Int32 = try readInt(&buf)
         switch variant {
-
+        
         case 1: return .accept
-
+        
         case 2: return .decline
-
+        
         case 3: return .busy
-
+        
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
 
     public static func write(_ value: CallAnswerKind, into buf: inout [UInt8]) {
         switch value {
-
-
+        
+        
         case .accept:
             writeInt(&buf, Int32(1))
-
-
+        
+        
         case .decline:
             writeInt(&buf, Int32(2))
-
-
+        
+        
         case .busy:
             writeInt(&buf, Int32(3))
-
+        
         }
     }
 }
@@ -4163,7 +4232,7 @@ public func FfiConverterTypeCallAnswerKind_lower(_ value: CallAnswerKind) -> Rus
  */
 
 public enum CallControlInfo: Equatable, Hashable {
-
+    
     case offer(callId: String, video: Bool, nodeAddrB64: String, unixSecs: UInt64
     )
     case answer(callId: String, answer: CallAnswerKind, nodeAddrB64: String
@@ -4192,52 +4261,52 @@ public struct FfiConverterTypeCallControlInfo: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CallControlInfo {
         let variant: Int32 = try readInt(&buf)
         switch variant {
-
+        
         case 1: return .offer(callId: try FfiConverterString.read(from: &buf), video: try FfiConverterBool.read(from: &buf), nodeAddrB64: try FfiConverterString.read(from: &buf), unixSecs: try FfiConverterUInt64.read(from: &buf)
         )
-
+        
         case 2: return .answer(callId: try FfiConverterString.read(from: &buf), answer: try FfiConverterTypeCallAnswerKind.read(from: &buf), nodeAddrB64: try FfiConverterString.read(from: &buf)
         )
-
+        
         case 3: return .cancel(callId: try FfiConverterString.read(from: &buf)
         )
-
+        
         case 4: return .end(callId: try FfiConverterString.read(from: &buf), reason: try FfiConverterString.read(from: &buf)
         )
-
+        
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
 
     public static func write(_ value: CallControlInfo, into buf: inout [UInt8]) {
         switch value {
-
-
+        
+        
         case let .offer(callId,video,nodeAddrB64,unixSecs):
             writeInt(&buf, Int32(1))
             FfiConverterString.write(callId, into: &buf)
             FfiConverterBool.write(video, into: &buf)
             FfiConverterString.write(nodeAddrB64, into: &buf)
             FfiConverterUInt64.write(unixSecs, into: &buf)
-
-
+            
+        
         case let .answer(callId,answer,nodeAddrB64):
             writeInt(&buf, Int32(2))
             FfiConverterString.write(callId, into: &buf)
             FfiConverterTypeCallAnswerKind.write(answer, into: &buf)
             FfiConverterString.write(nodeAddrB64, into: &buf)
-
-
+            
+        
         case let .cancel(callId):
             writeInt(&buf, Int32(3))
             FfiConverterString.write(callId, into: &buf)
-
-
+            
+        
         case let .end(callId,reason):
             writeInt(&buf, Int32(4))
             FfiConverterString.write(callId, into: &buf)
             FfiConverterString.write(reason, into: &buf)
-
+            
         }
     }
 }
@@ -4265,7 +4334,7 @@ public func FfiConverterTypeCallControlInfo_lower(_ value: CallControlInfo) -> R
  */
 
 public enum CallStateInfo: Equatable, Hashable {
-
+    
     case ringing
     case connecting
     case connected
@@ -4294,62 +4363,62 @@ public struct FfiConverterTypeCallStateInfo: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CallStateInfo {
         let variant: Int32 = try readInt(&buf)
         switch variant {
-
+        
         case 1: return .ringing
-
+        
         case 2: return .connecting
-
+        
         case 3: return .connected
-
+        
         case 4: return .ended
-
+        
         case 5: return .failed
-
+        
         case 6: return .declined
-
+        
         case 7: return .busy
-
+        
         case 8: return .missed
-
+        
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
 
     public static func write(_ value: CallStateInfo, into buf: inout [UInt8]) {
         switch value {
-
-
+        
+        
         case .ringing:
             writeInt(&buf, Int32(1))
-
-
+        
+        
         case .connecting:
             writeInt(&buf, Int32(2))
-
-
+        
+        
         case .connected:
             writeInt(&buf, Int32(3))
-
-
+        
+        
         case .ended:
             writeInt(&buf, Int32(4))
-
-
+        
+        
         case .failed:
             writeInt(&buf, Int32(5))
-
-
+        
+        
         case .declined:
             writeInt(&buf, Int32(6))
-
-
+        
+        
         case .busy:
             writeInt(&buf, Int32(7))
-
-
+        
+        
         case .missed:
             writeInt(&buf, Int32(8))
-
+        
         }
     }
 }
@@ -4370,6 +4439,113 @@ public func FfiConverterTypeCallStateInfo_lower(_ value: CallStateInfo) -> RustB
 }
 
 
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Transcript-level classification of a chat message, computed once in core
+ * so hosts never re-parse `content` on the UI render path. Malformed control
+ * lines classify as `Text` (a parse failure never hides a message).
+ */
+
+public enum MessageClassInfo: Equatable, Hashable {
+    
+    /**
+     * Plain chat text.
+     */
+    case text
+    /**
+     * `⚡PAY|1|<id>|<sats>` payment receipt — render a payment bubble.
+     */
+    case payReceipt(paymentId: String, amountSats: UInt64
+    )
+    /**
+     * `⚡PAYDONE|…` settlement — protocol control line, hidden from the
+     * transcript (still drives ledger state).
+     */
+    case payDone(paymentId: String, preimageHex: String?
+    )
+    /**
+     * `☎CALL|…` signaling line — hidden from the transcript.
+     */
+    case callControl
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension MessageClassInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMessageClassInfo: FfiConverterRustBuffer {
+    typealias SwiftType = MessageClassInfo
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MessageClassInfo {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .text
+        
+        case 2: return .payReceipt(paymentId: try FfiConverterString.read(from: &buf), amountSats: try FfiConverterUInt64.read(from: &buf)
+        )
+        
+        case 3: return .payDone(paymentId: try FfiConverterString.read(from: &buf), preimageHex: try FfiConverterOptionString.read(from: &buf)
+        )
+        
+        case 4: return .callControl
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: MessageClassInfo, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .text:
+            writeInt(&buf, Int32(1))
+        
+        
+        case let .payReceipt(paymentId,amountSats):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(paymentId, into: &buf)
+            FfiConverterUInt64.write(amountSats, into: &buf)
+            
+        
+        case let .payDone(paymentId,preimageHex):
+            writeInt(&buf, Int32(3))
+            FfiConverterString.write(paymentId, into: &buf)
+            FfiConverterOptionString.write(preimageHex, into: &buf)
+            
+        
+        case .callControl:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMessageClassInfo_lift(_ buf: RustBuffer) throws -> MessageClassInfo {
+    return try FfiConverterTypeMessageClassInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMessageClassInfo_lower(_ value: MessageClassInfo) -> RustBuffer {
+    return FfiConverterTypeMessageClassInfo.lower(value)
+}
+
+
 
 /**
  * Flat error: only the rendered message crosses the FFI boundary
@@ -4377,28 +4553,28 @@ public func FfiConverterTypeCallStateInfo_lower(_ value: CallStateInfo) -> RustB
  */
 public enum SonarFfiError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
 
-
-
+    
+    
     /**
      * Caller passed something unparseable (bad nsec, npub, hex, relay URL).
      */
     case InvalidInput(message: String)
-
+    
     /**
      * Anything that went wrong inside sonar-core (relay I/O, MLS, MDK...).
      */
     case Core(message: String)
+    
 
+    
 
+    
 
-
-
-
-
+    
     public var errorDescription: String? {
         String(reflecting: self)
     }
-
+    
 }
 
 #if compiler(>=6)
@@ -4415,17 +4591,17 @@ public struct FfiConverterTypeSonarFfiError: FfiConverterRustBuffer {
         let variant: Int32 = try readInt(&buf)
         switch variant {
 
+        
 
-
-
+        
         case 1: return .InvalidInput(
             message: try FfiConverterString.read(from: &buf)
         )
-
+        
         case 2: return .Core(
             message: try FfiConverterString.read(from: &buf)
         )
-
+        
 
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -4434,15 +4610,15 @@ public struct FfiConverterTypeSonarFfiError: FfiConverterRustBuffer {
     public static func write(_ value: SonarFfiError, into buf: inout [UInt8]) {
         switch value {
 
+        
 
-
-
+        
         case .InvalidInput(_ /* message is ignored*/):
             writeInt(&buf, Int32(1))
         case .Core(_ /* message is ignored*/):
             writeInt(&buf, Int32(2))
 
-
+        
         }
     }
 }
@@ -4466,7 +4642,7 @@ public func FfiConverterTypeSonarFfiError_lower(_ value: SonarFfiError) -> RustB
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
 public enum SonarNotificationKindInfo: Equatable, Hashable {
-
+    
     case message
     case payment
     case call
@@ -4494,56 +4670,56 @@ public struct FfiConverterTypeSonarNotificationKindInfo: FfiConverterRustBuffer 
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SonarNotificationKindInfo {
         let variant: Int32 = try readInt(&buf)
         switch variant {
-
+        
         case 1: return .message
-
+        
         case 2: return .payment
-
+        
         case 3: return .call
-
+        
         case 4: return .invite
-
+        
         case 5: return .mention
-
+        
         case 6: return .geohash
-
+        
         case 7: return .network
-
+        
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
 
     public static func write(_ value: SonarNotificationKindInfo, into buf: inout [UInt8]) {
         switch value {
-
-
+        
+        
         case .message:
             writeInt(&buf, Int32(1))
-
-
+        
+        
         case .payment:
             writeInt(&buf, Int32(2))
-
-
+        
+        
         case .call:
             writeInt(&buf, Int32(3))
-
-
+        
+        
         case .invite:
             writeInt(&buf, Int32(4))
-
-
+        
+        
         case .mention:
             writeInt(&buf, Int32(5))
-
-
+        
+        
         case .geohash:
             writeInt(&buf, Int32(6))
-
-
+        
+        
         case .network:
             writeInt(&buf, Int32(7))
-
+        
         }
     }
 }
@@ -4573,9 +4749,9 @@ public func FfiConverterTypeSonarNotificationKindInfo_lower(_ value: SonarNotifi
  * (message sent/received, group created/deleted, unread count changed).
  */
 public protocol ConversationChangeListener: AnyObject, Sendable {
-
-    func onConversationChanged(groupIdHex: String)
-
+    
+    func onConversationChanged(groupIdHex: String) 
+    
 }
 
 
@@ -4617,7 +4793,7 @@ fileprivate struct UniffiCallbackInterfaceConversationChangeListener {
                 )
             }
 
-
+            
             let writeReturn = { () }
             uniffiTraitInterfaceCall(
                 callStatus: uniffiCallStatus,
@@ -5893,7 +6069,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_drain_pending_marmot() != 2299) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_ensure_subscriptions() != 56185) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_ensure_subscriptions() != 49920) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_fetch_installed_packs() != 62453) {
@@ -5956,7 +6132,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_key_package() != 48211) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_key_package_background() != 41112) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_profile() != 42572) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_profile_background() != 18973) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_sonar_descriptor() != 7979) {

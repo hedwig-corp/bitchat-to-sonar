@@ -3028,6 +3028,21 @@ final class SonarAppStore: ObservableObject {
 
     // MARK: DM transcript + send
 
+    /// Live per-conversation render states, keyed by conversation id. NOT
+    /// @Published on purpose: creating one during a SwiftUI body evaluation
+    /// must not invalidate the store. Entries are released on `closedDM`.
+    private var conversationViewStates: [String: ConversationViewState] = [:]
+
+    /// The precomputed transcript for one conversation. Returns the same
+    /// instance across body evaluations so `@ObservedObject` subscriptions
+    /// stay stable while the chat is open.
+    func conversationViewState(_ id: String) -> ConversationViewState {
+        if let existing = conversationViewStates[id] { return existing }
+        let state = ConversationViewState(conversationId: id, store: self)
+        conversationViewStates[id] = state
+        return state
+    }
+
     /// How one chat line renders: regular text, a ⚡PAY receipt bubble,
     /// or hidden (⚡PAYDONE is a protocol control line). Unknown
     /// ⚡PAY versions decode to nothing and fall through as plain text.
@@ -3045,13 +3060,38 @@ final class SonarAppStore: ObservableObject {
         }
         guard let line = SonarPayMessage.decode(content) else { return .notPay }
         guard case .pay(let pid, let sats) = line else { return .hidden }
+        return payBubble(paymentId: pid, wireSats: sats, fallbackVia: fallbackVia)
+    }
+
+    /// Marmot messages arrive with a core-computed classification, so the
+    /// transcript build does zero content parsing (and zero FFI calls) for
+    /// them. Optimistic local echoes default to `.text` and fall back to the
+    /// string decode so a just-sent ⚡PAY line still bubbles immediately.
+    private func payMapping(
+        _ m: MarmotService.MarmotMessage,
+        fallbackVia: SNVia
+    ) -> PayMapping {
+        switch m.classification {
+        case .callControl, .payDone:
+            return .hidden
+        case .payReceipt(let pid, let sats):
+            return payBubble(paymentId: pid, wireSats: Int64(sats), fallbackVia: fallbackVia)
+        case .text:
+            if m.content.hasPrefix("\u{26A1}PAY") || Self.looksLikeCallControl(m.content) {
+                return payMapping(m.content, fallbackVia: fallbackVia)
+            }
+            return .notPay
+        }
+    }
+
+    private func payBubble(paymentId pid: String, wireSats: Int64, fallbackVia: SNVia) -> PayMapping {
         let entry = payLedger.entry(for: pid)
         // The coin renders with the transport it traveled over (recorded in
         // the ledger), not the conversation's current reachability.
         let via = entry.flatMap { SNVia(rawValue: $0.via) } ?? fallbackVia
         let isDirect = paymentActivityLedger.entries[pid] != nil
         return .bubble(
-            SNPayInfo(id: pid, sats: entry?.sats ?? sats, state: entry?.state ?? .sealed, direct: isDirect),
+            SNPayInfo(id: pid, sats: entry?.sats ?? wireSats, state: entry?.state ?? .sealed, direct: isDirect),
             via
         )
     }
@@ -3083,6 +3123,9 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
+    /// Build the render-ready transcript for one conversation. O(page) with
+    /// parsing/sorting — call it from `ConversationViewState` (per data
+    /// change), NEVER from a SwiftUI `body` (per render).
     func dmMsgs(_ id: String) -> [SNMessage] {
         if let groupId = marmotGroupId(id) {
             let groups = directMarmotGroups(matchingGroupId: groupId)
@@ -3092,7 +3135,7 @@ final class SonarAppStore: ObservableObject {
             var dated: [(Date, SNMessage)] = []
             for group in sourceGroups {
                 dated += (marmot.messagesByGroup[group.id] ?? []).compactMap { m in
-                    switch payMapping(m.content, fallbackVia: .internet) {
+                    switch payMapping(m, fallbackVia: .internet) {
                     case .hidden:
                         return nil
                     case .bubble(let pay, let payVia):
@@ -3206,7 +3249,7 @@ final class SonarAppStore: ObservableObject {
         // White Noise leg always renders as internet (indigo).
         if let profile = resolvedSonarProfile(id), let group = marmotGroup(forNpub: profile.npub) {
             dated += (marmot.messagesByGroup[group.id] ?? []).compactMap { m in
-                switch payMapping(m.content, fallbackVia: .internet) {
+                switch payMapping(m, fallbackVia: .internet) {
                 case .hidden:
                     return nil
                 case .bubble(let pay, let payVia):
@@ -4299,6 +4342,11 @@ final class SonarAppStore: ObservableObject {
     }
 
     func closedDM(_ id: String) {
+        // Drop the precomputed render state: closed chats must not keep
+        // rebuilding on every store invalidation. A view still holding the
+        // object keeps working (it owns its subscription); this only stops
+        // caching it for reuse.
+        conversationViewStates[id] = nil
         // NB: do NOT stop the Marmot subscription loop here — it now runs for as
         // long as we're connected (started in performConnect) so welcomes +
         // messages keep arriving live in the background list, not only while a
