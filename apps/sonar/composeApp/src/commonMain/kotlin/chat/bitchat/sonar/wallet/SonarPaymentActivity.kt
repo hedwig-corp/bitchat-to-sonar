@@ -3,6 +3,7 @@ package chat.bitchat.sonar.wallet
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import chat.bitchat.sonar.ConcurrencyLock
 import chat.bitchat.sonar.PayEntry
 import chat.bitchat.sonar.PayStatus
 import chat.bitchat.sonar.SonarClock
@@ -294,6 +295,13 @@ object PaymentActivityStore {
 
     private var ledger: SonarPaymentActivityLedger? = null
 
+    /** Guards the lazy [ledger] init + every mutate/persist. The Android Breez
+     *  event listener records incoming receives from an SDK callback thread
+     *  ([recordIncomingWalletPayment]) concurrently with the app's main scope
+     *  and the push-service settlement path, so the underlying LinkedHashMap
+     *  must not be touched by two threads at once. */
+    private val lock = ConcurrencyLock()
+
     /** Bumped whenever the ledger changes, so activity UI recomposes. */
     var version by mutableStateOf(0)
         private set
@@ -301,16 +309,17 @@ object PaymentActivityStore {
     private fun ledger(): SonarPaymentActivityLedger =
         ledger ?: SonarPaymentActivityLedger(SonarCore.loadBlob(BLOB_KEY)).also { ledger = it }
 
-    fun sorted(): List<SonarPaymentActivity> = ledger().sorted()
+    fun sorted(): List<SonarPaymentActivity> = lock.withLock { ledger().sorted() }
 
-    fun activities(peerKey: String): List<SonarPaymentActivity> = ledger().activities(peerKey)
+    fun activities(peerKey: String): List<SonarPaymentActivity> =
+        lock.withLock { ledger().activities(peerKey) }
 
-    fun get(id: String): SonarPaymentActivity? = ledger().get(id)
+    fun get(id: String): SonarPaymentActivity? = lock.withLock { ledger().get(id) }
 
-    fun recordPending(activity: SonarPaymentActivity): Boolean {
-        if (!ledger().recordPending(activity)) return false
+    fun recordPending(activity: SonarPaymentActivity): Boolean = lock.withLock {
+        if (!ledger().recordPending(activity)) return@withLock false
         persist(); version++
-        return true
+        true
     }
 
     /** Record a settled INCOMING external wallet payment. Called at the event
@@ -346,20 +355,21 @@ object PaymentActivityStore {
         walletPaymentId: String?,
         feesSats: Long?,
         settledAtSecs: Long = SonarClock.nowSecs(),
-    ): Boolean {
-        if (!ledger().markPaid(id, walletPaymentId, feesSats, settledAtSecs)) return false
+    ): Boolean = lock.withLock {
+        if (!ledger().markPaid(id, walletPaymentId, feesSats, settledAtSecs)) return@withLock false
         persist(); version++
-        return true
+        true
     }
 
-    fun markFailed(id: String, message: String, nowSecs: Long = SonarClock.nowSecs()): Boolean {
-        if (!ledger().markFailed(id, message, nowSecs)) return false
-        persist(); version++
-        return true
-    }
+    fun markFailed(id: String, message: String, nowSecs: Long = SonarClock.nowSecs()): Boolean =
+        lock.withLock {
+            if (!ledger().markFailed(id, message, nowSecs)) return@withLock false
+            persist(); version++
+            true
+        }
 
     /** Emergency wipe: forget every payment (iOS `wipe()`). */
-    fun wipe() {
+    fun wipe() = lock.withLock {
         ledger = SonarPaymentActivityLedger()
         SonarCore.saveBlob(BLOB_KEY, "")
         version++
