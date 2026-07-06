@@ -1921,10 +1921,12 @@ private fun MediaBubble(
 }
 
 /**
- * Album deck (xChat-style): the front media card sits on a small pile of peek
- * cards (offset + shadowed like stacked paper). Swipe left/right to page, tap to
- * open the fullscreen gallery. Paints from the already-loaded local media list;
- * each card loads its own bytes lazily so only visited pages decode.
+ * Album deck (xChat-style): the front photo card rests on the ACTUAL next
+ * photos, peeking out offset + dimmed + shadowed like a real stack of prints.
+ * Every card shares one uniform frame (fill-cropped) so the pile edges line
+ * up. Swipe left/right to page, tap to open the fullscreen gallery. Paints
+ * from the already-loaded local media list; the only extra work is the 1–2
+ * peeked thumbnails, which are the pages the user swipes to next anyway.
  */
 @Composable
 private fun MediaDeck(
@@ -1935,21 +1937,24 @@ private fun MediaDeck(
     onOpen: (Int) -> Unit,
 ) {
     val s = sonar
-    val deckWidth = if (maxBubbleWidth == Dp.Infinity) 240.dp else minOf(240.dp, maxBubbleWidth)
+    val deckWidth = if (maxBubbleWidth == Dp.Infinity) 250.dp else minOf(250.dp, maxBubbleWidth)
     val deckHeight = 240.dp
     val pagerState = androidx.compose.foundation.pager.rememberPagerState(pageCount = { media.size })
-    val peek = minOf(2, media.size - 1)
-    Box {
-        // Static peek cards behind the front card, offset right + down. Drawn
-        // deepest-first so the nearest sliver sits on top of the farther ones.
+    val current = pagerState.currentPage
+    val peek = minOf(2, media.size - 1 - current).coerceAtLeast(0)
+    Box(Modifier.padding(end = (peek * 6).dp + 0.dp, bottom = (peek * 5).dp + 0.dp)) {
+        // Real next-photo thumbnails behind the front card, deepest first, so
+        // the pile shows what's coming and shrinks toward the last photo.
         for (depth in peek downTo 1) {
-            Box(
-                Modifier
+            MediaDeckCard(
+                media = media[current + depth],
+                state = state,
+                chatId = chatId,
+                dim = 0.12f + 0.10f * depth,
+                onOpen = null,
+                modifier = Modifier
                     .padding(start = (depth * 6).dp, top = (depth * 5).dp)
-                    .size(width = deckWidth, height = deckHeight)
-                    .clip(RoundedCornerShape(18.dp))
-                    .background(s.surface2)
-                    .border(1.dp, Color.Black.copy(alpha = 0.06f), RoundedCornerShape(18.dp))
+                    .size(width = deckWidth, height = deckHeight),
             )
         }
         androidx.compose.foundation.pager.HorizontalPager(
@@ -1972,23 +1977,26 @@ private fun MediaDeck(
             repeat(media.size) { i ->
                 Box(
                     Modifier.size(6.dp).clip(CircleShape)
-                        .background(if (i == pagerState.currentPage) s.accent else s.text3.copy(alpha = 0.4f))
+                        .background(if (i == pagerState.currentPage) s.accent else Color.White.copy(alpha = 0.55f))
                 )
             }
         }
     }
 }
 
-/** One image card inside a [MediaDeck]: loads + decodes its own bytes and fits
- *  the image; falls back to skeleton / unavailable / file chip like the single
- *  media bubble. Tap opens the gallery (or retries a failed load). */
+/** One image card inside a [MediaDeck]: loads + decodes its own bytes and
+ *  FILL-CROPS the image into the uniform card frame; falls back to skeleton /
+ *  unavailable / file chip like the single media bubble. [dim] darkens peek
+ *  cards (which are not tappable — [onOpen] null). Tap opens the gallery (or
+ *  retries a failed load). */
 @Composable
 private fun MediaDeckCard(
     media: SonarMedia,
     state: SonarAppState,
     chatId: String,
-    onOpen: () -> Unit,
+    onOpen: (() -> Unit)?,
     modifier: Modifier = Modifier,
+    dim: Float = 0f,
 ) {
     val s = sonar
     var loadAttempt by remember(media.url, chatId) { mutableStateOf(0) }
@@ -2003,19 +2011,33 @@ private fun MediaDeckCard(
     val failed = loadResult.first && bytes == null
     Box(
         modifier.clip(RoundedCornerShape(18.dp)).background(s.surface2)
-            .clickable { if (failed) loadAttempt += 1 else if (bytes != null) onOpen() },
+            .border(1.dp, Color.Black.copy(alpha = 0.08f), RoundedCornerShape(18.dp))
+            .let { m ->
+                if (onOpen != null) {
+                    m.clickable { if (failed) loadAttempt += 1 else if (bytes != null) onOpen() }
+                } else m
+            },
         contentAlignment = Alignment.Center
     ) {
         when {
-            bytes != null && (renderAsGif || img != null) -> {
-                MediaImage(bytes = bytes, isGif = renderAsGif, modifier = Modifier.fillMaxSize())
-                if (renderAsGif) GifBadge(Modifier.align(Alignment.TopEnd).padding(8.dp))
+            renderAsGif && bytes != null -> {
+                MediaImage(bytes = bytes, isGif = true, modifier = Modifier.fillMaxSize())
+                GifBadge(Modifier.align(Alignment.TopEnd).padding(8.dp))
             }
-            bytes != null -> InlineMediaFileChip(media = media, onOpen = onOpen)
+            img != null -> Image(
+                img,
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize()
+            )
+            bytes != null -> InlineMediaFileChip(media = media, onOpen = { onOpen?.invoke() })
             failed -> MediaUnavailable(media)
             else -> MediaLoadingSkeleton(media)
         }
         if (media.isGif && bytes == null) GifBadge(Modifier.align(Alignment.TopEnd).padding(8.dp))
+        if (dim > 0f) {
+            Box(Modifier.matchParentSize().background(Color.Black.copy(alpha = dim)))
+        }
     }
 }
 

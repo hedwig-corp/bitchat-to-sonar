@@ -1111,13 +1111,16 @@ struct SNMediaBubble: View {
     }
 }
 
-/// One image card in a media deck: loads + decodes its own bytes and renders the
-/// fitted image (matching the single media bubble), or a loading / retry
-/// placeholder. Non-image attachments fall back to a compact chip. Each card
-/// loads lazily so a deck only decodes the pages the user actually reaches.
+/// One image card in a media deck: loads + decodes its own bytes and renders
+/// the image FILL-CROPPED into the deck's uniform card frame (every card in
+/// the pile shares the exact same size, so the peeks line up like a real photo
+/// stack). `dim` darkens peek cards slightly so the front card reads on top.
+/// Each card loads lazily so a deck only decodes visited + peeked pages.
 private struct SNMediaCardImage: View {
     let item: SNMediaItem
-    let maxBubbleWidth: CGFloat
+    let width: CGFloat
+    let height: CGFloat
+    var dim: Double = 0
     var load: ((SNMediaItem) async -> Data?)?
 
     @State private var bytes: Data?
@@ -1130,6 +1133,17 @@ private struct SNMediaCardImage: View {
 
     var body: some View {
         cardContent
+            .frame(width: width, height: height)
+            .clipShape(RoundedRectangle(cornerRadius: 18))
+            .overlay(
+                RoundedRectangle(cornerRadius: 18)
+                    .stroke(Color.black.opacity(0.08), lineWidth: 1)
+            )
+            .overlay(
+                // Peek cards get a soft dim so depth reads without hiding the photo.
+                RoundedRectangle(cornerRadius: 18)
+                    .fill(Color.black.opacity(dim))
+            )
             .task(id: loadKey) {
                 bytes = nil
                 failed = false
@@ -1148,27 +1162,19 @@ private struct SNMediaCardImage: View {
     @ViewBuilder private var cardContent: some View {
         if item.isImage, let bytes, item.isGif, bytes.snLooksLikeGif {
             SNGifView(data: bytes)
-                .frame(width: maxBubbleWidth, height: 220)
-                .clipShape(RoundedRectangle(cornerRadius: 18))
+                .frame(width: width, height: height)
                 .overlay(alignment: .topTrailing) { SNGifBadge().padding(8) }
         } else if item.isImage, let bytes, let decoded = snDecodedPlatformImage(bytes) {
-            let size = snFittedMediaSize(decoded.size, maxWidth: maxBubbleWidth, maxHeight: 300)
             decoded.image
                 .resizable()
-                .aspectRatio(contentMode: .fit)
-                .frame(width: size.width, height: size.height)
-                .background(SonarTheme.surface2)
-                .clipShape(RoundedRectangle(cornerRadius: 18))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 18)
-                        .stroke(Color.black.opacity(0.08), lineWidth: 1)
-                )
+                .aspectRatio(contentMode: .fill)
+                .frame(width: width, height: height)
+                .clipped()
         } else if item.isImage {
             RoundedRectangle(cornerRadius: 18)
                 .fill(SonarTheme.surface2)
-                .frame(width: maxBubbleWidth * 0.72, height: 200)
                 .overlay {
-                    if failed {
+                    if failed, dim == 0 {
                         Button {
                             loadAttempt += 1
                         } label: {
@@ -1177,7 +1183,7 @@ private struct SNMediaCardImage: View {
                                 .foregroundColor(SonarTheme.accent)
                         }
                         .buttonStyle(.plain)
-                    } else {
+                    } else if !failed {
                         ProgressView()
                     }
                 }
@@ -1194,16 +1200,18 @@ private struct SNMediaCardImage: View {
                     .font(SonarTheme.uiFont(size: 11))
                     .foregroundColor(SonarTheme.text3)
             }
-            .frame(width: maxBubbleWidth * 0.72, height: 200)
+            .frame(width: width, height: height)
             .background(RoundedRectangle(cornerRadius: 18).fill(SonarTheme.surface2))
         }
     }
 }
 
-/// xChat-style album deck: the front media card rests on a small pile of peek
-/// cards (offset + shadowed like stacked paper). Drag the front card left/right
-/// to page; tap to open the fullscreen gallery. Paints from the already-loaded
-/// local `media` list — no network on render beyond each card's own lazy fetch.
+/// xChat-style album deck: the front photo card rests on the ACTUAL next
+/// photos, peeking out offset + dimmed + shadowed like a real stack of prints.
+/// Every card shares one uniform frame so the pile edges line up. Drag the
+/// front card left/right to page; tap to open the fullscreen gallery. Paints
+/// from the already-loaded local `media` list — the only extra work is the 1–2
+/// peeked thumbnails, which are the pages the user swipes to next anyway.
 private struct SNMediaDeck: View {
     let items: [SNMediaItem]
     let maxBubbleWidth: CGFloat
@@ -1216,25 +1224,28 @@ private struct SNMediaDeck: View {
     var body: some View {
         let count = items.count
         let current = min(max(index, 0), count - 1)
+        let cardW = maxBubbleWidth * 0.78
+        let cardH: CGFloat = 240
+        let depths = peekDepths(count: count, current: current)
         VStack(alignment: .leading, spacing: 8) {
             ZStack(alignment: .topLeading) {
-                ForEach(Array(peekDepths(count: count, current: current).reversed()), id: \.self) { depth in
-                    RoundedRectangle(cornerRadius: 18)
-                        .fill(SonarTheme.surface2)
-                        .frame(width: maxBubbleWidth * 0.72, height: 220)
-                        .scaleEffect(1 - CGFloat(depth) * 0.04, anchor: .topLeading)
-                        .offset(x: CGFloat(depth) * 10, y: CGFloat(depth) * 8)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 18)
-                                .stroke(Color.black.opacity(0.06), lineWidth: 1)
-                                .scaleEffect(1 - CGFloat(depth) * 0.04, anchor: .topLeading)
-                                .offset(x: CGFloat(depth) * 10, y: CGFloat(depth) * 8)
-                        )
-                        .shadow(color: Color.black.opacity(0.10), radius: 4, x: 0, y: 2)
+                // Real next-photo thumbnails behind the front card, deepest first.
+                ForEach(Array(depths.reversed()), id: \.self) { depth in
+                    SNMediaCardImage(
+                        item: items[current + depth],
+                        width: cardW,
+                        height: cardH,
+                        dim: 0.12 + 0.10 * Double(depth),
+                        load: load
+                    )
+                    .scaleEffect(1 - CGFloat(depth) * 0.03, anchor: .topLeading)
+                    .offset(x: CGFloat(depth) * 12, y: CGFloat(depth) * 9)
+                    .shadow(color: Color.black.opacity(0.10), radius: 4, x: 0, y: 2)
+                    .allowsHitTesting(false)
                 }
-                SNMediaCardImage(item: items[current], maxBubbleWidth: maxBubbleWidth, load: load)
+                SNMediaCardImage(item: items[current], width: cardW, height: cardH, load: load)
                     .id(current)
-                    .shadow(color: Color.black.opacity(0.12), radius: 5, x: 0, y: 2)
+                    .shadow(color: Color.black.opacity(0.14), radius: 6, x: 0, y: 3)
                     .offset(x: dragX)
                     .contentShape(RoundedRectangle(cornerRadius: 18))
                     .onTapGesture { onOpen(current) }
@@ -1255,6 +1266,10 @@ private struct SNMediaDeck: View {
                             }
                     )
             }
+            // Reserve room for the deepest peek's overhang so following rows
+            // don't sit on top of the pile.
+            .padding(.trailing, CGFloat(depths.count) * 12)
+            .padding(.bottom, CGFloat(depths.count) * 9)
             SNDeckDots(count: count, index: current)
         }
     }
