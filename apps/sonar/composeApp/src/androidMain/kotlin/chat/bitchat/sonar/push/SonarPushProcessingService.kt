@@ -262,8 +262,11 @@ class SonarPushProcessingService : Service() {
                 // window) — the step iOS's NSE does via InvoiceRequestTask and
                 // Android must do itself (no notification plugin in the KMP
                 // bindings). Answer FIRST, then await the resulting payment.
+                // (breez/notify's lnurlpay_* callback types are intentionally
+                // unhandled: Sonar publishes no LNURL-pay endpoint, only BOLT12
+                // offers — extend here if LNURL receive ever ships.)
                 if (notificationType == NOTIF_TYPE_INVOICE_REQUEST) {
-                    answerInvoiceRequest(payload)
+                    answerInvoiceRequest(payload, deadline)
                 }
 
                 // Await a claimed receive: the first one ends this wake (each new
@@ -293,26 +296,43 @@ class SonarPushProcessingService : Service() {
      * gets a real error instead of the NDS's 60s timeout. The NDS relays the
      * body verbatim to the swap server.
      */
-    private suspend fun answerInvoiceRequest(payload: String) {
+    private suspend fun answerInvoiceRequest(payload: String, deadlineElapsedMs: Long) {
         val req = InvoiceRequestPayload.parse(payload) ?: run {
             Log.w(TAG, "invoice_request: unparseable payload")
             return
         }
-        if (!req.replyUrl.startsWith("https://")) {
-            // The reply URL is server-injected; anything non-HTTPS is malformed
-            // or tampered — never post an invoice to it.
-            Log.w(TAG, "invoice_request: refusing non-https reply URL")
+        // The reply URL is server-injected by OUR NDS; pin it there. Comparing
+        // the PARSED host (https, no userinfo) rejects both plain-http and
+        // `https://user@evil/` tricks — a forged push must not redirect the
+        // invoice elsewhere.
+        val replyHost = runCatching { URL(req.replyUrl) }.getOrNull()
+            ?.takeIf { it.protocol == "https" && it.userInfo == null }
+            ?.host
+        if (replyHost == null ||
+            !replyHost.equals(SonarPushRegistration.expectedNdsHost(), ignoreCase = true)
+        ) {
+            Log.w(TAG, "invoice_request: refusing reply URL (host/scheme mismatch)")
             return
         }
-        val body = WalletBridge.createBolt12Invoice(req.offer, req.invoiceRequest).fold(
-            onSuccess = { JsonLite.encodeObject("invoice", it) },
-            onFailure = {
-                Log.w(TAG, "invoice_request: createBolt12Invoice failed", it)
-                JsonLite.encodeObject("error", it.message ?: "failed to create invoice")
-            },
-        )
-        val posted = postReply(req.replyUrl, body)
-        Log.d(TAG, "invoice_request answered (posted=$posted)")
+        // The NDS blocks its caller ~60s from the webhook; past our own wake
+        // deadline the answer would land on an expired request id — don't
+        // bother producing (and leaking wall-clock on) a stale invoice.
+        val remainingMs = deadlineElapsedMs - SystemClock.elapsedRealtime()
+        if (remainingMs < 2_000) {
+            Log.w(TAG, "invoice_request: answer window already spent, skipping")
+            return
+        }
+        val answered = withTimeoutOrNull(remainingMs) {
+            val body = WalletBridge.createBolt12Invoice(req.offer, req.invoiceRequest).fold(
+                onSuccess = { JsonLite.encodeObject("invoice", it) },
+                onFailure = {
+                    Log.w(TAG, "invoice_request: createBolt12Invoice failed", it)
+                    JsonLite.encodeObject("error", it.message ?: "failed to create invoice")
+                },
+            )
+            postReply(req.replyUrl, body)
+        }
+        Log.d(TAG, "invoice_request answered (posted=${answered ?: false})")
     }
 
     /** POST [body] as JSON to [url]; true on 2xx. Bounded timeouts — the whole

@@ -81,4 +81,17 @@ class InvoiceRequestPayloadTest {
     fun nonStringValueForFieldReturnsNull() {
         assertNull(JsonLite.stringField("""{"offer":123,"x":"y"}""", "offer"))
     }
+
+    @Test
+    fun nestedObjectValueBailsInsteadOfMatchingInnerKey() {
+        // Descending into a nested value could match an inner "reply_url" and
+        // return a WRONG value — the parser must bail (null) on nesting.
+        assertNull(
+            JsonLite.stringField(
+                """{"a":{"reply_url":"https://evil/r/1"},"reply_url":"https://good/r/1"}""",
+                "reply_url",
+            )
+        )
+        assertNull(JsonLite.stringField("""{"a":[1,2],"offer":"lno1"}""", "offer"))
+    }
 }
