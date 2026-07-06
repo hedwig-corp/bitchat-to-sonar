@@ -290,6 +290,11 @@ actual object MeshRadio {
         }
     }
 
+    actual fun hasActivePeer(): Boolean =
+        // No list build/sort — called every 150ms by the adaptive drain loop.
+        // A live Noise link (definitely present) or any recent announce peer.
+        announcedPeers.keys.any { MeshGatt.hasLink(it) } || announcedSeen.isNotEmpty()
+
     actual fun peers(): List<MeshPeer> {
         val now = System.currentTimeMillis()
         // `seen` (raw scan results) is kept only to drive auto-dial — it is NOT
