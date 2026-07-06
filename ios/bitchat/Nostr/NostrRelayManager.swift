@@ -20,8 +20,6 @@ final class NostrRelayManager: ObservableObject {
         var isConnected: Bool = false
         var lastError: Error?
         var lastConnectedAt: Date?
-        var messagesSent: Int = 0
-        var messagesReceived: Int = 0
         var reconnectAttempts: Int = 0
         var lastDisconnectedAt: Date?
         var nextReconnectTime: Date?
@@ -568,9 +566,12 @@ final class NostrRelayManager: ObservableObject {
             if event.kind != 1059 {
                 SecureLogger.debug("📥 Event kind=\(event.kind) id=\(event.id.prefix(16))… relay=\(relayUrl)", category: .session)
             }
-            if let index = self.relays.firstIndex(where: { $0.url == relayUrl }) {
-                self.relays[index].messagesReceived += 1
-            }
+            // Do NOT touch the @Published `relays` array here: this runs once
+            // per incoming event (geohash presence alone is ~10/sec), and every
+            // mutation fires objectWillChange, which SonarAppStore republishes
+            // to the whole view tree — a permanent app-wide re-render storm
+            // that made typing and sending visibly lag. `relays` may only
+            // change on connection-lifecycle transitions.
             guard let handler = self.messageHandlers[subId] else {
                 // subscribe() always registers a handler synchronously, so a missing one
                 // means we already called unsubscribe(id:) and this is an in-flight event
@@ -618,18 +619,13 @@ final class NostrRelayManager: ObservableObject {
             
             SecureLogger.debug("📤 Send kind=\(event.kind) id=\(event.id.prefix(16))… relay=\(relayUrl)", category: .session)
             
-            connection.send(.string(message)) { [weak self] error in
-                DispatchQueue.main.async {
-                    if let error = error {
+            connection.send(.string(message)) { error in
+                if let error = error {
+                    DispatchQueue.main.async {
                         SecureLogger.error("❌ Failed to send event to \(relayUrl): \(error)", category: .session)
-                    } else {
-                        // SecureLogger.debug("✅ Event sent to relay: \(relayUrl)", category: .session)
-                        // Update relay stats
-                        if let index = self?.relays.firstIndex(where: { $0.url == relayUrl }) {
-                            self?.relays[index].messagesSent += 1
-                        }
                     }
                 }
+                // No per-send @Published mutation: see handleParsedMessage.
             }
         } catch {
             SecureLogger.error("Failed to encode event: \(error)", category: .session)

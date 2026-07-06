@@ -1169,8 +1169,16 @@ final class SonarAppStore: ObservableObject {
     #endif
 
     private func republish<P: Publisher>(_ publisher: P) where P.Output == Void, P.Failure == Never {
+        // Coalesce upstream invalidation bursts (BLE announce storms, relay
+        // EOSE bursts, presence heartbeats) into at most ~10 store-wide
+        // re-renders per second. Every screen reads computed properties off
+        // this store, so an unthrottled republish makes one chatty upstream
+        // service re-render the entire app at its event rate — measured as
+        // visible typing/sending lag in open conversations. Throttle keeps the
+        // first event immediate and delays followers by at most 100ms.
         publisher
             .receive(on: DispatchQueue.main)
+            .throttle(for: .milliseconds(100), scheduler: DispatchQueue.main, latest: true)
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &cancellables)
     }
