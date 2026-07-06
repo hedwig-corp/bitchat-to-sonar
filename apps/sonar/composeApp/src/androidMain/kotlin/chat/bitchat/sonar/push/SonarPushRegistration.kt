@@ -67,6 +67,17 @@ object SonarPushRegistration {
             Log.d(TAG, "Push not registered: disabled by user preference")
             return
         }
+        // NEVER register (or start the core) before an account exists.
+        // ensureRegistered() runs from SonarApp.onCreate; without this gate a
+        // fresh install with default push prefs + a configured transponder
+        // would reach SonarCore.start() → loadOrCreateIdentity() and MINT a new
+        // nsec, which onboarding-complete inference then treats as a finished
+        // account — booting an empty identity and skipping onboarding. Push has
+        // nothing to register for until onboarding has produced a key.
+        if (!SonarCore.hasIdentity()) {
+            Log.d(TAG, "Push not registered: no account yet (pre-onboarding)")
+            return
+        }
         if (transponderNpub.isBlank() && ndsUrl.isBlank()) {
             Log.d(TAG, "Push not configured (no TRANSPONDER_NPUB or NDS_URL)")
             return
@@ -125,6 +136,12 @@ object SonarPushRegistration {
 
     private fun registerTransponder(fcmToken: String) {
         if (transponderNpub.isBlank()) return
+        // Guard the SonarCore.start() below: never mint an identity from a push
+        // callback (token-refresh / background wakeup) before onboarding.
+        if (!SonarCore.hasIdentity()) {
+            Log.d(TAG, "Transponder: skipped, no account yet")
+            return
+        }
         scope.launch {
             var backoff = 2_000L
             for (attempt in 1..MAX_RETRIES) {
