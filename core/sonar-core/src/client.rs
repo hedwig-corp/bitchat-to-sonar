@@ -2928,6 +2928,16 @@ impl SonarClient {
                 }
                 Ok(incoming) => {
                     self.record_delivery_for_incoming(&incoming);
+                    // A welcome that created or updated a group must notify the
+                    // conversation listener like a message does: the hosts' chat
+                    // lists are event-driven, so without this a brand-new
+                    // conversation stays invisible until an unrelated slow
+                    // heartbeat repaints the list.
+                    if let Incoming::GroupUpdated(ref group_id)
+                    | Incoming::GroupInvitePending(ref group_id) = incoming
+                    {
+                        changed_groups.insert(hex::encode(group_id.as_slice()));
+                    }
                     self.mark_sync_event_processed(&event.id);
                     report.record_processed();
                 }
@@ -4317,5 +4327,61 @@ mod tests {
 
         assert_eq!(own.server_pubkey, server_pubkey);
         assert!(!own.encrypted_token_b64.is_empty());
+    }
+
+    struct RecordingChangeListener {
+        changed: Mutex<Vec<String>>,
+    }
+
+    impl ConversationChangeListener for RecordingChangeListener {
+        fn on_conversation_changed(&self, group_id_hex: String) {
+            self.changed.lock().unwrap().push(group_id_hex);
+        }
+    }
+
+    #[tokio::test]
+    async fn welcome_for_new_conversation_notifies_change_listener() {
+        // A 1:1 welcome is auto-accepted as Incoming::GroupUpdated. The host
+        // chat lists are event-driven, so processing it must emit a
+        // conversation-changed notification for the new group — otherwise a
+        // brand-new chat stays invisible until an unrelated refresh.
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client starts without relays");
+        let listener = Arc::new(RecordingChangeListener {
+            changed: Mutex::new(Vec::new()),
+        });
+        bob.set_conversation_change_listener(Some(listener.clone()));
+
+        let bob_kp = bob
+            .engine
+            .key_package_event(relays.clone())
+            .expect("bob key package");
+        let creation = alice
+            .create_group("alice & bob", vec![bob_kp], relays)
+            .expect("alice creates group");
+        let (bob_pubkey, bob_welcome) = creation
+            .welcomes
+            .into_iter()
+            .find(|(pk, _)| *pk == bob.identity().public_key())
+            .expect("bob welcome");
+        let wrapped = alice
+            .gift_wrap_welcome(&bob_pubkey, bob_welcome)
+            .await
+            .expect("wrap bob welcome");
+
+        let (report, _) = bob.process_marmot_events([wrapped], "test welcome").await;
+        assert_eq!(report.processed, 1);
+
+        let bob_groups = bob.engine.groups().expect("bob groups");
+        assert_eq!(bob_groups.len(), 1);
+        let expected = hex::encode(bob_groups[0].mls_group_id.as_slice());
+        let changed = listener.changed.lock().unwrap().clone();
+        assert!(
+            changed.contains(&expected),
+            "welcome must notify the conversation listener for the new group; got {changed:?}"
+        );
     }
 }
