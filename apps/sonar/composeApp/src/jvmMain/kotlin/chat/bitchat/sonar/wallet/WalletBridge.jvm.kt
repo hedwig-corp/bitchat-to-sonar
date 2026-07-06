@@ -53,6 +53,7 @@ actual object WalletBridge {
     @Volatile private var sdk: BindingLiquidSdk? = null
     @Volatile private var current: WalletState = WalletState.NotConfigured
     @Volatile private var rates: Map<String, ExchangeRate> = emptyMap()
+    @Volatile private var receiveOffer: String? = null
 
     /** Background home for listener-triggered balance refreshes — never the UI. */
     private val walletScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -198,12 +199,19 @@ actual object WalletBridge {
     }
 
     actual suspend fun createOffer(): String = withContext(Dispatchers.IO) {
-        val node = sdk ?: error("wallet not ready")
-        // Amountless reusable BOLT12 offer.
-        val prepared = node.prepareReceivePayment(
-            PrepareReceiveRequest(PaymentMethod.BOLT12_OFFER, null)
-        )
-        node.receivePayment(ReceivePaymentRequest(prepared, "Sonar", null, null)).destination
+        receiveOffer ?: lock.withLock {
+            receiveOffer ?: run {
+                val node = sdk ?: error("wallet not ready")
+                // Amountless reusable BOLT12 offer. Keep it stable across descriptor
+                // refreshes so peers do not race a rotated receive path.
+                val prepared = node.prepareReceivePayment(
+                    PrepareReceiveRequest(PaymentMethod.BOLT12_OFFER, null)
+                )
+                node.receivePayment(ReceivePaymentRequest(prepared, "Sonar", null, null))
+                    .destination
+                    .also { receiveOffer = it }
+            }
+        }
     }
 
     actual suspend fun send(destination: String, amountSats: Long, note: String): SendResult =
@@ -266,6 +274,7 @@ actual object WalletBridge {
             current = WalletState.NotConfigured
             balance.value = 0L
             rates = emptyMap()
+            receiveOffer = null
         }
     }
 }
