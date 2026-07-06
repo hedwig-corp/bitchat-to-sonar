@@ -7,7 +7,7 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- Push wakeup: foreground service for processing transponder/Breez pushes. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- shortService needs no type-specific permission (unlike dataSync). -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <!-- BLE mesh transport (peer discovery + GATT). Android 12+ uses the
@@ -86,11 +86,13 @@
             </intent-filter>
         </service>
 
-        <!-- Foreground service for processing push wakeups when the app is killed. -->
+        <!-- Foreground service for processing push wakeups when the app is
+             killed. shortService (not dataSync): a push-triggered settlement/
+             sync task, exempt from Android 15's cumulative dataSync time cap. -->
         <service
             android:name=".push.SonarPushProcessingService"
             android:exported="false"
-            android:foregroundServiceType="dataSync" />
+            android:foregroundServiceType="shortService" />
     </application>
 
 </manifest>

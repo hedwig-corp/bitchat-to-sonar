@@ -58,12 +58,41 @@ class SonarPushProcessingService : Service() {
             .setContentTitle("Sonar")
             .setContentText("Syncing...")
             .build()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(FOREGROUND_ID, notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
-        } else {
-            startForeground(FOREGROUND_ID, notification)
+        // SHORT_SERVICE (API 34+), not DATA_SYNC: a push-triggered settlement/
+        // sync wake is exactly the "short critical task" shortService exists for,
+        // and — unlike dataSync — it is NOT subject to Android 15's ~6h/24h
+        // cumulative dataSync cap (which was observed force-stopping a sibling
+        // app on-device with ForegroundServiceStartNotAllowedException). It needs
+        // only FOREGROUND_SERVICE (no type permission). onTimeout() below is the
+        // required backstop for its ~3-minute ceiling.
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                startForeground(FOREGROUND_ID, notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SHORT_SERVICE)
+            } else {
+                startForeground(FOREGROUND_ID, notification)
+            }
+        } catch (t: Throwable) {
+            // e.g. the background-start allowlist expired before we reached
+            // startForeground. Nothing can run without the FGS; stop cleanly
+            // rather than risk a crash loop.
+            Log.w(TAG, "startForeground(shortService) refused; stopping", t)
+            stopSelf()
         }
+    }
+
+    /** API 34 short-service timeout backstop → stop before the ANR. */
+    override fun onTimeout(startId: Int) {
+        Log.w(TAG, "shortService onTimeout(startId=$startId) — stopping")
+        scope.cancel()
+        stopSelf()
+    }
+
+    /** API 35 short-service timeout backstop (typed overload). */
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        Log.w(TAG, "shortService onTimeout(startId=$startId type=$fgsType) — stopping")
+        scope.cancel()
+        stopSelf()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -156,10 +185,11 @@ class SonarPushProcessingService : Service() {
      * A Breez offline receive is a swap the SDK claims only while connected —
      * the Android bindings ship no notification plugin (unlike iOS, whose NSE
      * extends `SDKNotificationService` and runs settlement jobs), so this
-     * service is the settlement orchestrator: stay alive until the payment
-     * reaches COMPLETE (event-first, poll fallback), then post one "Payment
-     * received" notification. Intermediate wakes (swap_updated fee bumps,
-     * refunds) settle nothing inside the budget and stay silent.
+     * service is the settlement orchestrator: connect, then stay alive until an
+     * incoming receive is claimed (event-first, poll fallback that accepts a
+     * PENDING/claimed receive so we don't burn the whole window waiting for full
+     * confirmation), then post one "Payment received" notification. Intermediate
+     * wakes (swap_updated fee bumps, refunds) claim nothing and stay silent.
      */
     private suspend fun processBreezWakeup(notificationType: String, payload: String) {
         try {
@@ -169,17 +199,18 @@ class SonarPushProcessingService : Service() {
                 Log.d(TAG, "Breez payload: ${payload.take(200)}")
             }
             val deadline = SystemClock.elapsedRealtime() + BREEZ_SETTLE_BUDGET_MS
-            // The poll fallback only exists for the seconds-wide race where a
-            // payment settles during connect(), before the event listener
-            // attaches. A tight floor keeps it from re-surfacing older receives
-            // the user already watched arrive in a foreground session.
+            // A generous floor: covers connect() latency, swap-claim time, and
+            // realistic device clock skew vs the swap server, while still
+            // excluding genuinely old receives so a first-ever wake (empty
+            // notified-ids ring) doesn't surface historical payments. Cross-wake
+            // dedup is [NotifiedPaymentIds], not this floor.
             val wakeFloorSecs =
                 System.currentTimeMillis() / 1000 - BREEZ_SETTLE_LOOKBACK_SECS
             val settled = AtomicInteger(0)
 
             coroutineScope {
-                // Subscribe BEFORE wallet setup so a payment settling right
-                // after connect() can't slip past the collector.
+                // Subscribe BEFORE wallet setup so a receive claimed right after
+                // connect() can't slip past the collector.
                 val events = launch {
                     WalletBridge.paymentEvents.collect { ev ->
                         if (ev.incoming && handleSettledReceive(ev, prefs)) {
@@ -200,6 +231,17 @@ class SonarPushProcessingService : Service() {
                     withTimeoutOrNull(WALLET_SETUP_TIMEOUT_MS) {
                         WalletBridge.setupIfNeeded(nsec)
                     }
+                } else if (!WalletBridge.isConnectionLive()) {
+                    // Ready but the reused websocket died in Doze — reconnect
+                    // rather than silently poll a dead node (empty → missed pay).
+                    Log.d(TAG, "Breez wakeup: stale connection, reconnecting")
+                    WalletBridge.shutdown()
+                    val nsec = SonarCore.identityNsec()
+                    if (nsec.isNotBlank()) {
+                        withTimeoutOrNull(WALLET_SETUP_TIMEOUT_MS) {
+                            WalletBridge.setupIfNeeded(nsec)
+                        }
+                    }
                 }
                 if (WalletBridge.state() !is WalletState.Ready) {
                     // Setup failed/timed out: no SDK, so nothing can settle —
@@ -210,12 +252,12 @@ class SonarPushProcessingService : Service() {
                 }
                 WalletBridge.refreshBalance()
 
-                // Await settlement: each new payment sends its own push, so the
-                // first settled receive ends this wake.
+                // Await a claimed receive: the first one ends this wake (each new
+                // payment gets its own push, so we don't need to drain many).
                 while (settled.get() == 0 &&
                     SystemClock.elapsedRealtime() < deadline
                 ) {
-                    for (ev in WalletBridge.recentSettledReceives(wakeFloorSecs)) {
+                    for (ev in WalletBridge.recentIncomingReceives(wakeFloorSecs)) {
                         if (handleSettledReceive(ev, prefs)) settled.incrementAndGet()
                     }
                     if (settled.get() > 0) break
@@ -285,15 +327,21 @@ class SonarPushProcessingService : Service() {
         private const val MARMOT_PUSH_SYNC_TIMEOUT_MS = 25_000L
 
         // Breez settlement budget: the SDK claims the swap only while we stay
-        // alive; 30s keeps the whole wake inside the FCM high-priority window
-        // while giving Boltz round-trips room on slow networks. Setup keeps its
-        // own 15s sub-budget so a hung connect() still leaves settle time.
-        private const val BREEZ_SETTLE_BUDGET_MS = 30_000L
-        private const val WALLET_SETUP_TIMEOUT_MS = 15_000L
+        // alive. shortService gives ~3 min (no dataSync cap), so this is a
+        // battery/latency choice, not an OS-imposed ceiling: 45s covers a cold
+        // connect (~10-15s) plus a claimed receive (~18s observed on device)
+        // with headroom, then we stop. Accepting a PENDING/claimed receive (see
+        // recentIncomingReceives) usually ends the wake well before this.
+        private const val BREEZ_SETTLE_BUDGET_MS = 45_000L
+        // Outer bound on connect(); the SDK's own connect timeout is ~20s, so
+        // 20s here avoids abandoning a connect the SDK would have completed.
+        private const val WALLET_SETUP_TIMEOUT_MS = 20_000L
         private const val BREEZ_SETTLE_POLL_MS = 2_500L
-        // Poll floor: wide enough for the connect()-race and modest clock skew,
-        // tight enough not to re-surface receives from an earlier session.
-        private const val BREEZ_SETTLE_LOOKBACK_SECS = 120L
+        // Poll floor: generous enough for connect()-latency, swap-claim time and
+        // realistic clock skew vs the swap server, while excluding genuinely old
+        // receives so a first-ever wake (empty notified-ids ring) doesn't surface
+        // history. Cross-wake dedup is [NotifiedPaymentIds], not this floor.
+        private const val BREEZ_SETTLE_LOOKBACK_SECS = 600L
         /** Blob key for the persisted notified-payment-ids ring. */
         private const val NOTIFIED_IDS_BLOB = "wallet.notifiedPaymentIds"
     }
