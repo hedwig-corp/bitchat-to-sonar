@@ -58,6 +58,9 @@ actual object MeshRadio {
     private fun isKnownPeer(peerId: String): Boolean =
         discoveryMode == BleDiscoveryMode.Normal || knownPeerIds.contains(peerId.lowercase())
 
+    actual fun hasActivePeer(): Boolean =
+        MeshLink.namedPeers().isNotEmpty() || BleBridge.peers().isNotEmpty()
+
     actual fun peers(): List<MeshPeer> {
         val named = MeshLink.namedPeers().filter { isKnownPeer(it.id.removePrefix("mesh:")) }
         if (named.isNotEmpty()) return named

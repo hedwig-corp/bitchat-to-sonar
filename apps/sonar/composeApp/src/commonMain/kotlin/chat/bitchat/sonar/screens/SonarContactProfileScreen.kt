@@ -17,6 +17,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -56,6 +57,7 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
     val scope = rememberCoroutineScope()
     var showVerify by remember { mutableStateOf(false) }
     var paySheet by remember { mutableStateOf(false) }
+    var confirmDelete by remember { mutableStateOf(false) }
 
     // Derive the peer npub from the chat members list, or accept a direct
     // npub when opened from a group member tap.
@@ -215,6 +217,7 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
                     peerName = screen.name,
                     myName = state.nick.ifBlank { "you" },
                     info = verifyInfo,
+                    peerKey = peerNpub,
                     onVerify = { state.markVerified(effectiveChatId) },
                     onDismiss = { showVerify = false }
                 )
@@ -334,7 +337,7 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
                     danger = true,
                     trail = SNTrail.None,
                     divider = false
-                ) { state.toast = "Coming soon" }
+                ) { confirmDelete = true }
             }
 
             Spacer(Modifier.height(40.dp))
@@ -352,6 +355,53 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
             },
             onClose = { paySheet = false }
         )
+    }
+    if (confirmDelete) {
+        // Cross-platform parity with the iOS contact-profile Delete: confirm,
+        // then route to the correct local delete (mesh vs Marmot) and pop back.
+        DeleteContactChatSheet(
+            name = screen.name,
+            onDelete = {
+                confirmDelete = false
+                if (effectiveChatId.startsWith("mesh:")) {
+                    state.deleteMeshDm(effectiveChatId.removePrefix("mesh:"))
+                } else {
+                    state.deleteMarmotChat(effectiveChatId)
+                }
+                state.back()
+            },
+            onClose = { confirmDelete = false },
+        )
+    }
+}
+
+/** Confirmation sheet for deleting a conversation from the contact profile
+ *  (design bc-sheet shell; mirrors the home DeleteChatSheet copy). */
+@Composable
+private fun DeleteContactChatSheet(name: String, onDelete: () -> Unit, onClose: () -> Unit) {
+    val s = sonar
+    Box(
+        Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
+        contentAlignment = Alignment.BottomCenter,
+    ) {
+        Surface(color = s.surface, shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)) {
+            Column(Modifier.fillMaxWidth().padding(20.dp)) {
+                Text("Delete chat", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    "This removes your copy of the conversation with $name from this phone. " +
+                        "It does not delete their copy.",
+                    color = s.text2, fontSize = 13.5.sp, lineHeight = 18.sp,
+                )
+                Spacer(Modifier.height(16.dp))
+                SNPrimaryButton("Delete chat", net = false, onClick = onDelete)
+                Spacer(Modifier.height(8.dp))
+                Box(
+                    Modifier.fillMaxWidth().height(44.dp).clickable(onClick = onClose),
+                    contentAlignment = Alignment.Center,
+                ) { Text("Cancel", color = s.text2, fontSize = 15.sp, fontWeight = FontWeight.SemiBold) }
+            }
+        }
     }
 }
 
@@ -388,16 +438,19 @@ private fun ActionCircle(
     }
 }
 
-/** Inline verify section — shows safety numbers and verify button. */
+/** Inline verify section — the design's verify sheet: heads, copy, safety
+ *  numbers, primary verify button, and a Show/Hide public key ghost. */
 @Composable
 private fun VerifyInline(
     peerName: String,
     myName: String,
     info: chat.bitchat.sonar.SonarVerify,
+    peerKey: String?,
     onVerify: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     val s = sonar
+    var showKey by remember { mutableStateOf(false) }
     Column(
         Modifier.fillMaxWidth().padding(horizontal = 14.dp)
             .clip(RoundedCornerShape(18.dp)).background(s.surface)
@@ -440,16 +493,28 @@ private fun VerifyInline(
                 textAlign = TextAlign.Center
             )
             Spacer(Modifier.height(14.dp))
-            // 3 rows x 4 groups, monospace.
+            // bc-safety: 3 rows x 4 groups, monospace, en-space separated.
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 listOf(0, 4, 8).forEach { row ->
                     Text(
-                        info.safety.subList(row, row + 4).joinToString(" "),
+                        info.safety.subList(row, row + 4).joinToString(" "),
                         color = s.text,
                         style = SonarType.mono(15.0),
                         modifier = Modifier.padding(vertical = 3.dp)
                     )
                 }
+            }
+            // bc-pubkey: revealed by the "Show public key" ghost, like the design.
+            if (showKey && peerKey != null) {
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    peerKey,
+                    color = s.text3,
+                    style = SonarType.mono(11.0),
+                    lineHeight = 17.5.sp,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 18.dp)
+                )
             }
             Spacer(Modifier.height(18.dp))
             if (info.verified) {
@@ -465,6 +530,20 @@ private fun VerifyInline(
                 }
             } else {
                 SNPrimaryButton("They match — mark as verified") { onVerify() }
+            }
+            if (peerKey != null) {
+                Spacer(Modifier.height(6.dp))
+                Box(
+                    Modifier.fillMaxWidth().height(40.dp).clickable { showKey = !showKey },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        if (showKey) "Hide public key" else "Show public key",
+                        color = s.text2,
+                        fontSize = 15.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
             }
         }
         Spacer(Modifier.height(8.dp))

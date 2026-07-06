@@ -91,6 +91,25 @@ class MessageCodecTest {
         assertEquals(msg, decoded)
     }
 
+    @Test fun meshEnvelopeRoundTripPreservesInternetTransportFlag() {
+        // Slice 4: a merged mesh thread can hold both BLE legs and direct
+        // NIP-17 internet legs (viaInternet drives the bubble colour). The
+        // flag must survive the exact on-disk format saveMeshDm writes and
+        // loadAllMeshDms reads back after an app restart.
+        val peerKey = "7a60f087831cb56d0011223344556677"
+        val msgs = listOf(
+            SonarMsg("m1", "npub1peer", "over BLE", mine = false, tsSecs = 10),
+            SonarMsg("m2", "npub1peer", "over NIP-17", mine = false, tsSecs = 20, viaInternet = true),
+            SonarMsg("m3", "", "my reply via internet", mine = true, tsSecs = 30, viaInternet = true),
+        )
+        val (key, decoded) = MessageCodec.decodeMeshEnvelope(
+            MessageCodec.encodeMeshEnvelope(peerKey, msgs)
+        )!!
+        assertEquals(peerKey, key)
+        assertEquals(msgs, decoded)
+        assertEquals(listOf(false, true, true), decoded.map { it.viaInternet })
+    }
+
     @Test fun dmRoundTripWithStickerAndMedia() {
         val ref = SonarStickerRef("30030:abc123:pack", "wave", "deadbeef")
         val media = SonarMedia("mesh-media:peer:message:voice.m4a", "audio/mp4", "voice.m4a", null, null, 1200)
@@ -98,6 +117,39 @@ class MessageCodecTest {
         val decoded = MessageCodec.decodeDm(MessageCodec.encodeDm(listOf(msg))).single()
         assertEquals(ref, decoded.stickerRef)
         assertEquals(media, decoded.media.single())
+    }
+
+    @Test fun dmRoundTripWithMediaCaption() {
+        val media = SonarMedia(
+            "mesh-media:peer:message:photo.jpg", "image/jpeg", "photo.jpg", 640, 480, null,
+            caption = "sunset at the pier\nwith tabs\tand |pipes| ⚡",
+        )
+        val msgs = listOf(
+            SonarMsg("a", "npub1xx", "", mine = true, tsSecs = 1, media = listOf(media)),
+            // Media WITHOUT caption in the same blob must stay caption-less.
+            SonarMsg(
+                "b", "npub1yy", "", mine = false, tsSecs = 2,
+                media = listOf(SonarMedia("mesh-media:x:y:v.m4a", "audio/mp4", "v.m4a", null, null, 900)),
+            ),
+        )
+        val decoded = MessageCodec.decodeDm(MessageCodec.encodeDm(msgs))
+        assertEquals(msgs, decoded)
+        assertEquals(media.caption, decoded[0].media.single().caption)
+        assertNull(decoded[1].media.single().caption)
+    }
+
+    @Test fun dmDecodeToleratesPreCaptionEnvelopes() {
+        // An envelope written by a build BEFORE the caption field (15 fields,
+        // ending at viaInternet) must decode with caption = null.
+        val media = SonarMedia("mesh-media:p:m:photo.jpg", "image/jpeg", "photo.jpg", 640, 480, null)
+        val msg = SonarMsg("a", "npub1xx", "", mine = true, tsSecs = 1, media = listOf(media), viaInternet = true)
+        val encoded = MessageCodec.encodeDm(listOf(msg))
+        // Strip the trailing (16th) caption field to simulate the old format.
+        val old = encoded.split("\t").dropLast(1).joinToString("\t")
+        val decoded = MessageCodec.decodeDm(old).single()
+        assertEquals(media, decoded.media.single())
+        assertNull(decoded.media.single().caption)
+        assertTrue(decoded.viaInternet)
     }
 
     @Test fun dmBackwardCompatOldFormatNoSticker() {

@@ -5,7 +5,9 @@ import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -19,6 +21,7 @@ import androidx.compose.foundation.gestures.transformable
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -57,6 +60,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.graphicsLayer
@@ -73,8 +77,17 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.foundation.text.InlineTextContent
+import androidx.compose.foundation.text.appendInlineContent
+import androidx.compose.ui.text.Placeholder
+import androidx.compose.ui.text.PlaceholderVerticalAlign
+import chat.bitchat.sonar.resources.Res
+import chat.bitchat.sonar.resources.sonar_icon
 import chat.bitchat.sonar.screens.SonarOnboardingScreen
+import chat.bitchat.sonar.ui.authorColor
+import chat.bitchat.sonar.ui.bcHue
 import chat.bitchat.sonar.ui.SNDot
+import org.jetbrains.compose.resources.painterResource
 import chat.bitchat.sonar.ui.SNSettingsRow
 import chat.bitchat.sonar.ui.SNTone
 import chat.bitchat.sonar.ui.SNTrail
@@ -200,7 +213,9 @@ private fun HomeScreen(state: SonarAppState) {
 
     Box(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize()) {
-            // bc-header: avatar (→settings) · "sonar" centered (triple-tap) · rings (→nearby)
+            // bc-header: avatar (→settings) · sn-wordmark = brand chip + "sonar"
+            // centered (triple-tap → wipe) · rings (→nearby). Design screens.jsx
+            // HomeScreen header + theme.css .sn-wordmark/.sn-brandchip.lg.
             Row(
                 Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, top = 6.dp, bottom = 8.dp),
                 verticalAlignment = Alignment.CenterVertically
@@ -209,13 +224,26 @@ private fun HomeScreen(state: SonarAppState) {
                     Modifier.size(38.dp).clip(CircleShape).clickable { state.push(Screen.Settings) },
                     contentAlignment = Alignment.Center
                 ) { SonarAvatar(state.nick.ifBlank { "you" }, 32.dp) }
-                Text(
-                    "sonar", color = s.text, fontSize = 27.sp, fontWeight = FontWeight.Black,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier.weight(1f).clickable(
+                Row(
+                    Modifier.weight(1f).clickable(
                         indication = null, interactionSource = remember { MutableInteractionSource() }
-                    ) { titleTaps++; if (titleTaps >= 3) { titleTaps = 0; wipeAsk = true } }
-                )
+                    ) { titleTaps++; if (titleTaps >= 3) { titleTaps = 0; wipeAsk = true } },
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    // sn-brandchip.lg: 30×30, radius 9, hairline inset ring.
+                    Image(
+                        painterResource(Res.drawable.sonar_icon), contentDescription = null,
+                        modifier = Modifier.size(30.dp).clip(RoundedCornerShape(9.dp))
+                            .border(1.dp, s.hairline, RoundedCornerShape(9.dp))
+                    )
+                    Spacer(Modifier.width(9.dp))
+                    // bc-htitle: 27px, weight 800, letter-spacing -0.02em.
+                    Text(
+                        "sonar", color = s.text, fontSize = 27.sp,
+                        fontWeight = FontWeight.ExtraBold, letterSpacing = (-0.54).sp
+                    )
+                }
                 SNIconButton(SNIconName.Rings, size = 22.dp, weight = 2f, tint = s.text2) { state.push(Screen.Nearby) }
             }
 
@@ -224,16 +252,16 @@ private fun HomeScreen(state: SonarAppState) {
                 StatusChipPill(state.started, state.connecting, meshCount) { connSheet = true }
             }
 
-            LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 110.dp)) {
+            LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 120.dp)) {
                 item { SNSectionLabel("Around you") }
                 // "Around you" collapses the geohash precision ladder (+ Mesh) into one
                 // card with a tier picker (design: HereCard) instead of a flat list.
                 item {
                     val hereItems = remember(state.locationChannels, meshCount, state.presenceByGeohash) {
                         buildList {
-                            add(HereItem("mesh", "Mesh", "Mesh", meshCount))
+                            add(HereItem("mesh", "Bluetooth mesh", "Mesh", "Mesh", meshCount))
                             state.locationChannels.forEach { c ->
-                                add(HereItem(c.geohash, c.name, c.level.label, state.presence(c.geohash)))
+                                add(HereItem(c.geohash, c.name, c.level.label, geoShort(c.level), state.presence(c.geohash)))
                             }
                         }
                     }
@@ -250,48 +278,65 @@ private fun HomeScreen(state: SonarAppState) {
                 val saved = state.savedChannels.filter { gh -> state.locationChannels.none { it.geohash == gh } }
                 if (saved.isNotEmpty()) {
                     item { SNSectionLabel("Saved channels") }
-                    items(saved, key = { "saved:" + it }) { gh ->
+                    itemsIndexed(saved, key = { _, gh -> "saved:" + gh }) { i, gh ->
                         val here = state.presence(gh)
                         val gc = state.locationChannels.firstOrNull { it.geohash == gh }
                         ConvRow(
                             avatar = { PlaceTile(52.dp) },
                             title = gc?.name ?: channelName(gh),
                             sub = if (here > 0) "$here here now" else "Saved channel",
+                            divider = i != saved.lastIndex,
                             onLongClick = { state.toggleSaved(gh) }, // long-press to unpin
                         ) { state.openChannel(gh) }
                     }
                 }
                 item { SNSectionLabel("Messages") }
-                if (state.groupInvites.isEmpty() && state.visibleChats.isEmpty() && state.meshDmRows.isEmpty()) item { EmptyMessages() }
-                items(state.groupInvites, key = { "invite:" + it.id }) { invite ->
+                val invites = state.groupInvites
+                val meshRows = state.meshDmRows
+                val chatRows = state.visibleChats
+                if (invites.isEmpty() && chatRows.isEmpty() && meshRows.isEmpty()) item { EmptyMessages() }
+                // The hairline hides under the last row of the list (design
+                // .bc-list .bc-row:last-child::after { display: none }).
+                val lastRowKey = chatRows.lastOrNull()?.id
+                    ?: meshRows.lastOrNull()?.let { "mesh:" + it.peerId }
+                    ?: invites.lastOrNull()?.let { "invite:" + it.id }
+                items(invites, key = { "invite:" + it.id }) { invite ->
                     val title = invite.groupName.ifBlank { "Group chat" }
                     ConvRow(
                         avatar = { SonarAvatar(title, 52.dp, presence = false) },
                         title = title,
                         sub = "${invite.memberCount} members · invite",
                         lock = true,
+                        divider = "invite:" + invite.id != lastRowKey,
                     ) { pendingInvite = invite }
                 }
                 // BLE-mesh DMs (incl. ones started by a peer messaging us) — over
                 // Bluetooth, so a cyan dot instead of the internet lock. A Sonar
                 // peer's White Noise leg is folded into this row (one row/person).
-                items(state.meshDmRows, key = { "mesh:" + it.peerId }) { row ->
+                items(meshRows, key = { "mesh:" + it.peerId }) { row ->
                     ConvRow(
                         avatar = { SonarAvatar(row.name, 52.dp, presence = state.dmInRange(row.peerId)) },
                         title = row.name, sub = row.preview, lock = false,
+                        time = rowTimeLabel(row.tsSecs),
+                        divider = "mesh:" + row.peerId != lastRowKey,
                         onLongClick = { pendingDelete = DeleteTarget(row.peerId, row.name, isMesh = true, isGroup = false) },
                     ) { state.openDm(row.peerId, row.name) }
                 }
-                items(state.visibleChats, key = { it.id }) { chat ->
-                    val chatTitle = state.chatTitle(chat)
-                    val pending = state.isPendingSecureChat(chat.id)
+                items(chatRows, key = { it.id }) { chat ->
+                    // O(1) precomputed row model — no per-row disk read or
+                    // O(chats) walk during composition (Signal cached row VM).
+                    val row = state.marmotRow(chat.id)
                     ConvRow(
-                        avatar = { SonarAvatar(chatTitle, 52.dp, presence = false) },
-                        title = chatTitle, sub = if (pending) "Setting up secure chat…" else "Tap to open", lock = true,
-                        verified = state.isVerified(chat.id),
-                        unread = state.unreadForChat(chat.id) > 0,
-                        onLongClick = if (pending) null else {
-                            { pendingDelete = DeleteTarget(chat.id, chatTitle, isMesh = false, isGroup = state.isMultiMemberChat(chat.id)) }
+                        avatar = { SonarAvatar(row.title, 52.dp, presence = false) },
+                        title = row.title,
+                        sub = row.sub,
+                        lock = true,
+                        time = if (row.tsSecs > 0L) rowTimeLabel(row.tsSecs) else "",
+                        verified = row.verified,
+                        unread = row.unread,
+                        divider = chat.id != lastRowKey,
+                        onLongClick = if (row.pending) null else {
+                            { pendingDelete = DeleteTarget(chat.id, row.title, isMesh = false, isGroup = row.multiMember) }
                         },
                     ) { state.openChat(chat) }
                 }
@@ -307,6 +352,7 @@ private fun HomeScreen(state: SonarAppState) {
         ) {
             Row(
                 Modifier.weight(1f).clip(RoundedCornerShape(999.dp)).background(s.surface)
+                    .border(1.dp, s.hairline, RoundedCornerShape(999.dp))
                     .clickable { state.push(Screen.Search) }.padding(horizontal = 16.dp, vertical = 13.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
@@ -357,6 +403,7 @@ private fun StatusChipPill(online: Boolean, connecting: Boolean, meshCount: Int,
     val s = sonar
     Row(
         Modifier.clip(RoundedCornerShape(999.dp)).background(s.surface)
+            .border(1.dp, s.hairline, RoundedCornerShape(999.dp))
             .clickable(onClick = onClick).padding(horizontal = 14.dp, vertical = 7.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
@@ -398,17 +445,30 @@ private fun MeshTile(size: Dp) {
     ) { SNIcon(SNIconName.Mesh, size * 0.5f, s.accentDeep, weight = 2f) }
 }
 
+/** bc-meshnote — the small informational note style from theme.css. */
 @Composable
 private fun LocationHint() {
     val s = sonar
     Text(
         "Turn on location to see public channels for your area (neighborhood → country).",
-        color = s.text3, fontSize = 13.sp, lineHeight = 18.sp,
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 4.dp)
+        color = s.text2, fontSize = 12.5.sp, lineHeight = 18.sp,
+        modifier = Modifier.fillMaxWidth().padding(start = 18.dp, end = 18.dp, top = 2.dp, bottom = 8.dp)
     )
 }
 
-/** bc-row — avatar · (title [+verified]) / (lock? + sub) · time/unread. */
+/** Design short labels for the HereCard precision scale (data.js `here[].short`). */
+private fun geoShort(level: GeoLevel): String = when (level) {
+    GeoLevel.Building -> "Building"
+    GeoLevel.Block -> "Block"
+    GeoLevel.Neighborhood -> "Area"
+    GeoLevel.City -> "City"
+    GeoLevel.Province -> "Province"
+    GeoLevel.Region -> "Region"
+}
+
+/** bc-row (components.jsx ConvRow / theme.css .bc-row) — avatar · (title
+ *  [+verified]) / (lock? + sub) · right column with time + unread dot, and a
+ *  hairline under the row inset to the text column (hidden on the last row). */
 @Composable
 @OptIn(ExperimentalFoundationApi::class)
 private fun ConvRow(
@@ -419,32 +479,55 @@ private fun ConvRow(
     lock: Boolean = false,
     verified: Boolean = false,
     unread: Boolean = false,
+    divider: Boolean = true,
     onLongClick: (() -> Unit)? = null,
     onClick: () -> Unit,
 ) {
     val s = sonar
-    Row(
-        Modifier.fillMaxWidth()
-            .combinedClickable(onClick = onClick, onLongClick = onLongClick)
-            .padding(horizontal = 16.dp, vertical = 9.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        avatar()
-        Spacer(Modifier.width(12.dp))
-        Column(Modifier.weight(1f)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(title, color = s.text, fontSize = 16.5.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                if (verified) { Spacer(Modifier.width(5.dp)); SNIcon(SNIconName.ShieldCheck, 14.dp, s.green, weight = 2.1f) }
+    Box(Modifier.fillMaxWidth()) {
+        Row(
+            Modifier.fillMaxWidth()
+                .combinedClickable(onClick = onClick, onLongClick = onLongClick)
+                .padding(horizontal = 16.dp, vertical = 11.dp), // --row-py: 11px
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            avatar()
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                // bc-rowtitle: 16.5 / 650 / -0.01em, verified shield gap 5.
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        title, color = s.text, fontSize = 16.5.sp, fontWeight = FontWeight.SemiBold,
+                        letterSpacing = (-0.17).sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false)
+                    )
+                    if (verified) { Spacer(Modifier.width(5.dp)); SNIcon(SNIconName.ShieldCheck, 14.dp, s.green, weight = 2.1f) }
+                }
+                Spacer(Modifier.height(2.dp))
+                // bc-rowsub: 14 text2, single line, ellipsized (npubs must never wrap).
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    if (lock) { SNIcon(SNIconName.Lock, 12.dp, s.text3, weight = 2.2f); Spacer(Modifier.width(4.dp)) }
+                    Text(
+                        sub, color = s.text2, fontSize = 14.sp,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false)
+                    )
+                }
             }
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                if (lock) { SNIcon(SNIconName.Lock, 12.dp, s.text3, weight = 2.2f); Spacer(Modifier.width(4.dp)) }
-                Text(sub, color = s.text2, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            // bc-rowend: time (12 text3) over the 11dp accent unread dot, gap 5.
+            if (!time.isNullOrEmpty() || unread) {
+                Spacer(Modifier.width(8.dp))
+                Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                    if (!time.isNullOrEmpty()) Text(time, color = s.text3, fontSize = 12.sp)
+                    if (unread) Box(Modifier.size(11.dp).clip(CircleShape).background(s.accent))
+                }
             }
         }
-        Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(5.dp)) {
-            if (time != null) Text(time, color = s.text3, fontSize = 12.sp)
-            if (unread) Box(Modifier.size(11.dp).clip(CircleShape).background(s.accent))
-        }
+        // bc-row::after — hairline from x=72 to the right edge.
+        if (divider) Box(
+            Modifier.align(Alignment.BottomStart).padding(start = 72.dp)
+                .fillMaxWidth().height(1.dp).background(s.hairline)
+        )
     }
 }
 
@@ -595,20 +678,11 @@ private fun GroupInviteSheet(
 
 @Composable
 private fun EmptyMessages() {
-    val s = sonar
-    Column(
-        Modifier.fillMaxWidth().padding(top = 80.dp, start = 24.dp, end = 24.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
-    ) {
-        SNIcon(SNIconName.Lock, 24.dp, s.text3)
-        Spacer(Modifier.height(10.dp))
-        Text("No secure chats yet", color = s.text2, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
-        Spacer(Modifier.height(4.dp))
-        Text(
-            "Tap Search and paste someone’s npub to start an end-to-end encrypted chat over the internet.",
-            color = s.text3, fontSize = 13.sp, lineHeight = 18.sp
-        )
-    }
+    chat.bitchat.sonar.ui.SNEmptyState(
+        icon = SNIconName.Lock,
+        title = "No secure chats yet",
+        desc = "Tap Search and paste someone’s npub to start an end-to-end encrypted chat over the internet."
+    )
 }
 
 @Composable
@@ -703,48 +777,76 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
 
     Box(Modifier.fillMaxSize()) {
     Column(Modifier.fillMaxSize()) {
-        // bc-header (DM): avatar + name + verified shield + lock·"Via internet"
-        Row(
-            Modifier.fillMaxWidth().padding(start = 6.dp, end = 12.dp, top = 12.dp, bottom = 8.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            SNIconButton(SNIconName.Back, onClick = { state.back() })
-            SonarAvatar(peerName, 36.dp, presence = false)
-            Spacer(Modifier.width(10.dp))
-            Column(Modifier.weight(1f).clip(RoundedCornerShape(8.dp)).clickable(enabled = canManageGroup || !isGroup) {
-                if (canManageGroup) state.push(Screen.GroupInfo(screen.id))
-                else state.push(Screen.ContactProfile(screen.id, peerName))
-            }) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        peerName, color = s.text, fontSize = 16.sp, fontWeight = FontWeight.Bold,
-                        maxLines = 1, overflow = TextOverflow.Ellipsis
-                    )
-                    if (verified) { Spacer(Modifier.width(5.dp)); SNIcon(SNIconName.ShieldCheck, 14.dp, s.green, weight = 2.1f) }
+        // bc-header.hl (DM, screens.jsx NavHeader): back · avatar 36 (+presence) ·
+        // name 17/700 + shield · lock + "Nearby · Bluetooth"/"Via internet" ·
+        // phone/videocam trailing, with a bottom hairline.
+        Column {
+            Row(
+                Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                SNIconButton(SNIconName.Back, onClick = { state.back() })
+                Row(
+                    Modifier.weight(1f).clip(RoundedCornerShape(8.dp)).clickable(enabled = canManageGroup || !isGroup) {
+                        if (canManageGroup) state.push(Screen.GroupInfo(screen.id))
+                        else state.push(Screen.ContactProfile(screen.id, peerName))
+                    },
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    SonarAvatar(peerName, 36.dp, presence = if (inRange) true else null)
+                    Column(Modifier.weight(1f)) {
+                        // bc-hname: 17 / 700 / -0.01em.
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                peerName, color = s.text, fontSize = 17.sp, fontWeight = FontWeight.Bold,
+                                letterSpacing = (-0.17).sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f, fill = false)
+                            )
+                            if (verified) { Spacer(Modifier.width(5.dp)); SNIcon(SNIconName.ShieldCheck, 15.dp, s.green, weight = 2.1f) }
+                        }
+                        Spacer(Modifier.height(1.dp))
+                        // bc-hsub: 12 text2 — 'Verified · ' + Nearby·Bluetooth /
+                        // Offline — will send later / Via internet (screens.jsx DMScreen).
+                        val subTransport = when {
+                            sendOverMesh -> "Nearby · Bluetooth"
+                            isMeshRoute && !inRange && !hasAccount -> "Offline — will send later"
+                            else -> "Via internet"
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            SNIcon(SNIconName.Lock, 11.dp, s.text2, weight = 2.4f)
+                            Spacer(Modifier.width(5.dp))
+                            Text(
+                                (if (verified) "Verified · " else "") + subTransport,
+                                color = s.text2, fontSize = 12.sp,
+                                maxLines = 1, overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
                 }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    SNIcon(SNIconName.Lock, 11.dp, s.text2, weight = 2.4f)
-                    Spacer(Modifier.width(4.dp))
-                    Text(
-                        (if (verified) "Verified · " else "") + "Via $transport",
-                        color = s.text3, fontSize = 11.5.sp
-                    )
+                // Audio + video call buttons (iOS SonarDMScreen parity). Calls are
+                // Sonar-only and use live BLE when available, otherwise White
+                // Noise signaling for that peer.
+                if (state.canCall(screen.id)) {
+                    SNIconButton(SNIconName.Phone, size = 20.dp, weight = 2f, tint = s.text2) {
+                        state.placeCall(screen.id, peerName, video = false)
+                    }
+                    SNIconButton(SNIconName.Videocam, size = 21.dp, weight = 2f, tint = s.text2) {
+                        state.placeCall(screen.id, peerName, video = true)
+                    }
                 }
             }
-            // Audio call button. Calls are Sonar-only and use live BLE when
-            // available, otherwise White Noise signaling for that peer.
-            if (state.canCall(screen.id)) {
-                SNIconButton(SNIconName.Phone, size = 20.dp, weight = 2f, tint = s.text2) {
-                    state.placeCall(screen.id, peerName, video = false)
-                }
-            }
+            Box(Modifier.fillMaxWidth().height(1.dp).background(s.hairline))
         }
 
         if (isMeshRoute && !inRange) {
             if (hasAccount) {
+                // Design DMScreen out-of-range banner (verbatim copy) + Verify action.
                 chat.bitchat.sonar.ui.SNBanner(
                     icon = SNIconName.Globe, tone = chat.bitchat.sonar.ui.SNBannerTone.Net,
-                    bold = "Out of range", rest = " — continuing over White Noise"
+                    bold = "Out of Bluetooth range", rest = " — encrypted over the internet instead",
+                    actionLabel = "Verify", onAction = { verifySheet = true }
                 )
             } else {
                 chat.bitchat.sonar.ui.SNBanner(
@@ -783,53 +885,73 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                 )
             }
         } else {
-            LazyColumn(
-                Modifier.weight(1f).fillMaxWidth(),
-                state = listState,
-                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
-            ) {
-                itemsIndexed(
-                    feed,
-                    // Index-keyed call records avoid duplicate keys when two calls end
-                    // in the same second (identical ts/dur/kind would otherwise collide).
-                    key = { i, it -> if (it is CallRecord) "c:$i" else "m:${(it as SonarMsg).id}" }
-                ) { i, item ->
-                    if (item is CallRecord) {
-                        CallLogRow(item)
-                    } else {
-                        val m = item as SonarMsg
-                        // Colour each bubble by the leg it travelled: mesh route + this
-                        // message went over mesh ⇒ cyan; otherwise indigo (internet).
-                        val msgMesh = isMeshRoute && !m.viaInternet
-                        val pay = PayLine.decode(m.content) as? PayLine.Pay
-                        if (pay != null) {
-                            val status = run { state.payVersion; state.payStatus(pay.uuid) }
-                            PayBubble(m, pay, status, peerName, mesh = msgMesh, fiatOf = { state.fiatOrNull(it) })
-                        } else if (m.media.isNotEmpty()) {
-                            MediaBubble(
+            // BoxWithConstraints (once, not per row) gives the .bc-msg max-width: 78%.
+            BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
+                val bubbleMax = maxWidth * 0.78f
+                LazyColumn(
+                    Modifier.fillMaxSize(),
+                    state = listState,
+                    contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = 6.dp, bottom = 10.dp)
+                ) {
+                    itemsIndexed(
+                        feed,
+                        // Index-keyed call records avoid duplicate keys when two calls end
+                        // in the same second (identical ts/dur/kind would otherwise collide).
+                        key = { i, it -> if (it is CallRecord) "c:$i" else "m:${(it as SonarMsg).id}" }
+                    ) { i, item ->
+                        val ts = if (item is CallRecord) item.tsSecs else (item as SonarMsg).tsSecs
+                        val prevAny = feed.getOrNull(i - 1)
+                        val prevTs = if (prevAny is CallRecord) prevAny.tsSecs else (prevAny as? SonarMsg)?.tsSecs
+                        // bc-datechip — "Today"/"Yesterday"/weekday/date when the local day flips.
+                        val newDay = prevTs == null || localDayDelta(prevTs) != localDayDelta(ts)
+                        if (newDay) DateChip(dayLabel(ts))
+                        if (item is CallRecord) {
+                            CallLogRow(item)
+                        } else {
+                            val m = item as SonarMsg
+                            // Colour each bubble by the leg it travelled: mesh route + this
+                            // message went over mesh ⇒ cyan; otherwise indigo (internet).
+                            val msgMesh = isMeshRoute && !m.viaInternet
+                            // Design cont rule: same author + same side, previous item is a
+                            // plain/media message (pay + call logs break the grouping).
+                            val prevMsg = prevAny as? SonarMsg
+                            val cont = !newDay && prevMsg != null && prevMsg.mine == m.mine &&
+                                prevMsg.senderNpub == m.senderNpub &&
+                                PayLine.decode(prevMsg.content) !is PayLine.Pay
+                            val pay = PayLine.decode(m.content) as? PayLine.Pay
+                            if (pay != null) {
+                                val status = run { state.payVersion; state.payStatus(pay.uuid) }
+                                PayBubble(m, pay, status, peerName, mesh = msgMesh, fiatOf = { state.fiatOrNull(it) })
+                            } else if (m.media.isNotEmpty()) {
+                                MediaBubble(
+                                    m,
+                                    state,
+                                    screen.id,
+                                    mesh = msgMesh,
+                                    author = if (cont) null else state.groupAuthorName(m, isGroup),
+                                    cont = cont,
+                                    showState = m.mine && i == feed.lastIndex,
+                                    maxBubbleWidth = bubbleMax,
+                                    onOpen = { mediaViewer = it }
+                                )
+                            } else if (m.stickerRef != null) {
+                                StickerBubble(
+                                    m,
+                                    state = state,
+                                    mesh = msgMesh,
+                                    author = if (cont) null else state.groupAuthorName(m, isGroup),
+                                    showState = m.mine && i == feed.lastIndex,
+                                    onTap = { coord -> previewPackCoordinate = coord },
+                                )
+                            } else MessageBubble(
                                 m,
-                                state,
-                                screen.id,
-                                mesh = msgMesh,
-                                author = state.groupAuthorName(m, isGroup),
+                                msgMesh,
+                                author = if (cont) null else state.groupAuthorName(m, isGroup),
+                                cont = cont,
                                 showState = m.mine && i == feed.lastIndex,
-                                onOpen = { mediaViewer = it }
+                                maxBubbleWidth = bubbleMax,
                             )
-                        } else if (m.stickerRef != null) {
-                            StickerBubble(
-                                m,
-                                state = state,
-                                mesh = msgMesh,
-                                author = state.groupAuthorName(m, isGroup),
-                                showState = m.mine && i == feed.lastIndex,
-                                onTap = { coord -> previewPackCoordinate = coord },
-                            )
-                        } else MessageBubble(
-                            m,
-                            msgMesh,
-                            author = state.groupAuthorName(m, isGroup),
-                            showState = m.mine && i == feed.lastIndex,
-                        )
+                        }
                     }
                 }
             }
@@ -857,28 +979,37 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         // mounted while recording, or Compose cancels its hold-to-record gesture
         // (the @RestrictsSuspension pointer coroutine dies with its layout node)
         // and the finger-release is never seen — the note never sends.
-        Row(Modifier.fillMaxWidth().padding(10.dp), verticalAlignment = Alignment.Bottom) {
+        // bc-composer (theme.css): plus 36 · field min-h 36/r 19/p 7×14 · send 34.
+        Row(
+            Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 10.dp),
+            verticalAlignment = Alignment.Bottom
+        ) {
             if (recording) {
-                // Slide-left-far OR tap the trash to discard.
+                // voice-trash: slide-left-far OR tap the trash to discard.
                 Box(
-                    Modifier.size(40.dp).clip(CircleShape).clickable { recorder.cancel(); recording = false; recDragX = 0f },
+                    Modifier.size(36.dp).clip(CircleShape).background(s.surface2)
+                        .clickable { recorder.cancel(); recording = false; recDragX = 0f },
                     contentAlignment = Alignment.Center
                 ) { SNIcon(SNIconName.Trash, 19.dp, s.danger, weight = 2f) }
                 Spacer(Modifier.width(8.dp))
                 RecordingPill(recElapsed, recLevel, recDragX, Modifier.weight(1f))
             } else {
-                // bc-plus: "Add to your message" sheet (bitcoin / location / verify / reactions)
+                // bc-plusbtn: "Add to your message" sheet (bitcoin / location / verify / reactions)
                 Box(
-                    Modifier.size(40.dp).clip(CircleShape).background(s.surface2).clickable { addSheet = true },
+                    Modifier.size(36.dp).clip(CircleShape).background(s.surface2).clickable { addSheet = true },
                     contentAlignment = Alignment.Center
-                ) { SNIcon(SNIconName.Plus, 20.dp, s.text2, weight = 2.4f) }
+                ) { SNIcon(SNIconName.Plus, 19.dp, s.text2, weight = 2.1f) }
                 Spacer(Modifier.width(8.dp))
                 Box(
-                    Modifier.weight(1f).clip(RoundedCornerShape(22.dp)).background(s.surface2)
-                        .heightIn(min = 46.dp)
-                        .padding(horizontal = 16.dp, vertical = 12.dp)
+                    Modifier.weight(1f).clip(RoundedCornerShape(19.dp)).background(s.surface2)
+                        .heightIn(min = 36.dp)
+                        .padding(horizontal = 14.dp, vertical = 7.dp),
+                    contentAlignment = Alignment.CenterStart
                 ) {
-                    if (draft.isEmpty()) Text("Message $peerName · via $transport", color = s.text3, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    if (draft.isEmpty()) Text(
+                        "Message $peerName" + (if (sendOverMesh) "" else " · via internet"),
+                        color = s.text3, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis
+                    )
                     BasicTextField(
                         value = draft, onValueChange = { draft = it },
                         textStyle = TextStyle(color = s.text, fontSize = 16.sp),
@@ -892,10 +1023,10 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             if (!recording) {
                 Spacer(Modifier.width(8.dp))
                 Box(
-                    Modifier.size(40.dp).clip(CircleShape).background(if (emojiTray) s.accentSoft else s.surface2)
+                    Modifier.size(34.dp).clip(CircleShape).background(if (emojiTray) s.accentSoft else s.surface2)
                         .clickable { emojiTray = !emojiTray },
                     contentAlignment = Alignment.Center
-                ) { SNIcon(SNIconName.Smile, 20.dp, if (emojiTray) s.accent else s.text2, weight = 2f) }
+                ) { SNIcon(SNIconName.Smile, 18.dp, if (emojiTray) s.accent else s.text2, weight = 2f) }
             }
             Spacer(Modifier.width(8.dp))
             if (draft.isEmpty() && state.canSendMedia(screen.id)) {
@@ -906,7 +1037,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                 val micBg = if (recording) (if (transport == "internet") s.netFill else s.accentFill) else s.surface2
                 val micFg = if (recording) (if (transport == "internet") s.onNet else s.onAccent) else s.text2
                 Box(
-                    Modifier.size(46.dp).clip(CircleShape).background(micBg)
+                    Modifier.size(34.dp).clip(CircleShape).background(micBg)
                         .pointerInput(screen.id) {
                             // The pointer scope is @RestrictsSuspension, so the recorder
                             // lifecycle runs in recScope: launch start() at down, join it on
@@ -935,13 +1066,15 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                             }
                         },
                     contentAlignment = Alignment.Center
-                ) { SNIcon(SNIconName.Mic, 20.dp, micFg, weight = 2f) }
+                ) { SNIcon(SNIconName.Mic, 18.dp, micFg, weight = 2f) }
             } else {
                 val sendEnabled = draft.isNotBlank()
                 val sendBg = if (!sendEnabled) s.surface2 else if (sendOverMesh) s.accentFill else s.netFill
                 val sendFg = if (!sendEnabled) s.text3 else if (sendOverMesh) s.onAccent else s.onNet
+                // bc-sendbtn: 34dp circle, send glyph 17/w2.3, cyan over mesh /
+                // indigo over internet when armed.
                 Box(
-                    Modifier.size(46.dp).clip(CircleShape).background(sendBg)
+                    Modifier.size(34.dp).clip(CircleShape).background(sendBg)
                         .clickable(enabled = sendEnabled) {
                             val d = draft; draft = ""
                             emojiTray = false
@@ -950,7 +1083,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                             }
                         },
                     contentAlignment = Alignment.Center
-                ) { Text("↑", color = sendFg, fontSize = 20.sp, fontWeight = FontWeight.Bold) }
+                ) { SNIcon(SNIconName.Send, 17.dp, sendFg, weight = 2.3f) }
             }
         }
     }
@@ -1290,11 +1423,15 @@ private fun GeoDmScreen(state: SonarAppState, screen: Screen.GeoDm) {
             SonarAvatar(screen.name, 36.dp, presence = false)
             Spacer(Modifier.width(10.dp))
             Column(Modifier.weight(1f)) {
-                Text(screen.name, color = s.text, fontSize = 16.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(
+                    screen.name, color = s.text, fontSize = 17.sp, fontWeight = FontWeight.Bold,
+                    letterSpacing = (-0.17).sp, maxLines = 1, overflow = TextOverflow.Ellipsis
+                )
+                Spacer(Modifier.height(1.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     SNIcon(SNIconName.Lock, 11.dp, s.text2, weight = 2.4f)
-                    Spacer(Modifier.width(4.dp))
-                    Text(if (blocked) "Blocked" else "Sonar · end-to-end encrypted", color = s.text3, fontSize = 11.5.sp)
+                    Spacer(Modifier.width(5.dp))
+                    Text(if (blocked) "Blocked" else "Sonar · end-to-end encrypted", color = s.text2, fontSize = 12.sp)
                 }
             }
             SNIconButton(
@@ -1322,10 +1459,14 @@ private fun GeoDmScreen(state: SonarAppState, screen: Screen.GeoDm) {
                 contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
             ) { items(state.messages, key = { it.id }) { m -> MessageBubble(m) } }
         }
-        Row(Modifier.fillMaxWidth().padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
+        Row(
+            Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 10.dp),
+            verticalAlignment = Alignment.Bottom
+        ) {
             Box(
-                Modifier.weight(1f).clip(RoundedCornerShape(22.dp)).background(s.surface2)
-                    .padding(horizontal = 16.dp, vertical = 12.dp)
+                Modifier.weight(1f).clip(RoundedCornerShape(19.dp)).background(s.surface2)
+                    .heightIn(min = 36.dp).padding(horizontal = 14.dp, vertical = 7.dp),
+                contentAlignment = Alignment.CenterStart
             ) {
                 if (draft.isEmpty()) Text("Message", color = s.text3, fontSize = 16.sp)
                 BasicTextField(
@@ -1336,51 +1477,103 @@ private fun GeoDmScreen(state: SonarAppState, screen: Screen.GeoDm) {
             }
             Spacer(Modifier.width(8.dp))
             Box(
-                Modifier.size(46.dp).clip(CircleShape).background(s.netFill)
-                    .clickable { state.sendGeoDmMsg(screen.geohash, screen.peerHex, draft); draft = "" },
+                Modifier.size(34.dp).clip(CircleShape).background(if (draft.isBlank()) s.surface2 else s.netFill)
+                    .clickable(enabled = draft.isNotBlank()) { state.sendGeoDmMsg(screen.geohash, screen.peerHex, draft); draft = "" },
                 contentAlignment = Alignment.Center
-            ) { Text("↑", color = s.onNet, fontSize = 20.sp, fontWeight = FontWeight.Bold) }
+            ) { SNIcon(SNIconName.Send, 17.dp, if (draft.isBlank()) s.text3 else s.onNet, weight = 2.3f) }
         }
     }
     state.toast?.let { ToastBar(it) { state.toast = null } }
 }
 
+/** Meta (time + via-transport icon) inline id — design .bc-meta. */
+private const val BUBBLE_META_ICON = "sn.meta.via"
+
+/** bc-msg / bc-bubble (components.jsx MsgBubble): max-width 78%, transport-
+ *  colored own bubbles (cyan mesh / indigo internet), tail corner at 28% of the
+ *  18dp radius, and the time + via icon inlined at the end of the text. */
 @Composable
-private fun MessageBubble(m: SonarMsg, mesh: Boolean = false, author: String? = null, showState: Boolean = false) {
+private fun MessageBubble(
+    m: SonarMsg,
+    mesh: Boolean = false,
+    author: String? = null,
+    cont: Boolean = false,
+    showState: Boolean = false,
+    maxBubbleWidth: Dp = Dp.Infinity,
+) {
     val s = sonar
     // Own bubble is cyan over BLE mesh, indigo over Nostr/internet (the design's
     // transport-colored bubbles); the other party's bubble is always the surface.
     val mineBg = if (mesh) s.accentFill else s.netFill
     val onMine = if (mesh) s.onAccent else s.onNet
     val linkColor = if (m.mine) onMine else s.accent
-    val annotated = remember(m.content, m.mine, mesh) { linkify(m.content, linkColor) }
+    // .bc-meta color: on own bubbles the on-color at 72%/75%, else text3.
+    val metaColor = if (m.mine) onMine.copy(alpha = if (mesh) 0.72f else 0.75f) else s.text3
+    val timeLabel = remember(m.tsSecs) { SonarClock.hourMinute(m.tsSecs) }
+    val annotated = remember(m.content, m.mine, mesh, timeLabel, s) {
+        buildAnnotatedString {
+            append(linkify(m.content, linkColor))
+            // bc-meta: 10.5px time + transport glyph riding the last line.
+            withStyle(SpanStyle(fontSize = 10.5.sp, color = metaColor)) { append(" " + timeLabel) }
+            appendInlineContent(BUBBLE_META_ICON, "·")
+        }
+    }
+    val inline = mapOf(
+        BUBBLE_META_ICON to InlineTextContent(
+            Placeholder(14.sp, 11.sp, PlaceholderVerticalAlign.TextCenter)
+        ) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.CenterEnd) {
+                SNIcon(if (mesh) SNIconName.Mesh else SNIconName.Globe, 11.dp, metaColor, weight = 2.2f)
+            }
+        }
+    )
     val firstUrl = remember(m.content) { firstUrl(m.content) }
     val uriHandler = androidx.compose.ui.platform.LocalUriHandler.current
+    val tail = 5.dp // calc(var(--r) * 0.28)
+    val shape = RoundedCornerShape(
+        topStart = 18.dp, topEnd = 18.dp,
+        bottomStart = if (m.mine) 18.dp else tail,
+        bottomEnd = if (m.mine) tail else 18.dp,
+    )
     Column(
-        Modifier.fillMaxWidth().padding(vertical = 3.dp),
+        Modifier.fillMaxWidth().padding(top = if (cont) 2.dp else 9.dp),
         horizontalAlignment = if (m.mine) Alignment.End else Alignment.Start
     ) {
         if (!author.isNullOrBlank()) {
+            // bc-author: 12/700 in the author's deterministic hue.
             Text(
                 author,
-                color = s.text3,
-                fontSize = 11.5.sp,
-                modifier = Modifier.padding(start = 6.dp, bottom = 2.dp)
+                color = authorColor(author, s.isDark),
+                fontSize = 12.sp, fontWeight = FontWeight.Bold,
+                modifier = Modifier.padding(start = 12.dp, bottom = 3.dp)
             )
         }
         Box(
-            Modifier.clip(RoundedCornerShape(18.dp))
+            Modifier.widthIn(max = maxBubbleWidth).clip(shape)
                 .background(if (m.mine) mineBg else s.bubbleOther)
                 .then(if (firstUrl != null) Modifier.clickable { uriHandler.openUri(firstUrl) } else Modifier)
-                .padding(horizontal = 12.dp, vertical = 8.dp)
+                .padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 9.dp)
         ) {
             // Selectable (long-press → Copy); tap opens a link if present —
             // mirrors the iOS deterministic copy + tappable-link behavior.
             androidx.compose.foundation.text.selection.SelectionContainer {
-                Text(annotated, color = if (m.mine) onMine else s.text, fontSize = 16.sp)
+                Text(
+                    annotated, color = if (m.mine) onMine else s.text,
+                    fontSize = 16.sp, lineHeight = 22.4.sp,
+                    inlineContent = inline,
+                )
             }
         }
         if (showState) MessageStatusFooter(m, mesh)
+    }
+}
+
+/** bc-datechip — centered day marker in the transcript. */
+@Composable
+private fun DateChip(label: String) {
+    val s = sonar
+    Box(Modifier.fillMaxWidth().padding(vertical = 5.dp), contentAlignment = Alignment.Center) {
+        Text(label, color = s.text3, fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold)
     }
 }
 
@@ -1433,15 +1626,15 @@ private fun StickerBubble(
         Modifier.clickable { onTap(ref.packCoordinate) }
     } else Modifier
     Column(
-        Modifier.fillMaxWidth().padding(vertical = 3.dp),
+        Modifier.fillMaxWidth().padding(top = 9.dp),
         horizontalAlignment = if (m.mine) Alignment.End else Alignment.Start
     ) {
         if (!author.isNullOrBlank()) {
             Text(
                 author,
-                color = sonar.text3,
-                fontSize = 11.5.sp,
-                modifier = Modifier.padding(start = 6.dp, bottom = 2.dp)
+                color = authorColor(author, sonar.isDark),
+                fontSize = 12.sp, fontWeight = FontWeight.Bold,
+                modifier = Modifier.padding(start = 12.dp, bottom = 3.dp)
             )
         }
         val image = remember(imageBytes) {
@@ -1612,21 +1805,29 @@ private fun MediaBubble(
     chatId: String,
     mesh: Boolean,
     author: String? = null,
+    cont: Boolean = false,
     showState: Boolean = false,
+    maxBubbleWidth: Dp = Dp.Infinity,
     onOpen: (SonarMedia) -> Unit,
 ) {
     val s = sonar
     val media = m.media.first()
+    val tail = 5.dp
+    val bubbleShape = RoundedCornerShape(
+        topStart = 18.dp, topEnd = 18.dp,
+        bottomStart = if (m.mine) 18.dp else tail,
+        bottomEnd = if (m.mine) tail else 18.dp,
+    )
     Column(
-        Modifier.fillMaxWidth().padding(vertical = 3.dp),
+        Modifier.fillMaxWidth().padding(top = if (cont) 2.dp else 9.dp),
         horizontalAlignment = if (m.mine) Alignment.End else Alignment.Start
     ) {
         if (!author.isNullOrBlank()) {
             Text(
                 author,
-                color = s.text3,
-                fontSize = 11.5.sp,
-                modifier = Modifier.padding(start = 6.dp, bottom = 2.dp)
+                color = authorColor(author, s.isDark),
+                fontSize = 12.sp, fontWeight = FontWeight.Bold,
+                modifier = Modifier.padding(start = 12.dp, bottom = 3.dp)
             )
         }
         if (media.isImage) {
@@ -1641,46 +1842,31 @@ private fun MediaBubble(
                 mediaBytes?.let { decodeImageBitmap(it) }
             }
             val renderAsGif = media.isGif && mediaBytes?.looksLikeGifBytes() == true
+            val bmp = img
+            val bytes = mediaBytes
+            val failed = loadResult.first && bytes == null
             Box(
-                Modifier.widthIn(max = 240.dp).clip(RoundedCornerShape(18.dp)).background(s.surface2)
-                    .clickable { onOpen(media) },
+                Modifier.widthIn(max = minOf(240.dp, maxBubbleWidth)).clip(bubbleShape).background(s.surface2)
+                    .clickable {
+                        // Design media-visual tap: open when loaded, retry when failed.
+                        if (failed) loadAttempt += 1 else if (bytes != null) onOpen(media)
+                    },
                 contentAlignment = Alignment.Center
             ) {
-                val bmp = img
-                val bytes = mediaBytes
                 when {
                     bytes != null && (renderAsGif || bmp != null) -> {
                         MediaImage(
                             bytes = bytes,
                             isGif = renderAsGif,
-                            modifier = Modifier.widthIn(max = 240.dp).heightIn(max = 300.dp)
+                            modifier = Modifier.widthIn(max = minOf(240.dp, maxBubbleWidth)).heightIn(max = 300.dp)
                         )
                         if (renderAsGif) GifBadge(Modifier.align(Alignment.TopEnd).padding(8.dp))
+                        // media-chip: glass time + via pill bottom-right.
+                        MediaMetaChip(m.tsSecs, mesh, Modifier.align(Alignment.BottomEnd).padding(8.dp))
                     }
                     bytes != null -> InlineMediaFileChip(media = media, onOpen = { onOpen(media) })
-                    loadResult.first -> Box(
-                        Modifier.size(width = 180.dp, height = 130.dp),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Text("Couldn't load image", color = s.text3, fontSize = 12.sp)
-                            Text(
-                                "Retry",
-                                color = s.accent,
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                modifier = Modifier.clickable { loadAttempt += 1 }
-                            )
-                        }
-                    }
-                    else -> Box(
-                        Modifier.size(width = 180.dp, height = 130.dp),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        androidx.compose.material3.CircularProgressIndicator(
-                            color = s.text3, strokeWidth = 2.dp
-                        )
-                    }
+                    failed -> MediaUnavailable(media)
+                    else -> MediaLoadingSkeleton(media)
                 }
                 if (media.isGif && bytes == null) GifBadge(Modifier.align(Alignment.TopEnd).padding(8.dp))
             }
@@ -1690,10 +1876,76 @@ private fun MediaBubble(
             InlineMediaFileChip(media = media, onOpen = { onOpen(media) })
         }
         if (m.content.isNotEmpty()) {
-            Spacer(Modifier.height(3.dp))
-            Text(m.content, color = s.text, fontSize = 14.5.sp)
+            // media-cap: caption in its own bubble under the media.
+            val capBg = if (m.mine) (if (mesh) s.accentFill else s.netFill) else s.bubbleOther
+            val capFg = if (m.mine) (if (mesh) s.onAccent else s.onNet) else s.text
+            Spacer(Modifier.height(4.dp))
+            Box(
+                Modifier.widthIn(max = maxBubbleWidth).clip(RoundedCornerShape(18.dp)).background(capBg)
+                    .padding(start = 12.dp, end = 12.dp, top = 7.dp, bottom = 8.dp)
+            ) { Text(m.content, color = capFg, fontSize = 15.5.sp, lineHeight = 21.7.sp) }
         }
         if (showState) MessageStatusFooter(m, mesh)
+    }
+}
+
+/** media-chip — glass pill (time + via glyph) over an image/video bubble. */
+@Composable
+private fun MediaMetaChip(tsSecs: Long, mesh: Boolean, modifier: Modifier = Modifier) {
+    Row(
+        modifier.clip(RoundedCornerShape(999.dp)).background(Color.Black.copy(alpha = 0.42f))
+            .padding(horizontal = 8.dp, vertical = 3.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(4.dp)
+    ) {
+        Text(SonarClock.hourMinute(tsSecs), color = Color.White, fontSize = 10.5.sp)
+        SNIcon(if (mesh) SNIconName.Mesh else SNIconName.Globe, 11.dp, Color.White, weight = 2.2f)
+    }
+}
+
+/** media-ph — the design's gradient placeholder (photo glyph + filename chip),
+ *  shown while the encrypted blob downloads. Hue is the filename hash, exactly
+ *  like the prototype's `--ph`/`--ph2`. */
+@Composable
+private fun MediaLoadingSkeleton(media: SonarMedia) {
+    val phue = remember(media.filename) { bcHue(media.filename) }
+    val ph = Color.hsl(phue, 0.34f, 0.52f)
+    val ph2 = Color.hsl((phue + 36f) % 360f, 0.38f, 0.42f)
+    Box(
+        Modifier.size(width = 216.dp, height = 150.dp)
+            .background(Brush.linearGradient(listOf(ph, ph2))),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            SNIcon(SNIconName.Camera, 26.dp, Color.White.copy(alpha = 0.92f), weight = 1.6f)
+            Text(
+                media.filename,
+                color = Color.White.copy(alpha = 0.78f),
+                style = SonarType.mono(10.5),
+                maxLines = 1, overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.clip(RoundedCornerShape(6.dp))
+                    .background(Color.Black.copy(alpha = 0.22f))
+                    .padding(horizontal = 8.dp, vertical = 2.dp)
+                    .widthIn(max = 170.dp)
+            )
+        }
+    }
+}
+
+/** Failed/unavailable media — quiet surface tile with an explicit retry
+ *  affordance (the whole bubble tap retries). */
+@Composable
+private fun MediaUnavailable(media: SonarMedia) {
+    val s = sonar
+    Box(
+        Modifier.size(width = 216.dp, height = 150.dp).background(s.surface2),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            SNIcon(SNIconName.Camera, 24.dp, s.text3, weight = 1.7f)
+            Text("Media unavailable", color = s.text2, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+            Text("Tap to retry", color = s.accent, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+        }
     }
 }
 
@@ -2027,6 +2279,7 @@ private fun AudioBubble(m: SonarMsg, state: SonarAppState, chatId: String, media
     val s = sonar
     val net = !mesh
     val tint = if (net) s.netFill else s.accentFill
+    val onTint = if (net) s.onNet else s.onAccent
     val bytes by androidx.compose.runtime.produceState<ByteArray?>(null, media.url) {
         value = state.mediaData(chatId, media)
     }
@@ -2038,15 +2291,26 @@ private fun AudioBubble(m: SonarMsg, state: SonarAppState, chatId: String, media
     val durText = remember(media.durationMs) {
         media.durationMs?.let { fmtDur((it / 1000).toInt()) } ?: ""
     }
+    val tail = 5.dp
+    // .media-audio: own notes ride the FULL transport fill (cyan/indigo), theirs
+    // the surface bubble; radius 18 with the tail corner; padding 11/15/11/11.
     Row(
-        Modifier.clip(RoundedCornerShape(18.dp))
-            .background(if (m.mine) tint.copy(alpha = 0.15f) else s.surface2)
-            .padding(horizontal = 12.dp, vertical = 9.dp),
+        Modifier.widthIn(min = 196.dp)
+            .clip(
+                RoundedCornerShape(
+                    topStart = 18.dp, topEnd = 18.dp,
+                    bottomStart = if (m.mine) 18.dp else tail,
+                    bottomEnd = if (m.mine) tail else 18.dp,
+                )
+            )
+            .background(if (m.mine) tint else s.bubbleOther)
+            .padding(start = 11.dp, end = 15.dp, top = 11.dp, bottom = 11.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
+        // media-playbtn: 34dp — white 24% on own bubbles, accent-soft on theirs.
         Box(
             Modifier.size(34.dp).clip(CircleShape)
-                .background(if (m.mine) tint else s.surface)
+                .background(if (m.mine) Color.White.copy(alpha = 0.24f) else s.accentSoft)
                 .clickable(enabled = bytes != null) {
                     val b = bytes ?: return@clickable
                     // onComplete resets `playing` when the note ends, is stopped, or
@@ -2058,23 +2322,29 @@ private fun AudioBubble(m: SonarMsg, state: SonarAppState, chatId: String, media
         ) {
             SNIcon(
                 if (playing) SNIconName.Pause else SNIconName.Play, 14.dp,
-                if (m.mine) (if (net) s.onNet else s.onAccent) else s.accent,
+                if (m.mine) Color.White else s.accentDeep,
                 weight = 2.2f
             )
         }
         Spacer(Modifier.width(11.dp))
-        MediaWaveStatic(media.filename, Modifier.width(124.dp).height(22.dp))
+        MediaWaveStatic(
+            media.filename,
+            color = if (m.mine) Color.White.copy(alpha = 0.6f) else s.accent.copy(alpha = 0.55f),
+            modifier = Modifier.width(124.dp).height(26.dp)
+        )
         if (durText.isNotEmpty()) {
             Spacer(Modifier.width(8.dp))
-            Text(durText, style = SonarType.mono(11.5), color = s.text3)
+            Text(
+                durText, style = SonarType.mono(11.5, FontWeight.SemiBold),
+                color = if (m.mine) onTint.copy(alpha = 0.8f) else s.text2.copy(alpha = 0.8f)
+            )
         }
     }
 }
 
 /** Static waveform (design: `MediaWave`) — deterministic hash bars from a seed. */
 @Composable
-private fun MediaWaveStatic(seed: String, modifier: Modifier = Modifier) {
-    val s = sonar
+private fun MediaWaveStatic(seed: String, color: Color, modifier: Modifier = Modifier) {
     val bars = remember(seed) {
         var h = 2166136261u
         for (b in seed.encodeToByteArray()) { h = (h xor (b.toInt() and 0xFF).toUInt()) * 16777619u }
@@ -2085,7 +2355,7 @@ private fun MediaWaveStatic(seed: String, modifier: Modifier = Modifier) {
     }
     Row(modifier, verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(2.dp)) {
         bars.forEach { v ->
-            Box(Modifier.width(2.dp).fillMaxHeight(v).clip(CircleShape).background(s.text2.copy(alpha = 0.5f)))
+            Box(Modifier.width(2.dp).fillMaxHeight(v).clip(CircleShape).background(color))
         }
     }
 }
@@ -2100,14 +2370,15 @@ private fun MediaWaveStatic(seed: String, modifier: Modifier = Modifier) {
 private fun RecordingPill(elapsed: Int, level: Float, dragX: Float, modifier: Modifier = Modifier) {
     val s = sonar
     val armed = dragX < -240f
+    // voice-bar: height 38, radius 19, rec dot 11, mono timer, live wave.
     Row(
-        modifier.heightIn(min = 46.dp).clip(RoundedCornerShape(22.dp)).background(s.surface2)
-            .padding(horizontal = 14.dp, vertical = 7.dp),
+        modifier.heightIn(min = 38.dp).clip(RoundedCornerShape(19.dp)).background(s.surface2)
+            .padding(horizontal = 14.dp, vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(9.dp)
     ) {
-        Box(Modifier.size(9.dp).clip(CircleShape).background(s.danger))
-        Text(fmtDur(elapsed), style = SonarType.mono(13.0, FontWeight.Medium), color = s.text, modifier = Modifier.width(38.dp))
+        Box(Modifier.size(11.dp).clip(CircleShape).background(s.danger))
+        Text(fmtDur(elapsed), style = SonarType.mono(14.0, FontWeight.SemiBold), color = s.text, modifier = Modifier.width(38.dp))
         LiveWave(level, Modifier.weight(1f))
         Row(
             Modifier.alpha((1f + dragX / 110f).coerceIn(0f, 1f)),
@@ -2117,7 +2388,7 @@ private fun RecordingPill(elapsed: Int, level: Float, dragX: Float, modifier: Mo
             SNIcon(SNIconName.Back, 12.dp, if (armed) s.danger else s.text3, weight = 2.4f)
             Text(
                 if (armed) "release to cancel" else "slide to cancel",
-                color = if (armed) s.danger else s.text3, fontSize = 12.sp, maxLines = 1
+                color = if (armed) s.danger else s.text3, fontSize = 12.5.sp, maxLines = 1
             )
         }
     }
@@ -2133,18 +2404,86 @@ private fun LiveWave(level: Float, modifier: Modifier = Modifier) {
         animationSpec = infiniteRepeatable(tween(900, easing = LinearEasing)),
         label = "phase"
     )
-    Row(modifier.height(20.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+    // .media-wave.live — accent-tinted bars while recording.
+    Row(modifier.height(22.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(2.dp)) {
         for (i in 0 until 22) {
             val p = phase * 6 + i * 0.5f
             val v = (sin(p * 0.7f) + sin(p * 1.9f + i)) * 0.5f
             val h = 4f + abs(v) * 14f * maxOf(0.25f, level)
-            Box(Modifier.width(2.dp).height(h.dp).clip(CircleShape).background(s.text2.copy(alpha = 0.55f)))
+            Box(Modifier.width(2.dp).height(h.dp).clip(CircleShape).background(s.accent.copy(alpha = 0.7f)))
         }
     }
 }
 
 /** m:ss like the design's fmtDur. */
 private fun fmtDur(sec: Int): String = "${sec / 60}:${(sec % 60).toString().padStart(2, '0')}"
+
+// ── Local-day helpers for row times + transcript date chips ──────────────
+// commonMain has no timezone API; local midnight is derived from the platform
+// "HH:MM" that SonarClock already provides (≤59s of error, invisible here).
+
+private val WEEKDAYS = arrayOf("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+private val MONTHS = arrayOf("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+/** Epoch seconds of the most recent local midnight. */
+private fun localMidnightEpoch(): Long {
+    val now = SonarClock.nowSecs()
+    val hm = SonarClock.hourMinute(now)
+    val h = hm.substringBefore(':').toIntOrNull() ?: 0
+    val m = hm.substringAfter(':').toIntOrNull() ?: 0
+    return now - (h * 3600L + m * 60L)
+}
+
+/** Whole local days between [tsSecs] and today (0 = today, -1 = yesterday…). */
+private fun localDayDelta(tsSecs: Long): Long =
+    (tsSecs - localMidnightEpoch()).floorDiv(86_400L)
+
+/** Local civil epoch-day of today (local noon trick keeps any UTC offset ≤12h safe). */
+private fun localEpochDayToday(): Long = (localMidnightEpoch() + 43_200L).floorDiv(86_400L)
+
+/** y/m/d from an epoch day (Howard Hinnant's civil_from_days). */
+private fun civilFromEpochDay(epochDay: Long): Triple<Int, Int, Int> {
+    val z = epochDay + 719_468L
+    val era = (if (z >= 0) z else z - 146_096L).floorDiv(146_097L)
+    val doe = z - era * 146_097L
+    val yoe = (doe - doe / 1460L + doe / 36_524L - doe / 146_096L) / 365L
+    val y = yoe + era * 400L
+    val doy = doe - (365L * yoe + yoe / 4L - yoe / 100L)
+    val mp = (5L * doy + 2L) / 153L
+    val d = doy - (153L * mp + 2L) / 5L + 1L
+    val mo = if (mp < 10L) mp + 3L else mp - 9L
+    return Triple((if (mo <= 2L) y + 1L else y).toInt(), mo.toInt(), d.toInt())
+}
+
+private fun weekdayName(epochDay: Long): String =
+    WEEKDAYS[(((epochDay + 3L) % 7L + 7L) % 7L).toInt()] // 1970-01-01 = Thu
+
+private fun shortDate(epochDay: Long): String {
+    val (_, mo, d) = civilFromEpochDay(epochDay)
+    return "$d ${MONTHS[mo - 1]}"
+}
+
+/** bc-time — chat-list right column: today → HH:MM, last week → weekday, older → date. */
+internal fun rowTimeLabel(tsSecs: Long): String {
+    if (tsSecs <= 0L) return ""
+    val delta = localDayDelta(tsSecs)
+    return when {
+        delta >= 0L -> SonarClock.hourMinute(tsSecs)
+        delta >= -6L -> weekdayName(localEpochDayToday() + delta)
+        else -> shortDate(localEpochDayToday() + delta)
+    }
+}
+
+/** bc-datechip label: Today / Yesterday / weekday / date. */
+private fun dayLabel(tsSecs: Long): String {
+    val delta = localDayDelta(tsSecs)
+    return when {
+        delta >= 0L -> "Today"
+        delta == -1L -> "Yesterday"
+        delta >= -6L -> weekdayName(localEpochDayToday() + delta)
+        else -> shortDate(localEpochDayToday() + delta)
+    }
+}
 
 /**
  * "Around you" card (design: screens.jsx HereCard) — collapses the geohash
@@ -2158,7 +2497,7 @@ private fun HereCard(items: List<HereItem>, onEnter: (String) -> Unit) {
     val s = sonar
     if (items.isEmpty()) {
         chat.bitchat.sonar.ui.SNEmptyState(
-            icon = SNIconName.Pin, iconSize = 22.dp,
+            icon = SNIconName.Pin, iconSize = 22.dp, amber = true,
             title = "Nothing around you yet",
             desc = "Turn on location to see public channels nearby, or use the radar to find people over Bluetooth."
         )
@@ -2167,51 +2506,66 @@ private fun HereCard(items: List<HereItem>, onEnter: (String) -> Unit) {
     val defaultIdx = items.indexOfFirst { it.count > 0 }.let { if (it >= 0) it else items.lastIndex }
     var idx by remember(items.size) { mutableStateOf(defaultIdx) }
     val sel = items[idx.coerceIn(0, items.lastIndex)]
-    Column(Modifier.fillMaxWidth()) {
+    val cardShape = RoundedCornerShape(20.dp)
+    // here-card: surface card, radius 20, hairline inset ring, margin 2/14/6.
+    Column(
+        Modifier.fillMaxWidth()
+            .padding(start = 14.dp, end = 14.dp, top = 2.dp, bottom = 6.dp)
+            .clip(cardShape).background(s.surface).border(1.dp, s.hairline, cardShape)
+    ) {
+        // here-main: tile 52 · name 16.5/700 · "tier · N here now" · chevron.
         Row(
-            Modifier.fillMaxWidth().clickable { onEnter(sel.geohash) }.padding(horizontal = 16.dp, vertical = 9.dp),
+            Modifier.fillMaxWidth().clickable { onEnter(sel.geohash) }
+                .padding(start = 14.dp, end = 14.dp, top = 12.dp, bottom = 10.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             if (sel.geohash == "mesh") MeshTile(52.dp) else PlaceTile(52.dp)
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
-                Text(sel.name, color = s.text, fontSize = 16.5.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 Text(
-                    if (sel.count > 0) "${sel.tier} · ${sel.count} here now" else sel.tier,
-                    color = s.text2, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis
+                    sel.name, color = s.text, fontSize = 16.5.sp, fontWeight = FontWeight.Bold,
+                    letterSpacing = (-0.17).sp, maxLines = 1, overflow = TextOverflow.Ellipsis
+                )
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    "${sel.tier} · ${sel.count} here now",
+                    color = s.text2, fontSize = 13.5.sp, maxLines = 1, overflow = TextOverflow.Ellipsis
                 )
             }
+            Spacer(Modifier.width(12.dp))
             SNIcon(SNIconName.Chevron, 15.dp, s.text3, weight = 2.2f)
         }
+        // here-scale: pill ticks — surface2/text2, selected accent-soft/accent-deep,
+        // 6dp green live dot when someone's there.
         Row(
             Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
-                .padding(start = 14.dp, end = 14.dp, bottom = 6.dp),
+                .padding(start = 12.dp, end = 12.dp, bottom = 12.dp),
             horizontalArrangement = Arrangement.spacedBy(6.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             items.forEachIndexed { i, ch ->
+                val on = i == idx
                 Row(
-                    Modifier.clip(CircleShape)
-                        .background(if (i == idx) s.surface2 else androidx.compose.ui.graphics.Color.Transparent)
+                    Modifier.clip(RoundedCornerShape(999.dp))
+                        .background(if (on) s.accentSoft else s.surface2)
                         .clickable { idx = i }
                         .padding(horizontal = 11.dp, vertical = 6.dp),
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    horizontalArrangement = Arrangement.spacedBy(5.dp)
                 ) {
                     Text(
-                        ch.tier.ifBlank { ch.name }, fontSize = 12.5.sp,
-                        fontWeight = if (i == idx) FontWeight.SemiBold else FontWeight.Normal,
-                        color = if (i == idx) s.text else s.text3
+                        ch.short, fontSize = 12.5.sp, fontWeight = FontWeight.SemiBold,
+                        color = if (on) s.accentDeep else s.text2, maxLines = 1
                     )
-                    if (ch.count > 0) Box(Modifier.size(5.dp).clip(CircleShape).background(s.green))
+                    if (ch.count > 0) Box(Modifier.size(6.dp).clip(CircleShape).background(s.green))
                 }
             }
         }
     }
 }
 
-/** One precision tick on the "Around you" ladder. */
-data class HereItem(val geohash: String, val name: String, val tier: String, val count: Int)
+/** One precision tick on the "Around you" ladder (data.js `here[]`). */
+data class HereItem(val geohash: String, val name: String, val tier: String, val short: String, val count: Int)
 
 private val URL_REGEX = Regex("""(https?://|www\.)\S+""")
 

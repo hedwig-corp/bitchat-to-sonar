@@ -209,7 +209,8 @@ fun SNDot(color: Color, size: Dp = 7.dp) {
 
 enum class SNBannerTone { Enc, Net, Neutral, Public }
 
-/** bc-banner: tinted strip with an icon + bold + rest text + optional action. */
+/** bc-banner (theme.css): margin 8/14/0 · radius 13 · padding 9/13 · gap 9 ·
+ *  icon 16/w2 · 12.5px text tinted in the tone color (bold w700, same color). */
 @Composable
 fun SNBanner(
     icon: SNIconName,
@@ -220,29 +221,32 @@ fun SNBanner(
     onAction: (() -> Unit)? = null,
 ) {
     val s = sonar
+    // Tone → (bg, text). Design: public → accent-soft/accent-deep,
+    // enc → green-soft/green-deep, net → net-soft/net-deep.
     val (bg, fg) = when (tone) {
-        SNBannerTone.Enc -> s.greenSoft to s.green
-        SNBannerTone.Net -> s.netSoft to s.net
+        SNBannerTone.Enc -> s.greenSoft to s.greenDeep
+        SNBannerTone.Net -> s.netSoft to s.netDeep
         SNBannerTone.Public -> s.accentSoft to s.accentDeep
         SNBannerTone.Neutral -> s.surface2 to s.text2
     }
     Row(
-        Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 6.dp)
-            .clip(RoundedCornerShape(12.dp)).background(bg)
-            .padding(horizontal = 12.dp, vertical = 9.dp),
+        Modifier.fillMaxWidth().padding(start = 14.dp, end = 14.dp, top = 8.dp)
+            .clip(RoundedCornerShape(13.dp)).background(bg)
+            .padding(horizontal = 13.dp, vertical = 9.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        SNIcon(icon, 15.dp, fg, weight = 2.2f)
-        Spacer(Modifier.width(8.dp))
+        SNIcon(icon, 16.dp, fg, weight = 2f)
+        Spacer(Modifier.width(9.dp))
         Text(
-            buildAnnotatedSimple(bold, rest),
-            color = s.text2, fontSize = 13.sp, lineHeight = 17.sp,
+            buildAnnotatedSimple(bold, rest, fg),
+            color = fg, fontSize = 12.5.sp, lineHeight = 17.sp,
             modifier = Modifier.weight(1f)
         )
         if (actionLabel != null && onAction != null) {
-            Spacer(Modifier.width(8.dp))
+            Spacer(Modifier.width(9.dp))
+            // bc-bannerbtn: surface pill, 12.5 w700, padding 6×12.
             Box(
-                Modifier.clip(RoundedCornerShape(9.dp)).background(s.surface)
+                Modifier.clip(RoundedCornerShape(999.dp)).background(s.surface)
                     .clickable(onClick = onAction).padding(horizontal = 12.dp, vertical = 6.dp)
             ) { Text(actionLabel, color = fg, fontSize = 12.5.sp, fontWeight = FontWeight.Bold) }
         }
@@ -250,27 +254,39 @@ fun SNBanner(
 }
 
 @Composable
-private fun buildAnnotatedSimple(bold: String, rest: String) =
+private fun buildAnnotatedSimple(bold: String, rest: String, tint: Color) =
     androidx.compose.ui.text.buildAnnotatedString {
-        pushStyle(androidx.compose.ui.text.SpanStyle(fontWeight = FontWeight.Bold, color = sonar.text))
+        pushStyle(androidx.compose.ui.text.SpanStyle(fontWeight = FontWeight.Bold, color = tint))
         append(bold)
         pop()
         append(rest)
     }
 
-/** An empty-state block: icon + title + description, centered. */
+/** bc-empty (theme.css): 56dp tinted icon tile (radius 18) + 17/w700 title +
+ *  13.5 text2 description, centered. Default tile is green-soft (DM empty);
+ *  [amber] switches to the accent-soft variant used by channels. */
 @Composable
-fun SNEmptyState(icon: SNIconName, title: String, desc: String, iconSize: Dp = 24.dp) {
+fun SNEmptyState(
+    icon: SNIconName,
+    title: String,
+    desc: String,
+    iconSize: Dp = 24.dp,
+    amber: Boolean = false,
+) {
     val s = sonar
+    val (tileBg, tileFg) = if (amber) s.accentSoft to s.accentDeep else s.greenSoft to s.greenDeep
     Column(
-        Modifier.fillMaxWidth().padding(top = 80.dp, start = 24.dp, end = 24.dp),
+        Modifier.fillMaxWidth().padding(top = 80.dp, start = 44.dp, end = 44.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        SNIcon(icon, iconSize, s.text3)
-        Spacer(Modifier.height(10.dp))
-        Text(title, color = s.text2, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
-        Spacer(Modifier.height(4.dp))
-        Text(desc, color = s.text3, fontSize = 13.sp, lineHeight = 18.sp, textAlign = TextAlign.Center)
+        Box(
+            Modifier.size(56.dp).clip(RoundedCornerShape(18.dp)).background(tileBg),
+            contentAlignment = Alignment.Center
+        ) { SNIcon(icon, iconSize, tileFg) }
+        Spacer(Modifier.height(14.dp))
+        Text(title, color = s.text, fontSize = 17.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
+        Spacer(Modifier.height(6.dp))
+        Text(desc, color = s.text2, fontSize = 13.5.sp, lineHeight = 20.sp, textAlign = TextAlign.Center)
     }
 }
 

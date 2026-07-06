@@ -1,10 +1,13 @@
 package chat.bitchat.sonar.screens
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -30,7 +33,11 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import chat.bitchat.sonar.Screen
@@ -41,6 +48,7 @@ import chat.bitchat.sonar.ToastBar
 import kotlinx.coroutines.launch
 import chat.bitchat.sonar.wallet.FiatCurrency
 import chat.bitchat.sonar.wallet.WalletState
+import chat.bitchat.sonar.ui.SNGhostButton
 import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconName
 import chat.bitchat.sonar.ui.SNNavHeader
@@ -54,13 +62,15 @@ import chat.bitchat.sonar.ui.SNTone
 import chat.bitchat.sonar.ui.SNTrail
 import chat.bitchat.sonar.ui.sonar
 import chat.bitchat.sonar.Notifier
+import kotlinx.coroutines.delay
 
 /**
  * Full Settings screen — 1:1 reproduction of design/handoff/project/sonar/
- * settings.jsx (Signal/XChat-inspired): profile row, App / Network / Wallet /
+ * settings.jsx (Signal/XChat-inspired): profile card, App / Network / Wallet /
  * Privacy & safety / Data & storage / About sections, with the Notifications,
- * App icon and Message-requests sheets. Real backends are bound where they
- * exist; demo-only rows persist their toggle locally.
+ * App icon, Message-requests, Currency, Export-key and Wipe sheets. Real
+ * backends are bound where they exist; demo-only rows persist their toggle
+ * locally.
  */
 @Composable
 fun SonarSettingsScreen(state: SonarAppState) {
@@ -83,9 +93,9 @@ fun SonarSettingsScreen(state: SonarAppState) {
     Column(Modifier.fillMaxSize().background(s.bg)) {
         SNNavHeader("Settings", hairline = false, onBack = { state.back() })
         Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
-            // profile card → Profile
+            // st-prof: profile card → Profile
             Row(
-                Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp)
+                Modifier.fillMaxWidth().padding(start = 14.dp, end = 14.dp, top = 8.dp, bottom = 4.dp)
                     .clip(RoundedCornerShape(20.dp)).background(s.surface)
                     .clickable { state.push(Screen.Profile) }
                     .padding(14.dp),
@@ -95,7 +105,7 @@ fun SonarSettingsScreen(state: SonarAppState) {
                 Spacer(Modifier.width(14.dp))
                 Column(Modifier.weight(1f)) {
                     Text(state.nick.ifBlank { "you" }, color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
-                    Text(shortKey(state.npub), color = s.text3, fontSize = 12.sp)
+                    Text(shortKey(state.npub), color = s.text3, style = SonarType.mono(12.0), modifier = Modifier.padding(top = 2.dp))
                 }
                 SNIcon(SNIconName.Chevron, 15.dp, s.text3, weight = 2.2f)
             }
@@ -104,15 +114,16 @@ fun SonarSettingsScreen(state: SonarAppState) {
             SNSettingsCard {
                 SNSettingsRow(
                     icon = SNIconName.Moon, label = "Appearance",
-                    value = if (state.dark) "Dark" else "Light", trail = SNTrail.None,
+                    value = if (state.dark) "Dark" else "Light",
                 ) { state.toggleDark() }
                 SNSettingsRow(
                     icon = SNIconName.Rings, label = "App icon", value = iconLabel,
                 ) { appicon = true }
-                SNSettingsRow(
-                    icon = SNIconName.Info, label = "Notifications",
+                SNXSettingsRow(
+                    label = "Notifications",
                     value = if (state.prefBool("notifs", true)) "On" else "Off",
-                    divider = false,
+                    chevron = true, divider = false,
+                    icon = { SNXIcon(SNXIconName.Bell, 18.dp, it) },
                 ) { notif = true }
             }
 
@@ -122,7 +133,6 @@ fun SonarSettingsScreen(state: SonarAppState) {
                     icon = SNIconName.Mesh, tone = SNTone.Cyan, label = "Connection",
                     sub = if (state.started) "Bluetooth + internet" else "Nearby only, no internet",
                     value = if (state.started) "Online" else "Bluetooth only",
-                    trail = SNTrail.None,
                 ) {}
                 SNSettingsRow(
                     icon = SNIconName.Mesh, tone = SNTone.Cyan, label = "Discover new people",
@@ -139,47 +149,55 @@ fun SonarSettingsScreen(state: SonarAppState) {
             SNSectionLabel("Wallet")
             SNSettingsCard {
                 SNSettingsRow(
-                    icon = SNIconName.Coin, tone = SNTone.Gold, label = "Bitcoin",
-                    sub = "Pays like you message — Bluetooth or Lightning",
-                    value = if (state.walletAvailable) "${formatThousands(balance)} sats" else "Off",
-                    trail = SNTrail.None,
+                    icon = SNIconName.Coin, tone = SNTone.Gold, label = "Balance",
+                    value = if (state.walletAvailable) state.money(balance) else "Off",
+                    divider = state.walletAvailable,
                 ) { if (state.walletAvailable) state.push(Screen.WalletActivity) }
                 if (state.walletAvailable) {
                     SNSettingsRow(
-                        icon = SNIconName.Coin, label = "Currency", value = state.currency.code,
+                        icon = SNIconName.Globe, label = "Currency", value = state.currency.code,
                     ) { currencyPick = true }
                     SNSettingsRow(
-                        icon = SNIconName.Bolt, label = "Show balance in fiat",
-                        toggle = state.showFiat, trail = SNTrail.None, divider = false,
+                        icon = SNIconName.Bolt, label = "Bitcoin mode",
+                        sub = "Show sats and bitcoin networks",
+                        toggle = !state.showFiat, trail = SNTrail.None, divider = false,
                     ) { state.toggleShowFiat() }
                 }
+            }
+            if (state.walletAvailable) {
+                StNote("Off by default — amounts show in your currency. Turn on to see sats, Lightning and ecash.")
             }
 
             SNSectionLabel("Privacy & safety")
             SNSettingsCard {
-                SNSettingsRow(
-                    icon = SNIconName.Lock, label = "App lock",
+                SNXSettingsRow(
+                    label = "App lock",
                     sub = "Require your device unlock to open Sonar",
                     toggle = state.appLockOn,
+                    icon = { SNXIcon(SNXIconName.FaceId, 18.dp, it) },
                 ) {
                     if (state.appLockAvailable) state.setAppLock(!state.appLockOn)
                     else state.toast = "Set a screen lock on your device first"
                 }
                 SNSettingsRow(
-                    icon = SNIconName.Key, tone = SNTone.Cyan, label = "Export private key",
-                    sub = "Back up or move this account",
-                ) { exportKey = true }
-                SNSettingsRow(
                     icon = SNIconName.Check, label = "Read receipts",
                     toggle = state.prefBool("readReceipts"),
                 ) { state.togglePref("readReceipts") }
-                SNSettingsRow(
-                    icon = SNIconName.Pin, label = "Message requests",
+                SNXSettingsRow(
+                    label = "Message requests",
+                    chevron = true,
+                    icon = { SNXIcon(SNXIconName.Inbox, 18.dp, it) },
                 ) { requests = true }
                 SNSettingsRow(
                     icon = SNIconName.ShieldCheck, tone = SNTone.Cyan, label = "Verified people",
                     value = state.verifiedCount().toString(),
                 ) { state.push(Screen.Nearby) }
+                SNXSettingsRow(
+                    label = "Export private key",
+                    sub = "Move your account to another wallet",
+                    chevron = true,
+                    icon = { SNXIcon(SNXIconName.ImportKey, 18.dp, it) },
+                ) { exportKey = true }
                 SNSettingsRow(
                     icon = SNIconName.Trash, tone = SNTone.Cyan, label = "Erase all chats",
                     sub = "Clears conversations — keeps your identity",
@@ -190,14 +208,14 @@ fun SonarSettingsScreen(state: SonarAppState) {
                     danger = true, trail = SNTrail.None, divider = false,
                 ) { wipeAsk = true }
             }
-            Text(
-                "Tip: triple-tap the Sonar title on the home screen to wipe instantly.",
-                color = s.text3, fontSize = 12.sp, modifier = Modifier.padding(horizontal = 26.dp, vertical = 6.dp)
-            )
+            StNote("Tip: triple-tap the sonar title on the home screen to wipe instantly.")
 
             SNSectionLabel("Data & storage")
             SNSettingsCard {
-                SNSettingsRow(icon = SNIconName.Pin, label = "Storage", value = "Local only", trail = SNTrail.None) {}
+                SNXSettingsRow(
+                    label = "Storage", value = "Local only",
+                    icon = { SNXIcon(SNXIconName.Drive, 18.dp, it) },
+                ) {}
                 // Desktop-only: no GPS sensor, so offer opt-in IP geolocation to
                 // populate the "Around you" geohash channels. Hidden on mobile
                 // (configurable() == false there). Off by default — enabling it
@@ -212,10 +230,11 @@ fun SonarSettingsScreen(state: SonarAppState) {
                         state.refreshLocationChannels()
                     }
                 }
-                SNSettingsRow(
-                    icon = SNIconName.Globe, label = "Data usage",
+                SNXSettingsRow(
+                    label = "Data usage",
                     value = if (state.prefBool("wifiOnly")) "Wi-Fi only" else "Always",
-                    toggle = state.prefBool("wifiOnly"), trail = SNTrail.None, divider = false,
+                    toggle = state.prefBool("wifiOnly"), divider = false,
+                    icon = { SNXIcon(SNXIconName.Data, 18.dp, it) },
                 ) { state.togglePref("wifiOnly") }
             }
 
@@ -227,13 +246,15 @@ fun SonarSettingsScreen(state: SonarAppState) {
                 ) { diagnostics = true }
                 SNSettingsRow(
                     icon = SNIconName.Info, label = "About Sonar",
-                    sub = "Open protocols — Bluetooth mesh + Nostr", trail = SNTrail.None,
+                    sub = "Open protocols — Bluetooth mesh + Nostr",
                 ) {}
-                SNSettingsRow(
-                    icon = SNIconName.People, label = "Help", trail = SNTrail.None, divider = false,
+                SNXSettingsRow(
+                    label = "Help", divider = false,
+                    trailing = { SNXIcon(SNXIconName.ArrowOut, 14.dp, s.text3, weight = 2.2f) },
+                    icon = { SNIcon(SNIconName.Smile, 18.dp, it) },
                 ) { state.toast = "Sonar — open protocols over Bluetooth mesh + Nostr" }
             }
-            Spacer(Modifier.height(40.dp))
+            Spacer(Modifier.height(56.dp))
         }
     }
 
@@ -253,52 +274,189 @@ fun SonarSettingsScreen(state: SonarAppState) {
     state.toast?.let { ToastBar(it) { state.toast = null } }
 }
 
+/** st-note: 12px text3 hanging under a card (padding 0 24px 4px). */
+@Composable
+private fun StNote(text: String) {
+    Text(
+        text, color = sonar.text3, fontSize = 12.sp, lineHeight = 18.sp,
+        modifier = Modifier.padding(start = 24.dp, end = 24.dp, bottom = 4.dp)
+    )
+}
+
+/**
+ * Design bottom sheet (bc-scrim + bc-sheet): floating card with 10dp side /
+ * 12dp bottom margins, 24dp radius, a grabber, and an uppercase title.
+ */
+@Composable
+internal fun Sheet(title: String?, onClose: () -> Unit, content: @Composable ColumnScope.() -> Unit) {
+    val s = sonar
+    Box(
+        Modifier.fillMaxSize().background(s.scrim).clickable(
+            interactionSource = remember { MutableInteractionSource() }, indication = null,
+            onClick = onClose,
+        ),
+        contentAlignment = Alignment.BottomCenter
+    ) {
+        Column(
+            Modifier.fillMaxWidth().padding(start = 10.dp, end = 10.dp, bottom = 12.dp)
+                .clip(RoundedCornerShape(24.dp)).background(s.surface)
+                .clickable(  // swallow taps on the sheet itself
+                    interactionSource = remember { MutableInteractionSource() }, indication = null,
+                    onClick = {},
+                )
+                .padding(start = 10.dp, end = 10.dp, top = 4.dp, bottom = 14.dp)
+        ) {
+            // bc-grabber
+            Box(
+                Modifier.align(Alignment.CenterHorizontally).padding(top = 8.dp, bottom = 8.dp)
+                    .size(width = 38.dp, height = 4.5.dp).clip(RoundedCornerShape(3.dp)).background(s.hairline)
+            )
+            if (title != null) {
+                Text(
+                    title.uppercase(), color = s.text3, fontSize = 12.5.sp,
+                    fontWeight = FontWeight.Bold, letterSpacing = 0.6.sp,
+                    modifier = Modifier.padding(start = 10.dp, end = 10.dp, top = 2.dp, bottom = 8.dp)
+                )
+            }
+            content()
+        }
+    }
+}
+
+/** bc-verifycopy: centered explainer copy inside a sheet. */
+@Composable
+private fun SheetCopy(text: String) {
+    Text(
+        text, color = sonar.text2, fontSize = 13.5.sp, lineHeight = 20.sp,
+        textAlign = TextAlign.Center,
+        modifier = Modifier.fillMaxWidth().padding(start = 14.dp, end = 14.dp, top = 8.dp, bottom = 2.dp)
+    )
+}
+
+/** bc-primary.danger */
+@Composable
+private fun DangerPrimaryButton(label: String, onClick: () -> Unit) {
+    val s = sonar
+    Box(
+        Modifier.fillMaxWidth().height(52.dp).clip(RoundedCornerShape(15.dp))
+            .background(s.danger).clickable(onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(label, color = Color(0xFFFFF6F6), fontSize = 16.5.sp, fontWeight = FontWeight.Bold)
+    }
+}
+
+/** Emergency wipe confirmation — copy verbatim from screens.jsx WipeSheet. */
+@Composable
+private fun WipeSheet(onWipe: () -> Unit, onClose: () -> Unit) {
+    Sheet("Emergency wipe", onClose) {
+        SheetCopy(
+            "This deletes your key, your nickname and every conversation from this phone. " +
+                "There is no account to recover — gone is gone."
+        )
+        Column(Modifier.padding(start = 8.dp, end = 8.dp, top = 6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            DangerPrimaryButton("Wipe everything") { onWipe() }
+            SNGhostButton("Cancel") { onClose() }
+        }
+    }
+}
+
+@Composable
+private fun EraseChatsSheet(onErase: () -> Unit, onClose: () -> Unit) {
+    Sheet("Erase all chats", onClose) {
+        SheetCopy(
+            "This deletes every conversation from this phone — Bluetooth chats and White Noise " +
+                "secure chats. Your identity, nickname and wallet stay, so you can start fresh " +
+                "without setting up again."
+        )
+        Column(Modifier.padding(start = 8.dp, end = 8.dp, top = 6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            SNPrimaryButton("Erase all chats", net = false) { onErase() }
+            SNGhostButton("Cancel") { onClose() }
+        }
+    }
+}
+
+/** Export private key (nsec) — settings.jsx ExportKeySheet: warning card,
+ *  masked reveal field with an eye, copy button, password-manager tip. */
 @Composable
 private fun ExportKeySheet(state: SonarAppState, onClose: () -> Unit) {
     val s = sonar
     val clipboard = LocalClipboardManager.current
     var revealed by remember { mutableStateOf(false) }
+    var copied by remember { mutableStateOf(false) }
+    LaunchedEffect(copied) { if (copied) { delay(1700); copied = false } }
     val nsec = state.exportNsec()
-    val masked = if (nsec.isBlank()) "No private key loaded" else nsec.take(5) + " " + "*".repeat(28)
+    val masked = if (nsec.isBlank()) "No private key loaded" else nsec.take(5) + " " + "•".repeat(28)
     Sheet("Export private key", onClose) {
-        Text(
-            "This nsec key controls your Sonar account and wallet. Keep it private.",
-            color = s.text2, fontSize = 13.5.sp, lineHeight = 18.sp
-        )
-        Spacer(Modifier.height(12.dp))
-        Box(
-            Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(s.surface2)
+        // nsec-warn
+        Row(
+            Modifier.fillMaxWidth().padding(start = 8.dp, end = 8.dp, top = 2.dp, bottom = 12.dp)
+                .clip(RoundedCornerShape(14.dp))
+                .background(Color(s.danger.value).copy(alpha = 0.10f))
+                .padding(horizontal = 15.dp, vertical = 13.dp),
+        ) {
+            SNIcon(SNIconName.Shield, 18.dp, s.danger, weight = 2f)
+            Spacer(Modifier.width(11.dp))
+            Text(
+                buildAnnotatedString {
+                    append("This ")
+                    withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append("nsec") }
+                    append(" key ")
+                    withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append("is") }
+                    append(
+                        " your account. Anyone who has it can read your messages and spend your " +
+                            "balance. Paste it into another Nostr app to move in — never share it with a person."
+                    )
+                },
+                color = s.text, fontSize = 13.sp, lineHeight = 19.5.sp,
+            )
+        }
+        // nsec-field: tap to reveal/hide, eye glyph trailing
+        Row(
+            Modifier.fillMaxWidth().padding(start = 8.dp, end = 8.dp, bottom = 12.dp)
+                .clip(RoundedCornerShape(14.dp)).background(s.surface2)
                 .clickable(enabled = nsec.isNotBlank()) { revealed = !revealed }
-                .padding(horizontal = 14.dp, vertical = 13.dp)
+                .padding(horizontal = 15.dp, vertical = 14.dp),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
             Text(
                 if (revealed) nsec else masked,
-                color = if (nsec.isBlank()) s.text3 else s.text,
-                style = SonarType.mono(13.5),
-                lineHeight = 18.sp,
+                color = if (revealed) s.text else s.text2,
+                style = SonarType.mono(13.0),
+                lineHeight = 19.5.sp,
+                modifier = Modifier.weight(1f),
             )
+            Spacer(Modifier.width(10.dp))
+            SNXIcon(if (revealed) SNXIconName.EyeOff else SNXIconName.Eye, 17.dp, s.text3, weight = 2f)
         }
-        Spacer(Modifier.height(12.dp))
-        Box(
-            Modifier.fillMaxWidth().height(46.dp).clip(RoundedCornerShape(13.dp))
-                .background(if (nsec.isBlank()) s.surface2 else s.accentFill)
-                .clickable(enabled = nsec.isNotBlank()) {
-                    if (revealed) {
+        // keyshare-btn primary — Copy private key / Copied
+        Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp)) {
+            Row(
+                Modifier.weight(1f).clip(RoundedCornerShape(13.dp))
+                    .background(if (nsec.isBlank()) s.surface2 else if (copied) s.green else s.accentFill)
+                    .clickable(enabled = nsec.isNotBlank()) {
                         clipboard.setText(AnnotatedString(nsec))
-                        state.toast = "Private key copied"
-                    } else {
-                        revealed = true
+                        copied = true
                     }
-                },
-            contentAlignment = Alignment.Center,
-        ) {
-            Text(
-                if (revealed) "Copy private key" else "Reveal private key",
-                color = if (nsec.isBlank()) s.text3 else s.onAccent,
-                fontSize = 15.sp,
-                fontWeight = FontWeight.Bold,
-            )
+                    .padding(vertical = 12.dp),
+                horizontalArrangement = Arrangement.Center,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                val fg = if (nsec.isBlank()) s.text3 else if (copied) Color.White else s.onAccent
+                if (copied) SNIcon(SNIconName.Check, 17.dp, fg, weight = 2.2f)
+                else SNXIcon(SNXIconName.Copy, 17.dp, fg, weight = 2.2f)
+                Spacer(Modifier.width(7.dp))
+                Text(
+                    if (copied) "Copied" else "Copy private key",
+                    color = fg, fontSize = 14.5.sp, fontWeight = FontWeight.Bold,
+                )
+            }
         }
+        Text(
+            "Tip: store it in a password manager. Sonar can’t recover it for you.",
+            color = s.text3, fontSize = 13.sp, lineHeight = 19.5.sp, textAlign = TextAlign.Center,
+            modifier = Modifier.fillMaxWidth().padding(start = 18.dp, end = 18.dp, top = 12.dp, bottom = 4.dp),
+        )
     }
 }
 
@@ -306,22 +464,23 @@ private fun ExportKeySheet(state: SonarAppState, onClose: () -> Unit) {
 private fun NotifSheet(state: SonarAppState, onClose: () -> Unit) {
     state.prefsVersion
     Sheet("Notifications", onClose) {
-        SNSettingsRow(
-            icon = SNIconName.Info, label = "Allow notifications",
-            toggle = state.prefBool("notifs", true), trail = SNTrail.None,
+        SNXSettingsRow(
+            label = "Allow notifications",
+            toggle = state.prefBool("notifs", true),
+            icon = { SNXIcon(SNXIconName.Bell, 18.dp, it) },
         ) {
             state.togglePref("notifs", true)
-            Notifier.setPushEnabled(state.prefBool("notifs", true))
+            syncPushEnabled(state)
         }
         SNSettingsRow(
             icon = SNIconName.People, label = "Show names",
             sub = "Hide to keep the lock screen private",
             toggle = state.prefBool("notifNames", true) && state.prefBool("notifs", true), trail = SNTrail.None,
         ) { state.togglePref("notifNames", true) }
-        SNSettingsRow(
-            icon = SNIconName.Pin, label = "Show message preview",
+        SNXSettingsRow(
+            label = "Show message preview",
             toggle = state.prefBool("notifPreview", false) && state.prefBool("notifs", true),
-            trail = SNTrail.None,
+            icon = { SNXIcon(SNXIconName.ListGlyph, 18.dp, it) },
         ) { state.togglePref("notifPreview", false) }
         SNSettingsRow(
             icon = SNIconName.Bolt, label = "Background push",
@@ -331,9 +490,18 @@ private fun NotifSheet(state: SonarAppState, onClose: () -> Unit) {
         ) {
             val newValue = !state.prefBool("pushEnabled", true)
             state.setPref("pushEnabled", newValue)
-            Notifier.setPushEnabled(newValue)
+            syncPushEnabled(state)
+        }
+        Column(Modifier.padding(start = 8.dp, end = 8.dp, top = 6.dp)) {
+            SNGhostButton("Done") { onClose() }
         }
     }
+}
+
+private fun syncPushEnabled(state: SonarAppState) {
+    Notifier.setPushEnabled(
+        state.prefBool("notifs", true) && state.prefBool("pushEnabled", true)
+    )
 }
 
 @Composable
@@ -346,19 +514,30 @@ private fun AppIconSheet(state: SonarAppState, onClose: () -> Unit) {
     )
     val current = state.prefStr("icon", "cyan")
     Sheet("App icon", onClose) {
-        Row(Modifier.fillMaxWidth().padding(vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(14.dp, Alignment.CenterHorizontally)) {
+        // ai-row: 62dp tiles, 15dp radius, accent ring on the selected one
+        Row(
+            Modifier.fillMaxWidth().padding(top = 12.dp, bottom = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(16.dp, Alignment.CenterHorizontally)
+        ) {
             icons.forEach { (id, bg, fg) ->
                 Box(
-                    Modifier.size(64.dp).clip(RoundedCornerShape(16.dp)).background(bg)
+                    Modifier.size(62.dp).clip(RoundedCornerShape(15.dp))
+                        .background(bg)
+                        .then(
+                            if (id == current) Modifier.border(2.5.dp, s.accent, RoundedCornerShape(15.dp))
+                            else Modifier
+                        )
                         .clickable { state.setPrefStr("icon", id); onClose() },
                     contentAlignment = Alignment.Center
                 ) {
                     SNIcon(SNIconName.Rings, 30.dp, fg)
-                    if (id == current) Box(Modifier.fillMaxWidth().height(64.dp))
                 }
             }
         }
-        Text("Quiet options only — no badges, no noise.", color = s.text3, fontSize = 12.sp, modifier = Modifier.padding(top = 4.dp))
+        SheetCopy("The Sonar mark — quiet, no badges.")
+        Column(Modifier.padding(start = 8.dp, end = 8.dp, top = 6.dp)) {
+            SNGhostButton("Done") { onClose() }
+        }
     }
 }
 
@@ -366,22 +545,33 @@ private fun AppIconSheet(state: SonarAppState, onClose: () -> Unit) {
 private fun RequestsSheet(onClose: () -> Unit) {
     val s = sonar
     Sheet("Message requests", onClose) {
-        Row(Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+        // pf-request
+        Row(
+            Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, top = 10.dp, bottom = 4.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
             SonarAvatar("driftwood", 46.dp)
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
-                Text("driftwood", color = s.text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
-                Text("Met on mesh · wants to message you", color = s.text3, fontSize = 12.5.sp)
+                Text("driftwood", color = s.text, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                Text("Met on mesh · wants to message you", color = s.text2, fontSize = 12.5.sp)
             }
         }
-        Spacer(Modifier.height(10.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            Box(Modifier.weight(1f).clip(RoundedCornerShape(12.dp)).background(s.accentFill).clickable(onClick = onClose).padding(vertical = 12.dp), contentAlignment = Alignment.Center) {
-                Text("Accept", color = s.onAccent, fontSize = 15.sp, fontWeight = FontWeight.Bold)
-            }
-            Box(Modifier.weight(1f).clip(RoundedCornerShape(12.dp)).background(s.surface2).clickable(onClick = onClose).padding(vertical = 12.dp), contentAlignment = Alignment.Center) {
-                Text("Decline", color = s.text2, fontSize = 15.sp, fontWeight = FontWeight.Bold)
-            }
+        // pf-reqbtns
+        Row(
+            Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, top = 10.dp, bottom = 4.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Box(
+                Modifier.weight(1f).clip(RoundedCornerShape(999.dp)).background(s.accentFill)
+                    .clickable(onClick = onClose).padding(vertical = 11.dp),
+                contentAlignment = Alignment.Center
+            ) { Text("Accept", color = s.onAccent, fontSize = 14.sp, fontWeight = FontWeight.Bold) }
+            Box(
+                Modifier.weight(1f).clip(RoundedCornerShape(999.dp)).background(s.surface2)
+                    .clickable(onClick = onClose).padding(vertical = 11.dp),
+                contentAlignment = Alignment.Center
+            ) { Text("Decline", color = s.text, fontSize = 14.sp, fontWeight = FontWeight.Bold) }
         }
     }
 }
@@ -456,93 +646,28 @@ private fun DiagnosticsSheet(state: SonarAppState, onClose: () -> Unit) {
     }
 }
 
-/** Generic bottom sheet shell. */
-@Composable
-private fun Sheet(title: String, onClose: () -> Unit, content: @Composable () -> Unit) {
-    val s = sonar
-    Box(
-        Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
-        contentAlignment = Alignment.BottomCenter
-    ) {
-        androidx.compose.material3.Surface(color = s.surface, shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)) {
-            Column(Modifier.fillMaxWidth().padding(20.dp)) {
-                Text(title, color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
-                Spacer(Modifier.height(10.dp))
-                content()
-                Spacer(Modifier.height(10.dp))
-                Box(Modifier.fillMaxWidth().height(44.dp).clickable(onClick = onClose), contentAlignment = Alignment.Center) {
-                    Text("Done", color = s.text2, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun EraseChatsSheet(onErase: () -> Unit, onClose: () -> Unit) {
-    val s = sonar
-    Box(
-        Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
-        contentAlignment = Alignment.BottomCenter
-    ) {
-        androidx.compose.material3.Surface(color = s.surface, shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)) {
-            Column(Modifier.fillMaxWidth().padding(20.dp)) {
-                Text("Erase all chats", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
-                Spacer(Modifier.height(6.dp))
-                Text(
-                    "This deletes every conversation from this phone — Bluetooth chats and White Noise secure chats. Your identity, nickname and wallet stay, so you can start fresh without setting up again.",
-                    color = s.text2, fontSize = 13.5.sp, lineHeight = 18.sp
-                )
-                Spacer(Modifier.height(16.dp))
-                SNPrimaryButton("Erase all chats", net = false) { onErase() }
-                Spacer(Modifier.height(8.dp))
-                Box(Modifier.fillMaxWidth().height(44.dp).clickable(onClick = onClose), contentAlignment = Alignment.Center) {
-                    Text("Cancel", color = s.text2, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun WipeSheet(onWipe: () -> Unit, onClose: () -> Unit) {
-    val s = sonar
-    Box(
-        Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
-        contentAlignment = Alignment.BottomCenter
-    ) {
-        androidx.compose.material3.Surface(color = s.surface, shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)) {
-            Column(Modifier.fillMaxWidth().padding(20.dp)) {
-                Text("Emergency wipe", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
-                Spacer(Modifier.height(6.dp))
-                Text(
-                    "This deletes your identity, wallet, all chats and your nickname from this phone. It can’t be undone.",
-                    color = s.text2, fontSize = 13.5.sp, lineHeight = 18.sp
-                )
-                Spacer(Modifier.height(16.dp))
-                SNPrimaryButton("Wipe everything", net = false) { onWipe() }
-                Spacer(Modifier.height(8.dp))
-                Box(Modifier.fillMaxWidth().height(44.dp).clickable(onClick = onClose), contentAlignment = Alignment.Center) {
-                    Text("Cancel", color = s.text2, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
-                }
-            }
-        }
-    }
-}
+private val CURRENCY_NAMES = mapOf(
+    "EUR" to "Euro", "USD" to "US Dollar", "GBP" to "British Pound", "CHF" to "Swiss Franc",
+)
 
 @Composable
 private fun CurrencySheet(selected: FiatCurrency, onPick: (FiatCurrency) -> Unit, onClose: () -> Unit) {
     val s = sonar
-    Sheet("Display currency", onClose) {
+    Sheet("Currency", onClose) {
         FiatCurrency.entries.forEach { c ->
-            Row(
-                Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
-                    .clickable { onPick(c) }.padding(vertical = 12.dp, horizontal = 6.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text("${c.code} · ${c.symbol.trim()}", color = s.text, fontSize = 16.sp, modifier = Modifier.weight(1f))
-                if (c == selected) SNIcon(SNIconName.ShieldCheck, 18.dp, s.accent)
-            }
+            SNXSettingsRow(
+                label = c.code,
+                sub = CURRENCY_NAMES[c.code] ?: c.code,
+                value = c.symbol.trim(),
+                divider = false,
+                trailing = if (c == selected) {
+                    { SNIcon(SNIconName.Check, 16.dp, s.accent, weight = 2.2f) }
+                } else null,
+                icon = { SNIcon(SNIconName.Globe, 18.dp, it) },
+            ) { onPick(c) }
+        }
+        Column(Modifier.padding(start = 8.dp, end = 8.dp, top = 6.dp)) {
+            SNGhostButton("Done") { onClose() }
         }
     }
 }
@@ -550,7 +675,8 @@ private fun CurrencySheet(selected: FiatCurrency, onPick: (FiatCurrency) -> Unit
 internal fun formatThousands(n: Long): String =
     n.toString().reversed().chunked(3).joinToString(",").reversed()
 
+/** Design short key: `pubkey.slice(0, 14) + '…' + pubkey.slice(-6)`. */
 internal fun shortKey(npub: String?): String {
     val k = npub ?: return "connecting…"
-    return if (k.length > 18) k.take(12) + "…" + k.takeLast(4) else k
+    return if (k.length > 20) k.take(14) + "…" + k.takeLast(6) else k
 }

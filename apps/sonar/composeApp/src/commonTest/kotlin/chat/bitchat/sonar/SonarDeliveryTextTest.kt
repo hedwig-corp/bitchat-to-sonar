@@ -28,4 +28,29 @@ class SonarDeliveryTextTest {
     @Test fun unknownStatePassesThrough() {
         assertEquals("Queued locally", sonarDeliveryLabel("Queued locally"))
     }
+
+    @Test fun partialDeliveryRendersReachedOfTotal() {
+        assertEquals("Delivered to 2 of 5", sonarDeliveryLabel("partial:2:5"))
+        // Case-insensitive marker, whitespace-tolerant like the other states.
+        assertEquals("Delivered to 1 of 3", sonarDeliveryLabel("  Partial:1:3  "))
+    }
+
+    @Test fun partialDeliveryEdgeCounts() {
+        // Nobody reached yet (iOS seeds .partiallyDelivered(reached: 0, total: n)).
+        assertEquals("Delivered to 0 of 4", sonarDeliveryLabel("partial:0:4"))
+        // Everyone reached — same copy as iOS stateText(), not folded to "Delivered".
+        assertEquals("Delivered to 4 of 4", sonarDeliveryLabel("partial:4:4"))
+    }
+
+    @Test fun malformedPartialFallsThroughToPassthrough() {
+        assertEquals("partial:2", sonarDeliveryLabel("partial:2"))
+        assertEquals("partial:x:y", sonarDeliveryLabel("partial:x:y"))
+        assertEquals("partial:-1:5", sonarDeliveryLabel("partial:-1:5"))
+        assertEquals("partial:2:5:9", sonarDeliveryLabel("partial:2:5:9"))
+    }
+
+    @Test fun partialDeliveryIsNeitherPendingNorFailed() {
+        assertFalse(sonarDeliveryPending("partial:2:5"))
+        assertFalse(sonarDeliveryFailed("partial:2:5"))
+    }
 }

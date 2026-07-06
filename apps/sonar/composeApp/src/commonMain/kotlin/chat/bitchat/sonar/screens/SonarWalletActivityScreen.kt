@@ -24,11 +24,11 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import chat.bitchat.sonar.PayEntry
-import chat.bitchat.sonar.PayStatus
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.ToastBar
 import chat.bitchat.sonar.payFmt
+import chat.bitchat.sonar.wallet.SonarPaymentActivity
+import chat.bitchat.sonar.wallet.WalletActivityItem
 import chat.bitchat.sonar.wallet.WalletState
 import chat.bitchat.sonar.ui.SNEmptyState
 import chat.bitchat.sonar.ui.SNIcon
@@ -40,12 +40,20 @@ import chat.bitchat.sonar.ui.sonar
 @Composable
 fun SonarWalletActivityScreen(state: SonarAppState) {
     val s = sonar
-    // Subscribe to pay-ledger changes so the list recomposes on new entries.
+    // Subscribe to ledger changes so the list recomposes on new entries:
+    // chat ⚡PAY receipts (payVersion) and direct wallet payment activity
+    // (paymentActivityVersion) — both read through state, never the store.
     state.payVersion
+    state.paymentActivityVersion
 
     val balanceSats = state.walletBalanceSats()
+    // iOS `hasLiveRate` rule: the fiat subline renders ONLY when a live rate
+    // exists — state.fiatOrNull already returns null otherwise (the
+    // Money.formatFiat live-rate predicate), from the same state.rate snapshot
+    // the rest of this screen uses.
     val fiat = state.fiatOrNull(balanceSats)
-    val entries = state.walletPayEntries()
+    // Chat receipts + direct wallet activity, deduped, newest first.
+    val entries = state.walletActivity()
 
     Column(Modifier.fillMaxSize().background(s.bg)) {
         SNNavHeader("Wallet", hairline = false, onBack = { state.back() })
@@ -63,20 +71,22 @@ fun SonarWalletActivityScreen(state: SonarAppState) {
             ) {
                 SNIcon(SNIconName.Coin, 32.dp, s.goldDeep)
                 Spacer(Modifier.height(10.dp))
+                // pay-big: 42/800 amount with a small 15/700 text3 unit.
                 Row(verticalAlignment = Alignment.Bottom) {
                     Text(
                         payFmt(balanceSats),
                         color = s.text,
-                        fontSize = 36.sp,
+                        fontSize = 42.sp,
                         fontWeight = FontWeight.ExtraBold,
+                        letterSpacing = (-0.5).sp,
                     )
-                    Spacer(Modifier.width(6.dp))
+                    Spacer(Modifier.width(7.dp))
                     Text(
                         "sats",
                         color = s.text3,
                         fontSize = 15.sp,
                         fontWeight = FontWeight.Bold,
-                        modifier = Modifier.padding(bottom = 5.dp),
+                        modifier = Modifier.padding(bottom = 7.dp),
                     )
                 }
                 if (fiat != null) {
@@ -145,8 +155,8 @@ fun SonarWalletActivityScreen(state: SonarAppState) {
                 )
             } else {
                 Column(Modifier.fillMaxWidth()) {
-                    entries.asReversed().forEach { entry ->
-                        PayEntryRow(entry, state)
+                    entries.forEach { entry ->
+                        ActivityRow(entry, state)
                     }
                 }
             }
@@ -157,20 +167,21 @@ fun SonarWalletActivityScreen(state: SonarAppState) {
 }
 
 @Composable
-private fun PayEntryRow(entry: PayEntry, state: SonarAppState) {
+private fun ActivityRow(entry: WalletActivityItem, state: SonarAppState) {
     val s = sonar
-    val sent = entry.mine
+    val sent = entry.sent
     val icon = if (sent) SNIconName.Bolt else SNIconName.Coin
 
+    // iOS SonarWalletActivityScreen.activityRow: Completed/Pending/Failed.
     val statusLabel = when (entry.status) {
-        PayStatus.Claimed -> "Completed"
-        PayStatus.Sealed, PayStatus.Claiming, PayStatus.Settling -> "Pending"
-        PayStatus.Failed -> "Failed"
+        SonarPaymentActivity.Status.Paid -> "Completed"
+        SonarPaymentActivity.Status.Pending -> "Pending"
+        SonarPaymentActivity.Status.Failed -> "Failed"
     }
     val statusColor = when (entry.status) {
-        PayStatus.Claimed -> s.green
-        PayStatus.Sealed, PayStatus.Claiming, PayStatus.Settling -> s.goldDeep
-        PayStatus.Failed -> s.danger
+        SonarPaymentActivity.Status.Paid -> s.green
+        SonarPaymentActivity.Status.Pending -> s.goldDeep
+        SonarPaymentActivity.Status.Failed -> s.danger
     }
 
     val amountPrefix = if (sent) "" else "+"

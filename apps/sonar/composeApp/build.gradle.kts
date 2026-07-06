@@ -102,6 +102,9 @@ kotlin {
             implementation(compose.foundation)
             implementation(compose.material3)
             implementation(compose.ui)
+            // Brand assets (design/handoff/project/sonar/brand) vendored into
+            // src/commonMain/composeResources — the home-header wordmark chip.
+            implementation(compose.components.resources)
             implementation(libs.coroutines.core)
         }
         commonTest.dependencies {
@@ -143,6 +146,12 @@ kotlin {
             }
         }
     }
+}
+
+compose.resources {
+    // Stable, explicit package for the generated Res class (default derives from
+    // the project name and is easy to break by renaming modules).
+    packageOfResClass = "chat.bitchat.sonar.resources"
 }
 
 compose.desktop {

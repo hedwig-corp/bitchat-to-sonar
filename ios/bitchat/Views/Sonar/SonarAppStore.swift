@@ -1694,6 +1694,12 @@ final class SonarAppStore: ObservableObject {
                     seenMarmotNotificationMessageIDs.insert(message.id)
                     continue
                 }
+                // A blocked person must not fire a notification — same rule the
+                // mesh inbound path applies via `isNostrBlocked`.
+                if isMarmotSenderBlocked(message.senderNpub) {
+                    seenMarmotNotificationMessageIDs.insert(message.id)
+                    continue
+                }
                 guard seenMarmotNotificationMessageIDs.insert(message.id).inserted else { continue }
                 let kind = localNotificationKind(for: message.content)
                 guard kind != .call else { continue }
@@ -1728,6 +1734,127 @@ final class SonarAppStore: ObservableObject {
 
     func toggleFavorite(_ id: String) {
         chatViewModel.toggleFavorite(peerID: PeerID(str: id))
+    }
+
+    // MARK: Contact profile social actions (favorite / block — Compose parity)
+
+    /// The peer's Noise public key for favorite/block bookkeeping: resolved
+    /// from a stable 64-hex chat id, a live mesh peer, or — for an offline
+    /// 16-hex short id — a favorites record that carries the key. Nil for
+    /// Marmot-only, pending and npub contacts (no mesh leg).
+    private func contactNoiseKey(_ id: String) -> Data? {
+        guard !id.hasPrefix(Self.marmotIDPrefix), !id.hasPrefix("npub1"),
+              !isPendingSecureChat(id)
+        else { return nil }
+        let peerID = PeerID(str: id)
+        if let key = peerID.noiseKey { return key }
+        if let peer = chatViewModel.unifiedPeerService.getPeer(by: peerID) {
+            return peer.noisePublicKey
+        }
+        let short = canonicalPeerKey(peerID)
+        for (noiseKey, _) in FavoritesPersistenceService.shared.favorites
+            where PeerID(publicKey: noiseKey).bare == short {
+            return noiseKey
+        }
+        return nil
+    }
+
+    /// Full Noise fingerprint for the mesh leg of this contact, if any — the
+    /// key the mesh block list (SecureIdentityStateManager) is indexed by.
+    private func contactFingerprint(_ id: String) -> String? {
+        guard !id.hasPrefix(Self.marmotIDPrefix), !id.hasPrefix("npub1"),
+              !isPendingSecureChat(id)
+        else { return nil }
+        if let fp = chatViewModel.getFingerprint(for: PeerID(str: id)) { return fp }
+        return contactNoiseKey(id)?.sha256Fingerprint()
+    }
+
+    /// Lowercased 32-byte hex of an npub, the key the Nostr block list uses.
+    private static func nostrBlockKey(_ npub: String) -> String? {
+        guard !npub.isEmpty else { return nil }
+        return nostrPubkeyData(npub)?.hexEncodedString()
+    }
+
+    /// Favorite is a mesh (bitchat) concept: it needs the peer's Noise key.
+    /// Mirrors Compose `canFavoriteContact`.
+    func canFavoriteContact(_ id: String) -> Bool {
+        contactNoiseKey(id) != nil
+    }
+
+    func isContactFavorite(_ id: String) -> Bool {
+        guard let noiseKey = contactNoiseKey(id) else { return false }
+        return FavoritesPersistenceService.shared.getFavoriteStatus(for: noiseKey)?.isFavorite ?? false
+    }
+
+    /// Toggle favorite from the contact profile (Compose `toggleFavoriteContact`).
+    /// Persists through FavoritesPersistenceService and sends the hidden
+    /// favorite/unfavorite control line over BLE when the peer is connected
+    /// (Nostr otherwise) via the existing ChatViewModel/UnifiedPeerService
+    /// plumbing. Returns the toast line to show.
+    func toggleFavoriteContact(_ id: String, npub: String, name: String) -> String {
+        let display = name.isEmpty ? "contact" : name
+        guard let noiseKey = contactNoiseKey(id) else {
+            return "Favorite works after meeting this contact over Bluetooth."
+        }
+        if isContactBlocked(id, npub: npub) {
+            return "Unblock \(display) before favoriting."
+        }
+        let wasFavorite = isContactFavorite(id)
+        chatViewModel.toggleFavorite(peerID: PeerID(hexData: noiseKey))
+        objectWillChange.send()
+        return wasFavorite
+            ? "Removed \(display) from favorites"
+            : "Added \(display) to favorites"
+    }
+
+    /// Blocked on either leg of the contact's stable identity: the mesh Noise
+    /// fingerprint or the linked npub (Nostr block list). One person, one
+    /// block — whichever transport they arrive over.
+    func isContactBlocked(_ id: String, npub: String) -> Bool {
+        if let fp = contactFingerprint(id),
+           chatViewModel.identityManager.isBlocked(fingerprint: fp) {
+            return true
+        }
+        if let hex = Self.nostrBlockKey(npub),
+           chatViewModel.identityManager.isNostrBlocked(pubkeyHexLowercased: hex) {
+            return true
+        }
+        return false
+    }
+
+    /// True when a Marmot (White Noise) message's sender npub is on the Nostr
+    /// block list. Mirrors the mesh inbound filter
+    /// (`ChatViewModel+PrivateChat` / `+Nostr`, `isNostrBlocked`): the block
+    /// list is keyed by the lowercased 32-byte pubkey hex, so map the sender
+    /// npub through `nostrBlockKey`. Used to drop a blocked person's messages
+    /// from both the transcript read path and the notification path.
+    private func isMarmotSenderBlocked(_ senderNpub: String) -> Bool {
+        guard let hex = Self.nostrBlockKey(senderNpub) else { return false }
+        return chatViewModel.identityManager.isNostrBlocked(pubkeyHexLowercased: hex)
+    }
+
+    /// Block/unblock BOTH identity legs so the person stays blocked whichever
+    /// transport discovery arrives over (Compose `setContactBlocked`).
+    /// Blocking also drops our favorite — can't be both favorite and blocked,
+    /// matching the mesh `/block` command. Returns the toast line to show.
+    func setContactBlocked(_ id: String, npub: String, name: String, blocked: Bool) -> String {
+        let fingerprint = contactFingerprint(id)
+        let nostrKey = Self.nostrBlockKey(npub)
+        guard fingerprint != nil || nostrKey != nil else {
+            return "No stable identity to block yet."
+        }
+        if let fingerprint {
+            chatViewModel.identityManager.setBlocked(fingerprint, isBlocked: blocked)
+        }
+        if let nostrKey {
+            chatViewModel.identityManager.setNostrBlocked(nostrKey, isBlocked: blocked)
+        }
+        if blocked, let noiseKey = contactNoiseKey(id) {
+            FavoritesPersistenceService.shared.removeFavorite(peerNoisePublicKey: noiseKey)
+        }
+        objectWillChange.send()
+        let display = name.isEmpty ? "contact" : name
+        return blocked ? "Blocked \(display)" : "Unblocked \(display)"
     }
 
     /// Start a Marmot (White Noise) secure chat with a Sonar-discovered peer
@@ -2984,6 +3111,10 @@ final class SonarAppStore: ObservableObject {
             let rowGroupId = latest?.groupId ?? rowGroup.id
             let rowLast = latest?.message
             let otherNpub = directOtherNpub(in: rowGroup) ?? peerKey
+            // Whole counterpart blocked → suppress this 1:1 chat from the list,
+            // the same way a blocked mesh peer never surfaces a row. `peerKey`
+            // is already reserved above so no duplicate row can slip through.
+            if let otherNpub, isMarmotSenderBlocked(otherNpub) { continue }
             // Live peer id (when currently discovered over 0x53) gives us mesh
             // presence; the persisted fingerprint still lets us build the SAME
             // Sonar row when BLE is down / after restart.
@@ -3223,6 +3354,9 @@ final class SonarAppStore: ObservableObject {
             var dated: [(Date, SNMessage)] = []
             for group in sourceGroups {
                 dated += (marmot.messagesByGroup[group.id] ?? []).compactMap { m in
+                    // Drop a blocked person's messages from the transcript, the
+                    // same way the mesh inbound path drops them via `isNostrBlocked`.
+                    if !m.isMine, isMarmotSenderBlocked(m.senderNpub) { return nil }
                     switch payMapping(m, fallbackVia: .internet) {
                     case .hidden:
                         return nil
@@ -3337,6 +3471,9 @@ final class SonarAppStore: ObservableObject {
         // White Noise leg always renders as internet (indigo).
         if let profile = resolvedSonarProfile(id), let group = marmotGroup(forNpub: profile.npub) {
             dated += (marmot.messagesByGroup[group.id] ?? []).compactMap { m in
+                // Drop a blocked person's messages from the transcript, the
+                // same way the mesh inbound path drops them via `isNostrBlocked`.
+                if !m.isMine, isMarmotSenderBlocked(m.senderNpub) { return nil }
                 switch payMapping(m, fallbackVia: .internet) {
                 case .hidden:
                     return nil
@@ -4618,6 +4755,11 @@ final class SonarAppStore: ObservableObject {
     @discardableResult
     func sendPay(_ id: String, sats: Int64) async -> String? {
         guard sats > 0, case .ready = walletState else { return nil }
+        // Store-level block enforcement (Android parity): UI gating alone
+        // would let stale UI state or future callers pay a blocked contact.
+        if isContactBlocked(id, npub: callNpub(id) ?? "") {
+            return "Unblock this contact before paying."
+        }
         var offer: String?
         if let npub = callNpub(id) {
             let cached = marmot.sonarDescriptorsByNpub[npub]
@@ -4994,6 +5136,12 @@ final class SonarAppStore: ObservableObject {
     /// and send the ☎CALL OFFER (with our dialable address) over the chat.
     func placeCall(_ convId: String, video: Bool) {
         guard activeCall == nil else { return }
+        // Store-level block enforcement (Android parity) — the profile UI
+        // already hides the buttons, but the store must not trust the view.
+        if isContactBlocked(convId, npub: callNpub(convId) ?? "") {
+            SecureLogger.debug("SonarCall: refusing call to blocked contact convId=\(convId.prefix(16))", category: .session)
+            return
+        }
         guard canCall(convId), let via = callSignalingVia(convId) else {
             SecureLogger.debug("SonarCall: refusing call without BLE or White Noise route convId=\(convId.prefix(16))", category: .session)
             return
@@ -5411,10 +5559,7 @@ final class SonarAppStore: ObservableObject {
                 pendingDirectMarmotSends[pendingNpub] = nil
                 cancelPendingSecureChatSetup(pendingId: id, npub: pendingNpub)
             }
-            if currentDMId == id { pop() }
-            return
-        }
-        if let groupId = marmotGroupId(id) {
+        } else if let groupId = marmotGroupId(id) {
             let shouldLeave = isMultiMemberMarmotGroupId(id)
             // A deduped direct row can represent several duplicate Marmot groups
             // for the same peer; delete the whole set so hidden duplicates don't

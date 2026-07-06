@@ -1,8 +1,10 @@
 package chat.bitchat.sonar.push
 
+import android.content.Context
 import android.net.Uri
 import android.os.SystemClock
 import android.util.Log
+import chat.bitchat.sonar.AppContextHolder
 import chat.bitchat.sonar.BuildConfig
 import chat.bitchat.sonar.SonarCore
 import chat.bitchat.sonar.wallet.WalletBridge
@@ -27,10 +29,21 @@ object SonarPushRegistration {
     private const val MAX_RETRIES = 3
     private const val DEFAULT_NDS_HOST = "nds.sonar.hedwig.sh"
     private const val WEBHOOK_MARKER_VERSION = "android-fcm-explicit-token-v2"
+    /**
+     * Persisted only for diagnostics (iOS `breez_webhook_marker` parity in
+     * `SonarPushRegistration.swift`); NEVER used as a cross-launch skip — Boltz
+     * owns the authoritative offer webhook state, and trusting a stale local
+     * marker would suppress the unregister -> register self-heal. Updated in
+     * place on success, removed on [unregister].
+     */
+    private const val WEBHOOK_MARKER_PREF_KEY = "breez_webhook_marker"
     private const val WEBHOOK_IN_FLIGHT_TIMEOUT_MS = 30_000L
     private const val WEBHOOK_REGISTRATION_TIMEOUT_MS = 20_000L
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val webhookLock = Any()
+
+    // Same app-private "sonar" prefs used by WalletBridge.android.kt.
+    private fun prefs() = AppContextHolder.ctx.getSharedPreferences("sonar", Context.MODE_PRIVATE)
 
     private val transponderNpub: String get() = BuildConfig.TRANSPONDER_NPUB
 
@@ -50,6 +63,21 @@ object SonarPushRegistration {
     @Volatile private var inFlightWebhookGeneration: Long = 0L
 
     fun ensureRegistered() {
+        if (!SonarPushPrefs.effectivePushEnabled(AppContextHolder.ctx)) {
+            Log.d(TAG, "Push not registered: disabled by user preference")
+            return
+        }
+        // NEVER register (or start the core) before an account exists.
+        // ensureRegistered() runs from SonarApp.onCreate; without this gate a
+        // fresh install with default push prefs + a configured transponder
+        // would reach SonarCore.start() → loadOrCreateIdentity() and MINT a new
+        // nsec, which onboarding-complete inference then treats as a finished
+        // account — booting an empty identity and skipping onboarding. Push has
+        // nothing to register for until onboarding has produced a key.
+        if (!SonarCore.hasIdentity()) {
+            Log.d(TAG, "Push not registered: no account yet (pre-onboarding)")
+            return
+        }
         if (transponderNpub.isBlank() && ndsUrl.isBlank()) {
             Log.d(TAG, "Push not configured (no TRANSPONDER_NPUB or NDS_URL)")
             return
@@ -65,6 +93,11 @@ object SonarPushRegistration {
     }
 
     fun onTokenRefresh(token: String) {
+        if (!SonarPushPrefs.effectivePushEnabled(AppContextHolder.ctx)) {
+            Log.d(TAG, "FCM token refreshed while push disabled")
+            cachedFcmToken = null
+            return
+        }
         Log.d(TAG, "FCM token refreshed")
         cachedFcmToken = token
         registerTransponder(token)
@@ -103,10 +136,17 @@ object SonarPushRegistration {
 
     private fun registerTransponder(fcmToken: String) {
         if (transponderNpub.isBlank()) return
+        // Guard the SonarCore.start() below: never mint an identity from a push
+        // callback (token-refresh / background wakeup) before onboarding.
+        if (!SonarCore.hasIdentity()) {
+            Log.d(TAG, "Transponder: skipped, no account yet")
+            return
+        }
         scope.launch {
             var backoff = 2_000L
             for (attempt in 1..MAX_RETRIES) {
                 try {
+                    SonarCore.start()
                     SonarCore.registerPushToken(
                         platform = "fcm",
                         token = fcmToken.toByteArray(Charsets.UTF_8),
@@ -181,6 +221,9 @@ object SonarPushRegistration {
             inFlightWebhookStartedAtMs = 0L
             if (completed) {
                 completedSessionWebhookMarker = marker
+                // Diagnostics-only persistence (update-in-place), mirroring iOS.
+                // The in-memory session marker above stays the fast path.
+                runCatching { prefs().edit().putString(WEBHOOK_MARKER_PREF_KEY, marker).apply() }
             }
             true
         }
@@ -198,6 +241,9 @@ object SonarPushRegistration {
             inFlightWebhookStartedAtMs = 0L
             inFlightWebhookGeneration += 1
         }
+        // Force a fresh subscribe next time (e.g. after a wallet/seed change),
+        // matching iOS `UserDefaults.removeObject(forKey: webhookMarkerKey)`.
+        runCatching { prefs().edit().remove(WEBHOOK_MARKER_PREF_KEY).apply() }
         Log.d(TAG, "Unregistered from push servers")
     }
 

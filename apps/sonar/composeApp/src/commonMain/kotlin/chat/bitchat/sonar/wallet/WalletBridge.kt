@@ -1,5 +1,8 @@
 package chat.bitchat.sonar.wallet
 
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.StateFlow
+
 /** Lightning wallet lifecycle state, mirrored from the iOS WalletBridgeService. */
 sealed interface WalletState {
     /** No API key, or not yet asked to set up. */
@@ -9,8 +12,32 @@ sealed interface WalletState {
     data class Failed(val message: String) : WalletState
 }
 
-/** Result of a wallet send: success flag plus the Lightning preimage when available. */
-data class SendResult(val ok: Boolean, val preimage: String? = null)
+/** Result of a wallet send: success flag plus the Lightning preimage and the
+ *  settlement details the payment-activity ledger records (iOS
+ *  `SonarWalletPayment`: id, feesSats, timestamp). */
+data class SendResult(
+    val ok: Boolean,
+    val preimage: String? = null,
+    /** Stable wallet payment id (txId, else payment hash, else destination). */
+    val paymentId: String? = null,
+    val feesSats: Long? = null,
+    val settledAtSecs: Long? = null,
+)
+
+/**
+ * One settled payment surfaced by the Breez SDK event listener — the Compose
+ * twin of iOS `SonarWallet.incomingPaymentsStream()`'s `Payment` element. Used
+ * to record `walletIncoming` rows in the payment-activity ledger.
+ */
+data class WalletPaymentEvent(
+    /** Stable wallet payment id (txId, else payment hash, else destination). */
+    val paymentId: String,
+    val incoming: Boolean,
+    val amountSats: Long,
+    val feesSats: Long?,
+    val timestampSecs: Long,
+    val preimage: String? = null,
+)
 
 /**
  * Thin Kotlin façade over the on-device Breez SDK Liquid wallet, the Android
@@ -35,6 +62,23 @@ expect object WalletBridge {
     /** Refresh + return the spendable balance in sats (0 if not ready). */
     suspend fun refreshBalance(): Long
 
+    /**
+     * Live spendable balance in sats — the Compose twin of iOS
+     * `WalletBridgeService.startObservingBalance()` (`balanceTask` stream).
+     * Produced entirely from a background listener/refresh path in the actuals
+     * (never on the Compose render path); the UI only collects. Emits 0 until
+     * the wallet is Ready and again after [shutdown].
+     */
+    val balanceFlow: StateFlow<Long>
+
+    /**
+     * Settled wallet payments from the Breez SDK event listener (both
+     * directions; consumers filter). Fed from the SDK callback thread via
+     * `tryEmit` on a buffered flow — never blocks the SDK, never touches the
+     * render path. iOS parity: `WalletBridgeService.incomingPayments()`.
+     */
+    val paymentEvents: SharedFlow<WalletPaymentEvent>
+
     /** A reusable BOLT12 offer string to receive payments. */
     suspend fun createOffer(): String
 
@@ -47,6 +91,13 @@ expect object WalletBridge {
 
     /** Cached rate for a currency (null until [fetchRates] succeeds). */
     fun cachedRate(currency: FiatCurrency): ExchangeRate?
+
+    /**
+     * True only when a usable live rate is cached for the selected [currency]
+     * (iOS `hasLiveRate`). The UI shows fiat ONLY when this is true; otherwise
+     * it must fall back to sats — never a bundled/stale rate.
+     */
+    fun hasLiveRate(): Boolean
 
     // ── Display preferences (persisted) ──
     fun showFiat(): Boolean

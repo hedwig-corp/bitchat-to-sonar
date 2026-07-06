@@ -110,8 +110,13 @@ fun PaySheet(
                             modifier = Modifier.padding(bottom = 6.dp))
                     }
                     Box(Modifier.height(20.dp).padding(top = 3.dp)) {
+                        // Explicit no-live-rate fallback (iOS `hasLiveRate` rule):
+                        // [fiatOf] returns null when no live rate exists, and the
+                        // subline stays empty — the main amount above is already
+                        // sats, so nothing fiat-looking is ever invented.
+                        val fiatHint = if (over) "Not enough sats" else fiatOf(sats).orEmpty()
                         Text(
-                            if (over) "Not enough sats" else (fiatOf(sats) ?: ""),
+                            fiatHint,
                             color = if (over) s.danger else s.text3, fontSize = 13.5.sp
                         )
                     }

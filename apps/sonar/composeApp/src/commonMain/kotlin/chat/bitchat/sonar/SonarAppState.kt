@@ -12,15 +12,20 @@ import chat.bitchat.sonar.unify.UnifyRadio
 import chat.bitchat.sonar.wallet.ExchangeRate
 import chat.bitchat.sonar.wallet.FiatCurrency
 import chat.bitchat.sonar.wallet.Money
+import chat.bitchat.sonar.wallet.PaymentActivityStore
 import chat.bitchat.sonar.wallet.SendResult
+import chat.bitchat.sonar.wallet.SonarPaymentActivity
+import chat.bitchat.sonar.wallet.WalletActivityItem
 import chat.bitchat.sonar.wallet.WalletBridge
 import chat.bitchat.sonar.wallet.WalletState
+import chat.bitchat.sonar.wallet.mergeWalletActivity
+import chat.bitchat.sonar.wallet.paymentDestinationHash
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.Dispatchers
@@ -31,11 +36,30 @@ import kotlinx.coroutines.withContext
 
 private const val SONAR_DESCRIPTOR_TTL_SECS = 15 * 60L
 private const val SONAR_DESCRIPTOR_MISS_TTL_SECS = 60L
+private const val PROFILE_MISS_TTL_SECS = 60L
+/** How long after BLE activity the mesh drain loop stays at 150ms. */
+private const val MESH_REALTIME_HOT_WINDOW_MS = 30_000L
 private const val PROFILE_REFRESH_TTL_SECS = 30 * 60L
 private const val LOCAL_TRANSCRIPT_PAGE_LIMIT = 100
 private const val LOCAL_SUMMARY_PAGE_LIMIT = 20
 private const val LOCAL_SUMMARY_CHAT_LIMIT = 5
+
+// ── Event-driven refresh cadence ──
+// The old poll ran a full cycle every 4 s. Now the cycle is driven by the core
+// `conversationChanged` flow (primary) plus a slow fallback heartbeat that only
+// covers time-based upkeep the core can't signal (presence, BLE policy, unify,
+// profile TTLs). Foreground idle CPU is set by the heartbeat cadence.
+private const val HEARTBEAT_FG_MS = 30_000L
+private const val HEARTBEAT_BG_MS = 60_000L
+/** Relay `sync()` cadence (was every ~60 s on the old 4 s tick). */
+private const val SYNC_INTERVAL_MS = 60_000L
+/** Coarse geohash presence beat (was `tick % 15` ≈ every 60 s). */
+private const val PRESENCE_BEAT_MS = 60_000L
+/** Stale kind-0 profile sweep (was `tick % 450` ≈ every 30 min). */
+private const val PROFILE_SWEEP_MS = 30 * 60_000L
 private const val GROUP_FOLDS_BLOB_KEY = "sonar.groupFolds"
+private const val NPUB_BLOB_KEY = "sonar.npub"
+private const val MESH_NAMES_BLOB_KEY = "sonar.meshNames"
 private const val FAVORITED_CONTROL = "[FAVORITED]"
 private const val UNFAVORITED_CONTROL = "[UNFAVORITED]"
 private const val MESH_MEDIA_URL_PREFIX = "mesh-media:"
@@ -144,6 +168,64 @@ internal fun dedupeDirectMarmotChats(
     return chats.filter { it.id in selectedIds }
 }
 
+/** Composite scan watermark: the newest-message SECOND plus the message COUNT.
+ *  Timestamps are second-resolution, so a message landing in the SAME second as
+ *  the last scanned one (common for ⚡PAY PAY/DONE pairs or a call control sent
+ *  right after a text) leaves `secs` unchanged — the count catches it. */
+internal data class ScanMark(val secs: Long, val count: Long)
+
+/** Per-chat probe used to decide, from the single `conversationSummaries()` FFI
+ *  call, which chats actually gained a newer message since the last scan. Only
+ *  those chats need the expensive `messagesPage` fetch + re-parse for call/pay
+ *  scanning; everything else is skipped. Pure so it can be unit-tested. */
+internal fun chatsNeedingPageScan(
+    latestByChat: Map<String, ScanMark>,
+    scannedWatermark: Map<String, ScanMark>,
+): Set<String> = buildSet {
+    for ((chatId, latest) in latestByChat) {
+        val seen = scannedWatermark[chatId] ?: ScanMark(Long.MIN_VALUE, Long.MIN_VALUE)
+        // A later second, OR the same second with more messages, means unseen
+        // content — either way the chat needs a rescan.
+        if (latest.secs > seen.secs || (latest.secs == seen.secs && latest.count > seen.count)) {
+            add(chatId)
+        }
+    }
+}
+
+/** Whether a per-chat notification should fire, derived purely from the cheap
+ *  `conversationSummaries()` probe. Mirrors the guard inside `notifyChatIfNew`:
+ *  the newest message must be incoming, strictly newer than what we last saw
+ *  AND last notified, the seed pass must be done, and the chat must not be the
+ *  one currently open. Kept pure for unit tests. */
+internal fun shouldNotifyIncoming(
+    latestAtSecs: Long,
+    latestMine: Boolean,
+    prevSeenSecs: Long?,
+    lastNotifiedSecs: Long,
+    seeded: Boolean,
+    isOpen: Boolean,
+): Boolean {
+    if (!seeded || isOpen || latestMine) return false
+    if (latestAtSecs <= 0L) return false
+    val prev = prevSeenSecs ?: return false
+    return latestAtSecs > prev && latestAtSecs > lastNotifiedSecs
+}
+
+/** Immutable fingerprint of every input `visibleChats` depends on. The getter
+ *  memoizes its result keyed by this value: two reads with an equal key return
+ *  the identical cached list without recomputing dedupe/fold/pending work, so
+ *  Compose recompositions that don't change conversation state are O(1). */
+internal data class VisibleChatsKey(
+    val chatsIdentity: Int,
+    val foldedGroupIds: Set<String>,
+    val pendingChatNpubs: Map<String, String>,
+    val pendingGroupIds: Set<String>,
+    val socialVersion: Int,
+    val snapshotVersion: Int,
+    val ownNpub: String,
+    val holdVersion: Int,
+)
+
 private fun decodeGroupFoldMap(blob: String): Map<String, String> =
     blob.lineSequence()
         .mapNotNull { line ->
@@ -216,10 +298,26 @@ data class ActiveCall(
     val muted: Boolean = false,
     val speakerOn: Boolean = true,
     val camOn: Boolean = false,
+    /** Which camera feeds the local PiP (iOS `frontCamera` parity). */
+    val frontCamera: Boolean = true,
 )
 
 /** Verify-sheet model: the safety groups (empty ⇒ show [note]) + verified flag. */
 data class SonarVerify(val safety: List<String>, val verified: Boolean, val note: String?)
+
+/** Precomputed home chat-list row (Signal-style cached row view model): all the
+ *  fields the design ConvRow needs, resolved off the render path so the home
+ *  LazyColumn reads O(1) per row instead of walking `chats` + hitting disk. */
+data class MarmotRowModel(
+    val id: String,
+    val title: String,
+    val sub: String,
+    val tsSecs: Long,
+    val verified: Boolean,
+    val unread: Boolean,
+    val pending: Boolean,
+    val multiMember: Boolean,
+)
 
 /**
  * Shared (commonMain) UI state for the Sonar app. Drives White Noise (Marmot)
@@ -233,7 +331,10 @@ class SonarAppState(private val scope: CoroutineScope) {
     private val initialFoldedGroupIds: Set<String> = initialChatSnapshot.first
         .mapTo(hashSetOf()) { it.id }
         .let { activeChatIds -> initialGroupFoldMap.keys.filterTo(hashSetOf()) { it in activeChatIds } }
-    var npub by mutableStateOf("")
+    // Local-first: the account npub is public and stable — restore it from the
+    // last session so chat titles/dedupe can identify "me" BEFORE the core
+    // starts (SonarCore.start() re-derives and overwrites it authoritatively).
+    var npub by mutableStateOf(SonarCore.loadBlob(NPUB_BLOB_KEY))
         private set
     var started by mutableStateOf(false)
         private set
@@ -241,18 +342,42 @@ class SonarAppState(private val scope: CoroutineScope) {
         private set
     var chats by mutableStateOf<List<SonarChat>>(initialChatSnapshot.first)
         private set
-    private var chatSnapshotMessagesByChat: Map<String, List<SonarMsg>> = initialChatSnapshot.second
+    /** Monotonic counter bumped whenever [chatSnapshotMessagesByChat] is
+     *  reassigned. Feeds the [visibleChats] memo key so the dedupe ordering
+     *  (which depends on per-chat latest ts) re-runs when the snapshot changes. */
+    private var snapshotVersion = 0
+    private var chatSnapshotMessagesByChatBacking: Map<String, List<SonarMsg>> = initialChatSnapshot.second
+    private var chatSnapshotMessagesByChat: Map<String, List<SonarMsg>>
+        get() = chatSnapshotMessagesByChatBacking
+        set(value) {
+            if (value !== chatSnapshotMessagesByChatBacking) {
+                chatSnapshotMessagesByChatBacking = value
+                snapshotVersion++
+            }
+        }
     private var pendingMarmotChatNpubs by mutableStateOf<Map<String, String>>(emptyMap())
     private var pendingMarmotGroups by mutableStateOf<Map<String, PendingMarmotGroup>>(emptyMap())
     var groupInvites by mutableStateOf<List<SonarGroupInvite>>(emptyList())
         private set
     private val pendingInviteTokens = mutableListOf<String>()
-    /** Resolved kind-0 profiles by npub — fills human names for Marmot members. */
-    var profilesByNpub by mutableStateOf(decodeProfileCache(SonarCore.loadBlob(PROFILE_CACHE_BLOB_KEY)))
+    /** Resolved kind-0 profiles by npub — fills human names for Marmot members.
+     *  Normalized on load so legacy key formats can't miss lookups (which would
+     *  paint npubs until a relay re-fetch — a local-first violation). */
+    var profilesByNpub by mutableStateOf(
+        normalizedProfileCache(decodeProfileCache(SonarCore.loadBlob(PROFILE_CACHE_BLOB_KEY)))
+    )
         private set
-    private var socialState by mutableStateOf(decodeSonarSocialState(SonarCore.loadBlob(SOCIAL_STATE_BLOB_KEY)))
+    private var socialStateBacking by mutableStateOf(decodeSonarSocialState(SonarCore.loadBlob(SOCIAL_STATE_BLOB_KEY)))
+    /** Bumped on every [socialState] reassignment so memo keys can compare an
+     *  Int instead of hashing the four favorite/blocked Sets on every read. */
+    private var socialVersion = 0
+    private var socialState: SonarSocialState
+        get() = socialStateBacking
+        set(value) { socialStateBacking = value; socialVersion++ }
     private val profileFetches = mutableSetOf<String>()
     private val profileFetchedAt = mutableMapOf<String, Long>()
+    /** Last kind-0 fetch MISS per npub — throttles per-render refetch spam. */
+    private val profileMissedAt = mutableMapOf<String, Long>()
 
     init {
         if (initialChatSnapshotBlob.isNotEmpty()) {
@@ -327,6 +452,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             walletState = WalletState.NotConfigured
             presenceByGeohash = emptyMap()
             payLedger = SonarPayLedger(); payVersion++
+            PaymentActivityStore.wipe() // iOS wipes both payment ledgers together
             mediaCache.clear(); stickerPackCache.clear(); stickerImageCache.clear(); installedPackCoordinates.clear()
             callLogs.clear(); callVersion++
             resetCallState()
@@ -356,6 +482,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             MessageStore.wipe()
             // In-memory conversation state.
             meshChats.clear(); meshChatNames.clear(); pendingMarmotSends.clear(); pendingDirectMarmotSends.clear(); pendingMarmotGroupSends.clear(); outbox.clear()
+            persistMeshNames() // clear the on-disk name cache too, else boot resurrects erased names
             pendingMarmotChatNpubs = emptyMap()
             pendingMarmotGroups = emptyMap()
             linkByFp.clear(); linkCapsByFp.clear(); groupFoldMap.clear()
@@ -368,10 +495,13 @@ class SonarAppState(private val scope: CoroutineScope) {
             lastWnGroups = -1; lastWnMsgs = -1
             // ⚡PAY coins live inside the erased chats — reset the ledger. The
             // Lightning wallet seed/balance is separate and is NOT touched.
+            // iOS eraseChatsKeepIdentity also wipes the activity ledger.
             payLedger = SonarPayLedger(); persistPay(); payVersion++
+            PaymentActivityStore.wipe()
             mediaCache.clear(); stickerPackCache.clear(); stickerImageCache.clear(); installedPackCoordinates.clear()
             callLogs.clear(); callVersion++
             lastSeenTs.clear(); lastNotifiedTs.clear(); seededSeen = false
+            scanWatermark.clear()
             // White Noise / Marmot DB: wipe + reconnect with the SAME identity.
             runCatching { SonarCore.eraseChats() }
             // The node is recreated → re-bind the iroh call endpoint on next use.
@@ -408,12 +538,25 @@ class SonarAppState(private val scope: CoroutineScope) {
     private var callTicker: kotlinx.coroutines.Job? = null
     private var meshRealtimeLoopRunning = false
     private var pollJob: Job? = null
+    /** Consumer of the event-driven housekeeping cycle. Triggered by the core
+     *  `conversationChanged` flow (primary) and a slow heartbeat (fallback);
+     *  the [housekeepingTrigger] channel conflates bursts into one pass. */
+    private var housekeepingJob: Job? = null
+    /** Conflated trigger for [runHousekeepingCycle]: many signals within one
+     *  cycle collapse to a single trailing run (Signal-style: react to database
+     *  invalidation, don't busy-poll). */
+    private val housekeepingTrigger = Channel<Unit>(Channel.CONFLATED)
     private val refreshMutex = Mutex()
     private var refreshRunning = false
     private var refreshPending = false
     private var refreshCompletion: CompletableDeferred<Unit>? = null
     /** Ids of ☎CALL control messages already routed to the engine (dedup). */
     private val scannedCall = mutableSetOf<String>()
+    /** Per-chat high-water mark of the newest message ts we have already fetched
+     *  a page for and scanned for ☎CALL / pay lines. The cheap
+     *  `conversationSummaries()` probe compares against this to skip the
+     *  expensive `messagesPage` fetch for chats whose latest ts hasn't moved. */
+    private val scanWatermark = HashMap<String, ScanMark>()
 
     /** Bind the iroh endpoint once + start the event loop (idempotent). */
     private suspend fun ensureCallStarted() {
@@ -428,15 +571,18 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  otherwise over the folded White Noise group for the same Sonar peer. */
     fun placeCall(chatId: String, peerName: String, video: Boolean) {
         if (activeCall != null) { toast = "Already in a call"; return }
-        if (video) { toast = "Video calls are coming soon."; return }
         if (isContactBlocked(chatId)) { toast = "Unblock this contact before calling."; return }
         if (!canCall(chatId)) { toast = "No call route to this Sonar peer yet."; return }
         val callId = randomMeshId()
         // Show the ringing screen IMMEDIATELY so the tap is responsive; the iroh
         // setup (bind/offer) runs below. (ensureCallStarted is idempotent — it
         // guards on callStarted, so unlike the old iOS path it never re-binds.)
-        CallAudioRoute.configure(active = true, speakerOn = true)
-        activeCall = ActiveCall(callId, chatId, peerName, video, incoming = false, phase = SonarCallState.Ringing)
+        // iOS parity: video defaults to speaker, voice to earpiece (+ proximity).
+        CallAudioRoute.configure(active = true, speakerOn = video, voiceProximity = !video)
+        activeCall = ActiveCall(
+            callId, chatId, peerName, video, incoming = false, phase = SonarCallState.Ringing,
+            speakerOn = video, camOn = video,
+        )
         push(Screen.Call(chatId, peerName, video))
         scope.launch {
             ensureCallStarted()
@@ -480,14 +626,14 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun acceptCall() {
         val c = activeCall ?: return
         activeCall = c.copy(phase = SonarCallState.Connecting)
-        CallAudioRoute.configure(active = true, speakerOn = c.speakerOn)
+        CallAudioRoute.configure(active = true, speakerOn = c.speakerOn, voiceProximity = !c.video)
         scope.launch {
             try {
                 val addr = SonarCore.callLocalAddress()
                 val sent = sendCallControl(c.chatId, SonarCore.callEncodeAnswer(c.callId, SonarAnswer.Accept, addr))
                 if (!sent) {
                     runCatching { SonarCore.callHangup(c.callId) }
-                    CallAudioRoute.configure(active = false, speakerOn = false)
+                    failAccept(c)
                     return@launch
                 }
                 if (activeCall?.callId == c.callId && activeCall?.muted == true) {
@@ -496,8 +642,25 @@ class SonarAppState(private val scope: CoroutineScope) {
                 sonarLog("SonarCall", "TX ANSWER accept + dialing callId=${c.callId.take(8)}")
                 SonarCore.callAccept(c.callId)
                 sonarLog("SonarCall", "callAccept returned (dialed) callId=${c.callId.take(8)}")
-            } catch (e: Throwable) { sonarLog("SonarCall", "accept FAILED: ${e.message}"); toast = "couldn’t accept: ${e.message}" }
+            } catch (e: Throwable) {
+                sonarLog("SonarCall", "accept FAILED: ${e.message}")
+                toast = "couldn’t accept: ${e.message}"
+                // Mirror placeCall's failure teardown — without this a thrown
+                // callAccept() leaves MODE_IN_COMMUNICATION + the proximity
+                // lock held with the UI stuck in Connecting (no terminal
+                // engine event ever finalizes a call the engine never had).
+                runCatching { SonarCore.callHangup(c.callId) }
+                failAccept(c)
+            }
         }
+    }
+
+    /** Shared accept-failure teardown: release audio/proximity, drop the call. */
+    private fun failAccept(c: ActiveCall) {
+        if (activeCall?.callId != c.callId) return
+        CallAudioRoute.configure(active = false, speakerOn = false)
+        activeCall = null
+        popCallScreenIfNeeded()
     }
 
     /** Decline incoming call: dismiss immediately (Signal pattern), then engine
@@ -550,12 +713,20 @@ class SonarAppState(private val scope: CoroutineScope) {
         val c = activeCall ?: return
         val next = !c.speakerOn
         activeCall = c.copy(speakerOn = next)
-        CallAudioRoute.setSpeaker(next)
+        // configure (not setSpeaker) so the proximity lock tracks earpiece
+        // use: iOS drops proximity monitoring while the speaker is on.
+        CallAudioRoute.configure(active = true, speakerOn = next, voiceProximity = !c.video && !next)
     }
 
     fun toggleCallCam() {
         val c = activeCall ?: return
         activeCall = c.copy(camOn = !c.camOn)
+    }
+
+    /** iOS parity (SonarCallScreen flip button): switch the local PiP camera. */
+    fun flipCallCamera() {
+        val c = activeCall ?: return
+        activeCall = c.copy(frontCamera = !c.frontCamera)
     }
 
     private fun startCallLoop() {
@@ -626,6 +797,11 @@ class SonarAppState(private val scope: CoroutineScope) {
             return
         }
         if (ctrl is SonarCallControl.Offer && !canCall(callChatId)) {
+            if (shouldDeferOfferForSonarDescriptor(callChatId)) {
+                sonarLog("SonarCall", "deferring offer until Sonar descriptor lookup completes chatId=$chatId folded=$callChatId")
+                scannedCall.remove(m.id) // retry on the next scan pass once the fetch lands
+                return
+            }
             sonarLog("SonarCall", "ignoring offer without Sonar call route chatId=$chatId folded=$callChatId")
             runCatching { sendCallControl(chatId, SonarCore.callEncodeAnswer(ctrl.callId, SonarAnswer.Decline, "")) }
             return
@@ -640,11 +816,6 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         when (ctrl) {
             is SonarCallControl.Offer -> {
-                if (ctrl.video) {
-                    runCatching { sendCallControl(callChatId, SonarCore.callEncodeAnswer(ctrl.callId, SonarAnswer.Decline, "")) }
-                    sonarLog("SonarCall", "declined unsupported video offer callId=${ctrl.callId.take(8)}")
-                    return
-                }
                 if (activeCall != null) { // busy: auto-decline
                     runCatching { sendCallControl(callChatId, SonarCore.callEncodeAnswer(ctrl.callId, SonarAnswer.Busy, "")) }
                     return
@@ -659,7 +830,12 @@ class SonarAppState(private val scope: CoroutineScope) {
                     return
                 }
                 val name = callPeerName(callChatId)
-                activeCall = ActiveCall(ctrl.callId, callChatId, name, ctrl.video, incoming = true, phase = SonarCallState.Ringing)
+                // iOS parity (SNActiveCall(speakerOn: video)): video rings on
+                // speaker with the camera armed; voice rings for the earpiece.
+                activeCall = ActiveCall(
+                    ctrl.callId, callChatId, name, ctrl.video, incoming = true, phase = SonarCallState.Ringing,
+                    speakerOn = ctrl.video, camOn = ctrl.video,
+                )
                 notifyIncoming(
                     idKey = callChatId,
                     conversationTitle = name,
@@ -703,6 +879,47 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Remembered display names for mesh peers we've chatted with (they can leave
      *  range, so we can't always re-derive the name from the live radar list). */
     private val meshChatNames = mutableMapOf<String, String>()
+
+    /** Remember a mesh peer's display name and persist it (change-only) so
+     *  restart paints names instead of key fallbacks — local-first parity with
+     *  iOS, whose nickname cache survives relaunch. */
+    private fun rememberMeshName(peerId: String, name: String) {
+        // Never remember a key-shaped fallback ("mesh·…", "npub1…") as a real
+        // name: callers pass through row labels that can themselves be
+        // fallbacks, and a persisted fallback MASKS later resolution (the
+        // remembered name short-circuits profile/announce lookups).
+        if (name.isKeyFallbackName()) return
+        if (meshChatNames[peerId] == name) return
+        meshChatNames[peerId] = name
+        persistMeshNames()
+    }
+
+    private fun persistMeshNames() {
+        // Value is hex-encoded (like the kind-0 profile cache): a peer's
+        // advertised nickname is arbitrary attacker-controlled unicode, so a
+        // raw newline would inject a fake `peerId=name` line on reload and
+        // poison a DIFFERENT peer's label. Hex framing makes that impossible
+        // and preserves emoji/whitespace byte-for-byte.
+        SonarCore.saveBlob(
+            MESH_NAMES_BLOB_KEY,
+            meshChatNames.entries.joinToString("\n") { "${it.key}=${hexEncodeUtf8(it.value)}" },
+        )
+    }
+
+    private fun loadMeshNames() {
+        SonarCore.loadBlob(MESH_NAMES_BLOB_KEY).lineSequence().forEach { line ->
+            val i = line.indexOf('=')
+            if (i > 0) {
+                val raw = line.substring(i + 1)
+                // Tolerate legacy plain-text blobs (pre-hex builds): decode
+                // hex, fall back to the raw value if it isn't hex.
+                val name = hexDecodeUtf8(raw) ?: raw
+                // Drop key-shaped fallbacks persisted by earlier builds — they
+                // mask real resolution.
+                if (!name.isKeyFallbackName()) meshChatNames.putIfAbsent(line.substring(0, i), name)
+            }
+        }
+    }
     /** Public BLE "Mesh" channel transcript (broadcast messages, not Nostr). */
     private var meshBroadcast = listOf<SonarChannelMsg>()
     var channels by mutableStateOf(SonarCore.joinedChannels())
@@ -729,6 +946,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             .mapNotNull { (id, raw) -> SonarAnnounce.decode(raw)?.let { id to it } }
             .toMap()
         sonarPeerProfiles.forEach { (peerId, ann) -> rememberLink(peerId, ann) }
+        // 0x53 profiles / links feed the capability-settle hold in [visibleChats].
+        bumpHoldInputs()
     }
 
     private fun updateMeshPeersFromRadio(nowMs: Long = SonarClock.nowMillis()) {
@@ -739,7 +958,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         meshPeers = rawPeers.filter { peer ->
             val peerId = meshPeerId(peer.id)
             if (socialState.isBlockedPeer(peerId)) return@filter false
-            if (peer.name.isNotBlank()) meshChatNames[peerId] = peer.name
+            if (peer.name.isNotBlank()) rememberMeshName(peerId, peer.name)
             val first = meshPeerFirstSeenMs.getOrPut(peerId) { nowMs }
             val hasProfile = peer.sonar || sonarPeerProfiles.containsKey(peerId) || linkByFp.containsKey(peerId)
             val hasMessages = meshChats[peerId]?.isNotEmpty() == true
@@ -754,6 +973,8 @@ class SonarAppState(private val scope: CoroutineScope) {
                 flushOutbox(peerId)
             }
         }
+        // Mesh peer set / first-seen / names feed the [visibleChats] hold filter.
+        bumpHoldInputs()
     }
 
     private fun scheduleCapabilitySettleRefresh(peerId: String, firstSeenMs: Long, nowMs: Long) {
@@ -828,19 +1049,76 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  lookup chain fails. */
     private val groupFoldMap = initialGroupFoldMap.toMutableMap()
 
-    /** White Noise chats to render on their own row: every Marmot group EXCEPT the
-     *  ones folded into a mesh DM. The Messages list uses this instead of [chats]. */
-    val visibleChats: List<SonarChat> get() {
-        val standalone = chats.filterNot {
-            it.id in foldedGroupIds ||
-                shouldHoldStandaloneMarmotChat(it) ||
-                isBlockedMarmotChat(it)
+    /** Memo cache for [visibleChats]. The home LazyColumn reads the getter on
+     *  every recomposition, so recomputing dedupe/fold/pending each read burned
+     *  CPU. We cache the result keyed by [VisibleChatsKey]; the getter returns
+     *  the cached list in O(1) when nothing it depends on changed. */
+    private var visibleChatsCacheKey: VisibleChatsKey? = null
+    private var visibleChatsCache: List<SonarChat> = emptyList()
+
+    /** Bumped whenever a hold-input map ([meshPeerFirstSeenMs], [meshChatNames],
+     *  [sonarPeerProfiles], [linkByFp], [foldedGroupPeerIds]) changes, so the
+     *  [visibleChats] memo re-runs the settle-hold filter. Call [bumpHoldInputs]
+     *  from the mutation sites. */
+    private var holdInputsVersion = 0
+    private fun bumpHoldInputs() { holdInputsVersion++ }
+
+    /** Reference-identity tracking for the immutable [chats] list: a fresh list
+     *  object is assigned on every change, so an `!==` comparison detects it
+     *  without hashing every chat. */
+    private var lastChatsRef: List<SonarChat>? = null
+    private var chatsIdentityCounter = 0
+
+    private fun currentVisibleChatsKey(): VisibleChatsKey {
+        val current = chats
+        if (current !== lastChatsRef) {
+            lastChatsRef = current
+            chatsIdentityCounter++
         }
-        return pendingMarmotChats() + pendingMarmotGroupChats() + dedupeDirectMarmotChats(
+        return VisibleChatsKey(
+            chatsIdentity = chatsIdentityCounter,
+            foldedGroupIds = foldedGroupIds,
+            pendingChatNpubs = pendingMarmotChatNpubs,
+            pendingGroupIds = pendingMarmotGroups.keys,
+            socialVersion = socialVersion,
+            snapshotVersion = snapshotVersion,
+            ownNpub = npub,
+            holdVersion = holdInputsVersion,
+        )
+    }
+
+    /** White Noise chats to render on their own row: every Marmot group EXCEPT the
+     *  ones folded into a mesh DM. The Messages list uses this instead of [chats].
+     *
+     *  Memoized: while no standalone chat is inside its brief capability-settle
+     *  window, the result is cached keyed by [VisibleChatsKey]. If a hold is
+     *  active (a newly-met peer is still settling, ≤ [CAPABILITY_SETTLE_MS]),
+     *  the result is time-dependent so we recompute and skip the cache — that
+     *  window is short and rare, so steady-state reads stay O(1). */
+    val visibleChats: List<SonarChat> get() {
+        val key = currentVisibleChatsKey()
+        visibleChatsCacheKey?.let { if (it == key) return visibleChatsCache }
+        var holdActive = false
+        val standalone = chats.filterNot {
+            val held = shouldHoldStandaloneMarmotChat(it)
+            if (held) holdActive = true
+            it.id in foldedGroupIds || held || isBlockedMarmotChat(it)
+        }
+        val result = pendingMarmotChats() + pendingMarmotGroupChats() + dedupeDirectMarmotChats(
             chats = standalone,
             ownNpub = npub,
             latestSecs = { chatSnapshotMessagesByChat[it]?.lastOrNull()?.tsSecs ?: 0L },
         )
+        // Only cache the stable (no active settle window) computation. A held
+        // chat can flip to visible purely by time passing, which the key can't
+        // capture, so leave the cache untouched until the window closes.
+        if (!holdActive) {
+            visibleChatsCacheKey = key
+            visibleChatsCache = result
+        } else {
+            visibleChatsCacheKey = null
+        }
+        return result
     }
 
     private fun pendingMarmotChats(): List<SonarChat> =
@@ -1338,10 +1616,39 @@ class SonarAppState(private val scope: CoroutineScope) {
         rate = WalletBridge.cachedRate(c)
     }
 
+    private var balanceFlowCollecting = false
+
     private fun setupWallet() {
         if (!walletAvailable) {
             scope.launch { publishSonarDescriptorIfNeeded(force = true) }
             return
+        }
+        if (!balanceFlowCollecting) {
+            balanceFlowCollecting = true
+            // Collect the background-produced balance stream (iOS balanceTask
+            // parity). WalletBridge.balanceFlow is fed from Breez SDK events on
+            // an IO scope — never the render path; we only collect state here.
+            scope.launch {
+                WalletBridge.balanceFlow.collect { sats ->
+                    if (WalletBridge.state() is WalletState.Ready) {
+                        walletState = WalletState.Ready(sats)
+                    }
+                }
+            }
+            // Record incoming external wallet payments (iOS
+            // recordIncomingWalletPayment): fed by the Breez event listener on
+            // an IO scope; we only collect + write the local ledger here. The
+            // merge layer folds chat ⚡PAY receipts by preimage so an incoming
+            // chat payment never appears twice.
+            scope.launch {
+                // WalletBridge already records incoming payments at the event
+                // source (headless-safe). Collecting here is the live-UI path
+                // for events that arrive while the app is open; recordPending is
+                // idempotent by wallet payment id, so this never double-records.
+                WalletBridge.paymentEvents.collect { ev ->
+                    PaymentActivityStore.recordIncomingWalletPayment(ev)
+                }
+            }
         }
         scope.launch {
             WalletBridge.setupIfNeeded(SonarCore.identityNsec())
@@ -1404,6 +1711,18 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun walletPayEntries(): List<PayEntry> = payLedger.all()
 
+    /** Recomposition key for [walletActivity] (the direct-ledger leg; ⚡PAY
+     *  receipts bump [payVersion]). Screens read it through state so all
+     *  wallet-facing reads flow through app state. */
+    val paymentActivityVersion get() = PaymentActivityStore.version
+
+    /** Merged wallet activity for the Wallet screen: chat ⚡PAY receipts +
+     *  direct/Unify/incoming ledger rows, deduped, newest-first. The ONLY
+     *  read path for the activity ledger — the UI never touches
+     *  [PaymentActivityStore] directly. */
+    fun walletActivity(): List<WalletActivityItem> =
+        mergeWalletActivity(walletPayEntries(), PaymentActivityStore.sorted())
+
     private fun persistPay() { SonarCore.saveBlob("pay.ledger", payLedger.serialize()) }
 
     private fun paymentNpubHex(chatId: String): String? =
@@ -1456,6 +1775,23 @@ class SonarAppState(private val scope: CoroutineScope) {
         val offer = directPaymentOffer(chatId)
         if (offer == null) return "Fetching payment details — try again in a moment."
         val payId = randomPayId()
+        // iOS parity (SonarAppStore.sendPay → SonarPaymentActivityLedger):
+        // record a pending sonarDirect activity BEFORE the wallet send, then
+        // settle or fail it below so the Wallet screen shows direct sends.
+        PaymentActivityStore.recordPending(
+            SonarPaymentActivity(
+                id = payId,
+                kind = SonarPaymentActivity.Kind.SonarDirect,
+                peerKey = chatId,
+                peerName = callPeerName(chatId),
+                direction = SonarPaymentActivity.Direction.Outgoing,
+                sats = sats,
+                via = if (isMeshChat(chatId) && hasLiveMeshRoute(meshPeerId(chatId))) "mesh" else "internet",
+                createdAtSecs = SonarClock.nowSecs(),
+                destinationHash = paymentDestinationHash(offer),
+                status = SonarPaymentActivity.Status.Pending,
+            )
+        )
         scope.launch {
             var failureMessage: String? = null
             val result = runCatching { WalletBridge.send(offer, sats, "Sonar payment $payId") }
@@ -1465,7 +1801,13 @@ class SonarAppState(private val scope: CoroutineScope) {
                 }
             walletState = WalletBridge.state()
             if (result.ok) {
-                if (payLedger.recordReceipt(payId, sats, mine = true)) {
+                // Wallet settled — record locally before the receipt lines so
+                // the ledger stays consistent even if chat delivery fails.
+                PaymentActivityStore.markPaid(
+                    payId, result.paymentId, result.feesSats,
+                    result.settledAtSecs ?: SonarClock.nowSecs(),
+                )
+                if (payLedger.recordReceipt(payId, sats, mine = true, tsSecs = SonarClock.nowSecs())) {
                     persistPay()
                     payVersion++
                 }
@@ -1480,6 +1822,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                     toast = "Payment sent but receipt delivery failed"
                 }
             } else {
+                PaymentActivityStore.markFailed(payId, failureMessage ?: "Payment failed")
                 toast = failureMessage ?: "Payment failed"
             }
         }
@@ -1528,7 +1871,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         var changed = false
         for (m in msgs) {
             when (val line = PayLine.decode(m.content)) {
-                is PayLine.Pay -> if (payLedger.recordReceipt(line.uuid, line.sats, m.mine)) changed = true
+                is PayLine.Pay -> if (payLedger.recordReceipt(line.uuid, line.sats, m.mine, tsSecs = m.tsSecs)) changed = true
                 is PayLine.Done -> if (payLedger.markClaimedOrPending(line.uuid, line.preimage)) changed = true
                 null -> {}
             }
@@ -1589,8 +1932,34 @@ class SonarAppState(private val scope: CoroutineScope) {
             val raw = UnifyRadio.fetchOffer(peerId)
             val dest = raw?.let { UnifyBIP321.parse(it) }?.lightning
             if (dest == null) { toast = "Couldn't read that user's payment request"; return@launch }
+            // iOS parity (SonarAppStore.payUnify): a direct Lightning send —
+            // Unify peers don't chat, so this shows up ONLY in the wallet
+            // activity ledger, not as a ⚡PAY chat receipt.
+            val activityId = randomPayId()
+            PaymentActivityStore.recordPending(
+                SonarPaymentActivity(
+                    id = activityId,
+                    kind = SonarPaymentActivity.Kind.UnifyNearby,
+                    peerKey = peerId,
+                    peerName = unifyPeers.firstOrNull { it.id == peerId }?.name ?: "Nearby user",
+                    direction = SonarPaymentActivity.Direction.Outgoing,
+                    sats = amountSats,
+                    via = "internet",
+                    createdAtSecs = SonarClock.nowSecs(),
+                    destinationHash = paymentDestinationHash(dest),
+                    status = SonarPaymentActivity.Status.Pending,
+                )
+            )
             val result = WalletBridge.send(dest, amountSats, "Sonar nearby")
             walletState = WalletBridge.state()
+            if (result.ok) {
+                PaymentActivityStore.markPaid(
+                    activityId, result.paymentId, result.feesSats,
+                    result.settledAtSecs ?: SonarClock.nowSecs(),
+                )
+            } else {
+                PaymentActivityStore.markFailed(activityId, "Payment failed")
+            }
             toast = if (result.ok) "Sent ${amountSats} sats" else "Payment failed"
         }
     }
@@ -1762,13 +2131,34 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     // ── Verify safety numbers (1:1 with iOS) ──
+    /** Verified chat ids held in memory so [isVerified] (read per home row) is an
+     *  O(1) set lookup, not a synchronous per-id `loadBlob` on the render path.
+     *  Seeded from disk once in [boot]; the `verified.<id>` blobs stay the
+     *  source of truth. [verifiedVersion] keys the row-model memo. */
+    private val verifiedChatIds = mutableSetOf<String>()
+    private var verifiedVersion = 0
+
+    /** One-time boot seed: read the persisted verify flag for each known chat id
+     *  (off the render path). Blobs have no enumeration, so we probe the ids we
+     *  actually have from the restored snapshot. */
+    private fun seedVerifiedChatIds() {
+        for (chat in chats) {
+            for (id in directMarmotChatIds(chat.id)) {
+                if (SonarCore.loadBlob("verified.$id") == "1") verifiedChatIds += id
+            }
+        }
+        verifiedVersion++
+    }
+
     fun isVerified(chatId: String): Boolean =
-        directMarmotChatIds(chatId).any { SonarCore.loadBlob("verified.$it") == "1" }
+        directMarmotChatIds(chatId).any { it in verifiedChatIds }
 
     fun markVerified(chatId: String) {
         for (id in directMarmotChatIds(chatId)) {
             SonarCore.saveBlob("verified.$id", "1")
+            verifiedChatIds += id
         }
+        verifiedVersion++
         payVersion++ // recompose verify-dependent UI
         toast = "Marked as verified"
     }
@@ -1834,10 +2224,15 @@ class SonarAppState(private val scope: CoroutineScope) {
                 chats = emptyList(); pendingMarmotChatNpubs = emptyMap(); pendingMarmotGroups = emptyMap(); messages = emptyList(); channelMsgs = emptyList()
                 lastWnGroups = -1; lastWnMsgs = -1
                 payLedger = SonarPayLedger(); persistPay(); payVersion++
+                PaymentActivityStore.wipe()
                 mediaCache.clear(); stickerPackCache.clear(); stickerImageCache.clear(); installedPackCoordinates.clear()
                 callLogs.clear(); callVersion++
 
                 npub = restoredNpub
+                // Keep the persisted npub consistent with the restored identity
+                // now, so a crash before start()'s re-save can't restore the OLD
+                // npub as "me" on the next launch's local-first paint.
+                SonarCore.saveBlob(NPUB_BLOB_KEY, restoredNpub)
                 started = false
                 connecting = false
                 SonarCore.setOnboardingComplete(true)
@@ -1974,6 +2369,83 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun unreadForChat(chatId: String): Long =
         directMarmotChatIds(chatId).sumOf { unreadByChat[it] ?: 0L }
 
+    /** Last-message preview + timestamp for a chat-list row (design ConvRow):
+     *  replaces the static "Tap to open" with the real transcript tail, read
+     *  from the in-memory snapshot only (local-first, no DB/relay work).
+     *  Filters control lines (☎CALL/⚡PAY/…) exactly like the transcript and
+     *  humanizes media/sticker previews — a raw wire line must never be a row
+     *  subtitle. */
+    fun chatRowMeta(chatId: String): Pair<String, Long>? =
+        directMarmotChatIds(chatId)
+            .mapNotNull { id ->
+                visibleMessagesForChat(id, chatSnapshotMessagesByChat[id].orEmpty()).lastOrNull()
+            }
+            .maxByOrNull { it.tsSecs }
+            ?.let { messagePreview(it.content, it.stickerRef, it.media) to it.tsSecs }
+
+    // ── Home Marmot-row view models (Signal "cache row view models") ──
+    // The home LazyColumn used to call chatTitle + chatRowMeta + isVerified +
+    // unreadForChat PER ROW during composition; each walked `chats` (O(chats)),
+    // so a home paint was O(chats²) plus a per-row disk read for verify. These
+    // are now precomputed ONCE per input change (peer-key grouping built a
+    // single time) and read O(1) by the row via [marmotRow].
+    private var marmotRowsKey: VisibleChatsKey? = null
+    private var marmotRowsUnread: Map<String, Long>? = null
+    private var marmotRowsProfiles: Map<String, SonarProfile>? = null
+    private var marmotRowsVerified = -1
+    private var marmotRowsCache: Map<String, MarmotRowModel> = emptyMap()
+
+    private fun marmotRowModels(): Map<String, MarmotRowModel> {
+        val vkey = currentVisibleChatsKey()
+        val unread = unreadByChat
+        val profiles = profilesByNpub
+        // Reassigned-map identity (===) detects change without hashing entries.
+        if (marmotRowsKey == vkey && marmotRowsUnread === unread &&
+            marmotRowsProfiles === profiles && marmotRowsVerified == verifiedVersion
+        ) return marmotRowsCache
+        val models = computeMarmotRowModels(visibleChats)
+        marmotRowsKey = vkey; marmotRowsUnread = unread
+        marmotRowsProfiles = profiles; marmotRowsVerified = verifiedVersion
+        marmotRowsCache = models
+        return models
+    }
+
+    private fun computeMarmotRowModels(rows: List<SonarChat>): Map<String, MarmotRowModel> {
+        // Peer-key → all its chat ids, built ONCE (was recomputed per row).
+        val idsByPeerKey = HashMap<String, MutableList<String>>()
+        for (c in chats) {
+            val pk = directMarmotPeerKey(c) ?: continue
+            idsByPeerKey.getOrPut(pk) { mutableListOf() }.add(c.id)
+        }
+        fun groupedIds(chat: SonarChat): List<String> =
+            directMarmotPeerKey(chat)?.let { idsByPeerKey[it] } ?: listOf(chat.id)
+        return rows.associate { chat ->
+            val pending = isPendingSecureChat(chat.id)
+            val ids = if (pending) listOf(chat.id) else groupedIds(chat)
+            val newest = if (pending) null else ids
+                .mapNotNull { visibleMessagesForChat(it, chatSnapshotMessagesByChat[it].orEmpty()).lastOrNull() }
+                .maxByOrNull { it.tsSecs }
+            chat.id to MarmotRowModel(
+                id = chat.id,
+                title = chatTitle(chat),
+                sub = when {
+                    pending -> "Setting up secure chat…"
+                    newest != null -> messagePreview(newest.content, newest.stickerRef, newest.media)
+                    else -> "Tap to open"
+                },
+                tsSecs = newest?.tsSecs ?: 0L,
+                verified = ids.any { it in verifiedChatIds },
+                unread = ids.sumOf { unreadByChat[it] ?: 0L } > 0,
+                pending = pending,
+                multiMember = isMultiMemberChat(chat.id),
+            )
+        }
+    }
+
+    /** O(1) precomputed home-row view model for [chatId] (see [marmotRowModels]). */
+    fun marmotRow(chatId: String): MarmotRowModel =
+        marmotRowModels()[chatId] ?: MarmotRowModel(chatId, chatId, "Tap to open", 0L, false, false, false, false)
+
     fun setForeground(value: Boolean) {
         val cameToForeground = value && !foreground
         foreground = value
@@ -1991,6 +2463,9 @@ class SonarAppState(private val scope: CoroutineScope) {
                     (screen as? Screen.Channel)?.let { refreshChannel(it.geohash) }
                     refreshPresenceCounts()
                 }
+                // Run a full housekeeping pass now rather than waiting for the
+                // next heartbeat (the old 4 s poll would have run within 4 s).
+                requestHousekeeping()
             }
         }
         // Unify receiver is foreground-only (matches iOS) — react immediately.
@@ -2054,44 +2529,97 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /** Notify for any chat whose newest incoming message is newer than last seen.
      *  Uses [lastNotifiedTs] to prevent double-fire when the conversationChanged
-     *  flow and poll loop both process the same message within one cycle. */
-    private suspend fun maybeNotify() {
+     *  flow and poll loop both process the same message within one cycle.
+     *
+     *  Driven by the single `conversationSummaries()` probe passed in as
+     *  [summaryByChat] — one FFI call for every chat's newest message, replacing
+     *  the old per-chat `messagesPage(chatId, 1)` (O(chats) FFI calls per cycle). */
+    private fun maybeNotify(summaryByChat: Map<String, SonarConversationSummary>) {
         val openChatId = (screen as? Screen.Chat)?.id
         val knownChatIds = chats.map { it.id }.toSet()
         val snapshot = visibleChats.filter { it.id in knownChatIds }
         for (c in snapshot) {
             val chatIds = if (isDirectMarmotChat(c)) directMarmotChatIds(c.id) else listOf(c.id)
-            val prev = chatIds.mapNotNull { lastSeenTs[it] }.maxOrNull()
-            val alreadyNotified = chatIds.map { lastNotifiedTs[it] ?: 0L }.maxOrNull() ?: 0L
-            var newestIncoming: SonarMsg? = null
-            for (chatId in chatIds) {
-                val msgs = SonarCore.messagesPage(chatId, 1)
-                val visibleMsgs = visibleMessagesForChat(chatId, msgs)
-                val incoming = visibleMsgs.lastOrNull { !it.mine }
-                if (incoming != null && (newestIncoming == null || incoming.tsSecs > newestIncoming!!.tsSecs)) {
-                    newestIncoming = incoming
-                }
-                lastSeenTs[chatId] = msgs.lastOrNull()?.tsSecs ?: (lastSeenTs[chatId] ?: 0L)
-            }
-            if (seededSeen && prev != null && newestIncoming != null &&
-                newestIncoming.tsSecs > prev && newestIncoming.tsSecs > alreadyNotified &&
-                (openChatId == null || openChatId !in chatIds)
-            ) {
-                val groupName = c.name.takeIf { c.members.size > 2 && it.isNotBlank() }
-                notifyIncoming(
-                    idKey = c.id,
-                    conversationTitle = chatTitle(c),
-                    content = newestIncoming.content,
-                    senderName = notificationSenderName(c, newestIncoming),
-                    groupName = groupName,
-                    unreadCount = unreadForChat(c.id).coerceAtLeast(1L),
-                )
-                for (chatId in chatIds) {
-                    lastNotifiedTs[chatId] = newestIncoming.tsSecs
-                }
-            }
+            notifyChatIfNew(
+                c,
+                scanIds = chatIds,
+                suppressIds = chatIds,
+                openChatId = openChatId,
+                idKey = c.id,
+                title = chatTitle(c),
+                summaryByChat = summaryByChat,
+            )
+        }
+        // A White Noise group folded into a mesh row is hidden from
+        // [visibleChats], so scan it here and notify under the mesh
+        // conversation identity (iOS folds the notification the same way).
+        // Open-chat suppression must match BOTH the mesh row and the folded
+        // group id so an open merged transcript never rings for itself.
+        val chatsById = chats.associateBy { it.id }
+        for ((groupId, peerId) in foldedGroupPeerIds) {
+            val c = chatsById[groupId] ?: continue
+            val meshId = meshChatId(peerId)
+            notifyChatIfNew(
+                c,
+                scanIds = listOf(groupId),
+                suppressIds = listOf(groupId, meshId),
+                openChatId = openChatId,
+                idKey = meshId,
+                title = meshPeerName(peerId),
+                summaryByChat = summaryByChat,
+            )
         }
         seededSeen = true
+    }
+
+    private fun notifyChatIfNew(
+        c: SonarChat,
+        scanIds: List<String>,
+        suppressIds: List<String>,
+        openChatId: String?,
+        idKey: String,
+        title: String?,
+        summaryByChat: Map<String, SonarConversationSummary>,
+    ) {
+        val prev = scanIds.mapNotNull { lastSeenTs[it] }.maxOrNull()
+        val alreadyNotified = scanIds.map { lastNotifiedTs[it] ?: 0L }.maxOrNull() ?: 0L
+        // Reconstruct the newest incoming message per chat from the summary
+        // probe (the summary's latest == what messagesPage(chatId, 1) returned).
+        // A summary whose newest line is our own send, or from a blocked sender,
+        // yields no incoming — matching the old visibleMessagesForChat filter.
+        var newestIncoming: SonarMsg? = null
+        for (chatId in scanIds) {
+            val s = summaryByChat[chatId] ?: continue
+            lastSeenTs[chatId] = s.latestAtSecs
+            if (s.latestMine) continue
+            if (!socialState.allowsChatMessage(chatId, s.latestSenderNpub, mine = false)) continue
+            if (newestIncoming == null || s.latestAtSecs > newestIncoming!!.tsSecs) {
+                newestIncoming = SonarMsg(
+                    id = chatId,
+                    senderNpub = s.latestSenderNpub,
+                    content = s.latestContent,
+                    mine = false,
+                    tsSecs = s.latestAtSecs,
+                )
+            }
+        }
+        if (seededSeen && prev != null && newestIncoming != null &&
+            newestIncoming.tsSecs > prev && newestIncoming.tsSecs > alreadyNotified &&
+            (openChatId == null || openChatId !in suppressIds)
+        ) {
+            val groupName = c.name.takeIf { c.members.size > 2 && it.isNotBlank() }
+            notifyIncoming(
+                idKey = idKey,
+                conversationTitle = title,
+                content = newestIncoming.content,
+                senderName = notificationSenderName(c, newestIncoming),
+                groupName = groupName,
+                unreadCount = unreadForChat(idKey).coerceAtLeast(1L),
+            )
+            for (chatId in scanIds) {
+                lastNotifiedTs[chatId] = newestIncoming.tsSecs
+            }
+        }
     }
 
     private fun notificationSenderName(chat: SonarChat, message: SonarMsg): String? {
@@ -2108,8 +2636,20 @@ class SonarAppState(private val scope: CoroutineScope) {
         connecting = true
         Notifier.ensureChannel()
         scope.launch {
+            // ── LOCAL-FIRST PAINT (Signal/iOS parity): this block reads disk
+            // and blobs only — no core start, no relay. The home list must be
+            // fully hydrated (mesh rows, names, links, folds) BEFORE
+            // SonarCore.start(), which can take seconds on a cold relay path.
+            // chats snapshot / profiles / npub already restore at construction.
+            meshChats.putAll(MessageStore.loadAllMeshDms())
+            loadLinks() // durable fingerprint↔npub so BLE chats stay unified after restart
+            loadMeshNames() // announce nicknames survive restart — names, not keys
+            seedVerifiedChatIds() // in-memory verify set (off render path)
+            refreshMeshDmRows()
+            recomputeConversations() // fold White Noise legs into mesh rows pre-start
             try {
                 npub = SonarCore.start()
+                SonarCore.saveBlob(NPUB_BLOB_KEY, npub) // restored at next construction
                 SonarCore.installConversationListener()
                 collectConversationChanges()
                 started = true
@@ -2118,14 +2658,15 @@ class SonarAppState(private val scope: CoroutineScope) {
                 launch { runCatching { SonarCore.publishProfile(nick) } }
                 // Descriptor publish runs after wallet setup so call metadata is
                 // discoverable without racing a wallet-ready BOLT12 offer.
-                // Hydrate BLE-mesh transcripts from disk so private mesh chats
-                // survive a restart (parity with the iOS MessageStore). Precedes
-                // refreshMeshDmRows so the Messages list is populated at launch.
-                meshChats.putAll(MessageStore.loadAllMeshDms())
-                loadLinks() // durable fingerprint↔npub so BLE chats stay unified after restart
                 updateBleDiscoveryPolicy()
                 refreshKnownContactDescriptors(clearMisses = true)
-                refreshMeshDmRows()
+                // Kind-0 names: boot-time fetches raced the relay connect and
+                // missed — retry now, and once more after the sockets settle.
+                launch {
+                    refreshChatMemberProfiles(clearMisses = true)
+                    delay(6_000)
+                    refreshChatMemberProfiles(clearMisses = true)
+                }
                 setupWallet()
                 refreshLocationChannels()
                 refreshChats()
@@ -2136,6 +2677,10 @@ class SonarAppState(private val scope: CoroutineScope) {
                 launch { ensureCallStarted() }
                 startMeshRealtimeLoop()
                 poll()
+                // Run the first housekeeping pass now instead of waiting a full
+                // heartbeat — seeds notifications/unread/profiles at launch (the
+                // old 4 s poll ran its first full cycle ~4 s in).
+                requestHousekeeping()
             } catch (t: Throwable) {
                 toast = "connect failed: ${t.message}"
             } finally {
@@ -2170,21 +2715,59 @@ class SonarAppState(private val scope: CoroutineScope) {
         return resolveGroupAuthorName(message, isGroup, profilesByNpub, ::ensureProfile)
     }
 
+    /** Re-fetch kind-0 profiles for every conversation member, optionally
+     *  clearing the miss throttles first. Fetches fired while the relays were
+     *  still connecting MISS and get throttled — this gives them a prompt
+     *  second chance once connectivity arrives, instead of leaving npub
+     *  titles until the ~30min housekeeping sweep. Bounded: distinct members
+     *  of current chats + mesh links only. */
+    private fun refreshChatMemberProfiles(clearMisses: Boolean) {
+        if (clearMisses) {
+            profileMissedAt.clear()
+            profileFetches.clear()
+        }
+        val mine = canonicalProfileKey(npub)
+        (chats.asSequence().flatMap { it.members.asSequence() } +
+            meshChats.keys.asSequence().mapNotNull { npubStringForPeer(it) })
+            .map { canonicalProfileKey(it) }
+            .filter { it.isNotBlank() && it != mine }
+            .distinct()
+            .forEach { ensureProfile(it) }
+    }
+
     /** Fetch + cache a peer's kind-0 profile, so their name replaces the
      *  raw npub in the chat list/header. */
     fun ensureProfile(otherNpub: String) {
         val key = canonicalProfileKey(otherNpub)
         if (key.isBlank() || key == canonicalProfileKey(npub)) return
+        // Throttle re-fetches after a miss: chatTitle() calls this on every
+        // list render, so without a TTL a peer with no kind-0 profile (or an
+        // offline relay window) triggers a relay query per recomposition.
+        val missedAt = profileMissedAt[key]
+        if (missedAt != null && SonarClock.nowSecs() - missedAt < PROFILE_MISS_TTL_SECS) return
         val hadCachedProfile = profilesByNpub.containsKey(key) || profilesByNpub.containsKey(otherNpub)
         if (!profileFetches.add(key)) return        // fetch already in flight
         scope.launch {
             val p = SonarCore.fetchProfile(key)
+            // Log the outcome only — a resolved display name is PII and this
+            // tees into the user-shareable diagnostics bundle.
+            sonarLog("SonarProfile", "kind-0 fetch ${key.take(12)}… → ${if (p?.bestName != null) "HIT" else "MISS"}")
             if (p?.bestName != null) {
-                profilesByNpub = normalizedProfileCache(profilesByNpub + (key to p) - otherNpub)
+                // Drop a legacy entry under the caller's ORIGINAL key only when
+                // it differs from the canonical one — when the caller already
+                // passed the canonical npub, `- otherNpub` would remove the
+                // entry we just added (this kept the cache empty on every
+                // device: names re-fetched from relays on each launch).
+                val updated = profilesByNpub + (key to p)
+                profilesByNpub = normalizedProfileCache(
+                    if (otherNpub != key) updated - otherNpub else updated
+                )
                 profileFetchedAt[key] = SonarClock.nowSecs()
+                profileMissedAt.remove(key)
                 persistProfileCache()
                 if (isMeshRelevantNpub(key)) recomputeConversations()
             } else {
+                profileMissedAt[key] = SonarClock.nowSecs()
                 if (!hadCachedProfile) profileFetches.remove(key)
             }
         }
@@ -2269,7 +2852,9 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private fun persistProfileCache() {
-        SonarCore.saveBlob(PROFILE_CACHE_BLOB_KEY, encodeProfileCache(profilesByNpub))
+        val encoded = encodeProfileCache(profilesByNpub)
+        sonarLog("SonarProfile", "persist cache: ${profilesByNpub.size} profiles → ${encoded.length} chars")
+        SonarCore.saveBlob(PROFILE_CACHE_BLOB_KEY, encoded)
     }
 
     fun openChat(chat: SonarChat) {
@@ -2287,6 +2872,13 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         val readChatIds = directMarmotChatIds(chat.id)
         unreadByChat = unreadByChat - readChatIds.toSet()
+        // Local-first paint (Signal-Comparable Performance Rule): show the
+        // cached snapshot synchronously so the transcript never opens empty;
+        // the bounded DB page + media/echo merge below replaces it async.
+        messages = visibleMessagesForChat(
+            chat.id,
+            withSendEchoes(chat.id, chatSnapshotMessagesByChat[chat.id].orEmpty()),
+        )
         scope.launch {
             for (readId in readChatIds) {
                 runCatching { SonarCore.markConversationRead(readId) }
@@ -2312,7 +2904,7 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  the payment sheet (radar "Send sats"). */
     fun openDm(peerId: String, name: String, pay: Boolean = false) {
         val id = meshChatId(peerId)
-        if (name.isNotBlank()) meshChatNames[peerId] = name
+        if (name.isNotBlank()) rememberMeshName(peerId, name)
         push(Screen.Chat(id, name, pay))
         messages = visibleMessagesForChat(id, meshChats[peerId].orEmpty()) // immediate mesh view; Marmot leg merges in async
         processPayLines(id, messages)
@@ -2674,7 +3266,18 @@ class SonarAppState(private val scope: CoroutineScope) {
      * `target` is the current channel/peer label used when an emote omits args.
      */
     fun handleCommand(text: String, target: String, channelGeohash: String?, chatId: String?): Boolean {
-        val parsed = SonarSlashCommands.parse(text) ?: return false
+        val parsed = SonarSlashCommands.parse(text)
+        if (parsed == null) {
+            // iOS parity (CommandProcessor default case): any slash-prefixed
+            // draft is a command attempt — surface "unknown command" instead
+            // of leaking it to the timeline as plaintext.
+            val trimmed = text.trim()
+            if (trimmed.startsWith("/")) {
+                toast = "unknown command: /" + trimmed.drop(1).trimStart().substringBefore(' ')
+                return true
+            }
+            return false
+        }
         return when (parsed.command) {
             SonarSlashCommand.Who -> {
                 push(Screen.Nearby)
@@ -4468,6 +5071,21 @@ class SonarAppState(private val scope: CoroutineScope) {
         return false
     }
 
+    /** Mirrors iOS `shouldDeferOfferForSonarDescriptor`: BLE discovery is
+     *  authoritative when present; only defer for npub-only Marmot contacts
+     *  whose public Sonar descriptor is still unknown (and not recently
+     *  missed). Kicks the background fetch so a later scan pass can ring. */
+    private fun shouldDeferOfferForSonarDescriptor(chatId: String): Boolean {
+        val peerId = if (isMeshChat(chatId)) meshPeerId(chatId) else peerIdForMarmotGroup(chatId)
+        if (peerId != null && sonarProfile(peerId) != null) return false
+        val key = callDescriptorNpubHex(chatId)?.lowercase() ?: return false
+        if (sonarDescriptorsByNpubHex[key] != null) return false
+        val missedAt = sonarDescriptorMissedAt[key]
+        if (missedAt != null && SonarClock.nowSecs() - missedAt < SONAR_DESCRIPTOR_MISS_TTL_SECS) return false
+        ensureSonarDescriptorHex(key)
+        return true
+    }
+
     private fun callDescriptorNpubHex(chatId: String): String? {
         val peerId = if (isMeshChat(chatId)) meshPeerId(chatId) else peerIdForMarmotGroup(chatId)
         return if (peerId == null) marmotChatPeerNpubHex(chatId) else npubRawFor(peerId)?.toHexLower()
@@ -4516,9 +5134,9 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /** Drain mesh DMs received since last poll into the per-peer transcripts,
      *  surface them as Messages rows, and notify for ones we're not looking at. */
-    private fun drainMeshDms() {
+    private fun drainMeshDms(): Boolean {
         val incoming = MeshRadio.drainMeshDm()
-        if (incoming.isEmpty()) return
+        if (incoming.isEmpty()) return false
         val touched = mutableSetOf<String>()
         for (m in incoming) {
             if (socialState.isBlockedPeer(m.peerId)) continue
@@ -4558,6 +5176,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 if (incoming.any { it.peerId == pid }) scope.launch { refreshOpenDm(pid) }
             }
         }
+        return true
     }
 
     private suspend fun drainDirectDms() {
@@ -4630,9 +5249,9 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Drain private BLE file transfers into the same mesh transcript model as
      * text DMs. The raw bytes are stored in MessageStore and referenced by a
      * local `mesh-media:` URL so bubbles survive an app restart. */
-    private fun drainMeshMedia() {
+    private fun drainMeshMedia(): Boolean {
         val incoming = MeshRadio.drainMeshMedia()
-        if (incoming.isEmpty()) return
+        if (incoming.isEmpty()) return false
         val touched = mutableSetOf<String>()
         for (m in incoming) {
             if (socialState.isBlockedPeer(m.peerId)) continue
@@ -4647,7 +5266,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             touched += m.peerId
             notifyIncoming(meshChatId(m.peerId), meshPeerName(m.peerId), mediaPreviewLabel(m.mimeType, m.filename))
         }
-        if (touched.isEmpty()) return
+        if (touched.isEmpty()) return false
         touched.forEach { persistMesh(it) }
         refreshMeshDmRows()
         (screen as? Screen.Chat)?.let { sc ->
@@ -4656,13 +5275,14 @@ class SonarAppState(private val scope: CoroutineScope) {
                 if (pid in touched) scope.launch { refreshOpenDm(pid) }
             }
         }
+        return true
     }
 
     /** Drain incoming public Mesh-channel broadcasts into the mesh transcript.
      *  The wire carries sender peerID + content; resolve the display nickname. */
-    private fun drainMeshBroadcasts() {
+    private fun drainMeshBroadcasts(): Boolean {
         val incoming = MeshRadio.drainMeshBroadcast()
-        if (incoming.isEmpty()) return
+        if (incoming.isEmpty()) return false
         val seen = meshBroadcast.mapTo(HashSet()) { it.id }
         val add = incoming
             .filter { socialState.allowsChannelSender(it.senderId, mine = false) }
@@ -4671,9 +5291,10 @@ class SonarAppState(private val scope: CoroutineScope) {
                 SonarChannelMsg(id, meshPeerName(it.senderId), it.senderId, it.content, mine = false, it.tsSecs)
             }
             .filter { it.id !in seen }
-        if (add.isEmpty()) return
+        if (add.isEmpty()) return false
         meshBroadcast = (meshBroadcast + add).sortedBy { it.tsSecs }.takeLast(200)
         if ((screen as? Screen.Channel)?.geohash == "mesh") channelMsgs = visibleChannelMessages(meshBroadcast)
+        return true
     }
 
     /** Display name for a mesh peer: prefer the live radar name, else a remembered
@@ -4687,13 +5308,13 @@ class SonarAppState(private val scope: CoroutineScope) {
         val remembered = meshChatNames[peerId]?.takeUnless { it.isKeyFallbackName() }
         if (profileName == null && peerNpub != null) ensureProfile(peerNpub)
         val name = live ?: profileName ?: remembered ?: ("mesh·" + peerId.take(6))
-        meshChatNames[peerId] = name
+        if (!name.isKeyFallbackName()) rememberMeshName(peerId, name) else meshChatNames[peerId] = name
         return name
     }
 
     private fun foldedPeerName(peerId: String, group: SonarChat?): String {
         meshPeers.firstOrNull { it.id == meshChatId(peerId) }?.name?.let {
-            meshChatNames[peerId] = it
+            rememberMeshName(peerId, it)
             return it
         }
         meshChatNames[peerId]?.takeUnless { it.isKeyFallbackName() }?.let { return it }
@@ -4709,8 +5330,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         return meshChatNames[peerId] ?: ("mesh·" + peerId.take(6))
     }
 
-    private fun String.isKeyFallbackName(): Boolean =
-        startsWith("mesh·") || startsWith("npub1")
+    private fun String.isKeyFallbackName(): Boolean = isKeyFallbackNameValue(this)
 
     /** Recompute the observable mesh DM rows (newest conversation first). Fast,
      *  BLE-leg only — for immediate feedback on send/receive. [recomputeConversations]
@@ -4771,6 +5391,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         foldedGroupIds = folded
         foldedGroupPeerIds = groupPeers
+        bumpHoldInputs()
         // Merge discovered folds into the persisted map (parity with iOS
         // marmotGroupIdsByConversationId). Prune entries for groups that no
         // longer exist so stale mappings don't accumulate.
@@ -4906,15 +5527,44 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     @OptIn(kotlinx.coroutines.FlowPreview::class)
+    /** Per-key debounce jobs for [collectConversationChanges]: rapid changes to
+     *  the SAME chat coalesce, but a burst across DIFFERENT chats no longer
+     *  drops the losers (a stream-wide `debounce` kept only the last groupId,
+     *  deferring the others' call/pay ring to a housekeeping cycle). */
+    private val conversationChangeJobs = mutableMapOf<String, Job>()
+
     private fun collectConversationChanges() {
         SonarCore.conversationChanged
-            .debounce(50)
             .onEach { groupIdHex ->
+                conversationChangeJobs.remove(groupIdHex)?.cancel()
+                conversationChangeJobs[groupIdHex] = scope.launch {
+                    delay(50)
+                    handleConversationChange(groupIdHex)
+                    conversationChangeJobs.remove(groupIdHex)
+                }
+            }
+            .launchIn(scope)
+    }
+
+    private suspend fun handleConversationChange(groupIdHex: String) {
+                // PRIMARY delivery path: refresh + process the CHANGED chat
+                // immediately so a call rings / pay processes / the open
+                // transcript updates without waiting for the heartbeat.
                 refreshChats()
                 val changedMessages = marmotMessagesPage(groupIdHex)
                 val visibleChangedMessages = visibleMessagesForChat(groupIdHex, changedMessages)
                 processPayLines(groupIdHex, visibleChangedMessages)
                 processCallLines(groupIdHex, visibleChangedMessages)
+                // The changed chat's newest ts is now handled; advance its scan
+                // watermark (secs + processed count) so the housekeeping cycle
+                // won't re-fetch its page for content we just processed.
+                changedMessages.lastOrNull()?.tsSecs?.let { ts ->
+                    val mark = ScanMark(ts, changedMessages.size.toLong())
+                    val prev = scanWatermark[groupIdHex]
+                    if (prev == null || mark.secs > prev.secs ||
+                        (mark.secs == prev.secs && mark.count > prev.count)
+                    ) scanWatermark[groupIdHex] = mark
+                }
                 (screen as? Screen.Chat)?.let { sc ->
                     if (!isMeshChat(sc.id) && (sc.id == groupIdHex || isSameDirectMarmotChat(sc.id, groupIdHex))) {
                         val mergedMessages = marmotMessagesPageForChat(sc.id)
@@ -4930,12 +5580,18 @@ class SonarAppState(private val scope: CoroutineScope) {
                         }
                     }
                 }
-            }
-            .launchIn(scope)
+                // Fan the rest of the maintenance work (notifications, unread
+                // counts, profile/presence/mesh upkeep) to the conflated
+                // housekeeping consumer instead of doing it inline per event.
+                requestHousekeeping()
     }
 
     private suspend fun refreshUnreadCounts() {
         val summaries = runCatching { SonarCore.conversationSummaries() }.getOrDefault(emptyList())
+        applyUnreadCounts(summaries)
+    }
+
+    private fun applyUnreadCounts(summaries: List<SonarConversationSummary>) {
         val counts = mutableMapOf<String, Long>()
         for (s in summaries) {
             if (s.unreadCount > 0) counts[s.groupIdHex] = s.unreadCount
@@ -4943,94 +5599,184 @@ class SonarAppState(private val scope: CoroutineScope) {
         unreadByChat = counts
     }
 
+    /** Request a housekeeping pass. Conflated: many requests within one in-flight
+     *  cycle collapse to a single trailing run (Signal-style — react to database
+     *  invalidation, don't busy-poll). Cheap and non-blocking; safe to call from
+     *  the event flow and the heartbeat. */
+    private fun requestHousekeeping() {
+        housekeepingTrigger.trySend(Unit)
+    }
+
+    /** Event-driven consumer + slow fallback heartbeat.
+     *
+     *  Topology:
+     *
+     *      conversationChanged ─debounce─▶ requestHousekeeping ─┐
+     *      heartbeat (30s fg / 60s bg) ── requestHousekeeping ──┤
+     *                                                            ▼
+     *                                        housekeepingTrigger (CONFLATED)
+     *                                                            │
+     *                                              runHousekeepingCycle()
+     *
+     *  The old 4 s poll ran the FULL cycle every 4 s forever. Now the cycle runs
+     *  only when the core signals a conversation change (primary) or the slow
+     *  heartbeat fires (fallback for time-based housekeeping the core can't
+     *  signal: presence, BLE policy, unify, profile TTLs). Message delivery /
+     *  call ringing / pay processing for the changed chat stay on the prompt
+     *  `conversationChanged` path in [collectConversationChanges]. */
     private fun poll() {
         if (pollJob?.isActive == true) return
+        startHousekeepingConsumer()
         pollJob = scope.launch {
-            var tick = 0
+            var beat = 0L
             while (true) {
-                delay(4000)
-                tick++
-                SonarCore.ensureSubscriptions()
-                refreshChats()
-                drainDirectDms()
-                // Observability for the BLE→White Noise fallback: a new Marmot
-                // group (a Welcome received over relays) or a grown transcript is
-                // the signal that White Noise delivery reached us. Logged only on
-                // change so a cross-device round trip shows up in logcat.
-                // Fetch each chat's messages once: sum sizes (observability) AND
-                // scan for inbound ☎CALL lines so a call rings even when the chat
-                // isn't open (the offer arrives over White Noise/Marmot).
-                var wnMsgs = 0
-                val senders = mutableSetOf<String>()
-                for (c in chats) {
-                    val ms = runCatching { SonarCore.messagesPage(c.id, LOCAL_TRANSCRIPT_PAGE_LIMIT) }.getOrDefault(emptyList())
-                    val visibleMs = visibleMessagesForChat(c.id, ms)
-                    wnMsgs += ms.size
-                    processCallLines(c.id, visibleMs)
-                    processPayLines(c.id, visibleMs)
-                    if (c.members.size > 2) {
-                        for (m in visibleMs) {
-                            if (!m.mine && m.senderNpub.isNotBlank()) senders.add(m.senderNpub)
-                        }
-                    }
+                // Slow heartbeat: 30 s foreground, 60 s background. Foreground
+                // events already drive the cycle, so idle-foreground CPU is set
+                // by this cadence, not the old 4 s tick.
+                delay(if (foreground) HEARTBEAT_FG_MS else HEARTBEAT_BG_MS)
+                beat++
+                // ensureSubscriptions / sync are relay-connection upkeep — keep a
+                // wall-clock cadence (was every 4 s / every 60 s on the old tick).
+                runCatching { SonarCore.ensureSubscriptions() }
+                if (beat == 1L || (beat * effectiveHeartbeatMs()) % SYNC_INTERVAL_MS < effectiveHeartbeatMs()) {
+                    runCatching { SonarCore.sync() }
                 }
-                if (chats.size != lastWnGroups || wnMsgs != lastWnMsgs) {
-                    sonarLog("SonarWN", "White Noise: ${chats.size} group(s), $wnMsgs message(s)")
-                    lastWnGroups = chats.size; lastWnMsgs = wnMsgs
+                // Coarse presence beat (~every 60 s), profile TTL sweep (~30 min).
+                if (beat * effectiveHeartbeatMs() % PRESENCE_BEAT_MS < effectiveHeartbeatMs()) {
+                    beatGlobalPresence()
                 }
-                // Resolve kind-0 profiles for chat members and message senders
-                // so chats show human names, not raw npubs.
-                for (c in chats) c.members.forEach { if (it != npub) ensureProfile(it) }
-                senders.forEach { ensureProfile(it) }
-                // Re-fetch stale profiles every ~30 minutes (450 ticks × 4s).
-                if (tick % 450 == 0) {
-                    val now = SonarClock.nowSecs()
-                    val stale = profileFetchedAt.entries
-                        .filter { now - it.value >= PROFILE_REFRESH_TTL_SECS }
-                        .map { it.key }
-                    stale.forEach { profileFetches.remove(it); profileFetchedAt.remove(it) }
+                if (beat * effectiveHeartbeatMs() % PROFILE_SWEEP_MS < effectiveHeartbeatMs()) {
+                    sweepStaleProfiles()
                 }
-                flushPendingMarmot() // a queued out-of-range send whose group just landed
-                flushAllOutbox() // retry any outbox messages whose peer is now reachable
-                maybeNotify()
-                // Marmot/Nostr chats refresh from the core; mesh chats are local
-                // and refreshed by drainMeshDms() below. A mesh-route DM merges
-                // both legs (mesh + White Noise) via refreshOpenDm.
-                (screen as? Screen.Chat)?.let {
-                    if (isMeshChat(it.id)) refreshOpenDm(meshPeerId(it.id))
-                    else {
-                        setCurrentVisibleMessages(it.id, withSendEchoes(it.id, mergePendingMediaUploads(it.id, marmotMessagesPageForChat(it.id))))
-                    }
-                }
-                (screen as? Screen.Channel)?.let { refreshChannel(it.geohash) }
-                (screen as? Screen.GeoDm)?.let { refreshGeoDm(it.geohash, it.peerHex) }
-                // Sonar Discovery (0x53): keep our announce current for outgoing
-                // links and decode any peers' announces received over the mesh.
-                refreshBatterySaving()
-                refreshMeshIdentity()
-                updateBleDiscoveryPolicy()
-                // Persist each peer's fingerprint→npub so its conversation stays
-                // unified after it leaves range / after a restart, then re-fold the
-                // White Noise legs into the mesh rows (one row per person).
-                refreshSonarDiscoveryProfiles()
-                updateMeshPeersFromRadio()
-                recomputeConversations()
-                // Unify nearby: keep the payer scan alive and refresh peers +
-                // the receiver advertising (wallet/foreground gated).
-                startUnify()
-                unifyPeers = UnifyRadio.peers()
-                updateUnifyReceiver()
-                if (locationChannels.isEmpty()) refreshLocationChannels()
-                // Presence: like iOS GeohashPresenceService, broadcast to the
-                // low-precision channels (region/province/city) on a ~60s
-                // heartbeat so others count us; then refresh "here now" counts.
-                if (tick % 15 == 1) beatGlobalPresence()
-                refreshPresenceCounts()
-                if (walletAvailable && walletState is WalletState.Ready) {
-                    WalletBridge.refreshBalance()
-                    walletState = WalletBridge.state()
+                requestHousekeeping()
+            }
+        }
+    }
+
+    private fun effectiveHeartbeatMs(): Long = if (foreground) HEARTBEAT_FG_MS else HEARTBEAT_BG_MS
+
+    /** Drop cached kind-0 fetch state for profiles older than the refresh TTL so
+     *  they get re-fetched. Was inlined in the old poll's `tick % 450` branch. */
+    private fun sweepStaleProfiles() {
+        val now = SonarClock.nowSecs()
+        val stale = profileFetchedAt.entries
+            .filter { now - it.value >= PROFILE_REFRESH_TTL_SECS }
+            .map { it.key }
+        stale.forEach { profileFetches.remove(it); profileFetchedAt.remove(it) }
+        // Prune expired MISS markers too (they only throttle re-fetch, but grew
+        // unbounded for npubs that came and went across a long-lived session).
+        profileMissedAt.entries
+            .filter { now - it.value >= PROFILE_MISS_TTL_SECS }
+            .map { it.key }
+            .forEach { profileMissedAt.remove(it) }
+    }
+
+    private fun startHousekeepingConsumer() {
+        if (housekeepingJob?.isActive == true) return
+        housekeepingJob = scope.launch {
+            for (unit in housekeepingTrigger) {
+                runCatching { runHousekeepingCycle() }
+            }
+        }
+    }
+
+    /** The periodic maintenance pass — everything the old 4 s poll did EXCEPT
+     *  the relay-upkeep bits (moved to the heartbeat). Runs on the conflated
+     *  trigger, so it fires promptly on a conversation change and otherwise at
+     *  the slow heartbeat cadence. FFI is off the main thread (each SonarCore
+     *  suspend hops to Dispatchers.IO), and per-chat page scanning is now
+     *  incremental via the [scanWatermark]. */
+    private suspend fun runHousekeepingCycle() {
+        refreshChats()
+        drainDirectDms()
+        // One cheap FFI probe of every chat's newest message + unread count.
+        val summaries = runCatching { SonarCore.conversationSummaries() }.getOrDefault(emptyList())
+        val summaryByChat = summaries.associateBy { it.groupIdHex }
+        applyUnreadCounts(summaries)
+        // Incremental scan: only chats whose newest ts moved past the watermark
+        // need a page fetch + ☎CALL / pay re-scan. Everything else is skipped —
+        // this replaces the old O(chats) messagesPage()+re-parse every 4 s.
+        scanChangedChatsForCallPay(summaryByChat)
+        // Resolve kind-0 profiles for chat members so chats show names, not npubs.
+        for (c in chats) c.members.forEach { if (it != npub) ensureProfile(it) }
+        flushPendingMarmot() // a queued out-of-range send whose group just landed
+        flushAllOutbox() // retry any outbox messages whose peer is now reachable
+        maybeNotify(summaryByChat)
+        // Marmot/Nostr chats refresh from the core; mesh chats are local and
+        // refreshed by drainMeshDms(). A mesh-route DM merges both legs.
+        (screen as? Screen.Chat)?.let {
+            if (isMeshChat(it.id)) refreshOpenDm(meshPeerId(it.id))
+            else {
+                setCurrentVisibleMessages(it.id, withSendEchoes(it.id, mergePendingMediaUploads(it.id, marmotMessagesPageForChat(it.id))))
+            }
+        }
+        (screen as? Screen.Channel)?.let { refreshChannel(it.geohash) }
+        (screen as? Screen.GeoDm)?.let { refreshGeoDm(it.geohash, it.peerHex) }
+        // Sonar Discovery (0x53): keep our announce current for outgoing links
+        // and decode any peers' announces received over the mesh.
+        refreshBatterySaving()
+        refreshMeshIdentity()
+        updateBleDiscoveryPolicy()
+        // Persist each peer's fingerprint→npub so its conversation stays unified
+        // after it leaves range / after a restart, then re-fold the White Noise
+        // legs into the mesh rows (one row per person).
+        refreshSonarDiscoveryProfiles()
+        updateMeshPeersFromRadio()
+        recomputeConversations()
+        // Unify nearby: keep the payer scan alive and refresh peers + receiver.
+        startUnify()
+        unifyPeers = UnifyRadio.peers()
+        updateUnifyReceiver()
+        if (locationChannels.isEmpty()) refreshLocationChannels()
+        refreshPresenceCounts()
+        if (walletAvailable && walletState is WalletState.Ready) {
+            WalletBridge.refreshBalance()
+            walletState = WalletBridge.state()
+        }
+    }
+
+    /** Fetch + scan for ☎CALL / ⚡PAY lines only the chats whose newest message
+     *  advanced past [scanWatermark]. So a call rings and a pay receipt processes
+     *  even when the chat isn't open, but idle chats cost nothing beyond the
+     *  single summaries() probe. Also emits the White Noise observability log. */
+    private suspend fun scanChangedChatsForCallPay(
+        summaryByChat: Map<String, SonarConversationSummary>,
+    ) {
+        val latestByChat = chats.associate { c ->
+            val s = summaryByChat[c.id]
+            c.id to ScanMark(s?.latestAtSecs ?: 0L, s?.messageCount ?: 0L)
+        }
+        val toScan = chatsNeedingPageScan(latestByChat, scanWatermark)
+        var wnMsgs = 0
+        val senders = mutableSetOf<String>()
+        for (c in chats) {
+            val summaryCount = summaryByChat[c.id]?.messageCount?.toInt()
+            if (c.id !in toScan) {
+                // Unchanged chat: no page fetch. Reuse the summary's count so the
+                // observability total still reflects every group.
+                wnMsgs += summaryCount ?: 0
+                continue
+            }
+            val ms = runCatching { SonarCore.messagesPage(c.id, LOCAL_TRANSCRIPT_PAGE_LIMIT) }.getOrDefault(emptyList())
+            val visibleMs = visibleMessagesForChat(c.id, ms)
+            wnMsgs += summaryCount ?: ms.size
+            processCallLines(c.id, visibleMs)
+            processPayLines(c.id, visibleMs)
+            if (c.members.size > 2) {
+                for (m in visibleMs) {
+                    if (!m.mine && m.senderNpub.isNotBlank()) senders.add(m.senderNpub)
                 }
             }
+            scanWatermark[c.id] = latestByChat[c.id] ?: ScanMark(0L, 0L)
+        }
+        // Prune watermarks for chats that no longer exist.
+        if (scanWatermark.size > latestByChat.size) {
+            scanWatermark.keys.retainAll(latestByChat.keys)
+        }
+        senders.forEach { ensureProfile(it) }
+        if (chats.size != lastWnGroups || wnMsgs != lastWnMsgs) {
+            sonarLog("SonarWN", "White Noise: ${chats.size} group(s), $wnMsgs message(s)")
+            lastWnGroups = chats.size; lastWnMsgs = wnMsgs
         }
     }
 
@@ -5042,11 +5788,20 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (meshRealtimeLoopRunning) return
         meshRealtimeLoopRunning = true
         scope.launch {
+            // Adaptive cadence (Signal-grade idle cost): the 150ms realtime
+            // tick only earns its keep while BLE traffic is actually possible
+            // — a peer in range or a recent drain hit. Otherwise 20 FFI
+            // calls/sec burn CPU draining empty queues forever. Idle backs
+            // off to 1s; any drain hit or in-range peer snaps back to 150ms.
+            var lastActivityMs = 0L
             while (true) {
-                drainMeshDms()
-                drainMeshMedia()
-                drainMeshBroadcasts()
-                delay(150)
+                val drained = drainMeshDms() or drainMeshMedia() or drainMeshBroadcasts()
+                val nowMs = SonarClock.nowMillis()
+                // hasActivePeer() is a cheap link/announce probe — unlike
+                // peers() it doesn't build+sort the whole list every tick.
+                if (drained || MeshRadio.hasActivePeer()) lastActivityMs = nowMs
+                val fast = nowMs - lastActivityMs < MESH_REALTIME_HOT_WINDOW_MS
+                delay(if (fast) 150 else 1000)
             }
         }
     }

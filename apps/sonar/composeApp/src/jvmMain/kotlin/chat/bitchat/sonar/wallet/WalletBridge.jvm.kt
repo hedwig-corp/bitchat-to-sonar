@@ -2,21 +2,32 @@ package chat.bitchat.sonar.wallet
 
 import breez_sdk_liquid.BindingLiquidSdk
 import breez_sdk_liquid.ConnectRequest
+import breez_sdk_liquid.EventListener
 import breez_sdk_liquid.LiquidNetwork
 import breez_sdk_liquid.PayAmount
+import breez_sdk_liquid.Payment
 import breez_sdk_liquid.PaymentMethod
+import breez_sdk_liquid.PaymentType
 import breez_sdk_liquid.PrepareReceiveRequest
 import breez_sdk_liquid.PrepareSendRequest
 import breez_sdk_liquid.ReceivePaymentRequest
 import breez_sdk_liquid.PaymentDetails
+import breez_sdk_liquid.SdkEvent
 import breez_sdk_liquid.SendPaymentRequest
 import breez_sdk_liquid.connect
 import breez_sdk_liquid.defaultConfig
 import chat.bitchat.sonar.DesktopEnv
 import chat.bitchat.sonar.crypto.Bech32
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -42,6 +53,22 @@ actual object WalletBridge {
     @Volatile private var sdk: BindingLiquidSdk? = null
     @Volatile private var current: WalletState = WalletState.NotConfigured
     @Volatile private var rates: Map<String, ExchangeRate> = emptyMap()
+
+    /** Background home for listener-triggered balance refreshes — never the UI. */
+    private val walletScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val balance = MutableStateFlow(0L)
+    actual val balanceFlow: StateFlow<Long> get() = balance
+    /** Buffered so the SDK callback thread can `tryEmit` without ever blocking. */
+    private val payments = MutableSharedFlow<WalletPaymentEvent>(extraBufferCapacity = 16)
+    actual val paymentEvents: SharedFlow<WalletPaymentEvent> get() = payments
+    @Volatile private var balanceListenerId: String? = null
+    /** Bumped in [shutdown] (inside [lock]); [refreshBalance] drops its writes
+     *  if the epoch moved while `getInfo()` ran, so a listener-triggered
+     *  refresh can never resurrect a torn-down wallet's balance. */
+    @Volatile private var walletEpoch = 0
+    /** One refresh in flight, at most one trailing — conflates event bursts. */
+    private val refreshGate = Mutex()
+    @Volatile private var refreshPending = false
 
     private val apiKey: String by lazy {
         runCatching {
@@ -82,18 +109,92 @@ actual object WalletBridge {
             current = when {
                 outcome.isFailure -> WalletState.Failed(outcome.exceptionOrNull()?.message ?: "wallet setup failed")
                 outcome.getOrNull() == null -> WalletState.Failed("wallet setup timed out")
-                else -> outcome.getOrThrow()!!.let { (node, bal) -> sdk = node; WalletState.Ready(bal) }
+                else -> outcome.getOrThrow()!!.let { (node, bal) ->
+                    sdk = node
+                    balance.value = bal
+                    startObservingBalance(node)
+                    WalletState.Ready(bal)
+                }
             }
         }
     }
 
     actual suspend fun refreshBalance(): Long = withContext(Dispatchers.IO) {
         val node = sdk ?: return@withContext 0L
+        val epoch = walletEpoch
         try {
             val bal = node.getInfo().walletInfo.balanceSat.toLong()
-            current = WalletState.Ready(bal)
+            // Drop the writes if shutdown/re-setup won the race while the
+            // blocking getInfo() ran — never resurrect a torn-down wallet.
+            if (epoch == walletEpoch && sdk === node) {
+                current = WalletState.Ready(bal)
+                balance.value = bal
+            }
             bal
         } catch (t: Throwable) { (current as? WalletState.Ready)?.balanceSats ?: 0L }
+    }
+
+    /**
+     * iOS parity (`WalletBridgeService.startObservingBalance()`): the Breez
+     * event listener drives a background `getInfo()` refresh on payment/sync
+     * events, so [balanceFlow] stays live without the UI ever polling. The
+     * callback arrives on an SDK thread — never block it; hop to [walletScope].
+     */
+    private fun startObservingBalance(node: BindingLiquidSdk) {
+        balanceListenerId = runCatching {
+            node.addEventListener(object : EventListener {
+                override fun onEvent(e: SdkEvent) {
+                    when (e) {
+                        is SdkEvent.PaymentSucceeded -> {
+                            emitPaymentEvent(e.details)
+                            requestBalanceRefresh()
+                        }
+                        is SdkEvent.Synced,
+                        is SdkEvent.DataSynced,
+                        is SdkEvent.PaymentWaitingConfirmation,
+                        is SdkEvent.PaymentPending,
+                        is SdkEvent.PaymentRefunded,
+                        is SdkEvent.PaymentFailed -> requestBalanceRefresh()
+                        else -> Unit
+                    }
+                }
+            })
+        }.getOrNull()
+    }
+
+    /** Surface a settled payment to [paymentEvents]. A stable wallet payment id
+     *  keeps `walletIncoming` recording idempotent across event replays (iOS
+     *  `SonarWallet.map`: txId ?? destination); with nothing stable we skip the
+     *  event rather than mint a random id that could duplicate ledger rows. */
+    private fun emitPaymentEvent(p: Payment) {
+        val lightning = p.details as? PaymentDetails.Lightning
+        val id = p.txId ?: lightning?.paymentHash ?: p.destination ?: return
+        val ev = WalletPaymentEvent(
+            paymentId = id,
+            incoming = p.paymentType == PaymentType.RECEIVE,
+            amountSats = p.amountSat.toLong(),
+            feesSats = p.feesSat.toLong(),
+            timestampSecs = p.timestamp.toLong(),
+            preimage = lightning?.preimage,
+        )
+        // Record at the source (headless-safe, idempotent) — see the android actual.
+        PaymentActivityStore.recordIncomingWalletPayment(ev)
+        payments.tryEmit(ev)
+    }
+
+    /** Conflates SDK event bursts (initial sync, payment storms) into at most
+     *  one in-flight `getInfo()` plus one trailing refresh, instead of one
+     *  concurrent refresh per event. */
+    private fun requestBalanceRefresh() {
+        walletScope.launch {
+            if (!refreshGate.tryLock()) { refreshPending = true; return@launch }
+            try {
+                do {
+                    refreshPending = false
+                    refreshBalance()
+                } while (refreshPending)
+            } finally { refreshGate.unlock() }
+        }
     }
 
     actual suspend fun createOffer(): String = withContext(Dispatchers.IO) {
@@ -114,9 +215,16 @@ actual object WalletBridge {
                     if (amountSats > 0) PayAmount.Bitcoin(amountSats.toULong()) else null
                 val prepared = node.prepareSendPayment(PrepareSendRequest(destination.trim(), amount))
                 val resp = node.sendPayment(SendPaymentRequest(prepared, null, note.ifBlank { null }))
-                val preimage = (resp.payment.details as? PaymentDetails.Lightning)?.preimage
+                val payment = resp.payment
+                val lightning = payment.details as? PaymentDetails.Lightning
                 refreshBalance()
-                SendResult(true, preimage)
+                SendResult(
+                    ok = true,
+                    preimage = lightning?.preimage,
+                    paymentId = payment.txId ?: lightning?.paymentHash ?: payment.destination,
+                    feesSats = payment.feesSat.toLong(),
+                    settledAtSecs = payment.timestamp.toLong(),
+                )
             } catch (t: Throwable) { SendResult(false) }
         }
 
@@ -130,6 +238,8 @@ actual object WalletBridge {
     }
 
     actual fun cachedRate(currency: FiatCurrency): ExchangeRate? = rates[currency.code]
+
+    actual fun hasLiveRate(): Boolean = Money.isLiveRate(rates[currency().code])
 
     actual fun showFiat(): Boolean = DesktopEnv.getBoolean("wallet.showFiat", false)
     actual fun setShowFiat(value: Boolean) { DesktopEnv.putBoolean("wallet.showFiat", value) }
@@ -147,10 +257,16 @@ actual object WalletBridge {
 
     actual suspend fun shutdown(): Unit = withContext(Dispatchers.IO) {
         lock.withLock {
-            try { sdk?.disconnect() } catch (_: Throwable) {}
+            walletEpoch += 1 // invalidate in-flight refreshBalance() writes
+            val node = sdk
+            balanceListenerId?.let { id -> runCatching { node?.removeEventListener(id) } }
+            balanceListenerId = null
+            try { node?.disconnect() } catch (_: Throwable) {}
             sdk = null
             current = WalletState.NotConfigured
+            balance.value = 0L
             rates = emptyMap()
         }
     }
 }
+

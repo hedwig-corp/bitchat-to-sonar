@@ -1,5 +1,8 @@
 # Android to iOS Parity Delivery Plan
 
+> Superseded for gap status by `docs/ANDROID-IOS-PARITY-MATRIX.md`
+> (2026-07-05); this plan is retained for slice history only.
+
 Date: 2026-06-27
 
 ## Current HEAD Baseline

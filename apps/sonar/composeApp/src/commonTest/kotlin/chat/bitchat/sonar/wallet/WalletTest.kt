@@ -2,8 +2,10 @@ package chat.bitchat.sonar.wallet
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 class WalletSeedTest {
     private val secret = "67dea2ed018072d675f5415ecfaed7d2597555e202d85b3d65ea4e58d2d92ffa"
@@ -67,5 +69,24 @@ class MoneyTest {
         assertEquals(FiatCurrency.GBP, FiatCurrency.of("gbp"))
         assertEquals(FiatCurrency.USD, FiatCurrency.of(null))
         assertEquals(FiatCurrency.USD, FiatCurrency.of("ZZZ"))
+    }
+
+    // iOS `hasLiveRate` predicate backing WalletBridge.hasLiveRate():
+    // true only for a present, positive live rate — never a stale/zero one.
+    @Test fun liveRatePredicate() {
+        assertFalse(Money.isLiveRate(null))
+        assertFalse(Money.isLiveRate(ExchangeRate("USD", 0.0)))
+        assertFalse(Money.isLiveRate(ExchangeRate("USD", -1.0)))
+        assertTrue(Money.isLiveRate(ExchangeRate("USD", 60_000.0)))
+    }
+
+    @Test fun liveRatePredicateMatchesFiatFormatting() {
+        // The predicate and formatFiat must agree: fiat renders iff live rate.
+        for (rate in listOf(null, ExchangeRate("EUR", 0.0), ExchangeRate("EUR", 55_000.0))) {
+            assertEquals(
+                Money.isLiveRate(rate),
+                Money.formatFiat(100_000, FiatCurrency.EUR, rate) != null,
+            )
+        }
     }
 }

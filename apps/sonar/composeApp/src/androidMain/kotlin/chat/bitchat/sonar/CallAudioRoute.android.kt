@@ -2,16 +2,20 @@ package chat.bitchat.sonar
 
 import android.content.Context
 import android.media.AudioManager
+import android.os.PowerManager
 
-// TODO(android): proximity monitoring — iOS uses UIDevice.isProximityMonitoringEnabled
-// + proximityStateDidChangeNotification to auto-disable speaker when phone is at ear
-// during voice calls. Android equivalent: PowerManager.PROXIMITY_SCREEN_OFF_WAKE_LOCK.
 actual object CallAudioRoute {
     private val audio: AudioManager
         get() = AppContextHolder.ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
+    /** iOS `isProximityMonitoringEnabled` parity: while a voice call is active
+     *  the proximity wake lock blanks the screen at the ear (and swallows
+     *  accidental touches). Held for the call duration, released in
+     *  `configure(active = false)` on every teardown path. */
+    private var proximityLock: PowerManager.WakeLock? = null
+
     @Suppress("DEPRECATION")
-    actual fun configure(active: Boolean, speakerOn: Boolean) {
+    actual fun configure(active: Boolean, speakerOn: Boolean, voiceProximity: Boolean) {
         val manager = audio
         if (active) {
             manager.mode = AudioManager.MODE_IN_COMMUNICATION
@@ -20,6 +24,24 @@ actual object CallAudioRoute {
             manager.isSpeakerphoneOn = false
             manager.mode = AudioManager.MODE_NORMAL
         }
+        if (active && voiceProximity) acquireProximity() else releaseProximity()
+    }
+
+    private fun acquireProximity() {
+        if (proximityLock?.isHeld == true) return
+        val pm = AppContextHolder.ctx.getSystemService(Context.POWER_SERVICE) as PowerManager
+        if (!pm.isWakeLockLevelSupported(PowerManager.PROXIMITY_SCREEN_OFF_WAKE_LOCK)) return
+        proximityLock = runCatching {
+            pm.newWakeLock(PowerManager.PROXIMITY_SCREEN_OFF_WAKE_LOCK, "sonar:call-proximity")
+                // Held for the call duration; every end path calls
+                // configure(active = false) which releases it.
+                .also { it.acquire() }
+        }.getOrNull()
+    }
+
+    private fun releaseProximity() {
+        runCatching { proximityLock?.takeIf { it.isHeld }?.release() }
+        proximityLock = null
     }
 
     @Suppress("DEPRECATION")

@@ -2,7 +2,6 @@ package chat.bitchat.sonar.push
 
 import android.content.Intent
 import android.util.Log
-import chat.bitchat.sonar.Notifier
 import com.google.firebase.messaging.FirebaseMessagingService
 import com.google.firebase.messaging.RemoteMessage
 
@@ -19,22 +18,41 @@ class SonarFirebaseMessagingService : FirebaseMessagingService() {
 
     override fun onMessageReceived(message: RemoteMessage) {
         val data = message.data
-        Log.d(TAG, "Push received: keys=${data.keys}")
+        val keys = data.keys.sorted().joinToString(",").ifEmpty { "<none>" }
+        val hasNotification = message.notification != null
+        Log.d(TAG, "Push received: keys=$keys notification=$hasNotification")
+
+        if (!SonarPushPrefs.effectivePushEnabled(this)) {
+            Log.d(TAG, "Push ignored: disabled by user preference")
+            return
+        }
 
         when {
-            isTransponderPush(data) -> handleMarmotWakeup(data)
+            isTransponderPush(data, message) -> handleMarmotWakeup()
             isBreezPush(data) -> handleBreezWakeup(data)
-            else -> Log.w(TAG, "Unknown push type, ignoring")
+            else -> Log.w(TAG, "Unknown push type, ignoring keys=$keys notification=$hasNotification")
         }
     }
 
-    private fun isTransponderPush(data: Map<String, String>): Boolean =
-        data.containsKey("mip05") || data.containsKey("transponder")
+    private fun isTransponderPush(data: Map<String, String>, message: RemoteMessage): Boolean {
+        if (isBreezPush(data)) return false
+
+        val source = data["source"]?.lowercase()
+        if (source == "transponder" || source == "marmot") return true
+
+        if (data.containsKey("mip05") ||
+            data.containsKey("transponder") ||
+            data.containsKey("wn_nse_prototype") ||
+            data["kind"] == "446"
+        ) return true
+
+        return data.isEmpty() && message.notification != null
+    }
 
     private fun isBreezPush(data: Map<String, String>): Boolean =
         data.containsKey("notification_type")
 
-    private fun handleMarmotWakeup(data: Map<String, String>) {
+    private fun handleMarmotWakeup() {
         Log.d(TAG, "Transponder push — starting Marmot sync")
         val intent = Intent(this, SonarPushProcessingService::class.java).apply {
             putExtra(SonarPushProcessingService.EXTRA_PUSH_TYPE, SonarPushProcessingService.TYPE_MARMOT)
