@@ -2933,8 +2933,8 @@ impl SonarClient {
                     // lists are event-driven, so without this a brand-new
                     // conversation stays invisible until an unrelated slow
                     // heartbeat repaints the list.
-                    if let Incoming::GroupUpdated(ref group_id)
-                    | Incoming::GroupInvitePending(ref group_id) = incoming
+                    if let Incoming::GroupUpdated(group_id)
+                    | Incoming::GroupInvitePending(group_id) = &incoming
                     {
                         changed_groups.insert(hex::encode(group_id.as_slice()));
                     }
@@ -4382,6 +4382,61 @@ mod tests {
         assert!(
             changed.contains(&expected),
             "welcome must notify the conversation listener for the new group; got {changed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_multimember_invite_notifies_change_listener() {
+        // A multi-member welcome (member_count > 2) is stored PENDING rather than
+        // auto-accepted, so it resolves to Incoming::GroupInvitePending and its
+        // group is not yet in groups() (only pending_group_invites()). It must
+        // still notify the conversation listener so the invite row appears in the
+        // backgrounded host without waiting for a heartbeat.
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let carol = MarmotEngine::in_memory(Identity::generate());
+        let bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client starts without relays");
+        let listener = Arc::new(RecordingChangeListener {
+            changed: Mutex::new(Vec::new()),
+        });
+        bob.set_conversation_change_listener(Some(listener.clone()));
+
+        let bob_kp = bob
+            .engine
+            .key_package_event(relays.clone())
+            .expect("bob key package");
+        let carol_kp = carol
+            .key_package_event(relays.clone())
+            .expect("carol key package");
+        let creation = alice
+            .create_group("alice, bob & carol", vec![bob_kp, carol_kp], relays)
+            .expect("alice creates 3-member group");
+        let (bob_pubkey, bob_welcome) = creation
+            .welcomes
+            .into_iter()
+            .find(|(pk, _)| *pk == bob.identity().public_key())
+            .expect("bob welcome");
+        let wrapped = alice
+            .gift_wrap_welcome(&bob_pubkey, bob_welcome)
+            .await
+            .expect("wrap bob welcome");
+
+        let (report, _) = bob
+            .process_marmot_events([wrapped], "test pending invite")
+            .await;
+        assert_eq!(report.processed, 1);
+
+        // Pending invite: the group is NOT active yet, only surfaced as an invite.
+        assert!(bob.engine.groups().expect("bob groups").is_empty());
+        let invites = bob.pending_group_invites().expect("pending invites");
+        assert_eq!(invites.len(), 1);
+        let expected = hex::encode(invites[0].group_id.as_slice());
+        let changed = listener.changed.lock().unwrap().clone();
+        assert!(
+            changed.contains(&expected),
+            "pending invite must notify the conversation listener; got {changed:?}"
         );
     }
 }
