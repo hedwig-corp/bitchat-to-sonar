@@ -12,8 +12,7 @@ The complete design handoff bundle lives in `design/handoff/`. It is **vendored*
   left sidebar nav + search, markdown article, sticky on-this-page TOC with
   scroll-spy, prev/next, mobile drawer) and `project/sonar/docs-content.js`
   (the doc corpus: `SONAR_DOCS.groups` + `SONAR_DOCS.docs`, markdown mirroring
-  the repo `docs/` folder — Discovery, Notifications, Payments, BIP-353,
-  Stickers). Implemented in the marketing site at `web/src/routes/docs/`
+  the repo `docs/` folder — Discovery, Payments, BIP-353, Stickers). Implemented in the marketing site at `web/src/routes/docs/`
   (`+page.svelte` + `$lib/docs-content.js` + `$lib/markdown.js`); the Nav
   "Open the prototype" link was replaced by a **Docs** link. The same project
   also carries a newer Stickers directory (`Sonar Stickers.html`,

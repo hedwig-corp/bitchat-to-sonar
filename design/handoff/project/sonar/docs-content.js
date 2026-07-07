@@ -3,7 +3,7 @@
 window.SONAR_DOCS = {
   groups: [
     { name: 'Overview', items: ['index'] },
-    { name: 'Protocol', items: ['SONAR-DISCOVERY', 'SONAR-NOTIFICATIONS'] },
+    { name: 'Protocol', items: ['SONAR-DISCOVERY'] },
     { name: 'Money', items: ['SONAR-PAYMENTS', 'bip353-registration'] },
     { name: 'Content', items: ['SONAR-STICKERS'] },
   ],
@@ -21,7 +21,6 @@ These docs describe the protocols and conventions behind the app.
 ## Where to start
 
 - **[Discovery](SONAR-DISCOVERY.md)** — how peers find each other over BLE and Nostr, and how capabilities are advertised.
-- **[Notifications](SONAR-NOTIFICATIONS.md)** — the core-owned notification envelope and push delivery.
 - **[Payments](SONAR-PAYMENTS.md)** — direct Bolt12 wallet payments and the in-chat receipt format.
 - **[Stickers](SONAR-STICKERS.md)** — the open sticker-pack directory published on Nostr.
 
@@ -136,64 +135,6 @@ The descriptor tells a peer that this npub is a Sonar client with compatible cal
 ## Call gating
 
 Voice/video calls are allowed when the conversation has a signaling route and either the BLE Sonar profile has the \`calls\` bit, or the fetched descriptor has \`calls = true\` with \`marmot\` signaling and \`iroh\` transport. Incoming call offers are deferred while descriptor discovery is in flight for an otherwise unknown npub.`,
-    },
-
-    'SONAR-NOTIFICATIONS': {
-      title: 'Notifications',
-      status: 'v1',
-      gh: 'https://github.com/hedwig-corp/bitchat-to-sonar/blob/main/docs/SONAR-NOTIFICATIONS.md',
-      blurb: 'core-owned notification envelope push delivery muting',
-      md: `# Sonar Notifications
-
-Notifications are owned by the Rust core, not by each platform. The core builds a single **notification envelope** and every surface — iOS, Android, desktop — renders the same envelope so copy and behavior stay identical.
-
-## The envelope
-
-The core emits a normalized envelope for every notifiable event:
-
-\`\`\`json
-{
-  "kind": "dm" | "group" | "call" | "payment" | "join-request",
-  "conversationId": "…",
-  "title": "Maya",
-  "body": "find me by the coffee table",
-  "sender": { "npub": "npub1…", "supporter": true },
-  "muteRespected": true
-}
-\`\`\`
-
-The platform layer maps \`kind\` to a channel and renders the title/body verbatim. It never composes notification copy itself.
-
-## Privacy-preserving previews
-
-Users choose how much shows on the lock screen:
-
-| Setting | Title | Body |
-| --- | --- | --- |
-| Show names & preview | sender name | message text |
-| Show names only | sender name | "New message" |
-| Hide everything | "Sonar" | "New message" |
-
-The core applies the setting **before** the envelope leaves the process, so a hidden preview never reaches the OS notification system as plaintext.
-
-## Muting
-
-Muting is per-conversation and time-boxed. A muted conversation still receives and decrypts messages; it simply suppresses the envelope.
-
-| Duration | Behavior |
-| --- | --- |
-| 1 hour / 8 hours | temporary, auto-expires |
-| 1 week | temporary, auto-expires |
-| Until I turn it back on | indefinite |
-
-A muted conversation shows a small muted glyph in the list. Mentions in a muted group may still notify, depending on the user's mention setting.
-
-## Delivery paths
-
-- **Foreground / nearby:** delivered directly from the mesh or an open relay subscription; no push service involved.
-- **Background:** an encrypted push envelope wakes the app, which fetches and decrypts the real message. The push service never sees plaintext.
-
-See the platform integration notes for the iOS NSE and Android FCM paths.`,
     },
 
     'SONAR-PAYMENTS': {
