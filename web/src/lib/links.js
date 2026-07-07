@@ -1,8 +1,9 @@
 // Outward links surfaced on the landing page.
 //
-// The design's "Open the prototype" / "Try the interactive demo" buttons point
-// at the in-bundle Sonar Prototype.html, which is not part of this site. Until a
-// hosted demo exists they route to the project repo.
+// The design's "Try the interactive demo" button points at the in-bundle Sonar
+// Prototype.html, which is not part of this site. Until a hosted demo exists it
+// routes to the project repo. (The nav's old "Open the prototype" link has been
+// replaced by a Docs link to the /docs route.)
 export const REPO_URL = 'https://github.com/hedwig-corp/bitchat-to-sonar';
 export const DEMO_URL = REPO_URL;
 
