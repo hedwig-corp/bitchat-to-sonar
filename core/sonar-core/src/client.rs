@@ -5607,6 +5607,17 @@ impl SonarClient {
         }
         let sub_id = SubscriptionId::new(SUB_MARMOT_GROUPS);
 
+        // Re-derive the typing mapping (and each group's direct/group typing
+        // mode) from the CURRENT engine state on every (re)subscribe. This runs
+        // BEFORE the empty-check and the equal-set fast-return below, because a
+        // membership-only change (DM↔group) keeps the `#h` set identical yet
+        // must flip `TypingGroup.direct` — otherwise a promoted DM keeps
+        // honoring anonymous STOPPED and a shrunk group ignores it until expiry.
+        // The empty-groups branch clears the mapping this way too. This is the
+        // background self-heal path (ensure_subscriptions, 25–60s), never the
+        // hot send/open path, so the per-group member reads are acceptable.
+        self.refresh_typing_groups();
+
         if group_ids.is_empty() {
             let had_subscription = {
                 let current = sub_state.lock().unwrap();
@@ -5631,11 +5642,6 @@ impl SonarClient {
                 return Ok(());
             }
         }
-
-        // Keep the typing manager's group mapping in step with the live
-        // subscription set (typing events arrive tagged with the nostr group
-        // id but are reported to hosts keyed by the MLS group id).
-        self.refresh_typing_groups();
 
         // Live tail is intentionally thin. Historical recovery is the catch-up
         // queue's job; using the full watermark here re-floods cold start.

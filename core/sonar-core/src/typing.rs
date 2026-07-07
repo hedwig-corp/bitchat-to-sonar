@@ -739,6 +739,34 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn direct_flag_flip_via_update_groups_changes_stopped_handling() {
+        // Mechanism behind the client-side membership-change fix: re-running
+        // update_groups with a flipped `direct` must change how the SAME group
+        // handles a subsequent remote STOPPED (event handling reads the flag
+        // live from the mapping, not a cached-at-first-event copy).
+        let publisher = RecordingPublisher::new();
+        let listener = RecordingListener::new();
+        let manager = TypingManager::spawn(publisher, test_config());
+        manager.set_listener(Some(listener.clone()));
+
+        // Starts as a multi-member group: STOPPED is ignored.
+        manager.update_groups([group("mls1", "nostr1", false)]);
+        manager.handle_remote_event(&remote_event("nostr1", "1"));
+        settle().await;
+        assert_eq!(listener.drain(), vec![("mls1".to_string(), true)]);
+        advance(Duration::from_secs(2)).await; // past min_display
+        manager.handle_remote_event(&remote_event("nostr1", "0"));
+        settle().await;
+        assert!(listener.drain().is_empty(), "group STOPPED ignored");
+
+        // Shrinks to a DM (direct=true). Now STOPPED clears immediately.
+        manager.update_groups([group("mls1", "nostr1", true)]);
+        manager.handle_remote_event(&remote_event("nostr1", "0"));
+        settle().await;
+        assert_eq!(listener.drain(), vec![("mls1".to_string(), false)]);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn update_groups_replaces_and_prunes_stale_mappings() {
         let publisher = RecordingPublisher::new();
         let listener = RecordingListener::new();

@@ -9737,10 +9737,27 @@ class SonarAppState(private val scope: CoroutineScope) {
             .launchIn(scope)
     }
 
-    /** Is a remote member composing in [chatId]? Folds duplicate direct-chat
-     *  groups so a DM's indicator shows whichever leg the peer typed on. */
-    fun isPeerTyping(chatId: String): Boolean =
-        typingChats.any { it == chatId || isSameDirectMarmotChat(chatId, it) }
+    /** Resolve any chat id to its backing Marmot group id, or null if there
+     *  is none yet. A real group id stays itself; a folded `mesh:<peerId>`
+     *  Sonar DM resolves through the peer's npub to its White Noise group, so
+     *  folded conversations get typing too (parity with iOS `marmotGroupId`,
+     *  and the "one conversation per person" rule). A pure BLE peer with no
+     *  White Noise account resolves to null — BLE-mesh typing is the tracked
+     *  follow-up. Pure: safe to call during render via `derivedStateOf`. */
+    private fun marmotGroupIdForChat(chatId: String): String? {
+        if (isPendingMarmotChat(chatId) || isPendingMarmotGroup(chatId)) return null
+        if (!isMeshChat(chatId)) return chatId.takeIf { id -> chats.any { it.id == id } }
+        val raw = npubRawFor(meshPeerId(chatId)) ?: return null
+        return marmotGroupForNpub(raw)?.id
+    }
+
+    /** Is a remote member composing in [chatId]? Resolves folded `mesh:` DMs
+     *  to their backing group and folds duplicate direct-chat legs, so a DM's
+     *  indicator shows whichever leg/route the peer typed on. */
+    fun isPeerTyping(chatId: String): Boolean {
+        val groupId = marmotGroupIdForChat(chatId) ?: return false
+        return typingChats.any { it == groupId || isSameDirectMarmotChat(groupId, it) }
+    }
 
     /** Drop all visible indicators now (used when the opt-in is toggled off,
      *  so stale hints don't linger until the core expiry event). */
@@ -9749,34 +9766,28 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     /** Composer text changed in [chatId]. Send side of the reciprocal opt-in:
-     *  no-op unless the pref is on and this is a real Marmot chat. Throttled
-     *  here to ≤1 FFI call/s; the core owns the Signal cadence. The pref read
-     *  (a blob FFI call) runs on IO so keystrokes never touch the render path. */
+     *  no-op unless the pref is on and the chat has a backing Marmot group
+     *  (including folded `mesh:` DMs). Throttled here to ≤1 FFI call/s, keyed
+     *  on the resolved group id; the core owns the Signal cadence. The pref
+     *  read (a blob FFI call) runs on IO so keystrokes never touch the render
+     *  path. BLE-mesh typing for account-less peers is a tracked follow-up. */
     fun onComposerTyping(chatId: String) {
-        if (!isEligibleTypingChat(chatId)) return
+        val groupId = marmotGroupIdForChat(chatId) ?: return
         val now = SonarClock.nowMillis()
-        if (now - (lastTypingSentAt[chatId] ?: 0L) < 1_000L) return
-        lastTypingSentAt[chatId] = now
+        if (now - (lastTypingSentAt[groupId] ?: 0L) < 1_000L) return
+        lastTypingSentAt[groupId] = now
         scope.launch(Dispatchers.IO) {
-            if (prefBool(PREF_TYPING_INDICATORS)) SonarCore.notifyTyping(chatId)
+            if (prefBool(PREF_TYPING_INDICATORS)) SonarCore.notifyTyping(groupId)
         }
     }
 
     /** Composer cleared or the chat screen closed: stop immediately (STOPPED
      *  goes out only if a STARTED is outstanding, so this is always safe). */
     fun onComposerIdle(chatId: String) {
-        if (!isEligibleTypingChat(chatId)) return
-        lastTypingSentAt.remove(chatId)
-        scope.launch(Dispatchers.IO) { SonarCore.notifyTypingStopped(chatId) }
+        val groupId = marmotGroupIdForChat(chatId) ?: return
+        lastTypingSentAt.remove(groupId)
+        scope.launch(Dispatchers.IO) { SonarCore.notifyTypingStopped(groupId) }
     }
-
-    /** Typing rides the Marmot relay path only: mesh-routed and pending
-     *  (not-yet-created) chats have no group to publish into. BLE-mesh typing
-     *  (NoisePayloadType 0x04, read-receipt path as template) is a tracked
-     *  follow-up — see PR #167's deferred list. */
-    private fun isEligibleTypingChat(chatId: String): Boolean =
-        !isMeshChat(chatId) && !isPendingMarmotChat(chatId) && !isPendingMarmotGroup(chatId) &&
-            chats.any { it.id == chatId }
 
     private suspend fun refreshUnreadCounts() {
         // null = FFI failure — keep the current map (same guard as markGroupsRead).
