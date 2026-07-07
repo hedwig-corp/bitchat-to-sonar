@@ -360,6 +360,76 @@ Relay propagation can take a few seconds; retry `listen --once` if needed.
 
 ---
 
+## Extending the agent: prediction markets (Polymarket)
+
+On the **native gateway** (mode A), Sonar DMs use the **same** Hermes runtime as
+Telegram: bundled **skills**, `terminal`, `web_search`, memory, and MCP. No
+extra Sonar-specific wiring is required — install or enable skills under
+`~/.hermes/skills/` and the agent loads them when relevant.
+
+### Read odds and research (bundled skill)
+
+**Skill:** `polymarket` (research)
+
+- **Docs:** https://hermes-agent.nousresearch.com/docs/user-guide/skills/bundled/research/research-polymarket
+- **Path:** `skills/research/polymarket`
+- **Purpose:** Read-only queries — Gamma search, CLOB prices, orderbooks, history.
+  Use when the user asks “what are the odds of X?” or wants market monitoring.
+- **Does not place bets** — no wallet, no orders.
+
+In chat or over Sonar, the agent should `skill_view(name='polymarket')` before
+answering market questions.
+
+### Place bets (CLI skill + wallet)
+
+**Skill:** `polymarket-cli` (research, companion to `polymarket`)
+
+- **Repo:** https://github.com/Polymarket/polymarket-cli
+- **Purpose:** `polymarket -o json …` for markets **and** CLOB trading when a
+  wallet is configured (`~/.config/polymarket/config.json` or
+  `POLYMARKET_PRIVATE_KEY` in `~/.hermes/.env`).
+- Load `skill_view(name='polymarket-cli')` for install, geoblock, soccer
+  knockout rules, and deposit flows.
+
+**Bitcoin → Polymarket (important):**
+
+- Markets settle in **USDC** on **Polygon**; you trade outcome shares priced
+  0.00–1.00 (probabilities).
+- **Lightning (`lnbc…`) is not supported** by the Polymarket bridge.
+- Typical path with BTC: on-chain BTC via `polymarket bridge deposit <proxy>`
+  (bridge converts to collateral), or hold USDC on Polygon and send to the
+  **proxy wallet** from `polymarket wallet show`.
+- Always match the deposit address shown on polymarket.com / `wallet show`; wrong
+  proxy = lost visibility on CLOB balance.
+
+**Geography:** `polymarket clob geoblock` may block **order placement** from some
+IPs; **read-only** odds ( `polymarket` skill / public APIs) still work.
+
+**Sonar UX:** When discussing bets over encrypted DMs, replies must be **plain
+text** (no markdown tables) — same rule as other Sonar replies.
+
+### Example operator setup (server agent)
+
+```bash
+# Skills ship with Hermes; confirm present
+ls ~/.hermes/skills/research/polymarket/SKILL.md
+ls ~/.hermes/skills/research/polymarket-cli/SKILL.md
+
+# CLI (if trading)
+polymarket --version
+polymarket clob geoblock
+polymarket wallet show    # after setup / import — fund proxy
+
+# Gateway already loads skills for Sonar sessions; ensure toolsets include terminal
+# for polymarket-cli subprocess calls.
+```
+
+Optional cron: community skill `polymarket-daily-alpha` combines Polymarket +
+ESPN + X for FIFA-style edges; attach via `cronjob` `skills=[...]` when creating
+jobs.
+
+---
+
 ## Optional: MCP wrapper
 
 For structured tools instead of shell, a thin stdio MCP server can wrap
@@ -372,4 +442,5 @@ A–C do not require it.
 
 - Hermes gateway plugin README: `hermes-agent/plugins/platforms/sonar/README.md`
 - Hermes docs: https://hermes-agent.nousresearch.com/docs
+- Polymarket (read-only skill): https://hermes-agent.nousresearch.com/docs/user-guide/skills/bundled/research/research-polymarket
 - Agent skill (terminal contract): `core/sonar-cli/hermes/SKILL.md`
