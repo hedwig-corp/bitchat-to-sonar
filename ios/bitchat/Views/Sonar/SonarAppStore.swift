@@ -4245,7 +4245,16 @@ final class SonarAppStore: ObservableObject {
             return
         }
         if meshReachable(id) {
-            for item in items { sendImageOverMesh(PeerID(str: id), data: item.data) }
+            // Per-item over mesh (no album packet), preserving each MIME:
+            // sendImageOverMesh forces JPEG, so route GIFs through the file
+            // path to keep the animation instead of flattening it.
+            for item in items {
+                if item.mime == "image/gif" {
+                    _ = sendAttachment(id, data: item.data, filename: item.filename, mime: item.mime)
+                } else {
+                    sendImageOverMesh(PeerID(str: id), data: item.data)
+                }
+            }
             return
         }
         let groupId: String?

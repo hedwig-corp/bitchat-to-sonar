@@ -1170,6 +1170,11 @@ private struct SNMediaCardImage: View {
                 .aspectRatio(contentMode: .fill)
                 .frame(width: width, height: height)
                 .clipped()
+        } else if item.isImage, bytes != nil {
+            // Bytes loaded but not decodable (corrupt / mislabeled MIME, e.g. a
+            // bad attachment from a peer). Fall back to a chip instead of an
+            // endless spinner, so a bad photo can't hide behind a good front card.
+            deckFileChip
         } else if item.isImage {
             RoundedRectangle(cornerRadius: 18)
                 .fill(SonarTheme.surface2)
@@ -1191,18 +1196,22 @@ private struct SNMediaCardImage: View {
                     if item.isGif { SNGifBadge().padding(8) }
                 }
         } else {
-            VStack(spacing: 6) {
-                Text(verbatim: item.filename)
-                    .font(SonarTheme.uiFont(size: 13, weight: .semibold))
-                    .foregroundColor(SonarTheme.text)
-                    .lineLimit(1)
-                Text(verbatim: item.mime)
-                    .font(SonarTheme.uiFont(size: 11))
-                    .foregroundColor(SonarTheme.text3)
-            }
-            .frame(width: width, height: height)
-            .background(RoundedRectangle(cornerRadius: 18).fill(SonarTheme.surface2))
+            deckFileChip
         }
+    }
+
+    private var deckFileChip: some View {
+        VStack(spacing: 6) {
+            Text(verbatim: item.filename)
+                .font(SonarTheme.uiFont(size: 13, weight: .semibold))
+                .foregroundColor(SonarTheme.text)
+                .lineLimit(1)
+            Text(verbatim: item.mime)
+                .font(SonarTheme.uiFont(size: 11))
+                .foregroundColor(SonarTheme.text3)
+        }
+        .frame(width: width, height: height)
+        .background(RoundedRectangle(cornerRadius: 18).fill(SonarTheme.surface2))
     }
 }
 
