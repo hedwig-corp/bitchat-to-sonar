@@ -11,6 +11,10 @@ package chat.bitchat.sonar.wallet
  * has none (structured data rides the Rust FFI), and pulling one in for three
  * flat string fields isn't warranted. [JsonLite] handles standard string
  * escapes, so a URL or field with escaped characters still round-trips.
+ *
+ * Lives in commonMain (not androidMain) for `commonTest` coverage and parity
+ * readiness, but is Android-consumed-only today: iOS answers invoice_request
+ * through the Breez `SDKNotificationService` NSE, not this path.
  */
 data class InvoiceRequestPayload(
     val offer: String,

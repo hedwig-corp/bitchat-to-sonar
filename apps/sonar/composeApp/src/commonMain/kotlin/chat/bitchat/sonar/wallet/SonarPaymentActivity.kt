@@ -316,10 +316,16 @@ object PaymentActivityStore {
 
     fun get(id: String): SonarPaymentActivity? = lock.withLock { ledger().get(id) }
 
-    fun recordPending(activity: SonarPaymentActivity): Boolean = lock.withLock {
-        if (!ledger().recordPending(activity)) return@withLock false
-        persist(); version++
-        true
+    fun recordPending(activity: SonarPaymentActivity): Boolean {
+        val inserted = lock.withLock {
+            if (!ledger().recordPending(activity)) return@withLock false
+            persist(); true
+        }
+        // Bump the Compose version OUTSIDE the lock: writing snapshot state under
+        // [lock] (from the Breez SDK callback thread) would establish a
+        // lock → snapshot-lock ordering; keeping it out avoids that fragility.
+        if (inserted) version++
+        return inserted
     }
 
     /** Record a settled INCOMING external wallet payment. Called at the event
@@ -355,23 +361,30 @@ object PaymentActivityStore {
         walletPaymentId: String?,
         feesSats: Long?,
         settledAtSecs: Long = SonarClock.nowSecs(),
-    ): Boolean = lock.withLock {
-        if (!ledger().markPaid(id, walletPaymentId, feesSats, settledAtSecs)) return@withLock false
-        persist(); version++
-        true
+    ): Boolean {
+        val changed = lock.withLock {
+            if (!ledger().markPaid(id, walletPaymentId, feesSats, settledAtSecs)) return@withLock false
+            persist(); true
+        }
+        if (changed) version++
+        return changed
     }
 
-    fun markFailed(id: String, message: String, nowSecs: Long = SonarClock.nowSecs()): Boolean =
-        lock.withLock {
+    fun markFailed(id: String, message: String, nowSecs: Long = SonarClock.nowSecs()): Boolean {
+        val changed = lock.withLock {
             if (!ledger().markFailed(id, message, nowSecs)) return@withLock false
-            persist(); version++
-            true
+            persist(); true
         }
+        if (changed) version++
+        return changed
+    }
 
     /** Emergency wipe: forget every payment (iOS `wipe()`). */
-    fun wipe() = lock.withLock {
-        ledger = SonarPaymentActivityLedger()
-        SonarCore.saveBlob(BLOB_KEY, "")
+    fun wipe() {
+        lock.withLock {
+            ledger = SonarPaymentActivityLedger()
+            SonarCore.saveBlob(BLOB_KEY, "")
+        }
         version++
     }
 
