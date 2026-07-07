@@ -65,7 +65,12 @@
 
   function syncFromHash() {
     const id = decodeURIComponent(location.hash.slice(1));
-    if (docs[id]) {
+    if (!id) {
+      // bare /docs (hash cleared) — reset to the first article.
+      currentId = order[0];
+      sidebarOpen = false;
+      window.scrollTo(0, 0);
+    } else if (docs[id]) {
       currentId = id;
       sidebarOpen = false;
       window.scrollTo(0, 0);
@@ -230,8 +235,9 @@
     line-height: 1.6;
   }
 
-  /* top bar */
-  .docs nav {
+  /* top bar — direct child only, so the on-this-page <nav class="toc"> keeps
+     its own full-height sticky column instead of inheriting height: 61px. */
+  .docs > nav {
     position: sticky;
     top: 0;
     z-index: 40;

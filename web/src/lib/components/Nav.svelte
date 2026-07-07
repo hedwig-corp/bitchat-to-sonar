@@ -16,7 +16,7 @@
     </a>
     <div class="navlinks">
       <a class="btn ghost small" href={stickersHref}>Stickers</a>
-      <a class="btn ghost small" href={docsHref}>Docs</a>
+      <a class="btn ghost small docs-link" href={docsHref}>Docs</a>
       <a class="btn primary small" href={downloadHref}>Get the app</a>
     </div>
   </div>
