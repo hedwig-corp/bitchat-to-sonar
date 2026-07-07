@@ -2875,8 +2875,13 @@ impl SonarClient {
                     report.record_processed();
                 }
                 Ok(Incoming::GroupProposal(update)) => {
+                    // Capture the group id before `update` is moved: a merged
+                    // proposal changes local membership, which the conversation
+                    // listener must see (same silent-miss class as welcomes).
+                    let proposal_group_hex = hex::encode(update.group_id.as_slice());
                     match self.publish_membership_update(update).await {
                         Ok(()) => {
+                            changed_groups.insert(proposal_group_hex);
                             self.mark_sync_event_processed(&event.id);
                             report.record_processed();
                         }
