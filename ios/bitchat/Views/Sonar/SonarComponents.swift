@@ -1227,6 +1227,9 @@ private struct SNMediaDeck: View {
         let cardW = maxBubbleWidth * 0.78
         let cardH: CGFloat = 240
         let depths = peekDepths(count: count, current: current)
+        // Reserve the deepest-possible overhang so the deck's footprint (and the
+        // row below) stays constant while paging, even as the peek count shrinks.
+        let maxDepth = min(2, count - 1)
         VStack(alignment: .leading, spacing: 8) {
             ZStack(alignment: .topLeading) {
                 // Real next-photo thumbnails behind the front card, deepest first.
@@ -1267,9 +1270,9 @@ private struct SNMediaDeck: View {
                     )
             }
             // Reserve room for the deepest peek's overhang so following rows
-            // don't sit on top of the pile.
-            .padding(.trailing, CGFloat(depths.count) * 12)
-            .padding(.bottom, CGFloat(depths.count) * 9)
+            // don't sit on top of the pile (stable across paging).
+            .padding(.trailing, CGFloat(maxDepth) * 12)
+            .padding(.bottom, CGFloat(maxDepth) * 9)
             SNDeckDots(count: count, index: current)
         }
     }

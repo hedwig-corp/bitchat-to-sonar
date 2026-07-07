@@ -1942,7 +1942,10 @@ private fun MediaDeck(
     val pagerState = androidx.compose.foundation.pager.rememberPagerState(pageCount = { media.size })
     val current = pagerState.currentPage
     val peek = minOf(2, media.size - 1 - current).coerceAtLeast(0)
-    Box(Modifier.padding(end = (peek * 6).dp + 0.dp, bottom = (peek * 5).dp + 0.dp)) {
+    // Reserve the deepest-possible overhang so the deck's footprint (and the row
+    // below it) stays put while paging, even as the visible peek count shrinks.
+    val maxPeek = minOf(2, media.size - 1)
+    Box(Modifier.padding(end = (maxPeek * 6).dp, bottom = (maxPeek * 5).dp)) {
         // Real next-photo thumbnails behind the front card, deepest first, so
         // the pile shows what's coming and shrinks toward the last photo.
         for (depth in peek downTo 1) {

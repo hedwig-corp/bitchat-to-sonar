@@ -3844,13 +3844,17 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private fun mergePendingMediaUploads(chatId: String, published: List<SonarMsg>): List<SonarMsg> {
         val pending = pendingMediaUploads[chatId] ?: return published.sortedBy { it.tsSecs }
-        val matchedIds = mutableSetOf<String>()
+        // Track matched entries INDIVIDUALLY, not by message id: an album's N
+        // attachments share one echo message id, so removing by id would drop the
+        // whole echo (and its not-yet-cached siblings) the instant one attachment
+        // reconciles. An echo survives until every one of its entries matches.
+        val matched = mutableSetOf<PendingMediaUpload>()
         val usedCanonicalUrls = mutableSetOf<String>()
         val completedUploads = pending
             .filter { it.message.state != "Couldn't send" && it.completedOrder != null }
             .sortedBy { it.completedOrder }
         for (upload in completedUploads) {
-            val matched = cacheUploadedMediaBytes(
+            val ok = cacheUploadedMediaBytes(
                 published,
                 upload.data,
                 upload.filename,
@@ -3860,15 +3864,16 @@ class SonarAppState(private val scope: CoroutineScope) {
                 upload.existingMediaUrls,
                 usedCanonicalUrls,
             )
-            if (matched) matchedIds += upload.message.id
+            if (ok) matched += upload
         }
-        val survivors = pending.filterNot { it.message.id in matchedIds }
+        val survivors = pending.filterNot { it in matched }
         if (survivors.isEmpty()) {
             pendingMediaUploads.remove(chatId)
             return published.sortedBy { it.tsSecs }
         }
         pendingMediaUploads[chatId] = survivors.toMutableList()
-        val survivorMessages = survivors.map { it.message }
+        // Distinct by id: an album echo appears once per surviving attachment.
+        val survivorMessages = survivors.map { it.message }.distinctBy { it.id }
         val survivorIds = survivorMessages.mapTo(mutableSetOf()) { it.id }
         return (published.filterNot { it.id in survivorIds } + survivorMessages)
             .distinctBy { it.id }
@@ -3988,9 +3993,11 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         if (isContactBlocked(chatId)) { toast = "Unblock this contact before sending."; return }
         if (isMeshChat(chatId) && MeshRadio.hasMeshLink(meshPeerId(chatId))) {
-            val allSent = items.all { sendMeshMedia(meshPeerId(chatId), it.bytes, it.filename, it.mime) }
-            if (allSent) return
-            if (resolveMarmotGroupId(chatId) == null) return
+            // Mesh has no album packet — send each over mesh and return. Sending
+            // per-item (not `all {}`, which short-circuits mid-batch) avoids a
+            // partial mesh send that then double-sends via the Marmot album path.
+            for (item in items) sendMeshMedia(meshPeerId(chatId), item.bytes, item.filename, item.mime)
+            return
         }
         scope.launch {
             val groupId = resolveMarmotGroupId(chatId)
