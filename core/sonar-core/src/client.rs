@@ -2928,11 +2928,13 @@ impl SonarClient {
                 }
                 Ok(incoming) => {
                     self.record_delivery_for_incoming(&incoming);
-                    // A welcome that created or updated a group must notify the
-                    // conversation listener like a message does: the hosts' chat
-                    // lists are event-driven, so without this a brand-new
-                    // conversation stays invisible until an unrelated slow
-                    // heartbeat repaints the list.
+                    // A welcome or membership update that created or changed a
+                    // group must notify the conversation listener like a message
+                    // does: the hosts' chat lists are event-driven, so without
+                    // this a brand-new conversation stays invisible until an
+                    // unrelated slow heartbeat repaints the list. GroupUpdated
+                    // also covers kind-445 commit/proposal merges, whose
+                    // member-list change the row should reflect.
                     if let Incoming::GroupUpdated(group_id)
                     | Incoming::GroupInvitePending(group_id) = &incoming
                     {
@@ -4379,9 +4381,10 @@ mod tests {
         assert_eq!(bob_groups.len(), 1);
         let expected = hex::encode(bob_groups[0].mls_group_id.as_slice());
         let changed = listener.changed.lock().unwrap().clone();
-        assert!(
-            changed.contains(&expected),
-            "welcome must notify the conversation listener for the new group; got {changed:?}"
+        assert_eq!(
+            changed,
+            vec![expected],
+            "welcome must notify the conversation listener exactly once for the new group"
         );
     }
 
@@ -4434,9 +4437,10 @@ mod tests {
         assert_eq!(invites.len(), 1);
         let expected = hex::encode(invites[0].group_id.as_slice());
         let changed = listener.changed.lock().unwrap().clone();
-        assert!(
-            changed.contains(&expected),
-            "pending invite must notify the conversation listener; got {changed:?}"
+        assert_eq!(
+            changed,
+            vec![expected],
+            "pending invite must notify the conversation listener exactly once"
         );
     }
 }
