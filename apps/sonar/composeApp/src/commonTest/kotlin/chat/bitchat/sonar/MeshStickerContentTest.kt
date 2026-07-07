@@ -7,13 +7,13 @@ import kotlin.test.assertNull
 class MeshStickerContentTest {
     @Test fun meshStickerContentRoundTrip() {
         val encoded = meshStickerContent(
-            packCoordinate = "30030:abc123:pack",
+            packCoordinate = "30031:abc123:pack",
             shortcode = "wave",
             plaintextSha256 = "deadbeef",
         )
         val decoded = meshParseStickerContent(encoded)
 
-        assertEquals("30030:abc123:pack", decoded?.packCoordinate)
+        assertEquals("30031:abc123:pack", decoded?.packCoordinate)
         assertEquals("wave", decoded?.shortcode)
         assertEquals("deadbeef", decoded?.plaintextSha256)
     }

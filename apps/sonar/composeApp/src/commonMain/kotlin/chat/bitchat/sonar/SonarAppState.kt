@@ -4069,7 +4069,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         identifier: String,
         relayUrls: List<String> = emptyList(),
     ): SonarStickerPack? {
-        val cacheKey = "30030:${authorPubkeyHex.lowercase()}:$identifier"
+        val cacheKey = "30031:${authorPubkeyHex.lowercase()}:$identifier"
         stickerPackCache.remove(cacheKey)?.let { stickerPackCache[cacheKey] = it; return it }
         return try {
             SonarCore.fetchStickerPack(authorPubkeyHex, identifier, relayUrls).also {

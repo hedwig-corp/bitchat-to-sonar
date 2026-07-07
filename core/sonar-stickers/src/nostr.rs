@@ -81,7 +81,7 @@ pub fn parse_installed_pack_list(event: &Event) -> Result<InstalledPackList> {
     if event.kind != Kind::Custom(USER_STICKER_PACKS_KIND) {
         return Err(StickerError::InvalidField {
             field: "kind",
-            reason: "expected kind 10030 installed sticker list".into(),
+            reason: "expected kind 10031 installed sticker list".into(),
         });
     }
     let packs = event
@@ -290,7 +290,7 @@ mod tests {
         assert_eq!(parsed.sticker("cat_wave").unwrap().sha256, HASH_A);
         assert_eq!(
             parsed.address.coordinate(),
-            format!("30030:{pubkey}:sonar-cats-v1")
+            format!("30031:{pubkey}:sonar-cats-v1")
         );
     }
 

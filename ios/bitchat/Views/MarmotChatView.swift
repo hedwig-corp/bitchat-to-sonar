@@ -1200,7 +1200,7 @@ final class MarmotChatModel: ObservableObject {
         identifier: String,
         relayUrls: [String]
     ) async -> StickerPackInfo? {
-        let cacheKey = "30030:\(authorPubkeyHex.lowercased()):\(identifier)"
+        let cacheKey = "30031:\(authorPubkeyHex.lowercased()):\(identifier)"
         if let cached = stickerPacksByCoordinate.removeValue(forKey: cacheKey) {
             stickerPacksByCoordinate[cacheKey] = cached
             return cached
@@ -1325,7 +1325,7 @@ final class MarmotChatModel: ObservableObject {
 
     private static func stickerPackParts(_ coordinate: String) -> (author: String, identifier: String)? {
         let parts = coordinate.split(separator: ":", maxSplits: 2, omittingEmptySubsequences: false)
-        guard parts.count == 3, parts[0] == "30030" else { return nil }
+        guard parts.count == 3, parts[0] == "30031" else { return nil }
         return (String(parts[1]), String(parts[2]))
     }
 

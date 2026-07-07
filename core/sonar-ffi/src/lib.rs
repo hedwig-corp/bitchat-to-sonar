@@ -2338,7 +2338,7 @@ mod tests {
 
     #[test]
     fn sticker_content_roundtrip() {
-        let pack = "30030:abc123:mypack".to_string();
+        let pack = "30031:abc123:mypack".to_string();
         let code = "wave".to_string();
         let hash = "deadbeef".to_string();
         let encoded = mesh_sticker_content(pack.clone(), code.clone(), hash.clone());

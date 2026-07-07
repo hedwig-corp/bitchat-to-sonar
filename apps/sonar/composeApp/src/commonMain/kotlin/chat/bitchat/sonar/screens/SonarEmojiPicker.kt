@@ -374,7 +374,7 @@ private fun ColumnScope.StickerTabContent(
 
     LaunchedEffect(Unit) {
         val coordinates = try { SonarCore.fetchInstalledPacks() } catch (_: Throwable) { emptyList() }
-        val toFetch = coordinates.ifEmpty { listOf("30030:$TEST_PACK_AUTHOR:$TEST_PACK_ID") }
+        val toFetch = coordinates.ifEmpty { listOf("30031:$TEST_PACK_AUTHOR:$TEST_PACK_ID") }
         val loaded = mutableListOf<SonarStickerPack>()
         for (coord in toFetch) {
             val parts = coord.split(":", limit = 3)

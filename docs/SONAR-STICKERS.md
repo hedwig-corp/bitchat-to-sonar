@@ -16,9 +16,18 @@ viewer.
 ## Identifiers
 
 - Pack format marker: `sonar-sticker-pack-v1`
-- Sticker pack event kind: `30030`
-- User installed-pack list kind: `10030`
-- Pack address coordinate: `30030:<author-pubkey-hex>:<identifier>`
+- Sticker pack event kind: `30031`
+- User installed-pack list kind: `10031`
+- Pack address coordinate: `30031:<author-pubkey-hex>:<identifier>`
+
+Kinds `30031` (addressable pack) and `10031` (replaceable installed list)
+deliberately sit one slot above the NIP-51/NIP-30 custom-emoji kinds `30030`
+(emoji set) and `10030` (user emoji list). Stickers reuse the emoji event shape
+(`title`/`image`/`description`/`emoji` tags on the pack, `a`-tag pointers on the
+list) but must not collide with emoji kinds, or every Nostr client would parse
+Sonar packs as emoji sets and a user's installed-pack list as their emoji list.
+These kinds are not yet in the Nostr registry-of-kinds; reserving them upstream
+is tracked as a follow-up.
 
 The `<author-pubkey-hex>` field is the 64-character lowercase Nostr public key
 that signed the pack event. The `<identifier>` field is the event `d` tag value
@@ -54,7 +63,7 @@ A sticker pack is a Nostr addressable event:
 
 ```json
 {
-  "kind": 30030,
+  "kind": 30031,
   "content": "",
   "tags": [
     ["d", "<identifier>"],
@@ -139,15 +148,15 @@ tags carry the immutable hash and MIME metadata required for safe rendering.
 
 ## Installed Pack List
 
-A user can publish the sticker packs installed in their client as kind `10030`.
+A user can publish the sticker packs installed in their client as kind `10031`.
 The event content is empty. Each installed pack is represented by an `a` tag:
 
 ```json
 {
-  "kind": 10030,
+  "kind": 10031,
   "content": "",
   "tags": [
-    ["a", "30030:<author-pubkey-hex>:<identifier>"]
+    ["a", "30031:<author-pubkey-hex>:<identifier>"]
   ]
 }
 ```
@@ -161,7 +170,7 @@ When a chat message references a sticker, the reference tag must include the
 immutable plaintext sticker hash:
 
 ```json
-["sticker", "30030:<author-pubkey-hex>:<identifier>", "<shortcode>", "<plaintext-sha256>"]
+["sticker", "30031:<author-pubkey-hex>:<identifier>", "<shortcode>", "<plaintext-sha256>"]
 ```
 
 The hash prevents an edited addressable pack from silently changing the meaning
@@ -181,8 +190,8 @@ untrusted sticker state instead of substituting a different image.
 4. Compute the plaintext SHA-256 of each sticker.
 5. Upload each plaintext sticker to the configured Blossom server.
 6. Build a Sonar `StickerPack` with address
-   `30030:<publisher-pubkey>:signal-<signal-pack-id>`.
-7. Publish the signed kind `30030` pack event to the configured relays.
+   `30031:<publisher-pubkey>:signal-<signal-pack-id>`.
+7. Publish the signed kind `30031` pack event to the configured relays.
 8. Print JSON containing the pack address, event id, relays, Blossom server,
    website URL, sticker count, and skipped Signal ids if any.
 
@@ -254,17 +263,17 @@ import.
 The `/stickers` web route accepts:
 
 ```text
-/stickers?a=30030:<author-pubkey-hex>:<identifier>&relay=wss://relay.example
+/stickers?a=30031:<author-pubkey-hex>:<identifier>&relay=wss://relay.example
 ```
 
-When `a` is present, the route queries the provided relays with a kind `30030`
+When `a` is present, the route queries the provided relays with a kind `30031`
 filter scoped to the author and `d` tag. Without `a`, it queries recent kind
-`30030` events tagged with `t=sonar-sticker-pack-v1`.
+`30031` events tagged with `t=sonar-sticker-pack-v1`.
 
 The web viewer treats relay events as untrusted input. It renders only parsed
 pack events that:
 
-- are kind `30030`;
+- are kind `30031`;
 - include `pack_format=sonar-sticker-pack-v1`;
 - have a valid 64-character hex publisher key;
 - have at least one valid `sticker` tag;

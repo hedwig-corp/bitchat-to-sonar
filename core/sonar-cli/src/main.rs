@@ -1409,7 +1409,7 @@ mod tests {
     fn website_url_encodes_address_and_relays() {
         let url = sticker_pack_website_url(
             "https://example.com/stickers/",
-            "30030:abc:def",
+            "30031:abc:def",
             &[
                 "wss://relay.example.com".to_owned(),
                 "wss://nos.lol".to_owned(),
@@ -1417,7 +1417,7 @@ mod tests {
         );
         assert_eq!(
             url,
-            "https://example.com/stickers?a=30030%3Aabc%3Adef&relay=wss%3A%2F%2Frelay.example.com&relay=wss%3A%2F%2Fnos.lol"
+            "https://example.com/stickers?a=30031%3Aabc%3Adef&relay=wss%3A%2F%2Frelay.example.com&relay=wss%3A%2F%2Fnos.lol"
         );
     }
 

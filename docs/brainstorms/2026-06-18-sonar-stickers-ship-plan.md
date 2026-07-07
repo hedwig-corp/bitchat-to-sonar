@@ -42,7 +42,7 @@ publisher, and web viewer. Native app follow-up:
 - `apps/sonar/`: Compose Multiplatform parity for discovery/install, picker,
   and rendering.
 - Shared contract: apps should consume the same `sonar-stickers` pack/ref
-  models and kind `30030`/`10030` event shapes.
+  models and kind `30031`/`10031` event shapes.
 
 ## Scope
 
@@ -65,8 +65,8 @@ publisher, and web viewer. Native app follow-up:
   - HTTPS Blossom URL shape
   - duplicate shortcode/hash rejection
 - Implement Nostr conversion for:
-  - `kind:30030` pack definitions
-  - `kind:10030` installed pack lists
+  - `kind:30031` pack definitions
+  - `kind:10031` installed pack lists
   - `sticker` reference tags for future chat messages
 - Implement Signal import/decryption behind the `signal-import` feature.
 - Add unit tests for pack conversion, Signal link parsing, HMAC rejection, and
@@ -87,7 +87,7 @@ publisher, and web viewer. Native app follow-up:
   generic Nostr relay filtering is only reliable for single-letter tag names.
   Use `["t", "sonar-sticker-pack-v1"]` plus a `pack_format` marker for clients.
 - Sent sticker references must include immutable plaintext hash material, not
-  only `(pack address, shortcode)`, because addressable `kind:30030` packs can
+  only `(pack address, shortcode)`, because addressable `kind:30031` packs can
   be edited.
 - Public pack events may include public Signal provenance, but Signal `pack_key`
   must not be published by default.
@@ -120,7 +120,7 @@ Feature flags:
 
 The `/stickers` route:
 
-- reads `?a=30030:<pubkey>:<identifier>&relay=wss://...` links returned by the
+- reads `?a=30031:<pubkey>:<identifier>&relay=wss://...` links returned by the
   CLI;
 - queries relays directly with a NIP-01 websocket subscription;
 - falls back to recent `sonar-sticker-pack-v1` tagged packs when no address is

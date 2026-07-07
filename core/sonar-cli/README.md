@@ -121,7 +121,7 @@ that send media do attach it, and `listen` surfaces it when present). Extending
 ## Sticker Packs
 
 `post` imports a Signal sticker pack, uploads the plaintext sticker images to a
-Blossom server, publishes a Sonar `kind:30030` sticker-pack event to the
+Blossom server, publishes a Sonar `kind:30031` sticker-pack event to the
 configured relays, and prints JSON with the website URL:
 
 ```bash

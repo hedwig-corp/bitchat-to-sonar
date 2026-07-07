@@ -252,7 +252,7 @@ private struct StickerTabContent: View {
 
     private func loadPacks() async {
         let coordinates = await fetchInstalledPacks()
-        let toFetch = coordinates.isEmpty ? ["30030:\(testPackAuthor):\(testPackId)"] : coordinates
+        let toFetch = coordinates.isEmpty ? ["30031:\(testPackAuthor):\(testPackId)"] : coordinates
         var loaded: [StickerPackInfo] = []
         for coord in toFetch {
             let parts = coord.split(separator: ":", maxSplits: 2).map(String.init)
