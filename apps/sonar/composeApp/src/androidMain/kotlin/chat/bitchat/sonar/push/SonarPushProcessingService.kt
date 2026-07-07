@@ -426,33 +426,22 @@ class SonarPushProcessingService : Service() {
                     }
                 }
 
-                if (WalletBridge.state() !is WalletState.Ready) {
-                    // Account Key Durability: a push path must never mint an
-                    // identity — bail silently when none exists yet.
-                    val nsec = SonarCore.identityNsec()
-                    if (nsec.isBlank()) {
-                        Log.d(TAG, "Breez wakeup skipped: no identity")
-                        events.cancel()
-                        return@coroutineScope
-                    }
-                    withTimeoutOrNull(WALLET_SETUP_TIMEOUT_MS) {
-                        WalletBridge.setupIfNeeded(nsec)
-                    }
-                } else if (!WalletBridge.isConnectionLive()) {
-                    // Ready but the reused websocket died in Doze — reconnect
-                    // rather than silently poll a dead node (empty → missed pay).
-                    Log.d(TAG, "Breez wakeup: stale connection, reconnecting")
-                    WalletBridge.shutdown()
-                    val nsec = SonarCore.identityNsec()
-                    if (nsec.isNotBlank()) {
-                        withTimeoutOrNull(WALLET_SETUP_TIMEOUT_MS) {
-                            WalletBridge.setupIfNeeded(nsec)
-                        }
-                    }
+                // Account Key Durability: a push path must never mint an
+                // identity — bail silently when none exists yet.
+                val nsec = SonarCore.identityNsec()
+                if (nsec.isBlank()) {
+                    Log.d(TAG, "Breez wakeup skipped: no identity")
+                    events.cancel()
+                    return@coroutineScope
                 }
-                if (WalletBridge.state() !is WalletState.Ready) {
-                    // Setup failed/timed out: no SDK, so nothing can settle —
-                    // don't burn the budget polling a nil wallet.
+                // One atomic probe+connect+reconnect under the wallet lock —
+                // handles cold-start (no SDK) and a Doze-stale reused handle,
+                // and serializes overlapping wakes onto one connection.
+                val live = withTimeoutOrNull(WALLET_SETUP_TIMEOUT_MS) {
+                    WalletBridge.ensureLiveConnection(nsec)
+                } ?: false
+                if (!live || WalletBridge.state() !is WalletState.Ready) {
+                    // No usable SDK — nothing can settle; don't burn the budget.
                     Log.w(TAG, "Breez wakeup: wallet not ready, giving up")
                     events.cancel()
                     return@coroutineScope
@@ -528,8 +517,11 @@ class SonarPushProcessingService : Service() {
             val body = WalletBridge.createBolt12Invoice(req.offer, req.invoiceRequest).fold(
                 onSuccess = { JsonLite.encodeObject("invoice", it) },
                 onFailure = {
+                    // Keep the detailed SDK message local; the reply is relayed
+                    // verbatim to the swap server, so send a generic reason and
+                    // don't leak Breez internals to a semi-trusted counterparty.
                     Log.w(TAG, "invoice_request: createBolt12Invoice failed", it)
-                    JsonLite.encodeObject("error", it.message ?: "failed to create invoice")
+                    JsonLite.encodeObject("error", "failed to create invoice")
                 },
             )
             postReply(req.replyUrl, body)
@@ -545,6 +537,10 @@ class SonarPushProcessingService : Service() {
                 val conn = URL(url).openConnection() as HttpURLConnection
                 try {
                     conn.requestMethod = "POST"
+                    // The host pin validates only this URL; don't let a 3xx from
+                    // the (compromised/open-redirecting) host bounce the POST past
+                    // the pin to another origin.
+                    conn.instanceFollowRedirects = false
                     conn.connectTimeout = 10_000
                     conn.readTimeout = 10_000
                     conn.doOutput = true

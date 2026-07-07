@@ -87,53 +87,95 @@ actual object WalletBridge {
         lock.withLock {
             recoverPendingCleanupLocked()
             if (sdk != null) return@withContext
-            val key = apiKey()
-            if (key.isEmpty()) { current = WalletState.NotConfigured; return@withContext }
-            val secretHex = Bech32.nsecToSecretHex(nsec)
-            if (secretHex == null) { current = WalletState.Failed("no identity"); return@withContext }
-            current = WalletState.SettingUp
-            // The Breez connect()/getInfo() are blocking native calls — a plain
-            // withTimeoutOrNull can't preempt them (cancellation is cooperative).
-            // Run them in a child coroutine and bound the await: on timeout the UI
-            // gets Failed instead of hanging on SettingUp forever (the abandoned
-            // call finishes on its IO thread but its result is discarded).
-            val outcome = coroutineScope {
-                val work = async(Dispatchers.IO) {
-                    val seed = WalletSeed.breezSeed(WalletSeed.hexToBytes(secretHex))
-                    val config = defaultConfig(LiquidNetwork.MAINNET, key).apply {
-                        val dir = File(ctx.filesDir, "sonar-wallet/mainnet").apply { mkdirs() }
-                        workingDir = dir.absolutePath
-                    }
-                    var node: BindingLiquidSdk? = null
-                    var handedOff = false
-                    try {
-                        val connected = connect(ConnectRequest(config, null, null, seed.map { it.toUByte() }))
-                        node = connected
-                        currentCoroutineContext().ensureActive()
-                        val balanceSats = connected.getInfo().walletInfo.balanceSat.toLong()
-                        currentCoroutineContext().ensureActive()
-                        handedOff = true
-                        connected to balanceSats
-                    } finally {
-                        // Timeout/cancellation is cooperative only after the native
-                        // call returns. Never leak that late node or let it retain a
-                        // database handle that a subsequent account restore deletes.
-                        if (!handedOff) runCatching { node?.disconnect() }
-                    }
+            connectLocked(nsec)
+        }
+    }
+
+    /**
+     * Connect + store the SDK. **Assumes [lock] is held and [sdk] is null.**
+     * Factored out of [setupIfNeeded] so [ensureLiveConnection] can reuse it
+     * inside the same lock acquisition (kotlinx `Mutex` is non-reentrant).
+     */
+    private suspend fun connectLocked(nsec: String) {
+        val key = apiKey()
+        if (key.isEmpty()) { current = WalletState.NotConfigured; return }
+        val secretHex = Bech32.nsecToSecretHex(nsec)
+        if (secretHex == null) { current = WalletState.Failed("no identity"); return }
+        current = WalletState.SettingUp
+        // The Breez connect()/getInfo() are blocking native calls — a plain
+        // withTimeoutOrNull can't preempt them (cancellation is cooperative).
+        // Run them in a child coroutine and bound the await: on timeout the UI
+        // gets Failed instead of hanging on SettingUp forever (the abandoned
+        // call finishes on its IO thread but its result is discarded).
+        val outcome = coroutineScope {
+            val work = async(Dispatchers.IO) {
+                val seed = WalletSeed.breezSeed(WalletSeed.hexToBytes(secretHex))
+                val config = defaultConfig(LiquidNetwork.MAINNET, key).apply {
+                    val dir = File(ctx.filesDir, "sonar-wallet/mainnet").apply { mkdirs() }
+                    workingDir = dir.absolutePath
                 }
-                runCatching { withTimeoutOrNull(20_000) { work.await() } }
-                    .also { if (it.getOrNull() == null) work.cancel() }
-            }
-            current = when {
-                outcome.isFailure -> WalletState.Failed(outcome.exceptionOrNull()?.message ?: "wallet setup failed")
-                outcome.getOrNull() == null -> WalletState.Failed("wallet setup timed out")
-                else -> outcome.getOrThrow()!!.let { (node, bal) ->
-                    sdk = node
-                    balance.value = bal
-                    startObservingBalance(node)
-                    WalletState.Ready(bal)
+                var node: BindingLiquidSdk? = null
+                var handedOff = false
+                try {
+                    val connected = connect(ConnectRequest(config, null, null, seed.map { it.toUByte() }))
+                    node = connected
+                    currentCoroutineContext().ensureActive()
+                    val balanceSats = connected.getInfo().walletInfo.balanceSat.toLong()
+                    currentCoroutineContext().ensureActive()
+                    handedOff = true
+                    connected to balanceSats
+                } finally {
+                    // Timeout/cancellation is cooperative only after the native
+                    // call returns. Never leak that late node or let it retain a
+                    // database handle that a subsequent account restore deletes.
+                    if (!handedOff) runCatching { node?.disconnect() }
                 }
             }
+            runCatching { withTimeoutOrNull(20_000) { work.await() } }
+                .also { if (it.getOrNull() == null) work.cancel() }
+        }
+        current = when {
+            outcome.isFailure -> WalletState.Failed(outcome.exceptionOrNull()?.message ?: "wallet setup failed")
+            outcome.getOrNull() == null -> WalletState.Failed("wallet setup timed out")
+            else -> outcome.getOrThrow()!!.let { (node, bal) ->
+                sdk = node
+                balance.value = bal
+                startObservingBalance(node)
+                WalletState.Ready(bal)
+            }
+        }
+    }
+
+    /**
+     * Bring the wallet to a live, connected state for a headless wake, atomically
+     * under [lock]: connect if there is no SDK, or probe a reused handle and
+     * reconnect it if its websocket died in Doze. Returns true when [sdk] is
+     * usable afterward.
+     *
+     * Replaces the caller-side `isConnectionLive() → shutdown() → setupIfNeeded()`
+     * dance, which was check-then-act across three separate lock acquisitions —
+     * two near-simultaneous Breez wakes could interleave it and tear down each
+     * other's freshly-built node. Doing the whole probe+reconnect in one lock
+     * acquisition serializes overlapping wakes onto a single connection.
+     */
+    suspend fun ensureLiveConnection(nsec: String): Boolean = withContext(Dispatchers.IO) {
+        lock.withLock {
+            val existing = sdk
+            if (existing != null && runCatching { existing.getInfo() }.isSuccess) {
+                return@withLock true
+            }
+            if (existing != null) {
+                // Stale handle — disconnect it inline (can't call shutdown(); it
+                // re-locks). Bump the epoch so any in-flight refreshBalance write
+                // is dropped, and detach the listener before disconnect.
+                walletEpoch += 1
+                balanceListenerId?.let { id -> runCatching { existing.removeEventListener(id) } }
+                balanceListenerId = null
+                runCatching { existing.disconnect() }
+                sdk = null
+            }
+            connectLocked(nsec)
+            sdk != null
         }
     }
 
@@ -186,6 +228,11 @@ actual object WalletBridge {
      *  payment rather than mint a random id that could duplicate ledger rows. */
     private fun paymentEventOf(p: Payment): WalletPaymentEvent? {
         val lightning = p.details as? PaymentDetails.Lightning
+        // A settled RECEIVE always carries a txId (chain) or paymentHash
+        // (Lightning); `destination` is a last-resort fallback for the
+        // both-null case. It is a reused target for a static offer, so if that
+        // case were ever reachable for two distinct receives they would collapse
+        // to one ledger id — in practice unreachable for settled receives.
         val id = p.txId ?: lightning?.paymentHash ?: p.destination ?: return null
         return WalletPaymentEvent(
             paymentId = id,
@@ -226,18 +273,24 @@ actual object WalletBridge {
      */
     suspend fun recentIncomingReceives(sinceSecs: Long): List<WalletPaymentEvent> =
         withContext(Dispatchers.IO) {
-            val node = sdk ?: return@withContext emptyList()
-            runCatching {
-                node.listPayments(
-                    ListPaymentsRequest(
-                        filters = listOf(PaymentType.RECEIVE),
-                        states = listOf(PaymentState.COMPLETE, PaymentState.PENDING),
-                        fromTimestamp = sinceSecs,
-                        sortAscending = false,
-                        limit = 20u,
+            // Under [lock] so a concurrent shutdown()/ensureLiveConnection() can't
+            // disconnect the handle mid-`listPayments` (a native call on a freed
+            // BindingLiquidSdk could abort). The wake calls this sequentially
+            // after ensureLiveConnection releases the lock, so no reentrancy.
+            lock.withLock {
+                val node = sdk ?: return@withLock emptyList()
+                runCatching {
+                    node.listPayments(
+                        ListPaymentsRequest(
+                            filters = listOf(PaymentType.RECEIVE),
+                            states = listOf(PaymentState.COMPLETE, PaymentState.PENDING),
+                            fromTimestamp = sinceSecs,
+                            sortAscending = false,
+                            limit = 20u,
+                        )
                     )
-                )
-            }.getOrDefault(emptyList()).mapNotNull(::paymentEventOf)
+                }.getOrDefault(emptyList()).mapNotNull(::paymentEventOf)
+            }
         }
 
     /**
@@ -245,28 +298,20 @@ actual object WalletBridge {
      * so the payer can pay it. The exact call iOS's `InvoiceRequestTask` makes
      * in the NSE (`liquidSDK.createBolt12Invoice`); on Android the push service
      * calls this headlessly and POSTs the result to the NDS reply URL itself,
-     * because the KMP bindings ship no notification plugin.
+     * because the KMP bindings ship no notification plugin. Held under [lock]
+     * for the same reason as [recentIncomingReceives] — the handle must not be
+     * torn down while the (multi-second) native call is in flight.
      */
     suspend fun createBolt12Invoice(offer: String, invoiceRequest: String): Result<String> =
         withContext(Dispatchers.IO) {
-            val node = sdk
-                ?: return@withContext Result.failure(IllegalStateException("wallet not ready"))
-            runCatching {
-                node.createBolt12Invoice(CreateBolt12InvoiceRequest(offer, invoiceRequest)).invoice
+            lock.withLock {
+                val node = sdk
+                    ?: return@withLock Result.failure(IllegalStateException("wallet not ready"))
+                runCatching {
+                    node.createBolt12Invoice(CreateBolt12InvoiceRequest(offer, invoiceRequest)).invoice
+                }
             }
         }
-
-    /**
-     * Liveness probe for a reused connection: a wake may find `state()` Ready
-     * from a prior wake whose websocket has since died in Doze. `getInfo()`
-     * round-trips the SDK; false means the handle is stale and the caller
-     * should `shutdown()` + `setupIfNeeded()` rather than silently poll a dead
-     * node (which returns empty → "nothing arrived" → missed payment).
-     */
-    suspend fun isConnectionLive(): Boolean = withContext(Dispatchers.IO) {
-        val node = sdk ?: return@withContext false
-        runCatching { node.getInfo() }.isSuccess
-    }
 
     /** Conflates SDK event bursts (initial sync, payment storms) into at most
      *  one in-flight `getInfo()` plus one trailing refresh, instead of one
