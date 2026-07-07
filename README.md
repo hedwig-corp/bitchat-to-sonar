@@ -84,7 +84,8 @@ person is one conversation whether they're reachable over BLE or White Noise.
 
 For protocol detail, see the [Technical Whitepaper](WHITEPAPER.md), the Noise
 write-up in [BRING_THE_NOISE.md](BRING_THE_NOISE.md), and the specs under
-[`docs/`](docs/).
+[`docs/`](docs/) — including [Hermes Agent integration](docs/HERMES-AGENT.md) for
+headless `sonar-cli` + AI agents.
 
 ## Platform support
 
