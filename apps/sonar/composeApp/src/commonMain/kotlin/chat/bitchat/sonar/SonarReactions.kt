@@ -69,6 +69,10 @@ internal fun foldMeshReactions(source: List<SonarMsg>): List<SonarMsg> {
     for (m in source) {
         val line = ReactionLine.decode(m.content)
         if (line == null) { visible.add(m); continue }
+        // A local reaction send that FAILED must not fold: the peer never got
+        // it, so showing the chip would lie. (Sending/sent lines fold
+        // optimistically like normal local echoes.)
+        if (m.mine && sonarDeliveryFailed(m.state)) continue
         val senderKey = if (m.mine) "" else m.senderNpub.ifBlank { "?" }
         val perSender = byTarget.getOrPut(line.targetMessageId) { LinkedHashMap() }
         if (line.add) {

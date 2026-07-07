@@ -47,6 +47,18 @@ pub const REACTION_RUMOR_KIND: u16 = 7;
 /// reject text smuggled through a reaction rumor.
 pub const REACTION_EMOJI_MAX_CHARS: usize = 16;
 
+/// App-layer mesh reaction control line (`⚡REACT|1|<meshMsgId>|<emoji>|<verb>`).
+/// It rides the Marmot fallback leg as normal kind-9 content when the peer is
+/// out of BLE range. Such rows stay in transcript pages (the apps fold them
+/// onto their mesh targets) but must never drive chat recency, previews, or
+/// per-chat resync floors — they are reactions, not chat messages.
+pub(crate) const MESH_REACTION_LINE_PREFIX: &str = "⚡REACT|";
+
+/// True when a stored kind-9 row is really a mesh-referencing reaction line.
+fn is_mesh_reaction_row(content: &str) -> bool {
+    content.starts_with(MESH_REACTION_LINE_PREFIX)
+}
+
 /// Marmot KeyPackage event kind (MIP-00). nostr 0.44 has no named constant
 /// for the modern addressable kind (Kind::MlsKeyPackage is the legacy 443).
 pub const KEY_PACKAGE_KIND: u16 = 30443;
@@ -1451,7 +1463,15 @@ impl MarmotEngine {
         let mut pages = Vec::new();
         for group in self.groups()? {
             let messages = self.messages_page_raw(&group.mls_group_id, page_limit, 0)?;
-            let Some(latest_created_at) = messages.iter().map(|m| m.created_at).max() else {
+            // Recency comes from real chat rows only: a mesh-referencing
+            // ⚡REACT fallback line must never bump/reorder a conversation
+            // (the rows stay in the page so hosts can fold them).
+            let Some(latest_created_at) = messages
+                .iter()
+                .filter(|m| !is_mesh_reaction_row(&m.content))
+                .map(|m| m.created_at)
+                .max()
+            else {
                 continue;
             };
             pages.push(RecentMessagePage {
@@ -1591,7 +1611,14 @@ impl MarmotEngine {
             raw_scanned += raw_len;
             raw_offset += raw_len;
             for m in msgs {
-                if m.kind.as_u16() == CHAT_RUMOR_KIND && m.pubkey != me {
+                // A remote ⚡REACT fallback row is a reaction, not a chat
+                // message: letting it advance this floor could hide an earlier
+                // missed peer message from relay resync (the same failure
+                // class as the sync-watermark pinning bug).
+                if m.kind.as_u16() == CHAT_RUMOR_KIND
+                    && m.pubkey != me
+                    && !is_mesh_reaction_row(&m.content)
+                {
                     return Some(m.created_at.as_secs());
                 }
             }

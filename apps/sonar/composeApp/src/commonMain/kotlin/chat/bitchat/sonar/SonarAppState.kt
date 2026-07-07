@@ -1299,7 +1299,6 @@ class SonarAppState(private val scope: CoroutineScope) {
     private var relayConnectJob: Job? = null
     private var relayStartupCompleted = false
     private var pollJob: Job? = null
-    private var marmotWakeJob: Job? = null
     /** Consumer of the event-driven housekeeping cycle. Triggered by the core
      *  `conversationChanged` flow (primary) and a slow heartbeat (fallback);
      *  the [housekeepingTrigger] channel conflates bursts into one pass. */
@@ -5896,7 +5895,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 val groups = npubRawFor(peerId)?.let { marmotGroupsForNpub(it) }
                     ?: chats.filter { peerIdForMarmotGroup(it) == peerId }
                 for (group in groups) {
-                    if (marmotMessages(group.id).any { it.id == messageId }) {
+                    if (marmotMessagesPage(group.id).any { it.id == messageId }) {
                         runCatching { SonarCore.toggleReaction(group.id, messageId, e) }
                             .onFailure { toast = "reaction failed: ${it.message}" }
                         refreshOpenDm(peerId)
@@ -5922,7 +5921,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             // the group whose local page actually contains the message.
             val groupIds = directMarmotChatIds(chatId)
             val owner = groupIds.firstOrNull { groupId ->
-                runCatching { marmotMessages(groupId).any { it.id == messageId } }
+                runCatching { marmotMessagesPage(groupId).any { it.id == messageId } }
                     .getOrDefault(false)
             } ?: groupIds.firstOrNull() ?: return@launch
             runCatching { SonarCore.toggleReaction(owner, messageId, e) }
@@ -9823,28 +9822,6 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  signal: presence, BLE policy, unify, profile TTLs). Message delivery /
      *  call ringing / pay processing for the changed chat stay on the prompt
      *  `conversationChanged` path in [collectConversationChanges]. */
-    /** Signal-style event-driven receive (iOS `startPolling` parity): park on
-     *  the core's live-event buffer and drain the instant a 445 lands, instead
-     *  of leaving buffered events to the 30/60 s heartbeat `sync()`. Repaint and
-     *  notifications ride the conversation-changed listener like every other
-     *  local-DB change; this loop never touches UI state itself. */
-    private fun startMarmotWakeLoop() {
-        if (marmotWakeJob?.isActive == true) return
-        marmotWakeJob = scope.launch {
-            while (true) {
-                val woke = SonarCore.waitForMarmotEvent(25L)
-                if (woke) {
-                    SonarCore.drainPendingMarmot()
-                } else {
-                    // Idle timeout (or node unavailable, which returns false
-                    // without parking): floor the loop so it can never spin
-                    // hot. Subscription self-heal stays the heartbeat's job.
-                    delay(1_000)
-                }
-            }
-        }
-    }
-
     private fun poll() {
         if (pollJob?.isActive == true) return
         startHousekeepingConsumer()

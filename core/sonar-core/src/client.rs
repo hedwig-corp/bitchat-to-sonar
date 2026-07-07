@@ -124,10 +124,7 @@ const STICKER_REF_PREFETCH_CONCURRENCY: usize = 2;
 const STICKER_PREFETCH_CANCEL_POLL: Duration = Duration::from_millis(25);
 const SONAR_DIRECT_DM_DESCRIPTION: &str = "sonar.direct-dm.v1";
 
-/// App-layer mesh reaction control line (`⚡REACT|1|<meshMsgId>|<emoji>|<verb>`).
-/// It rides the Marmot fallback leg as normal kind-9 content when the peer is
-/// out of BLE range; the drain path must treat it as a reaction, not a message.
-const MESH_REACTION_LINE_PREFIX: &str = "⚡REACT|";
+use crate::marmot::MESH_REACTION_LINE_PREFIX;
 
 /// Shared HTTP client for Blossom media downloads. Built once so every blob
 /// reuses keep-alive connections + the TLS session cache instead of paying a
@@ -5666,7 +5663,9 @@ impl SonarClient {
         groups
             .into_iter()
             .filter_map(
-                |group| match engine.messages_page(&group.mls_group_id, 1, 0) {
+                // Raw page: an emptiness probe must never pay the per-group
+                // reaction aggregation scan (cold-start sync path).
+                |group| match engine.messages_page_raw(&group.mls_group_id, 1, 0) {
                     Ok(page) if page.is_empty() => Some(hex::encode(group.nostr_group_id)),
                     _ => None,
                 },
@@ -5704,8 +5703,10 @@ impl SonarClient {
         groups
             .into_iter()
             .filter_map(|group| {
+                // Raw page: an emptiness probe must never pay the per-group
+                // reaction aggregation scan (cold-start sync path).
                 let has_local_chat = engine
-                    .messages_page(&group.mls_group_id, 1, 0)
+                    .messages_page_raw(&group.mls_group_id, 1, 0)
                     .map(|page| !page.is_empty())
                     .unwrap_or(false);
                 if !has_local_chat {
@@ -8051,6 +8052,7 @@ mod tests {
             media,
             sticker_ref: None,
             classification: crate::marmot::MessageClassification::Text,
+            reactions: Vec::new(),
         };
         // Caption/text always wins.
         assert_eq!(

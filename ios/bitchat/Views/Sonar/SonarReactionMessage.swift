@@ -117,25 +117,29 @@ enum SonarReactionMessage: Equatable {
         visible.reserveCapacity(messages.count)
         // Current reaction per (target message id, sender key).
         var current: [String: [String: (emoji: String, mine: Bool)]] = [:]
-        var sawReaction = false
         for message in messages {
             guard let line = decode(message.content) else {
                 visible.append(message)
                 continue
             }
-            sawReaction = true
             let mine = myPeerID != nil && message.senderPeerID == myPeerID
+            // A local reaction send that FAILED must not fold: the peer never
+            // got it, so showing the chip would lie. (Pending/sent lines fold
+            // optimistically like normal local echoes.)
+            if mine, case .failed = message.deliveryStatus { continue }
             let senderKey = mine ? "me" : (message.senderPeerID?.id ?? message.sender)
             apply(line, senderKey: senderKey, mine: mine, to: &current)
         }
         for external in externalLines.sorted(by: { $0.date < $1.date }) {
-            sawReaction = true
             // "me" folds cross-leg with the mesh key so my own toggle is one
             // slot regardless of which transport carried it.
             let senderKey = external.mine ? "me" : external.senderKey
             apply(external.line, senderKey: senderKey, mine: external.mine, to: &current)
         }
-        guard sawReaction else { return visible }
+        // No early-out on "no reaction lines": BitchatMessage is a class and a
+        // PREVIOUS fold may have set `reactions` on these same instances — if
+        // the last line disappeared from the input (blocked sender, removed
+        // fallback group, page window), the stale chip must clear below.
         for message in visible {
             let byEmoji = (current[message.id] ?? [:]).values
             var counts: [String: (count: Int, mine: Bool)] = [:]

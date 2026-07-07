@@ -1875,8 +1875,12 @@ final class MarmotChatModel: ObservableObject {
     }
 
     func homeRowMessage(groupId: String) -> MarmotService.MarmotMessage? {
+        // ⚡REACT fallback lines are reactions, not chat messages: the core
+        // conversation index already excludes them from the summary, but the
+        // in-memory loaded page still has them, so they must never win here
+        // either — a tapback must not drive this row's recency/preview.
         snMarmotHomeRowMessage(
-            loaded: messagesByGroup[groupId]?.last,
+            loaded: messagesByGroup[groupId]?.last(where: { !SonarReactionMessage.isReactionLine($0.content) }),
             summary: conversationSummariesByGroup[groupId]
         )
     }
