@@ -4,6 +4,20 @@ The complete design handoff bundle lives in `design/handoff/`. It is **vendored*
 (checked in) so agents read it from disk instead of re-fetching every time.
 
 - **Source share:** https://api.anthropic.com/v1/design/h/UQethAMsRlMNd4xMzNISTA?open_file=Sonar+Prototype.html (Claude Design / claude.ai/design)
+- **Docs refresh (2026-07-07)** — Claude Design project
+  `c6936a45-1fde-470e-9d0b-56b04428e60b`
+  ([open](https://claude.ai/design/p/c6936a45-1fde-470e-9d0b-56b04428e60b?file=Sonar+Docs.html)):
+  ADDS the documentation site. New files vendored here:
+  `project/Sonar Docs.html` (the docs shell — sticky top bar with a `docs` tag,
+  left sidebar nav + search, markdown article, sticky on-this-page TOC with
+  scroll-spy, prev/next, mobile drawer) and `project/sonar/docs-content.js`
+  (the doc corpus: `SONAR_DOCS.groups` + `SONAR_DOCS.docs`, markdown mirroring
+  the repo `docs/` folder — Discovery, Notifications, Payments, BIP-353,
+  Stickers). Implemented in the marketing site at `web/src/routes/docs/`
+  (`+page.svelte` + `$lib/docs-content.js` + `$lib/markdown.js`); the Nav
+  "Open the prototype" link was replaced by a **Docs** link. The same project
+  also carries a newer Stickers directory (`Sonar Stickers.html`,
+  `sonar/stickers/*`) that is out of scope for this refresh.
 - **Last synced:** 2026-06-16. Three design refreshes landed this day, all vendored here:
   - **Profile key-management** (`UQethAMsRlMNd4xMzNISTA`): reworks the profile view key
     management. ADDS a `KeyShareCard` in `project/sonar/settings.jsx` (QR + tap-to-expand

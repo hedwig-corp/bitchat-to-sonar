@@ -14,7 +14,13 @@ const config = {
       fallback: '404.html'
     }),
     paths: { base },
-    prerender: { entries: ['*'] }
+    prerender: {
+      entries: ['*'],
+      // The /docs page uses URL-hash fragments (#index, #SONAR-DISCOVERY, …) as
+      // client-side router keys, not as in-page scroll targets, so those ids do
+      // not exist as elements at prerender time. Don't fail the build on them.
+      handleMissingId: 'ignore'
+    }
   }
 };
 
