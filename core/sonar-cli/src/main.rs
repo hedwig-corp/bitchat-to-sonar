@@ -416,7 +416,18 @@ async fn run(cli: Cli) -> Result<()> {
                     })?;
                 } else {
                     // Multiple --file paths → one album message (N imeta tags on
-                    // a single event).
+                    // a single event). Albums are photos-only: the iOS/Compose
+                    // renderers show every attachment for all-image albums but
+                    // fall back to the first item otherwise, so a non-image album
+                    // would hide attachments 2..N on receipt. Reject those here;
+                    // send non-image media one file per message instead.
+                    if let Some(bad) = payloads.iter().find(|p| !p.2.starts_with("image/")) {
+                        return Err(CliError::Message(format!(
+                            "album sends (multiple --file) are images only; \"{}\" is {}. \
+                             Send non-image media one file per message.",
+                            bad.1, bad.2
+                        )));
+                    }
                     let count = payloads.len();
                     let total_bytes: usize = payloads.iter().map(|p| p.0.len()).sum();
                     let filenames: Vec<String> = payloads.iter().map(|p| p.1.clone()).collect();

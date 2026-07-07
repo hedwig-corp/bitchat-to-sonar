@@ -3848,7 +3848,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         // attachments share one echo message id, so removing by id would drop the
         // whole echo (and its not-yet-cached siblings) the instant one attachment
         // reconciles. An echo survives until every one of its entries matches.
-        val matched = mutableSetOf<PendingMediaUpload>()
+        // Key matches on the unique per-entry pendingUrl (a data class with a
+        // ByteArray field hashes on array identity, which is fragile in a Set).
+        val matchedUrls = mutableSetOf<String>()
         val usedCanonicalUrls = mutableSetOf<String>()
         val completedUploads = pending
             .filter { it.message.state != "Couldn't send" && it.completedOrder != null }
@@ -3864,9 +3866,9 @@ class SonarAppState(private val scope: CoroutineScope) {
                 upload.existingMediaUrls,
                 usedCanonicalUrls,
             )
-            if (ok) matched += upload
+            if (ok) matchedUrls += upload.pendingUrl
         }
-        val survivors = pending.filterNot { it in matched }
+        val survivors = pending.filterNot { it.pendingUrl in matchedUrls }
         if (survivors.isEmpty()) {
             pendingMediaUploads.remove(chatId)
             return published.sortedBy { it.tsSecs }
