@@ -219,11 +219,14 @@ expect object MeshRadio {
 
     /** Send an encrypted DM over the BLE mesh to the peer with stable [peerId]
      *  (fingerprint). Resolves the peer's CURRENT address/peerID at send time, so
-     *  delivery survives rotation. Returns false only if it could not be queued. */
+     *  delivery survives rotation. Fail-fast: returns true ONLY when the message
+     *  was written to a live Noise route, false otherwise — there is no hidden
+     *  queue, so the caller (app-level outbox) owns retry / White Noise fallback.
+     *  Never treat a `true` as "accepted for later delivery". */
     fun sendMeshDm(peerId: String, messageId: String, text: String): Boolean
-    /** Send an encrypted DM only if a Noise link is established right now.
-     *  Unlike [sendMeshDm], this must not queue. Call signaling uses this so a
-     *  stale OFFER/ANSWER/END is never delivered after the peer leaves BLE. */
+    /** Same fail-fast write contract as [sendMeshDm]; kept distinct for call
+     *  signaling, which must never risk delivering a stale OFFER/ANSWER/END after
+     *  the peer leaves BLE. (Neither variant queues; the split is historical.) */
     fun sendMeshDmNow(peerId: String, messageId: String, text: String): Boolean
     /** True iff an encrypted Noise link to the peer with stable [peerId]
      *  (fingerprint) is established right now. */
@@ -232,6 +235,11 @@ expect object MeshRadio {
     fun localPeerIdHex(): String
     /** Pull (and clear) all mesh DMs received since the last call. */
     fun drainMeshDm(): List<MeshDmIn>
+    /** Pull (and clear) the fingerprints whose Noise link (re)established since
+     *  the last call. The app drains this on its realtime tick to flush queued
+     *  outbox / favorite-control work for that peer — including BACKGROUND chats
+     *  that the open-chat link watch and the announce-set re-entry miss. */
+    fun drainMeshLinkUps(): List<String>
     /** Send a private BLE file transfer to a live mesh peer. This does not queue:
      * callers should fall back to White Noise or show a route error when false. */
     fun sendMeshMedia(peerId: String, messageId: String, bytes: ByteArray, filename: String, mimeType: String): Boolean

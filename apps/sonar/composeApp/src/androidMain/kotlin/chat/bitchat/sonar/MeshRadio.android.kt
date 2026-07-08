@@ -93,6 +93,9 @@ actual object MeshRadio {
     private val meshMediaInbox = java.util.concurrent.ConcurrentLinkedQueue<MeshMediaIn>()
     /** Incoming public Mesh-channel broadcasts, buffered until drained. */
     private val meshBroadcastInbox = java.util.concurrent.ConcurrentLinkedQueue<MeshBroadcastIn>()
+    /** Fingerprints whose Noise link (re)established, buffered until the app
+     *  drains them to flush queued outbox / favorite-control work on re-link. */
+    private val meshLinkUpInbox = java.util.concurrent.ConcurrentLinkedQueue<String>()
 
     init {
         // The String identity from MeshGatt is the peer's STABLE fingerprint
@@ -132,8 +135,13 @@ actual object MeshRadio {
             announcedSeen[fingerprint] = System.currentTimeMillis()
             if (previous != peer) notifyPeerUpdate()
         }
-        // Keep a peer fresh while its encrypted link is (re)established.
-        MeshGatt.addLinkListener { fingerprint -> announcedSeen[fingerprint] = System.currentTimeMillis() }
+        // Keep a peer fresh while its encrypted link is (re)established, and
+        // surface the re-link so the app flushes queued work for that peer
+        // (outbox + favorite controls) even for chats that aren't open.
+        MeshGatt.addLinkListener { fingerprint ->
+            announcedSeen[fingerprint] = System.currentTimeMillis()
+            if (isKnownPeer(fingerprint)) meshLinkUpInbox.add(fingerprint)
+        }
     }
 
     private val ctx: Context get() = AppContextHolder.ctx
@@ -372,6 +380,15 @@ actual object MeshRadio {
         MeshGatt.sendTextToPeerNow(peerId, messageId, text)
 
     actual fun hasMeshLink(peerId: String): Boolean = MeshGatt.hasLink(peerId)
+
+    actual fun drainMeshLinkUps(): List<String> {
+        val out = ArrayList<String>()
+        while (true) {
+            val fp = meshLinkUpInbox.poll() ?: break
+            if (isKnownPeer(fp)) out.add(fp)
+        }
+        return out
+    }
 
     actual fun localPeerIdHex(): String = MeshGatt.nodeId().toHexLower()
 
