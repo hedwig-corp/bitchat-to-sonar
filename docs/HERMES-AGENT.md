@@ -1,15 +1,181 @@
 # Running Sonar as a Hermes Agent
 
-Status: draft. This document is the operator runbook for driving `sonar-cli`
-(see `core/sonar-cli`) as an autonomous agent from
+Status: operator runbook for driving `sonar-cli` (see `core/sonar-cli`) as an
+autonomous agent from
 [Hermes Agent](https://hermes-agent.nousresearch.com/docs) by Nous Research.
 
-The goal is an always-on agent that reads inbound Sonar/Marmot direct messages
-and replies, using **zero integration code**: Hermes shells out to the prebuilt
-`sonar-cli` binary through its `terminal` toolset, and a `SKILL.md` teaches it
-the command contract.
+**Choose an integration path:**
 
-## Architecture
+| Path | Best for | Agent loop | Transport |
+|------|----------|------------|-----------|
+| **A. Native gateway (recommended)** | Production DMs with full tool/MCP/memory parity (same as Telegram) | `hermes gateway` + `SonarAdapter` | Long-running `sonar-cli listen` child process |
+| **B. Cron + skill (minimal)** | No gateway plugin; smallest moving parts | Hermes cron + `terminal` toolset | `sonar-cli listen --once` on an interval |
+
+Both paths use the same `sonar-cli` JSON contract and `SONAR_CLI_HOME` identity.
+**Never run two listeners** (gateway + legacy bridge, or gateway + cron drain) on
+the same identity — duplicate replies and pairing pressure.
+
+---
+
+## Shared prerequisites
+
+- Hermes Agent installed and authenticated.
+- **Correct binary:** crates.io `nostr-cli` is **not** Sonar. Verify:
+
+  ```bash
+  sonar-cli --help
+  # Must list: init, identity, publish, send, listen, groups, messages, post
+  ```
+
+- **Web tools:** set `web.backend` (e.g. `searxng`) in `~/.hermes/config.yaml` or
+  gateway/bridge subprocesses may fail with *"Web tools aren't configured"*.
+- **Config safety:** edit `~/.hermes/config.yaml` with `hermes config set` or
+  targeted patches — **never overwrite the whole file** with a partial snippet.
+  A truncated config (only `gateway.platforms.sonar.extra`) breaks Sonar silently.
+  Keep backups under `~/.hermes/state-snapshots/` before bulk edits.
+
+### Build `sonar-cli`
+
+From this repo's `core/` workspace:
+
+```bash
+cd core
+cargo build -p sonar-cli --release
+install -m 755 target/release/sonar-cli ~/.local/bin/sonar-cli
+```
+
+Media/voice builds expose `send --file` and `--kind voice` on `send --help`.
+
+### Provision the agent identity (one-time)
+
+```bash
+export SONAR_CLI_HOME="$HOME/.sonar-agent"
+sonar-cli init --nsec-file "$HOME/.secrets/sonar-agent.nsec"   # or generate fresh
+sonar-cli publish
+sonar-cli identity    # share this npub so peers can DM the agent
+```
+
+`SONAR_CLI_HOME` is stateful (`config.json`, Marmot DB, `seen.json`). Back it up
+before upgrades; do not commit secrets to git.
+
+### Secrets handling (Local Secrets Rule)
+
+- Prefer `init --nsec-file` or `--nsec-env`, not `init --nsec <literal>`.
+- Keep nsec and `SONAR_CLI_HOME` outside the repository.
+
+---
+
+## Path A — Native Hermes gateway (recommended)
+
+**Goal:** 1:1 parity with Telegram — same model, tools, memory, skills, MCP — on
+encrypted Sonar/Marmot DMs.
+
+**Upstream plugin:** `plugins/platforms/sonar/` in
+[NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) (or your
+local `~/.hermes/hermes-agent` tree). Optional legacy installer skill:
+`sonar-hermes-bridge` on the Hermes skill hub.
+
+### Architecture
+
+```
+Sonar app → Nostr relays → sonar-cli listen (gateway child)
+         → SonarAdapter → gateway agent loop → sonar-cli send [--file --kind voice]
+         → Sonar app
+```
+
+### 1. Enable the platform
+
+```bash
+hermes config set gateway.platforms.sonar.enabled true
+hermes config set gateway.platforms.sonar.extra.sonar_cli_home "$HOME/.sonar-agent"
+hermes config set gateway.platforms.sonar.extra.sonar_cli_path "$HOME/.local/bin/sonar-cli"
+```
+
+Illustrative `~/.hermes/config.yaml` fragment:
+
+```yaml
+gateway:
+  platforms:
+    sonar:
+      enabled: true
+      extra:
+        sonar_cli_home: ~/.sonar-agent
+        sonar_cli_path: ~/.local/bin/sonar-cli
+        display_name: "Hermes Agent · Sonar"
+        max_chunk_chars: 3200
+        authorized_senders:
+          - npub1...
+        instant_ack_enabled: false
+        typing_indicator_enabled: false
+web:
+  backend: searxng
+  searxng_url: https://searx.be   # example
+```
+
+After **any** change to `sonar_cli_path`, allowlist, or gateway Sonar keys,
+restart the gateway from an SSH shell (not from inside the gateway session):
+
+```bash
+systemctl --user daemon-reload
+systemctl --user restart hermes-gateway.service
+journalctl --user -u hermes-gateway -n 30 --no-pager | grep -i sonar
+```
+
+Expect: `[Sonar] listening as npub1...`
+
+### 2. Authorization
+
+The gateway reads **`SONAR_ALLOWED_SENDERS`** (comma-separated npubs) from the
+**process environment**. Use at least one of:
+
+1. `~/.hermes/.env`: `SONAR_ALLOWED_SENDERS=npub1...,npub2...`
+2. Yaml `authorized_senders` under `gateway.platforms.sonar.extra`
+3. `hermes pairing approve sonar <npub>` when pairing mode is active
+
+Systemd must load env (user unit example):
+
+`~/.config/systemd/user/hermes-gateway.service.d/sonar-env.conf`:
+
+```ini
+[Service]
+EnvironmentFile=-/home/USER/.hermes/.env
+Environment=SONAR_CLI_HOME=/home/USER/.sonar-agent
+```
+
+Install/start gateway: `hermes gateway install` then enable the user service.
+
+### 3. Disable duplicate listeners
+
+```bash
+systemctl --user stop sonar-bridge.service sonar-poller.service 2>/dev/null || true
+systemctl --user disable sonar-bridge.service sonar-poller.service 2>/dev/null || true
+pgrep -af 'sonar-cli listen'   # should show exactly one, owned by gateway
+```
+
+### 4. Verify
+
+From an **authorized** npub, DM the agent npub from `sonar-cli identity`. You
+should get a full agent reply (tools/MCP), not a static ping handler.
+
+Cron outbound: `deliver=sonar` or `deliver=sonar:<npub>` with `SONAR_HOME_CHANNEL`
+set in env.
+
+### Reply conventions on Sonar
+
+- Plain text DMs (no markdown tables/`**bold**`/headers).
+- Match the user's language.
+- Signature line, e.g. `— Hermes Agent · Sonar`.
+- Long answers: split ~3200 chars per DM; do not hard-truncate at ~2000.
+- Voice: `sonar-cli send --file audio.m4a --kind voice` (AAC `.m4a` preferred on iOS).
+
+---
+
+## Path B — Cron-polled drain (minimal, zero gateway code)
+
+**Goal:** always-on auto-reply using **only** the `terminal` toolset and the
+committed skill — no Hermes gateway Sonar plugin.
+
+### Architecture
 
 ```
 Nostr relays  <--Marmot/MLS-->  sonar-cli  <--terminal toolset-->  Hermes Agent
@@ -17,134 +183,69 @@ Nostr relays  <--Marmot/MLS-->  sonar-cli  <--terminal toolset-->  Hermes Agent
                           SONAR_CLI_HOME (identity + seen cursor)
 ```
 
-- **Transport is relay-only.** `sonar-cli` connects to Nostr relays and speaks
-  Marmot (MLS); it does not drive BLE mesh (that lives in the app shells). The
-  agent is reachable by any Sonar / White Noise peer over the shared relays,
-  whether or not it is co-located with anything.
-- **Runtime model is a cron-polled drain loop.** Hermes runs
-  `sonar-cli listen --once` on a short interval, feeds each emitted JSON line to
-  a turn, and replies with `sonar-cli send`. This is the mode `listen --once`
-  was built for, and it is restart-safe via the persisted seen cursor.
+- **Relay-only** transport (no BLE mesh from CLI).
+- **Runtime:** Hermes runs `sonar-cli listen --once` on a short interval, feeds
+  each JSON line to a turn, replies with `sonar-cli send`. Restart-safe via the
+  persisted seen cursor.
 
-## Prerequisites
-
-- Hermes Agent installed, authenticated, with the `terminal` toolset available
-  and `terminal.backend: local`.
-- A Rust toolchain to build the binary (or a prebuilt `sonar-cli` on `PATH`).
-
-## 1. Build the binary
-
-From the repo's `core/` workspace:
-
-```bash
-cd core
-cargo build -p sonar-cli --release
-# binary at core/target/release/sonar-cli
-```
-
-Put it on `PATH` (or reference it by absolute path in the cron command).
-
-## 2. Provision the agent identity (one-time)
-
-Give the agent its own isolated home so it never shares state with a human
-client:
-
-```bash
-export SONAR_CLI_HOME="$HOME/.sonar-agent"
-
-# Import an existing nsec from a file (preferred), or omit --nsec-file to
-# generate a fresh identity.
-sonar-cli init --nsec-file "$HOME/.secrets/sonar-agent.nsec"
-
-# Announce the agent's KeyPackage so peers can open a DM with it.
-sonar-cli publish
-
-# Confirm and capture the agent npub (share this so people can message it).
-sonar-cli identity
-```
-
-`init` writes `config.json` (the nsec, the Marmot DB key, and the relay list)
-under `SONAR_CLI_HOME`, with `0700` directories and `0600` secret files on Unix.
-The encrypted Marmot database and the `seen.json` cursor are created later, on
-the first `publish` / `send` / `listen`.
-
-### Secrets handling (Local Secrets Rule)
-
-- Never pass the key as `init --nsec <literal>` — command-line args leak into
-  shell history and process listings. Use `--nsec-file <path>` or
-  `--nsec-env <VAR>`.
-- `SONAR_CLI_HOME` and the `.nsec` file live **outside** the repository. Do not
-  commit them. Keep the nsec file in gitignored local storage or a CI/secret
-  store, exactly like the Breez key.
-- When rebuilding on a new host, recreate or copy the `SONAR_CLI_HOME` directory
-  (or re-`init` from the secret store) to preserve the agent's identity — the
-  npub is derived from the nsec, so the same nsec restores the same agent.
-
-## 3. Enable the terminal toolset in Hermes
-
-Either start chat with the toolset enabled:
+### Enable terminal + skill
 
 ```bash
 hermes chat --toolsets "terminal"
-```
+# or in ~/.hermes/config.yaml:
+# terminal:
+#   backend: local
 
-or configure it in `~/.hermes/config.yaml`. Hermes selects the execution
-backend via the `terminal.backend` key — `local`, `docker`, `ssh`,
-`singularity`, `modal`, or `daytona`; use `local` for a co-located agent.
-Confirm the exact schema against Hermes' config reference; illustratively:
-
-```yaml
-terminal:
-  backend: local
-```
-
-## 4. Install the skill
-
-Copy the committed skill so Hermes knows the `sonar-cli` contract:
-
-```bash
 cp core/sonar-cli/hermes/SKILL.md <hermes-skills-dir>/sonar-cli/SKILL.md
 ```
 
-The skill (`core/sonar-cli/hermes/SKILL.md`) documents the command surface, the
-inbound JSON contract, the `listen --once` requirement, and the DM-only /
-relay-only limitations.
+The skill documents inbound JSON, `listen --once` for polling, and DM-only limits.
 
-## 5. Create the auto-reply cron job
+### Cron auto-reply loop
 
-Use a Hermes cron job that, every interval, drains new messages and replies.
-Expressed as the work each tick performs:
+Each tick:
 
 ```bash
-# every ~30s
 SONAR_CLI_HOME="$HOME/.sonar-agent" sonar-cli listen --once
-# -> for each emitted {"type":"message", sender, content, ...} line, the agent
-#    composes a reply and runs:
+# for each {"type":"message", "sender", "content", ...} line:
 SONAR_CLI_HOME="$HOME/.sonar-agent" sonar-cli send --to <sender> --text "<reply>"
 ```
 
-Tune the interval against acceptable inbound latency: latency is at most one
-poll interval. The seen cursor guarantees no message is processed twice, and
-`listen` never emits the agent's own messages, so the loop cannot reply to
-itself.
+Tune interval vs latency. The seen cursor prevents double-processing; `mine:true`
+messages are not emitted to the loop.
+
+**Do not use bare `listen` in cron** — it blocks forever. Use `listen --once` or
+the gateway path (Path A) for streaming.
+
+---
+
+## Path C — Legacy Python bridge (migration / fallback)
+
+When the gateway plugin is unavailable, use the Hermes skill `sonar-hermes-bridge`
+(`install-sonar-bridge.sh`, `~/.sonar-agent/sonar_bridge_hermes.py`). That script
+streams `listen`, parses `sender`/`content`, and spawns `hermes chat -q` per
+message with `--resume` per `group_id`.
+
+**Disable `gateway.platforms.sonar` before enabling the bridge.** Same single-listener
+rule applies.
+
+---
 
 ## Command reference
 
-All commands accept the global flags `--home <dir>` (defaults to
-`SONAR_CLI_HOME`, then an XDG/platform data dir) and `--relay <wss-url>`
-(repeatable; overrides the configured relays; defaults: `relay.damus.io`,
-`nos.lol`, `relay.primal.net`).
+Global flags: `--home <dir>` (defaults to `SONAR_CLI_HOME`), `--relay <wss-url>`
+(repeatable).
 
 | Command | Output `type` | Purpose |
 | --- | --- | --- |
-| `init [--nsec-file p \| --nsec-env VAR \| --nsec s] [--force]` | `identity` | Provision/replace the identity. |
-| `identity` | `identity` | Print npub, pubkey hex, home, config path. |
-| `publish` | `published` | Publish the Marmot KeyPackage. |
-| `send --to <npub\|hex> --text <s> [--group-name <s>]` | `sent` | Send a DM (find/create the 1:1 group). |
-| `listen [--once] [--timeout-secs n] [--poll-secs n] [--no-publish]` | `message` | Drain inbound messages as JSON lines. |
-| `groups` | `group` | List known Marmot groups. |
-| `messages [--group <hex>]` | `message` | Print message history (includes `mine:true`). |
-| `post <signal-link> [--blossom url] [--site-url url] [--accept-invalid-signal-certs] [--skip-missing-signal-stickers]` | `posted_sticker_pack` | Import + publish a Signal sticker pack. |
+| `init [--nsec-file p \| --nsec-env VAR \| --nsec s] [--force]` | `identity` | Provision/replace identity. |
+| `identity` | `identity` | npub, pubkey hex, home, config path. |
+| `publish` | `published` | Publish Marmot KeyPackage. |
+| `send --to <npub\|hex> --text <s> [--file path --kind voice]` | `sent` | DM (find/create 1:1 group). |
+| `listen [--once] [--timeout-secs n] [--poll-secs n] [--no-publish]` | `message` | Inbound messages as JSON lines. |
+| `groups` | `group` | List Marmot groups. |
+| `messages [--group <hex>]` | `message` | History (includes `mine:true`). |
+| `post <signal-link> [...]` | `posted_sticker_pack` | Sticker pack import. |
 
 Inbound message line:
 
@@ -152,39 +253,42 @@ Inbound message line:
 {"type":"message","group_id":"...","id":"...","sender":"npub1...","content":"...","created_at_secs":123,"mine":false}
 ```
 
-## Known gaps and follow-ups
+| Rule | Detail |
+|------|--------|
+| Reply target | `send --to <sender>` (npub from inbound line) |
+| Field names | Use `sender` and `content`, not `from` / `text` |
+| DMs | Do not use `send --group` for 1:1 replies |
+| Polling | `listen --once` only in scripts/cron |
+| Streaming | bare `listen` for gateway/bridge only |
 
-- **Group replies are not supported.** `send` only targets an npub and
-  finds/creates a 1:1 DM group; there is no `send --group <id>`. The agent can
-  read inbound group messages (`listen` emits them) but can only reply to direct
-  messages. Follow-up: add a group send target in `core/sonar-cli/src/main.rs`
-  (a small change, tracked separately so this integration stays zero-code).
-- **No BLE mesh.** Relay-only, as above. Mesh-only nearby peers are out of reach
-  for the CLI agent.
+---
 
-## Upgrade path (optional, not required)
+## Pitfall checklist
 
-If you later want structured tool schemas instead of free-form shell calls,
-wrap `sonar-cli` in a thin stdio MCP server and register it in
-`~/.hermes/config.yaml`:
+| Symptom | Likely cause | Fix |
+|---------|--------------|-----|
+| No replies / silent drop | `SONAR_ALLOWED_SENDERS` missing or fewer npubs than yaml | Align `.env`, yaml, `bridge_config.json`; restart gateway |
+| `[Sonar] send failed` / wrong binary | Stale `sonar_cli_path` or gateway not restarted | Set path to real binary; `systemctl --user restart hermes-gateway` |
+| Truncated / broken Hermes | Partial overwrite of `config.yaml` | Restore from `state-snapshots`; use `hermes config set` only |
+| Duplicate replies | Gateway + bridge/cron both listening | Stop legacy bridge/poller; one `listen` only |
+| Web tools fail in service only | `.env` not loaded | `EnvironmentFile` in systemd drop-in |
+| Wrong CLI on PATH | `nostr-cli` impostor | Remove; verify subcommands on `sonar-cli --help` |
+| “Too many pairing requests” | Pairing mode + extra traffic | Allowlist env; disable typing spam; see `sonar-hermes-bridge` skill |
+| Voice fails on iOS | Wrong container/codec | AAC `.m4a`; media-capable `sonar-cli` build |
 
-```yaml
-mcp_servers:
-  sonar:
-    command: "sonar-mcp"        # a wrapper that shells out to sonar-cli
-    args: []
-    env:
-      SONAR_CLI_HOME: "/home/agent/.sonar-agent"
-    tools:
-      include: [sonar_send, sonar_poll, sonar_publish]
-```
+---
 
-That is strictly more work than the terminal + skill approach above and is not
-needed for the autonomous auto-reply loop.
+## Known gaps
 
-## Smoke test
+- **Group replies:** `send` targets npubs (1:1 DM groups only); no `send --group`.
+- **No BLE mesh** from CLI (relay-only).
 
-With two isolated homes on the same machine:
+Optional future: stdio MCP wrapper around `sonar-cli` in `mcp_servers` — more
+work than Path A or B; not required for auto-reply.
+
+---
+
+## Smoke test (two isolated homes)
 
 ```bash
 A=$(mktemp -d); B=$(mktemp -d)
@@ -193,10 +297,17 @@ sonar-cli --home "$B" init >/dev/null; sonar-cli --home "$B" publish >/dev/null
 NPUB_B=$(sonar-cli --home "$B" identity | python3 -c 'import sys,json;print(json.load(sys.stdin)["npub"])')
 
 sonar-cli --home "$A" send --to "$NPUB_B" --text "ping"
-sonar-cli --home "$B" listen --once          # emits the "ping" line
-sonar-cli --home "$B" listen --once          # emits nothing (cursor works)
+sonar-cli --home "$B" listen --once
+sonar-cli --home "$B" listen --once   # should emit nothing (cursor)
 ```
 
-Relay propagation is not instant; if the first `listen --once` prints nothing,
-wait a few seconds and run it again. (The example uses `python3` to read the
-npub from the JSON; substitute `jq` or any JSON reader you have.)
+Relay propagation may need a short retry on the first `listen --once`.
+
+---
+
+## Related docs
+
+- `core/sonar-cli/hermes/SKILL.md` — agent-facing CLI contract
+- `core/sonar-cli/README.md` — binary reference
+- Hermes plugin README: `hermes-agent/plugins/platforms/sonar/README.md`
+- Legacy bridge skill: `sonar-hermes-bridge` (Hermes skill hub / devops)
