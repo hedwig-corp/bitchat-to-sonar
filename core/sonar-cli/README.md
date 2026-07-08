@@ -176,6 +176,7 @@ performs a single sync/drain cycle, which is what cron-style agents and tests
 should use. `send` is direct-message only (it targets an npub), and transport is
 Nostr-relay only — the CLI does not drive BLE mesh.
 
-To run this as an autonomous Hermes agent (terminal toolset + cron-polled
-`listen --once`), see [`docs/HERMES-AGENT.md`](../../docs/HERMES-AGENT.md) and
-the bundled skill at [`hermes/SKILL.md`](hermes/SKILL.md).
+To run this as an autonomous Hermes agent, see
+[`docs/HERMES-AGENT.md`](../../docs/HERMES-AGENT.md): **Mode A** (native
+`hermes gateway` + Sonar platform plugin, recommended) or **Mode C** (terminal
+toolset + cron-polled `listen --once`). Skill: [`hermes/SKILL.md`](hermes/SKILL.md).
