@@ -1199,6 +1199,7 @@ impl SonarNode {
             &mime,
             &caption,
             &server_url,
+            None,
         ))?;
         Ok(())
     }
@@ -1222,6 +1223,7 @@ impl SonarNode {
                 data: i.data,
                 filename: i.filename,
                 mime: i.mime,
+                duration_ms: None,
             })
             .collect();
         self.runtime.block_on(self.client.send_media_multi(

@@ -168,6 +168,7 @@ async fn media_sends_over_white_noise_end_to_end() {
         "image/png",
         "from iOS",
         &blossom,
+        None,
     )
     .await
     .expect("ios sends media");
@@ -220,6 +221,7 @@ async fn media_sends_over_white_noise_end_to_end() {
             "application/octet-stream",
             "from Android",
             &blossom,
+            None,
         )
         .await
         .expect("android sends media");

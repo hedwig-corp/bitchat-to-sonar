@@ -71,6 +71,7 @@ pub struct MediaUpload {
     pub data: Vec<u8>,
     pub filename: String,
     pub mime: String,
+    pub duration_ms: Option<u64>,
 }
 
 /// Hard ceiling on a single downloaded media blob. The URL comes from the
@@ -3564,6 +3565,7 @@ impl SonarClient {
         mime: &str,
         caption: &str,
         server_url: &str,
+        duration_ms: Option<u64>,
     ) -> Result<()> {
         self.send_media_multi(
             group_id,
@@ -3571,6 +3573,7 @@ impl SonarClient {
                 data,
                 filename: filename.to_string(),
                 mime: mime.to_string(),
+                duration_ms,
             }],
             caption,
             server_url,
@@ -3619,9 +3622,12 @@ impl SonarClient {
         // single message. Any failure aborts the whole album with nothing sent.
         let mut uploads = Vec::with_capacity(items.len());
         for item in &items {
-            let upload =
+            let mut upload =
                 self.engine
                     .encrypt_media(group_id, &item.data, &item.mime, &item.filename)?;
+            if let Some(ms) = item.duration_ms.filter(|m| *m > 0) {
+                upload.duration_ms = Some(ms);
+            }
             let url = self
                 .blossom_upload(server_url, upload.encrypted_data.clone())
                 .await?;
@@ -6138,6 +6144,7 @@ mod tests {
                 data: vec![0u8; per_item],
                 filename: format!("clip-{i}.mp4"),
                 mime: "video/mp4".to_string(),
+                duration_ms: None,
             })
             .collect();
         let err = client
