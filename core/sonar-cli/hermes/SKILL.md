@@ -1,6 +1,8 @@
 ---
 name: sonar-cli
 description: Operate Sonar/Marmot encrypted messaging from Hermes. Use when the agent must read inbound Sonar direct messages and reply, publish presence, or post sticker packs. Wraps the headless `sonar-cli` binary (Marmot/MLS over Nostr relays). Production setups use the Hermes gateway Sonar platform (`docs/HERMES-AGENT.md` Mode A); minimal setups use cron + `listen --once` (Mode C). Replies are direct-message only.
+
+description: Operate Sonar/Marmot encrypted messaging from Hermes. Use when the agent must read inbound Sonar direct messages and reply, publish presence, or post sticker packs. Wraps the headless `sonar-cli` binary (Marmot/MLS over Nostr relays). Production setups use the Hermes gateway Sonar platform (`docs/HERMES-AGENT.md` Path A); minimal setups use cron + `listen --once` (Path B). Replies are direct-message only.
 ---
 
 # sonar-cli (Sonar/Marmot messaging)

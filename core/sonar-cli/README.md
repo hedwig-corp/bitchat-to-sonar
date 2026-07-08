@@ -189,4 +189,7 @@ Nostr-relay only — the CLI does not drive BLE mesh.
 To run this as an autonomous Hermes agent, see
 [`docs/HERMES-AGENT.md`](../../docs/HERMES-AGENT.md): **Mode A** (native
 `hermes gateway` + Sonar platform plugin, recommended) or **Mode C** (terminal
+
+[`docs/HERMES-AGENT.md`](../../docs/HERMES-AGENT.md): **Path A** (native
+`hermes gateway` + Sonar platform plugin, recommended) or **Path B** (terminal
 toolset + cron-polled `listen --once`). Skill: [`hermes/SKILL.md`](hermes/SKILL.md).
