@@ -52,6 +52,23 @@ sealed interface PayLine {
 internal fun randomPayId(): String =
     (0 until 16).map { "0123456789abcdef".random() }.joinToString("")
 
+/** Drop duplicate ⚡PAY / ⚡PAYDONE control lines (same pay uuid) from a merged
+ *  transcript. A partially-failed mesh receipt send re-sends the full receipt
+ *  set over White Noise, so the same uuid can arrive on BOTH legs of a mesh+WN
+ *  merge — the pay ledger is uuid-idempotent, but rendering two PayBubbles for
+ *  one payment is not. Keeps the first occurrence per (kind, uuid). */
+internal fun dedupePayLines(msgs: List<SonarMsg>): List<SonarMsg> {
+    val seen = HashSet<String>()
+    return msgs.filter { m ->
+        if (!m.content.startsWith("⚡PAY")) return@filter true
+        when (val line = PayLine.decode(m.content)) {
+            is PayLine.Pay -> seen.add("p:${line.uuid}")
+            is PayLine.Done -> seen.add("d:${line.uuid}")
+            null -> true
+        }
+    }
+}
+
 /**
  * Lifecycle of a direct payment receipt, mirrored from the iOS ledger.
  * [Claiming], [Settling], and [Failed] are vestigial — kept only for

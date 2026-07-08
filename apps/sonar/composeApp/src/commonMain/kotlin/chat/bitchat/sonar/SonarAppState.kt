@@ -1808,8 +1808,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         // When a peer (re)appears on the BLE mesh, flush any queued messages.
         // This mirrors iOS MessageRouter's flush-on-transport-available path.
         for (peerId in rawMeshPeerIds) {
-            if (peerId !in previousPeerIds && outbox.contains(peerId)) {
-                flushOutbox(peerId)
+            if (peerId !in previousPeerIds) {
+                if (outbox.contains(peerId)) flushOutbox(peerId)
+                flushPendingFavoriteControl(peerId)
             }
         }
         // Mesh peer set / first-seen / names feed the [visibleChats] hold filter.
@@ -2063,6 +2064,14 @@ class SonarAppState(private val scope: CoroutineScope) {
         recomputeSociallyFilteredRows()
     }
 
+    /** Favorite/unfavorite controls that could not be written to a live BLE link
+     *  yet (mesh-only peer out of range with no npub route). The transport-level
+     *  hidden queue that used to carry these was removed for lying about
+     *  delivery, so the app owns the retry now: only the LATEST control per peer
+     *  matters, flushed whenever the peer's link (re)appears. iOS parity:
+     *  MessageRouter queues the same control in its outbox. */
+    private val pendingFavoriteControls = mutableMapOf<String, String>()
+
     private fun sendFavoriteStatusNotification(peerId: String, favorite: Boolean) {
         val payload = buildString {
             append(if (favorite) FAVORITED_CONTROL else UNFAVORITED_CONTROL)
@@ -2071,7 +2080,14 @@ class SonarAppState(private val scope: CoroutineScope) {
                 append(it)
             }
         }
-        MeshRadio.sendMeshDm(liveMeshRoutePeerId(peerId) ?: peerId, randomMeshId(), payload)
+        val routePeerId = liveMeshRoutePeerId(peerId) ?: peerId
+        if (MeshRadio.sendMeshDm(routePeerId, randomMeshId(), payload)) {
+            pendingFavoriteControls.remove(peerId)
+        } else {
+            // No live Noise link — hold the control (it carries our npub, the
+            // seed of the mutual-favorite/NIP-17 continuation) for the next link.
+            pendingFavoriteControls[peerId] = payload
+        }
         val raw = npubRawFor(peerId) ?: return
         scope.launch {
             runCatching {
@@ -6597,7 +6613,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                             val mesh = refreshMeshTranscriptWindow(peerId)
                             val wn = marmotMessagesForPeer(peerId, chatId, generation)
                             if (isCurrentTranscriptSession(chatId, generation)) {
-                                val rows = refreshConversationRows(mesh + wn, chatId, generation)
+                                val rows = refreshConversationRows(dedupePayLines(mesh + wn), chatId, generation)
                                 val merged = withSendEchoes(chatId, mergePendingMediaUploads(chatId, rows))
                                 setCurrentVisibleMessages(chatId, merged)
                             }
@@ -6857,7 +6873,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                             val mesh = refreshMeshTranscriptWindow(peerId)
                             val wn = marmotMessagesForPeer(peerId, chatId, generation)
                             if (isCurrentTranscriptSession(chatId, generation)) {
-                                val rows = refreshConversationRows(mesh + wn, chatId, generation)
+                                val rows = refreshConversationRows(dedupePayLines(mesh + wn), chatId, generation)
                                 val merged = withSendEchoes(chatId, mergePendingMediaUploads(chatId, rows))
                                 setCurrentVisibleMessages(chatId, merged)
                             }
@@ -8295,6 +8311,9 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Flush outbox for ALL peers that now have a reachable transport. Called
      *  periodically and on transport-change events. */
     private fun flushAllOutbox() {
+        for (peerId in pendingFavoriteControls.keys.toList()) {
+            flushPendingFavoriteControl(peerId)
+        }
         if (outbox.isEmpty()) return
         for (peerId in outbox.peerIds()) {
             flushOutbox(peerId)
@@ -9061,7 +9080,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         val mesh = refreshMeshTranscriptWindow(canonicalPeerId)
         val wn = marmotMessagesForPeer(canonicalPeerId, chatId, generation)
         if (!isCurrentTranscriptSession(chatId, generation)) return
-        val bounded = refreshConversationRows(mesh + wn, chatId, generation)
+        val bounded = refreshConversationRows(dedupePayLines(mesh + wn), chatId, generation)
         val merged = withSendEchoes(chatId, mergePendingMediaUploads(chatId, bounded))
         val visible = visibleMessagesForChat(chatId, merged)
         publishOpenTranscript(chatId, visible)
@@ -10047,6 +10066,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                     meshLinkVersion++
                     if (linkUp) {
                         flushOutbox(openPeerId)
+                        flushPendingFavoriteControl(openPeerId)
                         lastActivityMs = nowMs
                     }
                 }

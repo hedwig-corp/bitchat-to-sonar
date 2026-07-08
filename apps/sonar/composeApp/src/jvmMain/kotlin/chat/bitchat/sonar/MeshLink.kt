@@ -84,6 +84,13 @@ object MeshLink {
         for (pkt in BleBridge.drainRx()) {
             val info = runCatching { meshDecodePacket(pkt) }.getOrNull() ?: continue
             val sender = info.senderIdHex
+            // ANY well-formed packet from a mapped sender proves the link is
+            // alive — including 0x53 and gossip/sync frames that fall through
+            // the `when` below. Phones announce only once per connection, so
+            // without this a connected-but-quiet peer ages out of seenByFp,
+            // hasLink() flips false, and sends detour to White Noise (or sit in
+            // the outbox for npub-less peers) despite a usable BLE session.
+            fpByPeerId[sender]?.let { touch(it) }
             when (info.packetType.toInt()) {
                 TYPE_ANNOUNCE -> {
                     val ann = runCatching { meshParseAnnounce(pkt) }.getOrNull() ?: continue
@@ -191,8 +198,10 @@ object MeshLink {
      *  disconnect callback (bluster stubs it), so without the [seenByFp] TTL an
      *  established session would report "in range" forever after the phone left,
      *  and [dmInRange] would keep echoing DMs as mesh-sent instead of falling
-     *  back to White Noise. `seenByFp` is touched by every announce/0x53/DM/
-     *  handshake, so a connected phone stays fresh well inside [PEER_TTL_MS]. */
+     *  back to White Noise. `seenByFp` is touched by EVERY well-formed packet
+     *  from a mapped sender (see [pump]) — announce, handshake, DM, 0x53, and
+     *  gossip frames alike — so a connected phone stays fresh inside
+     *  [PEER_TTL_MS]. */
     fun hasLink(fp: String): Boolean {
         val s = sessions[fp] ?: return false
         if (!s.established) return false
