@@ -69,6 +69,10 @@ actual object WalletBridge {
     private val refreshGate = Mutex()
     @Volatile private var refreshPending = false
 
+    /** Upper bound on the [ensureLiveConnection] liveness probe so a hung
+     *  native `getInfo()` can't hold [lock] indefinitely. */
+    private const val CONNECTION_PROBE_TIMEOUT_MS = 10_000L
+
     private val ctx: Context get() = AppContextHolder.ctx
     private fun prefs() = ctx.getSharedPreferences("sonar", Context.MODE_PRIVATE)
 
@@ -115,8 +119,18 @@ actual object WalletBridge {
                 .also { if (it.getOrNull() == null) work.cancel() }
         }
         current = when {
-            outcome.isFailure -> WalletState.Failed(outcome.exceptionOrNull()?.message ?: "wallet setup failed")
-            outcome.getOrNull() == null -> WalletState.Failed("wallet setup timed out")
+            // Zero the balance on failure: a reconnect via ensureLiveConnection
+            // may have disconnected a prior node, and only the success branch
+            // below writes balance — without this, balanceFlow would keep
+            // emitting the dead wallet's last balance alongside Failed state.
+            outcome.isFailure -> {
+                balance.value = 0L
+                WalletState.Failed(outcome.exceptionOrNull()?.message ?: "wallet setup failed")
+            }
+            outcome.getOrNull() == null -> {
+                balance.value = 0L
+                WalletState.Failed("wallet setup timed out")
+            }
             else -> outcome.getOrThrow()!!.let { (node, bal) ->
                 sdk = node
                 balance.value = bal
@@ -141,13 +155,21 @@ actual object WalletBridge {
     suspend fun ensureLiveConnection(nsec: String): Boolean = withContext(Dispatchers.IO) {
         lock.withLock {
             val existing = sdk
-            if (existing != null && runCatching { existing.getInfo() }.isSuccess) {
-                return@withLock true
-            }
             if (existing != null) {
-                // Stale handle — disconnect it inline (can't call shutdown(); it
-                // re-locks). Bump the epoch so any in-flight refreshBalance write
-                // is dropped, and detach the listener before disconnect.
+                // Bound the probe like connectLocked bounds connect(): getInfo()
+                // is a blocking native call, and a half-dead websocket could hang
+                // it for the SDK's internal timeout while we hold `lock`. A plain
+                // runCatching can't preempt that; a child-coroutine await can.
+                val liveProbe = coroutineScope {
+                    val work = async(Dispatchers.IO) { runCatching { existing.getInfo() }.isSuccess }
+                    (runCatching { withTimeoutOrNull(CONNECTION_PROBE_TIMEOUT_MS) { work.await() } }
+                        .getOrNull() ?: false)
+                        .also { if (!it) work.cancel() }
+                }
+                if (liveProbe) return@withLock true
+                // Stale/hung handle — disconnect it inline (can't call shutdown();
+                // it re-locks). Bump the epoch so any in-flight refreshBalance
+                // write is dropped, and detach the listener before disconnect.
                 walletEpoch += 1
                 balanceListenerId?.let { id -> runCatching { existing.removeEventListener(id) } }
                 balanceListenerId = null
