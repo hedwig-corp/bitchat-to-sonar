@@ -1,6 +1,8 @@
 package chat.bitchat.sonar
 
 import java.io.File
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 
 /**
  * Desktop (JVM) `actual`: recording is not wired yet (no JVM AAC encoder).
@@ -19,6 +21,14 @@ actual object AudioNotePlayer {
     private const val TMP_PREFIX = "sonar-vn-"
     private const val TMP_SUFFIX = ".m4a"
 
+    // Single control thread. All spawn/teardown work — the temp-file write, the
+    // afplay fork/exec, and destroy()/waitFor() — runs here, never on the Compose
+    // main thread (per the Signal-comparable perf rule). FIFO ordering guarantees a
+    // play() that follows a stop() always observes the teardown first.
+    private val control: ExecutorService = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "sonar-afplay-ctl").apply { isDaemon = true }
+    }
+
     private val lock = Any()
     private var process: Process? = null
     private var tempFile: File? = null
@@ -30,8 +40,8 @@ actual object AudioNotePlayer {
 
     init {
         // Sweep decrypted voice-note temp files orphaned by a prior hard kill
-        // (playback that never reached finishPlayback()). deleteOnExit() covers
-        // graceful exits; this covers crashes/kill -9 on the next launch.
+        // (playback that never reached teardown). Normal exit deletes them inline;
+        // this covers crashes/kill -9 on the next launch.
         runCatching {
             System.getProperty("java.io.tmpdir")?.let { dir ->
                 File(dir).listFiles { f ->
@@ -42,60 +52,69 @@ actual object AudioNotePlayer {
     }
 
     actual fun play(bytes: ByteArray, onComplete: () -> Unit) {
-        // Tear down any in-flight playback first (fires its completion, resets the
-        // previous bubble) before adopting the new note.
-        stop()
         val os = System.getProperty("os.name").lowercase()
         if (!os.contains("mac")) {
             // Linux/Windows desktop: no built-in AAC player yet (follow-up: ffplay/JavaFX).
             onComplete()
             return
         }
-        // Write to the OS temp dir (swept by the OS), never persistent app data, with
-        // deleteOnExit() as a backstop so an interrupted play cannot leave decrypted
-        // E2EE audio behind.
-        val file = runCatching {
-            File.createTempFile(TMP_PREFIX, TMP_SUFFIX).apply { deleteOnExit() }
-        }.getOrElse { onComplete(); return }
-        try {
-            file.writeBytes(bytes)
-        } catch (_: Exception) {
-            file.delete()
-            onComplete()
-            return
-        }
-        val afplay = runCatching {
-            ProcessBuilder("afplay", file.absolutePath)
-                .redirectErrorStream(true)
-                .start()
-        }.getOrElse {
-            file.delete()
-            onComplete()
-            return
-        }
-        val gen: Int
-        synchronized(lock) {
-            gen = ++generation
-            process = afplay
-            tempFile = file
-            onDone = onComplete
-        }
-        Thread {
+        control.execute {
+            // Tear down any in-flight playback first (fires its completion, resets the
+            // previous bubble) before adopting the new note.
+            teardown()
+            // OS temp dir (swept by the OS), never persistent app data — plus the
+            // startup sweep — so an interrupted play cannot leave decrypted E2EE audio.
+            val file = runCatching {
+                File.createTempFile(TMP_PREFIX, TMP_SUFFIX)
+            }.getOrElse { onComplete(); return@execute }
             try {
-                afplay.waitFor()
-            } catch (_: InterruptedException) {
-                runCatching { afplay.destroy() }
-            } finally {
-                finishPlayback(gen)
+                file.writeBytes(bytes)
+            } catch (_: Exception) {
+                file.delete()
+                onComplete()
+                return@execute
             }
-        }.apply {
-            isDaemon = true
-            name = "sonar-afplay"
-            start()
+            val afplay = runCatching {
+                ProcessBuilder("/usr/bin/afplay", file.absolutePath)
+                    .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+                    .redirectError(ProcessBuilder.Redirect.DISCARD)
+                    .start()
+            }.getOrElse {
+                file.delete()
+                onComplete()
+                return@execute
+            }
+            val gen: Int
+            synchronized(lock) {
+                gen = ++generation
+                process = afplay
+                tempFile = file
+                onDone = onComplete
+            }
+            Thread({
+                try {
+                    afplay.waitFor()
+                } catch (_: InterruptedException) {
+                    runCatching { afplay.destroy() }
+                } finally {
+                    finishPlayback(gen)
+                }
+            }, "sonar-afplay").apply {
+                isDaemon = true
+                start()
+            }
         }
     }
 
     actual fun stop() {
+        control.execute { teardown() }
+    }
+
+    // Runs on the control thread. Destroys the current process, deletes its temp
+    // file, fires the pending completion, and orphans the in-flight waiter so its
+    // finishPlayback() no-ops. waitFor() is intentionally outside the lock so the
+    // waiter can acquire it and bail immediately once the process dies.
+    private fun teardown() {
         val p: Process?
         val f: File?
         val cb: (() -> Unit)?
@@ -103,7 +122,7 @@ actual object AudioNotePlayer {
             p = process
             f = tempFile
             cb = onDone
-            generation++ // orphan the in-flight waiter so its finishPlayback() no-ops
+            generation++
             process = null
             tempFile = null
             onDone = null
