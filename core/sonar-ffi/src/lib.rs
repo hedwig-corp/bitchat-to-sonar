@@ -1373,6 +1373,7 @@ impl SonarNode {
             &mime,
             &caption,
             &server_url,
+            None,
         ))?;
         Ok(())
     }

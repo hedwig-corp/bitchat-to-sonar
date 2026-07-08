@@ -4490,6 +4490,7 @@ impl SonarClient {
         mime: &str,
         caption: &str,
         server_url: &str,
+        duration_ms: Option<u64>,
     ) -> Result<()> {
         self.send_media_multi(
             group_id,

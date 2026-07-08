@@ -3,7 +3,8 @@ use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::process::Command as ProcessCommand;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use nostr::prelude::*;
@@ -930,6 +931,68 @@ fn message_output(msg: &sonar_core::marmot::ChatMessage) -> Output {
     }
 }
 
+/// Probe audio duration in milliseconds for Sonar imeta (web/iOS show 0:00 without it).
+fn probe_duration_ms(path: &Path) -> Option<u64> {
+    for cmd in ["ffprobe", "ffmpeg"] {
+        let output = if cmd == "ffprobe" {
+            ProcessCommand::new(cmd)
+                .args([
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                ])
+                .arg(path)
+                .output()
+        } else {
+            ProcessCommand::new(cmd)
+                .args(["-hide_banner", "-i"])
+                .arg(path)
+                .output()
+        };
+        let output = match output {
+            Ok(o) => o,
+            Err(_) => continue,
+        };
+        if cmd == "ffprobe" {
+            if !output.status.success() {
+                continue;
+            }
+            let text = String::from_utf8_lossy(&output.stdout);
+            if let Ok(secs) = text.trim().parse::<f64>() {
+                let ms = (secs * 1000.0).round() as u64;
+                if ms > 0 {
+                    return Some(ms);
+                }
+            }
+            continue;
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for line in stderr.lines() {
+            if let Some(rest) = line.strip_prefix("  Duration: ") {
+                let hms = rest.split(',').next().unwrap_or("").trim();
+                let mut parts = hms.split(':');
+                if let (Some(h), Some(m), Some(s)) =
+                    (parts.next(), parts.next(), parts.next())
+                {
+                    if let (Ok(hours), Ok(mins), Ok(secs)) =
+                        (h.parse::<f64>(), m.parse::<f64>(), s.parse::<f64>())
+                    {
+                        let total = hours * 3600.0 + mins * 60.0 + secs;
+                        let ms = (total * 1000.0).round() as u64;
+                        if ms > 0 {
+                            return Some(ms);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 fn find_dm_group(client: &SonarClient, peer: PublicKey) -> Result<Option<GroupId>> {
     let me = client.identity().public_key();
     for group in client.groups()? {
@@ -1637,5 +1700,18 @@ mod tests {
         let emoji = short_emoji(Some("123456789"));
         assert_eq!(title.chars().count(), 80);
         assert_eq!(emoji.as_deref(), Some("12345678"));
+    }
+
+    #[test]
+    fn probe_duration_ms_reads_m4a_when_ffmpeg_present() {
+        let sample = PathBuf::from("/home/vincent/voice-memos/summary_final_20260708.m4a");
+        if !sample.is_file() {
+            return;
+        }
+        let ms = probe_duration_ms(&sample);
+        assert!(
+            ms.is_some() && ms.unwrap() > 10_000,
+            "expected ~59s voice sample, got {ms:?}"
+        );
     }
 }
