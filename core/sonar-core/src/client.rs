@@ -1966,8 +1966,12 @@ impl SonarClient {
         mime: &str,
         caption: &str,
         server_url: &str,
+        duration_ms: Option<u64>,
     ) -> Result<()> {
-        let upload = self.engine.encrypt_media(group_id, &data, mime, filename)?;
+        let mut upload = self.engine.encrypt_media(group_id, &data, mime, filename)?;
+        if let Some(ms) = duration_ms.filter(|m| *m > 0) {
+            upload.duration_ms = Some(ms);
+        }
         let url = self
             .blossom_upload(server_url, upload.encrypted_data.clone(), &upload.mime_type)
             .await?;
