@@ -19,6 +19,12 @@ fun main() {
     // Make UniFFI's JNA loader find the bundled libsonar_ffi before any FFI call.
     SonarNativeLoader.ensureLoaded()
 
+    // Real startup sweep of decrypted voice-note temp files left by a prior hard
+    // kill, and install the graceful-quit backstop. Must be called explicitly —
+    // AudioNotePlayer's init is lazy (first play/stop), so a session that never
+    // plays a note would otherwise never clean up.
+    AudioNotePlayer.sweepOrphans()
+
     application {
         val windowState = rememberWindowState(width = 1240.dp, height = 820.dp)
         Window(
