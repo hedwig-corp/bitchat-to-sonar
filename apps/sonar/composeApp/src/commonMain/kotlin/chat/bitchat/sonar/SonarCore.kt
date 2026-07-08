@@ -63,7 +63,7 @@ data class SonarStickerRef(
 ) {
     fun packAddressParts(): Pair<String, String>? {
         val parts = packCoordinate.split(":", limit = 3)
-        if (parts.size != 3 || parts[0] != "30030") return null
+        if (parts.size != 3 || parts[0] != "30031") return null
         return parts[1] to parts[2]
     }
 }
@@ -481,13 +481,13 @@ expect object SonarCore {
     /** Download a public sticker image and verify the bytes match [expectedSha256]. */
     suspend fun fetchStickerImage(url: String, expectedSha256: String): ByteArray
 
-    /** Fetch the user's installed sticker pack list (kind 10030) from relays. */
+    /** Fetch the user's installed sticker pack list (kind 10031) from relays. */
     suspend fun fetchInstalledPacks(): List<String>
 
-    /** Add a sticker pack to the user's installed list and publish kind 10030. */
+    /** Add a sticker pack to the user's installed list and publish kind 10031. */
     suspend fun installStickerPack(coordinate: String)
 
-    /** Remove a sticker pack from the user's installed list and publish kind 10030. */
+    /** Remove a sticker pack from the user's installed list and publish kind 10031. */
     suspend fun uninstallStickerPack(coordinate: String)
 
     /** Download + decrypt the media blob at [url] for the chat. Returns plaintext. */

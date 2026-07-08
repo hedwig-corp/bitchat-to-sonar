@@ -10,13 +10,13 @@ import SonarCore
 final class MeshStickerContentTests: XCTestCase {
     func testRoundTrip() {
         let encoded = SonarCore.meshStickerContent(
-            packCoordinate: "30030:abc123:pack",
+            packCoordinate: "30031:abc123:pack",
             shortcode: "wave",
             plaintextSha256: "deadbeef"
         )
         let decoded = SonarCore.meshParseStickerContent(content: encoded)
 
-        XCTAssertEqual(decoded?.packCoordinate, "30030:abc123:pack")
+        XCTAssertEqual(decoded?.packCoordinate, "30031:abc123:pack")
         XCTAssertEqual(decoded?.shortcode, "wave")
         XCTAssertEqual(decoded?.plaintextSha256, "deadbeef")
     }

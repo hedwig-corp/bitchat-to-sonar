@@ -8,8 +8,8 @@ use crate::validation::{normalize_sha256_hex, validate_dim, validate_shortcode};
 use crate::{is_allowed_sticker_mime, is_blossom_https_url};
 
 pub const PACK_FORMAT: &str = "sonar-sticker-pack-v1";
-pub const STICKER_PACK_KIND: u16 = 30030;
-pub const USER_STICKER_PACKS_KIND: u16 = 10030;
+pub const STICKER_PACK_KIND: u16 = 30031;
+pub const USER_STICKER_PACKS_KIND: u16 = 10031;
 pub const MAX_STICKERS_PER_PACK: usize = 200;
 pub const MAX_TITLE_CHARS: usize = 80;
 pub const MAX_DESCRIPTION_CHARS: usize = 500;
@@ -53,17 +53,17 @@ impl PackAddress {
         let kind = parts.next();
         let pubkey = parts.next();
         let identifier = parts.next();
-        if kind != Some("30030") || pubkey.is_none() || identifier.is_none() {
+        if kind != Some("30031") || pubkey.is_none() || identifier.is_none() {
             return Err(StickerError::InvalidField {
                 field: "pack_address",
-                reason: "expected 30030:<author-pubkey>:<identifier>".into(),
+                reason: "expected 30031:<author-pubkey>:<identifier>".into(),
             });
         }
         Self::new(pubkey.unwrap_or_default(), identifier.unwrap_or_default())
     }
 
     pub fn coordinate(&self) -> String {
-        format!("30030:{}:{}", self.author_pubkey_hex, self.identifier)
+        format!("30031:{}:{}", self.author_pubkey_hex, self.identifier)
     }
 }
 

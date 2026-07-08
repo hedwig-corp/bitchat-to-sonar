@@ -60,7 +60,7 @@ class MessageCodecTest {
     }
 
     @Test fun dmRoundTripWithStickerRef() {
-        val ref = SonarStickerRef("30030:abc123:pack", "wave", "deadbeef")
+        val ref = SonarStickerRef("30031:abc123:pack", "wave", "deadbeef")
         val msgs = listOf(
             SonarMsg("a", "npub1xx", "", mine = true, tsSecs = 1, stickerRef = ref),
             SonarMsg("b", "npub1yy", "plain text", mine = false, tsSecs = 2),
@@ -111,7 +111,7 @@ class MessageCodecTest {
     }
 
     @Test fun dmRoundTripWithStickerAndMedia() {
-        val ref = SonarStickerRef("30030:abc123:pack", "wave", "deadbeef")
+        val ref = SonarStickerRef("30031:abc123:pack", "wave", "deadbeef")
         val media = SonarMedia("mesh-media:peer:message:voice.m4a", "audio/mp4", "voice.m4a", null, null, 1200)
         val msg = SonarMsg("a", "npub1xx", "", mine = false, tsSecs = 3, media = listOf(media), stickerRef = ref)
         val decoded = MessageCodec.decodeDm(MessageCodec.encodeDm(listOf(msg))).single()

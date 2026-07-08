@@ -4,7 +4,7 @@
   import Nav from '$lib/components/Nav.svelte';
   import Footer from '$lib/components/Footer.svelte';
 
-  const PACK_KIND = 30030;
+  const PACK_KIND = 30031;
   const PACK_FORMAT = 'sonar-sticker-pack-v1';
   const DEFAULT_RELAYS = ['wss://relay.damus.io', 'wss://nos.lol', 'wss://relay.primal.net'];
   const QUERY_TIMEOUT_MS = 8000;
@@ -60,7 +60,7 @@
     const filter = buildFilter(address.trim());
     if (!filter) {
       status = 'error';
-      statusText = 'Pack address must use 30030:<pubkey>:<identifier>.';
+      statusText = 'Pack address must use 30031:<pubkey>:<identifier>.';
       relayStates = [];
       packs = [];
       return;
@@ -489,7 +489,7 @@
     <div class="controls" aria-label="Sticker pack query controls">
       <label>
         <span>Pack address</span>
-        <input bind:value={address} placeholder="30030:<pubkey>:signal-..." />
+        <input bind:value={address} placeholder="30031:<pubkey>:signal-..." />
       </label>
       <label>
         <span>Relays</span>

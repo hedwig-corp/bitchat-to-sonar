@@ -246,7 +246,7 @@ A resolved address shows on the contact profile under the payment capability, in
     'SONAR-STICKERS': {
       title: 'Stickers',
       status: 'ship plan',
-      kind: 'kind:30030',
+      kind: 'kind:30031',
       gh: 'https://github.com/hedwig-corp/bitchat-to-sonar/blob/main/docs/SONAR-STICKERS.md',
       blurb: 'sticker packs published on nostr open directory',
       md: `# Sonar Stickers
@@ -257,8 +257,8 @@ Sticker packs are published to the open Nostr network as addressable events. The
 
 | Event | Kind | Meaning |
 | --- | --- | --- |
-| Pack | 30030 | an addressable sticker pack authored by an npub |
-| Installed list | 10030 | a user's list of installed packs |
+| Pack | 30031 | an addressable sticker pack authored by an npub |
+| Installed list | 10031 | a user's list of installed packs |
 
 A pack event carries the pack title, author, tags, and an ordered list of sticker references. Each sticker is content-addressed, so a pack cannot be silently altered after you install it.
 
@@ -267,11 +267,11 @@ A pack event carries the pack title, author, tags, and an ordered list of sticke
 The [web directory](Sonar%20Stickers.html) indexes public pack events and lets anyone browse, search by tag, and preview a pack before adding it. Because packs are plain Nostr events, the directory is a convenience, not an authority — clients can mirror or replace it.
 
 \`\`\`text
-author signs pack (kind 30030)
+author signs pack (kind 30031)
    -> relays
    -> directory indexes #t tags + title
    -> user taps "Add to Sonar"
-   -> client appends to installed list (kind 10030)
+   -> client appends to installed list (kind 10031)
 \`\`\`
 
 ## Ownership
@@ -280,7 +280,7 @@ A pack is owned by the npub that signed it, forever. "Verified maker" in the dir
 
 ## In-app picker
 
-The composer sticker picker reads the user's installed list (kind 10030), resolves each pack, and renders recents first. Sending a sticker posts a bubble-less media message so the art is the message — the timestamp and delivery state sit beneath it.`,
+The composer sticker picker reads the user's installed list (kind 10031), resolves each pack, and renders recents first. Sending a sticker posts a bubble-less media message so the art is the message — the timestamp and delivery state sit beneath it.`,
     },
   },
 };
