@@ -943,9 +943,14 @@ struct SNMediaBubble: View {
     @State private var bytes: Data?
     @State private var failed = false
     @State private var viewerOpen = false
+    @State private var viewerIndex = 0
     @State private var loadAttempt = 0
 
     private var item: SNMediaItem? { m.media.first }
+    /// Album = more than one attachment, all images ⇒ render a swipeable card
+    /// deck. A mixed image+audio/file message keeps the single-first rendering
+    /// (so audio still gets its player), matching pre-album behavior.
+    private var isDeck: Bool { m.media.count > 1 && m.media.allSatisfy { $0.isImage } }
     private var loadKey: String {
         guard let item else { return "" }
         return [item.url, item.groupId, item.localPath ?? "", String(loadAttempt)].joined(separator: "|")
@@ -954,20 +959,21 @@ struct SNMediaBubble: View {
     var body: some View {
         #if os(iOS)
         bubble
-            .fullScreenCover(isPresented: $viewerOpen) {
-                if let item {
-                    SNMediaViewer(item: item, caption: m.text, initialBytes: bytes, load: load)
-                }
-            }
+            .fullScreenCover(isPresented: $viewerOpen) { viewer }
         #else
         bubble
             .sheet(isPresented: $viewerOpen) {
-                if let item {
-                    SNMediaViewer(item: item, caption: m.text, initialBytes: bytes, load: load)
-                        .frame(minWidth: 620, minHeight: 520)
-                }
+                viewer.frame(minWidth: 620, minHeight: 520)
             }
         #endif
+    }
+
+    @ViewBuilder private var viewer: some View {
+        if isDeck {
+            SNMediaGalleryViewer(items: m.media, startIndex: viewerIndex, caption: m.text, load: load)
+        } else if let item {
+            SNMediaViewer(item: item, caption: m.text, initialBytes: bytes, load: load)
+        }
     }
 
     private var bubble: some View {
@@ -995,7 +1001,9 @@ struct SNMediaBubble: View {
         .task(id: loadKey) {
             bytes = nil
             failed = false
-            guard let item else { return }
+            // A deck loads each card's bytes itself (lazy, only visible pages),
+            // so the bubble skips the single-item load path.
+            guard !isDeck, let item else { return }
             guard let load else {
                 failed = true
                 return
@@ -1010,7 +1018,12 @@ struct SNMediaBubble: View {
     }
 
     @ViewBuilder private var content: some View {
-        if let item, item.isImage {
+        if isDeck {
+            SNMediaDeck(items: m.media, maxBubbleWidth: maxBubbleWidth, load: load) { idx in
+                viewerIndex = idx
+                viewerOpen = true
+            }
+        } else if let item, item.isImage {
             if let bytes, item.isGif, bytes.snLooksLikeGif {
                 SNGifView(data: bytes)
                     .frame(width: maxBubbleWidth, height: 220)
@@ -1096,6 +1109,288 @@ struct SNMediaBubble: View {
         .background(RoundedRectangle(cornerRadius: 14).fill(SonarTheme.surface2))
         .contentShape(RoundedRectangle(cornerRadius: 14))
         .onTapGesture { viewerOpen = true }
+    }
+}
+
+/// One image card in a media deck: loads + decodes its own bytes and renders
+/// the image FILL-CROPPED into the deck's uniform card frame (every card in
+/// the pile shares the exact same size, so the peeks line up like a real photo
+/// stack). `dim` darkens peek cards slightly so the front card reads on top.
+/// Each card loads lazily so a deck only decodes visited + peeked pages.
+private struct SNMediaCardImage: View {
+    let item: SNMediaItem
+    let width: CGFloat
+    let height: CGFloat
+    var dim: Double = 0
+    var load: ((SNMediaItem) async -> Data?)?
+
+    @State private var bytes: Data?
+    @State private var failed = false
+    @State private var loadAttempt = 0
+
+    private var loadKey: String {
+        [item.url, item.groupId, item.localPath ?? "", String(loadAttempt)].joined(separator: "|")
+    }
+
+    var body: some View {
+        cardContent
+            .frame(width: width, height: height)
+            .clipShape(RoundedRectangle(cornerRadius: 18))
+            .overlay(
+                RoundedRectangle(cornerRadius: 18)
+                    .stroke(Color.black.opacity(0.08), lineWidth: 1)
+            )
+            .overlay(
+                // Peek cards get a soft dim so depth reads without hiding the photo.
+                RoundedRectangle(cornerRadius: 18)
+                    .fill(Color.black.opacity(dim))
+            )
+            .task(id: loadKey) {
+                bytes = nil
+                failed = false
+                guard let load else {
+                    failed = true
+                    return
+                }
+                if let d = await load(item) {
+                    bytes = d
+                } else {
+                    failed = true
+                }
+            }
+    }
+
+    @ViewBuilder private var cardContent: some View {
+        if item.isImage, let bytes, item.isGif, bytes.snLooksLikeGif {
+            SNGifView(data: bytes)
+                .frame(width: width, height: height)
+                .overlay(alignment: .topTrailing) { SNGifBadge().padding(8) }
+        } else if item.isImage, let bytes, let decoded = snDecodedPlatformImage(bytes) {
+            decoded.image
+                .resizable()
+                .aspectRatio(contentMode: .fill)
+                .frame(width: width, height: height)
+                .clipped()
+        } else if item.isImage, bytes != nil {
+            // Bytes loaded but not decodable (corrupt / mislabeled MIME, e.g. a
+            // bad attachment from a peer). Fall back to a chip instead of an
+            // endless spinner, so a bad photo can't hide behind a good front card.
+            deckFileChip
+        } else if item.isImage {
+            RoundedRectangle(cornerRadius: 18)
+                .fill(SonarTheme.surface2)
+                .overlay {
+                    if failed, dim == 0 {
+                        Button {
+                            loadAttempt += 1
+                        } label: {
+                            Text(verbatim: "Retry")
+                                .font(SonarTheme.uiFont(size: 12, weight: .semibold))
+                                .foregroundColor(SonarTheme.accent)
+                        }
+                        .buttonStyle(.plain)
+                    } else if !failed {
+                        ProgressView()
+                    }
+                }
+                .overlay(alignment: .topTrailing) {
+                    if item.isGif { SNGifBadge().padding(8) }
+                }
+        } else {
+            deckFileChip
+        }
+    }
+
+    private var deckFileChip: some View {
+        VStack(spacing: 6) {
+            Text(verbatim: item.filename)
+                .font(SonarTheme.uiFont(size: 13, weight: .semibold))
+                .foregroundColor(SonarTheme.text)
+                .lineLimit(1)
+            Text(verbatim: item.mime)
+                .font(SonarTheme.uiFont(size: 11))
+                .foregroundColor(SonarTheme.text3)
+        }
+        .frame(width: width, height: height)
+        .background(RoundedRectangle(cornerRadius: 18).fill(SonarTheme.surface2))
+    }
+}
+
+/// xChat-style album deck: the front photo card rests on the ACTUAL next
+/// photos, peeking out offset + dimmed + shadowed like a real stack of prints.
+/// Every card shares one uniform frame so the pile edges line up. Drag the
+/// front card left/right to page; tap to open the fullscreen gallery. Paints
+/// from the already-loaded local `media` list — the only extra work is the 1–2
+/// peeked thumbnails, which are the pages the user swipes to next anyway.
+private struct SNMediaDeck: View {
+    let items: [SNMediaItem]
+    let maxBubbleWidth: CGFloat
+    var load: ((SNMediaItem) async -> Data?)?
+    var onOpen: (Int) -> Void
+
+    @State private var index = 0
+    /// Last page direction: +1 advanced (card slides out left, next in from the
+    /// right), -1 went back. Drives the asymmetric slide transition so paging
+    /// feels like the xChat "slide the card away" gesture, not a swap.
+    @State private var slideDirection: CGFloat = 1
+    @GestureState private var dragX: CGFloat = 0
+
+    var body: some View {
+        let count = items.count
+        let current = min(max(index, 0), count - 1)
+        let cardW = maxBubbleWidth * 0.78
+        let cardH: CGFloat = 240
+        let depths = peekDepths(count: count, current: current)
+        // Reserve the deepest-possible overhang so the deck's footprint (and the
+        // row below) stays constant while paging, even as the peek count shrinks.
+        let maxDepth = min(2, count - 1)
+        VStack(alignment: .leading, spacing: 8) {
+            ZStack(alignment: .topLeading) {
+                // Real next-photo thumbnails behind the front card, deepest first.
+                ForEach(Array(depths.reversed()), id: \.self) { depth in
+                    SNMediaCardImage(
+                        item: items[current + depth],
+                        width: cardW,
+                        height: cardH,
+                        dim: 0.12 + 0.10 * Double(depth),
+                        load: load
+                    )
+                    .scaleEffect(1 - CGFloat(depth) * 0.03, anchor: .topLeading)
+                    .offset(x: CGFloat(depth) * 12, y: CGFloat(depth) * 9)
+                    .shadow(color: Color.black.opacity(0.10), radius: 4, x: 0, y: 2)
+                    .allowsHitTesting(false)
+                }
+                SNMediaCardImage(item: items[current], width: cardW, height: cardH, load: load)
+                    .id(current)
+                    // Directional slide: outgoing card exits toward the drag,
+                    // incoming enters from the opposite edge. Only animated
+                    // paging triggers it (transcript inserts are not animated).
+                    .transition(.asymmetric(
+                        insertion: .move(edge: slideDirection > 0 ? .trailing : .leading)
+                            .combined(with: .opacity),
+                        removal: .move(edge: slideDirection > 0 ? .leading : .trailing)
+                            .combined(with: .opacity)
+                    ))
+                    .zIndex(1)
+                    .shadow(color: Color.black.opacity(0.14), radius: 6, x: 0, y: 3)
+                    .offset(x: dragX)
+                    .contentShape(RoundedRectangle(cornerRadius: 18))
+                    .onTapGesture { onOpen(current) }
+                    .gesture(
+                        DragGesture(minimumDistance: 12)
+                            .updating($dragX) { value, state, _ in state = value.translation.width }
+                            .onEnded { value in
+                                let threshold: CGFloat = 56
+                                if value.translation.width <= -threshold, current < count - 1 {
+                                    slideDirection = 1
+                                    withAnimation(.spring(response: 0.3, dampingFraction: 0.82)) {
+                                        index = current + 1
+                                    }
+                                } else if value.translation.width >= threshold, current > 0 {
+                                    slideDirection = -1
+                                    withAnimation(.spring(response: 0.3, dampingFraction: 0.82)) {
+                                        index = current - 1
+                                    }
+                                }
+                            }
+                    )
+            }
+            // Reserve room for the deepest peek's overhang so following rows
+            // don't sit on top of the pile (stable across paging).
+            .padding(.trailing, CGFloat(maxDepth) * 12)
+            .padding(.bottom, CGFloat(maxDepth) * 9)
+            SNDeckDots(count: count, index: current)
+        }
+    }
+
+    /// Depths (1…2) of peek cards to draw behind the front card, capped by how
+    /// many items remain — so the pile visibly shrinks toward the last photo.
+    private func peekDepths(count: Int, current: Int) -> [Int] {
+        let remaining = count - 1 - current
+        let visible = min(2, max(0, remaining))
+        return visible == 0 ? [] : Array(1...visible)
+    }
+}
+
+/// Compact page-position dots under a media deck.
+private struct SNDeckDots: View {
+    let count: Int
+    let index: Int
+
+    var body: some View {
+        HStack(spacing: 5) {
+            ForEach(Array(0..<max(count, 0)), id: \.self) { i in
+                Circle()
+                    .fill(i == index ? SonarTheme.accent : SonarTheme.text3.opacity(0.4))
+                    .frame(width: 6, height: 6)
+            }
+        }
+        .padding(.leading, 4)
+    }
+}
+
+/// Fullscreen, swipeable gallery across a message's album. Each page is a full
+/// [SNMediaViewer] (lazy load, pinch-zoom, share, save); paging is native. Opens
+/// at the tapped card's index.
+struct SNMediaGalleryViewer: View {
+    let items: [SNMediaItem]
+    let startIndex: Int
+    let caption: String
+    var load: ((SNMediaItem) async -> Data?)? = nil
+
+    // Seeded in init (not onAppear) so the pager opens ON the tapped photo
+    // instead of flashing page 0 for a frame.
+    @State private var selection: Int
+
+    init(
+        items: [SNMediaItem],
+        startIndex: Int,
+        caption: String,
+        load: ((SNMediaItem) async -> Data?)? = nil
+    ) {
+        self.items = items
+        self.startIndex = startIndex
+        self.caption = caption
+        self.load = load
+        _selection = State(initialValue: min(max(startIndex, 0), max(items.count - 1, 0)))
+    }
+
+    private var safeIndex: Int { min(max(selection, 0), max(items.count - 1, 0)) }
+
+    var body: some View {
+        #if os(iOS)
+        TabView(selection: $selection) {
+            ForEach(Array(items.enumerated()), id: \.offset) { idx, item in
+                SNMediaViewer(item: item, caption: caption, initialBytes: nil, load: load)
+                    .tag(idx)
+            }
+        }
+        .tabViewStyle(.page(indexDisplayMode: .always))
+        .background(Color.black.ignoresSafeArea())
+        #else
+        ZStack {
+            Color.black
+            SNMediaViewer(item: items[safeIndex], caption: caption, initialBytes: nil, load: load)
+            HStack {
+                Button { selection = max(safeIndex - 1, 0) } label: {
+                    Image(systemName: "chevron.left").font(.system(size: 22, weight: .semibold))
+                }
+                .disabled(safeIndex == 0)
+                Spacer()
+                Button { selection = min(safeIndex + 1, items.count - 1) } label: {
+                    Image(systemName: "chevron.right").font(.system(size: 22, weight: .semibold))
+                }
+                .disabled(safeIndex >= items.count - 1)
+            }
+            .padding(.horizontal, 18)
+            .buttonStyle(.plain)
+            .foregroundColor(.white)
+            VStack {
+                Spacer()
+                SNDeckDots(count: items.count, index: safeIndex).padding(.bottom, 12)
+            }
+        }
+        #endif
     }
 }
 

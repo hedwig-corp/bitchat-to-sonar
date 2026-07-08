@@ -1169,6 +1169,73 @@ final class MarmotChatModel: ObservableObject {
         }
     }
 
+    /// Send N attachments as ONE album message (single kind-445, N imeta tags).
+    /// Shows a single optimistic echo carrying every pending preview so the
+    /// transcript paints the card deck immediately; the canonical message
+    /// replaces it after publish. Mirrors [sendMedia]'s echo lifecycle.
+    func sendMediaAlbum(
+        groupId: String,
+        items: [MarmotService.MediaAlbumItem],
+        caption: String = "",
+        localPreviewURLs: [String],
+        onComplete: (() -> Void)? = nil,
+        onFailure: (() -> Void)? = nil
+    ) {
+        guard !items.isEmpty, items.count == localPreviewURLs.count else { return }
+        let echo = MarmotService.MarmotMessage(
+            id: Self.optimisticIDPrefix + UUID().uuidString,
+            senderNpub: npub ?? "",
+            content: caption,
+            createdAt: Date(),
+            isMine: true,
+            media: zip(items, localPreviewURLs).map { item, url in
+                MarmotService.MarmotMedia(
+                    url: url,
+                    mimeType: item.mime,
+                    filename: item.filename,
+                    width: nil,
+                    height: nil,
+                    durationMs: nil
+                )
+            }
+        )
+        Task {
+            var echoVisible = false
+            do {
+                guard await ensureConnected() else {
+                    throw MarmotService.ServiceError.notConnected
+                }
+                await loadLocalPage(groupId: groupId)
+                pendingOptimistic[groupId, default: []].append(echo)
+                messagesByGroup[groupId, default: []].append(echo)
+                echoVisible = true
+                guard await ensureRelayConnected() else {
+                    throw MarmotService.ServiceError.notConnected
+                }
+                try await service.sendMediaMulti(groupId: groupId, items: items, caption: caption)
+                onComplete?()
+                await refreshWhenConnected(groupId: groupId, hydrateBeforeSync: false)
+            } catch {
+                pendingOptimistic[groupId]?.removeAll { $0.id == echo.id }
+                if echoVisible {
+                    let failed = MarmotService.MarmotMessage(
+                        id: Self.failedOptimisticIDPrefix + UUID().uuidString,
+                        senderNpub: echo.senderNpub,
+                        content: echo.content,
+                        createdAt: echo.createdAt,
+                        isMine: true,
+                        media: echo.media
+                    )
+                    pendingOptimistic[groupId, default: []].append(failed)
+                    messagesByGroup[groupId, default: []].removeAll { $0.id == echo.id }
+                    messagesByGroup[groupId, default: []].append(failed)
+                }
+                onFailure?()
+                self.errorText = Self.describe(error)
+            }
+        }
+    }
+
     func sendSticker(
         groupId: String,
         packCoordinate: String,

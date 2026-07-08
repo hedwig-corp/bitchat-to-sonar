@@ -54,7 +54,7 @@ struct SonarDMScreenContent: View {
     @State private var groupAddDraft = ""
     @State private var selectedAddNpubs: Set<String> = []
     @State private var pickPhoto = false
-    @State private var photoItem: PhotosPickerItem?
+    @State private var photoItems: [PhotosPickerItem] = []
     @State private var previewPackCoordinate: String?
 
     private var peer: SNPeerItem { store.peerItem(peerId) }
@@ -218,25 +218,30 @@ struct SonarDMScreenContent: View {
         }
         .photosPicker(
             isPresented: $pickPhoto,
-            selection: $photoItem,
+            selection: $photoItems,
+            maxSelectionCount: 10,
             matching: .images,
             preferredItemEncoding: .current
         )
-        .onChange(of: photoItem) { item in
-            guard let item else { return }
+        .onChange(of: photoItems) { items in
+            guard !items.isEmpty else { return }
             Task {
-                guard let data = try? await item.loadTransferable(type: Data.self) else { return }
-                let isGif = data.snIsGif
-                if isGif {
-                    await MainActor.run {
-                        store.stageMediaPreview(peerId, data: data, filename: "animation.gif", mime: "image/gif")
-                        photoItem = nil
+                // Load every pick in selection order; 2+ stage as one album.
+                var staged: [(data: Data, filename: String, mime: String)] = []
+                for item in items {
+                    guard let data = try? await item.loadTransferable(type: Data.self) else { continue }
+                    if data.snIsGif {
+                        staged.append((data: data, filename: "animation.gif", mime: "image/gif"))
+                    } else {
+                        staged.append((data: data, filename: "photo.jpg", mime: "image/jpeg"))
                     }
-                    return
                 }
+                let toStage = staged
                 await MainActor.run {
-                    store.stageMediaPreview(peerId, data: data, filename: "photo.jpg", mime: "image/jpeg")
-                    photoItem = nil
+                    if !toStage.isEmpty {
+                        store.stageMediaPreviews(peerId, items: toStage)
+                    }
+                    photoItems = []
                 }
             }
         }
@@ -300,9 +305,10 @@ struct SonarDMScreenContent: View {
 
     @ViewBuilder
     private var mediaPreviewContent: some View {
-        if let preview = store.pendingMediaPreviews.first(where: { $0.peerId == peerId }) {
+        let previews = store.pendingMediaPreviews.filter { $0.peerId == peerId }
+        if !previews.isEmpty {
             MediaSendPreviewLoaderView(
-                preview: preview,
+                previews: previews,
                 onSend: { store.confirmSendPreview(peerId: peerId) },
                 onCancel: { store.cancelPreview(peerId: peerId) }
             )
@@ -615,29 +621,29 @@ struct SonarDMScreenContent: View {
 }
 
 private struct MediaSendPreviewView: View {
-    let data: Data
-    let isGif: Bool
+    /// (bytes, isGif) per staged item, in pick order.
+    let items: [(data: Data, isGif: Bool)]
     let onSend: () -> Void
     let onCancel: () -> Void
+
+    @State private var page = 0
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
 
             #if os(iOS)
-            if isGif {
-                GifImageView(data: data)
-                    .ignoresSafeArea()
-                    .padding(.bottom, 80)
-            } else if let uiImage = UIImage(data: data) {
-                Image(uiImage: uiImage)
-                    .resizable()
-                    .scaledToFit()
-                    .ignoresSafeArea()
-                    .padding(.bottom, 80)
-            } else {
-                Text("Couldn't decode image")
-                    .foregroundColor(.white.opacity(0.6))
+            if items.count > 1 {
+                TabView(selection: $page) {
+                    ForEach(Array(items.enumerated()), id: \.offset) { idx, item in
+                        singleImage(item)
+                            .tag(idx)
+                    }
+                }
+                .tabViewStyle(.page(indexDisplayMode: .always))
+                .padding(.bottom, 80)
+            } else if let only = items.first {
+                singleImage(only)
             }
             #else
             Text("Preview")
@@ -653,6 +659,12 @@ private struct MediaSendPreviewView: View {
                             .padding(12)
                     }
                     Spacer()
+                    if items.count > 1 {
+                        Text(verbatim: "\(page + 1) of \(items.count)")
+                            .font(SonarTheme.uiFont(size: 13, weight: .semibold))
+                            .foregroundColor(.white.opacity(0.85))
+                            .padding(.trailing, 16)
+                    }
                 }
                 .padding(.horizontal, 8)
                 .padding(.top, 12)
@@ -662,33 +674,67 @@ private struct MediaSendPreviewView: View {
                 HStack {
                     Spacer()
                     Button { onSend() } label: {
-                        Image(systemName: "arrow.up")
-                            .font(.system(size: 20, weight: .bold))
-                            .foregroundColor(.white)
-                            .frame(width: 52, height: 52)
-                            .background(SonarTheme.accent)
-                            .clipShape(Circle())
+                        HStack(spacing: 6) {
+                            if items.count > 1 {
+                                Text(verbatim: "\(items.count)")
+                                    .font(SonarTheme.uiFont(size: 15, weight: .bold))
+                                    .foregroundColor(.white)
+                            }
+                            Image(systemName: "arrow.up")
+                                .font(.system(size: 20, weight: .bold))
+                                .foregroundColor(.white)
+                        }
+                        .frame(minWidth: 52)
+                        .frame(height: 52)
+                        .padding(.horizontal, items.count > 1 ? 14 : 0)
+                        .background(SonarTheme.accent)
+                        .clipShape(Capsule())
                     }
                 }
                 .padding(16)
             }
         }
     }
+
+    @ViewBuilder
+    private func singleImage(_ item: (data: Data, isGif: Bool)) -> some View {
+        #if os(iOS)
+        if item.isGif {
+            GifImageView(data: item.data)
+                .ignoresSafeArea()
+                .padding(.bottom, 80)
+        } else if let uiImage = UIImage(data: item.data) {
+            Image(uiImage: uiImage)
+                .resizable()
+                .scaledToFit()
+                .ignoresSafeArea()
+                .padding(.bottom, 80)
+        } else {
+            Text("Couldn't decode image")
+                .foregroundColor(.white.opacity(0.6))
+        }
+        #else
+        EmptyView()
+        #endif
+    }
 }
 
 private struct MediaSendPreviewLoaderView: View {
-    let preview: SonarAppStore.PendingMediaPreview
+    let previews: [SonarAppStore.PendingMediaPreview]
     let onSend: () -> Void
     let onCancel: () -> Void
 
-    @State private var data: Data?
+    @State private var items: [(data: Data, isGif: Bool)]?
+
+    private var loadKey: String {
+        previews.map(\.tempURL.absoluteString).joined(separator: "|")
+    }
 
     var body: some View {
         Group {
-            if let data {
+            if let items, !items.isEmpty {
                 MediaSendPreviewView(
-                    data: data,
-                    isGif: preview.mime == "image/gif",
+                    items: items,
                     onSend: onSend,
                     onCancel: onCancel
                 )
@@ -700,9 +746,13 @@ private struct MediaSendPreviewLoaderView: View {
                 }
             }
         }
-        .task(id: preview.tempURL) {
-            data = await Task.detached(priority: .userInitiated) {
-                try? Data(contentsOf: preview.tempURL)
+        .task(id: loadKey) {
+            let toLoad = previews
+            items = await Task.detached(priority: .userInitiated) {
+                toLoad.compactMap { preview in
+                    guard let data = try? Data(contentsOf: preview.tempURL) else { return nil }
+                    return (data: data, isGif: preview.mime == "image/gif")
+                }
             }.value
         }
     }

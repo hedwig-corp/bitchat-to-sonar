@@ -611,26 +611,45 @@ final class SonarAppStore: ObservableObject {
     }
 
     func stageMediaPreview(_ peerId: String, data: Data, filename: String, mime: String) {
-        guard currentDMId == peerId else { return }
+        stageMediaPreviews(peerId, items: [(data: data, filename: filename, mime: mime)])
+    }
+
+    /// Stage one or more picked photos for the pre-send preview. All items are
+    /// written to temp files off-main (Signal-style: full-quality until send
+    /// confirmation); the batch replaces any previously staged previews.
+    func stageMediaPreviews(
+        _ peerId: String,
+        items: [(data: Data, filename: String, mime: String)]
+    ) {
+        guard currentDMId == peerId, !items.isEmpty else { return }
         let generation = nextMediaPreviewGeneration()
         let previous = pendingMediaPreviews
         pendingMediaPreviews = []
         deletePreviewTempFilesAsync(previous)
-        let suffix = mime == "image/gif" ? ".gif" : ".img"
         Task { @MainActor in
-            guard let url = await Task.detached(priority: .userInitiated, operation: {
-                Self.writeTempMediaFile(data, suffix: suffix)
-            }).value else {
+            let written = await Task.detached(priority: .userInitiated, operation: { () -> [(URL, String, String)] in
+                items.compactMap { item in
+                    let suffix = item.mime == "image/gif" ? ".gif" : ".img"
+                    guard let url = Self.writeTempMediaFile(item.data, suffix: suffix) else { return nil }
+                    return (url, item.filename, item.mime)
+                }
+            }).value
+            guard written.count == items.count else {
+                Task.detached(priority: .utility) {
+                    for (url, _, _) in written { Self.deleteTempMediaFile(url) }
+                }
                 showToast("Couldn't prepare image.")
                 return
             }
             guard mediaPreviewGeneration == generation, currentDMId == peerId else {
                 Task.detached(priority: .utility) {
-                    Self.deleteTempMediaFile(url)
+                    for (url, _, _) in written { Self.deleteTempMediaFile(url) }
                 }
                 return
             }
-            pendingMediaPreviews = [PendingMediaPreview(peerId: peerId, tempURL: url, filename: filename, mime: mime)]
+            pendingMediaPreviews = written.map {
+                PendingMediaPreview(peerId: peerId, tempURL: $0.0, filename: $0.1, mime: $0.2)
+            }
         }
     }
 
@@ -643,25 +662,62 @@ final class SonarAppStore: ObservableObject {
         } else {
             pendingMediaPreviews = []
         }
-        for preview in items {
-            Task { @MainActor in
+        Task { @MainActor in
+            // Finalize every staged item off-main IN ORDER (lazy jpeg re-encode
+            // happens here, on send confirmation — Signal-style).
+            var prepared: [(peerId: String, data: Data, filename: String, mime: String)] = []
+            var encodeFailed = false
+            for preview in items {
                 guard let raw = await Task.detached(priority: .userInitiated, operation: { () -> Data? in
                     defer { Self.deleteTempMediaFile(preview.tempURL) }
                     return Self.readTempMediaFile(preview.tempURL)
-                }).value else { return }
+                }).value else { continue }
                 if preview.mime == "image/gif" {
-                    _ = sendAttachment(preview.peerId, data: raw, filename: preview.filename, mime: preview.mime)
+                    prepared.append((preview.peerId, raw, preview.filename, preview.mime))
+                } else if let bytes = await Task.detached(priority: .userInitiated, operation: {
+                    Self.reencodeToJpeg(raw)
+                }).value {
+                    prepared.append((preview.peerId, bytes, "photo.jpg", "image/jpeg"))
                 } else {
-                    guard let bytes = await Task.detached(priority: .userInitiated, operation: {
-                        Self.reencodeToJpeg(raw)
-                    }).value else {
-                        showToast("Couldn't encode image.")
-                        return
+                    encodeFailed = true
+                }
+            }
+            if encodeFailed { showToast("Couldn't encode image.") }
+            // Group per peer: 2+ items to one peer send as ONE album message;
+            // a single item keeps the exact pre-album behavior.
+            let peersInOrder = prepared.map(\.peerId).reduce(into: [String]()) {
+                if !$0.contains($1) { $0.append($1) }
+            }
+            for peer in peersInOrder {
+                let list = prepared.filter { $0.peerId == peer }
+                if list.count > 1 {
+                    let numbered = list.enumerated().map { idx, item in
+                        (
+                            data: item.data,
+                            filename: Self.numberedFilename(item.filename, index: idx + 1),
+                            mime: item.mime
+                        )
                     }
-                    sendImage(preview.peerId, data: bytes, filename: "photo.jpg", mime: "image/jpeg")
+                    sendImageAlbum(peer, items: numbered)
+                } else if let only = list.first {
+                    if only.mime == "image/gif" {
+                        _ = sendAttachment(only.peerId, data: only.data, filename: only.filename, mime: only.mime)
+                    } else {
+                        sendImage(only.peerId, data: only.data, filename: only.filename, mime: only.mime)
+                    }
                 }
             }
         }
+    }
+
+    /// "photo.jpg" + 2 → "photo-2.jpg". Distinct per-item filenames keep the
+    /// pending-upload echo reconciliation (keyed by filename) deterministic
+    /// across an album's attachments.
+    private static func numberedFilename(_ filename: String, index: Int) -> String {
+        let ns = filename as NSString
+        let ext = ns.pathExtension
+        let stem = ns.deletingPathExtension
+        return ext.isEmpty ? "\(stem)-\(index)" : "\(stem)-\(index).\(ext)"
     }
 
     func cancelPreview(peerId: String? = nil) {
@@ -3086,7 +3142,7 @@ final class SonarAppStore: ObservableObject {
                 marmotRows.append(SNDMRow(
                     id: Self.marmotIDPrefix + group.id,
                     title: marmot.title(for: group),
-                    preview: last.map { Self.previewText($0.content, stickerRef: $0.stickerRef) } ?? "Secure group · reaches anywhere",
+                    preview: last.map { Self.previewText($0.content, stickerRef: $0.stickerRef, media: $0.media) } ?? "Secure group · reaches anywhere",
                     time: last.map { Self.listTime($0.createdAt) } ?? "",
                     unread: (marmot.unreadByGroup[group.id] ?? 0) > 0,
                     presence: false,
@@ -3139,7 +3195,7 @@ final class SonarAppStore: ObservableObject {
                     byKey[foldKey] = SNDMRow(
                         id: existing.id,
                         title: existing.title,
-                        preview: Self.previewText(rowLast.content, stickerRef: rowLast.stickerRef),
+                        preview: Self.previewText(rowLast.content, stickerRef: rowLast.stickerRef, media: rowLast.media),
                         time: Self.listTime(rowLast.createdAt),
                         unread: existing.unread || hasUnreadMarmotMessage(in: groupSet),
                         presence: existing.presence,
@@ -3160,7 +3216,7 @@ final class SonarAppStore: ObservableObject {
                 byKey[foldKey] = SNDMRow(
                     id: rowId,
                     title: liveSonarPeerId == nil ? marmot.title(for: rowGroup) : peerDisplayName(rowId),
-                    preview: rowLast.map { Self.previewText($0.content, stickerRef: $0.stickerRef) } ?? networkLabel(forPeer: rowId),
+                    preview: rowLast.map { Self.previewText($0.content, stickerRef: $0.stickerRef, media: $0.media) } ?? networkLabel(forPeer: rowId),
                     time: rowLast.map { Self.listTime($0.createdAt) } ?? "",
                     unread: hasUnreadMarmotMessage(in: groupSet),
                     presence: liveSonarPeerId != nil && meshReachable(rowId),
@@ -3177,7 +3233,7 @@ final class SonarAppStore: ObservableObject {
             marmotRows.append(SNDMRow(
                 id: Self.marmotIDPrefix + rowGroupId,
                 title: marmot.title(for: rowGroup),
-                preview: rowLast.map { Self.previewText($0.content, stickerRef: $0.stickerRef) } ?? "Secure chat · reaches anywhere",
+                preview: rowLast.map { Self.previewText($0.content, stickerRef: $0.stickerRef, media: $0.media) } ?? "Secure chat · reaches anywhere",
                 time: rowLast.map { Self.listTime($0.createdAt) } ?? "",
                 unread: hasUnreadMarmotMessage(in: groupSet),
                 presence: false,
@@ -4178,6 +4234,89 @@ final class SonarAppStore: ObservableObject {
         )
     }
 
+    /// Send N images to one peer as ONE album message (single kind-445 with N
+    /// imeta tags) that renders as the swipeable card deck. BLE mesh has no
+    /// album packet, so a mesh-reachable peer gets N individual image sends.
+    func sendImageAlbum(_ id: String, items: [(data: Data, filename: String, mime: String)]) {
+        guard items.count > 1 else {
+            if let only = items.first {
+                sendImage(id, data: only.data, filename: only.filename, mime: only.mime)
+            }
+            return
+        }
+        if meshReachable(id) {
+            // Per-item over mesh (no album packet), preserving each MIME:
+            // sendImageOverMesh forces JPEG, so route GIFs through the file
+            // path to keep the animation instead of flattening it.
+            for item in items {
+                if item.mime == "image/gif" {
+                    _ = sendAttachment(id, data: item.data, filename: item.filename, mime: item.mime)
+                } else {
+                    sendImageOverMesh(PeerID(str: id), data: item.data)
+                }
+            }
+            return
+        }
+        let groupId: String?
+        if let gid = marmotGroupId(id) {
+            groupId = gid
+        } else if let profile = resolvedSonarProfile(id) {
+            groupId = marmotGroup(forNpub: profile.npub)?.id
+        } else {
+            groupId = nil
+        }
+        guard let gid = groupId else { return }
+        // One pending-echo entry per attachment; the canonical album message
+        // reconciles each media item against its filename-keyed cache entry.
+        var albumItems: [MarmotService.MediaAlbumItem] = []
+        var pendingURLs: [String] = []
+        for item in items {
+            let pendingURL = Self.pendingMediaURL()
+            pendingURLs.append(pendingURL)
+            rememberPendingUploadMedia(
+                groupId: gid,
+                filename: item.filename,
+                mime: item.mime,
+                caption: "",
+                localURL: pendingURL,
+                data: item.data
+            )
+            albumItems.append(
+                MarmotService.MediaAlbumItem(data: item.data, filename: item.filename, mime: item.mime)
+            )
+        }
+        let pairs = zip(items.map { ($0.filename, $0.mime) }, pendingURLs).map {
+            (filename: $0.0, mime: $0.1, url: $1)
+        }
+        marmot.sendMediaAlbum(
+            groupId: gid,
+            items: albumItems,
+            localPreviewURLs: pendingURLs,
+            onComplete: { [weak self] in
+                for pair in pairs {
+                    self?.markPendingUploadMediaCompleted(
+                        groupId: gid,
+                        filename: pair.filename,
+                        mime: pair.mime,
+                        caption: "",
+                        localURL: pair.url
+                    )
+                }
+            },
+            onFailure: { [weak self] in
+                for pair in pairs {
+                    self?.forgetPendingUploadMedia(
+                        groupId: gid,
+                        filename: pair.filename,
+                        mime: pair.mime,
+                        caption: "",
+                        localURL: pair.url
+                    )
+                }
+            }
+        )
+    }
+
     /// Send a desktop-selected attachment. White Noise can preserve the source
     /// MIME (including video); BLE mesh uses the existing safe file-packet
     /// allowlist and falls back to a generic file for unsupported types.
@@ -4883,13 +5022,32 @@ final class SonarAppStore: ObservableObject {
 
     /// Maps a raw last-message content to the home-row preview ("₿ Payment"
     /// for any ⚡PAY line, "Voice call" for ☎CALL signaling, so codecs never
-    /// leak into list rows).
-    static func previewText(_ content: String, stickerRef: MarmotService.MarmotStickerRef? = nil) -> String {
+    /// leak into list rows). A caption-less media message previews as its
+    /// attachment kind ("Photo", "3 photos", "Voice note", filename) instead
+    /// of an empty row.
+    static func previewText(
+        _ content: String,
+        stickerRef: MarmotService.MarmotStickerRef? = nil,
+        media: [MarmotService.MarmotMedia] = []
+    ) -> String {
         if stickerRef != nil { return "Sticker" }
         if looksLikeCallControl(content), callParseControl(content: content) != nil {
             return "Voice call"
         }
-        return SonarPayMessage.decode(content) != nil ? "\u{20BF} Payment" : content
+        if SonarPayMessage.decode(content) != nil { return "\u{20BF} Payment" }
+        if content.isEmpty, !media.isEmpty { return Self.mediaPreviewLabel(media) }
+        return content
+    }
+
+    /// "Photo" / "3 photos" / "Voice note" / filename for a media-only message.
+    private static func mediaPreviewLabel(_ media: [MarmotService.MarmotMedia]) -> String {
+        if media.count > 1, media.allSatisfy({ $0.isImage }) {
+            return "\(media.count) photos"
+        }
+        guard let first = media.first else { return "" }
+        if first.isImage { return "Photo" }
+        if first.isAudio { return "Voice note" }
+        return first.filename.isEmpty ? "File" : first.filename
     }
 
     /// Radar "Send sats": open the DM with the PaySheet already up.

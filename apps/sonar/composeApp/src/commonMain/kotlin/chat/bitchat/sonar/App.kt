@@ -707,10 +707,12 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     var addPeopleSheet by remember { mutableStateOf(false) }
     var removePeopleSheet by remember { mutableStateOf(false) }
     var mediaViewer by remember { mutableStateOf<SonarMedia?>(null) }
+    // Album opened fullscreen: the message's media + the tapped start index.
+    var mediaGallery by remember { mutableStateOf<Pair<List<SonarMedia>, Int>?>(null) }
     var previewPackCoordinate by remember { mutableStateOf<String?>(null) }
     val mediaActions = rememberMediaActions()
-    val pickPhoto = rememberPhotoPicker { bytes, name, mime ->
-        state.stageMediaPreview(screen.id, bytes, name, mime)
+    val pickPhoto = rememberPhotoPicker { items ->
+        state.stageMediaPreviews(screen.id, items)
     }
     // Voice-note recorder (hold the mic to record; drag left to cancel).
     val recorder = remember { VoiceRecorder() }
@@ -932,7 +934,8 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                                     cont = cont,
                                     showState = m.mine && i == feed.lastIndex,
                                     maxBubbleWidth = bubbleMax,
-                                    onOpen = { mediaViewer = it }
+                                    onOpen = { mediaViewer = it },
+                                    onOpenAlbum = { items, idx -> mediaGallery = items to idx }
                                 )
                             } else if (m.stickerRef != null) {
                                 StickerBubble(
@@ -1097,15 +1100,31 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             modifier = Modifier.matchParentSize()
         )
     }
-    state.pendingMediaPreviews.firstOrNull { it.chatId == screen.id }?.let { preview ->
-        val data by androidx.compose.runtime.produceState<ByteArray?>(null, preview.tempPath) {
-            value = withContext(Dispatchers.IO) { readTempMediaFile(preview.tempPath) }
+    mediaGallery?.let { (items, start) ->
+        MediaGalleryViewer(
+            items = items,
+            startIndex = start,
+            state = state,
+            chatId = screen.id,
+            actions = mediaActions,
+            onClose = { mediaGallery = null },
+            modifier = Modifier.matchParentSize()
+        )
+    }
+    val chatPreviews = state.pendingMediaPreviews.filter { it.chatId == screen.id }
+    if (chatPreviews.isNotEmpty()) {
+        val previewKey = chatPreviews.joinToString("|") { it.tempPath }
+        val loaded by androidx.compose.runtime.produceState<List<Pair<ByteArray, Boolean>>?>(null, previewKey) {
+            value = withContext(Dispatchers.IO) {
+                chatPreviews.mapNotNull { p ->
+                    readTempMediaFile(p.tempPath)?.let { it to (p.mime == "image/gif") }
+                }
+            }
         }
-        val previewData = data
-        if (previewData != null) {
+        val items = loaded
+        if (!items.isNullOrEmpty()) {
             MediaSendPreview(
-                data = previewData,
-                isGif = preview.mime == "image/gif",
+                items = items,
                 onSend = { state.confirmSendPreview(screen.id) },
                 onCancel = { state.cancelPreview(screen.id) },
                 modifier = Modifier.matchParentSize()
@@ -1809,6 +1828,7 @@ private fun MediaBubble(
     showState: Boolean = false,
     maxBubbleWidth: Dp = Dp.Infinity,
     onOpen: (SonarMedia) -> Unit,
+    onOpenAlbum: (List<SonarMedia>, Int) -> Unit = { _, _ -> },
 ) {
     val s = sonar
     val media = m.media.first()
@@ -1830,7 +1850,18 @@ private fun MediaBubble(
                 modifier = Modifier.padding(start = 12.dp, bottom = 3.dp)
             )
         }
-        if (media.isImage) {
+        if (m.media.size > 1 && m.media.all { it.isImage }) {
+            // Photo album: render a swipeable stacked-card deck (xChat-style). A
+            // mixed image+audio/file message keeps the single-first rendering
+            // below (so audio still gets its player).
+            MediaDeck(
+                media = m.media,
+                state = state,
+                chatId = chatId,
+                maxBubbleWidth = maxBubbleWidth,
+                onOpen = { idx -> onOpenAlbum(m.media, idx) },
+            )
+        } else if (media.isImage) {
             var loadAttempt by remember(media.url, chatId) { mutableStateOf(0) }
             val loadResult by androidx.compose.runtime.produceState<Pair<Boolean, ByteArray?>>(
                 false to null, media.url, chatId, loadAttempt
@@ -1886,6 +1917,178 @@ private fun MediaBubble(
             ) { Text(m.content, color = capFg, fontSize = 15.5.sp, lineHeight = 21.7.sp) }
         }
         if (showState) MessageStatusFooter(m, mesh)
+    }
+}
+
+/**
+ * Album deck (xChat-style): the front photo card rests on the ACTUAL next
+ * photos, peeking out offset + dimmed + shadowed like a real stack of prints.
+ * Every card shares one uniform frame (fill-cropped) so the pile edges line
+ * up. Swipe left/right to page, tap to open the fullscreen gallery. Paints
+ * from the already-loaded local media list; the only extra work is the 1–2
+ * peeked thumbnails, which are the pages the user swipes to next anyway.
+ */
+@Composable
+private fun MediaDeck(
+    media: List<SonarMedia>,
+    state: SonarAppState,
+    chatId: String,
+    maxBubbleWidth: Dp,
+    onOpen: (Int) -> Unit,
+) {
+    val s = sonar
+    val deckWidth = if (maxBubbleWidth == Dp.Infinity) 250.dp else minOf(250.dp, maxBubbleWidth)
+    val deckHeight = 240.dp
+    val pagerState = androidx.compose.foundation.pager.rememberPagerState(pageCount = { media.size })
+    val current = pagerState.currentPage
+    val peek = minOf(2, media.size - 1 - current).coerceAtLeast(0)
+    // Reserve the deepest-possible overhang so the deck's footprint (and the row
+    // below it) stays put while paging, even as the visible peek count shrinks.
+    val maxPeek = minOf(2, media.size - 1)
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Box(Modifier.padding(end = (maxPeek * 6).dp, bottom = (maxPeek * 5).dp)) {
+            // Real next-photo thumbnails behind the front card, deepest first, so
+            // the pile shows what's coming and shrinks toward the last photo.
+            for (depth in peek downTo 1) {
+                MediaDeckCard(
+                    media = media[current + depth],
+                    state = state,
+                    chatId = chatId,
+                    dim = 0.12f + 0.10f * depth,
+                    onOpen = null,
+                    modifier = Modifier
+                        .padding(start = (depth * 6).dp, top = (depth * 5).dp)
+                        .size(width = deckWidth, height = deckHeight),
+                )
+            }
+            androidx.compose.foundation.pager.HorizontalPager(
+                state = pagerState,
+                modifier = Modifier.size(width = deckWidth, height = deckHeight),
+                pageSpacing = 8.dp,
+            ) { page ->
+                MediaDeckCard(
+                    media = media[page],
+                    state = state,
+                    chatId = chatId,
+                    onOpen = { onOpen(page) },
+                    modifier = Modifier.fillMaxSize(),
+                )
+            }
+        }
+        // Dots BELOW the deck (matches iOS) so they never cover the photo.
+        Row(
+            Modifier.padding(start = 4.dp),
+            horizontalArrangement = Arrangement.spacedBy(5.dp)
+        ) {
+            repeat(media.size) { i ->
+                Box(
+                    Modifier.size(6.dp).clip(CircleShape)
+                        .background(if (i == pagerState.currentPage) s.accent else s.text3.copy(alpha = 0.4f))
+                )
+            }
+        }
+    }
+}
+
+/** One image card inside a [MediaDeck]: loads + decodes its own bytes and
+ *  FILL-CROPS the image into the uniform card frame; falls back to skeleton /
+ *  unavailable / file chip like the single media bubble. [dim] darkens peek
+ *  cards (which are not tappable — [onOpen] null). Tap opens the gallery (or
+ *  retries a failed load). */
+@Composable
+private fun MediaDeckCard(
+    media: SonarMedia,
+    state: SonarAppState,
+    chatId: String,
+    onOpen: (() -> Unit)?,
+    modifier: Modifier = Modifier,
+    dim: Float = 0f,
+) {
+    val s = sonar
+    var loadAttempt by remember(media.url, chatId) { mutableStateOf(0) }
+    val loadResult by androidx.compose.runtime.produceState<Pair<Boolean, ByteArray?>>(
+        false to null, media.url, chatId, loadAttempt
+    ) {
+        value = true to state.mediaData(chatId, media)
+    }
+    val bytes = loadResult.second
+    val img = remember(bytes) { if (media.isImage) bytes?.let { decodeImageBitmap(it) } else null }
+    val renderAsGif = media.isGif && bytes?.looksLikeGifBytes() == true
+    val failed = loadResult.first && bytes == null
+    Box(
+        modifier.clip(RoundedCornerShape(18.dp)).background(s.surface2)
+            .border(1.dp, Color.Black.copy(alpha = 0.08f), RoundedCornerShape(18.dp))
+            .let { m ->
+                if (onOpen != null) {
+                    m.clickable { if (failed) loadAttempt += 1 else if (bytes != null) onOpen() }
+                } else m
+            },
+        contentAlignment = Alignment.Center
+    ) {
+        when {
+            renderAsGif && bytes != null -> {
+                MediaImage(bytes = bytes, isGif = true, modifier = Modifier.fillMaxSize())
+                GifBadge(Modifier.align(Alignment.TopEnd).padding(8.dp))
+            }
+            img != null -> Image(
+                img,
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize()
+            )
+            bytes != null -> InlineMediaFileChip(media = media, onOpen = { onOpen?.invoke() })
+            failed -> MediaUnavailable(media)
+            else -> MediaLoadingSkeleton(media)
+        }
+        if (media.isGif && bytes == null) GifBadge(Modifier.align(Alignment.TopEnd).padding(8.dp))
+        if (dim > 0f) {
+            Box(Modifier.matchParentSize().background(Color.Black.copy(alpha = dim)))
+        }
+    }
+}
+
+/** Fullscreen, swipeable gallery across a message's album. Each page is a full
+ *  [MediaViewer] (lazy load, pinch-zoom, share, save); opens at the tapped
+ *  card's index. */
+@Composable
+private fun MediaGalleryViewer(
+    items: List<SonarMedia>,
+    startIndex: Int,
+    state: SonarAppState,
+    chatId: String,
+    actions: MediaActions,
+    onClose: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val pagerState = androidx.compose.foundation.pager.rememberPagerState(
+        initialPage = startIndex.coerceIn(0, (items.size - 1).coerceAtLeast(0)),
+        pageCount = { items.size }
+    )
+    Box(modifier.background(Color.Black)) {
+        androidx.compose.foundation.pager.HorizontalPager(
+            state = pagerState,
+            modifier = Modifier.fillMaxSize(),
+        ) { page ->
+            MediaViewer(
+                media = items[page],
+                state = state,
+                chatId = chatId,
+                actions = actions,
+                onClose = onClose,
+                modifier = Modifier.fillMaxSize(),
+            )
+        }
+        Row(
+            Modifier.align(Alignment.BottomCenter).padding(bottom = 20.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            repeat(items.size) { i ->
+                Box(
+                    Modifier.size(7.dp).clip(CircleShape)
+                        .background(if (i == pagerState.currentPage) Color.White else Color.White.copy(alpha = 0.4f))
+                )
+            }
+        }
     }
 }
 
@@ -2106,23 +2309,29 @@ private fun MediaViewer(
 
 @Composable
 private fun MediaSendPreview(
-    data: ByteArray,
-    isGif: Boolean,
+    items: List<Pair<ByteArray, Boolean>>,
     onSend: () -> Unit,
     onCancel: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val s = sonar
-    val image = remember(data) { if (!isGif) decodeImageBitmap(data) else null }
+    val pagerState = androidx.compose.foundation.pager.rememberPagerState(pageCount = { items.size })
     Box(modifier.background(Color.Black)) {
-        when {
-            isGif || image != null -> MediaImage(
-                bytes = data,
-                isGif = isGif,
-                modifier = Modifier.fillMaxSize().padding(bottom = 80.dp)
-            )
-            else -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text("Couldn't decode image", color = Color.White.copy(alpha = 0.6f), fontSize = 14.sp)
+        androidx.compose.foundation.pager.HorizontalPager(
+            state = pagerState,
+            modifier = Modifier.fillMaxSize(),
+        ) { page ->
+            val (data, isGif) = items[page]
+            val image = remember(data) { if (!isGif) decodeImageBitmap(data) else null }
+            when {
+                isGif || image != null -> MediaImage(
+                    bytes = data,
+                    isGif = isGif,
+                    modifier = Modifier.fillMaxSize().padding(bottom = 80.dp)
+                )
+                else -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Text("Couldn't decode image", color = Color.White.copy(alpha = 0.6f), fontSize = 14.sp)
+                }
             }
         }
         Row(
@@ -2130,15 +2339,39 @@ private fun MediaSendPreview(
             verticalAlignment = Alignment.CenterVertically
         ) {
             SNIconButton(SNIconName.Back, tint = Color.White, onClick = onCancel)
+            if (items.size > 1) {
+                Spacer(Modifier.weight(1f))
+                Text(
+                    "${pagerState.currentPage + 1} of ${items.size}",
+                    color = Color.White.copy(alpha = 0.85f),
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.padding(end = 12.dp)
+                )
+            }
         }
         Row(
             Modifier.fillMaxWidth().align(Alignment.BottomCenter).padding(16.dp),
-            horizontalArrangement = Arrangement.End
+            horizontalArrangement = Arrangement.End,
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            Box(
-                Modifier.size(52.dp).clip(CircleShape).background(s.accent).clickable { onSend() },
-                contentAlignment = Alignment.Center
+            Row(
+                Modifier.height(52.dp).clip(RoundedCornerShape(999.dp)).background(s.accent)
+                    .clickable { onSend() }
+                    .padding(horizontal = if (items.size > 1) 18.dp else 0.dp)
+                    .widthIn(min = 52.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.Center
             ) {
+                if (items.size > 1) {
+                    Text(
+                        "${items.size}",
+                        color = Color.White,
+                        fontSize = 15.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(end = 6.dp)
+                    )
+                }
                 Text("↑", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold)
             }
         }

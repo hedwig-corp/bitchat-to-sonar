@@ -48,6 +48,16 @@ const BLOSSOM_SERVER_LIST_KIND: u16 = 10063;
 /// Fallback Blossom server when the user has published no kind-10063 list.
 pub const DEFAULT_BLOSSOM_SERVER: &str = "https://blossom.primal.net";
 
+/// One attachment for an album send (see [`SonarClient::send_media_multi`]).
+/// Raw plaintext bytes plus the source filename and MIME; each item is
+/// encrypted + uploaded independently before the single message is published.
+#[derive(Debug, Clone)]
+pub struct MediaUpload {
+    pub data: Vec<u8>,
+    pub filename: String,
+    pub mime: String,
+}
+
 /// Hard ceiling on a single downloaded media blob. The URL comes from the
 /// SENDER (untrusted), so this bounds memory use against a malicious/huge blob.
 /// Comfortably above any real image while well under MDK's 100 MB MIP-04 limit.
@@ -1702,7 +1712,7 @@ impl SonarClient {
                 if let Err(e) = idx.lock().unwrap().upsert_summary(
                     &group_id_hex,
                     name,
-                    &message.content,
+                    &index_preview(&message),
                     &message.sender.to_string(),
                     message.created_at.as_secs(),
                     message.mine,
@@ -2024,13 +2034,52 @@ impl SonarClient {
         caption: &str,
         server_url: &str,
     ) -> Result<()> {
-        let upload = self.engine.encrypt_media(group_id, &data, mime, filename)?;
-        let url = self
-            .blossom_upload(server_url, upload.encrypted_data.clone(), &upload.mime_type)
-            .await?;
+        self.send_media_multi(
+            group_id,
+            vec![MediaUpload {
+                data,
+                filename: filename.to_string(),
+                mime: mime.to_string(),
+            }],
+            caption,
+            server_url,
+        )
+        .await
+    }
+
+    /// Send N media attachments as ONE message (album): encrypt each with the
+    /// group key (MIP-04), upload every ciphertext to Blossom, then publish a
+    /// single kind-445 event carrying all `imeta` tags in order plus the optional
+    /// `caption`. Every upload must succeed BEFORE the message is published, so a
+    /// failed upload never leaves a dangling reference and nothing partial hits
+    /// the wire. `items` must be non-empty. `server_url` empty →
+    /// [`DEFAULT_BLOSSOM_SERVER`].
+    pub async fn send_media_multi(
+        &self,
+        group_id: &GroupId,
+        items: Vec<MediaUpload>,
+        caption: &str,
+        server_url: &str,
+    ) -> Result<()> {
+        if items.is_empty() {
+            return Err(Error::Media("no media to send".into()));
+        }
+        // Encrypt + upload every attachment first; only then build + publish the
+        // single message. Any failure aborts the whole album with nothing sent.
+        let mut uploads = Vec::with_capacity(items.len());
+        for item in &items {
+            let upload =
+                self.engine
+                    .encrypt_media(group_id, &item.data, &item.mime, &item.filename)?;
+            let url = self
+                .blossom_upload(server_url, upload.encrypted_data.clone(), &upload.mime_type)
+                .await?;
+            uploads.push((upload, url));
+        }
+        let refs: Vec<_> = uploads.iter().map(|(u, url)| (u, url.as_str())).collect();
         let event = self
             .engine
-            .create_media_event(group_id, &upload, &url, caption)?;
+            .create_media_event_multi(group_id, &refs, caption)?;
         self.nostr.send_event(&event).await?;
         let incoming = self.engine.process_incoming(&event).await?;
         if let Incoming::Message(message) = incoming {
@@ -3227,7 +3276,7 @@ impl SonarClient {
         if let Err(e) = idx.lock().unwrap().upsert_summary(
             &group_id_hex,
             name,
-            &message.content,
+            &index_preview(message),
             &message.sender.to_string(),
             message.created_at.as_secs(),
             message.mine,
@@ -3801,6 +3850,30 @@ fn is_terminal_marmot_processing_error(err: &Error) -> bool {
     )
 }
 
+/// Chat-list preview text stored in the conversation index for `message`.
+/// The caption/text wins when present; a caption-less media message previews
+/// as its attachment kind ("Photo", "3 photos", "Voice note", filename) so an
+/// arriving album never shows an empty home row.
+fn index_preview(message: &ChatMessage) -> String {
+    if !message.content.is_empty() || message.media.is_empty() {
+        return message.content.clone();
+    }
+    let media = &message.media;
+    if media.len() > 1 && media.iter().all(|m| m.mime_type.starts_with("image/")) {
+        return format!("{} photos", media.len());
+    }
+    let first = &media[0];
+    if first.mime_type.starts_with("image/") {
+        "Photo".to_owned()
+    } else if first.mime_type.starts_with("audio/") {
+        "Voice note".to_owned()
+    } else if first.filename.is_empty() {
+        "File".to_owned()
+    } else {
+        first.filename.clone()
+    }
+}
+
 /// Read the value of a single-letter tag (e.g. `g`=geohash, `n`=nickname).
 fn tag_value(event: &Event, letter: Alphabet) -> Option<String> {
     event
@@ -3932,6 +4005,57 @@ mod tests {
         assert_eq!(relay_fetch_quorum(2), 2);
         assert_eq!(relay_fetch_quorum(3), 2);
         assert_eq!(relay_fetch_quorum(5), 2);
+    }
+
+    #[test]
+    fn index_preview_labels_media_only_messages() {
+        let media_ref = |mime: &str, filename: &str| crate::marmot::MediaRef {
+            url: "https://blossom.test/x".to_owned(),
+            mime_type: mime.to_owned(),
+            filename: filename.to_owned(),
+            width: None,
+            height: None,
+            duration_ms: None,
+        };
+        let msg = |content: &str, media: Vec<crate::marmot::MediaRef>| ChatMessage {
+            id: test_event_id(9),
+            group_id: GroupId::from_slice(&[1u8; 32]),
+            sender: Keys::generate().public_key(),
+            content: content.to_owned(),
+            created_at: Timestamp::from_secs(1),
+            mine: false,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media,
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::Text,
+        };
+        // Caption/text always wins.
+        assert_eq!(index_preview(&msg("hi", vec![media_ref("image/jpeg", "a.jpg")])), "hi");
+        // Caption-less media previews by kind — an album never shows blank.
+        assert_eq!(
+            index_preview(&msg("", vec![media_ref("image/jpeg", "a.jpg")])),
+            "Photo"
+        );
+        assert_eq!(
+            index_preview(&msg(
+                "",
+                vec![
+                    media_ref("image/jpeg", "a.jpg"),
+                    media_ref("image/png", "b.png"),
+                    media_ref("image/jpeg", "c.jpg"),
+                ]
+            )),
+            "3 photos"
+        );
+        assert_eq!(
+            index_preview(&msg("", vec![media_ref("audio/mp4", "voice.m4a")])),
+            "Voice note"
+        );
+        assert_eq!(
+            index_preview(&msg("", vec![media_ref("application/pdf", "doc.pdf")])),
+            "doc.pdf"
+        );
+        assert_eq!(index_preview(&msg("", vec![])), "");
     }
 
     #[test]

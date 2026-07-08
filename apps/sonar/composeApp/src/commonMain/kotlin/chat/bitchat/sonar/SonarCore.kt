@@ -382,6 +382,13 @@ sealed class SonarCallControl {
     data class End(override val callId: String, val reason: String) : SonarCallControl()
 }
 
+/** One attachment of an album send (one message, N attachments). */
+data class AlbumUpload(
+    val bytes: ByteArray,
+    val filename: String,
+    val mime: String,
+)
+
 /**
  * Shared boundary to the headless Rust core (`sonar-core`). UI in `commonMain`
  * calls these; each platform provides the `actual`:
@@ -459,6 +466,16 @@ expect object SonarCore {
         data: ByteArray,
         filename: String,
         mime: String,
+        caption: String,
+        serverUrl: String = "",
+    )
+
+    /** Encrypt + upload every [items] entry, then publish them as ONE album
+     *  message (a single event with N imeta tags, in order) carrying the
+     *  optional [caption]. If ANY upload fails nothing is published. */
+    suspend fun sendMediaMulti(
+        chatId: String,
+        items: List<AlbumUpload>,
         caption: String,
         serverUrl: String = "",
     )
