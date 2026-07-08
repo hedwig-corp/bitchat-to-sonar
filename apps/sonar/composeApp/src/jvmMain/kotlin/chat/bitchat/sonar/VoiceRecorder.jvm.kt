@@ -16,12 +16,34 @@ actual class VoiceRecorder {
 }
 
 actual object AudioNotePlayer {
+    private const val TMP_PREFIX = "sonar-vn-"
+    private const val TMP_SUFFIX = ".m4a"
+
+    private val lock = Any()
     private var process: Process? = null
     private var tempFile: File? = null
     private var onDone: (() -> Unit)? = null
-    private var waiter: Thread? = null
+    // Monotonic playback id. Every play()/stop() bumps it; the waiter thread
+    // captures its value and only finalizes if it is still current, so a stale
+    // waiter from a previous note can never clobber a newly-started one.
+    private var generation = 0
+
+    init {
+        // Sweep decrypted voice-note temp files orphaned by a prior hard kill
+        // (playback that never reached finishPlayback()). deleteOnExit() covers
+        // graceful exits; this covers crashes/kill -9 on the next launch.
+        runCatching {
+            System.getProperty("java.io.tmpdir")?.let { dir ->
+                File(dir).listFiles { f ->
+                    f.name.startsWith(TMP_PREFIX) && f.name.endsWith(TMP_SUFFIX)
+                }?.forEach { runCatching { it.delete() } }
+            }
+        }
+    }
 
     actual fun play(bytes: ByteArray, onComplete: () -> Unit) {
+        // Tear down any in-flight playback first (fires its completion, resets the
+        // previous bubble) before adopting the new note.
         stop()
         val os = System.getProperty("os.name").lowercase()
         if (!os.contains("mac")) {
@@ -29,7 +51,12 @@ actual object AudioNotePlayer {
             onComplete()
             return
         }
-        val file = File.createTempFile("sonar-vn-", ".m4a", DesktopEnv.dataDir)
+        // Write to the OS temp dir (swept by the OS), never persistent app data, with
+        // deleteOnExit() as a backstop so an interrupted play cannot leave decrypted
+        // E2EE audio behind.
+        val file = runCatching {
+            File.createTempFile(TMP_PREFIX, TMP_SUFFIX).apply { deleteOnExit() }
+        }.getOrElse { onComplete(); return }
         try {
             file.writeBytes(bytes)
         } catch (_: Exception) {
@@ -46,16 +73,20 @@ actual object AudioNotePlayer {
             onComplete()
             return
         }
-        tempFile = file
-        onDone = onComplete
-        process = afplay
-        waiter = Thread {
+        val gen: Int
+        synchronized(lock) {
+            gen = ++generation
+            process = afplay
+            tempFile = file
+            onDone = onComplete
+        }
+        Thread {
             try {
                 afplay.waitFor()
             } catch (_: InterruptedException) {
                 runCatching { afplay.destroy() }
             } finally {
-                finishPlayback()
+                finishPlayback(gen)
             }
         }.apply {
             isDaemon = true
@@ -65,21 +96,39 @@ actual object AudioNotePlayer {
     }
 
     actual fun stop() {
-        process?.let { p ->
+        val p: Process?
+        val f: File?
+        val cb: (() -> Unit)?
+        synchronized(lock) {
+            p = process
+            f = tempFile
+            cb = onDone
+            generation++ // orphan the in-flight waiter so its finishPlayback() no-ops
+            process = null
+            tempFile = null
+            onDone = null
+        }
+        if (p != null) {
             runCatching { p.destroy() }
             runCatching { p.waitFor() }
         }
-        process = null
-        waiter?.interrupt()
-        waiter = null
-        finishPlayback()
+        f?.let { runCatching { it.delete() } }
+        cb?.invoke()
     }
 
-    private fun finishPlayback() {
-        tempFile?.let { runCatching { it.delete() } }
-        tempFile = null
-        val cb = onDone
-        onDone = null
+    // Runs on the waiter thread when afplay exits on its own. Only finalizes if this
+    // is still the current generation; a newer play()/stop() already cleaned up.
+    private fun finishPlayback(gen: Int) {
+        val cb: (() -> Unit)?
+        synchronized(lock) {
+            if (gen != generation) return // superseded — the newer call owns the state
+            tempFile?.let { runCatching { it.delete() } }
+            tempFile = null
+            process = null
+            cb = onDone
+            onDone = null
+            generation++ // consume this generation
+        }
         cb?.invoke()
     }
 }
