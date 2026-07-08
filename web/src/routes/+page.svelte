@@ -2,7 +2,7 @@
   import Nav from '$lib/components/Nav.svelte';
   import Radar from '$lib/components/Radar.svelte';
   import Footer from '$lib/components/Footer.svelte';
-  import { DEMO_URL, DOWNLOAD_HREF, TESTFLIGHT_URL, TESTFLIGHT_MACOS_URL, ANDROID_APK_URL } from '$lib/links.js';
+  import { DOWNLOAD_HREF, TESTFLIGHT_URL, TESTFLIGHT_MACOS_URL, ANDROID_APK_URL } from '$lib/links.js';
 </script>
 
 <svelte:head>
@@ -22,7 +22,6 @@
     <p class="sub">Sonar is a private messenger that works two ways at once: Bluetooth finds the people around you — even with no internet — and the open Nostr network reaches everyone else. Your phone is the only account you need.</p>
     <div class="ctas">
       <a class="btn primary" href={DOWNLOAD_HREF}>Download</a>
-      <a class="btn ghost" href={DEMO_URL}>Try the interactive demo</a>
     </div>
     <p class="heronote">End-to-end encrypted · your key never leaves the phone · <code>a3f9 2c41 770e 5b2d</code></p>
   </div>
@@ -181,7 +180,6 @@
       <a class="btn primary" href={TESTFLIGHT_URL} target="_blank" rel="noopener">Join the iPhone beta (TestFlight)</a>
       <a class="btn primary" href={TESTFLIGHT_MACOS_URL} target="_blank" rel="noopener">Join the Mac beta (TestFlight)</a>
       <a class="btn primary" href={ANDROID_APK_URL}>Download for Android (APK)</a>
-      <a class="btn ghost" href={DEMO_URL}>Try the interactive demo</a>
     </div>
     <p class="heronote">Android APK is an arm64 alpha · sideload on 64-bit phones</p>
   </div>

@@ -69,9 +69,6 @@ repo name for the production build.
 
 ## Notes
 
-- The "Open the prototype" / "Try the interactive demo" buttons point at the
-  project repository until a hosted interactive demo exists. The `#download`
-  links are placeholders pending real App Store URLs (see the chat log).
 - Radar sweeps and pulses respect `prefers-reduced-motion`.
 
 ## Group invite links (App Links / Universal Links)
