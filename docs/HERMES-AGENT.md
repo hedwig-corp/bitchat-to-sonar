@@ -74,6 +74,10 @@ the agent over Nostr relays when they know the agent `npub`.
   the agent uses web tools — otherwise subprocesses fail with *"Web tools aren't
   configured"* even when the CLI works.
 - Rust toolchain to build `sonar-cli`, or a prebuilt binary on `PATH`.
+- **Config safety:** edit `~/.hermes/config.yaml` with `hermes config set` or
+  targeted patches — **never overwrite the whole file** with a partial snippet.
+  A truncated config (e.g. only `gateway.platforms.sonar.extra`) breaks Sonar
+  silently. Keep backups under `~/.hermes/state-snapshots/` before bulk edits.
 
 ### Build `sonar-cli`
 
@@ -340,6 +344,8 @@ Global flags: `--home <dir>` (else `SONAR_CLI_HOME`), `--relay <wss>` (repeatabl
 | Web tools fail in service | `.env` not loaded | systemd `EnvironmentFile` or bridge `load_hermes_env` |
 | Voice fails on iOS | Opus OGG or old CLI | Media build + `.m4a` / AAC |
 | `listen` hangs tool | Missing `--once` | Cron/tool calls must use `--once` |
+| Truncated / broken Hermes | Partial overwrite of `config.yaml` | Restore from `state-snapshots`; use `hermes config set` only |
+| "Too many pairing requests" | Pairing mode + extra traffic | Allowlist via env; disable typing/ack spam |
 
 ---
 
