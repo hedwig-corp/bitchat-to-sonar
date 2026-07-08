@@ -1712,7 +1712,7 @@ impl SonarClient {
                 if let Err(e) = idx.lock().unwrap().upsert_summary(
                     &group_id_hex,
                     name,
-                    &message.content,
+                    &index_preview(&message),
                     &message.sender.to_string(),
                     message.created_at.as_secs(),
                     message.mine,
@@ -3259,7 +3259,7 @@ impl SonarClient {
         if let Err(e) = idx.lock().unwrap().upsert_summary(
             &group_id_hex,
             name,
-            &message.content,
+            &index_preview(message),
             &message.sender.to_string(),
             message.created_at.as_secs(),
             message.mine,
@@ -3833,6 +3833,30 @@ fn is_terminal_marmot_processing_error(err: &Error) -> bool {
     )
 }
 
+/// Chat-list preview text stored in the conversation index for `message`.
+/// The caption/text wins when present; a caption-less media message previews
+/// as its attachment kind ("Photo", "3 photos", "Voice note", filename) so an
+/// arriving album never shows an empty home row.
+fn index_preview(message: &ChatMessage) -> String {
+    if !message.content.is_empty() || message.media.is_empty() {
+        return message.content.clone();
+    }
+    let media = &message.media;
+    if media.len() > 1 && media.iter().all(|m| m.mime_type.starts_with("image/")) {
+        return format!("{} photos", media.len());
+    }
+    let first = &media[0];
+    if first.mime_type.starts_with("image/") {
+        "Photo".to_owned()
+    } else if first.mime_type.starts_with("audio/") {
+        "Voice note".to_owned()
+    } else if first.filename.is_empty() {
+        "File".to_owned()
+    } else {
+        first.filename.clone()
+    }
+}
+
 /// Read the value of a single-letter tag (e.g. `g`=geohash, `n`=nickname).
 fn tag_value(event: &Event, letter: Alphabet) -> Option<String> {
     event
@@ -3964,6 +3988,57 @@ mod tests {
         assert_eq!(relay_fetch_quorum(2), 2);
         assert_eq!(relay_fetch_quorum(3), 2);
         assert_eq!(relay_fetch_quorum(5), 2);
+    }
+
+    #[test]
+    fn index_preview_labels_media_only_messages() {
+        let media_ref = |mime: &str, filename: &str| crate::marmot::MediaRef {
+            url: "https://blossom.test/x".to_owned(),
+            mime_type: mime.to_owned(),
+            filename: filename.to_owned(),
+            width: None,
+            height: None,
+            duration_ms: None,
+        };
+        let msg = |content: &str, media: Vec<crate::marmot::MediaRef>| ChatMessage {
+            id: test_event_id(9),
+            group_id: GroupId::from_slice(&[1u8; 32]),
+            sender: Keys::generate().public_key(),
+            content: content.to_owned(),
+            created_at: Timestamp::from_secs(1),
+            mine: false,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media,
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::Text,
+        };
+        // Caption/text always wins.
+        assert_eq!(index_preview(&msg("hi", vec![media_ref("image/jpeg", "a.jpg")])), "hi");
+        // Caption-less media previews by kind — an album never shows blank.
+        assert_eq!(
+            index_preview(&msg("", vec![media_ref("image/jpeg", "a.jpg")])),
+            "Photo"
+        );
+        assert_eq!(
+            index_preview(&msg(
+                "",
+                vec![
+                    media_ref("image/jpeg", "a.jpg"),
+                    media_ref("image/png", "b.png"),
+                    media_ref("image/jpeg", "c.jpg"),
+                ]
+            )),
+            "3 photos"
+        );
+        assert_eq!(
+            index_preview(&msg("", vec![media_ref("audio/mp4", "voice.m4a")])),
+            "Voice note"
+        );
+        assert_eq!(
+            index_preview(&msg("", vec![media_ref("application/pdf", "doc.pdf")])),
+            "doc.pdf"
+        );
+        assert_eq!(index_preview(&msg("", vec![])), "");
     }
 
     #[test]

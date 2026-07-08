@@ -3142,7 +3142,7 @@ final class SonarAppStore: ObservableObject {
                 marmotRows.append(SNDMRow(
                     id: Self.marmotIDPrefix + group.id,
                     title: marmot.title(for: group),
-                    preview: last.map { Self.previewText($0.content, stickerRef: $0.stickerRef) } ?? "Secure group · reaches anywhere",
+                    preview: last.map { Self.previewText($0.content, stickerRef: $0.stickerRef, media: $0.media) } ?? "Secure group · reaches anywhere",
                     time: last.map { Self.listTime($0.createdAt) } ?? "",
                     unread: (marmot.unreadByGroup[group.id] ?? 0) > 0,
                     presence: false,
@@ -3195,7 +3195,7 @@ final class SonarAppStore: ObservableObject {
                     byKey[foldKey] = SNDMRow(
                         id: existing.id,
                         title: existing.title,
-                        preview: Self.previewText(rowLast.content, stickerRef: rowLast.stickerRef),
+                        preview: Self.previewText(rowLast.content, stickerRef: rowLast.stickerRef, media: rowLast.media),
                         time: Self.listTime(rowLast.createdAt),
                         unread: existing.unread || hasUnreadMarmotMessage(in: groupSet),
                         presence: existing.presence,
@@ -3216,7 +3216,7 @@ final class SonarAppStore: ObservableObject {
                 byKey[foldKey] = SNDMRow(
                     id: rowId,
                     title: liveSonarPeerId == nil ? marmot.title(for: rowGroup) : peerDisplayName(rowId),
-                    preview: rowLast.map { Self.previewText($0.content, stickerRef: $0.stickerRef) } ?? networkLabel(forPeer: rowId),
+                    preview: rowLast.map { Self.previewText($0.content, stickerRef: $0.stickerRef, media: $0.media) } ?? networkLabel(forPeer: rowId),
                     time: rowLast.map { Self.listTime($0.createdAt) } ?? "",
                     unread: hasUnreadMarmotMessage(in: groupSet),
                     presence: liveSonarPeerId != nil && meshReachable(rowId),
@@ -3233,7 +3233,7 @@ final class SonarAppStore: ObservableObject {
             marmotRows.append(SNDMRow(
                 id: Self.marmotIDPrefix + rowGroupId,
                 title: marmot.title(for: rowGroup),
-                preview: rowLast.map { Self.previewText($0.content, stickerRef: $0.stickerRef) } ?? "Secure chat · reaches anywhere",
+                preview: rowLast.map { Self.previewText($0.content, stickerRef: $0.stickerRef, media: $0.media) } ?? "Secure chat · reaches anywhere",
                 time: rowLast.map { Self.listTime($0.createdAt) } ?? "",
                 unread: hasUnreadMarmotMessage(in: groupSet),
                 presence: false,
@@ -5022,13 +5022,32 @@ final class SonarAppStore: ObservableObject {
 
     /// Maps a raw last-message content to the home-row preview ("₿ Payment"
     /// for any ⚡PAY line, "Voice call" for ☎CALL signaling, so codecs never
-    /// leak into list rows).
-    static func previewText(_ content: String, stickerRef: MarmotService.MarmotStickerRef? = nil) -> String {
+    /// leak into list rows). A caption-less media message previews as its
+    /// attachment kind ("Photo", "3 photos", "Voice note", filename) instead
+    /// of an empty row.
+    static func previewText(
+        _ content: String,
+        stickerRef: MarmotService.MarmotStickerRef? = nil,
+        media: [MarmotService.MarmotMedia] = []
+    ) -> String {
         if stickerRef != nil { return "Sticker" }
         if looksLikeCallControl(content), callParseControl(content: content) != nil {
             return "Voice call"
         }
-        return SonarPayMessage.decode(content) != nil ? "\u{20BF} Payment" : content
+        if SonarPayMessage.decode(content) != nil { return "\u{20BF} Payment" }
+        if content.isEmpty, !media.isEmpty { return Self.mediaPreviewLabel(media) }
+        return content
+    }
+
+    /// "Photo" / "3 photos" / "Voice note" / filename for a media-only message.
+    private static func mediaPreviewLabel(_ media: [MarmotService.MarmotMedia]) -> String {
+        if media.count > 1, media.allSatisfy({ $0.isImage }) {
+            return "\(media.count) photos"
+        }
+        guard let first = media.first else { return "" }
+        if first.isImage { return "Photo" }
+        if first.isAudio { return "Voice note" }
+        return first.filename.isEmpty ? "File" : first.filename
     }
 
     /// Radar "Send sats": open the DM with the PaySheet already up.

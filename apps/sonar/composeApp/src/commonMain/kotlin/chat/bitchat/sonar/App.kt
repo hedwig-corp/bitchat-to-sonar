@@ -1945,42 +1945,45 @@ private fun MediaDeck(
     // Reserve the deepest-possible overhang so the deck's footprint (and the row
     // below it) stays put while paging, even as the visible peek count shrinks.
     val maxPeek = minOf(2, media.size - 1)
-    Box(Modifier.padding(end = (maxPeek * 6).dp, bottom = (maxPeek * 5).dp)) {
-        // Real next-photo thumbnails behind the front card, deepest first, so
-        // the pile shows what's coming and shrinks toward the last photo.
-        for (depth in peek downTo 1) {
-            MediaDeckCard(
-                media = media[current + depth],
-                state = state,
-                chatId = chatId,
-                dim = 0.12f + 0.10f * depth,
-                onOpen = null,
-                modifier = Modifier
-                    .padding(start = (depth * 6).dp, top = (depth * 5).dp)
-                    .size(width = deckWidth, height = deckHeight),
-            )
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Box(Modifier.padding(end = (maxPeek * 6).dp, bottom = (maxPeek * 5).dp)) {
+            // Real next-photo thumbnails behind the front card, deepest first, so
+            // the pile shows what's coming and shrinks toward the last photo.
+            for (depth in peek downTo 1) {
+                MediaDeckCard(
+                    media = media[current + depth],
+                    state = state,
+                    chatId = chatId,
+                    dim = 0.12f + 0.10f * depth,
+                    onOpen = null,
+                    modifier = Modifier
+                        .padding(start = (depth * 6).dp, top = (depth * 5).dp)
+                        .size(width = deckWidth, height = deckHeight),
+                )
+            }
+            androidx.compose.foundation.pager.HorizontalPager(
+                state = pagerState,
+                modifier = Modifier.size(width = deckWidth, height = deckHeight),
+                pageSpacing = 8.dp,
+            ) { page ->
+                MediaDeckCard(
+                    media = media[page],
+                    state = state,
+                    chatId = chatId,
+                    onOpen = { onOpen(page) },
+                    modifier = Modifier.fillMaxSize(),
+                )
+            }
         }
-        androidx.compose.foundation.pager.HorizontalPager(
-            state = pagerState,
-            modifier = Modifier.size(width = deckWidth, height = deckHeight),
-            pageSpacing = 8.dp,
-        ) { page ->
-            MediaDeckCard(
-                media = media[page],
-                state = state,
-                chatId = chatId,
-                onOpen = { onOpen(page) },
-                modifier = Modifier.fillMaxSize(),
-            )
-        }
+        // Dots BELOW the deck (matches iOS) so they never cover the photo.
         Row(
-            Modifier.align(Alignment.BottomCenter).padding(bottom = 8.dp),
+            Modifier.padding(start = 4.dp),
             horizontalArrangement = Arrangement.spacedBy(5.dp)
         ) {
             repeat(media.size) { i ->
                 Box(
                     Modifier.size(6.dp).clip(CircleShape)
-                        .background(if (i == pagerState.currentPage) s.accent else Color.White.copy(alpha = 0.55f))
+                        .background(if (i == pagerState.currentPage) s.accent else s.text3.copy(alpha = 0.4f))
                 )
             }
         }

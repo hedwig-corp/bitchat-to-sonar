@@ -1228,6 +1228,10 @@ private struct SNMediaDeck: View {
     var onOpen: (Int) -> Void
 
     @State private var index = 0
+    /// Last page direction: +1 advanced (card slides out left, next in from the
+    /// right), -1 went back. Drives the asymmetric slide transition so paging
+    /// feels like the xChat "slide the card away" gesture, not a swap.
+    @State private var slideDirection: CGFloat = 1
     @GestureState private var dragX: CGFloat = 0
 
     var body: some View {
@@ -1257,6 +1261,16 @@ private struct SNMediaDeck: View {
                 }
                 SNMediaCardImage(item: items[current], width: cardW, height: cardH, load: load)
                     .id(current)
+                    // Directional slide: outgoing card exits toward the drag,
+                    // incoming enters from the opposite edge. Only animated
+                    // paging triggers it (transcript inserts are not animated).
+                    .transition(.asymmetric(
+                        insertion: .move(edge: slideDirection > 0 ? .trailing : .leading)
+                            .combined(with: .opacity),
+                        removal: .move(edge: slideDirection > 0 ? .leading : .trailing)
+                            .combined(with: .opacity)
+                    ))
+                    .zIndex(1)
                     .shadow(color: Color.black.opacity(0.14), radius: 6, x: 0, y: 3)
                     .offset(x: dragX)
                     .contentShape(RoundedRectangle(cornerRadius: 18))
@@ -1267,10 +1281,12 @@ private struct SNMediaDeck: View {
                             .onEnded { value in
                                 let threshold: CGFloat = 56
                                 if value.translation.width <= -threshold, current < count - 1 {
+                                    slideDirection = 1
                                     withAnimation(.spring(response: 0.3, dampingFraction: 0.82)) {
                                         index = current + 1
                                     }
                                 } else if value.translation.width >= threshold, current > 0 {
+                                    slideDirection = -1
                                     withAnimation(.spring(response: 0.3, dampingFraction: 0.82)) {
                                         index = current - 1
                                     }
@@ -1321,7 +1337,22 @@ struct SNMediaGalleryViewer: View {
     let caption: String
     var load: ((SNMediaItem) async -> Data?)? = nil
 
-    @State private var selection = 0
+    // Seeded in init (not onAppear) so the pager opens ON the tapped photo
+    // instead of flashing page 0 for a frame.
+    @State private var selection: Int
+
+    init(
+        items: [SNMediaItem],
+        startIndex: Int,
+        caption: String,
+        load: ((SNMediaItem) async -> Data?)? = nil
+    ) {
+        self.items = items
+        self.startIndex = startIndex
+        self.caption = caption
+        self.load = load
+        _selection = State(initialValue: min(max(startIndex, 0), max(items.count - 1, 0)))
+    }
 
     private var safeIndex: Int { min(max(selection, 0), max(items.count - 1, 0)) }
 
@@ -1335,7 +1366,6 @@ struct SNMediaGalleryViewer: View {
         }
         .tabViewStyle(.page(indexDisplayMode: .always))
         .background(Color.black.ignoresSafeArea())
-        .onAppear { selection = min(max(startIndex, 0), max(items.count - 1, 0)) }
         #else
         ZStack {
             Color.black
@@ -1359,7 +1389,6 @@ struct SNMediaGalleryViewer: View {
                 SNDeckDots(count: items.count, index: safeIndex).padding(.bottom, 12)
             }
         }
-        .onAppear { selection = min(max(startIndex, 0), max(items.count - 1, 0)) }
         #endif
     }
 }
