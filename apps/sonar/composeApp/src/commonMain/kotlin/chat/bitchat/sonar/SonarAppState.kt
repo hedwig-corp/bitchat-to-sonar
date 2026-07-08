@@ -6926,7 +6926,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             // No npub yet: queue the sticker wire-encoding like text so it isn't
             // dropped — the outbox re-sends it over mesh on re-link, or as a real
             // sticker over White Noise if this peer's npub is learned first.
-            enqueueOutbox(peerId, content)
+            enqueueOutbox(peerId, encoded)
             toast = "Out of range — message queued and will send automatically."
             return
         }
@@ -8313,6 +8313,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         queued: QueuedMessage,
     ): Boolean {
         if (isMeshContactBlocked(peerId)) return false
+        // Sticker wire-encodings ride NIP-17 as content, exactly like the live
+        // sendDirectNip17 path: the receiver decodes them via meshParseStickerContent
+        // (see drainDirectDms) and privateDmMessage renders the local echo as a
+        // real sticker, so no raw control string leaks.
         val delivered = sendDirectNip17Now(peerId, npubRaw, queued.messageId, queued.content)
         if (!delivered) return false
         val msg = privateDmMessage(
