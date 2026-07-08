@@ -1936,29 +1936,41 @@ impl SonarClient {
         }
         let nostr = self.nostr.clone();
         let outbox_state = self.outbox_state.clone();
+        let change_listener = self.change_listener.clone();
+        // Kind-445 group messages carry the group id in the `h` tag; hosts key
+        // their transcript refresh on it, so the sent/failed flip below must
+        // notify them or the message shows "Sending" until the next poll.
+        let group_id_hex = tag_value(&event, Alphabet::H);
         tokio::spawn(async move {
             let result = nostr.send_event(&event).await;
             let now_secs = Timestamp::now().as_secs();
-            let mut outbox = outbox_state.lock().unwrap();
-            match result {
-                Ok(output) => {
-                    if let Err(err) = require_relay_success(&output, "text publish") {
+            {
+                let mut outbox = outbox_state.lock().unwrap();
+                match result {
+                    Ok(output) => {
+                        if let Err(err) = require_relay_success(&output, "text publish") {
+                            let _ = outbox.mark_failed_by_message_id(
+                                &message_id_hex,
+                                err.to_string(),
+                                now_secs,
+                            );
+                        } else {
+                            let _ = outbox.mark_sent_by_message_id(&message_id_hex, now_secs);
+                        }
+                    }
+                    Err(err) => {
                         let _ = outbox.mark_failed_by_message_id(
                             &message_id_hex,
                             err.to_string(),
                             now_secs,
                         );
-                    } else {
-                        let _ = outbox.mark_sent_by_message_id(&message_id_hex, now_secs);
                     }
                 }
-                Err(err) => {
-                    let _ = outbox.mark_failed_by_message_id(
-                        &message_id_hex,
-                        err.to_string(),
-                        now_secs,
-                    );
-                }
+            }
+            if let (Some(group_id_hex), Some(listener)) =
+                (group_id_hex, change_listener.lock().unwrap().clone())
+            {
+                listener.on_conversation_changed(group_id_hex);
             }
         });
     }
