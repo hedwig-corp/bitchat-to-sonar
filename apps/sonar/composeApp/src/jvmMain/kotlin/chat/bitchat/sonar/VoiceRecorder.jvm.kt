@@ -3,6 +3,7 @@ package chat.bitchat.sonar
 import java.io.File
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Desktop (JVM) `actual`: recording is not wired yet (no JVM AAC encoder).
@@ -38,10 +39,27 @@ actual object AudioNotePlayer {
     // waiter from a previous note can never clobber a newly-started one.
     private var generation = 0
 
-    init {
-        // Sweep decrypted voice-note temp files orphaned by a prior hard kill
-        // (playback that never reached teardown). Normal exit deletes them inline;
-        // this covers crashes/kill -9 on the next launch.
+    private val shutdownHookInstalled = AtomicBoolean(false)
+
+    /**
+     * Delete decrypted voice-note temp files orphaned by a prior hard kill (playback
+     * that never reached teardown). Call once from the desktop entry point ([main]):
+     * this object's `init` would be lazy (first play/stop), so leaving the sweep
+     * implicit would skip it in a session that never plays a note. Also installs a
+     * one-time shutdown hook so a graceful quit mid-playback deletes the live file
+     * (kill -9 is covered by the next launch's sweep).
+     */
+    fun sweepOrphans() {
+        if (shutdownHookInstalled.compareAndSet(false, true)) {
+            runCatching {
+                Runtime.getRuntime().addShutdownHook(Thread {
+                    synchronized(lock) {
+                        runCatching { process?.destroy() }
+                        tempFile?.let { runCatching { it.delete() } }
+                    }
+                })
+            }
+        }
         runCatching {
             System.getProperty("java.io.tmpdir")?.let { dir ->
                 File(dir).listFiles { f ->
