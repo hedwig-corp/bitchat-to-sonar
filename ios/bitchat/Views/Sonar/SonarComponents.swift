@@ -22,6 +22,7 @@ import AVFoundation
 import Photos
 #else
 import AppKit
+import AVFoundation
 #endif
 
 // MARK: - bcHash (FNV-1a, identical to components.jsx)
@@ -1665,18 +1666,14 @@ struct SNAudioBubble: View {
     let mine: Bool
     var via: SNVia = .mesh
 
-    #if os(iOS)
     @StateObject private var player = SNAudioPlayer()
-    #endif
 
     private var tint: Color { via == .internet ? SonarTheme.netFill : SonarTheme.accentFill }
 
     var body: some View {
         HStack(spacing: 11) {
             Button {
-                #if os(iOS)
                 player.toggle(bytes)
-                #endif
             } label: {
                 Circle().fill(mine ? tint : SonarTheme.surface)
                     .frame(width: 34, height: 34)
@@ -1697,20 +1694,8 @@ struct SNAudioBubble: View {
         .background(RoundedRectangle(cornerRadius: 18).fill(mine ? tint.opacity(0.15) : SonarTheme.surface2))
     }
 
-    private var isPlaying: Bool {
-        #if os(iOS)
-        return player.playing
-        #else
-        return false
-        #endif
-    }
-    private var durationText: String {
-        #if os(iOS)
-        return snFmtDur(Int(player.duration.rounded()))
-        #else
-        return "0:00"
-        #endif
-    }
+    private var isPlaying: Bool { player.playing }
+    private var durationText: String { snFmtDur(Int(player.duration.rounded())) }
 }
 
 /// Static waveform (design: `MediaWave` — deterministic hash bars).
@@ -1736,8 +1721,7 @@ struct SNMediaWave: View {
     }
 }
 
-#if os(iOS)
-/// Minimal AVAudioPlayer wrapper for the audio bubble.
+/// Minimal AVAudioPlayer wrapper for the audio bubble (iOS + native macOS Sonar.app).
 @MainActor
 final class SNAudioPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     @Published private(set) var playing = false
@@ -1747,8 +1731,10 @@ final class SNAudioPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     func toggle(_ bytes: Data?) {
         if playing { player?.pause(); playing = false; return }
         if player == nil, let bytes {
+            #if os(iOS)
             try? AVAudioSession.sharedInstance().setCategory(.playback)
             try? AVAudioSession.sharedInstance().setActive(true)
+            #endif
             player = try? AVAudioPlayer(data: bytes)
             player?.delegate = self
             duration = player?.duration ?? 0
@@ -1764,7 +1750,6 @@ final class SNAudioPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
         Task { @MainActor in self.playing = false }
     }
 }
-#endif
 
 struct SNComposer: View {
     let placeholder: String
