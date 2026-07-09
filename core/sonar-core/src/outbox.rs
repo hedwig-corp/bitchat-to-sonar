@@ -137,11 +137,14 @@ impl OutboxState {
         self.save_if_dirty()
     }
 
+    /// Returns `(message_id_hex, group_id_hex, event)` for each retryable row.
+    /// `group_id_hex` is the MLS id hosts use for conversation refresh (not
+    /// the Nostr `#h` / `nostr_group_id`).
     pub fn retryable_events(
         &mut self,
         now_secs: u64,
         active_group_ids: &HashSet<String>,
-    ) -> Result<Vec<(String, Event)>> {
+    ) -> Result<Vec<(String, String, Event)>> {
         let mut out = Vec::new();
         let before = self.entries.len();
         self.entries
@@ -162,7 +165,11 @@ impl OutboxState {
             entry.updated_at_secs = now_secs;
             entry.last_error = None;
             self.dirty = true;
-            out.push((entry.message_id_hex.clone(), event));
+            out.push((
+                entry.message_id_hex.clone(),
+                entry.group_id_hex.clone(),
+                event,
+            ));
         }
         self.save_if_dirty()?;
         Ok(out)

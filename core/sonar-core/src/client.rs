@@ -1687,7 +1687,7 @@ impl SonarClient {
         let group_name = self.resolve_group_name(group_id);
         self.mark_outbox_pending(group_id, &message, &event)?;
         let event_id = event.id;
-        self.spawn_outbox_publish(message.id.to_hex(), event);
+        self.spawn_outbox_publish(message.id.to_hex(), group_id_hex.clone(), event);
         self.notify_conversation_changed(&group_id_hex);
         // Deferred bookkeeping: index + sync-state disk writes don't block
         // the caller so the next send can start immediately.
@@ -1826,7 +1826,7 @@ impl SonarClient {
         let group_name = self.resolve_group_name(group_id);
         self.mark_outbox_pending(group_id, &message, &event)?;
         let event_id = event.id;
-        self.spawn_outbox_publish(message.id.to_hex(), event);
+        self.spawn_outbox_publish(message.id.to_hex(), group_id_hex.clone(), event);
         self.notify_conversation_changed(&group_id_hex);
         self.spawn_send_bookkeeping(group_name, message, event_id);
         self.spawn_push_notification(group_id.clone());
@@ -1930,36 +1930,78 @@ impl SonarClient {
         )
     }
 
-    fn spawn_outbox_publish(&self, message_id_hex: String, event: Event) {
+    /// Publish an outbox event and notify hosts when delivery state flips.
+    ///
+    /// [group_id_hex] must be the **MLS** group id hosts use for
+    /// `conversationChanged` / `messages_page` — not the Nostr `#h` tag
+    /// (`nostr_group_id`). Kind-445 `#h` is for relay filtering only.
+    fn spawn_outbox_publish(&self, message_id_hex: String, group_id_hex: String, event: Event) {
         if self.relays.is_empty() {
             return;
         }
         let nostr = self.nostr.clone();
         let outbox_state = self.outbox_state.clone();
+        let change_listener = self.change_listener.clone();
+        let relays = self.relays.clone();
         tokio::spawn(async move {
-            let result = nostr.send_event(&event).await;
-            let now_secs = Timestamp::now().as_secs();
-            let mut outbox = outbox_state.lock().unwrap();
-            match result {
-                Ok(output) => {
-                    if let Err(err) = require_relay_success(&output, "text publish") {
-                        let _ = outbox.mark_failed_by_message_id(
-                            &message_id_hex,
-                            err.to_string(),
-                            now_secs,
-                        );
-                    } else {
-                        let _ = outbox.mark_sent_by_message_id(&message_id_hex, now_secs);
-                    }
+            let notify = || {
+                if let Some(listener) = change_listener.lock().unwrap().clone() {
+                    listener.on_conversation_changed(group_id_hex.clone());
                 }
-                Err(err) => {
-                    let _ = outbox.mark_failed_by_message_id(
-                        &message_id_hex,
-                        err.to_string(),
-                        now_secs,
-                    );
+            };
+            // First-ack wins (Signal-style): the pool's `send_event` joins ALL
+            // relays, so one dead relay delays the Sending→Sent flip by its
+            // full timeout even though the fastest relay usually acks in well
+            // under a second. Fan out one publish per Marmot relay and mark
+            // the message Sent on the FIRST OK — the remaining publishes keep
+            // running in the background for redundancy. Only when EVERY relay
+            // has failed does the message flip to failed (outbox-retryable).
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            for url in relays {
+                let nostr = nostr.clone();
+                let event = event.clone();
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let outcome = match nostr.send_event_to([url], &event).await {
+                        Ok(output) if !output.success.is_empty() => Ok(()),
+                        Ok(output) => Err(output
+                            .failed
+                            .values()
+                            .next()
+                            .cloned()
+                            .unwrap_or_else(|| "relay rejected event".to_string())),
+                        Err(err) => Err(err.to_string()),
+                    };
+                    let _ = tx.send(outcome);
+                });
+            }
+            drop(tx);
+            let mut failures: Vec<String> = Vec::new();
+            while let Some(outcome) = rx.recv().await {
+                match outcome {
+                    Ok(()) => {
+                        let _ = outbox_state
+                            .lock()
+                            .unwrap()
+                            .mark_sent_by_message_id(&message_id_hex, Timestamp::now().as_secs());
+                        notify();
+                        return;
+                    }
+                    Err(err) => failures.push(err),
                 }
             }
+            // The channel closed without a single OK: every relay failed.
+            let reason = if failures.is_empty() {
+                "no relay accepted the event".to_string()
+            } else {
+                failures.join(", ")
+            };
+            let _ = outbox_state.lock().unwrap().mark_failed_by_message_id(
+                &message_id_hex,
+                reason,
+                Timestamp::now().as_secs(),
+            );
+            notify();
         });
     }
 
@@ -1995,8 +2037,9 @@ impl SonarClient {
                 }
             }
         };
-        for (message_id_hex, event) in retryable {
-            self.spawn_outbox_publish(message_id_hex, event);
+        for (message_id_hex, group_id_hex, event) in retryable {
+            // group_id_hex is the MLS id stored at mark_pending — same key hosts use.
+            self.spawn_outbox_publish(message_id_hex, group_id_hex, event);
         }
     }
 

@@ -24,6 +24,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.launchIn
@@ -461,6 +462,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             callLogs.clear(); callVersion++
             resetCallState()
             pollJob?.cancel(); pollJob = null
+            stopMarmotWakeLoop()
         }
     }
 
@@ -541,6 +543,9 @@ class SonarAppState(private val scope: CoroutineScope) {
     private var callLoopRunning = false
     private var callTicker: kotlinx.coroutines.Job? = null
     private var meshRealtimeLoopRunning = false
+    /** Live Marmot drain loop job (see [startMarmotWakeLoop]). Cancelled on
+     *  [wipe] / account restore so a dead node cannot keep a parked waiter. */
+    private var marmotWakeJob: Job? = null
     private var pollJob: Job? = null
     /** Consumer of the event-driven housekeeping cycle. Triggered by the core
      *  `conversationChanged` flow (primary) and a slow heartbeat (fallback);
@@ -2226,6 +2231,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 UnifyRadio.stopAdvertising()
                 unifyOffer = null; unifyPeers = emptyList()
                 pollJob?.cancel(); pollJob = null
+                stopMarmotWakeLoop()
                 resetCallState()
                 cancelPendingMarmotSetups()
                 cancelPendingMarmotGroupSetups()
@@ -2699,6 +2705,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // an incoming call rings without us having to place one first.
                 launch { ensureCallStarted() }
                 startMeshRealtimeLoop()
+                startMarmotWakeLoop()
                 poll()
                 // Run the first housekeeping pass now instead of waiting a full
                 // heartbeat — seeds notifications/unread/profiles at launch (the
@@ -5951,6 +5958,37 @@ class SonarAppState(private val scope: CoroutineScope) {
             sonarLog("SonarWN", "White Noise: ${chats.size} group(s), $wnMsgs message(s)")
             lastWnGroups = chats.size; lastWnMsgs = wnMsgs
         }
+    }
+
+    /** Live Marmot delivery (iOS `MarmotChatView.startPolling` parity): the
+     *  relay subscriptions push welcomes/group messages into a core buffer that
+     *  the host must drain — and `sync()` deliberately skips the kind-445 fetch
+     *  while live subscriptions are active, so WITHOUT this loop pushed
+     *  messages never reach local storage and an open transcript never
+     *  refreshes. Park on [SonarCore.waitForMarmotEvent] (blocks one IO thread,
+     *  no MLS state), then drain on wake; the drain writes to local storage and
+     *  fires [SonarCore.conversationChanged] per chat, which the existing
+     *  collector turns into transcript/chat-list repaints. On the idle timeout
+     *  re-subscribe to self-heal dropped relay sockets. Cancelled by
+     *  [stopMarmotWakeLoop] on wipe / account restore. */
+    private fun startMarmotWakeLoop() {
+        if (marmotWakeJob?.isActive == true) return
+        marmotWakeJob = scope.launch {
+            while (isActive) {
+                val woke = SonarCore.waitForMarmotEvent(25)
+                if (!isActive) return@launch
+                if (woke) {
+                    runCatching { SonarCore.drainPendingMarmot() }
+                } else {
+                    runCatching { SonarCore.ensureSubscriptions() }
+                }
+            }
+        }
+    }
+
+    private fun stopMarmotWakeLoop() {
+        marmotWakeJob?.cancel()
+        marmotWakeJob = null
     }
 
     /** BLE mesh is the real-time rail for calls, so it must not wait for the

@@ -542,6 +542,17 @@ expect object SonarCore {
      *  background/IO work and never before local chat paint. */
     suspend fun ensureSubscriptions()
 
+    /** Park up to [timeoutSecs] until the relay subscriptions push a live
+     *  Marmot event (welcome or group message). Returns true when there is
+     *  something to drain. Touches no MLS state — safe to park off the
+     *  engine path (mirrors iOS MarmotChatView.startPolling). */
+    suspend fun waitForMarmotEvent(timeoutSecs: Long): Boolean
+
+    /** Process buffered live Marmot events through the MLS engine and into
+     *  local storage. Fires [conversationChanged] per affected chat. Returns
+     *  the number of incoming-message notifications drained. */
+    suspend fun drainPendingMarmot(): Int
+
     /** JSON snapshot of relay/sync state (relay statuses, sync watermark,
      *  per-group catch-up floors) for the Diagnostics screen and the exported
      *  debug bundle. No message content or key material. Null before [start]. */
