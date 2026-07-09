@@ -1687,7 +1687,7 @@ impl SonarClient {
         let group_name = self.resolve_group_name(group_id);
         self.mark_outbox_pending(group_id, &message, &event)?;
         let event_id = event.id;
-        self.spawn_outbox_publish(message.id.to_hex(), event);
+        self.spawn_outbox_publish(message.id.to_hex(), group_id_hex.clone(), event);
         self.notify_conversation_changed(&group_id_hex);
         // Deferred bookkeeping: index + sync-state disk writes don't block
         // the caller so the next send can start immediately.
@@ -1826,7 +1826,7 @@ impl SonarClient {
         let group_name = self.resolve_group_name(group_id);
         self.mark_outbox_pending(group_id, &message, &event)?;
         let event_id = event.id;
-        self.spawn_outbox_publish(message.id.to_hex(), event);
+        self.spawn_outbox_publish(message.id.to_hex(), group_id_hex.clone(), event);
         self.notify_conversation_changed(&group_id_hex);
         self.spawn_send_bookkeeping(group_name, message, event_id);
         self.spawn_push_notification(group_id.clone());
@@ -1930,25 +1930,23 @@ impl SonarClient {
         )
     }
 
-    fn spawn_outbox_publish(&self, message_id_hex: String, event: Event) {
+    /// Publish an outbox event and notify hosts when delivery state flips.
+    ///
+    /// [group_id_hex] must be the **MLS** group id hosts use for
+    /// `conversationChanged` / `messages_page` — not the Nostr `#h` tag
+    /// (`nostr_group_id`). Kind-445 `#h` is for relay filtering only.
+    fn spawn_outbox_publish(&self, message_id_hex: String, group_id_hex: String, event: Event) {
         if self.relays.is_empty() {
             return;
         }
         let nostr = self.nostr.clone();
         let outbox_state = self.outbox_state.clone();
         let change_listener = self.change_listener.clone();
-        // Kind-445 group messages carry the group id in the `h` tag; hosts key
-        // their transcript refresh on it, so the sent/failed flip below must
-        // notify them or the message shows "Sending" until the next poll.
-        let group_id_hex = tag_value(&event, Alphabet::H);
         let relays = self.relays.clone();
         tokio::spawn(async move {
-            let notify = |group_id_hex: &Option<String>| {
-                if let (Some(id), Some(listener)) = (
-                    group_id_hex.clone(),
-                    change_listener.lock().unwrap().clone(),
-                ) {
-                    listener.on_conversation_changed(id);
+            let notify = || {
+                if let Some(listener) = change_listener.lock().unwrap().clone() {
+                    listener.on_conversation_changed(group_id_hex.clone());
                 }
             };
             // First-ack wins (Signal-style): the pool's `send_event` joins ALL
@@ -1986,7 +1984,7 @@ impl SonarClient {
                             .lock()
                             .unwrap()
                             .mark_sent_by_message_id(&message_id_hex, Timestamp::now().as_secs());
-                        notify(&group_id_hex);
+                        notify();
                         return;
                     }
                     Err(err) => failures.push(err),
@@ -2003,7 +2001,7 @@ impl SonarClient {
                 reason,
                 Timestamp::now().as_secs(),
             );
-            notify(&group_id_hex);
+            notify();
         });
     }
 
@@ -2039,8 +2037,9 @@ impl SonarClient {
                 }
             }
         };
-        for (message_id_hex, event) in retryable {
-            self.spawn_outbox_publish(message_id_hex, event);
+        for (message_id_hex, group_id_hex, event) in retryable {
+            // group_id_hex is the MLS id stored at mark_pending — same key hosts use.
+            self.spawn_outbox_publish(message_id_hex, group_id_hex, event);
         }
     }
 

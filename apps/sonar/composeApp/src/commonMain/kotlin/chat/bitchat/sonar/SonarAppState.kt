@@ -24,6 +24,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.launchIn
@@ -457,6 +458,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             callLogs.clear(); callVersion++
             resetCallState()
             pollJob?.cancel(); pollJob = null
+            stopMarmotWakeLoop()
         }
     }
 
@@ -537,7 +539,9 @@ class SonarAppState(private val scope: CoroutineScope) {
     private var callLoopRunning = false
     private var callTicker: kotlinx.coroutines.Job? = null
     private var meshRealtimeLoopRunning = false
-    private var marmotWakeLoopRunning = false
+    /** Live Marmot drain loop job (see [startMarmotWakeLoop]). Cancelled on
+     *  [wipe] / account restore so a dead node cannot keep a parked waiter. */
+    private var marmotWakeJob: Job? = null
     private var pollJob: Job? = null
     /** Consumer of the event-driven housekeeping cycle. Triggered by the core
      *  `conversationChanged` flow (primary) and a slow heartbeat (fallback);
@@ -2206,6 +2210,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 UnifyRadio.stopAdvertising()
                 unifyOffer = null; unifyPeers = emptyList()
                 pollJob?.cancel(); pollJob = null
+                stopMarmotWakeLoop()
                 resetCallState()
                 cancelPendingMarmotSetups()
                 cancelPendingMarmotGroupSetups()
@@ -5937,13 +5942,14 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  no MLS state), then drain on wake; the drain writes to local storage and
      *  fires [SonarCore.conversationChanged] per chat, which the existing
      *  collector turns into transcript/chat-list repaints. On the idle timeout
-     *  re-subscribe to self-heal dropped relay sockets. */
+     *  re-subscribe to self-heal dropped relay sockets. Cancelled by
+     *  [stopMarmotWakeLoop] on wipe / account restore. */
     private fun startMarmotWakeLoop() {
-        if (marmotWakeLoopRunning) return
-        marmotWakeLoopRunning = true
-        scope.launch {
-            while (true) {
+        if (marmotWakeJob?.isActive == true) return
+        marmotWakeJob = scope.launch {
+            while (isActive) {
                 val woke = SonarCore.waitForMarmotEvent(25)
+                if (!isActive) return@launch
                 if (woke) {
                     runCatching { SonarCore.drainPendingMarmot() }
                 } else {
@@ -5951,6 +5957,11 @@ class SonarAppState(private val scope: CoroutineScope) {
                 }
             }
         }
+    }
+
+    private fun stopMarmotWakeLoop() {
+        marmotWakeJob?.cancel()
+        marmotWakeJob = null
     }
 
     /** BLE mesh is the real-time rail for calls, so it must not wait for the
