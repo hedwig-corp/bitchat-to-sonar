@@ -2,6 +2,7 @@ package chat.bitchat.sonar
 
 import android.content.Context
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
@@ -366,7 +367,13 @@ actual object SonarCore {
 
     actual suspend fun waitForMarmotEvent(timeoutSecs: Long): Boolean =
         withContext(Dispatchers.IO) {
-            val n = node ?: return@withContext false
+            // Honor the "park up to timeoutSecs" contract even with no node
+            // (pre-start / post-wipe): returning instantly would make the host
+            // wake loop busy-spin a core until a node is recreated.
+            val n = node ?: run {
+                delay(timeoutSecs.coerceAtLeast(1) * 1000)
+                return@withContext false
+            }
             runCatching { n.waitForMarmotEvent(timeoutSecs.toULong()) }.getOrDefault(false)
         }
 
