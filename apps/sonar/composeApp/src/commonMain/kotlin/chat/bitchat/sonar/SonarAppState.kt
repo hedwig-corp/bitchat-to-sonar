@@ -355,7 +355,11 @@ class SonarAppState(private val scope: CoroutineScope) {
                 snapshotVersion++
             }
         }
-    private var pendingMarmotChatNpubs by mutableStateOf<Map<String, String>>(emptyMap())
+    /** Pending 1:1 secure chats keyed by local id (`npub:…`). Value carries
+     *  the peer npub plus [PendingMarmotDirect.createdAtSecs] so the Home list
+     *  can sort by creation time (iOS `pending.createdAt` / `dmRows` parity)
+     *  instead of treating them as epoch-zero after the recency merge. */
+    private var pendingMarmotChatNpubs by mutableStateOf<Map<String, PendingMarmotDirect>>(emptyMap())
     private var pendingMarmotGroups by mutableStateOf<Map<String, PendingMarmotGroup>>(emptyMap())
     var groupInvites by mutableStateOf<List<SonarGroupInvite>>(emptyList())
         private set
@@ -1078,7 +1082,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         return VisibleChatsKey(
             chatsIdentity = chatsIdentityCounter,
             foldedGroupIds = foldedGroupIds,
-            pendingChatNpubs = pendingMarmotChatNpubs,
+            pendingChatNpubs = pendingMarmotChatNpubs.mapValues { it.value.peerNpub },
             pendingGroupIds = pendingMarmotGroups.keys,
             socialVersion = socialVersion,
             snapshotVersion = snapshotVersion,
@@ -1122,12 +1126,29 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private fun pendingMarmotChats(): List<SonarChat> =
-        pendingMarmotChatNpubs.mapNotNull { (id, peerNpub) ->
+        pendingMarmotChatNpubs.mapNotNull { (id, pending) ->
+            val peerNpub = pending.peerNpub
             val npubHex = canonicalNpubHex(peerNpub) ?: return@mapNotNull null
             if (marmotGroupForNpub(npubHex.hexToBytesOrEmpty()) != null) return@mapNotNull null
             if (socialState.isBlockedNostr(npubHex)) return@mapNotNull null
             SonarChat(id = id, name = "", members = listOf(npub, peerNpub))
         }
+
+    /** Creation time for a pending secure chat/group, used as the Home-list
+     *  sort key while setup is in flight (iOS `lastDate = pending.createdAt`). */
+    private fun pendingCreatedAtSecs(chatId: String): Long? =
+        pendingMarmotChatNpubs[chatId]?.createdAtSecs
+            ?: pendingMarmotGroups[chatId]?.createdAtSecs
+
+    /** Upsert a pending 1:1 row, preserving [PendingMarmotDirect.createdAtSecs]
+     *  if the same id is re-armed during setup retries. */
+    private fun putPendingMarmotChat(pendingId: String, peerNpub: String) {
+        val existing = pendingMarmotChatNpubs[pendingId]
+        val created = existing?.createdAtSecs ?: SonarClock.nowSecs()
+        pendingMarmotChatNpubs = pendingMarmotChatNpubs + (
+            pendingId to PendingMarmotDirect(peerNpub = peerNpub, createdAtSecs = created)
+            )
+    }
 
     private fun pendingMarmotGroupChats(): List<SonarChat> =
         pendingMarmotGroups.entries.sortedByDescending { it.value.createdAtSecs }.map { (id, pending) ->
@@ -2433,7 +2454,9 @@ class SonarAppState(private val scope: CoroutineScope) {
                     newest != null -> messagePreview(newest.content, newest.stickerRef, newest.media)
                     else -> "Tap to open"
                 },
-                tsSecs = newest?.tsSecs ?: 0L,
+                // Pending rows use creation time so recency merge does not sink
+                // a freshly-started chat under older history (iOS dmRows parity).
+                tsSecs = newest?.tsSecs ?: pendingCreatedAtSecs(chat.id) ?: 0L,
                 verified = ids.any { it in verifiedChatIds },
                 unread = ids.sumOf { unreadByChat[it] ?: 0L } > 0,
                 pending = pending,
@@ -3017,7 +3040,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 openChat(existing)
                 return
             }
-            pendingMarmotChatNpubs = pendingMarmotChatNpubs + (pendingId to canonicalPeer)
+            putPendingMarmotChat(pendingId, canonicalPeer)
             ensureProfile(canonicalPeer)
             ensureSonarDescriptor(canonicalPeer)
             push(Screen.Chat(pendingId, profilesByNpub[canonicalProfileKey(canonicalPeer)]?.bestName ?: shortNpub(canonicalPeer)))
@@ -3046,7 +3069,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         val canonicalPeer = canonicalProfileKey(peerNpub)
         val npubHex = canonicalNpubHex(canonicalPeer) ?: return
         ensureProfile(canonicalPeer)
-        pendingMarmotChatNpubs = pendingMarmotChatNpubs + (pendingChatId to canonicalPeer)
+        putPendingMarmotChat(pendingChatId, canonicalPeer)
         marmotGroupForNpub(npubHex.hexToBytesOrEmpty())?.let { existing ->
             scope.launch { finishPendingMarmotChat(npubHex, canonicalPeer, pendingChatId, existing.id) }
             return
@@ -3101,8 +3124,8 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private suspend fun resolvePendingMarmotChats() {
         if (pendingMarmotChatNpubs.isEmpty()) return
-        for ((pendingChatId, peerNpub) in pendingMarmotChatNpubs.toMap()) {
-            val canonicalPeer = canonicalProfileKey(peerNpub)
+        for ((pendingChatId, pending) in pendingMarmotChatNpubs.toMap()) {
+            val canonicalPeer = canonicalProfileKey(pending.peerNpub)
             val npubHex = canonicalNpubHex(canonicalPeer) ?: continue
             val existing = marmotGroupForNpub(npubHex.hexToBytesOrEmpty()) ?: continue
             finishPendingMarmotChat(npubHex, canonicalPeer, pendingChatId, existing.id, refreshFirst = false)
@@ -3110,7 +3133,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private fun failPendingMarmotChat(npubHex: String, pendingChatId: String, setupToken: Long? = null): Boolean {
-        if (!isActivePendingMarmotSetup(pendingChatId, pendingMarmotChatNpubs[pendingChatId], setupToken)) return false
+        if (!isActivePendingMarmotSetup(pendingChatId, pendingMarmotChatNpubs[pendingChatId]?.peerNpub, setupToken)) return false
         pendingMarmotChatNpubs = pendingMarmotChatNpubs - pendingChatId
         pendingDirectMarmotSends.remove(npubHex)
         pendingSendEchoes[pendingChatId].orEmpty().map { it.id }.forEach { echoId ->
@@ -4541,6 +4564,10 @@ class SonarAppState(private val scope: CoroutineScope) {
     private val pendingMarmotSetupJobs = mutableMapOf<String, Job>()
     private val pendingMarmotSetupTokens = mutableMapOf<String, Long>()
     private var pendingMarmotSetupNonce = 0L
+    private data class PendingMarmotDirect(
+        val peerNpub: String,
+        val createdAtSecs: Long,
+    )
     private data class PendingMarmotGroup(
         val name: String,
         val members: List<String>,
@@ -4572,7 +4599,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         peerNpub: String?,
         setupToken: Long?,
     ): Boolean {
-        val activePeer = pendingMarmotChatNpubs[pendingChatId] ?: return false
+        val activePeer = pendingMarmotChatNpubs[pendingChatId]?.peerNpub ?: return false
         if (activePeer != peerNpub) return false
         return setupToken == null || pendingMarmotSetupTokens[pendingChatId] == setupToken
     }

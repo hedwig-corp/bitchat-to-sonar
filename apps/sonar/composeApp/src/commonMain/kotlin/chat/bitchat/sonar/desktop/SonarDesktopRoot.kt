@@ -46,11 +46,13 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import chat.bitchat.sonar.CallScreen
+import chat.bitchat.sonar.HomeMessageRow
 import chat.bitchat.sonar.Screen
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.SonarChat
 import chat.bitchat.sonar.SonarLifecycle
 import chat.bitchat.sonar.SonarScreenHost
+import chat.bitchat.sonar.mergeHomeMessageRows
 import chat.bitchat.sonar.screens.SonarOnboardingScreen
 import chat.bitchat.sonar.ui.SonarTheme
 import chat.bitchat.sonar.ui.SNDot
@@ -236,24 +238,37 @@ private fun DesktopSidebar(state: SonarAppState) {
                 ) { state.select { openChannel(gh) } }
             }
 
-            // Messages (mesh DMs — empty on desktop — + White Noise secure chats)
+            // Messages — one recency-ordered list across transports (same merge
+            // as phone HomeScreen / iOS dmRows). Mesh is typically empty on
+            // desktop; still merge so a future BLE path stays ordered correctly.
             item { SNSectionLabel("Messages") }
-            if (state.visibleChats.isEmpty() && state.meshDmRows.isEmpty()) {
+            val meshRows = state.meshDmRows
+            val chatRows = state.visibleChats
+            if (chatRows.isEmpty() && meshRows.isEmpty()) {
                 item { EmptyHint("No secure chats yet — use Search to paste an npub and start one.") }
             }
-            items(state.meshDmRows, key = { "mesh:" + it.peerId }) { row ->
-                DmRow(
-                    selected = (state.screen as? Screen.Chat)?.id == "mesh:" + row.peerId,
-                    name = row.name, preview = row.preview, mesh = true, verified = false,
-                ) { state.select { openDm(row.peerId, row.name) } }
+            val mergedRows = mergeHomeMessageRows(meshRows, chatRows) { chatId ->
+                state.marmotRow(chatId).tsSecs
             }
-            items(state.visibleChats, key = { it.id }) { chat ->
-                val title = state.chatTitle(chat)
-                DmRow(
-                    selected = (state.screen as? Screen.Chat)?.id == chat.id,
-                    name = title, preview = "Tap to open", mesh = false,
-                    verified = state.isVerified(chat.id),
-                ) { state.select { openChat(chat) } }
+            items(mergedRows, key = { it.listKey }) { homeRow ->
+                when (homeRow) {
+                    is HomeMessageRow.Mesh -> {
+                        val row = homeRow.row
+                        DmRow(
+                            selected = (state.screen as? Screen.Chat)?.id == homeRow.listKey,
+                            name = row.name, preview = row.preview, mesh = true, verified = false,
+                        ) { state.select { openDm(row.peerId, row.name) } }
+                    }
+                    is HomeMessageRow.Marmot -> {
+                        val chat = homeRow.chat
+                        val row = state.marmotRow(chat.id)
+                        DmRow(
+                            selected = (state.screen as? Screen.Chat)?.id == chat.id,
+                            name = row.title, preview = row.sub, mesh = false,
+                            verified = row.verified,
+                        ) { state.select { openChat(chat) } }
+                    }
+                }
             }
         }
 
