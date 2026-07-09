@@ -64,6 +64,12 @@ class SonarPushProcessingService : Service() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
+    /** Set only after `startForeground` actually succeeds. If the background-FGS
+     *  allowlist expired before we reached `startForeground`, we must NOT run the
+     *  wake work (Breez connect / invoice create / POST) — without a legal
+     *  foreground service the process can be killed mid-answer or ANR. */
+    @Volatile private var fgsReady = false
+
     override fun onCreate() {
         super.onCreate()
         Notifier.ensureChannel()
@@ -94,6 +100,7 @@ class SonarPushProcessingService : Service() {
             } else {
                 startForeground(FOREGROUND_ID, notification)
             }
+            fgsReady = true
         } catch (t: Throwable) {
             // e.g. the background-start allowlist expired before we reached
             // startForeground. Nothing can run without the FGS; stop cleanly
@@ -118,6 +125,15 @@ class SonarPushProcessingService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // startForeground refused in onCreate (background-FGS allowlist expired):
+        // don't launch money-path work without a legal foreground service — the
+        // process could be killed mid-answer. Stop cleanly; the app reconciles
+        // on next open / next high-priority wake.
+        if (!fgsReady) {
+            Log.w(TAG, "onStartCommand: no foreground service, skipping wake work")
+            stopSelf(startId)
+            return START_NOT_STICKY
+        }
         val type = intent?.getStringExtra(EXTRA_PUSH_TYPE)
         Log.d(TAG, "Processing push type=$type")
 

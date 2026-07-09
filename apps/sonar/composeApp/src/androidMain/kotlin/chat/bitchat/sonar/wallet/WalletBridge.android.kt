@@ -250,12 +250,14 @@ actual object WalletBridge {
      *  payment rather than mint a random id that could duplicate ledger rows. */
     private fun paymentEventOf(p: Payment): WalletPaymentEvent? {
         val lightning = p.details as? PaymentDetails.Lightning
-        // A settled RECEIVE always carries a txId (chain) or paymentHash
-        // (Lightning); `destination` is a last-resort fallback for the
-        // both-null case. It is a reused target for a static offer, so if that
-        // case were ever reachable for two distinct receives they would collapse
-        // to one ledger id — in practice unreachable for settled receives.
-        val id = p.txId ?: lightning?.paymentHash ?: p.destination ?: return null
+        // Prefer the STABLE Lightning id (`paymentHash`) first: a Lightning
+        // receive is PENDING with a null `txId` when the poll path accepts it,
+        // then COMPLETE with a `txId` set — so keying on `txId` first flips the
+        // id across states and double-ledgers / double-notifies the same
+        // payment. `paymentHash` is constant across the receive's lifecycle.
+        // Chain (Liquid) receives have no Lightning details, so they fall back
+        // to `txId`; `destination` remains the last-resort both-null fallback.
+        val id = lightning?.paymentHash ?: p.txId ?: p.destination ?: return null
         return WalletPaymentEvent(
             paymentId = id,
             incoming = p.paymentType == PaymentType.RECEIVE,
