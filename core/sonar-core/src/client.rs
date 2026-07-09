@@ -1941,37 +1941,69 @@ impl SonarClient {
         // their transcript refresh on it, so the sent/failed flip below must
         // notify them or the message shows "Sending" until the next poll.
         let group_id_hex = tag_value(&event, Alphabet::H);
+        let relays = self.relays.clone();
         tokio::spawn(async move {
-            let result = nostr.send_event(&event).await;
-            let now_secs = Timestamp::now().as_secs();
-            {
-                let mut outbox = outbox_state.lock().unwrap();
-                match result {
-                    Ok(output) => {
-                        if let Err(err) = require_relay_success(&output, "text publish") {
-                            let _ = outbox.mark_failed_by_message_id(
-                                &message_id_hex,
-                                err.to_string(),
-                                now_secs,
-                            );
-                        } else {
-                            let _ = outbox.mark_sent_by_message_id(&message_id_hex, now_secs);
-                        }
+            let notify = |group_id_hex: &Option<String>| {
+                if let (Some(id), Some(listener)) = (
+                    group_id_hex.clone(),
+                    change_listener.lock().unwrap().clone(),
+                ) {
+                    listener.on_conversation_changed(id);
+                }
+            };
+            // First-ack wins (Signal-style): the pool's `send_event` joins ALL
+            // relays, so one dead relay delays the Sending→Sent flip by its
+            // full timeout even though the fastest relay usually acks in well
+            // under a second. Fan out one publish per Marmot relay and mark
+            // the message Sent on the FIRST OK — the remaining publishes keep
+            // running in the background for redundancy. Only when EVERY relay
+            // has failed does the message flip to failed (outbox-retryable).
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            for url in relays {
+                let nostr = nostr.clone();
+                let event = event.clone();
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let outcome = match nostr.send_event_to([url], &event).await {
+                        Ok(output) if !output.success.is_empty() => Ok(()),
+                        Ok(output) => Err(output
+                            .failed
+                            .values()
+                            .next()
+                            .cloned()
+                            .unwrap_or_else(|| "relay rejected event".to_string())),
+                        Err(err) => Err(err.to_string()),
+                    };
+                    let _ = tx.send(outcome);
+                });
+            }
+            drop(tx);
+            let mut failures: Vec<String> = Vec::new();
+            while let Some(outcome) = rx.recv().await {
+                match outcome {
+                    Ok(()) => {
+                        let _ = outbox_state
+                            .lock()
+                            .unwrap()
+                            .mark_sent_by_message_id(&message_id_hex, Timestamp::now().as_secs());
+                        notify(&group_id_hex);
+                        return;
                     }
-                    Err(err) => {
-                        let _ = outbox.mark_failed_by_message_id(
-                            &message_id_hex,
-                            err.to_string(),
-                            now_secs,
-                        );
-                    }
+                    Err(err) => failures.push(err),
                 }
             }
-            if let (Some(group_id_hex), Some(listener)) =
-                (group_id_hex, change_listener.lock().unwrap().clone())
-            {
-                listener.on_conversation_changed(group_id_hex);
-            }
+            // The channel closed without a single OK: every relay failed.
+            let reason = if failures.is_empty() {
+                "no relay accepted the event".to_string()
+            } else {
+                failures.join(", ")
+            };
+            let _ = outbox_state.lock().unwrap().mark_failed_by_message_id(
+                &message_id_hex,
+                reason,
+                Timestamp::now().as_secs(),
+            );
+            notify(&group_id_hex);
         });
     }
 
