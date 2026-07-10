@@ -82,6 +82,22 @@ final class MarmotService: @unchecked Sendable {
         let relays: [String]
     }
 
+    /// One chat's outcome from a device-link pass.
+    /// `status`: linked | skipped_not_admin | already_linked | failed.
+    struct DeviceLinkOutcome: Sendable, Equatable {
+        let groupIdHex: String
+        let groupName: String
+        let status: String
+        let error: String?
+    }
+
+    /// Result of linking another device of this account into existing chats.
+    struct DeviceLinkReport: Sendable, Equatable {
+        /// Full KeyPackage `d` tag that was linked.
+        let dTag: String
+        let outcomes: [DeviceLinkOutcome]
+    }
+
     /// Core-computed content classification (mirrors FFI `MessageClassInfo`).
     /// Hosts render from this instead of re-parsing `content` per render.
     enum MarmotMessageClass: Sendable, Equatable, Codable {
@@ -494,6 +510,32 @@ final class MarmotService: @unchecked Sendable {
     /// Publish our MLS KeyPackage (kind 30443) so peers can invite us.
     func publishKeyPackage() async throws {
         try await run { try $0.requireNode().publishKeyPackage() }
+    }
+
+    // MARK: - Device linking (second MLS leaf for this account)
+
+    /// On the NEW device: create + publish a fresh KeyPackage and return its
+    /// full `d` tag. The UI shows a 12-char prefix as the link code.
+    func createDeviceLinkCode() async throws -> String {
+        try await run { try $0.requireNode().createDeviceLinkCode() }
+    }
+
+    /// On the OLD device: add the account's other device (by link code) as a
+    /// second leaf to every group where we are an admin. Runs on the serial
+    /// engine queue — it stages and merges MLS commits.
+    func linkDevice(code: String) async throws -> DeviceLinkReport {
+        let report = try await run { try $0.requireNode().linkDevice(code: code) }
+        return DeviceLinkReport(
+            dTag: report.dTag,
+            outcomes: report.outcomes.map {
+                DeviceLinkOutcome(
+                    groupIdHex: $0.groupIdHex,
+                    groupName: $0.groupName,
+                    status: $0.status,
+                    error: $0.error
+                )
+            }
+        )
     }
 
     /// Like `publishKeyPackage()`, but returns once the event is created and

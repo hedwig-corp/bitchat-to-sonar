@@ -28,6 +28,25 @@ data class SonarJoinRequest(
     val receivedAt: Long,
 )
 
+/** Chars of the KeyPackage `d` tag shown/typed as a device-link code.
+ *  Must match the core's `DEVICE_LINK_CODE_LEN`. */
+const val SONAR_DEVICE_LINK_CODE_LEN = 12
+
+/** One chat's outcome from a device-link pass.
+ *  [status]: linked | skipped_not_admin | already_linked | failed. */
+data class SonarDeviceLinkOutcome(
+    val groupId: String,
+    val name: String,
+    val status: String,
+    val error: String? = null,
+)
+
+/** Result of linking another device of this account into existing chats. */
+data class SonarDeviceLinkResult(
+    val dTag: String,
+    val outcomes: List<SonarDeviceLinkOutcome>,
+)
+
 /** A decrypted message in a chat. [viaInternet] marks the transport for the
  *  per-message bubble colour: false = BLE mesh (cyan), true = White Noise /
  *  Nostr internet (indigo). A Sonar-peer DM merges both legs into one thread. */
@@ -632,6 +651,16 @@ expect object SonarCore {
      *  the platform share affordance (share sheet on Android, file manager
      *  reveal on desktop). Returns false if there was nothing to share. */
     suspend fun exportDiagnostics(): Boolean
+
+    // ── Device linking (second MLS leaf for this account) ──
+
+    /** On the NEW device: publish a fresh KeyPackage and return the short
+     *  link code (a `d`-tag prefix) the user types on the old device. */
+    suspend fun createDeviceLinkCode(): String
+
+    /** On the OLD device: add the account's other device (by link code) as a
+     *  second leaf to every chat where we are an admin. Safe to re-run. */
+    suspend fun linkDevice(code: String): SonarDeviceLinkResult
 
     /** Publish our kind-0 profile (NIP-01) so peers see our nickname, not npub. */
     suspend fun publishProfile(name: String, about: String? = null, picture: String? = null)

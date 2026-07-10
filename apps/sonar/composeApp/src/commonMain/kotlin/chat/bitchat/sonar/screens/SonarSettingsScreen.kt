@@ -96,6 +96,7 @@ fun SonarSettingsScreen(state: SonarAppState) {
     var diagnostics by remember { mutableStateOf(false) }
     var transcriptSpikeB by remember { mutableStateOf(false) }
     var transcriptPolicyHost by remember { mutableStateOf(false) }
+    var linkedDevices by remember { mutableStateOf(false) }
     state.prefsVersion // subscribe so toggles recompose
 
     val balance = (state.walletState as? WalletState.Ready)?.balanceSats ?: 0L
@@ -205,6 +206,10 @@ fun SonarSettingsScreen(state: SonarAppState) {
                     icon = SNIconName.ShieldCheck, tone = SNTone.Cyan, label = "Verified people",
                     value = state.verifiedCount().toString(),
                 ) { state.push(Screen.Nearby) }
+                SNSettingsRow(
+                    icon = SNIconName.Link, tone = SNTone.Cyan, label = "Linked devices",
+                    sub = "Use this account on another phone or computer",
+                ) { linkedDevices = true }
                 SNXSettingsRow(
                     label = "Export private key",
                     sub = "Back up your nsec — needed to restore on another phone",
@@ -322,6 +327,7 @@ fun SonarSettingsScreen(state: SonarAppState) {
             TranscriptPolicyHostDemo(onClose = { transcriptPolicyHost = false })
         }
     }
+    if (linkedDevices) LinkedDevicesSheet(state) { linkedDevices = false }
 
     state.toast?.let { ToastBar(it) { state.toast = null } }
 }
@@ -782,6 +788,157 @@ private fun DiagnosticsSheet(state: SonarAppState, onClose: () -> Unit) {
         Spacer(Modifier.height(10.dp))
         Text(
             "Logs stay on this device until you share them. They contain relay and sync events — no message text and no keys.",
+            color = s.text3, fontSize = 12.5.sp, lineHeight = 17.sp,
+        )
+    }
+}
+
+/** Settings → Linked devices: add another device of THIS account as a second
+ *  MLS leaf in every admin chat. The NEW device shows a link code (a fresh
+ *  KeyPackage `d`-tag prefix); the OLD device enters it and runs the link
+ *  pass. History does not move — the new device sees messages from the moment
+ *  it is linked (tracked gap). */
+@Composable
+private fun LinkedDevicesSheet(state: SonarAppState, onClose: () -> Unit) {
+    val s = sonar
+    val scope = rememberCoroutineScope()
+    var linkCode by remember { mutableStateOf<String?>(null) }
+    var generating by remember { mutableStateOf(false) }
+    var entered by remember { mutableStateOf("") }
+    var linking by remember { mutableStateOf(false) }
+    var result by remember { mutableStateOf<chat.bitchat.sonar.SonarDeviceLinkResult?>(null) }
+    var error by remember { mutableStateOf<String?>(null) }
+
+    Sheet("Linked devices", onClose) {
+        // This device: show a link code (use on the NEW device).
+        Text("THIS DEVICE", color = s.text3, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(8.dp))
+        val code = linkCode
+        if (code != null) {
+            Text(
+                code.chunked(4).joinToString(" "),
+                color = s.text, style = SonarType.mono(20.0),
+                modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center,
+            )
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "On your other device: Settings → Linked devices → enter this code, then keep this device online.",
+                color = s.text3, fontSize = 12.5.sp, lineHeight = 17.sp,
+            )
+        } else {
+            Box(
+                Modifier.fillMaxWidth().height(46.dp).clip(RoundedCornerShape(13.dp))
+                    .background(if (generating) s.surface2 else s.accentFill)
+                    .clickable(enabled = !generating) {
+                        generating = true
+                        scope.launch {
+                            try {
+                                linkCode = SonarCore.createDeviceLinkCode()
+                            } catch (_: Exception) {
+                                state.toast = "Could not publish a link code — check your connection"
+                            } finally {
+                                generating = false
+                            }
+                        }
+                    },
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    if (generating) "Publishing…" else "Show link code",
+                    color = if (generating) s.text3 else s.onAccent,
+                    fontSize = 15.sp, fontWeight = FontWeight.Bold,
+                )
+            }
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "Use this on the device you are ADDING (your new phone). It publishes a fresh key so your other device can link it.",
+                color = s.text3, fontSize = 12.5.sp, lineHeight = 17.sp,
+            )
+        }
+
+        Spacer(Modifier.height(16.dp))
+
+        // Old device: enter the code shown on the new device.
+        Text("LINK A NEW DEVICE", color = s.text3, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(8.dp))
+        Box(
+            Modifier.fillMaxWidth().clip(RoundedCornerShape(13.dp)).background(s.surface2)
+                .padding(horizontal = 14.dp, vertical = 12.dp)
+        ) {
+            if (entered.isEmpty()) Text("Link code from the new device", color = s.text3, fontSize = 14.sp)
+            BasicTextField(
+                value = entered, onValueChange = { entered = it.trim() },
+                textStyle = SonarType.mono(14.0).copy(color = s.text),
+                cursorBrush = SolidColor(s.accent),
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+        Spacer(Modifier.height(8.dp))
+        val plausible = entered.length >= 8 && entered.all { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' }
+        Box(
+            Modifier.fillMaxWidth().height(46.dp).clip(RoundedCornerShape(13.dp))
+                .background(if (linking || !plausible) s.surface2 else s.accentFill)
+                .clickable(enabled = !linking && plausible) {
+                    linking = true
+                    error = null
+                    result = null
+                    scope.launch {
+                        try {
+                            result = SonarCore.linkDevice(entered)
+                        } catch (e: Exception) {
+                            error = e.message ?: "Linking failed — try again"
+                        } finally {
+                            linking = false
+                        }
+                    }
+                },
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                if (linking) "Linking…" else "Link device",
+                color = if (linking || !plausible) s.text3 else s.onAccent,
+                fontSize = 15.sp, fontWeight = FontWeight.Bold,
+            )
+        }
+        error?.let {
+            Spacer(Modifier.height(6.dp))
+            Text(it, color = s.danger, fontSize = 12.5.sp, lineHeight = 17.sp)
+        }
+        result?.let { r ->
+            val linked = r.outcomes.count { it.status == "linked" }
+            val already = r.outcomes.count { it.status == "already_linked" }
+            val skipped = r.outcomes.filter { it.status == "skipped_not_admin" }
+            val failed = r.outcomes.filter { it.status == "failed" }
+            Spacer(Modifier.height(10.dp))
+            Text(
+                "$linked chat${if (linked == 1) "" else "s"} linked" +
+                    if (already > 0) " · $already already linked" else "",
+                color = s.text, fontSize = 13.5.sp,
+            )
+            skipped.forEach {
+                Text(
+                    "Skipped ${it.name.ifBlank { "unnamed chat" }} — you are not an admin there",
+                    color = s.text3, fontSize = 12.5.sp, lineHeight = 17.sp,
+                )
+            }
+            failed.forEach {
+                Text(
+                    "Failed ${it.name.ifBlank { "unnamed chat" }}: ${it.error ?: "unknown error"}",
+                    color = s.danger, fontSize = 12.5.sp, lineHeight = 17.sp,
+                )
+            }
+            if (failed.isNotEmpty()) {
+                Text(
+                    "You can safely run the link again with the same code.",
+                    color = s.text3, fontSize = 12.5.sp, lineHeight = 17.sp,
+                )
+            }
+        }
+
+        Spacer(Modifier.height(10.dp))
+        Text(
+            "Linking adds your other device to every chat where you are an admin. New messages appear on both devices; older history stays on this one.",
             color = s.text3, fontSize = 12.5.sp, lineHeight = 17.sp,
         )
     }

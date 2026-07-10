@@ -10,7 +10,9 @@ use nostr::prelude::*;
 use nostr_blossom::prelude::*;
 use nostr_sdk::Client as NostrClient;
 use serde::{Deserialize, Serialize};
-use sonar_core::client::{MediaUpload, SonarClient, DEFAULT_BLOSSOM_SERVER};
+use sonar_core::client::{
+    DeviceLinkGroupStatus, MediaUpload, SonarClient, DEFAULT_BLOSSOM_SERVER, DEVICE_LINK_CODE_LEN,
+};
 use sonar_core::identity::Identity;
 use sonar_core::marmot::DeliveryState;
 use sonar_core::GroupId;
@@ -88,6 +90,21 @@ enum Command {
     Groups,
     /// Print messages for all groups or one group.
     Messages(MessagesArgs),
+    /// Link another device of THIS account (second MLS leaf per group).
+    #[command(subcommand)]
+    LinkDevice(LinkDeviceAction),
+}
+
+#[derive(Subcommand, Debug)]
+enum LinkDeviceAction {
+    /// On the NEW device: publish a fresh KeyPackage and print its link code.
+    Code,
+    /// On the OLD device: add the device showing `code` to every group where
+    /// this account is an admin. Safe to re-run.
+    Add {
+        /// Link code printed by `link-device code` on the other device.
+        code: String,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -302,6 +319,32 @@ enum Output {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         media: Vec<MediaRefOut>,
     },
+    DeviceLinkCode {
+        /// Short code to type on the old device.
+        code: String,
+        /// Full KeyPackage `d` tag behind the code.
+        d_tag: String,
+        npub: String,
+    },
+    DeviceLinked {
+        d_tag: String,
+        linked: usize,
+        skipped_not_admin: usize,
+        already_linked: usize,
+        failed: usize,
+        outcomes: Vec<DeviceLinkOutcomeOut>,
+    },
+}
+
+/// One group's outcome in `link-device add` JSON output.
+#[derive(Debug, Serialize)]
+struct DeviceLinkOutcomeOut {
+    group_id: String,
+    name: String,
+    /// linked | skipped_not_admin | already_linked | failed
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 /// A decrypted media attachment rendered in `listen`/`messages` JSON output.
@@ -548,6 +591,69 @@ async fn run(cli: Cli) -> Result<()> {
             let client = loaded.connect().await?;
             client.sync().await?;
             print_messages(&client, args.group.as_deref())?;
+            Ok(())
+        }
+        Command::LinkDevice(action) => {
+            let loaded = LoadedConfig::load(home, cli.relays)?;
+            let client = loaded.connect().await?;
+            match action {
+                LinkDeviceAction::Code => {
+                    let d_tag = client.create_device_link_code().await?;
+                    print_json(&Output::DeviceLinkCode {
+                        code: d_tag[..DEVICE_LINK_CODE_LEN.min(d_tag.len())].to_string(),
+                        d_tag,
+                        npub: client.identity().npub(),
+                    })?;
+                }
+                LinkDeviceAction::Add { code } => {
+                    // Sync first so the group list (and admin flags) reflect
+                    // the latest commits before staging device-link commits.
+                    client.sync().await?;
+                    let report = client.link_device(&code).await?;
+                    let mut linked = 0;
+                    let mut skipped = 0;
+                    let mut already = 0;
+                    let mut failed = 0;
+                    let outcomes = report
+                        .outcomes
+                        .into_iter()
+                        .map(|outcome| {
+                            let (status, error) = match outcome.status {
+                                DeviceLinkGroupStatus::Linked => {
+                                    linked += 1;
+                                    ("linked", None)
+                                }
+                                DeviceLinkGroupStatus::SkippedNotAdmin => {
+                                    skipped += 1;
+                                    ("skipped_not_admin", None)
+                                }
+                                DeviceLinkGroupStatus::AlreadyLinked => {
+                                    already += 1;
+                                    ("already_linked", None)
+                                }
+                                DeviceLinkGroupStatus::Failed(err) => {
+                                    failed += 1;
+                                    ("failed", Some(err))
+                                }
+                            };
+                            DeviceLinkOutcomeOut {
+                                group_id: outcome.group_id_hex,
+                                name: outcome.name,
+                                status: status.to_string(),
+                                error,
+                            }
+                        })
+                        .collect();
+                    print_json(&Output::DeviceLinked {
+                        d_tag: report.d_tag,
+                        linked,
+                        skipped_not_admin: skipped,
+                        already_linked: already,
+                        failed,
+                        outcomes,
+                    })?;
+                }
+            }
             Ok(())
         }
     }

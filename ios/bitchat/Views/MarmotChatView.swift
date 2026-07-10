@@ -594,6 +594,18 @@ final class MarmotChatModel: ObservableObject {
         await service.syncStateSnapshotJson()
     }
 
+    /// NEW device side of device linking: publish a fresh KeyPackage and
+    /// return its full `d` tag (the UI shows a prefix as the link code).
+    func createDeviceLinkCode() async throws -> String {
+        try await service.createDeviceLinkCode()
+    }
+
+    /// OLD device side of device linking: add the account's other device (by
+    /// link code) as a second MLS leaf to every group where we are an admin.
+    func linkDevice(code: String) async throws -> MarmotService.DeviceLinkReport {
+        try await service.linkDevice(code: code)
+    }
+
     /// Restore an existing identity from a pasted `nsec1…` backup (onboarding
     /// "I already have a key"): validate it, persist it as THE identity, then
     /// connect as it. Throws on an invalid key so the caller can surface it.

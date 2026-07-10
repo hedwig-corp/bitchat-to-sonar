@@ -428,6 +428,21 @@ actual object SonarCore {
         }
     }
 
+    // Device linking propagates errors (no runCatching): the sheet shows them.
+    actual suspend fun createDeviceLinkCode(): String = withContext(Dispatchers.IO) {
+        requireNode().createDeviceLinkCode().take(SONAR_DEVICE_LINK_CODE_LEN)
+    }
+
+    actual suspend fun linkDevice(code: String): SonarDeviceLinkResult = withContext(Dispatchers.IO) {
+        val report = requireNode().linkDevice(code)
+        SonarDeviceLinkResult(
+            dTag = report.dTag,
+            outcomes = report.outcomes.map {
+                SonarDeviceLinkOutcome(it.groupIdHex, it.groupName, it.status, it.error)
+            },
+        )
+    }
+
     actual suspend fun publishProfile(name: String, about: String?, picture: String?) = withContext(Dispatchers.IO) {
         runCatching { node?.publishProfile(name, about, picture) }
         Unit

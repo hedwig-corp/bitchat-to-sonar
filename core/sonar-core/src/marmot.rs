@@ -765,7 +765,8 @@ impl MarmotEngine {
 
     /// Process any incoming Marmot-relevant event:
     /// - kind 1059 gift wrap → unwrap; if it holds a kind-444 welcome, direct
-    ///   1:1 welcomes are auto-accepted for compatibility and group welcomes are
+    ///   1:1 welcomes and self-authored welcomes (device link from another
+    ///   device of this account) are auto-accepted; other group welcomes are
     ///   stored pending for explicit accept/decline UI.
     /// - kind 445 group message → decrypt/apply.
     pub async fn process_incoming(&self, event: &Event) -> Result<Incoming> {
@@ -784,7 +785,11 @@ impl MarmotEngine {
                 let _mls = self.mls_write();
                 let welcome = dispatch!(&self.storage, |mdk| mdk
                     .process_welcome(&event.id, &unwrapped.rumor))?;
-                if welcome.member_count <= 2 {
+                // A welcome authored by our own identity is a device link:
+                // another device holding this account's key added this one to
+                // an existing group. Only the nsec holder can author it, so it
+                // is accepted regardless of member count, like 1:1 welcomes.
+                if welcome.member_count <= 2 || welcome.welcomer == self.identity.public_key() {
                     dispatch!(&self.storage, |mdk| mdk.accept_welcome(&welcome))?;
                     return Ok(Incoming::GroupUpdated(welcome.mls_group_id));
                 }

@@ -32,6 +32,7 @@ struct SonarSettingsScreen: View {
     @State private var diagnosticsSheet = false
     @State private var transcriptSpikeB = false
     @State private var collectionHostEnabled = SNTranscriptCollectionHostFlag.isEnabled
+    @State private var linkedDevicesSheet = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -147,6 +148,12 @@ struct SonarSettingsScreen: View {
                     SNSettingsCard {
                         SNSettingsRow(icon: .shieldCheck, tone: .cyan, label: "Verified people", value: String(store.verifiedCount)) {
                             store.push(.nearby)
+                        }
+                        SNSettingsRow(
+                            icon: .link, tone: .cyan, label: "Linked devices",
+                            sub: "Use this account on another phone or computer"
+                        ) {
+                            linkedDevicesSheet = true
                         }
                         SNSettingsRow(
                             icon: .importKey, tone: .cyan, label: "Export private key",
@@ -278,6 +285,9 @@ struct SonarSettingsScreen: View {
             SonarTranscriptSpikeBDemo(onClose: { transcriptSpikeB = false })
         }
         #endif
+        .snSheet(isPresented: $linkedDevicesSheet, title: "Linked devices") {
+            SNLinkedDevicesSheetContent()
+        }
     }
 
     /// Build has a non-empty Breez key — not the same as wallet lifecycle ready.
