@@ -13,7 +13,100 @@ use super::{
 // TODO below) — write requests were acked but the bytes thrown away. Queue them
 // so PeripheralManager::take_writes() can hand the central's packets (its
 // announce / handshake) to the app.
-pub static WRITE_QUEUE: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+pub static WRITE_QUEUE: Mutex<Vec<(u64, Vec<u8>)>> = Mutex::new(Vec::new());
+
+// PATCH (Sonar): identify the current CoreBluetooth notification-subscription
+// lifetime. Noise sessions bind to this token so a newly connected central can
+// never make a historical session appear writable. Zero means there is not
+// exactly one subscriber; this fails closed rather than notifying a private
+// ciphertext to multiple centrals (the transport is intentionally single-peer).
+struct SubscriptionState {
+    subscribers: usize,
+    epoch: u64,
+}
+
+static SUBSCRIPTION_STATE: Mutex<SubscriptionState> = Mutex::new(SubscriptionState {
+    subscribers: 0,
+    epoch: 1,
+});
+
+fn next_subscription_epoch(state: &mut SubscriptionState) {
+    state.epoch = state.epoch.wrapping_add(1).max(1);
+}
+
+pub fn reset_subscriptions() {
+    if let Ok(mut state) = SUBSCRIPTION_STATE.lock() {
+        state.subscribers = 0;
+        next_subscription_epoch(&mut state);
+    }
+}
+
+pub fn subscription_token() -> u64 {
+    SUBSCRIPTION_STATE
+        .lock()
+        .map(|state| if state.subscribers == 1 { state.epoch } else { 0 })
+        .unwrap_or(0)
+}
+
+fn subscription_started() {
+    if let Ok(mut state) = SUBSCRIPTION_STATE.lock() {
+        state.subscribers = state.subscribers.saturating_add(1);
+        next_subscription_epoch(&mut state);
+    }
+}
+
+fn subscription_ended() {
+    if let Ok(mut state) = SUBSCRIPTION_STATE.lock() {
+        state.subscribers = state.subscribers.saturating_sub(1);
+        next_subscription_epoch(&mut state);
+    }
+}
+
+pub extern "C" fn peripheral_manager_did_subscribe(
+    _delegate: &mut Object,
+    _cmd: Sel,
+    _peripheral: *mut Object,
+    _central: *mut Object,
+    _characteristic: *mut Object,
+) {
+    subscription_started();
+}
+
+pub extern "C" fn peripheral_manager_did_unsubscribe(
+    _delegate: &mut Object,
+    _cmd: Sel,
+    _peripheral: *mut Object,
+    _central: *mut Object,
+    _characteristic: *mut Object,
+) {
+    subscription_ended();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_identifies_one_subscription_and_invalidates_every_transition() {
+        reset_subscriptions();
+        assert_eq!(subscription_token(), 0);
+
+        subscription_started();
+        let first = subscription_token();
+        assert_ne!(first, 0);
+
+        subscription_started();
+        assert_eq!(subscription_token(), 0);
+
+        subscription_ended();
+        let remaining = subscription_token();
+        assert_ne!(remaining, 0);
+        assert_ne!(remaining, first);
+
+        subscription_ended();
+        assert_eq!(subscription_token(), 0);
+    }
+}
 
 // TODO: Implement event stream for all below callback
 
@@ -29,18 +122,23 @@ pub extern "C" fn peripheral_manager_did_update_state(
         match state {
             CBManagerState::CBManagerStateUnknown => {
                 println!("CBManagerStateUnknown");
+                reset_subscriptions();
             }
             CBManagerState::CBManagerStateResetting => {
                 println!("CBManagerStateResetting");
+                reset_subscriptions();
             }
             CBManagerState::CBManagerStateUnsupported => {
                 println!("CBManagerStateUnsupported");
+                reset_subscriptions();
             }
             CBManagerState::CBManagerStateUnauthorized => {
                 println!("CBManagerStateUnauthorized");
+                reset_subscriptions();
             }
             CBManagerState::CBManagerStatePoweredOff => {
                 println!("CBManagerStatePoweredOff");
+                reset_subscriptions();
                 delegate.set_ivar::<BOOL>(POWERED_ON_IVAR, NO);
             }
             CBManagerState::CBManagerStatePoweredOn => {
@@ -105,10 +203,11 @@ pub extern "C" fn peripheral_manager_did_receive_write_requests(
             if !value.is_null() {
                 let data = value as *mut NSData;
                 let bytes = (*data).bytes().to_vec();
-                if !bytes.is_empty() {
+                let subscription_token = subscription_token();
+                if !bytes.is_empty() && subscription_token != 0 {
                     if let Ok(mut q) = WRITE_QUEUE.lock() {
                         if q.len() < 256 {
-                            q.push(bytes);
+                            q.push((subscription_token, bytes));
                         }
                     }
                 }

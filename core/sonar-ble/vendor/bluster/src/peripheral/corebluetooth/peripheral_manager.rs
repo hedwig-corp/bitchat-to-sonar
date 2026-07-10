@@ -19,8 +19,9 @@ use super::{
     constants::{PERIPHERAL_MANAGER_DELEGATE_CLASS_NAME, PERIPHERAL_MANAGER_IVAR, POWERED_ON_IVAR},
     events::{
         peripheral_manager_did_add_service_error, peripheral_manager_did_receive_read_request,
-        peripheral_manager_did_receive_write_requests,
+        peripheral_manager_did_receive_write_requests, peripheral_manager_did_subscribe,
         peripheral_manager_did_start_advertising_error, peripheral_manager_did_update_state,
+        peripheral_manager_did_unsubscribe,
     },
     ffi::{
         dispatch_queue_create, nil, CBAdvertisementDataLocalNameKey,
@@ -46,6 +47,7 @@ pub struct PeripheralManager {
 
 impl PeripheralManager {
     pub fn new() -> Self {
+        super::events::reset_subscriptions();
         REGISTER_DELEGATE_CLASS.call_once(|| {
             let mut decl =
                 ClassDecl::new(PERIPHERAL_MANAGER_DELEGATE_CLASS_NAME, class!(NSObject)).unwrap();
@@ -83,6 +85,28 @@ impl PeripheralManager {
                     sel!(peripheralManager:didReceiveWriteRequests:),
                     peripheral_manager_did_receive_write_requests
                         as extern "C" fn(&mut Object, Sel, *mut Object, *mut Object),
+                );
+                decl.add_method(
+                    sel!(peripheralManager:central:didSubscribeToCharacteristic:),
+                    peripheral_manager_did_subscribe
+                        as extern "C" fn(
+                            &mut Object,
+                            Sel,
+                            *mut Object,
+                            *mut Object,
+                            *mut Object,
+                        ),
+                );
+                decl.add_method(
+                    sel!(peripheralManager:central:didUnsubscribeFromCharacteristic:),
+                    peripheral_manager_did_unsubscribe
+                        as extern "C" fn(
+                            &mut Object,
+                            Sel,
+                            *mut Object,
+                            *mut Object,
+                            *mut Object,
+                        ),
                 );
             }
 
@@ -235,10 +259,18 @@ impl PeripheralManager {
         }
     }
 
+    pub fn subscription_token(self: &Self) -> u64 {
+        super::events::subscription_token()
+    }
+
+    pub fn reset_subscriptions(self: &Self) {
+        super::events::reset_subscriptions();
+    }
+
     // PATCH (Sonar): drain the bytes written to our characteristic by connected
     // centrals (their announce / handshake packets). Upstream bluster discarded
     // them; see events::WRITE_QUEUE.
-    pub fn take_writes(self: &Self) -> Vec<Vec<u8>> {
+    pub fn take_writes(self: &Self) -> Vec<(u64, Vec<u8>)> {
         super::events::WRITE_QUEUE
             .lock()
             .map(|mut q| std::mem::take(&mut *q))

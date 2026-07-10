@@ -12,6 +12,13 @@ use uuid::Uuid;
 use self::{adapter::Adapter, advertisement::Advertisement, connection::Connection, gatt::Gatt};
 use crate::{gatt::service::Service, Error};
 
+// BlueZ subscription/write attribution is not implemented by this vendored
+// backend yet. Returning zero makes the application fail closed to its relay
+// transport instead of treating an unverified Linux GATT route as writable.
+pub fn subscription_token() -> u64 {
+    0
+}
+
 #[derive(Debug)]
 pub struct Peripheral {
     adapter: Adapter,
@@ -78,5 +85,19 @@ impl Peripheral {
 
     pub fn add_service(self: &Self, service: &Service) -> Result<(), Error> {
         self.gatt.add_service(service)
+    }
+
+    pub fn notify(&self, _data: &[u8]) -> bool {
+        false
+    }
+
+    pub fn subscription_token(&self) -> u64 {
+        0
+    }
+
+    pub fn reset_subscriptions(&self) {}
+
+    pub fn take_writes(&self) -> Vec<(u64, Vec<u8>)> {
+        Vec::new()
     }
 }

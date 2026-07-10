@@ -34,7 +34,10 @@ object MeshLink {
     private const val TYPE_SONAR = 0x53
     private const val PEER_TTL_MS = 90_000L
 
-    private class Session(val noise: SonarNoise) {
+    private class Session(
+        val noise: SonarNoise,
+        val subscriptionToken: Long,
+    ) {
         @Volatile var established = false
     }
 
@@ -84,15 +87,15 @@ object MeshLink {
     }
 
     private fun pump() {
-        for (pkt in BleBridge.drainRx()) {
+        for (rx in BleBridge.drainRx()) {
+            val subscriptionToken = BleBridge.subscriptionToken()
+            if (rx.subscriptionToken == 0L || rx.subscriptionToken != subscriptionToken) continue
+            val pkt = rx.bytes
             val info = runCatching { meshDecodePacket(pkt) }.getOrNull() ?: continue
             val sender = info.senderIdHex
-            // ANY well-formed packet from a mapped sender proves the link is
-            // alive — including 0x53 and gossip/sync frames that fall through
-            // the `when` below. Phones announce only once per connection, so
-            // without this a connected-but-quiet peer ages out of seenByFp,
-            // hasLink() flips false, and sends detour to White Noise (or sit in
-            // the outbox for npub-less peers) despite a usable BLE session.
+            // Keep radar activity fresh for every well-formed packet. Outbound
+            // reachability does not trust this timestamp: it is bound to the
+            // native CoreBluetooth subscription token in freshSession().
             fpByPeerId[sender]?.let { touch(it) }
             when (info.packetType.toInt()) {
                 TYPE_ANNOUNCE -> {
@@ -107,8 +110,8 @@ object MeshLink {
                         if (!wasVisible || previousName != ann.nickname) notifyPeerUpdate()
                     }
                 }
-                TYPE_NOISE_HANDSHAKE -> handleHandshake(sender, info.payload)
-                TYPE_NOISE_ENCRYPTED -> handleEncrypted(sender, info.payload)
+                TYPE_NOISE_HANDSHAKE -> handleHandshake(sender, info.payload, rx.subscriptionToken)
+                TYPE_NOISE_ENCRYPTED -> handleEncrypted(sender, info.payload, rx.subscriptionToken)
                 TYPE_SONAR -> {
                     sonarSeenAt[sender] = System.currentTimeMillis()
                     val previous = sonarByPeerId.put(sender, info.payload)
@@ -129,12 +132,13 @@ object MeshLink {
 
         // Broadcast our signed 0x53 Sonar announce every ~3s so connected phones
         // learn our npub and can continue the chat over White Noise out of range.
-        // Only while a peer is actually around (a connected central writes its
-        // announce → seenByFp) — no point signing + notifying into the void.
+        // Only while CoreBluetooth has an active subscriber — no point signing +
+        // notifying into the void.
         val payload = sonarPayload
-        if (payload != null && seenByFp.isNotEmpty() && now - lastSonarSendMs >= 3_000L) {
+        val subscriptionToken = BleBridge.subscriptionToken()
+        if (payload != null && subscriptionToken != 0L && now - lastSonarSendMs >= 3_000L) {
             lastSonarSendMs = now
-            runCatching { BleBridge.notify(MeshIdentity.buildSonarPacket(payload)) }
+            BleBridge.notify(MeshIdentity.buildSonarPacket(payload), subscriptionToken)
         }
     }
 
@@ -143,23 +147,24 @@ object MeshLink {
     /** Noise XX responder: read m1 → reply m2 → read m3 → established.
      *
      *  A handshake packet arriving on an ALREADY-established session means the
-     *  phone reconnected its GATT link and is starting a FRESH handshake — and we
-     *  can't see the disconnect (bluster stubs the CoreBluetooth disconnect
-     *  callback), so without this the desktop keeps the stale session, ignores the
-     *  new m1, and the phone can never re-establish (its chat shows "out of
-     *  range"). So tear down + start fresh whenever a handshake doesn't fit the
-     *  current state. */
-    private fun handleHandshake(senderPeerId: String, m: ByteArray) {
+     *  phone is starting a FRESH handshake. Subscription tokens normally
+     *  invalidate the previous link first, but resetting here also handles a
+     *  peer-initiated rekey within the same GATT subscription. */
+    private fun handleHandshake(senderPeerId: String, m: ByteArray, subscriptionToken: Long) {
         val fp = fpByPeerId[senderPeerId] ?: senderPeerId
-        if (sessions[fp]?.established == true) {
+        if (subscriptionToken == 0L || subscriptionToken != BleBridge.subscriptionToken()) return
+        val current = sessions[fp]
+        if (current != null && (current.established || current.subscriptionToken != subscriptionToken)) {
             sonarLog("MeshLink", "re-handshake from ${nameByFp[fp] ?: fp.take(8)} → resetting session")
             sessions.remove(fp)
         }
-        val s = sessions.getOrPut(fp) { Session(SonarNoise.responder(MeshIdentity.noisePrivHex())) }
+        val s = sessions.getOrPut(fp) {
+            Session(SonarNoise.responder(MeshIdentity.noisePrivHex()), subscriptionToken)
+        }
         synchronized(s) {
             if (!feedHandshake(fp, senderPeerId, s, m)) {
                 // Wrong message for this state (a fresh m1 mid-handshake) — restart.
-                val fresh = Session(SonarNoise.responder(MeshIdentity.noisePrivHex()))
+                val fresh = Session(SonarNoise.responder(MeshIdentity.noisePrivHex()), subscriptionToken)
                 sessions[fp] = fresh
                 synchronized(fresh) { feedHandshake(fp, senderPeerId, fresh, m) }
             }
@@ -170,45 +175,49 @@ object MeshLink {
     /** Returns false if [m] couldn't be processed (caller restarts the handshake). */
     private fun feedHandshake(fp: String, senderPeerId: String, s: Session, m: ByteArray): Boolean =
         runCatching {
+            check(BleBridge.subscriptionToken() == s.subscriptionToken)
             s.noise.readMessage(m) // m1, then m3
+            check(BleBridge.subscriptionToken() == s.subscriptionToken)
             if (s.noise.isFinished()) {
                 s.noise.intoSession(); s.established = true
                 linkUps.add(fp) // surface the re-link so the app flushes queued work
                 sonarLog("MeshLink", "Noise link ESTABLISHED with ${nameByFp[fp] ?: fp.take(8)}")
             } else {
                 val m2 = s.noise.writeMessage()
-                BleBridge.notify(MeshIdentity.buildPacket(TYPE_NOISE_HANDSHAKE.toUByte(), senderPeerId, m2))
+                check(
+                    BleBridge.notify(
+                        MeshIdentity.buildPacket(TYPE_NOISE_HANDSHAKE.toUByte(), senderPeerId, m2),
+                        s.subscriptionToken,
+                    )
+                )
             }
             true
         }.getOrElse { sessions.remove(fp); false }
 
-    private fun handleEncrypted(senderPeerId: String, ciphertext: ByteArray) {
+    private fun handleEncrypted(senderPeerId: String, ciphertext: ByteArray, subscriptionToken: Long) {
         val fp = fpByPeerId[senderPeerId] ?: senderPeerId
-        val s = sessions[fp]?.takeIf { it.established } ?: return
+        val s = freshSession(fp) ?: return
+        if (s.subscriptionToken != subscriptionToken) return
         synchronized(s) {
-            runCatching {
+            val decrypted = runCatching {
                 val plain = s.noise.decrypt(ciphertext)
                 meshDecodePrivateMessage(plain)?.let { pm ->
                     sonarLog("MeshLink", "RX DM from ${nameByFp[fp] ?: fp.take(8)} (${pm.content.length} chars)")
                     rxDms.add(MeshDmIn(fp, pm.messageId, pm.content, System.currentTimeMillis() / 1000))
                 }
-            }
+            }.isSuccess
+            if (decrypted) touch(fp)
         }
-        touch(fp)
     }
 
-    /** An established session whose peer is still fresh. This is the single
-     *  reachability predicate shared by [hasLink], [sendDm] and [sendDmNow], so
-     *  they can never disagree: a stale desktop session (see [pump] — the crypto
-     *  survives the [seenByFp] TTL so inbound DMs still decrypt) must NOT be
-     *  reported in-range NOR accept an outbound write that `BleBridge.notify`
-     *  would sink into the void. `seenByFp` is touched by EVERY well-formed
-     *  packet from a mapped sender (announce, handshake, DM, 0x53, gossip), so a
-     *  connected phone stays fresh inside [PEER_TTL_MS]. */
+    /** An established session owned by the current native GATT subscription.
+     *  This predicate is shared by receive, reachability, and send paths. Quiet
+     *  links stay live indefinitely; disconnected and replaced links fail closed
+     *  without waiting for traffic or a wall-clock TTL. */
     private fun freshSession(fp: String): Session? {
         val s = sessions[fp]?.takeIf { it.established } ?: return null
-        val seen = seenByFp[fp] ?: return null
-        return if (System.currentTimeMillis() - seen < PEER_TTL_MS) s else null
+        val subscriptionToken = BleBridge.subscriptionToken()
+        return if (subscriptionToken != 0L && s.subscriptionToken == subscriptionToken) s else null
     }
 
     fun hasLink(fp: String): Boolean = freshSession(fp) != null
@@ -233,7 +242,14 @@ object MeshLink {
             runCatching {
                 val plain = meshEncodePrivateMessage(messageId, text)
                 val ct = s.noise.encrypt(plain)
-                BleBridge.notify(MeshIdentity.buildPacket(TYPE_NOISE_ENCRYPTED.toUByte(), peerId, ct))
+                if (!BleBridge.notify(
+                        MeshIdentity.buildPacket(TYPE_NOISE_ENCRYPTED.toUByte(), peerId, ct),
+                        s.subscriptionToken,
+                    )
+                ) {
+                    sessions.remove(fp, s)
+                    return@runCatching false
+                }
                 sonarLog("MeshLink", "TX DM to ${nameByFp[fp] ?: fp.take(8)} (${text.length} chars)")
                 true
             }.getOrDefault(false)

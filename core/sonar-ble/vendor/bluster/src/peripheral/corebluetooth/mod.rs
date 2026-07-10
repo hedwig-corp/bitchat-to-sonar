@@ -12,6 +12,10 @@ use uuid::Uuid;
 use self::peripheral_manager::PeripheralManager;
 use crate::{gatt::service::Service, Error};
 
+pub fn subscription_token() -> u64 {
+    events::subscription_token()
+}
+
 pub struct Peripheral {
     peripheral_manager: PeripheralManager,
 }
@@ -62,8 +66,18 @@ impl Peripheral {
         self.peripheral_manager.notify(data)
     }
 
+    /// PATCH (Sonar): non-zero identity of the active notification subscription.
+    pub fn subscription_token(&self) -> u64 {
+        self.peripheral_manager.subscription_token()
+    }
+
+    /// PATCH (Sonar): invalidate the active subscription at transport teardown.
+    pub fn reset_subscriptions(&self) {
+        self.peripheral_manager.reset_subscriptions()
+    }
+
     /// PATCH (Sonar): drain bytes written to our characteristic by centrals.
-    pub fn take_writes(&self) -> Vec<Vec<u8>> {
+    pub fn take_writes(&self) -> Vec<(u64, Vec<u8>)> {
         self.peripheral_manager.take_writes()
     }
 }
