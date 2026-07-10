@@ -248,6 +248,42 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
+    // Optional release signing for sideload / Zapstore (SDK 35 needs v2+).
+    // Never commit passwords. Set via env or apps/sonar/local.properties:
+    //   SONAR_KEYSTORE / sonar.keystore
+    //   SONAR_KEYSTORE_PASSWORD / sonar.keystore.password
+    //   SONAR_KEY_ALIAS / sonar.key.alias
+    //   SONAR_KEY_PASSWORD / sonar.key.password
+    val lpSigning = Properties().apply {
+        val f = rootProject.file("local.properties")
+        if (f.exists()) f.inputStream().use { load(it) }
+    }
+    fun signProp(env: String, fileKey: String): String? =
+        (System.getenv(env)?.takeIf { it.isNotBlank() }
+            ?: lpSigning.getProperty(fileKey)?.takeIf { it.isNotBlank() })
+
+    val releaseKeystorePath = signProp("SONAR_KEYSTORE", "sonar.keystore")
+    val releaseKeystorePassword = signProp("SONAR_KEYSTORE_PASSWORD", "sonar.keystore.password")
+    val releaseKeyAlias = signProp("SONAR_KEY_ALIAS", "sonar.key.alias")
+    val releaseKeyPassword = signProp("SONAR_KEY_PASSWORD", "sonar.key.password")
+    val hasReleaseSigning =
+        !releaseKeystorePath.isNullOrBlank() &&
+            !releaseKeystorePassword.isNullOrBlank() &&
+            !releaseKeyAlias.isNullOrBlank() &&
+            !releaseKeyPassword.isNullOrBlank() &&
+            file(releaseKeystorePath!!).isFile
+
+    if (hasReleaseSigning) {
+        signingConfigs {
+            create("release") {
+                storeFile = file(releaseKeystorePath!!)
+                storePassword = releaseKeystorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
+        }
+    }
+
     buildTypes {
         getByName("release") {
             isMinifyEnabled = false
@@ -261,6 +297,9 @@ android {
                 ndk {
                     abiFilters += listOf("arm64-v8a", "armeabi-v7a")
                 }
+            }
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.getByName("release")
             }
         }
         getByName("debug") {

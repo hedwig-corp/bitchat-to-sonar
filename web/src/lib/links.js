@@ -7,6 +7,8 @@ export const TESTFLIGHT_MACOS_URL = TESTFLIGHT_URL;
 // Android alpha — APK attached to the GitHub release.
 export const ANDROID_APK_URL =
   'https://github.com/hedwig-corp/bitchat-to-sonar/releases/download/v0.1-alpha.6/sonar-0.1-alpha.6-android.apk';
+// Android via Zapstore (signed package, updates over Nostr).
+export const ZAPSTORE_URL = 'https://zapstore.dev/apps/chat.bitchat.sonar';
 
 // In-page anchor to the download section.
 export const DOWNLOAD_HREF = '#download';

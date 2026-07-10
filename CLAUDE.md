@@ -135,3 +135,67 @@ can launch successfully while silently disabling Breez offline payment wakeups.
 When a change breaks existing behavior, fix the broken behavior directly before considering the work complete. Do not leave regressions for users to route around, and do not hide them with UI-only workarounds.
 
 For conversation identity specifically, a person must never be split into separate chats just because discovery arrives over different transports or in a different order. If a peer is first seen as Bitchat/mesh and later advertises Sonar features, fold the Bitchat, Sonar Discovery, and White Noise/Marmot legs into one conversation using the stable Noise fingerprint and NIP/npub identity link.
+
+## Android Build & Run
+
+Full guide: [`docs/ANDROID-BUILD.md`](docs/ANDROID-BUILD.md). App overview:
+[`apps/sonar/README.md`](apps/sonar/README.md).
+
+Compose app root: `apps/sonar/`. Gradle runs `core/build-android.sh` via
+`:composeApp:buildAndroidRustCore` (JNI `.so` + UniFFI under
+`composeApp/src/androidMain/`).
+
+```bash
+cd apps/sonar
+
+# Day-to-day: install debug on a connected arm64 device/emulator
+./gradlew :composeApp:installDebug
+
+# Release APK — phones only (arm64-v8a + armeabi-v7a), default for GitHub alpha
+./gradlew :composeApp:assembleRelease
+# → composeApp/build/outputs/apk/release/composeApp-release-unsigned.apk
+
+# Universal fat APK — also ships x86/x86_64 emulator natives
+./gradlew :composeApp:assembleRelease -Psonar.universalApk=true
+```
+
+Secrets (gitignored; never commit):
+
+- `apps/sonar/local.properties` — `sdk.dir=…` and `breez.apiKey=…` (or env
+  `BREEZ_API_KEY`). Without the key the app builds; wallet/payments will not.
+- `apps/sonar/composeApp/google-services.json` — FCM for offline payment wakeups;
+  missing file ⇒ silent no FCM (same class of issue as iOS
+  `GoogleService-Info.plist`).
+
+Debug is **arm64-v8a only**. Default release is **phones only**; universal is
+opt-in via `-Psonar.universalApk=true`. Website download points at the phone
+APK; GitHub pre-releases may attach both phone and universal assets.
+
+Force a native rebuild after `core/` changes if needed:
+
+```bash
+ANDROID_NDK_HOME=/path/to/ndk core/build-android.sh
+```
+
+## Zapstore Publish (Android)
+
+Full guide: [`docs/ZAPSTORE.md`](docs/ZAPSTORE.md). Config: root
+[`zapstore.yaml`](zapstore.yaml). Helper: `scripts/zapstore-publish.sh`.
+
+Zapstore needs a **v2+ signed** phone APK (unsigned `assembleRelease` fails on
+targetSdk 35) and Nostr signing via env `SIGN_WITH` (`nsec1…`, `bunker://…`, or
+`browser`). Alpha GitHub releases are pre-releases — always use
+`zsp publish --pre-release` (the script does).
+
+Keystore secrets (gitignored `apps/sonar/local.properties` or env):
+`sonar.keystore`, `sonar.keystore.password`, `sonar.key.alias`,
+`sonar.key.password` (or `SONAR_KEYSTORE*` / `SONAR_KEY_*`). Put the publisher
+`pubkey` (npub) in `zapstore.yaml` and commit it so the relay can whitelist the
+repo.
+
+```bash
+export SIGN_WITH=browser   # or nsec / bunker
+export GITHUB_TOKEN="$(gh auth token)"
+scripts/zapstore-publish.sh --local   # build + sign + publish
+# scripts/zapstore-publish.sh --check  # fetch-only dry run
+```

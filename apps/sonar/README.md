@@ -100,15 +100,29 @@ scan to `/tmp/sonar-ble.log`.
 
 ## Build & run — Android
 
+Full guide (secrets, ABIs, release APKs, pitfalls):
+[`docs/ANDROID-BUILD.md`](../../docs/ANDROID-BUILD.md).
+
 ```bash
 # Gradle runs :composeApp:buildAndroidRustCore first, generating Rust .so files
 # and UniFFI bindings under androidMain from core/build-android.sh.
 cd apps/sonar
+
+# Debug install (arm64-v8a only — modern phone or arm64 emulator)
 ./gradlew :composeApp:installDebug
 
-# Optional manual regeneration/debug:
+# Release APK — phones only (arm64-v8a + armeabi-v7a)
+./gradlew :composeApp:assembleRelease
+
+# Universal APK — phones + x86/x86_64 emulators
+./gradlew :composeApp:assembleRelease -Psonar.universalApk=true
+
+# Optional manual core rebuild:
 ANDROID_NDK_HOME=/path/to/ndk ../../core/build-android.sh
 ```
+
+Put `sdk.dir` and `breez.apiKey` in gitignored `local.properties` (or export
+`BREEZ_API_KEY`). Release APKs are unsigned unless you configure signing.
 
 ## Tests
 
