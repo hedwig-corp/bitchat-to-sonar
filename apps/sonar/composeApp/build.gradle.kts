@@ -251,6 +251,12 @@ android {
     buildTypes {
         getByName("release") {
             isMinifyEnabled = false
+            // Sideload/GitHub alpha APK: phones only. arm64-v8a = modern devices,
+            // armeabi-v7a = older 32-bit phones. Drop x86/x86_64 (emulators) so we
+            // don't ship ~2× native size from Breez + Rust + JNA for no device gain.
+            ndk {
+                abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+            }
         }
         getByName("debug") {
             // Debug builds only run on the local dev device. Both the Apple-
