@@ -24,6 +24,37 @@ data class MeshSendFailure(
     val tsSecs: Long,
 )
 
+/** A locally-accepted mesh media transfer that failed before every fragment
+ *  crossed the platform's local write boundary. The app removes the optimistic
+ *  mesh echo and retries the original bytes through its White Noise media path. */
+data class MeshMediaSendFailure(
+    val peerId: String,
+    val messageId: String,
+    val bytes: ByteArray,
+    val filename: String,
+    val mimeType: String,
+    val tsSecs: Long,
+) {
+    override fun equals(other: Any?): Boolean =
+        other is MeshMediaSendFailure &&
+            peerId == other.peerId &&
+            messageId == other.messageId &&
+            bytes.contentEquals(other.bytes) &&
+            filename == other.filename &&
+            mimeType == other.mimeType &&
+            tsSecs == other.tsSecs
+
+    override fun hashCode(): Int {
+        var result = peerId.hashCode()
+        result = 31 * result + messageId.hashCode()
+        result = 31 * result + bytes.contentHashCode()
+        result = 31 * result + filename.hashCode()
+        result = 31 * result + mimeType.hashCode()
+        result = 31 * result + tsSecs.hashCode()
+        return result
+    }
+}
+
 /** An incoming PUBLIC broadcast (the BLE "Mesh" channel) from another peer. The
  *  wire carries only content + sender peerID + timestamp; the display nickname is
  *  resolved from the sender's announce by the app. */
@@ -254,9 +285,14 @@ expect object MeshRadio {
      *  outbox / favorite-control work for that peer — including BACKGROUND chats
      *  that the open-chat link watch and the announce-set re-entry miss. */
     fun drainMeshLinkUps(): List<String>
-    /** Send a private BLE file transfer to a live mesh peer. This does not queue:
-     * callers should fall back to White Noise or show a route error when false. */
+    /** Send a private BLE file transfer to a live mesh peer. Returns true after
+     *  the first platform write is accepted; a later fragment/callback failure is
+     *  exposed by [drainMeshMediaSendFailures]. The transport never retains media
+     *  across reconnects, so the app owns White Noise fallback. */
     fun sendMeshMedia(peerId: String, messageId: String, bytes: ByteArray, filename: String, mimeType: String): Boolean
+    /** Pull (and clear) media whose asynchronous platform write failed after the
+     *  synchronous send call had returned true. */
+    fun drainMeshMediaSendFailures(): List<MeshMediaSendFailure>
     /** Pull (and clear) mesh media transfers received since the last call. */
     fun drainMeshMedia(): List<MeshMediaIn>
     /** Wall-clock seconds (platform clock) — for mesh message timestamps. */

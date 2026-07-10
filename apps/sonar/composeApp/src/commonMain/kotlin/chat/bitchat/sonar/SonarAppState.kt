@@ -6554,6 +6554,22 @@ class SonarAppState(private val scope: CoroutineScope) {
                 return
             }
         }
+        sendMediaOverMarmot(
+            chatId,
+            data,
+            filename,
+            mime,
+            missingRouteMessage = missingRouteMessage,
+            failureLabel = failureLabel,
+        )
+    }
+        chatId: String,
+        data: ByteArray,
+        filename: String,
+        mime: String,
+        missingRouteMessage: String,
+        failureLabel: String,
+    ) {
         scope.launch {
             val groupId = resolveMarmotGroupId(chatId)
             if (groupId == null) {
@@ -9349,6 +9365,48 @@ class SonarAppState(private val scope: CoroutineScope) {
         return true
     }
 
+    /** Remove an optimistic BLE media echo after a later fragment/callback
+     *  failure, then retry the original bytes over the existing Marmot route. */
+    private fun drainMeshMediaSendFailures(): Boolean {
+        val failures = MeshRadio.drainMeshMediaSendFailures()
+        if (failures.isEmpty()) return false
+        val touched = mutableSetOf<String>()
+        for (failure in failures) {
+            val peerId = normalizeSocialPeerId(failure.peerId)
+            val mediaUrl = meshMediaUrl(peerId, failure.messageId, failure.filename)
+            mediaCache.remove(mediaUrl)
+            val before = meshChats[peerId].orEmpty()
+            val after = before.filterNot { it.id == failure.messageId }
+            if (after.size != before.size) {
+                meshChats[peerId] = after
+                touched += peerId
+            }
+            if (socialState.isBlockedPeer(peerId)) continue
+            val failureLabel = when {
+                failure.mimeType.startsWith("audio/") -> "voice note"
+                failure.mimeType.startsWith("image/") -> "photo"
+                else -> "file"
+            }
+            sendMediaOverMarmot(
+                meshChatId(peerId),
+                failure.bytes,
+                failure.filename,
+                failure.mimeType,
+                missingRouteMessage = "Media wasn't sent — stay close and try again",
+                failureLabel = failureLabel,
+            )
+        }
+        touched.forEach { persistMesh(it) }
+        if (touched.isNotEmpty()) {
+            refreshMeshDmRows()
+            (screen as? Screen.Chat)?.let { open ->
+                val peerId = open.id.takeIf { isMeshChat(it) }?.let { meshPeerId(it) }
+                if (peerId != null && peerId in touched) scope.launch { refreshOpenDm(peerId) }
+            }
+        }
+        return true
+    }
+
     private suspend fun drainDirectDms() {
         val incoming = runCatching { SonarCore.drainDirectDms() }.getOrDefault(emptyList())
         if (incoming.isEmpty()) return
@@ -10140,7 +10198,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             var watchedPeerId: String? = null
             var watchedLinkUp = false
             while (true) {
-                val drained = drainMeshDms() or drainMeshSendFailures() or drainMeshMedia() or drainMeshBroadcasts()
+                val drained = drainMeshDms() or drainMeshSendFailures() or
+                    drainMeshMediaSendFailures() or drainMeshMedia() or drainMeshBroadcasts()
                 val nowMs = SonarClock.nowMillis()
                 // A Noise link (re)establishing flushes that peer's queued work
                 // regardless of whether its chat is open — the transport-level

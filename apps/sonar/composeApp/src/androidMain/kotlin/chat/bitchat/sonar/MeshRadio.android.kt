@@ -91,6 +91,8 @@ actual object MeshRadio {
     private val meshDmInbox = java.util.concurrent.ConcurrentLinkedQueue<MeshDmIn>()
     /** DMs accepted synchronously whose later GATT callback/disconnect failed. */
     private val meshSendFailureInbox = java.util.concurrent.ConcurrentLinkedQueue<MeshSendFailure>()
+    /** Media accepted synchronously whose later fragment/callback failed. */
+    private val meshMediaSendFailureInbox = java.util.concurrent.ConcurrentLinkedQueue<MeshMediaSendFailure>()
     /** Incoming private mesh file transfers, buffered until the app drains them. */
     private val meshMediaInbox = java.util.concurrent.ConcurrentLinkedQueue<MeshMediaIn>()
     /** Incoming public Mesh-channel broadcasts, buffered until drained. */
@@ -110,6 +112,9 @@ actual object MeshRadio {
         }
         MeshGatt.addSendFailureListener { failure ->
             if (isKnownPeer(failure.peerId)) meshSendFailureInbox.add(failure)
+        }
+        MeshGatt.addMediaSendFailureListener { failure ->
+            if (isKnownPeer(failure.peerId)) meshMediaSendFailureInbox.add(failure)
         }
         MeshGatt.addFileListener { fingerprint, messageId, filename, mime, bytes ->
             if (!isKnownPeer(fingerprint)) return@addFileListener
@@ -417,6 +422,15 @@ actual object MeshRadio {
 
     actual fun sendMeshMedia(peerId: String, messageId: String, bytes: ByteArray, filename: String, mimeType: String): Boolean =
         MeshGatt.sendFileToPeer(peerId, messageId, bytes, filename, mimeType)
+
+    actual fun drainMeshMediaSendFailures(): List<MeshMediaSendFailure> {
+        val out = ArrayList<MeshMediaSendFailure>()
+        while (true) {
+            val failure = meshMediaSendFailureInbox.poll() ?: break
+            if (isKnownPeer(failure.peerId)) out.add(failure)
+        }
+        return out
+    }
 
     actual fun drainMeshMedia(): List<MeshMediaIn> {
         val out = ArrayList<MeshMediaIn>()

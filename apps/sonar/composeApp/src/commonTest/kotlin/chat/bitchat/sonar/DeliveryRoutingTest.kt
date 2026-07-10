@@ -2,6 +2,7 @@ package chat.bitchat.sonar
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertNotEquals
 import kotlin.test.assertNull
 
 class DeliveryRoutingTest {
@@ -21,6 +22,17 @@ class DeliveryRoutingTest {
     @Test
     fun successfulDeliveryHasNoFallbackItems() {
         assertEquals(emptyList(), collectFailedDeliveries(listOf("a", "b")) { true })
+    }
+
+    @Test
+    fun mediaFailuresComparePayloadsByContent() {
+        val first = MeshMediaSendFailure("peer", "id", byteArrayOf(1, 2), "photo.jpg", "image/jpeg", 7)
+        val same = MeshMediaSendFailure("peer", "id", byteArrayOf(1, 2), "photo.jpg", "image/jpeg", 7)
+        val changed = MeshMediaSendFailure("peer", "id", byteArrayOf(1, 3), "photo.jpg", "image/jpeg", 7)
+
+        assertEquals(first, same)
+        assertEquals(first.hashCode(), same.hashCode())
+        assertNotEquals(first, changed)
     }
 
     @Test
