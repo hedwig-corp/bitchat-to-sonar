@@ -19,8 +19,8 @@ pub mod wasm;
 pub use blossom::{is_allowed_sticker_mime, is_blossom_https_url, sha256_hex};
 pub use error::{Result, StickerError};
 pub use model::{
-    InstalledPackList, PackAddress, Sticker, StickerPack, StickerRef, PACK_FORMAT,
-    STICKER_PACK_KIND, USER_STICKER_PACKS_KIND,
+    InstalledPackList, PackAddress, Sticker, StickerPack, StickerRef, LEGACY_STICKER_PACK_KIND,
+    LEGACY_USER_STICKER_PACKS_KIND, PACK_FORMAT, STICKER_PACK_KIND, USER_STICKER_PACKS_KIND,
 };
 pub use validation::{validate_sha256_hex, validate_shortcode};
 

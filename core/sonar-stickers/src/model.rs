@@ -8,8 +8,16 @@ use crate::validation::{normalize_sha256_hex, validate_dim, validate_shortcode};
 use crate::{is_allowed_sticker_mime, is_blossom_https_url};
 
 pub const PACK_FORMAT: &str = "sonar-sticker-pack-v1";
+/// Canonical addressable sticker-pack kind (one above NIP-30/NIP-51 emoji set).
 pub const STICKER_PACK_KIND: u16 = 30031;
+/// Pre-migration packs were published as kind 30030 (emoji-set collision).
+/// Clients still read them when `pack_format` is present, and always rewrite
+/// coordinates as [`STICKER_PACK_KIND`].
+pub const LEGACY_STICKER_PACK_KIND: u16 = 30030;
+/// Canonical replaceable installed-pack list kind.
 pub const USER_STICKER_PACKS_KIND: u16 = 10031;
+/// Pre-migration installed lists used kind 10030 (user emoji list collision).
+pub const LEGACY_USER_STICKER_PACKS_KIND: u16 = 10030;
 pub const MAX_STICKERS_PER_PACK: usize = 200;
 pub const MAX_TITLE_CHARS: usize = 80;
 pub const MAX_DESCRIPTION_CHARS: usize = 500;
@@ -53,7 +61,10 @@ impl PackAddress {
         let kind = parts.next();
         let pubkey = parts.next();
         let identifier = parts.next();
-        if kind != Some("30031") || pubkey.is_none() || identifier.is_none() {
+        // Accept legacy 30030 coordinates from packs published before the
+        // kind migration; always normalize to the canonical 30031 coordinate.
+        let kind_ok = matches!(kind, Some("30031") | Some("30030"));
+        if !kind_ok || pubkey.is_none() || identifier.is_none() {
             return Err(StickerError::InvalidField {
                 field: "pack_address",
                 reason: "expected 30031:<author-pubkey>:<identifier>".into(),

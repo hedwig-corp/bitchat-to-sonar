@@ -63,7 +63,9 @@ data class SonarStickerRef(
 ) {
     fun packAddressParts(): Pair<String, String>? {
         val parts = packCoordinate.split(":", limit = 3)
-        if (parts.size != 3 || parts[0] != "30031") return null
+        // Accept legacy 30030 coordinates from packs published before the
+        // kind migration; callers resolve against both kinds on fetch.
+        if (parts.size != 3 || (parts[0] != "30031" && parts[0] != "30030")) return null
         return parts[1] to parts[2]
     }
 }

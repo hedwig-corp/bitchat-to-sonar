@@ -2,8 +2,8 @@ use nostr::prelude::*;
 
 use crate::error::{Result, StickerError};
 use crate::model::{
-    InstalledPackList, PackAddress, Sticker, StickerPack, StickerRef, PACK_FORMAT,
-    STICKER_PACK_KIND, USER_STICKER_PACKS_KIND,
+    InstalledPackList, PackAddress, Sticker, StickerPack, StickerRef, LEGACY_STICKER_PACK_KIND,
+    LEGACY_USER_STICKER_PACKS_KIND, PACK_FORMAT, STICKER_PACK_KIND, USER_STICKER_PACKS_KIND,
 };
 
 pub fn build_pack_tags(pack: &StickerPack) -> Vec<Tag> {
@@ -45,9 +45,11 @@ pub fn build_pack_tags(pack: &StickerPack) -> Vec<Tag> {
 }
 
 pub fn parse_pack_event(event: &Event) -> Result<StickerPack> {
-    if event.kind != Kind::Custom(STICKER_PACK_KIND)
-        || !has_tag_value(event, "pack_format", PACK_FORMAT)
-    {
+    // Accept legacy kind 30030 packs that still carry the Sonar pack_format
+    // marker. Pure NIP-30 emoji sets lack that marker and are rejected.
+    let is_pack_kind = event.kind == Kind::Custom(STICKER_PACK_KIND)
+        || event.kind == Kind::Custom(LEGACY_STICKER_PACK_KIND);
+    if !is_pack_kind || !has_tag_value(event, "pack_format", PACK_FORMAT) {
         return Err(StickerError::NotStickerPack);
     }
     let identifier = first_tag_value(event, "d").ok_or(StickerError::MissingTag("d"))?;
@@ -78,7 +80,9 @@ pub fn build_installed_packs_tags(list: &InstalledPackList) -> Vec<Tag> {
 }
 
 pub fn parse_installed_pack_list(event: &Event) -> Result<InstalledPackList> {
-    if event.kind != Kind::Custom(USER_STICKER_PACKS_KIND) {
+    let is_list_kind = event.kind == Kind::Custom(USER_STICKER_PACKS_KIND)
+        || event.kind == Kind::Custom(LEGACY_USER_STICKER_PACKS_KIND);
+    if !is_list_kind {
         return Err(StickerError::InvalidField {
             field: "kind",
             reason: "expected kind 10031 installed sticker list".into(),
@@ -317,6 +321,76 @@ mod tests {
             .unwrap();
 
         assert_eq!(parse_pack_event(&event), Err(StickerError::NotStickerPack));
+    }
+
+    #[test]
+    fn parses_legacy_kind_30030_when_pack_format_present() {
+        let keys = Keys::parse(SECRET).unwrap();
+        let pubkey = keys.public_key().to_hex();
+        let address = PackAddress::new(pubkey.clone(), "sonar-cats-v1").unwrap();
+        let pack = StickerPack::new(
+            address,
+            "Legacy Cats",
+            None,
+            None,
+            vec![sticker("cat_wave", HASH_A)],
+            None,
+        )
+        .unwrap();
+        let event = EventBuilder::new(Kind::Custom(LEGACY_STICKER_PACK_KIND), "")
+            .tags(build_pack_tags(&pack))
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let parsed = parse_pack_event(&event).unwrap();
+        assert_eq!(parsed.title, "Legacy Cats");
+        assert_eq!(parsed.stickers.len(), 1);
+        // Coordinates always normalize to the canonical kind.
+        assert_eq!(
+            parsed.address.coordinate(),
+            format!("30031:{pubkey}:sonar-cats-v1")
+        );
+    }
+
+    #[test]
+    fn rejects_legacy_kind_30030_without_pack_format() {
+        let keys = Keys::parse(SECRET).unwrap();
+        // A bare NIP-30-style emoji set on kind 30030 must not parse as a
+        // Sonar sticker pack.
+        let event = EventBuilder::new(Kind::Custom(LEGACY_STICKER_PACK_KIND), "")
+            .tags([
+                d_tag("emoji-set"),
+                Tag::custom(TagKind::Custom("title".into()), ["Emojis"]),
+            ])
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        assert_eq!(parse_pack_event(&event), Err(StickerError::NotStickerPack));
+    }
+
+    #[test]
+    fn pack_address_accepts_legacy_30030_coordinate() {
+        let coord = format!(
+            "30030:{}:signal-8fa42aa13ec8f0efebe4b038f41afbd1",
+            "b".repeat(64)
+        );
+        let parsed = PackAddress::parse(&coord).unwrap();
+        assert!(parsed.coordinate().starts_with("30031:"));
+        assert_eq!(parsed.identifier, "signal-8fa42aa13ec8f0efebe4b038f41afbd1");
+    }
+
+    #[test]
+    fn parses_legacy_kind_10030_installed_list() {
+        let keys = Keys::parse(SECRET).unwrap();
+        let pack = PackAddress::new(keys.public_key().to_hex(), "sonar-cats-v1").unwrap();
+        let list = InstalledPackList::new(vec![pack.clone()]);
+        let event = EventBuilder::new(Kind::Custom(LEGACY_USER_STICKER_PACKS_KIND), "")
+            .tags(build_installed_packs_tags(&list))
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        let parsed = parse_installed_pack_list(&event).unwrap();
+        assert_eq!(parsed.packs, vec![pack]);
     }
 
     #[test]

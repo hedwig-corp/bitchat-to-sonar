@@ -20,7 +20,8 @@ use serde::{Deserialize, Serialize};
 
 use sonar_stickers::{
     build_installed_packs_tags, parse_installed_pack_list, parse_pack_event, InstalledPackList,
-    PackAddress, StickerPack, StickerRef, STICKER_PACK_KIND, USER_STICKER_PACKS_KIND,
+    PackAddress, StickerPack, StickerRef, LEGACY_STICKER_PACK_KIND, LEGACY_USER_STICKER_PACKS_KIND,
+    STICKER_PACK_KIND, USER_STICKER_PACKS_KIND,
 };
 
 use crate::conversation_index::{
@@ -1834,6 +1835,11 @@ impl SonarClient {
     }
 
     /// Fetch a sticker pack from relays by its pack address coordinate.
+    ///
+    /// Queries both the canonical kind (`30031`) and the pre-migration kind
+    /// (`30030`). Only events with `pack_format=sonar-sticker-pack-v1` parse
+    /// successfully, so NIP-30 emoji sets on 30030 are ignored. Prefer a
+    /// canonical event when both kinds are present.
     pub async fn fetch_sticker_pack(
         &self,
         author_pubkey_hex: &str,
@@ -1843,43 +1849,83 @@ impl SonarClient {
         let author = PublicKey::from_hex(author_pubkey_hex)
             .map_err(|e| Error::InvalidInput(format!("invalid pack author pubkey: {e}")))?;
         let filter = Filter::new()
-            .kind(Kind::Custom(STICKER_PACK_KIND))
+            .kinds([
+                Kind::Custom(STICKER_PACK_KIND),
+                Kind::Custom(LEGACY_STICKER_PACK_KIND),
+            ])
             .author(author)
             .custom_tag(
                 SingleLetterTag::lowercase(Alphabet::D),
                 identifier.to_string(),
             )
-            .limit(1);
+            // One of each kind is enough; prefer the canonical kind below.
+            .limit(4);
 
         let relays: Vec<String> = if relay_urls.is_empty() {
             self.relays.iter().map(|u| u.to_string()).collect()
         } else {
             relay_urls.to_vec()
         };
-        let timeout = Duration::from_secs(10);
+        // Pack metadata is small; keep this snappy so the sticker picker and
+        // chat bubbles fail fast when the pack is missing rather than hanging
+        // on a long multi-relay wait that feels like "stickers never load".
+        let timeout = Duration::from_secs(6);
         let events = self
             .nostr
             .fetch_events_from(relays, filter, timeout)
             .await?;
-        let event = events
-            .into_iter()
-            .next()
+        // Prefer canonical kind 30031 when both a migrated and a legacy pack
+        // event exist for the same d-tag.
+        let mut legacy: Option<Event> = None;
+        let mut canonical: Option<Event> = None;
+        for event in events {
+            if event.kind == Kind::Custom(STICKER_PACK_KIND) {
+                canonical = Some(event);
+            } else if event.kind == Kind::Custom(LEGACY_STICKER_PACK_KIND) && legacy.is_none() {
+                legacy = Some(event);
+            }
+        }
+        let event = canonical
+            .or(legacy)
             .ok_or_else(|| Error::Http("sticker pack not found on relays".into()))?;
         parse_pack_event(&event).map_err(|e| Error::Http(format!("invalid sticker pack: {e}")))
     }
 
     pub async fn fetch_installed_packs(&self) -> Result<Vec<PackAddress>> {
         let filter = Filter::new()
-            .kind(Kind::Custom(USER_STICKER_PACKS_KIND))
+            .kinds([
+                Kind::Custom(USER_STICKER_PACKS_KIND),
+                Kind::Custom(LEGACY_USER_STICKER_PACKS_KIND),
+            ])
             .author(self.identity().public_key())
-            .limit(1);
+            .limit(4);
         let relays: Vec<String> = self.relays.iter().map(|u| u.to_string()).collect();
-        let timeout = Duration::from_secs(10);
+        let timeout = Duration::from_secs(6);
         let events = self
             .nostr
             .fetch_events_from(relays, filter, timeout)
             .await?;
-        match events.into_iter().next() {
+        // Prefer the newest-looking canonical list; fall back to legacy 10030.
+        let mut best: Option<Event> = None;
+        for event in events {
+            let is_canonical = event.kind == Kind::Custom(USER_STICKER_PACKS_KIND);
+            let is_legacy = event.kind == Kind::Custom(LEGACY_USER_STICKER_PACKS_KIND);
+            if !is_canonical && !is_legacy {
+                continue;
+            }
+            match &best {
+                None => best = Some(event),
+                Some(prev) => {
+                    let prefer = (is_canonical
+                        && prev.kind != Kind::Custom(USER_STICKER_PACKS_KIND))
+                        || (event.kind == prev.kind && event.created_at > prev.created_at);
+                    if prefer {
+                        best = Some(event);
+                    }
+                }
+            }
+        }
+        match best {
             Some(event) => {
                 let list = parse_installed_pack_list(&event)
                     .map_err(|e| Error::Http(format!("invalid installed pack list: {e}")))?;
