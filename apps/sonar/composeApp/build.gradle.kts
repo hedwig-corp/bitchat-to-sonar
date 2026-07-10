@@ -251,11 +251,16 @@ android {
     buildTypes {
         getByName("release") {
             isMinifyEnabled = false
-            // Sideload/GitHub alpha APK: phones only. arm64-v8a = modern devices,
-            // armeabi-v7a = older 32-bit phones. Drop x86/x86_64 (emulators) so we
-            // don't ship ~2× native size from Breez + Rust + JNA for no device gain.
-            ndk {
-                abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+            // Default release APK is phones only (arm64-v8a + armeabi-v7a).
+            // Pass -Psonar.universalApk=true for a fat APK that also includes
+            // x86/x86_64 emulator natives (Breez + Rust + JNA).
+            val universal =
+                (project.findProperty("sonar.universalApk") as String?)
+                    ?.equals("true", ignoreCase = true) == true
+            if (!universal) {
+                ndk {
+                    abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+                }
             }
         }
         getByName("debug") {
