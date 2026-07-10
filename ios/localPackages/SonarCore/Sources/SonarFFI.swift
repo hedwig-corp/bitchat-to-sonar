@@ -3356,23 +3356,19 @@ public func FfiConverterTypeConversationSummaryInfo_lower(_ value: ConversationS
 
 
 /**
- * Per-group outcome of a device-link pass. `status` is one of `"linked"`,
- * `"skipped_not_admin"`, `"already_linked"`, `"failed"`; `error` is set only
- * for `"failed"`.
+ * Per-group outcome of a device-link pass.
  */
 public struct DeviceLinkGroupOutcomeInfo: Equatable, Hashable {
     public var groupIdHex: String
     public var groupName: String
-    public var status: String
-    public var error: String?
+    public var status: DeviceLinkGroupStatusInfo
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(groupIdHex: String, groupName: String, status: String, error: String?) {
+    public init(groupIdHex: String, groupName: String, status: DeviceLinkGroupStatusInfo) {
         self.groupIdHex = groupIdHex
         self.groupName = groupName
         self.status = status
-        self.error = error
     }
 
     
@@ -3393,16 +3389,14 @@ public struct FfiConverterTypeDeviceLinkGroupOutcomeInfo: FfiConverterRustBuffer
             try DeviceLinkGroupOutcomeInfo(
                 groupIdHex: FfiConverterString.read(from: &buf), 
                 groupName: FfiConverterString.read(from: &buf), 
-                status: FfiConverterString.read(from: &buf), 
-                error: FfiConverterOptionString.read(from: &buf)
+                status: FfiConverterTypeDeviceLinkGroupStatusInfo.read(from: &buf)
         )
     }
 
     public static func write(_ value: DeviceLinkGroupOutcomeInfo, into buf: inout [UInt8]) {
         FfiConverterString.write(value.groupIdHex, into: &buf)
         FfiConverterString.write(value.groupName, into: &buf)
-        FfiConverterString.write(value.status, into: &buf)
-        FfiConverterOptionString.write(value.error, into: &buf)
+        FfiConverterTypeDeviceLinkGroupStatusInfo.write(value.status, into: &buf)
     }
 }
 
@@ -5810,6 +5804,94 @@ public func FfiConverterTypeMeshEngineEvent_lift(_ buf: RustBuffer) throws -> Me
 #endif
 public func FfiConverterTypeMeshEngineEvent_lower(_ value: MeshEngineEvent) -> RustBuffer {
     return FfiConverterTypeMeshEngineEvent.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Typed per-group status of a device-link pass, so hosts get exhaustive
+ * switches instead of matching on strings.
+ */
+
+public enum DeviceLinkGroupStatusInfo: Equatable, Hashable {
+    
+    case linked
+    case skippedNotAdmin
+    case alreadyLinked
+    case failed(error: String
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension DeviceLinkGroupStatusInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDeviceLinkGroupStatusInfo: FfiConverterRustBuffer {
+    typealias SwiftType = DeviceLinkGroupStatusInfo
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DeviceLinkGroupStatusInfo {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .linked
+        
+        case 2: return .skippedNotAdmin
+        
+        case 3: return .alreadyLinked
+        
+        case 4: return .failed(error: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: DeviceLinkGroupStatusInfo, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .linked:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .skippedNotAdmin:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .alreadyLinked:
+            writeInt(&buf, Int32(3))
+        
+        
+        case let .failed(error):
+            writeInt(&buf, Int32(4))
+            FfiConverterString.write(error, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDeviceLinkGroupStatusInfo_lift(_ buf: RustBuffer) throws -> DeviceLinkGroupStatusInfo {
+    return try FfiConverterTypeDeviceLinkGroupStatusInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDeviceLinkGroupStatusInfo_lower(_ value: DeviceLinkGroupStatusInfo) -> RustBuffer {
+    return FfiConverterTypeDeviceLinkGroupStatusInfo.lower(value)
 }
 
 

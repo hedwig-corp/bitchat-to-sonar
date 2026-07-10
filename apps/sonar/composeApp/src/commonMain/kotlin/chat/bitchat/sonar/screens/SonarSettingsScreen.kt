@@ -875,7 +875,10 @@ private fun LinkedDevicesSheet(state: SonarAppState, onClose: () -> Unit) {
             )
         }
         Spacer(Modifier.height(8.dp))
-        val plausible = entered.length >= 8 && entered.all { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' }
+        // Whitespace is ignored — the code is displayed in spaced groups and
+        // users copy or retype it that way; the core strips it too.
+        val cleaned = entered.filter { !it.isWhitespace() }
+        val plausible = cleaned.length >= 8 && cleaned.all { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' }
         Box(
             Modifier.fillMaxWidth().height(46.dp).clip(RoundedCornerShape(13.dp))
                 .background(if (linking || !plausible) s.surface2 else s.accentFill)
@@ -930,7 +933,7 @@ private fun LinkedDevicesSheet(state: SonarAppState, onClose: () -> Unit) {
             }
             if (failed.isNotEmpty()) {
                 Text(
-                    "You can safely run the link again with the same code.",
+                    "Run the link again to retry. If a chat keeps failing, generate a fresh code on the new device.",
                     color = s.text3, fontSize = 12.5.sp, lineHeight = 17.sp,
                 )
             }

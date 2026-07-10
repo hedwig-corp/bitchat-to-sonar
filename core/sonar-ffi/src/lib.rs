@@ -225,15 +225,22 @@ pub struct GroupInviteInfo {
     pub relay_urls: Vec<String>,
 }
 
-/// Per-group outcome of a device-link pass. `status` is one of `"linked"`,
-/// `"skipped_not_admin"`, `"already_linked"`, `"failed"`; `error` is set only
-/// for `"failed"`.
+/// Typed per-group status of a device-link pass, so hosts get exhaustive
+/// switches instead of matching on strings.
+#[derive(uniffi::Enum)]
+pub enum DeviceLinkGroupStatusInfo {
+    Linked,
+    SkippedNotAdmin,
+    AlreadyLinked,
+    Failed { error: String },
+}
+
+/// Per-group outcome of a device-link pass.
 #[derive(uniffi::Record)]
 pub struct DeviceLinkGroupOutcomeInfo {
     pub group_id_hex: String,
     pub group_name: String,
-    pub status: String,
-    pub error: Option<String>,
+    pub status: DeviceLinkGroupStatusInfo,
 }
 
 /// Result of linking another device of this account: which KeyPackage slot
@@ -833,25 +840,23 @@ impl SonarNode {
             outcomes: report
                 .outcomes
                 .into_iter()
-                .map(|outcome| {
-                    let (status, error) = match outcome.status {
-                        sonar_core::client::DeviceLinkGroupStatus::Linked => ("linked", None),
+                .map(|outcome| DeviceLinkGroupOutcomeInfo {
+                    group_id_hex: outcome.group_id_hex,
+                    group_name: outcome.name,
+                    status: match outcome.status {
+                        sonar_core::client::DeviceLinkGroupStatus::Linked => {
+                            DeviceLinkGroupStatusInfo::Linked
+                        }
                         sonar_core::client::DeviceLinkGroupStatus::SkippedNotAdmin => {
-                            ("skipped_not_admin", None)
+                            DeviceLinkGroupStatusInfo::SkippedNotAdmin
                         }
                         sonar_core::client::DeviceLinkGroupStatus::AlreadyLinked => {
-                            ("already_linked", None)
+                            DeviceLinkGroupStatusInfo::AlreadyLinked
                         }
-                        sonar_core::client::DeviceLinkGroupStatus::Failed(err) => {
-                            ("failed", Some(err))
+                        sonar_core::client::DeviceLinkGroupStatus::Failed(error) => {
+                            DeviceLinkGroupStatusInfo::Failed { error }
                         }
-                    };
-                    DeviceLinkGroupOutcomeInfo {
-                        group_id_hex: outcome.group_id_hex,
-                        group_name: outcome.name,
-                        status: status.to_string(),
-                        error,
-                    }
+                    },
                 })
                 .collect(),
         })

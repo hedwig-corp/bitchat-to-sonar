@@ -158,7 +158,7 @@ struct SNLinkedDevicesSheetContent: View {
                     .foregroundColor(SonarTheme.danger)
             }
             if !failed.isEmpty {
-                Text("You can safely run the link again with the same code.")
+                Text("Run the link again to retry. If a chat keeps failing, generate a fresh code on the new device.")
                     .font(SonarTheme.uiFont(size: 12))
                     .foregroundColor(SonarTheme.text3)
             }
@@ -226,9 +226,11 @@ struct SNLinkedDevicesSheetContent: View {
     }
 
     /// Client-side plausibility only (length + hex); the core re-validates.
+    /// Whitespace is ignored — the code is displayed in spaced groups and
+    /// users copy or retype it that way.
     private static func isPlausible(code: String) -> Bool {
-        let trimmed = code.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.count >= 8 && trimmed.allSatisfy(\.isHexDigit)
+        let cleaned = code.filter { !$0.isWhitespace }
+        return cleaned.count >= 8 && cleaned.allSatisfy(\.isHexDigit)
     }
 
     /// `abcd efgh ijkl` grouping for readability.

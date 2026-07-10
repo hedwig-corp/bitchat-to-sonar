@@ -527,12 +527,30 @@ final class MarmotService: @unchecked Sendable {
         let report = try await run { try $0.requireNode().linkDevice(code: code) }
         return DeviceLinkReport(
             dTag: report.dTag,
-            outcomes: report.outcomes.map {
-                DeviceLinkOutcome(
-                    groupIdHex: $0.groupIdHex,
-                    groupName: $0.groupName,
-                    status: $0.status,
-                    error: $0.error
+            outcomes: report.outcomes.map { outcome in
+                // Exhaustive switch at the FFI boundary: a new core status is
+                // a compile error here, not a silently dropped report row.
+                let status: String
+                let error: String?
+                switch outcome.status {
+                case .linked:
+                    status = "linked"
+                    error = nil
+                case .skippedNotAdmin:
+                    status = "skipped_not_admin"
+                    error = nil
+                case .alreadyLinked:
+                    status = "already_linked"
+                    error = nil
+                case .failed(let message):
+                    status = "failed"
+                    error = message
+                }
+                return DeviceLinkOutcome(
+                    groupIdHex: outcome.groupIdHex,
+                    groupName: outcome.groupName,
+                    status: status,
+                    error: error
                 )
             }
         )

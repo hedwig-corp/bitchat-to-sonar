@@ -783,13 +783,19 @@ impl MarmotEngine {
                 // Taken after the gift-wrap unwrap await: the lock must never
                 // span an await, only the synchronous MLS mutation below.
                 let _mls = self.mls_write();
+                // A welcome SEALED by our own identity key is a device link:
+                // another device holding this account's key added this one to
+                // an existing group, so it is accepted regardless of member
+                // count, like 1:1 welcomes. The check uses `unwrapped.sender`
+                // — the NIP-59 seal signer, whose signature `UnwrappedGift`
+                // verifies — NOT the rumor's copied `pubkey` (the source of
+                // `welcome.welcomer`). nostr 0.44 additionally binds
+                // rumor.pubkey to the seal signer, but an auth decision must
+                // not lean on that transitive invariant.
+                let self_authored = unwrapped.sender == self.identity.public_key();
                 let welcome = dispatch!(&self.storage, |mdk| mdk
                     .process_welcome(&event.id, &unwrapped.rumor))?;
-                // A welcome authored by our own identity is a device link:
-                // another device holding this account's key added this one to
-                // an existing group. Only the nsec holder can author it, so it
-                // is accepted regardless of member count, like 1:1 welcomes.
-                if welcome.member_count <= 2 || welcome.welcomer == self.identity.public_key() {
+                if welcome.member_count <= 2 || self_authored {
                     dispatch!(&self.storage, |mdk| mdk.accept_welcome(&welcome))?;
                     return Ok(Incoming::GroupUpdated(welcome.mls_group_id));
                 }

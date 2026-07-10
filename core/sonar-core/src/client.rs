@@ -1320,6 +1320,21 @@ fn select_key_package_by_code<'a>(events: &'a [Event], code: &str) -> Result<&'a
     }
 }
 
+/// openmls rejects a commit re-adding a leaf whose signature/encryption/init
+/// key is already in the group. MDK flattens the error to a string, so
+/// classification is by message; `add_members_error_classification…` in the
+/// tests anchors these against the real strings so an MDK/openmls bump that
+/// rewords them fails loudly instead of misreporting link outcomes.
+fn is_duplicate_add_error(msg: &str) -> bool {
+    msg.to_ascii_lowercase().contains("duplicate")
+}
+
+/// openmls refuses to stage a second commit while one is pending
+/// (`MlsGroupStateError::PendingCommit`). Same string-anchoring test as above.
+fn is_pending_commit_error(msg: &str) -> bool {
+    msg.to_ascii_lowercase().contains("pending commit")
+}
+
 /// One received geohash channel event (ephemeral kind-20000), buffered from the
 /// live subscription. Geohash channels are public ephemeral events — relays do
 /// NOT store them, so we accumulate them in memory as the subscription delivers.
@@ -2143,14 +2158,31 @@ impl SonarClient {
     ///
     /// Per-group failures do not abort the loop: the report carries one
     /// outcome per active group (linked / skipped-not-admin / already-linked /
-    /// failed) and re-running with the same code is safe — a leaf that is
-    /// already in a group surfaces as [`DeviceLinkGroupStatus::AlreadyLinked`].
+    /// failed). Re-running is safe: a leaf already in a group surfaces as
+    /// [`DeviceLinkGroupStatus::AlreadyLinked`], and a pending commit left by
+    /// a previous partially-failed pass is merged and the add retried. The one
+    /// unrecoverable-with-the-same-code state — commit published but the
+    /// welcome never delivered — reports a `Failed` telling the user to
+    /// generate a FRESH code on the new device.
     pub async fn link_device(&self, code: &str) -> Result<DeviceLinkReport> {
-        let code = code.trim().to_ascii_lowercase();
+        // Users copy the code from a display that groups it as `abcd efgh …`;
+        // accept any embedded whitespace.
+        let code: String = code
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+            .to_ascii_lowercase();
         if code.len() < MIN_DEVICE_LINK_CODE_LEN || !code.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err(Error::InvalidInput(format!(
                 "device link code must be at least {MIN_DEVICE_LINK_CODE_LEN} hex characters"
             )));
+        }
+        // Refresh local group state so admin flags and epochs reflect the
+        // latest commits before staging on top of them. Best-effort: hosts run
+        // live sync anyway, and if relays are unreachable the per-group
+        // publishes below fail with honest `Failed` outcomes.
+        if let Err(err) = self.sync().await {
+            tracing::debug!(%err, "pre-link sync failed; linking from local state");
         }
         let own = self.identity().public_key();
         let candidates = self.fetch_all_key_packages(own).await?;
@@ -2164,37 +2196,11 @@ impl SonarClient {
         let mut outcomes = Vec::new();
         for group in self.engine.groups()? {
             let group_id_hex = hex::encode(group.mls_group_id.as_slice());
-            if !group.admin_pubkeys.contains(&own) {
-                outcomes.push(DeviceLinkGroupOutcome {
-                    group_id_hex,
-                    name: group.name,
-                    status: DeviceLinkGroupStatus::SkippedNotAdmin,
-                });
-                continue;
-            }
-            let status = match self
-                .engine
-                .add_members(&group.mls_group_id, vec![key_package.clone()])
-            {
-                Ok(update) => match self.publish_membership_update(update).await {
-                    Ok(()) => {
-                        self.notify_conversation_changed(&group_id_hex);
-                        DeviceLinkGroupStatus::Linked
-                    }
-                    Err(err) => DeviceLinkGroupStatus::Failed(err.to_string()),
-                },
-                // openmls rejects a commit re-adding a leaf whose keys are
-                // already in the group (duplicate signature/encryption/init
-                // key proposal validation). MDK flattens that to a string, so
-                // classification is best-effort by message.
-                Err(err) => {
-                    let msg = err.to_string();
-                    if msg.to_ascii_lowercase().contains("duplicate") {
-                        DeviceLinkGroupStatus::AlreadyLinked
-                    } else {
-                        DeviceLinkGroupStatus::Failed(msg)
-                    }
-                }
+            let status = if group.admin_pubkeys.contains(&own) {
+                self.link_device_into_group(&group.mls_group_id, &key_package)
+                    .await
+            } else {
+                DeviceLinkGroupStatus::SkippedNotAdmin
             };
             outcomes.push(DeviceLinkGroupOutcome {
                 group_id_hex,
@@ -2203,6 +2209,70 @@ impl SonarClient {
             });
         }
         Ok(DeviceLinkReport { d_tag, outcomes })
+    }
+
+    /// One group's device-link pass: stage the add commit, publish it plus the
+    /// self-addressed welcome, merge. Errors never propagate — every path
+    /// resolves to a [`DeviceLinkGroupStatus`] for the report.
+    async fn link_device_into_group(
+        &self,
+        group_id: &GroupId,
+        key_package: &Event,
+    ) -> DeviceLinkGroupStatus {
+        match self.engine.add_members(group_id, vec![key_package.clone()]) {
+            Ok(update) => self.publish_device_link_update(group_id, update).await,
+            Err(err) => {
+                let msg = err.to_string();
+                if is_duplicate_add_error(&msg) {
+                    DeviceLinkGroupStatus::AlreadyLinked
+                } else if is_pending_commit_error(&msg) {
+                    // `publish_membership_update` keeps a staged commit ONLY
+                    // when its commit event already reached the relays (it
+                    // clears the stage on earlier failures), so peers are on
+                    // the new epoch: merge to re-align, then retry the add.
+                    if let Err(merge_err) = self.engine.merge_pending_commit(group_id) {
+                        return DeviceLinkGroupStatus::Failed(format!(
+                            "merging a pending commit from an earlier attempt failed: {merge_err}"
+                        ));
+                    }
+                    match self.engine.add_members(group_id, vec![key_package.clone()]) {
+                        Ok(update) => self.publish_device_link_update(group_id, update).await,
+                        Err(retry_err) => {
+                            let retry_msg = retry_err.to_string();
+                            if is_duplicate_add_error(&retry_msg) {
+                                // The earlier pass added this leaf but its
+                                // welcome may never have been delivered; only
+                                // a fresh KeyPackage can re-invite the device.
+                                DeviceLinkGroupStatus::Failed(
+                                    "an earlier link attempt added this device but its invite \
+                                     may not have arrived; generate a fresh code on the new \
+                                     device and link again"
+                                        .into(),
+                                )
+                            } else {
+                                DeviceLinkGroupStatus::Failed(retry_msg)
+                            }
+                        }
+                    }
+                } else {
+                    DeviceLinkGroupStatus::Failed(msg)
+                }
+            }
+        }
+    }
+
+    async fn publish_device_link_update(
+        &self,
+        group_id: &GroupId,
+        update: GroupMembershipUpdate,
+    ) -> DeviceLinkGroupStatus {
+        match self.publish_membership_update(update).await {
+            Ok(()) => {
+                self.notify_conversation_changed(&hex::encode(group_id.as_slice()));
+                DeviceLinkGroupStatus::Linked
+            }
+            Err(err) => DeviceLinkGroupStatus::Failed(err.to_string()),
+        }
     }
 
     /// Publish our kind-0 profile (NIP-01 metadata) so peers can resolve our
@@ -7632,6 +7702,52 @@ mod tests {
             }
             other => panic!("expected message, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn add_members_error_classification_matches_real_strings() {
+        // `link_device` classifies add_members failures by error MESSAGE
+        // (MDK flattens openmls errors to strings). This test triggers the two
+        // real failure shapes so an MDK/openmls bump that rewords them fails
+        // here instead of silently misreporting link outcomes.
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let bob = MarmotEngine::in_memory(Identity::generate());
+        let device = MarmotEngine::in_memory(Identity::generate());
+
+        let bob_kp = bob.key_package_event(relays.clone()).expect("bob kp");
+        let creation = alice
+            .create_group("alice & bob", vec![bob_kp], relays.clone())
+            .expect("group");
+        let group_id = creation.group.mls_group_id.clone();
+        alice.merge_pending_commit(&group_id).expect("merge create");
+
+        // Stage an add without merging → a second add hits the pending gate.
+        let device_kp = device.key_package_event(relays.clone()).expect("device kp");
+        alice
+            .add_members(&group_id, vec![device_kp.clone()])
+            .expect("first add stages");
+        let pending_err = alice
+            .add_members(&group_id, vec![device_kp.clone()])
+            .expect_err("second add while pending must fail")
+            .to_string();
+        assert!(
+            is_pending_commit_error(&pending_err),
+            "pending-commit error no longer classified: {pending_err}"
+        );
+        assert!(!is_duplicate_add_error(&pending_err));
+
+        // Merge, then re-add the SAME KeyPackage → duplicate-key rejection.
+        alice.merge_pending_commit(&group_id).expect("merge add");
+        let duplicate_err = alice
+            .add_members(&group_id, vec![device_kp])
+            .expect_err("re-adding a present leaf must fail")
+            .to_string();
+        assert!(
+            is_duplicate_add_error(&duplicate_err),
+            "duplicate-add error no longer classified: {duplicate_err}"
+        );
+        assert!(!is_pending_commit_error(&duplicate_err));
     }
 
     #[test]
