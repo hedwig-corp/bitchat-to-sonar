@@ -117,8 +117,13 @@ private val emojiCategories = listOf(
     )),
 )
 
-/** Test sticker pack loaded on first Sticker tab open. */
-private const val TEST_PACK_AUTHOR = "b653c822dfbec71697d379658a58909c3bef59d71b1cf5c1f7035451cde2e9f7"
+/**
+ * Default sticker pack loaded on first Sticker tab open when the user has no
+ * installed packs (kind 10031). Must be the kind-30031 publisher pubkey —
+ * see [docs/SONAR-STICKERS.md](https://sonarprivacy.xyz/docs/#SONAR-STICKERS).
+ * Older kind-30030 publishes for the same Signal pack id are not used.
+ */
+private const val TEST_PACK_AUTHOR = "7215b2db8754494fd3452b7f2d28b56e23863b95446bf68d79f980a7ad5ec7cd"
 private const val TEST_PACK_ID = "signal-8fa42aa13ec8f0efebe4b038f41afbd1"
 private val TEST_PACK_RELAYS = listOf(
     "wss://relay.damus.io",

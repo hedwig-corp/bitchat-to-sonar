@@ -180,7 +180,10 @@ struct SonarEmojiPickerView: View {
 
 // MARK: - Sticker tab
 
-private let testPackAuthor = "b653c822dfbec71697d379658a58909c3bef59d71b1cf5c1f7035451cde2e9f7"
+// Default kind-30031 pack when the user has no installed packs (10031).
+// Older kind-30030 publishes for this Signal pack id are not used.
+// https://sonarprivacy.xyz/docs/#SONAR-STICKERS
+private let testPackAuthor = "7215b2db8754494fd3452b7f2d28b56e23863b95446bf68d79f980a7ad5ec7cd"
 private let testPackId = "signal-8fa42aa13ec8f0efebe4b038f41afbd1"
 private let testPackRelays = ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net"]
 

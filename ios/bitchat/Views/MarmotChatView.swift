@@ -1392,9 +1392,7 @@ final class MarmotChatModel: ObservableObject {
 
     private static func stickerPackParts(_ coordinate: String) -> (author: String, identifier: String)? {
         let parts = coordinate.split(separator: ":", maxSplits: 2, omittingEmptySubsequences: false)
-        // Accept legacy 30030 coordinates from packs published before the
-        // kind migration; fetch still dual-reads 30030/30031.
-        guard parts.count == 3, parts[0] == "30031" || parts[0] == "30030" else { return nil }
+        guard parts.count == 3, parts[0] == "30031" else { return nil }
         return (String(parts[1]), String(parts[2]))
     }
 

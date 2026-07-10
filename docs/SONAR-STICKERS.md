@@ -29,11 +29,6 @@ Sonar packs as emoji sets and a user's installed-pack list as their emoji list.
 These kinds are not yet in the Nostr registry-of-kinds; reserving them upstream
 is tracked as a follow-up.
 
-**Read compatibility:** clients still dual-read kinds `30030`/`10030` for packs
-published before the migration, but only accept events that carry
-`pack_format=sonar-sticker-pack-v1`. Coordinates are always normalized to
-`30031:…` / `10031` when parsed. New publishes use only the canonical kinds.
-
 The `<author-pubkey-hex>` field is the 64-character lowercase Nostr public key
 that signed the pack event. The `<identifier>` field is the event `d` tag value
 and must be 1 to 80 ASCII characters containing only alphanumeric characters,
