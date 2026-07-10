@@ -162,6 +162,11 @@ struct SNLinkedDevicesSheetContent: View {
                     .font(SonarTheme.uiFont(size: 12))
                     .foregroundColor(SonarTheme.text3)
             }
+            if already > 0 {
+                Text("If an already-linked chat does not appear on the new device, generate a fresh code there and link again.")
+                    .font(SonarTheme.uiFont(size: 12))
+                    .foregroundColor(SonarTheme.text3)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(EdgeInsets(top: 13, leading: 15, bottom: 13, trailing: 15))

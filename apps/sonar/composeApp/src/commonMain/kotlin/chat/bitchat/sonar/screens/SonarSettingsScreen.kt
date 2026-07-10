@@ -937,6 +937,12 @@ private fun LinkedDevicesSheet(state: SonarAppState, onClose: () -> Unit) {
                     color = s.text3, fontSize = 12.5.sp, lineHeight = 17.sp,
                 )
             }
+            if (already > 0) {
+                Text(
+                    "If an already-linked chat does not appear on the new device, generate a fresh code there and link again.",
+                    color = s.text3, fontSize = 12.5.sp, lineHeight = 17.sp,
+                )
+            }
         }
 
         Spacer(Modifier.height(10.dp))

@@ -606,9 +606,7 @@ async fn run(cli: Cli) -> Result<()> {
                     })?;
                 }
                 LinkDeviceAction::Add { code } => {
-                    // Sync first so the group list (and admin flags) reflect
-                    // the latest commits before staging device-link commits.
-                    client.sync().await?;
+                    // link_device syncs internally before staging commits.
                     let report = client.link_device(&code).await?;
                     let mut linked = 0;
                     let mut skipped = 0;

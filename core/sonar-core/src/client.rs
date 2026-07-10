@@ -2226,36 +2226,62 @@ impl SonarClient {
                 if is_duplicate_add_error(&msg) {
                     DeviceLinkGroupStatus::AlreadyLinked
                 } else if is_pending_commit_error(&msg) {
-                    // `publish_membership_update` keeps a staged commit ONLY
-                    // when its commit event already reached the relays (it
-                    // clears the stage on earlier failures), so peers are on
-                    // the new epoch: merge to re-align, then retry the add.
-                    if let Err(merge_err) = self.engine.merge_pending_commit(group_id) {
+                    self.recover_pending_commit_then_link(group_id, key_package)
+                        .await
+                } else {
+                    DeviceLinkGroupStatus::Failed(msg)
+                }
+            }
+        }
+    }
+
+    /// A staged commit blocked the add. It is either (a) published but
+    /// unmerged — a welcome publish or the final merge failed after the commit
+    /// event reached the relays — or (b) never published (process died between
+    /// staging and publish). Locally the two are indistinguishable, so ask the
+    /// relays: backfill the group's kind-445 history first. If (a), our own
+    /// commit comes back and MDK merges the stage (`process_message` detects
+    /// an undecryptable own commit with a pending stage and merges it); the
+    /// retried add then reports `AlreadyLinked`, which is accurate — the leaf
+    /// IS in the group. If (b), nothing arrives, the stage survives, and
+    /// clearing it is safe because no peer ever saw that epoch.
+    async fn recover_pending_commit_then_link(
+        &self,
+        group_id: &GroupId,
+        key_package: &Event,
+    ) -> DeviceLinkGroupStatus {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        if let Err(err) = self.backfill_group(&group_id_hex).await {
+            // Cannot tell (a) from (b) without the relays; do NOT touch the
+            // stage on a guess. The next run retries the whole recovery.
+            return DeviceLinkGroupStatus::Failed(format!(
+                "cannot verify an earlier attempt's pending commit against the relays: {err}"
+            ));
+        }
+        match self.engine.add_members(group_id, vec![key_package.clone()]) {
+            Ok(update) => self.publish_device_link_update(group_id, update).await,
+            Err(retry_err) => {
+                let retry_msg = retry_err.to_string();
+                if is_duplicate_add_error(&retry_msg) {
+                    DeviceLinkGroupStatus::AlreadyLinked
+                } else if is_pending_commit_error(&retry_msg) {
+                    // The stage survived a relay backfill → it was never
+                    // published; discarding it cannot desync anyone. (Residual
+                    // risk: a relay that stored the commit but failed to serve
+                    // it during this backfill — backfill_group only errors on
+                    // total fetch failure. Accepted: the window is one relay
+                    // flake immediately after an interrupted link pass.)
+                    if let Err(clear_err) = self.engine.clear_pending_commit(group_id) {
                         return DeviceLinkGroupStatus::Failed(format!(
-                            "merging a pending commit from an earlier attempt failed: {merge_err}"
+                            "clearing an unpublished pending commit failed: {clear_err}"
                         ));
                     }
                     match self.engine.add_members(group_id, vec![key_package.clone()]) {
                         Ok(update) => self.publish_device_link_update(group_id, update).await,
-                        Err(retry_err) => {
-                            let retry_msg = retry_err.to_string();
-                            if is_duplicate_add_error(&retry_msg) {
-                                // The earlier pass added this leaf but its
-                                // welcome may never have been delivered; only
-                                // a fresh KeyPackage can re-invite the device.
-                                DeviceLinkGroupStatus::Failed(
-                                    "an earlier link attempt added this device but its invite \
-                                     may not have arrived; generate a fresh code on the new \
-                                     device and link again"
-                                        .into(),
-                                )
-                            } else {
-                                DeviceLinkGroupStatus::Failed(retry_msg)
-                            }
-                        }
+                        Err(final_err) => DeviceLinkGroupStatus::Failed(final_err.to_string()),
                     }
                 } else {
-                    DeviceLinkGroupStatus::Failed(msg)
+                    DeviceLinkGroupStatus::Failed(retry_msg)
                 }
             }
         }
@@ -7702,6 +7728,61 @@ mod tests {
             }
             other => panic!("expected message, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn link_recovery_clears_unpublished_pending_commit_and_retries() {
+        // Simulates a link pass that died between staging an add commit and
+        // publishing it (a stale pending commit blocks every later add). With
+        // no relays, the recovery backfill finds nothing, so the stage must be
+        // classified as never-published, cleared, and the add retried; the
+        // retried add then proceeds to the publish step, which fails offline —
+        // proving the recovery path re-staged instead of dead-ending on the
+        // pending error or blindly merging an unpublished epoch.
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client starts without relays");
+        let bob = MarmotEngine::in_memory(Identity::generate());
+        let device = MarmotEngine::in_memory(Identity::generate());
+
+        let bob_kp = bob.key_package_event(relays.clone()).expect("bob kp");
+        let creation = alice
+            .engine
+            .create_group("alice & bob", vec![bob_kp], relays.clone())
+            .expect("group");
+        let group_id = creation.group.mls_group_id.clone();
+        alice
+            .engine
+            .merge_pending_commit(&group_id)
+            .expect("merge create");
+
+        // Crash simulation: stage an add and never publish or merge it.
+        let device_kp = device.key_package_event(relays).expect("device kp");
+        alice
+            .engine
+            .add_members(&group_id, vec![device_kp.clone()])
+            .expect("stale stage");
+
+        let status = alice.link_device_into_group(&group_id, &device_kp).await;
+        match &status {
+            DeviceLinkGroupStatus::Failed(msg) => {
+                assert!(
+                    !is_pending_commit_error(msg),
+                    "recovery must not dead-end on the pending error: {msg}"
+                );
+                assert!(
+                    !msg.contains("cannot verify"),
+                    "offline backfill of a no-relay client must not abort recovery: {msg}"
+                );
+            }
+            other => panic!("offline link must fail at the publish step, got {other:?}"),
+        }
+        // The stale stage is gone: a fresh add stages cleanly.
+        alice
+            .engine
+            .add_members(&group_id, vec![device_kp])
+            .expect("stage after recovery");
     }
 
     #[tokio::test]
