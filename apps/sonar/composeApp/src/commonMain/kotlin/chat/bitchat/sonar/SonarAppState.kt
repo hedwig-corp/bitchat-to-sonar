@@ -71,6 +71,13 @@ private const val PENDING_MARMOT_DIRECT_SEND_QUEUE_LIMIT = 100
 private const val PENDING_MARMOT_GROUP_SEND_QUEUE_LIMIT = 100
 internal const val BLE_DISCOVER_NEW_PEOPLE_PREF = "bleDiscoverNewPeople"
 
+internal fun shouldScanForNearbyPayments(
+    isNearbyVisible: Boolean,
+    isForeground: Boolean,
+    isOnboarded: Boolean,
+    isDiscoveryRestricted: Boolean,
+): Boolean = isNearbyVisible && isForeground && isOnboarded && !isDiscoveryRestricted
+
 internal fun shortNpubLabel(value: String): String =
     if (value.length > 16) value.take(10) + "…" + value.takeLast(4) else value
 
@@ -2123,14 +2130,20 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /** Start scanning for Unify peers (payer role). Idempotent; no-op until
      *  onboarded or while BLE permissions are missing. */
-    private fun startUnify() {
-        if (!onboarded) return
-        if (bleDiscoveryRestricted) {
+    private fun updateNearbyScanning(): Boolean {
+        val shouldScan = shouldScanForNearbyPayments(
+            isNearbyVisible = isNearbyVisible,
+            isForeground = foreground,
+            isOnboarded = onboarded,
+            isDiscoveryRestricted = bleDiscoveryRestricted,
+        )
+        if (!shouldScan) {
             UnifyRadio.stopScanning()
             unifyPeers = emptyList()
-            return
+        } else {
+            UnifyRadio.startScanning()
         }
-        UnifyRadio.startScanning()
+        return shouldScan
     }
 
     /** Advertise our receivable BOLT12 offer iff the wallet is ready AND we are
@@ -2492,6 +2505,8 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     // ── Local notifications (fire on new incoming message while backgrounded) ──
     private var foreground = true
+    /** The payment-only nearby scan is scoped to the visible Radar screen. */
+    private var isNearbyVisible = false
     private val lastSeenTs = HashMap<String, Long>()
     private val lastNotifiedTs = HashMap<String, Long>()
     private var seededSeen = false
@@ -2544,29 +2559,37 @@ class SonarAppState(private val scope: CoroutineScope) {
     val bleDiscoveryRestricted: Boolean
         get() = batterySaving || !discoverNewPeople
 
-    val bleDiscoveryStatusLine: String
+    val bleDiscoverySettingsDescription: String
         get() = when {
-            batterySaving -> "Battery saving · chats only"
-            discoverNewPeople -> "Discovering nearby people"
-            else -> "Chats only"
+            batterySaving && discoverNewPeople -> "On, but paused by battery saving; existing chats still reconnect"
+            batterySaving -> "Off; existing chats can still reconnect"
+            discoverNewPeople -> "Show nearby people you haven't chatted with yet"
+            else -> "Only people from existing chats can appear"
         }
 
     val radarDiscoveryStatusLine: String
-        get() = if (bleDiscoveryRestricted) {
-            "${meshPeers.size} in range · chats only"
-        } else {
-            "${meshPeers.size} in range · scanning"
+        get() = when {
+            batterySaving -> "${meshPeers.size} in range · battery saving"
+            bleDiscoveryRestricted -> "${meshPeers.size} in range · new people off"
+            else -> "${meshPeers.size} in range · scanning"
         }
+
+    fun nearbyAppeared() {
+        isNearbyVisible = true
+        updateNearbyScanning()
+    }
+
+    fun nearbyDisappeared() {
+        isNearbyVisible = false
+        updateNearbyScanning()
+    }
 
     fun setBleDiscoverNewPeople(enabled: Boolean) {
         if (discoverNewPeople == enabled) return
         discoverNewPeople = enabled
         setPref(BLE_DISCOVER_NEW_PEOPLE_PREF, enabled)
         updateBleDiscoveryPolicy()
-        if (bleDiscoveryRestricted) {
-            UnifyRadio.stopScanning()
-            unifyPeers = emptyList()
-        }
+        updateNearbyScanning()
     }
 
     private fun refreshBatterySaving() {
@@ -2574,10 +2597,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (batterySaving == enabled) return
         batterySaving = enabled
         updateBleDiscoveryPolicy()
-        if (bleDiscoveryRestricted) {
-            UnifyRadio.stopScanning()
-            unifyPeers = emptyList()
-        }
+        updateNearbyScanning()
     }
 
     private fun knownBlePeerIds(): Set<String> =
@@ -2686,6 +2706,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun setForeground(value: Boolean) {
         val cameToForeground = value && !foreground
         foreground = value
+        updateNearbyScanning()
         if (cameToForeground) {
             if (bypassRelock) bypassRelock = false        // return from our own unlock prompt
             else if (AppLock.isEnabled()) locked = true   // genuine app-switch → re-lock
@@ -6234,9 +6255,8 @@ class SonarAppState(private val scope: CoroutineScope) {
         refreshSonarDiscoveryProfiles()
         updateMeshPeersFromRadio()
         recomputeConversations()
-        // Unify nearby: keep the payer scan alive and refresh peers + receiver.
-        startUnify()
-        unifyPeers = UnifyRadio.peers()
+        // Unify nearby: scan only while the Radar is visible and foregrounded.
+        if (updateNearbyScanning()) unifyPeers = UnifyRadio.peers()
         updateUnifyReceiver()
         if (locationChannels.isEmpty()) refreshLocationChannels()
         refreshPresenceCounts()

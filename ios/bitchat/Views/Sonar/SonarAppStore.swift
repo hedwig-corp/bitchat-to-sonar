@@ -493,6 +493,9 @@ final class SonarAppStore: ObservableObject {
     /// Whether the app is in the foreground (set by BitchatApp scenePhase).
     /// Receiver advertising is gated on this AND a ready wallet.
     private var isForeground = true
+    /// The extra Unify payer scan is useful only while Radar is visible. Keep
+    /// this separate from the mesh radio, which remains available for chats.
+    private var isNearbyVisible = false
     /// Lightning wallet behind the payments UI; UnconfiguredWallet until the
     /// real bridge (Services/WalletBridgeService) is injected.
     let wallet: SonarWalletProviding
@@ -1382,13 +1385,13 @@ final class SonarAppStore: ObservableObject {
     /// when it goes away. Keeps the extra BLE scan off except when the user is
     /// actually looking for someone nearby to pay.
     func nearbyAppeared() {
-        if isBLEDiscoveryRestricted {
-            unify.stop()
-        } else {
-            unify.start()
-        }
+        isNearbyVisible = true
+        updateNearbyScanning()
     }
-    func nearbyDisappeared() { unify.stop() }
+    func nearbyDisappeared() {
+        isNearbyVisible = false
+        updateNearbyScanning()
+    }
 
     // MARK: Unify receiver (mirror role: a Unify user can pay us)
 
@@ -1418,6 +1421,7 @@ final class SonarAppStore: ObservableObject {
             }
         }
         #endif
+        updateNearbyScanning()
         guard changed else { return }
         updateReceiverAdvertising()
         if cameToForeground {
@@ -1446,18 +1450,26 @@ final class SonarAppStore: ObservableObject {
         batterySavingEnabled || !discoverNewPeople
     }
 
-    var bleDiscoveryStatusLine: String {
+    var bleDiscoverySettingsDescription: String {
         if batterySavingEnabled {
-            return "Battery saving · chats only"
+            return discoverNewPeople
+                ? "On, but paused by battery saving; existing chats still reconnect"
+                : "Off; existing chats can still reconnect"
         }
-        return discoverNewPeople ? "Discovering nearby people" : "Chats only"
+        return discoverNewPeople
+            ? "Show nearby people you haven't chatted with yet"
+            : "Only people from existing chats can appear"
     }
 
     var radarDiscoveryStatusLine: String {
-        if isBLEDiscoveryRestricted {
-            return "\(nearbyPeers.filter(\.inRange).count) in range · chats only"
+        let count = nearbyPeers.filter(\.inRange).count
+        if batterySavingEnabled {
+            return "\(count) in range · battery saving"
         }
-        return "\(nearbyPeers.filter(\.inRange).count) in range · scanning"
+        if isBLEDiscoveryRestricted {
+            return "\(count) in range · new people off"
+        }
+        return "\(count) in range · scanning"
     }
 
     func setDiscoverNewPeople(_ enabled: Bool) {
@@ -1465,9 +1477,7 @@ final class SonarAppStore: ObservableObject {
         discoverNewPeople = enabled
         defaults.set(enabled, forKey: Keys.discoverNewPeople)
         applyBLEDiscoveryPolicy()
-        if isBLEDiscoveryRestricted {
-            unify.stop()
-        }
+        updateNearbyScanning()
         updateReceiverAdvertising()
     }
 
@@ -1486,11 +1496,21 @@ final class SonarAppStore: ObservableObject {
         guard batterySavingEnabled != enabled else { return }
         batterySavingEnabled = enabled
         applyBLEDiscoveryPolicy()
-        if isBLEDiscoveryRestricted {
-            unify.stop()
-        }
+        updateNearbyScanning()
         updateReceiverAdvertising()
         #endif
+    }
+
+    private func updateNearbyScanning() {
+        if shouldScanForNearbyPayments(
+            isNearbyVisible: isNearbyVisible,
+            isForeground: isForeground,
+            isDiscoveryRestricted: isBLEDiscoveryRestricted
+        ) {
+            unify.start()
+        } else {
+            unify.stop()
+        }
     }
 
     private func wireBLEDiscoveryPolicy() {

@@ -29,6 +29,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -87,6 +88,11 @@ fun SonarRadarScreen(state: SonarAppState) {
     var paySheet by remember { mutableStateOf<chat.bitchat.sonar.unify.UnifyPeer?>(null) }
     val unify = state.unifyPeers
 
+    DisposableEffect(state) {
+        state.nearbyAppeared()
+        onDispose { state.nearbyDisappeared() }
+    }
+
     Column(Modifier.fillMaxSize().background(s.bg)) {
         // bc-header: back + "Sonar" + status subtitle (NavHeader, hairline=false)
         Row(
@@ -97,11 +103,15 @@ fun SonarRadarScreen(state: SonarAppState) {
             Column {
                 Text("Sonar", color = s.text, fontSize = 17.sp, fontWeight = FontWeight.Bold)
                 Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 1.dp)) {
-                    SNDot(s.green, 7.dp)
+                    SNDot(if (state.bleDiscoveryRestricted) s.text3 else s.green, 7.dp)
                     Spacer(Modifier.width(5.dp))
                     Text(state.radarDiscoveryStatusLine, color = s.text2, fontSize = 12.sp)
                 }
             }
+        }
+
+        if (state.bleDiscoveryRestricted) {
+            DiscoveryNotice(state)
         }
 
         // sn-seg segmented control: Radar | List
@@ -118,7 +128,7 @@ fun SonarRadarScreen(state: SonarAppState) {
         }
 
         if (listMode) {
-            if (state.meshPeers.isEmpty() && unify.isEmpty()) ListEmpty()
+            if (state.meshPeers.isEmpty() && unify.isEmpty()) ListEmpty(state)
             else LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 40.dp)) {
                 if (state.meshPeers.isNotEmpty()) {
                     item { chat.bitchat.sonar.ui.SNSectionLabel("In range · Bluetooth") }
@@ -149,7 +159,11 @@ fun SonarRadarScreen(state: SonarAppState) {
                 )
                 // sn-caption
                 Text(
-                    if (state.meshPeers.isEmpty() && unify.isEmpty()) "Looking for people around you…" else "Tap someone to chat",
+                    if (state.meshPeers.isEmpty() && unify.isEmpty()) {
+                        if (state.bleDiscoveryRestricted) "New people are paused" else "Looking for people around you…"
+                    } else {
+                        "Tap someone to chat"
+                    },
                     color = s.text3, fontSize = 12.5.sp, modifier = Modifier.padding(top = 4.dp)
                 )
                 // sn-legend
@@ -215,6 +229,43 @@ fun SonarRadarScreen(state: SonarAppState) {
             onSend = { state.sendSatsToUnify(p.id, it); paySheet = null },
             onClose = { paySheet = null },
         )
+    }
+}
+
+@Composable
+private fun DiscoveryNotice(state: SonarAppState) {
+    val s = sonar
+    Row(
+        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)
+            .clip(RoundedCornerShape(14.dp)).background(s.surface)
+            .border(1.dp, s.hairline, RoundedCornerShape(14.dp))
+            .padding(12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        SNIcon(SNIconName.Rings, 18.dp, s.accentDeep, weight = 2.1f)
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+            Text(
+                if (state.batterySaving) "New people paused" else "New people are hidden",
+                color = s.text,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Text(
+                if (state.batterySaving) {
+                    "Battery saving is on. People from existing chats can still reconnect."
+                } else {
+                    "Only people from existing chats appear until you turn discovery back on."
+                },
+                color = s.text2,
+                fontSize = 12.5.sp,
+                lineHeight = 16.sp,
+            )
+        }
+        if (!state.batterySaving) {
+            Spacer(Modifier.width(10.dp))
+            SNPill("Turn on", primary = true) { state.setBleDiscoverNewPeople(true) }
+        }
     }
 }
 
@@ -384,7 +435,7 @@ private fun Legend(color: Color, label: String) {
 }
 
 @Composable
-private fun ListEmpty() {
+private fun ListEmpty(state: SonarAppState) {
     val s = sonar
     Column(
         Modifier.fillMaxSize().padding(top = 80.dp, start = 24.dp, end = 24.dp),
@@ -392,10 +443,19 @@ private fun ListEmpty() {
     ) {
         SNIcon(SNIconName.Rings, 26.dp, s.text3)
         Spacer(Modifier.height(10.dp))
-        Text("Nobody in range yet", color = s.text2, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+        Text(
+            if (state.bleDiscoveryRestricted) "New people are paused" else "Nobody in range yet",
+            color = s.text2,
+            fontSize = 16.sp,
+            fontWeight = FontWeight.SemiBold,
+        )
         Spacer(Modifier.height(4.dp))
         Text(
-            "Keep Sonar open while you move around — people appear here as soon as Bluetooth finds them.",
+            if (state.bleDiscoveryRestricted) {
+                "People from existing chats can still reconnect. Use the control above to understand or change discovery."
+            } else {
+                "Keep Sonar open while you move around — people appear here as soon as Bluetooth finds them."
+            },
             color = s.text3, fontSize = 13.sp, lineHeight = 18.sp
         )
     }

@@ -91,16 +91,11 @@ struct SonarSettingsScreen: View {
                         }
                         SNSettingsRow(
                             icon: .mesh, tone: .cyan, label: "Discover new people",
-                            sub: store.batterySavingEnabled ? "Battery saving is limiting Bluetooth to existing chats" : "Allow nearby people without a chat to appear",
-                            value: store.bleDiscoveryStatusLine,
-                            trail: .toggle(store.discoverNewPeople && !store.batterySavingEnabled),
+                            sub: store.bleDiscoverySettingsDescription,
+                            trail: .toggle(store.discoverNewPeople),
                             divider: false
                         ) {
-                            if store.batterySavingEnabled {
-                                store.toast = "Battery saving keeps Bluetooth on chats only"
-                            } else {
-                                store.setDiscoverNewPeople(!store.discoverNewPeople)
-                            }
+                            store.setDiscoverNewPeople(!store.discoverNewPeople)
                         }
                     }
 
