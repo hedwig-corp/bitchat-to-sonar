@@ -22,8 +22,8 @@
 		A6E3EA7F2E7706720032EA8A /* Tor in Frameworks */ = {isa = PBXBuildFile; productRef = A6E3EA7E2E7706720032EA8A /* Tor */; };
 		A6E3EA812E7706A80032EA8A /* Tor in Frameworks */ = {isa = PBXBuildFile; productRef = A6E3EA802E7706A80032EA8A /* Tor */; };
 		C023033AECF95641458DD2F7 /* FirebaseMessaging in Frameworks */ = {isa = PBXBuildFile; productRef = D890FFFCA89747657296AB29 /* FirebaseMessaging */; };
-		E0A1B2C3D4E5F6012345678D /* online_relays_gps.csv in Resources */ = {isa = PBXBuildFile; fileRef = E0A1B2C3D4E5F6012345678A /* online_relays_gps.csv */; };
-		E0A1B2C3D4E5F6012345678E /* online_relays_gps.csv in Resources */ = {isa = PBXBuildFile; fileRef = E0A1B2C3D4E5F6012345678A /* online_relays_gps.csv */; };
+		E0A1B2C3D4E5F6012345678D /* ../relays/online_relays_gps.csv in Resources */ = {isa = PBXBuildFile; fileRef = E0A1B2C3D4E5F6012345678A /* ../relays/online_relays_gps.csv */; };
+		E0A1B2C3D4E5F6012345678E /* ../relays/online_relays_gps.csv in Resources */ = {isa = PBXBuildFile; fileRef = E0A1B2C3D4E5F6012345678A /* ../relays/online_relays_gps.csv */; };
 		E1264FD4C6E442FAAD407CCC /* SonarNotificationService.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = C771D3214DFE24F42D724BF4 /* SonarNotificationService.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 /* End PBXBuildFile section */
 
@@ -61,25 +61,21 @@
 /* Begin PBXCopyFilesBuildPhase section */
 		57662FE8E41AA1A75F445457 /* Embed Foundation Extensions */ = {
 			isa = PBXCopyFilesBuildPhase;
-			buildActionMask = 2147483647;
 			dstPath = "";
-			dstSubfolderSpec = 13;
+			dstSubfolder = PlugIns;
 			files = (
 				E1264FD4C6E442FAAD407CCC /* SonarNotificationService.appex in Embed Foundation Extensions */,
 			);
 			name = "Embed Foundation Extensions";
-			runOnlyForDeploymentPostprocessing = 0;
 		};
 		B6C356449BAE4E0F650565D1 /* Embed Foundation Extensions */ = {
 			isa = PBXCopyFilesBuildPhase;
-			buildActionMask = 2147483647;
 			dstPath = "";
-			dstSubfolderSpec = 13;
+			dstSubfolder = PlugIns;
 			files = (
 				17901751FD8010AFC8E750F2 /* bitchatShareExtension.appex in Embed Foundation Extensions */,
 			);
 			name = "Embed Foundation Extensions";
-			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXCopyFilesBuildPhase section */
 
@@ -94,7 +90,7 @@
 		A6F183FC2E948783006A9046 /* tor-nolzma.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = "tor-nolzma.xcframework"; path = "localPackages/Tor/Frameworks/tor-nolzma.xcframework"; sourceTree = "<group>"; };
 		C0DB1DE27F0AAB5092663E8E /* bitchatTests_iOS.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = bitchatTests_iOS.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		C771D3214DFE24F42D724BF4 /* SonarNotificationService.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = SonarNotificationService.appex; sourceTree = BUILT_PRODUCTS_DIR; };
-		E0A1B2C3D4E5F6012345678A /* online_relays_gps.csv */ = {isa = PBXFileReference; lastKnownFileType = text; path = ../relays/online_relays_gps.csv; sourceTree = "<group>"; };
+		E0A1B2C3D4E5F6012345678A /* ../relays/online_relays_gps.csv */ = {isa = PBXFileReference; lastKnownFileType = text; path = ../relays/online_relays_gps.csv; sourceTree = "<group>"; };
 		F62BDC1A7D4AF65B56B65F99 /* NotificationService.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = NotificationService.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -178,8 +174,6 @@
 		};
 		A6E367C92E76469E0032EA8A /* Configs */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
-			exceptions = (
-			);
 			path = Configs;
 			sourceTree = "<group>";
 		};
@@ -209,12 +203,10 @@
 		};
 		E623F623E75326E72E795105 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
-			buildActionMask = 2147483647;
 			files = (
 				62C08C1AD2F542AA138828E4 /* Foundation.framework in Frameworks */,
 				44AA8F6F653CD2B2A28DA1BB /* BreezSDKLiquid in Frameworks */,
 			);
-			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXFrameworksBuildPhase section */
 
@@ -226,7 +218,6 @@
 				04C92AF74AFC20D92B2BAD0A /* Info.plist */,
 				70DC7003F7A7B78C0FCDAC55 /* SonarNotificationService.entitlements */,
 			);
-			name = SonarNotificationService;
 			path = SonarNotificationService;
 			sourceTree = "<group>";
 		};
@@ -242,7 +233,7 @@
 			isa = PBXGroup;
 			children = (
 				A6E32C972E762EA70032EA8A /* bitchat */,
-				E0A1B2C3D4E5F6012345678A /* online_relays_gps.csv */,
+				E0A1B2C3D4E5F6012345678A /* ../relays/online_relays_gps.csv */,
 				A6E32D212E762EAB0032EA8A /* bitchatShareExtension */,
 				A6E32D412E762EAE0032EA8A /* bitchatTests */,
 				A6E367C92E76469E0032EA8A /* Configs */,
@@ -288,8 +279,6 @@
 			);
 			buildRules = (
 			);
-			dependencies = (
-			);
 			fileSystemSynchronizedGroups = (
 				A6E32C972E762EA70032EA8A /* bitchat */,
 			);
@@ -314,8 +303,6 @@
 				0DD1C92C7FFBFA9AF2219B69 /* Resources */,
 			);
 			buildRules = (
-			);
-			dependencies = (
 			);
 			name = SonarNotificationService;
 			packageProductDependencies = (
@@ -352,8 +339,6 @@
 				0A08E70F08F55FD5BA8C7EF3 /* Sources */,
 			);
 			buildRules = (
-			);
-			dependencies = (
 			);
 			name = bitchatShareExtension;
 			productName = bitchatShareExtension;
@@ -446,10 +431,10 @@
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				B8C407587481BBB190741C93 /* XCRemoteSwiftPackageReference "swift-secp256k1" */,
-				A6E3E56E2E77036A0032EA8A /* XCLocalSwiftPackageReference "BitLogger" */,
-				A6E3EA7D2E7706720032EA8A /* XCLocalSwiftPackageReference "Arti" */,
-				A15C0DE000000000000000A1 /* XCLocalSwiftPackageReference "SonarCore" */,
-				A15C0DE100000000000000B1 /* XCLocalSwiftPackageReference "SonarWalletKit" */,
+				A6E3E56E2E77036A0032EA8A /* XCLocalSwiftPackageReference "localPackages/BitLogger" */,
+				A6E3EA7D2E7706720032EA8A /* XCLocalSwiftPackageReference "localPackages/Arti" */,
+				A15C0DE000000000000000A1 /* XCLocalSwiftPackageReference "localPackages/SonarCore" */,
+				A15C0DE100000000000000B1 /* XCLocalSwiftPackageReference "localPackages/SonarWalletKit" */,
 				FCE6EED212F8EC310C71459F /* XCRemoteSwiftPackageReference "breez-sdk-liquid-swift" */,
 				418698187D457440F125E654 /* XCRemoteSwiftPackageReference "firebase-ios-sdk" */,
 			);
@@ -472,15 +457,13 @@
 		0214973A876129753D39EB47 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			files = (
-				E0A1B2C3D4E5F6012345678D /* online_relays_gps.csv in Resources */,
+				E0A1B2C3D4E5F6012345678D /* ../relays/online_relays_gps.csv in Resources */,
 			);
 		};
 		0DD1C92C7FFBFA9AF2219B69 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
-			buildActionMask = 2147483647;
 			files = (
 			);
-			runOnlyForDeploymentPostprocessing = 0;
 		};
 		C5E027A42ECCDFD700BD6012 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
@@ -495,7 +478,7 @@
 		CD6E8F32BC38357473954F97 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			files = (
-				E0A1B2C3D4E5F6012345678E /* online_relays_gps.csv in Resources */,
+				E0A1B2C3D4E5F6012345678E /* ../relays/online_relays_gps.csv in Resources */,
 			);
 		};
 /* End PBXResourcesBuildPhase section */
@@ -504,8 +487,6 @@
 		A15C0DE100000000000000B6 /* Remove static Breez framework wrapper */ = {
 			isa = PBXShellScriptBuildPhase;
 			alwaysOutOfDate = 1;
-			files = (
-			);
 			inputPaths = (
 				"$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/breez_sdk_liquidFFI.framework",
 			);
@@ -514,7 +495,13 @@
 				"$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)",
 			);
 			shellPath = /bin/sh;
-			shellScript = "set -e\nif [ \"${PLATFORM_NAME}\" = \"macosx\" ]; then\n  rm -rf \"${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}/breez_sdk_liquidFFI.framework\"\nfi\n";
+			shellScript = (
+				"set -e",
+				"if [ \"${PLATFORM_NAME}\" = \"macosx\" ]; then",
+				"  rm -rf \"${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}/breez_sdk_liquidFFI.framework\"",
+				"fi",
+				"",
+			);
 		};
 /* End PBXShellScriptBuildPhase section */
 
@@ -546,11 +533,9 @@
 		};
 		B1AA32C26EC0CA5984731609 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
-			buildActionMask = 2147483647;
 			files = (
 				7DD12DECDE2888D3342FC4E2 /* NotificationService.swift in Sources */,
 			);
-			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXSourcesBuildPhase section */
 
@@ -579,7 +564,7 @@
 /* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
-		077A5203074247CF8F766E2F /* Debug */ = {
+		077A5203074247CF8F766E2F /* Debug configuration for PBXNativeTarget "bitchatTests_iOS" */ = {
 			isa = XCBuildConfiguration;
 			baseConfigurationReferenceAnchor = A6E367C92E76469E0032EA8A /* Configs */;
 			baseConfigurationReferenceRelativePath = Debug.xcconfig;
@@ -604,7 +589,7 @@
 			};
 			name = Debug;
 		};
-		0DACAA261446D178EDD30ECA /* Release */ = {
+		0DACAA261446D178EDD30ECA /* Release configuration for PBXNativeTarget "bitchatTests_iOS" */ = {
 			isa = XCBuildConfiguration;
 			baseConfigurationReferenceAnchor = A6E367C92E76469E0032EA8A /* Configs */;
 			baseConfigurationReferenceRelativePath = Release.xcconfig;
@@ -629,7 +614,7 @@
 			};
 			name = Release;
 		};
-		147FDAE548082D5B921C6F0B /* Release */ = {
+		147FDAE548082D5B921C6F0B /* Release configuration for PBXNativeTarget "bitchatTests_macOS" */ = {
 			isa = XCBuildConfiguration;
 			baseConfigurationReferenceAnchor = A6E367C92E76469E0032EA8A /* Configs */;
 			baseConfigurationReferenceRelativePath = Release.xcconfig;
@@ -655,7 +640,7 @@
 			};
 			name = Release;
 		};
-		3DCF45111852FB2AEBE05E31 /* Release */ = {
+		3DCF45111852FB2AEBE05E31 /* Release configuration for PBXNativeTarget "bitchatShareExtension" */ = {
 			isa = XCBuildConfiguration;
 			baseConfigurationReferenceAnchor = A6E367C92E76469E0032EA8A /* Configs */;
 			baseConfigurationReferenceRelativePath = Release.xcconfig;
@@ -687,7 +672,7 @@
 			};
 			name = Release;
 		};
-		702E7395723CADA4B830F4A9 /* Debug */ = {
+		702E7395723CADA4B830F4A9 /* Debug configuration for PBXNativeTarget "bitchat_iOS" */ = {
 			isa = XCBuildConfiguration;
 			baseConfigurationReferenceAnchor = A6E367C92E76469E0032EA8A /* Configs */;
 			baseConfigurationReferenceRelativePath = Debug.xcconfig;
@@ -721,7 +706,7 @@
 			};
 			name = Debug;
 		};
-		7FA2BADBF3B325125030CAB1 /* Debug */ = {
+		7FA2BADBF3B325125030CAB1 /* Debug configuration for PBXNativeTarget "bitchatTests_macOS" */ = {
 			isa = XCBuildConfiguration;
 			baseConfigurationReferenceAnchor = A6E367C92E76469E0032EA8A /* Configs */;
 			baseConfigurationReferenceRelativePath = Debug.xcconfig;
@@ -747,7 +732,7 @@
 			};
 			name = Debug;
 		};
-		B36671AEACCBF92BE10852E9 /* Release */ = {
+		B36671AEACCBF92BE10852E9 /* Release configuration for PBXNativeTarget "bitchat_iOS" */ = {
 			isa = XCBuildConfiguration;
 			baseConfigurationReferenceAnchor = A6E367C92E76469E0032EA8A /* Configs */;
 			baseConfigurationReferenceRelativePath = Release.xcconfig;
@@ -781,7 +766,7 @@
 			};
 			name = Release;
 		};
-		BB044400A0F06B93F22D0D55 /* Release */ = {
+		BB044400A0F06B93F22D0D55 /* Release configuration for PBXNativeTarget "bitchat_macOS" */ = {
 			isa = XCBuildConfiguration;
 			baseConfigurationReferenceAnchor = A6E367C92E76469E0032EA8A /* Configs */;
 			baseConfigurationReferenceRelativePath = Release.xcconfig;
@@ -815,7 +800,7 @@
 			};
 			name = Release;
 		};
-		BF0D85727BCB6E346962F419 /* Release */ = {
+		BF0D85727BCB6E346962F419 /* Release configuration for PBXProject "bitchat" */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
@@ -875,7 +860,7 @@
 			};
 			name = Release;
 		};
-		CC79F65842D42034ACEE79B7 /* Debug */ = {
+		CC79F65842D42034ACEE79B7 /* Debug configuration for PBXNativeTarget "bitchat_macOS" */ = {
 			isa = XCBuildConfiguration;
 			baseConfigurationReferenceAnchor = A6E367C92E76469E0032EA8A /* Configs */;
 			baseConfigurationReferenceRelativePath = Debug.xcconfig;
@@ -909,7 +894,7 @@
 			};
 			name = Debug;
 		};
-		D8C5BF109BB2630752185FA0 /* Debug */ = {
+		D8C5BF109BB2630752185FA0 /* Debug configuration for PBXProject "bitchat" */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
@@ -976,7 +961,7 @@
 			};
 			name = Debug;
 		};
-		DAC5E82049F8A97360BE63D6 /* Debug */ = {
+		DAC5E82049F8A97360BE63D6 /* Debug configuration for PBXNativeTarget "bitchatShareExtension" */ = {
 			isa = XCBuildConfiguration;
 			baseConfigurationReferenceAnchor = A6E367C92E76469E0032EA8A /* Configs */;
 			baseConfigurationReferenceRelativePath = Debug.xcconfig;
@@ -1008,7 +993,7 @@
 			};
 			name = Debug;
 		};
-		F839C098CDA225859AA699AE /* Debug */ = {
+		F839C098CDA225859AA699AE /* Debug configuration for PBXNativeTarget "SonarNotificationService" */ = {
 			isa = XCBuildConfiguration;
 			baseConfigurationReferenceAnchor = A6E367C92E76469E0032EA8A /* Configs */;
 			baseConfigurationReferenceRelativePath = Debug.xcconfig;
@@ -1017,7 +1002,7 @@
 				CLANG_ENABLE_OBJC_WEAK = NO;
 				CODE_SIGN_ENTITLEMENTS = SonarNotificationService/SonarNotificationService.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 3;
+				CURRENT_PROJECT_VERSION = 21;
 				DEVELOPMENT_TEAM = "$(DEVELOPMENT_TEAM)";
 				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -1034,7 +1019,7 @@
 			};
 			name = Debug;
 		};
-		FAC1F3EA39F63B840D2E9806 /* Release */ = {
+		FAC1F3EA39F63B840D2E9806 /* Release configuration for PBXNativeTarget "SonarNotificationService" */ = {
 			isa = XCBuildConfiguration;
 			baseConfigurationReferenceAnchor = A6E367C92E76469E0032EA8A /* Configs */;
 			baseConfigurationReferenceRelativePath = Release.xcconfig;
@@ -1043,7 +1028,7 @@
 				CLANG_ENABLE_OBJC_WEAK = NO;
 				CODE_SIGN_ENTITLEMENTS = SonarNotificationService/SonarNotificationService.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 3;
+				CURRENT_PROJECT_VERSION = 21;
 				DEVELOPMENT_TEAM = "$(DEVELOPMENT_TEAM)";
 				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -1067,76 +1052,75 @@
 		1C27B5BA3DB46DDF0DBFEF62 /* Build configuration list for PBXNativeTarget "bitchatTests_macOS" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				7FA2BADBF3B325125030CAB1 /* Debug */,
-				147FDAE548082D5B921C6F0B /* Release */,
+				7FA2BADBF3B325125030CAB1 /* Debug configuration for PBXNativeTarget "bitchatTests_macOS" */,
+				147FDAE548082D5B921C6F0B /* Release configuration for PBXNativeTarget "bitchatTests_macOS" */,
 			);
 			defaultConfigurationName = Debug;
 		};
 		38C4AF6313E5037F25CEF30B /* Build configuration list for PBXNativeTarget "bitchatTests_iOS" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				077A5203074247CF8F766E2F /* Debug */,
-				0DACAA261446D178EDD30ECA /* Release */,
+				077A5203074247CF8F766E2F /* Debug configuration for PBXNativeTarget "bitchatTests_iOS" */,
+				0DACAA261446D178EDD30ECA /* Release configuration for PBXNativeTarget "bitchatTests_iOS" */,
 			);
 			defaultConfigurationName = Debug;
 		};
 		3EA424CBD51200895D361189 /* Build configuration list for PBXProject "bitchat" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				D8C5BF109BB2630752185FA0 /* Debug */,
-				BF0D85727BCB6E346962F419 /* Release */,
+				D8C5BF109BB2630752185FA0 /* Debug configuration for PBXProject "bitchat" */,
+				BF0D85727BCB6E346962F419 /* Release configuration for PBXProject "bitchat" */,
 			);
 			defaultConfigurationName = Debug;
 		};
 		53EADEF7546F94DDF82271B9 /* Build configuration list for PBXNativeTarget "bitchat_iOS" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				702E7395723CADA4B830F4A9 /* Debug */,
-				B36671AEACCBF92BE10852E9 /* Release */,
+				702E7395723CADA4B830F4A9 /* Debug configuration for PBXNativeTarget "bitchat_iOS" */,
+				B36671AEACCBF92BE10852E9 /* Release configuration for PBXNativeTarget "bitchat_iOS" */,
 			);
 			defaultConfigurationName = Debug;
 		};
 		5B2870A01227E06BFE4EFAE6 /* Build configuration list for PBXNativeTarget "SonarNotificationService" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				FAC1F3EA39F63B840D2E9806 /* Release */,
-				F839C098CDA225859AA699AE /* Debug */,
+				FAC1F3EA39F63B840D2E9806 /* Release configuration for PBXNativeTarget "SonarNotificationService" */,
+				F839C098CDA225859AA699AE /* Debug configuration for PBXNativeTarget "SonarNotificationService" */,
 			);
-			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
 		DA5644925338B8189B035657 /* Build configuration list for PBXNativeTarget "bitchat_macOS" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				CC79F65842D42034ACEE79B7 /* Debug */,
-				BB044400A0F06B93F22D0D55 /* Release */,
+				CC79F65842D42034ACEE79B7 /* Debug configuration for PBXNativeTarget "bitchat_macOS" */,
+				BB044400A0F06B93F22D0D55 /* Release configuration for PBXNativeTarget "bitchat_macOS" */,
 			);
 			defaultConfigurationName = Debug;
 		};
 		E4EA6DC648DF55FF84032EB5 /* Build configuration list for PBXNativeTarget "bitchatShareExtension" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				DAC5E82049F8A97360BE63D6 /* Debug */,
-				3DCF45111852FB2AEBE05E31 /* Release */,
+				DAC5E82049F8A97360BE63D6 /* Debug configuration for PBXNativeTarget "bitchatShareExtension" */,
+				3DCF45111852FB2AEBE05E31 /* Release configuration for PBXNativeTarget "bitchatShareExtension" */,
 			);
 			defaultConfigurationName = Debug;
 		};
 /* End XCConfigurationList section */
 
 /* Begin XCLocalSwiftPackageReference section */
-		A15C0DE000000000000000A1 /* XCLocalSwiftPackageReference "SonarCore" */ = {
+		A15C0DE000000000000000A1 /* XCLocalSwiftPackageReference "localPackages/SonarCore" */ = {
 			isa = XCLocalSwiftPackageReference;
 			relativePath = localPackages/SonarCore;
 		};
-		A15C0DE100000000000000B1 /* XCLocalSwiftPackageReference "SonarWalletKit" */ = {
+		A15C0DE100000000000000B1 /* XCLocalSwiftPackageReference "localPackages/SonarWalletKit" */ = {
 			isa = XCLocalSwiftPackageReference;
 			relativePath = localPackages/SonarWalletKit;
 		};
-		A6E3E56E2E77036A0032EA8A /* XCLocalSwiftPackageReference "BitLogger" */ = {
+		A6E3E56E2E77036A0032EA8A /* XCLocalSwiftPackageReference "localPackages/BitLogger" */ = {
 			isa = XCLocalSwiftPackageReference;
 			relativePath = localPackages/BitLogger;
 		};
-		A6E3EA7D2E7706720032EA8A /* XCLocalSwiftPackageReference "Arti" */ = {
+		A6E3EA7D2E7706720032EA8A /* XCLocalSwiftPackageReference "localPackages/Arti" */ = {
 			isa = XCLocalSwiftPackageReference;
 			relativePath = localPackages/Arti;
 		};

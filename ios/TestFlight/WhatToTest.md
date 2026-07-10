@@ -1,74 +1,110 @@
 # TestFlight — What to Test
 
-Build: **Sonar 1.6.0 (3)**
+Build: **Sonar 1.6.0 (21)** · release tag **v0.1-alpha.6**
 
-This build is mostly about **stability and offline payments**. It fixes the two
-top TestFlight crashes (app getting killed while locked/backgrounded) and makes
-paying a peer who is currently offline actually work. The payment, media, and
-GIF features from the previous build are still here — please give them a quick
-regression pass too.
+This build is a cross-platform alpha cut after the Signal-grade conversation
+work, multi-photo media, Android↔iOS parity batch, and a pile of sync/crash
+fixes. Opening a chat should paint from local storage first; missed messages
+should catch up in the background; payments and notifications should stay
+stable when the phone is locked or the app is killed.
 
-If something crashes on launch, while locked, or right after sending money,
-that is the highest-priority report.
+If something crashes on launch, while locked, or right after sending a message,
+photo, or payment — that is the highest-priority report. If sync feels slow or
+a message is missing, use **Settings → Diagnostics → Share** and send us the
+log.
 
-## 1. Background / locked stability (top crash fixes)
+## 1. Sync speed & catching up (headline)
 
-Previous builds were killed by iOS when the screen locked or the app went to
-the background during chat or wallet activity. This should no longer happen.
+Missed messages should arrive quickly on wake/foreground, and one chat’s
+activity must never hold back another’s resync.
 
-- Open a chat, then **lock the phone** for 30–60s and unlock — confirm the app
-  is still running (not relaunched) and the chat is intact.
-- Send or receive a **payment**, then immediately **lock the phone** or switch
-  to another app for a minute. Come back and confirm no crash and the payment
-  state is correct.
-- Leave the app **backgrounded for several minutes** with the phone locked,
-  then reopen — confirm it resumes instead of cold-launching/crashing.
-- After updating to this build, confirm your **identity, nickname, contacts,
-  and wallet balance survive** the upgrade.
+- Leave the app **closed/backgrounded**, have a peer send several messages,
+  then **open the app**. Confirm missed messages appear promptly without a
+  stuck “syncing” state.
+- Open an existing chat: it should **paint instantly from local history** and
+  fill gaps in the background — not blank/spinner while talking to relays.
+- Send in one chat, then open a **different** chat that still has older
+  unreceived peer messages. The second chat must still pull the missing ones
+  (a newer send elsewhere must not skip them).
+- Fire several messages in a row; sending stays snappy and is not blocked
+  behind background sync.
+- On Android/desktop: after a welcome creates a group or a live event arrives,
+  the open chat / list should refresh within seconds without a manual pull.
 
-## 2. Offline payments (pay a peer who isn't online)
+## 2. Home list & conversation correctness
 
-You can now pay a peer even when their app is closed/backgrounded — they get
-woken via push to receive.
+- Home / Messages should order by **latest activity across transports** (mesh +
+  relay), not leave a busy chat buried under an idle one.
+- A peer you talk to over **mesh and Sonar/relay** is **one conversation**, not
+  two rows. Moving in/out of BLE range must not create a duplicate pubkey chat.
+- Peer **nickname changes** should update list + transcript (not stick on the
+  old name or a raw key).
+- You should **not** get spammy system “reconnected” alerts when BLE flaps.
 
-- Pay a peer who has a **payment address** set but whose app is **closed or
-  backgrounded**. Confirm your bubble moves **sending → paid** and does not get
-  stuck or fail with a raw error.
-- On the **receiving** device (the offline one), confirm a notification/wake
-  arrives and the incoming payment shows up as pending/paid after settling.
-- Try a normal **both-online** payment too and confirm it still works.
+## 3. Multi-photo & media
 
-## 3. Notifications
+- Send **multiple photos** in one go: the transcript should show an album-style
+  card deck (xChat-style), not only a single image bubble.
+- Open the album / individual photos fullscreen; confirm save still works.
+- Animated GIFs still **animate** (not a frozen frame).
+- Stickers still send/receive (sticker kinds were moved to 30031/10031 — old
+  packs may need a re-publish if something looks empty).
 
-Notifications are now generated with useful content.
+## 4. Stability / crash fixes
 
-- With the app **backgrounded**, receive a **message** and a **payment** and
-  confirm the notifications are **meaningful** (who it's from / what it is), not
-  generic placeholders.
-- Check **Settings** for the notification **privacy** option and confirm
-  toggling it changes how much detail appears on the lock screen.
+- Mixed content (emoji, long text, links, reactions) renders without crashing.
+- Open a chat, **lock the phone** 30–60s, unlock — app should still be running
+  and the chat intact (no 0xdead10cc / cold relaunch from wallet work).
+- Send or receive a **payment**, then immediately lock or background for a
+  minute. Come back: no crash, correct payment state.
+- Leave the app backgrounded several minutes locked, then reopen — resume, not
+  crash-loop.
 
-## 4. Your payment address stays payable
+## 5. Wallet & offline payments
 
-Your published payment address (BOLT12 offer) should no longer get wiped when
-your profile/presence republishes.
+- After update: **identity, nickname, contacts, and wallet balance** survive.
+- Published **BOLT12 offer / payment address** still set; you remain payable
+  after reconnect / rename (offer must not get wiped by a later publish).
+- **Offline payments**: pay a peer whose app is closed/backgrounded; your
+  bubble moves sending → paid; they get woken to receive.
+- Direct wallet payments: gold payment bubble appears immediately; activity
+  list newest-first with amount, peer, rail, fee, status. Paying a peer with
+  **no** payment address is blocked, not a crash.
 
-- Set a **Payment address (BIP-353 / BOLT12)** in Settings.
-- Change your **nickname** / reconnect / move in and out of range so your
-  profile republishes, then have **another peer pay you**. Confirm you are
-  still payable (the address wasn't cleared).
+## 6. Notifications
 
-## Regression pass (from the previous build)
+- App backgrounded: message and payment produce **meaningful** notifications
+  (who/what), not generic placeholders; privacy toggle changes lock-screen
+  detail.
+- Push wake / foreground should kick Marmot relay sync so chats catch up after
+  a notification.
 
-- **Direct wallet payments**: gold payment bubble appears immediately; activity
-  list shows newest first with amount, peer, rail, fee, status. Paying a peer
-  with **no** payment address is blocked, not a crash.
-- **Media**: send/receive a photo, tap to open fullscreen, **save** it, and
-  confirm the file opens intact.
-- **GIFs / emoji**: an animated GIF **animates** in the chat (not a frozen
-  frame); a regular photo is not mislabeled as a GIF; the emoji tray works.
+## 7. Diagnostics (please use this)
+
+- **Settings → Diagnostics → Share** exports a log.
+- Try verbose + privacy/redaction levels; confirm a shareable file is produced.
+- After slow sync, missing message, or crash: export **right away** and attach
+  to the report.
+
+## 8. Account key durability
+
+- Updating must **not** mint a new account / nsec. If prefs are lost but the
+  keychain key remains, you should recover into the same account, not onboarding.
+
+## Regression pass (still expected)
+
+- Group invite links (QR / share / paste / join).
+- Calls: mute icon/label correct, hang-up dismisses immediately, no phantom
+  missed-call rows.
+- Voice notes play on the platform you test (iOS / Android / desktop).
+- Profile edit on iOS matches Compose (name / photo) where parity shipped.
 
 ## Known gaps
 
-- New payment/onboarding/safety-number strings are **English-only**; other
-  languages fall back to English. That is expected, not a bug.
+- Some newer payment/onboarding/safety-number strings are **English-only**;
+  other languages fall back to English — expected, not a bug.
+- In-app QR camera scanning may still be limited; paste/share links work.
+- Archive for this cut was verified as a valid **iOS App Archive** (single
+  `Sonar.app`, both extensions in `PlugIns`, `ApplicationProperties` present).
+  TestFlight upload still needs App Store Connect distribution signing via
+  Xcode Organizer / `xcodebuild -exportArchive`.
