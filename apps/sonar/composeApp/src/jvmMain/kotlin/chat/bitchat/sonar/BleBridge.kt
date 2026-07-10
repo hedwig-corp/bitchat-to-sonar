@@ -16,7 +16,8 @@ private interface BleLib : Library {
     fun sonar_ble_stop_advertising()
     fun sonar_ble_subscription_token(): Long
     fun sonar_ble_drain_rx_json(): Pointer?
-    fun sonar_ble_notify(data: ByteArray?, len: Long, expectedSubscriptionToken: Long): Int
+    fun sonar_ble_drain_tx_results_json(): Pointer?
+    fun sonar_ble_notify(data: ByteArray?, len: Long, expectedSubscriptionToken: Long, deliveryId: Long): Int
 }
 
 /**
@@ -32,6 +33,7 @@ private interface BleLib : Library {
 object BleBridge {
     data class Dev(val id: String, val name: String?, val rssi: Int)
     data class Rx(val bytes: ByteArray, val subscriptionToken: Long)
+    data class TxResult(val deliveryId: Long, val accepted: Boolean)
 
     private val lib: BleLib? by lazy { load() }
 
@@ -63,8 +65,8 @@ object BleBridge {
 
     /** Queue a raw mesh packet for the subscription that owns its Noise session.
      *  True means native code accepted it and will retry BLE backpressure FIFO. */
-    fun notify(bytes: ByteArray, expectedSubscriptionToken: Long): Boolean =
-        lib?.sonar_ble_notify(bytes, bytes.size.toLong(), expectedSubscriptionToken) == 1
+    fun notify(bytes: ByteArray, expectedSubscriptionToken: Long, deliveryId: Long = 0L): Boolean =
+        lib?.sonar_ble_notify(bytes, bytes.size.toLong(), expectedSubscriptionToken, deliveryId) == 1
 
     /** Packets centrals wrote to our GATT characteristic (announce/handshake). */
     fun drainRx(): List<Rx> {
@@ -72,6 +74,14 @@ object BleBridge {
         val ptr = l.sonar_ble_drain_rx_json() ?: return emptyList()
         val json = try { ptr.getString(0) } finally { l.sonar_ble_free(ptr) }
         return parseRx(json)
+    }
+
+    /** Native notify outcomes for tracked DMs. */
+    fun drainTxResults(): List<TxResult> {
+        val l = lib ?: return emptyList()
+        val ptr = l.sonar_ble_drain_tx_results_json() ?: return emptyList()
+        val json = try { ptr.getString(0) } finally { l.sonar_ble_free(ptr) }
+        return parseTxResults(json)
     }
 
     internal fun parseRx(json: String): List<Rx> {
@@ -83,8 +93,19 @@ object BleBridge {
         }.toList()
     }
 
+    internal fun parseTxResults(json: String): List<TxResult> =
+        OBJ.findAll(json).mapNotNull { match ->
+            val id = TX_ID.find(match.value)?.groupValues?.get(1)?.toLongOrNull() ?: return@mapNotNull null
+            val accepted = TX_ACCEPTED.find(match.value)?.groupValues?.get(1)?.toBooleanStrictOrNull()
+                ?: return@mapNotNull null
+            if (id == 0L) return@mapNotNull null
+            TxResult(id, accepted)
+        }.toList()
+
     private val RX_TOKEN = Regex(""""token"\s*:\s*(\d+)""")
     private val RX_DATA = Regex(""""data"\s*:\s*"([0-9a-fA-F]+)"""")
+    private val TX_ID = Regex(""""id"\s*:\s*(\d+)""")
+    private val TX_ACCEPTED = Regex(""""accepted"\s*:\s*(true|false)""")
     private fun hexToBytes(s: String): ByteArray =
         ByteArray(s.length / 2) { ((s[it * 2].digitToInt(16) shl 4) or s[it * 2 + 1].digitToInt(16)).toByte() }
 

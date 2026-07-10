@@ -36,6 +36,9 @@ internal class SonarOutbox(
 
     fun enqueue(peerId: String, content: String, messageId: String, timestampSecs: Long): OutboxEnqueueResult {
         val queue = queues.getOrPut(peerId) { mutableListOf() }
+        queue.firstOrNull { it.messageId == messageId }?.let { existing ->
+            return OutboxEnqueueResult(existing, evicted = null, depth = queue.size)
+        }
         val message = QueuedMessage(
             content = content,
             peerId = peerId,

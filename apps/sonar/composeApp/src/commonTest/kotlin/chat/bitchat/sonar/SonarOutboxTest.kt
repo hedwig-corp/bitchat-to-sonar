@@ -59,4 +59,16 @@ class SonarOutboxTest {
 
         assertEquals(listOf("three"), outbox.snapshot("peer-1").map { it.content })
     }
+
+    @Test
+    fun enqueueIsIdempotentByMessageId() {
+        val outbox = SonarOutbox(maxPerPeer = 10, ttlSecs = 100)
+
+        outbox.enqueue("peer-1", "original", "id-1", timestampSecs = 1)
+        val duplicate = outbox.enqueue("peer-1", "duplicate", "id-1", timestampSecs = 2)
+
+        assertEquals(listOf("original"), outbox.snapshot("peer-1").map { it.content })
+        assertEquals(1, duplicate.depth)
+        assertEquals(null, duplicate.evicted)
+    }
 }

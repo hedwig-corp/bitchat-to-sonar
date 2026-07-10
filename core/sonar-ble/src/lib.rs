@@ -19,6 +19,7 @@
 //!   sonar_ble_stop()           -> stop scanning + clear state
 //!   sonar_ble_subscription_token() -> identity of the active GATT subscriber
 //!   sonar_ble_notify(...)      -> enqueue for that subscriber, fail-fast otherwise
+//!   sonar_ble_drain_tx_results_json() -> native notify acceptance/failure results
 
 use btleplug::api::{Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter};
 use btleplug::platform::Manager;
@@ -62,10 +63,44 @@ static RX_PACKETS: Lazy<Mutex<Vec<RxPacket>>> = Lazy::new(|| Mutex::new(Vec::new
 /// handshake replies, encrypted DMs). The advertise loop drains + notifies them.
 struct TxPacket {
     subscription_token: u64,
+    delivery_id: u64,
     bytes: Vec<u8>,
 }
 
 static TX_PACKETS: Lazy<Mutex<VecDeque<TxPacket>>> = Lazy::new(|| Mutex::new(VecDeque::new()));
+
+struct TxResult {
+    delivery_id: u64,
+    accepted: bool,
+}
+
+static TX_RESULTS: Lazy<Mutex<Vec<TxResult>>> = Lazy::new(|| Mutex::new(Vec::new()));
+
+fn record_tx_result(delivery_id: u64, accepted: bool) {
+    if delivery_id == 0 {
+        return;
+    }
+    if let Ok(mut results) = TX_RESULTS.lock() {
+        results.push(TxResult {
+            delivery_id,
+            accepted,
+        });
+    }
+}
+
+fn fail_pending_tx() {
+    let delivery_ids: Vec<u64> = TX_PACKETS
+        .lock()
+        .map(|mut q| {
+            q.drain(..)
+                .filter_map(|packet| (packet.delivery_id != 0).then_some(packet.delivery_id))
+                .collect()
+        })
+        .unwrap_or_default();
+    for delivery_id in delivery_ids {
+        record_tx_result(delivery_id, false);
+    }
+}
 
 fn hex_encode(b: &[u8]) -> String {
     let mut s = String::with_capacity(b.len() * 2);
@@ -189,7 +224,29 @@ pub extern "C" fn sonar_ble_drain_rx_json() -> *mut c_char {
     CString::new(json).unwrap_or_default().into_raw()
 }
 
-/// Free a string returned by [`sonar_ble_peers_json`] / [`sonar_ble_drain_rx_json`].
+/// JSON array of tracked native notify outcomes. An accepted result means
+/// CoreBluetooth accepted the value through `updateValue`; a failed result means
+/// the subscription changed or advertising stopped before that boundary.
+#[no_mangle]
+pub extern "C" fn sonar_ble_drain_tx_results_json() -> *mut c_char {
+    let items: Vec<serde_json::Value> = TX_RESULTS
+        .lock()
+        .map(|mut q| {
+            q.drain(..)
+                .map(|result| {
+                    serde_json::json!({
+                        "id": result.delivery_id,
+                        "accepted": result.accepted,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let json = serde_json::Value::Array(items).to_string();
+    CString::new(json).unwrap_or_default().into_raw()
+}
+
+/// Free a string returned by a `sonar_ble_*_json` function.
 ///
 /// # Safety
 /// `ptr` must be a pointer previously returned by this library, or null.
@@ -321,6 +378,7 @@ pub extern "C" fn sonar_ble_start_advertising() {
                 if let Err(e) = run_peripheral().await {
                     dbg_log(&format!("advertise: ERR {e}"));
                 }
+                fail_pending_tx();
                 ADVERTISING.store(false, Ordering::SeqCst);
             });
         })
@@ -353,6 +411,7 @@ pub unsafe extern "C" fn sonar_ble_notify(
     ptr: *const u8,
     len: usize,
     expected_subscription_token: u64,
+    delivery_id: u64,
 ) -> i32 {
     if ptr.is_null() || len == 0 || expected_subscription_token == 0 {
         return 0;
@@ -364,6 +423,7 @@ pub unsafe extern "C" fn sonar_ble_notify(
     if let Ok(mut q) = TX_PACKETS.lock() {
         q.push_back(TxPacket {
             subscription_token: expected_subscription_token,
+            delivery_id,
             bytes,
         });
         1
@@ -377,9 +437,7 @@ async fn run_peripheral() -> Result<(), Box<dyn std::error::Error>> {
     let chr = Uuid08::from_u128(BITCHAT_CHAR_U128);
 
     let peripheral = Peripheral::new().await?;
-    if let Ok(mut q) = TX_PACKETS.lock() {
-        q.clear();
-    }
+    fail_pending_tx();
 
     // CoreBluetooth silently ignores addService:/startAdvertising: until the
     // CBPeripheralManager is powered on — so WAIT for power-on BEFORE registering
@@ -444,6 +502,7 @@ async fn run_peripheral() -> Result<(), Box<dyn std::error::Error>> {
             let next = TX_PACKETS.lock().ok().and_then(|mut q| q.pop_front());
             let Some(pkt) = next else { break };
             if pkt.subscription_token != peripheral.subscription_token() {
+                record_tx_result(pkt.delivery_id, false);
                 continue;
             }
             if !peripheral.notify(&pkt.bytes) {
@@ -452,6 +511,7 @@ async fn run_peripheral() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 break;
             }
+            record_tx_result(pkt.delivery_id, true);
         }
         // Drain packets centrals wrote to us (bluster's event channel is a no-op
         // on macOS; we patched it to queue writes — take them here).
@@ -492,8 +552,37 @@ async fn run_peripheral() -> Result<(), Box<dyn std::error::Error>> {
     }
     let _ = peripheral.stop_advertising().await;
     peripheral.reset_subscriptions();
-    if let Ok(mut q) = TX_PACKETS.lock() {
-        q.clear();
-    }
+    fail_pending_tx();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_tracked_transmissions_report_failure() {
+        TX_RESULTS.lock().unwrap().clear();
+        let mut packets = TX_PACKETS.lock().unwrap();
+        packets.clear();
+        packets.push_back(TxPacket {
+            subscription_token: 7,
+            delivery_id: 41,
+            bytes: vec![1, 2, 3],
+        });
+        packets.push_back(TxPacket {
+            subscription_token: 7,
+            delivery_id: 0,
+            bytes: vec![4, 5, 6],
+        });
+        drop(packets);
+
+        fail_pending_tx();
+
+        assert!(TX_PACKETS.lock().unwrap().is_empty());
+        let results = TX_RESULTS.lock().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].delivery_id, 41);
+        assert!(!results[0].accepted);
+    }
 }

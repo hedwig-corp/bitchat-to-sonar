@@ -24,4 +24,25 @@ class BleBridgeTest {
 
         assertEquals(emptyList(), packets)
     }
+
+    @Test
+    fun txResultParserPreservesDeliveryOutcomeRegardlessOfFieldOrder() {
+        val results = BleBridge.parseTxResults(
+            """[{"id":41,"accepted":true},{"accepted":false,"id":42}]""",
+        )
+
+        assertEquals(
+            listOf(BleBridge.TxResult(41, accepted = true), BleBridge.TxResult(42, accepted = false)),
+            results,
+        )
+    }
+
+    @Test
+    fun txResultParserDropsMalformedOrUntrackedResults() {
+        val results = BleBridge.parseTxResults(
+            """[{"id":0,"accepted":true},{"id":5},{"accepted":false}]""",
+        )
+
+        assertEquals(emptyList(), results)
+    }
 }

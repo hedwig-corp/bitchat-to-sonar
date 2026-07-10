@@ -7,6 +7,7 @@ import uniffi.sonar_ffi.meshEncodePrivateMessage
 import uniffi.sonar_ffi.meshParseAnnounce
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Desktop BLE mesh protocol engine — the Noise-over-GATT transport, the desktop
@@ -21,8 +22,9 @@ import java.util.concurrent.ConcurrentLinkedQueue
  * Replies (m2, encrypted DMs) go back out through the bridge's notify path. The
  * phone, not the desktop, initiates the handshake, so the desktop only ever plays
  * the responder. Outbound DMs are fail-fast: [sendDm] writes only over a fresh
- * established session and returns false otherwise, so the app-level outbox (not
- * this transport) owns retry and White Noise fallback.
+ * established session and reports native pre-flush drops back to the app, so the
+ * app-level outbox (not this transport) owns plaintext retry and White Noise
+ * fallback.
  *
  * Scope: a single connected phone (bluster doesn't attribute writes to a specific
  * central, and notify reaches all subscribers) — enough for desktop↔phone DMs.
@@ -41,6 +43,14 @@ object MeshLink {
         @Volatile var established = false
     }
 
+    private data class PendingSend(
+        val peerId: String,
+        val messageId: String,
+        val text: String,
+        val tsSecs: Long,
+        val session: Session,
+    )
+
     private val sessions = ConcurrentHashMap<String, Session>()        // fp -> Noise session
     private val fpByPeerId = ConcurrentHashMap<String, String>()       // peerId -> fp
     private val peerIdByFp = ConcurrentHashMap<String, String>()       // fp -> current peerId
@@ -50,6 +60,9 @@ object MeshLink {
     private val sonarSeenAt = ConcurrentHashMap<String, Long>()        // peerId -> last 0x53 ms (for TTL)
     private val rxDms = ConcurrentLinkedQueue<MeshDmIn>()
     private val linkUps = ConcurrentLinkedQueue<String>()              // fps whose link just established
+    private val nextDeliveryId = AtomicLong(1)
+    private val pendingSends = ConcurrentHashMap<Long, PendingSend>()
+    private val sendFailures = ConcurrentLinkedQueue<MeshSendFailure>()
 
     /** Our encoded SonarAnnounce (npub + caps) to broadcast as a signed 0x53, so
      *  phones treat us as a full Sonar peer and continue our chat over White Noise
@@ -87,6 +100,7 @@ object MeshLink {
     }
 
     private fun pump() {
+        processTxResults()
         for (rx in BleBridge.drainRx()) {
             val subscriptionToken = BleBridge.subscriptionToken()
             if (rx.subscriptionToken == 0L || rx.subscriptionToken != subscriptionToken) continue
@@ -239,26 +253,66 @@ object MeshLink {
     private fun encryptAndSend(fp: String, s: Session, messageId: String, text: String): Boolean {
         val peerId = peerIdByFp[fp] ?: return false
         return synchronized(s) {
-            runCatching {
+            val deliveryId = nextDeliveryId.getAndIncrement()
+            try {
                 val plain = meshEncodePrivateMessage(messageId, text)
                 val ct = s.noise.encrypt(plain)
+                pendingSends[deliveryId] = PendingSend(
+                    fp,
+                    messageId,
+                    text,
+                    System.currentTimeMillis() / 1000,
+                    s,
+                )
                 if (!BleBridge.notify(
                         MeshIdentity.buildPacket(TYPE_NOISE_ENCRYPTED.toUByte(), peerId, ct),
                         s.subscriptionToken,
+                        deliveryId,
                     )
                 ) {
+                    pendingSends.remove(deliveryId)
                     sessions.remove(fp, s)
-                    return@runCatching false
+                    return@synchronized false
                 }
                 sonarLog("MeshLink", "TX DM to ${nameByFp[fp] ?: fp.take(8)} (${text.length} chars)")
                 true
-            }.getOrDefault(false)
+            } catch (_: Throwable) {
+                pendingSends.remove(deliveryId)
+                sessions.remove(fp, s)
+                false
+            }
+        }
+    }
+
+    private fun processTxResults() {
+        for (result in BleBridge.drainTxResults()) {
+            val pending = pendingSends.remove(result.deliveryId) ?: continue
+            if (!result.accepted) {
+                sessions.remove(pending.peerId, pending.session)
+                sendFailures.add(
+                    MeshSendFailure(
+                        pending.peerId,
+                        pending.messageId,
+                        pending.text,
+                        pending.tsSecs,
+                    ),
+                )
+            }
         }
     }
 
     fun drainDms(): List<MeshDmIn> {
         val out = ArrayList<MeshDmIn>()
         while (true) out.add(rxDms.poll() ?: break)
+        return out
+    }
+
+    fun drainSendFailures(): List<MeshSendFailure> {
+        // Also process native results here so failures remain visible while the
+        // protocol pump is stopped during a radio policy transition.
+        processTxResults()
+        val out = ArrayList<MeshSendFailure>()
+        while (true) out.add(sendFailures.poll() ?: break)
         return out
     }
 
