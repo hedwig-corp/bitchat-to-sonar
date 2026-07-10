@@ -2,7 +2,13 @@
   import Nav from '$lib/components/Nav.svelte';
   import Radar from '$lib/components/Radar.svelte';
   import Footer from '$lib/components/Footer.svelte';
-  import { DOWNLOAD_HREF, TESTFLIGHT_URL, TESTFLIGHT_MACOS_URL, ANDROID_APK_URL } from '$lib/links.js';
+  import {
+    DOWNLOAD_HREF,
+    TESTFLIGHT_URL,
+    TESTFLIGHT_MACOS_URL,
+    ANDROID_APK_URL,
+    ZAPSTORE_URL
+  } from '$lib/links.js';
 </script>
 
 <svelte:head>
@@ -21,7 +27,10 @@
     <h1>Sense who&rsquo;s nearby <em>before you see them.</em></h1>
     <p class="sub">Sonar is a private messenger that works two ways at once: Bluetooth finds the people around you — even with no internet — and the open Nostr network reaches everyone else. Your phone is the only account you need.</p>
     <div class="ctas">
-      <a class="btn primary" href={DOWNLOAD_HREF}>Download</a>
+      <a class="btn primary" href={TESTFLIGHT_URL} target="_blank" rel="noopener">iPhone / Mac (TestFlight)</a>
+      <a class="btn primary" href={ZAPSTORE_URL} target="_blank" rel="noopener">Android (Zapstore)</a>
+      <a class="btn ghost" href={ANDROID_APK_URL}>Android APK</a>
+      <a class="btn ghost" href={DOWNLOAD_HREF}>All downloads</a>
     </div>
     <p class="heronote">End-to-end encrypted · your key never leaves the phone · <code>a3f9 2c41 770e 5b2d</code></p>
   </div>
@@ -175,13 +184,14 @@
 <section class="alt band" id="download">
   <div class="wrap">
     <h2>Hear the room before you enter it.</h2>
-    <p class="lede">Free, open source, end-to-end encrypted. iPhone and Mac beta on TestFlight — Android alpha APK available now.</p>
+    <p class="lede">Free, open source, end-to-end encrypted. iPhone and Mac beta on TestFlight — Android on Zapstore or as a sideload APK.</p>
     <div class="ctas">
       <a class="btn primary" href={TESTFLIGHT_URL} target="_blank" rel="noopener">Join the iPhone beta (TestFlight)</a>
       <a class="btn primary" href={TESTFLIGHT_MACOS_URL} target="_blank" rel="noopener">Join the Mac beta (TestFlight)</a>
+      <a class="btn primary" href={ZAPSTORE_URL} target="_blank" rel="noopener">Get Android on Zapstore</a>
       <a class="btn primary" href={ANDROID_APK_URL}>Download for Android (APK)</a>
     </div>
-    <p class="heronote">Android APK is an arm64 alpha · sideload on 64-bit phones</p>
+    <p class="heronote">Android: Zapstore (signed updates) or direct APK · phone ABIs arm64 + armeabi-v7a</p>
   </div>
 </section>
 

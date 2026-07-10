@@ -127,12 +127,15 @@ For a quick macOS run from source: `brew install just && just run` (and `just cl
 
 ```bash
 cd apps/sonar
-./gradlew :composeApp:assembleDebug        # Android APK
+./gradlew :composeApp:installDebug         # Android debug → device (arm64)
+./gradlew :composeApp:assembleRelease      # phone APK (arm64 + armeabi-v7a)
+./gradlew :composeApp:assembleRelease -Psonar.universalApk=true  # + emulators
 ./gradlew :composeApp:run                  # Compose Desktop
 ```
 
 The Gradle build invokes the Rust core build (`core/build-android.sh` /
 `build-desktop.sh`) to produce the JNI `.so` / host dylib and the Kotlin bindings.
+Android details (secrets, ABIs, sideload): [`docs/ANDROID-BUILD.md`](docs/ANDROID-BUILD.md).
 
 ### Web (landing page)
 

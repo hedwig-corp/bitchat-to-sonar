@@ -1,0 +1,79 @@
+# Zapstore publisher config (https://zapstore.dev/docs/publish)
+# Tool: zsp — https://github.com/zapstore/zsp
+#
+# First-time whitelist: commit this file with your publisher `pubkey` (npub),
+# then `zsp publish --pre-release`. The relay fetches this file from GitHub and
+# links your npub to the repo.
+#
+# Secrets are NEVER stored here — set SIGN_WITH in the environment (nsec / bunker
+# / browser). See docs/ZAPSTORE.md.
+
+repository: https://github.com/hedwig-corp/bitchat-to-sonar
+
+# Prefer the phone APK asset (exclude the fat universal build).
+# All GitHub alpha tags are pre-releases — always pass --pre-release to zsp.
+match: "sonar-.*-android\\.apk$"
+
+# Optional: local signed phone APK when not fetching from GitHub.
+# release_source: dist/sonar-0.1-alpha.6-android.apk
+
+name: Sonar
+summary: Private messenger — Bluetooth nearby, Nostr everywhere, Lightning in-chat
+description: |
+  Sense who’s nearby before you see them.
+
+  Sonar is a private messenger that works two ways at once: Bluetooth finds
+  the people around you — even with no internet — and the open Nostr network
+  reaches everyone else. Your phone is the only account you need. No phone
+  number, no company server, no cloud backup of your chats.
+
+  ## Why Sonar
+
+  - **Works without internet** — Bluetooth mesh relays messages phone-to-phone.
+    Festivals, flights, blackouts, protests: if people are around, Sonar works.
+  - **Reaches anyone, anywhere** — out of range, messages travel over Nostr
+    (Marmot / White Noise). An open relay network nobody owns sits between
+    you only as encrypted transport — not a product company.
+  - **Private by design** — end-to-end encrypted DMs and groups. Your identity
+    is a key created on the device; verify friends in person with a safety number.
+  - **Pay as easily as you message** — Lightning / BOLT12 in-chat. Settle dinner
+    across the table over mesh or send sats when peers are far away.
+  - **Local-first** — transcripts open from storage on your phone first
+    (Signal-style). Sync is background, never a spinner on open chat.
+
+  ## Two networks, one chat
+
+  Sonar routes automatically: Bluetooth when your friend is in range, encrypted
+  open internet when they are not. You always know how a message traveled.
+
+  ## What’s included (alpha)
+
+  Encrypted DMs & groups · media & stickers · voice notes · Lightning payments ·
+  nearby radar · location channels · shareable group invites · offline payment
+  wakeups where configured.
+
+  Free, open source (Unlicense). Android alpha on Zapstore; iPhone/Mac on TestFlight.
+
+tags:
+  - messaging
+  - privacy
+  - messenger
+  - nostr
+  - bitcoin
+  - lightning
+  - mesh
+  - bluetooth
+  - p2p
+  - encrypted
+
+license: Unlicense
+website: https://sonarprivacy.xyz
+
+icon: apps/sonar/composeApp/src/commonMain/composeResources/drawable/sonar_icon.png
+
+# Prefer our store copy over GitHub README scrape.
+# (YAML always wins; skip-metadata on republish is still recommended.)
+metadata_sources: []
+
+# Publisher Nostr identity (must match SIGN_WITH). Required for relay whitelist.
+pubkey: npub1wg2m9ku823y5l5699dlj6294dc3cvwu4g34ldrtelxq20t27clxsd7dzaw
