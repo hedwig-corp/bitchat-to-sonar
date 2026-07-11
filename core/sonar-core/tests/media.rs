@@ -65,6 +65,11 @@ fn handle_blossom_conn(
                 .map(|v| v.trim().parse::<usize>().unwrap_or(0))
         })
         .unwrap_or(0);
+    let content_type = head.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("content-type")
+            .then(|| value.trim().to_ascii_lowercase())
+    });
     let body_start = header_end + 4;
     while buf.len() < body_start + content_length {
         match stream.read(&mut tmp) {
@@ -75,6 +80,16 @@ fn handle_blossom_conn(
     let body = buf[body_start..(body_start + content_length).min(buf.len())].to_vec();
 
     if method == "PUT" && path.ends_with("/upload") {
+        // The body is MIP-04 ciphertext, regardless of the original attachment
+        // type. A production Blossom server may reject it when it is mislabeled
+        // as image/jpeg, image/png, etc. (HTTP 415).
+        if content_type.as_deref() != Some("application/octet-stream") {
+            let _ = stream.write_all(
+                b"HTTP/1.1 415 Unsupported Media Type\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+            let _ = stream.flush();
+            return;
+        }
         use sha2::{Digest, Sha256};
         let sha = hex::encode(Sha256::digest(&body));
         store.lock().unwrap().insert(sha.clone(), body.clone());
@@ -138,13 +153,19 @@ async fn media_sends_over_white_noise_end_to_end() {
     android.sync().await.expect("android joins");
     let android_group = android.groups().expect("groups")[0].mls_group_id.clone();
 
-    // iOS sends an "image" (generic mime → no image decoder dependency).
-    let image = b"PNGish bytes -- iOS to Android encrypted media over White Noise".to_vec();
+    // iOS sends a real 1x1 PNG. The mock Blossom accepts only the ciphertext's
+    // true MIME (application/octet-stream), catching source-MIME upload bugs.
+    let image = hex::decode(concat!(
+        "89504e470d0a1a0a0000000d4948445200000001000000010804000000b51c0c02",
+        "0000000b4944415478da6364f80f00010501012718e3660000000049454e44ae4260",
+        "82"
+    ))
+    .expect("valid png fixture");
     ios.send_media(
         &ios_group,
         image.clone(),
-        "photo.bin",
-        "application/octet-stream",
+        "photo.png",
+        "image/png",
         "from iOS",
         &blossom,
     )
@@ -160,6 +181,7 @@ async fn media_sends_over_white_noise_end_to_end() {
         .expect("android sees a media message");
     assert!(!media_msg.mine);
     assert_eq!(media_msg.content, "from iOS");
+    assert_eq!(media_msg.media[0].mime_type, "image/png");
     let url = media_msg.media[0].url.clone();
     assert!(
         url.starts_with(&blossom),
@@ -179,9 +201,13 @@ async fn media_sends_over_white_noise_end_to_end() {
         .engine()
         .decrypt_media_by_url(&android_group, &url, &ciphertext)
         .expect("android decrypts");
+    // MDK sanitizes/re-encodes images before encryption, so the PNG container
+    // may differ while the image type and dimensions remain intact.
+    assert!(decrypted.starts_with(b"\x89PNG\r\n\x1a\n"));
     assert_eq!(
-        decrypted, image,
-        "iOS→Android media round-trips byte-for-byte"
+        &decrypted[16..24],
+        &image[16..24],
+        "iOS→Android media preserves PNG dimensions"
     );
 
     // Reverse direction: Android → iOS.
