@@ -59,4 +59,50 @@ class HomeMessageRowsTest {
         assertTrue(merged.any { it.listKey == "mesh:abc" })
         assertTrue(merged.any { it.listKey == "group-1" })
     }
+
+    @Test
+    fun localHydrationUsesPreviousPaintOrderAsRecencyTieBreaker() {
+        val chats = listOf(chat("same-old"), chat("newest"), chat("same-new"), chat("new-row"))
+        val timestamps = mapOf(
+            "newest" to 300L,
+            "same-old" to 200L,
+            "same-new" to 200L,
+            "new-row" to 0L,
+        )
+
+        val ordered = orderChatsByLocalRecency(
+            chats = chats,
+            latestSecs = { timestamps[it] ?: 0L },
+            previousOrder = listOf("newest", "same-new", "same-old"),
+        )
+
+        assertEquals(
+            listOf("newest", "same-new", "same-old", "new-row"),
+            ordered.map { it.id },
+        )
+    }
+
+    @Test
+    fun restoredMetadataKeepsMixedTransportRowsInRecencyOrder() {
+        val newest = chat("marmot-new")
+        val oldest = chat("marmot-old")
+        val blob = encodeChatSnapshot(
+            chats = listOf(newest, oldest),
+            messagesByChat = emptyMap(),
+            latestByChat = mapOf(newest.id to 300L, oldest.id to 100L),
+        )
+        val restoredChats = decodeChatSnapshot(blob).first
+        val restoredLatest = decodeChatSnapshotLatest(blob)
+
+        val merged = mergeHomeMessageRows(
+            meshRows = listOf(mesh("mesh-middle", 200L)),
+            chatRows = restoredChats,
+            marmotTsSecs = { restoredLatest[it] ?: 0L },
+        )
+
+        assertEquals(
+            listOf("marmot-new", "mesh:mesh-middle", "marmot-old"),
+            merged.map { it.listKey },
+        )
+    }
 }

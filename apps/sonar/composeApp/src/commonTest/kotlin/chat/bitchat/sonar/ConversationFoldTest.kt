@@ -265,7 +265,8 @@ class ConversationFoldTest {
 
     @Test
     fun chatSnapshotKeepsRowsWithoutPersistingMessages() {
-        val chat = SonarChat("group-1", "", listOf("npub1sara", "npub1me"))
+        val newest = SonarChat("group-z", "", listOf("npub1sara", "npub1me"))
+        val older = SonarChat("group-a", "", listOf("npub1bob", "npub1me"))
         val messages = listOf(
             SonarMsg(
                 id = "msg-1",
@@ -279,10 +280,17 @@ class ConversationFoldTest {
             ),
         )
 
-        val decoded = decodeChatSnapshot(encodeChatSnapshot(listOf(chat), mapOf(chat.id to messages)))
+        val decoded = decodeChatSnapshot(
+            encodeChatSnapshot(listOf(newest, older), mapOf(newest.id to messages)),
+        )
 
-        assertEquals(listOf(chat), decoded.first)
+        // The snapshot keeps the last local recency order instead of sorting by
+        // opaque group id, while still excluding plaintext message content.
+        assertEquals(listOf(newest, older), decoded.first)
         assertEquals(emptyMap(), decoded.second)
+        assertEquals(mapOf(newest.id to 42L), decodeChatSnapshotLatest(
+            encodeChatSnapshot(listOf(newest, older), mapOf(newest.id to messages)),
+        ))
     }
 
     @Test

@@ -37,3 +37,25 @@ internal fun mergeHomeMessageRows(
             is HomeMessageRow.Marmot -> marmotTsSecs(row.chat.id)
         }
     }
+
+/**
+ * Order the authoritative local chat rows by their bounded transcript tails.
+ *
+ * [previousOrder] is the last list painted by the UI. It is the deterministic
+ * fallback for equal or unavailable timestamps, so opening the local database
+ * cannot reshuffle otherwise unchanged rows before their summaries arrive.
+ */
+internal fun orderChatsByLocalRecency(
+    chats: List<SonarChat>,
+    latestSecs: (chatId: String) -> Long,
+    previousOrder: List<String>,
+): List<SonarChat> {
+    val previousRank = previousOrder.withIndex().associate { it.value to it.index }
+    return chats.withIndex()
+        .sortedWith(
+            compareByDescending<IndexedValue<SonarChat>> { latestSecs(it.value.id) }
+                .thenBy { previousRank[it.value.id] ?: Int.MAX_VALUE }
+                .thenBy { it.index },
+        )
+        .map { it.value }
+}

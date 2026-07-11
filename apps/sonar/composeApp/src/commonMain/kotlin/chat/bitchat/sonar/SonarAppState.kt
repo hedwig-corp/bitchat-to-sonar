@@ -328,6 +328,7 @@ data class MarmotRowModel(
 class SonarAppState(private val scope: CoroutineScope) {
     private val initialChatSnapshotBlob = SonarCore.loadBlob(CHAT_SNAPSHOT_BLOB_KEY)
     private val initialChatSnapshot = decodeChatSnapshot(initialChatSnapshotBlob)
+    private val initialChatSnapshotLatest = decodeChatSnapshotLatest(initialChatSnapshotBlob)
     private val initialGroupFoldMap = decodeGroupFoldMap(SonarCore.loadBlob(GROUP_FOLDS_BLOB_KEY))
     private val initialFoldedGroupIds: Set<String> = initialChatSnapshot.first
         .mapTo(hashSetOf()) { it.id }
@@ -356,6 +357,15 @@ class SonarAppState(private val scope: CoroutineScope) {
                 snapshotVersion++
             }
         }
+    /** Thread-style local sort metadata restored before the encrypted core opens.
+     *  Message bodies remain in the core database; this map only prevents the
+     *  mixed mesh/Marmot Home list from treating every restored Marmot row as 0. */
+    private var chatSnapshotLatestByChat: Map<String, Long> = initialChatSnapshotLatest
+
+    private fun localLatestTs(chatId: String): Long =
+        chatSnapshotMessagesByChat[chatId]?.lastOrNull()?.tsSecs
+            ?: chatSnapshotLatestByChat[chatId]
+            ?: 0L
     /** Pending 1:1 secure chats keyed by local id (`npub:…`). Value carries
      *  the peer npub plus [PendingMarmotDirect.createdAtSecs] so the Home list
      *  can sort by creation time (iOS `pending.createdAt` / `dmRows` parity)
@@ -1012,7 +1022,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 ).also { if (it) scheduleCapabilitySettleRefresh(peerId, meshPeerFirstSeenMs[peerId] ?: nowMs, nowMs) }
         }
         if (nameMatched) return true
-        if (!hasRecentMarmotActivityForCapabilitySettle(chatSnapshotMessagesByChat[chat.id]?.lastOrNull()?.tsSecs, nowMs)) {
+        if (!hasRecentMarmotActivityForCapabilitySettle(localLatestTs(chat.id), nowMs)) {
             return false
         }
         // Also hold if ANY mesh peer is still within its settle window and
@@ -1116,7 +1126,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         val result = pendingMarmotChats() + pendingMarmotGroupChats() + dedupeDirectMarmotChats(
             chats = standalone,
             ownNpub = npub,
-            latestSecs = { chatSnapshotMessagesByChat[it]?.lastOrNull()?.tsSecs ?: 0L },
+            latestSecs = ::localLatestTs,
         )
         // Only cache the stable (no active settle window) computation. A held
         // chat can flip to visible purely by time passing, which the key can't
@@ -2390,7 +2400,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         dedupeDirectMarmotChats(
             chats = chats,
             ownNpub = npub,
-            latestSecs = { chatSnapshotMessagesByChat[it]?.lastOrNull()?.tsSecs ?: 0L },
+            latestSecs = ::localLatestTs,
         ).count { isVerified(it.id) }
 
     fun unreadForChat(chatId: String): Long =
@@ -2462,7 +2472,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 },
                 // Pending rows use creation time so recency merge does not sink
                 // a freshly-started chat under older history (iOS dmRows parity).
-                tsSecs = newest?.tsSecs ?: pendingCreatedAtSecs(chat.id) ?: 0L,
+                tsSecs = newest?.tsSecs ?: pendingCreatedAtSecs(chat.id) ?: localLatestTs(chat.id),
                 verified = ids.any { it in verifiedChatIds },
                 unread = ids.sumOf { unreadByChat[it] ?: 0L } > 0,
                 pending = pending,
@@ -5136,7 +5146,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private fun preferredDirectMarmotChat(groups: List<SonarChat>): SonarChat? =
         groups.maxWithOrNull(
-            compareBy<SonarChat> { chatSnapshotMessagesByChat[it.id]?.lastOrNull()?.tsSecs ?: 0L }
+            compareBy<SonarChat> { localLatestTs(it.id) }
                 .thenBy { it.id }
         )
 
@@ -5590,11 +5600,15 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private fun persistChatSnapshot() {
-        SonarCore.saveBlob(CHAT_SNAPSHOT_BLOB_KEY, encodeChatSnapshot(chats, chatSnapshotMessagesByChat))
+        SonarCore.saveBlob(
+            CHAT_SNAPSHOT_BLOB_KEY,
+            encodeChatSnapshot(chats, chatSnapshotMessagesByChat, chatSnapshotLatestByChat),
+        )
     }
 
     private fun clearChatSnapshot() {
         chatSnapshotMessagesByChat = emptyMap()
+        chatSnapshotLatestByChat = emptyMap()
         SonarCore.saveBlob(CHAT_SNAPSHOT_BLOB_KEY, "")
     }
 
@@ -5662,14 +5676,41 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private suspend fun refreshChatsInner() {
+        val previousOrder = chats.map { it.id }
         val loadedChats = SonarCore.chats()
-        if (started || loadedChats.isNotEmpty()) {
-            chats = loadedChats
-            val activeIds = loadedChats.mapTo(hashSetOf()) { it.id }
-            chatSnapshotMessagesByChat = chatSnapshotMessagesByChat.filterKeys { it in activeIds }
-            persistChatSnapshot()
+        val localChats = if (started || loadedChats.isNotEmpty()) loadedChats else chats
+        val activeIds = localChats.mapTo(hashSetOf()) { it.id }
+        val updatedMessages = chatSnapshotMessagesByChat
+            .filterKeys { it in activeIds }
+            .toMutableMap()
+        val updatedLatest = chatSnapshotLatestByChat
+            .filterKeys { it in activeIds }
+            .toMutableMap()
+        if (localChats.isNotEmpty()) {
+            val pages = runCatching {
+                SonarCore.recentMessagePages(LOCAL_SUMMARY_CHAT_LIMIT, LOCAL_SUMMARY_PAGE_LIMIT)
+            }.getOrDefault(emptyList())
+            for (page in pages) {
+                if (page.messages.isNotEmpty() && page.chatId in activeIds) {
+                    updatedMessages[page.chatId] = page.messages
+                    updatedLatest[page.chatId] = page.messages.last().tsSecs
+                }
+            }
         }
-        refreshTopChatLocalSummaries()
+
+        // Publish one coherent local snapshot. Previously `chats = loadedChats`
+        // rendered the core's raw order, then a suspension in
+        // `recentMessagePages()` let Compose paint again before the recency sort.
+        // That two-step hydrate was the visible startup reorder.
+        chatSnapshotMessagesByChat = updatedMessages
+        chatSnapshotLatestByChat = updatedLatest
+        chats = orderChatsByLocalRecency(
+            chats = localChats,
+            latestSecs = { updatedLatest[it] ?: 0L },
+            previousOrder = previousOrder,
+        )
+        persistChatSnapshot()
+        refreshUnreadCounts()
         for (c in chats) {
             c.members.forEach {
                 if (it != npub && it.isNotBlank()) ensureSonarDescriptor(it)
@@ -5677,33 +5718,6 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         groupInvites = runCatching { SonarCore.pendingGroupInvites() }.getOrDefault(emptyList())
         resolvePendingMarmotChats()
-    }
-
-    private suspend fun refreshTopChatLocalSummaries() {
-        if (chats.isEmpty()) return
-        val updated = chatSnapshotMessagesByChat.toMutableMap()
-        val pages = runCatching {
-            SonarCore.recentMessagePages(LOCAL_SUMMARY_CHAT_LIMIT, LOCAL_SUMMARY_PAGE_LIMIT)
-        }.getOrDefault(emptyList())
-        for (page in pages) {
-            if (page.messages.isNotEmpty()) {
-                updated[page.chatId] = page.messages
-            }
-        }
-        chatSnapshotMessagesByChat = updated
-        orderChatsByLocalRecency()
-        persistChatSnapshot()
-        refreshUnreadCounts()
-    }
-
-    private fun orderChatsByLocalRecency() {
-        chats = chats.withIndex()
-            .sortedWith(
-                compareByDescending<IndexedValue<SonarChat>> {
-                    chatSnapshotMessagesByChat[it.value.id]?.lastOrNull()?.tsSecs ?: 0L
-                }.thenBy { it.index }
-            )
-            .map { it.value }
     }
 
     @OptIn(kotlinx.coroutines.FlowPreview::class)
