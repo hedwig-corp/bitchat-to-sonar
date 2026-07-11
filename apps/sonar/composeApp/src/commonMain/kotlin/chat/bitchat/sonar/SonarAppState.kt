@@ -2209,6 +2209,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 SonarCore.setNickname(nickname)
                 npub = SonarCore.prepareIdentityForOnboarding()
                 SonarCore.setOnboardingComplete(true)
+                retryPushRegistrationAfterAccountReady()
                 nick = nickname
                 onboarded = true
                 refreshMeshIdentity()
@@ -2263,6 +2264,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 started = false
                 connecting = false
                 SonarCore.setOnboardingComplete(true)
+                retryPushRegistrationAfterAccountReady()
                 onboarded = true
                 nick = SonarCore.nickname()
                 stack = listOf(Screen.Home)
