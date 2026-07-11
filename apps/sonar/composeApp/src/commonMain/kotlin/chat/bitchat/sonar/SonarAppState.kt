@@ -6563,6 +6563,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             failureLabel = failureLabel,
         )
     }
+
+    private fun sendMediaOverMarmot(
         chatId: String,
         data: ByteArray,
         filename: String,

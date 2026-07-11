@@ -21,12 +21,12 @@
 //!   sonar_ble_notify(...)      -> enqueue for that subscriber, fail-fast otherwise
 //!   sonar_ble_drain_tx_results_json() -> native notify acceptance/failure results
 
-use btleplug::api::{Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter};
-use btleplug::platform::Manager;
 use bluster::gatt::characteristic::{Characteristic, Properties, Read, Secure, Write};
 use bluster::gatt::event::{Event, Response};
 use bluster::gatt::service::Service;
 use bluster::Peripheral;
+use btleplug::api::{Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter};
+use btleplug::platform::Manager;
 use futures::StreamExt;
 use once_cell::sync::Lazy;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -68,6 +68,7 @@ struct TxPacket {
 }
 
 static TX_PACKETS: Lazy<Mutex<VecDeque<TxPacket>>> = Lazy::new(|| Mutex::new(VecDeque::new()));
+const MAX_TX_PACKETS: usize = 256;
 
 struct TxResult {
     delivery_id: u64,
@@ -86,6 +87,14 @@ fn record_tx_result(delivery_id: u64, accepted: bool) {
             accepted,
         });
     }
+}
+
+fn enqueue_tx_packet(queue: &mut VecDeque<TxPacket>, packet: TxPacket) -> bool {
+    if queue.len() >= MAX_TX_PACKETS {
+        return false;
+    }
+    queue.push_back(packet);
+    true
 }
 
 fn fail_pending_tx() {
@@ -155,7 +164,10 @@ pub extern "C" fn sonar_ble_start() {
     std::thread::Builder::new()
         .name("sonar-ble-scan".into())
         .spawn(|| {
-            let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+            let rt = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
                 Ok(rt) => rt,
                 Err(_) => {
                     RUNNING.store(false, Ordering::SeqCst);
@@ -276,7 +288,9 @@ async fn scan_loop() {
     // Scan FILTERED to the bitchat service (like the Android app) — far more
     // reliable than scanning everything and checking the parsed service UUID,
     // which CoreBluetooth often reports empty (especially while also advertising).
-    let filter = ScanFilter { services: vec![BITCHAT_SERVICE] };
+    let filter = ScanFilter {
+        services: vec![BITCHAT_SERVICE],
+    };
     match central.start_scan(filter.clone()).await {
         Ok(_) => dbg_log("scan_loop: scan started (bitchat filter)"),
         Err(e) => dbg_log(&format!("scan_loop: start_scan ERR {e}")),
@@ -298,7 +312,9 @@ async fn scan_loop() {
             let total = DEVICES.lock().map(|d| d.len()).unwrap_or(0);
             dbg_log(&format!(
                 "scan: rescan stop={:?} start={:?} (total devices seen={})",
-                stop.is_ok(), start.is_ok(), total
+                stop.is_ok(),
+                start.is_ok(),
+                total
             ));
             last_rescan = Instant::now();
         }
@@ -320,7 +336,9 @@ async fn handle_event(central: &btleplug::platform::Adapter, ev: CentralEvent) {
         | CentralEvent::DeviceDisconnected(id) => id.clone(),
         _ => return,
     };
-    let Ok(p) = central.peripheral(&id).await else { return };
+    let Ok(p) = central.peripheral(&id).await else {
+        return;
+    };
     let props = p.properties().await.ok().flatten();
     let name = props.as_ref().and_then(|pr| pr.local_name.clone());
     let rssi = props.as_ref().and_then(|pr| pr.rssi).unwrap_or(0);
@@ -332,7 +350,12 @@ async fn handle_event(central: &btleplug::platform::Adapter, ev: CentralEvent) {
     if let Ok(mut d) = DEVICES.lock() {
         d.insert(
             id.to_string(),
-            Seen { name, rssi, bitchat, at: Instant::now() },
+            Seen {
+                name,
+                rssi,
+                bitchat,
+                at: Instant::now(),
+            },
         );
     }
 }
@@ -351,7 +374,10 @@ pub unsafe extern "C" fn sonar_ble_set_announce(ptr: *const u8, len: usize) {
     } else {
         Some(std::slice::from_raw_parts(ptr, len).to_vec())
     };
-    dbg_log(&format!("set_announce: {} bytes", next.as_ref().map(|v| v.len()).unwrap_or(0)));
+    dbg_log(&format!(
+        "set_announce: {} bytes",
+        next.as_ref().map(|v| v.len()).unwrap_or(0)
+    ));
     if let Ok(mut a) = ANNOUNCE.lock() {
         *a = next;
     }
@@ -367,7 +393,10 @@ pub extern "C" fn sonar_ble_start_advertising() {
     std::thread::Builder::new()
         .name("sonar-ble-adv".into())
         .spawn(|| {
-            let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+            let rt = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
                 Ok(rt) => rt,
                 Err(_) => {
                     ADVERTISING.store(false, Ordering::SeqCst);
@@ -421,12 +450,18 @@ pub unsafe extern "C" fn sonar_ble_notify(
     }
     let bytes = std::slice::from_raw_parts(ptr, len).to_vec();
     if let Ok(mut q) = TX_PACKETS.lock() {
-        q.push_back(TxPacket {
-            subscription_token: expected_subscription_token,
-            delivery_id,
-            bytes,
-        });
-        1
+        if enqueue_tx_packet(
+            &mut q,
+            TxPacket {
+                subscription_token: expected_subscription_token,
+                delivery_id,
+                bytes,
+            },
+        ) {
+            1
+        } else {
+            0
+        }
     } else {
         0
     }
@@ -476,7 +511,11 @@ async fn run_peripheral() -> Result<(), Box<dyn std::error::Error>> {
     dbg_log("advertise: started (bitchat service)");
 
     fn announce() -> Vec<u8> {
-        ANNOUNCE.lock().ok().and_then(|a| a.clone()).unwrap_or_default()
+        ANNOUNCE
+            .lock()
+            .ok()
+            .and_then(|a| a.clone())
+            .unwrap_or_default()
     }
 
     let mut last_notify = Instant::now()
@@ -490,7 +529,11 @@ async fn run_peripheral() -> Result<(), Box<dyn std::error::Error>> {
             let ann = announce();
             if !ann.is_empty() {
                 let sent = peripheral.notify(&ann);
-                dbg_log(&format!("advertise: notify announce ({} bytes) sent={}", ann.len(), sent));
+                dbg_log(&format!(
+                    "advertise: notify announce ({} bytes) sent={}",
+                    ann.len(),
+                    sent
+                ));
             }
             last_notify = Instant::now();
         }
@@ -505,7 +548,7 @@ async fn run_peripheral() -> Result<(), Box<dyn std::error::Error>> {
                 record_tx_result(pkt.delivery_id, false);
                 continue;
             }
-            if !peripheral.notify(&pkt.bytes) {
+            if !peripheral.notify_for_subscription(&pkt.bytes, pkt.subscription_token) {
                 if let Ok(mut q) = TX_PACKETS.lock() {
                     q.push_front(pkt);
                 }
@@ -517,7 +560,10 @@ async fn run_peripheral() -> Result<(), Box<dyn std::error::Error>> {
         // on macOS; we patched it to queue writes — take them here).
         let writes = peripheral.take_writes();
         if !writes.is_empty() {
-            dbg_log(&format!("advertise: rx {} write packet(s) from central", writes.len()));
+            dbg_log(&format!(
+                "advertise: rx {} write packet(s) from central",
+                writes.len()
+            ));
             if let Ok(mut q) = RX_PACKETS.lock() {
                 for (subscription_token, bytes) in writes {
                     if q.len() < 256 {
@@ -541,7 +587,10 @@ async fn run_peripheral() -> Result<(), Box<dyn std::error::Error>> {
                 Event::WriteRequest(req) => {
                     // The central's packets (its announce / handshake). Discovery
                     // doesn't consume them yet; ack so it isn't left hanging.
-                    dbg_log(&format!("advertise: rx write {} bytes from central", req.data.len()));
+                    dbg_log(&format!(
+                        "advertise: rx write {} bytes from central",
+                        req.data.len()
+                    ));
                     let _ = req.response.send(Response::Success(vec![]));
                 }
                 Event::NotifyUnsubscribe => {}
@@ -584,5 +633,35 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].delivery_id, 41);
         assert!(!results[0].accepted);
+    }
+
+    #[test]
+    fn native_transmit_queue_is_bounded_and_fifo() {
+        let mut queue = VecDeque::new();
+        for delivery_id in 1..=MAX_TX_PACKETS as u64 {
+            assert!(enqueue_tx_packet(
+                &mut queue,
+                TxPacket {
+                    subscription_token: 7,
+                    delivery_id,
+                    bytes: vec![delivery_id as u8],
+                },
+            ));
+        }
+
+        assert!(!enqueue_tx_packet(
+            &mut queue,
+            TxPacket {
+                subscription_token: 7,
+                delivery_id: MAX_TX_PACKETS as u64 + 1,
+                bytes: vec![0],
+            },
+        ));
+        assert_eq!(queue.len(), MAX_TX_PACKETS);
+        assert_eq!(queue.pop_front().map(|packet| packet.delivery_id), Some(1));
+        assert_eq!(
+            queue.pop_back().map(|packet| packet.delivery_id),
+            Some(MAX_TX_PACKETS as u64),
+        );
     }
 }

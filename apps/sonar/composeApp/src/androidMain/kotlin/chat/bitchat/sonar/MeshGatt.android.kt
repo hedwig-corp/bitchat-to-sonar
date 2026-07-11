@@ -618,6 +618,7 @@ object MeshGatt {
     /** When the in-flight op was issued, for the tick's stuck-op recovery. */
     private val opInFlightSinceMs = ConcurrentHashMap<String, Long>()
 
+    @Synchronized
     private fun writePacket(gatt: BluetoothGatt, ch: BluetoothGattCharacteristic, packet: ByteArray) {
         clientWriteQueue.getOrPut(gatt.device.address) { java.util.concurrent.ConcurrentLinkedQueue() }
             .add(GattOp.WriteChar(ch, packet))
@@ -695,16 +696,24 @@ object MeshGatt {
     /** When the in-flight notify was issued, for the tick's stuck recovery. */
     private val notifyInFlightSinceMs = ConcurrentHashMap<String, Long>()
 
+    @Synchronized
     private fun notify(device: BluetoothDevice, packet: ByteArray) {
-        serverNotifyQueue.getOrPut(device.address) { java.util.concurrent.ConcurrentLinkedQueue() }.add(OutboundPacket(packet))
-        pumpServerNotify(device.address)
+        val addr = device.address
+        val accepted = serverNotifyQueue
+            .getOrPut(addr) { BoundedFifo(MAX_PENDING_GATT_PACKETS) }
+            .tryAdd(OutboundPacket(packet))
+        if (!accepted) {
+            android.util.Log.w(TAG, "dropping discovery packet: server queue full for $addr")
+            return
+        }
+        pumpServerNotify(addr)
     }
 
     @Synchronized
     private fun pumpServerNotify(addr: String) {
         if (serverNotifying.contains(addr)) return
         val q = serverNotifyQueue[addr] ?: return
-        val next = q.poll() ?: return
+        val next = q.removeFirstOrNull() ?: return
         val s = server ?: return
         val ch = characteristic ?: return
         val device = serverDevices[addr] ?: return

@@ -91,6 +91,10 @@ impl Peripheral {
         false
     }
 
+    pub fn notify_for_subscription(&self, _data: &[u8], _subscription_token: u64) -> bool {
+        false
+    }
+
     pub fn subscription_token(&self) -> u64 {
         0
     }

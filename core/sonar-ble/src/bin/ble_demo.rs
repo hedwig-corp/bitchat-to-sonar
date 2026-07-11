@@ -33,7 +33,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into_iter()
         .next()
         .ok_or("no Bluetooth adapter found")?;
-    println!("adapter: {}\n", central.adapter_info().await.unwrap_or_default());
+    println!(
+        "adapter: {}\n",
+        central.adapter_info().await.unwrap_or_default()
+    );
 
     let mut events = central.events().await?;
     central.start_scan(ScanFilter::default()).await?;

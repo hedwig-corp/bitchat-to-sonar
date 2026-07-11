@@ -2,8 +2,10 @@ package chat.bitchat.sonar
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 class DeliveryRoutingTest {
     @Test
@@ -22,6 +24,40 @@ class DeliveryRoutingTest {
     @Test
     fun successfulDeliveryHasNoFallbackItems() {
         assertEquals(emptyList(), collectFailedDeliveries(listOf("a", "b")) { true })
+    }
+
+    @Test
+    fun boundedFifoPreservesRapidSendOrder() {
+        val queue = BoundedFifo<String>(3)
+
+        assertTrue(queue.tryAdd("first"))
+        assertTrue(queue.tryAddAll(listOf("second", "third")))
+
+        assertEquals("first", queue.removeFirstOrNull())
+        assertEquals("second", queue.removeFirstOrNull())
+        assertEquals("third", queue.removeFirstOrNull())
+        assertNull(queue.removeFirstOrNull())
+    }
+
+    @Test
+    fun boundedFifoRejectsFragmentedDeliveryAtomically() {
+        val queue = BoundedFifo<Int>(3)
+        assertTrue(queue.tryAdd(1))
+
+        assertFalse(queue.tryAddAll(listOf(2, 3, 4)))
+
+        assertEquals(listOf(1), queue.drain())
+    }
+
+    @Test
+    fun boundedFifoDrainsOnlySurvivingDeliveries() {
+        val queue = BoundedFifo<Int>(4)
+        assertTrue(queue.tryAddAll(listOf(1, 2, 3, 4)))
+
+        queue.removeAll { it % 2 == 0 }
+
+        assertEquals(listOf(1, 3), queue.drain())
+        assertFalse(queue.isNotEmpty())
     }
 
     @Test

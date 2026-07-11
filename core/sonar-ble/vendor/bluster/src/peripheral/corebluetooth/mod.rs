@@ -66,6 +66,12 @@ impl Peripheral {
         self.peripheral_manager.notify(data)
     }
 
+    /// PATCH (Sonar): notify only the central owning [subscription_token].
+    pub fn notify_for_subscription(&self, data: &[u8], subscription_token: u64) -> bool {
+        self.peripheral_manager
+            .notify_for_subscription(data, subscription_token)
+    }
+
     /// PATCH (Sonar): non-zero identity of the active notification subscription.
     pub fn subscription_token(&self) -> u64 {
         self.peripheral_manager.subscription_token()
