@@ -47,4 +47,14 @@ struct SonarConversationFoldTests {
 
         #expect(key == nil)
     }
+
+    @Test
+    func foldedHomeTitlePrefersMarmotProfileOverPeerRadarName() {
+        let title = snFoldedDirectMarmotHomeTitle(
+            isDirectGroup: true,
+            marmotProfileTitle: "Sara D",
+            peerDerivedTitle: "Wrong BLE Name"
+        )
+        #expect(title == "Sara D")
+    }
 }
