@@ -324,4 +324,40 @@ class ConversationFoldTest {
 
         assertEquals(listOf(newer, room), visible)
     }
+
+    @Test
+    fun meshFingerprintsLinkedToSameNpubFormOneConversation() {
+        val sharedNpubHex = "ab".repeat(32)
+        val groups = groupMeshPeerIdsByIdentity(
+            peerIds = listOf("fp-old", "fp-current", "fp-other"),
+            linkedNpubByPeer = mapOf(
+                "fp-old" to sharedNpubHex.uppercase(),
+                "fp-current" to sharedNpubHex,
+                "fp-other" to "cd".repeat(32),
+            ),
+        )
+
+        assertEquals(
+            setOf(setOf("fp-old", "fp-current"), setOf("fp-other")),
+            groups.map { it.toSet() }.toSet(),
+        )
+    }
+
+    @Test
+    fun persistedFoldTargetKeepsCanonicalMeshRowStable() {
+        assertEquals(
+            "fp-current",
+            selectCanonicalMeshPeerId(
+                aliases = listOf("fp-old", "fp-current", "fp-new"),
+                persistedFoldPeerIds = setOf("fp-current"),
+            ),
+        )
+        assertEquals(
+            "fp-new",
+            selectCanonicalMeshPeerId(
+                aliases = listOf("fp-old", "fp-new"),
+                persistedFoldPeerIds = emptySet(),
+            ),
+        )
+    }
 }

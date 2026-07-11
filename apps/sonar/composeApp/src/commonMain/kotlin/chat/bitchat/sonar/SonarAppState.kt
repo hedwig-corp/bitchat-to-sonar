@@ -169,6 +169,34 @@ internal fun dedupeDirectMarmotChats(
     return chats.filter { it.id in selectedIds }
 }
 
+/** Stable conversation identity for BLE fingerprints that advertise the same
+ *  Sonar account. Unlinked peers remain isolated by their Noise fingerprint. */
+internal fun meshConversationIdentityKey(peerId: String, linkedNpubHex: String?): String {
+    val linked = linkedNpubHex
+        ?.trim()
+        ?.lowercase()
+        ?.takeIf { value -> value.length == 64 && value.all { it in "0123456789abcdef" } }
+    return linked?.let { "npub:$it" } ?: "peer:$peerId"
+}
+
+internal fun groupMeshPeerIdsByIdentity(
+    peerIds: Collection<String>,
+    linkedNpubByPeer: Map<String, String>,
+): List<List<String>> =
+    peerIds.distinct()
+        .groupBy { meshConversationIdentityKey(it, linkedNpubByPeer[it]) }
+        .values
+        .map { it.sorted() }
+
+/** Prefer an already-persisted fold target so a row key stays stable; otherwise
+ *  choose a deterministic fingerprint from the alias set. */
+internal fun selectCanonicalMeshPeerId(
+    aliases: Collection<String>,
+    persistedFoldPeerIds: Set<String>,
+): String? =
+    aliases.filter { it in persistedFoldPeerIds }.minOrNull()
+        ?: aliases.minOrNull()
+
 /** Composite scan watermark: the newest-message SECOND plus the message COUNT.
  *  Timestamps are second-resolution, so a message landing in the SAME second as
  *  the last scanned one (common for ⚡PAY PAY/DONE pairs or a call control sent
@@ -1551,6 +1579,35 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun npubRawFor(peerId: String): ByteArray? =
         sonarProfile(peerId)?.npub
             ?: linkByFp[peerId]?.hexToBytesOrEmpty()?.takeIf { it.size == 32 }
+
+    /** Every historical/live Noise fingerprint known to represent the same npub. */
+    private fun meshPeerAliases(peerId: String): List<String> {
+        val identity = meshConversationIdentityKey(peerId, linkByFp[peerId])
+        val candidates = buildSet {
+            add(peerId)
+            addAll(meshChats.keys)
+            addAll(meshChatNames.keys)
+            addAll(linkByFp.keys)
+            addAll(rawMeshPeerIds)
+            addAll(foldedGroupPeerIds.values)
+            addAll(groupFoldMap.values)
+        }
+        return candidates
+            .filter { meshConversationIdentityKey(it, linkByFp[it]) == identity }
+            .sorted()
+    }
+
+    private fun canonicalMeshPeerId(peerId: String): String =
+        selectCanonicalMeshPeerId(meshPeerAliases(peerId), groupFoldMap.values.toSet()) ?: peerId
+
+    private fun mergedMeshMessages(peerId: String): List<SonarMsg> =
+        meshPeerAliases(peerId)
+            .flatMap { meshChats[it].orEmpty() }
+            .distinctBy { it.id }
+            .sortedBy { it.tsSecs }
+
+    private fun liveMeshRoutePeerId(peerId: String): String? =
+        meshPeerAliases(peerId).firstOrNull { MeshRadio.hasMeshLink(it) }
 
     fun npubStringForPeer(peerId: String): String? =
         npubRawFor(peerId)?.let { Bech32.encode("npub", it) }
@@ -2943,17 +3000,18 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  range for a Sonar peer — both legs merged into one thread. [pay] auto-opens
      *  the payment sheet (radar "Send sats"). */
     fun openDm(peerId: String, name: String, pay: Boolean = false) {
-        val id = meshChatId(peerId)
-        if (name.isNotBlank()) rememberMeshName(peerId, name)
+        val canonicalPeerId = canonicalMeshPeerId(peerId)
+        val id = meshChatId(canonicalPeerId)
+        if (name.isNotBlank()) rememberMeshName(canonicalPeerId, name)
         push(Screen.Chat(id, name, pay))
-        messages = visibleMessagesForChat(id, meshChats[peerId].orEmpty()) // immediate mesh view; Marmot leg merges in async
+        messages = visibleMessagesForChat(id, mergedMeshMessages(canonicalPeerId)) // immediate merged alias view; Marmot leg merges in async
         processPayLines(id, messages)
         scope.launch {
-            refreshOpenDm(peerId) // hydrate local Marmot transcript before chat list refresh
+            refreshOpenDm(canonicalPeerId) // hydrate local Marmot transcript before chat list refresh
             refreshChats()
             // Reconcile the open transcript after chat-list refresh may discover
             // the peer's Marmot group mapping.
-            refreshOpenDm(peerId)
+            refreshOpenDm(canonicalPeerId)
         }
     }
 
@@ -3011,16 +3069,23 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /** Delete ONE BLE-mesh private conversation locally (in-memory + on-disk). */
     fun deleteMeshDm(peerId: String) {
-        val chatId = meshChatId(peerId)
+        val canonicalPeerId = canonicalMeshPeerId(peerId)
+        val aliases = meshPeerAliases(canonicalPeerId)
+        val chatId = meshChatId(canonicalPeerId)
         val wasOpen = (stack.lastOrNull() as? Screen.Chat)?.id == chatId
         val foldedGroups = (
-            npubRawFor(peerId)?.let { marmotGroupsForNpub(it) }.orEmpty() +
-                chats.filter { isDirectMarmotChat(it) && peerIdForMarmotGroup(it) == peerId }
+            npubRawFor(canonicalPeerId)?.let { marmotGroupsForNpub(it) }.orEmpty() +
+                chats.filter { group ->
+                    isDirectMarmotChat(group) &&
+                        peerIdForMarmotGroup(group)?.let { it in aliases } == true
+                }
             ).distinctBy { it.id }
         val foldedGroupIdsToDelete = foldedGroups.mapTo(hashSetOf()) { it.id }
-        meshChats.remove(peerId)
-        meshChatNames.remove(peerId)
-        meshDmRows = meshDmRows.filterNot { it.peerId == peerId }
+        aliases.forEach { alias ->
+            meshChats.remove(alias)
+            meshChatNames.remove(alias)
+        }
+        meshDmRows = meshDmRows.filterNot { row -> row.peerId in aliases }
         if (foldedGroupIdsToDelete.isNotEmpty()) {
             chats = chats.filterNot { it.id in foldedGroupIdsToDelete }
             foldedGroupIds = foldedGroupIds - foldedGroupIdsToDelete
@@ -3037,7 +3102,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         updateBleDiscoveryPolicy()
         if (wasOpen && stack.size > 1) stack = stack.dropLast(1)
         scope.launch {
-            MessageStore.deleteMeshDm(peerId)
+            aliases.forEach { MessageStore.deleteMeshDm(it) }
             foldedGroups.forEach { group ->
                 runCatching { SonarCore.deleteChat(group.id) }
                     .onFailure { toast = "couldn't delete chat: ${it.message}" }
@@ -3530,15 +3595,18 @@ class SonarAppState(private val scope: CoroutineScope) {
             }
             chatId != null && isMeshChat(chatId) -> {
                 val peerId = meshPeerId(chatId)
+                val aliases = meshPeerAliases(peerId)
                 val hasWhiteNoiseLeg = npubRawFor(peerId)?.let { marmotGroupsForNpub(it).isNotEmpty() }
-                    ?: chats.any { peerIdForMarmotGroup(it) == peerId }
+                    ?: chats.any { group -> peerIdForMarmotGroup(group)?.let { it in aliases } == true }
                 if (hasWhiteNoiseLeg) {
                     toast = "Use Delete chat to remove White Noise history"
                     return
                 }
-                meshChats[peerId] = emptyList()
+                aliases.forEach { alias ->
+                    meshChats[alias] = emptyList()
+                    persistMesh(alias)
+                }
                 messages = emptyList()
-                persistMesh(peerId)
                 refreshMeshDmRows()
                 toast = "Cleared this chat on this device"
             }
@@ -4005,7 +4073,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                     if (sc.id == chatId) {
                         if (isMeshChat(chatId)) {
                             val peerId = meshPeerId(chatId)
-                            val mesh = meshChats[peerId].orEmpty()
+                            val mesh = mergedMeshMessages(peerId)
                             val wn = marmotMessagesForPeer(peerId)
                             val merged = withSendEchoes(chatId, mergePendingMediaUploads(chatId, mesh + wn))
                             setCurrentVisibleMessages(chatId, merged)
@@ -4092,7 +4160,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                     if (sc.id == chatId) {
                         if (isMeshChat(chatId)) {
                             val peerId = meshPeerId(chatId)
-                            val mesh = meshChats[peerId].orEmpty()
+                            val mesh = mergedMeshMessages(peerId)
                             val wn = marmotMessagesForPeer(peerId)
                             val merged = withSendEchoes(chatId, mergePendingMediaUploads(chatId, mesh + wn))
                             setCurrentVisibleMessages(chatId, merged)
@@ -4194,7 +4262,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                     if (sc.id == chatId) {
                         if (isMeshChat(chatId)) {
                             val peerId = meshPeerId(chatId)
-                            val mesh = meshChats[peerId].orEmpty()
+                            val mesh = mergedMeshMessages(peerId)
                             val wn = marmotMessagesForPeer(peerId)
                             val merged = withSendEchoes(chatId, mergePendingMediaUploads(chatId, mesh + wn))
                             setCurrentVisibleMessages(chatId, merged)
@@ -4223,7 +4291,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (isMeshChat(chatId)) {
             val peerId = meshPeerId(chatId)
             val content = meshStickerContent(packCoordinate, sticker.shortcode, sticker.sha256)
-            if (MeshRadio.hasMeshLink(peerId)) { sendMesh(peerId, content); return }
+            liveMeshRoutePeerId(peerId)?.let { route -> sendMesh(route, content); return }
             val raw = npubRawFor(peerId)
             if (raw != null) {
                 when {
@@ -4350,7 +4418,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             toast = "Message queued and will send in order."
             return
         }
-        if (MeshRadio.hasMeshLink(peerId)) { sendMesh(peerId, text); return }
+        liveMeshRoutePeerId(peerId)?.let { route -> sendMesh(route, text); return }
         val raw = npubRawFor(peerId)
         if (raw != null) {
             when {
@@ -4374,8 +4442,9 @@ class SonarAppState(private val scope: CoroutineScope) {
     private suspend fun sendCallControl(chatId: String, text: String): Boolean {
         if (isMeshChat(chatId)) {
             val peerId = meshPeerId(chatId)
-            if (hasLiveMeshRoute(peerId)) {
-                val ok = MeshRadio.sendMeshDmNow(peerId, randomMeshId(), text)
+            val routePeerId = liveMeshRoutePeerId(peerId)
+            if (routePeerId != null) {
+                val ok = MeshRadio.sendMeshDmNow(routePeerId, randomMeshId(), text)
                 if (!ok) {
                     toast = "Call route dropped — try again in a moment."
                     sonarLog("SonarCall", "failed to send call control on live mesh route chatId=$chatId")
@@ -4438,9 +4507,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         val msg = SonarMsg(mid, npub, if (stickerRef != null) "" else text, mine = true, MeshRadio.nowSecs(), stickerRef = stickerRef)
         meshChats[peerId] = meshChats[peerId].orEmpty() + msg
-        processPayLines(meshChatId(peerId), listOf(msg))
+        val canonicalPeerId = canonicalMeshPeerId(peerId)
+        processPayLines(meshChatId(canonicalPeerId), listOf(msg))
         persistMesh(peerId)
-        scope.launch { refreshOpenDm(peerId) }
+        scope.launch { refreshOpenDm(canonicalPeerId) }
         refreshMeshDmRows()
         return true
     }
@@ -4450,9 +4520,10 @@ class SonarAppState(private val scope: CoroutineScope) {
             toast = "Unblock this contact before sending."
             return false
         }
+        val routePeerId = liveMeshRoutePeerId(peerId) ?: peerId
         val mid = randomMeshId()
-        val mediaUrl = meshMediaUrl(peerId, mid, filename)
-        val ok = MeshRadio.sendMeshMedia(peerId, mid, data, filename, mime)
+        val mediaUrl = meshMediaUrl(routePeerId, mid, filename)
+        val ok = MeshRadio.sendMeshMedia(routePeerId, mid, data, filename, mime)
         if (!ok) {
             toast = "Not connected over Bluetooth yet — stay close and try again"
             return false
@@ -4461,9 +4532,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         mediaCache[mediaUrl] = data
         scope.launch { MessageStore.saveMeshMedia(mediaUrl, data) }
         val msg = SonarMsg(mid, npub, "", mine = true, tsSecs = MeshRadio.nowSecs(), media = listOf(media))
-        meshChats[peerId] = meshChats[peerId].orEmpty() + msg
-        persistMesh(peerId)
-        scope.launch { refreshOpenDm(peerId) }
+        meshChats[routePeerId] = meshChats[routePeerId].orEmpty() + msg
+        persistMesh(routePeerId)
+        scope.launch { refreshOpenDm(canonicalMeshPeerId(routePeerId)) }
         refreshMeshDmRows()
         return true
     }
@@ -4802,8 +4873,9 @@ class SonarAppState(private val scope: CoroutineScope) {
                 continue
             }
             // Try to send via the best available transport.
-            val delivered = if (MeshRadio.hasMeshLink(peerId)) {
-                sendMesh(peerId, msg.content)
+            val routePeerId = liveMeshRoutePeerId(peerId)
+            val delivered = if (routePeerId != null) {
+                sendMesh(routePeerId, msg.content)
             } else {
                 val raw = npubRawFor(peerId)
                 if (raw != null) {
@@ -5179,8 +5251,9 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private suspend fun marmotMessagesForPeer(peerId: String): List<SonarMsg> {
+        val aliases = meshPeerAliases(peerId)
         val groups = npubRawFor(peerId)?.let { marmotGroupsForNpub(it) }
-            ?: chats.filter { peerIdForMarmotGroup(it) == peerId }
+            ?: chats.filter { group -> peerIdForMarmotGroup(group)?.let { it in aliases } == true }
         val merged = ArrayList<SonarMsg>()
         for (group in groups) {
             val msgs = marmotMessages(group.id)
@@ -5206,16 +5279,18 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  peer with a Marmot group, the White Noise leg merged chronologically. The
      *  White Noise leg renders as internet (indigo). No-op if that DM isn't open. */
     private suspend fun refreshOpenDm(peerId: String) {
-        if ((screen as? Screen.Chat)?.id != meshChatId(peerId)) return
-        val chatId = meshChatId(peerId)
-        val mesh = meshChats[peerId].orEmpty()
-        val wn = marmotMessagesForPeer(peerId)
+        val canonicalPeerId = canonicalMeshPeerId(peerId)
+        if ((screen as? Screen.Chat)?.id != meshChatId(canonicalPeerId)) return
+        val chatId = meshChatId(canonicalPeerId)
+        val mesh = mergedMeshMessages(canonicalPeerId)
+        val wn = marmotMessagesForPeer(canonicalPeerId)
         val merged = withSendEchoes(chatId, mergePendingMediaUploads(chatId, mesh + wn))
         val visible = visibleMessagesForChat(chatId, merged)
         messages = visible
         processPayLines(chatId, visible)
-        val groups = npubRawFor(peerId)?.let { marmotGroupsForNpub(it) }
-            ?: chats.filter { peerIdForMarmotGroup(it) == peerId }
+        val aliases = meshPeerAliases(canonicalPeerId)
+        val groups = npubRawFor(canonicalPeerId)?.let { marmotGroupsForNpub(it) }
+            ?: chats.filter { group -> peerIdForMarmotGroup(group)?.let { it in aliases } == true }
         for (group in groups) {
             unreadByChat = unreadByChat - group.id
             runCatching { SonarCore.markConversationRead(group.id) }
@@ -5223,10 +5298,10 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private fun observedMeshPeer(peerId: String): Boolean =
-        peerId in rawMeshPeerIds
+        meshPeerAliases(peerId).any { it in rawMeshPeerIds }
 
     private fun hasLiveMeshRoute(peerId: String): Boolean =
-        observedMeshPeer(peerId) && MeshRadio.hasMeshLink(peerId)
+        observedMeshPeer(peerId) && liveMeshRoutePeerId(peerId) != null
 
     /** True while a live Noise link to [peerId] exists (peer is in Bluetooth range). */
     fun dmInRange(peerId: String): Boolean = hasLiveMeshRoute(peerId)
@@ -5254,8 +5329,9 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private fun callCapablePeer(peerId: String): Boolean {
-        if (sonarProfile(peerId)?.speaksCalls == true) return true
-        if (((linkCapsByFp[peerId] ?: 0) and SonarAnnounce.CAP_CALLS) != 0) return true
+        val aliases = meshPeerAliases(peerId)
+        if (aliases.any { sonarProfile(it)?.speaksCalls == true }) return true
+        if (aliases.any { ((linkCapsByFp[it] ?: 0) and SonarAnnounce.CAP_CALLS) != 0 }) return true
         val npubHex = npubRawFor(peerId)?.toHexLower() ?: return false
         sonarDescriptorsByNpubHex[npubHex]?.let { if (it.supportsCurrentCalls) return true }
         return false
@@ -5526,13 +5602,19 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  BLE-leg only — for immediate feedback on send/receive. [recomputeConversations]
      *  later folds in the White Noise leg. */
     private fun refreshMeshDmRows() {
-        meshDmRows = meshChats.entries
-            .filter { it.value.isNotEmpty() }
-            .filterNot { (pid, _) -> socialState.isBlockedPeer(pid) }
-            .map { (pid, msgs) ->
-                val last = msgs.last()
-                MeshDmRow(pid, meshPeerName(pid), messagePreview(last.content, last.stickerRef, last.media), last.tsSecs)
-            }
+        val groups = groupMeshPeerIdsByIdentity(
+            meshChats.filterValues { it.isNotEmpty() }.keys,
+            linkByFp,
+        )
+        meshDmRows = groups.mapNotNull { aliases ->
+            val peerId = selectCanonicalMeshPeerId(aliases, groupFoldMap.values.toSet()) ?: return@mapNotNull null
+            if (aliases.all { socialState.isBlockedPeer(it) }) return@mapNotNull null
+            val last = aliases.flatMap { meshChats[it].orEmpty() }
+                .distinctBy { it.id }
+                .maxByOrNull { it.tsSecs }
+                ?: return@mapNotNull null
+            MeshDmRow(peerId, meshPeerName(peerId), messagePreview(last.content, last.stickerRef, last.media), last.tsSecs)
+        }
             .sortedByDescending { it.tsSecs }
     }
 
@@ -5550,10 +5632,17 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (existing == null || row.tsSecs >= existing.tsSecs) rowsByPeer[peerId] = row
         }
         val groupPeers = LinkedHashMap<String, String>()
-        for ((peerId, msgs) in meshChats) {
-            if (msgs.isEmpty()) continue
-            if (socialState.isBlockedPeer(peerId)) continue
-            var last = msgs.last()
+        val meshGroups = groupMeshPeerIdsByIdentity(
+            meshChats.filterValues { it.isNotEmpty() }.keys,
+            linkByFp,
+        )
+        for (aliases in meshGroups) {
+            val peerId = selectCanonicalMeshPeerId(aliases, groupFoldMap.values.toSet()) ?: continue
+            if (aliases.all { socialState.isBlockedPeer(it) }) continue
+            var last = aliases.flatMap { meshChats[it].orEmpty() }
+                .distinctBy { it.id }
+                .maxByOrNull { it.tsSecs }
+                ?: continue
             val groups = npubRawFor(peerId)?.let { marmotGroupsForNpub(it) }.orEmpty()
             if (groups.isNotEmpty()) {
                 groups.forEach { g -> folded += g.id; groupPeers[g.id] = peerId }
@@ -5564,7 +5653,8 @@ class SonarAppState(private val scope: CoroutineScope) {
         for (group in chats) {
             if (!isDirectMarmotChat(group)) continue
             if (isBlockedMarmotChat(group)) continue
-            val peerId = peerIdForMarmotGroup(group) ?: continue
+            val rawPeerId = peerIdForMarmotGroup(group) ?: continue
+            val peerId = canonicalMeshPeerId(rawPeerId)
             if (socialState.isBlockedPeer(peerId)) continue
             folded += group.id
             groupPeers[group.id] = peerId
