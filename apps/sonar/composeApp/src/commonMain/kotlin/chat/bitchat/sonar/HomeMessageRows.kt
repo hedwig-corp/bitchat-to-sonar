@@ -59,3 +59,48 @@ internal fun orderChatsByLocalRecency(
         )
         .map { it.value }
 }
+
+/** Coherent local row state built from the core-owned conversation index plus
+ *  bounded transcript pages. Summaries cover every conversation in O(rows);
+ *  pages enrich only the newest window with media/sticker metadata. */
+internal data class LocalConversationHydration(
+    val messagesByChat: Map<String, List<SonarMsg>>,
+    val latestByChat: Map<String, Long>,
+)
+
+internal fun hydrateLocalConversationRows(
+    activeChatIds: Set<String>,
+    existingMessagesByChat: Map<String, List<SonarMsg>>,
+    existingLatestByChat: Map<String, Long>,
+    summaries: List<SonarConversationSummary>,
+    pages: List<SonarRecentTranscriptPage>,
+): LocalConversationHydration {
+    val messages = existingMessagesByChat.filterKeys { it in activeChatIds }.toMutableMap()
+    val latest = existingLatestByChat.filterKeys { it in activeChatIds }.toMutableMap()
+
+    for (summary in summaries) {
+        if (summary.groupIdHex !in activeChatIds || summary.latestAtSecs <= 0L) continue
+        latest[summary.groupIdHex] = summary.latestAtSecs
+        val existing = messages[summary.groupIdHex]
+        if (existing?.lastOrNull()?.tsSecs != summary.latestAtSecs) {
+            messages[summary.groupIdHex] = listOf(
+                SonarMsg(
+                    id = "summary:${summary.groupIdHex}:${summary.latestAtSecs}",
+                    senderNpub = summary.latestSenderNpub,
+                    content = summary.latestContent,
+                    mine = summary.latestMine,
+                    tsSecs = summary.latestAtSecs,
+                    viaInternet = true,
+                )
+            )
+        }
+    }
+
+    for (page in pages) {
+        if (page.chatId !in activeChatIds || page.messages.isEmpty()) continue
+        messages[page.chatId] = page.messages
+        latest[page.chatId] = page.latestTsSecs.takeIf { it > 0L }
+            ?: page.messages.maxOf { it.tsSecs }
+    }
+    return LocalConversationHydration(messages, latest)
+}

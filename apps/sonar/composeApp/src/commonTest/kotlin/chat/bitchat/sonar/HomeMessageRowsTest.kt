@@ -105,4 +105,25 @@ class HomeMessageRowsTest {
             merged.map { it.listKey },
         )
     }
+
+    @Test
+    fun conversationIndexHydratesRowsOutsideBoundedTranscriptWindow() {
+        val summaries = listOf(
+            SonarConversationSummary("paged", "", "summary paged", "peer", 400L, false, 2L, 0L),
+            SonarConversationSummary("outside", "", "outside preview", "peer", 300L, false, 1L, 0L),
+        )
+        val pageMessage = SonarMsg("page-msg", "peer", "page preview", false, 400L, viaInternet = true)
+
+        val hydration = hydrateLocalConversationRows(
+            activeChatIds = setOf("paged", "outside"),
+            existingMessagesByChat = emptyMap(),
+            existingLatestByChat = emptyMap(),
+            summaries = summaries,
+            pages = listOf(SonarRecentTranscriptPage("paged", 400L, listOf(pageMessage))),
+        )
+
+        assertEquals(300L, hydration.latestByChat["outside"])
+        assertEquals("outside preview", hydration.messagesByChat["outside"]?.single()?.content)
+        assertEquals(listOf(pageMessage), hydration.messagesByChat["paged"])
+    }
 }

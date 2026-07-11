@@ -422,9 +422,14 @@ data class AlbumUpload(
  * protocol + relays. BLE mesh / geohash come later (issue #6).
  */
 expect object SonarCore {
-    /** Ensure an identity exists, connect to relays, publish our KeyPackage.
-     *  Returns our npub. Safe to call repeatedly. */
+    /** Ensure an identity exists and open the encrypted local database without
+     *  waiting for relay connectivity. Returns our npub. Safe to call repeatedly. */
     suspend fun start(): String
+
+    /** Replace the local-only node with a relay-backed node using the same
+     *  identity and encrypted database. Existing local reads stay available
+     *  while the relay connection is established. */
+    suspend fun connectRelays(): String
 
     /** Our npub (empty until [start]). */
     fun myNpub(): String

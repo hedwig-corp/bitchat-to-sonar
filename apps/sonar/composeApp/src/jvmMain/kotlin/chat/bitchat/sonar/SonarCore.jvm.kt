@@ -39,6 +39,7 @@ actual object SonarCore {
 
     private val lock = Mutex()
     private var node: SonarNode? = null
+    private var relayConnected = false
     @Volatile private var npub: String = ""
     @Volatile private var pubkeyHex: String = ""
 
@@ -58,10 +59,30 @@ actual object SonarCore {
                 // Diagnostics file sink must exist before the node spins up so
                 // relay connect/EOSE/watermark events are captured. Non-fatal.
                 installCoreLogging(diagnosticsVerbose())
-                val n = SonarNode.connect(identity, relayUrls, dbPath, dbKeyHex)
-                runCatching { n.publishKeyPackage() }
-                node = n
+                node = SonarNode.connect(identity, emptyList(), dbPath, dbKeyHex)
+                relayConnected = false
             }
+            npub
+        }
+    }
+
+    actual suspend fun connectRelays(): String = withContext(Dispatchers.IO) {
+        SonarNativeLoader.ensureLoaded()
+        lock.withLock {
+            if (relayConnected) return@withLock npub
+            val identity = loadOrCreateIdentity()
+            npub = identity.npub()
+            pubkeyHex = identity.pubkeyHex()
+
+            val dbPath = File(marmotDir(), "marmot.sqlite").absolutePath
+            val dbKeyHex = loadOrCreateDbKey()
+            installCoreLogging(diagnosticsVerbose())
+
+            val connected = SonarNode.connect(identity, relayUrls, dbPath, dbKeyHex)
+            node = connected
+            relayConnected = true
+            runCatching { connected.retryOutbox() }
+            runCatching { connected.publishKeyPackageBackground() }
             npub
         }
     }
@@ -587,6 +608,7 @@ actual object SonarCore {
         val identity = SonarIdentity.import(nsec.trim())
         lock.withLock {
             node = null
+            relayConnected = false
             npub = identity.npub()
             pubkeyHex = identity.pubkeyHex()
             marmotDir().deleteRecursively()
@@ -616,6 +638,7 @@ actual object SonarCore {
     actual suspend fun wipe() = withContext(Dispatchers.IO) {
         lock.withLock {
             node = null
+            relayConnected = false
             npub = ""; pubkeyHex = ""
             // marmotDir() covers the DB + diagnostics logs (sonar-marmot/logs);
             // the exported diagnostics zips live in a sibling dir, so drop them
@@ -632,6 +655,7 @@ actual object SonarCore {
         withContext(Dispatchers.IO) {
             lock.withLock {
                 node = null
+                relayConnected = false
                 // Delete ONLY the encrypted Marmot DB — keep nsec, DB key,
                 // nickname and prefs. start() reopens a fresh empty DB with the
                 // SAME identity + key.
@@ -639,6 +663,7 @@ actual object SonarCore {
             }
         }
         start()
+        connectRelays()
     }
 
     actual suspend fun deleteChat(chatId: String): Unit = withContext(Dispatchers.IO) {

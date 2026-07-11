@@ -360,4 +360,23 @@ class ConversationFoldTest {
             ),
         )
     }
+
+    @Test
+    fun persistedAliasOutsideMessageKeysStillOwnsConversationRow() {
+        val sharedNpubHex = "ef".repeat(32)
+        val aliases = groupMeshConversationAliases(
+            knownPeerIds = listOf("fp-with-messages", "fp-persisted-fold", "fp-current"),
+            peerIdsWithMessages = setOf("fp-with-messages"),
+            linkedNpubByPeer = mapOf(
+                "fp-with-messages" to sharedNpubHex,
+                "fp-persisted-fold" to sharedNpubHex,
+                "fp-current" to sharedNpubHex,
+            ),
+        ).single()
+
+        assertEquals(
+            "fp-persisted-fold",
+            selectCanonicalMeshPeerId(aliases, setOf("fp-persisted-fold")),
+        )
+    }
 }

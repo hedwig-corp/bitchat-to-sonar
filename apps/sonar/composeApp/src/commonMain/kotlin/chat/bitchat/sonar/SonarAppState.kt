@@ -188,6 +188,14 @@ internal fun groupMeshPeerIdsByIdentity(
         .values
         .map { it.sorted() }
 
+internal fun groupMeshConversationAliases(
+    knownPeerIds: Collection<String>,
+    peerIdsWithMessages: Set<String>,
+    linkedNpubByPeer: Map<String, String>,
+): List<List<String>> =
+    groupMeshPeerIdsByIdentity(knownPeerIds, linkedNpubByPeer)
+        .filter { aliases -> aliases.any { it in peerIdsWithMessages } }
+
 /** Prefer an already-persisted fold target so a row key stays stable; otherwise
  *  choose a deterministic fingerprint from the alias set. */
 internal fun selectCanonicalMeshPeerId(
@@ -370,6 +378,11 @@ class SonarAppState(private val scope: CoroutineScope) {
         private set
     var connecting by mutableStateOf(false)
         private set
+    /** True only after mesh storage and the encrypted Marmot database have been
+     *  combined into one coherent local Home model. Relay state is irrelevant. */
+    var homeMessagesHydrated by mutableStateOf(false)
+        private set
+    private var localCoreReady = false
     var chats by mutableStateOf<List<SonarChat>>(initialChatSnapshot.first)
         private set
     /** Monotonic counter bumped whenever [chatSnapshotMessagesByChat] is
@@ -492,6 +505,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             chats = emptyList(); chatSnapshotMessagesByChat = emptyMap(); pendingMarmotChatNpubs = emptyMap(); pendingMarmotGroups = emptyMap(); groupInvites = emptyList(); messages = emptyList()
             clearChatSnapshot()
             onboarded = false; nick = ""; npub = ""; started = false
+            localCoreReady = false; homeMessagesHydrated = false
             walletState = WalletState.NotConfigured
             presenceByGeohash = emptyMap()
             payLedger = SonarPayLedger(); payVersion++
@@ -548,6 +562,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             scanWatermark.clear()
             // White Noise / Marmot DB: wipe + reconnect with the SAME identity.
             runCatching { SonarCore.eraseChats() }
+            localCoreReady = true
+            homeMessagesHydrated = true
             // The node is recreated → re-bind the iroh call endpoint on next use.
             resetCallState()
             ensureCallStarted()
@@ -1597,6 +1613,21 @@ class SonarAppState(private val scope: CoroutineScope) {
             .sorted()
     }
 
+    /** Alias groups for conversations that have a persisted mesh transcript.
+     *  Include name/link/fold-only aliases too: the transcript may live under
+     *  an old fingerprint while the stable fold target uses a newer one. */
+    private fun meshConversationAliasGroups(): List<List<String>> {
+        val candidates = buildSet {
+            addAll(meshChats.keys)
+            addAll(meshChatNames.keys)
+            addAll(linkByFp.keys)
+            addAll(foldedGroupPeerIds.values)
+            addAll(groupFoldMap.values)
+        }
+        val messagePeerIds = meshChats.filterValues { it.isNotEmpty() }.keys
+        return groupMeshConversationAliases(candidates, messagePeerIds, linkByFp)
+    }
+
     private fun canonicalMeshPeerId(peerId: String): String =
         selectCanonicalMeshPeerId(meshPeerAliases(peerId), groupFoldMap.values.toSet()) ?: peerId
 
@@ -2329,6 +2360,8 @@ class SonarAppState(private val scope: CoroutineScope) {
                 SonarCore.saveBlob(NPUB_BLOB_KEY, restoredNpub)
                 started = false
                 connecting = false
+                localCoreReady = false
+                homeMessagesHydrated = false
                 SonarCore.setOnboardingComplete(true)
                 onboarded = true
                 nick = SonarCore.nickname()
@@ -2730,6 +2763,8 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun boot() {
         if (started || connecting) return
         connecting = true
+        homeMessagesHydrated = false
+        localCoreReady = false
         Notifier.ensureChannel()
         scope.launch {
             // ── LOCAL-FIRST PAINT (Signal/iOS parity): this block reads disk
@@ -2741,11 +2776,23 @@ class SonarAppState(private val scope: CoroutineScope) {
             loadLinks() // durable fingerprint↔npub so BLE chats stay unified after restart
             loadMeshNames() // announce nicknames survive restart — names, not keys
             seedVerifiedChatIds() // in-memory verify set (off render path)
-            refreshMeshDmRows()
-            recomputeConversations() // fold White Noise legs into mesh rows pre-start
             try {
+                // Open the encrypted database with NO relays first, matching the
+                // native iOS MarmotService.connectLocal path. This makes the
+                // authoritative groups + summary index available before any
+                // network timeout can delay or reorder Home.
                 npub = SonarCore.start()
                 SonarCore.saveBlob(NPUB_BLOB_KEY, npub) // restored at next construction
+                localCoreReady = true
+                refreshChats()
+                recomputeConversations()
+                homeMessagesHydrated = true
+
+                // Relay attach replaces the local-only node in the background
+                // using the same encrypted DB. The already-painted Home model
+                // remains authoritative while sockets connect.
+                npub = SonarCore.connectRelays()
+                SonarCore.saveBlob(NPUB_BLOB_KEY, npub)
                 SonarCore.installConversationListener()
                 collectConversationChanges()
                 started = true
@@ -2781,6 +2828,9 @@ class SonarAppState(private val scope: CoroutineScope) {
             } catch (t: Throwable) {
                 toast = "connect failed: ${t.message}"
             } finally {
+                // If the encrypted DB itself failed to open, fall back to the
+                // metadata snapshot rather than leaving Home in a loading state.
+                homeMessagesHydrated = true
                 connecting = false
             }
         }
@@ -5602,10 +5652,7 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  BLE-leg only — for immediate feedback on send/receive. [recomputeConversations]
      *  later folds in the White Noise leg. */
     private fun refreshMeshDmRows() {
-        val groups = groupMeshPeerIdsByIdentity(
-            meshChats.filterValues { it.isNotEmpty() }.keys,
-            linkByFp,
-        )
+        val groups = meshConversationAliasGroups()
         meshDmRows = groups.mapNotNull { aliases ->
             val peerId = selectCanonicalMeshPeerId(aliases, groupFoldMap.values.toSet()) ?: return@mapNotNull null
             if (aliases.all { socialState.isBlockedPeer(it) }) return@mapNotNull null
@@ -5632,10 +5679,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (existing == null || row.tsSecs >= existing.tsSecs) rowsByPeer[peerId] = row
         }
         val groupPeers = LinkedHashMap<String, String>()
-        val meshGroups = groupMeshPeerIdsByIdentity(
-            meshChats.filterValues { it.isNotEmpty() }.keys,
-            linkByFp,
-        )
+        val meshGroups = meshConversationAliasGroups()
         for (aliases in meshGroups) {
             val peerId = selectCanonicalMeshPeerId(aliases, groupFoldMap.values.toSet()) ?: continue
             if (aliases.all { socialState.isBlockedPeer(it) }) continue
@@ -5768,35 +5812,31 @@ class SonarAppState(private val scope: CoroutineScope) {
     private suspend fun refreshChatsInner() {
         val previousOrder = chats.map { it.id }
         val loadedChats = SonarCore.chats()
-        val localChats = if (started || loadedChats.isNotEmpty()) loadedChats else chats
+        val localChats = if (localCoreReady || started || loadedChats.isNotEmpty()) loadedChats else chats
         val activeIds = localChats.mapTo(hashSetOf()) { it.id }
-        val updatedMessages = chatSnapshotMessagesByChat
-            .filterKeys { it in activeIds }
-            .toMutableMap()
-        val updatedLatest = chatSnapshotLatestByChat
-            .filterKeys { it in activeIds }
-            .toMutableMap()
-        if (localChats.isNotEmpty()) {
-            val pages = runCatching {
+        val summaries = if (localChats.isEmpty()) emptyList() else runCatching {
+            SonarCore.conversationSummaries()
+        }.getOrDefault(emptyList())
+        val pages = if (localChats.isEmpty()) emptyList() else runCatching {
                 SonarCore.recentMessagePages(LOCAL_SUMMARY_CHAT_LIMIT, LOCAL_SUMMARY_PAGE_LIMIT)
-            }.getOrDefault(emptyList())
-            for (page in pages) {
-                if (page.messages.isNotEmpty() && page.chatId in activeIds) {
-                    updatedMessages[page.chatId] = page.messages
-                    updatedLatest[page.chatId] = page.messages.last().tsSecs
-                }
-            }
-        }
+        }.getOrDefault(emptyList())
+        val hydration = hydrateLocalConversationRows(
+            activeChatIds = activeIds,
+            existingMessagesByChat = chatSnapshotMessagesByChat,
+            existingLatestByChat = chatSnapshotLatestByChat,
+            summaries = summaries,
+            pages = pages,
+        )
 
         // Publish one coherent local snapshot. Previously `chats = loadedChats`
         // rendered the core's raw order, then a suspension in
         // `recentMessagePages()` let Compose paint again before the recency sort.
         // That two-step hydrate was the visible startup reorder.
-        chatSnapshotMessagesByChat = updatedMessages
-        chatSnapshotLatestByChat = updatedLatest
+        chatSnapshotMessagesByChat = hydration.messagesByChat
+        chatSnapshotLatestByChat = hydration.latestByChat
         chats = orderChatsByLocalRecency(
             chats = localChats,
-            latestSecs = { updatedLatest[it] ?: 0L },
+            latestSecs = { hydration.latestByChat[it] ?: 0L },
             previousOrder = previousOrder,
         )
         persistChatSnapshot()

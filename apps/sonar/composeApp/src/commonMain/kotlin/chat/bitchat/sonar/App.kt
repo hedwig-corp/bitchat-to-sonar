@@ -291,67 +291,71 @@ private fun HomeScreen(state: SonarAppState) {
                     }
                 }
                 item { SNSectionLabel("Messages") }
-                val invites = state.groupInvites
-                val meshRows = state.meshDmRows
-                val chatRows = state.visibleChats
-                if (invites.isEmpty() && chatRows.isEmpty() && meshRows.isEmpty()) item { EmptyMessages() }
-                // ONE recency-ordered list across transports (Signal-style /
-                // iOS SonarAppStore.dmRows): mesh/folded + Marmot-only were two
-                // separately-sorted segments. Shared merge helper; invites stay
-                // pinned on top as actionable banners. Sort keys are O(1)
-                // cached (meshDmRows precomputed, marmotRow cached row VM —
-                // pending rows use creation time, not epoch zero).
-                val mergedRows = mergeHomeMessageRows(meshRows, chatRows) { chatId ->
-                    state.marmotRow(chatId).tsSecs
-                }
-                // The hairline hides under the last row of the list (design
-                // .bc-list .bc-row:last-child::after { display: none }).
-                val lastRowKey = mergedRows.lastOrNull()?.listKey
-                    ?: invites.lastOrNull()?.let { "invite:" + it.id }
-                items(invites, key = { "invite:" + it.id }) { invite ->
-                    val title = invite.groupName.ifBlank { "Group chat" }
-                    ConvRow(
-                        avatar = { SonarAvatar(title, 52.dp, presence = false) },
-                        title = title,
-                        sub = "${invite.memberCount} members · invite",
-                        lock = true,
-                        divider = "invite:" + invite.id != lastRowKey,
-                    ) { pendingInvite = invite }
-                }
-                items(mergedRows, key = { it.listKey }) { homeRow ->
-                    when (homeRow) {
-                        is HomeMessageRow.Mesh -> {
-                            val mesh = homeRow.row
-                            // BLE-mesh DM (incl. ones started by a peer messaging us)
-                            // — over Bluetooth, so a cyan dot instead of the internet
-                            // lock. A Sonar peer's White Noise leg is folded into
-                            // this row (one row/person).
-                            ConvRow(
-                                avatar = { SonarAvatar(mesh.name, 52.dp, presence = state.dmInRange(mesh.peerId)) },
-                                title = mesh.name, sub = mesh.preview, lock = false,
-                                time = rowTimeLabel(mesh.tsSecs),
-                                divider = homeRow.listKey != lastRowKey,
-                                onLongClick = { pendingDelete = DeleteTarget(mesh.peerId, mesh.name, isMesh = true, isGroup = false) },
-                            ) { state.openDm(mesh.peerId, mesh.name) }
-                        }
-                        is HomeMessageRow.Marmot -> {
-                            val chat = homeRow.chat
-                            // O(1) precomputed row model — no per-row disk read or
-                            // O(chats) walk during composition (Signal cached row VM).
-                            val row = state.marmotRow(chat.id)
-                            ConvRow(
-                                avatar = { SonarAvatar(row.title, 52.dp, presence = false) },
-                                title = row.title,
-                                sub = row.sub,
-                                lock = true,
-                                time = if (row.tsSecs > 0L) rowTimeLabel(row.tsSecs) else "",
-                                verified = row.verified,
-                                unread = row.unread,
-                                divider = homeRow.listKey != lastRowKey,
-                                onLongClick = if (row.pending) null else {
-                                    { pendingDelete = DeleteTarget(chat.id, row.title, isMesh = false, isGroup = row.multiMember) }
-                                },
-                            ) { state.openChat(chat) }
+                if (!state.homeMessagesHydrated) {
+                    item { LocalMessagesLoading() }
+                } else {
+                    val invites = state.groupInvites
+                    val meshRows = state.meshDmRows
+                    val chatRows = state.visibleChats
+                    if (invites.isEmpty() && chatRows.isEmpty() && meshRows.isEmpty()) item { EmptyMessages() }
+                    // ONE recency-ordered list across transports (Signal-style /
+                    // iOS SonarAppStore.dmRows): mesh/folded + Marmot-only were two
+                    // separately-sorted segments. Shared merge helper; invites stay
+                    // pinned on top as actionable banners. Sort keys are O(1)
+                    // cached (meshDmRows precomputed, marmotRow cached row VM —
+                    // pending rows use creation time, not epoch zero).
+                    val mergedRows = mergeHomeMessageRows(meshRows, chatRows) { chatId ->
+                        state.marmotRow(chatId).tsSecs
+                    }
+                    // The hairline hides under the last row of the list (design
+                    // .bc-list .bc-row:last-child::after { display: none }).
+                    val lastRowKey = mergedRows.lastOrNull()?.listKey
+                        ?: invites.lastOrNull()?.let { "invite:" + it.id }
+                    items(invites, key = { "invite:" + it.id }) { invite ->
+                        val title = invite.groupName.ifBlank { "Group chat" }
+                        ConvRow(
+                            avatar = { SonarAvatar(title, 52.dp, presence = false) },
+                            title = title,
+                            sub = "${invite.memberCount} members · invite",
+                            lock = true,
+                            divider = "invite:" + invite.id != lastRowKey,
+                        ) { pendingInvite = invite }
+                    }
+                    items(mergedRows, key = { it.listKey }) { homeRow ->
+                        when (homeRow) {
+                            is HomeMessageRow.Mesh -> {
+                                val mesh = homeRow.row
+                                // BLE-mesh DM (incl. ones started by a peer messaging us)
+                                // — over Bluetooth, so a cyan dot instead of the internet
+                                // lock. A Sonar peer's White Noise leg is folded into
+                                // this row (one row/person).
+                                ConvRow(
+                                    avatar = { SonarAvatar(mesh.name, 52.dp, presence = state.dmInRange(mesh.peerId)) },
+                                    title = mesh.name, sub = mesh.preview, lock = false,
+                                    time = rowTimeLabel(mesh.tsSecs),
+                                    divider = homeRow.listKey != lastRowKey,
+                                    onLongClick = { pendingDelete = DeleteTarget(mesh.peerId, mesh.name, isMesh = true, isGroup = false) },
+                                ) { state.openDm(mesh.peerId, mesh.name) }
+                            }
+                            is HomeMessageRow.Marmot -> {
+                                val chat = homeRow.chat
+                                // O(1) precomputed row model — no per-row disk read or
+                                // O(chats) walk during composition (Signal cached row VM).
+                                val row = state.marmotRow(chat.id)
+                                ConvRow(
+                                    avatar = { SonarAvatar(row.title, 52.dp, presence = false) },
+                                    title = row.title,
+                                    sub = row.sub,
+                                    lock = true,
+                                    time = if (row.tsSecs > 0L) rowTimeLabel(row.tsSecs) else "",
+                                    verified = row.verified,
+                                    unread = row.unread,
+                                    divider = homeRow.listKey != lastRowKey,
+                                    onLongClick = if (row.pending) null else {
+                                        { pendingDelete = DeleteTarget(chat.id, row.title, isMesh = false, isGroup = row.multiMember) }
+                                    },
+                                ) { state.openChat(chat) }
+                            }
                         }
                     }
                 }
@@ -697,6 +701,16 @@ private fun EmptyMessages() {
         icon = SNIconName.Lock,
         title = "No secure chats yet",
         desc = "Tap Search and paste someone’s npub to start an end-to-end encrypted chat over the internet."
+    )
+}
+
+@Composable
+private fun LocalMessagesLoading() {
+    Text(
+        "Loading chats from this device…",
+        color = sonar.text3,
+        fontSize = 14.sp,
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 18.dp),
     )
 }
 
