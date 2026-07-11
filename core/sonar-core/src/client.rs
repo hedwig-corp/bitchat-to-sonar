@@ -46,7 +46,12 @@ use crate::{Error, Result};
 const BLOSSOM_SERVER_LIST_KIND: u16 = 10063;
 
 /// Fallback Blossom server when the user has published no kind-10063 list.
-pub const DEFAULT_BLOSSOM_SERVER: &str = "https://nostr.download";
+pub const DEFAULT_BLOSSOM_SERVER: &str = "https://blossom.primal.net";
+
+/// MIP-04 uploads ciphertext, not the original media bytes. Blossom servers
+/// validate the request body's media type, so encrypted blobs must use the
+/// generic binary MIME even though the encrypted imeta keeps the source MIME.
+const ENCRYPTED_BLOB_MIME_TYPE: &str = "application/octet-stream";
 
 /// One attachment for an album send (see [`SonarClient::send_media_multi`]).
 /// Raw plaintext bytes plus the source filename and MIME; each item is
@@ -2114,14 +2119,8 @@ impl SonarClient {
             let upload =
                 self.engine
                     .encrypt_media(group_id, &item.data, &item.mime, &item.filename)?;
-            // Ciphertext is opaque binary; do not send plaintext imeta MIME as
-            // Blossom Content-Type (primal.net returns 415 on sniff mismatch).
             let url = self
-                .blossom_upload(
-                    server_url,
-                    upload.encrypted_data.clone(),
-                    "application/octet-stream",
-                )
+                .blossom_upload(server_url, upload.encrypted_data.clone())
                 .await?;
             uploads.push((upload, url));
         }
@@ -2150,7 +2149,7 @@ impl SonarClient {
 
     /// Upload an encrypted blob to a Blossom server (BUD-02), authed with our
     /// Nostr key, returning the URL where it can be fetched.
-    async fn blossom_upload(&self, server_url: &str, data: Vec<u8>, _mime: &str) -> Result<String> {
+    async fn blossom_upload(&self, server_url: &str, data: Vec<u8>) -> Result<String> {
         let server = if server_url.is_empty() {
             DEFAULT_BLOSSOM_SERVER
         } else {
@@ -2161,7 +2160,7 @@ impl SonarClient {
         let descriptor = BlossomClient::new(base)
             .upload_blob(
                 data,
-                None,
+                Some(ENCRYPTED_BLOB_MIME_TYPE.to_string()),
                 None,
                 Some(self.identity().keys()),
             )
@@ -4021,7 +4020,83 @@ mod tests {
     use crate::sonar_descriptor::{
         descriptor_content_json, meta_descriptor_content_json, SONAR_CALL_DESCRIPTOR_D_TAG,
     };
+    use sha2::Digest;
     use std::collections::{HashMap, HashSet, VecDeque};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    #[tokio::test]
+    async fn blossom_upload_sends_binary_content_type_and_accepts_created() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock Blossom");
+        let base = format!(
+            "http://{}",
+            listener.local_addr().expect("listener address")
+        );
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept upload");
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let header_end = loop {
+                let read = stream.read(&mut chunk).expect("read upload request");
+                assert!(read > 0, "upload request ended before its headers");
+                request.extend_from_slice(&chunk[..read]);
+                if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]).to_string();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().expect("content length"))
+                })
+                .expect("upload content length");
+            let body_start = header_end + 4;
+            while request.len() < body_start + content_length {
+                let read = stream.read(&mut chunk).expect("read upload body");
+                assert!(read > 0, "upload request ended before its body");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let body = &request[body_start..body_start + content_length];
+            let sha = hex::encode(sha2::Sha256::digest(body));
+            let json = format!(
+                "{{\"url\":\"http://blossom.test/{sha}\",\"sha256\":\"{sha}\",\"size\":{},\"type\":\"application/octet-stream\",\"uploaded\":0}}",
+                body.len()
+            );
+            // BUD-02 requires 201 for a newly stored blob. The media integration
+            // test exercises the complementary 200 response for an existing blob.
+            let response = format!(
+                "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}",
+                json.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+            headers
+        });
+
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client without relays");
+        client
+            .blossom_upload(&base, b"encrypted image ciphertext".to_vec())
+            .await
+            .expect("ciphertext uploads");
+
+        let headers = server.join().expect("mock Blossom exits");
+        assert!(
+            headers.lines().any(|line| {
+                let Some((name, value)) = line.split_once(':') else {
+                    return false;
+                };
+                name.eq_ignore_ascii_case("content-type")
+                    && value.trim().eq_ignore_ascii_case(ENCRYPTED_BLOB_MIME_TYPE)
+            }),
+            "encrypted uploads must use {ENCRYPTED_BLOB_MIME_TYPE}, got:\n{headers}"
+        );
+    }
 
     fn test_event_id(seed: u8) -> EventId {
         EventId::from_slice(&[seed; 32]).expect("event id")
