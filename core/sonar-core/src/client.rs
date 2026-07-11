@@ -4026,7 +4026,7 @@ mod tests {
     use std::net::TcpListener;
 
     #[tokio::test]
-    async fn blossom_upload_labels_ciphertext_as_octet_stream() {
+    async fn blossom_upload_sends_binary_content_type_and_accepts_created() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock Blossom");
         let base = format!(
             "http://{}",
@@ -4065,8 +4065,10 @@ mod tests {
                 "{{\"url\":\"http://blossom.test/{sha}\",\"sha256\":\"{sha}\",\"size\":{},\"type\":\"application/octet-stream\",\"uploaded\":0}}",
                 body.len()
             );
+            // BUD-02 requires 201 for a newly stored blob. The media integration
+            // test exercises the complementary 200 response for an existing blob.
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}",
+                "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}",
                 json.len()
             );
             stream

@@ -48,3 +48,8 @@ tracing-appender = "0.2.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3.20"
+
+# Accept HTTP 201 Created from Blossom servers (e.g. nostr.download) until upstream
+# nostr-blossom includes the same status handling.
+[patch.crates-io]
+nostr-blossom = { path = "vendor/nostr-blossom" }

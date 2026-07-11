@@ -3497,8 +3497,6 @@ dependencies = [
 [[package]]
 name = "nostr-blossom"
 version = "0.44.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d49532bc6c655ac58b90279647430d041616c718119138213b40a053c90f6e2"
 dependencies = [
  "base64",
  "nostr",
