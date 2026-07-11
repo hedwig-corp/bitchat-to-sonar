@@ -46,7 +46,7 @@ use crate::{Error, Result};
 const BLOSSOM_SERVER_LIST_KIND: u16 = 10063;
 
 /// Fallback Blossom server when the user has published no kind-10063 list.
-pub const DEFAULT_BLOSSOM_SERVER: &str = "https://blossom.primal.net";
+pub const DEFAULT_BLOSSOM_SERVER: &str = "https://nostr.download";
 
 /// One attachment for an album send (see [`SonarClient::send_media_multi`]).
 /// Raw plaintext bytes plus the source filename and MIME; each item is
@@ -2114,8 +2114,14 @@ impl SonarClient {
             let upload =
                 self.engine
                     .encrypt_media(group_id, &item.data, &item.mime, &item.filename)?;
+            // Ciphertext is opaque binary; do not send plaintext imeta MIME as
+            // Blossom Content-Type (primal.net returns 415 on sniff mismatch).
             let url = self
-                .blossom_upload(server_url, upload.encrypted_data.clone(), &upload.mime_type)
+                .blossom_upload(
+                    server_url,
+                    upload.encrypted_data.clone(),
+                    "application/octet-stream",
+                )
                 .await?;
             uploads.push((upload, url));
         }
@@ -2144,7 +2150,7 @@ impl SonarClient {
 
     /// Upload an encrypted blob to a Blossom server (BUD-02), authed with our
     /// Nostr key, returning the URL where it can be fetched.
-    async fn blossom_upload(&self, server_url: &str, data: Vec<u8>, mime: &str) -> Result<String> {
+    async fn blossom_upload(&self, server_url: &str, data: Vec<u8>, _mime: &str) -> Result<String> {
         let server = if server_url.is_empty() {
             DEFAULT_BLOSSOM_SERVER
         } else {
@@ -2155,7 +2161,7 @@ impl SonarClient {
         let descriptor = BlossomClient::new(base)
             .upload_blob(
                 data,
-                Some(mime.to_string()),
+                None,
                 None,
                 Some(self.identity().keys()),
             )
