@@ -12,24 +12,36 @@
 
 import SwiftUI
 
+func snShouldRevealLocalHome(onboarded: Bool, initialLocalHomeReady: Bool) -> Bool {
+    !onboarded || initialLocalHomeReady
+}
+
 struct SonarRootView: View {
     @EnvironmentObject private var store: SonarAppStore
 
     var body: some View {
         Group {
             if store.onboarded {
-                #if os(macOS)
-                SonarMacRootView()
-                #else
-                NavigationStack(path: $store.path) {
-                    SonarHomeScreen()
-                        .sonarBareScreen()
-                        .navigationDestination(for: SonarRoute.self) { route in
-                            destination(for: route)
-                                .sonarBareScreen()
-                        }
+                if snShouldRevealLocalHome(
+                    onboarded: store.onboarded,
+                    initialLocalHomeReady: store.marmot.initialLocalHomeReady
+                ) {
+                    #if os(macOS)
+                    SonarMacRootView()
+                    #else
+                    NavigationStack(path: $store.path) {
+                        SonarHomeScreen()
+                            .sonarBareScreen()
+                            .navigationDestination(for: SonarRoute.self) { route in
+                                destination(for: route)
+                                    .sonarBareScreen()
+                            }
+                    }
+                    #endif
+                } else {
+                    SonarLocalLaunchSurface()
+                        .transition(.identity)
                 }
-                #endif
             } else {
                 #if os(macOS)
                 SonarMacRootView()
@@ -58,6 +70,18 @@ struct SonarRootView: View {
             }
         }
         #endif
+    }
+
+    private struct SonarLocalLaunchSurface: View {
+        var body: some View {
+            ZStack {
+                Color(sonarHex: 0x060809).ignoresSafeArea()
+                Text("sonar")
+                    .font(.system(size: 38, weight: .heavy))
+                    .foregroundColor(Color(sonarHex: 0xEFF3F4))
+            }
+            .accessibilityIdentifier("sonar.localLaunchSurface")
+        }
     }
 
     @ViewBuilder

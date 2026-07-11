@@ -205,6 +205,37 @@ internal fun selectCanonicalMeshPeerId(
     aliases.filter { it in persistedFoldPeerIds }.minOrNull()
         ?: aliases.minOrNull()
 
+/** Prefer the active Noise fingerprint for transport/capability lookup while
+ * preserving deterministic alias order when the peer is offline. */
+internal fun orderMeshAliasesByLiveRoute(
+    aliases: Collection<String>,
+    livePeerId: String?,
+): List<String> = buildList {
+    if (livePeerId != null && livePeerId in aliases) add(livePeerId)
+    addAll(aliases.filter { it != livePeerId }.sorted())
+}
+
+/** True when a drain touched any fingerprint folded into the open contact. */
+internal fun meshAliasGroupWasTouched(
+    aliases: Collection<String>,
+    touchedPeerIds: Collection<String>,
+): Boolean {
+    if (aliases.isEmpty() || touchedPeerIds.isEmpty()) return false
+    val touched = touchedPeerIds.toSet()
+    return aliases.any { it in touched }
+}
+
+/** A folded contact is blocked when any known fingerprint or its durable npub
+ * identity is blocked. The npub check also covers aliases learned later. */
+internal fun isMeshAliasGroupBlocked(
+    aliases: Collection<String>,
+    isPeerBlocked: (String) -> Boolean,
+    linkedNpubHex: (String) -> String?,
+    isNpubBlocked: (String) -> Boolean,
+): Boolean =
+    aliases.any(isPeerBlocked) ||
+        aliases.asSequence().mapNotNull(linkedNpubHex).any(isNpubBlocked)
+
 /** Composite scan watermark: the newest-message SECOND plus the message COUNT.
  *  Timestamps are second-resolution, so a message landing in the SAME second as
  *  the last scanned one (common for ⚡PAY PAY/DONE pairs or a call control sent
@@ -1020,7 +1051,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         meshPeerFirstSeenMs.keys.retainAll(rawMeshPeerIds + meshChats.keys + linkByFp.keys)
         meshPeers = rawPeers.filter { peer ->
             val peerId = meshPeerId(peer.id)
-            if (socialState.isBlockedPeer(peerId)) return@filter false
+            if (isMeshContactBlocked(peerId)) return@filter false
             if (peer.name.isNotBlank()) rememberMeshName(peerId, peer.name)
             val first = meshPeerFirstSeenMs.getOrPut(peerId) { nowMs }
             val hasProfile = peer.sonar || sonarPeerProfiles.containsKey(peerId) || linkByFp.containsKey(peerId)
@@ -1244,7 +1275,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         socialState.isMutualFavorite(peerId)
 
     fun isBlockedPeer(peerId: String): Boolean =
-        socialState.isBlockedPeer(peerId)
+        isMeshContactBlocked(peerId)
 
     fun isBlockedNostrPubkey(value: String): Boolean =
         socialState.isBlockedNostr(value)
@@ -1268,7 +1299,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun setFavoritePeer(peerId: String, name: String = "", favorite: Boolean) {
         val key = normalizeSocialPeerId(peerId)
-        if (favorite && socialState.isBlockedPeer(key)) {
+        if (favorite && isMeshContactBlocked(key)) {
             toast = "Unblock ${name.ifBlank { "this contact" }} before favoriting."
             return
         }
@@ -1324,9 +1355,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             toast = "No stable identity to block yet."
             return
         }
-        if (peerId != null) socialState = socialState.withBlockedPeer(peerId, blocked)
+        if (peerId != null) setMeshContactBlocked(peerId, blocked)
         if (npubHex != null) socialState = socialState.withBlockedNostr(npubHex, blocked)
-        if (blocked && peerId != null) socialState = socialState.withFavoritePeer(peerId, false)
         persistSocialState()
         toast = if (blocked) "Blocked ${name.ifBlank { "contact" }}" else "Unblocked ${name.ifBlank { "contact" }}"
         recomputeSociallyFilteredRows()
@@ -1349,11 +1379,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun setPeerBlocked(peerId: String, name: String, blocked: Boolean) {
         val key = normalizeSocialPeerId(peerId)
-        socialState = socialState.withBlockedPeer(key, blocked)
-        npubRawFor(key)?.toHexLower()?.let {
-            socialState = socialState.withBlockedNostr(it, blocked)
-        }
-        if (blocked) socialState = socialState.withFavoritePeer(key, false)
+        setMeshContactBlocked(key, blocked)
         persistSocialState()
         toast = if (blocked) "Blocked ${name.ifBlank { "contact" }}" else "Unblocked ${name.ifBlank { "contact" }}"
         recomputeSociallyFilteredRows()
@@ -1444,7 +1470,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             socialNpubHexForChat(chat.id)?.let { socialState.isBlockedNostr(it) } == true
 
     private fun visibleMessagesForChat(chatId: String, source: List<SonarMsg>): List<SonarMsg> =
-        source.filter { msg -> socialState.allowsChatMessage(chatId, msg.senderNpub, msg.mine) }
+        if (isMeshChat(chatId) && isMeshContactBlocked(meshPeerId(chatId))) emptyList()
+        else source.filter { msg -> socialState.allowsChatMessage(chatId, msg.senderNpub, msg.mine) }
 
     private fun setCurrentVisibleMessages(chatId: String, source: List<SonarMsg>, processCalls: Boolean = false) {
         val visible = visibleMessagesForChat(chatId, source)
@@ -1509,8 +1536,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (directPaymentOffer(chatId) != null) return true
         if (isMeshChat(chatId)) {
             val peerId = meshPeerId(chatId)
-            if (sonarProfile(peerId)?.speaksPay == true) return true
-            if (((linkCapsByFp[peerId] ?: 0) and SonarAnnounce.CAP_PAY) != 0) return true
+            val aliases = preferredMeshAliases(peerId)
+            if (aliases.any { sonarProfile(it)?.speaksPay == true }) return true
+            if (aliases.any { ((linkCapsByFp[it] ?: 0) and SonarAnnounce.CAP_PAY) != 0 }) return true
         }
         paymentNpubHex(chatId)?.let {
             if (sonarDescriptorsByNpubHex[it]?.bolt12Offer?.isNotBlank() == true) return true
@@ -1592,7 +1620,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** This peer's npub (32 raw bytes) if known — from a live 0x53 OR the persisted
      *  [linkByFp] (so it still resolves out of range / after restart). The bridge
      *  that unifies the BLE-Noise and White-Noise legs of one conversation. */
-    private fun npubRawFor(peerId: String): ByteArray? =
+    private fun exactNpubRawFor(peerId: String): ByteArray? =
         sonarProfile(peerId)?.npub
             ?: linkByFp[peerId]?.hexToBytesOrEmpty()?.takeIf { it.size == 32 }
 
@@ -1630,6 +1658,33 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private fun canonicalMeshPeerId(peerId: String): String =
         selectCanonicalMeshPeerId(meshPeerAliases(peerId), groupFoldMap.values.toSet()) ?: peerId
+
+    private fun preferredMeshAliases(peerId: String): List<String> {
+        val aliases = meshPeerAliases(peerId)
+        val live = aliases.firstOrNull { MeshRadio.hasMeshLink(it) }
+        return orderMeshAliasesByLiveRoute(aliases, live)
+    }
+
+    private fun npubRawFor(peerId: String): ByteArray? =
+        preferredMeshAliases(peerId).firstNotNullOfOrNull(::exactNpubRawFor)
+
+    private fun isMeshContactBlocked(peerId: String): Boolean =
+        isMeshAliasGroupBlocked(
+            aliases = meshPeerAliases(peerId),
+            isPeerBlocked = socialState::isBlockedPeer,
+            linkedNpubHex = { alias -> exactNpubRawFor(alias)?.toHexLower() },
+            isNpubBlocked = socialState::isBlockedNostr,
+        )
+
+    private fun setMeshContactBlocked(peerId: String, blocked: Boolean) {
+        for (alias in meshPeerAliases(peerId)) {
+            socialState = socialState.withBlockedPeer(alias, blocked)
+            exactNpubRawFor(alias)?.toHexLower()?.let { npubHex ->
+                socialState = socialState.withBlockedNostr(npubHex, blocked)
+            }
+            if (blocked) socialState = socialState.withFavoritePeer(alias, false)
+        }
+    }
 
     private fun mergedMeshMessages(peerId: String): List<SonarMsg> =
         meshPeerAliases(peerId)
@@ -1861,7 +1916,9 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private fun directPaymentOffer(chatId: String): String? {
         if (isMeshChat(chatId)) {
-            sonarProfile(meshPeerId(chatId))?.bolt12Offer?.takeIf { it.isNotBlank() }?.let { return it }
+            preferredMeshAliases(meshPeerId(chatId)).firstNotNullOfOrNull { alias ->
+                sonarProfile(alias)?.bolt12Offer?.takeIf { it.isNotBlank() }
+            }?.let { return it }
         }
         val npubHex = paymentNpubHex(chatId) ?: return null
         return sonarDescriptorsByNpubHex[npubHex]?.bolt12Offer?.takeIf { it.isNotBlank() }
@@ -1959,8 +2016,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (isContactBlocked(chatId)) return false
         if (isMeshChat(chatId)) {
             val peerId = meshPeerId(chatId)
-            if (hasLiveMeshRoute(peerId)) {
-                return clean.all { sendMesh(peerId, it) }
+            val routePeerId = liveMeshRoutePeerId(peerId)
+            if (routePeerId != null) {
+                return clean.all { sendMesh(routePeerId, it) }
             }
             val raw = npubRawFor(peerId) ?: return false
             return sendPaymentReceiptLinesOverMarmot(
@@ -4071,14 +4129,14 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** True if [chatId] can carry media over live BLE mesh or an existing Marmot group. */
     fun canSendMedia(chatId: String): Boolean =
         !isContactBlocked(chatId) && (
-            (isMeshChat(chatId) && MeshRadio.hasMeshLink(meshPeerId(chatId))) ||
+            (isMeshChat(chatId) && liveMeshRoutePeerId(meshPeerId(chatId)) != null) ||
                 resolveMarmotGroupId(chatId) != null
             )
 
     /** Send an image to a White Noise chat: encrypt + Blossom upload + publish. */
     fun sendImage(chatId: String, data: ByteArray, filename: String, mime: String) {
         if (isContactBlocked(chatId)) { toast = "Unblock this contact before sending."; return }
-        if (isMeshChat(chatId) && MeshRadio.hasMeshLink(meshPeerId(chatId))) {
+        if (isMeshChat(chatId) && liveMeshRoutePeerId(meshPeerId(chatId)) != null) {
             if (sendMeshMedia(meshPeerId(chatId), data, filename, mime)) return
             if (resolveMarmotGroupId(chatId) == null) return
         }
@@ -4152,7 +4210,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             return
         }
         if (isContactBlocked(chatId)) { toast = "Unblock this contact before sending."; return }
-        if (isMeshChat(chatId) && MeshRadio.hasMeshLink(meshPeerId(chatId))) {
+        if (isMeshChat(chatId) && liveMeshRoutePeerId(meshPeerId(chatId)) != null) {
             // Mesh has no album packet — send each over mesh and return. Sending
             // per-item (not `all {}`, which short-circuits mid-batch) avoids a
             // partial mesh send that then double-sends via the Marmot album path.
@@ -4268,7 +4326,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (isContactBlocked(chatId)) { toast = "Unblock this contact before sending."; return }
         val filename = "vn-${(1000..99999).random()}.m4a"
         val mime = "audio/mp4"
-        if (isMeshChat(chatId) && MeshRadio.hasMeshLink(meshPeerId(chatId))) {
+        if (isMeshChat(chatId) && liveMeshRoutePeerId(meshPeerId(chatId)) != null) {
             if (sendMeshMedia(meshPeerId(chatId), bytes, filename, mime)) return
             if (resolveMarmotGroupId(chatId) == null) return
         }
@@ -4458,7 +4516,7 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  route is available the message is queued in the outbox (mirrors iOS
      *  MessageRouter) and auto-sent when a route becomes available. */
     private fun sendDmAuto(peerId: String, text: String) {
-        if (socialState.isBlockedPeer(peerId)) {
+        if (isMeshContactBlocked(peerId)) {
             toast = "Unblock this contact before sending."
             return
         }
@@ -4545,7 +4603,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /** Send a BLE-mesh DM over the Noise link + optimistically echo it. */
     private fun sendMesh(peerId: String, text: String): Boolean {
-        if (socialState.isBlockedPeer(peerId)) {
+        if (isMeshContactBlocked(peerId)) {
             toast = "Unblock this contact before sending."
             return false
         }
@@ -4566,7 +4624,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private fun sendMeshMedia(peerId: String, data: ByteArray, filename: String, mime: String): Boolean {
-        if (socialState.isBlockedPeer(peerId)) {
+        if (isMeshContactBlocked(peerId)) {
             toast = "Unblock this contact before sending."
             return false
         }
@@ -4632,7 +4690,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private fun sendDirectNip17(peerId: String, npubRaw: ByteArray, text: String) {
-        if (socialState.isBlockedPeer(peerId)) {
+        if (isMeshContactBlocked(peerId)) {
             toast = "Unblock this contact before sending."
             return
         }
@@ -4906,7 +4964,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     private suspend fun flushOutboxNow(peerId: String) {
         val queue = outbox.snapshot(peerId)
         if (queue.isEmpty()) { outbox.finishFlush(peerId, 0, emptyList()); return }
-        if (socialState.isBlockedPeer(peerId)) {
+        if (isMeshContactBlocked(peerId)) {
             sonarLog("SonarOutbox", "paused blocked outbox peer=${peerId.take(10)}…")
             return
         }
@@ -4980,7 +5038,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private suspend fun sendOutboxOverMarmot(peerId: String, groupId: String, text: String): Boolean {
-        if (socialState.isBlockedPeer(peerId)) return false
+        if (isMeshContactBlocked(peerId)) return false
         return try {
             SonarCore.send(groupId, text)
             refreshOpenDm(peerId)
@@ -4997,7 +5055,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         npubRaw: ByteArray,
         queued: QueuedMessage,
     ): Boolean {
-        if (socialState.isBlockedPeer(peerId)) return false
+        if (isMeshContactBlocked(peerId)) return false
         val delivered = sendDirectNip17Now(peerId, npubRaw, queued.messageId, queued.content)
         if (!delivered) return false
         val msg = privateDmMessage(
@@ -5455,7 +5513,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (incoming.isEmpty()) return false
         val touched = mutableSetOf<String>()
         for (m in incoming) {
-            if (socialState.isBlockedPeer(m.peerId)) continue
+            if (isMeshContactBlocked(m.peerId)) continue
             if (handleFavoriteControl(m.peerId, m.text)) continue
             val stickerRef = meshParseStickerContent(m.text)?.let {
                 SonarStickerRef(it.packCoordinate, it.shortcode, it.plaintextSha256)
@@ -5489,7 +5547,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         (screen as? Screen.Chat)?.let { sc ->
             if (isMeshChat(sc.id)) {
                 val pid = meshPeerId(sc.id)
-                if (incoming.any { it.peerId == pid }) scope.launch { refreshOpenDm(pid) }
+                if (meshAliasGroupWasTouched(meshPeerAliases(pid), touched)) scope.launch { refreshOpenDm(pid) }
             }
         }
         return true
@@ -5506,7 +5564,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 ackEventIds += m.eventId
                 continue
             }
-            if (socialState.isBlockedPeer(peerId) || socialState.isBlockedNostr(m.senderPubkeyHex)) {
+            if (isMeshContactBlocked(peerId) || socialState.isBlockedNostr(m.senderPubkeyHex)) {
                 ackEventIds += m.eventId
                 continue
             }
@@ -5556,7 +5614,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             (screen as? Screen.Chat)?.let { sc ->
                 if (isMeshChat(sc.id)) {
                     val pid = meshPeerId(sc.id)
-                    if (pid in touched) refreshOpenDm(pid)
+                    if (meshAliasGroupWasTouched(meshPeerAliases(pid), touched)) refreshOpenDm(pid)
                 }
             }
         }
@@ -5570,7 +5628,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (incoming.isEmpty()) return false
         val touched = mutableSetOf<String>()
         for (m in incoming) {
-            if (socialState.isBlockedPeer(m.peerId)) continue
+            if (isMeshContactBlocked(m.peerId)) continue
             val id = m.messageId.ifBlank { randomMeshId() }
             if (meshChats[m.peerId].orEmpty().any { it.id == id }) continue
             val mediaUrl = meshMediaUrl(m.peerId, id, m.filename)
@@ -5588,7 +5646,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         (screen as? Screen.Chat)?.let { sc ->
             if (isMeshChat(sc.id)) {
                 val pid = meshPeerId(sc.id)
-                if (pid in touched) scope.launch { refreshOpenDm(pid) }
+                if (meshAliasGroupWasTouched(meshPeerAliases(pid), touched)) scope.launch { refreshOpenDm(pid) }
             }
         }
         return true
@@ -5655,7 +5713,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         val groups = meshConversationAliasGroups()
         meshDmRows = groups.mapNotNull { aliases ->
             val peerId = selectCanonicalMeshPeerId(aliases, groupFoldMap.values.toSet()) ?: return@mapNotNull null
-            if (aliases.all { socialState.isBlockedPeer(it) }) return@mapNotNull null
+            if (isMeshContactBlocked(peerId)) return@mapNotNull null
             val last = aliases.flatMap { meshChats[it].orEmpty() }
                 .distinctBy { it.id }
                 .maxByOrNull { it.tsSecs }
@@ -5682,7 +5740,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         val meshGroups = meshConversationAliasGroups()
         for (aliases in meshGroups) {
             val peerId = selectCanonicalMeshPeerId(aliases, groupFoldMap.values.toSet()) ?: continue
-            if (aliases.all { socialState.isBlockedPeer(it) }) continue
+            if (isMeshContactBlocked(peerId)) continue
             var last = aliases.flatMap { meshChats[it].orEmpty() }
                 .distinctBy { it.id }
                 .maxByOrNull { it.tsSecs }
@@ -5699,7 +5757,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (isBlockedMarmotChat(group)) continue
             val rawPeerId = peerIdForMarmotGroup(group) ?: continue
             val peerId = canonicalMeshPeerId(rawPeerId)
-            if (socialState.isBlockedPeer(peerId)) continue
+            if (isMeshContactBlocked(peerId)) continue
             folded += group.id
             groupPeers[group.id] = peerId
             val last = latestMarmotMessage(listOf(group))

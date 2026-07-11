@@ -192,6 +192,9 @@ final class MarmotChatModel: ObservableObject {
     @Published private(set) var sonarDescriptorMissesByNpub: [String: Date] = [:]
     /// True when the current node is relay-backed, not just the local DB node.
     @Published private(set) var relayConnected = false
+    /// True after the first local encrypted-DB hydration attempt finishes.
+    /// Home uses this as its atomic reveal boundary; relay state is irrelevant.
+    @Published private(set) var initialLocalHomeReady = false
     /// Unread message counts per Marmot group, keyed by group ID hex.
     @Published var unreadByGroup: [String: UInt64] = [:]
 
@@ -199,7 +202,6 @@ final class MarmotChatModel: ObservableObject {
     private let keychain: KeychainManagerProtocol
     private let defaults: UserDefaults
     private var syncTask: Task<Void, Never>?
-    private var startupLocalSummaryTask: Task<Void, Never>?
     private var relayConnectTask: Task<Void, Never>?
     private var relayBusy = false
     #if DEBUG
@@ -289,12 +291,15 @@ final class MarmotChatModel: ObservableObject {
     }
 
     /// The actual connect sequence (awaitable, NOT guarded). Reuse the keychain
-    /// identity, open the encrypted DB, load local group metadata, then schedule
-    /// relay setup behind first-paint local reads. Used by the lazy
+    /// identity, open the encrypted DB, hydrate the bounded local Home window,
+    /// then schedule relay setup behind that first-paint boundary. Used by the lazy
     /// `connectIfNeeded()` and the erase-and-reconnect path —
     /// the latter must NOT be blocked by the `busy`/`npub` guard, which would
     /// silently leave the node disconnected ("not connected yet" until restart).
     private func performConnect(allowCreateIdentity: Bool = false) async -> Bool {
+        // A keychain/DB failure must reveal the cached fallback instead of
+        // leaving the app's launch surface visible forever.
+        defer { initialLocalHomeReady = true }
         // Read the persisted nsec SAFELY: transient read failures (e.g. device
         // LOCKED during a background BLE wake) must never generate a replacement
         // key. Even a genuine miss only creates a key during explicit onboarding.
@@ -368,14 +373,16 @@ final class MarmotChatModel: ObservableObject {
         do {
             _ = try await service.connectLocal(nsec: storedNsec)
             relayConnected = false
-            await loadLocalGroupMetadata()
+            // Publish one coherent, bounded local Home model before the root
+            // view becomes visible. This reads no relay and performs no sync.
+            await loadLocalSummaries(resolveMembers: false)
             #if DEBUG
-            // SONAR_BENCH: local-first paint ready — groups hydrated from the
-            // encrypted DB before any relay attach (T1).
+            // SONAR_BENCH: local-first paint ready — row previews/order hydrated
+            // from the encrypted DB before any relay attach (T1).
             SecureLogger.info("SONAR_BENCH t1_local_paint groups=\(groups.count)", category: .session)
             #endif
             self.errorText = nil
-            scheduleStartupLocalSummariesThenRelay()
+            scheduleRelayConnect(delaySeconds: 0.25)
             return true
         } catch {
             let desc = Self.describe(error)
@@ -443,21 +450,6 @@ final class MarmotChatModel: ObservableObject {
             guard !Task.isCancelled else { return }
             self?.connectRelaysIfNeeded()
             self?.relayConnectTask = nil
-        }
-    }
-
-    private func scheduleStartupLocalSummariesThenRelay(delaySeconds: Double = 0.25) {
-        guard startupLocalSummaryTask == nil else { return }
-        startupLocalSummaryTask = Task { [weak self] in
-            let nanos = UInt64(max(0, delaySeconds) * 1_000_000_000)
-            if nanos > 0 {
-                try? await Task.sleep(nanoseconds: nanos)
-            }
-            guard let self, !Task.isCancelled else { return }
-            await self.loadLocalSummaries(resolveMembers: false)
-            guard !Task.isCancelled else { return }
-            self.startupLocalSummaryTask = nil
-            self.scheduleRelayConnect(delaySeconds: 0.25)
         }
     }
 
@@ -603,26 +595,6 @@ final class MarmotChatModel: ObservableObject {
     /// so the chat list paints instantly on launch regardless of relay health.
     func loadLocal() async {
         await loadLocalSummaries()
-    }
-
-    /// Startup local read: load only row metadata, not even one message per
-    /// group. The selected chat's `messagesPage` must stay ahead of background
-    /// summaries/sync on the serialized engine queue.
-    private func loadLocalGroupMetadata() async {
-        do {
-            let groups = try await service.groups()
-            let invites = try await service.pendingGroupInvites()
-            self.groups = groups
-            dropResolvedPendingDirectChats()
-            self.pendingGroupInvites = invites
-            SNMarmotChatSnapshotCache.save(
-                groups: groups,
-                messagesByGroup: messagesByGroup,
-                to: defaults
-            )
-        } catch {
-            self.errorText = Self.describe(error)
-        }
     }
 
     /// Load the latest local transcript window for one group. Used by chat open
@@ -1458,8 +1430,6 @@ final class MarmotChatModel: ObservableObject {
     }
 
     func stopPolling() {
-        startupLocalSummaryTask?.cancel()
-        startupLocalSummaryTask = nil
         relayConnectTask?.cancel()
         relayConnectTask = nil
         syncTask?.cancel()

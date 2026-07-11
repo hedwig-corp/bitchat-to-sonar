@@ -135,4 +135,53 @@ class HomeMessageRowsTest {
         assertEquals("outside preview", hydration.messagesByChat["outside"]?.single()?.content)
         assertEquals(listOf(pageMessage), hydration.messagesByChat["paged"])
     }
+
+    @Test
+    fun sameSecondSummaryRefreshesWhenLatestContentChanges() {
+        val old = SonarMsg("summary:chat:42:1", "peer", "old", false, 42L, viaInternet = true)
+        val summary = SonarConversationSummary("chat", "", "new", "peer", 42L, false, 2L, 0L)
+
+        val hydration = hydrateLocalConversationRows(
+            activeChatIds = setOf("chat"),
+            existingMessagesByChat = mapOf("chat" to listOf(old)),
+            existingLatestByChat = mapOf("chat" to 42L),
+            summaries = listOf(summary),
+            pages = emptyList(),
+        )
+
+        assertEquals("new", hydration.messagesByChat["chat"]?.single()?.content)
+        assertEquals("summary:chat:42:2", hydration.messagesByChat["chat"]?.single()?.id)
+    }
+
+    @Test
+    fun sameSecondSummaryRefreshesSyntheticIdentityWhenCountChanges() {
+        val old = SonarMsg("summary:chat:42:1", "peer", "same", false, 42L, viaInternet = true)
+        val summary = SonarConversationSummary("chat", "", "same", "peer", 42L, false, 2L, 0L)
+
+        val hydration = hydrateLocalConversationRows(
+            activeChatIds = setOf("chat"),
+            existingMessagesByChat = mapOf("chat" to listOf(old)),
+            existingLatestByChat = mapOf("chat" to 42L),
+            summaries = listOf(summary),
+            pages = emptyList(),
+        )
+
+        assertEquals("summary:chat:42:2", hydration.messagesByChat["chat"]?.single()?.id)
+    }
+
+    @Test
+    fun matchingRealPageRowIsNotReplacedBySyntheticSummary() {
+        val pageRow = SonarMsg("real-message", "peer", "same", false, 42L, viaInternet = true)
+        val summary = SonarConversationSummary("chat", "", "same", "peer", 42L, false, 3L, 0L)
+
+        val hydration = hydrateLocalConversationRows(
+            activeChatIds = setOf("chat"),
+            existingMessagesByChat = mapOf("chat" to listOf(pageRow)),
+            existingLatestByChat = mapOf("chat" to 42L),
+            summaries = listOf(summary),
+            pages = emptyList(),
+        )
+
+        assertEquals(listOf(pageRow), hydration.messagesByChat["chat"])
+    }
 }

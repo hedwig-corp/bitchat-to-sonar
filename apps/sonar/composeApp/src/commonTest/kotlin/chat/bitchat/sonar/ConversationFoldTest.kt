@@ -4,6 +4,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 class ConversationFoldTest {
     @Test
@@ -377,6 +378,65 @@ class ConversationFoldTest {
         assertEquals(
             "fp-persisted-fold",
             selectCanonicalMeshPeerId(aliases, setOf("fp-persisted-fold")),
+        )
+    }
+
+    @Test
+    fun liveAliasIsPreferredForTransportAndCapabilityLookup() {
+        assertEquals(
+            listOf("fp-live", "fp-canonical", "fp-old"),
+            orderMeshAliasesByLiveRoute(
+                aliases = listOf("fp-old", "fp-live", "fp-canonical"),
+                livePeerId = "fp-live",
+            ),
+        )
+        assertEquals(
+            listOf("fp-canonical", "fp-old"),
+            orderMeshAliasesByLiveRoute(
+                aliases = listOf("fp-old", "fp-canonical"),
+                livePeerId = null,
+            ),
+        )
+    }
+
+    @Test
+    fun openFoldedConversationRefreshesWhenAnyAliasIsTouched() {
+        val aliases = setOf("fp-canonical", "fp-live")
+
+        assertTrue(meshAliasGroupWasTouched(aliases, setOf("fp-live")))
+        assertTrue(meshAliasGroupWasTouched(aliases, setOf("fp-canonical")))
+        assertFalse(meshAliasGroupWasTouched(aliases, setOf("fp-other")))
+        assertFalse(meshAliasGroupWasTouched(emptySet(), setOf("fp-live")))
+    }
+
+    @Test
+    fun anyAliasOrSharedNpubBlocksFoldedConversation() {
+        val aliases = setOf("fp-canonical", "fp-live")
+        val linked = aliases.associateWith { "ab".repeat(32) }
+
+        assertTrue(
+            isMeshAliasGroupBlocked(
+                aliases,
+                isPeerBlocked = { it == "fp-live" },
+                linkedNpubHex = linked::get,
+                isNpubBlocked = { false },
+            ),
+        )
+        assertTrue(
+            isMeshAliasGroupBlocked(
+                aliases + "fp-later",
+                isPeerBlocked = { false },
+                linkedNpubHex = { linked[it] ?: "ab".repeat(32) },
+                isNpubBlocked = { it == "ab".repeat(32) },
+            ),
+        )
+        assertFalse(
+            isMeshAliasGroupBlocked(
+                aliases,
+                isPeerBlocked = { false },
+                linkedNpubHex = linked::get,
+                isNpubBlocked = { false },
+            ),
         )
     }
 }

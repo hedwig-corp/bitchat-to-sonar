@@ -928,26 +928,23 @@ final class SonarAppStore: ObservableObject {
             .sink { [weak self] npub in
                 guard let self else { return }
                 self.wireSonarProfileProvider(npub)
-                // Publish our kind-0 profile (NIP-01) so peers resolve our
-                // nickname instead of our npub. MIP-00 identity == Nostr pubkey.
-                if npub != nil { self.marmot.publishProfile(name: self.chatViewModel.nickname) }
-                // Bind the iroh call endpoint + start the event loop once we're
-                // connected, so an incoming call rings without placing one first.
-                if npub != nil { self.ensureCallStarted() }
-                // The wallet derives from the same identity (nsec); once the
-                // Marmot identity exists, (re)attempt the deferred wallet setup.
-                #if os(iOS) || os(macOS)
-                if npub != nil { (self.wallet as? BridgedWallet)?.retrySetup() }
-                #endif
-                if npub != nil { self.publishPaymentMetadataIfNeeded(force: true) }
-                if npub != nil { self.drainPendingInviteLinks() }
+                self.runPostLocalMarmotStartupIfReady()
             }
+            .store(in: &cancellables)
+        marmot.$initialLocalHomeReady
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.runPostLocalMarmotStartupIfReady() }
             .store(in: &cancellables)
         marmot.$relayConnected
             .receive(on: DispatchQueue.main)
             .sink { [weak self] connected in
                 guard let self, connected else { return }
+                // Relay-dependent work starts only after the delayed background
+                // attach, never as a side effect of publishing the local Home.
+                self.marmot.publishProfile(name: self.chatViewModel.nickname)
+                self.ensureCallStarted()
                 self.publishPaymentMetadataIfNeeded(force: true)
+                self.drainPendingInviteLinks()
                 guard !self.refreshedKnownDescriptorsForRelaySession else { return }
                 self.refreshedKnownDescriptorsForRelaySession = true
                 self.refreshKnownContactDescriptors(clearMisses: true)
@@ -1097,6 +1094,17 @@ final class SonarAppStore: ObservableObject {
                 scheduleDebugMarmot(raw)
             }
         }
+        #endif
+    }
+
+    /// Identity publication happens before the encrypted DB opens so BLE can
+    /// advertise our npub early. Wallet setup is local-only, but still waits for
+    /// the coherent Home boundary so it cannot contend with first-paint reads.
+    private func runPostLocalMarmotStartupIfReady() {
+        guard marmot.initialLocalHomeReady, marmot.npub != nil else { return }
+        // The wallet derives from the same identity; retry its deferred setup.
+        #if os(iOS) || os(macOS)
+        (wallet as? BridgedWallet)?.retrySetup()
         #endif
     }
 

@@ -82,10 +82,22 @@ internal fun hydrateLocalConversationRows(
         if (summary.groupIdHex !in activeChatIds || summary.latestAtSecs <= 0L) continue
         latest[summary.groupIdHex] = summary.latestAtSecs
         val existing = messages[summary.groupIdHex]
-        if (existing?.lastOrNull()?.tsSecs != summary.latestAtSecs) {
+        val previous = existing?.lastOrNull()
+        val summaryId = "summary:${summary.groupIdHex}:${summary.latestAtSecs}:${summary.messageCount}"
+        val visibleFieldsMatch = previous != null &&
+            previous.tsSecs == summary.latestAtSecs &&
+            previous.content == summary.latestContent &&
+            previous.senderNpub == summary.latestSenderNpub &&
+            previous.mine == summary.latestMine
+        val staleSyntheticIdentity = previous?.id?.startsWith("summary:${summary.groupIdHex}:") == true &&
+            previous.id != summaryId
+        // Preserve a real bounded-page row when it already represents the same
+        // visible latest message. Synthetic summaries additionally track count,
+        // because core timestamps have only second resolution.
+        if (!visibleFieldsMatch || staleSyntheticIdentity) {
             messages[summary.groupIdHex] = listOf(
                 SonarMsg(
-                    id = "summary:${summary.groupIdHex}:${summary.latestAtSecs}",
+                    id = summaryId,
                     senderNpub = summary.latestSenderNpub,
                     content = summary.latestContent,
                     mine = summary.latestMine,
