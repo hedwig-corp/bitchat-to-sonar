@@ -316,4 +316,24 @@ class ConversationFoldTest {
 
         assertEquals(listOf(newer, room), visible)
     }
+
+    @Test
+    fun foldedHomeTitlePrefersMarmotProfileOverBleRadarName() {
+        val sara = SonarChat(id = "g-sara", name = "", members = listOf("npub1me", "npub1sara"))
+        val title = homeListTitleForFoldedMeshRow(
+            foldedGroup = sara,
+            isDirectMarmot = { chat -> directMarmotPeerKey(chat, "npub1me") != null },
+            groupTitle = { "Sara D" },
+            meshDerivedName = "Wrong BLE Name",
+        )
+        assertEquals("Sara D", title)
+    }
+
+    @Test
+    fun staleFoldRejectedWhenNpubHexDoesNotMatch() {
+        val groupHex = "aa".repeat(32)
+        val peerHex = "bb".repeat(32)
+        assertFalse(peerNpubHexMatchesLinkedPeer(groupHex, peerHex))
+        assertTrue(peerNpubHexMatchesLinkedPeer(groupHex, groupHex))
+    }
 }

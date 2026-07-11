@@ -143,6 +143,26 @@ internal fun inferUniquePeerByTitle(
         .singleOrNull()
 }
 
+/** Home list title when a Marmot DM is folded into a mesh row: the secure-chat
+ *  profile name wins over a live BLE radar label (wrong fold / nearby stranger). */
+internal fun homeListTitleForFoldedMeshRow(
+    foldedGroup: SonarChat?,
+    isDirectMarmot: (SonarChat) -> Boolean,
+    groupTitle: (SonarChat) -> String,
+    meshDerivedName: String,
+): String {
+    if (foldedGroup != null && isDirectMarmot(foldedGroup)) return groupTitle(foldedGroup)
+    return meshDerivedName
+}
+
+internal fun peerNpubHexMatchesLinkedPeer(
+    groupCounterpartyNpubHex: String,
+    linkedPeerNpubHex: String?,
+): Boolean {
+    if (linkedPeerNpubHex.isNullOrBlank()) return false
+    return groupCounterpartyNpubHex.equals(linkedPeerNpubHex, ignoreCase = true)
+}
+
 internal fun directMarmotPeerKey(chat: SonarChat, ownNpub: String): String? {
     val mine = canonicalProfileKey(ownNpub)
     val others = chat.members
@@ -5085,18 +5105,52 @@ class SonarAppState(private val scope: CoroutineScope) {
             ?.takeIf { it.size == 32 }
             ?.toHexLower()
 
+    /** Counterparty npub hex for a 1:1 Marmot group (npub or hex member). */
+    private fun npubHexForDirectGroup(group: SonarChat): String? =
+        npubHexForGroup(group) ?: directMarmotPeerKey(group, npub)?.let { canonicalNpubHex(it) }
+
+    private fun linkedNpubHexForPeer(peerId: String): String? =
+        linkByFp[peerId] ?: npubRawFor(peerId)?.toHexLower()
+
+    private fun peerLinkMatchesGroup(group: SonarChat, peerId: String): Boolean {
+        val want = npubHexForDirectGroup(group) ?: return false
+        val have = linkedNpubHexForPeer(peerId) ?: return false
+        return peerNpubHexMatchesLinkedPeer(want, have)
+    }
+
+    private fun pruneStaleGroupFold(groupId: String) {
+        if (groupFoldMap.remove(groupId) != null) {
+            persistGroupFolds()
+            updateBleDiscoveryPolicy()
+        }
+    }
+
     private fun peerIdForNpubHex(npubHex: String): String? =
         sonarPeerProfiles.entries.firstOrNull { (_, ann) -> ann.npub.toHexLower().equals(npubHex, ignoreCase = true) }?.key
             ?: linkByFp.entries.firstOrNull { it.value.equals(npubHex, ignoreCase = true) }?.key
 
-    private fun peerIdForMarmotGroup(groupId: String): String? =
-        foldedGroupPeerIds[groupId]
-            ?: groupFoldMap[groupId]
-            ?: chats.firstOrNull { it.id == groupId }?.let { peerIdForMarmotGroup(it) }
+    private fun peerIdForMarmotGroup(groupId: String): String? {
+        val group = chats.firstOrNull { it.id == groupId }
+        foldedGroupPeerIds[groupId]?.let { pid ->
+            if (group == null || peerLinkMatchesGroup(group, pid)) return pid
+        }
+        groupFoldMap[groupId]?.let { pid ->
+            if (group != null && !peerLinkMatchesGroup(group, pid)) {
+                pruneStaleGroupFold(groupId)
+            } else if (group == null || peerLinkMatchesGroup(group, pid)) {
+                return pid
+            }
+        }
+        return group?.let { peerIdForMarmotGroup(it) }
+    }
 
     private fun peerIdForMarmotGroup(group: SonarChat): String? {
-        val npubHex = npubHexForGroup(group) ?: return null
-        return peerIdForNpubHex(npubHex) ?: inferPeerLinkByUniqueTitle(group, npubHex)
+        val npubHex = npubHexForDirectGroup(group) ?: return null
+        peerIdForNpubHex(npubHex)?.let { pid ->
+            if (peerLinkMatchesGroup(group, pid)) return pid
+        }
+        val inferred = inferPeerLinkByUniqueTitle(group, npubHex) ?: return null
+        return inferred.takeIf { peerLinkMatchesGroup(group, it) }
     }
 
     private fun inferPeerLinkByUniqueTitle(group: SonarChat, npubHex: String): String? {
@@ -5493,21 +5547,28 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private fun foldedPeerName(peerId: String, group: SonarChat?): String {
-        meshPeers.firstOrNull { it.id == meshChatId(peerId) }?.name?.let {
-            rememberMeshName(peerId, it)
-            return it
-        }
-        meshChatNames[peerId]?.takeUnless { it.isKeyFallbackName() }?.let { return it }
-        val peerNpub = npubStringForPeer(peerId)
-        peerNpub
-            ?.let { profilesByNpub[canonicalProfileKey(it)]?.bestName }
-            ?.let { name ->
-                meshChatNames[peerId] = name
-                return name
+        val meshDerived = run {
+            meshPeers.firstOrNull { it.id == meshChatId(peerId) }?.name?.let {
+                rememberMeshName(peerId, it)
+                return@run it
             }
-        if (peerNpub != null) ensureProfile(peerNpub)
-        group?.let { return chatTitle(it) }
-        return meshChatNames[peerId] ?: ("mesh·" + peerId.take(6))
+            meshChatNames[peerId]?.takeUnless { it.isKeyFallbackName() }?.let { return@run it }
+            val peerNpub = npubStringForPeer(peerId)
+            peerNpub
+                ?.let { profilesByNpub[canonicalProfileKey(it)]?.bestName }
+                ?.let { name ->
+                    meshChatNames[peerId] = name
+                    return@run name
+                }
+            if (peerNpub != null) ensureProfile(peerNpub)
+            meshChatNames[peerId] ?: ("mesh·" + peerId.take(6))
+        }
+        return homeListTitleForFoldedMeshRow(
+            foldedGroup = group,
+            isDirectMarmot = ::isDirectMarmotChat,
+            groupTitle = ::chatTitle,
+            meshDerivedName = meshDerived,
+        )
     }
 
     private fun String.isKeyFallbackName(): Boolean = isKeyFallbackNameValue(this)
@@ -5555,6 +5616,10 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (!isDirectMarmotChat(group)) continue
             if (isBlockedMarmotChat(group)) continue
             val peerId = peerIdForMarmotGroup(group) ?: continue
+            if (!peerLinkMatchesGroup(group, peerId)) {
+                pruneStaleGroupFold(group.id)
+                continue
+            }
             if (socialState.isBlockedPeer(peerId)) continue
             folded += group.id
             groupPeers[group.id] = peerId
