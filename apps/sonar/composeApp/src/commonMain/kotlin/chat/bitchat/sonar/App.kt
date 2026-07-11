@@ -146,7 +146,7 @@ object SonarLifecycle {
 }
 
 @Composable
-fun App() {
+fun App(onFirstLocalStateReady: () -> Unit = {}) {
     val scope = rememberCoroutineScope()
     val state = remember { SonarAppState(scope) }
     LaunchedEffect(state) {
@@ -157,6 +157,14 @@ fun App() {
     LaunchedEffect(state.onboarded) {
         if (state.onboarded) state.boot()
     }
+    val firstLocalStateReady = isFirstLocalStateReady(
+        onboarded = state.onboarded,
+        locked = state.locked,
+        homeMessagesHydrated = state.homeMessagesHydrated,
+    )
+    LaunchedEffect(firstLocalStateReady) {
+        if (firstLocalStateReady) onFirstLocalStateReady()
+    }
     SonarTheme(dark = state.dark) {
         val s = sonar
 
@@ -165,12 +173,39 @@ fun App() {
                 LockScreen(onUnlock = { state.unlock() })
             } else if (!state.onboarded) {
                 Box(Modifier.statusBarsPadding().imePadding()) { SonarOnboardingScreen(state) }
+            } else if (!state.homeMessagesHydrated) {
+                // Never paint an incomplete Home shell. Android keeps its native
+                // launch window above this branch; it remains as a safe fallback
+                // for older Android versions and any future commonMain host.
+                LocalStateLaunchSurface()
             } else {
                 Box(Modifier.statusBarsPadding().imePadding()) {
                     SonarScreenHost(state)
                 }
             }
         }
+    }
+}
+
+/**
+ * A locked or not-yet-onboarded app has a complete first screen without chat
+ * hydration. An unlocked account must wait for the coherent local Home model;
+ * relay connectivity is deliberately not part of this boundary.
+ */
+internal fun isFirstLocalStateReady(
+    onboarded: Boolean,
+    locked: Boolean,
+    homeMessagesHydrated: Boolean,
+): Boolean = !onboarded || locked || homeMessagesHydrated
+
+@Composable
+private fun LocalStateLaunchSurface() {
+    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Image(
+            painter = painterResource(Res.drawable.sonar_icon),
+            contentDescription = null,
+            modifier = Modifier.size(64.dp).clip(RoundedCornerShape(18.dp)),
+        )
     }
 }
 

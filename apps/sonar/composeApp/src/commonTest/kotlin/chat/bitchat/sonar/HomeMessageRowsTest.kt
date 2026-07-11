@@ -2,10 +2,19 @@ package chat.bitchat.sonar
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertTrue
 
 class HomeMessageRowsTest {
+
+    @Test
+    fun unlockedAccountWaitsForCoherentLocalHomeBeforeFirstPaint() {
+        assertFalse(isFirstLocalStateReady(onboarded = true, locked = false, homeMessagesHydrated = false))
+        assertTrue(isFirstLocalStateReady(onboarded = true, locked = false, homeMessagesHydrated = true))
+        assertTrue(isFirstLocalStateReady(onboarded = true, locked = true, homeMessagesHydrated = false))
+        assertTrue(isFirstLocalStateReady(onboarded = false, locked = false, homeMessagesHydrated = false))
+    }
 
     private fun mesh(peerId: String, ts: Long) =
         MeshDmRow(peerId = peerId, name = peerId, preview = "m", tsSecs = ts)
