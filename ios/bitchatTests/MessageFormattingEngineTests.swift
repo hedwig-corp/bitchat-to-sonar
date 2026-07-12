@@ -193,17 +193,18 @@ struct MessageFormattingEngineTests {
         #expect(attributed.runs.contains { $0.link?.absoluteString.contains("example.com") == true })
     }
 
-    @Test func attributedBubbleText_canStyleLinksWithoutLinkAttributes() {
-        let content = "Open www.example.org and wave to @alice"
+    @Test func attributedBubbleText_preservesEveryLinkTarget() {
+        let content = "Compare https://first.example/path and www.second.example"
         let attributed = SonarMessageTextFormatter.attributedBubbleText(
             content,
             baseColor: .primary,
             linkColor: .blue,
-            includeLinkAttributes: false
+            detectBareDomains: true
         )
 
         #expect(String(attributed.characters) == content)
-        #expect(!attributed.runs.contains { $0.link != nil })
+        let links = attributed.runs.compactMap(\.link).map(\.absoluteString)
+        #expect(links == ["https://first.example/path", "http://www.second.example"])
     }
 
     @Test func attributedBubbleText_canDetectBareDomainsWhenRequested() {

@@ -27,6 +27,7 @@ struct TextMessageView: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .lineLimit(isLong && !isExpanded ? TransportConfig.uiLongMessageLineLimit : nil)
                     .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
                 
                 // Delivery status indicator for private messages
                 if message.isPrivate && message.sender == viewModel.nickname,

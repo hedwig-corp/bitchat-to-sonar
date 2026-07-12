@@ -68,6 +68,8 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.LinkAnnotation
+import androidx.compose.ui.text.TextLinkStyles
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -1561,8 +1563,6 @@ private fun MessageBubble(
             }
         }
     )
-    val firstUrl = remember(m.content) { firstUrl(m.content) }
-    val uriHandler = androidx.compose.ui.platform.LocalUriHandler.current
     val tail = 5.dp // calc(var(--r) * 0.28)
     val shape = RoundedCornerShape(
         topStart = 18.dp, topEnd = 18.dp,
@@ -1585,11 +1585,9 @@ private fun MessageBubble(
         Box(
             Modifier.widthIn(max = maxBubbleWidth).clip(shape)
                 .background(if (m.mine) mineBg else s.bubbleOther)
-                .then(if (firstUrl != null) Modifier.clickable { uriHandler.openUri(firstUrl) } else Modifier)
                 .padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 9.dp)
         ) {
-            // Selectable (long-press → Copy); tap opens a link if present —
-            // mirrors the iOS deterministic copy + tappable-link behavior.
+            // Selectable (long-press → Copy); each link keeps its own target.
             androidx.compose.foundation.text.selection.SelectionContainer {
                 Text(
                     annotated, color = if (m.mine) onMine else s.text,
@@ -2817,21 +2815,21 @@ data class HereItem(val geohash: String, val name: String, val tier: String, val
 
 private val URL_REGEX = Regex("""(https?://|www\.)\S+""")
 
-private fun firstUrl(text: String): String? {
-    val m = URL_REGEX.find(text) ?: return null
-    val raw = m.value
-    return if (raw.startsWith("www.")) "https://$raw" else raw
-}
-
 private fun linkify(text: String, linkColor: androidx.compose.ui.graphics.Color) =
     androidx.compose.ui.text.buildAnnotatedString {
         var last = 0
         for (match in URL_REGEX.findAll(text)) {
             append(text.substring(last, match.range.first))
-            pushStyle(
-                androidx.compose.ui.text.SpanStyle(
-                    color = linkColor,
-                    textDecoration = androidx.compose.ui.text.style.TextDecoration.Underline
+            val url = if (match.value.startsWith("www.")) "https://${match.value}" else match.value
+            pushLink(
+                LinkAnnotation.Url(
+                    url = url,
+                    styles = TextLinkStyles(
+                        style = androidx.compose.ui.text.SpanStyle(
+                            color = linkColor,
+                            textDecoration = androidx.compose.ui.text.style.TextDecoration.Underline
+                        )
+                    )
                 )
             )
             append(match.value)
