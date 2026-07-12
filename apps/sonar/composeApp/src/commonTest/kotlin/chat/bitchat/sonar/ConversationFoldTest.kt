@@ -4,39 +4,38 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 class ConversationFoldTest {
     @Test
-    fun uniqueTitleMatchInfersPeer() {
-        val peer = inferUniquePeerByTitle(
-            groupTitle = "  Vincenzo  Palazzo ",
-            peerTitles = mapOf("fp1" to "vincenzo palazzo", "fp2" to "Alice"),
-            allGroupTitles = listOf("Vincenzo Palazzo", "Alice Internet"),
+    fun foldedDirectDmTitleComesFromMarmotCounterpart() {
+        assertEquals(
+            "Sara D",
+            homeListTitleForFoldedMeshRow(
+                directMarmotTitle = "Sara D",
+                meshDerivedName = "Wrong BLE Name",
+            ),
         )
-
-        assertEquals("fp1", peer)
     }
 
     @Test
-    fun duplicatePeerTitlesDoNotInfer() {
-        val peer = inferUniquePeerByTitle(
-            groupTitle = "Vincenzo",
-            peerTitles = mapOf("fp1" to "Vincenzo", "fp2" to "vincenzo"),
-            allGroupTitles = listOf("Vincenzo"),
+    fun meshOnlyConversationKeepsMeshDerivedTitle() {
+        assertEquals(
+            "Nearby Peer",
+            homeListTitleForFoldedMeshRow(
+                directMarmotTitle = null,
+                meshDerivedName = "Nearby Peer",
+            ),
         )
-
-        assertNull(peer)
     }
 
     @Test
-    fun duplicateGroupTitlesDoNotInfer() {
-        val peer = inferUniquePeerByTitle(
-            groupTitle = "Vincenzo",
-            peerTitles = mapOf("fp1" to "Vincenzo"),
-            allGroupTitles = listOf("Vincenzo", "vincenzo"),
-        )
+    fun foldIdentityRequiresMatchingNpub() {
+        val sara = "ab".repeat(32)
 
-        assertNull(peer)
+        assertTrue(peerNpubHexMatchesLinkedPeer(sara, sara.uppercase()))
+        assertFalse(peerNpubHexMatchesLinkedPeer(sara, "cd".repeat(32)))
+        assertFalse(peerNpubHexMatchesLinkedPeer(sara, null))
     }
 
     @Test
@@ -265,7 +264,8 @@ class ConversationFoldTest {
 
     @Test
     fun chatSnapshotKeepsRowsWithoutPersistingMessages() {
-        val chat = SonarChat("group-1", "", listOf("npub1sara", "npub1me"))
+        val newest = SonarChat("group-z", "", listOf("npub1sara", "npub1me"))
+        val older = SonarChat("group-a", "", listOf("npub1bob", "npub1me"))
         val messages = listOf(
             SonarMsg(
                 id = "msg-1",
@@ -279,10 +279,17 @@ class ConversationFoldTest {
             ),
         )
 
-        val decoded = decodeChatSnapshot(encodeChatSnapshot(listOf(chat), mapOf(chat.id to messages)))
+        val decoded = decodeChatSnapshot(
+            encodeChatSnapshot(listOf(newest, older), mapOf(newest.id to messages)),
+        )
 
-        assertEquals(listOf(chat), decoded.first)
+        // The snapshot keeps the last local recency order instead of sorting by
+        // opaque group id, while still excluding plaintext message content.
+        assertEquals(listOf(newest, older), decoded.first)
         assertEquals(emptyMap(), decoded.second)
+        assertEquals(mapOf(newest.id to 42L), decodeChatSnapshotLatest(
+            encodeChatSnapshot(listOf(newest, older), mapOf(newest.id to messages)),
+        ))
     }
 
     @Test
@@ -315,5 +322,160 @@ class ConversationFoldTest {
         )
 
         assertEquals(listOf(newer, room), visible)
+    }
+
+    @Test
+    fun meshFingerprintsLinkedToSameNpubFormOneConversation() {
+        val sharedNpubHex = "ab".repeat(32)
+        val groups = groupMeshPeerIdsByIdentity(
+            peerIds = listOf("fp-old", "fp-current", "fp-other"),
+            linkedNpubByPeer = mapOf(
+                "fp-old" to sharedNpubHex.uppercase(),
+                "fp-current" to sharedNpubHex,
+                "fp-other" to "cd".repeat(32),
+            ),
+        )
+
+        assertEquals(
+            setOf(setOf("fp-old", "fp-current"), setOf("fp-other")),
+            groups.map { it.toSet() }.toSet(),
+        )
+    }
+
+    @Test
+    fun persistedFoldTargetKeepsCanonicalMeshRowStable() {
+        assertEquals(
+            "fp-current",
+            selectCanonicalMeshPeerId(
+                aliases = listOf("fp-old", "fp-current", "fp-new"),
+                persistedFoldPeerIds = setOf("fp-current"),
+            ),
+        )
+        assertEquals(
+            "fp-new",
+            selectCanonicalMeshPeerId(
+                aliases = listOf("fp-old", "fp-new"),
+                persistedFoldPeerIds = emptySet(),
+            ),
+        )
+    }
+
+    @Test
+    fun persistedAliasOutsideMessageKeysStillOwnsConversationRow() {
+        val sharedNpubHex = "ef".repeat(32)
+        val aliases = groupMeshConversationAliases(
+            knownPeerIds = listOf("fp-with-messages", "fp-persisted-fold", "fp-current"),
+            peerIdsWithMessages = setOf("fp-with-messages"),
+            linkedNpubByPeer = mapOf(
+                "fp-with-messages" to sharedNpubHex,
+                "fp-persisted-fold" to sharedNpubHex,
+                "fp-current" to sharedNpubHex,
+            ),
+        ).single()
+
+        assertEquals(
+            "fp-persisted-fold",
+            selectCanonicalMeshPeerId(aliases, setOf("fp-persisted-fold")),
+        )
+    }
+
+    @Test
+    fun liveAliasIsPreferredForTransportAndCapabilityLookup() {
+        assertEquals(
+            listOf("fp-live", "fp-canonical", "fp-old"),
+            orderMeshAliasesByLiveRoute(
+                aliases = listOf("fp-old", "fp-live", "fp-canonical"),
+                livePeerId = "fp-live",
+            ),
+        )
+        assertEquals(
+            listOf("fp-canonical", "fp-old"),
+            orderMeshAliasesByLiveRoute(
+                aliases = listOf("fp-old", "fp-canonical"),
+                livePeerId = null,
+            ),
+        )
+    }
+
+    @Test
+    fun rotatedAliasSuppliesMarmotAndSplitFavoriteRoutingCapabilities() {
+        val aliases = listOf("fp-canonical", "fp-live")
+
+        assertTrue(
+            aliasesSupportMarmotRoute(
+                aliases = aliases,
+                hasSonarProfile = { it == "fp-live" },
+                capabilitiesForAlias = { 0 },
+            ),
+        )
+        assertTrue(
+            aliasesSupportMarmotRoute(
+                aliases = aliases,
+                hasSonarProfile = { false },
+                capabilitiesForAlias = { if (it == "fp-live") SonarAnnounce.CAP_MARMOT else 0 },
+            ),
+        )
+        assertTrue(
+            aliasesHaveMutualFavorite(
+                aliases = aliases,
+                isFavorite = { it == "fp-canonical" },
+                isRemoteFavorite = { it == "fp-live" },
+            ),
+        )
+        assertFalse(
+            aliasesHaveMutualFavorite(
+                aliases = aliases,
+                isFavorite = { it == "fp-canonical" },
+                isRemoteFavorite = { false },
+            ),
+        )
+        assertFalse(
+            aliasesHaveMutualFavorite(
+                aliases = aliases,
+                isFavorite = { false },
+                isRemoteFavorite = { it == "fp-live" },
+            ),
+        )
+    }
+
+    @Test
+    fun openFoldedConversationRefreshesWhenAnyAliasIsTouched() {
+        val aliases = setOf("fp-canonical", "fp-live")
+
+        assertTrue(meshAliasGroupWasTouched(aliases, setOf("fp-live")))
+        assertTrue(meshAliasGroupWasTouched(aliases, setOf("fp-canonical")))
+        assertFalse(meshAliasGroupWasTouched(aliases, setOf("fp-other")))
+        assertFalse(meshAliasGroupWasTouched(emptySet(), setOf("fp-live")))
+    }
+
+    @Test
+    fun anyAliasOrSharedNpubBlocksFoldedConversation() {
+        val aliases = setOf("fp-canonical", "fp-live")
+        val linked = aliases.associateWith { "ab".repeat(32) }
+
+        assertTrue(
+            isMeshAliasGroupBlocked(
+                aliases,
+                isPeerBlocked = { it == "fp-live" },
+                linkedNpubHex = linked::get,
+                isNpubBlocked = { false },
+            ),
+        )
+        assertTrue(
+            isMeshAliasGroupBlocked(
+                aliases + "fp-later",
+                isPeerBlocked = { false },
+                linkedNpubHex = { linked[it] ?: "ab".repeat(32) },
+                isNpubBlocked = { it == "ab".repeat(32) },
+            ),
+        )
+        assertFalse(
+            isMeshAliasGroupBlocked(
+                aliases,
+                isPeerBlocked = { false },
+                linkedNpubHex = linked::get,
+                isNpubBlocked = { false },
+            ),
+        )
     }
 }

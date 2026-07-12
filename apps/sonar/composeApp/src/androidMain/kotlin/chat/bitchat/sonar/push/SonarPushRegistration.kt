@@ -147,6 +147,7 @@ object SonarPushRegistration {
             for (attempt in 1..MAX_RETRIES) {
                 try {
                     SonarCore.start()
+                    SonarCore.connectRelays()
                     SonarCore.registerPushToken(
                         platform = "fcm",
                         token = fcmToken.toByteArray(Charsets.UTF_8),

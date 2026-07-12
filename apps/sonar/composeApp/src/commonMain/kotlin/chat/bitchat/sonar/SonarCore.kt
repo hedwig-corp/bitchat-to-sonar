@@ -245,14 +245,23 @@ internal fun normalizedProfileCache(profiles: Map<String, SonarProfile>): Map<St
         result
     }
 
-@Suppress("UNUSED_PARAMETER")
-internal fun encodeChatSnapshot(chats: List<SonarChat>, messagesByChat: Map<String, List<SonarMsg>>): String =
+internal fun encodeChatSnapshot(
+    chats: List<SonarChat>,
+    messagesByChat: Map<String, List<SonarMsg>>,
+    latestByChat: Map<String, Long> = emptyMap(),
+): String =
     buildString {
-        chats.sortedBy { it.id }.forEach { chat ->
+        // Order is part of this metadata-only snapshot: it is the last locally
+        // computed recency order and lets Home paint without an ID-order flash
+        // while the encrypted core database opens. Only the thread-style latest
+        // timestamp is cached for cross-transport sorting; message bodies stay
+        // out of this preferences blob.
+        chats.forEach { chat ->
             append("c\t")
             append(hexEnc(chat.id)).append('\t')
             append(hexEnc(chat.name)).append('\t')
-            append(chat.members.joinToString(",") { hexEnc(it) })
+            append(chat.members.joinToString(",") { hexEnc(it) }).append('\t')
+            append(messagesByChat[chat.id]?.lastOrNull()?.tsSecs ?: latestByChat[chat.id] ?: 0L)
             append('\n')
         }
     }
@@ -264,7 +273,7 @@ internal fun decodeChatSnapshot(blob: String): Pair<List<SonarChat>, Map<String,
         val parts = line.split('\t')
         when (parts.firstOrNull()) {
             "c" -> {
-                if (parts.size != 4) return@forEach
+                if (parts.size !in 4..5) return@forEach
                 val id = hexDec(parts[1]) ?: return@forEach
                 val name = hexDec(parts[2]) ?: return@forEach
                 val members = parts[3]
@@ -278,6 +287,18 @@ internal fun decodeChatSnapshot(blob: String): Pair<List<SonarChat>, Map<String,
     }
     return chats to emptyMap()
 }
+
+/** Latest local message timestamp per chat from the metadata-only snapshot. */
+internal fun decodeChatSnapshotLatest(blob: String): Map<String, Long> =
+    buildMap {
+        blob.lineSequence().forEach { line ->
+            val parts = line.split('\t')
+            if (parts.firstOrNull() != "c" || parts.size != 5) return@forEach
+            val id = hexDec(parts[1]) ?: return@forEach
+            val latest = parts[4].toLongOrNull()?.takeIf { it > 0L } ?: return@forEach
+            put(id, latest)
+        }
+    }
 
 private fun profileField(value: String?): String =
     value?.let { "1" + hexEnc(it) } ?: "0"
@@ -401,9 +422,18 @@ data class AlbumUpload(
  * protocol + relays. BLE mesh / geohash come later (issue #6).
  */
 expect object SonarCore {
-    /** Ensure an identity exists, connect to relays, publish our KeyPackage.
-     *  Returns our npub. Safe to call repeatedly. */
+    /** Ensure an identity exists and open the encrypted local database without
+     *  waiting for relay connectivity. Returns our npub. Safe to call repeatedly. */
     suspend fun start(): String
+
+    /** Replace the local-only node with a relay-backed node using the same
+     *  identity and encrypted database. Existing local reads stay available
+     *  while the relay connection is established. */
+    suspend fun connectRelays(): String
+
+    /** True only after [connectRelays] installed the relay-backed node. Local
+     * database reads remain available while this is false. */
+    fun isRelayConnected(): Boolean
 
     /** Our npub (empty until [start]). */
     fun myNpub(): String

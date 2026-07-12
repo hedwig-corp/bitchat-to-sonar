@@ -208,19 +208,14 @@ func snCanonicalConversationTitle(_ value: String) -> String {
         .lowercased()
 }
 
-func snInferUniquePeerKeyByTitle(
-    groupTitle: String,
-    peerTitles: [String: String],
-    allGroupTitles: [String]
-) -> String? {
-    let title = snCanonicalConversationTitle(groupTitle)
-    guard !title.isEmpty else { return nil }
-    guard allGroupTitles.filter({ snCanonicalConversationTitle($0) == title }).count == 1 else {
-        return nil
-    }
-    let matches = peerTitles.filter { snCanonicalConversationTitle($0.value) == title }
-    guard matches.count == 1 else { return nil }
-    return matches.first?.key
+/// A folded direct DM keeps the Marmot counterpart's profile title. BLE radar
+/// names are transport metadata and must never relabel an encrypted transcript.
+func snFoldedDirectMarmotHomeTitle(
+    isDirectGroup: Bool,
+    marmotProfileTitle: String,
+    peerDerivedTitle: String
+) -> String {
+    isDirectGroup ? marmotProfileTitle : peerDerivedTitle
 }
 
 /// A stored call record: its timeline `date` (used to merge it
@@ -408,6 +403,19 @@ struct SNDMRow: Identifiable {
     let lastDate: Date?
     /// Marmot MLS group backing this row, even when the row id is a folded peer id.
     var marmotGroupId: String? = nil
+}
+
+/// Stable home ordering shared by the live list and the regression smoke
+/// suite. A newly received message moves only its cryptographic conversation;
+/// equal timestamps retain deterministic title ordering across restarts.
+func snSortDMRowsByRecency(_ rows: [SNDMRow]) -> [SNDMRow] {
+    rows.sorted {
+        let lhs = $0.lastDate ?? .distantPast
+        let rhs = $1.lastDate ?? .distantPast
+        return lhs == rhs
+            ? $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
+            : lhs > rhs
+    }
 }
 
 /// A local contact that can be invited into a Marmot group.
@@ -928,26 +936,23 @@ final class SonarAppStore: ObservableObject {
             .sink { [weak self] npub in
                 guard let self else { return }
                 self.wireSonarProfileProvider(npub)
-                // Publish our kind-0 profile (NIP-01) so peers resolve our
-                // nickname instead of our npub. MIP-00 identity == Nostr pubkey.
-                if npub != nil { self.marmot.publishProfile(name: self.chatViewModel.nickname) }
-                // Bind the iroh call endpoint + start the event loop once we're
-                // connected, so an incoming call rings without placing one first.
-                if npub != nil { self.ensureCallStarted() }
-                // The wallet derives from the same identity (nsec); once the
-                // Marmot identity exists, (re)attempt the deferred wallet setup.
-                #if os(iOS) || os(macOS)
-                if npub != nil { (self.wallet as? BridgedWallet)?.retrySetup() }
-                #endif
-                if npub != nil { self.publishPaymentMetadataIfNeeded(force: true) }
-                if npub != nil { self.drainPendingInviteLinks() }
+                self.runPostLocalMarmotStartupIfReady()
             }
+            .store(in: &cancellables)
+        marmot.$initialLocalHomeReady
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.runPostLocalMarmotStartupIfReady() }
             .store(in: &cancellables)
         marmot.$relayConnected
             .receive(on: DispatchQueue.main)
             .sink { [weak self] connected in
                 guard let self, connected else { return }
+                // Relay-dependent work starts only after the delayed background
+                // attach, never as a side effect of publishing the local Home.
+                self.marmot.publishProfile(name: self.chatViewModel.nickname)
+                self.ensureCallStarted()
                 self.publishPaymentMetadataIfNeeded(force: true)
+                self.drainPendingInviteLinks()
                 guard !self.refreshedKnownDescriptorsForRelaySession else { return }
                 self.refreshedKnownDescriptorsForRelaySession = true
                 self.refreshKnownContactDescriptors(clearMisses: true)
@@ -1097,6 +1102,17 @@ final class SonarAppStore: ObservableObject {
                 scheduleDebugMarmot(raw)
             }
         }
+        #endif
+    }
+
+    /// Identity publication happens before the encrypted DB opens so BLE can
+    /// advertise our npub early. Wallet setup is local-only, but still waits for
+    /// the coherent Home boundary so it cannot contend with first-paint reads.
+    private func runPostLocalMarmotStartupIfReady() {
+        guard marmot.initialLocalHomeReady, marmot.npub != nil else { return }
+        // The wallet derives from the same identity; retry its deferred setup.
+        #if os(iOS) || os(macOS)
+        (wallet as? BridgedWallet)?.retrySetup()
         #endif
     }
 
@@ -2865,7 +2881,7 @@ final class SonarAppStore: ObservableObject {
     ) -> (groupId: String, message: MarmotService.MarmotMessage)? {
         var latest: (groupId: String, message: MarmotService.MarmotMessage)?
         for group in groups {
-            guard let message = marmot.messagesByGroup[group.id]?.last else { continue }
+            guard let message = marmot.homeRowMessage(groupId: group.id) else { continue }
             if latest == nil || message.createdAt > latest!.message.createdAt {
                 latest = (group.id, message)
             }
@@ -2877,8 +2893,8 @@ final class SonarAppStore: ObservableObject {
         in groups: [MarmotService.MarmotGroup]
     ) -> MarmotService.MarmotGroup? {
         groups.sorted { lhs, rhs in
-            let lhsDate = marmot.messagesByGroup[lhs.id]?.last?.createdAt ?? .distantPast
-            let rhsDate = marmot.messagesByGroup[rhs.id]?.last?.createdAt ?? .distantPast
+            let lhsDate = marmot.homeRowMessage(groupId: lhs.id)?.createdAt ?? .distantPast
+            let rhsDate = marmot.homeRowMessage(groupId: rhs.id)?.createdAt ?? .distantPast
             if lhsDate != rhsDate { return lhsDate > rhsDate }
             let lhsVerified = marmotVerified[lhs.id] ?? false
             let rhsVerified = marmotVerified[rhs.id] ?? false
@@ -3057,32 +3073,6 @@ final class SonarAppStore: ObservableObject {
         return sonarPeerKey(forNpub: otherNpub)
     }
 
-    private func inferFoldKeyByUniqueTitle(
-        for group: MarmotService.MarmotGroup,
-        otherNpub: String,
-        rowsByKey: [String: SNDMRow]
-    ) -> String? {
-        guard let targetNpub = Self.nostrPubkeyData(otherNpub) else { return nil }
-        let peerTitles = rowsByKey.mapValues(\.title)
-        let groupTitles = marmot.groups.map { marmot.title(for: $0) }
-        guard let peerKey = snInferUniquePeerKeyByTitle(
-            groupTitle: marmot.title(for: group),
-            peerTitles: peerTitles,
-            allGroupTitles: groupTitles
-        ) else { return nil }
-        if let existing = sonarProfilesByFingerprint[peerKey],
-           Self.nostrPubkeyData(existing.npub) != targetNpub {
-            return nil
-        }
-        sonarProfilesByFingerprint[peerKey] = SonarPeerProfile(
-            npub: otherNpub,
-            bip353: sonarProfilesByFingerprint[peerKey]?.bip353,
-            capabilities: sonarProfilesByFingerprint[peerKey]?.capabilities ?? SonarCapability.marmotDM
-        )
-        persistSonarProfiles()
-        return peerKey
-    }
-
     private func callConversationId(_ id: String) -> String {
         if let groupId = marmotGroupId(id),
            let folded = foldedConversationId(forMarmotGroupId: groupId) {
@@ -3136,8 +3126,7 @@ final class SonarAppStore: ObservableObject {
         let directGroupsByPeer = snCanonicalDirectMarmotGroups(marmot.groups, ownNpub: marmot.npub)
         var renderedDirectPeerKeys = Set<String>()
         for group in marmot.groups {
-            let msgs = marmot.messagesByGroup[group.id] ?? []
-            let last = msgs.last
+            let last = marmot.homeRowMessage(groupId: group.id)
             guard marmot.isDirectGroup(group) else {
                 marmotRows.append(SNDMRow(
                     id: Self.marmotIDPrefix + group.id,
@@ -3177,10 +3166,9 @@ final class SonarAppStore: ObservableObject {
             let liveSonarPeerId = otherNpub.flatMap { np in
                 sonarProfiles.first(where: { $0.value.npub == np })?.key
             }
-            let foldKey = otherNpub.flatMap { npub in
-                sonarPeerKey(forNpub: npub)
-                    ?? inferFoldKeyByUniqueTitle(for: rowGroup, otherNpub: npub, rowsByKey: byKey)
-            }
+            // Identity is cryptographic: never create a persisted peer↔npub link
+            // from a display-title match, even when that title is unique.
+            let foldKey = otherNpub.flatMap { sonarPeerKey(forNpub: $0) }
             if let liveSonarPeerId {
                 rememberMarmotGroup(rowGroupId, forConversationId: liveSonarPeerId)
             }
@@ -3191,10 +3179,15 @@ final class SonarAppStore: ObservableObject {
                 // Same person as a mesh/bitchat chat → merge the White Noise leg
                 // into that one row instead of showing a duplicate conversation.
                 rememberMarmotGroup(rowGroupId, forConversationId: existing.id)
+                let rowTitle = snFoldedDirectMarmotHomeTitle(
+                    isDirectGroup: marmot.isDirectGroup(rowGroup),
+                    marmotProfileTitle: marmot.title(for: rowGroup),
+                    peerDerivedTitle: existing.title
+                )
                 if let rowLast, rowLast.createdAt > (existing.lastDate ?? .distantPast) {
                     byKey[foldKey] = SNDMRow(
                         id: existing.id,
-                        title: existing.title,
+                        title: rowTitle,
                         preview: Self.previewText(rowLast.content, stickerRef: rowLast.stickerRef, media: rowLast.media),
                         time: Self.listTime(rowLast.createdAt),
                         unread: existing.unread || hasUnreadMarmotMessage(in: groupSet),
@@ -3202,6 +3195,19 @@ final class SonarAppStore: ObservableObject {
                         verified: existing.verified || hasVerifiedMarmotGroup(in: groupSet),
                         isMarmot: false,
                         lastDate: rowLast.createdAt,
+                        marmotGroupId: rowGroupId
+                    )
+                } else if existing.title != rowTitle {
+                    byKey[foldKey] = SNDMRow(
+                        id: existing.id,
+                        title: rowTitle,
+                        preview: existing.preview,
+                        time: existing.time,
+                        unread: existing.unread || hasUnreadMarmotMessage(in: groupSet),
+                        presence: existing.presence,
+                        verified: existing.verified || hasVerifiedMarmotGroup(in: groupSet),
+                        isMarmot: existing.isMarmot,
+                        lastDate: existing.lastDate,
                         marmotGroupId: rowGroupId
                     )
                 }
@@ -3213,9 +3219,14 @@ final class SonarAppStore: ObservableObject {
                 // duplicate.
                 let rowId = liveSonarPeerId ?? foldKey
                 rememberMarmotGroup(rowGroupId, forConversationId: rowId)
+                let rowTitle = snFoldedDirectMarmotHomeTitle(
+                    isDirectGroup: marmot.isDirectGroup(rowGroup),
+                    marmotProfileTitle: marmot.title(for: rowGroup),
+                    peerDerivedTitle: peerDisplayName(rowId)
+                )
                 byKey[foldKey] = SNDMRow(
                     id: rowId,
-                    title: liveSonarPeerId == nil ? marmot.title(for: rowGroup) : peerDisplayName(rowId),
+                    title: rowTitle,
                     preview: rowLast.map { Self.previewText($0.content, stickerRef: $0.stickerRef, media: $0.media) } ?? networkLabel(forPeer: rowId),
                     time: rowLast.map { Self.listTime($0.createdAt) } ?? "",
                     unread: hasUnreadMarmotMessage(in: groupSet),
@@ -3274,11 +3285,7 @@ final class SonarAppStore: ObservableObject {
             )
         }
         let rows = Array(byKey.values) + pendingRows + pendingGroupRows + marmotRows
-        return rows.sorted {
-            let l = $0.lastDate ?? .distantPast
-            let r = $1.lastDate ?? .distantPast
-            return l == r ? $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending : l > r
-        }
+        return snSortDMRowsByRecency(rows)
     }
 
     private func meshRow(peerID: PeerID, last: BitchatMessage?) -> SNDMRow {

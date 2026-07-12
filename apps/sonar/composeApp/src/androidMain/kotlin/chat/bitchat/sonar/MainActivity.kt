@@ -5,12 +5,18 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.view.View
+import android.view.ViewTreeObserver
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 
 class MainActivity : ComponentActivity() {
+
+    @Volatile
+    private var firstLocalStateReady = false
+    private var postFirstDrawStartupScheduled = false
 
     /** Every runtime permission the app needs, requested together so Android
      *  shows them in one sequence (firing three separate launchers in onCreate
@@ -69,14 +75,39 @@ class MainActivity : ComponentActivity() {
         unlockLauncher.launch(intent)
     }
 
+    /**
+     * Delay the activity's first draw—not its creation—until Compose has a
+     * coherent local model. Android therefore keeps the native starting window
+     * visible and swaps it directly for the hydrated Home screen on every API
+     * level we support, without blocking local I/O or relay work on the UI thread.
+     */
+    private fun deferFirstDrawUntilLocalStateReady() {
+        val content = findViewById<View>(android.R.id.content)
+        content.viewTreeObserver.addOnPreDrawListener(object : ViewTreeObserver.OnPreDrawListener {
+            override fun onPreDraw(): Boolean {
+                if (!firstLocalStateReady) return false
+                if (content.viewTreeObserver.isAlive) {
+                    content.viewTreeObserver.removeOnPreDrawListener(this)
+                }
+                if (!postFirstDrawStartupScheduled) {
+                    postFirstDrawStartupScheduled = true
+                    content.post {
+                        requestAllPermissions()
+                        Thread(::meshNoiseSmokeTest, "sonar-noise-smoke").start()
+                    }
+                }
+                return true
+            }
+        })
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
+        deferFirstDrawUntilLocalStateReady()
         ActivityBridge.requestUnlock = { cb -> confirmDeviceCredential(cb) }
-        meshNoiseSmokeTest()
-        requestAllPermissions()
         setContent {
-            App()
+            App(onFirstLocalStateReady = { firstLocalStateReady = true })
         }
         handleInviteIntent(intent)
         handleShareIntent(intent)

@@ -81,6 +81,7 @@ class SonarPushProcessingService : Service() {
             val prefs = notificationPrefs()
             withTimeoutOrNull(MARMOT_PUSH_SYNC_TIMEOUT_MS) {
                 SonarCore.start()
+                SonarCore.connectRelays()
                 SonarCore.sync()
             } ?: run {
                 Log.w(TAG, "Marmot sync timed out, showing fallback")

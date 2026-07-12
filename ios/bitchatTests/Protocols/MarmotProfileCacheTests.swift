@@ -9,6 +9,13 @@ import Testing
 
 struct MarmotProfileCacheTests {
     @Test
+    func onboardedHomeWaitsForFirstCoherentLocalHydration() {
+        #expect(!snShouldRevealLocalHome(onboarded: true, initialLocalHomeReady: false))
+        #expect(snShouldRevealLocalHome(onboarded: true, initialLocalHomeReady: true))
+        #expect(snShouldRevealLocalHome(onboarded: false, initialLocalHomeReady: false))
+    }
+
+    @Test
     func cacheRoundTripsProfileDisplayName() {
         let suiteName = "MarmotProfileCacheTests-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
