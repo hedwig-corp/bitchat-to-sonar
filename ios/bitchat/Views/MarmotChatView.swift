@@ -119,6 +119,33 @@ func snResolvedMarmotAuthorName(
     return shortNpub(message.senderNpub)
 }
 
+/// Home-only projection of the core conversation index. Transcript pages stay
+/// bounded and authoritative; a synthetic row is used only when the summary is
+/// newer than the loaded page (or that group is outside the page window).
+func snMarmotHomeRowMessage(
+    loaded: MarmotService.MarmotMessage?,
+    summary: MarmotService.ConversationSummary?
+) -> MarmotService.MarmotMessage? {
+    guard let summary, summary.messageCount > 0 else { return loaded }
+    if let loaded {
+        if loaded.createdAt > summary.latestAt { return loaded }
+        if loaded.createdAt == summary.latestAt,
+           loaded.senderNpub == summary.latestSenderNpub,
+           loaded.content == summary.latestContent,
+           loaded.isMine == summary.latestMine {
+            return loaded
+        }
+    }
+    return MarmotService.MarmotMessage(
+        id: "summary:\(summary.groupIdHex):\(summary.messageCount)",
+        senderNpub: summary.latestSenderNpub,
+        content: summary.latestContent,
+        createdAt: summary.latestAt,
+        isMine: summary.latestMine,
+        media: []
+    )
+}
+
 enum SNMarmotChatSnapshotCache {
     private static let defaultsKey = "marmot.chatSnapshot.v1"
 
@@ -179,6 +206,9 @@ final class MarmotChatModel: ObservableObject {
     @Published var pendingGroupInvites: [MarmotService.GroupInvite] = []
     @Published var pendingDirectChats: [String: Date] = [:]
     @Published var messagesByGroup: [String: [MarmotService.MarmotMessage]] = [:]
+    /// Core-owned row metadata for every conversation. Kept separate from
+    /// transcript pages so summary placeholders never render as chat bubbles.
+    @Published private(set) var conversationSummariesByGroup: [String: MarmotService.ConversationSummary] = [:]
     @Published var busy = false
     @Published var errorText: String?
     /// Resolved kind-0 profiles, keyed by npub — fills in human names/avatars
@@ -653,6 +683,12 @@ final class MarmotChatModel: ObservableObject {
                 )
             }
             let summaries = await service.conversationSummaries()
+            let activeGroupIds = Set(groups.map(\.id))
+            self.conversationSummariesByGroup = Dictionary(
+                uniqueKeysWithValues: summaries
+                    .filter { activeGroupIds.contains($0.groupIdHex) }
+                    .map { ($0.groupIdHex, $0) }
+            )
             var unread: [String: UInt64] = [:]
             for s in summaries where s.unreadCount > 0 {
                 unread[s.groupIdHex] = s.unreadCount
@@ -681,6 +717,13 @@ final class MarmotChatModel: ObservableObject {
         } catch {
             self.errorText = Self.describe(error)
         }
+    }
+
+    func homeRowMessage(groupId: String) -> MarmotService.MarmotMessage? {
+        snMarmotHomeRowMessage(
+            loaded: messagesByGroup[groupId]?.last,
+            summary: conversationSummariesByGroup[groupId]
+        )
     }
 
     private static func mergeMessages(
@@ -1465,6 +1508,7 @@ final class MarmotChatModel: ObservableObject {
         try? await service.deleteGroup(groupId: groupId)
         groups.removeAll { $0.id == groupId }
         messagesByGroup[groupId] = nil
+        conversationSummariesByGroup[groupId] = nil
         pendingOptimistic[groupId] = nil
         profileFetches = []
         profileFetchedAt = [:]
@@ -1482,6 +1526,7 @@ final class MarmotChatModel: ObservableObject {
         }
         groups.removeAll { $0.id == groupId }
         messagesByGroup[groupId] = nil
+        conversationSummariesByGroup[groupId] = nil
         pendingOptimistic[groupId] = nil
         profileFetches = []
         profileFetchedAt = [:]
@@ -1500,6 +1545,7 @@ final class MarmotChatModel: ObservableObject {
         groups = []
         pendingGroupInvites = []
         messagesByGroup = [:]
+        conversationSummariesByGroup = [:]
         pendingOptimistic = [:]
         descriptorBolt12Offer = nil
         profilesByNpub = [:]
@@ -1524,6 +1570,7 @@ final class MarmotChatModel: ObservableObject {
         groups = []
         pendingGroupInvites = []
         messagesByGroup = [:]
+        conversationSummariesByGroup = [:]
         pendingOptimistic = [:]
         profilesByNpub = [:]
         profileFetches = []

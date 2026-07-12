@@ -44,6 +44,7 @@ private const val PROFILE_REFRESH_TTL_SECS = 30 * 60L
 private const val LOCAL_TRANSCRIPT_PAGE_LIMIT = 100
 private const val LOCAL_SUMMARY_PAGE_LIMIT = 20
 private const val LOCAL_SUMMARY_CHAT_LIMIT = 5
+private const val RELAY_RECONNECT_RETRY_MS = 10_000L
 
 // ── Event-driven refresh cadence ──
 // The old poll ran a full cycle every 4 s. Now the cycle is driven by the core
@@ -157,6 +158,22 @@ internal fun resolvePeerIdForNpubHex(
 } ?: persistedNpubHexByPeer.entries.firstOrNull { (_, npubHex) ->
     npubHex.equals(senderNpubHex, ignoreCase = true)
 }?.key
+
+/** Folded transport routing must inspect every fingerprint for the account, not
+ * only the canonical row id. */
+internal fun aliasesSupportMarmotRoute(
+    aliases: Iterable<String>,
+    hasSonarProfile: (String) -> Boolean,
+    capabilitiesForAlias: (String) -> Int,
+): Boolean = aliases.any { alias ->
+    hasSonarProfile(alias) ||
+        (capabilitiesForAlias(alias) and SonarAnnounce.CAP_MARMOT) != 0
+}
+
+internal fun aliasesHaveMutualFavorite(
+    aliases: Iterable<String>,
+    isMutualFavorite: (String) -> Boolean,
+): Boolean = aliases.any(isMutualFavorite)
 
 internal fun directMarmotPeerKey(chat: SonarChat, ownNpub: String): String? {
     val mine = canonicalProfileKey(ownNpub)
@@ -520,6 +537,8 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun wipe() {
         scope.launch {
+            relayConnectJob?.cancel(); relayConnectJob = null
+            relayStartupCompleted = false
             cancelPendingMarmotSetups()
             cancelPendingMarmotGroupSetups()
             WalletBridge.shutdown()
@@ -608,10 +627,12 @@ class SonarAppState(private val scope: CoroutineScope) {
             scanWatermark.clear()
             // White Noise / Marmot DB: wipe + reconnect with the SAME identity.
             runCatching { SonarCore.eraseChats() }
+            relayStartupCompleted = false
             localCoreReady = true
             homeMessagesHydrated = true
             // The node is recreated → re-bind the iroh call endpoint on next use.
             resetCallState()
+            startRelayConnection()
             ensureCallStarted()
             refreshChats()
             stack = listOf(Screen.Home)
@@ -646,6 +667,10 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Live Marmot drain loop job (see [startMarmotWakeLoop]). Cancelled on
      *  [wipe] / account restore so a dead node cannot keep a parked waiter. */
     private var marmotWakeJob: Job? = null
+    /** Relay attach is independent from local startup. Failure retries here
+     * while BLE, wallet, and local database services remain usable. */
+    private var relayConnectJob: Job? = null
+    private var relayStartupCompleted = false
     private var pollJob: Job? = null
     /** Consumer of the event-driven housekeeping cycle. Triggered by the core
      *  `conversationChanged` flow (primary) and a slow heartbeat (fallback);
@@ -2402,6 +2427,8 @@ class SonarAppState(private val scope: CoroutineScope) {
                 UnifyRadio.stopAdvertising()
                 unifyOffer = null; unifyPeers = emptyList()
                 pollJob?.cancel(); pollJob = null
+                relayConnectJob?.cancel(); relayConnectJob = null
+                relayStartupCompleted = false
                 stopMarmotWakeLoop()
                 resetCallState()
                 cancelPendingMarmotSetups()
@@ -2452,7 +2479,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         nick = value
         refreshMeshIdentity()
         // Re-publish our kind-0 profile so peers see the new name.
-        if (started) scope.launch { runCatching { SonarCore.publishProfile(value) } }
+        if (SonarCore.isRelayConnected()) scope.launch { runCatching { SonarCore.publishProfile(value) } }
     }
 
     // ── Local notifications (fire on new incoming message while backgrounded) ──
@@ -2655,10 +2682,13 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (bypassRelock) bypassRelock = false        // return from our own unlock prompt
             else if (AppLock.isEnabled()) locked = true   // genuine app-switch → re-lock
             if (started) {
-                refreshKnownContactDescriptors(clearMisses = false)
+                startRelayConnection()
+                if (SonarCore.isRelayConnected()) refreshKnownContactDescriptors(clearMisses = false)
                 scope.launch {
-                    publishSonarDescriptorIfNeeded(force = true)
-                    SonarCore.sync()
+                    if (SonarCore.isRelayConnected()) {
+                        publishSonarDescriptorIfNeeded(force = true)
+                        runCatching { SonarCore.sync() }
+                    }
                     drainDirectDms()
                     refreshChats()
                     recomputeConversations()
@@ -2676,8 +2706,9 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun requestImmediateSync() {
         if (!started) return
+        startRelayConnection()
         scope.launch {
-            runCatching { SonarCore.sync() }
+            if (SonarCore.isRelayConnected()) runCatching { SonarCore.sync() }
             drainDirectDms()
             refreshChats()
             recomputeConversations()
@@ -2833,76 +2864,98 @@ class SonarAppState(private val scope: CoroutineScope) {
         return profilesByNpub[key]?.bestName ?: chatTitle(chat)
     }
 
+    /** Start or resume the relay attach without owning local app readiness.
+     * Failures retry while BLE, wallet, and the encrypted local database keep
+     * running. */
+    private fun startRelayConnection() {
+        if (!started || relayConnectJob?.isActive == true) return
+        relayConnectJob = scope.launch {
+            while (isActive && started) {
+                if (!SonarCore.isRelayConnected()) {
+                    val result = runCatching { SonarCore.connectRelays() }
+                    if (result.isFailure) {
+                        toast = "relay connect failed: ${result.exceptionOrNull()?.message}"
+                        delay(RELAY_RECONNECT_RETRY_MS)
+                        continue
+                    }
+                    npub = result.getOrThrow()
+                    SonarCore.saveBlob(NPUB_BLOB_KEY, npub)
+                }
+                completeRelayStartup()
+                return@launch
+            }
+        }
+    }
+
+    /** Wait for KeyPackage/relay-dependent operations without blocking local
+     * startup. Pending chat rows remain visible while this suspends. */
+    private suspend fun awaitRelayConnection(): Boolean {
+        if (!started) return false
+        startRelayConnection()
+        while (started && !SonarCore.isRelayConnected()) delay(100)
+        return started && SonarCore.isRelayConnected()
+    }
+
+    private suspend fun completeRelayStartup() {
+        if (relayStartupCompleted) return
+        relayStartupCompleted = true
+        SonarCore.installConversationListener()
+        collectConversationChanges()
+        startMarmotWakeLoop()
+        scope.launch { runCatching { SonarCore.publishProfile(nick) } }
+        scope.launch { publishSonarDescriptorIfNeeded(force = true) }
+        updateBleDiscoveryPolicy()
+        refreshKnownContactDescriptors(clearMisses = true)
+        scope.launch {
+            refreshChatMemberProfiles(clearMisses = true)
+            delay(6_000)
+            refreshChatMemberProfiles(clearMisses = true)
+        }
+        runCatching { refreshChats() }
+        runCatching { recomputeConversations() }
+        drainPendingInviteTokens()
+        requestHousekeeping()
+    }
+
     fun boot() {
         if (started || connecting) return
         connecting = true
+        relayStartupCompleted = false
         homeMessagesHydrated = false
         localCoreReady = false
         Notifier.ensureChannel()
         scope.launch {
-            // ── LOCAL-FIRST PAINT (Signal/iOS parity): this block reads disk
-            // and blobs only — no core start, no relay. The home list must be
-            // fully hydrated (mesh rows, names, links, folds) BEFORE
-            // SonarCore.start(), which can take seconds on a cold relay path.
-            // chats snapshot / profiles / npub already restore at construction.
+            // ── LOCAL-FIRST PAINT (Signal/iOS parity): hydrate disk state and
+            // open the encrypted database without any relay dependency.
             meshChats.putAll(MessageStore.loadAllMeshDms())
-            loadLinks() // durable fingerprint↔npub so BLE chats stay unified after restart
-            loadMeshNames() // announce nicknames survive restart — names, not keys
-            seedVerifiedChatIds() // in-memory verify set (off render path)
+            loadLinks()
+            loadMeshNames()
+            seedVerifiedChatIds()
             try {
-                // Open the encrypted database with NO relays first, matching the
-                // native iOS MarmotService.connectLocal path. This makes the
-                // authoritative groups + summary index available before any
-                // network timeout can delay or reorder Home.
                 npub = SonarCore.start()
-                SonarCore.saveBlob(NPUB_BLOB_KEY, npub) // restored at next construction
+                SonarCore.saveBlob(NPUB_BLOB_KEY, npub)
                 localCoreReady = true
                 refreshChats()
                 recomputeConversations()
                 homeMessagesHydrated = true
 
-                // Relay attach replaces the local-only node in the background
-                // using the same encrypted DB. The already-painted Home model
-                // remains authoritative while sockets connect.
-                npub = SonarCore.connectRelays()
-                SonarCore.saveBlob(NPUB_BLOB_KEY, npub)
-                SonarCore.installConversationListener()
-                collectConversationChanges()
+                // Local usability begins here. These services must work through
+                // a relay outage; relay attach/retry runs independently below.
                 started = true
                 refreshMeshIdentity()
-                // Publish our kind-0 profile so peers see our nickname, not npub.
-                launch { runCatching { SonarCore.publishProfile(nick) } }
-                // Descriptor publish runs after wallet setup so call metadata is
-                // discoverable without racing a wallet-ready BOLT12 offer.
                 updateBleDiscoveryPolicy()
-                refreshKnownContactDescriptors(clearMisses = true)
-                // Kind-0 names: boot-time fetches raced the relay connect and
-                // missed — retry now, and once more after the sockets settle.
-                launch {
-                    refreshChatMemberProfiles(clearMisses = true)
-                    delay(6_000)
-                    refreshChatMemberProfiles(clearMisses = true)
-                }
                 setupWallet()
                 refreshLocationChannels()
-                refreshChats()
-                recomputeConversations() // fold White Noise legs into mesh rows at launch
-                drainPendingInviteTokens()
-                // Bind the iroh call endpoint + start the call event loop early so
-                // an incoming call rings without us having to place one first.
-                launch { ensureCallStarted() }
                 startMeshRealtimeLoop()
-                startMarmotWakeLoop()
                 poll()
-                // Run the first housekeeping pass now instead of waiting a full
-                // heartbeat — seeds notifications/unread/profiles at launch (the
-                // old 4 s poll ran its first full cycle ~4 s in).
                 requestHousekeeping()
+                launch { ensureCallStarted() }
+                startRelayConnection()
             } catch (t: Throwable) {
-                toast = "connect failed: ${t.message}"
+                toast = "local startup failed: ${t.message}"
             } finally {
-                // If the encrypted DB itself failed to open, fall back to the
-                // metadata snapshot rather than leaving Home in a loading state.
+                // If the encrypted DB itself failed to open, reveal the metadata
+                // snapshot instead of leaving the launch surface visible.
                 homeMessagesHydrated = true
                 connecting = false
             }
@@ -3254,6 +3307,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             return
         }
         scope.launch {
+            if (!awaitRelayConnection()) return@launch
             try {
                 val chatId = SonarCore.startChat(p)
                 refreshChats()
@@ -3283,6 +3337,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         val setupToken = nextPendingMarmotSetupToken(pendingChatId)
         val setupJob = scope.launch {
             try {
+                if (!awaitRelayConnection()) return@launch
                 val chatId = SonarCore.startChat(npubHex)
                 finishPendingMarmotChat(npubHex, canonicalPeer, pendingChatId, chatId, setupToken = setupToken)
             } catch (t: Throwable) {
@@ -3389,6 +3444,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         val setupToken = nextPendingMarmotGroupSetupToken(pendingChatId)
         val setupJob = scope.launch {
             try {
+                if (!awaitRelayConnection()) return@launch
                 val chatId = SonarCore.startGroup(pending.members, pending.name)
                 finishPendingMarmotGroup(pendingChatId, chatId, setupToken = setupToken)
             } catch (t: Throwable) {
@@ -3407,6 +3463,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         val setupToken = nextPendingMarmotGroupSetupToken(pendingChatId)
         val setupJob = scope.launch {
             try {
+                if (!awaitRelayConnection()) return@launch
                 val chatId = SonarCore.acceptGroupInvite(inviteId)
                 finishPendingMarmotGroup(pendingChatId, chatId, setupToken = setupToken)
             } catch (t: Throwable) {
@@ -4602,7 +4659,10 @@ class SonarAppState(private val scope: CoroutineScope) {
     private suspend fun sendCallOverMarmot(peerId: String, npubRaw: ByteArray, text: String): Boolean {
         return try {
             refreshChats()
-            val groupId = marmotGroupForNpub(npubRaw)?.id ?: SonarCore.startChat(npubRaw.toHexLower()).also {
+            val groupId = marmotGroupForNpub(npubRaw)?.id ?: run {
+                if (!awaitRelayConnection()) return false
+                SonarCore.startChat(npubRaw.toHexLower())
+            }.also {
                 refreshChats()
                 recomputeConversations()
             }
@@ -4674,13 +4734,17 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun shouldUseMarmotRoute(peerId: String, npubRaw: ByteArray): Boolean {
         val npubHex = npubRaw.toHexLower()
         return marmotGroupForNpub(npubRaw) != null ||
-            sonarProfile(peerId) != null ||
-            ((linkCapsByFp[peerId] ?: 0) and SonarAnnounce.CAP_MARMOT) != 0 ||
+            aliasesSupportMarmotRoute(
+                aliases = preferredMeshAliases(peerId),
+                hasSonarProfile = { alias -> sonarProfile(alias) != null },
+                capabilitiesForAlias = { alias -> linkCapsByFp[alias] ?: 0 },
+            ) ||
             sonarDescriptorsByNpubHex[npubHex] != null
     }
 
     private fun canUseDirectNip17(peerId: String, npubRaw: ByteArray): Boolean =
-        !socialState.isBlockedNostr(npubRaw.toHexLower()) && socialState.isMutualFavorite(peerId)
+        !socialState.isBlockedNostr(npubRaw.toHexLower()) &&
+            aliasesHaveMutualFavorite(preferredMeshAliases(peerId), socialState::isMutualFavorite)
 
     private suspend fun sendDirectNip17Now(
         peerId: String,
@@ -4898,6 +4962,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (!startingMarmotChats.add(npubHex)) return
         scope.launch {
             try {
+                if (!awaitRelayConnection()) return@launch
                 SonarCore.startChat(npubHex) // start_dm accepts a hex pubkey
                 refreshChats(); flushPendingMarmot(); flushOutbox(peerId); refreshOpenDm(peerId)
             } catch (e: Throwable) { toast = "couldn’t start secure chat: ${e.message}" }
@@ -4925,6 +4990,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (!startingMarmotChats.add(npubHex)) return
         scope.launch {
             try {
+                if (!awaitRelayConnection()) return@launch
                 SonarCore.startChat(npubHex)
                 refreshChats(); flushPendingMarmot(); refreshOpenDm(peerId)
             } catch (e: Throwable) { toast = "couldn't start secure chat: ${e.message}" }
@@ -5028,6 +5094,10 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private suspend fun ensureMarmotGroupForOutbox(peerId: String, npubRaw: ByteArray): String? {
         marmotGroupForNpub(npubRaw)?.id?.let { return it }
+        if (!SonarCore.isRelayConnected()) {
+            startRelayConnection()
+            return null
+        }
         val npubHex = npubRaw.toHexLower()
         return try {
             refreshChats()
@@ -5230,6 +5300,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             return
         }
         scope.launch {
+            if (!awaitRelayConnection()) return@launch
             try {
                 SonarCore.requestJoinViaLink(token)
                 toast = "Join request sent"
@@ -5945,8 +6016,11 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  drops the losers (a stream-wide `debounce` kept only the last groupId,
      *  deferring the others' call/pay ring to a housekeeping cycle). */
     private val conversationChangeJobs = mutableMapOf<String, Job>()
+    private var conversationChangesCollecting = false
 
     private fun collectConversationChanges() {
+        if (conversationChangesCollecting) return
+        conversationChangesCollecting = true
         SonarCore.conversationChanged
             .onEach { groupIdHex ->
                 conversationChangeJobs.remove(groupIdHex)?.cancel()
@@ -6050,9 +6124,13 @@ class SonarAppState(private val scope: CoroutineScope) {
                 beat++
                 // ensureSubscriptions / sync are relay-connection upkeep — keep a
                 // wall-clock cadence (was every 4 s / every 60 s on the old tick).
-                runCatching { SonarCore.ensureSubscriptions() }
-                if (beat == 1L || (beat * effectiveHeartbeatMs()) % SYNC_INTERVAL_MS < effectiveHeartbeatMs()) {
-                    runCatching { SonarCore.sync() }
+                if (SonarCore.isRelayConnected()) {
+                    runCatching { SonarCore.ensureSubscriptions() }
+                    if (beat == 1L || (beat * effectiveHeartbeatMs()) % SYNC_INTERVAL_MS < effectiveHeartbeatMs()) {
+                        runCatching { SonarCore.sync() }
+                    }
+                } else {
+                    startRelayConnection()
                 }
                 // Coarse presence beat (~every 60 s), profile TTL sweep (~30 min).
                 if (beat * effectiveHeartbeatMs() % PRESENCE_BEAT_MS < effectiveHeartbeatMs()) {

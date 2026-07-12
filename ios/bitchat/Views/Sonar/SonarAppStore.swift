@@ -2881,7 +2881,7 @@ final class SonarAppStore: ObservableObject {
     ) -> (groupId: String, message: MarmotService.MarmotMessage)? {
         var latest: (groupId: String, message: MarmotService.MarmotMessage)?
         for group in groups {
-            guard let message = marmot.messagesByGroup[group.id]?.last else { continue }
+            guard let message = marmot.homeRowMessage(groupId: group.id) else { continue }
             if latest == nil || message.createdAt > latest!.message.createdAt {
                 latest = (group.id, message)
             }
@@ -2893,8 +2893,8 @@ final class SonarAppStore: ObservableObject {
         in groups: [MarmotService.MarmotGroup]
     ) -> MarmotService.MarmotGroup? {
         groups.sorted { lhs, rhs in
-            let lhsDate = marmot.messagesByGroup[lhs.id]?.last?.createdAt ?? .distantPast
-            let rhsDate = marmot.messagesByGroup[rhs.id]?.last?.createdAt ?? .distantPast
+            let lhsDate = marmot.homeRowMessage(groupId: lhs.id)?.createdAt ?? .distantPast
+            let rhsDate = marmot.homeRowMessage(groupId: rhs.id)?.createdAt ?? .distantPast
             if lhsDate != rhsDate { return lhsDate > rhsDate }
             let lhsVerified = marmotVerified[lhs.id] ?? false
             let rhsVerified = marmotVerified[rhs.id] ?? false
@@ -3126,8 +3126,7 @@ final class SonarAppStore: ObservableObject {
         let directGroupsByPeer = snCanonicalDirectMarmotGroups(marmot.groups, ownNpub: marmot.npub)
         var renderedDirectPeerKeys = Set<String>()
         for group in marmot.groups {
-            let msgs = marmot.messagesByGroup[group.id] ?? []
-            let last = msgs.last
+            let last = marmot.homeRowMessage(groupId: group.id)
             guard marmot.isDirectGroup(group) else {
                 marmotRows.append(SNDMRow(
                     id: Self.marmotIDPrefix + group.id,

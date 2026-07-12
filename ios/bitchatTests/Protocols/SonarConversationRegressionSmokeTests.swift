@@ -79,4 +79,50 @@ struct SonarConversationRegressionSmokeTests {
         #expect(snSortDMRowsByRecency(rows).map(\.id) == ["sara", "vincenzo"])
         #expect(snSortDMRowsByRecency(Array(rows.reversed())).map(\.id) == ["sara", "vincenzo"])
     }
+
+    @Test
+    func summaryHydratesConversationOutsideBoundedTranscriptPages() {
+        let summary = MarmotService.ConversationSummary(
+            groupIdHex: "outside-window",
+            name: "",
+            latestContent: "Good morning",
+            latestSenderNpub: npub(2),
+            latestAt: Date(timeIntervalSince1970: 300),
+            latestMine: false,
+            messageCount: 7,
+            unreadCount: 1
+        )
+
+        let row = snMarmotHomeRowMessage(loaded: nil, summary: summary)
+
+        #expect(row?.content == "Good morning")
+        #expect(row?.createdAt == summary.latestAt)
+        #expect(row?.id == "summary:outside-window:7")
+    }
+
+    @Test
+    func realTranscriptMessageWinsWhenItMatchesSummary() {
+        let date = Date(timeIntervalSince1970: 300)
+        let peer = npub(2)
+        let loaded = MarmotService.MarmotMessage(
+            id: "real-message",
+            senderNpub: peer,
+            content: "Good morning",
+            createdAt: date,
+            isMine: false,
+            media: []
+        )
+        let summary = MarmotService.ConversationSummary(
+            groupIdHex: "sara",
+            name: "",
+            latestContent: loaded.content,
+            latestSenderNpub: peer,
+            latestAt: date,
+            latestMine: false,
+            messageCount: 7,
+            unreadCount: 0
+        )
+
+        #expect(snMarmotHomeRowMessage(loaded: loaded, summary: summary)?.id == loaded.id)
+    }
 }

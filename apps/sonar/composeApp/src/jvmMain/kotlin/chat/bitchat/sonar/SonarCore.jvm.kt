@@ -39,7 +39,7 @@ actual object SonarCore {
 
     private val lock = Mutex()
     private var node: SonarNode? = null
-    private var relayConnected = false
+    @Volatile private var relayConnected = false
     @Volatile private var npub: String = ""
     @Volatile private var pubkeyHex: String = ""
 
@@ -86,6 +86,8 @@ actual object SonarCore {
             npub
         }
     }
+
+    actual fun isRelayConnected(): Boolean = relayConnected
 
     actual fun myNpub(): String = npub
 

@@ -431,6 +431,10 @@ expect object SonarCore {
      *  while the relay connection is established. */
     suspend fun connectRelays(): String
 
+    /** True only after [connectRelays] installed the relay-backed node. Local
+     * database reads remain available while this is false. */
+    fun isRelayConnected(): Boolean
+
     /** Our npub (empty until [start]). */
     fun myNpub(): String
 
