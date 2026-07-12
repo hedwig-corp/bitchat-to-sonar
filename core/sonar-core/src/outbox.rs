@@ -137,6 +137,39 @@ impl OutboxState {
         self.save_if_dirty()
     }
 
+    /// Move one failed row back to pending and return its already-encrypted
+    /// relay event for a user-initiated retry. Manual retry deliberately resets
+    /// the automatic-attempt budget: a long outage must not permanently disable
+    /// the Signal-style retry button after the transport comes back.
+    pub fn retry_failed_event(
+        &mut self,
+        group_id_hex: &str,
+        message_id_hex: &str,
+        now_secs: u64,
+    ) -> Result<Event> {
+        let entry = self
+            .entries
+            .get_mut(message_id_hex)
+            .ok_or_else(|| Error::InvalidInput("message is no longer available to retry".into()))?;
+        if entry.group_id_hex != group_id_hex {
+            return Err(Error::InvalidInput(
+                "message does not belong to this conversation".into(),
+            ));
+        }
+        if entry.state != DeliveryState::Failed {
+            return Err(Error::InvalidInput("message is not failed".into()));
+        }
+        let event = Event::from_json(&entry.event_json)
+            .map_err(|e| Error::Storage(format!("outbox event decode: {e}")))?;
+        entry.state = DeliveryState::Pending;
+        entry.updated_at_secs = now_secs;
+        entry.attempts = 0;
+        entry.last_error = None;
+        self.dirty = true;
+        self.save_if_dirty()?;
+        Ok(event)
+    }
+
     /// Returns `(message_id_hex, group_id_hex, event)` for each retryable row.
     /// `group_id_hex` is the MLS id hosts use for conversation refresh (not
     /// the Nostr `#h` / `nostr_group_id`).
@@ -224,6 +257,7 @@ fn outbox_state_tmp_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nostr::{EventBuilder, Keys, Kind};
 
     #[test]
     fn mark_sent_compacts_retry_payload() {
@@ -333,5 +367,53 @@ mod tests {
 
         let reloaded = OutboxState::load(Some(path));
         assert_eq!(reloaded.status_for_message("deleted-message"), None);
+    }
+
+    #[test]
+    fn manual_retry_resets_failed_entry_and_attempt_budget() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("outbox.json");
+        let mut outbox = OutboxState::load(Some(path.clone()));
+        let event = EventBuilder::new(Kind::TextNote, "encrypted payload")
+            .sign_with_keys(&Keys::generate())
+            .expect("signed event");
+
+        outbox
+            .mark_pending(
+                "group".into(),
+                "message".into(),
+                event.id.to_hex(),
+                event.as_json(),
+                1,
+            )
+            .expect("mark pending");
+        for attempt in 0..OUTBOX_RETRY_ATTEMPT_LIMIT {
+            outbox
+                .mark_failed_by_message_id("message", format!("offline {attempt}"), 2)
+                .expect("mark failed");
+        }
+
+        let retried = outbox
+            .retry_failed_event("group", "message", 3)
+            .expect("manual retry");
+        assert_eq!(retried.id, event.id);
+        assert_eq!(
+            outbox.status_for_message("message"),
+            Some(DeliveryState::Pending)
+        );
+
+        outbox
+            .mark_failed_by_message_id("message", "still offline".into(), 4)
+            .expect("mark failed after retry");
+        let retryable = outbox
+            .retryable_events(5, &HashSet::from(["group".to_string()]))
+            .expect("automatic retry budget was reset");
+        assert_eq!(retryable.len(), 1);
+
+        let reloaded = OutboxState::load(Some(path));
+        assert_eq!(
+            reloaded.status_for_message("message"),
+            Some(DeliveryState::Pending)
+        );
     }
 }

@@ -185,6 +185,10 @@ actual object SonarCore {
         requireNode().sendText(chatId, text)
     }
 
+    actual suspend fun retryMessage(chatId: String, messageId: String) = withContext(Dispatchers.IO) {
+        requireNode().retryMessage(chatId, messageId)
+    }
+
     actual suspend fun sendMedia(
         chatId: String,
         data: ByteArray,

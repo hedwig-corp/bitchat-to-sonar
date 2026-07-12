@@ -1176,6 +1176,13 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func requestJoinViaLink(inviteToken: String) throws 
     
     /**
+     * Retry one failed outgoing message from the durable local outbox. The
+     * original encrypted event is republished, so retry cannot duplicate the
+     * plaintext transcript row or mutate MLS state a second time.
+     */
+    func retryMessage(groupIdHex: String, messageIdHex: String) throws
+
+    /**
      * Reload the durable outbox sidecar and retry pending sends. Hosts call this
      * after replacing a local-only node with a relay-backed node so sends created
      * during relay connect are not stranded until app restart.
@@ -2018,6 +2025,20 @@ open func requestJoinViaLink(inviteToken: String)throws   {try rustCallWithError
 }
 }
     
+    /**
+     * Retry one failed outgoing message from the durable local outbox. The
+     * original encrypted event is republished, so retry cannot duplicate the
+     * plaintext transcript row or mutate MLS state a second time.
+     */
+open func retryMessage(groupIdHex: String, messageIdHex: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_retry_message(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(groupIdHex),
+        FfiConverterString.lower(messageIdHex),$0
+    )
+}
+}
+
     /**
      * Reload the durable outbox sidecar and retry pending sends. Hosts call this
      * after replacing a local-only node with a relay-backed node so sends created
@@ -6574,6 +6595,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_request_join_via_link() != 14691) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_retry_message() != 19486) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_retry_outbox() != 58495) {

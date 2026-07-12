@@ -489,6 +489,9 @@ expect object SonarCore {
     /** Send an encrypted text message to a chat. */
     suspend fun send(chatId: String, text: String)
 
+    /** Republish one failed message from the durable local outbox. */
+    suspend fun retryMessage(chatId: String, messageId: String)
+
     /** Encrypt + upload [data] to a Blossom server, then publish a media message
      *  to the chat. [serverUrl] empty → the core default. */
     suspend fun sendMedia(

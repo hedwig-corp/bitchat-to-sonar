@@ -125,4 +125,29 @@ struct SonarConversationRegressionSmokeTests {
 
         #expect(snMarmotHomeRowMessage(loaded: loaded, summary: summary)?.id == loaded.id)
     }
+
+    @Test
+    func retryDeliveryStateReturnsToSending() {
+        let pending = MarmotService.MarmotMessage(
+            id: "core-message",
+            senderNpub: npub(1),
+            content: "hello",
+            createdAt: Date(timeIntervalSince1970: 400),
+            isMine: true,
+            deliveryState: "pending",
+            media: []
+        )
+        let failed = MarmotService.MarmotMessage(
+            id: "core-message",
+            senderNpub: npub(1),
+            content: "hello",
+            createdAt: pending.createdAt,
+            isMine: true,
+            deliveryState: "failed",
+            media: []
+        )
+
+        #expect(MarmotChatModel.stateText(for: failed) == "Couldn't send")
+        #expect(MarmotChatModel.stateText(for: pending) == "Sending")
+    }
 }

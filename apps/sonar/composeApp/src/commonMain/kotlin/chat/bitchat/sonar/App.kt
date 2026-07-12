@@ -1116,6 +1116,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                                 prevMsg.senderNpub == m.senderNpub &&
                                 PayLine.decode(prevMsg.content) !is PayLine.Pay
                             val pay = PayLine.decode(m.content) as? PayLine.Pay
+                            val failedSend = m.mine && sonarDeliveryFailed(m.state)
                             if (pay != null) {
                                 val status = run { state.payVersion; state.payStatus(pay.uuid) }
                                 PayBubble(m, pay, status, peerName, mesh = msgMesh, fiatOf = { state.fiatOrNull(it) })
@@ -1127,7 +1128,8 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                                     mesh = msgMesh,
                                     author = if (cont) null else state.groupAuthorName(m, isGroup),
                                     cont = cont,
-                                    showState = m.mine && i == feed.lastIndex,
+                                    showState = m.mine && (i == feed.lastIndex || failedSend),
+                                    onRetry = if (failedSend) { { state.retryMessage(screen.id, m) } } else null,
                                     maxBubbleWidth = bubbleMax,
                                     onOpen = { mediaViewer = it },
                                     onOpenAlbum = { items, idx -> mediaGallery = items to idx }
@@ -1138,7 +1140,8 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                                     state = state,
                                     mesh = msgMesh,
                                     author = if (cont) null else state.groupAuthorName(m, isGroup),
-                                    showState = m.mine && i == feed.lastIndex,
+                                    showState = m.mine && (i == feed.lastIndex || failedSend),
+                                    onRetry = if (failedSend) { { state.retryMessage(screen.id, m) } } else null,
                                     onTap = { coord -> previewPackCoordinate = coord },
                                 )
                             } else MessageBubble(
@@ -1146,7 +1149,8 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                                 msgMesh,
                                 author = if (cont) null else state.groupAuthorName(m, isGroup),
                                 cont = cont,
-                                showState = m.mine && i == feed.lastIndex,
+                                showState = m.mine && (i == feed.lastIndex || failedSend),
+                                onRetry = if (failedSend) { { state.retryMessage(screen.id, m) } } else null,
                                 maxBubbleWidth = bubbleMax,
                             )
                         }
@@ -1722,6 +1726,7 @@ private fun MessageBubble(
     author: String? = null,
     cont: Boolean = false,
     showState: Boolean = false,
+    onRetry: (() -> Unit)? = null,
     maxBubbleWidth: Dp = Dp.Infinity,
 ) {
     val s = sonar
@@ -1820,7 +1825,7 @@ private fun MessageBubble(
                 }
             }
         }
-        if (showState) MessageStatusFooter(m, mesh)
+        if (showState) MessageStatusFooter(m, mesh, onRetry)
     }
 }
 
@@ -1834,7 +1839,7 @@ private fun DateChip(label: String) {
 }
 
 @Composable
-private fun MessageStatusFooter(m: SonarMsg, mesh: Boolean) {
+private fun MessageStatusFooter(m: SonarMsg, mesh: Boolean, onRetry: (() -> Unit)? = null) {
     val state = sonarDeliveryLabel(m.state) ?: return
     val s = sonar
     val pending = sonarDeliveryPending(state)
@@ -1858,6 +1863,18 @@ private fun MessageStatusFooter(m: SonarMsg, mesh: Boolean) {
             color = if (failed) s.danger else s.text3,
             fontSize = 11.sp,
         )
+        if (failed && onRetry != null) {
+            Text(
+                "Retry",
+                color = s.danger,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier
+                    .heightIn(min = 32.dp)
+                    .clickable(role = Role.Button, onClick = onRetry)
+                    .padding(horizontal = 7.dp, vertical = 7.dp),
+            )
+        }
     }
 }
 
@@ -1868,6 +1885,7 @@ private fun StickerBubble(
     mesh: Boolean = false,
     author: String? = null,
     showState: Boolean = false,
+    onRetry: (() -> Unit)? = null,
     onTap: ((String) -> Unit)? = null,
 ) {
     val ref = m.stickerRef ?: return
@@ -1920,7 +1938,7 @@ private fun StickerBubble(
                 )
             }
         }
-        if (showState) MessageStatusFooter(m, mesh)
+        if (showState) MessageStatusFooter(m, mesh, onRetry)
     }
 }
 
@@ -2067,6 +2085,7 @@ private fun MediaBubble(
     author: String? = null,
     cont: Boolean = false,
     showState: Boolean = false,
+    onRetry: (() -> Unit)? = null,
     maxBubbleWidth: Dp = Dp.Infinity,
     onOpen: (SonarMedia) -> Unit,
     onOpenAlbum: (List<SonarMedia>, Int) -> Unit = { _, _ -> },
@@ -2183,7 +2202,7 @@ private fun MediaBubble(
                     .padding(start = 12.dp, end = 12.dp, top = 7.dp, bottom = 8.dp)
             ) { Text(m.content, color = capFg, fontSize = 15.5.sp, lineHeight = 21.7.sp) }
         }
-        if (showState) MessageStatusFooter(m, mesh)
+        if (showState) MessageStatusFooter(m, mesh, onRetry)
     }
 }
 
