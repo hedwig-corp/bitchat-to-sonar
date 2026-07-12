@@ -46,7 +46,9 @@ use crate::{Error, Result};
 const BLOSSOM_SERVER_LIST_KIND: u16 = 10063;
 
 /// Fallback Blossom server when the user has published no kind-10063 list.
-pub const DEFAULT_BLOSSOM_SERVER: &str = "https://blossom.primal.net";
+/// primal.net returns HTTP 415 for Marmot ciphertext uploads (even with
+/// `application/octet-stream`); nostr.download accepts them (201 Created).
+pub const DEFAULT_BLOSSOM_SERVER: &str = "https://nostr.download";
 
 /// MIP-04 uploads ciphertext, not the original media bytes. Blossom servers
 /// validate the request body's media type, so encrypted blobs must use the
