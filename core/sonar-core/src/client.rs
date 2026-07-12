@@ -2957,18 +2957,18 @@ impl SonarClient {
 
             match self.engine.process_incoming(&event).await {
                 Ok(Incoming::Failed) => {
-                    // MDK blocks reprocessing of failed events, so retrying by
-                    // rewinding the sync watermark refetches the same history
-                    // forever without ever succeeding (observed pinning the
-                    // watermark weeks in the past, turning every sync into a
-                    // multi-day backfill). Mark processed and move on.
+                    // Count the delivery as handled so one bad ciphertext does
+                    // not pin the global watermark, but do NOT add it to Sonar's
+                    // durable processed-ID set. MDK can change a Failed record
+                    // to Retryable after an MLS commit rollback; a later relay
+                    // catch-up must then reach MDK so the missing message can be
+                    // decrypted and stored.
                     tracing::debug!(
                         event_id = %event.id,
                         event_created_at = event.created_at.as_secs(),
                         context,
-                        "marmot event permanently failed in MDK; marking processed"
+                        "marmot event failed in MDK; preserving rollback retry"
                     );
-                    self.mark_sync_event_processed(&event.id);
                     report.record_processed();
                 }
                 Ok(Incoming::GroupProposal(update)) => {
@@ -4538,6 +4538,137 @@ mod tests {
         state.rewind_for_retry(900);
 
         assert_eq!(state.watermark_secs(), 900 - SYNC_OVERLAP_SECS);
+    }
+
+    #[tokio::test]
+    async fn failed_group_message_remains_visible_to_mdk_rollback_retry() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let bob = MarmotEngine::in_memory(Identity::generate());
+        let charlie = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("charlie starts without relays");
+        let bob_kp = bob
+            .key_package_event(relays.clone())
+            .expect("bob key package");
+        let charlie_kp = charlie
+            .engine
+            .key_package_event(relays.clone())
+            .expect("charlie key package");
+        let creation = alice
+            .create_group("rollback retry", vec![bob_kp, charlie_kp], relays.clone())
+            .expect("alice creates group");
+        let alice_group_id = creation.group.mls_group_id.clone();
+
+        for (member, welcome) in creation.welcomes {
+            let wrapped = alice
+                .gift_wrap_welcome(&member, welcome)
+                .await
+                .expect("wrap welcome");
+            if member == bob.identity().public_key() {
+                assert!(matches!(
+                    bob.process_incoming(&wrapped)
+                        .await
+                        .expect("bob processes welcome"),
+                    Incoming::GroupInvitePending(_)
+                ));
+                let invite = bob.pending_group_invites().expect("bob invites").remove(0);
+                bob.accept_group_invite(&invite.id)
+                    .expect("bob accepts invite");
+            } else {
+                let (report, _) = charlie
+                    .process_marmot_events([wrapped], "test charlie welcome")
+                    .await;
+                assert_eq!(report.processed, 1);
+                let invite = charlie
+                    .engine
+                    .pending_group_invites()
+                    .expect("charlie invites")
+                    .remove(0);
+                charlie
+                    .engine
+                    .accept_group_invite(&invite.id)
+                    .expect("charlie accepts invite");
+            }
+        }
+        alice
+            .merge_pending_commit(&creation.group.mls_group_id)
+            .expect("merge pending commit");
+
+        let bob_group_id = bob.groups().expect("bob groups")[0].mls_group_id.clone();
+        let charlie_group_id = charlie.engine.groups().expect("charlie groups")[0]
+            .mls_group_id
+            .clone();
+        let dave = MarmotEngine::in_memory(Identity::generate());
+        let erin = MarmotEngine::in_memory(Identity::generate());
+
+        // Bob's earlier commit is the MIP-03 winner, but Charlie sees Alice's
+        // competing commit first and therefore cannot initially decrypt Bob's
+        // message from the winning epoch.
+        let bob_update = bob
+            .add_members(
+                &bob_group_id,
+                vec![dave
+                    .key_package_event(relays.clone())
+                    .expect("dave key package")],
+            )
+            .expect("bob creates earlier commit");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let alice_update = alice
+            .add_members(
+                &alice_group_id,
+                vec![erin.key_package_event(relays).expect("erin key package")],
+            )
+            .expect("alice creates later commit");
+        assert!(
+            bob_update.evolution_event.created_at < alice_update.evolution_event.created_at,
+            "competing commits need deterministic MIP-03 order"
+        );
+        bob.merge_pending_commit(&bob_group_id)
+            .expect("bob merges winning commit");
+        let bob_message = bob
+            .create_text_message(&bob_group_id, "message recovered after rollback")
+            .expect("bob creates message in winning epoch");
+
+        let (wrong_commit, _) = charlie
+            .process_marmot_events([alice_update.evolution_event], "test losing commit first")
+            .await;
+        assert_eq!(wrong_commit.processed, 1);
+
+        let (first_failure, _) = charlie
+            .process_marmot_events([bob_message.clone()], "test initial message failure")
+            .await;
+        assert_eq!(first_failure.retryable_failures, 1);
+
+        // A duplicate relay delivery reaches MDK's Incoming::Failed branch.
+        // Sonar used to add the event to its own durable processed-ID set here.
+        let (failed_redelivery, _) = charlie
+            .process_marmot_events([bob_message.clone()], "test failed redelivery")
+            .await;
+        assert_eq!(failed_redelivery.processed, 1);
+        assert!(
+            !charlie.is_sync_event_processed(&bob_message.id),
+            "Sonar dedup must not hide an MDK Failed event that a later MLS rollback can make Retryable"
+        );
+
+        let (winning_commit, _) = charlie
+            .process_marmot_events([bob_update.evolution_event], "test winning commit rollback")
+            .await;
+        assert_eq!(winning_commit.processed, 1);
+
+        let (recovered, _) = charlie
+            .process_marmot_events([bob_message], "test retry after rollback")
+            .await;
+        assert_eq!(recovered.processed, 1);
+        assert!(
+            charlie
+                .engine
+                .messages(&charlie_group_id)
+                .expect("charlie transcript")
+                .iter()
+                .any(|message| message.content == "message recovered after rollback"),
+            "relay redelivery after rollback must restore the missing peer message"
+        );
     }
 
     #[test]

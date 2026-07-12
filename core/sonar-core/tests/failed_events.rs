@@ -1,13 +1,12 @@
 //! Regression test for the sync-watermark poisoning bug: a kind-445 event that
-//! MDK cannot process gets a durable Failed record, and MDK short-circuits all
-//! re-deliveries of it. The engine must surface those re-deliveries as terminal
-//! [`Incoming::Failed`] — NOT as retryable — otherwise the relay sync layer
-//! rewinds its global watermark behind the event forever and every sync
-//! re-downloads weeks of history (observed pinning a real account 18 days in
-//! the past, with every app foreground re-fetching 32 groups of backlog).
+//! MDK cannot currently process gets a durable Failed record and surfaces as
+//! [`Incoming::Failed`] on unchanged re-delivery. The relay sync layer counts
+//! that delivery as handled so it does not rewind forever, while deliberately
+//! leaving the outer processed-ID unset because an MLS rollback can later move
+//! the MDK record to Retryable.
 
-use nostr::{EventBuilder, Keys, Kind, Tag};
 use nostr::RelayUrl;
+use nostr::{EventBuilder, Keys, Kind, Tag};
 use sonar_core::identity::Identity;
 use sonar_core::marmot::{Incoming, MarmotEngine};
 
@@ -16,7 +15,7 @@ fn relays() -> Vec<RelayUrl> {
 }
 
 #[tokio::test]
-async fn undecryptable_group_message_is_terminal_not_retryable() {
+async fn undecryptable_group_message_surfaces_as_failed_until_rollback() {
     // Alice forms a real MLS group so the garbage event's `h` tag resolves to
     // a known group (the decrypt itself is what fails, as with a message
     // encrypted for an MLS state we do not have).
@@ -45,15 +44,16 @@ async fn undecryptable_group_message_is_terminal_not_retryable() {
         "garbage ciphertext must not decrypt"
     );
 
-    // Re-delivery (same event fetched again by relay sync): MDK blocks
-    // reprocessing, so this must map to the terminal Incoming::Failed that the
-    // sync layer marks processed, never to a retry that pins the watermark.
+    // Re-delivery before any rollback: MDK blocks reprocessing and surfaces
+    // Incoming::Failed. Sonar treats this pass as handled for watermark
+    // purposes, but must still allow a future relay redelivery to reach MDK if
+    // a competing commit rollback changes this record to Retryable.
     let second = alice
         .process_incoming(&garbage)
         .await
         .expect("re-delivery of a failed event must not error");
     assert!(
         matches!(second, Incoming::Failed),
-        "re-delivered failed event must be terminal, got {second:?}"
+        "re-delivered failed event must remain failed before rollback, got {second:?}"
     );
 }
