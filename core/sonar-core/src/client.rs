@@ -2018,6 +2018,24 @@ impl SonarClient {
         self.retry_outbox().await;
     }
 
+    /// Retry one failed outgoing message using the exact encrypted event stored
+    /// in the durable outbox. This never creates a second local transcript row
+    /// or advances MLS state; it only republishes the original wrapper event.
+    pub async fn retry_message(&self, group_id: &GroupId, message_id_hex: &str) -> Result<()> {
+        if self.relays.is_empty() {
+            return Err(Error::NoRelayConnected);
+        }
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let event = self.outbox_state.lock().unwrap().retry_failed_event(
+            &group_id_hex,
+            message_id_hex,
+            Timestamp::now().as_secs(),
+        )?;
+        self.notify_conversation_changed(&group_id_hex);
+        self.spawn_outbox_publish(message_id_hex.to_string(), group_id_hex, event);
+        Ok(())
+    }
+
     async fn retry_outbox(&self) {
         if self.relays.is_empty() {
             return;
@@ -2609,6 +2627,10 @@ impl SonarClient {
             Ok(report) => self.save_or_rewind_without_advancing_watermark(report)?,
             Err(err) => tracing::debug!(%err, "initial Marmot per-group catch-up failed"),
         }
+        // The apps use this lightweight idle path instead of `sync()`. Retry
+        // the durable outbox here too so a transient outage self-heals after
+        // relay reconnection even when the user does not tap the retry button.
+        self.retry_outbox().await;
         Ok(())
     }
 

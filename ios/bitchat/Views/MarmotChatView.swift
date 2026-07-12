@@ -288,7 +288,12 @@ final class MarmotChatModel: ObservableObject {
             return message.media.isEmpty ? "Sending" : "Uploading"
         }
         if message.deliveryState == "failed" { return "Couldn't send" }
+        if message.deliveryState == "pending" { return "Sending" }
         return "Sent"
+    }
+
+    static func isFailedOptimisticMessageId(_ id: String) -> Bool {
+        id.hasPrefix(failedOptimisticIDPrefix)
     }
 
     init(
@@ -1274,6 +1279,32 @@ final class MarmotChatModel: ObservableObject {
             _ = await chain.result
         }
         return errorText == nil
+    }
+
+    /// Retry a core-backed failed row without creating a second transcript row
+    /// or re-running MLS encryption. The core flips the durable row back to
+    /// pending before republishing the original encrypted wrapper event.
+    func retryMessage(groupId: String, messageId: String) {
+        errorText = nil
+        Task {
+            do {
+                guard await ensureConnected(timeoutSeconds: 2) else {
+                    throw MarmotService.ServiceError.notConnected
+                }
+                try await service.retryMessage(groupId: groupId, messageId: messageId)
+                await loadLocalPage(groupId: groupId)
+            } catch {
+                errorText = Self.describe(error)
+            }
+        }
+    }
+
+    /// Remove a failed platform-local media echo immediately before replacing
+    /// it with a new upload attempt that reuses the retained local bytes.
+    func removeFailedOptimisticMessage(groupId: String, messageId: String) {
+        guard Self.isFailedOptimisticMessageId(messageId) else { return }
+        pendingOptimistic[groupId]?.removeAll { $0.id == messageId }
+        messagesByGroup[groupId, default: []].removeAll { $0.id == messageId }
     }
 
     /// Send a media attachment (encrypt with the group key, upload the ciphertext

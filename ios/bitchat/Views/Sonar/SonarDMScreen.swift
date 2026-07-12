@@ -129,6 +129,7 @@ struct SonarDMScreenContent: View {
                     loadMedia: { await store.mediaData($0) },
                     loadSticker: { await store.stickerImageData(for: $0) },
                     onTapPack: { previewPackCoordinate = $0 },
+                    onRetry: { store.retryDm(peerId, message: $0) },
                     loadOlder: { await convo.loadOlder() },
                     loadNewest: { await convo.loadNewestIfNeeded() }
                 )

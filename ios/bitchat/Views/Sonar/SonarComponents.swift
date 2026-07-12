@@ -488,6 +488,7 @@ struct SNBannerButton: View {
 private struct SNMessageStatusFooter: View {
     let stateText: String
     let via: SNVia?
+    var onRetry: (() -> Void)? = nil
 
     private var isPending: Bool {
         stateText == "Sending" || stateText == "Uploading"
@@ -508,6 +509,16 @@ private struct SNMessageStatusFooter: View {
             }
             Text(verbatim: "\(stateText) · \(via?.label ?? "")")
                 .font(SonarTheme.uiFont(size: 11))
+            if isFailed, let onRetry {
+                Button(action: onRetry) {
+                    Text(verbatim: "Retry")
+                        .font(SonarTheme.uiFont(size: 11, weight: .bold))
+                        .padding(.vertical, 7)
+                        .padding(.horizontal, 7)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Retry sending message")
+            }
         }
         .foregroundColor(isFailed ? SonarTheme.danger : SonarTheme.text3)
     }
@@ -520,6 +531,7 @@ struct SNMsgBubble: View {
     var showAuthor: Bool = false
     var cont: Bool = false
     var showState: Bool = false
+    var onRetry: (() -> Void)? = nil
     let maxBubbleWidth: CGFloat
     /// Tap another participant's name/bubble to open a private DM (channels).
     var onTapAuthor: ((SNMessage) -> Void)? = nil
@@ -658,7 +670,7 @@ struct SNMsgBubble: View {
                 .padding(.horizontal, 6)
             }
             if showState, let stateText = m.state {
-                SNMessageStatusFooter(stateText: stateText, via: m.via)
+                SNMessageStatusFooter(stateText: stateText, via: m.via, onRetry: onRetry)
                 .padding(EdgeInsets(top: 3, leading: 4, bottom: 0, trailing: 4))
             }
         }
@@ -683,6 +695,8 @@ struct SNMsgList: View {
     var loadMedia: ((SNMediaItem) async -> Data?)? = nil
     var loadSticker: ((MarmotService.MarmotStickerRef) async -> Data?)? = nil
     var onTapPack: ((String) -> Void)? = nil
+    /// Retry one failed outgoing message without rebuilding the transcript.
+    var onRetry: ((SNMessage) -> Void)? = nil
     /// Load one older local database page. Nil for non-paged channel surfaces.
     var loadOlder: (() async -> Bool)? = nil
     /// Restore a movable historical window to its newest local page.
@@ -723,17 +737,21 @@ struct SNMsgList: View {
                                     maxBubbleWidth: geo.size.width * 0.78
                                 )
                             } else if !m.media.isEmpty {
+                                let showDeliveryState = m.mine && (i == msgs.count - 1 || m.state == "Couldn't send")
                                 SNMediaBubble(
                                     m: m,
                                     maxBubbleWidth: geo.size.width * 0.72,
-                                    showState: m.mine && i == msgs.count - 1,
+                                    showState: showDeliveryState,
+                                    onRetry: m.state == "Couldn't send" ? { onRetry?(m) } : nil,
                                     load: loadMedia
                                 )
                             } else if m.stickerRef != nil {
+                                let showDeliveryState = m.mine && (i == msgs.count - 1 || m.state == "Couldn't send")
                                 SNStickerBubble(
                                     m: m,
                                     showAuthor: showAuthors && !m.mine,
-                                    showState: m.mine && i == msgs.count - 1,
+                                    showState: showDeliveryState,
+                                    onRetry: m.state == "Couldn't send" ? { onRetry?(m) } : nil,
                                     load: loadSticker,
                                     onTapPack: onTapPack
                                 )
@@ -754,7 +772,8 @@ struct SNMsgList: View {
                                     expandedMessageIDs: $expandedMessageIDs,
                                     showAuthor: showAuthors && !m.mine && !cont,
                                     cont: cont,
-                                    showState: m.mine && i == msgs.count - 1,
+                                    showState: m.mine && (i == msgs.count - 1 || m.state == "Couldn't send"),
+                                    onRetry: m.state == "Couldn't send" ? { onRetry?(m) } : nil,
                                     maxBubbleWidth: geo.size.width * 0.78,
                                     onTapAuthor: onTapAuthor
                                 )
@@ -925,6 +944,7 @@ struct SNStickerBubble: View {
     let m: SNMessage
     var showAuthor: Bool = false
     var showState: Bool = false
+    var onRetry: (() -> Void)? = nil
     var load: ((MarmotService.MarmotStickerRef) async -> Data?)? = nil
     var onTapPack: ((String) -> Void)? = nil
 
@@ -979,7 +999,7 @@ struct SNStickerBubble: View {
                 }
             }
             if showState, let stateText = m.state {
-                SNMessageStatusFooter(stateText: stateText, via: m.via)
+                SNMessageStatusFooter(stateText: stateText, via: m.via, onRetry: onRetry)
                     .padding(EdgeInsets(top: 1, leading: 4, bottom: 0, trailing: 4))
             }
         }
@@ -1010,6 +1030,7 @@ struct SNMediaBubble: View {
     let m: SNMessage
     let maxBubbleWidth: CGFloat
     var showState: Bool = false
+    var onRetry: (() -> Void)? = nil
     var load: ((SNMediaItem) async -> Data?)? = nil
 
     @State private var bytes: Data?
@@ -1063,7 +1084,7 @@ struct SNMediaBubble: View {
                     .font(SonarTheme.uiFont(size: 10.5))
                     .foregroundColor(SonarTheme.text3)
                 if showState, let stateText = m.state {
-                    SNMessageStatusFooter(stateText: stateText, via: m.via)
+                    SNMessageStatusFooter(stateText: stateText, via: m.via, onRetry: onRetry)
                 }
             }
             if !m.mine { Spacer(minLength: 40) }

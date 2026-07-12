@@ -584,6 +584,13 @@ final class MarmotService: @unchecked Sendable {
         try await run { try $0.requireNode().sendText(groupIdHex: groupId, text: text) }
     }
 
+    /// Republish one failed message from the durable local outbox.
+    func retryMessage(groupId: String, messageId: String) async throws {
+        try await run {
+            try $0.requireNode().retryMessage(groupIdHex: groupId, messageIdHex: messageId)
+        }
+    }
+
     /// Encrypt `data`, upload the ciphertext to a Blossom server, and publish a
     /// media message to the group. `serverUrl` empty → the core default.
     func sendMedia(

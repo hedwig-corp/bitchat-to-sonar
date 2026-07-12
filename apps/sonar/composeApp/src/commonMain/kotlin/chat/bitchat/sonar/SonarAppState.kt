@@ -3622,12 +3622,12 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private fun failPendingMarmotChat(npubHex: String, pendingChatId: String, setupToken: Long? = null): Boolean {
         if (!isActivePendingMarmotSetup(pendingChatId, pendingMarmotChatNpubs[pendingChatId]?.peerNpub, setupToken)) return false
-        pendingMarmotChatNpubs = pendingMarmotChatNpubs - pendingChatId
         pendingDirectMarmotSends.remove(npubHex)
         pendingSendEchoes[pendingChatId].orEmpty().map { it.id }.forEach { echoId ->
             failSendEcho(pendingChatId, echoId)
         }
-        pendingSendEchoes.remove(pendingChatId)
+        // Keep the pending route + failed echoes. Tapping Retry replaces just
+        // that echo, rebuilds the queue, and starts secure-chat setup again.
         return true
     }
 
@@ -4108,6 +4108,121 @@ class SonarAppState(private val scope: CoroutineScope) {
             }
         }
         reloadNewestAfterSendIfNeeded(chatId)
+    }
+
+    /** Signal-style retry for one failed outgoing row. Core-backed messages
+     *  republish their original encrypted event; optimistic setup/media rows
+     *  reuse the local plaintext/bytes that are already held for that row. */
+    fun retryMessage(chatId: String, message: SonarMsg) {
+        if (!sonarDeliveryFailed(message.state)) return
+        val mediaUploads = pendingMediaUploads[chatId]
+            ?.filter { it.message.id == message.id }
+            .orEmpty()
+        if (mediaUploads.isNotEmpty()) {
+            retryPendingMedia(chatId, message.id, mediaUploads)
+            return
+        }
+
+        if (message.id.startsWith(echoIdPrefix)) {
+            pendingSendEchoes[chatId]?.removeAll { it.id == message.id }
+            if (pendingSendEchoes[chatId].isNullOrEmpty()) pendingSendEchoes.remove(chatId)
+            messages = messages.filterNot { it.id == message.id }
+            send(chatId, message.content)
+            return
+        }
+
+        val groupId = resolveMarmotGroupId(chatId)
+        if (groupId == null) {
+            toast = "This message is no longer available to retry."
+            return
+        }
+        messages = messages.map {
+            if (it.id == message.id) it.copy(state = "Sending") else it
+        }
+        scope.launch {
+            runCatching { SonarCore.retryMessage(groupId, message.id) }
+                .onSuccess { refreshRetriedMarmotMessage(chatId) }
+                .onFailure { error ->
+                    if ((screen as? Screen.Chat)?.id == chatId) {
+                        messages = messages.map {
+                            if (it.id == message.id) it.copy(state = "Couldn't send") else it
+                        }
+                    }
+                    toast = "retry failed: ${error.message}"
+                }
+        }
+    }
+
+    private fun retryPendingMedia(
+        chatId: String,
+        pendingId: String,
+        uploads: List<PendingMediaUpload>,
+    ) {
+        val pending = pendingMediaUploads[chatId] ?: return
+        for (index in pending.indices) {
+            if (pending[index].message.id == pendingId) {
+                pending[index] = pending[index].copy(
+                    message = pending[index].message.copy(state = "Uploading"),
+                    completedOrder = null,
+                )
+            }
+        }
+        messages = messages.map {
+            if (it.id == pendingId) it.copy(state = "Uploading") else it
+        }
+        scope.launch {
+            val groupId = resolveMarmotGroupId(chatId)
+            if (groupId == null) {
+                markPendingMediaFailed(chatId, pendingId)
+                toast = "This media is no longer available to retry."
+                return@launch
+            }
+            try {
+                if (uploads.size == 1) {
+                    val upload = uploads.single()
+                    SonarCore.sendMedia(groupId, upload.data, upload.filename, upload.mime, upload.message.content)
+                } else {
+                    SonarCore.sendMediaMulti(
+                        groupId,
+                        uploads.map { AlbumUpload(it.data, it.filename, it.mime) },
+                        uploads.first().message.content,
+                    )
+                }
+                markPendingMediaCompleted(chatId, pendingId)
+                refreshRetriedMarmotMessage(chatId)
+            } catch (error: Throwable) {
+                markPendingMediaFailed(chatId, pendingId)
+                if ((screen as? Screen.Chat)?.id == chatId) {
+                    messages = visibleMessagesForChat(
+                        chatId,
+                        mergePendingMediaUploads(chatId, messages),
+                    )
+                }
+                toast = "retry failed: ${error.message}"
+            }
+        }
+    }
+
+    private suspend fun refreshRetriedMarmotMessage(chatId: String) {
+        if ((screen as? Screen.Chat)?.id != chatId) return
+        val generation = transcriptGeneration
+        val fresh = if (isMeshChat(chatId)) {
+            val peerId = meshPeerId(chatId)
+            refreshConversationRows(
+                refreshMeshTranscriptWindow(peerId) + marmotMessagesForPeer(peerId, chatId, generation),
+                chatId,
+                generation,
+            )
+        } else {
+            marmotMessagesPageForChat(chatId, generation)
+        }
+        if (isCurrentTranscriptSession(chatId, generation)) {
+            setCurrentVisibleMessages(
+                chatId,
+                withSendEchoes(chatId, mergePendingMediaUploads(chatId, fresh)),
+                processCalls = true,
+            )
+        }
     }
 
     // ── Optimistic send echoes ──

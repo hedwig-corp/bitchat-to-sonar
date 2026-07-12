@@ -3745,6 +3745,37 @@ final class SonarAppStore: ObservableObject {
         chatViewModel.sendPrivateMessage(text, to: PeerID(str: id))
     }
 
+    /// Signal-style retry for one failed outgoing row. Durable Marmot rows
+    /// republish the original encrypted event; platform-local setup/media rows
+    /// reuse the content already retained for that exact bubble.
+    func retryDm(_ id: String, message: SNMessage) {
+        guard message.state == "Couldn't send" else { return }
+        let groupId = message.media.first?.groupId
+            ?? marmotGroupId(id)
+            ?? resolvedSonarProfile(id).flatMap { marmotGroup(forNpub: $0.npub)?.id }
+
+        if let groupId,
+           MarmotChatModel.isFailedOptimisticMessageId(message.id),
+           !message.media.isEmpty {
+            retryFailedMedia(message, groupId: groupId)
+            return
+        }
+
+        if message.id.hasPrefix("echo-") {
+            for key in Array(pendingMarmotMessagesByChat.keys) {
+                pendingMarmotMessagesByChat[key]?.removeAll { $0.id == message.id }
+            }
+            sendDm(id, message.text)
+            return
+        }
+
+        guard let groupId else {
+            showToast("This message is no longer available to retry.")
+            return
+        }
+        marmot.retryMessage(groupId: groupId, messageId: message.id)
+    }
+
     private func sendPaymentReceiptLines(_ lines: [String], to id: String) async -> Bool {
         guard !lines.isEmpty else { return true }
         if meshReachable(id) {
@@ -4295,6 +4326,94 @@ final class SonarAppStore: ObservableObject {
                 }
             }
         }
+    }
+
+    private func retryFailedMedia(_ message: SNMessage, groupId: String) {
+        let payloads: [(item: SNMediaItem, data: Data)] = message.media.compactMap { item in
+            mediaImageCache[item.url].map { (item, $0) }
+        }
+        guard payloads.count == message.media.count, !payloads.isEmpty else {
+            showToast("This media is no longer available to retry.")
+            return
+        }
+
+        marmot.removeFailedOptimisticMessage(groupId: groupId, messageId: message.id)
+        for payload in payloads {
+            rememberPendingUploadMedia(
+                groupId: groupId,
+                filename: payload.item.filename,
+                mime: payload.item.mime,
+                caption: message.text,
+                localURL: payload.item.url,
+                data: payload.data
+            )
+        }
+
+        if payloads.count == 1, let payload = payloads.first {
+            marmot.sendMedia(
+                groupId: groupId,
+                data: payload.data,
+                filename: payload.item.filename,
+                mime: payload.item.mime,
+                caption: message.text,
+                localPreviewURL: payload.item.url,
+                onComplete: { [weak self] in
+                    self?.markPendingUploadMediaCompleted(
+                        groupId: groupId,
+                        filename: payload.item.filename,
+                        mime: payload.item.mime,
+                        caption: message.text,
+                        localURL: payload.item.url
+                    )
+                },
+                onFailure: { [weak self] in
+                    self?.forgetPendingUploadMedia(
+                        groupId: groupId,
+                        filename: payload.item.filename,
+                        mime: payload.item.mime,
+                        caption: message.text,
+                        localURL: payload.item.url
+                    )
+                }
+            )
+            return
+        }
+
+        let items = payloads.map {
+            MarmotService.MediaAlbumItem(
+                data: $0.data,
+                filename: $0.item.filename,
+                mime: $0.item.mime
+            )
+        }
+        marmot.sendMediaAlbum(
+            groupId: groupId,
+            items: items,
+            caption: message.text,
+            localPreviewURLs: payloads.map { $0.item.url },
+            onComplete: { [weak self] in
+                for payload in payloads {
+                    self?.markPendingUploadMediaCompleted(
+                        groupId: groupId,
+                        filename: payload.item.filename,
+                        mime: payload.item.mime,
+                        caption: message.text,
+                        localURL: payload.item.url
+                    )
+                }
+            },
+            onFailure: { [weak self] in
+                for payload in payloads {
+                    self?.forgetPendingUploadMedia(
+                        groupId: groupId,
+                        filename: payload.item.filename,
+                        mime: payload.item.mime,
+                        caption: message.text,
+                        localURL: payload.item.url
+                    )
+                }
+            }
+        )
     }
 
     /// True if `id` is a chat that can carry media: an existing Marmot group, a
