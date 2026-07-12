@@ -136,13 +136,11 @@ fun SonarSettingsScreen(state: SonarAppState) {
                 ) {}
                 SNSettingsRow(
                     icon = SNIconName.Mesh, tone = SNTone.Cyan, label = "Discover new people",
-                    sub = if (state.batterySaving) "Battery saving is limiting Bluetooth to existing chats" else "Allow nearby people without a chat to appear",
-                    value = state.bleDiscoveryStatusLine,
-                    toggle = state.discoverNewPeople && !state.batterySaving,
+                    sub = state.bleDiscoverySettingsDescription,
+                    toggle = state.discoverNewPeople,
                     trail = SNTrail.None, divider = false,
                 ) {
-                    if (state.batterySaving) state.toast = "Battery saving keeps Bluetooth on chats only"
-                    else state.setBleDiscoverNewPeople(!state.discoverNewPeople)
+                    state.setBleDiscoverNewPeople(!state.discoverNewPeople)
                 }
             }
 

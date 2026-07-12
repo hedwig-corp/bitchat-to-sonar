@@ -31,12 +31,16 @@ struct SonarRadarScreen: View {
             VStack(spacing: 0) {
                 SNNavHeader(hairline: false, onBack: { store.pop() }) {
                     SNHeaderTitle(name: "Sonar") {
-                        SNDot(color: SonarTheme.green, small: true)
+                        SNDot(color: store.isBLEDiscoveryRestricted ? SonarTheme.text3 : SonarTheme.green, small: true)
                         Text(verbatim: store.radarDiscoveryStatusLine)
                     }
                 }
 
                 segControl
+
+                if store.isBLEDiscoveryRestricted {
+                    discoveryNotice
+                }
 
                 if mode == .radar {
                     radarView
@@ -153,6 +157,35 @@ struct SonarRadarScreen: View {
         .buttonStyle(.plain)
     }
 
+    private var discoveryNotice: some View {
+        HStack(spacing: 12) {
+            SNIcon(name: .rings, size: 18, weight: 2.1)
+                .foregroundColor(SonarTheme.accentDeep)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(verbatim: store.batterySavingEnabled ? "New people paused" : "New people are hidden")
+                    .font(SonarTheme.uiFont(size: 14, weight: .semibold))
+                    .foregroundColor(SonarTheme.text)
+                Text(verbatim: store.batterySavingEnabled
+                    ? "Battery saving is on. People from existing chats can still reconnect."
+                    : "Only people from existing chats appear until you turn discovery back on.")
+                    .font(SonarTheme.uiFont(size: 12.5))
+                    .foregroundColor(SonarTheme.text2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            if !store.batterySavingEnabled {
+                SNSmallButton(label: "Turn on", primary: true, expand: false) {
+                    store.setDiscoverNewPeople(true)
+                }
+            }
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(SonarTheme.surface))
+        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(SonarTheme.hairline, lineWidth: 1))
+        .padding(.horizontal, 16)
+        .padding(.top, 4)
+    }
+
     private func peerCardSub(_ p: SNPeerItem) -> String {
         if p.unify { return "Unify user \u{00B7} pay only" }
         return p.inRange ? "\(p.hint) \u{00B7} over Bluetooth" : "Out of range \u{00B7} over the internet"
@@ -179,7 +212,7 @@ struct SonarRadarScreen: View {
                 onTapPeer: { open($0) }
             )
             Text(inRange.isEmpty && far.isEmpty
-                ? "Looking for people around you\u{2026}"
+                ? (store.isBLEDiscoveryRestricted ? "New people are paused" : "Looking for people around you\u{2026}")
                 : "Tap someone to chat")
                 .font(SonarTheme.uiFont(size: 12.5))
                 .foregroundColor(SonarTheme.text3)
@@ -211,8 +244,10 @@ struct SonarRadarScreen: View {
                     SNEmptyState(
                         icon: .rings,
                         iconSize: 26,
-                        title: "Nobody in range yet",
-                        desc: "Keep Sonar open while you move around — people appear here as soon as Bluetooth finds them."
+                        title: store.isBLEDiscoveryRestricted ? "New people are paused" : "Nobody in range yet",
+                        desc: store.isBLEDiscoveryRestricted
+                            ? "People from existing chats can still reconnect. Use the control above to understand or change discovery."
+                            : "Keep Sonar open while you move around — people appear here as soon as Bluetooth finds them."
                     )
                     .padding(.vertical, 60)
                 } else {
