@@ -4135,6 +4135,9 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun clearSendEcho(chatId: String, echoId: String) {
         pendingSendEchoes[chatId]?.removeAll { it.id == echoId }
         if (pendingSendEchoes[chatId].isNullOrEmpty()) pendingSendEchoes.remove(chatId)
+        if ((screen as? Screen.Chat)?.id == chatId) {
+            messages = messages.filterNot { it.id == echoId }
+        }
     }
 
     private fun failSendEcho(chatId: String, echoId: String) {
@@ -4152,22 +4155,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private fun withSendEchoes(chatId: String, published: List<SonarMsg>): List<SonarMsg> {
         val echoes = pendingSendEchoes[chatId] ?: return published
-        val fulfilled = mutableSetOf<String>()
-        val consumedPublished = mutableSetOf<String>()
-        val ownPublished = published.filter { it.mine }.groupBy { it.content }
-        for (echo in echoes) {
-            if (echo.state == "Couldn't send") continue
-            val match = ownPublished[echo.content]
-                ?.filter { it.id !in consumedPublished }
-                ?.firstOrNull {
-                    it.viaInternet == echo.viaInternet &&
-                        it.tsSecs > echo.tsSecs && it.tsSecs - echo.tsSecs < 30
-                }
-            if (match != null) {
-                fulfilled.add(echo.id)
-                consumedPublished.add(match.id)
-            }
-        }
+        val fulfilled = fulfilledSendEchoIds(echoes, published)
         echoes.removeAll { it.id in fulfilled }
         if (echoes.isEmpty()) {
             pendingSendEchoes.remove(chatId)

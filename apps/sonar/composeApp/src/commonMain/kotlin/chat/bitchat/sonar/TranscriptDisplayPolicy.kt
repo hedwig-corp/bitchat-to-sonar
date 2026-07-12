@@ -5,6 +5,7 @@ internal const val TRANSCRIPT_PAGE_FETCH_SIZE = TRANSCRIPT_PAGE_SIZE + 1
 internal const val TRANSCRIPT_RETAINED_ROWS = 500
 internal const val TRANSCRIPT_PREVIEW_GRAPHEMES = 512
 internal const val TRANSCRIPT_PREVIEW_NEWLINES = 15
+internal const val SEND_ECHO_MATCH_SLACK_SECS = 5L
 
 internal data class TranscriptPreview(
     val text: String,
@@ -125,6 +126,40 @@ internal fun visibleTranscriptPage(
 ): List<SonarMsg> = fetchedNewestFirst
     .take(pageSize.coerceAtLeast(0))
     .sortedWith(compareBy<SonarMsg>({ it.tsSecs }, { it.id }))
+
+/**
+ * Match optimistic outgoing echoes to canonical local-storage rows one-for-one.
+ *
+ * The core writes the canonical row before `send` returns, so it commonly has
+ * the same whole-second timestamp as the echo. First-chat setup can also delay
+ * that row well beyond 30 seconds. Only reject canonical rows that are clearly
+ * older than the echo; the small backwards slack mirrors iOS and accounts for
+ * whole-second timestamps plus minor clock skew.
+ */
+internal fun fulfilledSendEchoIds(
+    echoes: List<SonarMsg>,
+    published: List<SonarMsg>,
+    matchSlackSecs: Long = SEND_ECHO_MATCH_SLACK_SECS,
+): Set<String> {
+    val fulfilled = mutableSetOf<String>()
+    val consumedPublished = mutableSetOf<String>()
+    val ownPublished = published.filter { it.mine }.groupBy { it.content }
+    for (echo in echoes) {
+        if (echo.state == "Couldn't send") continue
+        val earliestMatch = echo.tsSecs - matchSlackSecs.coerceAtLeast(0L)
+        val match = ownPublished[echo.content]
+            ?.firstOrNull {
+                it.id !in consumedPublished &&
+                    it.viaInternet == echo.viaInternet &&
+                    it.tsSecs >= earliestMatch
+            }
+        if (match != null) {
+            fulfilled.add(echo.id)
+            consumedPublished.add(match.id)
+        }
+    }
+    return fulfilled
+}
 
 private fun newlinePrefixEnd(source: String, maxNewlines: Int): Int {
     if (maxNewlines < 0) return 0
