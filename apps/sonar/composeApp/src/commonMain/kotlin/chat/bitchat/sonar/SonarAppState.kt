@@ -172,8 +172,12 @@ internal fun aliasesSupportMarmotRoute(
 
 internal fun aliasesHaveMutualFavorite(
     aliases: Iterable<String>,
-    isMutualFavorite: (String) -> Boolean,
-): Boolean = aliases.any(isMutualFavorite)
+    isFavorite: (String) -> Boolean,
+    isRemoteFavorite: (String) -> Boolean,
+): Boolean {
+    val stableAliases = aliases.toList()
+    return stableAliases.any(isFavorite) && stableAliases.any(isRemoteFavorite)
+}
 
 internal fun directMarmotPeerKey(chat: SonarChat, ownNpub: String): String? {
     val mine = canonicalProfileKey(ownNpub)
@@ -1309,10 +1313,10 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     fun isFavorite(peerId: String): Boolean =
-        socialState.isFavoritePeer(peerId)
+        meshPeerAliases(peerId).any(socialState::isFavoritePeer)
 
     fun isMutualFavorite(peerId: String): Boolean =
-        socialState.isMutualFavorite(peerId)
+        meshAliasGroupIsMutualFavorite(peerId)
 
     fun isBlockedPeer(peerId: String): Boolean =
         isMeshContactBlocked(peerId)
@@ -1334,7 +1338,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun toggleFavorite(peerId: String, name: String = "") {
         val key = normalizeSocialPeerId(peerId)
-        setFavoritePeer(key, name, !socialState.isFavoritePeer(key))
+        setFavoritePeer(key, name, !isFavorite(key))
     }
 
     fun setFavoritePeer(peerId: String, name: String = "", favorite: Boolean) {
@@ -1343,7 +1347,9 @@ class SonarAppState(private val scope: CoroutineScope) {
             toast = "Unblock ${name.ifBlank { "this contact" }} before favoriting."
             return
         }
-        socialState = socialState.withFavoritePeer(key, favorite)
+        socialState = meshPeerAliases(key).fold(socialState) { state, alias ->
+            state.withFavoritePeer(alias, favorite)
+        }
         persistSocialState()
         sendFavoriteStatusNotification(key, favorite)
         toast = if (favorite) {
@@ -1362,7 +1368,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 append(it)
             }
         }
-        MeshRadio.sendMeshDm(peerId, randomMeshId(), payload)
+        MeshRadio.sendMeshDm(liveMeshRoutePeerId(peerId) ?: peerId, randomMeshId(), payload)
         val raw = npubRawFor(peerId) ?: return
         scope.launch {
             runCatching {
@@ -4744,7 +4750,14 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private fun canUseDirectNip17(peerId: String, npubRaw: ByteArray): Boolean =
         !socialState.isBlockedNostr(npubRaw.toHexLower()) &&
-            aliasesHaveMutualFavorite(preferredMeshAliases(peerId), socialState::isMutualFavorite)
+            meshAliasGroupIsMutualFavorite(peerId)
+
+    private fun meshAliasGroupIsMutualFavorite(peerId: String): Boolean =
+        aliasesHaveMutualFavorite(
+            aliases = meshPeerAliases(peerId),
+            isFavorite = socialState::isFavoritePeer,
+            isRemoteFavorite = socialState::isRemoteFavoritePeer,
+        )
 
     private suspend fun sendDirectNip17Now(
         peerId: String,
@@ -5594,7 +5607,9 @@ class SonarAppState(private val scope: CoroutineScope) {
                 refreshKnownContactDescriptors()
             }
         }
-        socialState = socialState.withRemoteFavoritePeer(peerId, favorite)
+        socialState = meshPeerAliases(peerId).fold(socialState) { state, alias ->
+            state.withRemoteFavoritePeer(alias, favorite)
+        }
         persistSocialState()
         recomputeSociallyFilteredRows()
         if (favorite) flushOutbox(peerId)
@@ -5667,7 +5682,10 @@ class SonarAppState(private val scope: CoroutineScope) {
                 ackEventIds += m.eventId
                 continue
             }
-            if (!socialState.isMutualFavorite(peerId)) {
+            // Rejected events are acknowledged below, so use the same
+            // account-level predicate as the send path. Favorite controls can
+            // legitimately land on different rotated fingerprints.
+            if (!meshAliasGroupIsMutualFavorite(peerId)) {
                 ackEventIds += m.eventId
                 continue
             }

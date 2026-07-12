@@ -398,7 +398,7 @@ class ConversationFoldTest {
     }
 
     @Test
-    fun rotatedAliasSuppliesMarmotAndFavoriteRoutingCapabilities() {
+    fun rotatedAliasSuppliesMarmotAndSplitFavoriteRoutingCapabilities() {
         val aliases = listOf("fp-canonical", "fp-live")
 
         assertTrue(
@@ -415,8 +415,27 @@ class ConversationFoldTest {
                 capabilitiesForAlias = { if (it == "fp-live") SonarAnnounce.CAP_MARMOT else 0 },
             ),
         )
-        assertTrue(aliasesHaveMutualFavorite(aliases) { it == "fp-live" })
-        assertFalse(aliasesHaveMutualFavorite(aliases) { false })
+        assertTrue(
+            aliasesHaveMutualFavorite(
+                aliases = aliases,
+                isFavorite = { it == "fp-canonical" },
+                isRemoteFavorite = { it == "fp-live" },
+            ),
+        )
+        assertFalse(
+            aliasesHaveMutualFavorite(
+                aliases = aliases,
+                isFavorite = { it == "fp-canonical" },
+                isRemoteFavorite = { false },
+            ),
+        )
+        assertFalse(
+            aliasesHaveMutualFavorite(
+                aliases = aliases,
+                isFavorite = { false },
+                isRemoteFavorite = { it == "fp-live" },
+            ),
+        )
     }
 
     @Test

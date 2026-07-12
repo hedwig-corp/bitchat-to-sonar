@@ -77,6 +77,26 @@ class ConversationRegressionSmokeTest {
     }
 
     @Test
+    fun splitAliasFavoritesAllowFoldedSendAndReceive() {
+        val aliases = listOf("fp-vincenzo", "fp-vincenzo-mac")
+        val state = SonarSocialState()
+            .withFavoritePeer("fp-vincenzo", true)
+            .withRemoteFavoritePeer("fp-vincenzo-mac", true)
+
+        // Neither exact fingerprint is mutual. Both the outbound NIP-17 route
+        // and inbound drain must nevertheless accept their folded account.
+        assertFalse(state.isMutualFavorite("fp-vincenzo"))
+        assertFalse(state.isMutualFavorite("fp-vincenzo-mac"))
+        assertTrue(
+            aliasesHaveMutualFavorite(
+                aliases = aliases,
+                isFavorite = state::isFavoritePeer,
+                isRemoteFavorite = state::isRemoteFavoritePeer,
+            ),
+        )
+    }
+
+    @Test
     fun duplicateSaraGroupsKeepOneNewestTranscript() {
         val oldSara = chat("sara-old", saraNpubHex)
         val newSara = chat("sara-new", saraNpubHex)

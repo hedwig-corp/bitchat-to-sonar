@@ -11,6 +11,9 @@ internal data class SonarSocialState(
     fun isFavoritePeer(peerId: String): Boolean =
         normalizeSocialPeerId(peerId) in favoritePeers
 
+    fun isRemoteFavoritePeer(peerId: String): Boolean =
+        normalizeSocialPeerId(peerId) in remoteFavoritePeers
+
     fun isBlockedPeer(peerId: String): Boolean =
         normalizeSocialPeerId(peerId) in blockedPeers
 
