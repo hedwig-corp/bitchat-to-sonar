@@ -522,8 +522,6 @@ struct SNMsgBubble: View {
     /// Tap another participant's name/bubble to open a private DM (channels).
     var onTapAuthor: ((SNMessage) -> Void)? = nil
 
-    @Environment(\.openURL) private var openURL
-
     private var mine: Bool { m.mine }
     /// Only other participants' names in a channel context are tappable.
     private var tappable: Bool { onTapAuthor != nil && !mine }
@@ -534,26 +532,8 @@ struct SNMsgBubble: View {
             m.text,
             baseColor: bubbleText,
             linkColor: mine ? bubbleText : SonarTheme.accentDeep,
-            detectBareDomains: true,
-            includeLinkAttributes: false
+            detectBareDomains: true
         )
-    }
-
-    /// The first URL in the message, if any (drives the "Open link" action).
-    private var firstURL: URL? {
-        let ns = m.text as NSString
-        guard ns.length > 0, let detector = MessageFormattingEngine.Patterns.linkDetector else { return nil }
-        return detector.firstMatch(in: m.text, options: [], range: NSRange(location: 0, length: ns.length))?.url
-    }
-
-    static func copyToClipboard(_ text: String) {
-        #if os(iOS)
-        UIPasteboard.general.string = text
-        #else
-        let pb = NSPasteboard.general
-        pb.clearContents()
-        pb.setString(text, forType: .string)
-        #endif
     }
     private var bubbleFill: Color {
         guard mine else { return SonarTheme.bubbleOther }
@@ -597,6 +577,7 @@ struct SNMsgBubble: View {
                     .lineSpacing(16 * 0.2)
                     .foregroundColor(bubbleText)
                     .tint(mine ? bubbleText : SonarTheme.accentDeep)
+                    .textSelection(.enabled)
                 HStack(spacing: 3) {
                     Text(verbatim: m.time)
                         .font(SonarTheme.uiFont(size: 10.5))
@@ -613,25 +594,6 @@ struct SNMsgBubble: View {
                     .fill(bubbleFill)
                     .shadow(color: mine ? .clear : Color(sonarHex: 0x0A232D, opacity: 0.07), radius: 0.75, y: 1)
             )
-            .contentShape(bubbleShape)
-            // Tap a bubble that contains a link → open it in the browser.
-            // (Deterministic: we don't rely on SwiftUI's inline link tap, which
-            // is flaky next to the context menu.)
-            .onTapGesture { if let url = firstURL { openURL(url) } }
-            .contextMenu {
-                Button {
-                    SNMsgBubble.copyToClipboard(m.text)
-                } label: {
-                    Label("Copy", systemImage: "doc.on.doc")
-                }
-                if let url = firstURL {
-                    Button {
-                        openURL(url)
-                    } label: {
-                        Label("Open link", systemImage: "safari")
-                    }
-                }
-            }
             if showState, let stateText = m.state {
                 SNMessageStatusFooter(stateText: stateText, via: m.via)
                 .padding(EdgeInsets(top: 3, leading: 4, bottom: 0, trailing: 4))

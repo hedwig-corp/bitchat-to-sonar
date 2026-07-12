@@ -23,8 +23,7 @@ enum SonarMessageTextFormatter {
         baseColor: Color,
         linkColor: Color? = nil,
         mentionFont: Font? = nil,
-        detectBareDomains: Bool = false,
-        includeLinkAttributes: Bool = true
+        detectBareDomains: Bool = false
     ) -> AttributedString {
         let matches = textMatches(in: text, mentionFont: mentionFont, detectBareDomains: detectBareDomains)
         var result = AttributedString()
@@ -38,9 +37,7 @@ enum SonarMessageTextFormatter {
                 case .link(let url):
                     segment.underlineStyle = .single
                     segment.foregroundColor = linkColor ?? baseColor
-                    if includeLinkAttributes {
-                        segment.link = url
-                    }
+                    segment.link = url
                 case .mention:
                     if let mentionFont {
                         segment.font = mentionFont

@@ -133,6 +133,7 @@ struct SonarMessageBubbleView: View {
                 .font(SonarTheme.uiFont(size: 16))
                 .lineLimit(isLongMessage && !isExpanded ? TransportConfig.uiLongMessageLineLimit : nil)
                 .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
 
             HStack(spacing: 3) {
                 Text(shortTime)
