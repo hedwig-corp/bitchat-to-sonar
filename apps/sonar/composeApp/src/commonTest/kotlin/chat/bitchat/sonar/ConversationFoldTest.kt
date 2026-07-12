@@ -39,6 +39,21 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun rotatedMeshAliasesStillMatchTheActiveConversation() {
+        val npub = "ab".repeat(32)
+        val links = mapOf("old-fingerprint" to npub, "new-fingerprint" to npub.uppercase())
+
+        assertTrue(sameMeshConversationIdentity("old-fingerprint", "new-fingerprint", links))
+        assertFalse(
+            sameMeshConversationIdentity(
+                "old-fingerprint",
+                "different-peer",
+                links + ("different-peer" to "cd".repeat(32)),
+            ),
+        )
+    }
+
+    @Test
     fun restrictedBlePolicyIgnoresDiscoveryOnlyLinks() {
         val discoveryOnlyPeerIds = setOf("STRANGER")
         val allowed = knownBlePeerIdsForPolicy(

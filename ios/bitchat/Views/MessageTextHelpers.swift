@@ -23,9 +23,16 @@ enum SonarMessageTextFormatter {
         baseColor: Color,
         linkColor: Color? = nil,
         mentionFont: Font? = nil,
-        detectBareDomains: Bool = false
+        detectBareDomains: Bool = false,
+        includeLinkAttributes: Bool = true,
+        excludeLinkBeforeTrailingEllipsis: Bool = false
     ) -> AttributedString {
-        let matches = textMatches(in: text, mentionFont: mentionFont, detectBareDomains: detectBareDomains)
+        let matches = textMatches(
+            in: text,
+            mentionFont: mentionFont,
+            detectBareDomains: detectBareDomains,
+            excludeLinkBeforeTrailingEllipsis: excludeLinkBeforeTrailingEllipsis
+        )
         var result = AttributedString()
         var cursor = text.startIndex
 
@@ -37,7 +44,9 @@ enum SonarMessageTextFormatter {
                 case .link(let url):
                     segment.underlineStyle = .single
                     segment.foregroundColor = linkColor ?? baseColor
-                    segment.link = url
+                    if includeLinkAttributes {
+                        segment.link = url
+                    }
                 case .mention:
                     if let mentionFont {
                         segment.font = mentionFont
@@ -51,7 +60,12 @@ enum SonarMessageTextFormatter {
         return result
     }
 
-    private static func textMatches(in text: String, mentionFont: Font?, detectBareDomains: Bool) -> [TextMatch] {
+    private static func textMatches(
+        in text: String,
+        mentionFont: Font?,
+        detectBareDomains: Bool,
+        excludeLinkBeforeTrailingEllipsis: Bool
+    ) -> [TextMatch] {
         let nsText = text as NSString
         let fullRange = NSRange(location: 0, length: nsText.length)
         guard nsText.length > 0 else { return [] }
@@ -60,6 +74,11 @@ enum SonarMessageTextFormatter {
         if (detectBareDomains || text.contains("://") || text.localizedCaseInsensitiveContains("www.")),
            let detector = MessageFormattingEngine.Patterns.linkDetector {
             for match in detector.matches(in: text, options: [], range: fullRange) {
+                if excludeLinkBeforeTrailingEllipsis,
+                   NSMaxRange(match.range) < nsText.length,
+                   nsText.substring(from: NSMaxRange(match.range)) == SonarTranscriptDisplayPolicy.ellipsis {
+                    continue
+                }
                 appendMatch(match.range, kind: .link(match.url), priority: 0, in: text, to: &matches)
             }
         }
@@ -111,6 +130,55 @@ enum SonarMessageTextFormatter {
         segment.foregroundColor = color
         configure?(&segment)
         result.append(segment)
+    }
+}
+
+struct SonarTranscriptTextPreview: Equatable {
+    let text: String
+    let isTruncated: Bool
+}
+
+/// Signal-style cheap first render for long command output. Truncation walks
+/// Swift `Character`s, so emoji and combining sequences are never split.
+enum SonarTranscriptDisplayPolicy {
+    static let ellipsis = "…"
+
+    static func preview(
+        _ text: String,
+        maxGlyphs: Int = TransportConfig.sonarTranscriptPreviewGlyphCount,
+        maxNewlines: Int = TransportConfig.sonarTranscriptPreviewNewlineCount
+    ) -> SonarTranscriptTextPreview {
+        guard maxGlyphs > 0, maxNewlines >= 0 else {
+            return SonarTranscriptTextPreview(text: ellipsis, isTruncated: !text.isEmpty)
+        }
+
+        var rendered = String()
+        rendered.reserveCapacity(min(text.utf8.count, maxGlyphs * 2))
+        var glyphs = 0
+        var newlines = 0
+        var truncated = false
+
+        for character in text {
+            if glyphs >= maxGlyphs {
+                truncated = true
+                break
+            }
+            if character.isNewline {
+                if newlines >= maxNewlines {
+                    truncated = true
+                    break
+                }
+                newlines += 1
+            }
+            rendered.append(character)
+            glyphs += 1
+        }
+
+        guard truncated else {
+            return SonarTranscriptTextPreview(text: text, isTruncated: false)
+        }
+        let trimmed = rendered.trimmingCharacters(in: .whitespacesAndNewlines)
+        return SonarTranscriptTextPreview(text: trimmed + ellipsis, isTruncated: true)
     }
 }
 

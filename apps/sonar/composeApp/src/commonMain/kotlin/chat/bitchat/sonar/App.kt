@@ -81,6 +81,12 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.foundation.text.InlineTextContent
 import androidx.compose.foundation.text.appendInlineContent
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.withFrameNanos
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.Placeholder
 import androidx.compose.ui.text.PlaceholderVerticalAlign
 import chat.bitchat.sonar.resources.Res
@@ -103,6 +109,8 @@ import chat.bitchat.sonar.ui.SonarTheme
 import chat.bitchat.sonar.ui.SonarType
 import chat.bitchat.sonar.ui.sonar
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.math.abs
@@ -761,6 +769,9 @@ private fun ChannelHint() {
     )
 }
 
+private fun transcriptFeedKey(item: Any): String =
+    if (item is CallRecord) "c:${item.id}" else "m:${(item as SonarMsg).id}"
+
 @Composable
 private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     val s = sonar
@@ -817,8 +828,82 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     }
     val calls = run { state.callVersion; state.callRecords(screen.id) }
     val feed: List<Any> = (visible + calls).sortedBy { if (it is CallRecord) it.tsSecs else (it as SonarMsg).tsSecs }
-    LaunchedEffect(feed.size) {
-        if (feed.isNotEmpty()) listState.animateScrollToItem(feed.size - 1)
+    val newestFeedKey = feed.lastOrNull()?.let(::transcriptFeedKey)
+    val currentFeed by rememberUpdatedState(feed)
+    var isNearBottom by remember(screen.id) { mutableStateOf(true) }
+    var didInitialScroll by remember(screen.id) { mutableStateOf(false) }
+    var didLeaveTail by remember(screen.id) { mutableStateOf(false) }
+    var isPrepending by remember(screen.id) { mutableStateOf(false) }
+
+    // Observe the position independently of transcript publication. A newly
+    // appended row follows only when the user was already reading the tail.
+    LaunchedEffect(screen.id, listState) {
+        snapshotFlow {
+            val info = listState.layoutInfo
+            val lastVisible = info.visibleItemsInfo.lastOrNull()?.index ?: -1
+            info.totalItemsCount == 0 || lastVisible >= info.totalItemsCount - 2
+        }.distinctUntilChanged().collect {
+            isNearBottom = it
+            if (didInitialScroll && !it) didLeaveTail = true
+        }
+    }
+    LaunchedEffect(screen.id, newestFeedKey) {
+        if (feed.isEmpty()) return@LaunchedEffect
+        if (!didInitialScroll) {
+            listState.scrollToItem(feed.lastIndex)
+            didInitialScroll = true
+        } else if (isNearBottom && !isPrepending) {
+            listState.animateScrollToItem(feed.lastIndex)
+        }
+    }
+
+    // Load one local cursor page when the reader reaches the top. Capture a
+    // stable visible message and pixel offset, then restore it after prepend so
+    // the existing content does not jump under the reader's finger.
+    LaunchedEffect(screen.id, listState) {
+        snapshotFlow {
+            didInitialScroll && listState.layoutInfo.totalItemsCount > 0 &&
+                listState.firstVisibleItemIndex <= 2
+        }.distinctUntilChanged().filter { it }.collect {
+            val visibleInfo = listState.layoutInfo.visibleItemsInfo
+            val anchor = visibleInfo.firstOrNull { it.key.toString().startsWith("m:") }
+                ?: visibleInfo.firstOrNull()
+                ?: return@collect
+            val anchorKey = anchor.key.toString()
+            val anchorOffset = anchor.offset
+            isPrepending = true
+            if (!state.loadOlderMessages(screen.id)) {
+                isPrepending = false
+                return@collect
+            }
+            withFrameNanos { }
+            val newIndex = currentFeed.indices.firstOrNull { index ->
+                transcriptFeedKey(currentFeed[index]) == anchorKey
+            } ?: -1
+            if (newIndex >= 0) {
+                listState.scrollToItem(newIndex, scrollOffset = -anchorOffset)
+            }
+            isPrepending = false
+        }
+    }
+
+    // A 500-row window can move away from the tail. Reaching its bottom after
+    // the reader has left the tail resets to a fresh bounded newest page.
+    LaunchedEffect(screen.id, listState) {
+        snapshotFlow {
+            didInitialScroll && didLeaveTail && state.canLoadNewestMessages(screen.id) &&
+                listState.layoutInfo.totalItemsCount > 0 &&
+                listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ==
+                    listState.layoutInfo.totalItemsCount - 1
+        }.distinctUntilChanged().filter { it }.collect {
+            isPrepending = true
+            if (state.loadNewestMessages(screen.id)) {
+                withFrameNanos { }
+                if (currentFeed.isNotEmpty()) listState.scrollToItem(currentFeed.lastIndex)
+                didLeaveTail = false
+            }
+            isPrepending = false
+        }
     }
     val currentChat = state.chats.firstOrNull { it.id == screen.id }
     val isGroup = state.isMultiMemberChat(screen.id)
@@ -963,9 +1048,8 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                 ) {
                     itemsIndexed(
                         feed,
-                        // Index-keyed call records avoid duplicate keys when two calls end
-                        // in the same second (identical ts/dur/kind would otherwise collide).
-                        key = { i, it -> if (it is CallRecord) "c:$i" else "m:${(it as SonarMsg).id}" }
+                        // Call IDs and message IDs remain stable when history is prepended.
+                        key = { _, it -> transcriptFeedKey(it) }
                     ) { i, item ->
                         val ts = if (item is CallRecord) item.tsSecs else (item as SonarMsg).tsSecs
                         val prevAny = feed.getOrNull(i - 1)
@@ -1577,6 +1661,7 @@ private const val BUBBLE_META_ICON = "sn.meta.via"
 /** bc-msg / bc-bubble (components.jsx MsgBubble): max-width 78%, transport-
  *  colored own bubbles (cyan mesh / indigo internet), tail corner at 28% of the
  *  18dp radius, and the time + via icon inlined at the end of the text. */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun MessageBubble(
     m: SonarMsg,
@@ -1595,9 +1680,12 @@ private fun MessageBubble(
     // .bc-meta color: on own bubbles the on-color at 72%/75%, else text3.
     val metaColor = if (m.mine) onMine.copy(alpha = if (mesh) 0.72f else 0.75f) else s.text3
     val timeLabel = remember(m.tsSecs) { SonarClock.hourMinute(m.tsSecs) }
-    val annotated = remember(m.content, m.mine, mesh, timeLabel, s) {
+    val preview = remember(m.content) { transcriptPreview(m.content) }
+    var expanded by remember(m.id) { mutableStateOf(false) }
+    val visibleText = if (expanded || !preview.truncated) m.content else preview.text
+    val annotated = remember(visibleText, m.mine, mesh, timeLabel, s) {
         buildAnnotatedString {
-            append(linkify(m.content, linkColor))
+            append(linkify(visibleText, linkColor))
             // bc-meta: 10.5px time + transport glyph riding the last line.
             withStyle(SpanStyle(fontSize = 10.5.sp, color = metaColor)) { append(" " + timeLabel) }
             appendInlineContent(BUBBLE_META_ICON, "·")
@@ -1638,28 +1726,45 @@ private fun MessageBubble(
                 .background(if (m.mine) mineBg else s.bubbleOther)
                 .padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 9.dp)
         ) {
-            // Selectable (long-press → Copy); each link keeps its own target.
-            androidx.compose.foundation.text.selection.SelectionContainer {
-                Text(
-                    annotated, color = if (m.mine) onMine else s.text,
-                    fontSize = 16.sp, lineHeight = 22.4.sp,
-                    inlineContent = inline,
-                    onTextLayout = { textLayout = it },
-                    modifier = Modifier.pointerInput(annotated) {
-                        awaitEachGesture {
-                            val down = awaitFirstDown(requireUnconsumed = false)
-                            val up = waitForUpOrCancellation()
-                            if (up != null && !down.isConsumed) {
-                                val offset = textLayout?.getOffsetForPosition(down.position)
-                                offset?.let {
-                                    annotated.getStringAnnotations(URL_ANNOTATION_TAG, it, it)
-                                        .firstOrNull()
-                                        ?.let { link -> uriHandler.openUri(link.item) }
+            Column {
+                // Selectable (long-press → Copy); each visible link keeps its own target.
+                androidx.compose.foundation.text.selection.SelectionContainer {
+                    Text(
+                        annotated, color = if (m.mine) onMine else s.text,
+                        fontSize = 16.sp, lineHeight = 22.4.sp,
+                        inlineContent = inline,
+                        onTextLayout = { textLayout = it },
+                        modifier = Modifier.pointerInput(annotated) {
+                            awaitEachGesture {
+                                val down = awaitFirstDown(requireUnconsumed = false)
+                                val up = waitForUpOrCancellation()
+                                if (up != null && !down.isConsumed) {
+                                    val offset = textLayout?.getOffsetForPosition(down.position)
+                                    offset?.let {
+                                        annotated.getStringAnnotations(URL_ANNOTATION_TAG, it, it)
+                                            .firstOrNull()
+                                            ?.let { link -> uriHandler.openUri(link.item) }
+                                    }
                                 }
                             }
-                        }
-                    },
-                )
+                        },
+                    )
+                }
+                if (preview.truncated) {
+                    Text(
+                        if (expanded) "Show less" else "Show more",
+                        color = if (m.mine) onMine else s.accentDeep,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier
+                            .heightIn(min = 44.dp)
+                            .semantics {
+                                stateDescription = if (expanded) "Expanded" else "Collapsed"
+                            }
+                            .clickable(role = Role.Button) { expanded = !expanded }
+                            .padding(top = 8.dp),
+                    )
+                }
             }
         }
         if (showState) MessageStatusFooter(m, mesh)

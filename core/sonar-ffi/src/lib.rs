@@ -1009,6 +1009,9 @@ impl SonarNode {
         self.client.mark_conversation_read(&group_id_hex);
     }
 
+    /// Stable newest-first transcript page ordered by
+    /// `(created_at DESC, event_id DESC)`. The cursor is exclusive; callers
+    /// should pass the final message tuple from the previous page.
     pub fn messages_cursor_page(
         &self,
         group_id_hex: String,

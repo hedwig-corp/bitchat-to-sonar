@@ -220,6 +220,42 @@ struct MessageFormattingEngineTests {
         #expect(attributed.runs.contains { $0.link?.absoluteString.contains("example.org") == true })
     }
 
+    @Test func transcriptPreview_isGraphemeSafeAtSignalBoundary() {
+        let family = "👨‍👩‍👧‍👦"
+        let exact = String(repeating: family, count: 512)
+        #expect(SonarTranscriptDisplayPolicy.preview(exact).isTruncated == false)
+
+        let preview = SonarTranscriptDisplayPolicy.preview(exact + family)
+        #expect(preview.isTruncated)
+        #expect(preview.text.dropLast().count == 512)
+        #expect(preview.text.hasSuffix(SonarTranscriptDisplayPolicy.ellipsis))
+    }
+
+    @Test func transcriptPreview_limitsNewlinesWithoutChangingFullText() {
+        let full = (0...16).map { "line-\($0)" }.joined(separator: "\n")
+        let preview = SonarTranscriptDisplayPolicy.preview(full)
+
+        #expect(preview.isTruncated)
+        #expect(preview.text.filter { $0.isNewline }.count == 15)
+        #expect(full.contains("line-16"))
+        #expect(!preview.text.contains("line-16"))
+    }
+
+    @Test func transcriptPreview_doesNotLinkifyCutURL() {
+        let full = String(repeating: "x", count: 490) + " https://example.org/a-very-long-path"
+        let preview = SonarTranscriptDisplayPolicy.preview(full)
+        let attributed = SonarMessageTextFormatter.attributedBubbleText(
+            preview.text,
+            baseColor: .primary,
+            linkColor: .blue,
+            detectBareDomains: true,
+            excludeLinkBeforeTrailingEllipsis: true
+        )
+
+        #expect(preview.isTruncated)
+        #expect(!attributed.runs.contains { $0.link != nil })
+    }
+
     // MARK: - String Extension Tests
 
     @Test func splitSuffix_withSuffix() {

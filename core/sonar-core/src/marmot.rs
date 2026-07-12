@@ -13,6 +13,7 @@
 //! - Committers must call `merge_pending_commit` only after the commit/welcome
 //!   has been published; see MDK docs.
 
+use std::cmp::Ordering;
 use std::path::Path;
 
 use mdk_core::encrypted_media::{EncryptedMediaUpload, MediaReference};
@@ -206,6 +207,39 @@ pub struct ChatMessage {
     /// Content classification (pay/call control vs plain text), precomputed so
     /// hosts never parse `content` on the render path.
     pub classification: MessageClassification,
+}
+
+/// Compare render messages in the stable newest-first order used by transcript
+/// cursors. Deliberately excludes MDK's local `processed_at` value: two devices
+/// must page the same event set even when they received same-second events in a
+/// different order.
+fn compare_message_cursor_desc(a: &ChatMessage, b: &ChatMessage) -> Ordering {
+    compare_message_cursor_keys_desc(a.created_at, &a.id, b.created_at, &b.id)
+}
+
+fn compare_message_cursor_keys_desc(
+    a_created_at: Timestamp,
+    a_id: &EventId,
+    b_created_at: Timestamp,
+    b_id: &EventId,
+) -> Ordering {
+    b_created_at.cmp(&a_created_at).then_with(|| b_id.cmp(a_id))
+}
+
+/// True when a message belongs strictly after the supplied newest-first page
+/// cursor. With no event id, the whole cursor second is excluded, preserving the
+/// previous timestamp-only API behavior.
+fn is_before_message_cursor(
+    created_at_secs: u64,
+    id: &EventId,
+    before_secs: Option<u64>,
+    before_id: Option<&EventId>,
+) -> bool {
+    let Some(cursor_secs) = before_secs else {
+        return true;
+    };
+    created_at_secs < cursor_secs
+        || (created_at_secs == cursor_secs && before_id.is_some_and(|cursor_id| id < cursor_id))
 }
 
 /// Bounded transcript page for one recent group.
@@ -856,14 +890,16 @@ impl MarmotEngine {
         Ok(page_messages)
     }
 
-    /// Cursor-based transcript page: return up to `limit` chat messages whose
-    /// timestamp is strictly before the cursor `(before_secs, before_id)`.
-    /// When the cursor is `None`, returns the newest messages (first page).
-    /// Messages are returned newest-first for display.
+    /// Cursor-based transcript page: return up to `limit` chat messages strictly
+    /// before `(before_secs, before_id)` in the canonical
+    /// `(created_at DESC, event_id DESC)` transcript order. When the cursor is
+    /// `None`, returns the newest messages (first page).
     ///
-    /// Uses bounded-memory scanning via [`messages_page`] instead of loading
-    /// the full transcript. Memory stays O(batch + limit) regardless of total
-    /// message count.
+    /// MDK's created-at-first storage order uses `processed_at` as its secondary
+    /// key. We therefore scan through the complete created-at second containing
+    /// the page boundary and re-sort that bounded candidate set by event id. This
+    /// prevents messages created in the same second from moving between pages
+    /// according to local receive order.
     pub fn messages_cursor_page(
         &self,
         group_id: &GroupId,
@@ -874,46 +910,71 @@ impl MarmotEngine {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        if before_secs.is_none() {
-            return self.messages_page(group_id, limit, 0);
-        }
 
-        let cursor_secs = before_secs.unwrap();
-        let cursor_id_hex = before_id.map(|id| id.to_hex());
-        let scan_batch = limit.max(20);
-        let mut chat_offset = 0usize;
-        let mut result = Vec::with_capacity(limit);
+        let raw_batch = limit.saturating_mul(4).clamp(32, 500);
+        let mut raw_offset = 0usize;
+        let mut raw_scanned = 0usize;
+        let mut candidates = Vec::with_capacity(limit);
+        // Once `limit` eligible chat rows have been seen, keep scanning until
+        // storage advances to an older second. That captures every possible ID
+        // which can sort into the page at the boundary timestamp.
+        let mut boundary_secs = None;
+        let mut scan_complete = false;
 
-        loop {
-            let batch = self.messages_page(group_id, scan_batch, chat_offset)?;
-            if batch.is_empty() {
+        'scan: while raw_scanned < MESSAGE_PAGE_RAW_SCAN_LIMIT {
+            let remaining_scan = MESSAGE_PAGE_RAW_SCAN_LIMIT - raw_scanned;
+            let batch_limit = raw_batch.min(remaining_scan);
+            let page = Pagination::with_sort_order(
+                Some(batch_limit),
+                Some(raw_offset),
+                MessageSortOrder::CreatedAtFirst,
+            );
+            let raw_msgs = dispatch!(&self.storage, |mdk| mdk.get_messages(group_id, Some(page)))?;
+            if raw_msgs.is_empty() {
+                scan_complete = true;
                 break;
             }
 
-            for msg in batch {
+            let raw_len = raw_msgs.len();
+            raw_scanned += raw_len;
+            raw_offset += raw_len;
+            for msg in raw_msgs {
                 let msg_secs = msg.created_at.as_secs();
-                if msg_secs > cursor_secs {
+                if boundary_secs.is_some_and(|boundary| msg_secs < boundary) {
+                    scan_complete = true;
+                    break 'scan;
+                }
+                if msg.kind.as_u16() != CHAT_RUMOR_KIND
+                    || !is_before_message_cursor(msg_secs, &msg.id, before_secs, before_id)
+                {
                     continue;
                 }
-                if msg_secs == cursor_secs {
-                    match cursor_id_hex {
-                        Some(ref cid) if msg.id.to_hex() < *cid => {}
-                        _ => continue,
-                    }
-                }
-                result.push(msg);
-                if result.len() >= limit {
-                    return Ok(result);
+                candidates.push(self.to_chat_message(msg));
+                if candidates.len() == limit {
+                    boundary_secs = Some(msg_secs);
                 }
             }
 
-            chat_offset += scan_batch;
-            if chat_offset >= MESSAGE_PAGE_RAW_SCAN_LIMIT {
+            if raw_len < batch_limit {
+                scan_complete = true;
                 break;
             }
         }
 
-        Ok(result)
+        // A page cannot be deterministic if the safety cap stops before the
+        // requested window is complete: an unscanned event ID could sort ahead
+        // of a selected one. Fail explicitly instead of returning a page whose
+        // membership depends on MDK's processed-at tie ordering. This requires
+        // at least 10,000 raw rows in the relevant window and is pathological.
+        if !scan_complete {
+            return Err(Error::Storage(format!(
+                "cursor page exceeds bounded scan of {MESSAGE_PAGE_RAW_SCAN_LIMIT} rows"
+            )));
+        }
+
+        candidates.sort_unstable_by(compare_message_cursor_desc);
+        candidates.truncate(limit);
+        Ok(candidates)
     }
 
     /// Latest local transcript windows for the most recent groups. This is the
@@ -1190,6 +1251,92 @@ fn sidecar_paths(base: &Path) -> Vec<std::path::PathBuf> {
     paths.push(base.with_file_name(format!("{name}{SYNC_STATE_FILE_SUFFIX}.tmp")));
     paths.push(base.with_file_name(format!("{name}{OUTBOX_STATE_FILE_SUFFIX}.tmp")));
     paths
+}
+
+#[cfg(test)]
+mod message_cursor_tests {
+    use super::{compare_message_cursor_keys_desc, is_before_message_cursor, EventId, Timestamp};
+
+    fn event_id(byte: u8) -> EventId {
+        EventId::from_byte_array([byte; EventId::LEN])
+    }
+
+    #[test]
+    fn cursor_keys_sort_by_created_at_then_event_id_descending() {
+        let mut keys = [
+            (Timestamp::from_secs(100), event_id(0x02)),
+            (Timestamp::from_secs(99), event_id(0xff)),
+            (Timestamp::from_secs(100), event_id(0xff)),
+            (Timestamp::from_secs(101), event_id(0x01)),
+        ];
+
+        keys.sort_unstable_by(|(a_secs, a_id), (b_secs, b_id)| {
+            compare_message_cursor_keys_desc(*a_secs, a_id, *b_secs, b_id)
+        });
+
+        assert_eq!(
+            keys,
+            [
+                (Timestamp::from_secs(101), event_id(0x01)),
+                (Timestamp::from_secs(100), event_id(0xff)),
+                (Timestamp::from_secs(100), event_id(0x02)),
+                (Timestamp::from_secs(99), event_id(0xff)),
+            ]
+        );
+    }
+
+    #[test]
+    fn same_second_cursor_boundary_is_strictly_event_id_based() {
+        let cursor_id = event_id(0x80);
+
+        assert!(!is_before_message_cursor(
+            101,
+            &event_id(0x00),
+            Some(100),
+            Some(&cursor_id)
+        ));
+        assert!(!is_before_message_cursor(
+            100,
+            &event_id(0x81),
+            Some(100),
+            Some(&cursor_id)
+        ));
+        assert!(!is_before_message_cursor(
+            100,
+            &cursor_id,
+            Some(100),
+            Some(&cursor_id)
+        ));
+        assert!(is_before_message_cursor(
+            100,
+            &event_id(0x7f),
+            Some(100),
+            Some(&cursor_id)
+        ));
+        assert!(is_before_message_cursor(
+            99,
+            &event_id(0xff),
+            Some(100),
+            Some(&cursor_id)
+        ));
+    }
+
+    #[test]
+    fn timestamp_only_cursor_excludes_its_entire_second() {
+        assert!(!is_before_message_cursor(
+            100,
+            &event_id(0x00),
+            Some(100),
+            None
+        ));
+        assert!(is_before_message_cursor(
+            99,
+            &event_id(0xff),
+            Some(100),
+            None
+        ));
+        assert!(is_before_message_cursor(101, &event_id(0x00), None, None));
+    }
 }
 
 #[cfg(test)]

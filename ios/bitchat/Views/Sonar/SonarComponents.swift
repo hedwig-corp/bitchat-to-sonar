@@ -515,6 +515,8 @@ private struct SNMessageStatusFooter: View {
 
 struct SNMsgBubble: View {
     let m: SNMessage
+    let preview: SonarTranscriptTextPreview
+    @Binding var expandedMessageIDs: Set<String>
     var showAuthor: Bool = false
     var cont: Bool = false
     var showState: Bool = false
@@ -522,18 +524,49 @@ struct SNMsgBubble: View {
     /// Tap another participant's name/bubble to open a private DM (channels).
     var onTapAuthor: ((SNMessage) -> Void)? = nil
 
+    @Environment(\.openURL) private var openURL
+
     private var mine: Bool { m.mine }
     /// Only other participants' names in a channel context are tappable.
     private var tappable: Bool { onTapAuthor != nil && !mine }
+    private var isExpanded: Bool { expandedMessageIDs.contains(m.id) }
+    private var visibleText: String { isExpanded ? m.text : preview.text }
 
     /// Message text with detected URLs turned into tappable, underlined links.
     private var linkified: AttributedString {
         SonarMessageTextFormatter.attributedBubbleText(
-            m.text,
+            visibleText,
             baseColor: bubbleText,
             linkColor: mine ? bubbleText : SonarTheme.accentDeep,
-            detectBareDomains: true
+            detectBareDomains: true,
+            excludeLinkBeforeTrailingEllipsis: preview.isTruncated && !isExpanded
         )
+    }
+
+    /// The first URL in the message, if any (drives the "Open link" action).
+    private var firstURL: URL? {
+        let text = visibleText
+        let ns = text as NSString
+        guard ns.length > 0, let detector = MessageFormattingEngine.Patterns.linkDetector else { return nil }
+        for match in detector.matches(in: text, options: [], range: NSRange(location: 0, length: ns.length)) {
+            if preview.isTruncated, !isExpanded,
+               NSMaxRange(match.range) < ns.length,
+               ns.substring(from: NSMaxRange(match.range)) == SonarTranscriptDisplayPolicy.ellipsis {
+                continue
+            }
+            return match.url
+        }
+        return nil
+    }
+
+    static func copyToClipboard(_ text: String) {
+        #if os(iOS)
+        UIPasteboard.general.string = text
+        #else
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(text, forType: .string)
+        #endif
     }
     private var bubbleFill: Color {
         guard mine else { return SonarTheme.bubbleOther }
@@ -587,6 +620,23 @@ struct SNMsgBubble: View {
                 }
                 .foregroundColor(metaColor)
                 .padding(.bottom, 1.5)
+                // Keep the message Text free for native selection and targeted
+                // inline-link taps. The metadata owns the whole-message actions
+                // so Copy still uses the untruncated source text.
+                .contextMenu {
+                    Button {
+                        SNMsgBubble.copyToClipboard(m.text)
+                    } label: {
+                        Label("Copy message", systemImage: "doc.on.doc")
+                    }
+                    if let url = firstURL {
+                        Button {
+                            openURL(url)
+                        } label: {
+                            Label("Open link", systemImage: "safari")
+                        }
+                    }
+                }
             }
             .padding(EdgeInsets(top: 8, leading: 12, bottom: 9, trailing: 12))
             .background(
@@ -594,6 +644,19 @@ struct SNMsgBubble: View {
                     .fill(bubbleFill)
                     .shadow(color: mine ? .clear : Color(sonarHex: 0x0A232D, opacity: 0.07), radius: 0.75, y: 1)
             )
+            if preview.isTruncated {
+                Button(isExpanded
+                       ? String(localized: "content.message.show_less")
+                       : String(localized: "content.message.show_more")) {
+                    if isExpanded { expandedMessageIDs.remove(m.id) }
+                    else { expandedMessageIDs.insert(m.id) }
+                }
+                .font(SonarTheme.uiFont(size: 12, weight: .semibold))
+                .foregroundColor(SonarTheme.accentDeep)
+                .buttonStyle(.plain)
+                .frame(minHeight: 44)
+                .padding(.horizontal, 6)
+            }
             if showState, let stateText = m.state {
                 SNMessageStatusFooter(stateText: stateText, via: m.via)
                 .padding(EdgeInsets(top: 3, leading: 4, bottom: 0, trailing: 4))
@@ -620,8 +683,19 @@ struct SNMsgList: View {
     var loadMedia: ((SNMediaItem) async -> Data?)? = nil
     var loadSticker: ((MarmotService.MarmotStickerRef) async -> Data?)? = nil
     var onTapPack: ((String) -> Void)? = nil
+    /// Load one older local database page. Nil for non-paged channel surfaces.
+    var loadOlder: (() async -> Bool)? = nil
+    /// Restore a movable historical window to its newest local page.
+    var loadNewest: (() async -> Void)? = nil
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     @State private var isNearBottom = true
+    @State private var hasReachedBottomOnce = false
+    @State private var hasLeftBottom = false
+    @State private var isLoadingOlder = false
+    @State private var isLoadingNewest = false
+    @State private var expandedMessageIDs: Set<String> = []
 
     var body: some View {
         GeometryReader { geo in
@@ -637,6 +711,7 @@ struct SNMsgList: View {
                             .foregroundColor(SonarTheme.text3)
                             .padding(EdgeInsets(top: 5, leading: 10, bottom: 5, trailing: 10))
                         ForEach(Array(msgs.enumerated()), id: \.element.id) { i, m in
+                            Group {
                             if let call = m.call {
                                 SNCallLogRow(call: call, mine: m.mine, time: m.time)
                             } else if m.pay != nil {
@@ -675,6 +750,8 @@ struct SNMsgList: View {
                                 let cont = prev != nil && !(prev!.action) && prev!.author == m.author && prev!.mine == m.mine
                                 SNMsgBubble(
                                     m: m,
+                                    preview: SonarTranscriptDisplayPolicy.preview(m.text),
+                                    expandedMessageIDs: $expandedMessageIDs,
                                     showAuthor: showAuthors && !m.mine && !cont,
                                     cont: cont,
                                     showState: m.mine && i == msgs.count - 1,
@@ -682,17 +759,46 @@ struct SNMsgList: View {
                                     onTapAuthor: onTapAuthor
                                 )
                             }
+                            }
+                            .onAppear {
+                                guard i == 0, hasLeftBottom, let loadOlder, !isLoadingOlder else { return }
+                                let preserveID = m.id
+                                isLoadingOlder = true
+                                Task { @MainActor in
+                                    let added = await loadOlder()
+                                    isLoadingOlder = false
+                                    guard added else { return }
+                                    await Task.yield()
+                                    proxy.scrollTo(preserveID, anchor: .top)
+                                }
+                            }
                         }
                         Color.clear.frame(height: 1).id("sn-bottom")
-                            .onAppear { isNearBottom = true }
-                            .onDisappear { isNearBottom = false }
+                            .onAppear {
+                                isNearBottom = true
+                                hasReachedBottomOnce = true
+                                guard hasLeftBottom, let loadNewest, !isLoadingNewest else { return }
+                                isLoadingNewest = true
+                                Task { @MainActor in
+                                    await loadNewest()
+                                    isLoadingNewest = false
+                                }
+                            }
+                            .onDisappear {
+                                isNearBottom = false
+                                if hasReachedBottomOnce { hasLeftBottom = true }
+                            }
                     }
                     .padding(EdgeInsets(top: 6, leading: 14, bottom: 10, trailing: 14))
                 }
                 .onAppear { proxy.scrollTo("sn-bottom", anchor: .bottom) }
                 .onChange(of: msgs.count) { _ in
                     guard isNearBottom else { return }
-                    withAnimation { proxy.scrollTo("sn-bottom", anchor: .bottom) }
+                    if reduceMotion {
+                        proxy.scrollTo("sn-bottom", anchor: .bottom)
+                    } else {
+                        withAnimation { proxy.scrollTo("sn-bottom", anchor: .bottom) }
+                    }
                 }
             }
         }
