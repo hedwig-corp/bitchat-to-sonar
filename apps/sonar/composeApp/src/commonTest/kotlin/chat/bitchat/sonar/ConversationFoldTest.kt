@@ -8,36 +8,34 @@ import kotlin.test.assertTrue
 
 class ConversationFoldTest {
     @Test
-    fun uniqueTitleMatchInfersPeer() {
-        val peer = inferUniquePeerByTitle(
-            groupTitle = "  Vincenzo  Palazzo ",
-            peerTitles = mapOf("fp1" to "vincenzo palazzo", "fp2" to "Alice"),
-            allGroupTitles = listOf("Vincenzo Palazzo", "Alice Internet"),
+    fun foldedDirectDmTitleComesFromMarmotCounterpart() {
+        assertEquals(
+            "Sara D",
+            homeListTitleForFoldedMeshRow(
+                directMarmotTitle = "Sara D",
+                meshDerivedName = "Wrong BLE Name",
+            ),
         )
-
-        assertEquals("fp1", peer)
     }
 
     @Test
-    fun duplicatePeerTitlesDoNotInfer() {
-        val peer = inferUniquePeerByTitle(
-            groupTitle = "Vincenzo",
-            peerTitles = mapOf("fp1" to "Vincenzo", "fp2" to "vincenzo"),
-            allGroupTitles = listOf("Vincenzo"),
+    fun meshOnlyConversationKeepsMeshDerivedTitle() {
+        assertEquals(
+            "Nearby Peer",
+            homeListTitleForFoldedMeshRow(
+                directMarmotTitle = null,
+                meshDerivedName = "Nearby Peer",
+            ),
         )
-
-        assertNull(peer)
     }
 
     @Test
-    fun duplicateGroupTitlesDoNotInfer() {
-        val peer = inferUniquePeerByTitle(
-            groupTitle = "Vincenzo",
-            peerTitles = mapOf("fp1" to "Vincenzo"),
-            allGroupTitles = listOf("Vincenzo", "vincenzo"),
-        )
+    fun foldIdentityRequiresMatchingNpub() {
+        val sara = "ab".repeat(32)
 
-        assertNull(peer)
+        assertTrue(peerNpubHexMatchesLinkedPeer(sara, sara.uppercase()))
+        assertFalse(peerNpubHexMatchesLinkedPeer(sara, "cd".repeat(32)))
+        assertFalse(peerNpubHexMatchesLinkedPeer(sara, null))
     }
 
     @Test

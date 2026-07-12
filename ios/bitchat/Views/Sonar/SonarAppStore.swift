@@ -208,19 +208,14 @@ func snCanonicalConversationTitle(_ value: String) -> String {
         .lowercased()
 }
 
-func snInferUniquePeerKeyByTitle(
-    groupTitle: String,
-    peerTitles: [String: String],
-    allGroupTitles: [String]
-) -> String? {
-    let title = snCanonicalConversationTitle(groupTitle)
-    guard !title.isEmpty else { return nil }
-    guard allGroupTitles.filter({ snCanonicalConversationTitle($0) == title }).count == 1 else {
-        return nil
-    }
-    let matches = peerTitles.filter { snCanonicalConversationTitle($0.value) == title }
-    guard matches.count == 1 else { return nil }
-    return matches.first?.key
+/// A folded direct DM keeps the Marmot counterpart's profile title. BLE radar
+/// names are transport metadata and must never relabel an encrypted transcript.
+func snFoldedDirectMarmotHomeTitle(
+    isDirectGroup: Bool,
+    marmotProfileTitle: String,
+    peerDerivedTitle: String
+) -> String {
+    isDirectGroup ? marmotProfileTitle : peerDerivedTitle
 }
 
 /// A stored call record: its timeline `date` (used to merge it
@@ -3065,32 +3060,6 @@ final class SonarAppStore: ObservableObject {
         return sonarPeerKey(forNpub: otherNpub)
     }
 
-    private func inferFoldKeyByUniqueTitle(
-        for group: MarmotService.MarmotGroup,
-        otherNpub: String,
-        rowsByKey: [String: SNDMRow]
-    ) -> String? {
-        guard let targetNpub = Self.nostrPubkeyData(otherNpub) else { return nil }
-        let peerTitles = rowsByKey.mapValues(\.title)
-        let groupTitles = marmot.groups.map { marmot.title(for: $0) }
-        guard let peerKey = snInferUniquePeerKeyByTitle(
-            groupTitle: marmot.title(for: group),
-            peerTitles: peerTitles,
-            allGroupTitles: groupTitles
-        ) else { return nil }
-        if let existing = sonarProfilesByFingerprint[peerKey],
-           Self.nostrPubkeyData(existing.npub) != targetNpub {
-            return nil
-        }
-        sonarProfilesByFingerprint[peerKey] = SonarPeerProfile(
-            npub: otherNpub,
-            bip353: sonarProfilesByFingerprint[peerKey]?.bip353,
-            capabilities: sonarProfilesByFingerprint[peerKey]?.capabilities ?? SonarCapability.marmotDM
-        )
-        persistSonarProfiles()
-        return peerKey
-    }
-
     private func callConversationId(_ id: String) -> String {
         if let groupId = marmotGroupId(id),
            let folded = foldedConversationId(forMarmotGroupId: groupId) {
@@ -3185,10 +3154,9 @@ final class SonarAppStore: ObservableObject {
             let liveSonarPeerId = otherNpub.flatMap { np in
                 sonarProfiles.first(where: { $0.value.npub == np })?.key
             }
-            let foldKey = otherNpub.flatMap { npub in
-                sonarPeerKey(forNpub: npub)
-                    ?? inferFoldKeyByUniqueTitle(for: rowGroup, otherNpub: npub, rowsByKey: byKey)
-            }
+            // Identity is cryptographic: never create a persisted peer↔npub link
+            // from a display-title match, even when that title is unique.
+            let foldKey = otherNpub.flatMap { sonarPeerKey(forNpub: $0) }
             if let liveSonarPeerId {
                 rememberMarmotGroup(rowGroupId, forConversationId: liveSonarPeerId)
             }
@@ -3199,10 +3167,15 @@ final class SonarAppStore: ObservableObject {
                 // Same person as a mesh/bitchat chat → merge the White Noise leg
                 // into that one row instead of showing a duplicate conversation.
                 rememberMarmotGroup(rowGroupId, forConversationId: existing.id)
+                let rowTitle = snFoldedDirectMarmotHomeTitle(
+                    isDirectGroup: marmot.isDirectGroup(rowGroup),
+                    marmotProfileTitle: marmot.title(for: rowGroup),
+                    peerDerivedTitle: existing.title
+                )
                 if let rowLast, rowLast.createdAt > (existing.lastDate ?? .distantPast) {
                     byKey[foldKey] = SNDMRow(
                         id: existing.id,
-                        title: existing.title,
+                        title: rowTitle,
                         preview: Self.previewText(rowLast.content, stickerRef: rowLast.stickerRef, media: rowLast.media),
                         time: Self.listTime(rowLast.createdAt),
                         unread: existing.unread || hasUnreadMarmotMessage(in: groupSet),
@@ -3210,6 +3183,19 @@ final class SonarAppStore: ObservableObject {
                         verified: existing.verified || hasVerifiedMarmotGroup(in: groupSet),
                         isMarmot: false,
                         lastDate: rowLast.createdAt,
+                        marmotGroupId: rowGroupId
+                    )
+                } else if existing.title != rowTitle {
+                    byKey[foldKey] = SNDMRow(
+                        id: existing.id,
+                        title: rowTitle,
+                        preview: existing.preview,
+                        time: existing.time,
+                        unread: existing.unread || hasUnreadMarmotMessage(in: groupSet),
+                        presence: existing.presence,
+                        verified: existing.verified || hasVerifiedMarmotGroup(in: groupSet),
+                        isMarmot: existing.isMarmot,
+                        lastDate: existing.lastDate,
                         marmotGroupId: rowGroupId
                     )
                 }
@@ -3221,9 +3207,14 @@ final class SonarAppStore: ObservableObject {
                 // duplicate.
                 let rowId = liveSonarPeerId ?? foldKey
                 rememberMarmotGroup(rowGroupId, forConversationId: rowId)
+                let rowTitle = snFoldedDirectMarmotHomeTitle(
+                    isDirectGroup: marmot.isDirectGroup(rowGroup),
+                    marmotProfileTitle: marmot.title(for: rowGroup),
+                    peerDerivedTitle: peerDisplayName(rowId)
+                )
                 byKey[foldKey] = SNDMRow(
                     id: rowId,
-                    title: liveSonarPeerId == nil ? marmot.title(for: rowGroup) : peerDisplayName(rowId),
+                    title: rowTitle,
                     preview: rowLast.map { Self.previewText($0.content, stickerRef: $0.stickerRef, media: $0.media) } ?? networkLabel(forPeer: rowId),
                     time: rowLast.map { Self.listTime($0.createdAt) } ?? "",
                     unread: hasUnreadMarmotMessage(in: groupSet),
