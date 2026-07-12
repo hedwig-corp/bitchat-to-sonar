@@ -627,7 +627,11 @@ struct SNMsgList: View {
         GeometryReader { geo in
             ScrollViewReader { proxy in
                 ScrollView {
-                    VStack(spacing: 0) {
+                    // Keep chat open proportional to the visible viewport. Agent
+                    // conversations can contain a page of long command output;
+                    // eagerly building every attributed-text bubble here stalls
+                    // first paint even though the database read is already bounded.
+                    LazyVStack(spacing: 0) {
                         Text("Today")
                             .font(SonarTheme.uiFont(size: 11.5, weight: .semibold))
                             .foregroundColor(SonarTheme.text3)
