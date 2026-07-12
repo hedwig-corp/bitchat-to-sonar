@@ -14,6 +14,7 @@ import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.rememberTransformableState
@@ -67,9 +68,8 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.TextStyle
-import androidx.compose.ui.text.LinkAnnotation
-import androidx.compose.ui.text.TextLinkStyles
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -1554,6 +1554,8 @@ private fun MessageBubble(
             appendInlineContent(BUBBLE_META_ICON, "·")
         }
     }
+    var textLayout by remember(annotated) { mutableStateOf<TextLayoutResult?>(null) }
+    val uriHandler = androidx.compose.ui.platform.LocalUriHandler.current
     val inline = mapOf(
         BUBBLE_META_ICON to InlineTextContent(
             Placeholder(14.sp, 11.sp, PlaceholderVerticalAlign.TextCenter)
@@ -1593,6 +1595,21 @@ private fun MessageBubble(
                     annotated, color = if (m.mine) onMine else s.text,
                     fontSize = 16.sp, lineHeight = 22.4.sp,
                     inlineContent = inline,
+                    onTextLayout = { textLayout = it },
+                    modifier = Modifier.pointerInput(annotated) {
+                        awaitEachGesture {
+                            val down = awaitFirstDown(requireUnconsumed = false)
+                            val up = waitForUpOrCancellation()
+                            if (up != null && !down.isConsumed) {
+                                val offset = textLayout?.getOffsetForPosition(down.position)
+                                offset?.let {
+                                    annotated.getStringAnnotations(URL_ANNOTATION_TAG, it, it)
+                                        .firstOrNull()
+                                        ?.let { link -> uriHandler.openUri(link.item) }
+                                }
+                            }
+                        }
+                    },
                 )
             }
         }
@@ -2814,6 +2831,7 @@ private fun HereCard(items: List<HereItem>, onEnter: (String) -> Unit) {
 data class HereItem(val geohash: String, val name: String, val tier: String, val short: String, val count: Int)
 
 private val URL_REGEX = Regex("""(https?://|www\.)\S+""")
+private const val URL_ANNOTATION_TAG = "url"
 
 private fun linkify(text: String, linkColor: androidx.compose.ui.graphics.Color) =
     androidx.compose.ui.text.buildAnnotatedString {
@@ -2821,18 +2839,15 @@ private fun linkify(text: String, linkColor: androidx.compose.ui.graphics.Color)
         for (match in URL_REGEX.findAll(text)) {
             append(text.substring(last, match.range.first))
             val url = if (match.value.startsWith("www.")) "https://${match.value}" else match.value
-            pushLink(
-                LinkAnnotation.Url(
-                    url = url,
-                    styles = TextLinkStyles(
-                        style = androidx.compose.ui.text.SpanStyle(
-                            color = linkColor,
-                            textDecoration = androidx.compose.ui.text.style.TextDecoration.Underline
-                        )
-                    )
+            pushStringAnnotation(URL_ANNOTATION_TAG, url)
+            pushStyle(
+                androidx.compose.ui.text.SpanStyle(
+                    color = linkColor,
+                    textDecoration = androidx.compose.ui.text.style.TextDecoration.Underline
                 )
             )
             append(match.value)
+            pop()
             pop()
             last = match.range.last + 1
         }
