@@ -1072,6 +1072,11 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      */
     func messages(groupIdHex: String) throws  -> [MessageInfo]
     
+    /**
+     * Stable newest-first transcript page ordered by
+     * `(created_at DESC, event_id DESC)`. The cursor is exclusive; callers
+     * should pass the final message tuple from the previous page.
+     */
     func messagesCursorPage(groupIdHex: String, beforeSecs: UInt64?, beforeIdHex: String?, limit: UInt32) throws  -> [MessageInfo]
     
     /**
@@ -1764,6 +1769,11 @@ open func messages(groupIdHex: String)throws  -> [MessageInfo]  {
 })
 }
     
+    /**
+     * Stable newest-first transcript page ordered by
+     * `(created_at DESC, event_id DESC)`. The cursor is exclusive; callers
+     * should pass the final message tuple from the previous page.
+     */
 open func messagesCursorPage(groupIdHex: String, beforeSecs: UInt64?, beforeIdHex: String?, limit: UInt32)throws  -> [MessageInfo]  {
     return try  FfiConverterSequenceTypeMessageInfo.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_messages_cursor_page(
@@ -6272,7 +6282,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_messages() != 63355) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_messages_cursor_page() != 46097) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_messages_cursor_page() != 62639) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_messages_page() != 43697) {

@@ -41,7 +41,8 @@ private const val PROFILE_MISS_TTL_SECS = 60L
 /** How long after BLE activity the mesh drain loop stays at 150ms. */
 private const val MESH_REALTIME_HOT_WINDOW_MS = 30_000L
 private const val PROFILE_REFRESH_TTL_SECS = 30 * 60L
-private const val LOCAL_TRANSCRIPT_PAGE_LIMIT = 100
+/** Non-render scan budget used by pay/call reconciliation and media matching. */
+private const val BACKGROUND_TRANSCRIPT_SCAN_LIMIT = 100
 private const val LOCAL_SUMMARY_PAGE_LIMIT = 20
 private const val LOCAL_SUMMARY_CHAT_LIMIT = 5
 private const val RELAY_RECONNECT_RETRY_MS = 10_000L
@@ -235,6 +236,13 @@ internal fun meshConversationIdentityKey(peerId: String, linkedNpubHex: String?)
     return linked?.let { "npub:$it" } ?: "peer:$peerId"
 }
 
+internal fun sameMeshConversationIdentity(
+    firstPeerId: String,
+    secondPeerId: String,
+    linkedNpubByPeer: Map<String, String>,
+): Boolean = meshConversationIdentityKey(firstPeerId, linkedNpubByPeer[firstPeerId]) ==
+    meshConversationIdentityKey(secondPeerId, linkedNpubByPeer[secondPeerId])
+
 internal fun groupMeshPeerIdsByIdentity(
     peerIds: Collection<String>,
     linkedNpubByPeer: Map<String, String>,
@@ -401,6 +409,7 @@ internal fun knownBlePeerIdsForPolicy(
  *  memory only (no MessageStore/SonarCore/Marmot write). [durSecs] == 0 ⇒ the call never connected
  *  (rendered as "Missed"); otherwise it's the connected duration. */
 data class CallRecord(
+    val id: String,
     val video: Boolean,
     val mine: Boolean,
     val durSecs: Int,
@@ -561,6 +570,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun wipe() {
         scope.launch {
+            endTranscriptSession()
             relayConnectJob?.cancel(); relayConnectJob = null
             relayStartupCompleted = false
             cancelPendingMarmotSetups()
@@ -623,6 +633,7 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  Marmot group) without re-running onboarding. Mirrors iOS `eraseAllChats`. */
     fun eraseAllChats() {
         scope.launch {
+            endTranscriptSession()
             cancelPendingMarmotSetups()
             cancelPendingMarmotGroupSetups()
             // Local transcripts on disk (mesh DMs, channels, geo DMs).
@@ -666,6 +677,103 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     var messages by mutableStateOf<List<SonarMsg>>(emptyList())
         private set
+
+    /** One bounded canonical DB window per folded Marmot source group. */
+    private data class TranscriptGroupWindow(
+        val rows: List<SonarMsg>,
+        val hasMore: Boolean,
+        val loadingOlder: Boolean = false,
+        val pinnedToOlderEdge: Boolean = false,
+    )
+
+    private val transcriptWindows = mutableMapOf<String, TranscriptGroupWindow>()
+    private var meshTranscriptRows: List<SonarMsg> = emptyList()
+    private var meshTranscriptPinnedToOlderEdge = false
+    private var conversationTranscriptRows: List<SonarMsg> = emptyList()
+    private var conversationVisibleRowLimit = TRANSCRIPT_PAGE_SIZE
+    private var conversationPinnedToOlderEdge by mutableStateOf(false)
+    private var transcriptGeneration = 0L
+    private var activeTranscriptChatId: String? = null
+
+    private fun isCurrentTranscriptSession(chatId: String, generation: Long): Boolean =
+        generation == transcriptGeneration &&
+            activeTranscriptChatId == chatId &&
+            (screen as? Screen.Chat)?.id == chatId
+
+    private fun beginTranscriptSession(chatId: String): Long {
+        transcriptGeneration += 1
+        activeTranscriptChatId = chatId
+        // Reopening starts from a viewport-sized local page. Older pages are a
+        // property of the live view, not an account-wide plaintext cache.
+        transcriptWindows.clear()
+        meshTranscriptRows = emptyList()
+        meshTranscriptPinnedToOlderEdge = false
+        conversationTranscriptRows = emptyList()
+        conversationVisibleRowLimit = TRANSCRIPT_PAGE_SIZE
+        conversationPinnedToOlderEdge = false
+        return transcriptGeneration
+    }
+
+    private fun endTranscriptSession() {
+        transcriptGeneration += 1
+        activeTranscriptChatId = null
+        transcriptWindows.clear()
+        meshTranscriptRows = emptyList()
+        meshTranscriptPinnedToOlderEdge = false
+        conversationTranscriptRows = emptyList()
+        conversationVisibleRowLimit = TRANSCRIPT_PAGE_SIZE
+        conversationPinnedToOlderEdge = false
+    }
+
+    /** True when the active 500-row window has moved away from the newest edge. */
+    fun canLoadNewestMessages(chatId: String): Boolean =
+        conversationPinnedToOlderEdge &&
+            activeTranscriptChatId == chatId &&
+            (screen as? Screen.Chat)?.id == chatId
+
+    /**
+     * Reset this live conversation to its bounded newest edge. Advancing the
+     * generation invalidates any older-page query still suspended in the core.
+     */
+    suspend fun loadNewestMessages(chatId: String): Boolean {
+        if (!canLoadNewestMessages(chatId)) return false
+        val generation = beginTranscriptSession(chatId)
+
+        // Paint a bounded local tail immediately, before any FFI cursor read.
+        val snapshot = if (isMeshChat(chatId)) {
+            refreshMeshTranscriptWindow(meshPeerId(chatId))
+        } else {
+            chatSnapshotMessagesByChat[chatId].orEmpty().takeLast(TRANSCRIPT_PAGE_SIZE)
+        }
+        val immediate = refreshConversationRows(snapshot, chatId, generation)
+        setCurrentVisibleMessages(
+            chatId,
+            withSendEchoes(chatId, mergePendingMediaUploads(chatId, immediate)),
+            processCalls = true,
+        )
+
+        val newest = when {
+            isMeshChat(chatId) -> {
+                val peerId = meshPeerId(chatId)
+                refreshMeshTranscriptWindow(peerId) + marmotMessagesForPeer(peerId, chatId, generation)
+            }
+            pendingMarmotNpub(chatId) != null || isPendingMarmotGroup(chatId) -> emptyList()
+            else -> marmotMessagesPageForChat(chatId, generation)
+        }
+        if (!isCurrentTranscriptSession(chatId, generation)) return false
+        val visibleNewest = refreshConversationRows(newest, chatId, generation)
+        setCurrentVisibleMessages(
+            chatId,
+            withSendEchoes(chatId, mergePendingMediaUploads(chatId, visibleNewest)),
+            processCalls = true,
+        )
+        return true
+    }
+
+    /** Sending owns its transport path; newest-edge restoration is independent. */
+    private fun reloadNewestAfterSendIfNeeded(chatId: String) {
+        if (canLoadNewestMessages(chatId)) scope.launch { loadNewestMessages(chatId) }
+    }
     var unreadByChat by mutableStateOf<Map<String, Long>>(emptyMap())
         private set
 
@@ -828,7 +936,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         callTicker?.cancel(); callTicker = null
         CallAudioRoute.configure(active = false, speakerOn = false)
         callLogs.getOrPut(c.chatId) { mutableListOf() }.add(
-            CallRecord(video = c.video, mine = false, durSecs = 0, tsSecs = SonarClock.nowSecs())
+            CallRecord(id = c.callId, video = c.video, mine = false, durSecs = 0, tsSecs = SonarClock.nowSecs())
         )
         callVersion++
         activeCall = null
@@ -846,7 +954,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         callTicker?.cancel(); callTicker = null
         CallAudioRoute.configure(active = false, speakerOn = false)
         callLogs.getOrPut(c.chatId) { mutableListOf() }.add(
-            CallRecord(video = c.video, mine = !c.incoming, durSecs = c.connectedSecs, tsSecs = SonarClock.nowSecs())
+            CallRecord(id = c.callId, video = c.video, mine = !c.incoming, durSecs = c.connectedSecs, tsSecs = SonarClock.nowSecs())
         )
         callVersion++
         activeCall = null
@@ -924,7 +1032,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         CallAudioRoute.configure(active = false, speakerOn = false)
         val connected = ev.durationSecs > 0
         callLogs.getOrPut(c.chatId) { mutableListOf() }.add(
-            CallRecord(video = c.video, mine = !c.incoming, durSecs = ev.durationSecs.toInt(), tsSecs = SonarClock.nowSecs())
+            CallRecord(id = c.callId, video = c.video, mine = !c.incoming, durSecs = ev.durationSecs.toInt(), tsSecs = SonarClock.nowSecs())
         )
         callVersion++
         activeCall = null
@@ -983,7 +1091,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 if (SonarClock.nowSecs() - ctrl.unixSecs > 60) {
                     runCatching { SonarCore.callHangup(ctrl.callId) }
                     callLogs.getOrPut(callChatId) { mutableListOf() }
-                        .add(CallRecord(video = ctrl.video, mine = false, durSecs = 0, tsSecs = SonarClock.nowSecs()))
+                        .add(CallRecord(id = ctrl.callId, video = ctrl.video, mine = false, durSecs = 0, tsSecs = SonarClock.nowSecs()))
                     callVersion++
                     return
                 }
@@ -1540,6 +1648,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         else source.filter { msg -> socialState.allowsChatMessage(chatId, msg.senderNpub, msg.mine) }
 
     private fun setCurrentVisibleMessages(chatId: String, source: List<SonarMsg>, processCalls: Boolean = false) {
+        // Local cursor reads race navigation. A late page from chat A must not
+        // overwrite chat B's render state after the user switches screens.
+        if ((screen as? Screen.Chat)?.id != chatId || activeTranscriptChatId != chatId) return
         val visible = visibleMessagesForChat(chatId, source)
         messages = visible
         processPayLines(chatId, visible)
@@ -3183,6 +3294,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun openChat(chat: SonarChat) {
         push(Screen.Chat(chat.id, chatTitle(chat)))
+        val generation = beginTranscriptSession(chat.id)
         pendingMarmotNpub(chat.id)?.let { pendingNpub ->
             messages = visibleMessagesForChat(chat.id, withSendEchoes(chat.id, emptyList()))
             ensureProfile(pendingNpub)
@@ -3201,20 +3313,22 @@ class SonarAppState(private val scope: CoroutineScope) {
         // the bounded DB page + media/echo merge below replaces it async.
         messages = visibleMessagesForChat(
             chat.id,
-            withSendEchoes(chat.id, chatSnapshotMessagesByChat[chat.id].orEmpty()),
+            withSendEchoes(chat.id, chatSnapshotMessagesByChat[chat.id].orEmpty().takeLast(TRANSCRIPT_PAGE_SIZE)),
         )
         scope.launch {
             for (readId in readChatIds) {
                 runCatching { SonarCore.markConversationRead(readId) }
             }
-            val local = withSendEchoes(chat.id, mergePendingMediaUploads(chat.id, marmotMessagesPageForChat(chat.id)))
+            val local = withSendEchoes(chat.id, mergePendingMediaUploads(chat.id, marmotMessagesPageForChat(chat.id, generation)))
             val visibleLocal = visibleMessagesForChat(chat.id, local)
+            if (!isCurrentTranscriptSession(chat.id, generation)) return@launch
             messages = visibleLocal
             processPayLines(chat.id, visibleLocal)
             for (m in visibleLocal) if (!m.mine && m.senderNpub.isNotBlank()) ensureProfile(m.senderNpub)
             runCatching { refreshChats() }
-            if ((screen as? Screen.Chat)?.id == chat.id) {
-                val fresh = withSendEchoes(chat.id, mergePendingMediaUploads(chat.id, marmotMessagesPageForChat(chat.id)))
+            if (isCurrentTranscriptSession(chat.id, generation)) {
+                val fresh = withSendEchoes(chat.id, mergePendingMediaUploads(chat.id, marmotMessagesPageForChat(chat.id, generation)))
+                if (!isCurrentTranscriptSession(chat.id, generation)) return@launch
                 val visibleFresh = visibleMessagesForChat(chat.id, fresh)
                 messages = visibleFresh
                 processPayLines(chat.id, visibleFresh)
@@ -3231,7 +3345,11 @@ class SonarAppState(private val scope: CoroutineScope) {
         val id = meshChatId(canonicalPeerId)
         if (name.isNotBlank()) rememberMeshName(canonicalPeerId, name)
         push(Screen.Chat(id, name, pay))
-        messages = visibleMessagesForChat(id, mergedMeshMessages(canonicalPeerId)) // immediate merged alias view; Marmot leg merges in async
+        val generation = beginTranscriptSession(id)
+        messages = visibleMessagesForChat(
+            id,
+            refreshConversationRows(refreshMeshTranscriptWindow(canonicalPeerId), id, generation),
+        ) // bounded local-first mesh view
         processPayLines(id, messages)
         scope.launch {
             refreshOpenDm(canonicalPeerId) // hydrate local Marmot transcript before chat list refresh
@@ -3246,10 +3364,50 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun meshPeerId(chatId: String) = chatId.removePrefix("mesh:")
     private fun isMeshChat(chatId: String) = chatId.startsWith("mesh:")
 
+    /** Recreate bounded transcript state when Back reveals an earlier chat in the stack. */
+    private fun restoreTranscriptSession(chat: Screen.Chat) {
+        val generation = beginTranscriptSession(chat.id)
+        if (isMeshChat(chat.id)) {
+            val peerId = meshPeerId(chat.id)
+            messages = visibleMessagesForChat(
+                chat.id,
+                refreshConversationRows(refreshMeshTranscriptWindow(peerId), chat.id, generation),
+            )
+            scope.launch { refreshOpenDm(peerId) }
+            return
+        }
+        if (pendingMarmotNpub(chat.id) != null || isPendingMarmotGroup(chat.id)) {
+            messages = visibleMessagesForChat(chat.id, withSendEchoes(chat.id, emptyList()))
+            return
+        }
+        messages = visibleMessagesForChat(
+            chat.id,
+            withSendEchoes(chat.id, chatSnapshotMessagesByChat[chat.id].orEmpty().takeLast(TRANSCRIPT_PAGE_SIZE)),
+        )
+        scope.launch {
+            val local = withSendEchoes(
+                chat.id,
+                mergePendingMediaUploads(chat.id, marmotMessagesPageForChat(chat.id, generation)),
+            )
+            if (!isCurrentTranscriptSession(chat.id, generation)) return@launch
+            setCurrentVisibleMessages(chat.id, local, processCalls = true)
+        }
+    }
+
+    private fun restoreRevealedChatOrClear() {
+        val restoredChat = stack.lastOrNull() as? Screen.Chat
+        if (restoredChat == null) {
+            if (activeTranscriptChatId != null) endTranscriptSession()
+            messages = emptyList()
+        } else if (activeTranscriptChatId != restoredChat.id) {
+            restoreTranscriptSession(restoredChat)
+        }
+    }
+
     fun back() {
         cleanupPreviewTempFiles()
         if (stack.size > 1) stack = stack.dropLast(1)
-        if (stack.lastOrNull() !is Screen.Chat) messages = emptyList()
+        restoreRevealedChatOrClear()
         scope.launch { refreshChats() }
     }
 
@@ -3259,7 +3417,11 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  deselects (returns to the welcome pane) instead of walking history. */
     fun resetToHome() {
         cleanupPreviewTempFiles()
-        if (stack.size > 1) { stack = listOf(Screen.Home); messages = emptyList() }
+        if (stack.size > 1) {
+            endTranscriptSession()
+            stack = listOf(Screen.Home)
+            messages = emptyList()
+        }
     }
 
     /** True when the desktop content pane should show the welcome placeholder. */
@@ -3279,7 +3441,11 @@ class SonarAppState(private val scope: CoroutineScope) {
         val deleteIdSet = deleteIds.toSet()
         chats = chats.filterNot { it.id in deleteIdSet }
         for (id in deleteIds) { lastSeenTs.remove(id); lastNotifiedTs.remove(id) }
-        if (wasOpen && stack.size > 1) stack = stack.dropLast(1) // pop WITHOUT refresh
+        if (wasOpen && stack.size > 1) {
+            endTranscriptSession()
+            stack = stack.dropLast(1) // pop WITHOUT refresh
+            restoreRevealedChatOrClear()
+        }
         scope.launch {
             try {
                 if (isGroup) {
@@ -3327,7 +3493,11 @@ class SonarAppState(private val scope: CoroutineScope) {
             clearChatSnapshot()
         }
         updateBleDiscoveryPolicy()
-        if (wasOpen && stack.size > 1) stack = stack.dropLast(1)
+        if (wasOpen && stack.size > 1) {
+            endTranscriptSession()
+            stack = stack.dropLast(1)
+            restoreRevealedChatOrClear()
+        }
         scope.launch {
             aliases.forEach { MessageStore.deleteMeshDm(it) }
             foldedGroups.forEach { group ->
@@ -3353,6 +3523,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             ensureProfile(canonicalPeer)
             ensureSonarDescriptor(canonicalPeer)
             push(Screen.Chat(pendingId, profilesByNpub[canonicalProfileKey(canonicalPeer)]?.bestName ?: shortNpub(canonicalPeer)))
+            beginTranscriptSession(pendingId)
             messages = visibleMessagesForChat(pendingId, withSendEchoes(pendingId, emptyList()))
             startPendingMarmotChat(canonicalPeer, pendingId)
             return
@@ -3367,7 +3538,11 @@ class SonarAppState(private val scope: CoroutineScope) {
                     openChat(chat)
                 } else {
                     push(Screen.Chat(chatId, shortNpub(p)))
-                    messages = marmotMessagesPageForChat(chatId)
+                    val generation = beginTranscriptSession(chatId)
+                    val local = marmotMessagesPageForChat(chatId, generation)
+                    if (isCurrentTranscriptSession(chatId, generation)) {
+                        setCurrentVisibleMessages(chatId, local, processCalls = true)
+                    }
                 }
             } catch (t: Throwable) {
                 toast = "couldn't start: ${t.message}"
@@ -3427,9 +3602,11 @@ class SonarAppState(private val scope: CoroutineScope) {
         flushPendingDirectMarmot(npubHex, chatId)
         val openChatId = (screen as? Screen.Chat)?.id
         if (openChatId == chatId) {
-            messages = visibleMessagesForChat(chatId, withSendEchoes(chatId, mergePendingMediaUploads(chatId, marmotMessagesPageForChat(chatId))))
-            processPayLines(chatId, messages)
-            processCallLines(chatId, messages)
+            val generation = beginTranscriptSession(chatId)
+            val local = withSendEchoes(chatId, mergePendingMediaUploads(chatId, marmotMessagesPageForChat(chatId, generation)))
+            if (isCurrentTranscriptSession(chatId, generation)) {
+                setCurrentVisibleMessages(chatId, local, processCalls = true)
+            }
         }
     }
 
@@ -3486,6 +3663,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun openPendingMarmotGroup(pendingId: String, pending: PendingMarmotGroup) {
         pendingMarmotGroups = pendingMarmotGroups + (pendingId to pending)
         push(Screen.Chat(pendingId, pending.name))
+        beginTranscriptSession(pendingId)
         messages = visibleMessagesForChat(pendingId, withSendEchoes(pendingId, emptyList()))
     }
 
@@ -3551,9 +3729,11 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         flushPendingMarmotGroupSends(pendingChatId, chatId)
         if ((screen as? Screen.Chat)?.id == chatId) {
-            messages = visibleMessagesForChat(chatId, withSendEchoes(chatId, mergePendingMediaUploads(chatId, marmotMessagesPageForChat(chatId))))
-            processPayLines(chatId, messages)
-            processCallLines(chatId, messages)
+            val generation = beginTranscriptSession(chatId)
+            val local = withSendEchoes(chatId, mergePendingMediaUploads(chatId, marmotMessagesPageForChat(chatId, generation)))
+            if (isCurrentTranscriptSession(chatId, generation)) {
+                setCurrentVisibleMessages(chatId, local, processCalls = true)
+            }
         }
     }
 
@@ -3566,7 +3746,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         pendingSendEchoes.remove(pendingChatId)
         if ((screen as? Screen.Chat)?.id == pendingChatId && stack.size > 1) {
+            endTranscriptSession()
             stack = stack.dropLast(1)
+            restoreRevealedChatOrClear()
         }
         return true
     }
@@ -3891,13 +4073,19 @@ class SonarAppState(private val scope: CoroutineScope) {
             toast = "Unblock this contact before sending."
             return
         }
-        if (isMeshChat(chatId)) { sendDmAuto(meshPeerId(chatId), t); return }
+        if (isMeshChat(chatId)) {
+            sendDmAuto(meshPeerId(chatId), t)
+            reloadNewestAfterSendIfNeeded(chatId)
+            return
+        }
         pendingMarmotNpub(chatId)?.let { pendingNpub ->
             sendPendingMarmotChat(chatId, pendingNpub, t)
+            reloadNewestAfterSendIfNeeded(chatId)
             return
         }
         if (isPendingMarmotGroup(chatId)) {
             sendPendingMarmotGroup(chatId, t)
+            reloadNewestAfterSendIfNeeded(chatId)
             return
         }
         val echo = createSendEcho(chatId, t)
@@ -3906,14 +4094,20 @@ class SonarAppState(private val scope: CoroutineScope) {
             try {
                 SonarCore.send(chatId, t)
                 clearSendEcho(chatId, echo.id)
-                messages = visibleMessagesForChat(chatId, withSendEchoes(chatId, mergePendingMediaUploads(chatId, marmotMessagesPageForChat(chatId))))
-                processPayLines(chatId, messages)
-                processCallLines(chatId, messages)
+                val refreshGeneration = transcriptGeneration
+                val local = withSendEchoes(
+                    chatId,
+                    mergePendingMediaUploads(chatId, marmotMessagesPageForChat(chatId, refreshGeneration)),
+                )
+                if (isCurrentTranscriptSession(chatId, refreshGeneration)) {
+                    setCurrentVisibleMessages(chatId, local, processCalls = true)
+                }
             } catch (e: Throwable) {
                 failSendEcho(chatId, echo.id)
                 toast = "send failed: ${e.message}"
             }
         }
+        reloadNewestAfterSendIfNeeded(chatId)
     }
 
     // ── Optimistic send echoes ──
@@ -4222,7 +4416,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private suspend fun existingPublishedMediaUrls(groupId: String): Set<String> =
-        runCatching { SonarCore.messagesPage(groupId, LOCAL_TRANSCRIPT_PAGE_LIMIT) }
+        runCatching { SonarCore.messagesPage(groupId, BACKGROUND_TRANSCRIPT_SCAN_LIMIT) }
             .getOrDefault(messages)
             .asSequence()
             .flatMap { it.media.asSequence() }
@@ -4304,12 +4498,16 @@ class SonarAppState(private val scope: CoroutineScope) {
                     if (sc.id == chatId) {
                         if (isMeshChat(chatId)) {
                             val peerId = meshPeerId(chatId)
-                            val mesh = mergedMeshMessages(peerId)
-                            val wn = marmotMessagesForPeer(peerId)
-                            val merged = withSendEchoes(chatId, mergePendingMediaUploads(chatId, mesh + wn))
-                            setCurrentVisibleMessages(chatId, merged)
+                            val generation = transcriptGeneration
+                            val mesh = refreshMeshTranscriptWindow(peerId)
+                            val wn = marmotMessagesForPeer(peerId, chatId, generation)
+                            if (isCurrentTranscriptSession(chatId, generation)) {
+                                val rows = refreshConversationRows(mesh + wn, chatId, generation)
+                                val merged = withSendEchoes(chatId, mergePendingMediaUploads(chatId, rows))
+                                setCurrentVisibleMessages(chatId, merged)
+                            }
                         } else {
-                            val fresh = SonarCore.messagesPage(groupId, LOCAL_TRANSCRIPT_PAGE_LIMIT)
+                            val fresh = marmotMessagesPageForChat(chatId)
                             setCurrentVisibleMessages(chatId, withSendEchoes(chatId, mergePendingMediaUploads(chatId, fresh)))
                         }
                     }
@@ -4391,12 +4589,16 @@ class SonarAppState(private val scope: CoroutineScope) {
                     if (sc.id == chatId) {
                         if (isMeshChat(chatId)) {
                             val peerId = meshPeerId(chatId)
-                            val mesh = mergedMeshMessages(peerId)
-                            val wn = marmotMessagesForPeer(peerId)
-                            val merged = withSendEchoes(chatId, mergePendingMediaUploads(chatId, mesh + wn))
-                            setCurrentVisibleMessages(chatId, merged)
+                            val generation = transcriptGeneration
+                            val mesh = refreshMeshTranscriptWindow(peerId)
+                            val wn = marmotMessagesForPeer(peerId, chatId, generation)
+                            if (isCurrentTranscriptSession(chatId, generation)) {
+                                val rows = refreshConversationRows(mesh + wn, chatId, generation)
+                                val merged = withSendEchoes(chatId, mergePendingMediaUploads(chatId, rows))
+                                setCurrentVisibleMessages(chatId, merged)
+                            }
                         } else {
-                            val fresh = SonarCore.messagesPage(groupId, LOCAL_TRANSCRIPT_PAGE_LIMIT)
+                            val fresh = marmotMessagesPageForChat(chatId)
                             setCurrentVisibleMessages(chatId, withSendEchoes(chatId, mergePendingMediaUploads(chatId, fresh)))
                         }
                     }
@@ -4493,12 +4695,16 @@ class SonarAppState(private val scope: CoroutineScope) {
                     if (sc.id == chatId) {
                         if (isMeshChat(chatId)) {
                             val peerId = meshPeerId(chatId)
-                            val mesh = mergedMeshMessages(peerId)
-                            val wn = marmotMessagesForPeer(peerId)
-                            val merged = withSendEchoes(chatId, mergePendingMediaUploads(chatId, mesh + wn))
-                            setCurrentVisibleMessages(chatId, merged)
+                            val generation = transcriptGeneration
+                            val mesh = refreshMeshTranscriptWindow(peerId)
+                            val wn = marmotMessagesForPeer(peerId, chatId, generation)
+                            if (isCurrentTranscriptSession(chatId, generation)) {
+                                val rows = refreshConversationRows(mesh + wn, chatId, generation)
+                                val merged = withSendEchoes(chatId, mergePendingMediaUploads(chatId, rows))
+                                setCurrentVisibleMessages(chatId, merged)
+                            }
                         } else {
-                            val fresh = SonarCore.messagesPage(groupId, LOCAL_TRANSCRIPT_PAGE_LIMIT)
+                            val fresh = marmotMessagesPageForChat(chatId)
                             setCurrentVisibleMessages(chatId, withSendEchoes(chatId, mergePendingMediaUploads(chatId, fresh)))
                         }
                     }
@@ -5483,44 +5689,277 @@ class SonarAppState(private val scope: CoroutineScope) {
                 .thenBy { it.id }
         )
 
-    private suspend fun marmotMessages(groupId: String): List<SonarMsg> {
-        val loaded = runCatching { SonarCore.messagesPage(groupId, LOCAL_TRANSCRIPT_PAGE_LIMIT) }.getOrNull()
-        if (!started && loaded.isNullOrEmpty()) {
-            return chatSnapshotMessagesByChat[groupId].orEmpty()
+    private suspend fun latestCursorPage(groupId: String): List<SonarMsg>? = runCatching {
+        SonarCore.messagesCursorPage(
+            chatId = groupId,
+            beforeSecs = null,
+            beforeIdHex = null,
+            limit = TRANSCRIPT_PAGE_FETCH_SIZE,
+        )
+    }.getOrNull()
+
+    /** Refresh the newest local rows without replacing pages already prepended. */
+    private suspend fun refreshTranscriptGroupWindow(
+        groupId: String,
+        sessionChatId: String,
+        generation: Long,
+    ): List<SonarMsg> {
+        val fetched = latestCursorPage(groupId)
+        if (!isCurrentTranscriptSession(sessionChatId, generation)) {
+            return when {
+                !started && fetched.isNullOrEmpty() ->
+                    chatSnapshotMessagesByChat[groupId].orEmpty().takeLast(TRANSCRIPT_PAGE_SIZE)
+                fetched == null -> chatSnapshotMessagesByChat[groupId].orEmpty().takeLast(TRANSCRIPT_PAGE_SIZE)
+                else -> visibleTranscriptPage(fetched)
+            }
         }
-        return loaded ?: chatSnapshotMessagesByChat[groupId].orEmpty()
+
+        val current = transcriptWindows[groupId]
+        if (fetched == null || (!started && fetched.isEmpty())) {
+            if (current != null) return current.rows
+            val fallback = chatSnapshotMessagesByChat[groupId].orEmpty().takeLast(TRANSCRIPT_PAGE_SIZE)
+            transcriptWindows[groupId] = TranscriptGroupWindow(fallback, hasMore = false)
+            return fallback
+        }
+
+        val newest = visibleTranscriptPage(fetched)
+        val unboundedCount = (current?.rows.orEmpty() + newest).distinctBy { it.id }.size
+        val merged = refreshTranscriptRows(
+            existing = current?.rows.orEmpty(),
+            newest = newest,
+            pinnedToOlderEdge = current?.pinnedToOlderEdge == true,
+        )
+        val hasMore = when {
+            unboundedCount > TRANSCRIPT_RETAINED_ROWS -> true
+            current != null -> current.hasMore || fetched.size > TRANSCRIPT_PAGE_SIZE
+            else -> fetched.size > TRANSCRIPT_PAGE_SIZE
+        }
+        transcriptWindows[groupId] = TranscriptGroupWindow(
+            rows = merged,
+            hasMore = hasMore,
+            loadingOlder = current?.loadingOlder == true,
+            pinnedToOlderEdge = current?.pinnedToOlderEdge == true,
+        )
+        return merged
     }
 
     private suspend fun marmotMessagesPage(groupId: String): List<SonarMsg> {
         val loaded = runCatching {
-            SonarCore.messagesPage(groupId, LOCAL_TRANSCRIPT_PAGE_LIMIT)
+            SonarCore.messagesPage(groupId, BACKGROUND_TRANSCRIPT_SCAN_LIMIT)
         }.getOrNull()
         if (!started && loaded.isNullOrEmpty()) {
-            return chatSnapshotMessagesByChat[groupId].orEmpty().takeLast(LOCAL_TRANSCRIPT_PAGE_LIMIT)
+            return chatSnapshotMessagesByChat[groupId].orEmpty().takeLast(BACKGROUND_TRANSCRIPT_SCAN_LIMIT)
         }
-        return loaded ?: chatSnapshotMessagesByChat[groupId].orEmpty().takeLast(LOCAL_TRANSCRIPT_PAGE_LIMIT)
+        return loaded ?: chatSnapshotMessagesByChat[groupId].orEmpty().takeLast(BACKGROUND_TRANSCRIPT_SCAN_LIMIT)
     }
 
-    private suspend fun marmotMessagesPageForChat(chatId: String): List<SonarMsg> {
+    private suspend fun marmotMessagesPageForChat(
+        chatId: String,
+        generation: Long = transcriptGeneration,
+    ): List<SonarMsg> {
         val groups = duplicateDirectMarmotChats(chatId)
-        if (groups.size <= 1) return marmotMessagesPage(chatId)
+        if (groups.isEmpty()) {
+            return refreshConversationRows(
+                refreshTranscriptGroupWindow(chatId, chatId, generation),
+                chatId,
+                generation,
+            )
+        }
         val merged = ArrayList<SonarMsg>()
         for (group in groups) {
-            merged += marmotMessagesPage(group.id)
+            merged += refreshTranscriptGroupWindow(group.id, chatId, generation)
         }
-        return merged.distinctBy { it.id }.sortedBy { it.tsSecs }.takeLast(LOCAL_TRANSCRIPT_PAGE_LIMIT)
+        return refreshConversationRows(merged, chatId, generation)
     }
 
-    private suspend fun marmotMessagesForPeer(peerId: String): List<SonarMsg> {
-        val aliases = meshPeerAliases(peerId)
-        val groups = npubRawFor(peerId)?.let { marmotGroupsForNpub(it) }
+    private suspend fun marmotMessagesForPeer(
+        peerId: String,
+        sessionChatId: String,
+        generation: Long,
+    ): List<SonarMsg> {
+        val canonicalPeerId = canonicalMeshPeerId(peerId)
+        val aliases = meshPeerAliases(canonicalPeerId)
+        val groups = npubRawFor(canonicalPeerId)?.let { marmotGroupsForNpub(it) }
             ?: chats.filter { group -> peerIdForMarmotGroup(group)?.let { it in aliases } == true }
         val merged = ArrayList<SonarMsg>()
         for (group in groups) {
-            val msgs = marmotMessages(group.id)
+            val msgs = refreshTranscriptGroupWindow(group.id, sessionChatId, generation)
             merged += msgs.map { it.copy(viaInternet = true) }
         }
-        return merged.distinctBy { it.id }
+        return mergeAllTranscriptRows(merged)
+    }
+
+    private fun refreshConversationRows(
+        source: List<SonarMsg>,
+        chatId: String,
+        generation: Long,
+    ): List<SonarMsg> {
+        val merged = mergeAllTranscriptRows(source)
+        if (!isCurrentTranscriptSession(chatId, generation)) {
+            return boundedTranscriptRows(merged, TRANSCRIPT_PAGE_SIZE, pinnedToOlderEdge = false)
+        }
+        conversationTranscriptRows = if (conversationTranscriptRows.isEmpty()) {
+            boundedTranscriptRows(merged, conversationVisibleRowLimit, conversationPinnedToOlderEdge)
+        } else {
+            refreshTranscriptRows(
+                existing = conversationTranscriptRows,
+                newest = merged,
+                pinnedToOlderEdge = conversationPinnedToOlderEdge,
+                retainedRows = conversationVisibleRowLimit,
+            )
+        }
+        return conversationTranscriptRows
+    }
+
+    /** Select only the closest globally older page, even when every folded source fetched 30 rows. */
+    private fun prependConversationRows(source: List<SonarMsg>): Boolean {
+        val merged = mergeAllTranscriptRows(source)
+        val current = conversationTranscriptRows
+        if (current.isEmpty()) {
+            conversationTranscriptRows = boundedTranscriptRows(
+                merged,
+                conversationVisibleRowLimit,
+                pinnedToOlderEdge = false,
+            )
+            return conversationTranscriptRows.isNotEmpty()
+        }
+        val oldest = current.first()
+        val nearestOlder = nearestOlderTranscriptPage(merged, oldest)
+        if (nearestOlder.isEmpty()) return false
+
+        conversationVisibleRowLimit =
+            (conversationVisibleRowLimit + TRANSCRIPT_PAGE_SIZE).coerceAtMost(TRANSCRIPT_RETAINED_ROWS)
+        conversationTranscriptRows = prependTranscriptRows(
+            existing = current,
+            older = nearestOlder,
+            retainedRows = conversationVisibleRowLimit,
+        )
+        if (conversationVisibleRowLimit >= TRANSCRIPT_RETAINED_ROWS) {
+            conversationPinnedToOlderEdge = true
+        }
+        return true
+    }
+
+    private fun transcriptGroupIds(chatId: String): List<String> {
+        if (!isMeshChat(chatId)) return directMarmotChatIds(chatId).distinct()
+        val peerId = canonicalMeshPeerId(meshPeerId(chatId))
+        val aliases = meshPeerAliases(peerId)
+        val groups = npubRawFor(peerId)?.let { marmotGroupsForNpub(it) }
+            ?: chats.filter { group -> peerIdForMarmotGroup(group)?.let { it in aliases } == true }
+        return groups.map { it.id }.distinct()
+    }
+
+    /** Keep only the active viewport's BLE history; the complete transcript remains in MessageStore. */
+    private fun refreshMeshTranscriptWindow(peerId: String): List<SonarMsg> {
+        val canonicalPeerId = canonicalMeshPeerId(peerId)
+        val mergedAliases = mergedMeshMessages(canonicalPeerId)
+        val activeSessionChatId = activeTranscriptChatId
+        val activePeerId = activeSessionChatId
+            ?.takeIf(::isMeshChat)
+            ?.let(::meshPeerId)
+        if (activePeerId == null ||
+            !sameMeshConversationIdentity(activePeerId, canonicalPeerId, linkByFp)
+        ) {
+            return mergedAliases.takeLast(TRANSCRIPT_PAGE_SIZE)
+        }
+        val newest = mergedAliases.takeLast(TRANSCRIPT_PAGE_SIZE)
+        meshTranscriptRows = refreshTranscriptRows(
+            existing = meshTranscriptRows,
+            newest = newest,
+            pinnedToOlderEdge = meshTranscriptPinnedToOlderEdge,
+        )
+        return meshTranscriptRows
+    }
+
+    /** Move the BLE window toward older rows, evicting its newer edge at the 500-row cap. */
+    private fun prependOlderMeshRows(peerId: String): Boolean {
+        val allRows = mergedMeshMessages(canonicalMeshPeerId(peerId))
+            .sortedWith(compareBy<SonarMsg>({ it.tsSecs }, { it.id }))
+        val current = if (meshTranscriptRows.isEmpty()) refreshMeshTranscriptWindow(peerId) else meshTranscriptRows
+        val oldest = current.firstOrNull() ?: return false
+        val cursorIndex = allRows.indexOfFirst { it.id == oldest.id }
+        if (cursorIndex <= 0) return false
+        val pageStart = (cursorIndex - TRANSCRIPT_PAGE_SIZE).coerceAtLeast(0)
+        val older = allRows.subList(pageStart, cursorIndex)
+        val trimsNewerEdge = current.size >= TRANSCRIPT_RETAINED_ROWS &&
+            older.any { candidate -> current.none { it.id == candidate.id } }
+        val merged = prependTranscriptRows(current, older)
+        val changed = merged.map { it.id } != current.map { it.id }
+        meshTranscriptRows = merged
+        meshTranscriptPinnedToOlderEdge = meshTranscriptPinnedToOlderEdge || trimsNewerEdge
+        return changed
+    }
+
+    /**
+     * Prepend one cursor page for every folded source and publish only if this
+     * is still the active chat. Repeated top-edge callbacks coalesce through
+     * each source window's loading flag.
+     */
+    suspend fun loadOlderMessages(chatId: String): Boolean {
+        val generation = transcriptGeneration
+        if (activeTranscriptChatId != chatId || (screen as? Screen.Chat)?.id != chatId) return false
+
+        val groupIds = transcriptGroupIds(chatId)
+        if (isMeshChat(chatId)) prependOlderMeshRows(meshPeerId(chatId))
+        for (groupId in groupIds) {
+            var window = transcriptWindows[groupId]
+            if (window == null) {
+                refreshTranscriptGroupWindow(groupId, chatId, generation)
+                if (!isCurrentTranscriptSession(chatId, generation)) return false
+                window = transcriptWindows[groupId]
+            }
+            val current = window ?: continue
+            if (current.loadingOlder || !current.hasMore || current.rows.isEmpty()) continue
+
+            if (!isCurrentTranscriptSession(chatId, generation)) return false
+            transcriptWindows[groupId] = current.copy(loadingOlder = true)
+            val cursor = current.rows.first()
+            val fetched = runCatching {
+                SonarCore.messagesCursorPage(
+                    chatId = groupId,
+                    beforeSecs = cursor.tsSecs,
+                    beforeIdHex = cursor.id,
+                    limit = TRANSCRIPT_PAGE_FETCH_SIZE,
+                )
+            }.getOrNull()
+
+            if (!isCurrentTranscriptSession(chatId, generation)) return false
+
+            if (fetched == null) {
+                val latest = transcriptWindows[groupId] ?: current
+                transcriptWindows[groupId] = latest.copy(loadingOlder = false)
+                continue
+            }
+            val older = visibleTranscriptPage(fetched)
+            // A newest-page refresh can finish while this older query is
+            // suspended. Merge into the latest window so it cannot overwrite
+            // a new canonical row or clear the in-flight state prematurely.
+            val latest = transcriptWindows[groupId] ?: current
+            val trimsNewerEdge = latest.rows.size >= TRANSCRIPT_RETAINED_ROWS &&
+                older.any { candidate -> latest.rows.none { it.id == candidate.id } }
+            val merged = prependTranscriptRows(latest.rows, older)
+            transcriptWindows[groupId] = TranscriptGroupWindow(
+                rows = merged,
+                hasMore = fetched.size > TRANSCRIPT_PAGE_SIZE,
+                pinnedToOlderEdge = latest.pinnedToOlderEdge || trimsNewerEdge,
+            )
+        }
+
+        if (!isCurrentTranscriptSession(chatId, generation)) return false
+
+        val canonical = groupIds.flatMap { transcriptWindows[it]?.rows.orEmpty() }
+        val source = if (isMeshChat(chatId)) {
+            meshTranscriptRows + canonical
+        } else {
+            canonical
+        }
+        if (!prependConversationRows(source)) return false
+        setCurrentVisibleMessages(
+            chatId,
+            withSendEchoes(chatId, mergePendingMediaUploads(chatId, conversationTranscriptRows)),
+            processCalls = true,
+        )
+        return true
     }
 
     private fun latestMarmotMessage(groups: List<SonarChat>): SonarMsg? {
@@ -5540,12 +5979,21 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  peer with a Marmot group, the White Noise leg merged chronologically. The
      *  White Noise leg renders as internet (indigo). No-op if that DM isn't open. */
     private suspend fun refreshOpenDm(peerId: String) {
+        val activeChat = screen as? Screen.Chat ?: return
+        if (!isMeshChat(activeChat.id)) return
+        val activePeerId = meshPeerId(activeChat.id)
         val canonicalPeerId = canonicalMeshPeerId(peerId)
-        if ((screen as? Screen.Chat)?.id != meshChatId(canonicalPeerId)) return
-        val chatId = meshChatId(canonicalPeerId)
-        val mesh = mergedMeshMessages(canonicalPeerId)
-        val wn = marmotMessagesForPeer(canonicalPeerId)
-        val merged = withSendEchoes(chatId, mergePendingMediaUploads(chatId, mesh + wn))
+        if (!sameMeshConversationIdentity(activePeerId, canonicalPeerId, linkByFp)) return
+        // Keep publication keyed to the screen/session the user actually
+        // opened. Canonical aliases select sources; they do not re-key UI state.
+        val chatId = activeChat.id
+        val generation = transcriptGeneration
+        if (!isCurrentTranscriptSession(chatId, generation)) return
+        val mesh = refreshMeshTranscriptWindow(canonicalPeerId)
+        val wn = marmotMessagesForPeer(canonicalPeerId, chatId, generation)
+        if (!isCurrentTranscriptSession(chatId, generation)) return
+        val bounded = refreshConversationRows(mesh + wn, chatId, generation)
+        val merged = withSendEchoes(chatId, mergePendingMediaUploads(chatId, bounded))
         val visible = visibleMessagesForChat(chatId, merged)
         messages = visible
         processPayLines(chatId, visible)
@@ -6310,7 +6758,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 wnMsgs += summaryCount ?: 0
                 continue
             }
-            val ms = runCatching { SonarCore.messagesPage(c.id, LOCAL_TRANSCRIPT_PAGE_LIMIT) }.getOrDefault(emptyList())
+            val ms = runCatching { SonarCore.messagesPage(c.id, BACKGROUND_TRANSCRIPT_SCAN_LIMIT) }.getOrDefault(emptyList())
             val visibleMs = visibleMessagesForChat(c.id, ms)
             wnMsgs += summaryCount ?: ms.size
             processCallLines(c.id, visibleMs)

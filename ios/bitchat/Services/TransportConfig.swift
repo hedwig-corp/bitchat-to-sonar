@@ -201,6 +201,12 @@ enum TransportConfig {
     static let uiLongMessageLengthThreshold: Int = 2000
     static let uiVeryLongTokenThreshold: Int = 512
     static let uiLongMessageLineLimit: Int = 30
+    /// Signal-style Sonar transcript windowing. The initial page is sized to
+    /// roughly one phone viewport; one look-ahead row determines `hasMore`.
+    static let sonarTranscriptPageCount: Int = 30
+    static let sonarTranscriptRetainedCount: Int = 500
+    static let sonarTranscriptPreviewGlyphCount: Int = 512
+    static let sonarTranscriptPreviewNewlineCount: Int = 15
     static let uiFingerprintSampleCount: Int = 3
     
     // UI swipe/gesture thresholds

@@ -128,14 +128,25 @@ struct SonarDMScreenContent: View {
                     fiatText: { store.moneySatsLine($0) },
                     loadMedia: { await store.mediaData($0) },
                     loadSticker: { await store.stickerImageData(for: $0) },
-                    onTapPack: { previewPackCoordinate = $0 }
+                    onTapPack: { previewPackCoordinate = $0 },
+                    loadOlder: { await convo.loadOlder() },
+                    loadNewest: { await convo.loadNewestIfNeeded() }
                 )
             }
 
             SNComposer(
                 placeholder: "Message \(peer.name)" + (transport == .internet ? " · via internet" : ""),
                 transport: transport,
-                onSend: { store.sendDm(peerId, $0) },
+                onSend: { text in
+                    // Delivery must never wait on a historical-window reset or
+                    // its unrelated metadata reads. Move back to the live edge
+                    // independently after the send has entered the local-first
+                    // transport/outbox path.
+                    store.sendDm(peerId, text)
+                    Task { @MainActor in
+                        await convo.loadNewestIfNeeded()
+                    }
+                },
                 onPlus: { sheet = true },
                 onCommand: { cmd in
                     store.onCommand(.init(type: .dm, id: peerId, target: peer.name), cmd)
