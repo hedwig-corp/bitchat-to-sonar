@@ -808,16 +808,9 @@ impl SonarNode {
         let expected_sha256 = expected_sha256.to_ascii_lowercase();
         sonar_stickers::validate_sha256_hex(&expected_sha256)
             .map_err(|e| SonarFfiError::InvalidInput(format!("bad sticker sha256: {e}")))?;
-        let bytes = self
-            .runtime
-            .block_on(sonar_core::client::http_get_public(&url))?;
-        let actual_sha256 = sonar_stickers::sha256_hex(&bytes);
-        if actual_sha256 != expected_sha256 {
-            return Err(SonarFfiError::InvalidInput(format!(
-                "sticker image sha256 mismatch: expected {expected_sha256}, got {actual_sha256}"
-            )));
-        }
-        Ok(bytes)
+        self.runtime
+            .block_on(self.client.fetch_sticker_image(&url, &expected_sha256))
+            .map_err(Into::into)
     }
 
     pub fn fetch_installed_packs(&self) -> FfiResult<Vec<String>> {

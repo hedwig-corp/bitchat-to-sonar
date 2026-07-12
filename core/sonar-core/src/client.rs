@@ -19,8 +19,9 @@ use nostr_sdk::{Client, RelayPoolNotification, RelayStatus};
 use serde::{Deserialize, Serialize};
 
 use sonar_stickers::{
-    build_installed_packs_tags, parse_installed_pack_list, parse_pack_event, InstalledPackList,
-    PackAddress, StickerPack, StickerRef, STICKER_PACK_KIND, USER_STICKER_PACKS_KIND,
+    build_installed_packs_tags, parse_installed_pack_list, parse_pack_event, sha256_hex,
+    validate_sha256_hex, InstalledPackList, PackAddress, StickerPack, StickerRef,
+    STICKER_PACK_KIND, USER_STICKER_PACKS_KIND,
 };
 
 use crate::conversation_index::{
@@ -38,6 +39,9 @@ use crate::push::{push_token_cache_path_for_db, wipe_push_token_cache_for_db, Pu
 use crate::sonar_descriptor::{
     descriptor_d_tags, descriptor_events, descriptor_tags, parse_descriptor_event, SonarDescriptor,
     SONAR_DESCRIPTOR_KIND, SONAR_META_DESCRIPTOR_D_TAG,
+};
+use crate::sticker_cache::{
+    read_sticker_cache, sticker_cache_dir_for_db, wipe_sticker_cache_for_db, write_sticker_cache,
 };
 use crate::{Error, Result};
 
@@ -799,6 +803,8 @@ pub struct SonarClient {
     push_token_cache: PushTokenCache,
     /// Durable path for cached member push tokens (None for in-memory tests).
     push_token_cache_path: Option<PathBuf>,
+    /// Directory for content-addressed sticker image bytes (None for in-memory tests).
+    sticker_cache_dir: Option<PathBuf>,
     /// This device's own push registration (set after `register_push_token`).
     own_push_registration: Arc<Mutex<Option<crate::push::OwnPushRegistration>>>,
 }
@@ -836,6 +842,7 @@ impl SonarClient {
             Some(outbox_state_path_for_db(db_path)),
             Some(invite_link_state_path_for_db(db_path)),
             Some(push_token_cache_path_for_db(db_path)),
+            Some(sticker_cache_dir_for_db(db_path)),
             index.map(|idx| Arc::new(Mutex::new(idx))),
         )
         .await?;
@@ -848,7 +855,7 @@ impl SonarClient {
     pub async fn connect_in_memory(identity: Identity, relays: Vec<RelayUrl>) -> Result<Self> {
         let engine = MarmotEngine::in_memory(identity.clone());
         Self::with_engine(
-            identity, relays, engine, false, None, None, None, None, None,
+            identity, relays, engine, false, None, None, None, None, None, None,
         )
         .await
     }
@@ -862,6 +869,7 @@ impl SonarClient {
         outbox_state_path: Option<PathBuf>,
         invite_link_state_path: Option<PathBuf>,
         push_token_cache_path: Option<PathBuf>,
+        sticker_cache_dir: Option<PathBuf>,
         conversation_index: Option<Arc<Mutex<ConversationIndex>>>,
     ) -> Result<Self> {
         let boot_start = std::time::Instant::now();
@@ -1226,6 +1234,7 @@ impl SonarClient {
             )),
             push_token_cache,
             push_token_cache_path,
+            sticker_cache_dir,
             own_push_registration: Arc::new(Mutex::new(None)),
         };
         // Open the live Marmot subscriptions for real sessions. In-memory test
@@ -2058,6 +2067,58 @@ impl SonarClient {
         parse_pack_event(&event).map_err(|e| Error::Http(format!("invalid sticker pack: {e}")))
     }
 
+    /// Download a public sticker image (HTTPS), verify SHA256, and persist to the
+    /// content-addressed disk cache when configured.
+    pub async fn fetch_sticker_image(&self, url: &str, expected_sha256: &str) -> Result<Vec<u8>> {
+        let expected = expected_sha256.to_ascii_lowercase();
+        validate_sha256_hex(&expected)
+            .map_err(|e| Error::Http(format!("bad sticker sha256: {e}")))?;
+        if let Ok(Some(cached)) = read_sticker_cache(self.sticker_cache_dir.as_deref(), &expected) {
+            return Ok(cached);
+        }
+        if !url.starts_with("https://") {
+            return Err(Error::Http("sticker URL must be HTTPS".into()));
+        }
+        let bytes = http_get_public(url).await?;
+        let actual = sha256_hex(&bytes);
+        if actual != expected {
+            return Err(Error::Http(format!(
+                "sticker image sha256 mismatch: expected {expected}, got {actual}"
+            )));
+        }
+        let _ = write_sticker_cache(self.sticker_cache_dir.as_deref(), &expected, &bytes);
+        Ok(bytes)
+    }
+
+    /// Best-effort prefetch of all sticker images in a pack after install.
+    async fn prefetch_sticker_pack_images(&self, coordinate: &str) {
+        let address = match PackAddress::parse(coordinate) {
+            Ok(a) => a,
+            Err(err) => {
+                tracing::debug!(%err, coordinate, "sticker prefetch: bad coordinate");
+                return;
+            }
+        };
+        let pack = match self
+            .fetch_sticker_pack(&address.author_pubkey_hex, &address.identifier, &[])
+            .await
+        {
+            Ok(p) => p,
+            Err(err) => {
+                tracing::debug!(%err, coordinate, "sticker prefetch: pack fetch failed");
+                return;
+            }
+        };
+        for sticker in &pack.stickers {
+            if let Err(err) = self
+                .fetch_sticker_image(&sticker.url, &sticker.sha256)
+                .await
+            {
+                tracing::debug!(%err, url = %sticker.url, "sticker prefetch: image failed");
+            }
+        }
+    }
+
     pub async fn fetch_installed_packs(&self) -> Result<Vec<PackAddress>> {
         let filter = Filter::new()
             .kind(Kind::Custom(USER_STICKER_PACKS_KIND))
@@ -2094,7 +2155,9 @@ impl SonarClient {
         if !packs.iter().any(|p| p.coordinate() == address.coordinate()) {
             packs.push(address);
         }
-        self.publish_installed_packs(packs).await
+        self.publish_installed_packs(packs).await?;
+        self.prefetch_sticker_pack_images(coordinate).await;
+        Ok(())
     }
 
     pub async fn uninstall_sticker_pack(&self, coordinate: &str) -> Result<()> {
@@ -4075,9 +4138,11 @@ impl SonarClient {
         let db_result = MarmotEngine::wipe(db_path);
         let index_result = wipe_index_for_db(db_path);
         let push_result = wipe_push_token_cache_for_db(db_path);
+        let sticker_result = wipe_sticker_cache_for_db(db_path);
         db_result?;
         index_result?;
-        push_result
+        push_result?;
+        sticker_result
     }
 
     /// MIP-05: encrypt a device push token to the transponder's public key.
