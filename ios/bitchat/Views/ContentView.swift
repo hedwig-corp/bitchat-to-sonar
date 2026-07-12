@@ -434,17 +434,6 @@ struct ContentView: View {
                                     isTextFieldFocused = true
                                 }
                             }
-                            .contextMenu {
-                                Button("content.message.copy") {
-                                    #if os(iOS)
-                                    UIPasteboard.general.string = message.content
-                                    #else
-                                    let pb = NSPasteboard.general
-                                    pb.clearContents()
-                                    pb.setString(message.content, forType: .string)
-                                    #endif
-                                }
-                            }
                             .padding(.horizontal, 12)
                             .padding(.vertical, 1)
                     }
@@ -1635,6 +1624,7 @@ private extension ContentView {
         Text(viewModel.formatMessageAsText(message, colorScheme: colorScheme))
             .fixedSize(horizontal: false, vertical: true)
             .frame(maxWidth: .infinity, alignment: .leading)
+            .textSelection(.enabled)
     }
 
     @ViewBuilder
