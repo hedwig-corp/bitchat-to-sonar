@@ -204,8 +204,8 @@ android {
         applicationId = "chat.bitchat.sonar"
         minSdk = libs.versions.android.minSdk.get().toInt()
         targetSdk = libs.versions.android.targetSdk.get().toInt()
-        versionCode = 6
-        versionName = "0.1-alpha.6"
+        versionCode = 7
+        versionName = "0.1-alpha.7"
         buildConfigField("String", "BREEZ_API_KEY", "\"$breezApiKey\"")
         val lp = Properties().apply {
             val f = rootProject.file("local.properties")

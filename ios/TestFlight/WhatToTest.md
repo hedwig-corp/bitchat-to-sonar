@@ -1,6 +1,6 @@
 # TestFlight — What to Test
 
-Build: **Sonar 1.6.0 (21)** · release tag **v0.1-alpha.6**
+Build: **Sonar 1.7.0 (22)** · release tag **v0.1-alpha.7**
 
 This build is a cross-platform alpha cut after the Signal-grade conversation
 work, multi-photo media, Android↔iOS parity batch, and a pile of sync/crash
