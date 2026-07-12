@@ -405,6 +405,19 @@ struct SNDMRow: Identifiable {
     var marmotGroupId: String? = nil
 }
 
+/// Stable home ordering shared by the live list and the regression smoke
+/// suite. A newly received message moves only its cryptographic conversation;
+/// equal timestamps retain deterministic title ordering across restarts.
+func snSortDMRowsByRecency(_ rows: [SNDMRow]) -> [SNDMRow] {
+    rows.sorted {
+        let lhs = $0.lastDate ?? .distantPast
+        let rhs = $1.lastDate ?? .distantPast
+        return lhs == rhs
+            ? $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
+            : lhs > rhs
+    }
+}
+
 /// A local contact that can be invited into a Marmot group.
 struct SNGroupContact: Identifiable, Hashable {
     let id: String          // npub, so duplicates across radar/messages collapse.
@@ -3273,11 +3286,7 @@ final class SonarAppStore: ObservableObject {
             )
         }
         let rows = Array(byKey.values) + pendingRows + pendingGroupRows + marmotRows
-        return rows.sorted {
-            let l = $0.lastDate ?? .distantPast
-            let r = $1.lastDate ?? .distantPast
-            return l == r ? $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending : l > r
-        }
+        return snSortDMRowsByRecency(rows)
     }
 
     private func meshRow(peerID: PeerID, last: BitchatMessage?) -> SNDMRow {

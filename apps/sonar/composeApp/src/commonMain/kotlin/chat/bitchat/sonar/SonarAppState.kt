@@ -143,6 +143,21 @@ internal fun peerNpubHexMatchesLinkedPeer(
     linkedPeerNpubHex: String?,
 ): Boolean = linkedPeerNpubHex?.equals(groupCounterpartyNpubHex, ignoreCase = true) == true
 
+/** Resolve an incoming Nostr sender through cryptographic links only. Live
+ * announces win, then the restart-persisted link is used. Display names never
+ * participate, so two contacts called Vincenzo/Sara cannot absorb each other's
+ * messages when profiles or BLE aliases refresh. */
+internal fun resolvePeerIdForNpubHex(
+    senderNpubHex: String,
+    livePeerIds: Iterable<String>,
+    liveNpubHexForPeer: (String) -> String?,
+    persistedNpubHexByPeer: Map<String, String>,
+): String? = livePeerIds.firstOrNull { peerId ->
+    liveNpubHexForPeer(peerId)?.equals(senderNpubHex, ignoreCase = true) == true
+} ?: persistedNpubHexByPeer.entries.firstOrNull { (_, npubHex) ->
+    npubHex.equals(senderNpubHex, ignoreCase = true)
+}?.key
+
 internal fun directMarmotPeerKey(chat: SonarChat, ownNpub: String): String? {
     val mine = canonicalProfileKey(ownNpub)
     val others = chat.members
@@ -5295,8 +5310,12 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private fun peerIdForNpubHex(npubHex: String): String? =
-        sonarPeerProfiles.entries.firstOrNull { (_, ann) -> ann.npub.toHexLower().equals(npubHex, ignoreCase = true) }?.key
-            ?: linkByFp.entries.firstOrNull { it.value.equals(npubHex, ignoreCase = true) }?.key
+        resolvePeerIdForNpubHex(
+            senderNpubHex = npubHex,
+            livePeerIds = sonarPeerProfiles.keys,
+            liveNpubHexForPeer = { peerId -> sonarPeerProfiles[peerId]?.npub?.toHexLower() },
+            persistedNpubHexByPeer = linkByFp,
+        )
 
     private fun peerIdForMarmotGroup(groupId: String): String? {
         val group = chats.firstOrNull { it.id == groupId }
