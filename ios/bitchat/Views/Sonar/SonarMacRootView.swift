@@ -514,6 +514,7 @@ private struct MacConversationPane: View {
     @State private var selectedAddNpubs: Set<String> = []
     @State private var importMedia = false
     @State private var importFile = false
+    @State private var fileDropTargeted = false
     @State private var authorSheet: SonarAppStore.SNChannelAuthor?
     @State private var toast: String?
     @State private var previewPackCoordinate: String?
@@ -548,6 +549,15 @@ private struct MacConversationPane: View {
             composer
         }
         .background(SonarTheme.bg.ignoresSafeArea())
+        .overlay {
+            if fileDropTargeted {
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .strokeBorder(SonarTheme.accent, style: StrokeStyle(lineWidth: 2, dash: [8, 6]))
+                    .background(SonarTheme.accentSoft.opacity(0.18))
+                    .padding(8)
+                    .allowsHitTesting(false)
+            }
+        }
         .overlay {
             if let coord = previewPackCoordinate {
                 StickerPackPreviewSheet(
@@ -645,6 +655,13 @@ private struct MacConversationPane: View {
             allowsMultipleSelection: true
         ) { result in
             importAttachments(result)
+        }
+        .dropDestination(for: URL.self) { urls, _ in
+            guard !isChannel, store.canSendMedia(id), !urls.isEmpty else { return false }
+            importAttachments(.success(urls))
+            return true
+        } isTargeted: { targeted in
+            fileDropTargeted = targeted && !isChannel && store.canSendMedia(id)
         }
         .onChange(of: addPeopleSheet) { open in
             if !open {

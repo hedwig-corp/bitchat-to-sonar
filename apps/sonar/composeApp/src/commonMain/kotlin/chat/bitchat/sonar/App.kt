@@ -927,8 +927,30 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     // Transport the NEXT message will take (drives header + composer + send button).
     val sendOverMesh = isMeshRoute && inRange
     val transport = if (sendOverMesh) "Bluetooth" else "internet"
+    val attachmentLimit = if (sendOverMesh) {
+        MAX_MESH_ATTACHMENT_BYTES
+    } else {
+        MAX_INTERNET_ATTACHMENT_BYTES
+    }
 
-    Box(Modifier.fillMaxSize()) {
+    Box(
+        Modifier.fillMaxSize().fileDropTarget(
+            enabled = state.canSendMedia(screen.id),
+            maxBytes = attachmentLimit,
+        ) { dropped ->
+            if ((state.screen as? Screen.Chat)?.id != screen.id) return@fileDropTarget
+            dropped.files.forEach { file ->
+                state.sendImage(screen.id, file.bytes, file.filename, file.mime)
+            }
+            if (dropped.rejectedCount > 0) {
+                state.toast = if (dropped.files.isEmpty()) {
+                    "Couldn't attach that file."
+                } else {
+                    "Some files couldn't be attached."
+                }
+            }
+        }
+    ) {
     Column(Modifier.fillMaxSize()) {
         // bc-header.hl (DM, screens.jsx NavHeader): back · avatar 36 (+presence) ·
         // name 17/700 + shield · lock + "Nearby · Bluetooth"/"Via internet" ·
