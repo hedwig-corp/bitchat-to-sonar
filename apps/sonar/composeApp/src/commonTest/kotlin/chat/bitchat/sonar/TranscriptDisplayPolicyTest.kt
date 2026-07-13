@@ -214,11 +214,25 @@ class TranscriptDisplayPolicyTest {
     }
 
     @Test
-    fun olderIdenticalRowDoesNotConsumeNewEcho() {
+    fun priorIdenticalRowWithinFormerSlackDoesNotConsumeNewEcho() {
         val echo = message("echo-1", 100, "hello", mine = true, viaInternet = true, state = "Sending")
-        val older = message("event-old", 94, "hello", mine = true, viaInternet = true)
+        val older = message("event-old", 99, "hello", mine = true, viaInternet = true)
 
         assertTrue(fulfilledSendEchoIds(listOf(echo), listOf(older)).isEmpty())
+    }
+
+    @Test
+    fun priorSameSecondIdenticalRowDoesNotConsumeNewEcho() {
+        val echo = message("echo-1", 100, "hello", mine = true, viaInternet = true, state = "Sending")
+        val earlier = message("event-earlier", 100, "hello", mine = true, viaInternet = true)
+
+        assertTrue(
+            fulfilledSendEchoIds(
+                echoes = listOf(echo),
+                published = listOf(earlier),
+                excludedPublishedIdsByEcho = mapOf(echo.id to setOf(earlier.id)),
+            ).isEmpty(),
+        )
     }
 
     @Test

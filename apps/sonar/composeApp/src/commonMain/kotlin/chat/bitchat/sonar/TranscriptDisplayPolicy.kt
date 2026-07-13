@@ -5,7 +5,6 @@ internal const val TRANSCRIPT_PAGE_FETCH_SIZE = TRANSCRIPT_PAGE_SIZE + 1
 internal const val TRANSCRIPT_RETAINED_ROWS = 500
 internal const val TRANSCRIPT_PREVIEW_GRAPHEMES = 512
 internal const val TRANSCRIPT_PREVIEW_NEWLINES = 15
-internal const val SEND_ECHO_MATCH_SLACK_SECS = 5L
 
 internal data class TranscriptPreview(
     val text: String,
@@ -133,25 +132,30 @@ internal fun visibleTranscriptPage(
  * The core writes the canonical row before `send` returns, so it commonly has
  * the same whole-second timestamp as the echo. First-chat setup can also delay
  * that row well beyond 30 seconds. Only reject canonical rows that are clearly
- * older than the echo; the small backwards slack mirrors iOS and accounts for
- * whole-second timestamps plus minor clock skew.
+ * older than the echo. Compose and the Rust core read whole epoch seconds from
+ * the same device clock, so a row from this send can share the echo's second or
+ * follow it, but cannot legitimately predate it. That lower bound prevents a
+ * recent identical send from consuming the new echo before its canonical row
+ * exists. Callers also exclude matching canonical rows that were already
+ * visible when an echo was created: same-second timestamps alone cannot
+ * distinguish an earlier identical send from the new one.
  */
 internal fun fulfilledSendEchoIds(
     echoes: List<SonarMsg>,
     published: List<SonarMsg>,
-    matchSlackSecs: Long = SEND_ECHO_MATCH_SLACK_SECS,
+    excludedPublishedIdsByEcho: Map<String, Set<String>> = emptyMap(),
 ): Set<String> {
     val fulfilled = mutableSetOf<String>()
     val consumedPublished = mutableSetOf<String>()
     val ownPublished = published.filter { it.mine }.groupBy { it.content }
     for (echo in echoes) {
         if (echo.state == "Couldn't send") continue
-        val earliestMatch = echo.tsSecs - matchSlackSecs.coerceAtLeast(0L)
         val match = ownPublished[echo.content]
             ?.firstOrNull {
                 it.id !in consumedPublished &&
+                    it.id !in excludedPublishedIdsByEcho[echo.id].orEmpty() &&
                     it.viaInternet == echo.viaInternet &&
-                    it.tsSecs >= earliestMatch
+                    it.tsSecs >= echo.tsSecs
             }
         if (match != null) {
             fulfilled.add(echo.id)
