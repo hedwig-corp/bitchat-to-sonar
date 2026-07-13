@@ -57,6 +57,32 @@ enum class BleDiscoveryMode {
     KnownOnly,
 }
 
+internal enum class BleScanRestartReason(val logValue: String) {
+    NoCallbacks("no_callbacks"),
+    RepeatingKnownWithoutUsableLink("no_new_address_no_link"),
+}
+
+/**
+ * Decide whether Android's BLE scan needs recovery without confusing repeated
+ * advertisements from a connected peer with scanner starvation.
+ */
+internal fun bleScanRestartReason(
+    nowMs: Long,
+    lastCallbackMs: Long,
+    lastNewDiscoveryMs: Long,
+    lastScanStartMs: Long,
+    hasUsableLink: Boolean,
+    staleMs: Long,
+    gapMs: Long,
+): BleScanRestartReason? {
+    if (nowMs - lastScanStartMs < gapMs) return null
+    if (nowMs - lastCallbackMs >= staleMs) return BleScanRestartReason.NoCallbacks
+    if (nowMs - lastNewDiscoveryMs >= staleMs && !hasUsableLink) {
+        return BleScanRestartReason.RepeatingKnownWithoutUsableLink
+    }
+    return null
+}
+
 /**
  * The BLE mesh radio: scans for and advertises the bitchat mesh service so
  * nearby Sonar/bitchat phones discover each other over Bluetooth. This is the
