@@ -4,6 +4,18 @@ The complete design handoff bundle lives in `design/handoff/`. It is **vendored*
 (checked in) so agents read it from disk instead of re-fetching every time.
 
 - **Source share:** https://api.anthropic.com/v1/design/h/UQethAMsRlMNd4xMzNISTA?open_file=Sonar+Prototype.html (Claude Design / claude.ai/design)
+- **Blog refresh (2026-07-14)** — Claude Design project
+  `c6936a45-1fde-470e-9d0b-56b04428e60b`
+  ([open](https://claude.ai/design/p/c6936a45-1fde-470e-9d0b-56b04428e60b?file=Sonar+Blog.html)):
+  ADDS the blog. New files vendored here: `project/Sonar Blog.html` (list view
+  with kicker + featured post + 3-col grid, hash-routed article view with the
+  same tiny markdown renderer as Docs, per-category glyphs/colors — Policy gold,
+  Design indigo, default cyan — article CTA card and "More from the blog") and
+  `project/sonar/blog-content.js` (three sample posts; kept as reference only).
+  Implemented in the marketing site at `web/src/routes/blog/` reusing
+  `$lib/markdown.js`; the site ships with an **empty post list**
+  (`web/src/lib/blog-content.js`) by request — the design's sample posts are not
+  published. A **Blog** link was added to the site Nav.
 - **Docs refresh (2026-07-07)** — Claude Design project
   `c6936a45-1fde-470e-9d0b-56b04428e60b`
   ([open](https://claude.ai/design/p/c6936a45-1fde-470e-9d0b-56b04428e60b?file=Sonar+Docs.html)):
