@@ -1,0 +1,66 @@
+name: Relay smoke test
+
+# Daily Sonar/Marmot relay smoke test. Provisions ephemeral identities, exchanges
+# encrypted DMs over the target relay (nostr.relay.hedwig.sh) and a control set,
+# measures delivery/loss/latency/errors, DMs a report, and opens an issue on
+# failure. See scripts/smoke/relay-smoke.sh and docs/RELAY-SMOKE.md.
+
+on:
+  schedule:
+    - cron: '17 6 * * *'   # daily 06:17 UTC (off the top of the hour)
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: 'RNG seed for the topology (blank = date-based)'
+        required: false
+        default: ''
+      skip_control:
+        description: 'Skip the control relay comparison (1 = target only)'
+        required: false
+        default: '0'
+      identities:
+        description: 'Number of ephemeral identities'
+        required: false
+        default: '5'
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+
+      - name: Build sonar-cli
+        working-directory: core
+        run: cargo build -p sonar-cli --release
+
+      - name: Run relay smoke test
+        env:
+          SONAR_CLI: ${{ github.workspace }}/core/target/release/sonar-cli
+          SEED: ${{ github.event.inputs.seed }}
+          SKIP_CONTROL: ${{ github.event.inputs.skip_control }}
+          IDENTITIES: ${{ github.event.inputs.identities }}
+          SONAR_SMOKE_REPORTER_NSEC: ${{ secrets.SONAR_SMOKE_REPORTER_NSEC }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPO: ${{ github.repository }}
+          OPEN_ISSUES: '1'
+          METRICS_JSON: ${{ runner.temp }}/metrics.json
+        run: scripts/smoke/relay-smoke.sh
+
+      - name: Upload metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: relay-smoke-metrics
+          path: ${{ runner.temp }}/metrics.json
+          if-no-files-found: ignore

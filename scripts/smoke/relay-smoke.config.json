@@ -1,0 +1,21 @@
+{
+  "target_relay": "wss://nostr.relay.hedwig.sh",
+  "control_relays": [
+    "wss://relay.damus.io",
+    "wss://nos.lol",
+    "wss://relay.primal.net"
+  ],
+  "skip_control": 0,
+  "identities": 5,
+  "fanout": 2,
+  "messages_per_pair": 2,
+  "receive_timeout_secs": 20,
+  "thresholds": {
+    "max_loss_pct": 0,
+    "max_p95_latency_ms": 5000,
+    "max_errors": 0
+  },
+  "report": {
+    "npub": "npub10srglj0rdsmtehwlflxptwz74c955c2y7jrhdmjm5gr6gycpsp5sg3fm3c"
+  }
+}
