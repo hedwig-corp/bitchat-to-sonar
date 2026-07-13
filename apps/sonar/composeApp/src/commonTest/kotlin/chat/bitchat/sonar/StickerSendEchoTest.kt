@@ -4,6 +4,7 @@ import chat.bitchat.sonar.screens.filterCachedStickerPacksByInstalledCoordinates
 import chat.bitchat.sonar.screens.mergeRefreshedStickerPacks
 import chat.bitchat.sonar.screens.shouldPreserveCachedStickerPacks
 import kotlin.test.Test
+import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 

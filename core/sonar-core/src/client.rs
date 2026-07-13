@@ -112,6 +112,7 @@ fn media_download_cancelled(observer: Option<&dyn MediaDownloadObserver>) -> boo
     observer.is_some_and(MediaDownloadObserver::is_cancelled)
 }
 
+#[cfg(test)]
 async fn http_get(url: &str, observer: Option<&dyn MediaDownloadObserver>) -> Result<Vec<u8>> {
     http_get_with_limit_observer(url, MAX_MEDIA_DOWNLOAD_BYTES, observer).await
 }
