@@ -621,8 +621,7 @@ final class MarmotChatModel: ObservableObject {
         }
         if await ensureRelayConnected() {
             do {
-                try await service.syncForce()
-                try? await service.retryOutbox()
+                try await service.syncOnce()
                 self.errorText = nil
             } catch {
                 self.errorText = Self.describe(error)

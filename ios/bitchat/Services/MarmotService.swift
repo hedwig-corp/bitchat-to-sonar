@@ -737,11 +737,6 @@ final class MarmotService: @unchecked Sendable {
         try await run { try $0.requireNode().syncForce() }
     }
 
-    /// Retry Marmot outbox publishes (pending/failed) after relay reconnect.
-    func retryOutbox() async throws {
-        try await run { try $0.requireNode().retryOutbox() }
-    }
-
     /// Re-subscribe with current watermark + group set to self-heal after
     /// relay disconnects. May perform one bounded chat repair fetch; keep this
     /// on the service work queue and never await it before local chat paint.
