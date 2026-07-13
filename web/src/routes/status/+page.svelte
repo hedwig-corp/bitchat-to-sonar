@@ -65,7 +65,7 @@
 			? ''
 			: worst === 'down'
 				? 'One or more services are unavailable · '
-				: 'Voice & video calls are recovering · ';
+				: 'Some services are degraded · ';
 
 	/**
 	 * @param {StatusService} s
@@ -204,8 +204,9 @@
 
 	function refreshUpdatedLabel() {
 		const now = new Date().toUTCString().replace('GMT', 'UTC');
+		// v1 does not verify schnorr — say "status feed", not "signed feed".
 		if (dataSource === 'nostr') {
-			updatedLabel = `signed feed · updated ${now}`;
+			updatedLabel = `status feed · updated ${now}`;
 		} else {
 			updatedLabel = `seed data · page loaded ${now}`;
 		}
