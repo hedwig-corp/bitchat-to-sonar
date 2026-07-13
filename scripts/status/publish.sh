@@ -48,6 +48,13 @@ if [[ -n "${SONAR_STATUS_PROBE_NSEC_FILE:-}" ]]; then
   args+=(--probe-nsec-file "$SONAR_STATUS_PROBE_NSEC_FILE")
 fi
 
+if [[ "${SONAR_STATUS_STICKER_PROBE:-}" == "1" || "${SONAR_STATUS_STICKER_PROBE:-}" == "true" ]]; then
+  args+=(--sticker-probe)
+fi
+if [[ "${SONAR_STATUS_MEDIA_PROBE:-}" == "1" || "${SONAR_STATUS_MEDIA_PROBE:-}" == "true" ]]; then
+  args+=(--media-probe)
+fi
+
 if [[ "${1:-}" == "--dry-run" ]]; then
   args+=(--dry-run)
 fi

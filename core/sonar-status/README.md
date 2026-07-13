@@ -93,3 +93,17 @@ export SONAR_STATUS_CHAT_PROBE=1
 ```
 
 Publishes service `id: "dm"` when the KeyPackage publish+fetch succeeds.
+
+### Sticker pack directory probe
+
+REQs kind 30031 on bootstrap relays, counts visible sticker packs. No nsec needed.
+
+### Blossom media probe
+
+HTTP HEADs the Blossom server to verify reachability and measure latency. No nsec needed.
+
+```bash
+export SONAR_STATUS_STICKER_PROBE=1
+export SONAR_STATUS_MEDIA_PROBE=1
+./scripts/status/publish.sh
+```
