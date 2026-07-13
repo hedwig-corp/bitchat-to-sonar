@@ -6,6 +6,6 @@ import androidx.compose.ui.Modifier
 @Composable
 internal actual fun Modifier.fileDropTarget(
     enabled: Boolean,
-    maxBytes: Long,
+    maxTotalBytes: Long,
     onDropped: (DroppedFiles) -> Unit,
 ): Modifier = this

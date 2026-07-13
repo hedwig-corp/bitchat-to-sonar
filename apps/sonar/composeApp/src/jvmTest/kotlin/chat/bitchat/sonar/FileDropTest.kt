@@ -17,7 +17,7 @@ class FileDropTest {
         val bytes = "desktop drop".encodeToByteArray()
         file.writeBytes(bytes)
 
-        val result = readDroppedFiles(listOf(file.toUri().toString()), maxBytes = 1024)
+        val result = readDroppedFiles(listOf(file.toUri().toString()), maxTotalBytes = 1024)
 
         assertEquals(0, result.rejectedCount)
         assertEquals("hello world.txt", result.files.single().filename)
@@ -33,10 +33,37 @@ class FileDropTest {
 
         val result = readDroppedFiles(
             listOf(oversized.toUri().toString(), dir.toUri().toString()),
-            maxBytes = 4,
+            maxTotalBytes = 4,
         )
 
         assertTrue(result.files.isEmpty())
         assertEquals(2, result.rejectedCount)
+    }
+
+    @Test
+    fun rejectsNonFileUris() {
+        val result = readDroppedFiles(
+            listOf("https://example.com/attachment.txt", "not a uri"),
+            maxTotalBytes = 1024,
+        )
+
+        assertTrue(result.files.isEmpty())
+        assertEquals(2, result.rejectedCount)
+    }
+
+    @Test
+    fun boundsFileCountAndAggregateBytes() {
+        val dir = Files.createTempDirectory("sonar-drop-test")
+        val uris = (0..MAX_DROPPED_FILES).map { index ->
+            dir.resolve("$index.bin").createFile().also {
+                it.writeBytes(ByteArray(2) { index.toByte() })
+            }.toUri().toString()
+        }
+
+        val result = readDroppedFiles(uris, maxTotalBytes = 5)
+
+        assertEquals(2, result.files.size)
+        assertEquals(uris.size - result.files.size, result.rejectedCount)
+        assertTrue(result.files.sumOf { it.bytes.size } <= 5)
     }
 }

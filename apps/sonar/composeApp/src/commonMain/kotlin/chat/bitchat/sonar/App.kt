@@ -936,7 +936,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     Box(
         Modifier.fillMaxSize().fileDropTarget(
             enabled = state.canSendMedia(screen.id),
-            maxBytes = attachmentLimit,
+            maxTotalBytes = attachmentLimit,
         ) { dropped ->
             if ((state.screen as? Screen.Chat)?.id != screen.id) return@fileDropTarget
             dropped.files.forEach { file ->

@@ -496,6 +496,95 @@ private enum MacConversationMode: Hashable {
     case dm(String)
 }
 
+private let macMaxDroppedAttachments = 10
+
+private struct MacImportedAttachment: Sendable {
+    let data: Data
+    let filename: String
+    let mime: String
+}
+
+private struct MacAttachmentImportResult: Sendable {
+    let attachments: [MacImportedAttachment]
+    let rejectedCount: Int
+    let oversizedCount: Int
+}
+
+private enum MacAttachmentReadResult: Sendable {
+    case attachment(MacImportedAttachment)
+    case tooLarge
+    case unreadable
+}
+
+private func readMacAttachment(_ url: URL, maxBytes: Int) -> MacAttachmentReadResult {
+    guard url.isFileURL, maxBytes > 0 else { return .unreadable }
+    let scoped = url.startAccessingSecurityScopedResource()
+    defer {
+        if scoped { url.stopAccessingSecurityScopedResource() }
+    }
+
+    let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey, .contentTypeKey])
+    guard values?.isRegularFile == true else { return .unreadable }
+    if let size = values?.fileSize, size > maxBytes { return .tooLarge }
+
+    do {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        let readLimit = min(maxBytes, Int.max - 1) + 1
+        var data = Data()
+        data.reserveCapacity(min(values?.fileSize ?? 0, maxBytes))
+        var remainingRead = readLimit
+        while remainingRead > 0 {
+            guard let chunk = try handle.read(upToCount: min(64 * 1024, remainingRead)),
+                  !chunk.isEmpty else { break }
+            data.append(chunk)
+            remainingRead -= chunk.count
+        }
+        guard data.count <= maxBytes else { return .tooLarge }
+        let filename = url.lastPathComponent.isEmpty ? "attachment" : url.lastPathComponent
+        let mime = values?.contentType?.preferredMIMEType
+            ?? UTType(filenameExtension: url.pathExtension)?.preferredMIMEType
+            ?? "application/octet-stream"
+        return .attachment(MacImportedAttachment(data: data, filename: filename, mime: mime))
+    } catch {
+        return .unreadable
+    }
+}
+
+private func readMacAttachments(_ urls: [URL], maxTotalBytes: Int) -> MacAttachmentImportResult {
+    let fileURLs = urls.filter(\.isFileURL)
+    var rejectedCount = urls.count - fileURLs.count
+    rejectedCount += max(0, fileURLs.count - macMaxDroppedAttachments)
+    guard maxTotalBytes > 0 else {
+        return MacAttachmentImportResult(
+            attachments: [],
+            rejectedCount: rejectedCount + min(fileURLs.count, macMaxDroppedAttachments),
+            oversizedCount: min(fileURLs.count, macMaxDroppedAttachments)
+        )
+    }
+
+    var attachments: [MacImportedAttachment] = []
+    var oversizedCount = 0
+    var remainingBytes = maxTotalBytes
+    for url in fileURLs.prefix(macMaxDroppedAttachments) {
+        switch readMacAttachment(url, maxBytes: remainingBytes) {
+        case .attachment(let attachment):
+            attachments.append(attachment)
+            remainingBytes -= attachment.data.count
+        case .tooLarge:
+            rejectedCount += 1
+            oversizedCount += 1
+        case .unreadable:
+            rejectedCount += 1
+        }
+    }
+    return MacAttachmentImportResult(
+        attachments: attachments,
+        rejectedCount: rejectedCount,
+        oversizedCount: oversizedCount
+    )
+}
+
 private struct MacConversationPane: View {
     @EnvironmentObject private var store: SonarAppStore
     let mode: MacConversationMode
@@ -515,6 +604,7 @@ private struct MacConversationPane: View {
     @State private var importMedia = false
     @State private var importFile = false
     @State private var fileDropTargeted = false
+    @State private var attachmentImportGeneration = 0
     @State private var authorSheet: SonarAppStore.SNChannelAuthor?
     @State private var toast: String?
     @State private var previewPackCoordinate: String?
@@ -657,7 +747,9 @@ private struct MacConversationPane: View {
             importAttachments(result)
         }
         .dropDestination(for: URL.self) { urls, _ in
-            guard !isChannel, store.canSendMedia(id), !urls.isEmpty else { return false }
+            guard !isChannel,
+                  store.canSendMedia(id),
+                  urls.contains(where: \.isFileURL) else { return false }
             importAttachments(.success(urls))
             return true
         } isTargeted: { targeted in
@@ -1022,6 +1114,8 @@ private struct MacConversationPane: View {
     }
 
     private func disappeared() {
+        attachmentImportGeneration += 1
+        fileDropTargeted = false
         if case .dm(let id) = mode {
             store.closedDM(id)
         }
@@ -1051,43 +1145,49 @@ private struct MacConversationPane: View {
     private func importAttachments(_ result: Result<[URL], Error>) {
         switch result {
         case .success(let urls):
-            let imported = urls.reduce(0) { count, url in
-                sendAttachment(from: url) ? count + 1 : count
+            guard urls.contains(where: \.isFileURL) else {
+                showToast("Couldn't attach that file")
+                return
             }
-            if imported > 0 {
-                showToast(imported == 1 ? "Attachment added" : "\(imported) attachments added")
+            attachmentImportGeneration += 1
+            let generation = attachmentImportGeneration
+            let conversationID = id
+            let limit = attachmentLimitBytes
+            Task { @MainActor in
+                let result = await Task.detached(priority: .userInitiated) {
+                    readMacAttachments(urls, maxTotalBytes: limit)
+                }.value
+                guard attachmentImportGeneration == generation,
+                      store.canSendMedia(conversationID) else { return }
+
+                var imported = 0
+                var rejected = result.rejectedCount
+                for attachment in result.attachments {
+                    if store.sendAttachment(
+                        conversationID,
+                        data: attachment.data,
+                        filename: attachment.filename,
+                        mime: attachment.mime
+                    ) {
+                        imported += 1
+                    } else {
+                        rejected += 1
+                    }
+                }
+
+                if imported > 0, rejected > 0 {
+                    showToast("\(imported) attached; some files couldn't be attached")
+                } else if imported > 0 {
+                    showToast(imported == 1 ? "Attachment added" : "\(imported) attachments added")
+                } else if result.oversizedCount > 0 {
+                    showToast("File is too large")
+                } else {
+                    showToast("Couldn't attach that file")
+                }
             }
         case .failure:
             showToast("Couldn't attach that file")
         }
-    }
-
-    private func sendAttachment(from url: URL) -> Bool {
-        let scoped = url.startAccessingSecurityScopedResource()
-        defer {
-            if scoped { url.stopAccessingSecurityScopedResource() }
-        }
-
-        let limit = attachmentLimitBytes
-        if let size = fileSizeBytes(for: url), size > limit {
-            showToast("File is too large")
-            return false
-        }
-
-        guard let data = try? Data(contentsOf: url) else {
-            showToast("Couldn't read \(url.lastPathComponent)")
-            return false
-        }
-        guard data.count <= limit else {
-            showToast("File is too large")
-            return false
-        }
-        return store.sendAttachment(
-            id,
-            data: data,
-            filename: url.lastPathComponent,
-            mime: mimeType(for: url)
-        )
     }
 
     private var attachmentLimitBytes: Int {
@@ -1096,29 +1196,6 @@ private struct MacConversationPane: View {
             : Self.maxInternetAttachmentBytes
     }
 
-    private func fileSizeBytes(for url: URL) -> Int? {
-        if let values = try? url.resourceValues(forKeys: [.fileSizeKey]),
-           let size = values.fileSize {
-            return size
-        }
-        if let size = try? FileManager.default
-            .attributesOfItem(atPath: url.path)[.size] as? NSNumber {
-            return size.intValue
-        }
-        return nil
-    }
-
-    private func mimeType(for url: URL) -> String {
-        if let values = try? url.resourceValues(forKeys: [.contentTypeKey]),
-           let mime = values.contentType?.preferredMIMEType {
-            return mime
-        }
-        if let type = UTType(filenameExtension: url.pathExtension),
-           let mime = type.preferredMIMEType {
-            return mime
-        }
-        return "application/octet-stream"
-    }
 }
 
 private struct MacVerifySheetContent: View {

@@ -16,11 +16,12 @@ internal data class DroppedFiles(
 
 internal const val MAX_INTERNET_ATTACHMENT_BYTES = 25L * 1024L * 1024L
 internal const val MAX_MESH_ATTACHMENT_BYTES = 1L * 1024L * 1024L
+internal const val MAX_DROPPED_FILES = MAX_ALBUM_PHOTOS
 
 /** Desktop file-drop target. Mobile actuals are a no-op. */
 @Composable
 internal expect fun Modifier.fileDropTarget(
     enabled: Boolean,
-    maxBytes: Long,
+    maxTotalBytes: Long,
     onDropped: (DroppedFiles) -> Unit,
 ): Modifier
