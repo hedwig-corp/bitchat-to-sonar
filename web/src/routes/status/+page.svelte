@@ -13,6 +13,7 @@
 	import {
 		SONAR_STATUS_SEED,
 		STATUS_NPUB,
+		mergeStatusPayload,
 		syntheticHistory,
 		worstServiceState
 	} from '$lib/status-data.js';
@@ -220,10 +221,13 @@
 
 		fetchStatusFromNostr().then(({ payload, source }) => {
 			if (!payload || source !== 'nostr') return;
-			services = payload.services;
-			incidents = payload.incidents;
-			if (payload.relays && payload.relays.length > 0) {
-				relays = payload.relays;
+			const merged = mergeStatusPayload(SONAR_STATUS_SEED, payload);
+			const prevRelayKey = relays.map((r) => r.url).join('|');
+			services = merged.services;
+			incidents = merged.incidents;
+			relays = merged.relays;
+			const nextRelayKey = relays.map((r) => r.url).join('|');
+			if (nextRelayKey !== prevRelayKey) {
 				relayRows = relays.map((r) => ({
 					url: r.url,
 					region: r.region,
@@ -318,7 +322,7 @@
 			<span><span class="dot ok"></span>Operational</span>
 			<span><span class="dot warn"></span>Degraded performance</span>
 			<span><span class="dot down"></span>Outage</span>
-			<span class="legend-note">Each bar = 1 day · last 90 days (illustrative until feed history)</span>
+			<span class="legend-note">Each bar = 1 day · last 90 days (illustrative; live state from status feed when configured)</span>
 		</div>
 
 		<h2>
@@ -360,31 +364,35 @@
 			{pingNote}
 		</div>
 		<p class="relay-disclaimer">
-			RTT is WebSocket open latency from <em>your</em> browser to common public relays — not Sonar’s
-			full geohash relay directory.
+			These are Sonar’s client bootstrap relays (iOS + Android defaults). RTT is WebSocket open
+			latency from <em>your</em> browser. Geohash channels use a separate GPS relay directory.
 		</p>
 
 		<h2>Past incidents</h2>
-		{#each incidents as inc, idx (idx)}
-			<div class="inc">
-				<div class="incdate">{inc.date}</div>
-				<div class="inctitle">
-					{inc.title}<span class="itag {inc.level}">{inc.level}</span>
-				</div>
-				{#each inc.updates as u, uidx (uidx)}
-					<div class="upd">
-						<span class="updt">{u.t}</span>
-						<span
-							class="upds"
-							class:ok={u.s === 'Resolved' || u.s === 'Completed'}
-							class:warn={u.s === 'Monitoring' || u.s === 'Identified'}
-							class:down={u.s === 'Investigating'}>{u.s}</span
-						>
-						<span class="updb">{u.b}</span>
+		{#if incidents.length === 0}
+			<p class="empty-incidents">No incidents reported.</p>
+		{:else}
+			{#each incidents as inc, idx (idx)}
+				<div class="inc">
+					<div class="incdate">{inc.date}</div>
+					<div class="inctitle">
+						{inc.title}<span class="itag {inc.level}">{inc.level}</span>
 					</div>
-				{/each}
-			</div>
-		{/each}
+					{#each inc.updates as u, uidx (uidx)}
+						<div class="upd">
+							<span class="updt">{u.t}</span>
+							<span
+								class="upds"
+								class:ok={u.s === 'Resolved' || u.s === 'Completed'}
+								class:warn={u.s === 'Monitoring' || u.s === 'Identified'}
+								class:down={u.s === 'Investigating'}>{u.s}</span
+							>
+							<span class="updb">{u.b}</span>
+						</div>
+					{/each}
+				</div>
+			{/each}
+		{/if}
 	</div>
 
 	<footer>
@@ -781,6 +789,11 @@
 		margin-left: auto;
 	}
 
+	.empty-incidents {
+		font-size: 13.5px;
+		color: var(--text3);
+		margin: 0 0 26px;
+	}
 	.inc {
 		border-left: 2px solid var(--hairline);
 		padding: 2px 0 2px 18px;

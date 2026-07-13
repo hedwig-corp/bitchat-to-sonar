@@ -59,14 +59,16 @@ export const STATUS_NPUB = '<identity npub>';
 
 ## What is probed today
 
-1. **Public Nostr relays** — WebSocket open RTT (same class of check as the
-   browser status page). Reachability drives derived service health for
-   Marmot/DM/groups/media/stickers.
-2. **Optional HTTP URLs** (`--http`) — any GET endpoint you care about
-   (transponder health, Blossom, Pages, etc.) becomes an extra service row.
+1. **Sonar client bootstrap relays** — WebSocket open RTT to the same default
+   set iOS/Android use (`damus`, `nos.lol`, `primal`, `offchain.pub`,
+   `nostr21.com`, `kaleidoswap`, `nostr.relay.hedwig.sh`). Published as service
+   `id: "relays"`.
+2. **Optional HTTP URLs** (`--http` / `SONAR_STATUS_HTTP`) — GET health checks
+   become extra service rows (`id: "http-<host>"`).
 
-Payments/push currently report nominal unless you add HTTP probes; extend
-`derive_services` when dedicated checks exist.
+Application rows (DM, groups, media, push, payments, calls) are **not** mocked.
+They appear only when a dedicated probe exists — see
+[`docs/SONAR-STATUS.md`](../../docs/SONAR-STATUS.md) § "Real service probes".
 
 ## Incident continuity
 
