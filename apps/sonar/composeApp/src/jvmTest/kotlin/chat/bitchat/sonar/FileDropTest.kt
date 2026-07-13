@@ -7,6 +7,7 @@ import kotlin.io.path.writeBytes
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class FileDropTest {
@@ -65,5 +66,30 @@ class FileDropTest {
         assertEquals(2, result.files.size)
         assertEquals(uris.size - result.files.size, result.rejectedCount)
         assertTrue(result.files.sumOf { it.bytes.size } <= 5)
+    }
+
+    @Test
+    fun acceptsDropWhileDirectSecureRouteIsStillStarting() {
+        assertTrue(
+            canPrepareAttachmentRoute(
+                hasMeshRoute = false,
+                hasExistingMarmotRoute = false,
+                hasPendingDirectMarmotRoute = true,
+            )
+        )
+        assertTrue(
+            canPrepareAttachmentRoute(
+                hasMeshRoute = false,
+                hasExistingMarmotRoute = true,
+                hasPendingDirectMarmotRoute = false,
+            )
+        )
+        assertFalse(
+            canPrepareAttachmentRoute(
+                hasMeshRoute = false,
+                hasExistingMarmotRoute = false,
+                hasPendingDirectMarmotRoute = false,
+            )
+        )
     }
 }

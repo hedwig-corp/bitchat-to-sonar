@@ -92,6 +92,21 @@ internal fun <T> CoroutineScope.launchNearbyPeerRefresh(
     }
 }
 
+/** A media drop may wait for a direct White Noise group that chat startup has
+ * already begun creating. This is deliberately separate from send readiness:
+ * it keeps the desktop drop target usable without duplicating group setup. */
+internal fun canPrepareAttachmentRoute(
+    hasMeshRoute: Boolean,
+    hasExistingMarmotRoute: Boolean,
+    hasPendingDirectMarmotRoute: Boolean,
+): Boolean = hasMeshRoute || hasExistingMarmotRoute || hasPendingDirectMarmotRoute
+
+internal sealed interface AttachmentRoutePreparation {
+    data class Ready(val chatId: String) : AttachmentRoutePreparation
+    data object Unavailable : AttachmentRoutePreparation
+    data object Failed : AttachmentRoutePreparation
+}
+
 internal fun shortNpubLabel(value: String): String =
     if (value.length > 16) value.take(10) + "…" + value.takeLast(4) else value
 
@@ -4441,6 +4456,63 @@ class SonarAppState(private val scope: CoroutineScope) {
         mime.startsWith("audio/") -> "Voice note"
         filename.isNotBlank() -> filename
         else -> "File"
+    }
+
+    /** True if [chatId] can carry media now, or is a pending direct secure chat
+     * whose existing setup task can establish the group before the first send. */
+    fun canPrepareMedia(chatId: String): Boolean =
+        !isContactBlocked(chatId) && canPrepareAttachmentRoute(
+            hasMeshRoute = isMeshChat(chatId) && liveMeshRoutePeerId(meshPeerId(chatId)) != null,
+            hasExistingMarmotRoute = resolveMarmotGroupId(chatId) != null,
+            hasPendingDirectMarmotRoute = pendingMarmotNpub(chatId) != null,
+        )
+
+    /** Wait for the local pending-DM setup task rather than racing it with a
+     * second group creation. The caller receives the resolved group id, so the
+     * first dropped file survives the screen's pending-id replacement. */
+    internal suspend fun prepareMediaRoute(chatId: String): AttachmentRoutePreparation {
+        if (isContactBlocked(chatId)) return AttachmentRoutePreparation.Unavailable
+        if (isMeshChat(chatId) && liveMeshRoutePeerId(meshPeerId(chatId)) != null) {
+            return AttachmentRoutePreparation.Ready(chatId)
+        }
+        resolveMarmotGroupId(chatId)?.let { return AttachmentRoutePreparation.Ready(it) }
+
+        val pendingNpub = pendingMarmotNpub(chatId)
+            ?: return AttachmentRoutePreparation.Unavailable
+        pendingMarmotSetupJobs[chatId]?.join()
+        val groupId = canonicalNpubHex(pendingNpub)
+            ?.let { marmotGroupForNpub(it.hexToBytesOrEmpty()) }
+            ?.id
+            ?: return AttachmentRoutePreparation.Failed
+        return AttachmentRoutePreparation.Ready(groupId)
+    }
+
+    /** Import results arrive after desktop file IO. Queue the first dropped
+     * attachment behind the pre-existing direct-chat setup, then send using the
+     * resolved group id rather than the transient pending chat id. */
+    internal fun sendDroppedAttachments(chatId: String, dropped: DroppedFiles) {
+        if (dropped.files.isEmpty()) {
+            toast = "Couldn't attach that file."
+            return
+        }
+        scope.launch {
+            when (val route = prepareMediaRoute(chatId)) {
+                is AttachmentRoutePreparation.Ready -> {
+                    dropped.files.forEach { file ->
+                        sendImage(route.chatId, file.bytes, file.filename, file.mime)
+                    }
+                    if (dropped.rejectedCount > 0) {
+                        toast = "Some files couldn't be attached."
+                    }
+                }
+                AttachmentRoutePreparation.Unavailable -> {
+                    toast = "This contact must be online to receive files."
+                }
+                AttachmentRoutePreparation.Failed -> {
+                    toast = "Couldn't set up a secure file transfer."
+                }
+            }
+        }
     }
 
     /** True if [chatId] can carry media over live BLE mesh or an existing Marmot group. */

@@ -500,6 +500,16 @@ func snAcceptsMacFileDrop(isChannel: Bool, urls: [URL]) -> Bool {
     !isChannel && urls.contains(where: \.isFileURL)
 }
 
+/// A pending secure chat is replaced with its resolved group while the first
+/// attachment may still be reading or awaiting that route. Preserve that one
+/// import; every other disappearance still invalidates its in-flight import.
+func snPreservesMacAttachmentImport(
+    conversationID: String,
+    routeReplacement: SNMarmotRouteReplacement?
+) -> Bool {
+    routeReplacement?.pendingId == conversationID
+}
+
 private let macMaxDroppedAttachments = 10
 
 private struct MacImportedAttachment: Sendable {
@@ -1116,7 +1126,18 @@ private struct MacConversationPane: View {
     }
 
     private func disappeared() {
-        attachmentImportGeneration += 1
+        let preservesImport: Bool
+        if case .dm(let conversationID) = mode {
+            preservesImport = snPreservesMacAttachmentImport(
+                conversationID: conversationID,
+                routeReplacement: store.pendingMarmotRouteReplacement
+            )
+        } else {
+            preservesImport = false
+        }
+        if !preservesImport {
+            attachmentImportGeneration += 1
+        }
         fileDropTargeted = false
         if case .dm(let id) = mode {
             store.closedDM(id)

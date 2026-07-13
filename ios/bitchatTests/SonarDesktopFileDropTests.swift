@@ -43,5 +43,21 @@ struct SonarDesktopFileDropTests {
             resolvedNpub: nil
         ) == .unavailable)
     }
+
+    @Test func preservesFirstImportDuringPendingRouteReplacement() {
+        let replacement = SNMarmotRouteReplacement(
+            pendingId: "pending:npub1peer",
+            realId: "marmot:group"
+        )
+
+        #expect(snPreservesMacAttachmentImport(
+            conversationID: "pending:npub1peer",
+            routeReplacement: replacement
+        ))
+        #expect(!snPreservesMacAttachmentImport(
+            conversationID: "another-chat",
+            routeReplacement: replacement
+        ))
+    }
 }
 #endif
