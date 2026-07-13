@@ -309,6 +309,33 @@ struct SNMarmotRouteFailure: Equatable {
     let nonce = UUID()
 }
 
+enum SNAttachmentRoutePlan: Equatable {
+    case ready
+    case startSecureChat(npub: String)
+    case unavailable
+}
+
+enum SNAttachmentRoutePreparationResult: Equatable {
+    case ready
+    case unavailable
+    case failed
+}
+
+func snAttachmentRoutePlan(
+    hasExistingRoute: Bool,
+    pendingNpub: String?,
+    resolvedNpub: String?
+) -> SNAttachmentRoutePlan {
+    if hasExistingRoute { return .ready }
+    if let pendingNpub, !pendingNpub.isEmpty {
+        return .startSecureChat(npub: pendingNpub)
+    }
+    if let resolvedNpub, !resolvedNpub.isEmpty {
+        return .startSecureChat(npub: resolvedNpub)
+    }
+    return .unavailable
+}
+
 struct SNMessage: Identifiable, Equatable {
     var id: String = UUID().uuidString
     var mine: Bool = false
@@ -4304,6 +4331,51 @@ final class SonarAppStore: ObservableObject {
         if marmotGroupId(id) != nil { return true }
         if let profile = resolvedSonarProfile(id), marmotGroup(forNpub: profile.npub) != nil { return true }
         return meshReachable(id)
+    }
+
+    /// True when media can be sent now or a White Noise route can be created
+    /// for this DM. Unlike `canSendMedia`, this includes a newly discovered
+    /// Sonar peer whose direct group has not been created yet.
+    func canPrepareMedia(_ id: String) -> Bool {
+        snAttachmentRoutePlan(
+            hasExistingRoute: canSendMedia(id),
+            pendingNpub: pendingMarmotNpub(for: id),
+            resolvedNpub: resolvedSonarProfile(id)?.npub
+        ) != .unavailable
+    }
+
+    /// Ensure a route exists before importing desktop-selected media. Text
+    /// sends already create a White Noise DM on first use; file sends must do
+    /// the same instead of silently rejecting the drop.
+    func prepareMediaRoute(_ id: String) async -> SNAttachmentRoutePreparationResult {
+        let plan = snAttachmentRoutePlan(
+            hasExistingRoute: canSendMedia(id),
+            pendingNpub: pendingMarmotNpub(for: id),
+            resolvedNpub: resolvedSonarProfile(id)?.npub
+        )
+        switch plan {
+        case .ready:
+            return .ready
+        case .unavailable:
+            return .unavailable
+        case .startSecureChat(let npub):
+            // A newly opened npub chat starts its setup from `openedDM`. Await
+            // that work rather than racing it and creating a duplicate group.
+            if let setupTask = pendingMarmotSetupTasks[id] {
+                await setupTask.value
+                return canSendMedia(id) ? .ready : .failed
+            }
+
+            marmot.connectIfNeeded()
+            guard let groupId = await marmot.startChatReturningId(with: npub) else {
+                return .failed
+            }
+            rememberMarmotGroup(groupId, forConversationId: id)
+            if resolvedSonarProfile(id) != nil {
+                rememberMarmotGroup(groupId, forConversationId: canonicalPeerKey(PeerID(str: id)))
+            }
+            return .ready
+        }
     }
 
     /// True for a non-geo private peer reachable over the BLE mesh right now.
