@@ -245,4 +245,24 @@ class TranscriptDisplayPolicyTest {
 
         assertEquals(setOf("echo-2"), fulfilledSendEchoIds(echoes, canonical))
     }
+
+    @Test
+    fun clearedNewerEchoReservesItsCanonicalRowForOlderPendingDuplicate() {
+        val older = message("echo-1", 100, "hello", mine = true, viaInternet = true, state = "Sending")
+        val newer = message("echo-2", 101, "hello", mine = true, viaInternet = true, state = "Sending")
+        val canonical = message("event-2", 101, "hello", mine = true, viaInternet = true)
+
+        val succeededCanonicalIds = eligibleCanonicalRowsForSendEcho(newer, listOf(canonical))
+            .map { it.id }
+            .toSet()
+
+        assertEquals(setOf(canonical.id), succeededCanonicalIds)
+        assertTrue(
+            fulfilledSendEchoIds(
+                echoes = listOf(older),
+                published = listOf(canonical),
+                excludedPublishedIdsByEcho = mapOf(older.id to succeededCanonicalIds),
+            ).isEmpty(),
+        )
+    }
 }

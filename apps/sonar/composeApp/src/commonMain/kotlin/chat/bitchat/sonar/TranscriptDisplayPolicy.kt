@@ -126,6 +126,19 @@ internal fun visibleTranscriptPage(
     .take(pageSize.coerceAtLeast(0))
     .sortedWith(compareBy<SonarMsg>({ it.tsSecs }, { it.id }))
 
+/** Canonical rows that could represent [echo], excluding rows known to predate it. */
+internal fun eligibleCanonicalRowsForSendEcho(
+    echo: SonarMsg,
+    published: List<SonarMsg>,
+    excludedPublishedIds: Set<String> = emptySet(),
+): List<SonarMsg> = published.filter {
+    it.id !in excludedPublishedIds &&
+        it.mine &&
+        it.content == echo.content &&
+        it.viaInternet == echo.viaInternet &&
+        it.tsSecs >= echo.tsSecs
+}
+
 /**
  * Match optimistic outgoing echoes to canonical local-storage rows one-for-one.
  *
@@ -152,13 +165,11 @@ internal fun fulfilledSendEchoIds(
     // hide an older send whose result is still unknown.
     for (echo in echoes.asReversed()) {
         if (echo.state == "Couldn't send") continue
-        val match = ownPublished[echo.content]
-            ?.firstOrNull {
-                it.id !in consumedPublished &&
-                    it.id !in excludedPublishedIdsByEcho[echo.id].orEmpty() &&
-                    it.viaInternet == echo.viaInternet &&
-                    it.tsSecs >= echo.tsSecs
-            }
+        val match = eligibleCanonicalRowsForSendEcho(
+            echo = echo,
+            published = ownPublished[echo.content].orEmpty(),
+            excludedPublishedIds = excludedPublishedIdsByEcho[echo.id].orEmpty(),
+        ).firstOrNull { it.id !in consumedPublished }
         if (match != null) {
             fulfilled.add(echo.id)
             consumedPublished.add(match.id)

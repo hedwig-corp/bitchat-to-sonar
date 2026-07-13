@@ -4093,12 +4093,14 @@ class SonarAppState(private val scope: CoroutineScope) {
         scope.launch {
             try {
                 SonarCore.send(chatId, t)
-                clearSendEcho(chatId, echo.id)
                 val refreshGeneration = transcriptGeneration
-                val local = withSendEchoes(
+                val published = mergePendingMediaUploads(
                     chatId,
-                    mergePendingMediaUploads(chatId, marmotMessagesPageForChat(chatId, refreshGeneration)),
+                    marmotMessagesPageForChat(chatId, refreshGeneration),
                 )
+                reserveSuccessfulEchoCanonicalRows(chatId, echo, published)
+                clearSendEcho(chatId, echo.id)
+                val local = withSendEchoes(chatId, published)
                 if (isCurrentTranscriptSession(chatId, refreshGeneration)) {
                     setCurrentVisibleMessages(chatId, local, processCalls = true)
                 }
@@ -4152,6 +4154,38 @@ class SonarAppState(private val scope: CoroutineScope) {
         if ((screen as? Screen.Chat)?.id == chatId) {
             messages = messages.filterNot { it.id == echoId }
         }
+    }
+
+    /**
+     * A successful send's local canonical copy can appear before an older,
+     * identical send completes. Reserve every eligible new row for the older
+     * pending echo so its later failure stays visible instead of being
+     * heuristically fulfilled by this confirmed send.
+     */
+    private fun reserveSuccessfulEchoCanonicalRows(
+        chatId: String,
+        succeededEcho: SonarMsg,
+        published: List<SonarMsg>,
+    ) {
+        val canonicalIds = eligibleCanonicalRowsForSendEcho(
+            echo = succeededEcho,
+            published = published,
+            excludedPublishedIds = previouslyPublishedMessageIdsByEcho[succeededEcho.id].orEmpty(),
+        ).mapTo(mutableSetOf()) { it.id }
+        if (canonicalIds.isEmpty()) return
+
+        pendingSendEchoes[chatId].orEmpty()
+            .asSequence()
+            .filter {
+                it.id != succeededEcho.id &&
+                    it.state == "Sending" &&
+                    it.content == succeededEcho.content &&
+                    it.viaInternet == succeededEcho.viaInternet
+            }
+            .forEach { pendingEcho ->
+                previouslyPublishedMessageIdsByEcho[pendingEcho.id] =
+                    previouslyPublishedMessageIdsByEcho[pendingEcho.id].orEmpty() + canonicalIds
+            }
     }
 
     private fun failSendEcho(chatId: String, echoId: String) {
