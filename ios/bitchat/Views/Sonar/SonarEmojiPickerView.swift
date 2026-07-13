@@ -42,6 +42,27 @@ func snFilterCachedStickerPacks(
     return packs.filter { installed.contains($0.packCoordinate.lowercased()) }
 }
 
+func snMergeRefreshedStickerPacks(
+    cachedPacks: [StickerPackInfo],
+    refreshedPacks: [StickerPackInfo],
+    installedCoordinates: [String]
+) -> [StickerPackInfo] {
+    let cachedByCoordinate = Dictionary(
+        cachedPacks.map { ($0.packCoordinate.lowercased(), $0) },
+        uniquingKeysWith: { first, _ in first }
+    )
+    let refreshedByCoordinate = Dictionary(
+        refreshedPacks.map { ($0.packCoordinate.lowercased(), $0) },
+        uniquingKeysWith: { _, latest in latest }
+    )
+    var added = Set<String>()
+    return installedCoordinates.compactMap { coordinate in
+        let key = coordinate.lowercased()
+        guard added.insert(key).inserted else { return nil }
+        return refreshedByCoordinate[key] ?? cachedByCoordinate[key]
+    }
+}
+
 struct SonarEmojiPickerView: View {
     let onEmoji: (String) -> Void
     let onSticker: (StickerInfo, String) -> Void
@@ -315,8 +336,13 @@ private struct StickerTabContent: View {
                 loaded.append(p)
             }
         }
-        if !loaded.isEmpty {
-            packs = loaded
+        let merged = snMergeRefreshedStickerPacks(
+            cachedPacks: packs,
+            refreshedPacks: loaded,
+            installedCoordinates: coordinates
+        )
+        if !merged.isEmpty {
+            packs = merged
             error = nil
         } else if coordinates.isEmpty {
             packs = []

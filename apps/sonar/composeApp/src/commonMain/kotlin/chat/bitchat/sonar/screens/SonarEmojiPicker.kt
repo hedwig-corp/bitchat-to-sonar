@@ -60,6 +60,20 @@ internal fun filterCachedStickerPacksByInstalledCoordinates(
     return packs.filter { it.packCoordinate.lowercase() in installed }
 }
 
+internal fun mergeRefreshedStickerPacks(
+    cachedPacks: List<SonarStickerPack>,
+    refreshedPacks: List<SonarStickerPack>,
+    installedCoordinates: List<String>,
+): List<SonarStickerPack> {
+    val cachedByCoordinate = cachedPacks.associateBy { it.packCoordinate.lowercase() }
+    val refreshedByCoordinate = refreshedPacks.associateBy { it.packCoordinate.lowercase() }
+    val added = mutableSetOf<String>()
+    return installedCoordinates.mapNotNull { coordinate ->
+        val key = coordinate.lowercase()
+        if (!added.add(key)) null else refreshedByCoordinate[key] ?: cachedByCoordinate[key]
+    }
+}
+
 private enum class PickerTab { Emoji, Gif, Sticker }
 
 private val frequentEmojis = listOf("👍", "❤️", "😂", "🔥", "🙏", "👏", "🎉", "👀", "💯", "⚡")
@@ -418,9 +432,10 @@ private fun ColumnScope.StickerTabContent(
                 ?.takeIf { it.stickers.isNotEmpty() }
                 ?.let { loaded += it }
         }
-        if (loaded.isNotEmpty()) {
-            packs = loaded
-            onStickerPacksLoaded(loaded)
+        val merged = mergeRefreshedStickerPacks(filteredCachedPacks, loaded, coordinates)
+        if (merged.isNotEmpty()) {
+            packs = merged
+            onStickerPacksLoaded(merged)
             error = null
         } else if (coordinates.isEmpty()) {
             packs = emptyList()

@@ -152,6 +152,42 @@ final class MarmotStickerOptimisticTests: XCTestCase {
         )
     }
 
+    func testPartialMetadataRefreshPreservesEachUnrefreshedInstalledPack() {
+        let cachedFirst = StickerPackInfo(
+            packCoordinate: "30031:author:first",
+            title: "Cached first",
+            description: nil,
+            coverUrl: nil,
+            stickers: []
+        )
+        let cachedSecond = StickerPackInfo(
+            packCoordinate: "30031:author:second",
+            title: "Cached second",
+            description: nil,
+            coverUrl: nil,
+            stickers: []
+        )
+        let refreshedFirst = StickerPackInfo(
+            packCoordinate: cachedFirst.packCoordinate,
+            title: "Fresh first",
+            description: nil,
+            coverUrl: nil,
+            stickers: []
+        )
+
+        XCTAssertEqual(
+            snMergeRefreshedStickerPacks(
+                cachedPacks: [cachedFirst, cachedSecond],
+                refreshedPacks: [refreshedFirst],
+                installedCoordinates: [
+                    "30031:AUTHOR:FIRST",
+                    "30031:author:second",
+                ]
+            ),
+            [refreshedFirst, cachedSecond]
+        )
+    }
+
     func testStickerEchoMatchesOnlyTheSameSticker() {
         let createdAt = Date()
         let expectedRef = MarmotService.MarmotStickerRef(

@@ -1,6 +1,7 @@
 package chat.bitchat.sonar
 
 import chat.bitchat.sonar.screens.filterCachedStickerPacksByInstalledCoordinates
+import chat.bitchat.sonar.screens.mergeRefreshedStickerPacks
 import chat.bitchat.sonar.screens.shouldPreserveCachedStickerPacks
 import kotlin.test.Test
 import kotlin.test.assertFalse
@@ -61,6 +62,24 @@ class StickerSendEchoTest {
             filterCachedStickerPacksByInstalledCoordinates(
                 packs = listOf(removed, installed),
                 installedCoordinates = listOf("30031:AUTHOR:INSTALLED"),
+            ),
+        )
+    }
+
+    @Test fun partialMetadataRefreshPreservesEachUnrefreshedInstalledPack() {
+        val cachedFirst = SonarStickerPack("30031:author:first", "Cached first", null, null, emptyList())
+        val cachedSecond = SonarStickerPack("30031:author:second", "Cached second", null, null, emptyList())
+        val refreshedFirst = cachedFirst.copy(title = "Fresh first")
+
+        assertEquals(
+            listOf(refreshedFirst, cachedSecond),
+            mergeRefreshedStickerPacks(
+                cachedPacks = listOf(cachedFirst, cachedSecond),
+                refreshedPacks = listOf(refreshedFirst),
+                installedCoordinates = listOf(
+                    "30031:AUTHOR:FIRST",
+                    "30031:author:second",
+                ),
             ),
         )
     }
