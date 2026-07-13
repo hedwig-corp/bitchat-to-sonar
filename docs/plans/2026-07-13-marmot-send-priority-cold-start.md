@@ -45,3 +45,7 @@ PR #220 device logs showed multi-second (often ~10–20s) send lag after launch 
 ## Status
 - Core P0–P3: `72843b0c`
 - This ship: plan doc + FFI/iOS prefer hook + review
+
+
+## Review fix
+- Hosts pass MLS group id into prefer_catchup_group; core maps MLS to nostr #h id used by the catch-up queue.

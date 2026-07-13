@@ -880,10 +880,11 @@ impl SonarNode {
     /// after relay disconnects. Hosts call this on the idle timeout path
     /// instead of `sync_once()`. It may run one bounded per-chat repair fetch,
     /// so hosts must keep it off the local-first chat-open path.
-    /// Prefer this nostr group id for cold-start historical catch-up (open chat).
-    /// Pass empty string to clear. Does not block local-first paint or send.
-    pub fn prefer_catchup_group(&self, nostr_group_id_hex: String) {
-        let preferred = nostr_group_id_hex.trim();
+    /// Prefer catch-up for the open chat. Pass the MLS group id hex (same id
+    /// hosts use for send_text / messages). Empty clears. Local-first: does not
+    /// block paint or send. Core maps MLS to nostr group id for the catch-up queue.
+    pub fn prefer_catchup_group(&self, mls_group_id_hex: String) {
+        let preferred = mls_group_id_hex.trim();
         if preferred.is_empty() {
             self.client.prefer_catchup_group(None);
         } else {

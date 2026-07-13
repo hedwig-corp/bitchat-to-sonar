@@ -299,6 +299,20 @@ fn take_catchup_entry(
     queue.pop_front()
 }
 
+fn map_mls_hex_to_nostr_hex(
+    mls_hex: &str,
+    pairs: &[(String, String)],
+) -> Option<String> {
+    let clean = mls_hex.trim().to_ascii_lowercase();
+    if clean.is_empty() {
+        return None;
+    }
+    pairs
+        .iter()
+        .find(|(mls, _)| mls == &clean)
+        .map(|(_, nostr)| nostr.clone())
+}
+
 /// Minimum number of relays that must be connected before `connect()` returns.
 /// Modeled after whitenoise-rs `min_connected_relays = 2`. A quorum of 2
 /// means the client can send and fetch immediately; the remaining relays
@@ -2833,11 +2847,35 @@ impl SonarClient {
     /// replacing the heavy `sync()` poll on the idle path. It may also run one
     /// bounded per-chat repair fetch for existing installs, so callers must keep
     /// it on a background/IO queue and never in the local-first chat-open path.
-    /// Tell catch-up to service this nostr group id first (open chat). Empty clears.
-    pub fn prefer_catchup_group(&self, nostr_group_id_hex: Option<String>) {
-        *self.preferred_catchup_group.lock().unwrap() = nostr_group_id_hex
-            .map(|s| s.trim().to_ascii_lowercase())
-            .filter(|s| !s.is_empty());
+    /// Prefer catch-up for the open chat.
+    ///
+    /// Hosts pass the MLS group id hex (same id used by send_text / messages).
+    /// We map it to the public nostr group id used by the catch-up queue (#h tag).
+    /// Unknown/empty clears the preference.
+    pub fn prefer_catchup_group(&self, mls_group_id_hex: Option<String>) {
+        let preferred = match mls_group_id_hex {
+            None => None,
+            Some(raw) => {
+                let clean = raw.trim().to_ascii_lowercase();
+                if clean.is_empty() {
+                    None
+                } else if let Ok(groups) = self.engine.groups() {
+                    groups.into_iter().find_map(|g| {
+                        let mls = hex::encode(g.mls_group_id.as_slice());
+                        if mls == clean {
+                            Some(hex::encode(g.nostr_group_id))
+                        } else {
+                            None
+                        }
+                    })
+                } else {
+                    // Fall back to treating the input as already-nostr hex so
+                    // tests/tools can still target the queue key directly.
+                    Some(clean)
+                }
+            }
+        };
+        *self.preferred_catchup_group.lock().unwrap() = preferred;
     }
 
     pub async fn ensure_subscriptions(&self) -> Result<()> {
@@ -4813,6 +4851,17 @@ mod tests {
             elapsed.as_millis() < 500,
             "policy helpers too slow: {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn map_mls_hex_to_nostr_hex_finds_pair() {
+        let pairs = vec![
+            ("aa".into(), "n1".into()),
+            ("bb".into(), "n2".into()),
+        ];
+        assert_eq!(map_mls_hex_to_nostr_hex("BB", &pairs).as_deref(), Some("n2"));
+        assert_eq!(map_mls_hex_to_nostr_hex("", &pairs), None);
+        assert_eq!(map_mls_hex_to_nostr_hex("zz", &pairs), None);
     }
 
     #[test]
