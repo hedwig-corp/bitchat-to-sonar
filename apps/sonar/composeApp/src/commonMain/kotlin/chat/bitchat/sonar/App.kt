@@ -1927,9 +1927,11 @@ private fun StickerPackPreviewSheet(state: SonarAppState, coordinate: String, on
     LaunchedEffect(coordinate) {
         loading = true
         val refreshed = state.fetchInstalledPacks()
-        installed = refreshed
-            ?.any { it.equals(coordinate, ignoreCase = true) }
-            ?: state.isPackInstalled(coordinate)
+        installed = stickerPackInstalledState(
+            coordinate = coordinate,
+            refreshedCoordinates = refreshed,
+            cachedInstalled = state.isPackInstalled(coordinate),
+        )
         if (parts.size == 3) {
             pack = state.stickerPack(parts[1], parts[2])
         }

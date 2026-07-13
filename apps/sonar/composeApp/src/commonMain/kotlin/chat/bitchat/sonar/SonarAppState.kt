@@ -406,7 +406,27 @@ internal fun shouldWaitForCapabilities(
 internal fun shouldExposeCachedStickerPack(
     coordinate: String,
     installedCoordinates: Set<String>,
-): Boolean = coordinate.lowercase() in installedCoordinates
+): Boolean = normalizeStickerPackCoordinate(coordinate) in installedCoordinates
+
+internal fun normalizeStickerPackCoordinate(coordinate: String): String {
+    val firstSeparator = coordinate.indexOf(':')
+    if (firstSeparator < 0) return coordinate
+    val secondSeparator = coordinate.indexOf(':', startIndex = firstSeparator + 1)
+    if (secondSeparator < 0) return coordinate
+    return buildString(coordinate.length) {
+        append(coordinate, 0, firstSeparator + 1)
+        append(coordinate.substring(firstSeparator + 1, secondSeparator).lowercase())
+        append(coordinate, secondSeparator, coordinate.length)
+    }
+}
+
+internal fun stickerPackInstalledState(
+    coordinate: String,
+    refreshedCoordinates: List<String>?,
+    cachedInstalled: Boolean,
+): Boolean = refreshedCoordinates?.any {
+    normalizeStickerPackCoordinate(it) == normalizeStickerPackCoordinate(coordinate)
+} ?: cachedInstalled
 
 internal enum class StickerCacheLookupState { HIT, MISS, INVALIDATED }
 
@@ -5068,7 +5088,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     fun isPackInstalled(coordinate: String): Boolean =
-        installedPackCoordinates.contains(coordinate.lowercase())
+        installedPackCoordinates.contains(normalizeStickerPackCoordinate(coordinate))
 
     suspend fun fetchInstalledPacks(): List<String>? {
         return try {
@@ -5082,13 +5102,13 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private fun replaceInstalledPacks(coords: List<String>) {
         installedPackCoordinates.clear()
-        installedPackCoordinates.addAll(coords.map { it.lowercase() })
+        installedPackCoordinates.addAll(coords.map(::normalizeStickerPackCoordinate))
     }
 
     suspend fun installStickerPack(coordinate: String): Boolean {
         return try {
             SonarCore.installStickerPack(coordinate)
-            installedPackCoordinates.add(coordinate.lowercase())
+            installedPackCoordinates.add(normalizeStickerPackCoordinate(coordinate))
             true
         } catch (_: Throwable) {
             false
@@ -5098,7 +5118,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     suspend fun uninstallStickerPack(coordinate: String): Boolean {
         return try {
             SonarCore.uninstallStickerPack(coordinate)
-            val normalized = coordinate.lowercase()
+            val normalized = normalizeStickerPackCoordinate(coordinate)
             installedPackCoordinates.remove(normalized)
             stickerPackCache.remove(normalized)
             true

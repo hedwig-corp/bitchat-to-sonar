@@ -41,6 +41,7 @@ import chat.bitchat.sonar.SonarGifItem
 import chat.bitchat.sonar.SonarStickerItem
 import chat.bitchat.sonar.SonarStickerPack
 import chat.bitchat.sonar.decodeImageBitmap
+import chat.bitchat.sonar.normalizeStickerPackCoordinate
 import chat.bitchat.sonar.ui.SNEmptyState
 import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconName
@@ -56,8 +57,8 @@ internal fun filterCachedStickerPacksByInstalledCoordinates(
     packs: List<SonarStickerPack>,
     installedCoordinates: List<String>,
 ): List<SonarStickerPack> {
-    val installed = installedCoordinates.mapTo(mutableSetOf()) { it.lowercase() }
-    return packs.filter { it.packCoordinate.lowercase() in installed }
+    val installed = installedCoordinates.mapTo(mutableSetOf(), ::normalizeStickerPackCoordinate)
+    return packs.filter { normalizeStickerPackCoordinate(it.packCoordinate) in installed }
 }
 
 internal fun mergeRefreshedStickerPacks(
@@ -65,11 +66,11 @@ internal fun mergeRefreshedStickerPacks(
     refreshedPacks: List<SonarStickerPack>,
     installedCoordinates: List<String>,
 ): List<SonarStickerPack> {
-    val cachedByCoordinate = cachedPacks.associateBy { it.packCoordinate.lowercase() }
-    val refreshedByCoordinate = refreshedPacks.associateBy { it.packCoordinate.lowercase() }
+    val cachedByCoordinate = cachedPacks.associateBy { normalizeStickerPackCoordinate(it.packCoordinate) }
+    val refreshedByCoordinate = refreshedPacks.associateBy { normalizeStickerPackCoordinate(it.packCoordinate) }
     val added = mutableSetOf<String>()
     return installedCoordinates.mapNotNull { coordinate ->
-        val key = coordinate.lowercase()
+        val key = normalizeStickerPackCoordinate(coordinate)
         if (!added.add(key)) null else refreshedByCoordinate[key] ?: cachedByCoordinate[key]
     }
 }

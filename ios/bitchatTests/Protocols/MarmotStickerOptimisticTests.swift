@@ -80,7 +80,7 @@ final class MarmotStickerOptimisticTests: XCTestCase {
     }
 
     func testCachedStickerPacksFollowInstalledAuthority() {
-        let coordinate = "30031:author:pack"
+        let coordinate = "30031:abcdef:Pack"
 
         // Preview/transcript metadata is not installed authority. Before the
         // local installed set is known, the composer must expose nothing.
@@ -90,7 +90,7 @@ final class MarmotStickerOptimisticTests: XCTestCase {
         ))
         XCTAssertTrue(MarmotChatModel.shouldExposeCachedStickerPack(
             coordinate: coordinate,
-            installedCoordinates: [coordinate]
+            installedCoordinates: [snNormalizeStickerPackCoordinate("30031:ABCDEF:Pack")]
         ))
         XCTAssertFalse(MarmotChatModel.shouldExposeCachedStickerPack(
             coordinate: coordinate,
@@ -98,8 +98,16 @@ final class MarmotStickerOptimisticTests: XCTestCase {
         ))
         XCTAssertFalse(MarmotChatModel.shouldExposeCachedStickerPack(
             coordinate: coordinate,
-            installedCoordinates: ["30031:author:other"]
+            installedCoordinates: [snNormalizeStickerPackCoordinate("30031:abcdef:pack")]
         ))
+    }
+
+    func testStickerPackCoordinateNormalizesOnlyTheAuthor() {
+        XCTAssertEqual(
+            snNormalizeStickerPackCoordinate("30031:ABCDEF:Pack"),
+            "30031:abcdef:Pack"
+        )
+        XCTAssertEqual(snNormalizeStickerPackCoordinate("invalid"), "invalid")
     }
 
     func testStickerPreviewPreservesCachedInstallStateOnlyOnRefreshFailure() {
@@ -122,8 +130,13 @@ final class MarmotStickerOptimisticTests: XCTestCase {
         ))
         XCTAssertTrue(snStickerPackInstalledState(
             coordinate: coordinate,
-            refreshedCoordinates: ["30031:AUTHOR:PACK"],
+            refreshedCoordinates: ["30031:AUTHOR:pack"],
             cachedInstalled: false
+        ))
+        XCTAssertFalse(snStickerPackInstalledState(
+            coordinate: coordinate,
+            refreshedCoordinates: ["30031:AUTHOR:PACK"],
+            cachedInstalled: true
         ))
     }
 
@@ -131,6 +144,13 @@ final class MarmotStickerOptimisticTests: XCTestCase {
         let removed = StickerPackInfo(
             packCoordinate: "30031:author:removed",
             title: "Removed",
+            description: nil,
+            coverUrl: nil,
+            stickers: []
+        )
+        let caseCollision = StickerPackInfo(
+            packCoordinate: "30031:author:Installed",
+            title: "Wrong case",
             description: nil,
             coverUrl: nil,
             stickers: []
@@ -145,8 +165,8 @@ final class MarmotStickerOptimisticTests: XCTestCase {
 
         XCTAssertEqual(
             snFilterCachedStickerPacks(
-                [removed, installed],
-                installedCoordinates: ["30031:AUTHOR:INSTALLED"]
+                [removed, caseCollision, installed],
+                installedCoordinates: ["30031:AUTHOR:installed"]
             ),
             [installed]
         )
@@ -180,7 +200,7 @@ final class MarmotStickerOptimisticTests: XCTestCase {
                 cachedPacks: [cachedFirst, cachedSecond],
                 refreshedPacks: [refreshedFirst],
                 installedCoordinates: [
-                    "30031:AUTHOR:FIRST",
+                    "30031:AUTHOR:first",
                     "30031:author:second",
                 ]
             ),

@@ -34,14 +34,14 @@ class StickerSendEchoTest {
     }
 
     @Test fun cachedStickerPacksFollowInstalledAuthority() {
-        val coordinate = "30031:author:pack"
+        val coordinate = "30031:abcdef:Pack"
 
         // Preview/transcript metadata is not installed authority. Before the
         // local installed set is known, the composer must expose nothing.
         assertFalse(shouldExposeCachedStickerPack(coordinate, emptySet()))
         assertTrue(shouldExposeCachedStickerPack(
             coordinate,
-            setOf(coordinate),
+            setOf("30031:ABCDEF:Pack").mapTo(mutableSetOf(), ::normalizeStickerPackCoordinate),
         ))
         assertFalse(shouldExposeCachedStickerPack(
             coordinate,
@@ -49,19 +49,41 @@ class StickerSendEchoTest {
         ))
         assertFalse(shouldExposeCachedStickerPack(
             coordinate,
-            setOf("30031:author:other"),
+            setOf(normalizeStickerPackCoordinate("30031:abcdef:pack")),
+        ))
+    }
+
+    @Test fun stickerPackCoordinateNormalizesOnlyTheAuthor() {
+        assertEquals(
+            "30031:abcdef:Pack",
+            normalizeStickerPackCoordinate("30031:ABCDEF:Pack"),
+        )
+        assertEquals("invalid", normalizeStickerPackCoordinate("invalid"))
+    }
+
+    @Test fun stickerPreviewKeepsIdentifierCaseSensitive() {
+        assertTrue(stickerPackInstalledState(
+            coordinate = "30031:abcdef:Pack",
+            refreshedCoordinates = listOf("30031:ABCDEF:Pack"),
+            cachedInstalled = false,
+        ))
+        assertFalse(stickerPackInstalledState(
+            coordinate = "30031:abcdef:Pack",
+            refreshedCoordinates = listOf("30031:ABCDEF:pack"),
+            cachedInstalled = true,
         ))
     }
 
     @Test fun successfulInstalledRefreshFiltersCachedPickerPacks() {
         val removed = SonarStickerPack("30031:author:removed", "Removed", null, null, emptyList())
+        val caseCollision = SonarStickerPack("30031:author:Installed", "Wrong case", null, null, emptyList())
         val installed = SonarStickerPack("30031:author:installed", "Installed", null, null, emptyList())
 
         assertEquals(
             listOf(installed),
             filterCachedStickerPacksByInstalledCoordinates(
-                packs = listOf(removed, installed),
-                installedCoordinates = listOf("30031:AUTHOR:INSTALLED"),
+                packs = listOf(removed, caseCollision, installed),
+                installedCoordinates = listOf("30031:AUTHOR:installed"),
             ),
         )
     }
@@ -77,7 +99,7 @@ class StickerSendEchoTest {
                 cachedPacks = listOf(cachedFirst, cachedSecond),
                 refreshedPacks = listOf(refreshedFirst),
                 installedCoordinates = listOf(
-                    "30031:AUTHOR:FIRST",
+                    "30031:AUTHOR:first",
                     "30031:author:second",
                 ),
             ),

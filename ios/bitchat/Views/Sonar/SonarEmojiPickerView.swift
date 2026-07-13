@@ -30,7 +30,7 @@ func snStickerPackInstalledState(
     cachedInstalled: Bool
 ) -> Bool {
     refreshedCoordinates?.contains {
-        $0.caseInsensitiveCompare(coordinate) == .orderedSame
+        snNormalizeStickerPackCoordinate($0) == snNormalizeStickerPackCoordinate(coordinate)
     } ?? cachedInstalled
 }
 
@@ -38,8 +38,8 @@ func snFilterCachedStickerPacks(
     _ packs: [StickerPackInfo],
     installedCoordinates: [String]
 ) -> [StickerPackInfo] {
-    let installed = Set(installedCoordinates.map { $0.lowercased() })
-    return packs.filter { installed.contains($0.packCoordinate.lowercased()) }
+    let installed = Set(installedCoordinates.map(snNormalizeStickerPackCoordinate))
+    return packs.filter { installed.contains(snNormalizeStickerPackCoordinate($0.packCoordinate)) }
 }
 
 func snMergeRefreshedStickerPacks(
@@ -48,16 +48,16 @@ func snMergeRefreshedStickerPacks(
     installedCoordinates: [String]
 ) -> [StickerPackInfo] {
     let cachedByCoordinate = Dictionary(
-        cachedPacks.map { ($0.packCoordinate.lowercased(), $0) },
+        cachedPacks.map { (snNormalizeStickerPackCoordinate($0.packCoordinate), $0) },
         uniquingKeysWith: { first, _ in first }
     )
     let refreshedByCoordinate = Dictionary(
-        refreshedPacks.map { ($0.packCoordinate.lowercased(), $0) },
+        refreshedPacks.map { (snNormalizeStickerPackCoordinate($0.packCoordinate), $0) },
         uniquingKeysWith: { _, latest in latest }
     )
     var added = Set<String>()
     return installedCoordinates.compactMap { coordinate in
-        let key = coordinate.lowercased()
+        let key = snNormalizeStickerPackCoordinate(coordinate)
         guard added.insert(key).inserted else { return nil }
         return refreshedByCoordinate[key] ?? cachedByCoordinate[key]
     }
