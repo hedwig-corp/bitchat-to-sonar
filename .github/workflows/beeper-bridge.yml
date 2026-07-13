@@ -1,0 +1,65 @@
+name: Beeper bridge tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  go:
+    name: Bridge v2 connector
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: bridges/sonar
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: bridges/sonar/go.mod
+          cache-dependency-path: bridges/sonar/go.sum
+      - name: Test connector
+        run: go test -tags goolm ./...
+      - name: Vet connector
+        run: go vet -tags goolm ./...
+      - name: Build connector
+        run: go build -tags goolm ./cmd/matrix-sonar
+
+  daemon:
+    name: Sonar account daemon
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Test daemon
+        working-directory: core
+        run: cargo test -p sonar-bridge-daemon
+      - name: Lint daemon
+        working-directory: core
+        run: cargo clippy -p sonar-bridge-daemon --no-deps -- -D warnings
+      - name: Test core bridge paths
+        working-directory: core
+        run: cargo test -p sonar-core
+      - name: Build daemon
+        working-directory: core
+        run: cargo build --release -p sonar-bridge-daemon
+
+  container:
+    name: Self-hosted image
+    needs: [go, daemon]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: bridges/sonar/Dockerfile
+          push: false
+          tags: matrix-sonar:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

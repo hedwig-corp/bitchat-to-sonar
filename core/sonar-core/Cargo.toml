@@ -64,6 +64,7 @@ nostr-blossom = "0.44"
 # feature set as nostr-blossom so cargo unifies ONE reqwest build (no
 # native-tls/OpenSSL → iOS/Android cross-compile stays OpenSSL-free).
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+url = "2"
 # Map a filename extension → MIME type for outgoing media.
 mime_guess = "2"
 tokio.workspace = true

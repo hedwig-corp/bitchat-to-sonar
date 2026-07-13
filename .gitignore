@@ -86,3 +86,10 @@ deploy/secrets/
 # Android Rust core build outputs (regenerate with core/build-android.sh)
 core/android-out/
 ios/bitchat/GoogleService-Info.plist
+
+# Local Matrix/Beeper bridge configuration and encrypted account state
+bridges/sonar/config.yaml
+bridges/sonar/.env
+bridges/sonar/data/
+bridges/sonar/master-key
+bridges/sonar/matrix-sonar

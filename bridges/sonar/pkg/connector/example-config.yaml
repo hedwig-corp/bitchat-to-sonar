@@ -1,0 +1,22 @@
+# The daemon contains the Sonar MLS engine. It is separate so a crash or
+# upgrade cannot make two bridge workers mutate the same account database.
+daemon_path: /usr/local/bin/sonar-bridge-daemon
+
+# Durable account directories are created below this root. Back this up with
+# the bridge database; never expose it through a web server.
+state_dir: /var/lib/matrix-sonar/accounts
+
+# A 0600 file containing exactly 32 random bytes encoded as 64 hex characters.
+# This path is safe in config; the key value is never placed here or on argv.
+master_key_file: /etc/matrix-sonar/master-key
+
+relays:
+  - wss://relay.damus.io
+  - wss://nos.lol
+  - wss://relay.primal.net
+
+blossom_server: https://nostr.download
+# Inbound encrypted blobs are only fetched from these operator-approved hosts.
+media_download_hosts:
+  - nostr.download
+poll_interval_millis: 2000

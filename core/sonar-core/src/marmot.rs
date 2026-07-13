@@ -731,6 +731,13 @@ impl MarmotEngine {
             .collect())
     }
 
+    /// Look up one active group by its MLS id without enumerating unrelated
+    /// conversations.
+    pub fn group(&self, group_id: &GroupId) -> Result<Option<group_types::Group>> {
+        Ok(dispatch!(&self.storage, |mdk| mdk.get_group(group_id))?
+            .filter(|group| group.state == group_types::GroupState::Active))
+    }
+
     /// Pending multi-member welcomes waiting for user acceptance.
     pub fn pending_group_invites(&self) -> Result<Vec<GroupInvite>> {
         let welcomes = dispatch!(&self.storage, |mdk| mdk.get_pending_welcomes(None))?;

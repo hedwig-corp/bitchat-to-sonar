@@ -137,6 +137,16 @@ async fn start_dm_reuses_existing_direct_group() {
 
     assert_eq!(second_group, first_group);
     assert_eq!(alice.groups().expect("alice groups").len(), 1);
+    assert_eq!(
+        alice.dm_peer_for_group(&first_group).unwrap(),
+        Some(bob.identity().public_key())
+    );
+    assert_eq!(
+        alice
+            .dm_peers_for_groups(std::slice::from_ref(&first_group))
+            .unwrap(),
+        vec![(first_group, bob.identity().public_key())]
+    );
 }
 
 #[tokio::test]
