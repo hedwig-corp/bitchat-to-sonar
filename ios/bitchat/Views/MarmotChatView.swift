@@ -1830,7 +1830,7 @@ final class MarmotChatModel: ObservableObject {
         installedPackCoordinatesLoaded = false
     }
 
-    func fetchInstalledPacks() async -> [String] {
+    func fetchInstalledPacks() async -> [String]? {
         if installedPackCoordinatesLoaded {
             Task { await refreshInstalledPacks() }
             return Array(installedPackCoordinates)
@@ -1842,7 +1842,7 @@ final class MarmotChatModel: ObservableObject {
             return coords
         } catch {
             self.errorText = Self.describe(error)
-            return []
+            return nil
         }
     }
 

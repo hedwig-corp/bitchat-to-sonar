@@ -4973,7 +4973,7 @@ final class SonarAppStore: ObservableObject {
         await marmot.stickerData(for: ref)
     }
 
-    func fetchInstalledPacks() async -> [String] {
+    func fetchInstalledPacks() async -> [String]? {
         await marmot.fetchInstalledPacks()
     }
 

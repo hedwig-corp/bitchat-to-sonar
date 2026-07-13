@@ -8,6 +8,21 @@ import XCTest
 
 @MainActor
 final class MarmotStickerOptimisticTests: XCTestCase {
+    func testFailedInstalledRefreshPreservesCachedPacks() {
+        XCTAssertTrue(snShouldPreserveCachedStickerPacks(
+            hadCachedPacks: true,
+            installedCoordinates: nil
+        ))
+        XCTAssertFalse(snShouldPreserveCachedStickerPacks(
+            hadCachedPacks: false,
+            installedCoordinates: nil
+        ))
+        XCTAssertFalse(snShouldPreserveCachedStickerPacks(
+            hadCachedPacks: true,
+            installedCoordinates: []
+        ))
+    }
+
     func testCachedStickerPacksFollowInstalledAuthority() {
         let coordinate = "30031:author:pack"
 

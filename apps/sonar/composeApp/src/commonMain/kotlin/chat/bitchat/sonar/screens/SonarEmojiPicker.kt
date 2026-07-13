@@ -47,6 +47,11 @@ import chat.bitchat.sonar.ui.SNIconName
 import chat.bitchat.sonar.ui.SNSectionLabel
 import chat.bitchat.sonar.ui.sonar
 
+internal fun shouldPreserveCachedStickerPacks(
+    hadCachedPacks: Boolean,
+    installedCoordinates: List<String>?,
+): Boolean = hadCachedPacks && installedCoordinates == null
+
 private enum class PickerTab { Emoji, Gif, Sticker }
 
 private val frequentEmojis = listOf("👍", "❤️", "😂", "🔥", "🙏", "👏", "🎉", "👀", "💯", "⚡")
@@ -128,7 +133,9 @@ fun SonarEmojiPicker(
     loadStickerImage: suspend (String, String) -> ByteArray? = { url, expectedSha256 ->
         runCatching { SonarCore.fetchStickerImage(url, expectedSha256) }.getOrNull()
     },
-    fetchInstalledPacks: suspend () -> List<String> = { SonarCore.fetchInstalledPacks() },
+    fetchInstalledPacks: suspend () -> List<String>? = {
+        runCatching { SonarCore.fetchInstalledPacks() }.getOrNull()
+    },
     initialStickerPacks: List<SonarStickerPack> = emptyList(),
     onStickerPacksLoaded: (List<SonarStickerPack>) -> Unit = {},
     onClose: () -> Unit,
@@ -366,7 +373,7 @@ private fun ColumnScope.StickerTabContent(
     onSticker: (SonarStickerItem, String) -> Unit,
     loadStickerPack: suspend (String, String, List<String>) -> SonarStickerPack?,
     loadStickerImage: suspend (String, String) -> ByteArray?,
-    fetchInstalledPacks: suspend () -> List<String>,
+    fetchInstalledPacks: suspend () -> List<String>?,
     initialStickerPacks: List<SonarStickerPack>,
     onStickerPacksLoaded: (List<SonarStickerPack>) -> Unit,
 ) {
@@ -382,7 +389,14 @@ private fun ColumnScope.StickerTabContent(
         if (hadCachedPacks) {
             loading = false
         }
-        val coordinates = try { fetchInstalledPacks() } catch (_: Throwable) { emptyList() }
+        val coordinates = try { fetchInstalledPacks() } catch (_: Throwable) { null }
+        if (coordinates == null) {
+            if (!shouldPreserveCachedStickerPacks(hadCachedPacks, coordinates)) {
+                error = "Failed to load sticker packs"
+            }
+            loading = false
+            return@LaunchedEffect
+        }
         val loaded = mutableListOf<SonarStickerPack>()
         for (coord in coordinates) {
             val parts = coord.split(":", limit = 3)

@@ -17,12 +17,19 @@ import UIKit
 import AppKit
 #endif
 
+func snShouldPreserveCachedStickerPacks(
+    hadCachedPacks: Bool,
+    installedCoordinates: [String]?
+) -> Bool {
+    hadCachedPacks && installedCoordinates == nil
+}
+
 struct SonarEmojiPickerView: View {
     let onEmoji: (String) -> Void
     let onSticker: (StickerInfo, String) -> Void
     let loadStickerPack: (String, String, [String]) async -> StickerPackInfo?
     let loadStickerImage: (String, String) async -> Data?
-    let fetchInstalledPacks: () async -> [String]
+    let fetchInstalledPacks: () async -> [String]?
     let onClose: () -> Void
 
     @Binding var stickerPacks: [StickerPackInfo]
@@ -188,7 +195,7 @@ private struct StickerTabContent: View {
     let onSticker: (StickerInfo, String) -> Void
     let loadPack: (String, String, [String]) async -> StickerPackInfo?
     let loadImage: (String, String) async -> Data?
-    let fetchInstalledPacks: () async -> [String]
+    let fetchInstalledPacks: () async -> [String]?
 
     @State private var loading = true
     @State private var error: String?
@@ -270,7 +277,17 @@ private struct StickerTabContent: View {
         if hadCachedPacks {
             loading = false
         }
-        let coordinates = await fetchInstalledPacks()
+        let installedCoordinates = await fetchInstalledPacks()
+        guard let coordinates = installedCoordinates else {
+            if !snShouldPreserveCachedStickerPacks(
+                hadCachedPacks: hadCachedPacks,
+                installedCoordinates: installedCoordinates
+            ) {
+                error = "Failed to load sticker packs"
+            }
+            loading = false
+            return
+        }
         var loaded: [StickerPackInfo] = []
         for coord in coordinates {
             let parts = coord.split(separator: ":", maxSplits: 2).map(String.init)

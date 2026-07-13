@@ -1,10 +1,17 @@
 package chat.bitchat.sonar
 
+import chat.bitchat.sonar.screens.shouldPreserveCachedStickerPacks
 import kotlin.test.Test
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class StickerSendEchoTest {
+    @Test fun failedInstalledRefreshPreservesCachedPacks() {
+        assertTrue(shouldPreserveCachedStickerPacks(hadCachedPacks = true, installedCoordinates = null))
+        assertFalse(shouldPreserveCachedStickerPacks(hadCachedPacks = false, installedCoordinates = null))
+        assertFalse(shouldPreserveCachedStickerPacks(hadCachedPacks = true, installedCoordinates = emptyList()))
+    }
+
     @Test fun cachedStickerPacksFollowInstalledAuthority() {
         val coordinate = "30031:author:pack"
 
