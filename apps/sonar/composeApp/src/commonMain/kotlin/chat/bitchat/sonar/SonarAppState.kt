@@ -111,6 +111,12 @@ internal sealed interface AttachmentRoutePreparation {
 internal fun shortNpubLabel(value: String): String =
     if (value.length > 16) value.take(10) + "…" + value.takeLast(4) else value
 
+internal fun sonarSendEchoMatches(published: SonarMsg, echo: SonarMsg): Boolean =
+    published.content == echo.content &&
+        published.stickerRef == echo.stickerRef &&
+        published.viaInternet == echo.viaInternet &&
+        published.tsSecs > echo.tsSecs && published.tsSecs - echo.tsSecs < 30
+
 internal fun resolveGroupAuthorName(
     message: SonarMsg,
     isGroup: Boolean,
@@ -3673,7 +3679,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     private suspend fun flushPendingDirectMarmot(npubHex: String, chatId: String) {
         val queued = pendingDirectMarmotSends.remove(npubHex).orEmpty()
         for (send in queued) {
-            runCatching { SonarCore.send(chatId, send.text) }
+            runCatching { sendQueuedMarmotContent(chatId, send.text) }
                 .onSuccess { clearSendEcho(chatId, send.echoId) }
                 .onFailure {
                     failSendEcho(chatId, send.echoId)
@@ -3794,12 +3800,26 @@ class SonarAppState(private val scope: CoroutineScope) {
     private suspend fun flushPendingMarmotGroupSends(pendingChatId: String, chatId: String) {
         val queued = pendingMarmotGroupSends.remove(pendingChatId).orEmpty()
         for (send in queued) {
-            runCatching { SonarCore.send(chatId, send.text) }
+            runCatching { sendQueuedMarmotContent(chatId, send.text) }
                 .onSuccess { clearSendEcho(chatId, send.echoId) }
                 .onFailure {
                     failSendEcho(chatId, send.echoId)
                     toast = "send failed: ${it.message}"
                 }
+        }
+    }
+
+    private suspend fun sendQueuedMarmotContent(chatId: String, text: String) {
+        val sticker = meshParseStickerContent(text)
+        if (sticker != null) {
+            SonarCore.sendSticker(
+                chatId,
+                sticker.packCoordinate,
+                sticker.shortcode,
+                sticker.plaintextSha256,
+            )
+        } else {
+            SonarCore.send(chatId, text)
         }
     }
 
@@ -4850,20 +4870,29 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun sendStickerItem(chatId: String, sticker: SonarStickerItem, packCoordinate: String) {
         if (isContactBlocked(chatId)) { toast = "Unblock this contact before sending."; return }
+        val encoded = meshStickerContent(packCoordinate, sticker.shortcode, sticker.sha256)
+        reloadNewestAfterSendIfNeeded(chatId)
         if (isMeshChat(chatId)) {
             val peerId = meshPeerId(chatId)
-            val content = meshStickerContent(packCoordinate, sticker.shortcode, sticker.sha256)
-            liveMeshRoutePeerId(peerId)?.let { route -> sendMesh(route, content); return }
+            liveMeshRoutePeerId(peerId)?.let { route -> sendMesh(route, encoded); return }
             val raw = npubRawFor(peerId)
             if (raw != null) {
                 when {
                     shouldUseMarmotRoute(peerId, raw) -> sendStickerOverMarmot(peerId, raw, packCoordinate, sticker)
-                    canUseDirectNip17(peerId, raw) -> sendDirectNip17(peerId, raw, content)
+                    canUseDirectNip17(peerId, raw) -> sendDirectNip17(peerId, raw, encoded)
                     else -> toast = "Out of range — add each other as favorites to continue over Nostr."
                 }
                 return
             }
             toast = "Not connected — stay close and try again"
+            return
+        }
+        pendingMarmotNpub(chatId)?.let { pendingNpub ->
+            sendPendingMarmotChat(chatId, pendingNpub, encoded)
+            return
+        }
+        if (isPendingMarmotGroup(chatId)) {
+            sendPendingMarmotGroup(chatId, encoded)
             return
         }
         scope.launch {
@@ -4872,9 +4901,21 @@ class SonarAppState(private val scope: CoroutineScope) {
                 toast = "Stickers require an encrypted chat"
                 return@launch
             }
+            val echo = createSendEcho(chatId, encoded)
+            messages = (messages + echo).sortedBy { it.tsSecs }
             try {
                 SonarCore.sendSticker(groupId, packCoordinate, sticker.shortcode, sticker.sha256)
+                clearSendEcho(chatId, echo.id)
+                val generation = transcriptGeneration
+                val local = withSendEchoes(
+                    chatId,
+                    mergePendingMediaUploads(chatId, marmotMessagesPageForChat(chatId, generation)),
+                )
+                if (isCurrentTranscriptSession(chatId, generation)) {
+                    setCurrentVisibleMessages(chatId, local, processCalls = true)
+                }
             } catch (e: Throwable) {
+                failSendEcho(chatId, echo.id)
                 toast = "send failed: ${e.message}"
             }
         }
@@ -4896,6 +4937,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             null
         }
     }
+
+    fun cachedStickerPacks(): List<SonarStickerPack> = stickerPackCache.values.toList()
 
     suspend fun stickerImage(url: String, expectedSha256: String): ByteArray? {
         stickerImageFromMemory(expectedSha256)?.let { return it }
@@ -5510,9 +5553,20 @@ class SonarAppState(private val scope: CoroutineScope) {
     ) {
         val group = marmotGroupForNpub(npubRaw)
         if (group != null) {
+            val chatId = meshChatId(peerId)
+            val encoded = meshStickerContent(packCoordinate, sticker.shortcode, sticker.sha256)
+            val echo = createSendEcho(chatId, encoded)
+            messages = (messages + echo).sortedBy { it.tsSecs }
             scope.launch {
                 runCatching { SonarCore.sendSticker(group.id, packCoordinate, sticker.shortcode, sticker.sha256) }
-                    .onFailure { toast = "send failed: ${it.message}" }
+                    .onSuccess {
+                        clearSendEcho(chatId, echo.id)
+                        refreshOpenDm(peerId)
+                    }
+                    .onFailure {
+                        failSendEcho(chatId, echo.id)
+                        toast = "send failed: ${it.message}"
+                    }
             }
             return
         }

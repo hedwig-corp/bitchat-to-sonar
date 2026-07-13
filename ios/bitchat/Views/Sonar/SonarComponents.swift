@@ -2516,12 +2516,14 @@ struct SNComposer: View {
     var loadStickerPack: (String, String, [String]) async -> StickerPackInfo? = { _, _, _ in nil }
     var loadStickerImage: (String, String) async -> Data? = { _, _ in nil }
     var fetchInstalledPacks: () async -> [String] = { [] }
+    var cachedStickerPacks: () -> [StickerPackInfo] = { [] }
     var voiceEnabled: Bool = true
     /// Hold-to-record produced a voice note at this file URL (audio/mp4 .m4a).
     var onVoice: (URL) -> Void = { _ in }
 
     @State private var text = ""
     @State private var showEmojiTray = false
+    @State private var stickerPacks: [StickerPackInfo] = []
     #if os(iOS)
     @StateObject private var voice = VoiceNoteRecorder()
     @State private var recording = false
@@ -2584,7 +2586,8 @@ struct SNComposer: View {
                     loadStickerPack: loadStickerPack,
                     loadStickerImage: loadStickerImage,
                     fetchInstalledPacks: fetchInstalledPacks,
-                    onClose: { showEmojiTray = false }
+                    onClose: { showEmojiTray = false },
+                    stickerPacks: $stickerPacks
                 )
             }
             #if os(iOS)
@@ -2651,6 +2654,9 @@ struct SNComposer: View {
                     .submitLabel(.send)
                     .onSubmit(send)
                 Button {
+                    if !showEmojiTray {
+                        stickerPacks = cachedStickerPacks()
+                    }
                     showEmojiTray.toggle()
                 } label: {
                     SNIcon(name: .smile, size: 19, weight: 2)

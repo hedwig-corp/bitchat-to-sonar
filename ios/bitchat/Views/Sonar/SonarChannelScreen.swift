@@ -121,6 +121,7 @@ struct SonarChannelScreen: View {
                 },
                 loadStickerImage: { await store.stickerImageData(url: $0, expectedSha256: $1) },
                 fetchInstalledPacks: { await store.fetchInstalledPacks() },
+                cachedStickerPacks: { store.cachedStickerPacks() },
                 voiceEnabled: false
             )
         }

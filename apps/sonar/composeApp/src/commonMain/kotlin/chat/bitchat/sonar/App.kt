@@ -800,6 +800,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     val scope = rememberCoroutineScope()
     var draft by remember { mutableStateOf("") }
     var emojiTray by remember { mutableStateOf(false) }
+    var stickerPacks by remember { mutableStateOf(state.cachedStickerPacks()) }
     var paySheet by remember { mutableStateOf(false) }
     var verifySheet by remember { mutableStateOf(false) }
     var addSheet by remember { mutableStateOf(false) }
@@ -1160,6 +1161,8 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                 state.stickerPack(author, identifier, relays)
             },
             loadStickerImage = { url, expectedSha256 -> state.stickerImage(url, expectedSha256) },
+            initialStickerPacks = stickerPacks,
+            onStickerPacksLoaded = { stickerPacks = it },
             onClose = { emojiTray = false }
         )
         // ONE composer row in BOTH states. Only the left (plus↔trash) and middle
@@ -1212,7 +1215,12 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                 Spacer(Modifier.width(8.dp))
                 Box(
                     Modifier.size(34.dp).clip(CircleShape).background(if (emojiTray) s.accentSoft else s.surface2)
-                        .clickable { emojiTray = !emojiTray },
+                        .clickable {
+                            if (!emojiTray) {
+                                stickerPacks = state.cachedStickerPacks()
+                            }
+                            emojiTray = !emojiTray
+                        },
                     contentAlignment = Alignment.Center
                 ) { SNIcon(SNIconName.Smile, 18.dp, if (emojiTray) s.accent else s.text2, weight = 2f) }
             }

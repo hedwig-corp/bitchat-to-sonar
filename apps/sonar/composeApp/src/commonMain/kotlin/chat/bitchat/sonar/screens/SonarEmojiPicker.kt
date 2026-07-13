@@ -143,6 +143,8 @@ fun SonarEmojiPicker(
     loadStickerImage: suspend (String, String) -> ByteArray? = { url, expectedSha256 ->
         runCatching { SonarCore.fetchStickerImage(url, expectedSha256) }.getOrNull()
     },
+    initialStickerPacks: List<SonarStickerPack> = emptyList(),
+    onStickerPacksLoaded: (List<SonarStickerPack>) -> Unit = {},
     onClose: () -> Unit,
 ) {
     val s = sonar
@@ -180,7 +182,13 @@ fun SonarEmojiPicker(
         when (tab) {
             PickerTab.Emoji -> EmojiTabContent(onEmoji)
             PickerTab.Gif -> GifTabContent()
-            PickerTab.Sticker -> StickerTabContent(onSticker, loadStickerPack, loadStickerImage)
+            PickerTab.Sticker -> StickerTabContent(
+                onSticker,
+                loadStickerPack,
+                loadStickerImage,
+                initialStickerPacks,
+                onStickerPacksLoaded,
+            )
         }
     }
 }
@@ -371,13 +379,21 @@ private fun ColumnScope.StickerTabContent(
     onSticker: (SonarStickerItem, String) -> Unit,
     loadStickerPack: suspend (String, String, List<String>) -> SonarStickerPack?,
     loadStickerImage: suspend (String, String) -> ByteArray?,
+    initialStickerPacks: List<SonarStickerPack>,
+    onStickerPacksLoaded: (List<SonarStickerPack>) -> Unit,
 ) {
     val s = sonar
-    var packs by remember { mutableStateOf<List<SonarStickerPack>>(emptyList()) }
-    var loading by remember { mutableStateOf(true) }
+    var packs by remember { mutableStateOf(initialStickerPacks) }
+    var loading by remember { mutableStateOf(initialStickerPacks.isEmpty()) }
     var error by remember { mutableStateOf<String?>(null) }
 
     LaunchedEffect(Unit) {
+        // ChatScreen owns the loaded packs, so closing/reopening the tray can
+        // paint immediately while app-level caches refresh metadata behind it.
+        val hadCachedPacks = packs.isNotEmpty()
+        if (hadCachedPacks) {
+            loading = false
+        }
         val coordinates = try { SonarCore.fetchInstalledPacks() } catch (_: Throwable) { emptyList() }
         val toFetch = coordinates.ifEmpty { listOf("30031:$TEST_PACK_AUTHOR:$TEST_PACK_ID") }
         val loaded = mutableListOf<SonarStickerPack>()
@@ -390,8 +406,13 @@ private fun ColumnScope.StickerTabContent(
         if (loaded.isEmpty()) {
             loadStickerPack(TEST_PACK_AUTHOR, TEST_PACK_ID, TEST_PACK_RELAYS)?.let { loaded += it }
         }
-        packs = loaded
-        if (loaded.isEmpty()) error = "Failed to load sticker packs"
+        if (loaded.isNotEmpty()) {
+            packs = loaded
+            onStickerPacksLoaded(loaded)
+            error = null
+        } else if (!hadCachedPacks) {
+            error = "Failed to load sticker packs"
+        }
         loading = false
     }
 

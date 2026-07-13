@@ -25,6 +25,8 @@ struct SonarEmojiPickerView: View {
     let fetchInstalledPacks: () async -> [String]
     let onClose: () -> Void
 
+    @Binding var stickerPacks: [StickerPackInfo]
+
     @State private var tab = 0
     @State private var search = ""
     @State private var category = 0
@@ -71,6 +73,7 @@ struct SonarEmojiPickerView: View {
             case 0: emojiTab
             case 1: placeholderTab("GIF search coming soon")
             default: StickerTabContent(
+                packs: $stickerPacks,
                 onSticker: onSticker,
                 loadPack: loadStickerPack,
                 loadImage: loadStickerImage,
@@ -188,18 +191,18 @@ private let testPackId = "signal-8fa42aa13ec8f0efebe4b038f41afbd1"
 private let testPackRelays = ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net"]
 
 private struct StickerTabContent: View {
+    @Binding var packs: [StickerPackInfo]
     let onSticker: (StickerInfo, String) -> Void
     let loadPack: (String, String, [String]) async -> StickerPackInfo?
     let loadImage: (String, String) async -> Data?
     let fetchInstalledPacks: () async -> [String]
 
-    @State private var packs: [StickerPackInfo] = []
     @State private var loading = true
     @State private var error: String?
 
     var body: some View {
         Group {
-            if loading {
+            if loading && packs.isEmpty {
                 VStack(spacing: 8) {
                     Spacer()
                     ProgressView()
@@ -254,6 +257,12 @@ private struct StickerTabContent: View {
     }
 
     private func loadPacks() async {
+        // SNComposer owns the loaded packs, so closing/reopening the tray can
+        // paint immediately while app-level caches refresh metadata behind it.
+        let hadCachedPacks = !packs.isEmpty
+        if hadCachedPacks {
+            loading = false
+        }
         let coordinates = await fetchInstalledPacks()
         let toFetch = coordinates.isEmpty ? ["30031:\(testPackAuthor):\(testPackId)"] : coordinates
         var loaded: [StickerPackInfo] = []
@@ -270,8 +279,12 @@ private struct StickerTabContent: View {
                 loaded.append(fallback)
             }
         }
-        packs = loaded
-        if loaded.isEmpty { self.error = "Failed to load sticker packs" }
+        if !loaded.isEmpty {
+            packs = loaded
+            error = nil
+        } else if !hadCachedPacks {
+            error = "Failed to load sticker packs"
+        }
         loading = false
     }
 }

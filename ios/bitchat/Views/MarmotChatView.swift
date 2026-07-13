@@ -1322,7 +1322,10 @@ final class MarmotChatModel: ObservableObject {
         guard !optimistic.id.hasPrefix(failedOptimisticIDPrefix) else { return false }
         guard !server.id.hasPrefix(optimisticIDPrefix),
               !server.id.hasPrefix(failedOptimisticIDPrefix) else { return false }
-        guard server.isMine, server.content == optimistic.content else { return false }
+        guard server.isMine,
+              server.content == optimistic.content,
+              server.stickerRef == optimistic.stickerRef
+        else { return false }
         guard !excludingServerIDs.contains(server.id) else { return false }
         // Only a row created around/after the echo can be THIS send's copy.
         // Without this, re-sending text identical to an OLDER own message
@@ -1646,22 +1649,60 @@ final class MarmotChatModel: ObservableObject {
         shortcode: String,
         plaintextSha256: String
     ) {
-        Task {
+        errorText = nil
+        let echo = MarmotService.MarmotMessage(
+            id: Self.optimisticIDPrefix + UUID().uuidString,
+            senderNpub: npub ?? "",
+            content: "",
+            createdAt: Date(),
+            isMine: true,
+            media: [],
+            stickerRef: MarmotService.MarmotStickerRef(
+                packCoordinate: packCoordinate,
+                shortcode: shortcode,
+                plaintextSha256: plaintextSha256
+            )
+        )
+        pendingOptimistic[groupId, default: []].append(echo)
+        messagesByGroup[groupId, default: []].append(echo)
+
+        let previous = sendChain
+        sendChain = Task { [weak self] in
+            _ = await previous?.result
+            guard let self else { return }
             do {
-                guard await ensureConnected() else {
+                guard await self.ensureConnected(timeoutSeconds: 2) else {
                     throw MarmotService.ServiceError.notConnected
                 }
-                await loadLocalPage(groupId: groupId)
-                try await service.sendSticker(
+                try await self.service.sendSticker(
                     groupId: groupId,
                     packCoordinate: packCoordinate,
                     shortcode: shortcode,
                     plaintextSha256: plaintextSha256
                 )
-                await loadLocalPage(groupId: groupId)
-                await refreshWhenConnected(groupId: groupId, hydrateBeforeSync: false)
             } catch {
+                self.pendingOptimistic[groupId]?.removeAll { $0.id == echo.id }
+                let failed = MarmotService.MarmotMessage(
+                    id: Self.failedOptimisticIDPrefix + UUID().uuidString,
+                    senderNpub: echo.senderNpub,
+                    content: echo.content,
+                    createdAt: echo.createdAt,
+                    isMine: true,
+                    media: [],
+                    stickerRef: echo.stickerRef
+                )
+                self.pendingOptimistic[groupId, default: []].append(failed)
+                self.messagesByGroup[groupId, default: []].removeAll { $0.id == echo.id }
+                self.messagesByGroup[groupId, default: []].append(failed)
                 self.errorText = Self.describe(error)
+                return
+            }
+            // The core writes the canonical row locally before publishing.
+            // Refresh outside the send chain so the next queued send never
+            // waits on transcript hydration or relay subscription work.
+            Task { [weak self] in
+                await self?.loadLocalPage(groupId: groupId)
+                try? await self?.service.ensureSubscriptions()
             }
         }
     }
@@ -1694,6 +1735,12 @@ final class MarmotChatModel: ObservableObject {
             self.errorText = Self.describe(error)
             return nil
         }
+    }
+
+    /// App-lifetime pack metadata already verified/fetched by the core.
+    /// Picker views use this synchronously for a zero-spinner first frame.
+    func cachedStickerPacksSnapshot() -> [StickerPackInfo] {
+        Array(stickerPacksByCoordinate.values)
     }
 
     func fetchStickerImage(url: String, expectedSha256: String) async -> Data? {
