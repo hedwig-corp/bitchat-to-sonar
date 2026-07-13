@@ -68,54 +68,58 @@ export const STATUS_NPUB = '';
 export const STATUS_FEED_RELAYS = [
 	'wss://relay.damus.io',
 	'wss://nos.lol',
-	'wss://relay.primal.net'
+	'wss://relay.primal.net',
+	'wss://nostr.relay.hedwig.sh'
 ];
 
-/** Seed payload — first paint; optional Nostr overlay may replace services/incidents. */
+/** Seed payload — first paint only.
+ * Services start as "unknown/operational skeleton" with empty incidents.
+ * Live state comes from sonar-status → kind 30078 (see docs/SONAR-STATUS.md).
+ * Relay list matches Sonar client bootstrap defaults (iOS + Android/JVM union).
+ */
 export const SONAR_STATUS_SEED = /** @type {StatusPayload} */ ({
 	services: [
 		{
 			id: 'dm',
 			name: 'Encrypted DMs (Marmot)',
 			desc: 'End-to-end encrypted direct messages',
-			uptime: 99.95
+			uptime: 100
 		},
 		{
 			id: 'groups',
 			name: 'Group chats (White Noise)',
 			desc: 'MLS-over-Nostr encrypted groups',
-			uptime: 99.91
+			uptime: 100
 		},
 		{
 			id: 'media',
 			name: 'Media messages',
 			desc: 'Image, video & file delivery',
-			uptime: 99.9
+			uptime: 100
 		},
 		{
 			id: 'voice',
 			name: 'Voice messages',
 			desc: 'Push-to-talk voice notes',
-			uptime: 99.93
+			uptime: 100
 		},
 		{
 			id: 'calls',
 			name: 'Voice & video calls',
 			desc: 'Iroh transport, Marmot signaling',
-			uptime: 99.72,
-			state: 'degraded'
+			uptime: 100
 		},
 		{
 			id: 'payments',
 			name: 'Payments (Bolt12)',
 			desc: 'Direct Lightning wallet payments',
-			uptime: 99.94
+			uptime: 100
 		},
 		{
 			id: 'push',
 			name: 'Push notifications',
 			desc: 'Encrypted push envelopes',
-			uptime: 99.88
+			uptime: 100
 		},
 		{
 			id: 'stickers',
@@ -124,68 +128,19 @@ export const SONAR_STATUS_SEED = /** @type {StatusPayload} */ ({
 			uptime: 100
 		}
 	],
-	// Common public relays Sonar clients can use (not a full geo-directory dump).
+	// Sonar client bootstrap relays (union of iOS NostrRelayManager + Android/JVM SonarCore).
+	// Geo-channel relays are chosen dynamically from relays_gps.csv and are not listed here.
 	relays: [
 		{ url: 'wss://relay.damus.io', region: 'Global · CDN' },
 		{ url: 'wss://nos.lol', region: 'EU · Germany' },
 		{ url: 'wss://relay.primal.net', region: 'US · East' },
-		{ url: 'wss://relay.snort.social', region: 'EU · UK' },
-		{ url: 'wss://nostr.wine', region: 'US · Central' },
-		{ url: 'wss://relay.nostr.band', region: 'Global · Anycast' }
+		{ url: 'wss://offchain.pub', region: 'Global · iOS default' },
+		{ url: 'wss://nostr21.com', region: 'Global · iOS default' },
+		{ url: 'wss://relay.kaleidoswap.com', region: 'Global · client default' },
+		{ url: 'wss://nostr.relay.hedwig.sh', region: 'Hedwig · Sonar' }
 	],
-	incidents: [
-		{
-			date: 'Jul 9, 2026',
-			title: 'Elevated call setup latency',
-			level: 'degraded',
-			updates: [
-				{
-					t: '14:02 UTC',
-					s: 'Resolved',
-					b: 'Iroh relay capacity restored. Call setup times back to normal.'
-				},
-				{
-					t: '13:20 UTC',
-					s: 'Monitoring',
-					b: 'Added relay capacity in US-East; setup times improving.'
-				},
-				{
-					t: '12:41 UTC',
-					s: 'Investigating',
-					b: 'Some voice/video calls are slow to connect. Messaging is unaffected.'
-				}
-			]
-		},
-		{
-			date: 'Jun 28, 2026',
-			title: 'Push notification delays (Android)',
-			level: 'degraded',
-			updates: [
-				{
-					t: '09:15 UTC',
-					s: 'Resolved',
-					b: 'FCM delivery normalized after upstream provider recovery.'
-				},
-				{
-					t: '07:50 UTC',
-					s: 'Identified',
-					b: 'Upstream push provider degradation. Foreground/nearby delivery unaffected.'
-				}
-			]
-		},
-		{
-			date: 'Jun 14, 2026',
-			title: 'Scheduled relay maintenance',
-			level: 'maintenance',
-			updates: [
-				{
-					t: '03:00 UTC',
-					s: 'Completed',
-					b: 'Relay pool upgraded with no user-visible downtime.'
-				}
-			]
-		}
-	]
+	// No mock history — incidents appear only from the status feed / operator notes.
+	incidents: []
 });
 
 /**
@@ -195,35 +150,53 @@ export const SONAR_STATUS_SEED = /** @type {StatusPayload} */ ({
  * @param {ServiceState} [state]
  * @returns {Array<'ok' | 'warn' | 'down'>}
  */
-export function syntheticHistory(id, state = 'ok') {
-	/** @type {Array<'ok' | 'warn' | 'down'>} */
-	const out = [];
-	let r = fnv1a(id);
-	for (let d = 0; d < 90; d++) {
-		r = (Math.imul(r, 1664525) + 1013904223) >>> 0;
-		const v = r / 4294967296;
-		/** @type {'ok' | 'warn' | 'down'} */
-		let cls = 'ok';
-		if (state === 'degraded' && d > 85) cls = v < 0.5 ? 'warn' : 'ok';
-		else if (state === 'down' && d > 88) cls = 'down';
-		else if (v > 0.985) cls = 'down';
-		else if (v > 0.955) cls = 'warn';
-		out.push(cls);
+
+/**
+ * Merge a live feed payload onto the seed skeleton.
+ * - services: upsert by id (feed wins); seed-only rows stay as placeholders
+ * - incidents: feed replaces entirely (seed is empty by design)
+ * - relays: non-empty feed list replaces seed; otherwise keep seed defaults
+ * @param {StatusPayload} seed
+ * @param {StatusPayload} feed
+ * @returns {StatusPayload}
+ */
+export function mergeStatusPayload(seed, feed) {
+	/** @type {Map<string, StatusService>} */
+	const byId = new Map();
+	for (const s of seed.services) {
+		byId.set(s.id, { ...s });
 	}
-	return out;
+	for (const s of feed.services) {
+		byId.set(s.id, { ...s });
+	}
+	return {
+		services: Array.from(byId.values()),
+		relays: feed.relays && feed.relays.length > 0 ? feed.relays.slice() : seed.relays.slice(),
+		incidents: Array.isArray(feed.incidents) ? feed.incidents.slice() : []
+	};
 }
 
 /**
- * @param {string} s
- * @returns {number}
+ * Placeholder 90-day bars until real daily samples exist.
+ * @param {string} id
+ * @param {ServiceState} [state]
+ * @returns {Array<'ok' | 'warn' | 'down'>}
  */
-function fnv1a(s) {
-	let h = 2166136261;
-	for (let i = 0; i < s.length; i++) {
-		h ^= s.charCodeAt(i);
-		h = Math.imul(h, 16777619);
+export function syntheticHistory(id, state = 'ok') {
+	/** @type {Array<'ok' | 'warn' | 'down'>} */
+	const out = [];
+	// Placeholder bars until real daily samples exist. Operational services stay green;
+	// only current degraded/down states tint the most recent days (no random mock outages).
+	for (let d = 0; d < 90; d++) {
+		/** @type {'ok' | 'warn' | 'down'} */
+		let cls = 'ok';
+		if (state === 'degraded' && d > 85) cls = 'warn';
+		else if (state === 'down' && d > 87) cls = 'down';
+		out.push(cls);
 	}
-	return h >>> 0;
+	// keep id referenced so call sites stay stable when we switch to real history
+	void id;
+	return out;
 }
 
 /**
