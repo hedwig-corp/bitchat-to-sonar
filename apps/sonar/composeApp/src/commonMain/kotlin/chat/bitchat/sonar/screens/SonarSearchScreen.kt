@@ -44,6 +44,15 @@ import chat.bitchat.sonar.ui.sonar
 /** A `sinvite1` token followed by its hex payload, anywhere in the input. */
 private val INVITE_TOKEN_RE = Regex("sinvite1[0-9a-fA-F]{2,}")
 
+/** Close Search before [startChat] pushes its pending/existing chat screen. */
+internal fun startSecureChatFromSearch(
+    closeSearch: () -> Unit,
+    startChat: () -> Unit,
+) {
+    closeSearch()
+    startChat()
+}
+
 /**
  * Search screen behind the home Search bar (the prototype's `sn-search`).
  * Filters the user's channels + secure chats by query, and — since there's no
@@ -120,7 +129,10 @@ fun SonarSearchScreen(state: SonarAppState) {
             // Start-a-chat-by-npub / join-by-geohash actions when the query matches.
             if (looksLikeNpub) item {
                 ActionResult(SNIconName.Key, "Start secure chat", query, net = false) {
-                    state.startChat(query); state.back()
+                    startSecureChatFromSearch(
+                        closeSearch = state::back,
+                        startChat = { state.startChat(query) },
+                    )
                 }
             }
             if (looksLikeGeohash) item {
