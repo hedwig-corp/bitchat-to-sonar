@@ -25,7 +25,7 @@ use sonar_stickers::{
 
 use crate::conversation_index::{
     index_db_path_for_db, wipe_index_for_db, ConversationChangeListener, ConversationIndex,
-    ConversationSummary,
+    ConversationSummary, MessageChangeListener,
 };
 use crate::identity::Identity;
 use crate::invite_link::invite_link_state_path_for_db;
@@ -83,8 +83,11 @@ static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(60))
+        // Media URLs are controlled by the sender. Refuse redirects so a
+        // public HTTPS URL cannot bounce into a private address or downgrade.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .expect("static media HTTP client configuration is valid")
 });
 
 /// Download raw bytes for an encrypted media blob by its full imeta URL.
@@ -109,9 +112,7 @@ async fn http_get(url: &str, observer: Option<&dyn MediaDownloadObserver>) -> Re
     if media_download_cancelled(observer) {
         return Err(Error::MediaDownloadCancelled);
     }
-    if !url.starts_with("https://") {
-        return Err(Error::Http(format!("refusing non-https media url: {url}")));
-    }
+    validate_media_url(url)?;
     let send = HTTP_CLIENT.get(url).send();
     tokio::pin!(send);
     let mut resp = loop {
@@ -170,6 +171,45 @@ async fn http_get(url: &str, observer: Option<&dyn MediaDownloadObserver>) -> Re
         observer.on_progress(out.len() as u64, total.or(Some(out.len() as u64)));
     }
     Ok(out)
+}
+
+fn validate_media_url(value: &str) -> Result<()> {
+    let url = Url::parse(value).map_err(|_| Error::Http("invalid media URL".into()))?;
+    if url.scheme() != "https" {
+        return Err(Error::Http("refusing non-https media url".into()));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(Error::Http("refusing unsafe media URL".into()));
+    }
+    let host = url
+        .host()
+        .ok_or_else(|| Error::Http("media URL has no host".into()))?;
+    let unsafe_host = match host {
+        url::Host::Domain(domain) => {
+            let domain = domain.trim_end_matches('.');
+            domain.eq_ignore_ascii_case("localhost")
+                || domain.to_ascii_lowercase().ends_with(".localhost")
+        }
+        url::Host::Ipv4(address) => {
+            address.is_private()
+                || address.is_loopback()
+                || address.is_link_local()
+                || address.is_unspecified()
+                || address.is_multicast()
+                || address.is_broadcast()
+        }
+        url::Host::Ipv6(address) => {
+            address.is_loopback()
+                || address.is_unspecified()
+                || address.is_unique_local()
+                || address.is_unicast_link_local()
+                || address.is_multicast()
+        }
+    };
+    if unsafe_host {
+        return Err(Error::Http("refusing private media host".into()));
+    }
+    Ok(())
 }
 
 /// Download public bytes from an HTTPS URL (for plaintext sticker images).
@@ -795,6 +835,8 @@ pub struct SonarClient {
     conversation_index: Option<Arc<Mutex<ConversationIndex>>>,
     /// Host-registered callback fired when a conversation summary changes.
     change_listener: Arc<Mutex<Option<Arc<dyn ConversationChangeListener>>>>,
+    /// Host-registered callback fired after an exact transcript row commits.
+    message_listener: Arc<Mutex<Option<Arc<dyn MessageChangeListener>>>>,
     /// In-memory store for invite link secrets and pending join requests.
     invite_links: Arc<crate::invite_link::InviteLinkStore>,
     /// Cached push tokens for group members (pubkey hex → encrypted token).
@@ -839,6 +881,46 @@ impl SonarClient {
             Some(invite_link_state_path_for_db(db_path)),
             Some(push_token_cache_path_for_db(db_path)),
             index.map(|idx| Arc::new(Mutex::new(idx))),
+            true,
+        )
+        .await?;
+        client.materialize_index_if_empty();
+        Ok(client)
+    }
+
+    /// Open persistent local state without waiting for a relay connection.
+    ///
+    /// Existing chat summaries and bounded transcript pages are ready when this
+    /// returns, even during a complete relay outage. Relay connection and live
+    /// subscriptions are started normally, but readiness is not coupled to
+    /// their health. This is the preferred constructor for bridges.
+    pub async fn connect_local_first(
+        identity: Identity,
+        relays: Vec<RelayUrl>,
+        db_path: impl AsRef<Path>,
+        db_key: [u8; 32],
+    ) -> Result<Self> {
+        let db_path = db_path.as_ref();
+        let engine = MarmotEngine::persistent(identity.clone(), db_path, db_key)?;
+        let index_path = index_db_path_for_db(db_path);
+        let index = match ConversationIndex::open(&index_path, db_key) {
+            Ok(idx) => Some(Arc::new(Mutex::new(idx))),
+            Err(err) => {
+                tracing::warn!(%err, "conversation index open failed; continuing without");
+                None
+            }
+        };
+        let mut client = Self::with_engine(
+            identity,
+            relays,
+            engine,
+            true,
+            Some(sync_state_path_for_db(db_path)),
+            Some(outbox_state_path_for_db(db_path)),
+            Some(invite_link_state_path_for_db(db_path)),
+            Some(push_token_cache_path_for_db(db_path)),
+            index,
+            false,
         )
         .await?;
         client.materialize_index_if_empty();
@@ -850,7 +932,7 @@ impl SonarClient {
     pub async fn connect_in_memory(identity: Identity, relays: Vec<RelayUrl>) -> Result<Self> {
         let engine = MarmotEngine::in_memory(identity.clone());
         Self::with_engine(
-            identity, relays, engine, false, None, None, None, None, None,
+            identity, relays, engine, false, None, None, None, None, None, true,
         )
         .await
     }
@@ -865,6 +947,7 @@ impl SonarClient {
         invite_link_state_path: Option<PathBuf>,
         push_token_cache_path: Option<PathBuf>,
         conversation_index: Option<Arc<Mutex<ConversationIndex>>>,
+        wait_for_relay: bool,
     ) -> Result<Self> {
         let boot_start = std::time::Instant::now();
         let nostr = Client::new(identity.keys().clone());
@@ -882,7 +965,11 @@ impl SonarClient {
         // live. Mirrors whitenoise-rs `prepare_relay_urls` which uses
         // FuturesUnordered and returns at the quorum threshold.
         nostr.connect().await;
-        let quorum = MIN_CONNECTED_RELAYS.min(relays.len());
+        let quorum = if wait_for_relay {
+            MIN_CONNECTED_RELAYS.min(relays.len())
+        } else {
+            0
+        };
         if quorum > 0 {
             let relay_handles: Vec<_> = {
                 let map = nostr.relays().await;
@@ -1223,6 +1310,7 @@ impl SonarClient {
             allow_geo_relays,
             conversation_index,
             change_listener: Arc::new(Mutex::new(None)),
+            message_listener: Arc::new(Mutex::new(None)),
             invite_links: Arc::new(crate::invite_link::InviteLinkStore::load(
                 invite_link_state_path,
             )),
@@ -1241,7 +1329,9 @@ impl SonarClient {
                 elapsed_ms = boot_start.elapsed().as_millis() as u64,
                 "subscribe_marmot done"
             );
-            client.retry_outbox().await;
+            if wait_for_relay {
+                client.retry_outbox().await;
+            }
             tracing::info!(
                 elapsed_ms = boot_start.elapsed().as_millis() as u64,
                 "with_engine complete"
@@ -1504,6 +1594,46 @@ impl SonarClient {
             self.relays.clone(),
         )?;
         self.publish_group_creation(creation).await
+    }
+
+    /// Resolve an existing exact 1:1 group without touching the network.
+    /// Bridges use the peer pubkey as their stable portal identity and keep the
+    /// mutable MLS group id as local metadata.
+    pub fn dm_group_with(&self, peer: &PublicKey) -> Result<Option<GroupId>> {
+        self.find_dm_group_with(peer)
+    }
+
+    /// Resolve one known MLS group to its exact 1:1 peer using a direct local
+    /// group lookup. This is the fast path for bridge-owned peer/group mappings.
+    pub fn dm_peer_for_group(&self, group_id: &GroupId) -> Result<Option<PublicKey>> {
+        let Some(group) = self.engine.group(group_id)? else {
+            return Ok(None);
+        };
+        let members = self.engine.members(group_id)?;
+        let me = self.identity().public_key();
+        if members.len() != 2 || !members.contains(&me) {
+            return Ok(None);
+        }
+        let Some(peer) = members.iter().copied().find(|member| member != &me) else {
+            return Ok(None);
+        };
+        Ok(Self::is_reusable_dm_group(&group, &members, &me, &peer).then_some(peer))
+    }
+
+    /// Resolve a bounded set of local group IDs to exact 1:1 peers with one
+    /// group-metadata scan. This is intended for background bridge hydration;
+    /// callers choose the bounded IDs from the conversation-summary index.
+    pub fn dm_peers_for_groups(&self, group_ids: &[GroupId]) -> Result<Vec<(GroupId, PublicKey)>> {
+        if group_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut direct = Vec::new();
+        for group_id in group_ids {
+            if let Some(peer) = self.dm_peer_for_group(group_id)? {
+                direct.push((group_id.clone(), peer));
+            }
+        }
+        Ok(direct)
     }
 
     /// Scan active groups for an existing 1:1 DM with `peer`.
@@ -1837,6 +1967,15 @@ impl SonarClient {
     /// in the background. Publish success/failure only updates local delivery
     /// state; it does not gate transcript visibility.
     pub async fn send_text(&self, group_id: &GroupId, text: &str) -> Result<()> {
+        self.send_text_receipt(group_id, text).await.map(|_| ())
+    }
+
+    /// Local-first text send returning the stable committed Sonar row.
+    ///
+    /// Bridge callers journal their source transaction key and this event ID
+    /// before acknowledging Matrix, so replay after either process crashes is
+    /// idempotent.
+    pub async fn send_text_receipt(&self, group_id: &GroupId, text: &str) -> Result<ChatMessage> {
         let event = self.engine.create_text_message(group_id, text)?;
         let incoming = self.engine.process_incoming(&event).await?;
         let Incoming::Message(message) = incoming else {
@@ -1855,11 +1994,12 @@ impl SonarClient {
         );
         self.spawn_outbox_publish(message.id.to_hex(), group_id_hex.clone(), event);
         self.notify_conversation_changed(&group_id_hex);
+        self.notify_message_committed(&message);
         // Deferred bookkeeping: index + sync-state disk writes don't block
         // the caller so the next send can start immediately.
-        self.spawn_send_bookkeeping(group_name, message, event_id);
+        self.spawn_send_bookkeeping(group_name, message.clone(), event_id);
         self.spawn_push_notification(group_id.clone());
-        Ok(())
+        Ok(self.with_delivery_state(message))
     }
 
     fn spawn_send_bookkeeping(
@@ -2273,7 +2413,7 @@ impl SonarClient {
         caption: &str,
         server_url: &str,
     ) -> Result<()> {
-        self.send_media_multi(
+        self.send_media_multi_receipt(
             group_id,
             vec![MediaUpload {
                 data,
@@ -2284,6 +2424,7 @@ impl SonarClient {
             server_url,
         )
         .await
+        .map(|_| ())
     }
 
     /// Send N media attachments as ONE message (album): encrypt each with the
@@ -2300,6 +2441,60 @@ impl SonarClient {
         caption: &str,
         server_url: &str,
     ) -> Result<()> {
+        self.send_media_multi_receipt(group_id, items, caption, server_url)
+            .await
+            .map(|_| ())
+    }
+
+    /// Path-based media entry point for process/FFI integrations. The file path
+    /// crosses the boundary, never the media bytes, and the size is bounded
+    /// before allocation. The returned row supplies the stable message ID used
+    /// for bridge idempotency.
+    pub async fn send_media_from_path_receipt(
+        &self,
+        group_id: &GroupId,
+        path: &Path,
+        filename: &str,
+        mime: &str,
+        caption: &str,
+        server_url: &str,
+    ) -> Result<ChatMessage> {
+        let metadata = fs::metadata(path)
+            .map_err(|error| Error::Storage(format!("inspect media source: {error}")))?;
+        if !metadata.is_file() {
+            return Err(Error::InvalidInput(
+                "media source is not a regular file".into(),
+            ));
+        }
+        if metadata.len() > MAX_MEDIA_DOWNLOAD_BYTES as u64 {
+            return Err(Error::Media(format!(
+                "media too large: {} bytes (max {})",
+                metadata.len(),
+                MAX_MEDIA_DOWNLOAD_BYTES
+            )));
+        }
+        let data = fs::read(path)
+            .map_err(|error| Error::Storage(format!("read media source: {error}")))?;
+        self.send_media_multi_receipt(
+            group_id,
+            vec![MediaUpload {
+                data,
+                filename: filename.to_owned(),
+                mime: mime.to_owned(),
+            }],
+            caption,
+            server_url,
+        )
+        .await
+    }
+
+    pub async fn send_media_multi_receipt(
+        &self,
+        group_id: &GroupId,
+        items: Vec<MediaUpload>,
+        caption: &str,
+        server_url: &str,
+    ) -> Result<ChatMessage> {
         if items.is_empty() {
             return Err(Error::Media("no media to send".into()));
         }
@@ -2319,16 +2514,22 @@ impl SonarClient {
         let event = self
             .engine
             .create_media_event_multi(group_id, &refs, caption)?;
-        self.nostr.send_event(&event).await?;
         let incoming = self.engine.process_incoming(&event).await?;
-        if let Incoming::Message(message) = incoming {
-            let group_id_hex = hex::encode(group_id.as_slice());
-            let group_name = self.resolve_group_name(group_id);
-            self.notify_conversation_changed(&group_id_hex);
-            self.spawn_send_bookkeeping(group_name, message, event.id);
-        }
+        let Incoming::Message(message) = incoming else {
+            return Err(Error::Storage(
+                "created media message did not produce a local transcript row".into(),
+            ));
+        };
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let group_name = self.resolve_group_name(group_id);
+        self.mark_outbox_pending(group_id, &message, &event)?;
+        let event_id = event.id;
+        self.spawn_outbox_publish(message.id.to_hex(), group_id_hex.clone(), event);
+        self.notify_conversation_changed(&group_id_hex);
+        self.notify_message_committed(&message);
+        self.spawn_send_bookkeeping(group_name, message.clone(), event_id);
         self.spawn_push_notification(group_id.clone());
-        Ok(())
+        Ok(self.with_delivery_state(message))
     }
 
     /// Download the encrypted blob at `url` and decrypt it with the group media
@@ -3306,6 +3507,7 @@ impl SonarClient {
                         .get(message.group_id.as_slice())
                         .map(|s| s.as_str());
                     self.upsert_index_for_message(message, cached_name);
+                    self.notify_message_committed(message);
                     changed_groups.insert(hex::encode(message.group_id.as_slice()));
                     if !message.mine {
                         let preview = if message.content.len() > 100 {
@@ -3581,11 +3783,30 @@ impl SonarClient {
         *self.change_listener.lock().unwrap() = listener;
     }
 
+    pub fn set_message_change_listener(&self, listener: Option<Arc<dyn MessageChangeListener>>) {
+        *self.message_listener.lock().unwrap() = listener;
+    }
+
     pub fn conversation_summaries(&self) -> Vec<ConversationSummary> {
         let Some(ref idx) = self.conversation_index else {
             return Vec::new();
         };
         idx.lock().unwrap().summaries_ordered().unwrap_or_default()
+    }
+
+    /// Bounded Signal-style chat-list hydration for bridge/native startup.
+    pub fn conversation_summaries_page(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Vec<ConversationSummary> {
+        let Some(ref idx) = self.conversation_index else {
+            return Vec::new();
+        };
+        idx.lock()
+            .unwrap()
+            .summaries_page(limit, offset)
+            .unwrap_or_default()
     }
 
     pub fn conversation_summary(&self, group_id_hex: &str) -> Option<ConversationSummary> {
@@ -3668,6 +3889,12 @@ impl SonarClient {
         if let Some(l) = self.change_listener.lock().unwrap().clone() {
             let id = group_id_hex.to_owned();
             l.on_conversation_changed(id);
+        }
+    }
+
+    fn notify_message_committed(&self, message: &ChatMessage) {
+        if let Some(listener) = self.message_listener.lock().unwrap().clone() {
+            listener.on_message_committed(message.clone());
         }
     }
 
@@ -4321,6 +4548,25 @@ fn require_relay_success(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn local_first_persistent_open_does_not_require_a_relay() {
+        let directory = tempfile::tempdir().unwrap();
+        let client = tokio::time::timeout(
+            Duration::from_secs(1),
+            SonarClient::connect_local_first(
+                Identity::generate(),
+                Vec::new(),
+                directory.path().join("sonar.sqlite"),
+                [19u8; 32],
+            ),
+        )
+        .await
+        .expect("local storage open must not wait on relay health")
+        .expect("local storage opens");
+
+        assert!(client.conversation_summaries_page(20, 0).is_empty());
+    }
+
     struct CancelledDownload;
 
     impl MediaDownloadObserver for CancelledDownload {
@@ -4341,6 +4587,23 @@ mod tests {
         .expect_err("cancelled transfer must fail");
 
         assert!(matches!(error, Error::MediaDownloadCancelled));
+    }
+
+    #[test]
+    fn media_url_policy_rejects_private_hosts_credentials_and_downgrades() {
+        for value in [
+            "http://cdn.example/blob",
+            "https://127.0.0.1/blob",
+            "https://[::1]/blob",
+            "https://localhost/blob",
+            "https://user:password@cdn.example/blob",
+        ] {
+            assert!(
+                validate_media_url(value).is_err(),
+                "accepted unsafe URL {value}"
+            );
+        }
+        assert!(validate_media_url("https://cdn.example/blob").is_ok());
     }
     use crate::sonar_descriptor::{
         descriptor_content_json, meta_descriptor_content_json, SONAR_CALL_DESCRIPTOR_D_TAG,
@@ -4479,7 +4742,10 @@ mod tests {
             classification: crate::marmot::MessageClassification::Text,
         };
         // Caption/text always wins.
-        assert_eq!(index_preview(&msg("hi", vec![media_ref("image/jpeg", "a.jpg")])), "hi");
+        assert_eq!(
+            index_preview(&msg("hi", vec![media_ref("image/jpeg", "a.jpg")])),
+            "hi"
+        );
         // Caption-less media previews by kind — an album never shows blank.
         assert_eq!(
             index_preview(&msg("", vec![media_ref("image/jpeg", "a.jpg")])),

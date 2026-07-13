@@ -1,0 +1,70 @@
+name: Beeper bridge tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  go:
+    name: Bridge v2 connector
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: bridges/sonar
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: bridges/sonar/go.mod
+          cache-dependency-path: bridges/sonar/go.sum
+      - name: Test connector
+        run: go test -tags goolm ./...
+      - name: Vet connector
+        run: go vet -tags goolm ./...
+      - name: Build connector
+        run: go build -tags goolm ./cmd/matrix-sonar
+
+  daemon:
+    name: Sonar account daemon
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Test daemon
+        working-directory: core
+        run: cargo test -p sonar-bridge-daemon
+      - name: Lint daemon
+        working-directory: core
+        run: cargo clippy -p sonar-bridge-daemon --no-deps -- -D warnings
+      - name: Test core bridge paths
+        working-directory: core
+        run: |
+          cargo test -p sonar-core --lib client::tests::local_first_persistent_open_does_not_require_a_relay
+          cargo test -p sonar-core --lib client::tests::media_url_policy_rejects_private_hosts_credentials_and_downgrades
+          cargo test -p sonar-core --lib conversation_index::tests::summaries_page_is_bounded_and_stable_for_ties
+          cargo test -p sonar-core --test e2e start_dm_reuses_existing_direct_group
+          cargo test -p sonar-core --test e2e start_dm_does_not_reuse_named_group_reduced_to_two_members
+      - name: Build daemon
+        working-directory: core
+        run: cargo build --release -p sonar-bridge-daemon
+
+  container:
+    name: Self-hosted image
+    needs: [go, daemon]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: bridges/sonar/Dockerfile
+          push: false
+          tags: matrix-sonar:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

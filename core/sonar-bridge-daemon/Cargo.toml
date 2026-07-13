@@ -1,0 +1,24 @@
+[package]
+name = "sonar-bridge-daemon"
+description = "Local-first Sonar account daemon for Matrix/Beeper Bridge v2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sonar-core = { path = "../sonar-core" }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+sha2 = "0.10"
+chacha20poly1305 = "0.10"
+getrandom = "0.2"
+zeroize = "1"
+nostr.workspace = true
+rusqlite = { version = "0.37", features = ["bundled-sqlcipher"] }
+fs2 = "0.4"
+
+[dev-dependencies]
+tempfile.workspace = true

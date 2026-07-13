@@ -1,0 +1,22 @@
+[Unit]
+Description=Sonar Matrix/Beeper Bridge v2
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=matrix-sonar
+Group=matrix-sonar
+WorkingDirectory=/var/lib/matrix-sonar
+UMask=0077
+ExecStart=/usr/local/bin/matrix-sonar -c /etc/matrix-sonar/config.yaml
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/matrix-sonar
+
+[Install]
+WantedBy=multi-user.target

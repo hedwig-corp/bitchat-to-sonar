@@ -31,6 +31,14 @@ pub trait ConversationChangeListener: Send + Sync {
     fn on_conversation_changed(&self, group_id_hex: String);
 }
 
+/// Exact committed-message callback for durable local-first integrations.
+///
+/// Callbacks are at-least-once. Consumers replay bounded transcript pages
+/// after restart and deduplicate using the stable `ChatMessage::id`.
+pub trait MessageChangeListener: Send + Sync {
+    fn on_message_committed(&self, message: crate::marmot::ChatMessage);
+}
+
 pub const INDEX_DB_SUFFIX: &str = ".sonar-index.db";
 
 pub fn index_db_path_for_db(db_path: &Path) -> std::path::PathBuf {
@@ -178,7 +186,8 @@ impl ConversationIndex {
             .query_map([], |row| row.get::<_, String>(1))
             .map_err(|e| crate::Error::Storage(format!("index table_info query: {e}")))?;
         for name in names {
-            let name = name.map_err(|e| crate::Error::Storage(format!("index table_info row: {e}")))?;
+            let name =
+                name.map_err(|e| crate::Error::Storage(format!("index table_info row: {e}")))?;
             if name == column {
                 return Ok(true);
             }
@@ -268,30 +277,45 @@ impl ConversationIndex {
     }
 
     pub fn summaries_ordered(&self) -> Result<Vec<ConversationSummary>> {
+        self.summaries_page(usize::MAX, 0)
+    }
+
+    /// Return a bounded local chat-list page in deterministic recency order.
+    pub fn summaries_page(&self, limit: usize, offset: usize) -> Result<Vec<ConversationSummary>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let mut stmt = self
             .db
             .prepare(
                 "SELECT group_id_hex, name, latest_content, latest_sender,
                         latest_at_secs, latest_mine, message_count, unread_count, version
                  FROM conversation_summary
-                 ORDER BY latest_at_secs DESC",
+                 ORDER BY latest_at_secs DESC, group_id_hex ASC
+                 LIMIT ?1 OFFSET ?2",
             )
             .map_err(|e| crate::Error::Storage(format!("index summaries prepare: {e}")))?;
 
         let rows = stmt
-            .query_map([], |row| {
-                Ok(ConversationSummary {
-                    group_id_hex: row.get(0)?,
-                    name: row.get(1)?,
-                    latest_content: row.get(2)?,
-                    latest_sender: row.get(3)?,
-                    latest_at_secs: row.get::<_, i64>(4)? as u64,
-                    latest_mine: row.get::<_, i32>(5)? != 0,
-                    message_count: row.get::<_, i64>(6)? as u64,
-                    unread_count: row.get::<_, i64>(7)? as u64,
-                    version: row.get::<_, i64>(8)? as u64,
-                })
-            })
+            .query_map(
+                params![
+                    limit.min(i64::MAX as usize) as i64,
+                    offset.min(i64::MAX as usize) as i64
+                ],
+                |row| {
+                    Ok(ConversationSummary {
+                        group_id_hex: row.get(0)?,
+                        name: row.get(1)?,
+                        latest_content: row.get(2)?,
+                        latest_sender: row.get(3)?,
+                        latest_at_secs: row.get::<_, i64>(4)? as u64,
+                        latest_mine: row.get::<_, i32>(5)? != 0,
+                        message_count: row.get::<_, i64>(6)? as u64,
+                        unread_count: row.get::<_, i64>(7)? as u64,
+                        version: row.get::<_, i64>(8)? as u64,
+                    })
+                },
+            )
             .map_err(|e| crate::Error::Storage(format!("index summaries query: {e}")))?;
 
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -373,6 +397,32 @@ mod tests {
         let idx = ConversationIndex::open_in_memory().unwrap();
         assert!(idx.is_empty());
         assert!(idx.summaries_ordered().unwrap().is_empty());
+    }
+
+    #[test]
+    fn summaries_page_is_bounded_and_stable_for_ties() {
+        let idx = ConversationIndex::open_in_memory().unwrap();
+        for id in ["cc", "aa", "bb"] {
+            idx.upsert_summary(id, id, "hello", "sender", 10, false)
+                .unwrap();
+        }
+
+        let first = idx.summaries_page(2, 0).unwrap();
+        let second = idx.summaries_page(2, 2).unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .map(|row| row.group_id_hex.as_str())
+                .collect::<Vec<_>>(),
+            ["aa", "bb"]
+        );
+        assert_eq!(
+            second
+                .iter()
+                .map(|row| row.group_id_hex.as_str())
+                .collect::<Vec<_>>(),
+            ["cc"]
+        );
     }
 
     #[test]

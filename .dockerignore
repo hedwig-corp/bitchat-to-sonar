@@ -1,0 +1,14 @@
+.git
+**/target
+**/build
+**/.gradle
+**/.idea
+**/.kotlin
+**/node_modules
+*.xcresult
+bridges/sonar/config.yaml
+bridges/sonar/data
+bridges/sonar/master-key
+bridges/sonar/matrix-sonar
+core/android-out
+deploy/secrets
