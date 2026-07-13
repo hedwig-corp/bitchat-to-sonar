@@ -556,9 +556,14 @@ private func readMacAttachment(_ url: URL, maxBytes: Int) -> MacAttachmentReadRe
         }
         guard data.count <= maxBytes else { return .tooLarge }
         let filename = url.lastPathComponent.isEmpty ? "attachment" : url.lastPathComponent
-        let mime = values?.contentType?.preferredMIMEType
+        let detectedMime = values?.contentType?.preferredMIMEType
             ?? UTType(filenameExtension: url.pathExtension)?.preferredMIMEType
             ?? "application/octet-stream"
+        let mime = snEffectiveAttachmentMime(
+            declaredMime: detectedMime,
+            filename: filename,
+            plaintext: data
+        )
         return .attachment(MacImportedAttachment(data: data, filename: filename, mime: mime))
     } catch {
         return .unreadable

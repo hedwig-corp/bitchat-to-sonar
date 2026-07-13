@@ -79,9 +79,9 @@ internal fun readDroppedFile(uri: String, maxBytes: Long): DroppedFile? {
     }.getOrNull() ?: return null
     if (bytes.size.toLong() > maxBytes) return null
     val filename = file.name.ifBlank { "attachment" }
-    val mime = runCatching { Files.probeContentType(file.toPath()) }
+    val probedMime = runCatching { Files.probeContentType(file.toPath()) }
         .getOrNull()
         .orEmpty()
-        .ifBlank { "application/octet-stream" }
+    val mime = effectiveAttachmentMime(probedMime, filename, bytes)
     return DroppedFile(bytes, filename, mime)
 }

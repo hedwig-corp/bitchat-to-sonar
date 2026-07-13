@@ -2392,6 +2392,7 @@ private fun MediaViewer(
     var chrome by remember(media.url) { mutableStateOf(true) }
     var status by remember(media.url) { mutableStateOf<String?>(null) }
     var loadAttempt by remember(media.url, chatId) { mutableStateOf(0) }
+    var autoOpenedPdf by remember(media.url, chatId, loadAttempt) { mutableStateOf(false) }
     val loadResult by androidx.compose.runtime.produceState<Pair<Boolean, ByteArray?>>(
         false to null, media.url, chatId, loadAttempt
     ) {
@@ -2401,6 +2402,23 @@ private fun MediaViewer(
     val loadedBytes = loadResult.second
     val image = remember(loadedBytes, media.url) {
         if (media.isImage) loadedBytes?.let { decodeImageBitmap(it) } else null
+    }
+    val actionMime = remember(loadedBytes, media.mimeType, media.filename) {
+        loadedBytes?.let { effectiveAttachmentMime(media.mimeType, media.filename, it) }
+            ?: media.mimeType.substringBefore(';').trim().ifBlank { "application/octet-stream" }
+    }
+    val displayMedia = remember(media, actionMime) { media.copy(mimeType = actionMime) }
+
+    // A file-chip tap means "open this document". Once the encrypted blob has
+    // been fetched and authenticated, hand verified PDFs straight to the native
+    // viewer instead of making the user tap a second generic Open button.
+    LaunchedEffect(loadedBytes, actionMime, loadAttempt) {
+        val data = loadedBytes ?: return@LaunchedEffect
+        if (!autoOpenedPdf && isVerifiedPdfAttachment(media.mimeType, media.filename, data)) {
+            autoOpenedPdf = true
+            val ok = actions.open(data, media.filename, actionMime)
+            status = if (ok) "Opened" else "Couldn't open media"
+        }
     }
 
     Box(modifier.background(Color.Black)) {
@@ -2412,10 +2430,10 @@ private fun MediaViewer(
                 modifier = Modifier.fillMaxSize()
             )
             loadedBytes != null -> MediaFilePreview(
-                media = media,
+                media = displayMedia,
                 onOpen = {
                     scope.launch {
-                        val ok = actions.open(loadedBytes, media.filename, media.mimeType)
+                        val ok = actions.open(loadedBytes, media.filename, actionMime)
                         status = if (ok) "Opened" else "Couldn't open media"
                     }
                 },
@@ -2468,12 +2486,12 @@ private fun MediaViewer(
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
-                        Text(media.mimeType, color = Color.White.copy(alpha = 0.62f), fontSize = 12.sp)
+                        Text(actionMime, color = Color.White.copy(alpha = 0.62f), fontSize = 12.sp)
                     }
                     if (actions.canShare) {
                         MediaActionText("Share", enabled = loadedBytes != null) {
                             scope.launch {
-                                val ok = actions.share(loadedBytes ?: return@launch, media.filename, media.mimeType)
+                                val ok = actions.share(loadedBytes ?: return@launch, media.filename, actionMime)
                                 status = if (ok) "Opening share sheet" else "Couldn't share media"
                             }
                         }
@@ -2481,7 +2499,7 @@ private fun MediaViewer(
                     }
                     MediaActionText("Save", enabled = loadedBytes != null) {
                         scope.launch {
-                            val ok = actions.save(loadedBytes ?: return@launch, media.filename, media.mimeType)
+                            val ok = actions.save(loadedBytes ?: return@launch, media.filename, actionMime)
                             status = if (ok) "Saved" else "Couldn't save media"
                         }
                     }

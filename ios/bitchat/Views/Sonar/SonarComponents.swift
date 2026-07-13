@@ -12,6 +12,7 @@
 
 import SwiftUI
 import WebKit
+import QuickLook
 import SonarCore
 #if canImport(BitLogger)
 import BitLogger
@@ -901,6 +902,74 @@ private extension Data {
     }
 }
 
+private let snGenericAttachmentMime = "application/octet-stream"
+private let snPdfAttachmentMime = "application/pdf"
+
+/// MIME used for local presentation and native actions. The encrypted Blossom
+/// object intentionally remains application/octet-stream; this only refines
+/// decrypted attachment metadata when filename and plaintext signature agree.
+func snEffectiveAttachmentMime(declaredMime: String, filename: String, plaintext: Data) -> String {
+    let normalized = declaredMime
+        .split(separator: ";", maxSplits: 1, omittingEmptySubsequences: false)
+        .first
+        .map(String.init)?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased() ?? ""
+    guard normalized.isEmpty || normalized == snGenericAttachmentMime else { return normalized }
+    return snIsVerifiedPDFAttachment(declaredMime: declaredMime, filename: filename, plaintext: plaintext)
+        ? snPdfAttachmentMime
+        : (normalized.isEmpty ? snGenericAttachmentMime : normalized)
+}
+
+/// A PDF declaration or extension is never trusted without matching plaintext.
+func snIsVerifiedPDFAttachment(declaredMime: String, filename: String, plaintext: Data) -> Bool {
+    let normalized = declaredMime
+        .split(separator: ";", maxSplits: 1, omittingEmptySubsequences: false)
+        .first
+        .map(String.init)?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased() ?? ""
+    let hasPDFMetadata = normalized == snPdfAttachmentMime ||
+        (filename as NSString).pathExtension.caseInsensitiveCompare("pdf") == .orderedSame
+    return hasPDFMetadata && MimeType.pdf.matches(data: plaintext)
+}
+
+private struct SNStagedAttachmentPreview: Sendable {
+    let fileURL: URL
+    let directoryURL: URL
+}
+
+/// Write a decrypted native-preview copy off the UI thread. A per-preview
+/// directory keeps the visible filename clean while preserving uniqueness.
+private func snStageAttachmentPreview(_ data: Data, filename: String) -> SNStagedAttachmentPreview? {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("sonar-media-previews", isDirectory: true)
+    let directory = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let file = directory.appendingPathComponent(snSafeAttachmentFilename(filename), isDirectory: false)
+    do {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        #if os(iOS)
+        try data.write(to: file, options: [.atomic, .completeFileProtection])
+        #else
+        try data.write(to: file, options: .atomic)
+        #endif
+        return SNStagedAttachmentPreview(fileURL: file, directoryURL: directory)
+    } catch {
+        try? FileManager.default.removeItem(at: directory)
+        return nil
+    }
+}
+
+func snSafeAttachmentFilename(_ filename: String) -> String {
+    let basename = (filename as NSString).lastPathComponent
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    let cleaned = String(basename.unicodeScalars.filter {
+        !CharacterSet.controlCharacters.contains($0)
+    })
+    guard !cleaned.isEmpty, cleaned != ".", cleaned != ".." else { return "attachment" }
+    return cleaned
+}
+
 private func snLogMediaWarning(_ message: String) {
     #if canImport(BitLogger)
     SecureLogger.warning(message, category: .session)
@@ -1076,6 +1145,9 @@ struct SNMediaBubble: View {
             // A deck loads each card's bytes itself (lazy, only visible pages),
             // so the bubble skips the single-item load path.
             guard !isDeck, let item else { return }
+            // Generic documents follow Signal's lazy path: don't download and
+            // decrypt up to 25 MiB merely because their transcript row appeared.
+            guard item.isImage || item.mime.hasPrefix("audio/") else { return }
             guard let load else {
                 failed = true
                 return
@@ -1481,6 +1553,10 @@ struct SNMediaViewer: View {
     @State private var status: String?
     @State private var tempURLs: [URL] = []
     @State private var loadAttempt = 0
+    @State private var previewURL: URL?
+    @State private var previewFileURL: URL?
+    @State private var previewDirectoryURL: URL?
+    @State private var autoPreviewedPDF = false
 
     #if os(iOS)
     @State private var shareItems: [Any] = []
@@ -1504,8 +1580,10 @@ struct SNMediaViewer: View {
         .task(id: [item.url, item.groupId, item.localPath ?? "", String(loadAttempt)].joined(separator: "|")) {
             failed = false
             status = nil
+            autoPreviewedPDF = false
             if let initialBytes {
                 bytes = initialBytes
+                await previewPDFIfNeeded(initialBytes)
                 return
             }
             bytes = nil
@@ -1515,11 +1593,17 @@ struct SNMediaViewer: View {
             }
             if let data = await load(item) {
                 bytes = data
+                await previewPDFIfNeeded(data)
             } else {
                 failed = true
             }
         }
+        .quickLookPreview($previewURL)
+        .onChange(of: previewURL) { url in
+            if url == nil { cleanupNativePreview() }
+        }
         .onDisappear {
+            cleanupNativePreview()
             tempURLs.forEach { try? FileManager.default.removeItem(at: $0) }
             tempURLs = []
         }
@@ -1549,7 +1633,7 @@ struct SNMediaViewer: View {
                     .fill(Color.white.opacity(0.10))
                     .frame(width: 74, height: 74)
                     .overlay(
-                        Text(verbatim: item.mime.hasPrefix("video/") ? "▶" : "·")
+                        Text(verbatim: effectiveMime.hasPrefix("video/") ? "▶" : "·")
                             .font(SonarTheme.uiFont(size: 30, weight: .bold))
                             .foregroundColor(.white.opacity(0.86))
                     )
@@ -1559,7 +1643,7 @@ struct SNMediaViewer: View {
                     .multilineTextAlignment(.center)
                     .lineLimit(3)
                     .padding(.horizontal, 28)
-                Text(verbatim: item.mime)
+                Text(verbatim: effectiveMime)
                     .font(SonarTheme.uiFont(size: 12))
                     .foregroundColor(.white.opacity(0.62))
                 Button {
@@ -1738,18 +1822,65 @@ struct SNMediaViewer: View {
     }
 
     private func openMedia() {
-        guard let url = writeTempFile() else { return }
-        #if os(iOS)
-        shareItems = [url]
-        showShare = true
-        #else
-        NSWorkspace.shared.open(url)
-        #endif
+        guard let data = bytes else { return }
+        Task { @MainActor in
+            await presentNativePreview(data)
+        }
+    }
+
+    private var effectiveMime: String {
+        guard let bytes else {
+            return item.mime.split(separator: ";", maxSplits: 1).first.map(String.init) ?? item.mime
+        }
+        return snEffectiveAttachmentMime(
+            declaredMime: item.mime,
+            filename: item.filename,
+            plaintext: bytes
+        )
+    }
+
+    @MainActor
+    private func previewPDFIfNeeded(_ data: Data) async {
+        guard !autoPreviewedPDF,
+              snIsVerifiedPDFAttachment(
+                declaredMime: item.mime,
+                filename: item.filename,
+                plaintext: data
+              ) else { return }
+        autoPreviewedPDF = true
+        await presentNativePreview(data)
+    }
+
+    @MainActor
+    private func presentNativePreview(_ data: Data) async {
+        if let previewFileURL, FileManager.default.fileExists(atPath: previewFileURL.path) {
+            previewURL = previewFileURL
+            return
+        }
+        let filename = safeFilename
+        let staged = await Task.detached(priority: .userInitiated) {
+            snStageAttachmentPreview(data, filename: filename)
+        }.value
+        guard let staged else {
+            status = "Couldn't prepare media"
+            return
+        }
+        previewFileURL = staged.fileURL
+        previewDirectoryURL = staged.directoryURL
+        previewURL = staged.fileURL
+    }
+
+    private func cleanupNativePreview() {
+        if let previewDirectoryURL {
+            try? FileManager.default.removeItem(at: previewDirectoryURL)
+        }
+        previewURL = nil
+        previewFileURL = nil
+        previewDirectoryURL = nil
     }
 
     private var safeFilename: String {
-        let name = (item.filename as NSString).lastPathComponent
-        return name.isEmpty ? "attachment" : name
+        snSafeAttachmentFilename(item.filename)
     }
 
     private func writeTempFile(track: Bool = true) -> URL? {

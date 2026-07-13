@@ -92,4 +92,28 @@ class FileDropTest {
             )
         )
     }
+
+    @Test
+    fun promotesVerifiedPdfFromGenericMime() {
+        val pdf = "%PDF-1.7\nreceipt".encodeToByteArray()
+
+        assertEquals(
+            "application/pdf",
+            effectiveAttachmentMime("application/octet-stream", "receipt.PDF", pdf),
+        )
+        assertTrue(isVerifiedPdfAttachment("application/octet-stream", "receipt.PDF", pdf))
+    }
+
+    @Test
+    fun leavesFakePdfAndExplicitMimeUnchanged() {
+        val fakePdf = "not a pdf".encodeToByteArray()
+        val realPdf = "%PDF-1.7\nreceipt".encodeToByteArray()
+
+        assertEquals(
+            "application/octet-stream",
+            effectiveAttachmentMime("application/octet-stream", "receipt.pdf", fakePdf),
+        )
+        assertFalse(isVerifiedPdfAttachment("application/octet-stream", "receipt.pdf", fakePdf))
+        assertEquals("text/plain", effectiveAttachmentMime("text/plain; charset=utf-8", "receipt.pdf", realPdf))
+    }
 }
