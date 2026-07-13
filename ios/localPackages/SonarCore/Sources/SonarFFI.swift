@@ -1098,10 +1098,11 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * after relay disconnects. Hosts call this on the idle timeout path
      * instead of `sync_once()`. It may run one bounded per-chat repair fetch,
      * so hosts must keep it off the local-first chat-open path.
-     * Prefer this nostr group id for cold-start historical catch-up (open chat).
-     * Pass empty string to clear. Does not block local-first paint or send.
+     * Prefer catch-up for the open chat. Pass the MLS group id hex (same id used
+     * by send_text / messages). Empty clears. Local-first: does not block paint
+     * or send. Core maps MLS to the public nostr group id for the catch-up queue.
      */
-    func preferCatchupGroup(nostrGroupIdHex: String) 
+    func preferCatchupGroup(mlsGroupIdHex: String) 
     
     /**
      * Publish the user's Blossom server list (kind-10063).
@@ -1847,13 +1848,14 @@ open func pendingJoinRequests(groupIdHex: String)throws  -> [JoinRequestInfo]  {
      * after relay disconnects. Hosts call this on the idle timeout path
      * instead of `sync_once()`. It may run one bounded per-chat repair fetch,
      * so hosts must keep it off the local-first chat-open path.
-     * Prefer this nostr group id for cold-start historical catch-up (open chat).
-     * Pass empty string to clear. Does not block local-first paint or send.
+     * Prefer catch-up for the open chat. Pass the MLS group id hex (same id used
+     * by send_text / messages). Empty clears. Local-first: does not block paint
+     * or send. Core maps MLS to the public nostr group id for the catch-up queue.
      */
-open func preferCatchupGroup(nostrGroupIdHex: String)  {try! rustCall() {
+open func preferCatchupGroup(mlsGroupIdHex: String)  {try! rustCall() {
     uniffi_sonar_ffi_fn_method_sonarnode_prefer_catchup_group(
             self.uniffiCloneHandle(),
-        FfiConverterString.lower(nostrGroupIdHex),$0
+        FfiConverterString.lower(mlsGroupIdHex),$0
     )
 }
 }

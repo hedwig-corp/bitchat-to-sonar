@@ -44,10 +44,12 @@ PR #220 device logs showed multi-second (often ~10–20s) send lag after launch 
 
 ## Status
 - Core P0–P3: `72843b0c`
-- This ship: plan doc + FFI/iOS prefer hook + review
-
+- Plan + FFI/iOS prefer hook: `cb804932`
+- MLS→nostr prefer mapping: `5d5365b0`
+- Compose openChat/openDm prefer: `5bb1b11a`
+- Swift FFI param name aligned to MLS: this ship
 
 ## Review fix
 - Hosts pass MLS group id into prefer_catchup_group; core maps MLS to nostr #h id used by the catch-up queue.
-
 - Compose preferCatchupGroup on openChat/openDm for Android/desktop parity.
+- Swift UniFFI surface uses `mlsGroupIdHex` (not the misleading `nostrGroupIdHex` label).

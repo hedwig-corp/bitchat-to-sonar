@@ -747,7 +747,8 @@ final class MarmotService: @unchecked Sendable {
         // Best-effort: local-only sessions may not have a relay-backed node yet.
         try? await run { service in
             guard service.relayConnected else { return }
-            service.requireNode().preferCatchupGroup(nostrGroupIdHex: value)
+            // Host ids are MLS group ids (send_text / MarmotGroup.id); core maps to nostr #h.
+            service.requireNode().preferCatchupGroup(mlsGroupIdHex: value)
         }
     }
 
