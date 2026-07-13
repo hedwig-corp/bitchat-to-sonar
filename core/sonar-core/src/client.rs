@@ -77,6 +77,7 @@ const MEDIA_DOWNLOAD_ATTEMPTS: usize = 3;
 const MEDIA_DOWNLOAD_RETRY_DELAY: Duration = Duration::from_millis(350);
 const MEDIA_DOWNLOAD_CANCEL_POLL: Duration = Duration::from_millis(100);
 const MEDIA_DOWNLOAD_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+const STICKER_PREFETCH_CONCURRENCY: usize = 4;
 const SONAR_DIRECT_DM_DESCRIPTION: &str = "sonar.direct-dm.v1";
 
 /// Shared HTTP client for Blossom media downloads. Built once so every blob
@@ -179,6 +180,46 @@ async fn http_get(url: &str, observer: Option<&dyn MediaDownloadObserver>) -> Re
 /// Download public bytes from an HTTPS URL (for plaintext sticker images).
 pub async fn http_get_public(url: &str) -> Result<Vec<u8>> {
     http_get_with_retries(url, None).await
+}
+
+async fn fetch_sticker_image_with_cache(
+    sticker_cache_dir: Option<&Path>,
+    url: &str,
+    expected_sha256: &str,
+) -> Result<Vec<u8>> {
+    let expected = expected_sha256.to_ascii_lowercase();
+    validate_sha256_hex(&expected).map_err(|e| Error::Http(format!("bad sticker sha256: {e}")))?;
+    if let Ok(Some(cached)) = read_sticker_cache(sticker_cache_dir, &expected) {
+        return Ok(cached);
+    }
+    if !url.starts_with("https://") {
+        return Err(Error::Http("sticker URL must be HTTPS".into()));
+    }
+    let bytes = http_get_public(url).await?;
+    let actual = sha256_hex(&bytes);
+    if actual != expected {
+        return Err(Error::Http(format!(
+            "sticker image sha256 mismatch: expected {expected}, got {actual}"
+        )));
+    }
+    let _ = write_sticker_cache(sticker_cache_dir, &expected, &bytes);
+    Ok(bytes)
+}
+
+type StickerPrefetchTaskResult = (String, Result<Vec<u8>>);
+type StickerPrefetchJoinResult =
+    std::result::Result<StickerPrefetchTaskResult, tokio::task::JoinError>;
+
+fn log_sticker_prefetch_result(outcome: Option<StickerPrefetchJoinResult>) {
+    match outcome {
+        Some(Ok((url, Err(err)))) => {
+            tracing::debug!(%err, %url, "sticker prefetch: image failed");
+        }
+        Some(Err(err)) => {
+            tracing::debug!(%err, "sticker prefetch: image task failed");
+        }
+        Some(Ok((_, Ok(_)))) | None => {}
+    }
 }
 
 async fn http_get_with_retries(
@@ -2039,6 +2080,23 @@ impl SonarClient {
         identifier: &str,
         relay_urls: &[String],
     ) -> Result<StickerPack> {
+        Self::fetch_sticker_pack_with_client(
+            &self.nostr,
+            &self.relays,
+            author_pubkey_hex,
+            identifier,
+            relay_urls,
+        )
+        .await
+    }
+
+    async fn fetch_sticker_pack_with_client(
+        nostr: &Client,
+        default_relays: &[RelayUrl],
+        author_pubkey_hex: &str,
+        identifier: &str,
+        relay_urls: &[String],
+    ) -> Result<StickerPack> {
         let author = PublicKey::from_hex(author_pubkey_hex)
             .map_err(|e| Error::InvalidInput(format!("invalid pack author pubkey: {e}")))?;
         let filter = Filter::new()
@@ -2051,15 +2109,12 @@ impl SonarClient {
             .limit(1);
 
         let relays: Vec<String> = if relay_urls.is_empty() {
-            self.relays.iter().map(|u| u.to_string()).collect()
+            default_relays.iter().map(|u| u.to_string()).collect()
         } else {
             relay_urls.to_vec()
         };
         let timeout = Duration::from_secs(10);
-        let events = self
-            .nostr
-            .fetch_events_from(relays, filter, timeout)
-            .await?;
+        let events = nostr.fetch_events_from(relays, filter, timeout).await?;
         let event = events
             .into_iter()
             .next()
@@ -2070,53 +2125,58 @@ impl SonarClient {
     /// Download a public sticker image (HTTPS), verify SHA256, and persist to the
     /// content-addressed disk cache when configured.
     pub async fn fetch_sticker_image(&self, url: &str, expected_sha256: &str) -> Result<Vec<u8>> {
-        let expected = expected_sha256.to_ascii_lowercase();
-        validate_sha256_hex(&expected)
-            .map_err(|e| Error::Http(format!("bad sticker sha256: {e}")))?;
-        if let Ok(Some(cached)) = read_sticker_cache(self.sticker_cache_dir.as_deref(), &expected) {
-            return Ok(cached);
-        }
-        if !url.starts_with("https://") {
-            return Err(Error::Http("sticker URL must be HTTPS".into()));
-        }
-        let bytes = http_get_public(url).await?;
-        let actual = sha256_hex(&bytes);
-        if actual != expected {
-            return Err(Error::Http(format!(
-                "sticker image sha256 mismatch: expected {expected}, got {actual}"
-            )));
-        }
-        let _ = write_sticker_cache(self.sticker_cache_dir.as_deref(), &expected, &bytes);
-        Ok(bytes)
+        fetch_sticker_image_with_cache(self.sticker_cache_dir.as_deref(), url, expected_sha256)
+            .await
     }
 
-    /// Best-effort prefetch of all sticker images in a pack after install.
-    async fn prefetch_sticker_pack_images(&self, coordinate: &str) {
-        let address = match PackAddress::parse(coordinate) {
-            Ok(a) => a,
-            Err(err) => {
-                tracing::debug!(%err, coordinate, "sticker prefetch: bad coordinate");
-                return;
-            }
-        };
-        let pack = match self
-            .fetch_sticker_pack(&address.author_pubkey_hex, &address.identifier, &[])
+    /// Schedule bounded best-effort prefetch without holding the install/FFI
+    /// call or the host's serialized Marmot queue open on network I/O.
+    fn spawn_sticker_pack_prefetch(&self, coordinate: String) {
+        let nostr = self.nostr.clone();
+        let relays = self.relays.clone();
+        let sticker_cache_dir = self.sticker_cache_dir.clone();
+        let _prefetch = tokio::spawn(async move {
+            let address = match PackAddress::parse(&coordinate) {
+                Ok(address) => address,
+                Err(err) => {
+                    tracing::debug!(%err, coordinate, "sticker prefetch: bad coordinate");
+                    return;
+                }
+            };
+            let pack = match Self::fetch_sticker_pack_with_client(
+                &nostr,
+                &relays,
+                &address.author_pubkey_hex,
+                &address.identifier,
+                &[],
+            )
             .await
-        {
-            Ok(p) => p,
-            Err(err) => {
-                tracing::debug!(%err, coordinate, "sticker prefetch: pack fetch failed");
-                return;
-            }
-        };
-        for sticker in &pack.stickers {
-            if let Err(err) = self
-                .fetch_sticker_image(&sticker.url, &sticker.sha256)
-                .await
             {
-                tracing::debug!(%err, url = %sticker.url, "sticker prefetch: image failed");
+                Ok(pack) => pack,
+                Err(err) => {
+                    tracing::debug!(%err, coordinate, "sticker prefetch: pack fetch failed");
+                    return;
+                }
+            };
+
+            let mut tasks = tokio::task::JoinSet::new();
+            for sticker in pack.stickers {
+                while tasks.len() >= STICKER_PREFETCH_CONCURRENCY {
+                    log_sticker_prefetch_result(tasks.join_next().await);
+                }
+                let cache_dir = sticker_cache_dir.clone();
+                tasks.spawn(async move {
+                    let url = sticker.url;
+                    let result =
+                        fetch_sticker_image_with_cache(cache_dir.as_deref(), &url, &sticker.sha256)
+                            .await;
+                    (url, result)
+                });
             }
-        }
+            while !tasks.is_empty() {
+                log_sticker_prefetch_result(tasks.join_next().await);
+            }
+        });
     }
 
     pub async fn fetch_installed_packs(&self) -> Result<Vec<PackAddress>> {
@@ -2156,7 +2216,7 @@ impl SonarClient {
             packs.push(address);
         }
         self.publish_installed_packs(packs).await?;
-        self.prefetch_sticker_pack_images(coordinate).await;
+        self.spawn_sticker_pack_prefetch(coordinate.to_owned());
         Ok(())
     }
 
