@@ -62,7 +62,8 @@ Output is a single metrics JSON object on stdout. Tunables
 
 `TARGET_RELAY`, `CONTROL_RELAYS`, `SKIP_CONTROL`, `IDENTITIES`, `FANOUT`,
 `MESSAGES_PER_PAIR`, `RECEIVE_TIMEOUT_SECS`, `SEED`, and thresholds
-`MAX_LOSS_PCT` / `MAX_P95_LATENCY_MS` / `MAX_ERRORS`.
+`MAX_LOSS_PCT` / `MAX_P95_LATENCY_MS` / `MAX_ERRORS` / `MAX_LOST`
+(tolerates a single transient lost message by default).
 
 ## Reporting (DM) — one-time reporter setup
 

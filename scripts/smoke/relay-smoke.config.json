@@ -13,7 +13,8 @@
   "thresholds": {
     "max_loss_pct": 0,
     "max_p95_latency_ms": 5000,
-    "max_errors": 0
+    "max_errors": 0,
+    "max_lost": 1
   },
   "report": {
     "npub": "npub10srglj0rdsmtehwlflxptwz74c955c2y7jrhdmjm5gr6gycpsp5sg3fm3c"

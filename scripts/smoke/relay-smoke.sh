@@ -70,6 +70,9 @@ MAX_P95_LATENCY_MS="${MAX_P95_LATENCY_MS:-$(cfg '.thresholds.max_p95_latency_ms'
 MAX_P95_LATENCY_MS="${MAX_P95_LATENCY_MS:-5000}"
 MAX_ERRORS="${MAX_ERRORS:-$(cfg '.thresholds.max_errors')}"
 MAX_ERRORS="${MAX_ERRORS:-0}"
+# tolerate a single transient drop so a one-off blip does not flip the run to fail
+MAX_LOST="${MAX_LOST:-$(cfg '.thresholds.max_lost')}"
+MAX_LOST="${MAX_LOST:-1}"
 
 # reporting
 REPORT_NPUB="${REPORT_NPUB:-$(cfg '.report.npub')}"
@@ -285,12 +288,14 @@ run_exchange() {
       errors:$errors}'
 }
 
-# pass/fail for a single relay-set given thresholds
+# pass/fail for a single relay-set given thresholds. Gates on absolute lost-message
+# count (MAX_LOST) so a single transient drop does not flip a healthy relay-set to
+# fail; p95 latency and CLI errors still gate directly.
 set_status() {
-  local loss_pct="$1" p95="$2" errors="$3"
-  awk -v l="$loss_pct" -v p="$p95" -v e="$errors" \
-      -v ml="$MAX_LOSS_PCT" -v mp="$MAX_P95_LATENCY_MS" -v me="$MAX_ERRORS" \
-  'BEGIN{ if(l+0>ml+0 || p+0>mp+0 || e+0>me+0) print "fail"; else print "pass" }'
+  local loss_pct="$1" p95="$2" errors="$3" lost="${4:-0}"
+  awk -v p="$p95" -v e="$errors" -v lo="$lost" \
+      -v mp="$MAX_P95_LATENCY_MS" -v me="$MAX_ERRORS" -v mlo="$MAX_LOST" \
+  'BEGIN{ if(lo+0>mlo+0 || p+0>mp+0 || e+0>me+0) print "fail"; else print "pass" }'
 }
 
 # ---- main ----
@@ -308,12 +313,13 @@ main() {
   provision "target"
   build_graph
   target_metrics=$(run_exchange "target")
-  local t_loss t_p95 t_err
+  local t_loss t_p95 t_err t_lost
   t_loss=$(printf '%s' "$target_metrics" | jq -r '.loss_pct')
+  t_lost=$(printf '%s' "$target_metrics" | jq -r '.lost')
   t_p95=$(printf '%s' "$target_metrics" | jq -r '.latency_ms.p95')
   t_err=$(printf '%s' "$target_metrics" | jq -r '.errors')
-  target_status=$(set_status "$t_loss" "$t_p95" "$t_err")
-  log "target: $target_status (loss=${t_loss}% p95=${t_p95}ms errors=${t_err})"
+  target_status=$(set_status "$t_loss" "$t_p95" "$t_err" "$t_lost")
+  log "target: $target_status (loss=${t_loss}% lost=${t_lost} p95=${t_p95}ms errors=${t_err})"
 
   # control relay set (unless skipped)
   if [[ "$SKIP_CONTROL" != "1" ]]; then
@@ -322,12 +328,13 @@ main() {
     provision "control"
     build_graph   # same seed -> same topology
     control_metrics=$(run_exchange "control")
-    local c_loss c_p95 c_err
+    local c_loss c_p95 c_err c_lost
     c_loss=$(printf '%s' "$control_metrics" | jq -r '.loss_pct')
+    c_lost=$(printf '%s' "$control_metrics" | jq -r '.lost')
     c_p95=$(printf '%s' "$control_metrics" | jq -r '.latency_ms.p95')
     c_err=$(printf '%s' "$control_metrics" | jq -r '.errors')
-    control_status=$(set_status "$c_loss" "$c_p95" "$c_err")
-    log "control: $control_status (loss=${c_loss}% p95=${c_p95}ms errors=${c_err})"
+    control_status=$(set_status "$c_loss" "$c_p95" "$c_err" "$c_lost")
+    log "control: $control_status (loss=${c_loss}% lost=${c_lost} p95=${c_p95}ms errors=${c_err})"
   fi
 
   # classify
@@ -352,7 +359,7 @@ main() {
     --argjson messages_per_pair "$MESSAGES_PER_PAIR" \
     --argjson receive_timeout_secs "$RECEIVE_TIMEOUT_SECS" \
     --arg max_loss_pct "$MAX_LOSS_PCT" --arg max_p95_latency_ms "$MAX_P95_LATENCY_MS" \
-    --argjson max_errors "$MAX_ERRORS" \
+    --argjson max_errors "$MAX_ERRORS" --argjson max_lost "$MAX_LOST" \
     --arg target_status "$target_status" --arg control_status "$control_status" \
     --arg overall "$overall" --arg report_npub "$REPORT_NPUB" \
     --argjson target "$target_metrics" --argjson control "$control_metrics" \
@@ -360,7 +367,7 @@ main() {
       config:{target_relay:$target_relay, control_relays:($control_relays|split(" ")),
               identities:$identities, fanout:$fanout, messages_per_pair:$messages_per_pair,
               receive_timeout_secs:$receive_timeout_secs},
-      thresholds:{max_loss_pct:($max_loss_pct|tonumber), max_p95_latency_ms:($max_p95_latency_ms|tonumber), max_errors:$max_errors},
+      thresholds:{max_loss_pct:($max_loss_pct|tonumber), max_p95_latency_ms:($max_p95_latency_ms|tonumber), max_errors:$max_errors, max_lost:$max_lost},
       target_status:$target_status, control_status:$control_status, overall:$overall,
       target:$target, control:$control, report_npub:$report_npub}' \
     > "$METRICS_JSON"
@@ -411,9 +418,11 @@ issue_if_needed() {
   command -v gh >/dev/null 2>&1 || { log "gh not found -> cannot open issue"; return 0; }
 
   local kind="$overall"
-  local title="[relay-smoke] $kind on $TARGET_RELAY ($(date -u +%F))"
+  # stable title (no date) so repeated failures dedupe onto ONE open issue per kind
+  local title="[relay-smoke] $kind on $TARGET_RELAY"
   local body
-  body=$(jq -r --arg relay "$TARGET_RELAY" --arg ctrl "$CONTROL_RELAYS" '
+  body=$(jq -r --arg relay "$TARGET_RELAY" --arg ctrl "$CONTROL_RELAYS" --arg ts "$(date -u +'%F %H:%M UTC')" '
+    "**Update " + $ts + "**.\n\n" +
     "Daily relay smoke test classified this run as **" + .overall + "**.\n\n" +
     "- target `" + $relay + "`: " + .target_status + " (loss=" + (.target.loss_pct|tostring) +
       "%, lost " + (.target.lost|tostring) + "/" + (.target.sent|tostring) +
@@ -430,7 +439,21 @@ issue_if_needed() {
 
   local repo_args=()
   [[ -n "$GITHUB_REPO" ]] && repo_args=(--repo "$GITHUB_REPO")
-  # labels may not exist in the repo yet; try with, fall back to without
+  # dedupe: comment on an existing OPEN issue with this title instead of opening a
+  # new one each run; only create on the first failure of a streak
+  local existing
+  existing=$(gh issue list "${repo_args[@]}" --state open --search "$title in:title" --limit 1 \
+              --json number --jq '.[0].number // empty' 2>/dev/null || true)
+  if [[ -n "$existing" ]]; then
+    if gh issue comment "$existing" "${repo_args[@]}" --body "$body" \
+         >/tmp/relay-smoke-issue.txt 2>/tmp/relay-smoke-issue.err; then
+      log "commented on existing issue #$existing: $(cat /tmp/relay-smoke-issue.txt)"
+    else
+      log "gh issue comment failed: $(cat /tmp/relay-smoke-issue.err)"
+    fi
+    return 0
+  fi
+  # first failure of the streak: create (labels may not exist yet; fall back to without)
   if gh issue create "${repo_args[@]}" --title "$title" --body "$body" \
        --label "smoke,relay,$kind" >/tmp/relay-smoke-issue.txt 2>/tmp/relay-smoke-issue.err; then
     log "issue opened: $(cat /tmp/relay-smoke-issue.txt)"
