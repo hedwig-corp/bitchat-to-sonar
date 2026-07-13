@@ -1,0 +1,21 @@
+[package]
+name = "sonar-ircd"
+description = "IRC server bridge to Sonar: speak IRC to any client (halloy, irssi), sonar-core underneath."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sonar-core = { path = "../sonar-core" }
+async-trait = "0.1"
+anyhow = "1"
+hex.workspace = true
+nostr.workspace = true
+nostr-sdk.workspace = true
+rand = "0.8"
+serde.workspace = true
+toml = "0.8"
+tokio = { workspace = true, features = ["net", "io-util"] }
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }

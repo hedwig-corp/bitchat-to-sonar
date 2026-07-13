@@ -1,0 +1,22 @@
+# sonar-ircd configuration (in-tree). Run with:
+#   cargo run -p sonar-ircd -- core/sonar-ircd/config.example.toml
+# or:
+#   SONAR_IRCD_CONFIG=core/sonar-ircd/config.example.toml cargo run -p sonar-ircd
+
+listen = "127.0.0.1:6667"
+server_name = "sonar-ircd"
+
+[backend]
+# home      = "/home/you/.sonar-ircd"
+# nsec_file = "/home/you/.sonar-ircd/identity.nsec"
+# nick      = "you"
+relays = ["wss://relay.damus.io", "wss://nos.lol"]
+
+# Optional: bridge an external IRC channel into a local channel.
+# [irc_bridge]
+# enabled = true
+# server = "irc.libera.chat"
+# port = 6667
+# nickname = "sonar-bridge"
+# channel = "#halloy"
+# local_channel = "#halloy"
