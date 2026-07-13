@@ -1830,10 +1830,6 @@ final class MarmotChatModel: ObservableObject {
     }
 
     func fetchInstalledPacks() async -> [String]? {
-        if installedPackCoordinatesLoaded {
-            Task { await refreshInstalledPacks() }
-            return Array(installedPackCoordinates)
-        }
         do {
             let coords = try await service.fetchInstalledPacks()
             installedPackCoordinates = Set(coords.map { $0.lowercased() })
@@ -1842,16 +1838,6 @@ final class MarmotChatModel: ObservableObject {
         } catch {
             self.errorText = Self.describe(error)
             return nil
-        }
-    }
-
-    func refreshInstalledPacks() async {
-        do {
-            let coords = try await service.fetchInstalledPacks()
-            installedPackCoordinates = Set(coords.map { $0.lowercased() })
-            installedPackCoordinatesLoaded = true
-        } catch {
-            self.errorText = Self.describe(error)
         }
     }
 
