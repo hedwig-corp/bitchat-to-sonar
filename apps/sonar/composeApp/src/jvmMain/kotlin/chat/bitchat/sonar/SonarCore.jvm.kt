@@ -219,8 +219,14 @@ actual object SonarCore {
     actual suspend fun fetchStickerImage(url: String, expectedSha256: String): ByteArray =
         withContext(Dispatchers.IO) { requireNode().fetchStickerImage(url, expectedSha256) }
 
-    actual suspend fun cachedStickerImage(expectedSha256: String): ByteArray? =
-        withContext(Dispatchers.IO) { requireNode().cachedStickerImage(expectedSha256) }
+    actual suspend fun cachedStickerImageForRef(ref: SonarStickerRef): ByteArray? =
+        withContext(Dispatchers.IO) {
+            requireNode().cachedStickerImageForRef(
+                ref.packCoordinate,
+                ref.shortcode,
+                ref.plaintextSha256,
+            )
+        }
 
     actual suspend fun fetchInstalledPacks(): List<String> =
         withContext(Dispatchers.IO) { requireNode().fetchInstalledPacks() }

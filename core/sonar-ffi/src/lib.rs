@@ -813,14 +813,21 @@ impl SonarNode {
             .map_err(Into::into)
     }
 
-    /// Return verified sticker bytes from the local persistent cache by SHA256.
-    /// Never contacts relays or HTTP; `None` is an ordinary cache miss.
-    pub fn cached_sticker_image(&self, expected_sha256: String) -> FfiResult<Option<Vec<u8>>> {
-        let expected_sha256 = expected_sha256.to_ascii_lowercase();
-        sonar_stickers::validate_sha256_hex(&expected_sha256)
-            .map_err(|e| SonarFfiError::InvalidInput(format!("bad sticker sha256: {e}")))?;
+    /// Return verified local bytes only when the latest locally cached pack
+    /// definition authorizes the exact sticker reference. Never contacts relays
+    /// or HTTP; `None` is an ordinary cache or validation miss.
+    pub fn cached_sticker_image_for_ref(
+        &self,
+        pack_coordinate: String,
+        shortcode: String,
+        plaintext_sha256: String,
+    ) -> FfiResult<Option<Vec<u8>>> {
+        let pack = sonar_stickers::PackAddress::parse(&pack_coordinate)
+            .map_err(|e| SonarFfiError::InvalidInput(format!("bad pack coordinate: {e}")))?;
+        let sticker_ref = sonar_stickers::StickerRef::new(pack, shortcode, plaintext_sha256)
+            .map_err(|e| SonarFfiError::InvalidInput(format!("bad sticker ref: {e}")))?;
         self.client
-            .cached_sticker_image(&expected_sha256)
+            .cached_sticker_image_for_ref(&sticker_ref)
             .map_err(Into::into)
     }
 

@@ -4973,20 +4973,19 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     suspend fun stickerImage(ref: SonarStickerRef): ByteArray? {
-        cachedStickerImage(ref.plaintextSha256)?.let { return it }
+        cachedStickerImage(ref)?.let { return it }
         val (author, identifier) = ref.packAddressParts() ?: return null
         val pack = stickerPack(author, identifier) ?: return null
         val sticker = pack.stickerMatching(ref) ?: return null
         return stickerImage(sticker.url, ref.plaintextSha256)
     }
 
-    private suspend fun cachedStickerImage(expectedSha256: String): ByteArray? {
-        stickerImageFromMemory(expectedSha256)?.let { return it }
+    private suspend fun cachedStickerImage(ref: SonarStickerRef): ByteArray? {
         val generation = stickerCacheGeneration
         return try {
-            val bytes = SonarCore.cachedStickerImage(expectedSha256) ?: return null
+            val bytes = SonarCore.cachedStickerImageForRef(ref) ?: return null
             if (stickerCacheGeneration != generation) return null
-            rememberStickerImage(expectedSha256, bytes)
+            rememberStickerImage(ref.plaintextSha256, bytes)
             bytes
         } catch (e: CancellationException) {
             throw e

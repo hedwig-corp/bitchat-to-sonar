@@ -683,14 +683,18 @@ final class MarmotService: @unchecked Sendable {
         }
     }
 
-    /// Read verified sticker bytes by hash from the shared persistent cache.
-    /// A nil result is an ordinary local miss; no relay or HTTP work is started.
-    func cachedStickerImage(expectedSha256: String) async throws -> Data? {
+    /// Read verified sticker bytes only when cached pack metadata authorizes the
+    /// full reference. A nil result is an ordinary local validation/cache miss.
+    func cachedStickerImage(for ref: MarmotStickerRef) async throws -> Data? {
         let (nodeRef, generation): (SonarNode, UInt64) = try await run {
             (try $0.requireNode(), $0.sessionGeneration)
         }
         let data = try await Task.detached {
-            try nodeRef.cachedStickerImage(expectedSha256: expectedSha256)
+            try nodeRef.cachedStickerImageForRef(
+                packCoordinate: ref.packCoordinate,
+                shortcode: ref.shortcode,
+                plaintextSha256: ref.plaintextSha256
+            )
         }.value
         return try await run {
             guard $0.sessionGeneration == generation else { throw ServiceError.cancelled }

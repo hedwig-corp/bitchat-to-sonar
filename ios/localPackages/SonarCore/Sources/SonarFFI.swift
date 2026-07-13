@@ -908,10 +908,11 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func blossomServers() throws  -> [String]
     
     /**
-     * Return verified sticker bytes from the local persistent cache by SHA256.
-     * Never contacts relays or HTTP; `None` is an ordinary cache miss.
+     * Return verified local bytes only when the latest locally cached pack
+     * definition authorizes the exact sticker reference. Never contacts relays
+     * or HTTP; `None` is an ordinary cache or validation miss.
      */
-    func cachedStickerImage(expectedSha256: String) throws  -> Data?
+    func cachedStickerImageForRef(packCoordinate: String, shortcode: String, plaintextSha256: String) throws  -> Data?
 
     /**
      * The user accepted an incoming call: we are the dialer. Dials the offerer
@@ -1350,7 +1351,7 @@ public static func connect(identity: SonarIdentity, relayUrls: [String], dbPath:
     )
 })
 }
-    
+
 
     
     /**
@@ -1410,14 +1411,17 @@ open func blossomServers()throws  -> [String]  {
 }
     
     /**
-     * Return verified sticker bytes from the local persistent cache by SHA256.
-     * Never contacts relays or HTTP; `None` is an ordinary cache miss.
+     * Return verified local bytes only when the latest locally cached pack
+     * definition authorizes the exact sticker reference. Never contacts relays
+     * or HTTP; `None` is an ordinary cache or validation miss.
      */
-open func cachedStickerImage(expectedSha256: String)throws  -> Data?  {
+open func cachedStickerImageForRef(packCoordinate: String, shortcode: String, plaintextSha256: String)throws  -> Data?  {
     return try  FfiConverterOptionData.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
-    uniffi_sonar_ffi_fn_method_sonarnode_cached_sticker_image(
+    uniffi_sonar_ffi_fn_method_sonarnode_cached_sticker_image_for_ref(
             self.uniffiCloneHandle(),
-        FfiConverterString.lower(expectedSha256),$0
+        FfiConverterString.lower(packCoordinate),
+        FfiConverterString.lower(shortcode),
+        FfiConverterString.lower(plaintextSha256),$0
     )
 })
 }
@@ -6408,7 +6412,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_blossom_servers() != 8214) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_cached_sticker_image() != 42673) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_cached_sticker_image_for_ref() != 15827) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_call_accept() != 7250) {

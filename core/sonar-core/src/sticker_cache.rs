@@ -8,13 +8,16 @@ use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::SystemTime;
 
-use sonar_stickers::{sha256_hex, validate_sha256_hex};
+use sonar_stickers::{sha256_hex, validate_sha256_hex, PackAddress, StickerPack};
 
 use crate::Result;
 
 pub(crate) const STICKER_CACHE_DIR_SUFFIX: &str = ".sonar-stickers";
 pub(crate) const MAX_STICKER_CACHE_BYTES: usize = 5 * 1024 * 1024;
 const MAX_STICKER_CACHE_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
+const VALIDATED_PACKS_DIR: &str = "validated-packs";
+const MAX_VALIDATED_PACK_BYTES: u64 = 512 * 1024;
+const MAX_VALIDATED_PACK_CACHE_BYTES: u64 = 10 * 1024 * 1024;
 /// Bound install prefetch to the leading window that can fit even when every
 /// sticker is at the per-object maximum. This keeps picker-order stickers warm
 /// instead of downloading the whole pack and evicting its first entries.
@@ -101,6 +104,42 @@ impl StickerCache {
         self.write_with_budget(expected_sha256, bytes, MAX_STICKER_CACHE_TOTAL_BYTES)
     }
 
+    /// Persist the latest locally validated definition for a pack. Transcript
+    /// cache hits are authorized against this metadata before any image bytes
+    /// are returned, matching Signal's local-database source-of-truth model.
+    pub(crate) fn remember_validated_pack(&self, pack: &StickerPack) -> Result<bool> {
+        let Some(root) = self.root.as_deref() else {
+            return Ok(true);
+        };
+        let state = lock_cache()?;
+        if !self.is_current(&state, root) {
+            return Ok(false);
+        }
+        write_validated_pack(root, pack)?;
+        Ok(true)
+    }
+
+    /// Return verified image bytes only when the latest locally validated pack
+    /// still contains the exact coordinate + shortcode + plaintext hash.
+    pub(crate) fn read_validated_image(
+        &self,
+        pack_coordinate: &str,
+        shortcode: &str,
+        expected_sha256: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(root) = self.root.as_deref() else {
+            return Ok(None);
+        };
+        let state = lock_cache()?;
+        if !self.is_current(&state, root) {
+            return Ok(None);
+        }
+        if !validated_pack_contains(root, pack_coordinate, shortcode, expected_sha256)? {
+            return Ok(None);
+        }
+        read_sticker_cache(root, expected_sha256)
+    }
+
     fn write_with_budget(
         &self,
         expected_sha256: &str,
@@ -137,6 +176,99 @@ pub(crate) fn wipe_sticker_cache_for_db(db_path: &Path) -> Result<()> {
 fn cache_file_path(root: &Path, sha256_hex_lower: &str) -> PathBuf {
     let prefix = &sha256_hex_lower[0..2];
     root.join(prefix).join(sha256_hex_lower)
+}
+
+fn validated_pack_file_path(root: &Path, coordinate: &str) -> PathBuf {
+    root.join(VALIDATED_PACKS_DIR)
+        .join(format!("{}.json", sha256_hex(coordinate.as_bytes())))
+}
+
+fn write_validated_pack(root: &Path, pack: &StickerPack) -> Result<()> {
+    pack.validate().map_err(|e| {
+        crate::Error::InvalidInput(format!("invalid sticker pack cache entry: {e}"))
+    })?;
+    let coordinate = pack.address.coordinate();
+    let bytes = serde_json::to_vec(pack)
+        .map_err(|e| crate::Error::Storage(format!("encode sticker pack cache: {e}")))?;
+    if bytes.len() as u64 > MAX_VALIDATED_PACK_BYTES {
+        return Err(crate::Error::Storage(format!(
+            "sticker pack metadata exceeds {MAX_VALIDATED_PACK_BYTES} byte cache cap"
+        )));
+    }
+    let path = validated_pack_file_path(root, &coordinate);
+    let parent = path
+        .parent()
+        .ok_or_else(|| crate::Error::Storage("invalid sticker pack cache path".into()))?;
+    fs::create_dir_all(parent).map_err(|e| {
+        crate::Error::Storage(format!(
+            "create sticker pack cache dir {}: {e}",
+            parent.display()
+        ))
+    })?;
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    if let Err(error) = fs::write(&tmp, bytes) {
+        let _ = fs::remove_file(&tmp);
+        return Err(crate::Error::Storage(format!(
+            "write sticker pack cache tmp {}: {error}",
+            tmp.display()
+        )));
+    }
+    if let Err(error) = fs::rename(&tmp, &path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(crate::Error::Storage(format!(
+            "commit sticker pack cache {}: {error}",
+            path.display()
+        )));
+    }
+    enforce_cache_budget(parent, MAX_VALIDATED_PACK_CACHE_BYTES, &path)
+}
+
+fn validated_pack_contains(
+    root: &Path,
+    pack_coordinate: &str,
+    shortcode: &str,
+    expected_sha256: &str,
+) -> Result<bool> {
+    let address = PackAddress::parse(pack_coordinate)
+        .map_err(|e| crate::Error::InvalidInput(format!("invalid sticker pack coordinate: {e}")))?;
+    let expected = expected_sha256.to_ascii_lowercase();
+    validate_sha256_hex(&expected).map_err(|e| crate::Error::InvalidInput(e.to_string()))?;
+    let coordinate = address.coordinate();
+    let path = validated_pack_file_path(root, &coordinate);
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(crate::Error::Storage(format!(
+                "inspect sticker pack cache {}: {error}",
+                path.display()
+            )))
+        }
+    };
+    if metadata.len() > MAX_VALIDATED_PACK_BYTES {
+        let _ = fs::remove_file(&path);
+        return Ok(false);
+    }
+    let bytes = fs::read(&path).map_err(|error| {
+        crate::Error::Storage(format!(
+            "read sticker pack cache {}: {error}",
+            path.display()
+        ))
+    })?;
+    let pack: StickerPack = match serde_json::from_slice(&bytes) {
+        Ok(pack) => pack,
+        Err(_) => {
+            let _ = fs::remove_file(&path);
+            return Ok(false);
+        }
+    };
+    if pack.address != address || pack.validate().is_err() {
+        let _ = fs::remove_file(&path);
+        return Ok(false);
+    }
+    Ok(pack.stickers.iter().any(|sticker| {
+        sticker.shortcode == shortcode && sticker.sha256.eq_ignore_ascii_case(&expected)
+    }))
 }
 
 fn read_sticker_cache(root: &Path, expected_sha256: &str) -> Result<Option<Vec<u8>>> {
@@ -240,6 +372,9 @@ fn collect_cache_entries(dir: &Path, entries: &mut Vec<CacheEntry>) -> Result<()
             ))
         })?;
         if file_type.is_dir() {
+            if child.file_name().to_str() == Some(VALIDATED_PACKS_DIR) {
+                continue;
+            }
             collect_cache_entries(&child.path(), entries)?;
         } else if file_type.is_file() {
             let metadata = child.metadata().map_err(|error| {
@@ -298,7 +433,25 @@ fn enforce_cache_budget(root: &Path, total_budget: u64, protected: &Path) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sonar_stickers::Sticker;
     use tempfile::tempdir;
+
+    fn pack_with_sticker(shortcode: &str, bytes: &[u8]) -> StickerPack {
+        let sha = sha256_hex(bytes);
+        let address = PackAddress::new("11".repeat(32), "pack").unwrap();
+        let sticker = Sticker::new(
+            shortcode,
+            format!("https://example.com/{sha}"),
+            sha,
+            "image/png",
+            Some(128),
+            Some(128),
+            None,
+            None,
+        )
+        .unwrap();
+        StickerPack::new(address, "Pack", None, None, vec![sticker], None).unwrap()
+    }
 
     #[test]
     fn round_trip_and_wipe() {
@@ -335,6 +488,54 @@ mod tests {
         assert_eq!(
             fresh.read(&sha256_hex(after)).unwrap().as_deref(),
             Some(after.as_slice())
+        );
+    }
+
+    #[test]
+    fn cached_image_requires_current_validated_pack_reference() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("marmot.sqlite");
+        let cache = StickerCache::for_db(&db).unwrap();
+        let bytes = b"first-sticker";
+        let sha = sha256_hex(bytes);
+        let pack = pack_with_sticker("wave", bytes);
+        let coordinate = pack.address.coordinate();
+
+        assert!(cache.write(&sha, bytes).unwrap());
+        assert!(cache
+            .read_validated_image(&coordinate, "wave", &sha)
+            .unwrap()
+            .is_none());
+
+        assert!(cache.remember_validated_pack(&pack).unwrap());
+        assert_eq!(
+            cache
+                .read_validated_image(&coordinate, "wave", &sha)
+                .unwrap()
+                .as_deref(),
+            Some(bytes.as_slice())
+        );
+        assert!(cache
+            .read_validated_image(&coordinate, "other", &sha)
+            .unwrap()
+            .is_none());
+
+        let replacement = b"replacement-sticker";
+        let replacement_sha = sha256_hex(replacement);
+        assert!(cache.write(&replacement_sha, replacement).unwrap());
+        assert!(cache
+            .remember_validated_pack(&pack_with_sticker("new", replacement))
+            .unwrap());
+        assert!(cache
+            .read_validated_image(&coordinate, "wave", &sha)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            cache
+                .read_validated_image(&coordinate, "new", &replacement_sha)
+                .unwrap()
+                .as_deref(),
+            Some(replacement.as_slice())
         );
     }
 

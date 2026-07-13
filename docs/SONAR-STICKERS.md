@@ -179,6 +179,11 @@ current pack still contains a sticker with both the referenced shortcode and the
 referenced plaintext hash. If it does not, the client should render a missing or
 untrusted sticker state instead of substituting a different image.
 
+Local-first clients may render verified cached image bytes without relay access
+only when their latest locally validated pack metadata still authorizes the
+exact pack coordinate, shortcode, and plaintext hash. Pack metadata and image
+bytes must be invalidated together when local chat identity data is erased.
+
 ## Publishing Flow
 
 `sonar-cli post <signal-link>` implements the current publishing flow:

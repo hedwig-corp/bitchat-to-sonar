@@ -1778,7 +1778,7 @@ final class MarmotChatModel: ObservableObject {
     }
 
     func stickerData(for ref: MarmotService.MarmotStickerRef) async -> Data? {
-        if let cached = await cachedStickerImage(expectedSha256: ref.plaintextSha256) {
+        if let cached = await cachedStickerImage(for: ref) {
             return cached
         }
         guard let parts = Self.stickerPackParts(ref.packCoordinate),
@@ -1795,14 +1795,13 @@ final class MarmotChatModel: ObservableObject {
         return await fetchStickerImage(url: sticker.url, expectedSha256: ref.plaintextSha256)
     }
 
-    private func cachedStickerImage(expectedSha256: String) async -> Data? {
-        if let cached = stickerImageFromMemory(expectedSha256: expectedSha256) { return cached }
+    private func cachedStickerImage(for ref: MarmotService.MarmotStickerRef) async -> Data? {
         let generation = stickerCacheGeneration
-        guard let data = try? await service.cachedStickerImage(expectedSha256: expectedSha256) else {
+        guard let data = try? await service.cachedStickerImage(for: ref) else {
             return nil
         }
         guard stickerCacheGeneration == generation else { return nil }
-        rememberStickerImage(data, expectedSha256: expectedSha256)
+        rememberStickerImage(data, expectedSha256: ref.plaintextSha256)
         return data
     }
 

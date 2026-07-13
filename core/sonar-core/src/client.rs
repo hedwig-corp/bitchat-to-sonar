@@ -2114,14 +2114,18 @@ impl SonarClient {
         identifier: &str,
         relay_urls: &[String],
     ) -> Result<StickerPack> {
-        Self::fetch_sticker_pack_with_client(
+        let pack = Self::fetch_sticker_pack_with_client(
             &self.nostr,
             &self.relays,
             author_pubkey_hex,
             identifier,
             relay_urls,
         )
-        .await
+        .await?;
+        if let Err(err) = self.sticker_cache.remember_validated_pack(&pack) {
+            tracing::debug!(%err, coordinate = %pack.address, "sticker pack metadata cache write failed");
+        }
+        Ok(pack)
     }
 
     async fn fetch_sticker_pack_with_client(
@@ -2168,11 +2172,18 @@ impl SonarClient {
         .await
     }
 
-    /// Return a verified local sticker image by content hash without consulting
-    /// relays or HTTP. Hosts use this before resolving pack metadata so cached
-    /// transcript stickers can paint immediately after restart and while offline.
-    pub fn cached_sticker_image(&self, expected_sha256: &str) -> Result<Option<Vec<u8>>> {
-        self.sticker_cache.read(expected_sha256)
+    /// Return a verified local sticker only if the latest locally validated pack
+    /// still authorizes the exact coordinate + shortcode + plaintext hash.
+    /// Never consults relays or HTTP.
+    pub fn cached_sticker_image_for_ref(
+        &self,
+        sticker_ref: &StickerRef,
+    ) -> Result<Option<Vec<u8>>> {
+        self.sticker_cache.read_validated_image(
+            &sticker_ref.pack.coordinate(),
+            &sticker_ref.shortcode,
+            &sticker_ref.plaintext_sha256,
+        )
     }
 
     /// Schedule bounded best-effort prefetch without holding the install/FFI
@@ -2204,6 +2215,9 @@ impl SonarClient {
                     return;
                 }
             };
+            if let Err(err) = sticker_cache.remember_validated_pack(&pack) {
+                tracing::debug!(%err, coordinate, "sticker prefetch: metadata cache write failed");
+            }
 
             let mut tasks = tokio::task::JoinSet::new();
             for sticker in pack
