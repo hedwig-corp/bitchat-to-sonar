@@ -11,7 +11,7 @@ use serde::Serialize;
 use crate::schema::{ServiceState, StatusService};
 
 /// Soft latency budget for Blossom HEAD (ms). Above this → degraded.
-const MEDIA_DEGRADED_MS: u64 = 3_000;
+const MEDIA_DEGRADED_MS: u64 = 5_000;
 /// Hard timeout for the Blossom probe.
 const MEDIA_TIMEOUT: Duration = Duration::from_secs(8);
 
