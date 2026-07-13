@@ -2,8 +2,9 @@
 //!
 //! Survives app restarts and complements the UI-layer in-memory LRU.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::SystemTime;
@@ -16,6 +17,7 @@ pub(crate) const STICKER_CACHE_DIR_SUFFIX: &str = ".sonar-stickers";
 pub(crate) const MAX_STICKER_CACHE_BYTES: usize = 5 * 1024 * 1024;
 const MAX_STICKER_CACHE_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
 const VALIDATED_PACKS_DIR: &str = "validated-packs";
+const FAILED_WIPE_TOMBSTONE_SUFFIX: &str = ".wipe-incomplete";
 const MAX_VALIDATED_PACK_BYTES: u64 = 512 * 1024;
 const MAX_VALIDATED_PACK_CACHE_BYTES: u64 = 10 * 1024 * 1024;
 /// Bound install prefetch to the leading window that can fit even when every
@@ -30,6 +32,9 @@ struct StickerCacheState {
     /// node creation, so an old async fetch cannot recreate files after panic
     /// wipe (or write into a freshly-created session for the same DB path).
     generations: HashMap<PathBuf, u64>,
+    /// Roots whose durable wipe tombstone could not yet be cleared. This also
+    /// covers the current process if persisting the tombstone itself failed.
+    failed_wipes: HashSet<PathBuf>,
 }
 
 // Serializes cache reads, writes, eviction, and wipe within the process. The
@@ -75,6 +80,13 @@ impl StickerCache {
     pub(crate) fn for_db(db_path: &Path) -> Result<Self> {
         let root = sticker_cache_dir_for_db(db_path);
         let mut state = lock_cache()?;
+        if state.failed_wipes.contains(&root) || failed_wipe_tombstone_exists(&root)? {
+            tracing::warn!(
+                cache_dir = %root.display(),
+                "sticker cache disabled until an incomplete wipe is retried"
+            );
+            return Ok(Self::disabled());
+        }
         let generation = *state.generations.entry(root.clone()).or_default();
         Ok(Self {
             root: Some(root),
@@ -163,13 +175,107 @@ pub(crate) fn wipe_sticker_cache_for_db(db_path: &Path) -> Result<()> {
     let mut state = lock_cache()?;
     let generation = state.generations.entry(dir.clone()).or_default();
     *generation = generation.wrapping_add(1);
+    state.failed_wipes.insert(dir.clone());
+
+    let tombstone = failed_wipe_tombstone_path(&dir);
+    persist_failed_wipe_tombstone(&tombstone)?;
     match fs::remove_dir_all(&dir) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(crate::Error::Storage(format!(
-            "remove sticker cache {}: {e}",
-            dir.display()
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(crate::Error::Storage(format!(
+                "remove sticker cache {}: {e}",
+                dir.display()
+            )))
+        }
+    }
+    remove_failed_wipe_tombstone(&tombstone)?;
+    state.failed_wipes.remove(&dir);
+    Ok(())
+}
+
+fn failed_wipe_tombstone_path(root: &Path) -> PathBuf {
+    let file_name = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("marmot.sqlite.sonar-stickers");
+    root.with_file_name(format!("{file_name}{FAILED_WIPE_TOMBSTONE_SUFFIX}"))
+}
+
+fn failed_wipe_tombstone_exists(root: &Path) -> Result<bool> {
+    let path = failed_wipe_tombstone_path(root);
+    match fs::metadata(&path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(crate::Error::Storage(format!(
+            "inspect sticker cache wipe tombstone {}: {error}",
+            path.display()
         ))),
+    }
+}
+
+fn persist_failed_wipe_tombstone(path: &Path) -> Result<()> {
+    let mut file = fs::File::create(path).map_err(|error| {
+        crate::Error::Storage(format!(
+            "create sticker cache wipe tombstone {}: {error}",
+            path.display()
+        ))
+    })?;
+    file.write_all(b"sticker cache wipe incomplete\n")
+        .and_then(|()| file.sync_all())
+        .map_err(|error| {
+            crate::Error::Storage(format!(
+                "persist sticker cache wipe tombstone {}: {error}",
+                path.display()
+            ))
+        })
+}
+
+fn remove_failed_wipe_tombstone(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(crate::Error::Storage(format!(
+            "remove sticker cache wipe tombstone {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+#[cfg(not(windows))]
+fn atomic_replace_file(from: &Path, to: &Path) -> io::Result<()> {
+    fs::rename(from, to)
+}
+
+#[cfg(windows)]
+fn atomic_replace_file(from: &Path, to: &Path) -> io::Result<()> {
+    use std::iter;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let from = from
+        .as_os_str()
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect::<Vec<_>>();
+    let to = to
+        .as_os_str()
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect::<Vec<_>>();
+    let result = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
     }
 }
 
@@ -213,7 +319,7 @@ fn write_validated_pack(root: &Path, pack: &StickerPack) -> Result<()> {
             tmp.display()
         )));
     }
-    if let Err(error) = fs::rename(&tmp, &path) {
+    if let Err(error) = atomic_replace_file(&tmp, &path) {
         let _ = fs::remove_file(&tmp);
         return Err(crate::Error::Storage(format!(
             "commit sticker pack cache {}: {error}",
@@ -332,7 +438,7 @@ fn write_sticker_cache_with_budget(
             tmp.display()
         )));
     }
-    if let Err(error) = fs::rename(&tmp, &path) {
+    if let Err(error) = atomic_replace_file(&tmp, &path) {
         let _ = fs::remove_file(&tmp);
         return Err(crate::Error::Storage(format!(
             "commit sticker cache {}: {error}",
@@ -488,6 +594,40 @@ mod tests {
         assert_eq!(
             fresh.read(&sha256_hex(after)).unwrap().as_deref(),
             Some(after.as_slice())
+        );
+    }
+
+    #[test]
+    fn failed_wipe_tombstone_blocks_cache_until_cleanup_succeeds() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("marmot.sqlite");
+        let cache_root = sticker_cache_dir_for_db(&db);
+        let tombstone = failed_wipe_tombstone_path(&cache_root);
+        let stale = StickerCache::for_db(&db).unwrap();
+
+        // A plain file at the cache-directory path makes remove_dir_all fail on
+        // every supported host without relying on permissions or test hooks.
+        fs::write(&cache_root, b"not-a-directory").unwrap();
+        assert!(wipe_sticker_cache_for_db(&db).is_err());
+        assert!(tombstone.is_file());
+        assert!(stale.read(&sha256_hex(b"old")).unwrap().is_none());
+        assert!(StickerCache::for_db(&db).unwrap().root.is_none());
+
+        // Simulate a process restart: the durable tombstone remains sufficient
+        // even after the in-memory failed-wipe record is gone.
+        lock_cache().unwrap().failed_wipes.remove(&cache_root);
+        assert!(StickerCache::for_db(&db).unwrap().root.is_none());
+
+        fs::remove_file(&cache_root).unwrap();
+        wipe_sticker_cache_for_db(&db).unwrap();
+        assert!(!tombstone.exists());
+
+        let fresh = StickerCache::for_db(&db).unwrap();
+        let bytes = b"new-session";
+        assert!(fresh.write(&sha256_hex(bytes), bytes).unwrap());
+        assert_eq!(
+            fresh.read(&sha256_hex(bytes)).unwrap().as_deref(),
+            Some(bytes.as_slice())
         );
     }
 
