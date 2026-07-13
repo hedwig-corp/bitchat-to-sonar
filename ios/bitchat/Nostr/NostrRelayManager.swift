@@ -763,16 +763,11 @@ final class NostrRelayManager: ObservableObject {
         do {
             let ms = try await measureRelayRoundTrip(url: canonical, timeoutSeconds: timeoutSeconds)
             if let index = relays.firstIndex(where: { $0.url == canonical }) {
+                // Publish RTT only; leave isConnected to real lifecycle pings so
+                // connect-latency fallbacks do not pretend the messaging socket is live.
                 relays[index].lastRttMs = ms
                 relays[index].lastRttAt = Date()
                 relays[index].lastProbeError = nil
-                if !relays[index].isConnected {
-                    // Connect-latency fallback still proves the path; only mark
-                    // connected when we already had a live messaging socket or
-                    // the probe used REQ→EOSE on an existing connection.
-                    // Keep lifecycle honest: leave isConnected to real pings,
-                    // but always publish RTT for UX.
-                }
             }
             let result = RelayBenchmarkResult(
                 url: canonical,
