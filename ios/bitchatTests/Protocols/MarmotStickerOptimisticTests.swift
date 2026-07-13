@@ -9,6 +9,38 @@ import SonarCore
 
 @MainActor
 final class MarmotStickerOptimisticTests: XCTestCase {
+    func testIdentityReplacementClearsPickerAuthorityBeforeDatabaseWipe() async {
+        let suiteName = "MarmotStickerOptimisticTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let model = MarmotChatModel(
+            service: MarmotService(relayUrls: []),
+            keychain: MockKeychain(),
+            defaults: defaults
+        )
+        let coordinate = "30031:author:old-account-pack"
+        let pack = StickerPackInfo(
+            packCoordinate: coordinate,
+            title: "Old account",
+            description: nil,
+            coverUrl: nil,
+            stickers: []
+        )
+        model.rememberStickerPack(pack, cacheKey: coordinate)
+        model.replaceInstalledPackCoordinates([coordinate])
+        XCTAssertEqual(model.cachedStickerPacksSnapshot(), [pack])
+
+        var wipeObservedClearedMemory = false
+        await model.prepareForIdentityReplacement {
+            wipeObservedClearedMemory = model.cachedStickerPacksSnapshot().isEmpty
+                && !model.isStickerPackInstalled(coordinate)
+        }
+
+        XCTAssertTrue(wipeObservedClearedMemory)
+        XCTAssertTrue(model.cachedStickerPacksSnapshot().isEmpty)
+        XCTAssertFalse(model.isStickerPackInstalled(coordinate))
+    }
+
     func testFailedInstalledRefreshPreservesCachedPacks() {
         XCTAssertTrue(snShouldPreserveCachedStickerPacks(
             hadCachedPacks: true,

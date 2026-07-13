@@ -479,17 +479,27 @@ final class MarmotChatModel: ObservableObject {
     /// connect as it. Throws on an invalid key so the caller can surface it.
     func restoreIdentity(nsec raw: String) async throws {
         let nsec = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        // Validate by importing — throws on a malformed/!nsec key, so we never
-        // persist garbage over a (possibly existing) identity.
-        _ = try await service.loadIdentityNpub(nsec: nsec)
+        // Validate without mutating the live service. A failed import must leave
+        // the currently connected identity and its local database untouched.
+        _ = try SonarIdentity.import(nsec: nsec)
+        // Block connectIfNeeded while the old node, database, and identity-bound
+        // caches are invalidated and the replacement identity is connected.
+        busy = true
+        defer { busy = false }
         guard keychain.saveIdentityKey(Data(nsec.utf8), forKey: Self.nsecKeychainKey) else {
             throw MarmotService.ServiceError.core("failed to persist restored identity")
         }
-        // Drive the full connect sequence directly (performConnect reads the
-        // nsec we just persisted); guard concurrent connectIfNeeded with busy.
-        busy = true
-        defer { busy = false }
-        npub = nil
+        // Identity restore is an account replacement, not a reconnect. Match
+        // the Compose import path: invalidate memory first, then wipe the old
+        // core database (including its sticker caches) before opening the new
+        // account. The generation bump prevents an in-flight image read from
+        // repopulating old bytes while the disk wipe is awaiting completion.
+        let service = self.service
+        await prepareForIdentityReplacement {
+            await service.wipeDatabase()
+        }
+        // Drive the full local-first connect sequence directly; performConnect
+        // reads the nsec persisted above and opens a fresh encrypted database.
         guard await performConnect() else {
             throw MarmotService.ServiceError.core(errorText ?? "failed to connect restored identity")
         }
@@ -1735,10 +1745,7 @@ final class MarmotChatModel: ObservableObject {
                 identifier: identifier,
                 relayUrls: relayUrls
             )
-            if stickerPacksByCoordinate.count >= 20, let oldest = stickerPacksByCoordinate.keys.first {
-                stickerPacksByCoordinate.removeValue(forKey: oldest)
-            }
-            stickerPacksByCoordinate[cacheKey] = pack
+            rememberStickerPack(pack, cacheKey: cacheKey)
             return pack
         } catch {
             self.errorText = Self.describe(error)
@@ -1824,10 +1831,24 @@ final class MarmotChatModel: ObservableObject {
         installedPackCoordinates = []
     }
 
+    /// Cache insertion kept as one production path so identity-reset regression
+    /// tests can seed the same picker state that relay hydration creates.
+    func rememberStickerPack(_ pack: StickerPackInfo, cacheKey: String) {
+        stickerPacksByCoordinate.removeValue(forKey: cacheKey)
+        if stickerPacksByCoordinate.count >= 20, let oldest = stickerPacksByCoordinate.keys.first {
+            stickerPacksByCoordinate.removeValue(forKey: oldest)
+        }
+        stickerPacksByCoordinate[cacheKey] = pack
+    }
+
+    func replaceInstalledPackCoordinates(_ coordinates: [String]) {
+        installedPackCoordinates = Set(coordinates.map { $0.lowercased() })
+    }
+
     func fetchInstalledPacks() async -> [String]? {
         do {
             let coords = try await service.fetchInstalledPacks()
-            installedPackCoordinates = Set(coords.map { $0.lowercased() })
+            replaceInstalledPackCoordinates(coords)
             return coords
         } catch {
             self.errorText = Self.describe(error)
@@ -2047,6 +2068,20 @@ final class MarmotChatModel: ObservableObject {
         pendingConversationRefreshGroups = []
         let service = self.service
         Task { await service.wipeDatabase() }
+        clearIdentityScopedState()
+    }
+
+    /// Reset every account-bound in-memory/cache value through the same path as
+    /// panic wipe, then await deletion of the old persistent database. The wipe
+    /// operation is injected so tests can verify ordering without touching the
+    /// developer's real application-support directory.
+    func prepareForIdentityReplacement(wipeDatabase: () async -> Void) async {
+        stopPolling()
+        clearIdentityScopedState()
+        await wipeDatabase()
+    }
+
+    private func clearIdentityScopedState() {
         relayConnected = false
         npub = nil
         groups = []
