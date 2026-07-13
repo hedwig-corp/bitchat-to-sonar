@@ -49,3 +49,5 @@ PR #220 device logs showed multi-second (often ~10–20s) send lag after launch 
 
 ## Review fix
 - Hosts pass MLS group id into prefer_catchup_group; core maps MLS to nostr #h id used by the catch-up queue.
+
+- Compose preferCatchupGroup on openChat/openDm for Android/desktop parity.
