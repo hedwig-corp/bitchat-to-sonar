@@ -5347,6 +5347,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "sonar-status"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "futures-util",
+ "hex",
+ "nostr",
+ "nostr-sdk",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite",
+ "url",
+]
+
+[[package]]
 name = "sonar-stickers"
 version = "0.1.0"
 dependencies = [
