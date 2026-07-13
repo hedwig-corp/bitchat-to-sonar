@@ -182,7 +182,8 @@ Goal: every row on `/status` should eventually mean "we ran a check", not
 | Service id | Check (v1 target) | How `sonar-status` implements it | Auth / secrets |
 | --- | --- | --- | --- |
 | `relays` | WebSocket open RTT to client default relays | **Done** — `probe_relay_ws` | None |
-| `dm` / `groups` | Publish + fetch a disposable Marmot/MLS control event (or KeyPackage round-trip) via `sonar-core` / `sonar-cli` identity | `probe_marmot_roundtrip` (planned) | Status nsec or dedicated probe nsec |
+| `dm` | KeyPackage publish + fetch own package from bootstrap relays via `sonar-core` | **Done** — `chat::probe_marmot_keypackage` (`--chat-probe`) | **Dedicated probe nsec** (`SONAR_STATUS_PROBE_NSEC`) — not the publisher key |
+| `groups` | Create/send in durable probe MLS group (A→B or multi-member) | planned | Probe nsec(s) |
 | `media` / `voice` | Upload tiny blob to Blossom (`DEFAULT_BLOSSOM_SERVER`) + HEAD/GET | `probe_blossom` (planned) | Optional blossom auth |
 | `stickers` | REQ kind `30031` pack index on bootstrap relays, expect ≥1 EVENT or EOSE | `probe_sticker_index` (planned) | None |
 | `push` | HTTP GET transponder health (and optionally sandbox) | `--http` / `SONAR_STATUS_HTTP` | None if health is public |
@@ -210,13 +211,13 @@ is reported on `id: "relays"`; product rows appear only when their probe runs.
 
 ### Rollout steps
 
-1. **Now:** client-default relays on the page; empty incidents; probe publishes
-   measured `relays` (+ HTTP); site seed is non-mock skeleton.
-2. **Next:** implement `probe_sticker_index` + Blossom HEAD (no chat identity).
-3. **Then:** Marmot round-trip probe with a dedicated throwaway identity under
-   `SONAR_STATUS_PROBE_HOME` (not the status publisher key if you want isolation).
-4. **Website upsert-by-id** merge so partial feeds don't wipe skeleton rows.
-5. **Optional:** store daily uptime samples to drive real 90-day bars (replace
+1. **Done:** client-default relays; empty seed incidents; measured `relays` (+ HTTP).
+2. **Done:** website upsert-by-id merge (`mergeStatusPayload`).
+3. **Done:** Marmot KeyPackage round-trip → service `dm` via `--chat-probe` +
+   dedicated probe nsec (`core/sonar-status/src/chat.rs`).
+4. **Next:** A→B text canary (two probe identities) for stronger E2E `dm` / `groups`.
+5. **Next:** `probe_sticker_index` + Blossom HEAD (no chat identity).
+6. **Optional:** store daily uptime samples to drive real 90-day bars (replace
    `syntheticHistory`).
 
 ### Local verify

@@ -66,8 +66,7 @@ export const STATUS_NPUB = '<identity npub>';
 2. **Optional HTTP URLs** (`--http` / `SONAR_STATUS_HTTP`) — GET health checks
    become extra service rows (`id: "http-<host>"`).
 
-Application rows (DM, groups, media, push, payments, calls) are **not** mocked.
-They appear only when a dedicated probe exists — see
+Optional **chat probe** adds `id: "dm"` via KeyPackage publish+fetch. Other rows (groups, media, …) appear only when their probes exist — see
 [`docs/SONAR-STATUS.md`](../../docs/SONAR-STATUS.md) § "Real service probes".
 
 ## Incident continuity
@@ -75,3 +74,22 @@ They appear only when a dedicated probe exists — see
 Pass `--previous /path/to/last.json` (the `--out` file from the last run) so
 open auto-incidents get Monitoring/Resolved updates instead of a new incident
 every poll.
+
+### Chat probe (Marmot KeyPackage)
+
+Uses a **dedicated** probe identity (not the status publisher nsec):
+
+```bash
+openssl rand -hex 32 > ~/.config/sonar/status-probe.hex
+chmod 600 ~/.config/sonar/status-probe.hex
+
+cargo run -p sonar-status --manifest-path core/Cargo.toml -- \
+  probe --pretty --chat-probe --probe-nsec-file ~/.config/sonar/status-probe.hex
+
+export SONAR_STATUS_NSEC_FILE=~/.config/sonar/status.hex
+export SONAR_STATUS_PROBE_NSEC_FILE=~/.config/sonar/status-probe.hex
+export SONAR_STATUS_CHAT_PROBE=1
+./scripts/status/publish.sh
+```
+
+Publishes service `id: "dm"` when the KeyPackage publish+fetch succeeds.

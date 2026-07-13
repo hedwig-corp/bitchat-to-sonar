@@ -1,12 +1,15 @@
 //! Sonar status tracer + Nostr publisher.
 //!
-//! Probes public Nostr relays (WebSocket open RTT) and optional HTTP health
-//! endpoints for Sonar-adjacent services, then either:
-//!   - prints a website-compatible JSON status document, or
-//!   - signs and publishes it as a replaceable event (kind 30078, d=sonar-status).
+//! Probes:
+//! - public Sonar client bootstrap relays (WebSocket open RTT)
+//! - optional HTTP health URLs
+//! - optional Marmot chat path (KeyPackage publish + fetch) when a probe nsec is set
 //!
-//! The marketing site (`web/src/lib/status-nostr.js`) REQs that event and fills
-//! the `/status` page when `STATUS_PUBKEY_HEX` matches this publisher.
+//! Publishes a replaceable event (kind 30078, d=sonar-status) that the marketing
+//! site (`web/src/lib/status-nostr.js`) REQs when `STATUS_PUBKEY_HEX` matches.
+
+mod chat;
+mod schema;
 
 use std::env;
 use std::path::PathBuf;
@@ -17,12 +20,17 @@ use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
 use nostr::prelude::*;
 use nostr_sdk::Client as NostrClient;
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::time::timeout;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use ::url::Url;
+
+use chat::{load_probe_secret, probe_marmot_keypackage, ChatProbeReport};
+use schema::{
+    website_view, IncidentLevel, IncidentUpdate, ServiceState, StatusIncident, StatusPayload,
+    StatusRelay, StatusService,
+};
 
 /// Replaceable parameterized event kind for the Sonar status document.
 /// Must match `web/src/lib/status-data.js` `STATUS_EVENT_KIND`.
@@ -103,12 +111,21 @@ struct ProbeArgs {
     /// Extra HTTP health URLs to probe as `http-<host>` services (GET).
     #[arg(long = "http", value_name = "URL")]
     http_urls: Vec<String>,
-    /// Comma-separated wss:// relays to RTT-probe (defaults to public set).
+    /// Comma-separated wss:// relays to RTT-probe (defaults to client bootstrap set).
     #[arg(long, env = "SONAR_STATUS_PROBE_RELAYS")]
     relays: Option<String>,
     /// Path to a previous status document used to merge incident history.
     #[arg(long)]
     previous: Option<PathBuf>,
+    /// Run Marmot KeyPackage chat probe (requires probe nsec).
+    #[arg(long, env = "SONAR_STATUS_CHAT_PROBE")]
+    chat_probe: bool,
+    /// Probe identity nsec1… / hex (prefer --probe-nsec-file).
+    #[arg(long, env = "SONAR_STATUS_PROBE_NSEC", conflicts_with = "probe_nsec_file")]
+    probe_nsec: Option<String>,
+    /// Read probe nsec from a local file (0600 recommended).
+    #[arg(long, conflicts_with = "probe_nsec")]
+    probe_nsec_file: Option<PathBuf>,
     /// Pretty-print JSON.
     #[arg(long)]
     pretty: bool,
@@ -140,6 +157,15 @@ struct PublishArgs {
     /// Dry-run: probe + sign but do not send to relays.
     #[arg(long)]
     dry_run: bool,
+    /// Run Marmot KeyPackage chat probe (requires probe nsec).
+    #[arg(long, env = "SONAR_STATUS_CHAT_PROBE")]
+    chat_probe: bool,
+    /// Probe identity nsec1… / hex (prefer --probe-nsec-file).
+    #[arg(long, env = "SONAR_STATUS_PROBE_NSEC", conflicts_with = "probe_nsec_file")]
+    probe_nsec: Option<String>,
+    /// Read probe nsec from a local file (0600 recommended).
+    #[arg(long, conflicts_with = "probe_nsec")]
+    probe_nsec_file: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug)]
@@ -148,76 +174,6 @@ struct IdentityArgs {
     nsec: Option<String>,
     #[arg(long, conflicts_with = "nsec")]
     nsec_file: Option<PathBuf>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-enum ServiceState {
-    Ok,
-    Degraded,
-    Down,
-}
-
-impl ServiceState {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::Ok => "ok",
-            Self::Degraded => "degraded",
-            Self::Down => "down",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct StatusService {
-    id: String,
-    name: String,
-    desc: String,
-    uptime: f64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    state: Option<ServiceState>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct StatusRelay {
-    url: String,
-    region: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-enum IncidentLevel {
-    Degraded,
-    Maintenance,
-    Down,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct IncidentUpdate {
-    t: String,
-    s: String,
-    b: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct StatusIncident {
-    date: String,
-    title: String,
-    level: IncidentLevel,
-    updates: Vec<IncidentUpdate>,
-}
-
-/// Website-compatible payload (`web/src/lib/status-nostr.js` schema).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct StatusPayload {
-    services: Vec<StatusService>,
-    relays: Vec<StatusRelay>,
-    incidents: Vec<StatusIncident>,
-    /// Extra metadata for operators (ignored by the website parser).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    updated_at: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    probe: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -239,6 +195,13 @@ struct HttpProbe {
     error: Option<String>,
 }
 
+#[derive(Debug, Default)]
+struct ProbeOptions {
+    chat_probe: bool,
+    probe_nsec: Option<String>,
+    probe_nsec_file: Option<PathBuf>,
+}
+
 #[tokio::main]
 async fn main() {
     if let Err(e) = run().await {
@@ -251,10 +214,22 @@ async fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Probe(args) => {
+            let opts = ProbeOptions {
+                chat_probe: args.chat_probe
+                    || args.probe_nsec.is_some()
+                    || args.probe_nsec_file.is_some()
+                    || env::var_os("SONAR_STATUS_PROBE_NSEC").is_some()
+                    || env::var_os("SONAR_STATUS_PROBE_NSEC_FILE").is_some(),
+                probe_nsec: args.probe_nsec,
+                probe_nsec_file: args.probe_nsec_file.or_else(|| {
+                    env::var_os("SONAR_STATUS_PROBE_NSEC_FILE").map(PathBuf::from)
+                }),
+            };
             let payload = build_payload(
                 parse_list(args.relays.as_deref(), DEFAULT_RELAYS),
                 &args.http_urls,
                 args.previous.as_ref(),
+                &opts,
             )
             .await?;
             print_json(&payload, args.pretty)?;
@@ -263,8 +238,19 @@ async fn run() -> Result<()> {
             let keys = load_keys(args.nsec.as_deref(), args.nsec_file.as_ref())?;
             let probe_relays = parse_list(args.probe_relays.as_deref(), DEFAULT_RELAYS);
             let publish_relays = parse_list(args.publish_relays.as_deref(), DEFAULT_PUBLISH_RELAYS);
+            let opts = ProbeOptions {
+                chat_probe: args.chat_probe
+                    || args.probe_nsec.is_some()
+                    || args.probe_nsec_file.is_some()
+                    || env::var_os("SONAR_STATUS_PROBE_NSEC").is_some()
+                    || env::var_os("SONAR_STATUS_PROBE_NSEC_FILE").is_some(),
+                probe_nsec: args.probe_nsec,
+                probe_nsec_file: args.probe_nsec_file.or_else(|| {
+                    env::var_os("SONAR_STATUS_PROBE_NSEC_FILE").map(PathBuf::from)
+                }),
+            };
             let payload =
-                build_payload(probe_relays, &args.http_urls, args.previous.as_ref()).await?;
+                build_payload(probe_relays, &args.http_urls, args.previous.as_ref(), &opts).await?;
             if let Some(path) = &args.out {
                 std::fs::write(path, serde_json::to_vec_pretty(&payload)?)?;
             }
@@ -285,7 +271,10 @@ async fn run() -> Result<()> {
             );
 
             if args.dry_run {
-                println!("dry-run: not publishing ({} relays configured)", publish_relays.len());
+                println!(
+                    "dry-run: not publishing ({} relays configured)",
+                    publish_relays.len()
+                );
                 return Ok(());
             }
 
@@ -320,17 +309,6 @@ async fn run() -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Strip operator-only fields so the website schema validator stays happy.
-fn website_view(payload: &StatusPayload) -> StatusPayload {
-    StatusPayload {
-        services: payload.services.clone(),
-        relays: payload.relays.clone(),
-        incidents: payload.incidents.clone(),
-        updated_at: None,
-        probe: None,
-    }
 }
 
 fn print_json(payload: &StatusPayload, pretty: bool) -> Result<()> {
@@ -379,6 +357,7 @@ async fn build_payload(
     relay_urls: Vec<String>,
     http_urls: &[String],
     previous: Option<&PathBuf>,
+    opts: &ProbeOptions,
 ) -> Result<StatusPayload> {
     let mut relay_probes = Vec::with_capacity(relay_urls.len());
     for url in &relay_urls {
@@ -396,7 +375,19 @@ async fn build_payload(
         http_probes.push(probe_http(url).await);
     }
 
-    let services = derive_services(&relay_probes, &http_probes);
+    let chat_report = if opts.chat_probe {
+        let secret = load_probe_secret(
+            opts.probe_nsec.as_deref(),
+            opts.probe_nsec_file.as_ref(),
+            "SONAR_STATUS_PROBE_NSEC",
+        )
+        .map_err(Error::Msg)?;
+        Some(probe_marmot_keypackage(&secret, &relay_urls).await)
+    } else {
+        None
+    };
+
+    let services = derive_services(&relay_probes, &http_probes, chat_report.as_ref());
     let relays: Vec<StatusRelay> = relay_probes
         .iter()
         .map(|r| StatusRelay {
@@ -430,6 +421,7 @@ async fn build_payload(
             "ms": h.ms,
             "error": h.error,
         })).collect::<Vec<_>>(),
+        "chat": chat_report.as_ref().map(|c| serde_json::to_value(c).unwrap_or_default()),
     });
 
     Ok(StatusPayload {
@@ -467,10 +459,8 @@ async fn probe_relay_ws(url: &str) -> Option<u64> {
     match timeout(WS_TIMEOUT, connect).await {
         Ok(Ok((mut ws, _))) => {
             let ms = t0.elapsed().as_millis() as u64;
-            // Best-effort clean close.
             let _ = ws.send(Message::Close(None)).await;
             let _ = ws.close(None).await;
-            // Drain briefly so the close completes without hanging the tool.
             let _ = timeout(Duration::from_millis(200), ws.next()).await;
             Some(ms)
         }
@@ -536,7 +526,11 @@ async fn probe_http(url: &str) -> HttpProbe {
     }
 }
 
-fn derive_services(relays: &[RelayProbe], https: &[HttpProbe]) -> Vec<StatusService> {
+fn derive_services(
+    relays: &[RelayProbe],
+    https: &[HttpProbe],
+    chat: Option<&ChatProbeReport>,
+) -> Vec<StatusService> {
     let total = relays.len().max(1);
     let reachable = relays.iter().filter(|r| r.ms.is_some()).count();
     let ratio = reachable as f64 / total as f64;
@@ -553,10 +547,8 @@ fn derive_services(relays: &[RelayProbe], https: &[HttpProbe]) -> Vec<StatusServ
         (None, 99.5 + ratio * 0.5)
     };
 
-    // Only services we can actually observe today.
-    // Application surfaces (DM/groups/media/…) require dedicated probes —
-    // see docs/SONAR-STATUS.md § "Real service probes". Until those land,
-    // do NOT invent mock degraded rows for them.
+    // Only services we can actually observe. Application rows appear only when
+    // their probe ran — see docs/SONAR-STATUS.md.
     let mut services = vec![StatusService {
         id: "relays".into(),
         name: "Nostr relay network (client defaults)".into(),
@@ -567,6 +559,10 @@ fn derive_services(relays: &[RelayProbe], https: &[HttpProbe]) -> Vec<StatusServ
         uptime: (relay_uptime * 100.0).round() / 100.0,
         state: relay_state,
     }];
+
+    if let Some(report) = chat {
+        services.push(report.to_service());
+    }
 
     for h in https {
         let state = if h.ok {
@@ -588,7 +584,6 @@ fn derive_services(relays: &[RelayProbe], https: &[HttpProbe]) -> Vec<StatusServ
     services
 }
 
-
 fn median_u64(vals: &[u64]) -> Option<u64> {
     if vals.is_empty() {
         return None;
@@ -609,11 +604,7 @@ fn derive_incidents(
     let worst = services
         .iter()
         .filter_map(|s| s.state.as_ref())
-        .max_by_key(|s| match s {
-            ServiceState::Down => 2,
-            ServiceState::Degraded => 1,
-            ServiceState::Ok => 0,
-        });
+        .max_by_key(|s| s.rank());
 
     let now = Utc::now();
     let date = now.format("%b %-d, %Y").to_string();
@@ -643,7 +634,6 @@ fn derive_incidents(
                 .collect::<Vec<_>>()
                 .join(", ");
 
-            // If the latest incident is still open for this title, prepend a monitoring update.
             if let Some(first) = incidents.first_mut() {
                 if first.title == title {
                     first.updates.insert(
@@ -673,7 +663,6 @@ fn derive_incidents(
             );
         }
         _ => {
-            // Recover open auto-incidents.
             if let Some(first) = incidents.first_mut() {
                 if first.title.starts_with("Probe detected") {
                     let already_resolved = first
@@ -695,7 +684,6 @@ fn derive_incidents(
         }
     }
 
-    // Cap history for event size.
     incidents.truncate(20);
     incidents
 }
@@ -734,11 +722,32 @@ mod tests {
             region: "x".into(),
             ms: None,
         }];
-        let services = derive_services(&relays, &[]);
+        let services = derive_services(&relays, &[], None);
         let relays_svc = services.iter().find(|s| s.id == "relays").unwrap();
         assert_eq!(relays_svc.state, Some(ServiceState::Down));
-        // No mock application rows until dedicated probes exist.
         assert!(services.iter().all(|s| s.id == "relays" || s.id.starts_with("http-")));
+    }
+
+    #[test]
+    fn derive_services_includes_chat_when_present() {
+        let relays = vec![RelayProbe {
+            url: "wss://example".into(),
+            region: "x".into(),
+            ms: Some(50),
+        }];
+        let chat = ChatProbeReport {
+            ok: true,
+            state: ServiceState::Ok,
+            publish_ms: Some(10),
+            fetch_ms: Some(20),
+            total_ms: 30,
+            npub: "npub1test".into(),
+            pubkey_hex: "aa".into(),
+            error: None,
+        };
+        let services = derive_services(&relays, &[], Some(&chat));
+        assert!(services.iter().any(|s| s.id == "dm"));
+        assert!(services.iter().any(|s| s.id == "relays"));
     }
 
     #[test]

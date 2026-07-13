@@ -39,6 +39,15 @@ if [[ -n "${SONAR_STATUS_HTTP:-}" ]]; then
   done
 fi
 
+# Optional chat probe: set SONAR_STATUS_CHAT_PROBE=1 and
+# SONAR_STATUS_PROBE_NSEC or SONAR_STATUS_PROBE_NSEC_FILE (dedicated identity).
+if [[ "${SONAR_STATUS_CHAT_PROBE:-}" == "1" || "${SONAR_STATUS_CHAT_PROBE:-}" == "true" ]]; then
+  args+=(--chat-probe)
+fi
+if [[ -n "${SONAR_STATUS_PROBE_NSEC_FILE:-}" ]]; then
+  args+=(--probe-nsec-file "$SONAR_STATUS_PROBE_NSEC_FILE")
+fi
+
 if [[ "${1:-}" == "--dry-run" ]]; then
   args+=(--dry-run)
 fi
