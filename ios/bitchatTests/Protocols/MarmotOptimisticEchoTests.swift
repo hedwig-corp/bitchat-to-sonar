@@ -12,7 +12,8 @@ struct MarmotOptimisticEchoTests {
     private func message(
         id: String,
         createdAt: Date,
-        content: String = "hello"
+        content: String = "hello",
+        deliveryState: String? = nil
     ) -> MarmotService.MarmotMessage {
         MarmotService.MarmotMessage(
             id: id,
@@ -20,6 +21,7 @@ struct MarmotOptimisticEchoTests {
             content: content,
             createdAt: createdAt,
             isMine: true,
+            deliveryState: deliveryState,
             media: []
         )
     }
@@ -77,5 +79,37 @@ struct MarmotOptimisticEchoTests {
 
         #expect(reconciliation.survivors.isEmpty)
         #expect(reconciliation.visible.map(\.id) == [canonical.id])
+    }
+
+    @Test
+    func relayAckReplacesSendingStateWithoutAnotherSync() {
+        let createdAt = Date(timeIntervalSince1970: 100)
+        let echo = message(id: "optimistic-1", createdAt: createdAt)
+        let pending = message(
+            id: "canonical-1",
+            createdAt: createdAt,
+            deliveryState: "pending"
+        )
+        let local = MarmotChatModel.reconciledOptimisticMessages(
+            source: [echo, pending],
+            pending: [echo]
+        )
+
+        #expect(local.survivors.isEmpty)
+        #expect(local.visible.map(\.id) == [pending.id])
+        #expect(MarmotChatModel.stateText(for: local.visible[0]) == "Sending")
+
+        let sent = message(
+            id: pending.id,
+            createdAt: createdAt,
+            deliveryState: "sent"
+        )
+        let refreshed = MarmotChatModel.reconciledOptimisticMessages(
+            source: local.visible + [sent],
+            pending: []
+        ).visible
+
+        #expect(refreshed.map(\.id) == [sent.id])
+        #expect(MarmotChatModel.stateText(for: refreshed[0]) == "Sent")
     }
 }
