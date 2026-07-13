@@ -578,6 +578,11 @@ expect object SonarCore {
     /** Re-subscribe with current watermark + group set to self-heal after
      *  relay disconnects. May perform one bounded chat repair fetch; call from
      *  background/IO work and never before local chat paint. */
+    suspend fun preferCatchupGroup(mlsGroupIdHex: String?)
+
+    /** Re-subscribe with current watermark + group set to self-heal after
+     *  relay disconnects. May perform one bounded chat repair fetch; call from
+     *  background/IO work and never before local chat paint. */
     suspend fun ensureSubscriptions()
 
     /** Park up to [timeoutSecs] until the relay subscriptions push a live
