@@ -1835,6 +1835,10 @@ final class MarmotChatModel: ObservableObject {
         }
     }
 
+    func isStickerPackInstalled(_ coordinate: String) -> Bool {
+        installedPackCoordinates.contains(coordinate.lowercased())
+    }
+
     func installStickerPack(coordinate: String) async -> Bool {
         do {
             try await service.installStickerPack(coordinate: coordinate)

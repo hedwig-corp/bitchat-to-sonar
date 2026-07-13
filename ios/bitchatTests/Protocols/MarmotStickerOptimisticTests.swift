@@ -46,6 +46,31 @@ final class MarmotStickerOptimisticTests: XCTestCase {
         ))
     }
 
+    func testStickerPreviewPreservesCachedInstallStateOnlyOnRefreshFailure() {
+        let coordinate = "30031:author:pack"
+
+        XCTAssertTrue(snStickerPackInstalledState(
+            coordinate: coordinate,
+            refreshedCoordinates: nil,
+            cachedInstalled: true
+        ))
+        XCTAssertFalse(snStickerPackInstalledState(
+            coordinate: coordinate,
+            refreshedCoordinates: nil,
+            cachedInstalled: false
+        ))
+        XCTAssertFalse(snStickerPackInstalledState(
+            coordinate: coordinate,
+            refreshedCoordinates: [],
+            cachedInstalled: true
+        ))
+        XCTAssertTrue(snStickerPackInstalledState(
+            coordinate: coordinate,
+            refreshedCoordinates: ["30031:AUTHOR:PACK"],
+            cachedInstalled: false
+        ))
+    }
+
     func testStickerEchoMatchesOnlyTheSameSticker() {
         let createdAt = Date()
         let expectedRef = MarmotService.MarmotStickerRef(

@@ -186,7 +186,11 @@ struct SonarDMScreenContent: View {
                     uninstallPack: { await store.uninstallStickerPack(coordinate: $0) },
                     isInstalled: { packCoord in
                         let installed = await store.fetchInstalledPacks()
-                        return installed?.contains(where: { $0.lowercased() == packCoord.lowercased() }) ?? false
+                        return snStickerPackInstalledState(
+                            coordinate: packCoord,
+                            refreshedCoordinates: installed,
+                            cachedInstalled: store.isStickerPackInstalled(packCoord)
+                        )
                     },
                     onClose: { previewPackCoordinate = nil }
                 )

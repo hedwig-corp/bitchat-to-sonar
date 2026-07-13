@@ -24,6 +24,16 @@ func snShouldPreserveCachedStickerPacks(
     hadCachedPacks && installedCoordinates == nil
 }
 
+func snStickerPackInstalledState(
+    coordinate: String,
+    refreshedCoordinates: [String]?,
+    cachedInstalled: Bool
+) -> Bool {
+    refreshedCoordinates?.contains {
+        $0.caseInsensitiveCompare(coordinate) == .orderedSame
+    } ?? cachedInstalled
+}
+
 struct SonarEmojiPickerView: View {
     let onEmoji: (String) -> Void
     let onSticker: (StickerInfo, String) -> Void

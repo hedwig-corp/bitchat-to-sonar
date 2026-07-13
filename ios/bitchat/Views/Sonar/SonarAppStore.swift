@@ -4977,6 +4977,10 @@ final class SonarAppStore: ObservableObject {
         await marmot.fetchInstalledPacks()
     }
 
+    func isStickerPackInstalled(_ coordinate: String) -> Bool {
+        marmot.isStickerPackInstalled(coordinate)
+    }
+
     func installStickerPack(coordinate: String) async -> Bool {
         await marmot.installStickerPack(coordinate: coordinate)
     }
