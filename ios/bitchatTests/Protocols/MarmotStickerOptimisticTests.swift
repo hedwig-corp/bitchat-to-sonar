@@ -9,6 +9,29 @@ import SonarCore
 
 @MainActor
 final class MarmotStickerOptimisticTests: XCTestCase {
+    func testInvalidatedStickerLookupNeverFallsThroughAsCacheMiss() {
+        XCTAssertEqual(MarmotChatModel.stickerCacheLookupState(
+            hasData: false,
+            startedGeneration: 1,
+            currentGeneration: 2
+        ), .invalidated)
+        XCTAssertEqual(MarmotChatModel.stickerCacheLookupState(
+            hasData: true,
+            startedGeneration: 1,
+            currentGeneration: 2
+        ), .invalidated)
+        XCTAssertEqual(MarmotChatModel.stickerCacheLookupState(
+            hasData: false,
+            startedGeneration: 2,
+            currentGeneration: 2
+        ), .miss)
+        XCTAssertEqual(MarmotChatModel.stickerCacheLookupState(
+            hasData: true,
+            startedGeneration: 2,
+            currentGeneration: 2
+        ), .hit)
+    }
+
     func testIdentityReplacementClearsPickerAuthorityBeforeDatabaseWipe() async {
         let suiteName = "MarmotStickerOptimisticTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!

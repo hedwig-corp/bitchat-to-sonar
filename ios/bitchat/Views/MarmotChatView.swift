@@ -187,6 +187,12 @@ enum SNMarmotChatSnapshotCache {
 /// identity in the keychain (wiped by emergency wipe like everything else).
 @MainActor
 final class MarmotChatModel: ObservableObject {
+    enum StickerCacheLookupState: Equatable {
+        case hit
+        case miss
+        case invalidated
+    }
+
     private static let nsecKeychainKey = "marmot-nsec"
     private static let sonarDescriptorRefreshInterval: TimeInterval = 15 * 60
     private static let sonarDescriptorMissRetryInterval: TimeInterval = 60
@@ -314,6 +320,21 @@ final class MarmotChatModel: ObservableObject {
         installedCoordinates: Set<String>
     ) -> Bool {
         installedCoordinates.contains(coordinate.lowercased())
+    }
+
+    static func stickerCacheLookupState(
+        hasData: Bool,
+        startedGeneration: UInt64,
+        currentGeneration: UInt64
+    ) -> StickerCacheLookupState {
+        guard startedGeneration == currentGeneration else { return .invalidated }
+        return hasData ? .hit : .miss
+    }
+
+    private enum CachedStickerImageResult {
+        case hit(Data)
+        case miss
+        case invalidated
     }
 
     init(
@@ -1729,8 +1750,11 @@ final class MarmotChatModel: ObservableObject {
     func fetchStickerPack(
         authorPubkeyHex: String,
         identifier: String,
-        relayUrls: [String]
+        relayUrls: [String],
+        expectedGeneration: UInt64? = nil
     ) async -> StickerPackInfo? {
+        let generation = expectedGeneration ?? stickerCacheGeneration
+        guard stickerCacheGeneration == generation else { return nil }
         let cacheKey = "30031:\(authorPubkeyHex.lowercased()):\(identifier)"
         if let cached = stickerPacksByCoordinate.removeValue(forKey: cacheKey) {
             stickerPacksByCoordinate[cacheKey] = cached
@@ -1745,6 +1769,7 @@ final class MarmotChatModel: ObservableObject {
                 identifier: identifier,
                 relayUrls: relayUrls
             )
+            guard stickerCacheGeneration == generation else { return nil }
             rememberStickerPack(pack, cacheKey: cacheKey)
             return pack
         } catch {
@@ -1764,9 +1789,14 @@ final class MarmotChatModel: ObservableObject {
         }
     }
 
-    func fetchStickerImage(url: String, expectedSha256: String) async -> Data? {
+    func fetchStickerImage(
+        url: String,
+        expectedSha256: String,
+        expectedGeneration: UInt64? = nil
+    ) async -> Data? {
+        let generation = expectedGeneration ?? stickerCacheGeneration
+        guard stickerCacheGeneration == generation else { return nil }
         if let cached = stickerImageFromMemory(expectedSha256: expectedSha256) { return cached }
-        let generation = stickerCacheGeneration
         do {
             let data = try await service.fetchStickerImage(url: url, expectedSha256: expectedSha256)
             guard stickerCacheGeneration == generation else { return nil }
@@ -1781,31 +1811,54 @@ final class MarmotChatModel: ObservableObject {
     }
 
     func stickerData(for ref: MarmotService.MarmotStickerRef) async -> Data? {
-        if let cached = await cachedStickerImage(for: ref) {
-            return cached
+        let generation = stickerCacheGeneration
+        switch await cachedStickerImage(for: ref, generation: generation) {
+        case .hit(let data):
+            return data
+        case .invalidated:
+            return nil
+        case .miss:
+            break
         }
+        guard stickerCacheGeneration == generation else { return nil }
         guard let parts = Self.stickerPackParts(ref.packCoordinate),
               let pack = await fetchStickerPack(
                   authorPubkeyHex: parts.author,
                   identifier: parts.identifier,
-                  relayUrls: []
+                  relayUrls: [],
+                  expectedGeneration: generation
               ),
               let sticker = pack.stickers.first(where: {
                   $0.shortcode == ref.shortcode &&
                       $0.sha256.caseInsensitiveCompare(ref.plaintextSha256) == .orderedSame
               })
         else { return nil }
-        return await fetchStickerImage(url: sticker.url, expectedSha256: ref.plaintextSha256)
+        return await fetchStickerImage(
+            url: sticker.url,
+            expectedSha256: ref.plaintextSha256,
+            expectedGeneration: generation
+        )
     }
 
-    private func cachedStickerImage(for ref: MarmotService.MarmotStickerRef) async -> Data? {
-        let generation = stickerCacheGeneration
-        guard let data = try? await service.cachedStickerImage(for: ref) else {
-            return nil
+    private func cachedStickerImage(
+        for ref: MarmotService.MarmotStickerRef,
+        generation: UInt64
+    ) async -> CachedStickerImageResult {
+        let data = try? await service.cachedStickerImage(for: ref)
+        switch Self.stickerCacheLookupState(
+            hasData: data != nil,
+            startedGeneration: generation,
+            currentGeneration: stickerCacheGeneration
+        ) {
+        case .hit:
+            guard let data else { return .miss }
+            rememberStickerImage(data, expectedSha256: ref.plaintextSha256)
+            return .hit(data)
+        case .miss:
+            return .miss
+        case .invalidated:
+            return .invalidated
         }
-        guard stickerCacheGeneration == generation else { return nil }
-        rememberStickerImage(data, expectedSha256: ref.plaintextSha256)
-        return data
     }
 
     private func stickerImageFromMemory(expectedSha256: String) -> Data? {

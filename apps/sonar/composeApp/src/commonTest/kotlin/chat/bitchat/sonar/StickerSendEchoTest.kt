@@ -7,6 +7,25 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class StickerSendEchoTest {
+    @Test fun invalidatedStickerLookupNeverFallsThroughAsCacheMiss() {
+        assertEquals(
+            StickerCacheLookupState.INVALIDATED,
+            stickerCacheLookupState(hasBytes = false, startedGeneration = 1, currentGeneration = 2),
+        )
+        assertEquals(
+            StickerCacheLookupState.INVALIDATED,
+            stickerCacheLookupState(hasBytes = true, startedGeneration = 1, currentGeneration = 2),
+        )
+        assertEquals(
+            StickerCacheLookupState.MISS,
+            stickerCacheLookupState(hasBytes = false, startedGeneration = 2, currentGeneration = 2),
+        )
+        assertEquals(
+            StickerCacheLookupState.HIT,
+            stickerCacheLookupState(hasBytes = true, startedGeneration = 2, currentGeneration = 2),
+        )
+    }
+
     @Test fun failedInstalledRefreshPreservesCachedPacks() {
         assertTrue(shouldPreserveCachedStickerPacks(hadCachedPacks = true, installedCoordinates = null))
         assertFalse(shouldPreserveCachedStickerPacks(hadCachedPacks = false, installedCoordinates = null))

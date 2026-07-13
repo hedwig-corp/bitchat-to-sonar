@@ -408,6 +408,18 @@ internal fun shouldExposeCachedStickerPack(
     installedCoordinates: Set<String>,
 ): Boolean = coordinate.lowercase() in installedCoordinates
 
+internal enum class StickerCacheLookupState { HIT, MISS, INVALIDATED }
+
+internal fun stickerCacheLookupState(
+    hasBytes: Boolean,
+    startedGeneration: Long,
+    currentGeneration: Long,
+): StickerCacheLookupState = when {
+    startedGeneration != currentGeneration -> StickerCacheLookupState.INVALIDATED
+    hasBytes -> StickerCacheLookupState.HIT
+    else -> StickerCacheLookupState.MISS
+}
+
 internal fun hasRecentMarmotActivityForCapabilitySettle(
     latestMessageTsSecs: Long?,
     nowMs: Long,
@@ -4417,6 +4429,13 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  contains previews/transcript packs and must never grant picker access. */
     private val installedPackCoordinates = mutableSetOf<String>()
     private var stickerCacheGeneration = 0L
+
+    private sealed interface CachedStickerImageResult {
+        data class Hit(val bytes: ByteArray) : CachedStickerImageResult
+        data object Miss : CachedStickerImageResult
+        data object Invalidated : CachedStickerImageResult
+    }
+
     private val pendingMediaUrlPrefix = "pending-media-"
 
     private data class PendingMediaUpload(
@@ -4932,14 +4951,20 @@ class SonarAppState(private val scope: CoroutineScope) {
         authorPubkeyHex: String,
         identifier: String,
         relayUrls: List<String> = emptyList(),
+        expectedGeneration: Long? = null,
     ): SonarStickerPack? {
+        val generation = expectedGeneration ?: stickerCacheGeneration
+        if (stickerCacheGeneration != generation) return null
         val cacheKey = "30031:${authorPubkeyHex.lowercase()}:$identifier"
         stickerPackCache.remove(cacheKey)?.let { stickerPackCache[cacheKey] = it; return it }
         return try {
-            SonarCore.fetchStickerPack(authorPubkeyHex, identifier, relayUrls).also {
-                if (stickerPackCache.size >= 20) stickerPackCache.remove(stickerPackCache.keys.first())
-                stickerPackCache[cacheKey] = it
-            }
+            val pack = SonarCore.fetchStickerPack(authorPubkeyHex, identifier, relayUrls)
+            if (stickerCacheGeneration != generation) return null
+            if (stickerPackCache.size >= 20) stickerPackCache.remove(stickerPackCache.keys.first())
+            stickerPackCache[cacheKey] = pack
+            pack
+        } catch (e: CancellationException) {
+            throw e
         } catch (_: Throwable) {
             null
         }
@@ -4955,9 +4980,14 @@ class SonarAppState(private val scope: CoroutineScope) {
         .values
         .toList()
 
-    suspend fun stickerImage(url: String, expectedSha256: String): ByteArray? {
+    suspend fun stickerImage(
+        url: String,
+        expectedSha256: String,
+        expectedGeneration: Long? = null,
+    ): ByteArray? {
+        val generation = expectedGeneration ?: stickerCacheGeneration
+        if (stickerCacheGeneration != generation) return null
         stickerImageFromMemory(expectedSha256)?.let { return it }
-        val generation = stickerCacheGeneration
         return try {
             val bytes = SonarCore.fetchStickerImage(url, expectedSha256)
             if (stickerCacheGeneration != generation) return null
@@ -4971,24 +5001,50 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     suspend fun stickerImage(ref: SonarStickerRef): ByteArray? {
-        cachedStickerImage(ref)?.let { return it }
+        val generation = stickerCacheGeneration
+        when (val cached = cachedStickerImage(ref, generation)) {
+            is CachedStickerImageResult.Hit -> return cached.bytes
+            CachedStickerImageResult.Invalidated -> return null
+            CachedStickerImageResult.Miss -> Unit
+        }
+        if (stickerCacheGeneration != generation) return null
         val (author, identifier) = ref.packAddressParts() ?: return null
-        val pack = stickerPack(author, identifier) ?: return null
+        val pack = stickerPack(
+            authorPubkeyHex = author,
+            identifier = identifier,
+            expectedGeneration = generation,
+        ) ?: return null
         val sticker = pack.stickerMatching(ref) ?: return null
-        return stickerImage(sticker.url, ref.plaintextSha256)
+        return stickerImage(
+            url = sticker.url,
+            expectedSha256 = ref.plaintextSha256,
+            expectedGeneration = generation,
+        )
     }
 
-    private suspend fun cachedStickerImage(ref: SonarStickerRef): ByteArray? {
-        val generation = stickerCacheGeneration
+    private suspend fun cachedStickerImage(
+        ref: SonarStickerRef,
+        generation: Long,
+    ): CachedStickerImageResult {
         return try {
-            val bytes = SonarCore.cachedStickerImageForRef(ref) ?: return null
-            if (stickerCacheGeneration != generation) return null
-            rememberStickerImage(ref.plaintextSha256, bytes)
-            bytes
+            val bytes = SonarCore.cachedStickerImageForRef(ref)
+            when (stickerCacheLookupState(bytes != null, generation, stickerCacheGeneration)) {
+                StickerCacheLookupState.HIT -> {
+                    val verifiedBytes = requireNotNull(bytes)
+                    rememberStickerImage(ref.plaintextSha256, verifiedBytes)
+                    CachedStickerImageResult.Hit(verifiedBytes)
+                }
+                StickerCacheLookupState.MISS -> CachedStickerImageResult.Miss
+                StickerCacheLookupState.INVALIDATED -> CachedStickerImageResult.Invalidated
+            }
         } catch (e: CancellationException) {
             throw e
         } catch (_: Exception) {
-            null
+            if (stickerCacheGeneration == generation) {
+                CachedStickerImageResult.Miss
+            } else {
+                CachedStickerImageResult.Invalidated
+            }
         }
     }
 
