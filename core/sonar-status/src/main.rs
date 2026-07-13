@@ -30,19 +30,25 @@ const STATUS_EVENT_KIND: u16 = 30078;
 /// `d` tag — must match `web/src/lib/status-data.js` `STATUS_EVENT_D`.
 const STATUS_EVENT_D: &str = "sonar-status";
 
+/// Sonar client bootstrap relays — union of iOS `NostrRelayManager.defaultRelays`
+/// and Android/JVM `SonarCore` defaults. Keep in sync with
+/// `web/src/lib/status-data.js` seed relays.
 const DEFAULT_RELAYS: &[&str] = &[
     "wss://relay.damus.io",
     "wss://nos.lol",
     "wss://relay.primal.net",
-    "wss://relay.snort.social",
-    "wss://nostr.wine",
-    "wss://relay.nostr.band",
+    "wss://offchain.pub",
+    "wss://nostr21.com",
+    "wss://relay.kaleidoswap.com",
+    "wss://nostr.relay.hedwig.sh",
 ];
 
+/// Where the signed status document is published (must be readable by the site).
 const DEFAULT_PUBLISH_RELAYS: &[&str] = &[
     "wss://relay.damus.io",
     "wss://nos.lol",
     "wss://relay.primal.net",
+    "wss://nostr.relay.hedwig.sh",
 ];
 
 const WS_TIMEOUT: Duration = Duration::from_secs(4);
@@ -440,6 +446,10 @@ fn region_for(url: &str) -> String {
         u if u.contains("damus") => "Global · CDN".into(),
         u if u.contains("nos.lol") => "EU · Germany".into(),
         u if u.contains("primal") => "US · East".into(),
+        u if u.contains("offchain.pub") => "Global · iOS default".into(),
+        u if u.contains("nostr21.com") => "Global · iOS default".into(),
+        u if u.contains("kaleidoswap") => "Global · client default".into(),
+        u if u.contains("hedwig") => "Hedwig · Sonar".into(),
         u if u.contains("snort") => "EU · UK".into(),
         u if u.contains("nostr.wine") => "US · Central".into(),
         u if u.contains("nostr.band") => "Global · Anycast".into(),
@@ -543,107 +553,41 @@ fn derive_services(relays: &[RelayProbe], https: &[HttpProbe]) -> Vec<StatusServ
         (None, 99.5 + ratio * 0.5)
     };
 
-    let mut services = vec![
-        StatusService {
-            id: "relays".into(),
-            name: "Nostr relay network".into(),
-            desc: format!(
-                "{reachable}/{total} public relays reachable from probe · median {} ms",
-                median.map(|m| m.to_string()).unwrap_or_else(|| "—".into())
-            ),
-            uptime: (relay_uptime * 100.0).round() / 100.0,
-            state: relay_state.clone(),
-        },
-        // Application surfaces inherit relay health as a first-order dependency.
-        // Real per-surface probes (Marmot publish, push, payments) can replace
-        // these heuristics later without changing the Nostr schema.
-        StatusService {
-            id: "dm".into(),
-            name: "Encrypted DMs (Marmot)".into(),
-            desc: "End-to-end encrypted direct messages".into(),
-            uptime: clamp_uptime(relay_uptime + 0.2),
-            state: relay_state.clone(),
-        },
-        StatusService {
-            id: "groups".into(),
-            name: "Group chats (White Noise)".into(),
-            desc: "MLS-over-Nostr encrypted groups".into(),
-            uptime: clamp_uptime(relay_uptime + 0.1),
-            state: relay_state.clone(),
-        },
-        StatusService {
-            id: "media".into(),
-            name: "Media messages".into(),
-            desc: "Image, video & file delivery".into(),
-            uptime: clamp_uptime(relay_uptime),
-            state: relay_state.clone(),
-        },
-        StatusService {
-            id: "voice".into(),
-            name: "Voice messages".into(),
-            desc: "Push-to-talk voice notes".into(),
-            uptime: clamp_uptime(relay_uptime),
-            state: relay_state.clone(),
-        },
-        StatusService {
-            id: "calls".into(),
-            name: "Voice & video calls".into(),
-            desc: "Iroh transport, Marmot signaling".into(),
-            // Calls are more sensitive to relay signaling latency.
-            uptime: clamp_uptime(relay_uptime - 0.3),
-            state: if median.map(|m| m > 450).unwrap_or(false) {
-                Some(ServiceState::Degraded)
-            } else {
-                relay_state.clone()
-            },
-        },
-        StatusService {
-            id: "payments".into(),
-            name: "Payments (Bolt12)".into(),
-            desc: "Direct Lightning wallet payments".into(),
-            uptime: 99.9,
-            state: None,
-        },
-        StatusService {
-            id: "push".into(),
-            name: "Push notifications".into(),
-            desc: "Encrypted push envelopes".into(),
-            uptime: 99.85,
-            state: None,
-        },
-        StatusService {
-            id: "stickers".into(),
-            name: "Stickers directory".into(),
-            desc: "Nostr sticker-pack index".into(),
-            uptime: clamp_uptime(relay_uptime + 0.3),
-            state: if reachable == 0 {
-                Some(ServiceState::Down)
-            } else {
-                None
-            },
-        },
-    ];
+    // Only services we can actually observe today.
+    // Application surfaces (DM/groups/media/…) require dedicated probes —
+    // see docs/SONAR-STATUS.md § "Real service probes". Until those land,
+    // do NOT invent mock degraded rows for them.
+    let mut services = vec![StatusService {
+        id: "relays".into(),
+        name: "Nostr relay network (client defaults)".into(),
+        desc: format!(
+            "{reachable}/{total} Sonar bootstrap relays reachable · median {} ms",
+            median.map(|m| m.to_string()).unwrap_or_else(|| "—".into())
+        ),
+        uptime: (relay_uptime * 100.0).round() / 100.0,
+        state: relay_state,
+    }];
 
     for h in https {
+        let state = if h.ok {
+            None
+        } else if h.status.map(|s| s >= 500).unwrap_or(true) {
+            Some(ServiceState::Down)
+        } else {
+            Some(ServiceState::Degraded)
+        };
         services.push(StatusService {
             id: h.id.clone(),
             name: h.name.clone(),
             desc: format!("Health check {}", h.url),
             uptime: if h.ok { 99.9 } else { 90.0 },
-            state: if h.ok {
-                None
-            } else {
-                Some(ServiceState::Down)
-            },
+            state,
         });
     }
 
     services
 }
 
-fn clamp_uptime(v: f64) -> f64 {
-    ((v.clamp(0.0, 100.0)) * 100.0).round() / 100.0
-}
 
 fn median_u64(vals: &[u64]) -> Option<u64> {
     if vals.is_empty() {
@@ -791,8 +735,10 @@ mod tests {
             ms: None,
         }];
         let services = derive_services(&relays, &[]);
-        let dm = services.iter().find(|s| s.id == "dm").unwrap();
-        assert_eq!(dm.state, Some(ServiceState::Down));
+        let relays_svc = services.iter().find(|s| s.id == "relays").unwrap();
+        assert_eq!(relays_svc.state, Some(ServiceState::Down));
+        // No mock application rows until dedicated probes exist.
+        assert!(services.iter().all(|s| s.id == "relays" || s.id.starts_with("http-")));
     }
 
     #[test]
