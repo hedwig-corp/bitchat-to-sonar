@@ -671,10 +671,31 @@ final class MarmotService: @unchecked Sendable {
     /// Download a public sticker image by its plaintext HTTPS URL.
     /// Runs off the serial workQueue to avoid blocking sends and message reads.
     func fetchStickerImage(url: String, expectedSha256: String) async throws -> Data {
-        let nodeRef: SonarNode = try await run { try $0.requireNode() }
-        return try await Task.detached {
+        let (nodeRef, generation): (SonarNode, UInt64) = try await run {
+            (try $0.requireNode(), $0.sessionGeneration)
+        }
+        let data = try await Task.detached {
             try nodeRef.fetchStickerImage(url: url, expectedSha256: expectedSha256)
         }.value
+        return try await run {
+            guard $0.sessionGeneration == generation else { throw ServiceError.cancelled }
+            return data
+        }
+    }
+
+    /// Read verified sticker bytes by hash from the shared persistent cache.
+    /// A nil result is an ordinary local miss; no relay or HTTP work is started.
+    func cachedStickerImage(expectedSha256: String) async throws -> Data? {
+        let (nodeRef, generation): (SonarNode, UInt64) = try await run {
+            (try $0.requireNode(), $0.sessionGeneration)
+        }
+        let data = try await Task.detached {
+            try nodeRef.cachedStickerImage(expectedSha256: expectedSha256)
+        }.value
+        return try await run {
+            guard $0.sessionGeneration == generation else { throw ServiceError.cancelled }
+            return data
+        }
     }
 
     func fetchInstalledPacks() async throws -> [String] {
@@ -1037,6 +1058,9 @@ final class MarmotService: @unchecked Sendable {
     func wipeDatabase() async {
         await runNonThrowing { service in
             service.sessionGeneration = service.sessionGeneration &+ 1
+            #if os(iOS)
+            SonarPushRegistration.shared.clearSonarNode()
+            #endif
             service.nodeLock.lock()
             service.node = nil
             service.relayConnected = false

@@ -626,7 +626,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             payLedger = SonarPayLedger(); payVersion++
             PaymentActivityStore.wipe() // iOS wipes both payment ledgers together
             cancelAllMediaDownloads(); MediaCache.wipe()
-            mediaCache.clear(); stickerPackCache.clear(); stickerImageCache.clear(); installedPackCoordinates.clear()
+            mediaCache.clear(); clearStickerCaches()
             callLogs.clear(); callVersion++
             resetCallState()
             pollJob?.cancel(); pollJob = null
@@ -674,7 +674,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             payLedger = SonarPayLedger(); persistPay(); payVersion++
             PaymentActivityStore.wipe()
             cancelAllMediaDownloads(); MediaCache.wipe()
-            mediaCache.clear(); stickerPackCache.clear(); stickerImageCache.clear(); installedPackCoordinates.clear()
+            mediaCache.clear(); clearStickerCaches()
             callLogs.clear(); callVersion++
             lastSeenTs.clear(); lastNotifiedTs.clear(); seededSeen = false
             scanWatermark.clear()
@@ -2620,7 +2620,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 payLedger = SonarPayLedger(); persistPay(); payVersion++
                 PaymentActivityStore.wipe()
                 cancelAllMediaDownloads(); MediaCache.wipe()
-                mediaCache.clear(); stickerPackCache.clear(); stickerImageCache.clear(); installedPackCoordinates.clear()
+                mediaCache.clear(); clearStickerCaches()
                 callLogs.clear(); callVersion++
 
                 npub = restoredNpub
@@ -4389,6 +4389,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     private val stickerPackCache = linkedMapOf<String, SonarStickerPack>()
     private val stickerImageCache = linkedMapOf<String, ByteArray>()
     private val installedPackCoordinates = mutableSetOf<String>()
+    private var stickerCacheGeneration = 0L
     private val pendingMediaUrlPrefix = "pending-media-"
 
     private data class PendingMediaUpload(
@@ -4897,23 +4898,60 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     suspend fun stickerImage(url: String, expectedSha256: String): ByteArray? {
-        val cacheKey = "${expectedSha256.lowercase()}|$url"
-        stickerImageCache.remove(cacheKey)?.let { stickerImageCache[cacheKey] = it; return it }
+        stickerImageFromMemory(expectedSha256)?.let { return it }
+        val generation = stickerCacheGeneration
         return try {
-            SonarCore.fetchStickerImage(url, expectedSha256).also {
-                if (stickerImageCache.size >= 500) stickerImageCache.remove(stickerImageCache.keys.first())
-                stickerImageCache[cacheKey] = it
-            }
-        } catch (_: Throwable) {
+            val bytes = SonarCore.fetchStickerImage(url, expectedSha256)
+            if (stickerCacheGeneration != generation) return null
+            rememberStickerImage(expectedSha256, bytes)
+            bytes
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
             null
         }
     }
 
     suspend fun stickerImage(ref: SonarStickerRef): ByteArray? {
+        cachedStickerImage(ref.plaintextSha256)?.let { return it }
         val (author, identifier) = ref.packAddressParts() ?: return null
         val pack = stickerPack(author, identifier) ?: return null
         val sticker = pack.stickerMatching(ref) ?: return null
         return stickerImage(sticker.url, ref.plaintextSha256)
+    }
+
+    private suspend fun cachedStickerImage(expectedSha256: String): ByteArray? {
+        stickerImageFromMemory(expectedSha256)?.let { return it }
+        val generation = stickerCacheGeneration
+        return try {
+            val bytes = SonarCore.cachedStickerImage(expectedSha256) ?: return null
+            if (stickerCacheGeneration != generation) return null
+            rememberStickerImage(expectedSha256, bytes)
+            bytes
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun stickerImageFromMemory(expectedSha256: String): ByteArray? {
+        val cacheKey = expectedSha256.lowercase()
+        return stickerImageCache.remove(cacheKey)?.also { stickerImageCache[cacheKey] = it }
+    }
+
+    private fun rememberStickerImage(expectedSha256: String, bytes: ByteArray) {
+        val cacheKey = expectedSha256.lowercase()
+        stickerImageCache.remove(cacheKey)
+        if (stickerImageCache.size >= 500) stickerImageCache.remove(stickerImageCache.keys.first())
+        stickerImageCache[cacheKey] = bytes
+    }
+
+    private fun clearStickerCaches() {
+        stickerCacheGeneration++
+        stickerPackCache.clear()
+        stickerImageCache.clear()
+        installedPackCoordinates.clear()
     }
 
     fun isPackInstalled(coordinate: String): Boolean =

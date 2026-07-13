@@ -267,7 +267,8 @@ final class MarmotChatModel: ObservableObject {
     /// They must not be mistaken for the relay copy of a later identical send.
     private var preexistingCanonicalMessageIDsByOptimisticID: [String: Set<String>] = [:]
     private var stickerPacksByCoordinate: [String: StickerPackInfo] = [:]
-    private var stickerImagesByURL: [String: Data] = [:]
+    private var stickerImagesBySHA256: [String: Data] = [:]
+    private var stickerCacheGeneration: UInt64 = 0
     /// Last desired payment offer metadata for our public descriptor. Reused
     /// when other descriptor refreshes publish capabilities without changing
     /// payment state.
@@ -1696,18 +1697,15 @@ final class MarmotChatModel: ObservableObject {
     }
 
     func fetchStickerImage(url: String, expectedSha256: String) async -> Data? {
-        let cacheKey = "\(expectedSha256.lowercased())|\(url)"
-        if let cached = stickerImagesByURL.removeValue(forKey: cacheKey) {
-            stickerImagesByURL[cacheKey] = cached
-            return cached
-        }
+        if let cached = stickerImageFromMemory(expectedSha256: expectedSha256) { return cached }
+        let generation = stickerCacheGeneration
         do {
             let data = try await service.fetchStickerImage(url: url, expectedSha256: expectedSha256)
-            if stickerImagesByURL.count >= 500, let oldest = stickerImagesByURL.keys.first {
-                stickerImagesByURL.removeValue(forKey: oldest)
-            }
-            stickerImagesByURL[cacheKey] = data
+            guard stickerCacheGeneration == generation else { return nil }
+            rememberStickerImage(data, expectedSha256: expectedSha256)
             return data
+        } catch MarmotService.ServiceError.cancelled {
+            return nil
         } catch {
             self.errorText = Self.describe(error)
             return nil
@@ -1715,6 +1713,9 @@ final class MarmotChatModel: ObservableObject {
     }
 
     func stickerData(for ref: MarmotService.MarmotStickerRef) async -> Data? {
+        if let cached = await cachedStickerImage(expectedSha256: ref.plaintextSha256) {
+            return cached
+        }
         guard let parts = Self.stickerPackParts(ref.packCoordinate),
               let pack = await fetchStickerPack(
                   authorPubkeyHex: parts.author,
@@ -1727,6 +1728,40 @@ final class MarmotChatModel: ObservableObject {
               })
         else { return nil }
         return await fetchStickerImage(url: sticker.url, expectedSha256: ref.plaintextSha256)
+    }
+
+    private func cachedStickerImage(expectedSha256: String) async -> Data? {
+        if let cached = stickerImageFromMemory(expectedSha256: expectedSha256) { return cached }
+        let generation = stickerCacheGeneration
+        guard let data = try? await service.cachedStickerImage(expectedSha256: expectedSha256) else {
+            return nil
+        }
+        guard stickerCacheGeneration == generation else { return nil }
+        rememberStickerImage(data, expectedSha256: expectedSha256)
+        return data
+    }
+
+    private func stickerImageFromMemory(expectedSha256: String) -> Data? {
+        let cacheKey = expectedSha256.lowercased()
+        guard let cached = stickerImagesBySHA256.removeValue(forKey: cacheKey) else { return nil }
+        stickerImagesBySHA256[cacheKey] = cached
+        return cached
+    }
+
+    private func rememberStickerImage(_ data: Data, expectedSha256: String) {
+        let cacheKey = expectedSha256.lowercased()
+        stickerImagesBySHA256.removeValue(forKey: cacheKey)
+        if stickerImagesBySHA256.count >= 500, let oldest = stickerImagesBySHA256.keys.first {
+            stickerImagesBySHA256.removeValue(forKey: oldest)
+        }
+        stickerImagesBySHA256[cacheKey] = data
+    }
+
+    private func clearStickerCaches() {
+        stickerCacheGeneration = stickerCacheGeneration &+ 1
+        stickerPacksByCoordinate = [:]
+        stickerImagesBySHA256 = [:]
+        installedPackCoordinates = []
     }
 
     func fetchInstalledPacks() async -> [String] {
@@ -1972,7 +2007,7 @@ final class MarmotChatModel: ObservableObject {
         profilesByNpub = [:]
         profileFetches = []
         profileFetchedAt = [:]
-        installedPackCoordinates = []
+        clearStickerCaches()
         SNMarmotProfileCache.clear(from: defaults)
         SNMarmotChatSnapshotCache.clear(from: defaults)
     }
@@ -2004,7 +2039,7 @@ final class MarmotChatModel: ObservableObject {
         profilesByNpub = [:]
         profileFetches = []
         profileFetchedAt = [:]
-        installedPackCoordinates = []
+        clearStickerCaches()
         SNMarmotProfileCache.clear(from: defaults)
         SNMarmotChatSnapshotCache.clear(from: defaults)
         errorText = nil

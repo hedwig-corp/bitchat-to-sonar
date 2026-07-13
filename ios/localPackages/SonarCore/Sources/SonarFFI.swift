@@ -908,6 +908,12 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func blossomServers() throws  -> [String]
     
     /**
+     * Return verified sticker bytes from the local persistent cache by SHA256.
+     * Never contacts relays or HTTP; `None` is an ordinary cache miss.
+     */
+    func cachedStickerImage(expectedSha256: String) throws  -> Data?
+
+    /**
      * The user accepted an incoming call: we are the dialer. Dials the offerer
      * and starts media. Blocks on the QUIC connect.
      */
@@ -1403,6 +1409,19 @@ open func blossomServers()throws  -> [String]  {
 })
 }
     
+    /**
+     * Return verified sticker bytes from the local persistent cache by SHA256.
+     * Never contacts relays or HTTP; `None` is an ordinary cache miss.
+     */
+open func cachedStickerImage(expectedSha256: String)throws  -> Data?  {
+    return try  FfiConverterOptionData.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_cached_sticker_image(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(expectedSha256),$0
+    )
+})
+}
+
     /**
      * The user accepted an incoming call: we are the dialer. Dials the offerer
      * and starts media. Blocks on the QUIC connect.
@@ -6387,6 +6406,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_blossom_servers() != 8214) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_cached_sticker_image() != 42673) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_call_accept() != 7250) {

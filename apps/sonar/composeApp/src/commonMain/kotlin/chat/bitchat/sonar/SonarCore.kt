@@ -528,6 +528,9 @@ expect object SonarCore {
     /** Download a public sticker image and verify the bytes match [expectedSha256]. */
     suspend fun fetchStickerImage(url: String, expectedSha256: String): ByteArray
 
+    /** Return verified local sticker bytes by hash without relay or HTTP access. */
+    suspend fun cachedStickerImage(expectedSha256: String): ByteArray?
+
     /** Fetch the user's installed sticker pack list (kind 10031) from relays. */
     suspend fun fetchInstalledPacks(): List<String>
 

@@ -41,7 +41,7 @@ use crate::sonar_descriptor::{
     SONAR_DESCRIPTOR_KIND, SONAR_META_DESCRIPTOR_D_TAG,
 };
 use crate::sticker_cache::{
-    read_sticker_cache, sticker_cache_dir_for_db, wipe_sticker_cache_for_db, write_sticker_cache,
+    wipe_sticker_cache_for_db, StickerCache, STICKER_CACHE_PREFETCH_IMAGE_LIMIT,
 };
 use crate::{Error, Result};
 
@@ -183,13 +183,13 @@ pub async fn http_get_public(url: &str) -> Result<Vec<u8>> {
 }
 
 async fn fetch_sticker_image_with_cache(
-    sticker_cache_dir: Option<&Path>,
+    sticker_cache: &StickerCache,
     url: &str,
     expected_sha256: &str,
 ) -> Result<Vec<u8>> {
     let expected = expected_sha256.to_ascii_lowercase();
     validate_sha256_hex(&expected).map_err(|e| Error::Http(format!("bad sticker sha256: {e}")))?;
-    if let Ok(Some(cached)) = read_sticker_cache(sticker_cache_dir, &expected) {
+    if let Ok(Some(cached)) = sticker_cache.read(&expected) {
         return Ok(cached);
     }
     if !url.starts_with("https://") {
@@ -202,7 +202,9 @@ async fn fetch_sticker_image_with_cache(
             "sticker image sha256 mismatch: expected {expected}, got {actual}"
         )));
     }
-    let _ = write_sticker_cache(sticker_cache_dir, &expected, &bytes);
+    if matches!(sticker_cache.write(&expected, &bytes), Ok(false)) {
+        return Err(Error::Storage("sticker cache session invalidated".into()));
+    }
     Ok(bytes)
 }
 
@@ -845,7 +847,7 @@ pub struct SonarClient {
     /// Durable path for cached member push tokens (None for in-memory tests).
     push_token_cache_path: Option<PathBuf>,
     /// Directory for content-addressed sticker image bytes (None for in-memory tests).
-    sticker_cache_dir: Option<PathBuf>,
+    sticker_cache: StickerCache,
     /// This device's own push registration (set after `register_push_token`).
     own_push_registration: Arc<Mutex<Option<crate::push::OwnPushRegistration>>>,
 }
@@ -883,7 +885,7 @@ impl SonarClient {
             Some(outbox_state_path_for_db(db_path)),
             Some(invite_link_state_path_for_db(db_path)),
             Some(push_token_cache_path_for_db(db_path)),
-            Some(sticker_cache_dir_for_db(db_path)),
+            StickerCache::for_db(db_path)?,
             index.map(|idx| Arc::new(Mutex::new(idx))),
         )
         .await?;
@@ -896,7 +898,16 @@ impl SonarClient {
     pub async fn connect_in_memory(identity: Identity, relays: Vec<RelayUrl>) -> Result<Self> {
         let engine = MarmotEngine::in_memory(identity.clone());
         Self::with_engine(
-            identity, relays, engine, false, None, None, None, None, None, None,
+            identity,
+            relays,
+            engine,
+            false,
+            None,
+            None,
+            None,
+            None,
+            StickerCache::disabled(),
+            None,
         )
         .await
     }
@@ -910,7 +921,7 @@ impl SonarClient {
         outbox_state_path: Option<PathBuf>,
         invite_link_state_path: Option<PathBuf>,
         push_token_cache_path: Option<PathBuf>,
-        sticker_cache_dir: Option<PathBuf>,
+        sticker_cache: StickerCache,
         conversation_index: Option<Arc<Mutex<ConversationIndex>>>,
     ) -> Result<Self> {
         let boot_start = std::time::Instant::now();
@@ -1275,7 +1286,7 @@ impl SonarClient {
             )),
             push_token_cache,
             push_token_cache_path,
-            sticker_cache_dir,
+            sticker_cache,
             own_push_registration: Arc::new(Mutex::new(None)),
         };
         // Open the live Marmot subscriptions for real sessions. In-memory test
@@ -2125,8 +2136,14 @@ impl SonarClient {
     /// Download a public sticker image (HTTPS), verify SHA256, and persist to the
     /// content-addressed disk cache when configured.
     pub async fn fetch_sticker_image(&self, url: &str, expected_sha256: &str) -> Result<Vec<u8>> {
-        fetch_sticker_image_with_cache(self.sticker_cache_dir.as_deref(), url, expected_sha256)
-            .await
+        fetch_sticker_image_with_cache(&self.sticker_cache, url, expected_sha256).await
+    }
+
+    /// Return a verified local sticker image by content hash without consulting
+    /// relays or HTTP. Hosts use this before resolving pack metadata so cached
+    /// transcript stickers can paint immediately after restart and while offline.
+    pub fn cached_sticker_image(&self, expected_sha256: &str) -> Result<Option<Vec<u8>>> {
+        self.sticker_cache.read(expected_sha256)
     }
 
     /// Schedule bounded best-effort prefetch without holding the install/FFI
@@ -2134,7 +2151,7 @@ impl SonarClient {
     fn spawn_sticker_pack_prefetch(&self, coordinate: String) {
         let nostr = self.nostr.clone();
         let relays = self.relays.clone();
-        let sticker_cache_dir = self.sticker_cache_dir.clone();
+        let sticker_cache = self.sticker_cache.clone();
         let _prefetch = tokio::spawn(async move {
             let address = match PackAddress::parse(&coordinate) {
                 Ok(address) => address,
@@ -2160,16 +2177,19 @@ impl SonarClient {
             };
 
             let mut tasks = tokio::task::JoinSet::new();
-            for sticker in pack.stickers {
+            for sticker in pack
+                .stickers
+                .into_iter()
+                .take(STICKER_CACHE_PREFETCH_IMAGE_LIMIT)
+            {
                 while tasks.len() >= STICKER_PREFETCH_CONCURRENCY {
                     log_sticker_prefetch_result(tasks.join_next().await);
                 }
-                let cache_dir = sticker_cache_dir.clone();
+                let cache = sticker_cache.clone();
                 tasks.spawn(async move {
                     let url = sticker.url;
                     let result =
-                        fetch_sticker_image_with_cache(cache_dir.as_deref(), &url, &sticker.sha256)
-                            .await;
+                        fetch_sticker_image_with_cache(&cache, &url, &sticker.sha256).await;
                     (url, result)
                 });
             }

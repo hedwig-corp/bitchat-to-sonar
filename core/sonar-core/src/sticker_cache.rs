@@ -2,6 +2,7 @@
 //!
 //! Survives app restarts and complements the UI-layer in-memory LRU.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex, MutexGuard};
@@ -14,14 +15,28 @@ use crate::Result;
 pub(crate) const STICKER_CACHE_DIR_SUFFIX: &str = ".sonar-stickers";
 const MAX_STICKER_CACHE_BYTES: usize = 5 * 1024 * 1024;
 const MAX_STICKER_CACHE_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
+/// Bound install prefetch to the leading window that can fit even when every
+/// sticker is at the per-object maximum. This keeps picker-order stickers warm
+/// instead of downloading the whole pack and evicting its first entries.
+pub(crate) const STICKER_CACHE_PREFETCH_IMAGE_LIMIT: usize =
+    MAX_STICKER_CACHE_TOTAL_BYTES as usize / MAX_STICKER_CACHE_BYTES;
+
+#[derive(Default)]
+struct StickerCacheState {
+    /// Incremented before every wipe. A cache handle captures the generation at
+    /// node creation, so an old async fetch cannot recreate files after panic
+    /// wipe (or write into a freshly-created session for the same DB path).
+    generations: HashMap<PathBuf, u64>,
+}
 
 // Serializes cache reads, writes, eviction, and wipe within the process. The
 // cache is best-effort, but readers must never observe a half-finished
 // replacement and wipe must not race an in-flight write.
-static STICKER_CACHE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static STICKER_CACHE_STATE: LazyLock<Mutex<StickerCacheState>> =
+    LazyLock::new(|| Mutex::new(StickerCacheState::default()));
 
-fn lock_cache() -> Result<MutexGuard<'static, ()>> {
-    STICKER_CACHE_LOCK
+fn lock_cache() -> Result<MutexGuard<'static, StickerCacheState>> {
+    STICKER_CACHE_STATE
         .lock()
         .map_err(|_| crate::Error::Storage("sticker cache lock poisoned".into()))
 }
@@ -35,9 +50,80 @@ pub fn sticker_cache_dir_for_db(db_path: &Path) -> PathBuf {
     db_path.with_file_name(format!("{file_name}{STICKER_CACHE_DIR_SUFFIX}"))
 }
 
+/// One node/session's view of the persistent sticker cache.
+///
+/// The captured generation makes cache writes revocable: once the DB path is
+/// wiped, retained host references and detached prefetch tasks become read-only
+/// misses and their later writes are ignored.
+#[derive(Clone, Debug)]
+pub(crate) struct StickerCache {
+    root: Option<PathBuf>,
+    generation: u64,
+}
+
+impl StickerCache {
+    pub(crate) fn disabled() -> Self {
+        Self {
+            root: None,
+            generation: 0,
+        }
+    }
+
+    pub(crate) fn for_db(db_path: &Path) -> Result<Self> {
+        let root = sticker_cache_dir_for_db(db_path);
+        let mut state = lock_cache()?;
+        let generation = *state.generations.entry(root.clone()).or_default();
+        Ok(Self {
+            root: Some(root),
+            generation,
+        })
+    }
+
+    fn is_current(&self, state: &StickerCacheState, root: &Path) -> bool {
+        state.generations.get(root).copied().unwrap_or_default() == self.generation
+    }
+
+    /// Read verified bytes from disk if present and SHA256 matches.
+    pub(crate) fn read(&self, expected_sha256: &str) -> Result<Option<Vec<u8>>> {
+        let Some(root) = self.root.as_deref() else {
+            return Ok(None);
+        };
+        let state = lock_cache()?;
+        if !self.is_current(&state, root) {
+            return Ok(None);
+        }
+        read_sticker_cache(root, expected_sha256)
+    }
+
+    /// Persist verified sticker bytes atomically. A write from a node invalidated
+    /// by panic wipe is intentionally a no-op.
+    pub(crate) fn write(&self, expected_sha256: &str, bytes: &[u8]) -> Result<bool> {
+        self.write_with_budget(expected_sha256, bytes, MAX_STICKER_CACHE_TOTAL_BYTES)
+    }
+
+    fn write_with_budget(
+        &self,
+        expected_sha256: &str,
+        bytes: &[u8],
+        total_budget: u64,
+    ) -> Result<bool> {
+        let Some(root) = self.root.as_deref() else {
+            return Ok(true);
+        };
+        let state = lock_cache()?;
+        if !self.is_current(&state, root) {
+            return Ok(false);
+        }
+        write_sticker_cache_with_budget(root, expected_sha256, bytes, total_budget)?;
+        Ok(true)
+    }
+}
+
 pub(crate) fn wipe_sticker_cache_for_db(db_path: &Path) -> Result<()> {
-    let _guard = lock_cache()?;
     let dir = sticker_cache_dir_for_db(db_path);
+    let mut state = lock_cache()?;
+    let generation = state.generations.entry(dir.clone()).or_default();
+    *generation = generation.wrapping_add(1);
     match fs::remove_dir_all(&dir) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -53,12 +139,7 @@ fn cache_file_path(root: &Path, sha256_hex_lower: &str) -> PathBuf {
     root.join(prefix).join(sha256_hex_lower)
 }
 
-/// Read verified bytes from disk if present and SHA256 matches.
-pub fn read_sticker_cache(root: Option<&Path>, expected_sha256: &str) -> Result<Option<Vec<u8>>> {
-    let Some(root) = root else {
-        return Ok(None);
-    };
-    let _guard = lock_cache()?;
+fn read_sticker_cache(root: &Path, expected_sha256: &str) -> Result<Option<Vec<u8>>> {
     let expected = expected_sha256.to_ascii_lowercase();
     validate_sha256_hex(&expected).map_err(|e| crate::Error::InvalidInput(e.to_string()))?;
     let path = cache_file_path(root, &expected);
@@ -78,15 +159,6 @@ pub fn read_sticker_cache(root: Option<&Path>, expected_sha256: &str) -> Result<
         return Ok(None);
     }
     Ok(Some(bytes))
-}
-
-/// Persist verified sticker bytes (atomic write). No-op when `root` is None.
-pub fn write_sticker_cache(root: Option<&Path>, expected_sha256: &str, bytes: &[u8]) -> Result<()> {
-    let Some(root) = root else {
-        return Ok(());
-    };
-    let _guard = lock_cache()?;
-    write_sticker_cache_with_budget(root, expected_sha256, bytes, MAX_STICKER_CACHE_TOTAL_BYTES)
 }
 
 fn write_sticker_cache_with_budget(
@@ -233,24 +305,48 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = dir.path().join("marmot.sqlite");
         let cache_root = sticker_cache_dir_for_db(&db);
+        let cache = StickerCache::for_db(&db).unwrap();
         let bytes = b"png-bytes";
         let sha = sha256_hex(bytes);
-        write_sticker_cache(Some(&cache_root), &sha, bytes).unwrap();
-        let hit = read_sticker_cache(Some(&cache_root), &sha)
-            .unwrap()
-            .unwrap();
+        assert!(cache.write(&sha, bytes).unwrap());
+        let hit = cache.read(&sha).unwrap().unwrap();
         assert_eq!(hit, bytes);
         wipe_sticker_cache_for_db(&db).unwrap();
         assert!(!cache_root.exists());
+        assert!(cache.read(&sha).unwrap().is_none());
+    }
+
+    #[test]
+    fn stale_writer_cannot_recreate_cache_after_wipe() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("marmot.sqlite");
+        let cache_root = sticker_cache_dir_for_db(&db);
+        let stale = StickerCache::for_db(&db).unwrap();
+        let before = b"before-wipe";
+        assert!(stale.write(&sha256_hex(before), before).unwrap());
+
+        wipe_sticker_cache_for_db(&db).unwrap();
+        let after = b"late-old-session-write";
+        assert!(!stale.write(&sha256_hex(after), after).unwrap());
+        assert!(!cache_root.exists());
+
+        let fresh = StickerCache::for_db(&db).unwrap();
+        assert!(fresh.write(&sha256_hex(after), after).unwrap());
+        assert_eq!(
+            fresh.read(&sha256_hex(after)).unwrap().as_deref(),
+            Some(after.as_slice())
+        );
     }
 
     #[test]
     fn evicts_oldest_entries_to_total_budget() {
         let dir = tempdir().unwrap();
-        let cache_root = dir.path().join("stickers");
+        let db = dir.path().join("marmot.sqlite");
+        let cache_root = sticker_cache_dir_for_db(&db);
+        let cache = StickerCache::for_db(&db).unwrap();
         for bytes in [b"aaaa".as_slice(), b"bbbb".as_slice(), b"cccc".as_slice()] {
             let sha = sha256_hex(bytes);
-            write_sticker_cache_with_budget(&cache_root, &sha, bytes, 8).unwrap();
+            assert!(cache.write_with_budget(&sha, bytes, 8).unwrap());
         }
 
         let mut entries = Vec::new();
@@ -258,5 +354,17 @@ mod tests {
         assert!(entries.iter().map(|entry| entry.len).sum::<u64>() <= 8);
         let newest = sha256_hex(b"cccc");
         assert!(cache_file_path(&cache_root, &newest).is_file());
+    }
+
+    #[test]
+    fn prefetch_window_cannot_exceed_total_budget() {
+        assert!(
+            STICKER_CACHE_PREFETCH_IMAGE_LIMIT * MAX_STICKER_CACHE_BYTES
+                <= MAX_STICKER_CACHE_TOTAL_BYTES as usize
+        );
+        assert!(
+            (STICKER_CACHE_PREFETCH_IMAGE_LIMIT + 1) * MAX_STICKER_CACHE_BYTES
+                > MAX_STICKER_CACHE_TOTAL_BYTES as usize
+        );
     }
 }

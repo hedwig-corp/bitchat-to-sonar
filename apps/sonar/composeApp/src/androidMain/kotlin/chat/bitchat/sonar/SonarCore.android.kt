@@ -12,6 +12,7 @@ import kotlinx.coroutines.withContext
 import uniffi.sonar_ffi.SonarIdentity
 import uniffi.sonar_ffi.MediaDownloadListener as FfiMediaDownloadListener
 import uniffi.sonar_ffi.SonarNode
+import uniffi.sonar_ffi.wipeMarmotDatabase
 import java.io.File
 import java.security.SecureRandom
 
@@ -211,6 +212,9 @@ actual object SonarCore {
 
     actual suspend fun fetchStickerImage(url: String, expectedSha256: String): ByteArray =
         withContext(Dispatchers.IO) { requireNode().fetchStickerImage(url, expectedSha256) }
+
+    actual suspend fun cachedStickerImage(expectedSha256: String): ByteArray? =
+        withContext(Dispatchers.IO) { requireNode().cachedStickerImage(expectedSha256) }
 
     actual suspend fun fetchInstalledPacks(): List<String> =
         withContext(Dispatchers.IO) { requireNode().fetchInstalledPacks() }
@@ -642,7 +646,9 @@ actual object SonarCore {
             relayConnected = false
             npub = identity.npub()
             pubkeyHex = identity.pubkeyHex()
-            File(ctx.filesDir, "sonar-marmot").deleteRecursively()
+            val marmotDir = File(ctx.filesDir, "sonar-marmot")
+            runCatching { wipeMarmotDatabase(File(marmotDir, "marmot.sqlite").absolutePath) }
+            marmotDir.deleteRecursively()
             AndroidSecrets.put("nsec", identity.nsec(), durable = true)
             npub
         }
@@ -675,7 +681,9 @@ actual object SonarCore {
             // live under sonar-marmot/ (logs/), so this also removes them — at
             // verbose level they can contain peer npubs and must not survive a
             // wipe (Account Key Durability / privacy rule).
-            File(ctx.filesDir, "sonar-marmot").deleteRecursively()
+            val marmotDir = File(ctx.filesDir, "sonar-marmot")
+            runCatching { wipeMarmotDatabase(File(marmotDir, "marmot.sqlite").absolutePath) }
+            marmotDir.deleteRecursively()
             // Exported diagnostics bundles are staged in the FileProvider cache
             // dir (not under sonar-marmot); drop them too — at verbose level
             // they can contain peer npubs.
@@ -695,7 +703,9 @@ actual object SonarCore {
                 // Delete ONLY the encrypted Marmot DB — keep nsec, the DB key,
                 // nickname and every pref. start() (below) reopens a fresh empty
                 // DB with the SAME identity + key.
-                File(ctx.filesDir, "sonar-marmot").deleteRecursively()
+                val marmotDir = File(ctx.filesDir, "sonar-marmot")
+                runCatching { wipeMarmotDatabase(File(marmotDir, "marmot.sqlite").absolutePath) }
+                marmotDir.deleteRecursively()
             }
         }
         // Reconnect with the same identity and republish our KeyPackage so peers

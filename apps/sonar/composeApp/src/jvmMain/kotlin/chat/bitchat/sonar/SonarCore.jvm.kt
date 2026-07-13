@@ -11,6 +11,7 @@ import kotlinx.coroutines.withContext
 import uniffi.sonar_ffi.SonarIdentity
 import uniffi.sonar_ffi.MediaDownloadListener as FfiMediaDownloadListener
 import uniffi.sonar_ffi.SonarNode
+import uniffi.sonar_ffi.wipeMarmotDatabase
 import java.io.File
 import java.security.SecureRandom
 
@@ -217,6 +218,9 @@ actual object SonarCore {
 
     actual suspend fun fetchStickerImage(url: String, expectedSha256: String): ByteArray =
         withContext(Dispatchers.IO) { requireNode().fetchStickerImage(url, expectedSha256) }
+
+    actual suspend fun cachedStickerImage(expectedSha256: String): ByteArray? =
+        withContext(Dispatchers.IO) { requireNode().cachedStickerImage(expectedSha256) }
 
     actual suspend fun fetchInstalledPacks(): List<String> =
         withContext(Dispatchers.IO) { requireNode().fetchInstalledPacks() }
@@ -639,7 +643,9 @@ actual object SonarCore {
             relayConnected = false
             npub = identity.npub()
             pubkeyHex = identity.pubkeyHex()
-            marmotDir().deleteRecursively()
+            val marmotDir = marmotDir()
+            runCatching { wipeMarmotDatabase(File(marmotDir, "marmot.sqlite").absolutePath) }
+            marmotDir.deleteRecursively()
             DesktopSecrets.put("nsec", identity.nsec())
             npub
         }
@@ -672,7 +678,9 @@ actual object SonarCore {
             // the exported diagnostics zips live in a sibling dir, so drop them
             // too — at verbose level they can contain peer npubs and must not
             // survive a wipe (Account Key Durability / privacy rule).
-            marmotDir().deleteRecursively()
+            val marmotDir = marmotDir()
+            runCatching { wipeMarmotDatabase(File(marmotDir, "marmot.sqlite").absolutePath) }
+            marmotDir.deleteRecursively()
             DesktopEnv.file("diagnostics").deleteRecursively()
             DesktopSecrets.clear("nsec", "dbKeyHex")
             DesktopEnv.clear()
@@ -687,7 +695,9 @@ actual object SonarCore {
                 // Delete ONLY the encrypted Marmot DB — keep nsec, DB key,
                 // nickname and prefs. start() reopens a fresh empty DB with the
                 // SAME identity + key.
-                marmotDir().deleteRecursively()
+                val marmotDir = marmotDir()
+                runCatching { wipeMarmotDatabase(File(marmotDir, "marmot.sqlite").absolutePath) }
+                marmotDir.deleteRecursively()
             }
         }
         start()
