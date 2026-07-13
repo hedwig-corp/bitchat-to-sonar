@@ -2021,19 +2021,18 @@ impl SonarClient {
     /// Retry one failed outgoing message using the exact encrypted event stored
     /// in the durable outbox. This never creates a second local transcript row
     /// or advances MLS state; it only republishes the original wrapper event.
-    pub async fn retry_message(&self, group_id: &GroupId, message_id_hex: &str) -> Result<()> {
+    pub async fn retry_message(&self, message_id_hex: &str) -> Result<String> {
         if self.relays.is_empty() {
             return Err(Error::NoRelayConnected);
         }
-        let group_id_hex = hex::encode(group_id.as_slice());
-        let event = self.outbox_state.lock().unwrap().retry_failed_event(
-            &group_id_hex,
-            message_id_hex,
-            Timestamp::now().as_secs(),
-        )?;
+        let (group_id_hex, event) = self
+            .outbox_state
+            .lock()
+            .unwrap()
+            .retry_failed_event(message_id_hex, Timestamp::now().as_secs())?;
         self.notify_conversation_changed(&group_id_hex);
-        self.spawn_outbox_publish(message_id_hex.to_string(), group_id_hex, event);
-        Ok(())
+        self.spawn_outbox_publish(message_id_hex.to_string(), group_id_hex.clone(), event);
+        Ok(group_id_hex)
     }
 
     async fn retry_outbox(&self) {
@@ -2062,6 +2061,7 @@ impl SonarClient {
         };
         for (message_id_hex, group_id_hex, event) in retryable {
             // group_id_hex is the MLS id stored at mark_pending — same key hosts use.
+            self.notify_conversation_changed(&group_id_hex);
             self.spawn_outbox_publish(message_id_hex, group_id_hex, event);
         }
     }
