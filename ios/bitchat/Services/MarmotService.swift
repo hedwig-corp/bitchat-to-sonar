@@ -740,6 +740,17 @@ final class MarmotService: @unchecked Sendable {
     /// Re-subscribe with current watermark + group set to self-heal after
     /// relay disconnects. May perform one bounded chat repair fetch; keep this
     /// on the service work queue and never await it before local chat paint.
+    /// Prefer this group for cold-start historical catch-up (open chat).
+    /// Local-first: never blocks paint/send. Empty/nil clears preference.
+    func preferCatchupGroup(_ groupId: String?) async {
+        let value = (groupId ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        // Best-effort: local-only sessions may not have a relay-backed node yet.
+        try? await run { service in
+            guard service.relayConnected else { return }
+            service.requireNode().preferCatchupGroup(nostrGroupIdHex: value)
+        }
+    }
+
     func ensureSubscriptions() async throws {
         try await run { try $0.requireNode().ensureSubscriptions() }
     }
