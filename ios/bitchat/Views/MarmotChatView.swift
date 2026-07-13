@@ -592,6 +592,12 @@ final class MarmotChatModel: ObservableObject {
         }
     }
 
+    /// Prefer cold-start historical catch-up for the open chat (MLS group id).
+    /// Local-first: never blocks paint/send. Empty/nil clears preference.
+    func preferCatchupGroup(_ groupId: String?) async {
+        await service.preferCatchupGroup(groupId)
+    }
+
     /// Best-effort local hydration for screen open paths. This never waits for
     /// relay connect/sync; if the encrypted DB is not open yet, connectIfNeeded()
     /// continues opening it in the background.

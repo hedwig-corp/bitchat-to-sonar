@@ -748,7 +748,7 @@ final class MarmotService: @unchecked Sendable {
         try? await run { service in
             guard service.relayConnected else { return }
             // Host ids are MLS group ids (send_text / MarmotGroup.id); core maps to nostr #h.
-            service.requireNode().preferCatchupGroup(mlsGroupIdHex: value)
+            try service.requireNode().preferCatchupGroup(mlsGroupIdHex: value)
         }
     }
 
