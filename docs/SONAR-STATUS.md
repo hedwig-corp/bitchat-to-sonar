@@ -183,7 +183,7 @@ Goal: every row on `/status` should eventually mean "we ran a check", not
 | --- | --- | --- | --- |
 | `relays` | WebSocket open RTT to client default relays | **Done** — `probe_relay_ws` | None |
 | `dm` | KeyPackage publish + fetch own package from bootstrap relays via `sonar-core` | **Done** — `chat::probe_marmot_keypackage` (`--chat-probe`) | **Dedicated probe nsec** (`SONAR_STATUS_PROBE_NSEC`) — not the publisher key |
-| `groups` | Create/send in durable probe MLS group (A→B or multi-member) | planned | Probe nsec(s) |
+| `groups` | 5-agent MLS group via Hermes task (A→B or multi-member) | **Done** (Hermes `groups-probe.sh`) | Probe nsec(s) |
 | `media` | Blossom reachability: HTTP HEAD `DEFAULT_BLOSSOM_SERVER` | **Done** | None |
 | `stickers` | REQ kind 30031 on bootstrap relays, count visible packs | **Done** | None |
 | `push` | HTTP GET transponder health (and optionally sandbox) | `--http` / `SONAR_STATUS_HTTP` | None if health is public |
