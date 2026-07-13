@@ -9,7 +9,9 @@
 //! site (`web/src/lib/status-nostr.js`) REQs when `STATUS_PUBKEY_HEX` matches.
 
 mod chat;
+mod media;
 mod schema;
+mod stickers;
 
 use std::env;
 use std::path::PathBuf;
@@ -27,6 +29,8 @@ use tokio_tungstenite::tungstenite::Message;
 use ::url::Url;
 
 use chat::{load_probe_secret, probe_marmot_keypackage, ChatProbeReport};
+use media::{probe_blossom, MediaProbeReport};
+use stickers::{probe_sticker_index, StickerProbeReport};
 use schema::{
     website_view, IncidentLevel, IncidentUpdate, ServiceState, StatusIncident, StatusPayload,
     StatusRelay, StatusService,
@@ -126,6 +130,15 @@ struct ProbeArgs {
     /// Read probe nsec from a local file (0600 recommended).
     #[arg(long, conflicts_with = "probe_nsec")]
     probe_nsec_file: Option<PathBuf>,
+    /// Run sticker pack directory probe (REQ kind 30031 on bootstrap relays).
+    #[arg(long, env = "SONAR_STATUS_STICKER_PROBE")]
+    sticker_probe: bool,
+    /// Run Blossom media reachability probe (HTTP HEAD).
+    #[arg(long, env = "SONAR_STATUS_MEDIA_PROBE")]
+    media_probe: bool,
+    /// Blossom server to probe (defaults to sonar-core DEFAULT_BLOSSOM_SERVER).
+    #[arg(long, env = "SONAR_STATUS_BLOSSOM_SERVER")]
+    blossom_server: Option<String>,
     /// Pretty-print JSON.
     #[arg(long)]
     pretty: bool,
@@ -166,6 +179,15 @@ struct PublishArgs {
     /// Read probe nsec from a local file (0600 recommended).
     #[arg(long, conflicts_with = "probe_nsec")]
     probe_nsec_file: Option<PathBuf>,
+    /// Run sticker pack directory probe (REQ kind 30031 on bootstrap relays).
+    #[arg(long, env = "SONAR_STATUS_STICKER_PROBE")]
+    sticker_probe: bool,
+    /// Run Blossom media reachability probe (HTTP HEAD).
+    #[arg(long, env = "SONAR_STATUS_MEDIA_PROBE")]
+    media_probe: bool,
+    /// Blossom server to probe (defaults to sonar-core DEFAULT_BLOSSOM_SERVER).
+    #[arg(long, env = "SONAR_STATUS_BLOSSOM_SERVER")]
+    blossom_server: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -200,6 +222,9 @@ struct ProbeOptions {
     chat_probe: bool,
     probe_nsec: Option<String>,
     probe_nsec_file: Option<PathBuf>,
+    sticker_probe: bool,
+    media_probe: bool,
+    blossom_server: Option<String>,
 }
 
 #[tokio::main]
@@ -224,6 +249,9 @@ async fn run() -> Result<()> {
                 probe_nsec_file: args.probe_nsec_file.or_else(|| {
                     env::var_os("SONAR_STATUS_PROBE_NSEC_FILE").map(PathBuf::from)
                 }),
+                sticker_probe: args.sticker_probe,
+                media_probe: args.media_probe,
+                blossom_server: args.blossom_server,
             };
             let payload = build_payload(
                 parse_list(args.relays.as_deref(), DEFAULT_RELAYS),
@@ -248,6 +276,9 @@ async fn run() -> Result<()> {
                 probe_nsec_file: args.probe_nsec_file.or_else(|| {
                     env::var_os("SONAR_STATUS_PROBE_NSEC_FILE").map(PathBuf::from)
                 }),
+                sticker_probe: args.sticker_probe,
+                media_probe: args.media_probe,
+                blossom_server: args.blossom_server,
             };
             let payload =
                 build_payload(probe_relays, &args.http_urls, args.previous.as_ref(), &opts).await?;
@@ -387,7 +418,29 @@ async fn build_payload(
         None
     };
 
-    let services = derive_services(&relay_probes, &http_probes, chat_report.as_ref());
+    let sticker_report = if opts.sticker_probe {
+        Some(probe_sticker_index(&relay_urls).await)
+    } else {
+        None
+    };
+
+    let media_report = if opts.media_probe {
+        let server = opts
+            .blossom_server
+            .as_deref()
+            .unwrap_or(sonar_core::client::DEFAULT_BLOSSOM_SERVER);
+        Some(probe_blossom(server).await)
+    } else {
+        None
+    };
+
+    let services = derive_services(
+        &relay_probes,
+        &http_probes,
+        chat_report.as_ref(),
+        sticker_report.as_ref(),
+        media_report.as_ref(),
+    );
     let relays: Vec<StatusRelay> = relay_probes
         .iter()
         .map(|r| StatusRelay {
@@ -422,6 +475,8 @@ async fn build_payload(
             "error": h.error,
         })).collect::<Vec<_>>(),
         "chat": chat_report.as_ref().map(|c| serde_json::to_value(c).unwrap_or_default()),
+        "stickers": sticker_report.as_ref().map(|s| serde_json::to_value(s).unwrap_or_default()),
+        "media": media_report.as_ref().map(|m| serde_json::to_value(m).unwrap_or_default()),
     });
 
     Ok(StatusPayload {
@@ -530,6 +585,8 @@ fn derive_services(
     relays: &[RelayProbe],
     https: &[HttpProbe],
     chat: Option<&ChatProbeReport>,
+    stickers: Option<&StickerProbeReport>,
+    media: Option<&MediaProbeReport>,
 ) -> Vec<StatusService> {
     let total = relays.len().max(1);
     let reachable = relays.iter().filter(|r| r.ms.is_some()).count();
@@ -561,6 +618,14 @@ fn derive_services(
     }];
 
     if let Some(report) = chat {
+        services.push(report.to_service());
+    }
+
+    if let Some(report) = stickers {
+        services.push(report.to_service());
+    }
+
+    if let Some(report) = media {
         services.push(report.to_service());
     }
 
@@ -722,7 +787,7 @@ mod tests {
             region: "x".into(),
             ms: None,
         }];
-        let services = derive_services(&relays, &[], None);
+        let services = derive_services(&relays, &[], None, None, None);
         let relays_svc = services.iter().find(|s| s.id == "relays").unwrap();
         assert_eq!(relays_svc.state, Some(ServiceState::Down));
         assert!(services.iter().all(|s| s.id == "relays" || s.id.starts_with("http-")));
@@ -745,7 +810,7 @@ mod tests {
             pubkey_hex: "aa".into(),
             error: None,
         };
-        let services = derive_services(&relays, &[], Some(&chat));
+        let services = derive_services(&relays, &[], Some(&chat), None, None);
         assert!(services.iter().any(|s| s.id == "dm"));
         assert!(services.iter().any(|s| s.id == "relays"));
     }
