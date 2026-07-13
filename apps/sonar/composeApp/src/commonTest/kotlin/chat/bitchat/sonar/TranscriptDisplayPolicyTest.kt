@@ -6,12 +6,21 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class TranscriptDisplayPolicyTest {
-    private fun message(id: String, ts: Long, content: String = id) = SonarMsg(
+    private fun message(
+        id: String,
+        ts: Long,
+        content: String = id,
+        mine: Boolean = false,
+        viaInternet: Boolean = false,
+        state: String? = null,
+    ) = SonarMsg(
         id = id,
         senderNpub = "npub",
         content = content,
-        mine = false,
+        mine = mine,
         tsSecs = ts,
+        viaInternet = viaInternet,
+        state = state,
     )
 
     @Test
@@ -186,5 +195,74 @@ class TranscriptDisplayPolicyTest {
         assertEquals("01", visible.first().id)
         assertEquals("30", visible.last().id)
         assertFalse(visible.any { it.id == "00" })
+    }
+
+    @Test
+    fun sameSecondCanonicalRowFulfillsOptimisticEcho() {
+        val echo = message("echo-1", 100, "hello", mine = true, viaInternet = true, state = "Sending")
+        val canonical = message("event-1", 100, "hello", mine = true, viaInternet = true)
+
+        assertEquals(setOf("echo-1"), fulfilledSendEchoIds(listOf(echo), listOf(canonical)))
+    }
+
+    @Test
+    fun delayedCanonicalRowStillFulfillsFirstChatEcho() {
+        val echo = message("echo-1", 100, "hello", mine = true, viaInternet = true, state = "Sending")
+        val canonical = message("event-1", 180, "hello", mine = true, viaInternet = true)
+
+        assertEquals(setOf("echo-1"), fulfilledSendEchoIds(listOf(echo), listOf(canonical)))
+    }
+
+    @Test
+    fun priorIdenticalRowWithinFormerSlackDoesNotConsumeNewEcho() {
+        val echo = message("echo-1", 100, "hello", mine = true, viaInternet = true, state = "Sending")
+        val older = message("event-old", 99, "hello", mine = true, viaInternet = true)
+
+        assertTrue(fulfilledSendEchoIds(listOf(echo), listOf(older)).isEmpty())
+    }
+
+    @Test
+    fun priorSameSecondIdenticalRowDoesNotConsumeNewEcho() {
+        val echo = message("echo-1", 100, "hello", mine = true, viaInternet = true, state = "Sending")
+        val earlier = message("event-earlier", 100, "hello", mine = true, viaInternet = true)
+
+        assertTrue(
+            fulfilledSendEchoIds(
+                echoes = listOf(echo),
+                published = listOf(earlier),
+                excludedPublishedIdsByEcho = mapOf(echo.id to setOf(earlier.id)),
+            ).isEmpty(),
+        )
+    }
+
+    @Test
+    fun newestIdenticalEchoTakesCanonicalRowBeforeStaleEcho() {
+        val echoes = listOf(
+            message("echo-1", 100, "hello", mine = true, viaInternet = true, state = "Sending"),
+            message("echo-2", 101, "hello", mine = true, viaInternet = true, state = "Sending"),
+        )
+        val canonical = listOf(message("event-1", 101, "hello", mine = true, viaInternet = true))
+
+        assertEquals(setOf("echo-2"), fulfilledSendEchoIds(echoes, canonical))
+    }
+
+    @Test
+    fun clearedNewerEchoReservesItsCanonicalRowForOlderPendingDuplicate() {
+        val older = message("echo-1", 100, "hello", mine = true, viaInternet = true, state = "Sending")
+        val newer = message("echo-2", 101, "hello", mine = true, viaInternet = true, state = "Sending")
+        val canonical = message("event-2", 101, "hello", mine = true, viaInternet = true)
+
+        val succeededCanonicalIds = eligibleCanonicalRowsForSendEcho(newer, listOf(canonical))
+            .map { it.id }
+            .toSet()
+
+        assertEquals(setOf(canonical.id), succeededCanonicalIds)
+        assertTrue(
+            fulfilledSendEchoIds(
+                echoes = listOf(older),
+                published = listOf(canonical),
+                excludedPublishedIdsByEcho = mapOf(older.id to succeededCanonicalIds),
+            ).isEmpty(),
+        )
     }
 }

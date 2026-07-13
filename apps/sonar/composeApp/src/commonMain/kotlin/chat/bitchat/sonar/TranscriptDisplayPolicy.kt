@@ -126,6 +126,58 @@ internal fun visibleTranscriptPage(
     .take(pageSize.coerceAtLeast(0))
     .sortedWith(compareBy<SonarMsg>({ it.tsSecs }, { it.id }))
 
+/** Canonical rows that could represent [echo], excluding rows known to predate it. */
+internal fun eligibleCanonicalRowsForSendEcho(
+    echo: SonarMsg,
+    published: List<SonarMsg>,
+    excludedPublishedIds: Set<String> = emptySet(),
+): List<SonarMsg> = published.filter {
+    it.id !in excludedPublishedIds &&
+        it.mine &&
+        it.content == echo.content &&
+        it.viaInternet == echo.viaInternet &&
+        it.tsSecs >= echo.tsSecs
+}
+
+/**
+ * Match optimistic outgoing echoes to canonical local-storage rows one-for-one.
+ *
+ * The core writes the canonical row before `send` returns, so it commonly has
+ * the same whole-second timestamp as the echo. First-chat setup can also delay
+ * that row well beyond 30 seconds. Only reject canonical rows that are clearly
+ * older than the echo. Compose and the Rust core read whole epoch seconds from
+ * the same device clock, so a row from this send can share the echo's second or
+ * follow it, but cannot legitimately predate it. That lower bound prevents a
+ * recent identical send from consuming the new echo before its canonical row
+ * exists. Callers also exclude matching canonical rows that were already
+ * visible when an echo was created: same-second timestamps alone cannot
+ * distinguish an earlier identical send from the new one.
+ */
+internal fun fulfilledSendEchoIds(
+    echoes: List<SonarMsg>,
+    published: List<SonarMsg>,
+    excludedPublishedIdsByEcho: Map<String, Set<String>> = emptyMap(),
+): Set<String> {
+    val fulfilled = mutableSetOf<String>()
+    val consumedPublished = mutableSetOf<String>()
+    val ownPublished = published.filter { it.mine }.groupBy { it.content }
+    // Prefer the most recent pending duplicate. A newer canonical row must not
+    // hide an older send whose result is still unknown.
+    for (echo in echoes.asReversed()) {
+        if (echo.state == "Couldn't send") continue
+        val match = eligibleCanonicalRowsForSendEcho(
+            echo = echo,
+            published = ownPublished[echo.content].orEmpty(),
+            excludedPublishedIds = excludedPublishedIdsByEcho[echo.id].orEmpty(),
+        ).firstOrNull { it.id !in consumedPublished }
+        if (match != null) {
+            fulfilled.add(echo.id)
+            consumedPublished.add(match.id)
+        }
+    }
+    return fulfilled
+}
+
 private fun newlinePrefixEnd(source: String, maxNewlines: Int): Int {
     if (maxNewlines < 0) return 0
     var seen = 0
