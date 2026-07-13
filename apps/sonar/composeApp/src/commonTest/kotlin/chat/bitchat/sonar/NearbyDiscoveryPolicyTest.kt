@@ -8,6 +8,7 @@ import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class NearbyDiscoveryPolicyTest {
@@ -45,4 +46,79 @@ class NearbyDiscoveryPolicyTest {
         runCurrent()
         assertEquals(listOf("payer"), publishedPeers)
     }
+
+    @Test
+    fun watchdogKeepsScanRunningForRepeatedCallbacksWithUsableLink() {
+        assertNull(
+            watchdogReason(
+                lastCallbackMs = 19_000,
+                lastNewDiscoveryMs = 1_000,
+                hasUsableLink = true,
+            ),
+        )
+    }
+
+    @Test
+    fun watchdogRestartsWhenCallbacksStopEvenWithUsableLink() {
+        assertEquals(
+            BleScanRestartReason.NoCallbacks,
+            watchdogReason(
+                lastCallbackMs = 13_000,
+                lastNewDiscoveryMs = 13_000,
+                hasUsableLink = true,
+            ),
+        )
+    }
+
+    @Test
+    fun watchdogRetainsTunnelBlindRecoveryWithoutUsableLink() {
+        assertEquals(
+            BleScanRestartReason.RepeatingKnownWithoutUsableLink,
+            watchdogReason(
+                lastCallbackMs = 19_000,
+                lastNewDiscoveryMs = 13_000,
+                hasUsableLink = false,
+            ),
+        )
+    }
+
+    @Test
+    fun watchdogWaitsForRestartGap() {
+        assertNull(
+            watchdogReason(
+                nowMs = 8_999,
+                lastCallbackMs = 1_000,
+                lastNewDiscoveryMs = 1_000,
+                lastScanStartMs = 1_000,
+                hasUsableLink = false,
+            ),
+        )
+    }
+
+    @Test
+    fun watchdogKeepsScanRunningAfterFreshDiscovery() {
+        assertNull(
+            watchdogReason(
+                lastCallbackMs = 19_000,
+                lastNewDiscoveryMs = 19_000,
+                hasUsableLink = false,
+            ),
+        )
+    }
+
+    private fun watchdogReason(
+        nowMs: Long = 20_000,
+        lastCallbackMs: Long,
+        lastNewDiscoveryMs: Long,
+        lastScanStartMs: Long = 1_000,
+        hasUsableLink: Boolean,
+    ): BleScanRestartReason? = bleScanRestartReason(
+        nowMs = nowMs,
+        lastCallbackMs = lastCallbackMs,
+        lastNewDiscoveryMs = lastNewDiscoveryMs,
+        lastScanStartMs = lastScanStartMs,
+        hasUsableLink = hasUsableLink,
+        staleMs = 7_000,
+        gapMs = 8_000,
+    )
 }

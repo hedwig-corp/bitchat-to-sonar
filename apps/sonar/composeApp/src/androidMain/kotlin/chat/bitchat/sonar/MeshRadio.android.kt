@@ -15,6 +15,7 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.ParcelUuid
+import android.os.SystemClock
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
@@ -52,10 +53,13 @@ actual object MeshRadio {
     // are spaced ≥ WATCHDOG_GAP_MS apart to stay under Android's "5 scan starts /
     // 30 s" throttle (which would otherwise silently stop the scan for 30 s).
     private val handler = android.os.Handler(android.os.Looper.getMainLooper())
-    // Track the last NEW (distinct-address) discovery, not just any scan result:
+    // Track callbacks separately from NEW (distinct-address) discoveries:
     // the Pixel 10 Pro's scanner goes "tunnel-blind" after a dial — it keeps
-    // re-reporting the ONE address it locked onto (so any-result staleness never
-    // trips) while missing every other advertiser, including the peer we need.
+    // re-reporting the ONE address it locked onto while missing every other
+    // advertiser, including the peer we need. Once distinct-address progress
+    // stops, repeated callbacks are healthy only when there is also an
+    // established, writable Noise link.
+    @Volatile private var lastScanCallbackMs = 0L
     @Volatile private var lastNewDiscoveryMs = 0L
     @Volatile private var lastScanStartMs = 0L
     @Volatile private var scanResultCount = 0L
@@ -187,7 +191,6 @@ actual object MeshRadio {
         try {
             scanner = a.bluetoothLeScanner
             startScanInternal()
-            lastNewDiscoveryMs = System.currentTimeMillis()
             handler.postDelayed(scanWatchdog, WATCHDOG_TICK_MS)
 
             startAdvertisingInternal(a)
@@ -232,7 +235,10 @@ actual object MeshRadio {
             .setReportDelay(0)
             .build()
         scanner?.startScan(filters, settings, scanCallback)
-        lastScanStartMs = System.currentTimeMillis()
+        val now = SystemClock.elapsedRealtime()
+        lastScanStartMs = now
+        lastScanCallbackMs = now
+        lastNewDiscoveryMs = now
     }
 
     private fun startAdvertisingInternal(adapter: BluetoothAdapter) {
@@ -271,20 +277,33 @@ actual object MeshRadio {
         sonarProfiles.keys.removeIf { !isKnownPeer(it) }
     }
 
-    /** Revive a scanner that a `connectGatt` dial has starved (no results for a
-     *  while), spacing restarts to stay under Android's scan-start throttle. */
+    /** Revive a scanner that a `connectGatt` dial has starved, either by stopping
+     *  callbacks or by locking onto one address without reaching a usable link.
+     *  Restarts stay spaced to remain under Android's scan-start throttle. */
     private val scanWatchdog = object : Runnable {
         override fun run() {
             if (!scanning) return
-            val now = System.currentTimeMillis()
-            if (now - lastNewDiscoveryMs > WATCHDOG_STALE_MS && now - lastScanStartMs > WATCHDOG_GAP_MS) {
-                android.util.Log.i(
+            val now = SystemClock.elapsedRealtime()
+            val hasUsableLink = announcedPeers.keys.any { MeshGatt.hasLink(it) }
+            val restartReason = bleScanRestartReason(
+                nowMs = now,
+                lastCallbackMs = lastScanCallbackMs,
+                lastNewDiscoveryMs = lastNewDiscoveryMs,
+                lastScanStartMs = lastScanStartMs,
+                hasUsableLink = hasUsableLink,
+                staleMs = WATCHDOG_STALE_MS,
+                gapMs = WATCHDOG_GAP_MS,
+            )
+            if (restartReason != null) {
+                sonarLog(
                     TAG,
-                    "scan tunnel-blind (${now - lastNewDiscoveryMs}ms no new peer, $scanResultCount results) — restarting",
+                    "scan watchdog restart reason=${restartReason.logValue} " +
+                        "callbackAgeMs=${now - lastScanCallbackMs} " +
+                        "newAddressAgeMs=${now - lastNewDiscoveryMs} " +
+                        "results=$scanResultCount usableLink=$hasUsableLink",
                 )
                 runCatching { scanner?.stopScan(scanCallback) }
                 runCatching { startScanInternal() }
-                lastNewDiscoveryMs = now // give the fresh scan a grace period
             }
             handler.postDelayed(this, WATCHDOG_TICK_MS)
         }
@@ -373,6 +392,7 @@ actual object MeshRadio {
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             scanResultCount++
+            lastScanCallbackMs = SystemClock.elapsedRealtime()
             val id = result.device.address
             if (discoveryMode == BleDiscoveryMode.KnownOnly && knownPeerIds.isEmpty()) return
             val name = runCatching { result.scanRecord?.deviceName }.getOrNull()
@@ -384,7 +404,7 @@ actual object MeshRadio {
                 result.scanRecord?.getManufacturerSpecificData(NODE_ID_COMPANY)
             }.getOrNull()
             if (isNew) {
-                lastNewDiscoveryMs = System.currentTimeMillis()
+                lastNewDiscoveryMs = SystemClock.elapsedRealtime()
                 // SOFT dialer election. Two Sonar-Android phones dialing each
                 // other at once race the controller (status 19), so the SMALLER
                 // node id dials immediately and the larger holds back — BUT only
