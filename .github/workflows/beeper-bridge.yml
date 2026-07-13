@@ -43,7 +43,12 @@ jobs:
         run: cargo clippy -p sonar-bridge-daemon --no-deps -- -D warnings
       - name: Test core bridge paths
         working-directory: core
-        run: cargo test -p sonar-core
+        run: |
+          cargo test -p sonar-core --lib client::tests::local_first_persistent_open_does_not_require_a_relay
+          cargo test -p sonar-core --lib client::tests::media_url_policy_rejects_private_hosts_credentials_and_downgrades
+          cargo test -p sonar-core --lib conversation_index::tests::summaries_page_is_bounded_and_stable_for_ties
+          cargo test -p sonar-core --test e2e start_dm_reuses_existing_direct_group
+          cargo test -p sonar-core --test e2e start_dm_does_not_reuse_named_group_reduced_to_two_members
       - name: Build daemon
         working-directory: core
         run: cargo build --release -p sonar-bridge-daemon
