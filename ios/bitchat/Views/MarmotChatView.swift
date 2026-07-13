@@ -292,6 +292,7 @@ final class MarmotChatModel: ObservableObject {
             return message.media.isEmpty ? "Sending" : "Uploading"
         }
         if message.deliveryState == "failed" { return "Couldn't send" }
+        if message.deliveryState == "pending" { return message.media.isEmpty ? "Sending" : "Uploading" }
         return "Sent"
     }
 
@@ -620,7 +621,8 @@ final class MarmotChatModel: ObservableObject {
         }
         if await ensureRelayConnected() {
             do {
-                try await service.syncOnce()
+                try await service.syncForce()
+                try? await service.retryOutbox()
                 self.errorText = nil
             } catch {
                 self.errorText = Self.describe(error)
