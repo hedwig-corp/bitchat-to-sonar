@@ -13,7 +13,7 @@ use sonar_stickers::{sha256_hex, validate_sha256_hex};
 use crate::Result;
 
 pub(crate) const STICKER_CACHE_DIR_SUFFIX: &str = ".sonar-stickers";
-const MAX_STICKER_CACHE_BYTES: usize = 5 * 1024 * 1024;
+pub(crate) const MAX_STICKER_CACHE_BYTES: usize = 5 * 1024 * 1024;
 const MAX_STICKER_CACHE_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
 /// Bound install prefetch to the leading window that can fit even when every
 /// sticker is at the per-object maximum. This keeps picker-order stickers warm

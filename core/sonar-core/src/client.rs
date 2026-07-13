@@ -41,7 +41,8 @@ use crate::sonar_descriptor::{
     SONAR_DESCRIPTOR_KIND, SONAR_META_DESCRIPTOR_D_TAG,
 };
 use crate::sticker_cache::{
-    wipe_sticker_cache_for_db, StickerCache, STICKER_CACHE_PREFETCH_IMAGE_LIMIT,
+    wipe_sticker_cache_for_db, StickerCache, MAX_STICKER_CACHE_BYTES,
+    STICKER_CACHE_PREFETCH_IMAGE_LIMIT,
 };
 use crate::{Error, Result};
 
@@ -78,6 +79,7 @@ const MEDIA_DOWNLOAD_RETRY_DELAY: Duration = Duration::from_millis(350);
 const MEDIA_DOWNLOAD_CANCEL_POLL: Duration = Duration::from_millis(100);
 const MEDIA_DOWNLOAD_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 const STICKER_PREFETCH_CONCURRENCY: usize = 4;
+const STICKER_PREFETCH_DOWNLOAD_BYTES: usize = MAX_STICKER_CACHE_BYTES;
 const SONAR_DIRECT_DM_DESCRIPTION: &str = "sonar.direct-dm.v1";
 
 /// Shared HTTP client for Blossom media downloads. Built once so every blob
@@ -111,6 +113,14 @@ fn media_download_cancelled(observer: Option<&dyn MediaDownloadObserver>) -> boo
 }
 
 async fn http_get(url: &str, observer: Option<&dyn MediaDownloadObserver>) -> Result<Vec<u8>> {
+    http_get_with_limit_observer(url, MAX_MEDIA_DOWNLOAD_BYTES, observer).await
+}
+
+async fn http_get_with_limit_observer(
+    url: &str,
+    max_bytes: usize,
+    observer: Option<&dyn MediaDownloadObserver>,
+) -> Result<Vec<u8>> {
     if media_download_cancelled(observer) {
         return Err(Error::MediaDownloadCancelled);
     }
@@ -134,9 +144,9 @@ async fn http_get(url: &str, observer: Option<&dyn MediaDownloadObserver>) -> Re
     }
     let total = resp.content_length();
     if let Some(len) = total {
-        if len as usize > MAX_MEDIA_DOWNLOAD_BYTES {
+        if len > max_bytes as u64 {
             return Err(Error::Http(format!(
-                "media too large: {len} bytes (cap {MAX_MEDIA_DOWNLOAD_BYTES})"
+                "media too large: {len} bytes (cap {max_bytes})"
             )));
         }
     }
@@ -159,7 +169,7 @@ async fn http_get(url: &str, observer: Option<&dyn MediaDownloadObserver>) -> Re
             }
         };
         let Some(chunk) = chunk else { break };
-        if out.len() + chunk.len() > MAX_MEDIA_DOWNLOAD_BYTES {
+        if chunk.len() > max_bytes.saturating_sub(out.len()) {
             return Err(Error::Http("media exceeds size cap".into()));
         }
         out.extend_from_slice(&chunk);
@@ -186,6 +196,7 @@ async fn fetch_sticker_image_with_cache(
     sticker_cache: &StickerCache,
     url: &str,
     expected_sha256: &str,
+    max_download_bytes: usize,
 ) -> Result<Vec<u8>> {
     let expected = expected_sha256.to_ascii_lowercase();
     validate_sha256_hex(&expected).map_err(|e| Error::Http(format!("bad sticker sha256: {e}")))?;
@@ -195,7 +206,7 @@ async fn fetch_sticker_image_with_cache(
     if !url.starts_with("https://") {
         return Err(Error::Http("sticker URL must be HTTPS".into()));
     }
-    let bytes = http_get_public(url).await?;
+    let bytes = http_get_with_retries_limit(url, max_download_bytes).await?;
     let actual = sha256_hex(&bytes);
     if actual != expected {
         return Err(Error::Http(format!(
@@ -228,8 +239,20 @@ async fn http_get_with_retries(
     url: &str,
     observer: Option<&dyn MediaDownloadObserver>,
 ) -> Result<Vec<u8>> {
+    http_get_with_retries_limit_observer(url, MAX_MEDIA_DOWNLOAD_BYTES, observer).await
+}
+
+async fn http_get_with_retries_limit(url: &str, max_bytes: usize) -> Result<Vec<u8>> {
+    http_get_with_retries_limit_observer(url, max_bytes, None).await
+}
+
+async fn http_get_with_retries_limit_observer(
+    url: &str,
+    max_bytes: usize,
+    observer: Option<&dyn MediaDownloadObserver>,
+) -> Result<Vec<u8>> {
     for attempt in 1..=MEDIA_DOWNLOAD_ATTEMPTS {
-        match http_get(url, observer).await {
+        match http_get_with_limit_observer(url, max_bytes, observer).await {
             Ok(bytes) => return Ok(bytes),
             Err(error)
                 if attempt < MEDIA_DOWNLOAD_ATTEMPTS && retryable_media_http_error(&error) =>
@@ -2136,7 +2159,13 @@ impl SonarClient {
     /// Download a public sticker image (HTTPS), verify SHA256, and persist to the
     /// content-addressed disk cache when configured.
     pub async fn fetch_sticker_image(&self, url: &str, expected_sha256: &str) -> Result<Vec<u8>> {
-        fetch_sticker_image_with_cache(&self.sticker_cache, url, expected_sha256).await
+        fetch_sticker_image_with_cache(
+            &self.sticker_cache,
+            url,
+            expected_sha256,
+            MAX_MEDIA_DOWNLOAD_BYTES,
+        )
+        .await
     }
 
     /// Return a verified local sticker image by content hash without consulting
@@ -2188,8 +2217,13 @@ impl SonarClient {
                 let cache = sticker_cache.clone();
                 tasks.spawn(async move {
                     let url = sticker.url;
-                    let result =
-                        fetch_sticker_image_with_cache(&cache, &url, &sticker.sha256).await;
+                    let result = fetch_sticker_image_with_cache(
+                        &cache,
+                        &url,
+                        &sticker.sha256,
+                        STICKER_PREFETCH_DOWNLOAD_BYTES,
+                    )
+                    .await;
                     (url, result)
                 });
             }
@@ -4736,6 +4770,13 @@ mod tests {
         assert!(!retryable_media_http_error(&Error::Http(
             "media exceeds size cap".into()
         )));
+    }
+
+    #[test]
+    fn sticker_prefetch_download_cap_is_cacheable() {
+        let prefetch_limit = std::hint::black_box(STICKER_PREFETCH_DOWNLOAD_BYTES);
+        assert_eq!(prefetch_limit, MAX_STICKER_CACHE_BYTES);
+        assert!(prefetch_limit < MAX_MEDIA_DOWNLOAD_BYTES);
     }
 
     #[test]
