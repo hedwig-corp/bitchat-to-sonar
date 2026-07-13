@@ -366,6 +366,35 @@ Relay propagation can take a few seconds; retry `listen --once` if needed.
 
 ---
 
+## Relay smoke (Hermes-driven)
+
+The daily relay gate is `scripts/smoke/relay-smoke.sh` (`docs/RELAY-SMOKE.md`),
+scheduled on this Hermes host (Mode C: cron + terminal), not CI. The Hermes
+agent runs the harness and can then read its metrics for an adaptive triage of
+what it flagged.
+
+```bash
+# latest gate result (metrics.json written by the last run)
+jq '{overall, target_loss_pct: .target.loss_pct, control_loss_pct: .control.loss_pct}' metrics.json
+
+# adaptive probe: ephemeral identities, receiver subscribed BEFORE the send
+A=$(mktemp -d); B=$(mktemp -d); R=wss://nostr.relay.hedwig.sh
+sonar-cli --home "$A" --relay "$R" init >/dev/null;  sonar-cli --home "$A" --relay "$R" publish >/dev/null
+sonar-cli --home "$B" --relay "$R" init >/dev/null;  sonar-cli --home "$B" --relay "$R" publish >/dev/null
+NPUB_B=$(sonar-cli --home "$B" --relay "$R" identity | jq -r .npub)
+( sonar-cli --home "$B" --relay "$R" listen --timeout-secs 20 --no-publish ) &
+sleep 5
+sonar-cli --home "$A" --relay "$R" send --to "$NPUB_B" --text "probe-$RANDOM"
+wait
+```
+
+The receiver must be subscribed before the send (gift-wrap events arrive live);
+the gate proves the same flow works on the control relays, so a target-only
+failure points at the relay. Report triage to the ops npub with `send --to` and
+optionally summarise a hypothesis as a comment on the open `[relay-smoke]` issue.
+
+---
+
 ## Optional: MCP wrapper
 
 For structured tools instead of shell, a thin stdio MCP server can wrap

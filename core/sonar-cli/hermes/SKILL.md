@@ -98,3 +98,27 @@ one object per line). The `type` field tells you which: `identity`, `published`,
 - **Relay transport only.** `sonar-cli` reaches peers over Nostr relays
   (Marmot/MLS); it does not drive BLE mesh. Nearby-only mesh peers are not
   reachable from the CLI.
+
+## Relay smoke (Hermes-driven gate + triage)
+
+The deterministic daily gate is `scripts/smoke/relay-smoke.sh` (see
+`docs/RELAY-SMOKE.md`). On a Hermes host this skill is the **driver**: schedule
+the harness on a cron (Mode C: cron + terminal) to run it daily, then optionally
+read the metrics JSON from each run and post an adaptive triage.
+
+When invoked for relay triage:
+
+1. Read the latest gate metrics artifact (`relay-smoke-metrics`, a JSON object with
+   `target`/`control` per-relay numbers and an `overall` classification:
+   `pass` / `relay_issue` / `regression` / `target_fail`) and any open
+   `[relay-smoke]` issues.
+2. Reproduce or probe adaptively with `sonar-cli` — back-to-back sends to a fresh
+   pair, reconnect storms, varied payload sizes — across the failing relay and a
+   control relay, to localise whether the loss is relay-side or load-dependent.
+3. The receiver must be subscribed (`listen`) BEFORE the sender fires; gift-wrap
+   events arrive live. Match results by message `content`.
+4. Report a short natural-language triage to the ops npub via `send --to`, and
+   optionally summarise a hypothesis as a comment on the open issue.
+
+Keep it read-only with respect to production state: spin up ephemeral identities
+in a temp `SONAR_CLI_HOME`, never the gate's reporter identity.

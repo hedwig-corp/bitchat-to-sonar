@@ -237,3 +237,12 @@ When a change touches conversation open/send/sync or the startup path, re-run th
 faithful benchmark and compare `launch→t4`/`t0→t4`, `t2→t4`, `t3→t3a`, and
 `t3b→t4` against this baseline; a regression there means sync moved onto the
 critical path.
+
+## Relay smoke test (delivery / loss)
+
+Separate from the cold-start benchmark above: `scripts/smoke/relay-smoke.sh`
+measures **relay-side** Sonar/Marmot DM delivery (not app startup) against
+`wss://nostr.relay.hedwig.sh` and a control relay set, reporting
+delivery/loss/latency/errors. It runs daily in CI
+(`.github/workflows/relay-smoke.yml`) and classifies each run as
+`pass` / `relay_issue` / `regression` / `target_fail`. See `docs/RELAY-SMOKE.md`.
