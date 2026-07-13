@@ -1134,29 +1134,20 @@ final class MarmotChatModel: ObservableObject {
         guard !pendingOptimistic.isEmpty else { return byGroup }
         var merged = byGroup
         for (groupId, pending) in pendingOptimistic {
-            let server = byGroup[groupId] ?? []
-            var unmatchedServer = server
-            var survivors: [MarmotService.MarmotMessage] = []
-            for optimistic in pending {
-                if let match = unmatchedServer.firstIndex(where: {
-                    Self.serverMessage(
-                        $0,
-                        matchesOptimistic: optimistic,
-                        excludingServerIDs: preexistingCanonicalMessageIDsByOptimisticID[optimistic.id] ?? []
-                    )
-                }) {
-                    unmatchedServer.remove(at: match)
-                    preexistingCanonicalMessageIDsByOptimisticID[optimistic.id] = nil
-                } else {
-                    survivors.append(optimistic)
-                }
+            let reconciliation = Self.reconciledOptimisticMessages(
+                source: byGroup[groupId] ?? [],
+                pending: pending,
+                exclusionsByOptimisticID: preexistingCanonicalMessageIDsByOptimisticID
+            )
+            for echo in pending where !reconciliation.survivors.contains(where: { $0.id == echo.id }) {
+                preexistingCanonicalMessageIDsByOptimisticID[echo.id] = nil
             }
-            if survivors.isEmpty {
+            if reconciliation.survivors.isEmpty {
                 pendingOptimistic[groupId] = nil
             } else {
-                pendingOptimistic[groupId] = survivors
-                merged[groupId] = (server + survivors).sorted { $0.createdAt < $1.createdAt }
+                pendingOptimistic[groupId] = reconciliation.survivors
             }
+            merged[groupId] = reconciliation.visible
         }
         return merged
     }
@@ -1193,6 +1184,40 @@ final class MarmotChatModel: ObservableObject {
                 $0.filename == pending.filename && $0.mimeType == pending.mimeType
             }
         }
+    }
+
+    struct OptimisticReconciliation {
+        let survivors: [MarmotService.MarmotMessage]
+        let visible: [MarmotService.MarmotMessage]
+    }
+
+    /// Reconcile only canonical rows; [source] can contain local echoes from a
+    /// previous local-first paint, but those are re-added exactly once below.
+    static func reconciledOptimisticMessages(
+        source: [MarmotService.MarmotMessage],
+        pending: [MarmotService.MarmotMessage],
+        exclusionsByOptimisticID: [String: Set<String>] = [:]
+    ) -> OptimisticReconciliation {
+        let canonical = source.filter { !isLocalTranscriptEcho($0) }
+        var unmatchedCanonical = canonical
+        var survivors: [MarmotService.MarmotMessage] = []
+        for optimistic in pending {
+            if let match = unmatchedCanonical.firstIndex(where: {
+                serverMessage(
+                    $0,
+                    matchesOptimistic: optimistic,
+                    excludingServerIDs: exclusionsByOptimisticID[optimistic.id] ?? []
+                )
+            }) {
+                unmatchedCanonical.remove(at: match)
+            } else {
+                survivors.append(optimistic)
+            }
+        }
+        return OptimisticReconciliation(
+            survivors: survivors,
+            visible: mergeMessages(existing: canonical, incoming: survivors)
+        )
     }
 
     private func appendOptimistic(

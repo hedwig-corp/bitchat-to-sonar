@@ -53,4 +53,29 @@ struct MarmotOptimisticEchoTests {
 
         #expect(!MarmotChatModel.serverMessage(echo, matchesOptimistic: echo))
     }
+
+    @Test
+    func refreshKeepsPendingLocalEchoExactlyOnce() {
+        let echo = message(id: "optimistic-1", createdAt: Date(timeIntervalSince1970: 100))
+        let reconciliation = MarmotChatModel.reconciledOptimisticMessages(
+            source: [echo],
+            pending: [echo]
+        )
+
+        #expect(reconciliation.survivors.map(\.id) == [echo.id])
+        #expect(reconciliation.visible.map(\.id) == [echo.id])
+    }
+
+    @Test
+    func refreshRemovesFulfilledLocalEcho() {
+        let echo = message(id: "optimistic-1", createdAt: Date(timeIntervalSince1970: 100))
+        let canonical = message(id: "canonical-1", createdAt: Date(timeIntervalSince1970: 101))
+        let reconciliation = MarmotChatModel.reconciledOptimisticMessages(
+            source: [echo, canonical],
+            pending: [echo]
+        )
+
+        #expect(reconciliation.survivors.isEmpty)
+        #expect(reconciliation.visible.map(\.id) == [canonical.id])
+    }
 }

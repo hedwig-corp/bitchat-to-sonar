@@ -4171,13 +4171,12 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun withSendEchoes(chatId: String, published: List<SonarMsg>): List<SonarMsg> {
         val echoes = pendingSendEchoes[chatId] ?: return published
         val fulfilled = fulfilledSendEchoIds(echoes, published, previouslyPublishedMessageIdsByEcho)
-        echoes.removeAll { it.id in fulfilled }
-        fulfilled.forEach(previouslyPublishedMessageIdsByEcho::remove)
-        if (echoes.isEmpty()) {
-            pendingSendEchoes.remove(chatId)
-            return published
-        }
-        return (published.filterNot { it.id.startsWith(echoIdPrefix) } + echoes)
+        // A canonical row can suppress a duplicate bubble before the send
+        // coroutine reports its exact outcome. Keep the echo pending until
+        // clearSendEcho/failSendEcho receives that outcome so a late failure
+        // still renders "Couldn't send" instead of disappearing.
+        val visibleEchoes = echoes.filterNot { it.id in fulfilled }
+        return (published.filterNot { it.id.startsWith(echoIdPrefix) } + visibleEchoes)
             .distinctBy { it.id }
             .sortedBy { it.tsSecs }
     }

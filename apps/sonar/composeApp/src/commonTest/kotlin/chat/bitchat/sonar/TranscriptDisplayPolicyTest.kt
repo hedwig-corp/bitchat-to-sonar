@@ -236,13 +236,13 @@ class TranscriptDisplayPolicyTest {
     }
 
     @Test
-    fun identicalEchoesConsumeCanonicalRowsOneForOne() {
+    fun newestIdenticalEchoTakesCanonicalRowBeforeStaleEcho() {
         val echoes = listOf(
             message("echo-1", 100, "hello", mine = true, viaInternet = true, state = "Sending"),
             message("echo-2", 101, "hello", mine = true, viaInternet = true, state = "Sending"),
         )
         val canonical = listOf(message("event-1", 101, "hello", mine = true, viaInternet = true))
 
-        assertEquals(setOf("echo-1"), fulfilledSendEchoIds(echoes, canonical))
+        assertEquals(setOf("echo-2"), fulfilledSendEchoIds(echoes, canonical))
     }
 }

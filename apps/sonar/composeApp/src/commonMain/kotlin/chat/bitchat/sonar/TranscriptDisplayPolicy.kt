@@ -148,7 +148,9 @@ internal fun fulfilledSendEchoIds(
     val fulfilled = mutableSetOf<String>()
     val consumedPublished = mutableSetOf<String>()
     val ownPublished = published.filter { it.mine }.groupBy { it.content }
-    for (echo in echoes) {
+    // Prefer the most recent pending duplicate. A newer canonical row must not
+    // hide an older send whose result is still unknown.
+    for (echo in echoes.asReversed()) {
         if (echo.state == "Couldn't send") continue
         val match = ownPublished[echo.content]
             ?.firstOrNull {
