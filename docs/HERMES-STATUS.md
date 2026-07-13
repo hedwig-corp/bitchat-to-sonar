@@ -49,3 +49,11 @@ Optional post-step: parse `~/.local/state/sonar-status/last.json` and alert if a
 - `http-*` — when `SONAR_STATUS_HTTP` is set
 
 See [`SONAR-STATUS.md`](SONAR-STATUS.md) for the full contract.
+
+## Groups probe (5-agent MLS)
+
+1. setup: ./scripts/status/groups-probe.sh --setup
+2. run: ./scripts/status/groups-probe.sh
+3. publish: SONAR_STATUS_GROUPS_RESULT=... ./scripts/status/publish.sh
+
+Removed: push (not possible), calls (too complex).

@@ -11,9 +11,7 @@
 	import SonarMark from '$lib/components/SonarMark.svelte';
 	import { STATUS_SUBSCRIBE_URL } from '$lib/links.js';
 	import {
-		SONAR_STATUS_SEED,
 		STATUS_NPUB,
-		mergeStatusPayload,
 		syntheticHistory,
 		worstServiceState
 	} from '$lib/status-data.js';
@@ -31,15 +29,15 @@
 			: STATUS_SUBSCRIBE_URL;
 
 	/** @type {StatusService[]} */
-	let services = structuredClone(SONAR_STATUS_SEED.services);
+	let services = [];
 	/** @type {StatusRelay[]} */
-	let relays = structuredClone(SONAR_STATUS_SEED.relays);
+	let relays = [];
 	/** @type {StatusIncident[]} */
-	let incidents = structuredClone(SONAR_STATUS_SEED.incidents);
+	let incidents = [];
 
-	/** @type {'seed' | 'nostr'} */
-	let dataSource = 'seed';
-	let updatedLabel = 'seed data';
+	/** @type {'waiting' | 'nostr'} */
+	let dataSource = 'waiting';
+	let updatedLabel = 'waiting for status feed';
 
 	/** @type {Array<{ url: string, region: string, ms: number | null, pending: boolean }>} */
 	let relayRows = relays.map((r) => ({
@@ -209,7 +207,7 @@
 		if (dataSource === 'nostr') {
 			updatedLabel = `status feed · updated ${now}`;
 		} else {
-			updatedLabel = `seed data · page loaded ${now}`;
+			updatedLabel = 'waiting for status feed';
 		}
 	}
 
@@ -221,11 +219,11 @@
 
 		fetchStatusFromNostr().then(({ payload, source }) => {
 			if (!payload || source !== 'nostr') return;
-			const merged = mergeStatusPayload(SONAR_STATUS_SEED, payload);
+			// Feed data replaces empty state directly.
 			const prevRelayKey = relays.map((r) => r.url).join('|');
-			services = merged.services;
-			incidents = merged.incidents;
-			relays = merged.relays;
+			services = payload.services;
+			incidents = payload.incidents;
+			relays = payload.relays;
 			const nextRelayKey = relays.map((r) => r.url).join('|');
 			if (nextRelayKey !== prevRelayKey) {
 				relayRows = relays.map((r) => ({
@@ -295,7 +293,10 @@
 
 		<h2>Sonar services <span class="rt">{services.length} services</span></h2>
 		<div class="svc">
-			{#each services as s (s.id)}
+			{#if services.length === 0}
+			<p class="waiting-state">Waiting for status feed data…</p>
+		{:else}
+		{#each services as s (s.id)}
 				{@const state = serviceBadge(s)}
 				{@const hist = syntheticHistory(s.id, s.state ?? 'ok')}
 				<div class="row">
@@ -317,6 +318,7 @@
 					</div>
 				</div>
 			{/each}
+			{/if}
 		</div>
 		<div class="legend">
 			<span><span class="dot ok"></span>Operational</span>
@@ -789,6 +791,11 @@
 		margin-left: auto;
 	}
 
+	.waiting-state {
+		font-size: 14px;
+		color: var(--text3);
+		margin: 0 0 26px;
+	}
 	.empty-incidents {
 		font-size: 13.5px;
 		color: var(--text3);

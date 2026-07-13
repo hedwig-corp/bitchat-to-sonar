@@ -9,6 +9,7 @@
 //! site (`web/src/lib/status-nostr.js`) REQs when `STATUS_PUBKEY_HEX` matches.
 
 mod chat;
+mod groups;
 mod media;
 mod schema;
 mod stickers;
@@ -29,6 +30,7 @@ use tokio_tungstenite::tungstenite::Message;
 use ::url::Url;
 
 use chat::{load_probe_secret, probe_marmot_keypackage, ChatProbeReport};
+use groups::{load_groups_result, payments_coming_soon, GroupsProbeResult};
 use media::{probe_blossom, MediaProbeReport};
 use stickers::{probe_sticker_index, StickerProbeReport};
 use schema::{
@@ -139,6 +141,12 @@ struct ProbeArgs {
     /// Blossom server to probe (defaults to sonar-core DEFAULT_BLOSSOM_SERVER).
     #[arg(long, env = "SONAR_STATUS_BLOSSOM_SERVER")]
     blossom_server: Option<String>,
+    /// Path to Hermes groups-probe result JSON.
+    #[arg(long, env = "SONAR_STATUS_GROUPS_RESULT")]
+    groups_result: Option<PathBuf>,
+    /// Include payments row as coming soon.
+    #[arg(long, env = "SONAR_STATUS_PAYMENTS_COMING_SOON")]
+    payments_coming_soon: bool,
     /// Pretty-print JSON.
     #[arg(long)]
     pretty: bool,
@@ -188,6 +196,12 @@ struct PublishArgs {
     /// Blossom server to probe (defaults to sonar-core DEFAULT_BLOSSOM_SERVER).
     #[arg(long, env = "SONAR_STATUS_BLOSSOM_SERVER")]
     blossom_server: Option<String>,
+    /// Path to Hermes groups-probe result JSON.
+    #[arg(long, env = "SONAR_STATUS_GROUPS_RESULT")]
+    groups_result: Option<PathBuf>,
+    /// Include payments row as coming soon.
+    #[arg(long, env = "SONAR_STATUS_PAYMENTS_COMING_SOON")]
+    payments_coming_soon: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -225,6 +239,8 @@ struct ProbeOptions {
     sticker_probe: bool,
     media_probe: bool,
     blossom_server: Option<String>,
+    groups_result: Option<PathBuf>,
+    payments_coming_soon: bool,
 }
 
 #[tokio::main]
@@ -252,6 +268,8 @@ async fn run() -> Result<()> {
                 sticker_probe: args.sticker_probe,
                 media_probe: args.media_probe,
                 blossom_server: args.blossom_server,
+                groups_result: args.groups_result,
+                payments_coming_soon: args.payments_coming_soon,
             };
             let payload = build_payload(
                 parse_list(args.relays.as_deref(), DEFAULT_RELAYS),
@@ -279,6 +297,8 @@ async fn run() -> Result<()> {
                 sticker_probe: args.sticker_probe,
                 media_probe: args.media_probe,
                 blossom_server: args.blossom_server,
+                groups_result: args.groups_result,
+                payments_coming_soon: args.payments_coming_soon,
             };
             let payload =
                 build_payload(probe_relays, &args.http_urls, args.previous.as_ref(), &opts).await?;
@@ -434,12 +454,32 @@ async fn build_payload(
         None
     };
 
+    let groups_report = if let Some(path) = &opts.groups_result {
+        match load_groups_result(path) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                eprintln!("warning: groups result: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let payments = if opts.payments_coming_soon {
+        Some(payments_coming_soon())
+    } else {
+        None
+    };
+
     let services = derive_services(
         &relay_probes,
         &http_probes,
         chat_report.as_ref(),
         sticker_report.as_ref(),
         media_report.as_ref(),
+        groups_report.as_ref(),
+        payments.as_ref(),
     );
     let relays: Vec<StatusRelay> = relay_probes
         .iter()
@@ -477,6 +517,7 @@ async fn build_payload(
         "chat": chat_report.as_ref().map(|c| serde_json::to_value(c).unwrap_or_default()),
         "stickers": sticker_report.as_ref().map(|s| serde_json::to_value(s).unwrap_or_default()),
         "media": media_report.as_ref().map(|m| serde_json::to_value(m).unwrap_or_default()),
+        "groups": groups_report.as_ref().map(|g| serde_json::to_value(g).unwrap_or_default()),
     });
 
     Ok(StatusPayload {
@@ -587,6 +628,8 @@ fn derive_services(
     chat: Option<&ChatProbeReport>,
     stickers: Option<&StickerProbeReport>,
     media: Option<&MediaProbeReport>,
+    groups: Option<&GroupsProbeResult>,
+    payments: Option<&StatusService>,
 ) -> Vec<StatusService> {
     let total = relays.len().max(1);
     let reachable = relays.iter().filter(|r| r.ms.is_some()).count();
@@ -627,6 +670,14 @@ fn derive_services(
 
     if let Some(report) = media {
         services.push(report.to_service());
+    }
+
+    if let Some(report) = groups {
+        services.push(report.to_service());
+    }
+
+    if let Some(svc) = payments {
+        services.push(svc.clone());
     }
 
     for h in https {
@@ -787,7 +838,7 @@ mod tests {
             region: "x".into(),
             ms: None,
         }];
-        let services = derive_services(&relays, &[], None, None, None);
+        let services = derive_services(&relays, &[], None, None, None, None, None);
         let relays_svc = services.iter().find(|s| s.id == "relays").unwrap();
         assert_eq!(relays_svc.state, Some(ServiceState::Down));
         assert!(services.iter().all(|s| s.id == "relays" || s.id.starts_with("http-")));
@@ -810,7 +861,7 @@ mod tests {
             pubkey_hex: "aa".into(),
             error: None,
         };
-        let services = derive_services(&relays, &[], Some(&chat), None, None);
+        let services = derive_services(&relays, &[], Some(&chat), None, None, None, None);
         assert!(services.iter().any(|s| s.id == "dm"));
         assert!(services.iter().any(|s| s.id == "relays"));
     }

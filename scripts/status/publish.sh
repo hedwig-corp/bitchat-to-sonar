@@ -55,6 +55,13 @@ if [[ "${SONAR_STATUS_MEDIA_PROBE:-}" == "1" || "${SONAR_STATUS_MEDIA_PROBE:-}" 
   args+=(--media-probe)
 fi
 
+if [[ -n "${SONAR_STATUS_GROUPS_RESULT:-}" ]]; then
+  args+=(--groups-result "$SONAR_STATUS_GROUPS_RESULT")
+fi
+if [[ "${SONAR_STATUS_PAYMENTS_COMING_SOON:-}" == "1" ]]; then
+  args+=(--payments-coming-soon)
+fi
+
 if [[ "${1:-}" == "--dry-run" ]]; then
   args+=(--dry-run)
 fi
