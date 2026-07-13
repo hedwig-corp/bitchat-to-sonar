@@ -55,14 +55,14 @@ export const STATUS_EVENT_D = 'sonar-status';
  * When set, status-nostr filters `authors: [STATUS_PUBKEY_HEX]`.
  * @type {string}
  */
-export const STATUS_PUBKEY_HEX = '';
+export const STATUS_PUBKEY_HEX = 'e11b61c2a0e8b48159bb9991dc20fa03054e87eeb1da8f0f8b310580b940f428';
 
 /**
  * Public npub for “Subscribe to updates” (bech32). Empty hides a real profile link
  * and falls back to STATUS_SUBSCRIBE_URL.
  * @type {string}
  */
-export const STATUS_NPUB = '';
+export const STATUS_NPUB = 'npub1uydkrs4qaz6gzkdmnxgacg86qvz5aplwk8dg7rutxyzcpw2q7s5qr5c90c';
 
 /** Relays used for the optional status-feed query (subset of public network). */
 export const STATUS_FEED_RELAYS = [
