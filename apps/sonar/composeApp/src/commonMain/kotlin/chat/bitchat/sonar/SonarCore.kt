@@ -540,6 +540,14 @@ expect object SonarCore {
     /** Download + decrypt the media blob at [url] for the chat. Returns plaintext. */
     suspend fun fetchMedia(chatId: String, url: String): ByteArray
 
+    /** Download + decrypt directly into a private partial file. */
+    suspend fun fetchMediaToFile(
+        chatId: String,
+        url: String,
+        destinationPath: String,
+        listener: SonarMediaDownloadListener,
+    ): Long
+
     /** Decrypted message history for a chat, oldest first. */
     suspend fun messages(chatId: String): List<SonarMsg>
 

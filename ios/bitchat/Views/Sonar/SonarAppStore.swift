@@ -374,6 +374,63 @@ struct SNMediaItem: Equatable {
     }
 }
 
+enum SNMediaTransferPhase: Equatable {
+    case notDownloaded
+    case downloading
+    case available
+    case failed
+}
+
+/// Signal-style attachment state. A remote pointer becomes a local file before
+/// any viewer is presented; network activity never owns a fullscreen surface.
+struct SNMediaTransferState: Equatable {
+    let phase: SNMediaTransferPhase
+    let progress: Double?
+    let localURL: URL?
+
+    static let notDownloaded = SNMediaTransferState(
+        phase: .notDownloaded,
+        progress: nil,
+        localURL: nil
+    )
+
+    static func downloading(_ progress: Double?) -> SNMediaTransferState {
+        SNMediaTransferState(phase: .downloading, progress: progress, localURL: nil)
+    }
+
+    static func available(_ url: URL) -> SNMediaTransferState {
+        SNMediaTransferState(phase: .available, progress: 1, localURL: url)
+    }
+
+    static let failed = SNMediaTransferState(phase: .failed, progress: nil, localURL: nil)
+}
+
+private final class SNMediaDownloadListener: MediaDownloadListener, @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+    private let progressHandler: @Sendable (UInt64, UInt64?) -> Void
+
+    init(progress: @escaping @Sendable (UInt64, UInt64?) -> Void) {
+        self.progressHandler = progress
+    }
+
+    func onProgress(bytesReceived: UInt64, totalBytes: UInt64?) {
+        progressHandler(bytesReceived, totalBytes)
+    }
+
+    func isCancelled() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        lock.unlock()
+    }
+}
+
 /// A public channel row: the `#mesh` channel or one geohash level around the
 /// current location.
 struct SNChannelItem: Identifiable {
@@ -642,7 +699,7 @@ final class SonarAppStore: ObservableObject {
     }
 
     private func cleanupPreviewTempFiles() {
-        nextMediaPreviewGeneration()
+        _ = nextMediaPreviewGeneration()
         let previews = pendingMediaPreviews
         pendingMediaPreviews = []
         deletePreviewTempFilesAsync(previews)
@@ -694,7 +751,7 @@ final class SonarAppStore: ObservableObject {
     func confirmSendPreview(peerId: String? = nil) {
         let items = peerId.map { id in pendingMediaPreviews.filter { $0.peerId == id } } ?? pendingMediaPreviews
         guard !items.isEmpty else { return }
-        nextMediaPreviewGeneration()
+        _ = nextMediaPreviewGeneration()
         if let peerId {
             pendingMediaPreviews.removeAll { $0.peerId == peerId }
         } else {
@@ -759,7 +816,7 @@ final class SonarAppStore: ObservableObject {
     }
 
     func cancelPreview(peerId: String? = nil) {
-        nextMediaPreviewGeneration()
+        _ = nextMediaPreviewGeneration()
         let toRemove = peerId.map { id in pendingMediaPreviews.filter { $0.peerId == id } } ?? pendingMediaPreviews
         if let peerId {
             pendingMediaPreviews.removeAll { $0.peerId == peerId }
@@ -4188,6 +4245,10 @@ final class SonarAppStore: ObservableObject {
     /// In-memory decrypted-media cache (raw bytes), keyed by the ciphertext's
     /// Blossom URL. Cleared by `wipe()` and `eraseAllChats()`.
     private var mediaImageCache: [String: Data] = [:]
+    @Published private var mediaTransferStates: [String: SNMediaTransferState] = [:]
+    private var mediaDownloadTasks: [String: Task<Void, Never>] = [:]
+    private var mediaDownloadListeners: [String: SNMediaDownloadListener] = [:]
+    private var mediaDownloadGenerations: [String: UUID] = [:]
 
     private struct PendingUploadMedia {
         let localURL: String
@@ -4683,54 +4744,183 @@ final class SonarAppStore: ObservableObject {
         return nil
     }
 
-    /// Bytes for a media attachment: a local file (BLE-mesh) or download+decrypt
-    /// from Blossom (Marmot), cached by URL.
+    private static let reactiveMediaCacheLimit = 1024 * 1024
+
+    private static func mediaKey(_ item: SNMediaItem) -> String {
+        item.localPath ?? item.url
+    }
+
+    private func existingMediaURL(_ item: SNMediaItem) -> URL? {
+        if let path = item.localPath {
+            let url = URL(fileURLWithPath: path)
+            return FileManager.default.fileExists(atPath: url.path) ? url : nil
+        }
+        guard let disk = Self.mediaCacheURL(for: item.url, createDirectory: false),
+              FileManager.default.fileExists(atPath: disk.path)
+        else { return nil }
+        return disk
+    }
+
+    func mediaTransferState(_ item: SNMediaItem) -> SNMediaTransferState {
+        let key = Self.mediaKey(item)
+        if let state = mediaTransferStates[key] { return state }
+        if let url = existingMediaURL(item) { return .available(url) }
+        return .notDownloaded
+    }
+
+    /// Hydrate the local state without network work. Visual/audio attachments
+    /// may opt into automatic download; generic files remain tap-to-download.
+    func prepareMedia(_ item: SNMediaItem, autoDownload: Bool) {
+        let key = Self.mediaKey(item)
+        if let url = existingMediaURL(item) {
+            mediaTransferStates[key] = .available(url)
+            return
+        }
+        if autoDownload || mediaImageCache[key] != nil {
+            requestMediaDownload(item)
+        }
+    }
+
+    func requestMediaDownload(_ item: SNMediaItem) {
+        let key = Self.mediaKey(item)
+        if let url = existingMediaURL(item) {
+            mediaTransferStates[key] = .available(url)
+            return
+        }
+        guard mediaDownloadTasks[key] == nil,
+              let finalURL = Self.mediaCacheURL(for: key)
+        else { return }
+
+        let generation = UUID()
+        let partialURL = finalURL
+            .deletingLastPathComponent()
+            .appendingPathComponent(".\(finalURL.lastPathComponent).\(generation.uuidString).part")
+        let cachedData = mediaImageCache[key]
+        mediaDownloadGenerations[key] = generation
+        mediaTransferStates[key] = .downloading(nil)
+
+        let listener = SNMediaDownloadListener { [weak self] received, total in
+            Task { @MainActor [weak self] in
+                guard let self,
+                      self.mediaDownloadGenerations[key] == generation
+                else { return }
+                let progress = total.flatMap { total -> Double? in
+                    guard total > 0 else { return nil }
+                    return min(1, Double(received) / Double(total))
+                }
+                self.mediaTransferStates[key] = .downloading(progress)
+            }
+        }
+        mediaDownloadListeners[key] = listener
+
+        mediaDownloadTasks[key] = Task { [weak self] in
+            guard let self else { return }
+            do {
+                if let cachedData {
+                    try await Task.detached(priority: .utility) {
+                        #if os(iOS)
+                        try cachedData.write(to: partialURL, options: [.atomic, .completeFileProtection])
+                        #else
+                        try cachedData.write(to: partialURL, options: .atomic)
+                        #endif
+                    }.value
+                } else {
+                    guard !item.groupId.isEmpty, !item.url.isEmpty else {
+                        throw MarmotService.ServiceError.invalidInput("attachment has no download route")
+                    }
+                    _ = try await marmot.fetchMediaToFile(
+                        groupId: item.groupId,
+                        url: item.url,
+                        destination: partialURL,
+                        listener: listener
+                    )
+                }
+                guard !listener.isCancelled(), !Task.isCancelled else {
+                    throw CancellationError()
+                }
+                let localURL = try await Task.detached(priority: .utility) {
+                    try Self.promoteMediaDownload(from: partialURL, to: finalURL)
+                }.value
+                guard mediaDownloadGenerations[key] == generation else { return }
+                mediaTransferStates[key] = .available(localURL)
+                if let cachedData, cachedData.count > Self.reactiveMediaCacheLimit {
+                    mediaImageCache.removeValue(forKey: key)
+                }
+            } catch {
+                await Task.detached(priority: .utility) {
+                    try? FileManager.default.removeItem(at: partialURL)
+                }.value
+                guard mediaDownloadGenerations[key] == generation else { return }
+                mediaTransferStates[key] = listener.isCancelled() || error is CancellationError
+                    ? .notDownloaded
+                    : .failed
+            }
+            if mediaDownloadGenerations[key] == generation {
+                mediaDownloadTasks[key] = nil
+                mediaDownloadListeners[key] = nil
+                mediaDownloadGenerations[key] = nil
+            }
+        }
+    }
+
+    func cancelMediaDownload(_ item: SNMediaItem) {
+        let key = Self.mediaKey(item)
+        mediaDownloadListeners[key]?.cancel()
+        mediaDownloadTasks[key]?.cancel()
+        mediaDownloadTasks[key] = nil
+        mediaDownloadListeners[key] = nil
+        mediaDownloadGenerations[key] = nil
+        mediaTransferStates[key] = .notDownloaded
+    }
+
+    private func cancelAllMediaDownloads() {
+        mediaDownloadListeners.values.forEach { $0.cancel() }
+        mediaDownloadTasks.values.forEach { $0.cancel() }
+        mediaDownloadTasks = [:]
+        mediaDownloadListeners = [:]
+        mediaDownloadGenerations = [:]
+        mediaTransferStates = [:]
+    }
+
+    nonisolated private static func promoteMediaDownload(from partialURL: URL, to finalURL: URL) throws -> URL {
+        if FileManager.default.fileExists(atPath: finalURL.path) {
+            try? FileManager.default.removeItem(at: partialURL)
+            return finalURL
+        }
+        try FileManager.default.moveItem(at: partialURL, to: finalURL)
+        #if os(iOS)
+        try? FileManager.default.setAttributes(
+            [.protectionKey: FileProtectionType.complete],
+            ofItemAtPath: finalURL.path
+        )
+        #endif
+        return finalURL
+    }
+
+    /// Read already-local attachment bytes for image decode or audio playback.
+    /// This function deliberately never starts network work.
     func mediaData(_ item: SNMediaItem) async -> Data? {
         let logId = Self.mediaLogId(for: item)
-        if let path = item.localPath {
+        let key = Self.mediaKey(item)
+        if let cached = mediaImageCache[key] {
+            SecureLogger.info("SonarMedia[\(logId)]: memory cache hit bytes=\(cached.count) name=\(item.filename) mime=\(item.mime)", category: .session)
+            return cached
+        }
+        if let localURL = existingMediaURL(item) {
             do {
-                let data = try Data(contentsOf: URL(fileURLWithPath: path))
+                let data = try Data(contentsOf: localURL, options: .mappedIfSafe)
                 SecureLogger.info("SonarMedia[\(logId)]: local file hit bytes=\(data.count) name=\(item.filename) mime=\(item.mime)", category: .session)
+                if data.count <= Self.reactiveMediaCacheLimit {
+                    mediaImageCache[key] = data
+                }
                 return data
             } catch {
                 SecureLogger.warning("SonarMedia[\(logId)]: local file read failed name=\(item.filename) mime=\(item.mime) error=\(error.localizedDescription)", category: .session)
                 return nil
             }
         }
-        if let cached = mediaImageCache[item.url] {
-            SecureLogger.info("SonarMedia[\(logId)]: memory cache hit bytes=\(cached.count) name=\(item.filename) mime=\(item.mime)", category: .session)
-            return cached
-        }
-        // Persistent on-disk cache: a decrypted blob survives relaunch and, on a
-        // hit, returns WITHOUT touching the serialized Marmot FFI queue — so it
-        // can never queue behind an in-flight sync (the cause of slow media).
-        if let disk = Self.mediaCacheURL(for: item.url),
-           FileManager.default.fileExists(atPath: disk.path) {
-            do {
-                let data = try Data(contentsOf: disk)
-                mediaImageCache[item.url] = data
-                SecureLogger.info("SonarMedia[\(logId)]: disk cache hit bytes=\(data.count) name=\(item.filename) mime=\(item.mime)", category: .session)
-                return data
-            } catch {
-                SecureLogger.warning("SonarMedia[\(logId)]: disk cache read failed name=\(item.filename) mime=\(item.mime) error=\(error.localizedDescription)", category: .session)
-            }
-        }
-        SecureLogger.info("SonarMedia[\(logId)]: remote fetch start name=\(item.filename) mime=\(item.mime)", category: .session)
-        guard let data = await marmot.fetchMedia(groupId: item.groupId, url: item.url) else {
-            SecureLogger.warning("SonarMedia[\(logId)]: remote fetch returned no data name=\(item.filename) mime=\(item.mime)", category: .session)
-            return nil
-        }
-        mediaImageCache[item.url] = data
-        SecureLogger.info("SonarMedia[\(logId)]: remote fetch hit bytes=\(data.count) name=\(item.filename) mime=\(item.mime)", category: .session)
-        // Write-through to disk, protected at rest like MessageStore plaintext.
-        if let disk = Self.mediaCacheURL(for: item.url) {
-            do {
-                try data.write(to: disk, options: [.atomic, .completeFileProtection])
-            } catch {
-                SecureLogger.warning("SonarMedia[\(logId)]: disk cache write failed name=\(item.filename) mime=\(item.mime) error=\(error.localizedDescription)", category: .session)
-            }
-        }
-        return data
+        SecureLogger.info("SonarMedia[\(logId)]: local media miss name=\(item.filename) mime=\(item.mime)", category: .session)
+        return nil
     }
 
     func stickerPack(
@@ -4776,12 +4966,18 @@ final class SonarAppStore: ObservableObject {
 
     /// `<AppSupport>/media-cache/<sha256(url)>` — content-addressed by the
     /// ciphertext's Blossom URL (a stable per-blob key). Creates the dir lazily.
-    private static func mediaCacheURL(for url: String) -> URL? {
+    private static func mediaCacheURL(for url: String, createDirectory: Bool = true) -> URL? {
         guard !url.isEmpty, let base = try? FileManager.default.url(
-            for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: createDirectory
+        )
         else { return nil }
         let dir = base.appendingPathComponent("media-cache", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        if createDirectory {
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
         let name = SHA256.hash(data: Data(url.utf8)).map { String(format: "%02x", $0) }.joined()
         return dir.appendingPathComponent(name)
     }
@@ -6017,6 +6213,7 @@ final class SonarAppStore: ObservableObject {
         // The Lightning wallet seed/balance is separate and is NOT touched.
         payLedger.wipe()
         paymentActivityLedger.wipe()
+        cancelAllMediaDownloads()
         mediaImageCache = [:]
         pendingUploadMediaCache = [:]
         clearMediaDiskCache()
@@ -6096,6 +6293,7 @@ final class SonarAppStore: ObservableObject {
         #endif
         payLedger.wipe()
         paymentActivityLedger.wipe()
+        cancelAllMediaDownloads()
         mediaImageCache = [:]
         pendingUploadMediaCache = [:]
         clearMediaDiskCache()

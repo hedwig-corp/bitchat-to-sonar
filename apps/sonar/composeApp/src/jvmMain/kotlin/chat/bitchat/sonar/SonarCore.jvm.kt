@@ -9,6 +9,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import uniffi.sonar_ffi.SonarIdentity
+import uniffi.sonar_ffi.MediaDownloadListener as FfiMediaDownloadListener
 import uniffi.sonar_ffi.SonarNode
 import java.io.File
 import java.security.SecureRandom
@@ -228,6 +229,25 @@ actual object SonarCore {
 
     actual suspend fun fetchMedia(chatId: String, url: String): ByteArray =
         withContext(Dispatchers.IO) { requireNode().fetchMedia(chatId, url) }
+
+    actual suspend fun fetchMediaToFile(
+        chatId: String,
+        url: String,
+        destinationPath: String,
+        listener: SonarMediaDownloadListener,
+    ): Long = withContext(Dispatchers.IO) {
+        requireNode().fetchMediaToFile(
+            chatId,
+            url,
+            destinationPath,
+            object : FfiMediaDownloadListener {
+                override fun onProgress(bytesReceived: ULong, totalBytes: ULong?) =
+                    listener.onProgress(bytesReceived, totalBytes)
+
+                override fun isCancelled(): Boolean = listener.isCancelled()
+            },
+        ).toLong()
+    }
 
     actual suspend fun messages(chatId: String): List<SonarMsg> = withContext(Dispatchers.IO) {
         val n = node ?: return@withContext emptyList()

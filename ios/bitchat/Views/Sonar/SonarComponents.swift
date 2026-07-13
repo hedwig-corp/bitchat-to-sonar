@@ -669,6 +669,22 @@ struct SNMsgBubble: View {
     }
 }
 
+struct SNMediaPipeline {
+    var state: (SNMediaItem) -> SNMediaTransferState
+    var prepare: (SNMediaItem, Bool) -> Void
+    var request: (SNMediaItem) -> Void
+    var cancel: (SNMediaItem) -> Void
+    var loadLocal: (SNMediaItem) async -> Data?
+
+    static let unavailable = SNMediaPipeline(
+        state: { _ in .notDownloaded },
+        prepare: { _, _ in },
+        request: { _ in },
+        cancel: { _ in },
+        loadLocal: { _ in nil }
+    )
+}
+
 struct SNMsgList: View {
     let msgs: [SNMessage]
     let showAuthors: Bool
@@ -680,8 +696,8 @@ struct SNMsgList: View {
     var fiatText: (Int64) -> String? = { _ in nil }
     /// Tap on another participant's bubble/name (geohash channels) to DM them.
     var onTapAuthor: ((SNMessage) -> Void)? = nil
-    /// Download + decrypt a media attachment to raw bytes (cached by the store).
-    var loadMedia: ((SNMediaItem) async -> Data?)? = nil
+    /// Signal-style attachment lifecycle owned by the app store.
+    var mediaPipeline: SNMediaPipeline = .unavailable
     var loadSticker: ((MarmotService.MarmotStickerRef) async -> Data?)? = nil
     var onTapPack: ((String) -> Void)? = nil
     /// Load one older local database page. Nil for non-paged channel surfaces.
@@ -728,7 +744,7 @@ struct SNMsgList: View {
                                     m: m,
                                     maxBubbleWidth: geo.size.width * 0.72,
                                     showState: m.mine && i == msgs.count - 1,
-                                    load: loadMedia
+                                    pipeline: mediaPipeline
                                 )
                             } else if m.stickerRef != nil {
                                 SNStickerBubble(
@@ -960,6 +976,34 @@ private func snStageAttachmentPreview(_ data: Data, filename: String) -> SNStage
     }
 }
 
+/// Stage an already-local decrypted attachment under its user-visible filename
+/// without round-tripping the payload through `Data`. A hard link is preferred;
+/// filesystems that do not support it fall back to a file-to-file copy.
+private func snStageAttachmentPreview(sourceURL: URL, filename: String) -> SNStagedAttachmentPreview? {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("sonar-media-previews", isDirectory: true)
+    let directory = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let file = directory.appendingPathComponent(snSafeAttachmentFilename(filename), isDirectory: false)
+    do {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        do {
+            try FileManager.default.linkItem(at: sourceURL, to: file)
+        } catch {
+            try FileManager.default.copyItem(at: sourceURL, to: file)
+        }
+        #if os(iOS)
+        try? FileManager.default.setAttributes(
+            [.protectionKey: FileProtectionType.complete],
+            ofItemAtPath: file.path
+        )
+        #endif
+        return SNStagedAttachmentPreview(fileURL: file, directoryURL: directory)
+    } catch {
+        try? FileManager.default.removeItem(at: directory)
+        return nil
+    }
+}
+
 func snSafeAttachmentFilename(_ filename: String) -> String {
     let basename = (filename as NSString).lastPathComponent
         .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1079,41 +1123,68 @@ struct SNMediaBubble: View {
     let m: SNMessage
     let maxBubbleWidth: CGFloat
     var showState: Bool = false
-    var load: ((SNMediaItem) async -> Data?)? = nil
+    var pipeline: SNMediaPipeline = .unavailable
 
     @State private var bytes: Data?
     @State private var failed = false
     @State private var viewerOpen = false
     @State private var viewerIndex = 0
     @State private var loadAttempt = 0
+    @State private var nativePreviewURL: URL?
+    @State private var nativePreviewDirectory: URL?
 
     private var item: SNMediaItem? { m.media.first }
     /// Album = more than one attachment, all images ⇒ render a swipeable card
     /// deck. A mixed image+audio/file message keeps the single-first rendering
     /// (so audio still gets its player), matching pre-album behavior.
     private var isDeck: Bool { m.media.count > 1 && m.media.allSatisfy { $0.isImage } }
+    private var prepareKey: String {
+        guard let item else { return "" }
+        return [item.url, item.groupId, item.localPath ?? ""].joined(separator: "|")
+    }
     private var loadKey: String {
         guard let item else { return "" }
-        return [item.url, item.groupId, item.localPath ?? "", String(loadAttempt)].joined(separator: "|")
+        let state = pipeline.state(item)
+        return [
+            item.url,
+            item.groupId,
+            item.localPath ?? "",
+            String(loadAttempt),
+            String(describing: state.phase),
+            state.localURL?.path ?? ""
+        ].joined(separator: "|")
     }
 
     var body: some View {
-        #if os(iOS)
-        bubble
-            .fullScreenCover(isPresented: $viewerOpen) { viewer }
-        #else
-        bubble
-            .sheet(isPresented: $viewerOpen) {
-                viewer.frame(minWidth: 620, minHeight: 520)
+        Group {
+            #if os(iOS)
+            bubble
+                .fullScreenCover(isPresented: $viewerOpen) { viewer }
+                .quickLookPreview($nativePreviewURL)
+            #else
+            bubble
+                .sheet(isPresented: $viewerOpen) {
+                    viewer.frame(minWidth: 620, minHeight: 520)
+                }
+                .quickLookPreview($nativePreviewURL)
+            #endif
+        }
+            .onChange(of: nativePreviewURL) { url in
+                if url == nil { cleanupNativePreview() }
             }
-        #endif
+            .onDisappear { cleanupNativePreview() }
     }
 
     @ViewBuilder private var viewer: some View {
         if isDeck {
-            SNMediaGalleryViewer(items: m.media, startIndex: viewerIndex, caption: m.text, load: load)
+            SNMediaGalleryViewer(
+                items: m.media,
+                startIndex: viewerIndex,
+                caption: m.text,
+                load: pipeline.loadLocal
+            )
         } else if let item {
-            SNMediaViewer(item: item, caption: m.text, initialBytes: bytes, load: load)
+            SNMediaViewer(item: item, caption: m.text, initialBytes: bytes, load: pipeline.loadLocal)
         }
     }
 
@@ -1139,20 +1210,20 @@ struct SNMediaBubble: View {
         }
         .padding(.horizontal, 2)
         .padding(.top, 7)
+        .task(id: prepareKey) {
+            guard !isDeck, let item else { return }
+            pipeline.prepare(item, item.isImage || item.mime.hasPrefix("audio/"))
+        }
         .task(id: loadKey) {
             bytes = nil
             failed = false
             // A deck loads each card's bytes itself (lazy, only visible pages),
             // so the bubble skips the single-item load path.
             guard !isDeck, let item else { return }
-            // Generic documents follow Signal's lazy path: don't download and
-            // decrypt up to 25 MiB merely because their transcript row appeared.
-            guard item.isImage || item.mime.hasPrefix("audio/") else { return }
-            guard let load else {
-                failed = true
-                return
-            }
-            if let d = await load(item) {
+            let transfer = pipeline.state(item)
+            failed = transfer.phase == .failed
+            guard transfer.phase == .available else { return }
+            if let d = await pipeline.loadLocal(item) {
                 bytes = d
                 snLogRecoveredUndecodableImage(item, bytes: d)
             } else {
@@ -1163,7 +1234,7 @@ struct SNMediaBubble: View {
 
     @ViewBuilder private var content: some View {
         if isDeck {
-            SNMediaDeck(items: m.media, maxBubbleWidth: maxBubbleWidth, load: load) { idx in
+            SNMediaDeck(items: m.media, maxBubbleWidth: maxBubbleWidth, pipeline: pipeline) { idx in
                 viewerIndex = idx
                 viewerOpen = true
             }
@@ -1204,13 +1275,26 @@ struct SNMediaBubble: View {
                                     .font(SonarTheme.uiFont(size: 12))
                                     .foregroundColor(SonarTheme.text3)
                                 Button {
-                                    loadAttempt += 1
+                                    if pipeline.state(item).phase == .failed {
+                                        pipeline.request(item)
+                                    } else {
+                                        loadAttempt += 1
+                                    }
                                 } label: {
                                     Text(verbatim: "Retry")
                                         .font(SonarTheme.uiFont(size: 12, weight: .semibold))
                                         .foregroundColor(SonarTheme.accent)
                                 }
                                 .buttonStyle(.plain)
+                            }
+                        } else if pipeline.state(item).phase == .notDownloaded {
+                            VStack(spacing: 6) {
+                                Image(systemName: "arrow.down.circle")
+                                    .font(.system(size: 24, weight: .medium))
+                                    .foregroundColor(SonarTheme.accent)
+                                Text(verbatim: "Tap to download")
+                                    .font(SonarTheme.uiFont(size: 11.5, weight: .semibold))
+                                    .foregroundColor(SonarTheme.text3)
                             }
                         } else {
                             ProgressView()
@@ -1222,17 +1306,26 @@ struct SNMediaBubble: View {
                         }
                     }
                     .contentShape(RoundedRectangle(cornerRadius: 18))
-                    .onTapGesture { viewerOpen = true }
+                    .onTapGesture { handleTap(item) }
             }
         } else if let item, item.mime.hasPrefix("audio/") {
-            SNAudioBubble(bytes: bytes, seed: item.filename, mine: m.mine, via: m.via ?? .mesh)
+            SNAudioBubble(
+                bytes: bytes,
+                seed: item.filename,
+                mine: m.mine,
+                via: m.via ?? .mesh,
+                transfer: pipeline.state(item),
+                onRequest: { pipeline.request(item) },
+                onCancel: { pipeline.cancel(item) }
+            )
         } else if let item {
             fileChip(for: item)
         }
     }
 
     private func fileChip(for item: SNMediaItem) -> some View {
-        HStack(spacing: 10) {
+        let transfer = pipeline.state(item)
+        return HStack(spacing: 10) {
             RoundedRectangle(cornerRadius: 8)
                 .fill(SonarTheme.accent.opacity(0.18))
                 .frame(width: 34, height: 34)
@@ -1242,17 +1335,99 @@ struct SNMediaBubble: View {
                     .font(SonarTheme.uiFont(size: 13.5, weight: .semibold))
                     .foregroundColor(SonarTheme.text)
                     .lineLimit(1)
-                Text(verbatim: item.mime)
+                Text(verbatim: transferLabel(transfer, fallback: item.mime))
                     .font(SonarTheme.uiFont(size: 11))
                     .foregroundColor(SonarTheme.text3)
             }
+            Spacer(minLength: 6)
+            transferIndicator(transfer)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 9)
         .frame(maxWidth: maxBubbleWidth, alignment: .leading)
         .background(RoundedRectangle(cornerRadius: 14).fill(SonarTheme.surface2))
         .contentShape(RoundedRectangle(cornerRadius: 14))
-        .onTapGesture { viewerOpen = true }
+        .onTapGesture { handleTap(item) }
+    }
+
+    @ViewBuilder
+    private func transferIndicator(_ transfer: SNMediaTransferState) -> some View {
+        switch transfer.phase {
+        case .notDownloaded:
+            Image(systemName: "arrow.down.circle")
+                .foregroundColor(SonarTheme.accent)
+        case .downloading:
+            ZStack {
+                if let progress = transfer.progress {
+                    Circle().stroke(SonarTheme.text3.opacity(0.25), lineWidth: 2)
+                    Circle()
+                        .trim(from: 0, to: progress)
+                        .stroke(SonarTheme.accent, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                        .rotationEffect(.degrees(-90))
+                } else {
+                    ProgressView().controlSize(.small)
+                }
+                Image(systemName: "xmark")
+                    .font(.system(size: 7, weight: .bold))
+                    .foregroundColor(SonarTheme.text2)
+            }
+            .frame(width: 22, height: 22)
+        case .available:
+            Image(systemName: "arrow.up.right.square")
+                .foregroundColor(SonarTheme.accent)
+        case .failed:
+            Image(systemName: "exclamationmark.circle")
+                .foregroundColor(.red)
+        }
+    }
+
+    private func transferLabel(_ transfer: SNMediaTransferState, fallback: String) -> String {
+        switch transfer.phase {
+        case .notDownloaded: return "Tap to download"
+        case .downloading:
+            if let progress = transfer.progress { return "Downloading \(Int(progress * 100))%"
+            }
+            return "Downloading"
+        case .available: return fallback
+        case .failed: return "Download failed · tap to retry"
+        }
+    }
+
+    private func handleTap(_ item: SNMediaItem) {
+        switch pipeline.state(item).phase {
+        case .notDownloaded, .failed:
+            pipeline.request(item)
+        case .downloading:
+            pipeline.cancel(item)
+        case .available:
+            if item.isImage {
+                viewerOpen = true
+            } else {
+                openNativePreview(item)
+            }
+        }
+    }
+
+    private func openNativePreview(_ item: SNMediaItem) {
+        guard let sourceURL = pipeline.state(item).localURL else { return }
+        let filename = item.filename
+        Task { @MainActor in
+            let staged = await Task.detached(priority: .userInitiated) {
+                snStageAttachmentPreview(sourceURL: sourceURL, filename: filename)
+            }.value
+            guard let staged else { return }
+            cleanupNativePreview()
+            nativePreviewDirectory = staged.directoryURL
+            nativePreviewURL = staged.fileURL
+        }
+    }
+
+    private func cleanupNativePreview() {
+        if let nativePreviewDirectory {
+            try? FileManager.default.removeItem(at: nativePreviewDirectory)
+        }
+        nativePreviewURL = nil
+        nativePreviewDirectory = nil
     }
 }
 
@@ -1266,14 +1441,26 @@ private struct SNMediaCardImage: View {
     let width: CGFloat
     let height: CGFloat
     var dim: Double = 0
-    var load: ((SNMediaItem) async -> Data?)?
+    var pipeline: SNMediaPipeline
 
     @State private var bytes: Data?
     @State private var failed = false
     @State private var loadAttempt = 0
 
+    private var prepareKey: String {
+        [item.url, item.groupId, item.localPath ?? ""].joined(separator: "|")
+    }
+
     private var loadKey: String {
-        [item.url, item.groupId, item.localPath ?? "", String(loadAttempt)].joined(separator: "|")
+        let transfer = pipeline.state(item)
+        return [
+            item.url,
+            item.groupId,
+            item.localPath ?? "",
+            String(loadAttempt),
+            String(describing: transfer.phase),
+            transfer.localURL?.path ?? ""
+        ].joined(separator: "|")
     }
 
     var body: some View {
@@ -1289,14 +1476,15 @@ private struct SNMediaCardImage: View {
                 RoundedRectangle(cornerRadius: 18)
                     .fill(Color.black.opacity(dim))
             )
+            .task(id: prepareKey) {
+                pipeline.prepare(item, true)
+            }
             .task(id: loadKey) {
                 bytes = nil
-                failed = false
-                guard let load else {
-                    failed = true
-                    return
-                }
-                if let d = await load(item) {
+                let transfer = pipeline.state(item)
+                failed = transfer.phase == .failed
+                guard transfer.phase == .available else { return }
+                if let d = await pipeline.loadLocal(item) {
                     bytes = d
                 } else {
                     failed = true
@@ -1326,13 +1514,21 @@ private struct SNMediaCardImage: View {
                 .overlay {
                     if failed, dim == 0 {
                         Button {
-                            loadAttempt += 1
+                            if pipeline.state(item).phase == .failed {
+                                pipeline.request(item)
+                            } else {
+                                loadAttempt += 1
+                            }
                         } label: {
                             Text(verbatim: "Retry")
                                 .font(SonarTheme.uiFont(size: 12, weight: .semibold))
                                 .foregroundColor(SonarTheme.accent)
                         }
                         .buttonStyle(.plain)
+                    } else if pipeline.state(item).phase == .notDownloaded, dim == 0 {
+                        Image(systemName: "arrow.down.circle")
+                            .font(.system(size: 24, weight: .medium))
+                            .foregroundColor(SonarTheme.accent)
                     } else if !failed {
                         ProgressView()
                     }
@@ -1369,7 +1565,7 @@ private struct SNMediaCardImage: View {
 private struct SNMediaDeck: View {
     let items: [SNMediaItem]
     let maxBubbleWidth: CGFloat
-    var load: ((SNMediaItem) async -> Data?)?
+    var pipeline: SNMediaPipeline
     var onOpen: (Int) -> Void
 
     @State private var index = 0
@@ -1397,14 +1593,14 @@ private struct SNMediaDeck: View {
                         width: cardW,
                         height: cardH,
                         dim: 0.12 + 0.10 * Double(depth),
-                        load: load
+                        pipeline: pipeline
                     )
                     .scaleEffect(1 - CGFloat(depth) * 0.03, anchor: .topLeading)
                     .offset(x: CGFloat(depth) * 12, y: CGFloat(depth) * 9)
                     .shadow(color: Color.black.opacity(0.10), radius: 4, x: 0, y: 2)
                     .allowsHitTesting(false)
                 }
-                SNMediaCardImage(item: items[current], width: cardW, height: cardH, load: load)
+                SNMediaCardImage(item: items[current], width: cardW, height: cardH, pipeline: pipeline)
                     .id(current)
                     // Directional slide: outgoing card exits toward the drag,
                     // incoming enters from the opposite edge. Only animated
@@ -1419,7 +1615,7 @@ private struct SNMediaDeck: View {
                     .shadow(color: Color.black.opacity(0.14), radius: 6, x: 0, y: 3)
                     .offset(x: dragX)
                     .contentShape(RoundedRectangle(cornerRadius: 18))
-                    .onTapGesture { onOpen(current) }
+                    .onTapGesture { handleTap(current) }
                     .gesture(
                         DragGesture(minimumDistance: 12)
                             .updating($dragX) { value, state, _ in state = value.translation.width }
@@ -1453,6 +1649,18 @@ private struct SNMediaDeck: View {
         let remaining = count - 1 - current
         let visible = min(2, max(0, remaining))
         return visible == 0 ? [] : Array(1...visible)
+    }
+
+    private func handleTap(_ index: Int) {
+        let item = items[index]
+        switch pipeline.state(item).phase {
+        case .notDownloaded, .failed:
+            pipeline.request(item)
+        case .downloading:
+            pipeline.cancel(item)
+        case .available:
+            onOpen(index)
+        }
     }
 }
 
@@ -2163,6 +2371,9 @@ struct SNAudioBubble: View {
     let seed: String
     let mine: Bool
     var via: SNVia = .mesh
+    var transfer: SNMediaTransferState = .notDownloaded
+    var onRequest: () -> Void = {}
+    var onCancel: () -> Void = {}
 
     @StateObject private var player = SNAudioPlayer()
 
@@ -2171,15 +2382,18 @@ struct SNAudioBubble: View {
     var body: some View {
         HStack(spacing: 11) {
             Button {
-                player.toggle(bytes)
+                switch transfer.phase {
+                case .notDownloaded, .failed:
+                    onRequest()
+                case .downloading:
+                    onCancel()
+                case .available:
+                    player.toggle(bytes)
+                }
             } label: {
                 Circle().fill(mine ? tint : SonarTheme.surface)
                     .frame(width: 34, height: 34)
-                    .overlay(
-                        Image(systemName: isPlaying ? "pause.fill" : "play.fill")
-                            .font(.system(size: 13, weight: .bold))
-                            .foregroundColor(mine ? (via == .internet ? SonarTheme.onNet : SonarTheme.onAccent) : SonarTheme.accent)
-                    )
+                    .overlay { audioControl }
             }
             .buttonStyle(SNScaleStyle(scale: 0.92))
             SNMediaWave(seed: seed).frame(width: 124, height: 22)
@@ -2194,6 +2408,42 @@ struct SNAudioBubble: View {
 
     private var isPlaying: Bool { player.playing }
     private var durationText: String { snFmtDur(Int(player.duration.rounded())) }
+
+    @ViewBuilder private var audioControl: some View {
+        let color = mine
+            ? (via == .internet ? SonarTheme.onNet : SonarTheme.onAccent)
+            : SonarTheme.accent
+        switch transfer.phase {
+        case .notDownloaded:
+            Image(systemName: "arrow.down")
+                .font(.system(size: 13, weight: .bold))
+                .foregroundColor(color)
+        case .downloading:
+            ZStack {
+                if let progress = transfer.progress {
+                    Circle().stroke(color.opacity(0.28), lineWidth: 2)
+                    Circle()
+                        .trim(from: 0, to: progress)
+                        .stroke(color, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                        .rotationEffect(.degrees(-90))
+                } else {
+                    ProgressView().controlSize(.small).tint(color)
+                }
+                Image(systemName: "xmark")
+                    .font(.system(size: 7, weight: .bold))
+                    .foregroundColor(color)
+            }
+            .padding(5)
+        case .available:
+            Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+                .font(.system(size: 13, weight: .bold))
+                .foregroundColor(color)
+        case .failed:
+            Image(systemName: "arrow.clockwise")
+                .font(.system(size: 13, weight: .bold))
+                .foregroundColor(color)
+        }
+    }
 }
 
 /// Static waveform (design: `MediaWave` — deterministic hash bars).

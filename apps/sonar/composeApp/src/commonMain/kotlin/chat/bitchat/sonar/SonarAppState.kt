@@ -21,6 +21,7 @@ import chat.bitchat.sonar.wallet.WalletState
 import chat.bitchat.sonar.wallet.mergeWalletActivity
 import chat.bitchat.sonar.wallet.paymentDestinationHash
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
@@ -624,6 +625,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             presenceByGeohash = emptyMap()
             payLedger = SonarPayLedger(); payVersion++
             PaymentActivityStore.wipe() // iOS wipes both payment ledgers together
+            cancelAllMediaDownloads(); MediaCache.wipe()
             mediaCache.clear(); stickerPackCache.clear(); stickerImageCache.clear(); installedPackCoordinates.clear()
             callLogs.clear(); callVersion++
             resetCallState()
@@ -671,6 +673,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             // iOS eraseChatsKeepIdentity also wipes the activity ledger.
             payLedger = SonarPayLedger(); persistPay(); payVersion++
             PaymentActivityStore.wipe()
+            cancelAllMediaDownloads(); MediaCache.wipe()
             mediaCache.clear(); stickerPackCache.clear(); stickerImageCache.clear(); installedPackCoordinates.clear()
             callLogs.clear(); callVersion++
             lastSeenTs.clear(); lastNotifiedTs.clear(); seededSeen = false
@@ -2616,6 +2619,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 lastWnGroups = -1; lastWnMsgs = -1
                 payLedger = SonarPayLedger(); persistPay(); payVersion++
                 PaymentActivityStore.wipe()
+                cancelAllMediaDownloads(); MediaCache.wipe()
                 mediaCache.clear(); stickerPackCache.clear(); stickerImageCache.clear(); installedPackCoordinates.clear()
                 callLogs.clear(); callVersion++
 
@@ -4334,6 +4338,11 @@ class SonarAppState(private val scope: CoroutineScope) {
     // ── Media (White Noise / Marmot MIP-04) ──
     /** Decrypted-media cache (raw bytes), keyed by the ciphertext's Blossom URL. */
     private val mediaCache = mutableMapOf<String, ByteArray>()
+    private var mediaTransfers by mutableStateOf<Map<String, MediaTransferState>>(emptyMap())
+    private val mediaDownloadJobs = mutableMapOf<String, Job>()
+    private val mediaDownloadControls = mutableMapOf<String, MediaDownloadControl>()
+    private val mediaDownloadGenerations = mutableMapOf<String, Long>()
+    private var nextMediaDownloadGeneration = 0L
     private val stickerPackCache = linkedMapOf<String, SonarStickerPack>()
     private val stickerImageCache = linkedMapOf<String, ByteArray>()
     private val installedPackCoordinates = mutableSetOf<String>()
@@ -4893,22 +4902,129 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
-    /** Download + decrypt a media attachment, cached by URL. */
+    fun mediaTransferState(media: SonarMedia): MediaTransferState =
+        mediaTransfers[media.url] ?: MediaTransferState.NotDownloaded
+
+    /** Check persistent state off-main, then optionally apply media auto-download
+     * policy. Documents and videos pass false and remain tap-to-download. */
+    fun prepareMedia(chatId: String, media: SonarMedia, autoDownload: Boolean) {
+        val key = media.url
+        if (mediaTransfers[key]?.phase == MediaTransferPhase.Downloading) return
+        scope.launch {
+            val finalPath = MediaCache.finalPath(key)
+            if (MediaCache.exists(finalPath)) {
+                setMediaTransfer(key, MediaTransferState.available(finalPath))
+            } else if (autoDownload || mediaCache[key] != null) {
+                requestMediaDownload(chatId, media)
+            }
+        }
+    }
+
+    fun requestMediaDownload(chatId: String, media: SonarMedia) {
+        val key = media.url
+        if (mediaDownloadJobs[key]?.isActive == true) return
+        val generation = ++nextMediaDownloadGeneration
+        val finalPath = MediaCache.finalPath(key)
+        val partialPath = MediaCache.partialPath(key, generation.toString())
+        mediaDownloadGenerations[key] = generation
+        setMediaTransfer(key, MediaTransferState.downloading(null))
+
+        val control = MediaDownloadControl { received, total ->
+            scope.launch {
+                if (mediaDownloadGenerations[key] != generation) return@launch
+                val progress = total?.takeIf { it > 0uL }?.let {
+                    (received.toDouble() / it.toDouble()).toFloat().coerceIn(0f, 1f)
+                }
+                setMediaTransfer(key, MediaTransferState.downloading(progress))
+            }
+        }
+        mediaDownloadControls[key] = control
+
+        mediaDownloadJobs[key] = scope.launch {
+            var succeeded = false
+            try {
+                MediaCache.prepare()
+                if (MediaCache.exists(finalPath)) {
+                    succeeded = true
+                } else {
+                    val cached = mediaCache[key]
+                    val wrotePartial = when {
+                        cached != null -> MediaCache.write(partialPath, cached)
+                        key.startsWith(MESH_MEDIA_URL_PREFIX) -> {
+                            val bytes = MessageStore.loadMeshMedia(key)
+                            bytes != null && MediaCache.write(partialPath, bytes)
+                        }
+                        else -> {
+                            val groupId = resolveMarmotGroupId(chatId)
+                                ?: throw IllegalStateException("attachment has no secure media route")
+                            SonarCore.fetchMediaToFile(groupId, key, partialPath, control)
+                            true
+                        }
+                    }
+                    if (!wrotePartial) throw IllegalStateException("could not write attachment cache")
+                    if (control.isCancelled()) throw CancellationException("media download cancelled")
+                    succeeded = MediaCache.promote(partialPath, finalPath)
+                    if (!succeeded) throw IllegalStateException("could not finalize attachment cache")
+                }
+                if (mediaDownloadGenerations[key] == generation) {
+                    setMediaTransfer(key, MediaTransferState.available(finalPath))
+                    mediaCache[key]?.takeIf { it.size > 1024 * 1024 }?.let { mediaCache.remove(key) }
+                }
+            } catch (_: CancellationException) {
+                if (mediaDownloadGenerations[key] == generation) {
+                    setMediaTransfer(key, MediaTransferState.NotDownloaded)
+                }
+            } catch (_: Throwable) {
+                if (mediaDownloadGenerations[key] == generation) {
+                    setMediaTransfer(
+                        key,
+                        if (control.isCancelled()) MediaTransferState.NotDownloaded else MediaTransferState.Failed,
+                    )
+                }
+            } finally {
+                withContext(NonCancellable) {
+                    if (!succeeded) MediaCache.remove(partialPath)
+                }
+                if (mediaDownloadGenerations[key] == generation) {
+                    mediaDownloadJobs.remove(key)
+                    mediaDownloadControls.remove(key)
+                    mediaDownloadGenerations.remove(key)
+                }
+            }
+        }
+    }
+
+    fun cancelMediaDownload(media: SonarMedia) {
+        val key = media.url
+        mediaDownloadControls.remove(key)?.cancel()
+        mediaDownloadJobs.remove(key)?.cancel()
+        mediaDownloadGenerations.remove(key)
+        setMediaTransfer(key, MediaTransferState.NotDownloaded)
+    }
+
+    private fun setMediaTransfer(key: String, state: MediaTransferState) {
+        if (mediaTransfers[key] == state) return
+        mediaTransfers = mediaTransfers + (key to state)
+    }
+
+    private fun cancelAllMediaDownloads() {
+        mediaDownloadControls.values.forEach(MediaDownloadControl::cancel)
+        mediaDownloadJobs.values.forEach(Job::cancel)
+        mediaDownloadControls.clear()
+        mediaDownloadJobs.clear()
+        mediaDownloadGenerations.clear()
+        mediaTransfers = emptyMap()
+    }
+
+    /** Read an already-local attachment for image decode or voice playback.
+     * This function deliberately never starts network work. */
     suspend fun mediaData(chatId: String, media: SonarMedia): ByteArray? {
         mediaCache[media.url]?.let { return it }
-        if (media.url.startsWith(MESH_MEDIA_URL_PREFIX)) {
-            val bytes = MessageStore.loadMeshMedia(media.url) ?: return null
-            mediaCache[media.url] = bytes
-            return bytes
-        }
-        val groupId = resolveMarmotGroupId(chatId) ?: return null
-        return try {
-            val bytes = SonarCore.fetchMedia(groupId, media.url)
-            mediaCache[media.url] = bytes
-            bytes
-        } catch (e: Throwable) {
-            null
-        }
+        val path = mediaTransfers[media.url]?.localPath ?: MediaCache.finalPath(media.url)
+        if (!MediaCache.exists(path)) return null
+        val bytes = MediaCache.read(path) ?: return null
+        if (bytes.size <= 1024 * 1024) mediaCache[media.url] = bytes
+        return bytes
     }
 
     /** Auto-pick the transport for a radar-peer DM (mirrors iOS `sendDm`): a live

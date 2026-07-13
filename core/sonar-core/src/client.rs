@@ -71,6 +71,8 @@ pub struct MediaUpload {
 const MAX_MEDIA_DOWNLOAD_BYTES: usize = 25 * 1024 * 1024;
 const MEDIA_DOWNLOAD_ATTEMPTS: usize = 3;
 const MEDIA_DOWNLOAD_RETRY_DELAY: Duration = Duration::from_millis(350);
+const MEDIA_DOWNLOAD_CANCEL_POLL: Duration = Duration::from_millis(100);
+const MEDIA_DOWNLOAD_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 const SONAR_DIRECT_DM_DESCRIPTION: &str = "sonar.direct-dm.v1";
 
 /// Shared HTTP client for Blossom media downloads. Built once so every blob
@@ -92,48 +94,107 @@ static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
 /// schemes) and stream with a hard size cap (no memory-DoS from a server that
 /// lies about / omits Content-Length). Integrity is still verified afterwards by
 /// `decrypt_from_download` (AEAD + original-hash check).
-async fn http_get(url: &str) -> Result<Vec<u8>> {
+/// Host-facing progress/cancellation hook for an attachment transfer. The
+/// callback must be cheap: downloads invoke it from a Rust runtime worker.
+pub trait MediaDownloadObserver: Send + Sync {
+    fn on_progress(&self, bytes_received: u64, total_bytes: Option<u64>);
+    fn is_cancelled(&self) -> bool;
+}
+
+fn media_download_cancelled(observer: Option<&dyn MediaDownloadObserver>) -> bool {
+    observer.is_some_and(MediaDownloadObserver::is_cancelled)
+}
+
+async fn http_get(url: &str, observer: Option<&dyn MediaDownloadObserver>) -> Result<Vec<u8>> {
+    if media_download_cancelled(observer) {
+        return Err(Error::MediaDownloadCancelled);
+    }
     if !url.starts_with("https://") {
         return Err(Error::Http(format!("refusing non-https media url: {url}")));
     }
-    let mut resp = HTTP_CLIENT
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| Error::Http(e.to_string()))?;
+    let send = HTTP_CLIENT.get(url).send();
+    tokio::pin!(send);
+    let mut resp = loop {
+        tokio::select! {
+            result = &mut send => break result.map_err(|e| Error::Http(e.to_string()))?,
+            _ = tokio::time::sleep(MEDIA_DOWNLOAD_CANCEL_POLL) => {
+                if media_download_cancelled(observer) {
+                    return Err(Error::MediaDownloadCancelled);
+                }
+            }
+        }
+    };
     if !resp.status().is_success() {
         return Err(Error::Http(format!("GET {url} -> HTTP {}", resp.status())));
     }
-    if let Some(len) = resp.content_length() {
+    let total = resp.content_length();
+    if let Some(len) = total {
         if len as usize > MAX_MEDIA_DOWNLOAD_BYTES {
             return Err(Error::Http(format!(
                 "media too large: {len} bytes (cap {MAX_MEDIA_DOWNLOAD_BYTES})"
             )));
         }
     }
+    if let Some(observer) = observer {
+        observer.on_progress(0, total);
+    }
     let mut out: Vec<u8> = Vec::new();
-    while let Some(chunk) = resp.chunk().await.map_err(|e| Error::Http(e.to_string()))? {
+    let mut last_progress = Instant::now();
+    loop {
+        let chunk = loop {
+            let next = resp.chunk();
+            tokio::pin!(next);
+            tokio::select! {
+                result = &mut next => break result.map_err(|e| Error::Http(e.to_string()))?,
+                _ = tokio::time::sleep(MEDIA_DOWNLOAD_CANCEL_POLL) => {
+                    if media_download_cancelled(observer) {
+                        return Err(Error::MediaDownloadCancelled);
+                    }
+                }
+            }
+        };
+        let Some(chunk) = chunk else { break };
         if out.len() + chunk.len() > MAX_MEDIA_DOWNLOAD_BYTES {
             return Err(Error::Http("media exceeds size cap".into()));
         }
         out.extend_from_slice(&chunk);
+        if let Some(observer) = observer {
+            let finished = total.is_some_and(|expected| out.len() as u64 >= expected);
+            if finished || last_progress.elapsed() >= MEDIA_DOWNLOAD_PROGRESS_INTERVAL {
+                observer.on_progress(out.len() as u64, total);
+                last_progress = Instant::now();
+            }
+        }
+    }
+    if let Some(observer) = observer {
+        observer.on_progress(out.len() as u64, total.or(Some(out.len() as u64)));
     }
     Ok(out)
 }
 
 /// Download public bytes from an HTTPS URL (for plaintext sticker images).
 pub async fn http_get_public(url: &str) -> Result<Vec<u8>> {
-    http_get_with_retries(url).await
+    http_get_with_retries(url, None).await
 }
 
-async fn http_get_with_retries(url: &str) -> Result<Vec<u8>> {
+async fn http_get_with_retries(
+    url: &str,
+    observer: Option<&dyn MediaDownloadObserver>,
+) -> Result<Vec<u8>> {
     for attempt in 1..=MEDIA_DOWNLOAD_ATTEMPTS {
-        match http_get(url).await {
+        match http_get(url, observer).await {
             Ok(bytes) => return Ok(bytes),
             Err(error)
                 if attempt < MEDIA_DOWNLOAD_ATTEMPTS && retryable_media_http_error(&error) =>
             {
-                tokio::time::sleep(MEDIA_DOWNLOAD_RETRY_DELAY).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(MEDIA_DOWNLOAD_RETRY_DELAY) => {}
+                    _ = async {
+                        while !media_download_cancelled(observer) {
+                            tokio::time::sleep(MEDIA_DOWNLOAD_CANCEL_POLL).await;
+                        }
+                    } => return Err(Error::MediaDownloadCancelled),
+                }
             }
             Err(error) => return Err(error),
         }
@@ -2145,8 +2206,53 @@ impl SonarClient {
     /// Download the encrypted blob at `url` and decrypt it with the group media
     /// key (resolved from the message's imeta tag). Returns plaintext bytes.
     pub async fn fetch_media(&self, group_id: &GroupId, url: &str) -> Result<Vec<u8>> {
-        let ciphertext = http_get_with_retries(url).await?;
+        let ciphertext = http_get_with_retries(url, None).await?;
         self.engine.decrypt_media_by_url(group_id, url, &ciphertext)
+    }
+
+    /// Download, authenticate, and decrypt an attachment into a host-owned
+    /// file. Only the final byte count crosses FFI, keeping large documents and
+    /// videos out of Swift/Kotlin reactive state. The host supplies a unique
+    /// partial path and atomically promotes it into its cache after success.
+    pub async fn fetch_media_to_file(
+        &self,
+        group_id: &GroupId,
+        url: &str,
+        destination: &Path,
+        observer: &dyn MediaDownloadObserver,
+    ) -> Result<u64> {
+        let ciphertext = http_get_with_retries(url, Some(observer)).await?;
+        if observer.is_cancelled() {
+            return Err(Error::MediaDownloadCancelled);
+        }
+        let plaintext = self
+            .engine
+            .decrypt_media_by_url(group_id, url, &ciphertext)?;
+        if observer.is_cancelled() {
+            return Err(Error::MediaDownloadCancelled);
+        }
+        let parent = destination
+            .parent()
+            .ok_or_else(|| Error::InvalidInput("media destination has no parent".into()))?;
+        fs::create_dir_all(parent)
+            .map_err(|error| Error::Storage(format!("create media cache directory: {error}")))?;
+        let mut options = fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(destination)
+            .map_err(|error| Error::Storage(format!("create media cache file: {error}")))?;
+        use std::io::Write as _;
+        if let Err(error) = file.write_all(&plaintext).and_then(|_| file.sync_all()) {
+            drop(file);
+            let _ = fs::remove_file(destination);
+            return Err(Error::Storage(format!("write media cache file: {error}")));
+        }
+        Ok(plaintext.len() as u64)
     }
 
     /// Upload an encrypted blob to a Blossom server (BUD-02), authed with our
@@ -4019,6 +4125,28 @@ fn require_relay_success(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct CancelledDownload;
+
+    impl MediaDownloadObserver for CancelledDownload {
+        fn on_progress(&self, _: u64, _: Option<u64>) {}
+
+        fn is_cancelled(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn media_download_honors_cancellation_before_network_io() {
+        let error = http_get(
+            "https://download.invalid/never-requested",
+            Some(&CancelledDownload),
+        )
+        .await
+        .expect_err("cancelled transfer must fail");
+
+        assert!(matches!(error, Error::MediaDownloadCancelled));
+    }
     use crate::sonar_descriptor::{
         descriptor_content_json, meta_descriptor_content_json, SONAR_CALL_DESCRIPTOR_D_TAG,
     };

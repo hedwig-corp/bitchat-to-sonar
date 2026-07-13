@@ -126,7 +126,13 @@ struct SonarDMScreenContent: View {
                     peerName: peer.name,
                     money: { store.money($0) },
                     fiatText: { store.moneySatsLine($0) },
-                    loadMedia: { await store.mediaData($0) },
+                    mediaPipeline: SNMediaPipeline(
+                        state: { store.mediaTransferState($0) },
+                        prepare: { store.prepareMedia($0, autoDownload: $1) },
+                        request: { store.requestMediaDownload($0) },
+                        cancel: { store.cancelMediaDownload($0) },
+                        loadLocal: { await store.mediaData($0) }
+                    ),
                     loadSticker: { await store.stickerImageData(for: $0) },
                     onTapPack: { previewPackCoordinate = $0 },
                     loadOlder: { await convo.loadOlder() },

@@ -261,7 +261,8 @@ final class MarmotService: @unchecked Sendable {
     /// would stall syncs/sends). The wait touches no MLS state, so this is safe.
     private let waitQueue = DispatchQueue(label: "chat.bitchat.marmot-wait", qos: .utility)
 
-    // Guarded by `workQueue`.
+    // Identity is guarded by `workQueue`; node/relay connection state is
+    // guarded by `nodeLock` so read-only transfers can safely snapshot it.
     private var identity: SonarIdentity?
     private var node: SonarNode?
     private var relayConnected = false
@@ -688,9 +689,29 @@ final class MarmotService: @unchecked Sendable {
         try await run { try $0.requireNode().uninstallStickerPack(coordinate: coordinate) }
     }
 
-    /// Download + decrypt the media blob at `url` for the group. Returns plaintext.
+    /// Download + decrypt the media blob at `url` for the group. This read-only
+    /// operation must never occupy the serialized MLS mutation queue.
     func fetchMedia(groupId: String, url: String) async throws -> Data {
-        try await run { try $0.requireNode().fetchMedia(groupIdHex: groupId, url: url) }
+        try await readOnly { try $0.fetchMedia(groupIdHex: groupId, url: url) }
+    }
+
+    /// File-backed attachment transfer with progress and cancellation. The core
+    /// writes only to the unique partial path supplied by the app; the caller
+    /// atomically promotes it to the persistent cache after this returns.
+    func fetchMediaToFile(
+        groupId: String,
+        url: String,
+        destination: URL,
+        listener: MediaDownloadListener
+    ) async throws -> UInt64 {
+        try await readOnly {
+            try $0.fetchMediaToFile(
+                groupIdHex: groupId,
+                url: url,
+                destinationPath: destination.path,
+                listener: listener
+            )
+        }
     }
 
     /// The user's Blossom server list (kind-10063). Empty if unset.
@@ -1206,11 +1227,14 @@ final class MarmotService: @unchecked Sendable {
     /// from the concurrent queue is safe. This never blocks behind serial
     /// workQueue tasks.
     private let nodeLock = NSLock()
-    private func readOnly<T: Sendable>(_ body: @escaping @Sendable (SonarNode) throws -> T) async throws -> T {
+    private func currentNode() -> SonarNode? {
         nodeLock.lock()
-        let nodeRef = self.node
-        nodeLock.unlock()
-        guard let nodeRef else { throw ServiceError.notConnected }
+        defer { nodeLock.unlock() }
+        return node
+    }
+
+    private func readOnly<T: Sendable>(_ body: @escaping @Sendable (SonarNode) throws -> T) async throws -> T {
+        guard let nodeRef = currentNode() else { throw ServiceError.notConnected }
         return try await withCheckedThrowingContinuation { continuation in
             readQueue.async {
                 do {
@@ -1230,10 +1254,7 @@ final class MarmotService: @unchecked Sendable {
     }
 
     private func readOnlyNonThrowing<T: Sendable>(_ body: @escaping @Sendable (SonarNode) -> T, default defaultValue: T) async -> T {
-        nodeLock.lock()
-        let nodeRef = self.node
-        nodeLock.unlock()
-        guard let nodeRef else { return defaultValue }
+        guard let nodeRef = currentNode() else { return defaultValue }
         return await withCheckedContinuation { continuation in
             readQueue.async {
                 continuation.resume(returning: body(nodeRef))

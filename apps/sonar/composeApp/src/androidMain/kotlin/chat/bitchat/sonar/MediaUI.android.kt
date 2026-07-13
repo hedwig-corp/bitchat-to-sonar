@@ -150,22 +150,23 @@ actual fun rememberMediaActions(): MediaActions {
     }
     return remember(ctx, legacySaver, legacySaveLauncher) {
         MediaActions(
-            share = { bytes, filename, mime -> shareMedia(ctx, bytes, filename, mime) },
-            save = { bytes, filename, mime ->
+            share = { path, filename, mime -> shareMedia(ctx, path, filename, mime) },
+            save = { path, filename, mime ->
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    saveMedia(ctx, bytes, filename, mime)
+                    saveMedia(ctx, path, filename, mime)
                 } else {
-                    legacySaver.save(bytes, filename, mime, legacySaveLauncher)
+                    val bytes = withContext(Dispatchers.IO) { runCatching { File(path).readBytes() }.getOrNull() }
+                    bytes != null && legacySaver.save(bytes, filename, mime, legacySaveLauncher)
                 }
             },
-            open = { bytes, filename, mime -> openMedia(ctx, bytes, filename, mime) },
+            open = { path, filename, mime -> openMedia(ctx, path, filename, mime) },
         )
     }
 }
 
-private suspend fun shareMedia(ctx: Context, bytes: ByteArray, filename: String, mime: String): Boolean {
+private suspend fun shareMedia(ctx: Context, path: String, filename: String, mime: String): Boolean {
     val uri = withContext(Dispatchers.IO) {
-        runCatching { cacheUri(ctx, bytes, filename) }.getOrNull()
+        runCatching { cacheUri(ctx, File(path), filename) }.getOrNull()
     } ?: return false
     val intent = Intent(Intent.ACTION_SEND).apply {
         type = mime
@@ -180,9 +181,9 @@ private suspend fun shareMedia(ctx: Context, bytes: ByteArray, filename: String,
     }
 }
 
-private suspend fun openMedia(ctx: Context, bytes: ByteArray, filename: String, mime: String): Boolean {
+private suspend fun openMedia(ctx: Context, path: String, filename: String, mime: String): Boolean {
     val uri = withContext(Dispatchers.IO) {
-        runCatching { cacheUri(ctx, bytes, filename) }.getOrNull()
+        runCatching { cacheUri(ctx, File(path), filename) }.getOrNull()
     } ?: return false
     val intent = Intent(Intent.ACTION_VIEW).apply {
         setDataAndType(uri, mime)
@@ -196,14 +197,14 @@ private suspend fun openMedia(ctx: Context, bytes: ByteArray, filename: String, 
     }
 }
 
-private suspend fun saveMedia(ctx: Context, bytes: ByteArray, filename: String, mime: String): Boolean =
+private suspend fun saveMedia(ctx: Context, path: String, filename: String, mime: String): Boolean =
     withContext(Dispatchers.IO) {
         runCatching {
-            saveMediaStore(ctx, bytes, filename, mime)
+            saveMediaStore(ctx, File(path), filename, mime)
         }.getOrDefault(false)
     }
 
-private fun saveMediaStore(ctx: Context, bytes: ByteArray, filename: String, mime: String): Boolean {
+private fun saveMediaStore(ctx: Context, source: File, filename: String, mime: String): Boolean {
     val resolver = ctx.contentResolver
     val safeName = safeFilename(filename)
     val collection: Uri
@@ -234,7 +235,7 @@ private fun saveMediaStore(ctx: Context, bytes: ByteArray, filename: String, mim
             resolver.delete(uri, null, null)
             return false
         }
-        output.use { it.write(bytes) }
+        output.use { destination -> source.inputStream().use { it.copyTo(destination) } }
         values.clear()
         values.put(MediaStore.MediaColumns.IS_PENDING, 0)
         resolver.update(uri, values, null, null)
@@ -245,7 +246,7 @@ private fun saveMediaStore(ctx: Context, bytes: ByteArray, filename: String, mim
     }
 }
 
-private fun cacheUri(ctx: Context, bytes: ByteArray, filename: String): Uri? {
+private fun cacheUri(ctx: Context, source: File, filename: String): Uri? {
     val dir = File(ctx.cacheDir, "media-share").apply { mkdirs() }
     val now = System.currentTimeMillis()
     dir.listFiles()?.forEach { file ->
@@ -254,7 +255,7 @@ private fun cacheUri(ctx: Context, bytes: ByteArray, filename: String): Uri? {
         }
     }
     val file = File(dir, "${UUID.randomUUID()}-${safeFilename(filename)}")
-    file.writeBytes(bytes)
+    source.copyTo(file, overwrite = false)
     return FileProvider.getUriForFile(ctx, "${ctx.packageName}.fileprovider", file)
 }
 
