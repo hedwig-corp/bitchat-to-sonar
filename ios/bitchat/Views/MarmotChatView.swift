@@ -206,6 +206,7 @@ final class MarmotChatModel: ObservableObject {
     @Published var groups: [MarmotService.MarmotGroup] = []
     @Published var pendingGroupInvites: [MarmotService.GroupInvite] = []
     @Published var pendingDirectChats: [String: Date] = [:]
+    private var directChatSetupTasks: [String: (token: UUID, task: Task<String?, Never>)] = [:]
     @Published var messagesByGroup: [String: [MarmotService.MarmotMessage]] = [:]
     /// Core-owned row metadata for every conversation. Kept separate from
     /// transcript pages so summary placeholders never render as chat bubbles.
@@ -1189,28 +1190,49 @@ final class MarmotChatModel: ObservableObject {
         let clean = SNMarmotProfileCache.canonicalKey(trimmed)
         guard !clean.isEmpty else { return }
         if directGroup(forNpub: clean) != nil { return }
-        if pendingDirectChats[clean] != nil { return }
-        pendingDirectChats[clean] = Date()
         ensureProfile(clean)
         ensureSonarDescriptor(clean)
         Task {
             _ = await startChatReturningId(with: clean)
-            pendingDirectChats[clean] = nil
         }
     }
 
     func startChatReturningId(with peer: String) async -> String? {
         let trimmed = peer.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
-        if let existing = directGroup(forNpub: trimmed) {
+        let clean = SNMarmotProfileCache.canonicalKey(trimmed)
+        guard !clean.isEmpty else { return nil }
+        if let existing = directGroup(forNpub: clean) {
             return existing.id
         }
+        if let existingSetup = directChatSetupTasks[clean] {
+            return await existingSetup.task.value
+        }
+
+        pendingDirectChats[clean] = Date()
+        let setupToken = UUID()
+        let setupTask = Task { @MainActor [weak self] in
+            await self?.performDirectChatSetup(with: clean)
+        }
+        directChatSetupTasks[clean] = (setupToken, setupTask)
+        let groupId = await setupTask.value
+        if directChatSetupTasks[clean]?.token == setupToken {
+            directChatSetupTasks[clean] = nil
+            pendingDirectChats[clean] = nil
+        }
+        return groupId
+    }
+
+    private func performDirectChatSetup(with npub: String) async -> String? {
         guard await ensureRelayConnected() else {
             self.errorText = "Not connected yet — try again in a moment."
             return nil
         }
+        if let existing = directGroup(forNpub: npub) {
+            return existing.id
+        }
         do {
-            let groupId = try await service.startDirectMessage(with: trimmed, name: "")
+            let groupId = try await service.startDirectMessage(with: npub, name: "")
             await loadLocalPage(groupId: groupId)
             Task { [weak self] in
                 await self?.refreshWhenConnected(groupId: groupId, hydrateBeforeSync: false)

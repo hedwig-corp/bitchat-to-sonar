@@ -496,6 +496,10 @@ private enum MacConversationMode: Hashable {
     case dm(String)
 }
 
+func snAcceptsMacFileDrop(isChannel: Bool, urls: [URL]) -> Bool {
+    !isChannel && urls.contains(where: \.isFileURL)
+}
+
 private let macMaxDroppedAttachments = 10
 
 private struct MacImportedAttachment: Sendable {
@@ -747,13 +751,11 @@ private struct MacConversationPane: View {
             importAttachments(result)
         }
         .dropDestination(for: URL.self) { urls, _ in
-            guard !isChannel,
-                  store.canSendMedia(id),
-                  urls.contains(where: \.isFileURL) else { return false }
+            guard snAcceptsMacFileDrop(isChannel: isChannel, urls: urls) else { return false }
             importAttachments(.success(urls))
             return true
         } isTargeted: { targeted in
-            fileDropTargeted = targeted && !isChannel && store.canSendMedia(id)
+            fileDropTargeted = targeted && !isChannel
         }
         .onChange(of: addPeopleSheet) { open in
             if !open {
@@ -939,7 +941,7 @@ private struct MacConversationPane: View {
                     openPaySheetOrWallet()
                 }
             }
-            if !isChannel, store.canSendMedia(id) {
+            if !isChannel, store.canPrepareMedia(id) {
                 SNActionRow(icon: .drive, label: "Send photo, video, or audio", desc: "Encrypted end-to-end") {
                     actionSheet = false
                     importMedia = true
@@ -1157,8 +1159,28 @@ private struct MacConversationPane: View {
                 let result = await Task.detached(priority: .userInitiated) {
                     readMacAttachments(urls, maxTotalBytes: limit)
                 }.value
-                guard attachmentImportGeneration == generation,
-                      store.canSendMedia(conversationID) else { return }
+                guard attachmentImportGeneration == generation else { return }
+                guard !result.attachments.isEmpty else {
+                    if result.oversizedCount > 0 {
+                        showToast("File is too large")
+                    } else {
+                        showToast("Couldn't attach that file")
+                    }
+                    return
+                }
+                switch await store.prepareMediaRoute(conversationID) {
+                case .ready:
+                    break
+                case .unavailable:
+                    guard attachmentImportGeneration == generation else { return }
+                    showToast("This contact must be online to receive files")
+                    return
+                case .failed:
+                    guard attachmentImportGeneration == generation else { return }
+                    showToast("Couldn't set up a secure file transfer")
+                    return
+                }
+                guard attachmentImportGeneration == generation else { return }
 
                 var imported = 0
                 var rejected = result.rejectedCount
