@@ -35,12 +35,12 @@ expect fun MediaImage(
 /** Decode decrypted image bytes into a Compose [ImageBitmap] (null on failure). */
 expect fun decodeImageBitmap(bytes: ByteArray): ImageBitmap?
 
-/** Native actions for already-decrypted media bytes. */
+/** Native actions for an already-decrypted private local file. */
 class MediaActions(
     val canShare: Boolean = true,
-    val share: suspend (bytes: ByteArray, filename: String, mime: String) -> Boolean,
-    val save: suspend (bytes: ByteArray, filename: String, mime: String) -> Boolean,
-    val open: suspend (bytes: ByteArray, filename: String, mime: String) -> Boolean,
+    val share: suspend (path: String, filename: String, mime: String) -> Boolean,
+    val save: suspend (path: String, filename: String, mime: String) -> Boolean,
+    val open: suspend (path: String, filename: String, mime: String) -> Boolean,
 )
 
 /** Write [data] to a platform temp file, returning its absolute path. */

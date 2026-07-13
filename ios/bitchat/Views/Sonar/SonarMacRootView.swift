@@ -556,9 +556,14 @@ private func readMacAttachment(_ url: URL, maxBytes: Int) -> MacAttachmentReadRe
         }
         guard data.count <= maxBytes else { return .tooLarge }
         let filename = url.lastPathComponent.isEmpty ? "attachment" : url.lastPathComponent
-        let mime = values?.contentType?.preferredMIMEType
+        let detectedMime = values?.contentType?.preferredMIMEType
             ?? UTType(filenameExtension: url.pathExtension)?.preferredMIMEType
             ?? "application/octet-stream"
+        let mime = snEffectiveAttachmentMime(
+            declaredMime: detectedMime,
+            filename: filename,
+            plaintext: data
+        )
         return .attachment(MacImportedAttachment(data: data, filename: filename, mime: mime))
     } catch {
         return .unreadable
@@ -3591,7 +3596,13 @@ private struct MacDMTranscript: View {
                 peerName: peerName,
                 money: { store.money($0) },
                 fiatText: { store.moneySatsLine($0) },
-                loadMedia: { await store.mediaData($0) },
+                mediaPipeline: SNMediaPipeline(
+                    state: { store.mediaTransferState($0) },
+                    prepare: { store.prepareMedia($0, autoDownload: $1) },
+                    request: { store.requestMediaDownload($0) },
+                    cancel: { store.cancelMediaDownload($0) },
+                    loadLocal: { await store.mediaData($0) }
+                ),
                 loadSticker: { await store.stickerImageData(for: $0) },
                 onTapPack: onTapPack
             )

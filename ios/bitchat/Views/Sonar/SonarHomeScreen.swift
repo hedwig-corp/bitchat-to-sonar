@@ -711,28 +711,39 @@ struct SNConnectivitySheetContent: View {
     @EnvironmentObject private var store: SonarAppStore
     let onClose: () -> Void
 
+    @State private var showRelayStatus = false
+
     var body: some View {
         VStack(spacing: 0) {
-            SNSettingsRow(
-                icon: .globe,
-                tone: store.online ? .cyan : .neutral,
-                label: "Internet",
-                sub: store.connectedRelaySummary,
-                value: store.online ? "Online" : "Offline",
-                trail: .none
-            ) {}
-            SNSettingsRow(
-                icon: .mesh,
-                tone: .cyan,
-                label: "Bluetooth mesh",
-                sub: "\(store.meshCount) people in range",
-                trail: .none,
-                divider: false
-            ) {}
-            VStack(spacing: 6) {
-                SNGhostButton(label: "Done", action: onClose)
+            if showRelayStatus {
+                SNRelayStatusSheetContent(onClose: {
+                    // Back to the compact connection summary, not all the way out.
+                    showRelayStatus = false
+                })
+            } else {
+                SNSettingsRow(
+                    icon: .globe,
+                    tone: store.online ? .cyan : .neutral,
+                    label: "Internet",
+                    sub: store.connectedRelaySummary,
+                    value: store.online ? "Online" : "Offline",
+                    trail: .chevron
+                ) {
+                    showRelayStatus = true
+                }
+                SNSettingsRow(
+                    icon: .mesh,
+                    tone: .cyan,
+                    label: "Bluetooth mesh",
+                    sub: "\(store.meshCount) people in range",
+                    trail: .none,
+                    divider: false
+                ) {}
+                VStack(spacing: 6) {
+                    SNGhostButton(label: "Done", action: onClose)
+                }
+                .padding(EdgeInsets(top: 6, leading: 8, bottom: 0, trailing: 8))
             }
-            .padding(EdgeInsets(top: 6, leading: 8, bottom: 0, trailing: 8))
         }
     }
 }

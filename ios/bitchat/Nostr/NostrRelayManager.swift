@@ -23,6 +23,10 @@ final class NostrRelayManager: ObservableObject {
         var reconnectAttempts: Int = 0
         var lastDisconnectedAt: Date?
         var nextReconnectTime: Date?
+        /// Last measured WebSocket round-trip (REQ→EOSE) latency, if any.
+        var lastRttMs: Int?
+        var lastRttAt: Date?
+        var lastProbeError: String?
     }
     
     // Default relay list (can be customized)
@@ -33,11 +37,15 @@ final class NostrRelayManager: ObservableObject {
         "wss://offchain.pub",
         "wss://nostr21.com",
         "wss://relay.kaleidoswap.com",
+        "wss://nostr.relay.hedwig.sh",
     ]
     private static let defaultRelaySet = Set(defaultRelays)
     
     @Published private(set) var relays: [Relay] = []
     @Published private(set) var isConnected = false
+    /// Latest benchmark result per canonical relay URL (includes Marmot-only hosts
+    /// that are not always present in `relays`, e.g. nostr.relay.hedwig.sh).
+    @Published private(set) var lastProbeByURL: [String: RelayBenchmarkResult] = [:]
     
     private var allowDefaultRelays: Bool = false
     private var hasMutualFavorites: Bool = false
@@ -720,7 +728,233 @@ final class NostrRelayManager: ObservableObject {
     }
     
     // MARK: - Public Utility Methods
-    
+
+    /// Probe every known relay once and publish RTT / failure into `relays`.
+    /// Prefers already-open sockets (same path the app uses for messaging).
+    /// Safe for UI: bounded timeout, no message content, no key material.
+    @discardableResult
+    func runRelayBenchmarks(timeoutSeconds: TimeInterval = 5.0) async -> [RelayBenchmarkResult] {
+        let urls = relays.map { $0.url }
+        guard !urls.isEmpty else { return [] }
+
+        // Sequential probes on the shared receive loop: parallel REQ/EOSE on one
+        // socket races the single `receiveMessage` pump and drops replies.
+        var results: [RelayBenchmarkResult] = []
+        results.reserveCapacity(urls.count)
+        for url in urls {
+            results.append(await probeRelayLatency(url: url, timeoutSeconds: timeoutSeconds))
+        }
+        return results
+    }
+
+    /// Probe a single relay with a tiny disposable REQ and wait for EOSE.
+    @discardableResult
+    func probeRelayLatency(url: String, timeoutSeconds: TimeInterval = 5.0) async -> RelayBenchmarkResult {
+        let canonical = Self.canonicalRelayURL(url)
+        let started = Date()
+
+        // Ensure the host exists in `relays` so the Connection sheet can bind
+        // RTT even for Marmot-only relays (hedwig) that are not on the bitchat
+        // default list until first connect.
+        if !relays.contains(where: { $0.url == canonical }) {
+            relays.append(Relay(url: canonical))
+        }
+
+        do {
+            let ms = try await measureRelayRoundTrip(url: canonical, timeoutSeconds: timeoutSeconds)
+            if let index = relays.firstIndex(where: { $0.url == canonical }) {
+                // Publish RTT only; leave isConnected to real lifecycle pings so
+                // connect-latency fallbacks do not pretend the messaging socket is live.
+                relays[index].lastRttMs = ms
+                relays[index].lastRttAt = Date()
+                relays[index].lastProbeError = nil
+            }
+            let result = RelayBenchmarkResult(
+                url: canonical,
+                success: true,
+                rttMs: ms,
+                error: nil,
+                measuredAt: Date(),
+                durationMs: Int(Date().timeIntervalSince(started) * 1000)
+            )
+            lastProbeByURL[canonical] = result
+            SecureLogger.info("Relay bench OK \(canonical) rtt=\(ms)ms", category: .session)
+            return result
+        } catch {
+            let message: String
+            if let probeError = error as? RelayProbeError {
+                message = probeError.message
+            } else {
+                message = error.localizedDescription
+            }
+            if let index = relays.firstIndex(where: { $0.url == canonical }) {
+                relays[index].lastProbeError = message
+                relays[index].lastRttAt = Date()
+            }
+            let result = RelayBenchmarkResult(
+                url: canonical,
+                success: false,
+                rttMs: nil,
+                error: message,
+                measuredAt: Date(),
+                durationMs: Int(Date().timeIntervalSince(started) * 1000)
+            )
+            lastProbeByURL[canonical] = result
+            SecureLogger.warning("Relay bench FAIL \(canonical): \(message)", category: .session)
+            return result
+        }
+    }
+
+    private enum RelayProbeError: Error {
+        case timeout
+        case badURL
+        case notConnected
+        case transport(String)
+
+        var message: String {
+            switch self {
+            case .timeout: return "timeout"
+            case .badURL: return "bad url"
+            case .notConnected: return "not connected"
+            case .transport(let s): return s
+            }
+        }
+    }
+
+    /// Measure path quality for a relay.
+    ///
+    /// Primary: REQ→EOSE on the **existing** app socket (Tor-aware, already
+    /// handshaken). This is the only reliable way — a second URLSession receive
+    /// loop on the same or a racing socket drops replies.
+    ///
+    /// Fallback: TCP/TLS connect+ping latency when no live socket exists yet.
+    private func measureRelayRoundTrip(url: String, timeoutSeconds: TimeInterval) async throws -> Int {
+        if let existing = connections[url] {
+            return try await sendProbeOnExistingConnection(
+                url: url,
+                task: existing,
+                timeoutSeconds: timeoutSeconds
+            )
+        }
+
+        // No live socket yet — kick reconnect for later and measure connect RTT.
+        if networkService.activationAllowed {
+            connectToRelay(url)
+        }
+        return try await measureConnectLatency(url: url, timeoutSeconds: timeoutSeconds)
+    }
+
+    /// Send a disposable REQ on an already-open socket and wait for its EOSE
+    /// through the shared `receiveMessage` → `eoseTrackers` path.
+    private func sendProbeOnExistingConnection(
+        url: String,
+        task: URLSessionWebSocketTask,
+        timeoutSeconds: TimeInterval
+    ) async throws -> Int {
+        // Only probe sockets we already consider connected (ping succeeded).
+        let isLive = relays.first(where: { $0.url == url })?.isConnected == true
+        if !isLive {
+            throw RelayProbeError.notConnected
+        }
+
+        let subId = "sonar-bench-\(UUID().uuidString.prefix(8))"
+        // kinds:[0] limit:1 is widely accepted; limit:0 is rejected by some relays.
+        let req = "[\"REQ\",\"\(subId)\",{\"kinds\":[0],\"limit\":1}]"
+        let close = "[\"CLOSE\",\"\(subId)\"]"
+        let started = Date()
+        let gate = RelayProbeResumeGate()
+
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            let timer = Timer(timeInterval: timeoutSeconds, repeats: false) { [weak self] _ in
+                Task { @MainActor in
+                    guard let self else { return }
+                    self.cleanupProbeSubscription(subId)
+                    gate.resume(cont, throwing: RelayProbeError.timeout)
+                }
+            }
+            RunLoop.main.add(timer, forMode: .common)
+
+            eoseTrackers[subId] = EOSETracker(
+                completion: NostrEOSECompletionTracker(relays: [url], requiredRelayCount: 1),
+                callback: { [weak self] in
+                    timer.invalidate()
+                    self?.cleanupProbeSubscription(subId)
+                    gate.resume(cont)
+                },
+                timer: timer
+            )
+            // Handler required by receive path; ignore events for the probe.
+            messageHandlers[subId] = { _ in }
+            var subs = subscriptions[url] ?? Set<String>()
+            subs.insert(subId)
+            subscriptions[url] = subs
+
+            task.send(.string(req)) { [weak self] error in
+                if let error {
+                    Task { @MainActor in
+                        timer.invalidate()
+                        self?.cleanupProbeSubscription(subId)
+                        gate.resume(cont, throwing: RelayProbeError.transport(error.localizedDescription))
+                    }
+                }
+            }
+        }
+
+        task.send(.string(close)) { _ in }
+        return max(1, Int(Date().timeIntervalSince(started) * 1000))
+    }
+
+    private func cleanupProbeSubscription(_ subId: String) {
+        if let tracker = eoseTrackers.removeValue(forKey: subId) {
+            tracker.timer?.invalidate()
+        }
+        messageHandlers.removeValue(forKey: subId)
+        for (relay, subs) in subscriptions {
+            if subs.contains(subId) {
+                var next = subs
+                next.remove(subId)
+                subscriptions[relay] = next
+            }
+        }
+    }
+
+    /// Connect RTT fallback when no live messaging socket exists.
+    /// Uses the same Tor/direct session policy as `connectToRelay`.
+    private func measureConnectLatency(url: String, timeoutSeconds: TimeInterval) async throws -> Int {
+        guard let wsURL = URL(string: url) else { throw RelayProbeError.badURL }
+        if shouldUseTor && TorManager.shared.torEnforced && !TorManager.shared.isReady {
+            let ready = await TorManager.shared.awaitReady()
+            if !ready { throw RelayProbeError.transport("Tor not ready") }
+        }
+
+        let session = TorURLSession.shared.session
+        let task = session.webSocketTask(with: wsURL)
+        let started = Date()
+        task.resume()
+        defer { task.cancel(with: .goingAway, reason: nil) }
+
+        let gate = RelayProbeResumeGate()
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            let timer = Timer(timeInterval: min(timeoutSeconds, 5.0), repeats: false) { _ in
+                Task { @MainActor in
+                    gate.resume(cont, throwing: RelayProbeError.timeout)
+                }
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            task.sendPing { error in
+                DispatchQueue.main.async {
+                    timer.invalidate()
+                    if let error {
+                        gate.resume(cont, throwing: RelayProbeError.transport(error.localizedDescription))
+                    } else {
+                        gate.resume(cont)
+                    }
+                }
+            }
+        }
+        return max(1, Int(Date().timeIntervalSince(started) * 1000))
+    }
+
     /// Manually retry connection to a specific relay
     func retryConnection(to relayUrl: String) {
         guard let index = relays.firstIndex(where: { $0.url == relayUrl }) else { return }
@@ -1088,5 +1322,35 @@ private struct DynamicCodingKey: CodingKey {
 private extension TimeInterval {
     func toInt() -> Int {
         return Int(self)
+    }
+}
+
+
+/// One relay probe result for Connection → Internet diagnostics.
+struct RelayBenchmarkResult: Identifiable, Equatable {
+    var id: String { url }
+    let url: String
+    let success: Bool
+    let rttMs: Int?
+    let error: String?
+    let measuredAt: Date
+    let durationMs: Int
+}
+
+/// One-shot resume helper so probe continuations cannot double-resume.
+@MainActor
+private final class RelayProbeResumeGate {
+    private var resumed = false
+
+    func resume(_ cont: CheckedContinuation<Void, Error>) {
+        guard !resumed else { return }
+        resumed = true
+        cont.resume()
+    }
+
+    func resume(_ cont: CheckedContinuation<Void, Error>, throwing error: Error) {
+        guard !resumed else { return }
+        resumed = true
+        cont.resume(throwing: error)
     }
 }

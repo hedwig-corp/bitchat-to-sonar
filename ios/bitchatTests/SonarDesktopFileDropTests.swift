@@ -59,5 +59,49 @@ struct SonarDesktopFileDropTests {
             routeReplacement: replacement
         ))
     }
+
+    @Test func promotesOnlyVerifiedPDFsFromGenericMime() {
+        let pdf = Data("%PDF-1.7\nreceipt".utf8)
+        let fake = Data("not a pdf".utf8)
+
+        #expect(snEffectiveAttachmentMime(
+            declaredMime: "application/octet-stream",
+            filename: "receipt.PDF",
+            plaintext: pdf
+        ) == "application/pdf")
+        #expect(snIsVerifiedPDFAttachment(
+            declaredMime: "application/octet-stream",
+            filename: "receipt.PDF",
+            plaintext: pdf
+        ))
+        #expect(snEffectiveAttachmentMime(
+            declaredMime: "application/octet-stream",
+            filename: "receipt.pdf",
+            plaintext: fake
+        ) == "application/octet-stream")
+    }
+
+    @Test func preservesExplicitMimeAndSanitizesPreviewFilename() {
+        let pdf = Data("%PDF-1.7\nreceipt".utf8)
+        let fake = Data("not a pdf".utf8)
+
+        #expect(snEffectiveAttachmentMime(
+            declaredMime: "text/plain; charset=utf-8",
+            filename: "receipt.pdf",
+            plaintext: pdf
+        ) == "text/plain")
+        #expect(snEffectiveAttachmentMime(
+            declaredMime: "application/pdf",
+            filename: "receipt.bin",
+            plaintext: fake
+        ) == "application/octet-stream")
+        #expect(snEffectiveAttachmentMime(
+            declaredMime: "application/pdf",
+            filename: "receipt.bin",
+            plaintext: pdf
+        ) == "application/pdf")
+        #expect(snSafeAttachmentFilename("../../receipt.pdf") == "receipt.pdf")
+        #expect(snSafeAttachmentFilename("..") == "attachment")
+    }
 }
 #endif

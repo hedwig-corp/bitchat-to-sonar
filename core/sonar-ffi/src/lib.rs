@@ -8,6 +8,7 @@
 //!   plain synchronous functions.
 //! - GroupId crosses the boundary as lowercase hex of `GroupId::as_slice()`.
 
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use nostr::prelude::*;
@@ -396,6 +397,28 @@ pub struct DirectDmInfo {
 #[uniffi::export(callback_interface)]
 pub trait ConversationChangeListener: Send + Sync {
     fn on_conversation_changed(&self, group_id_hex: String);
+}
+
+/// Progress and cancellation bridge for a file-backed media download. Hosts
+/// keep this object alive until the blocking `fetch_media_to_file` call exits.
+#[uniffi::export(callback_interface)]
+pub trait MediaDownloadListener: Send + Sync {
+    fn on_progress(&self, bytes_received: u64, total_bytes: Option<u64>);
+    fn is_cancelled(&self) -> bool;
+}
+
+struct FfiMediaDownloadObserver<'a> {
+    listener: &'a dyn MediaDownloadListener,
+}
+
+impl sonar_core::client::MediaDownloadObserver for FfiMediaDownloadObserver<'_> {
+    fn on_progress(&self, bytes_received: u64, total_bytes: Option<u64>) {
+        self.listener.on_progress(bytes_received, total_bytes);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.listener.is_cancelled()
+    }
 }
 
 /// FFI-friendly conversation summary from the core-owned index.
@@ -1093,6 +1116,27 @@ impl SonarNode {
         Ok(self
             .runtime
             .block_on(self.client.fetch_media(&group_id, &url))?)
+    }
+
+    /// Download + decrypt directly into `destination_path`, reporting network
+    /// progress and observing host cancellation throughout the blocking call.
+    pub fn fetch_media_to_file(
+        &self,
+        group_id_hex: String,
+        url: String,
+        destination_path: String,
+        listener: Box<dyn MediaDownloadListener>,
+    ) -> FfiResult<u64> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        let observer = FfiMediaDownloadObserver {
+            listener: listener.as_ref(),
+        };
+        Ok(self.runtime.block_on(self.client.fetch_media_to_file(
+            &group_id,
+            &url,
+            Path::new(&destination_path),
+            &observer,
+        ))?)
     }
 
     /// The user's Blossom server list (kind-10063). Empty if unset.

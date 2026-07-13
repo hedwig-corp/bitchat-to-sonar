@@ -1637,6 +1637,23 @@ final class MarmotChatModel: ObservableObject {
         }
     }
 
+    /// Download and decrypt media directly into a private partial file. Errors
+    /// are propagated so the attachment bubble can present retry/cancel state
+    /// without turning a transfer failure into a global chat error.
+    func fetchMediaToFile(
+        groupId: String,
+        url: String,
+        destination: URL,
+        listener: MediaDownloadListener
+    ) async throws -> UInt64 {
+        try await service.fetchMediaToFile(
+            groupId: groupId,
+            url: url,
+            destination: destination,
+            listener: listener
+        )
+    }
+
     private static func mediaLogId(for url: String) -> String {
         SHA256.hash(data: Data(url.utf8))
             .prefix(8)

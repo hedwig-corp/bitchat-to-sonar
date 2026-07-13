@@ -131,27 +131,27 @@ actual fun rememberMediaActions(): MediaActions =
         MediaActions(
             canShare = false,
             share = { _, _, _ -> false },
-            save = { bytes, filename, _ -> saveMediaFile(bytes, filename) },
-            open = { bytes, filename, _ -> openTempMedia(bytes, filename) },
+            save = { path, filename, _ -> saveMediaFile(path, filename) },
+            open = { path, filename, _ -> openLocalMedia(path, filename) },
         )
     }
 
-private suspend fun saveMediaFile(bytes: ByteArray, filename: String): Boolean {
+private suspend fun saveMediaFile(path: String, filename: String): Boolean {
     val picked = pickSaveFile(safeFilename(filename)) ?: return false
     return withContext(Dispatchers.IO) {
         runCatching {
-            picked.writeBytes(bytes)
+            File(path).copyTo(picked, overwrite = true)
             true
         }.getOrDefault(false)
     }
 }
 
-private suspend fun openTempMedia(bytes: ByteArray, filename: String): Boolean =
+private suspend fun openLocalMedia(path: String, filename: String): Boolean =
     withContext(Dispatchers.IO) {
         runCatching {
             if (!Desktop.isDesktopSupported()) return@runCatching false
             val file = File.createTempFile("sonar-media-", "-" + safeFilename(filename))
-            file.writeBytes(bytes)
+            File(path).copyTo(file, overwrite = true)
             file.deleteOnExit()
             Desktop.getDesktop().open(file)
             true

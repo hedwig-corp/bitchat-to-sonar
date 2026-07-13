@@ -1015,6 +1015,12 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func fetchMedia(groupIdHex: String, url: String) throws  -> Data
     
     /**
+     * Download + decrypt directly into `destination_path`, reporting network
+     * progress and observing host cancellation throughout the blocking call.
+     */
+    func fetchMediaToFile(groupIdHex: String, url: String, destinationPath: String, listener: MediaDownloadListener) throws  -> UInt64
+
+    /**
      * Fetch a peer's kind-0 profile (npub or hex pubkey). `None` if they have
      * not published one. Used to resolve a Marmot member's display name.
      */
@@ -1626,6 +1632,22 @@ open func fetchMedia(groupIdHex: String, url: String)throws  -> Data  {
 })
 }
     
+    /**
+     * Download + decrypt directly into `destination_path`, reporting network
+     * progress and observing host cancellation throughout the blocking call.
+     */
+open func fetchMediaToFile(groupIdHex: String, url: String, destinationPath: String, listener: MediaDownloadListener)throws  -> UInt64  {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_fetch_media_to_file(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(groupIdHex),
+        FfiConverterString.lower(url),
+        FfiConverterString.lower(destinationPath),
+        FfiConverterCallbackInterfaceMediaDownloadListener_lower(listener),$0
+    )
+})
+}
+
     /**
      * Fetch a peer's kind-0 profile (npub or hex pubkey). `None` if they have
      * not published one. Used to resolve a Marmot member's display name.
@@ -4998,6 +5020,167 @@ public func FfiConverterCallbackInterfaceConversationChangeListener_lower(_ v: C
     return FfiConverterCallbackInterfaceConversationChangeListener.lower(v)
 }
 
+
+
+
+/**
+ * Progress and cancellation bridge for a file-backed media download. Hosts
+ * keep this object alive until the blocking `fetch_media_to_file` call exits.
+ */
+public protocol MediaDownloadListener: AnyObject, Sendable {
+
+    func onProgress(bytesReceived: UInt64, totalBytes: UInt64?)
+
+    func isCancelled()  -> Bool
+
+}
+
+
+// Put the implementation in a struct so we don't pollute the top-level namespace
+fileprivate struct UniffiCallbackInterfaceMediaDownloadListener {
+
+    // Create the VTable using a series of closures.
+    // Swift automatically converts these into C callback functions.
+    //
+    // Store the vtable directly.
+    static let vtable: UniffiVTableCallbackInterfaceMediaDownloadListener = UniffiVTableCallbackInterfaceMediaDownloadListener(
+        uniffiFree: { (uniffiHandle: UInt64) -> () in
+            do {
+                try FfiConverterCallbackInterfaceMediaDownloadListener.handleMap.remove(handle: uniffiHandle)
+            } catch {
+                print("Uniffi callback interface MediaDownloadListener: handle missing in uniffiFree")
+            }
+        },
+        uniffiClone: { (uniffiHandle: UInt64) -> UInt64 in
+            do {
+                return try FfiConverterCallbackInterfaceMediaDownloadListener.handleMap.clone(handle: uniffiHandle)
+            } catch {
+                fatalError("Uniffi callback interface MediaDownloadListener: handle missing in uniffiClone")
+            }
+        },
+        onProgress: { (
+            uniffiHandle: UInt64,
+            bytesReceived: UInt64,
+            totalBytes: RustBuffer,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceMediaDownloadListener.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onProgress(
+                     bytesReceived: try FfiConverterUInt64.lift(bytesReceived),
+                     totalBytes: try FfiConverterOptionUInt64.lift(totalBytes)
+                )
+            }
+
+
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        },
+        isCancelled: { (
+            uniffiHandle: UInt64,
+            uniffiOutReturn: UnsafeMutablePointer<Int8>,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> Bool in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceMediaDownloadListener.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.isCancelled(
+                )
+            }
+
+
+            let writeReturn = { uniffiOutReturn.pointee = FfiConverterBool.lower($0) }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        }
+    )
+
+    // Rust stores this pointer for future callback invocations, so it must live
+    // for the process lifetime (not just for the init function call).
+    static let vtablePtr: UnsafePointer<UniffiVTableCallbackInterfaceMediaDownloadListener> = {
+        let ptr = UnsafeMutablePointer<UniffiVTableCallbackInterfaceMediaDownloadListener>.allocate(capacity: 1)
+        ptr.initialize(to: vtable)
+        return UnsafePointer(ptr)
+    }()
+}
+
+private func uniffiCallbackInitMediaDownloadListener() {
+    uniffi_sonar_ffi_fn_init_callback_vtable_mediadownloadlistener(UniffiCallbackInterfaceMediaDownloadListener.vtablePtr)
+}
+
+// FfiConverter protocol for callback interfaces
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterCallbackInterfaceMediaDownloadListener {
+    fileprivate static let handleMap = UniffiHandleMap<MediaDownloadListener>()
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+extension FfiConverterCallbackInterfaceMediaDownloadListener : FfiConverter {
+    typealias SwiftType = MediaDownloadListener
+    typealias FfiType = UInt64
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func lift(_ handle: UInt64) throws -> SwiftType {
+        try handleMap.get(handle: handle)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func lower(_ v: SwiftType) -> UInt64 {
+        return handleMap.insert(obj: v)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func write(_ v: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(v))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterCallbackInterfaceMediaDownloadListener_lift(_ handle: UInt64) throws -> MediaDownloadListener {
+    return try FfiConverterCallbackInterfaceMediaDownloadListener.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterCallbackInterfaceMediaDownloadListener_lower(_ v: MediaDownloadListener) -> UInt64 {
+    return FfiConverterCallbackInterfaceMediaDownloadListener.lower(v)
+}
+
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
@@ -6246,6 +6429,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_fetch_media() != 440) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_fetch_media_to_file() != 21937) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_fetch_profile() != 10147) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -6417,8 +6603,15 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_conversationchangelistener_on_conversation_changed() != 35719) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_mediadownloadlistener_on_progress() != 26755) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_mediadownloadlistener_is_cancelled() != 18068) {
+        return InitializationResult.apiChecksumMismatch
+    }
 
     uniffiCallbackInitConversationChangeListener()
+    uniffiCallbackInitMediaDownloadListener()
     return InitializationResult.ok
 }()
 

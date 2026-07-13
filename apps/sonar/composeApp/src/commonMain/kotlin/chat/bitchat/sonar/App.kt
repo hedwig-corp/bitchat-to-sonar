@@ -657,30 +657,52 @@ private fun DeleteChatSheet(name: String, isGroup: Boolean, onDelete: () -> Unit
 @Composable
 private fun ConnectivitySheet(online: Boolean, meshCount: Int, onClose: () -> Unit) {
     val s = sonar
+    var showRelayStatus by remember { mutableStateOf(false) }
     Box(
         Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
         contentAlignment = Alignment.BottomCenter
     ) {
-        Surface(color = s.surface, shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)) {
+        Surface(
+            color = s.surface,
+            shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp),
+            modifier = Modifier.clickable(
+                indication = null,
+                interactionSource = remember { MutableInteractionSource() },
+                onClick = {},
+            ),
+        ) {
             Column(Modifier.fillMaxWidth().padding(vertical = 16.dp)) {
-                Text(
-                    "Connections", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold,
-                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp)
-                )
-                Spacer(Modifier.height(6.dp))
-                chat.bitchat.sonar.ui.SNSettingsRow(
-                    icon = SNIconName.Globe, tone = if (online) SNTone.Cyan else SNTone.Default,
-                    label = "Internet",
-                    sub = if (online) "Connected · Nostr relays" else "Offline — messages wait or travel over Bluetooth",
-                    value = if (online) "Online" else "Offline", trail = SNTrail.None,
-                )
-                chat.bitchat.sonar.ui.SNSettingsRow(
-                    icon = SNIconName.Mesh, tone = SNTone.Cyan, label = "Bluetooth mesh",
-                    sub = "$meshCount people in range", trail = SNTrail.None, divider = false,
-                )
-                Spacer(Modifier.height(10.dp))
-                Box(Modifier.fillMaxWidth().height(44.dp).clickable(onClick = onClose), contentAlignment = Alignment.Center) {
-                    Text("Done", color = s.text2, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                if (showRelayStatus) {
+                    Text(
+                        "Internet", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp)
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    chat.bitchat.sonar.screens.SonarRelayStatusSheetContent(
+                        online = online,
+                        onClose = { showRelayStatus = false },
+                    )
+                } else {
+                    Text(
+                        "Connections", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp)
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    chat.bitchat.sonar.ui.SNSettingsRow(
+                        icon = SNIconName.Globe, tone = if (online) SNTone.Cyan else SNTone.Default,
+                        label = "Internet",
+                        sub = if (online) "Connected · Nostr relays" else "Offline — messages wait or travel over Bluetooth",
+                        value = if (online) "Online" else "Offline",
+                        trail = SNTrail.Chevron,
+                    ) { showRelayStatus = true }
+                    chat.bitchat.sonar.ui.SNSettingsRow(
+                        icon = SNIconName.Mesh, tone = SNTone.Cyan, label = "Bluetooth mesh",
+                        sub = "$meshCount people in range", trail = SNTrail.None, divider = false,
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    Box(Modifier.fillMaxWidth().height(44.dp).clickable(onClick = onClose), contentAlignment = Alignment.Center) {
+                        Text("Done", color = s.text2, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                    }
                 }
             }
         }
@@ -2059,11 +2081,18 @@ private fun MediaBubble(
                 onOpen = { idx -> onOpenAlbum(m.media, idx) },
             )
         } else if (media.isImage) {
-            var loadAttempt by remember(media.url, chatId) { mutableStateOf(0) }
+            val transfer = state.mediaTransferState(media)
+            androidx.compose.runtime.LaunchedEffect(media.url, chatId) {
+                state.prepareMedia(chatId, media, autoDownload = true)
+            }
             val loadResult by androidx.compose.runtime.produceState<Pair<Boolean, ByteArray?>>(
-                false to null, media.url, chatId, loadAttempt
+                false to null, media.url, chatId, transfer.localPath
             ) {
-                value = true to state.mediaData(chatId, media)
+                value = if (transfer.phase == MediaTransferPhase.Available) {
+                    true to state.mediaData(chatId, media)
+                } else {
+                    false to null
+                }
             }
             val mediaBytes = loadResult.second
             val img = androidx.compose.runtime.remember(mediaBytes) {
@@ -2072,12 +2101,17 @@ private fun MediaBubble(
             val renderAsGif = media.isGif && mediaBytes?.looksLikeGifBytes() == true
             val bmp = img
             val bytes = mediaBytes
-            val failed = loadResult.first && bytes == null
+            val failed = transfer.phase == MediaTransferPhase.Failed ||
+                (transfer.phase == MediaTransferPhase.Available && loadResult.first && bytes == null)
             Box(
                 Modifier.widthIn(max = minOf(240.dp, maxBubbleWidth)).clip(bubbleShape).background(s.surface2)
                     .clickable {
-                        // Design media-visual tap: open when loaded, retry when failed.
-                        if (failed) loadAttempt += 1 else if (bytes != null) onOpen(media)
+                        when (transfer.phase) {
+                            MediaTransferPhase.NotDownloaded, MediaTransferPhase.Failed ->
+                                state.requestMediaDownload(chatId, media)
+                            MediaTransferPhase.Downloading -> state.cancelMediaDownload(media)
+                            MediaTransferPhase.Available -> if (bytes != null) onOpen(media)
+                        }
                     },
                 contentAlignment = Alignment.Center
             ) {
@@ -2092,16 +2126,30 @@ private fun MediaBubble(
                         // media-chip: glass time + via pill bottom-right.
                         MediaMetaChip(m.tsSecs, mesh, Modifier.align(Alignment.BottomEnd).padding(8.dp))
                     }
-                    bytes != null -> InlineMediaFileChip(media = media, onOpen = { onOpen(media) })
+                    bytes != null -> InlineMediaFileChip(media, transfer) { onOpen(media) }
                     failed -> MediaUnavailable(media)
                     else -> MediaLoadingSkeleton(media)
+                }
+                if (transfer.phase == MediaTransferPhase.Downloading) {
+                    MediaTransferOverlay(transfer, Modifier.align(Alignment.Center))
                 }
                 if (media.isGif && bytes == null) GifBadge(Modifier.align(Alignment.TopEnd).padding(8.dp))
             }
         } else if (media.mimeType.startsWith("audio/")) {
             AudioBubble(m, state, chatId, media, mesh = mesh)
         } else {
-            InlineMediaFileChip(media = media, onOpen = { onOpen(media) })
+            val transfer = state.mediaTransferState(media)
+            androidx.compose.runtime.LaunchedEffect(media.url, chatId) {
+                state.prepareMedia(chatId, media, autoDownload = false)
+            }
+            InlineMediaFileChip(media, transfer) {
+                when (transfer.phase) {
+                    MediaTransferPhase.NotDownloaded, MediaTransferPhase.Failed ->
+                        state.requestMediaDownload(chatId, media)
+                    MediaTransferPhase.Downloading -> state.cancelMediaDownload(media)
+                    MediaTransferPhase.Available -> onOpen(media)
+                }
+            }
         }
         if (m.content.isNotEmpty()) {
             // media-cap: caption in its own bubble under the media.
@@ -2202,29 +2250,44 @@ private fun MediaDeckCard(
     dim: Float = 0f,
 ) {
     val s = sonar
-    var loadAttempt by remember(media.url, chatId) { mutableStateOf(0) }
+    val transfer = state.mediaTransferState(media)
+    androidx.compose.runtime.LaunchedEffect(media.url, chatId) {
+        state.prepareMedia(chatId, media, autoDownload = true)
+    }
     val loadResult by androidx.compose.runtime.produceState<Pair<Boolean, ByteArray?>>(
-        false to null, media.url, chatId, loadAttempt
+        false to null, media.url, chatId, transfer.localPath
     ) {
-        value = true to state.mediaData(chatId, media)
+        value = if (transfer.phase == MediaTransferPhase.Available) {
+            true to state.mediaData(chatId, media)
+        } else {
+            false to null
+        }
     }
     val bytes = loadResult.second
     val img = remember(bytes) { if (media.isImage) bytes?.let { decodeImageBitmap(it) } else null }
-    val renderAsGif = media.isGif && bytes?.looksLikeGifBytes() == true
-    val failed = loadResult.first && bytes == null
+    val gifBytes = bytes?.takeIf { media.isGif && it.looksLikeGifBytes() }
+    val failed = transfer.phase == MediaTransferPhase.Failed ||
+        (transfer.phase == MediaTransferPhase.Available && loadResult.first && bytes == null)
     Box(
         modifier.clip(RoundedCornerShape(18.dp)).background(s.surface2)
             .border(1.dp, Color.Black.copy(alpha = 0.08f), RoundedCornerShape(18.dp))
             .let { m ->
                 if (onOpen != null) {
-                    m.clickable { if (failed) loadAttempt += 1 else if (bytes != null) onOpen() }
+                    m.clickable {
+                        when (transfer.phase) {
+                            MediaTransferPhase.NotDownloaded, MediaTransferPhase.Failed ->
+                                state.requestMediaDownload(chatId, media)
+                            MediaTransferPhase.Downloading -> state.cancelMediaDownload(media)
+                            MediaTransferPhase.Available -> if (bytes != null) onOpen()
+                        }
+                    }
                 } else m
             },
         contentAlignment = Alignment.Center
     ) {
         when {
-            renderAsGif && bytes != null -> {
-                MediaImage(bytes = bytes, isGif = true, modifier = Modifier.fillMaxSize())
+            gifBytes != null -> {
+                MediaImage(bytes = gifBytes, isGif = true, modifier = Modifier.fillMaxSize())
                 GifBadge(Modifier.align(Alignment.TopEnd).padding(8.dp))
             }
             img != null -> Image(
@@ -2233,9 +2296,12 @@ private fun MediaDeckCard(
                 contentScale = ContentScale.Crop,
                 modifier = Modifier.fillMaxSize()
             )
-            bytes != null -> InlineMediaFileChip(media = media, onOpen = { onOpen?.invoke() })
+            bytes != null -> InlineMediaFileChip(media, transfer) { onOpen?.invoke() }
             failed -> MediaUnavailable(media)
             else -> MediaLoadingSkeleton(media)
+        }
+        if (transfer.phase == MediaTransferPhase.Downloading) {
+            MediaTransferOverlay(transfer, Modifier.align(Alignment.Center))
         }
         if (media.isGif && bytes == null) GifBadge(Modifier.align(Alignment.TopEnd).padding(8.dp))
         if (dim > 0f) {
@@ -2359,22 +2425,84 @@ private fun ByteArray.looksLikeGifBytes(): Boolean =
         this[5] == 0x61.toByte()
 
 @Composable
-private fun InlineMediaFileChip(media: SonarMedia, onOpen: () -> Unit) {
+private fun InlineMediaFileChip(
+    media: SonarMedia,
+    transfer: MediaTransferState,
+    onAction: () -> Unit,
+) {
     val s = sonar
     Row(
         Modifier.clip(RoundedCornerShape(14.dp)).background(s.surface2)
-            .clickable { onOpen() }
+            .clickable { onAction() }
             .padding(horizontal = 12.dp, vertical = 9.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Text(
-            media.filename,
-            color = s.text,
-            fontSize = 13.5.sp,
-            fontWeight = FontWeight.SemiBold,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis
-        )
+        Column(Modifier.weight(1f)) {
+            Text(
+                media.filename,
+                color = s.text,
+                fontSize = 13.5.sp,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                mediaTransferLabel(transfer, media.mimeType),
+                color = if (transfer.phase == MediaTransferPhase.Failed) s.danger else s.text3,
+                fontSize = 11.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        Spacer(Modifier.width(10.dp))
+        when (transfer.phase) {
+            MediaTransferPhase.Downloading -> MediaTransferProgress(transfer, 22.dp)
+            MediaTransferPhase.NotDownloaded -> Text("↓", color = s.accent, fontSize = 19.sp, fontWeight = FontWeight.Bold)
+            MediaTransferPhase.Available -> Text("↗", color = s.accent, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+            MediaTransferPhase.Failed -> Text("↻", color = s.danger, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+        }
+    }
+}
+
+private fun mediaTransferLabel(transfer: MediaTransferState, fallback: String): String =
+    when (transfer.phase) {
+        MediaTransferPhase.NotDownloaded -> "Tap to download"
+        MediaTransferPhase.Downloading -> transfer.progress?.let { "Downloading ${(it * 100).toInt()}%" } ?: "Downloading"
+        MediaTransferPhase.Available -> fallback
+        MediaTransferPhase.Failed -> "Download failed · tap to retry"
+    }
+
+@Composable
+private fun MediaTransferProgress(transfer: MediaTransferState, size: Dp) {
+    val s = sonar
+    Box(Modifier.size(size), contentAlignment = Alignment.Center) {
+        val progress = transfer.progress
+        if (progress != null) {
+            androidx.compose.material3.CircularProgressIndicator(
+                progress = { progress },
+                color = s.accent,
+                trackColor = s.text3.copy(alpha = 0.22f),
+                strokeWidth = 2.dp,
+                modifier = Modifier.fillMaxSize(),
+            )
+        } else {
+            androidx.compose.material3.CircularProgressIndicator(
+                color = s.accent,
+                strokeWidth = 2.dp,
+                modifier = Modifier.fillMaxSize(),
+            )
+        }
+        Text("×", color = s.text2, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+    }
+}
+
+@Composable
+private fun MediaTransferOverlay(transfer: MediaTransferState, modifier: Modifier = Modifier) {
+    Box(
+        modifier.size(48.dp).clip(CircleShape).background(Color.Black.copy(alpha = 0.58f)),
+        contentAlignment = Alignment.Center,
+    ) {
+        MediaTransferProgress(transfer, 30.dp)
     }
 }
 
@@ -2387,20 +2515,39 @@ private fun MediaViewer(
     onClose: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val s = sonar
     val scope = rememberCoroutineScope()
     var chrome by remember(media.url) { mutableStateOf(true) }
     var status by remember(media.url) { mutableStateOf<String?>(null) }
-    var loadAttempt by remember(media.url, chatId) { mutableStateOf(0) }
-    val loadResult by androidx.compose.runtime.produceState<Pair<Boolean, ByteArray?>>(
-        false to null, media.url, chatId, loadAttempt
+    var autoOpenedNative by remember(media.url, chatId) { mutableStateOf(false) }
+    val transfer = state.mediaTransferState(media)
+    val localPath = transfer.localPath
+    val loadedBytes by androidx.compose.runtime.produceState<ByteArray?>(
+        null, media.url, localPath
     ) {
         status = null
-        value = true to state.mediaData(chatId, media)
+        value = if (media.isImage && localPath != null) state.mediaData(chatId, media) else null
     }
-    val loadedBytes = loadResult.second
     val image = remember(loadedBytes, media.url) {
         if (media.isImage) loadedBytes?.let { decodeImageBitmap(it) } else null
+    }
+    val prefix by androidx.compose.runtime.produceState<ByteArray?>(null, localPath) {
+        value = localPath?.let { MediaCache.readPrefix(it, 16) }
+    }
+    val actionMime = remember(prefix, media.mimeType, media.filename) {
+        prefix?.let { effectiveAttachmentMime(media.mimeType, media.filename, it) }
+            ?: media.mimeType.substringBefore(';').trim().ifBlank { "application/octet-stream" }
+    }
+    val displayMedia = remember(media, actionMime) { media.copy(mimeType = actionMime) }
+
+    // File-chip taps only reach this viewer once a complete local stream exists.
+    // Documents, video and other native formats open immediately from that file.
+    LaunchedEffect(localPath, actionMime) {
+        val path = localPath ?: return@LaunchedEffect
+        if (!media.isImage && !autoOpenedNative) {
+            autoOpenedNative = true
+            val ok = actions.open(path, media.filename, actionMime)
+            status = if (ok) "Opened" else "Couldn't open media"
+        }
     }
 
     Box(modifier.background(Color.Black)) {
@@ -2411,38 +2558,26 @@ private fun MediaViewer(
                 onSingleTap = { chrome = !chrome },
                 modifier = Modifier.fillMaxSize()
             )
-            loadedBytes != null -> MediaFilePreview(
-                media = media,
+            localPath != null -> MediaFilePreview(
+                media = displayMedia,
                 onOpen = {
                     scope.launch {
-                        val ok = actions.open(loadedBytes, media.filename, media.mimeType)
+                        val ok = actions.open(localPath, media.filename, actionMime)
                         status = if (ok) "Opened" else "Couldn't open media"
                     }
                 },
                 onSingleTap = { chrome = !chrome },
                 modifier = Modifier.fillMaxSize()
             )
-            loadResult.first -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            else -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     Text(
-                        "Couldn't load media",
+                        "Attachment isn't available locally",
                         color = Color.White.copy(alpha = 0.82f),
                         fontSize = 14.sp,
                         fontWeight = FontWeight.SemiBold
                     )
-                    Text(
-                        "Retry",
-                        color = Color.White,
-                        fontSize = 14.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        modifier = Modifier.clip(CircleShape).background(Color.White.copy(alpha = 0.16f))
-                            .clickable { loadAttempt += 1 }
-                            .padding(horizontal = 18.dp, vertical = 9.dp)
-                    )
                 }
-            }
-            else -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                androidx.compose.material3.CircularProgressIndicator(color = s.text3, strokeWidth = 2.dp)
             }
         }
 
@@ -2468,20 +2603,20 @@ private fun MediaViewer(
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
-                        Text(media.mimeType, color = Color.White.copy(alpha = 0.62f), fontSize = 12.sp)
+                        Text(actionMime, color = Color.White.copy(alpha = 0.62f), fontSize = 12.sp)
                     }
                     if (actions.canShare) {
-                        MediaActionText("Share", enabled = loadedBytes != null) {
+                        MediaActionText("Share", enabled = localPath != null) {
                             scope.launch {
-                                val ok = actions.share(loadedBytes ?: return@launch, media.filename, media.mimeType)
+                                val ok = actions.share(localPath ?: return@launch, media.filename, actionMime)
                                 status = if (ok) "Opening share sheet" else "Couldn't share media"
                             }
                         }
                         Spacer(Modifier.width(12.dp))
                     }
-                    MediaActionText("Save", enabled = loadedBytes != null) {
+                    MediaActionText("Save", enabled = localPath != null) {
                         scope.launch {
-                            val ok = actions.save(loadedBytes ?: return@launch, media.filename, media.mimeType)
+                            val ok = actions.save(localPath ?: return@launch, media.filename, actionMime)
                             status = if (ok) "Saved" else "Couldn't save media"
                         }
                     }
@@ -2710,8 +2845,12 @@ private fun AudioBubble(m: SonarMsg, state: SonarAppState, chatId: String, media
     val net = !mesh
     val tint = if (net) s.netFill else s.accentFill
     val onTint = if (net) s.onNet else s.onAccent
-    val bytes by androidx.compose.runtime.produceState<ByteArray?>(null, media.url) {
-        value = state.mediaData(chatId, media)
+    val transfer = state.mediaTransferState(media)
+    androidx.compose.runtime.LaunchedEffect(media.url, chatId) {
+        state.prepareMedia(chatId, media, autoDownload = true)
+    }
+    val bytes by androidx.compose.runtime.produceState<ByteArray?>(null, media.url, transfer.localPath) {
+        value = if (transfer.phase == MediaTransferPhase.Available) state.mediaData(chatId, media) else null
     }
     var playing by remember { mutableStateOf(false) }
     // Stop playback if the bubble leaves composition.
@@ -2741,20 +2880,32 @@ private fun AudioBubble(m: SonarMsg, state: SonarAppState, chatId: String, media
         Box(
             Modifier.size(34.dp).clip(CircleShape)
                 .background(if (m.mine) Color.White.copy(alpha = 0.24f) else s.accentSoft)
-                .clickable(enabled = bytes != null) {
-                    val b = bytes ?: return@clickable
-                    // onComplete resets `playing` when the note ends, is stopped, or
-                    // another note steals the shared player.
-                    if (playing) AudioNotePlayer.stop()
-                    else { playing = true; AudioNotePlayer.play(b) { playing = false } }
+                .clickable {
+                    when (transfer.phase) {
+                        MediaTransferPhase.NotDownloaded, MediaTransferPhase.Failed ->
+                            state.requestMediaDownload(chatId, media)
+                        MediaTransferPhase.Downloading -> state.cancelMediaDownload(media)
+                        MediaTransferPhase.Available -> {
+                            val b = bytes ?: return@clickable
+                            // onComplete resets `playing` when the note ends, is stopped, or
+                            // another note steals the shared player.
+                            if (playing) AudioNotePlayer.stop()
+                            else { playing = true; AudioNotePlayer.play(b) { playing = false } }
+                        }
+                    }
                 },
             contentAlignment = Alignment.Center
         ) {
-            SNIcon(
-                if (playing) SNIconName.Pause else SNIconName.Play, 14.dp,
-                if (m.mine) Color.White else s.accentDeep,
-                weight = 2.2f
-            )
+            when (transfer.phase) {
+                MediaTransferPhase.NotDownloaded -> Text("↓", color = if (m.mine) Color.White else s.accentDeep, fontSize = 17.sp, fontWeight = FontWeight.Bold)
+                MediaTransferPhase.Downloading -> MediaTransferProgress(transfer, 24.dp)
+                MediaTransferPhase.Failed -> Text("↻", color = if (m.mine) Color.White else s.accentDeep, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                MediaTransferPhase.Available -> SNIcon(
+                    if (playing) SNIconName.Pause else SNIconName.Play, 14.dp,
+                    if (m.mine) Color.White else s.accentDeep,
+                    weight = 2.2f
+                )
+            }
         }
         Spacer(Modifier.width(11.dp))
         MediaWaveStatic(

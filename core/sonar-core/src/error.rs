@@ -54,6 +54,9 @@ pub enum Error {
     #[error("http error: {0}")]
     Http(String),
 
+    #[error("media download cancelled")]
+    MediaDownloadCancelled,
+
     #[error("no relay connected within timeout")]
     NoRelayConnected,
 
