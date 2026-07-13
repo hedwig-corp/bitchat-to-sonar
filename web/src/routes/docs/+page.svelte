@@ -30,7 +30,9 @@
       'Sonar Stickers.html': `${base}/stickers`,
       'Sonar%20Stickers.html': `${base}/stickers`,
       'Sonar Landing.html': `${base}/`,
-      'Sonar%20Landing.html': `${base}/`
+      'Sonar%20Landing.html': `${base}/`,
+      'Sonar Status.html': `${base}/status`,
+      'Sonar%20Status.html': `${base}/status`
     };
     return map[href] ?? href;
   }

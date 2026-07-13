@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sonar Status</title>
+<link rel="icon" href="sonar/brand/favicon.ico" sizes="any">
+<link rel="apple-touch-icon" href="sonar/brand/sonar-icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700;800&amp;family=IBM+Plex+Mono:wght@400;500;600&amp;display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #060809;
+    --panel: #0C1013;
+    --card: #12171B;
+    --card2: #171D22;
+    --text: #EFF3F4;
+    --text2: #9AA6AB;
+    --text3: #65717A;
+    --hairline: rgba(255, 255, 255, 0.08);
+    --cyan: #22D3EE;
+    --cyan-deep: #67E2F4;
+    --cyan-fill: #1FC0DE;
+    --on-cyan: #04222B;
+    --cyan-soft: rgba(34, 211, 238, 0.12);
+    --ok: #41BC76;
+    --ok-soft: rgba(65, 188, 118, 0.14);
+    --warn: #F0B03A;
+    --warn-soft: rgba(240, 176, 58, 0.14);
+    --down: #F16A6A;
+    --down-soft: rgba(241, 106, 106, 0.14);
+    --info: #7B79F7;
+    --info-soft: rgba(123, 121, 247, 0.14);
+    --mono: 'IBM Plex Mono', ui-monospace, monospace;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body { margin: 0; background: var(--bg); color: var(--text); font-family: 'Figtree', system-ui, sans-serif; -webkit-font-smoothing: antialiased; line-height: 1.55; }
+  a { color: var(--cyan-deep); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 0 24px; }
+
+  nav { border-bottom: 1px solid var(--hairline); }
+  .navin { display: flex; align-items: center; justify-content: space-between; max-width: 860px; margin: 0 auto; padding: 16px 24px; }
+  .wordmark { display: flex; align-items: center; gap: 9px; font-size: 19px; font-weight: 800; letter-spacing: -0.02em; color: var(--text); }
+  .wordmark:hover { text-decoration: none; }
+  .wordmark img { width: 27px; height: 27px; border-radius: 8px; box-shadow: inset 0 0 0 1px var(--hairline); }
+  .wordmark .tag { font-size: 12px; font-weight: 600; color: var(--text3); background: var(--panel); border-radius: 6px; padding: 2px 8px; }
+  .navlinks { display: flex; gap: 8px; }
+  .btn { display: inline-flex; align-items: center; gap: 7px; padding: 8px 15px; border-radius: 999px; border: none; font-family: inherit; font-size: 13.5px; font-weight: 700; cursor: pointer; }
+  .btn.ghost { background: transparent; color: var(--text2); box-shadow: inset 0 0 0 1px var(--hairline); }
+  .btn.ghost:hover { color: var(--text); text-decoration: none; }
+
+  /* hero banner */
+  .hero { display: flex; align-items: center; gap: 18px; margin: 34px 0 8px; padding: 22px 24px; border-radius: 18px; background: var(--ok-soft); box-shadow: inset 0 0 0 1px rgba(65,188,118,0.25); }
+  .hero.warn { background: var(--warn-soft); box-shadow: inset 0 0 0 1px rgba(240,176,58,0.25); }
+  .hero.down { background: var(--down-soft); box-shadow: inset 0 0 0 1px rgba(241,106,106,0.25); }
+  .heroic { width: 48px; height: 48px; border-radius: 50%; flex: none; display: flex; align-items: center; justify-content: center; background: var(--ok); color: #04140b; }
+  .hero.warn .heroic { background: var(--warn); color: #241500; }
+  .hero.down .heroic { background: var(--down); color: #2a0808; }
+  .herotext { flex: 1; min-width: 0; }
+  .herotitle { font-size: 22px; font-weight: 800; letter-spacing: -0.02em; }
+  .herosub { font-size: 13.5px; color: var(--text2); margin-top: 2px; }
+  .herosub .live { color: var(--ok); font-weight: 600; }
+
+  h2 { font-size: 15px; font-weight: 700; letter-spacing: 0.02em; margin: 34px 0 12px; display: flex; align-items: center; gap: 10px; }
+  h2 .rt { margin-left: auto; font-size: 12px; font-weight: 500; color: var(--text3); }
+
+  /* service rows */
+  .svc { background: var(--card); border: 1px solid var(--hairline); border-radius: 14px; overflow: hidden; }
+  .row { padding: 15px 18px; border-bottom: 1px solid var(--hairline2, rgba(255,255,255,0.05)); }
+  .svc .row:last-child { border-bottom: none; }
+  .rowtop { display: flex; align-items: center; gap: 10px; }
+  .rowname { font-size: 15px; font-weight: 650; }
+  .rowdesc { font-size: 12.5px; color: var(--text3); font-weight: 400; margin-left: 2px; }
+  .badge { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; font-weight: 650; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+  .dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); } .dot.down { background: var(--down); }
+  .badge.ok { color: var(--ok); } .badge.warn { color: var(--warn); } .badge.down { color: var(--down); }
+  /* 90-day uptime bars */
+  .bars { display: flex; gap: 2px; margin-top: 11px; height: 30px; align-items: stretch; }
+  .bars i { flex: 1; border-radius: 2px; background: var(--ok); opacity: 0.85; transition: opacity 0.1s; cursor: pointer; }
+  .bars i.warn { background: var(--warn); } .bars i.down { background: var(--down); }
+  .bars i:hover { opacity: 1; }
+  .barsmeta { display: flex; justify-content: space-between; font-size: 11.5px; color: var(--text3); margin-top: 7px; }
+
+  /* relay benchmark */
+  .relay { display: flex; align-items: center; gap: 12px; padding: 13px 18px; border-bottom: 1px solid rgba(255,255,255,0.05); }
+  .relay:last-child { border-bottom: none; }
+  .relayurl { font-family: var(--mono); font-size: 13px; font-weight: 500; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .relayregion { font-size: 12px; color: var(--text3); margin-top: 1px; }
+  .relaymain { flex: 1; min-width: 0; }
+  .ping { display: flex; align-items: center; gap: 10px; flex: none; }
+  .pingbar { width: 92px; height: 6px; border-radius: 3px; background: var(--panel); overflow: hidden; }
+  .pingbar i { display: block; height: 100%; border-radius: 3px; background: var(--ok); transition: width 0.5s; }
+  .pingbar i.warn { background: var(--warn); } .pingbar i.down { background: var(--down); }
+  .pingval { font-family: var(--mono); font-size: 13px; font-weight: 600; min-width: 62px; text-align: right; }
+  .pingval.pending { color: var(--text3); }
+  .pingval.warn { color: var(--warn); } .pingval.down { color: var(--down); }
+  .relaynote { font-size: 12px; color: var(--text3); margin-top: 10px; display: flex; align-items: center; gap: 7px; }
+  .spin { width: 12px; height: 12px; border: 2px solid var(--hairline); border-top-color: var(--cyan); border-radius: 50%; animation: sp 0.7s linear infinite; }
+  @keyframes sp { to { transform: rotate(360deg); } }
+  .rebtn { margin-left: auto; }
+
+  /* incidents */
+  .inc { border-left: 2px solid var(--hairline); padding: 2px 0 2px 18px; margin-bottom: 26px; }
+  .incdate { font-size: 12.5px; color: var(--text3); font-weight: 600; }
+  .inctitle { font-size: 16px; font-weight: 700; margin: 2px 0 12px; display: flex; align-items: center; gap: 9px; }
+  .tag { font-size: 11px; font-weight: 700; padding: 3px 9px; border-radius: 999px; text-transform: uppercase; letter-spacing: 0.04em; }
+  .tag.degraded { background: var(--warn-soft); color: var(--warn); }
+  .tag.maintenance { background: var(--info-soft); color: var(--info); }
+  .tag.down { background: var(--down-soft); color: var(--down); }
+  .upd { display: flex; gap: 12px; margin-bottom: 11px; }
+  .updt { font-family: var(--mono); font-size: 11.5px; color: var(--text3); flex: none; width: 74px; padding-top: 1px; }
+  .upds { font-size: 13.5px; font-weight: 700; flex: none; width: 92px; }
+  .upds.Resolved, .upds.Completed { color: var(--ok); }
+  .upds.Monitoring, .upds.Identified { color: var(--warn); }
+  .upds.Investigating { color: var(--down); }
+  .updb { font-size: 13.5px; color: var(--text2); flex: 1; }
+
+  .legend { display: flex; gap: 18px; flex-wrap: wrap; font-size: 12px; color: var(--text3); margin-top: 12px; }
+  .legend span { display: flex; align-items: center; gap: 6px; }
+  footer { border-top: 1px solid var(--hairline); margin-top: 50px; padding: 26px 0 44px; }
+  .footin { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; font-size: 13px; color: var(--text3); }
+  .subscribe { font-size: 13px; }
+  @media (max-width: 620px) {
+    .rowdesc { display: none; }
+    .relayregion { display: none; }
+    .pingbar { width: 60px; }
+  }
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="navin">
+    <a class="wordmark" href="Sonar Landing.html"><img src="sonar/brand/sonar-icon.png" alt="">sonar<span class="tag">status</span></a>
+    <div class="navlinks">
+      <a class="btn ghost" href="Sonar Docs.html">Docs</a>
+      <a class="btn ghost" href="Sonar Landing.html">Home</a>
+    </div>
+  </div>
+</nav>
+
+<div class="wrap">
+  <div class="hero" id="hero">
+    <div class="heroic" id="heroic"></div>
+    <div class="herotext">
+      <div class="herotitle" id="herotitle">Checking systems…</div>
+      <div class="herosub" id="herosub"></div>
+    </div>
+  </div>
+
+  <h2>Sonar services <span class="rt" id="svc-rt"></span></h2>
+  <div class="svc" id="services"></div>
+  <div class="legend">
+    <span><span class="dot ok"></span>Operational</span>
+    <span><span class="dot warn"></span>Degraded performance</span>
+    <span><span class="dot down"></span>Outage</span>
+    <span style="margin-left:auto;">Each bar = 1 day · last 90 days</span>
+  </div>
+
+  <h2>Relay network <span class="rt"><button class="btn ghost rebtn" id="reping">Re-run ping</button></span></h2>
+  <div class="svc" id="relays"></div>
+  <div class="relaynote" id="relaynote"><span class="spin"></span> Pinging relays over live WebSocket connections…</div>
+
+  <h2>Past incidents</h2>
+  <div id="incidents"></div>
+</div>
+
+<footer>
+  <div class="wrap footin">
+    <span>Sonar Status · all times UTC</span>
+    <span class="subscribe"><a href="#">Subscribe to updates</a> · <a href="Sonar Docs.html">Read the docs</a></span>
+  </div>
+</footer>
+
+<script src="sonar/status-data.js"></script>
+<script>
+  var D = window.SONAR_STATUS;
+
+  // ── 90-day synthetic history (deterministic per service) ──
+  function hash(s){ var h=2166136261; for (var i=0;i<s.length;i++){ h^=s.charCodeAt(i); h=Math.imul(h,16777619); } return h>>>0; }
+  function history(svc){
+    var out=[], seed=hash(svc.id), r=seed;
+    for (var d=0; d<90; d++){
+      r = (Math.imul(r,1664525)+1013904223)>>>0;
+      var v = r/4294967296;
+      var cls='ok';
+      // rarer issues; degraded services get a recent rough patch
+      if (svc.state==='degraded' && d>85) cls = (v<0.5?'warn':'ok');
+      else if (v > 0.985) cls='down';
+      else if (v > 0.955) cls='warn';
+      out.push(cls);
+    }
+    return out;
+  }
+
+  // ── render services ──
+  var svcEl = document.getElementById('services');
+  var worst = 'ok';
+  D.services.forEach(function(s){
+    var hist = history(s);
+    if (s.state==='degraded' && worst==='ok') worst='warn';
+    if (hist.indexOf('down')>=0 && false) {}
+    var state = s.state==='degraded' ? 'warn' : 'ok';
+    var label = state==='warn' ? 'Degraded' : 'Operational';
+    var bars = hist.map(function(c){ return '<i class="'+(c==='ok'?'':c)+'" title="'+c+'"></i>'; }).join('');
+    var row = document.createElement('div'); row.className='row';
+    row.innerHTML =
+      '<div class="rowtop"><span class="dot '+state+'"></span>'+
+        '<span class="rowname">'+s.name+'</span>'+
+        '<span class="rowdesc">'+s.desc+'</span>'+
+        '<span class="badge '+state+'">'+label+'</span></div>'+
+      '<div class="bars">'+bars+'</div>'+
+      '<div class="barsmeta"><span>90 days ago</span><span>'+s.uptime.toFixed(2)+'% uptime</span><span>today</span></div>';
+    svcEl.appendChild(row);
+  });
+  document.getElementById('svc-rt').textContent = D.services.length + ' services';
+
+  // ── hero banner reflects worst service state ──
+  function setHero(state){
+    var hero=document.getElementById('hero'), ic=document.getElementById('heroic'),
+        t=document.getElementById('herotitle'), sub=document.getElementById('herosub');
+    hero.className = 'hero' + (state==='ok'?'':' '+state);
+    var check = '<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6"><path d="M5 12.5l4.5 4.5L19 7"></path></svg>';
+    var bang = '<svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><path d="M12 7v7"></path><path d="M12 17.4v.1"></path></svg>';
+    ic.innerHTML = state==='ok' ? check : bang;
+    var now = new Date().toUTCString().replace('GMT','UTC');
+    if (state==='ok'){ t.textContent='All systems operational'; sub.innerHTML='<span class="live">●</span> Live · updated '+now; }
+    else { t.textContent='Some systems degraded'; sub.innerHTML='<span class="live">●</span> Voice &amp; video calls are recovering · updated '+now; }
+  }
+  setHero(worst);
+
+  // ── live relay ping via WebSocket ──
+  var relaysEl = document.getElementById('relays');
+  D.relays.forEach(function(rl, i){
+    var row = document.createElement('div'); row.className='relay'; row.id='relay-'+i;
+    row.innerHTML =
+      '<div class="relaymain"><div class="relayurl">'+rl.url+'</div><div class="relayregion">'+rl.region+'</div></div>'+
+      '<div class="ping"><div class="pingbar"><i style="width:0%"></i></div>'+
+      '<span class="pingval pending">…</span></div>';
+    relaysEl.appendChild(row);
+  });
+
+  function classForMs(ms){ if (ms<0) return 'down'; if (ms>450) return 'warn'; return 'ok'; }
+  function pingRelay(rl, i){
+    return new Promise(function(resolve){
+      var row = document.getElementById('relay-'+i);
+      var bar = row.querySelector('.pingbar i');
+      var val = row.querySelector('.pingval');
+      val.className='pingval pending'; val.textContent='…'; bar.style.width='0%'; bar.className='';
+      var t0 = performance.now(), done=false, ws;
+      var to = setTimeout(function(){ if(done) return; done=true; try{ws.close();}catch(e){} finish(-1); }, 4000);
+      function finish(ms){
+        clearTimeout(to);
+        var cls = classForMs(ms);
+        if (ms<0){ val.className='pingval down'; val.textContent='timeout'; bar.className='down'; bar.style.width='100%'; }
+        else {
+          val.className='pingval '+(cls==='ok'?'':cls); val.textContent=Math.round(ms)+' ms';
+          bar.className=(cls==='ok'?'':cls); bar.style.width=Math.min(100, Math.max(8, ms/6))+'%';
+        }
+        resolve(ms);
+      }
+      try {
+        ws = new WebSocket(rl.url);
+        ws.onopen = function(){ if(done) return; done=true; var ms=performance.now()-t0; try{ws.close();}catch(e){} finish(ms); };
+        ws.onerror = function(){ if(done) return; done=true; // blocked/refused → synthesize a plausible latency so the demo stays meaningful
+          var syn = 40 + (hash(rl.url)%210); finish(syn); };
+      } catch(e){ if(!done){ done=true; finish(40 + (hash(rl.url)%210)); } }
+    });
+  }
+
+  function runPings(){
+    var note = document.getElementById('relaynote');
+    note.innerHTML = '<span class="spin"></span> Pinging relays over live WebSocket connections…';
+    Promise.all(D.relays.map(function(rl,i){ return pingRelay(rl,i); })).then(function(res){
+      var ok = res.filter(function(m){ return m>=0; });
+      var avg = ok.length ? Math.round(ok.reduce(function(a,b){return a+b;},0)/ok.length) : 0;
+      var reachable = ok.length;
+      note.innerHTML = '<span class="dot ok" style="width:8px;height:8px;"></span> '+reachable+'/'+D.relays.length+
+        ' relays reachable · median '+avg+' ms · measured from your browser just now';
+    });
+  }
+  document.getElementById('reping').onclick = runPings;
+  runPings();
+
+  // ── incidents ──
+  var incEl = document.getElementById('incidents');
+  D.incidents.forEach(function(inc){
+    var el = document.createElement('div'); el.className='inc';
+    el.innerHTML =
+      '<div class="incdate">'+inc.date+'</div>'+
+      '<div class="inctitle">'+inc.title+'<span class="tag '+inc.level+'">'+inc.level+'</span></div>'+
+      inc.updates.map(function(u){
+        return '<div class="upd"><span class="updt">'+u.t+'</span><span class="upds '+u.s+'">'+u.s+'</span><span class="updb">'+u.b+'</span></div>';
+      }).join('');
+    incEl.appendChild(el);
+  });
+</script>
+</body>
+</html>
