@@ -87,14 +87,26 @@ on every host, so recipients see a stable "Sonar Smoke" contact.
 Marmot KeyPackage published to the target/control relays; otherwise the reporter
 cannot start the DM and the report will not land.
 
-## CI
+## Scheduled via Hermes
 
-`.github/workflows/relay-smoke.yml` runs daily (`schedule`, 06:17 UTC) and on
-demand (`workflow_dispatch`, accepts `seed`, `skip_control`, `identities`). It
-builds `sonar-cli`, runs the harness with `OPEN_ISSUES=1` and the reporter
-secret, and uploads `metrics.json` as a workflow artifact. On a non-`pass` run it
-opens a GitHub issue with the classification, the metrics, and the `SEED` to
-reproduce locally.
+This repository does **not** run the smoke test through GitHub Actions; it is
+driven by a Hermes host (the same runtime that powers the Sonar agent). On a host
+with Hermes installed, `sonar-cli` built, and `gh` authenticated, schedule the
+harness on a cron (Mode C: cron + terminal). For example, a daily run:
+
+```sh
+# one-time on the Hermes host
+( cd core && cargo build -p sonar-cli --release )   # build the CLI once
+export SONAR_SMOKE_REPORTER_NSEC=nsec1...           # persistent reporter identity
+
+# daily (Hermes terminal cron / system crontab): DMs the report, opens an issue on failure
+SKIP_REPORT=0 OPEN_ISSUES=1 scripts/smoke/relay-smoke.sh >> /var/log/relay-smoke.log 2>&1
+```
+
+The Hermes agent can also read the metrics JSON from each run and post an
+adaptive triage; see `core/sonar-cli/hermes/SKILL.md`. Env the harness honors on
+the host: `SONAR_CLI` (path to the binary), `SONAR_SMOKE_REPORTER_NSEC` (DM
+report), `OPEN_ISSUES=1` + `gh` auth (auto-issue), `SEED` (reproducibility).
 
 ## Caveats
 
@@ -106,6 +118,5 @@ reproduce locally.
   MLS groups need a `create-group` / `send-group` CLI capability — tracked as a
   follow-up, see `docs/brainstorms/2026-07-13-relay-hermes-smoke-test.md`.
 - **Ephemeral identities** are created fresh each run and discarded.
-- **Hermes exploratory layer** (brainstorm "Approach B") runs on-demand on an
-  operator host with Hermes installed — see `docs/HERMES-AGENT.md` § "Exploratory
-  relay smoke". It is not part of the daily gate.
+- **Hermes-driven:** the daily gate runs on a Hermes host (Mode C cron), not CI;
+  see "Scheduled via Hermes" above and `core/sonar-cli/hermes/SKILL.md`.

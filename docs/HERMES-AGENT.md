@@ -366,15 +366,15 @@ Relay propagation can take a few seconds; retry `listen --once` if needed.
 
 ---
 
-## Exploratory relay smoke (on-demand triage)
+## Relay smoke (Hermes-driven)
 
-The deterministic daily relay gate runs in CI as `scripts/smoke/relay-smoke.sh`
-(`docs/RELAY-SMOKE.md`). This is the **optional adaptive layer** an operator runs
-on a Hermes host (Mode A/B/C) to triage what the gate flagged — not the gate
-itself.
+The daily relay gate is `scripts/smoke/relay-smoke.sh` (`docs/RELAY-SMOKE.md`),
+scheduled on this Hermes host (Mode C: cron + terminal), not CI. The Hermes
+agent runs the harness and can then read its metrics for an adaptive triage of
+what it flagged.
 
 ```bash
-# latest gate result (CI artifact: relay-smoke-metrics/metrics.json)
+# latest gate result (metrics.json written by the last run)
 jq '{overall, target_loss_pct: .target.loss_pct, control_loss_pct: .control.loss_pct}' metrics.json
 
 # adaptive probe: ephemeral identities, receiver subscribed BEFORE the send

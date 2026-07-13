@@ -99,11 +99,12 @@ one object per line). The `type` field tells you which: `identity`, `published`,
   (Marmot/MLS); it does not drive BLE mesh. Nearby-only mesh peers are not
   reachable from the CLI.
 
-## Exploratory relay smoke (on-demand)
+## Relay smoke (Hermes-driven gate + triage)
 
 The deterministic daily gate is `scripts/smoke/relay-smoke.sh` (see
-`docs/RELAY-SMOKE.md`). This skill is the **optional adaptive layer** an operator
-runs on a Hermes host to triage what the gate flagged — it is NOT the gate.
+`docs/RELAY-SMOKE.md`). On a Hermes host this skill is the **driver**: schedule
+the harness on a cron (Mode C: cron + terminal) to run it daily, then optionally
+read the metrics JSON from each run and post an adaptive triage.
 
 When invoked for relay triage:
 
