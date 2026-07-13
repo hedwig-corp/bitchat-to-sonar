@@ -3314,9 +3314,6 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun openChat(chat: SonarChat) {
         push(Screen.Chat(chat.id, chatTitle(chat)))
         val generation = beginTranscriptSession(chat.id)
-        resolveMarmotGroupId(chat.id)?.let { groupId ->
-            scope.launch { runCatching { SonarCore.preferCatchupGroup(groupId) } }
-        }
         pendingMarmotNpub(chat.id)?.let { pendingNpub ->
             messages = visibleMessagesForChat(chat.id, withSendEchoes(chat.id, emptyList()))
             ensureProfile(pendingNpub)
@@ -3368,9 +3365,6 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (name.isNotBlank()) rememberMeshName(canonicalPeerId, name)
         push(Screen.Chat(id, name, pay))
         val generation = beginTranscriptSession(id)
-        resolveMarmotGroupId(id)?.let { groupId ->
-            scope.launch { runCatching { SonarCore.preferCatchupGroup(groupId) } }
-        }
         messages = visibleMessagesForChat(
             id,
             refreshConversationRows(refreshMeshTranscriptWindow(canonicalPeerId), id, generation),

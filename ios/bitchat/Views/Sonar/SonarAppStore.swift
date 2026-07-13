@@ -5058,10 +5058,6 @@ final class SonarAppStore: ObservableObject {
                 let fp = self.chatViewModel.getFingerprint(for: PeerID(str: id)) ?? id
                 self.rememberMarmotGroup(hydratedGroupId, forConversationId: fp)
             }
-            // P2: service cold-start catch-up for the conversation the user opened.
-            if let hydratedGroupId {
-                Task { await self.marmot.preferCatchupGroup(hydratedGroupId) }
-            }
             let needsHistoryBackfill = hydratedGroupId.map {
                 let groups = self.directMarmotGroups(matchingGroupId: $0)
                 let sourceGroups = groups.isEmpty

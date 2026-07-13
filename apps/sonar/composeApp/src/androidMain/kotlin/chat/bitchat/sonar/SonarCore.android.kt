@@ -405,12 +405,6 @@ actual object SonarCore {
         Unit
     }
 
-    actual suspend fun preferCatchupGroup(mlsGroupIdHex: String?) = withContext(Dispatchers.IO) {
-        val value = mlsGroupIdHex?.trim().orEmpty()
-        runCatching { node?.preferCatchupGroup(value) }
-        Unit
-    }
-
     actual suspend fun ensureSubscriptions() = withContext(Dispatchers.IO) {
         runCatching { node?.ensureSubscriptions() }
         Unit
