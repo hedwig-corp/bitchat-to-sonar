@@ -1,0 +1,21 @@
+# Copy to an allowlisted repository root as `.ai-fix.toml`.
+# Repository policy is untrusted: it may only add blocked paths and select
+# commands already present in the service's exact command allowlist.
+version = 1
+additional_blocked_paths = ["generated/**", "vendor/**"]
+
+[[validation_commands]]
+program = "cargo"
+args = ["fmt", "--all", "--check"]
+
+[[validation_commands]]
+program = "cargo"
+args = ["check", "--workspace", "--all-targets"]
+
+[[validation_commands]]
+program = "cargo"
+args = ["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]
+
+[[validation_commands]]
+program = "cargo"
+args = ["test", "--workspace"]

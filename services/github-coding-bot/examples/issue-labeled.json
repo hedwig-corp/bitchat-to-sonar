@@ -1,0 +1,19 @@
+{
+  "action": "labeled",
+  "issue": {
+    "number": 42,
+    "state": "open",
+    "title": "Parser accepts an invalid record",
+    "body": "Reproduction and expected behavior.",
+    "user": { "login": "reporter", "type": "User" }
+  },
+  "label": { "name": "ai-fix" },
+  "repository": {
+    "id": 123456789,
+    "name": "repository",
+    "owner": { "login": "owner", "type": "Organization" },
+    "default_branch": "main"
+  },
+  "sender": { "login": "trusted-maintainer", "type": "User" },
+  "installation": { "id": 987654 }
+}
