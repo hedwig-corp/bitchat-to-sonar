@@ -1161,6 +1161,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                 state.stickerPack(author, identifier, relays)
             },
             loadStickerImage = { url, expectedSha256 -> state.stickerImage(url, expectedSha256) },
+            fetchInstalledPacks = { state.fetchInstalledPacks() },
             initialStickerPacks = stickerPacks,
             onStickerPacksLoaded = { stickerPacks = it },
             onClose = { emojiTray = false }

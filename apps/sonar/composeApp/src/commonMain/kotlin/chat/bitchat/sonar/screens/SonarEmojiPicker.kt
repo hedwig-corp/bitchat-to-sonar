@@ -117,21 +117,6 @@ private val emojiCategories = listOf(
     )),
 )
 
-/**
- * Default sticker pack loaded on first Sticker tab open when the user has no
- * installed packs (kind 10031). Must be the kind-30031 publisher pubkey —
- * see [docs/SONAR-STICKERS.md](https://sonarprivacy.xyz/docs/#SONAR-STICKERS).
- * Older kind-30030 publishes for the same Signal pack id are not used.
- */
-private const val TEST_PACK_AUTHOR = "7215b2db8754494fd3452b7f2d28b56e23863b95446bf68d79f980a7ad5ec7cd"
-private const val TEST_PACK_ID = "signal-8fa42aa13ec8f0efebe4b038f41afbd1"
-private val TEST_PACK_RELAYS = listOf(
-    "wss://relay.damus.io",
-    "wss://nos.lol",
-    "wss://relay.primal.net",
-    "wss://nostr.relay.hedwig.sh",
-)
-
 @Composable
 fun SonarEmojiPicker(
     onEmoji: (String) -> Unit,
@@ -143,6 +128,7 @@ fun SonarEmojiPicker(
     loadStickerImage: suspend (String, String) -> ByteArray? = { url, expectedSha256 ->
         runCatching { SonarCore.fetchStickerImage(url, expectedSha256) }.getOrNull()
     },
+    fetchInstalledPacks: suspend () -> List<String> = { SonarCore.fetchInstalledPacks() },
     initialStickerPacks: List<SonarStickerPack> = emptyList(),
     onStickerPacksLoaded: (List<SonarStickerPack>) -> Unit = {},
     onClose: () -> Unit,
@@ -186,6 +172,7 @@ fun SonarEmojiPicker(
                 onSticker,
                 loadStickerPack,
                 loadStickerImage,
+                fetchInstalledPacks,
                 initialStickerPacks,
                 onStickerPacksLoaded,
             )
@@ -379,6 +366,7 @@ private fun ColumnScope.StickerTabContent(
     onSticker: (SonarStickerItem, String) -> Unit,
     loadStickerPack: suspend (String, String, List<String>) -> SonarStickerPack?,
     loadStickerImage: suspend (String, String) -> ByteArray?,
+    fetchInstalledPacks: suspend () -> List<String>,
     initialStickerPacks: List<SonarStickerPack>,
     onStickerPacksLoaded: (List<SonarStickerPack>) -> Unit,
 ) {
@@ -394,21 +382,22 @@ private fun ColumnScope.StickerTabContent(
         if (hadCachedPacks) {
             loading = false
         }
-        val coordinates = try { SonarCore.fetchInstalledPacks() } catch (_: Throwable) { emptyList() }
-        val toFetch = coordinates.ifEmpty { listOf("30031:$TEST_PACK_AUTHOR:$TEST_PACK_ID") }
+        val coordinates = try { fetchInstalledPacks() } catch (_: Throwable) { emptyList() }
         val loaded = mutableListOf<SonarStickerPack>()
-        for (coord in toFetch) {
+        for (coord in coordinates) {
             val parts = coord.split(":", limit = 3)
             if (parts.size != 3) continue
-            val relays = if (coord.contains(TEST_PACK_AUTHOR)) TEST_PACK_RELAYS else emptyList()
-            loadStickerPack(parts[1], parts[2], relays)?.takeIf { it.stickers.isNotEmpty() }?.let { loaded += it }
-        }
-        if (loaded.isEmpty()) {
-            loadStickerPack(TEST_PACK_AUTHOR, TEST_PACK_ID, TEST_PACK_RELAYS)?.let { loaded += it }
+            loadStickerPack(parts[1], parts[2], emptyList())
+                ?.takeIf { it.stickers.isNotEmpty() }
+                ?.let { loaded += it }
         }
         if (loaded.isNotEmpty()) {
             packs = loaded
             onStickerPacksLoaded(loaded)
+            error = null
+        } else if (coordinates.isEmpty()) {
+            packs = emptyList()
+            onStickerPacksLoaded(emptyList())
             error = null
         } else if (!hadCachedPacks) {
             error = "Failed to load sticker packs"
@@ -430,11 +419,18 @@ private fun ColumnScope.StickerTabContent(
             Spacer(Modifier.height(8.dp))
             Text("Loading stickers…", color = s.text3, fontSize = 13.sp)
         }
-    } else if (error != null || packs.isEmpty()) {
+    } else if (error != null) {
         SNEmptyState(
             icon = SNIconName.Sticker,
             title = "Couldn't load stickers",
             desc = error ?: "Try again later",
+        )
+        Spacer(Modifier.weight(1f))
+    } else if (packs.isEmpty()) {
+        SNEmptyState(
+            icon = SNIconName.Sticker,
+            title = "No sticker packs installed",
+            desc = "Install a pack from a shared sticker link to use it here.",
         )
         Spacer(Modifier.weight(1f))
     } else {

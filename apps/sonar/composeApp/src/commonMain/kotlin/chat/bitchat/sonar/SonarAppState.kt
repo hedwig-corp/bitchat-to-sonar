@@ -403,6 +403,12 @@ internal fun shouldWaitForCapabilities(
     return nowMs - first < settleMs
 }
 
+internal fun shouldExposeCachedStickerPack(
+    coordinate: String,
+    installedCoordinates: Set<String>,
+    installedCoordinatesLoaded: Boolean,
+): Boolean = !installedCoordinatesLoaded || coordinate.lowercase() in installedCoordinates
+
 internal fun hasRecentMarmotActivityForCapabilitySettle(
     latestMessageTsSecs: Long?,
     nowMs: Long,
@@ -4409,6 +4415,8 @@ class SonarAppState(private val scope: CoroutineScope) {
     private val stickerPackCache = linkedMapOf<String, SonarStickerPack>()
     private val stickerImageCache = linkedMapOf<String, ByteArray>()
     private val installedPackCoordinates = mutableSetOf<String>()
+    /** Distinguishes an unhydrated relay-backed list from a known empty list. */
+    private var installedPackCoordinatesLoaded = false
     private var stickerCacheGeneration = 0L
     private val pendingMediaUrlPrefix = "pending-media-"
 
@@ -4938,7 +4946,16 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
-    fun cachedStickerPacks(): List<SonarStickerPack> = stickerPackCache.values.toList()
+    fun cachedStickerPacks(): List<SonarStickerPack> = stickerPackCache
+        .filterKeys {
+            shouldExposeCachedStickerPack(
+                coordinate = it,
+                installedCoordinates = installedPackCoordinates,
+                installedCoordinatesLoaded = installedPackCoordinatesLoaded,
+            )
+        }
+        .values
+        .toList()
 
     suspend fun stickerImage(url: String, expectedSha256: String): ByteArray? {
         stickerImageFromMemory(expectedSha256)?.let { return it }
@@ -4995,15 +5012,35 @@ class SonarAppState(private val scope: CoroutineScope) {
         stickerPackCache.clear()
         stickerImageCache.clear()
         installedPackCoordinates.clear()
+        installedPackCoordinatesLoaded = false
     }
 
     fun isPackInstalled(coordinate: String): Boolean =
         installedPackCoordinates.contains(coordinate.lowercase())
 
+    suspend fun fetchInstalledPacks(): List<String> {
+        if (installedPackCoordinatesLoaded) {
+            scope.launch { refreshInstalledPacks() }
+            return installedPackCoordinates.toList()
+        }
+        return try {
+            val coordinates = SonarCore.fetchInstalledPacks()
+            replaceInstalledPacks(coordinates)
+            coordinates
+        } catch (_: Throwable) {
+            emptyList()
+        }
+    }
+
     suspend fun refreshInstalledPacks() {
-        val coords = try { SonarCore.fetchInstalledPacks() } catch (_: Throwable) { emptyList() }
+        val coords = try { SonarCore.fetchInstalledPacks() } catch (_: Throwable) { return }
+        replaceInstalledPacks(coords)
+    }
+
+    private fun replaceInstalledPacks(coords: List<String>) {
         installedPackCoordinates.clear()
         installedPackCoordinates.addAll(coords.map { it.lowercase() })
+        installedPackCoordinatesLoaded = true
     }
 
     suspend fun installStickerPack(coordinate: String): Boolean {
@@ -5019,7 +5056,9 @@ class SonarAppState(private val scope: CoroutineScope) {
     suspend fun uninstallStickerPack(coordinate: String): Boolean {
         return try {
             SonarCore.uninstallStickerPack(coordinate)
-            installedPackCoordinates.remove(coordinate.lowercase())
+            val normalized = coordinate.lowercase()
+            installedPackCoordinates.remove(normalized)
+            stickerPackCache.remove(normalized)
             true
         } catch (_: Throwable) {
             false

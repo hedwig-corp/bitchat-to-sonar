@@ -5,6 +5,31 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class StickerSendEchoTest {
+    @Test fun cachedStickerPacksFollowInstalledAuthority() {
+        val coordinate = "30031:author:pack"
+
+        assertTrue(shouldExposeCachedStickerPack(
+            coordinate,
+            emptySet(),
+            installedCoordinatesLoaded = false,
+        ))
+        assertTrue(shouldExposeCachedStickerPack(
+            coordinate,
+            setOf(coordinate),
+            installedCoordinatesLoaded = true,
+        ))
+        assertFalse(shouldExposeCachedStickerPack(
+            coordinate,
+            emptySet(),
+            installedCoordinatesLoaded = true,
+        ))
+        assertFalse(shouldExposeCachedStickerPack(
+            coordinate,
+            setOf("30031:author:other"),
+            installedCoordinatesLoaded = true,
+        ))
+    }
+
     @Test fun stickerEchoMatchesOnlyTheSameSticker() {
         val expectedRef = SonarStickerRef("30031:author:pack", "wave", "aabbcc")
         val echo = message("echo", 100, expectedRef)

@@ -8,6 +8,31 @@ import XCTest
 
 @MainActor
 final class MarmotStickerOptimisticTests: XCTestCase {
+    func testCachedStickerPacksFollowInstalledAuthority() {
+        let coordinate = "30031:author:pack"
+
+        XCTAssertTrue(MarmotChatModel.shouldExposeCachedStickerPack(
+            coordinate: coordinate,
+            installedCoordinates: [],
+            installedCoordinatesLoaded: false
+        ))
+        XCTAssertTrue(MarmotChatModel.shouldExposeCachedStickerPack(
+            coordinate: coordinate,
+            installedCoordinates: [coordinate],
+            installedCoordinatesLoaded: true
+        ))
+        XCTAssertFalse(MarmotChatModel.shouldExposeCachedStickerPack(
+            coordinate: coordinate,
+            installedCoordinates: [],
+            installedCoordinatesLoaded: true
+        ))
+        XCTAssertFalse(MarmotChatModel.shouldExposeCachedStickerPack(
+            coordinate: coordinate,
+            installedCoordinates: ["30031:author:other"],
+            installedCoordinatesLoaded: true
+        ))
+    }
+
     func testStickerEchoMatchesOnlyTheSameSticker() {
         let createdAt = Date()
         let expectedRef = MarmotService.MarmotStickerRef(

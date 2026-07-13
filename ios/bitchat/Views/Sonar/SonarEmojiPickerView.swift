@@ -183,13 +183,6 @@ struct SonarEmojiPickerView: View {
 
 // MARK: - Sticker tab
 
-// Default kind-30031 pack when the user has no installed packs (10031).
-// Older kind-30030 publishes for this Signal pack id are not used.
-// https://sonarprivacy.xyz/docs/#SONAR-STICKERS
-private let testPackAuthor = "7215b2db8754494fd3452b7f2d28b56e23863b95446bf68d79f980a7ad5ec7cd"
-private let testPackId = "signal-8fa42aa13ec8f0efebe4b038f41afbd1"
-private let testPackRelays = ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net"]
-
 private struct StickerTabContent: View {
     @Binding var packs: [StickerPackInfo]
     let onSticker: (StickerInfo, String) -> Void
@@ -249,6 +242,20 @@ private struct StickerTabContent: View {
                     .padding(.horizontal, 8)
                     .padding(.bottom, 8)
                 }
+            } else {
+                VStack(spacing: 8) {
+                    Spacer()
+                    Text("No sticker packs installed")
+                        .font(SonarTheme.uiFont(size: 14, weight: .semibold))
+                        .foregroundColor(SonarTheme.text)
+                    Text("Install a pack from a shared sticker link to use it here.")
+                        .font(SonarTheme.uiFont(size: 12))
+                        .foregroundColor(SonarTheme.text3)
+                        .multilineTextAlignment(.center)
+                    Spacer()
+                }
+                .padding(.horizontal, 24)
+                .frame(maxWidth: .infinity)
             }
         }
         .task {
@@ -264,23 +271,19 @@ private struct StickerTabContent: View {
             loading = false
         }
         let coordinates = await fetchInstalledPacks()
-        let toFetch = coordinates.isEmpty ? ["30031:\(testPackAuthor):\(testPackId)"] : coordinates
         var loaded: [StickerPackInfo] = []
-        for coord in toFetch {
+        for coord in coordinates {
             let parts = coord.split(separator: ":", maxSplits: 2).map(String.init)
             guard parts.count == 3 else { continue }
-            let relays = coord.contains(testPackAuthor) ? testPackRelays : []
-            if let p = await loadPack(parts[1], parts[2], relays), !p.stickers.isEmpty {
+            if let p = await loadPack(parts[1], parts[2], []), !p.stickers.isEmpty {
                 loaded.append(p)
-            }
-        }
-        if loaded.isEmpty {
-            if let fallback = await loadPack(testPackAuthor, testPackId, testPackRelays) {
-                loaded.append(fallback)
             }
         }
         if !loaded.isEmpty {
             packs = loaded
+            error = nil
+        } else if coordinates.isEmpty {
+            packs = []
             error = nil
         } else if !hadCachedPacks {
             error = "Failed to load sticker packs"
