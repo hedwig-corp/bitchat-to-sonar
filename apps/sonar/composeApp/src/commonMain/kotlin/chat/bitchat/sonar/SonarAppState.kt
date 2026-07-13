@@ -4324,7 +4324,7 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  republish their original encrypted event; optimistic setup/media rows
      *  reuse the local plaintext/bytes that are already held for that row. */
     fun retryMessage(chatId: String, message: SonarMsg) {
-        if (!sonarDeliveryFailed(message.state)) return
+        if (!sonarCanRetryMessage(message)) return
         val mediaUploads = pendingMediaUploads[chatId]
             ?.filter { it.message.id == message.id }
             .orEmpty()
@@ -4341,16 +4341,11 @@ class SonarAppState(private val scope: CoroutineScope) {
             return
         }
 
-        val groupId = resolveMarmotGroupId(chatId)
-        if (groupId == null) {
-            toast = "This message is no longer available to retry."
-            return
-        }
         messages = messages.map {
             if (it.id == message.id) it.copy(state = "Sending") else it
         }
         scope.launch {
-            runCatching { SonarCore.retryMessage(groupId, message.id) }
+            runCatching { SonarCore.retryMessage(message.id) }
                 .onSuccess { refreshRetriedMarmotMessage(chatId) }
                 .onFailure { error ->
                     if ((screen as? Screen.Chat)?.id == chatId) {

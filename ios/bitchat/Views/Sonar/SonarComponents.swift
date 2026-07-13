@@ -755,20 +755,22 @@ struct SNMsgList: View {
                                 )
                             } else if !m.media.isEmpty {
                                 let showDeliveryState = m.mine && (i == msgs.count - 1 || m.state == "Couldn't send")
+                                let canRetry = snCanRetryFailedMessage(m)
                                 SNMediaBubble(
                                     m: m,
                                     maxBubbleWidth: geo.size.width * 0.72,
                                     showState: showDeliveryState,
-                                    onRetry: m.state == "Couldn't send" ? { onRetry?(m) } : nil,
+                                    onRetry: canRetry ? { onRetry?(m) } : nil,
                                     pipeline: mediaPipeline
                                 )
                             } else if m.stickerRef != nil {
                                 let showDeliveryState = m.mine && (i == msgs.count - 1 || m.state == "Couldn't send")
+                                let canRetry = snCanRetryFailedMessage(m)
                                 SNStickerBubble(
                                     m: m,
                                     showAuthor: showAuthors && !m.mine,
                                     showState: showDeliveryState,
-                                    onRetry: m.state == "Couldn't send" ? { onRetry?(m) } : nil,
+                                    onRetry: canRetry ? { onRetry?(m) } : nil,
                                     load: loadSticker,
                                     onTapPack: onTapPack
                                 )
@@ -790,7 +792,7 @@ struct SNMsgList: View {
                                     showAuthor: showAuthors && !m.mine && !cont,
                                     cont: cont,
                                     showState: m.mine && (i == msgs.count - 1 || m.state == "Couldn't send"),
-                                    onRetry: m.state == "Couldn't send" ? { onRetry?(m) } : nil,
+                                    onRetry: snCanRetryFailedMessage(m) ? { onRetry?(m) } : nil,
                                     maxBubbleWidth: geo.size.width * 0.78,
                                     onTapAuthor: onTapAuthor
                                 )

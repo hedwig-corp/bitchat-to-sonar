@@ -39,3 +39,9 @@ internal fun sonarDeliveryPending(state: String?): Boolean =
 
 internal fun sonarDeliveryFailed(state: String?): Boolean =
     sonarDeliveryLabel(state) == "Couldn't send"
+
+/** Retry is intentionally scoped to failed White Noise/Marmot sends. Mesh
+ * failures have a different resend pipeline and must not be routed into the
+ * durable Internet outbox. */
+internal fun sonarCanRetryMessage(message: SonarMsg): Boolean =
+    message.mine && message.viaInternet && sonarDeliveryFailed(message.state)

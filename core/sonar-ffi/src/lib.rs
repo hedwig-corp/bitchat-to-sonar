@@ -903,11 +903,10 @@ impl SonarNode {
     /// Retry one failed outgoing message from the durable local outbox. The
     /// original encrypted event is republished, so retry cannot duplicate the
     /// plaintext transcript row or mutate MLS state a second time.
-    pub fn retry_message(&self, group_id_hex: String, message_id_hex: String) -> FfiResult<()> {
-        let group_id = parse_group_id(&group_id_hex)?;
-        self.runtime
-            .block_on(self.client.retry_message(&group_id, &message_id_hex))?;
-        Ok(())
+    pub fn retry_message(&self, message_id_hex: String) -> FfiResult<String> {
+        Ok(self
+            .runtime
+            .block_on(self.client.retry_message(&message_id_hex))?)
     }
 
     /// Re-subscribe with the current watermark and group set to self-heal

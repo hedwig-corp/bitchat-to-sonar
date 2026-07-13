@@ -1116,7 +1116,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                                 prevMsg.senderNpub == m.senderNpub &&
                                 PayLine.decode(prevMsg.content) !is PayLine.Pay
                             val pay = PayLine.decode(m.content) as? PayLine.Pay
-                            val failedSend = m.mine && sonarDeliveryFailed(m.state)
+                            val failedSend = sonarCanRetryMessage(m)
                             if (pay != null) {
                                 val status = run { state.payVersion; state.payStatus(pay.uuid) }
                                 PayBubble(m, pay, status, peerName, mesh = msgMesh, fiatOf = { state.fiatOrNull(it) })

@@ -143,31 +143,26 @@ impl OutboxState {
     /// the Signal-style retry button after the transport comes back.
     pub fn retry_failed_event(
         &mut self,
-        group_id_hex: &str,
         message_id_hex: &str,
         now_secs: u64,
-    ) -> Result<Event> {
+    ) -> Result<(String, Event)> {
         let entry = self
             .entries
             .get_mut(message_id_hex)
             .ok_or_else(|| Error::InvalidInput("message is no longer available to retry".into()))?;
-        if entry.group_id_hex != group_id_hex {
-            return Err(Error::InvalidInput(
-                "message does not belong to this conversation".into(),
-            ));
-        }
         if entry.state != DeliveryState::Failed {
             return Err(Error::InvalidInput("message is not failed".into()));
         }
         let event = Event::from_json(&entry.event_json)
             .map_err(|e| Error::Storage(format!("outbox event decode: {e}")))?;
+        let group_id_hex = entry.group_id_hex.clone();
         entry.state = DeliveryState::Pending;
         entry.updated_at_secs = now_secs;
         entry.attempts = 0;
         entry.last_error = None;
         self.dirty = true;
         self.save_if_dirty()?;
-        Ok(event)
+        Ok((group_id_hex, event))
     }
 
     /// Returns `(message_id_hex, group_id_hex, event)` for each retryable row.
@@ -393,9 +388,10 @@ mod tests {
                 .expect("mark failed");
         }
 
-        let retried = outbox
-            .retry_failed_event("group", "message", 3)
+        let (source_group, retried) = outbox
+            .retry_failed_event("message", 3)
             .expect("manual retry");
+        assert_eq!(source_group, "group");
         assert_eq!(retried.id, event.id);
         assert_eq!(
             outbox.status_for_message("message"),

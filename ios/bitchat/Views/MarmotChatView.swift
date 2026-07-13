@@ -1845,7 +1845,12 @@ final class MarmotChatModel: ObservableObject {
         }
     }
 
-    func send(_ text: String, to groupId: String) {
+    func send(
+        _ text: String,
+        to groupId: String,
+        onEchoVisible: (() -> Void)? = nil,
+        onFailure: (() -> Void)? = nil
+    ) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         errorText = nil
@@ -1858,6 +1863,7 @@ final class MarmotChatModel: ObservableObject {
             media: []
         )
         appendOptimistic(echo, to: groupId)
+        onEchoVisible?()
         let prev = sendChain
         sendChain = Task { [weak self] in
             _ = await prev?.result
@@ -1869,6 +1875,7 @@ final class MarmotChatModel: ObservableObject {
                 try await self.service.sendText(groupId: groupId, text: trimmed)
             } catch {
                 self.discardOptimistic(id: echo.id, from: groupId)
+                onFailure?()
                 self.errorText = Self.describe(error)
                 return
             }
@@ -1897,23 +1904,23 @@ final class MarmotChatModel: ObservableObject {
     /// Retry a core-backed failed row without creating a second transcript row
     /// or re-running MLS encryption. The core flips the durable row back to
     /// pending before republishing the original encrypted wrapper event.
-    func retryMessage(groupId: String, messageId: String) {
+    func retryMessage(messageId: String) {
         errorText = nil
         Task {
             do {
                 guard await ensureConnected(timeoutSeconds: 2) else {
                     throw MarmotService.ServiceError.notConnected
                 }
-                try await service.retryMessage(groupId: groupId, messageId: messageId)
-                await loadLocalPage(groupId: groupId)
+                let groupId = try await service.retryMessage(messageId: messageId)
+                await loadLocalPage(groupId: groupId, mode: .preserveHistoricalWindow)
             } catch {
                 errorText = Self.describe(error)
             }
         }
     }
 
-    /// Remove a failed platform-local media echo immediately before replacing
-    /// it with a new upload attempt that reuses the retained local bytes.
+    /// Remove a failed platform-local media echo after its replacement upload
+    /// echo is visible, so retry never leaves a gap in the transcript.
     func removeFailedOptimisticMessage(groupId: String, messageId: String) {
         guard Self.isFailedOptimisticMessageId(messageId) else { return }
         pendingOptimistic[groupId]?.removeAll { $0.id == messageId }
@@ -1929,6 +1936,7 @@ final class MarmotChatModel: ObservableObject {
         mime: String,
         caption: String = "",
         localPreviewURL: String? = nil,
+        onEchoVisible: (() -> Void)? = nil,
         onComplete: (() -> Void)? = nil,
         onFailure: (() -> Void)? = nil
     ) {
@@ -1958,6 +1966,7 @@ final class MarmotChatModel: ObservableObject {
                 await loadLocalPage(groupId: groupId, mode: .preserveHistoricalWindow)
                 appendOptimistic(echo, to: groupId)
                 echoVisible = true
+                onEchoVisible?()
                 guard await ensureRelayConnected() else {
                     throw MarmotService.ServiceError.notConnected
                 }
@@ -1995,6 +2004,7 @@ final class MarmotChatModel: ObservableObject {
         items: [MarmotService.MediaAlbumItem],
         caption: String = "",
         localPreviewURLs: [String],
+        onEchoVisible: (() -> Void)? = nil,
         onComplete: (() -> Void)? = nil,
         onFailure: (() -> Void)? = nil
     ) {
@@ -2025,6 +2035,7 @@ final class MarmotChatModel: ObservableObject {
                 await loadLocalPage(groupId: groupId, mode: .preserveHistoricalWindow)
                 appendOptimistic(echo, to: groupId)
                 echoVisible = true
+                onEchoVisible?()
                 guard await ensureRelayConnected() else {
                     throw MarmotService.ServiceError.notConnected
                 }

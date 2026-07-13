@@ -641,9 +641,9 @@ final class MarmotService: @unchecked Sendable {
     }
 
     /// Republish one failed message from the durable local outbox.
-    func retryMessage(groupId: String, messageId: String) async throws {
+    func retryMessage(messageId: String) async throws -> String {
         try await run {
-            try $0.requireNode().retryMessage(groupIdHex: groupId, messageIdHex: messageId)
+            try $0.requireNode().retryMessage(messageIdHex: messageId)
         }
     }
 

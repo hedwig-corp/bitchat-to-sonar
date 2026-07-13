@@ -1180,7 +1180,7 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * original encrypted event is republished, so retry cannot duplicate the
      * plaintext transcript row or mutate MLS state a second time.
      */
-    func retryMessage(groupIdHex: String, messageIdHex: String) throws
+    func retryMessage(messageIdHex: String) throws  -> String
 
     /**
      * Reload the durable outbox sidecar and retry pending sends. Hosts call this
@@ -2030,13 +2030,13 @@ open func requestJoinViaLink(inviteToken: String)throws   {try rustCallWithError
      * original encrypted event is republished, so retry cannot duplicate the
      * plaintext transcript row or mutate MLS state a second time.
      */
-open func retryMessage(groupIdHex: String, messageIdHex: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+open func retryMessage(messageIdHex: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_retry_message(
             self.uniffiCloneHandle(),
-        FfiConverterString.lower(groupIdHex),
         FfiConverterString.lower(messageIdHex),$0
     )
-}
+})
 }
 
     /**
@@ -6597,7 +6597,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_request_join_via_link() != 14691) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_retry_message() != 19486) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_retry_message() != 18819) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_retry_outbox() != 58495) {

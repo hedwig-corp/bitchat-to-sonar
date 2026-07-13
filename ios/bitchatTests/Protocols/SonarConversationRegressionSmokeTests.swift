@@ -150,4 +150,31 @@ struct SonarConversationRegressionSmokeTests {
         #expect(MarmotChatModel.stateText(for: failed) == "Couldn't send")
         #expect(MarmotChatModel.stateText(for: pending) == "Sending")
     }
+
+    @Test
+    func retryIsOnlyOfferedForFailedOutgoingInternetMessages() {
+        let failedInternet = SNMessage(
+            mine: true,
+            text: "hello",
+            time: "",
+            via: .internet,
+            state: "Couldn't send"
+        )
+
+        #expect(snCanRetryFailedMessage(failedInternet))
+        #expect(!snCanRetryFailedMessage(SNMessage(
+            mine: true,
+            text: "hello",
+            time: "",
+            via: .mesh,
+            state: "Couldn't send"
+        )))
+        #expect(!snCanRetryFailedMessage(SNMessage(
+            mine: false,
+            text: "hello",
+            time: "",
+            via: .internet,
+            state: "Couldn't send"
+        )))
+    }
 }
