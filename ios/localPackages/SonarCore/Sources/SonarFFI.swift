@@ -1098,9 +1098,9 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * after relay disconnects. Hosts call this on the idle timeout path
      * instead of `sync_once()`. It may run one bounded per-chat repair fetch,
      * so hosts must keep it off the local-first chat-open path.
-     * Prefer catch-up for the open chat. Pass the MLS group id hex (same id used
-     * by send_text / messages). Empty clears. Local-first: does not block paint
-     * or send. Core maps MLS to the public nostr group id for the catch-up queue.
+     * Prefer catch-up for the open chat. Pass the MLS group id hex (same id
+     * hosts use for send_text / messages). Empty clears. Local-first: does not
+     * block paint or send. Core maps MLS to nostr group id for the catch-up queue.
      */
     func preferCatchupGroup(mlsGroupIdHex: String) 
     
@@ -1848,9 +1848,9 @@ open func pendingJoinRequests(groupIdHex: String)throws  -> [JoinRequestInfo]  {
      * after relay disconnects. Hosts call this on the idle timeout path
      * instead of `sync_once()`. It may run one bounded per-chat repair fetch,
      * so hosts must keep it off the local-first chat-open path.
-     * Prefer catch-up for the open chat. Pass the MLS group id hex (same id used
-     * by send_text / messages). Empty clears. Local-first: does not block paint
-     * or send. Core maps MLS to the public nostr group id for the catch-up queue.
+     * Prefer catch-up for the open chat. Pass the MLS group id hex (same id
+     * hosts use for send_text / messages). Empty clears. Local-first: does not
+     * block paint or send. Core maps MLS to nostr group id for the catch-up queue.
      */
 open func preferCatchupGroup(mlsGroupIdHex: String)  {try! rustCall() {
     uniffi_sonar_ffi_fn_method_sonarnode_prefer_catchup_group(
@@ -6496,7 +6496,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_pending_join_requests() != 43500) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_prefer_catchup_group() != 53691) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_prefer_catchup_group() != 47202) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_blossom_servers() != 35600) {

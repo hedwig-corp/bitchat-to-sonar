@@ -91,3 +91,30 @@ commit them. The `SONAR_BENCH_NSEC` hook and markers are `#if DEBUG` only.
 
 Raw per-run logs land in `/tmp/sonar-bench/runs/run_*.ndjson`. The aggregator
 (`_aggregate.py`) prints a min/median/max table per phase.
+
+## Text-send flow (iPhone, macOS, Android)
+
+The shared Rust core emits these content-free markers for every Marmot text
+send on every app surface:
+
+| marker | duration field | meaning |
+|---|---:|---|
+| `send_local_pending` | `local_ms` | MLS event creation, local transcript processing, and durable pending-outbox write |
+| `send_publish_start` | — | background relay fan-out started |
+| `send_first_ack` | `rtt_ms` | first relay accepted the event; the row can flip from **Sending** to **Sent** |
+| `send_publish_failed` | `rtt_ms` | every configured relay failed |
+
+Capture the platform log while sending a fixed number of text messages, then
+feed it to the same parser:
+
+```bash
+scripts/bench/_send_aggregate.py --label "iPhone 14 Pro Max" /tmp/iphone-send.log
+scripts/bench/_send_aggregate.py --label "macOS native" /tmp/macos-send.log
+scripts/bench/_send_aggregate.py --label "Android emulator" /tmp/android-send.log
+```
+
+Apple writes the core markers to `os_log` (subsystem `chat.bitchat`, category
+`core`), Android writes them to logcat tag `SonarCore`, and Compose Desktop
+writes them to stderr. The parser uses the structured duration fields rather
+than host timestamps, so the three results are directly comparable. Message
+content and private keys are never logged.

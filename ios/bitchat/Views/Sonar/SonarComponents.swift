@@ -2647,6 +2647,7 @@ struct SNComposer: View {
                     .font(SonarTheme.uiFont(size: 16))
                     .lineLimit(1...5)
                     .foregroundColor(SonarTheme.text)
+                    .accessibilityIdentifier("sonar-message-composer")
                     .submitLabel(.send)
                     .onSubmit(send)
                 Button {
@@ -2676,6 +2677,7 @@ struct SNComposer: View {
                 .padding(.bottom, 1)
         }
         .buttonStyle(SNScaleStyle(scale: 0.92))
+        .accessibilityIdentifier("sonar-message-send")
         .disabled(!hasText)
     }
 

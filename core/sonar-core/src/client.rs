@@ -1837,6 +1837,7 @@ impl SonarClient {
     /// in the background. Publish success/failure only updates local delivery
     /// state; it does not gate transcript visibility.
     pub async fn send_text(&self, group_id: &GroupId, text: &str) -> Result<()> {
+        let local_started = Instant::now();
         let event = self.engine.create_text_message(group_id, text)?;
         let incoming = self.engine.process_incoming(&event).await?;
         let Incoming::Message(message) = incoming else {
@@ -1848,17 +1849,20 @@ impl SonarClient {
         let group_name = self.resolve_group_name(group_id);
         self.mark_outbox_pending(group_id, &message, &event)?;
         let event_id = event.id;
+        let local_ms = local_started.elapsed().as_millis() as u64;
         tracing::info!(
             message_id = %message.id.to_hex(),
             event_id = %event_id.to_hex(),
+            local_ms,
             "send_local_pending"
         );
-        self.spawn_outbox_publish(message.id.to_hex(), group_id_hex.clone(), event);
+        let publish_ack =
+            self.spawn_outbox_publish(message.id.to_hex(), group_id_hex.clone(), event);
         self.notify_conversation_changed(&group_id_hex);
         // Deferred bookkeeping: index + sync-state disk writes don't block
         // the caller so the next send can start immediately.
         self.spawn_send_bookkeeping(group_name, message, event_id);
-        self.spawn_push_notification(group_id.clone());
+        self.spawn_push_notification(group_id.clone(), publish_ack);
         Ok(())
     }
 
@@ -1896,7 +1900,11 @@ impl SonarClient {
         });
     }
 
-    fn spawn_push_notification(&self, group_id: GroupId) {
+    fn spawn_push_notification(
+        &self,
+        group_id: GroupId,
+        publish_ack: tokio::sync::oneshot::Receiver<bool>,
+    ) {
         let members = match self.engine.members(&group_id) {
             Ok(m) => m,
             Err(e) => {
@@ -1909,6 +1917,14 @@ impl SonarClient {
         let nostr = self.nostr.clone();
         let tokens = self.push_token_cache.lock().unwrap().clone();
         tokio::spawn(async move {
+            // Push traffic shares the relay pool with the encrypted message.
+            // Give the user-visible send priority and only notify after at least
+            // one relay has accepted the message, so the notification cannot
+            // outrun the content it announces.
+            if !matches!(publish_ack.await, Ok(true)) {
+                tracing::debug!("push notify skipped: message publish was not acknowledged");
+                return;
+            }
             for member in &members {
                 if member == &my_pubkey {
                     continue;
@@ -1992,10 +2008,11 @@ impl SonarClient {
         let group_name = self.resolve_group_name(group_id);
         self.mark_outbox_pending(group_id, &message, &event)?;
         let event_id = event.id;
-        self.spawn_outbox_publish(message.id.to_hex(), group_id_hex.clone(), event);
+        let publish_ack =
+            self.spawn_outbox_publish(message.id.to_hex(), group_id_hex.clone(), event);
         self.notify_conversation_changed(&group_id_hex);
         self.spawn_send_bookkeeping(group_name, message, event_id);
-        self.spawn_push_notification(group_id.clone());
+        self.spawn_push_notification(group_id.clone(), publish_ack);
         Ok(())
     }
 
@@ -2101,9 +2118,15 @@ impl SonarClient {
     /// [group_id_hex] must be the **MLS** group id hosts use for
     /// `conversationChanged` / `messages_page` — not the Nostr `#h` tag
     /// (`nostr_group_id`). Kind-445 `#h` is for relay filtering only.
-    fn spawn_outbox_publish(&self, message_id_hex: String, group_id_hex: String, event: Event) {
+    fn spawn_outbox_publish(
+        &self,
+        message_id_hex: String,
+        group_id_hex: String,
+        event: Event,
+    ) -> tokio::sync::oneshot::Receiver<bool> {
+        let (publish_result_tx, publish_result_rx) = tokio::sync::oneshot::channel();
         if self.relays.is_empty() {
-            return;
+            return publish_result_rx;
         }
         let nostr = self.nostr.clone();
         let outbox_state = self.outbox_state.clone();
@@ -2120,6 +2143,7 @@ impl SonarClient {
             "send_publish_start"
         );
         tokio::spawn(async move {
+            let mut publish_result_tx = Some(publish_result_tx);
             let notify = || {
                 if let Some(listener) = change_listener.lock().unwrap().clone() {
                     listener.on_conversation_changed(group_id_hex.clone());
@@ -2170,6 +2194,9 @@ impl SonarClient {
                             rtt_ms,
                             "send_first_ack"
                         );
+                        if let Some(tx) = publish_result_tx.take() {
+                            let _ = tx.send(true);
+                        }
                         notify();
                         send_inflight.fetch_sub(1, Ordering::Relaxed);
                         return;
@@ -2196,9 +2223,13 @@ impl SonarClient {
                 reason,
                 Timestamp::now().as_secs(),
             );
+            if let Some(tx) = publish_result_tx.take() {
+                let _ = tx.send(false);
+            }
             notify();
             send_inflight.fetch_sub(1, Ordering::Relaxed);
         });
+        publish_result_rx
     }
 
     pub async fn reload_outbox_and_retry(&self) {
@@ -2327,7 +2358,9 @@ impl SonarClient {
             self.notify_conversation_changed(&group_id_hex);
             self.spawn_send_bookkeeping(group_name, message, event.id);
         }
-        self.spawn_push_notification(group_id.clone());
+        let (publish_result_tx, publish_result_rx) = tokio::sync::oneshot::channel();
+        let _ = publish_result_tx.send(true);
+        self.spawn_push_notification(group_id.clone(), publish_result_rx);
         Ok(())
     }
 
