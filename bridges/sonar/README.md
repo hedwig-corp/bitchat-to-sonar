@@ -19,7 +19,7 @@ Groups, reactions, edits, replies, read receipts, typing, disappearing messages,
 
 ## Build
 
-Requirements are Rust 1.85+, Go 1.25+, a C toolchain for SQLite, and `bbctl`.
+Requirements are Rust 1.90+, Go 1.25+, a C toolchain for SQLite, and `bbctl`.
 
 ```sh
 cd core
