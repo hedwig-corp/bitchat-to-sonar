@@ -1,82 +1,46 @@
-name: sonar-github-coding-bot
+name: sonar-hermes-github
 
 services:
   postgres:
     image: postgres:17-bookworm
     environment:
-      POSTGRES_DB: coding_bot
-      POSTGRES_USER: coding_bot
+      POSTGRES_DB: hermes_github
+      POSTGRES_USER: hermes_github
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
     ports:
       - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U coding_bot -d coding_bot"]
+      test: ["CMD-SHELL", "pg_isready -U hermes_github -d hermes_github"]
       interval: 5s
       timeout: 3s
       retries: 20
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
-    cap_drop:
-      - ALL
-    cap_add:
-      - CHOWN
-      - DAC_OVERRIDE
-      - FOWNER
-      - SETGID
-      - SETUID
 
-  worker-image:
-    image: ${WORKER_IMAGE:-sonar-github-coding-bot-sandbox:local}
+  sandbox-image:
+    image: ${WORKER_IMAGE:-sonar-hermes-github-sandbox:local}
     build:
       context: .
       dockerfile: Dockerfile.worker
     restart: "no"
 
-  api:
-    image: sonar-github-coding-bot-service:local
+  mcp:
+    image: sonar-hermes-github-mcp:local
     build:
       context: .
-      dockerfile: Dockerfile.api
-    env_file: .env
+      dockerfile: Dockerfile.mcp
+    env_file:
+      - path: .env
+        required: false
     environment:
-      RUN_MODE: api
-      LISTEN_ADDR: 0.0.0.0:8080
-      DATABASE_URL: postgres://coding_bot:${POSTGRES_PASSWORD}@postgres:5432/coding_bot
+      DATABASE_URL: postgres://hermes_github:${POSTGRES_PASSWORD}@postgres:5432/hermes_github
       GITHUB_PRIVATE_KEY_PATH: /run/secrets/github-app.pem
-      WORKER_IMAGE: ${WORKER_IMAGE:-sonar-github-coding-bot-sandbox:local}
-    ports:
-      - "127.0.0.1:${API_PORT:-8080}:8080"
-    volumes:
-      - ${GITHUB_PRIVATE_KEY_FILE:?set GITHUB_PRIVATE_KEY_FILE in .env}:/run/secrets/github-app.pem:ro
-    depends_on:
-      postgres:
-        condition: service_healthy
-      worker:
-        condition: service_started
-    read_only: true
-    tmpfs:
-      - /tmp:rw,noexec,nosuid,nodev,size=64m
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    restart: unless-stopped
-
-  worker:
-    image: sonar-github-coding-bot-service:local
-    build:
-      context: .
-      dockerfile: Dockerfile.api
-    env_file: .env
-    environment:
-      RUN_MODE: worker
-      DATABASE_URL: postgres://coding_bot:${POSTGRES_PASSWORD}@postgres:5432/coding_bot
-      GITHUB_PRIVATE_KEY_PATH: /run/secrets/github-app.pem
-      WORKER_IMAGE: ${WORKER_IMAGE:-sonar-github-coding-bot-sandbox:local}
+      WORKER_IMAGE: ${WORKER_IMAGE:-sonar-hermes-github-sandbox:local}
       WORKER_NETWORK: bridge
+    stdin_open: true
     group_add:
       - ${DOCKER_GID:-0}
     volumes:
@@ -85,7 +49,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      worker-image:
+      sandbox-image:
         condition: service_completed_successfully
     read_only: true
     tmpfs:
@@ -94,7 +58,7 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
-    restart: unless-stopped
+    restart: "no"
 
 volumes:
   postgres-data:

@@ -1,46 +1,28 @@
 # GitHub App setup
 
-Create an organization-owned GitHub App. Do not use a personal access token.
-
-## Permissions
+Create an organization-owned GitHub App. Its name becomes the visible
+`app-name[bot]` identity. Do not use a personal access token or machine user.
 
 Repository permissions:
 
-- Contents: read and write
-- Pull requests: read and write
-- Issues: read and write
 - Metadata: read
+- Contents: read and write
+- Issues: read and write
+- Pull requests: read and write
 - Checks: read
 
-Subscribe to:
-
-- `issues`
-- `issue_comment`
-- `installation`
-- `installation_repositories`
-
-Only the `issues` `labeled` action with exact label `ai-fix` triggers an MVP job;
-the other subscriptions keep the installation contract forward-compatible and
-are acknowledged without queueing.
-
-## Configure
+No webhook URL, webhook secret, or event subscriptions are required. Hermes
+initiates every action through MCP.
 
 1. Generate and download the App private key.
-2. Generate a long random webhook secret.
-3. Set the webhook URL to `https://HOST/webhooks/github` and content type JSON.
-4. Install the App only on repositories intended for automation.
-5. Add each exact `owner/repository` to `REPOSITORY_ALLOWLIST`.
-6. Put the key in a root-readable/operator-managed secret location with mode
-   `0600`; mount it read-only into API and controller containers.
-7. Set `GITHUB_APP_ID`, `GITHUB_BOT_LOGIN`, key path, and webhook secret in the
-   uncommitted `.env` or equivalent secret manager.
+2. Install the App only on repositories intended for automation.
+3. Add every exact `owner/repository` to `REPOSITORY_ALLOWLIST`; installation
+   alone is not authorization.
+4. Add exact authenticated Sonar sender IDs to `SONAR_AUTHORIZED_SENDERS`.
+5. Store the private key outside the repository with restrictive permissions
+   and mount it read-only at `GITHUB_PRIVATE_KEY_PATH`.
+6. Set `GITHUB_APP_ID`; never put key contents in `.env` or Hermes prompts.
 
-The labeler is checked through GitHub's collaborator-permission endpoint. An
-untrusted issue author is acceptable only when a trusted maintainer applies the
-label. Events sent by the bot itself are ignored.
-
-## Verify
-
-Use GitHub's webhook delivery page to redeliver a signed test event. A valid
-delivery returns HTTP 202. Redelivery returns 202 with `duplicate_delivery` and
-does not create another job. Inspect `/jobs/{id}` using the admin bearer token.
+GitHub installation tokens are minted on demand, expire automatically, and are
+injected only into the GitHub API client or one controller-owned Git process.
+They are never returned by an MCP tool.

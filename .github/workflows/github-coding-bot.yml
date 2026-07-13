@@ -1,4 +1,4 @@
-name: GitHub coding bot
+name: Hermes GitHub MCP bot
 
 on:
   push:
@@ -50,11 +50,11 @@ jobs:
         run: cargo check --workspace --all-targets
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Unit and mocked end-to-end tests
+      - name: Unit tests
         run: cargo test --workspace
-      - name: PostgreSQL queue integration
-        run: cargo test -p coding-bot-store --test postgres_queue -- --ignored
-      - name: Build API/controller image
-        run: docker build --file Dockerfile.api --tag coding-bot-service:test .
+      - name: PostgreSQL state integration
+        run: cargo test -p coding-bot-store --test postgres_state -- --ignored
+      - name: Build MCP/controller image
+        run: docker build --file Dockerfile.mcp --tag hermes-github-mcp:test .
       - name: Build sandbox image
-        run: docker build --file Dockerfile.worker --tag coding-bot-sandbox:test .
+        run: docker build --file Dockerfile.worker --tag hermes-github-sandbox:test .

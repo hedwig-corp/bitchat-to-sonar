@@ -1,0 +1,14 @@
+# Merge this under mcp_servers in ~/.hermes/config.yaml.
+# Build the images and start PostgreSQL first. Replace the absolute path.
+mcp_servers:
+  sonar_github:
+    command: docker
+    args:
+      - compose
+      - --project-directory
+      - /absolute/path/to/bitchat-to-sonar/services/github-coding-bot
+      - run
+      - --rm
+      - -T
+      - mcp
+    timeout: 3600

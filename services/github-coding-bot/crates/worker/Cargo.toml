@@ -6,27 +6,15 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-async-trait.workspace = true
 chrono.workspace = true
-coding-bot-agent = { path = "../agent" }
-coding-bot-config = { path = "../config" }
 coding-bot-domain = { path = "../domain" }
-coding-bot-github = { path = "../github" }
-coding-bot-store = { path = "../store" }
 globset.workspace = true
 metrics.workspace = true
-regex.workspace = true
-secrecy.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-toml.workspace = true
 tracing.workspace = true
 uuid.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true
 
 [lints]
 workspace = true

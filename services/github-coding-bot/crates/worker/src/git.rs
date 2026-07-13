@@ -14,22 +14,28 @@ impl<'a> GitWorkflow<'a> {
         Self { sandbox }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn commit(
         &self,
         branch: &str,
-        issue_number: u64,
+        message: &str,
         changed_files: &[String],
+        author_name: &str,
+        author_email: &str,
     ) -> Result<String, GitWorkflowError> {
         validate_git_ref(branch)?;
         if changed_files.is_empty() {
             return Err(GitWorkflowError::NoChanges);
         }
+        validate_commit_field("message", message, 240)?;
+        validate_commit_field("author name", author_name, 120)?;
+        validate_commit_field("author email", author_email, 254)?;
         self.run(
             "configure Git author",
             &[
                 "config".to_owned(),
                 "user.name".to_owned(),
-                "Sonar AI Fix Bot".to_owned(),
+                author_name.to_owned(),
             ],
         )
         .await?;
@@ -38,7 +44,7 @@ impl<'a> GitWorkflow<'a> {
             &[
                 "config".to_owned(),
                 "user.email".to_owned(),
-                "ai-fix-bot@users.noreply.github.com".to_owned(),
+                author_email.to_owned(),
             ],
         )
         .await?;
@@ -85,7 +91,7 @@ impl<'a> GitWorkflow<'a> {
             &[
                 "commit".to_owned(),
                 "--message".to_owned(),
-                format!("fix: resolve issue #{issue_number}"),
+                message.to_owned(),
             ],
         )
         .await?;
@@ -166,10 +172,10 @@ impl<'a> GitWorkflow<'a> {
 }
 
 #[must_use]
-pub fn proposal_branch(issue_number: u64, title: &str, job_id: Uuid) -> String {
+pub fn proposal_branch(task: &str, workspace_id: Uuid) -> String {
     let mut slug = String::new();
     let mut previous_dash = false;
-    for character in title.chars().flat_map(char::to_lowercase) {
+    for character in task.chars().flat_map(char::to_lowercase) {
         if character.is_ascii_alphanumeric() {
             slug.push(character);
             previous_dash = false;
@@ -177,31 +183,29 @@ pub fn proposal_branch(issue_number: u64, title: &str, job_id: Uuid) -> String {
             slug.push('-');
             previous_dash = true;
         }
-        if slug.len() >= 48 {
+        if slug.len() >= 52 {
             break;
         }
     }
     let slug = slug.trim_matches('-');
-    let slug = if slug.is_empty() {
-        "proposed-fix"
-    } else {
-        slug
-    };
-    let id = job_id.simple().to_string();
-    format!("ai-fix/issue-{issue_number}-{slug}-{}", &id[..8])
+    let slug = if slug.is_empty() { "change" } else { slug };
+    let id = workspace_id.simple().to_string();
+    format!("hermes/{slug}-{}", &id[..8])
 }
 
-#[must_use]
-pub fn pull_request_title(summary: &str) -> String {
-    let single_line = summary.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut title = single_line.chars().take(120).collect::<String>();
-    if title.is_empty() {
-        title = "Propose a safe issue fix".to_owned();
+fn validate_commit_field(
+    name: &'static str,
+    value: &str,
+    maximum: usize,
+) -> Result<(), GitWorkflowError> {
+    if value.trim().is_empty()
+        || value.len() > maximum
+        || value.contains(['\0', '\n', '\r'])
+        || value.starts_with('-')
+    {
+        return Err(GitWorkflowError::InvalidCommitField(name));
     }
-    if let Some(first) = title.get_mut(0..1) {
-        first.make_ascii_uppercase();
-    }
-    title
+    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -214,7 +218,7 @@ pub enum GitWorkflowError {
         code: Option<i32>,
         stderr: String,
     },
-    #[error("proposal contains no meaningful changes")]
+    #[error("workspace contains no meaningful changes")]
     NoChanges,
     #[error("Git returned an invalid commit revision")]
     InvalidRevision,
@@ -222,6 +226,8 @@ pub enum GitWorkflowError {
     InvalidRepositoryUrl,
     #[error("sandbox network could not be disabled after push")]
     NetworkIsolation,
+    #[error("invalid Git commit {0}")]
+    InvalidCommitField(&'static str),
 }
 
 #[cfg(test)]
@@ -231,13 +237,16 @@ mod tests {
     #[test]
     fn branch_names_are_sanitized_and_bounded() {
         let id = Uuid::from_u128(0x1234);
-        let branch = proposal_branch(
-            42,
-            "Fix parser: don't accept ../../outside or `--flags`!",
-            id,
-        );
-        assert!(branch.starts_with("ai-fix/issue-42-fix-parser-don-t-accept-outside-or-flags-"));
+        let branch = proposal_branch("Fix parser: don't accept ../../outside!", id);
+        assert!(branch.starts_with("hermes/fix-parser-don-t-accept-outside-"));
         assert!(validate_git_ref(&branch).is_ok());
         assert!(branch.len() < 120);
+    }
+
+    #[test]
+    fn commit_messages_cannot_inject_options_or_multiple_lines() {
+        assert!(validate_commit_field("message", "feat: safe", 240).is_ok());
+        assert!(validate_commit_field("message", "--amend", 240).is_err());
+        assert!(validate_commit_field("message", "one\ntwo", 240).is_err());
     }
 }

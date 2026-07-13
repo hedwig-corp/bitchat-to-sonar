@@ -1,69 +1,56 @@
-# Sonar GitHub Coding Bot
+# Hermes GitHub Bot
 
-Production-oriented MVP of a self-hosted GitHub App that turns an `ai-fix`
-issue label into a bounded coding job and, when a meaningful proposal exists,
-a draft pull request. It never merges pull requests.
+A dedicated GitHub App that Hermes controls from authenticated Sonar DMs through
+an MCP server. Hermes remains the only reasoning agent. This service holds the
+GitHub App credentials, exposes typed GitHub tools, provides isolated coding
+workspaces, and records durable audit/confirmation state. It has no webhook
+trigger and no internal LLM.
 
-## What is implemented
+```text
+Sonar DM -> Hermes gateway -> stdio MCP -> GitHub App API
+                                      \-> isolated Docker workspace
+```
 
-- Raw-body `X-Hub-Signature-256` verification and delivery replay protection.
-- Allowlisted repositories and trusted-labeler permission checks.
-- PostgreSQL queue with an active-issue unique index, `FOR UPDATE SKIP LOCKED`,
-  leases, attempt fencing, cancellation, and worker heartbeats.
-- GitHub App JWT and short-lived installation-token authentication through
-  Octocrab; no personal access tokens.
-- OpenAI-compatible chat-completions provider behind the `LanguageModel` trait.
-- Explicit agent tools: `list_files`, `search_files`, `read_file`,
-  `apply_patch`, `git_diff`, `git_status`, `run_validation_command`, `finish`.
-- Hard limits for steps, files, diff lines, commands, job duration, output,
-  retries, and LLM tokens.
-- Docker-isolated repository execution with a temporary filesystem, non-root
-  user, no host mounts, no Docker socket, bounded CPU/RAM/PIDs, read-only root,
-  and network disabled except controller-owned clone/push windows.
-- Controller-owned final diff validation, validation commands, Git commit/push,
-  draft PR reporting, and issue lifecycle comments.
-- Optional root `.ai-fix.toml` policy that can only tighten protected paths and
-  select exact pre-allowlisted validation commands; see the sample under
-  `examples/`.
-- Structured tracing and Prometheus metrics.
+## Capabilities
 
-See [Architecture](docs/ARCHITECTURE.md) and [Security model](docs/SECURITY.md).
+- read repositories, issues, pull requests, changed files, and checks;
+- create/update/reopen/comment on issues;
+- comment on and submit COMMENT/APPROVE/REQUEST_CHANGES PR reviews;
+- let Hermes inspect, patch, validate, commit, and normal-push code in a
+  network-off sandbox, then open a draft PR;
+- close issues and merge PRs only through short-lived, single-use confirmation
+  tokens bound to the Sonar sender and exact target; merge tokens are also bound
+  to the current head SHA and merge method;
+- never expose installation tokens to Hermes, never force-push, and never delete
+  branches or rewrite history.
 
-## Quick start
+See [Architecture](docs/ARCHITECTURE.md), [Security](docs/SECURITY.md), and the
+[GitHub App setup](docs/GITHUB_APP_SETUP.md).
 
-1. Follow [GitHub App setup](docs/GITHUB_APP_SETUP.md).
-2. Copy `.env.example` to `.env` and replace every placeholder.
-3. Set `DOCKER_GID` to the group ID that owns `/var/run/docker.sock` on Linux.
-4. Build and start:
+## Connect Hermes
+
+1. Create and install the GitHub App.
+2. Copy `.env.example` to `.env`, set an exact repository allowlist and the
+   authenticated Sonar sender IDs allowed to operate the bot.
+3. Build the MCP and sandbox images:
 
    ```sh
    docker compose build
-   docker compose up -d
-   docker compose ps
+   docker compose up -d postgres
    ```
 
-5. Configure the GitHub App webhook URL as
-   `https://your-host.example/webhooks/github` and label an allowlisted issue
-   `ai-fix` as a trusted maintainer.
+4. Add the example from [`examples/hermes-config.yaml`](examples/hermes-config.yaml)
+   to `~/.hermes/config.yaml`, replacing the absolute project directory.
+5. Install [`hermes/SKILL.md`](hermes/SKILL.md) in the Hermes agent's skill
+   directory so it follows the read/write and confirmation protocol.
+6. Configure the Hermes Sonar gateway's own sender allowlist to the same or a
+   stricter set; the MCP allowlist is defense in depth, not a replacement.
 
-The API binds to `127.0.0.1:8080` by default. Put it behind a TLS reverse proxy.
+The MCP transport is stdio. Its logs go only to stderr so they cannot corrupt
+JSON-RPC on stdout. GitHub sees actions as `your-app-name[bot]`, not as the
+human running Hermes.
 
-## API
-
-| Method | Path | Authentication | Purpose |
-| --- | --- | --- | --- |
-| `POST` | `/webhooks/github` | GitHub HMAC | Receive GitHub events |
-| `GET` | `/health` | none | Process liveness |
-| `GET` | `/ready` | none | Database and worker readiness |
-| `GET` | `/metrics` | admin bearer token | Prometheus metrics |
-| `GET` | `/jobs/{id}` | admin bearer token | Job status |
-| `POST` | `/jobs/{id}/cancel` | admin bearer token | Cooperative cancellation |
-
-Administrative calls use `Authorization: Bearer $ADMIN_API_TOKEN`.
-
-## Validation
-
-From this directory:
+## Development checks
 
 ```sh
 cargo fmt --all --check
@@ -71,21 +58,9 @@ cargo check --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 
-# Requires a disposable PostgreSQL DATABASE_URL:
-cargo test -p coding-bot-store --test postgres_queue -- --ignored
+# Disposable PostgreSQL required:
+cargo test -p coding-bot-store --test postgres_state -- --ignored
 ```
 
-Docker and local development details are in [Development](docs/DEVELOPMENT.md).
-
-## MVP limitations
-
-- One OpenAI-compatible chat-completions provider is included; the trait permits
-  additional providers.
-- The bundled sandbox image covers Rust, Go, Node/npm, Python/pytest, and Make.
-  Build a custom image for pnpm or repository-specific native dependencies.
-- Validation failures may be published only in a meaningful draft proposal and
-  are always reported as failed. An empty proposal is never published.
-- A push that succeeds immediately before a GitHub API outage can leave an
-  orphan proposal branch. The job remains failed and no merge occurs.
-- The trusted controller needs Docker daemon access. Treat it as a privileged
-  infrastructure component and never mount the socket into sandbox containers.
+This is backend/operator tooling, not a Sonar app-surface feature; it does not
+add iOS or Compose UI.

@@ -16,6 +16,7 @@ RUN apt-get update \
         python3-pytest \
         ripgrep \
     && rm -rf /var/lib/apt/lists/* \
+    && npm install --global pnpm@10.13.1 \
     && useradd --create-home --uid 10001 --shell /usr/sbin/nologin worker \
     && useradd --create-home --uid 10002 --gid worker --shell /usr/sbin/nologin publisher \
     && mkdir --parents /workspace \

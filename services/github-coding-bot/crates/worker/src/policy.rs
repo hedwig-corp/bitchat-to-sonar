@@ -77,14 +77,28 @@ impl PathPolicy {
 
         let mut paths = HashSet::new();
         for line in patch.lines() {
-            if let Some(value) = line.strip_prefix("+++ ") {
+            if let Some(value) = line.strip_prefix("diff --git ") {
+                let mut headers = value.split_ascii_whitespace();
+                let (Some(old), Some(new), None) = (headers.next(), headers.next(), headers.next())
+                else {
+                    return Err(PolicyError::UnsafePatch(
+                        "malformed or quoted diff header paths are not supported".to_owned(),
+                    ));
+                };
+                collect_patch_path(old, &mut paths)?;
+                collect_patch_path(new, &mut paths)?;
+            } else if let Some(value) = line.strip_prefix("+++ ") {
                 collect_patch_path(value, &mut paths)?;
             } else if let Some(value) = line.strip_prefix("--- ") {
                 collect_patch_path(value, &mut paths)?;
             } else if let Some(value) = line.strip_prefix("rename from ") {
-                paths.insert(value.to_owned());
+                collect_metadata_path(value, &mut paths)?;
             } else if let Some(value) = line.strip_prefix("rename to ") {
-                paths.insert(value.to_owned());
+                collect_metadata_path(value, &mut paths)?;
+            } else if let Some(value) = line.strip_prefix("copy from ") {
+                collect_metadata_path(value, &mut paths)?;
+            } else if let Some(value) = line.strip_prefix("copy to ") {
+                collect_metadata_path(value, &mut paths)?;
             }
         }
         if paths.is_empty() {
@@ -107,6 +121,16 @@ impl PathPolicy {
         }
         Ok(())
     }
+}
+
+fn collect_metadata_path(value: &str, paths: &mut HashSet<String>) -> Result<(), PolicyError> {
+    if value.starts_with('"') || value.contains('\0') {
+        return Err(PolicyError::UnsafePatch(
+            "quoted or NUL-containing metadata paths are not supported".to_owned(),
+        ));
+    }
+    paths.insert(value.to_owned());
+    Ok(())
 }
 
 fn collect_patch_path(value: &str, paths: &mut HashSet<String>) -> Result<(), PolicyError> {
@@ -187,6 +211,33 @@ mod tests {
         assert!(matches!(
             policy().validate_patch(patch),
             Err(PolicyError::UnsafePatch(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_copy_metadata_that_mentions_a_protected_path() {
+        let patch = "diff --git a/safe.txt b/copy.txt\nsimilarity index 100%\ncopy from deploy/secret.txt\ncopy to copy.txt\ndiff --git a/other.txt b/other.txt\n--- a/other.txt\n+++ b/other.txt\n@@ -1 +1 @@\n-old\n+new\n";
+        assert!(matches!(
+            policy().validate_patch(patch),
+            Err(PolicyError::BlockedPath(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_quoted_metadata_paths_instead_of_misvalidating_them() {
+        let patch = "diff --git a/safe.txt b/copy.txt\nsimilarity index 100%\ncopy from \"deploy/secret file\"\ncopy to copy.txt\n";
+        assert!(matches!(
+            policy().validate_patch(patch),
+            Err(PolicyError::UnsafePatch(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_mode_only_changes_to_protected_paths() {
+        let patch = "diff --git a/deploy/release.sh b/deploy/release.sh\nold mode 100644\nnew mode 100755\n";
+        assert!(matches!(
+            policy().validate_patch(patch),
+            Err(PolicyError::BlockedPath(_))
         ));
     }
 }

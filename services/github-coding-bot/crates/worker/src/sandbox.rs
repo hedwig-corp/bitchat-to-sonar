@@ -8,10 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use async_trait::async_trait;
-use coding_bot_agent::{ToolExecutionError, ToolExecutor, WorkspaceAudit};
-use coding_bot_domain::{AgentLimits, ModelToolCall, ToolOutput, ValidationResult};
-use serde::Deserialize;
+use coding_bot_domain::{ValidationResult, WorkspaceAudit, WorkspaceLimits};
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
@@ -19,7 +16,7 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use crate::{AllowedCommand, CommandPolicy, PathPolicy, PolicyError};
+use crate::{CommandPolicy, PathPolicy, PolicyError};
 
 const REPOSITORY_ROOT: &str = "/workspace/repo";
 const GIT_METADATA_ROOT: &str = "/git";
@@ -45,9 +42,59 @@ pub struct DockerSandbox {
 }
 
 impl DockerSandbox {
+    pub async fn cleanup_orphans(config: &DockerSandboxConfig) -> Result<usize, SandboxError> {
+        let mut list = Command::new(&config.docker_binary);
+        list.args([
+            "ps",
+            "--all",
+            "--quiet",
+            "--filter",
+            "label=dev.sonar.hermes-github.workspace",
+        ]);
+        let output = run_process(
+            "list orphaned sandboxes",
+            list,
+            None,
+            DOCKER_COMMAND_TIMEOUT,
+            config.max_output_bytes,
+        )
+        .await?;
+        output.require_success("list orphaned sandboxes")?;
+        let ids = output
+            .stdout
+            .lines()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        if ids.len() > 100
+            || ids
+                .iter()
+                .any(|id| id.len() > 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            return Err(SandboxError::InvalidDockerOutput);
+        }
+        let mut remove = Command::new(&config.docker_binary);
+        remove.args(["rm", "--force"]);
+        remove.args(&ids);
+        let output = run_process(
+            "remove orphaned sandboxes",
+            remove,
+            None,
+            DOCKER_COMMAND_TIMEOUT,
+            config.max_output_bytes,
+        )
+        .await?;
+        output.require_success("remove orphaned sandboxes")?;
+        Ok(ids.len())
+    }
+
     pub async fn create(config: DockerSandboxConfig, job_id: Uuid) -> Result<Self, SandboxError> {
         let short_id = job_id.simple().to_string();
-        let container_name = format!("coding-bot-{}", &short_id[..12]);
+        let container_name = format!("hermes-github-{}", &short_id[..12]);
         let sandbox = Self {
             config,
             container_name,
@@ -59,6 +106,8 @@ impl DockerSandbox {
             "--rm".to_owned(),
             "--name".to_owned(),
             sandbox.container_name.clone(),
+            "--label".to_owned(),
+            format!("dev.sonar.hermes-github.workspace={job_id}"),
             "--network".to_owned(),
             "none".to_owned(),
             "--read-only".to_owned(),
@@ -561,7 +610,7 @@ impl Drop for DockerSandbox {
         let docker = self.config.docker_binary.clone();
         let container = self.container_name.clone();
         let _ = std::thread::Builder::new()
-            .name("coding-bot-sandbox-cleanup".to_owned())
+            .name("hermes-github-sandbox-cleanup".to_owned())
             .spawn(move || {
                 let _ = std::process::Command::new(docker)
                     .args(["rm", "--force", &container])
@@ -574,11 +623,9 @@ pub struct SandboxToolExecutor {
     sandbox: Arc<DockerSandbox>,
     paths: PathPolicy,
     commands: CommandPolicy,
-    limits: AgentLimits,
+    limits: WorkspaceLimits,
     files_read: Mutex<HashSet<String>>,
     validations: Mutex<Vec<ValidationResult>>,
-    cancelled: Arc<AtomicBool>,
-    repository_validation: Vec<AllowedCommand>,
 }
 
 impl SandboxToolExecutor {
@@ -587,9 +634,7 @@ impl SandboxToolExecutor {
         sandbox: Arc<DockerSandbox>,
         paths: PathPolicy,
         commands: CommandPolicy,
-        limits: AgentLimits,
-        cancelled: Arc<AtomicBool>,
-        repository_validation: Vec<AllowedCommand>,
+        limits: WorkspaceLimits,
     ) -> Self {
         Self {
             sandbox,
@@ -598,8 +643,6 @@ impl SandboxToolExecutor {
             limits,
             files_read: Mutex::new(HashSet::new()),
             validations: Mutex::new(Vec::new()),
-            cancelled,
-            repository_validation,
         }
     }
 
@@ -611,12 +654,8 @@ impl SandboxToolExecutor {
         &self.paths
     }
 
-    pub(crate) fn limits(&self) -> &AgentLimits {
+    pub(crate) fn limits(&self) -> &WorkspaceLimits {
         &self.limits
-    }
-
-    pub(crate) fn repository_validation_commands(&self) -> &[AllowedCommand] {
-        &self.repository_validation
     }
 
     pub async fn run_validation(
@@ -730,7 +769,7 @@ impl SandboxToolExecutor {
                 )
                 .await?;
             output.require_success("read repository instructions")?;
-            lock_or_recover(&self.files_read).insert(path.clone());
+            self.record_read(&path)?;
             let section = format!("\n## {path}\n\n{}\n", output.stdout);
             if context.len().saturating_add(section.len()) > MAX_INSTRUCTION_BYTES {
                 context.push_str("\n[additional repository instructions omitted by size limit]\n");
@@ -942,205 +981,179 @@ impl SandboxToolExecutor {
     }
 }
 
-#[async_trait]
-impl ToolExecutor for SandboxToolExecutor {
-    async fn execute(&self, call: &ModelToolCall) -> Result<ToolOutput, ToolExecutionError> {
-        self.execute_tool(call)
-            .await
-            .map_err(|error| ToolExecutionError {
-                public_message: error.to_string(),
-            })
-    }
-
-    async fn audit(&self) -> Result<WorkspaceAudit, ToolExecutionError> {
-        self.final_security_audit()
-            .await
-            .map_err(|error| ToolExecutionError {
-                public_message: error.to_string(),
-            })
-    }
-
-    async fn cancelled(&self) -> Result<bool, ToolExecutionError> {
-        Ok(self.cancelled.load(Ordering::Acquire))
-    }
-}
-
 impl SandboxToolExecutor {
-    async fn execute_tool(&self, call: &ModelToolCall) -> Result<ToolOutput, SandboxError> {
-        match call.name.as_str() {
-            "list_files" => {
-                let arguments: ListFiles = parse_arguments(call)?;
-                let path = self
-                    .paths
-                    .validate_relative(arguments.path.as_deref().unwrap_or("."))?;
-                self.sandbox.canonical_repository_path(&path).await?;
-                let depth = arguments.max_depth.unwrap_or(4).clamp(1, 8);
-                let output = self
-                    .sandbox
-                    .exec_in_repository(
-                        "find",
-                        &[
-                            path,
-                            "-maxdepth".to_owned(),
-                            depth.to_string(),
-                            "-type".to_owned(),
-                            "f".to_owned(),
-                            "-not".to_owned(),
-                            "-path".to_owned(),
-                            "./.git".to_owned(),
-                            "-not".to_owned(),
-                            "-path".to_owned(),
-                            "./.git/*".to_owned(),
-                            "-print".to_owned(),
-                        ],
-                        Duration::from_secs(30),
-                    )
-                    .await?;
-                output.into_tool_output()
-            }
-            "search_files" => {
-                let arguments: SearchFiles = parse_arguments(call)?;
-                if arguments.query.len() > 256 || arguments.query.contains('\0') {
-                    return Err(SandboxError::InvalidToolArguments(
-                        "search query exceeds 256 bytes or contains NUL".to_owned(),
-                    ));
-                }
-                let path = self
-                    .paths
-                    .validate_relative(arguments.path.as_deref().unwrap_or("."))?;
-                self.sandbox.canonical_repository_path(&path).await?;
-                let output = self
-                    .sandbox
-                    .exec_in_repository(
-                        "rg",
-                        &[
-                            "--line-number".to_owned(),
-                            "--fixed-strings".to_owned(),
-                            "--no-heading".to_owned(),
-                            "--glob".to_owned(),
-                            "!.git/**".to_owned(),
-                            "--".to_owned(),
-                            arguments.query,
-                            path,
-                        ],
-                        Duration::from_secs(30),
-                    )
-                    .await?;
-                if output.success() || output.code == Some(1) {
-                    for line in output.stdout.lines() {
-                        if let Some(path) = line.split(':').next() {
-                            if !path.is_empty() {
-                                lock_or_recover(&self.files_read).insert(path.to_owned());
-                            }
-                        }
-                    }
-                    Ok(ToolOutput {
-                        content: output.stdout,
-                        is_error: false,
-                    })
-                } else {
-                    output.into_tool_output()
-                }
-            }
-            "read_file" => {
-                let arguments: ReadFile = parse_arguments(call)?;
-                let path = self.paths.validate_relative(&arguments.path)?;
-                self.sandbox.canonical_repository_path(&path).await?;
-                let start = arguments.start_line.unwrap_or(1);
-                let end = arguments
-                    .end_line
-                    .unwrap_or_else(|| start.saturating_add(399));
-                if start == 0 || end < start || end.saturating_sub(start) > 399 {
-                    return Err(SandboxError::InvalidToolArguments(
-                        "read_file permits at most 400 lines and uses 1-based ranges".to_owned(),
-                    ));
-                }
-                lock_or_recover(&self.files_read).insert(path.clone());
-                let output = self
-                    .sandbox
-                    .exec_in_repository(
-                        "sed",
-                        &[
-                            "-n".to_owned(),
-                            format!("{start},{end}p"),
-                            "--".to_owned(),
-                            path,
-                        ],
-                        Duration::from_secs(30),
-                    )
-                    .await?;
-                output.into_tool_output()
-            }
-            "apply_patch" => {
-                let arguments: ApplyPatch = parse_arguments(call)?;
-                let maximum = usize::try_from(self.limits.max_diff_lines)
-                    .unwrap_or(usize::MAX)
-                    .saturating_mul(4096);
-                if arguments.patch.len() > maximum {
-                    return Err(SandboxError::Limit("patch payload is too large".to_owned()));
-                }
-                self.paths.validate_patch(&arguments.patch)?;
-                let output = self
-                    .sandbox
-                    .exec_with_stdin(
-                        "git",
-                        &[
-                            "apply".to_owned(),
-                            "--whitespace=nowarn".to_owned(),
-                            "--".to_owned(),
-                            "-".to_owned(),
-                        ],
-                        Duration::from_secs(30),
-                        arguments.patch.as_bytes(),
-                    )
-                    .await?;
-                output.into_tool_output()
-            }
-            "git_diff" => {
-                for path in self.changed_files().await? {
-                    lock_or_recover(&self.files_read).insert(path);
-                }
-                Ok(ToolOutput {
-                    content: self.full_diff().await?,
-                    is_error: false,
-                })
-            }
-            "git_status" => {
-                let output = self
-                    .sandbox
-                    .exec_in_repository(
-                        "git",
-                        &[
-                            "status".to_owned(),
-                            "--short".to_owned(),
-                            "--untracked-files=all".to_owned(),
-                        ],
-                        Duration::from_secs(30),
-                    )
-                    .await?;
-                output.into_tool_output()
-            }
-            "run_validation_command" => {
-                let arguments: ValidationCommand = parse_arguments(call)?;
-                let result = self
-                    .run_validation(&arguments.program, &arguments.args)
-                    .await?;
-                Ok(ToolOutput {
-                    content: serde_json::to_string(&result)
-                        .map_err(|error| SandboxError::InvalidToolArguments(error.to_string()))?,
-                    is_error: !result.passed,
-                })
-            }
-            _ => Err(SandboxError::InvalidToolArguments(
-                "unsupported tool".to_owned(),
-            )),
-        }
+    pub async fn list_files(
+        &self,
+        path: Option<&str>,
+        max_depth: Option<u8>,
+    ) -> Result<String, SandboxError> {
+        let path = self.paths.validate_relative(path.unwrap_or("."))?;
+        self.sandbox.canonical_repository_path(&path).await?;
+        let find_path = if path == "." {
+            path
+        } else {
+            format!("./{path}")
+        };
+        let depth = max_depth.unwrap_or(4).clamp(1, 8);
+        let output = self
+            .sandbox
+            .exec_in_repository(
+                "find",
+                &[
+                    find_path,
+                    "-maxdepth".to_owned(),
+                    depth.to_string(),
+                    "-type".to_owned(),
+                    "f".to_owned(),
+                    "-not".to_owned(),
+                    "-path".to_owned(),
+                    "./.git".to_owned(),
+                    "-not".to_owned(),
+                    "-path".to_owned(),
+                    "./.git/*".to_owned(),
+                    "-print".to_owned(),
+                ],
+                Duration::from_secs(30),
+            )
+            .await?;
+        output.into_text("list workspace files")
     }
-}
 
-fn parse_arguments<T: for<'de> Deserialize<'de>>(call: &ModelToolCall) -> Result<T, SandboxError> {
-    serde_json::from_value(call.arguments.clone())
-        .map_err(|error| SandboxError::InvalidToolArguments(error.to_string()))
+    pub async fn search_files(
+        &self,
+        query: &str,
+        path: Option<&str>,
+    ) -> Result<String, SandboxError> {
+        if query.len() > 256 || query.contains('\0') {
+            return Err(SandboxError::InvalidToolArguments(
+                "search query exceeds 256 bytes or contains NUL".to_owned(),
+            ));
+        }
+        let path = self.paths.validate_relative(path.unwrap_or("."))?;
+        self.sandbox.canonical_repository_path(&path).await?;
+        let output = self
+            .sandbox
+            .exec_in_repository(
+                "rg",
+                &[
+                    "--line-number".to_owned(),
+                    "--fixed-strings".to_owned(),
+                    "--no-heading".to_owned(),
+                    "--glob".to_owned(),
+                    "!.git/**".to_owned(),
+                    "--".to_owned(),
+                    query.to_owned(),
+                    path,
+                ],
+                Duration::from_secs(30),
+            )
+            .await?;
+        if !output.success() && output.code != Some(1) {
+            return Err(output.failure("search workspace files"));
+        }
+        for line in output.stdout.lines() {
+            if let Some(path) = line.split(':').next() {
+                if !path.is_empty() {
+                    self.record_read(path)?;
+                }
+            }
+        }
+        Ok(output.stdout)
+    }
+
+    pub async fn read_file(
+        &self,
+        path: &str,
+        start_line: Option<u32>,
+        end_line: Option<u32>,
+    ) -> Result<String, SandboxError> {
+        let path = self.paths.validate_relative(path)?;
+        self.sandbox.canonical_repository_path(&path).await?;
+        let start = start_line.unwrap_or(1);
+        let end = end_line.unwrap_or_else(|| start.saturating_add(399));
+        if start == 0 || end < start || end.saturating_sub(start) > 399 {
+            return Err(SandboxError::InvalidToolArguments(
+                "read_file permits at most 400 lines and uses 1-based ranges".to_owned(),
+            ));
+        }
+        self.record_read(&path)?;
+        let output = self
+            .sandbox
+            .exec_in_repository(
+                "sed",
+                &[
+                    "-n".to_owned(),
+                    format!("{start},{end}p"),
+                    "--".to_owned(),
+                    path,
+                ],
+                Duration::from_secs(30),
+            )
+            .await?;
+        output.into_text("read workspace file")
+    }
+
+    pub async fn apply_patch(&self, patch: &str) -> Result<String, SandboxError> {
+        let maximum = usize::try_from(self.limits.max_diff_lines)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(4096);
+        if patch.len() > maximum {
+            return Err(SandboxError::Limit("patch payload is too large".to_owned()));
+        }
+        self.paths.validate_patch(patch)?;
+        let output = self
+            .sandbox
+            .exec_with_stdin(
+                "git",
+                &[
+                    "apply".to_owned(),
+                    "--whitespace=nowarn".to_owned(),
+                    "--".to_owned(),
+                    "-".to_owned(),
+                ],
+                Duration::from_secs(30),
+                patch.as_bytes(),
+            )
+            .await?;
+        output.into_text("apply workspace patch")
+    }
+
+    pub async fn git_diff(&self) -> Result<String, SandboxError> {
+        let _ = self.final_security_audit().await?;
+        for path in self.changed_files().await? {
+            self.record_read(&path)?;
+        }
+        self.full_diff().await
+    }
+
+    pub async fn git_status(&self) -> Result<String, SandboxError> {
+        let output = self
+            .sandbox
+            .exec_in_repository(
+                "git",
+                &[
+                    "status".to_owned(),
+                    "--short".to_owned(),
+                    "--untracked-files=all".to_owned(),
+                ],
+                Duration::from_secs(30),
+            )
+            .await?;
+        output.into_text("read workspace status")
+    }
+
+    fn record_read(&self, path: &str) -> Result<(), SandboxError> {
+        let mut files = lock_or_recover(&self.files_read);
+        files.insert(path.to_owned());
+        let count = u32::try_from(files.len()).unwrap_or(u32::MAX);
+        if count > self.limits.max_files_read {
+            return Err(SandboxError::Limit(format!(
+                "read {count} files; limit is {}",
+                self.limits.max_files_read
+            )));
+        }
+        Ok(())
+    }
 }
 
 fn parse_numstat(value: &str) -> Result<u32, SandboxError> {
@@ -1326,8 +1339,10 @@ impl ProcessOutput {
         }
     }
 
-    fn into_tool_output(self) -> Result<ToolOutput, SandboxError> {
-        let is_error = !self.success();
+    fn into_text(self, operation: &'static str) -> Result<String, SandboxError> {
+        if !self.success() {
+            return Err(self.failure(operation));
+        }
         let mut content = self.stdout;
         if !self.stderr.is_empty() {
             if !content.is_empty() {
@@ -1335,7 +1350,7 @@ impl ProcessOutput {
             }
             content.push_str(&self.stderr);
         }
-        Ok(ToolOutput { content, is_error })
+        Ok(content)
     }
 
     fn redact(&mut self, secret: &str) {
@@ -1345,41 +1360,6 @@ impl ProcessOutput {
         self.stdout = self.stdout.replace(secret, "[REDACTED]");
         self.stderr = self.stderr.replace(secret, "[REDACTED]");
     }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ListFiles {
-    path: Option<String>,
-    max_depth: Option<u8>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SearchFiles {
-    query: String,
-    path: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ReadFile {
-    path: String,
-    start_line: Option<u32>,
-    end_line: Option<u32>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ApplyPatch {
-    patch: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ValidationCommand {
-    program: String,
-    args: Vec<String>,
 }
 
 #[derive(Debug, Error)]
@@ -1428,6 +1408,8 @@ pub enum SandboxError {
     BinaryChange,
     #[error("Git returned malformed diff statistics")]
     InvalidGitOutput,
+    #[error("Docker returned malformed sandbox identifiers")]
+    InvalidDockerOutput,
     #[error("hard limit exceeded: {0}")]
     Limit(String),
     #[error("invalid tool arguments: {0}")]
@@ -1444,7 +1426,7 @@ mod tests {
 
     #[test]
     fn validates_branch_names_without_option_injection() {
-        assert!(validate_git_ref("ai-fix/issue-42-parser").is_ok());
+        assert!(validate_git_ref("hermes/issue-42-parser").is_ok());
         assert!(validate_git_ref("--upload-pack=evil").is_err());
         assert!(validate_git_ref("refs/../evil").is_err());
         assert!(validate_git_ref("bad name").is_err());

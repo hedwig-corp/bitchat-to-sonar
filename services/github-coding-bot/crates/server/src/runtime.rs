@@ -1,22 +1,23 @@
 use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
-use coding_bot_agent::OpenAiCompatibleModel;
-use coding_bot_config::{Config, RunMode};
-use coding_bot_github::{GitHubApp, GitHubAppApi};
+use coding_bot_config::Config;
+use coding_bot_github::GitHubApp;
 use coding_bot_store::PostgresStore;
-use coding_bot_worker::Worker;
-use metrics_exporter_prometheus::PrometheusBuilder;
+use coding_bot_worker::{
+    DockerSandbox, DockerSandboxConfig, WorkspaceManager, WorkspaceManagerConfig,
+};
+use rmcp::{transport::stdio, ServiceExt};
 use sqlx::postgres::PgPoolOptions;
-use tokio::{net::TcpListener, sync::watch};
+use tokio::sync::watch;
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-use crate::{router, AppState};
+use crate::HermesGitHubServer;
 
 pub async fn run() -> Result<()> {
     init_tracing()?;
-    let config = Arc::new(Config::from_env().context("load service configuration")?);
+    let config = Arc::new(Config::from_env().context("load MCP service configuration")?);
     let pool = PgPoolOptions::new()
         .max_connections(10)
         .connect(config.database_url())
@@ -24,8 +25,19 @@ pub async fn run() -> Result<()> {
         .context("connect to PostgreSQL")?;
     let store = Arc::new(PostgresStore::new(pool));
     store.migrate().await.context("run database migrations")?;
+    let _controller_lock = store
+        .acquire_controller_lock()
+        .await
+        .context("acquire singleton controller lock")?;
+    let stale = store
+        .recover_abandoned_workspaces()
+        .await
+        .context("recover abandoned workspace metadata")?;
+    if !stale.is_empty() {
+        info!(count = stale.len(), "expired stale workspace metadata");
+    }
 
-    let github: Arc<dyn GitHubAppApi> = Arc::new(
+    let github = Arc::new(
         GitHubApp::from_pem_file(
             config.github_app_id,
             &config.github_private_key_path,
@@ -33,109 +45,78 @@ pub async fn run() -> Result<()> {
         )
         .context("initialize GitHub App client")?,
     );
-    let model = Arc::new(
-        OpenAiCompatibleModel::new(
-            &config.llm_base_url,
-            config.llm_api_key().to_owned(),
-            config.llm_model.clone(),
-            config.limits.max_retries,
-            Duration::from_secs(config.limits.max_command_seconds),
-        )
-        .context("initialize LLM provider")?,
-    );
-    let metrics = PrometheusBuilder::new()
-        .install_recorder()
-        .context("install metrics recorder")?;
-    let state = AppState {
-        config: config.clone(),
-        store: store.clone(),
-        github: github.clone(),
-        metrics,
+    let sandbox_config = DockerSandboxConfig {
+        docker_binary: config.docker_binary.clone(),
+        image: config.worker_image.clone(),
+        network: config.worker_network.clone(),
+        memory: config.worker_memory.clone(),
+        cpus: config.worker_cpus.clone(),
+        pids_limit: config.worker_pids_limit,
+        workspace_size: config.worker_workspace_size.clone(),
+        max_output_bytes: config.limits.max_tool_output_bytes,
     };
-    let worker = Arc::new(Worker::new(store, github, model, config.clone()));
-
-    match config.run_mode {
-        RunMode::Api => serve_api(state, shutdown_signal()).await,
-        RunMode::Worker => run_worker(worker).await,
-        RunMode::All => run_all(state, worker).await,
+    let removed = DockerSandbox::cleanup_orphans(&sandbox_config)
+        .await
+        .context("remove orphaned coding sandboxes")?;
+    if removed > 0 {
+        info!(count = removed, "removed orphaned coding sandboxes");
     }
-}
-
-async fn serve_api(
-    state: AppState,
-    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
-) -> Result<()> {
-    let listener = TcpListener::bind(state.config.listen_addr)
-        .await
-        .with_context(|| format!("bind API listener at {}", state.config.listen_addr))?;
-    info!(address = %state.config.listen_addr, "HTTP API listening");
-    axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown)
-        .await
-        .context("serve HTTP API")
-}
-
-async fn run_worker(worker: Arc<Worker>) -> Result<()> {
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let task = tokio::spawn(worker.run(shutdown_rx));
-    shutdown_signal().await;
-    let _ = shutdown_tx.send(true);
-    task.await.context("join worker task")?;
-    Ok(())
-}
-
-async fn run_all(state: AppState, worker: Arc<Worker>) -> Result<()> {
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let worker_task = tokio::spawn(worker.run(shutdown_rx.clone()));
-    let mut api_shutdown = shutdown_rx;
-    let mut api_task = tokio::spawn(serve_api(state, async move {
-        while !*api_shutdown.borrow() {
-            if api_shutdown.changed().await.is_err() {
-                break;
-            }
-        }
+    let workspaces = Arc::new(WorkspaceManager::new(WorkspaceManagerConfig {
+        sandbox: sandbox_config,
+        limits: config.limits.clone(),
+        blocked_paths: config.blocked_paths.clone(),
+        git_author_name: config.git_author_name.clone(),
+        git_author_email: config.git_author_email.clone(),
+        web_base_url: config.github_web_base_url.to_string(),
     }));
-    let mut api_finished = false;
-    tokio::select! {
-        () = shutdown_signal() => {}
-        result = &mut api_task => {
-            api_finished = true;
-            result.context("join API task")??;
-        }
+    let server = HermesGitHubServer::new(config, github, store.clone(), workspaces.clone());
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let cleanup = tokio::spawn(cleanup_loop(store.clone(), workspaces.clone(), shutdown_rx));
+
+    info!("Hermes GitHub MCP server starting on stdio");
+    let result = async {
+        let service = server
+            .serve(stdio())
+            .await
+            .context("initialize MCP stdio transport")?;
+        service
+            .waiting()
+            .await
+            .context("serve MCP stdio transport")?;
+        Ok::<(), anyhow::Error>(())
     }
+    .await;
+
     let _ = shutdown_tx.send(true);
-    if !api_finished {
-        api_task.await.context("join API task")??;
+    if let Err(error) = cleanup.await {
+        error!(%error, "workspace cleanup task failed");
     }
-    worker_task.await.context("join worker task")?;
-    Ok(())
+    workspaces.shutdown_all().await;
+    result
 }
 
-async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-
-        let mut terminate = match signal(SignalKind::terminate()) {
-            Ok(signal) => signal,
-            Err(error) => {
-                error!(%error, "failed to install SIGTERM handler");
-                let _ = tokio::signal::ctrl_c().await;
-                return;
-            }
-        };
+async fn cleanup_loop(
+    store: Arc<PostgresStore>,
+    workspaces: Arc<WorkspaceManager>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(30));
+    loop {
         tokio::select! {
-            result = tokio::signal::ctrl_c() => {
-                if let Err(error) = result {
-                    error!(%error, "failed to listen for Ctrl-C");
+            _ = interval.tick() => {
+                let expired = workspaces.expire().await;
+                for id in expired {
+                    if let Err(error) = store.finish_workspace(id, "expired").await {
+                        error!(%id, %error, "failed to persist workspace expiry");
+                    }
                 }
             }
-            _ = terminate.recv() => {}
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
         }
-    }
-    #[cfg(not(unix))]
-    if let Err(error) = tokio::signal::ctrl_c().await {
-        error!(%error, "failed to listen for Ctrl-C");
     }
 }
 
@@ -143,7 +124,11 @@ fn init_tracing() -> Result<()> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::registry()
         .with(filter)
-        .with(tracing_subscriber::fmt::layer().json())
+        .with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(std::io::stderr),
+        )
         .try_init()
-        .context("install tracing subscriber")
+        .context("install stderr tracing subscriber")
 }

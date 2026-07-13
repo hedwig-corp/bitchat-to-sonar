@@ -7,9 +7,6 @@ use crate::{AllowedCommand, SandboxError, SandboxToolExecutor};
 pub async fn validation_plan(
     executor: &SandboxToolExecutor,
 ) -> Result<Vec<AllowedCommand>, SandboxError> {
-    if !executor.repository_validation_commands().is_empty() {
-        return Ok(executor.repository_validation_commands().to_vec());
-    }
     let timeout = executor.command_timeout_seconds();
     if executor.repository_file_exists("Cargo.toml").await? {
         return Ok(vec![

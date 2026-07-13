@@ -1,17 +1,12 @@
-use std::{fmt, path::Path, sync::Arc};
+use std::{fmt, path::Path};
 
-use async_trait::async_trait;
-use coding_bot_domain::{DraftPullRequest, IssueComment, IssueContext, OpenedPullRequest};
 use jsonwebtoken::EncodingKey;
 use octocrab::{models::AppId, Octocrab};
 use secrecy::{ExposeSecret, SecretString};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 use url::Url;
-
-const MAX_ISSUE_BODY_BYTES: usize = 32 * 1024;
-const MAX_COMMENT_BODY_BYTES: usize = 4 * 1024;
-const MAX_ISSUE_COMMENTS: usize = 50;
 
 #[derive(Clone)]
 pub struct GitHubApp {
@@ -24,6 +19,14 @@ impl GitHubApp {
         private_key_path: &Path,
         api_base_url: &Url,
     ) -> Result<Self, GitHubError> {
+        let metadata =
+            std::fs::metadata(private_key_path).map_err(|source| GitHubError::ReadKey {
+                path: private_key_path.display().to_string(),
+                source,
+            })?;
+        if metadata.len() > 1024 * 1024 {
+            return Err(GitHubError::KeyTooLarge);
+        }
         let pem = std::fs::read(private_key_path).map_err(|source| GitHubError::ReadKey {
             path: private_key_path.display().to_string(),
             source,
@@ -36,73 +39,107 @@ impl GitHubApp {
         Ok(Self { app })
     }
 
-    pub fn generate_app_jwt(app_id: u64, key: &EncodingKey) -> Result<String, GitHubError> {
-        Ok(octocrab::auth::create_jwt(AppId(app_id), key)?)
-    }
-}
-
-#[async_trait]
-pub trait GitHubAppApi: Send + Sync {
-    async fn installation(&self, installation_id: u64) -> Result<InstallationAccess, GitHubError>;
-}
-
-#[async_trait]
-impl GitHubAppApi for GitHubApp {
-    async fn installation(&self, installation_id: u64) -> Result<InstallationAccess, GitHubError> {
+    pub async fn repository(
+        &self,
+        owner: &str,
+        repository: &str,
+    ) -> Result<RepositoryClient, GitHubError> {
+        validate_component(owner)?;
+        validate_component(repository)?;
+        let route = format!("/repos/{owner}/{repository}/installation");
+        let installation: RepositoryInstallation = self.app.get(route, None::<&()>).await?;
         let (client, token) = self
             .app
-            .installation_and_token(octocrab::models::InstallationId(installation_id))
+            .installation_and_token(octocrab::models::InstallationId(installation.id))
             .await?;
-        Ok(InstallationAccess {
-            api: Arc::new(OctocrabInstallation { client }),
-            token: InstallationToken(token),
+        Ok(RepositoryClient {
+            client,
+            token: InstallationToken(SecretString::from(token)),
+            owner: owner.to_owned(),
+            repository: repository.to_owned(),
+            installation_id: installation.id,
         })
     }
 }
 
-pub struct InstallationAccess {
-    pub api: Arc<dyn GitHubInstallationApi>,
+pub struct RepositoryClient {
+    client: Octocrab,
     token: InstallationToken,
+    owner: String,
+    repository: String,
+    installation_id: u64,
 }
 
-impl InstallationAccess {
+impl RepositoryClient {
     #[must_use]
-    pub fn new(api: Arc<dyn GitHubInstallationApi>, token: String) -> Self {
-        Self {
-            api,
-            token: InstallationToken::new(token),
-        }
+    pub fn installation_id(&self) -> u64 {
+        self.installation_id
     }
 
     #[must_use]
     pub fn token(&self) -> &str {
-        self.token.expose()
+        self.token.0.expose_secret()
+    }
+
+    pub fn repository_route(&self, suffix: &str) -> Result<String, GitHubError> {
+        if (!suffix.is_empty() && !suffix.starts_with('/')) || suffix.starts_with("//") {
+            return Err(GitHubError::InvalidRoute);
+        }
+        if suffix.contains("..") || suffix.contains(['?', '#', '\0']) {
+            return Err(GitHubError::InvalidRoute);
+        }
+        Ok(format!(
+            "/repos/{}/{}{}",
+            self.owner, self.repository, suffix
+        ))
+    }
+
+    pub async fn get<P: Serialize + ?Sized>(
+        &self,
+        suffix: &str,
+        query: Option<&P>,
+    ) -> Result<Value, GitHubError> {
+        Ok(self
+            .client
+            .get(self.repository_route(suffix)?, query)
+            .await?)
+    }
+
+    pub async fn post<B: Serialize + ?Sized>(
+        &self,
+        suffix: &str,
+        body: &B,
+    ) -> Result<Value, GitHubError> {
+        Ok(self
+            .client
+            .post(self.repository_route(suffix)?, Some(body))
+            .await?)
+    }
+
+    pub async fn patch<B: Serialize + ?Sized>(
+        &self,
+        suffix: &str,
+        body: &B,
+    ) -> Result<Value, GitHubError> {
+        Ok(self
+            .client
+            .patch(self.repository_route(suffix)?, Some(body))
+            .await?)
+    }
+
+    pub async fn put<B: Serialize + ?Sized>(
+        &self,
+        suffix: &str,
+        body: &B,
+    ) -> Result<Value, GitHubError> {
+        Ok(self
+            .client
+            .put(self.repository_route(suffix)?, Some(body))
+            .await?)
     }
 }
 
-impl fmt::Debug for InstallationAccess {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("InstallationAccess")
-            .field("api", &"GitHubInstallationApi")
-            .field("token", &self.token)
-            .finish()
-    }
-}
-
-pub struct InstallationToken(SecretString);
-
-impl InstallationToken {
-    #[must_use]
-    pub fn new(value: String) -> Self {
-        Self(SecretString::from(value))
-    }
-
-    #[must_use]
-    pub fn expose(&self) -> &str {
-        self.0.expose_secret()
-    }
-}
+struct InstallationToken(SecretString);
 
 impl fmt::Debug for InstallationToken {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -110,185 +147,36 @@ impl fmt::Debug for InstallationToken {
     }
 }
 
-#[async_trait]
-pub trait GitHubInstallationApi: Send + Sync {
-    async fn trusted_actor(
-        &self,
-        owner: &str,
-        repository: &str,
-        login: &str,
-    ) -> Result<bool, GitHubError>;
-
-    async fn issue_context(
-        &self,
-        owner: &str,
-        repository: &str,
-        issue_number: u64,
-    ) -> Result<IssueContext, GitHubError>;
-
-    async fn issue_is_open_with_label(
-        &self,
-        owner: &str,
-        repository: &str,
-        issue_number: u64,
-        label: &str,
-    ) -> Result<bool, GitHubError>;
-
-    async fn comment(
-        &self,
-        owner: &str,
-        repository: &str,
-        issue_number: u64,
-        body: &str,
-    ) -> Result<(), GitHubError>;
-
-    async fn create_draft_pull_request(
-        &self,
-        owner: &str,
-        repository: &str,
-        request: DraftPullRequest,
-    ) -> Result<OpenedPullRequest, GitHubError>;
+#[derive(Debug, Deserialize)]
+struct RepositoryInstallation {
+    id: u64,
 }
 
-struct OctocrabInstallation {
-    client: Octocrab,
+pub fn validate_component(value: &str) -> Result<(), GitHubError> {
+    if value.is_empty()
+        || value.len() > 100
+        || !value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-_.".contains(character))
+    {
+        return Err(GitHubError::InvalidRepository);
+    }
+    Ok(())
 }
 
-#[async_trait]
-impl GitHubInstallationApi for OctocrabInstallation {
-    async fn trusted_actor(
-        &self,
-        owner: &str,
-        repository: &str,
-        login: &str,
-    ) -> Result<bool, GitHubError> {
-        let route = format!("/repos/{owner}/{repository}/collaborators/{login}/permission");
-        let response: PermissionResponse = self.client.get(route, None::<&()>).await?;
-        Ok(matches!(
-            response.permission.as_str(),
-            "admin" | "maintain" | "write"
-        ))
+pub fn bounded_json(value: &Value, maximum_bytes: usize) -> Result<String, GitHubError> {
+    let serialized = serde_json::to_string_pretty(value)?;
+    if serialized.len() <= maximum_bytes {
+        return Ok(serialized);
     }
-
-    async fn issue_context(
-        &self,
-        owner: &str,
-        repository: &str,
-        issue_number: u64,
-    ) -> Result<IssueContext, GitHubError> {
-        let issue = self
-            .client
-            .issues(owner, repository)
-            .get(issue_number)
-            .await?;
-        let mut page = self
-            .client
-            .issues(owner, repository)
-            .list_comments(issue_number)
-            .per_page(100)
-            .send()
-            .await?;
-        let mut comments = Vec::new();
-        loop {
-            for comment in page.take_items() {
-                if comments.len() >= MAX_ISSUE_COMMENTS {
-                    break;
-                }
-                comments.push(IssueComment {
-                    author: comment.user.login,
-                    body: bounded_text(comment.body.unwrap_or_default(), MAX_COMMENT_BODY_BYTES),
-                });
-            }
-            if comments.len() >= MAX_ISSUE_COMMENTS {
-                break;
-            }
-            let Some(next) = self.client.get_page(&page.next).await? else {
-                break;
-            };
-            page = next;
-        }
-
-        Ok(IssueContext {
-            title: issue.title,
-            body: bounded_text(issue.body.unwrap_or_default(), MAX_ISSUE_BODY_BYTES),
-            author: issue.user.login,
-            state: format!("{:?}", issue.state).to_ascii_lowercase(),
-            labels: issue.labels.into_iter().map(|label| label.name).collect(),
-            comments,
-            html_url: issue.html_url.to_string(),
-        })
-    }
-
-    async fn issue_is_open_with_label(
-        &self,
-        owner: &str,
-        repository: &str,
-        issue_number: u64,
-        label: &str,
-    ) -> Result<bool, GitHubError> {
-        let issue = self
-            .client
-            .issues(owner, repository)
-            .get(issue_number)
-            .await?;
-        Ok(format!("{:?}", issue.state).eq_ignore_ascii_case("open")
-            && issue.labels.iter().any(|candidate| candidate.name == label))
-    }
-
-    async fn comment(
-        &self,
-        owner: &str,
-        repository: &str,
-        issue_number: u64,
-        body: &str,
-    ) -> Result<(), GitHubError> {
-        self.client
-            .issues(owner, repository)
-            .create_comment(issue_number, body)
-            .await?;
-        Ok(())
-    }
-
-    async fn create_draft_pull_request(
-        &self,
-        owner: &str,
-        repository: &str,
-        request: DraftPullRequest,
-    ) -> Result<OpenedPullRequest, GitHubError> {
-        let pull = self
-            .client
-            .pulls(owner, repository)
-            .create(request.title, request.head, request.base)
-            .body(request.body)
-            .draft(true)
-            .send()
-            .await?;
-        let html_url = pull
-            .html_url
-            .ok_or(GitHubError::MissingResponseField("pull_request.html_url"))?;
-        Ok(OpenedPullRequest {
-            number: pull.number,
-            html_url: html_url.to_string(),
-        })
-    }
-}
-
-fn bounded_text(mut value: String, maximum_bytes: usize) -> String {
-    if value.len() <= maximum_bytes {
-        return value;
-    }
-    let mut boundary = maximum_bytes;
-    while boundary > 0 && !value.is_char_boundary(boundary) {
+    let mut boundary = maximum_bytes.saturating_sub(64);
+    while boundary > 0 && !serialized.is_char_boundary(boundary) {
         boundary -= 1;
     }
-    value.truncate(boundary);
-    value.push_str("\n[truncated by coding bot]");
-    value
-}
-
-#[derive(Debug, Deserialize)]
-struct PermissionResponse {
-    permission: String,
+    Ok(format!(
+        "{}\n[GitHub response truncated at {maximum_bytes} bytes]",
+        &serialized[..boundary]
+    ))
 }
 
 #[derive(Debug, Error)]
@@ -303,49 +191,32 @@ pub enum GitHubError {
     Jwt(#[from] jsonwebtoken::errors::Error),
     #[error(transparent)]
     Octocrab(#[from] octocrab::Error),
-    #[error("GitHub response omitted {0}")]
-    MissingResponseField(&'static str),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error("repository owner or name is invalid")]
+    InvalidRepository,
+    #[error("GitHub API route is invalid")]
+    InvalidRoute,
+    #[error("GitHub App private key exceeds 1 MiB")]
+    KeyTooLarge,
 }
 
 #[cfg(test)]
 mod tests {
-    use jsonwebtoken::{decode_header, Algorithm};
-    use rand::rngs::OsRng;
-    use rsa::{pkcs8::EncodePrivateKey, RsaPrivateKey};
-
     use super::*;
 
     #[test]
-    fn installation_token_debug_is_redacted() {
-        let token = InstallationToken::new("ghs_test_secret".to_owned());
-        let rendered = format!("{token:?}");
-        assert!(!rendered.contains("ghs_test_secret"));
-        assert!(rendered.contains("REDACTED"));
+    fn repository_components_cannot_inject_routes() {
+        assert!(validate_component("acme-inc").is_ok());
+        assert!(validate_component("../installation").is_err());
+        assert!(validate_component("name/other").is_err());
     }
 
     #[test]
-    fn generates_rs256_github_app_jwt() {
-        let key = RsaPrivateKey::new(&mut OsRng, 2048);
-        let Ok(key) = key else {
-            panic!("test RSA key generation failed");
-        };
-        let pem = key.to_pkcs8_pem(Default::default());
-        let Ok(pem) = pem else {
-            panic!("test RSA key encoding failed");
-        };
-        let encoding_key = EncodingKey::from_rsa_pem(pem.as_bytes());
-        let Ok(encoding_key) = encoding_key else {
-            panic!("jsonwebtoken rejected generated RSA key");
-        };
-        let token = GitHubApp::generate_app_jwt(1234, &encoding_key);
-        let Ok(token) = token else {
-            panic!("GitHub App JWT generation failed");
-        };
-        let header = decode_header(&token);
-        let Ok(header) = header else {
-            panic!("generated JWT header could not be decoded");
-        };
-        assert_eq!(header.alg, Algorithm::RS256);
-        assert_eq!(token.split('.').count(), 3);
+    fn bounded_json_limits_model_context() {
+        let value = serde_json::json!({"body": "x".repeat(10_000)});
+        let rendered = bounded_json(&value, 1024).expect("JSON should serialize");
+        assert!(rendered.len() < 1100);
+        assert!(rendered.contains("truncated"));
     }
 }

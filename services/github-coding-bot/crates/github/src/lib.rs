@@ -1,7 +1,5 @@
-//! GitHub webhook validation, GitHub App authentication, and API operations.
+//! GitHub App authentication and installation-scoped API operations.
 
 mod app;
-mod webhook;
 
 pub use app::*;
-pub use webhook::*;

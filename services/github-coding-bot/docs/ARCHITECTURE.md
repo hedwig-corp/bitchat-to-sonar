@@ -1,54 +1,54 @@
 # Architecture
 
-## Components
+## Ownership
 
-The project is an independent Cargo workspace so its server dependencies do not
-enter Sonar's mobile `core/` build graph.
+Hermes owns intent, planning, code reasoning, and the conversation with the
+Sonar user. The Rust MCP server owns authorization and side effects. It never
+calls a model and cannot start work from a GitHub event.
 
-- `domain`: serializable jobs, issue context, model/tool contracts, validation,
-  and pull-request reports.
-- `config`: typed environment configuration, hard-limit validation, and secret
-  redaction.
-- `store`: SQLx/PostgreSQL durable queue, migrations, leases, cancellation, and
-  readiness heartbeats.
-- `github`: webhook HMAC/filtering, GitHub App authentication, installation
-  sessions, issue/comments, permission checks, and draft pull requests.
-- `agent`: provider-independent `LanguageModel`, OpenAI-compatible provider, tool
-  schemas, budget enforcement, and the agent loop.
-- `worker`: Docker sandbox lifecycle, path/command policy, Git workflow,
-  controller validation, and job orchestration.
-- `server`: Axum endpoints, administrative authentication, metrics, startup,
-  and API/worker process modes.
+- `server`: typed stdio MCP tools and Sonar-sender authorization;
+- `github`: GitHub App JWT, repository-installation lookup, and short-lived
+  installation clients;
+- `worker`: isolated workspaces, protected Git metadata, bounded reads/patches,
+  allowlisted validation, commit, and normal push;
+- `store`: append-only audit events, workspace metadata, and atomic single-use
+  confirmation challenges;
+- `config`/`domain`: validated operator policy and shared types.
 
-## Job sequence
+## GitHub action flow
 
-1. Axum reads a bounded raw webhook body and verifies its HMAC.
-2. The API filters the event, authenticates the installation, verifies that the
-   labeler has write/maintain/admin permission, and transactionally enqueues it.
-3. A worker claims one row using `FOR UPDATE SKIP LOCKED` and starts a lease.
-4. The trusted controller fetches issue context and creates an ephemeral Docker
-   sandbox with networking disabled.
-5. Controller-owned Git metadata is initialized on a separate protected tmpfs.
-   Networking is connected only while a bounded fetch receives a short-lived
-   token through process environment; it is disconnected before agent execution.
-6. Root instructions are loaded in `AGENTS.md`, `CLAUDE.md`,
-   `CONTRIBUTING.md`, `README.md` order. Bounded nested `AGENTS.md`/`CLAUDE.md`
-   files are also supplied, with closer scope taking precedence.
-7. The LLM calls only typed tools. Every path, patch, command, output, duration,
-   and workspace audit is bounded by controller policy.
-8. The controller runs its own project validation plan and re-audits all tracked
-   and untracked changes, file modes, symlinks, protected paths, and diff size.
-9. After confirming that no untrusted process remains, meaningful changes are
-   staged explicitly by a separate publication UID, committed on an
-   `ai-fix/issue-*` branch, and pushed to the expected repository URL without
-   force using a fresh installation token.
-10. The sandbox is destroyed before the controller opens a draft pull request.
-11. The job and issue are updated. No code path performs merge operations.
+Every call includes the exact authenticated Sonar sender ID. The server checks
+that ID and `owner/repository` against independent allowlists before requesting
+an installation token. GitHub responses and workspace output are bounded before
+they enter Hermes context. Mutations are attributed by GitHub to the installed
+App's `[bot]` identity and written to the audit log.
 
-## Queue recovery
+Issue close and PR merge are two-phase actions. Prepare reads the current target
+and returns a token plus an exact human-readable summary. Confirm atomically
+consumes the matching unexpired token. A merge confirmation is bound to actor,
+repository, PR number, current head SHA, and merge method; any change requires a
+new confirmation. GitHub branch protection remains the final merge policy.
 
-`coding_jobs_one_active_issue` prevents concurrent active jobs for the same
-numeric repository ID and issue number. Claims increment an attempt fence and
-set `lease_expires_at`. A crashed worker's expired job can be reclaimed; a stale
-attempt cannot renew or complete it. Cancellation is immediate for pending jobs
-and cooperative for running jobs.
+## Code-change flow
+
+1. Hermes calls `workspace_create`; the server resolves the base branch and SHA.
+2. A disposable Docker container starts with a read-only root, tmpfs worktree,
+   separate controller-owned Git metadata, and network `none`.
+3. The controller briefly connects a configured Docker network only for clone,
+   injects a short-lived installation token into one Git process, disconnects,
+   and verifies the cloned SHA did not move.
+4. Hermes reads guidance/files, searches, and applies unified text patches via
+   typed MCP calls. It cannot run arbitrary commands or change network state.
+5. Validation runs exact controller allowlisted commands in the network-off
+   sandbox. Publication always re-runs the full plan and audits protected paths,
+   diff/file limits, binary content, and symlinks.
+6. A separate publisher UID commits and normal-pushes `hermes/*` with a fresh
+   installation token. Force push is not implemented.
+7. The workspace is destroyed. Hermes opens the PR with
+   `github_pull_request_create`, so a transient PR API failure can be retried
+   without repeating or losing the successful branch push.
+
+Workspace state is intentionally process-local while metadata is durable. A
+PostgreSQL advisory lock permits one controller per database. At startup that
+controller removes any labeled sandbox left by a prior crash, invalidates old
+workspace IDs, and expires their database rows.

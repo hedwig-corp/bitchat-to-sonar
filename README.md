@@ -49,7 +49,7 @@ core/                     shared Rust core (Cargo workspace)
 ios/                      native SwiftUI reference app (iOS + macOS)
 apps/sonar/               Compose Multiplatform app (Android + Desktop JVM)
 web/                      SvelteKit marketing landing page
-services/github-coding-bot/ self-hosted GitHub issue-to-draft-PR coding bot
+services/github-coding-bot/ Hermes MCP server for the dedicated GitHub App bot
 relays/                   curated Nostr relay list
 design/                   vendored design handoff (source of truth for the UI)
 docs/                     protocol & feature specs (payments, discovery, calls, Tor, …)

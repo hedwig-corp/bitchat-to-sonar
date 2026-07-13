@@ -1,7 +1,7 @@
-//! HTTP API and process runtime for the GitHub coding bot.
+//! Hermes-facing MCP server for the dedicated GitHub App bot.
 
-mod api;
+mod mcp;
 mod runtime;
 
-pub use api::*;
+pub use mcp::*;
 pub use runtime::*;

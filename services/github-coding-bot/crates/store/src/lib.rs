@@ -1,14 +1,13 @@
-//! PostgreSQL-backed durable job queue.
+//! PostgreSQL audit, confirmation, and workspace metadata store.
 
-use std::{str::FromStr, time::Duration};
+use std::time::Duration;
 
-use chrono::{DateTime, Utc};
-use coding_bot_domain::{CodingJob, JobStatus, NewCodingJob};
-use sqlx::{FromRow, PgPool, Postgres, Transaction};
+use chrono::Utc;
+use coding_bot_domain::{AuditEvent, ConfirmationScope, PreparedConfirmation, WorkspaceDescriptor};
+use sha2::{Digest, Sha256};
+use sqlx::{pool::PoolConnection, PgPool, Postgres};
 use thiserror::Error;
 use uuid::Uuid;
-
-static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 
 #[derive(Clone)]
 pub struct PostgresStore {
@@ -21,408 +20,194 @@ impl PostgresStore {
         Self { pool }
     }
 
-    #[must_use]
-    pub fn pool(&self) -> &PgPool {
-        &self.pool
-    }
-
     pub async fn migrate(&self) -> Result<(), StoreError> {
-        MIGRATOR.run(&self.pool).await?;
+        sqlx::migrate!("../../migrations").run(&self.pool).await?;
         Ok(())
     }
 
-    pub async fn ping(&self) -> Result<(), StoreError> {
-        sqlx::query("SELECT 1").execute(&self.pool).await?;
-        Ok(())
-    }
-
-    pub async fn enqueue(
-        &self,
-        event_name: &str,
-        new_job: NewCodingJob,
-    ) -> Result<EnqueueResult, StoreError> {
-        let mut transaction = self.pool.begin().await?;
-        let delivery_insert = sqlx::query(
-            "INSERT INTO webhook_deliveries (delivery_id, event_name) VALUES ($1, $2) \
-             ON CONFLICT (delivery_id) DO NOTHING",
-        )
-        .bind(&new_job.delivery_id)
-        .bind(event_name)
-        .execute(&mut *transaction)
-        .await?;
-
-        if delivery_insert.rows_affected() == 0 {
-            transaction.rollback().await?;
-            return Ok(EnqueueResult::DuplicateDelivery);
+    /// Holds a PostgreSQL advisory lock for this process lifetime so two MCP
+    /// controllers cannot race over Docker workspace cleanup or confirmations.
+    pub async fn acquire_controller_lock(&self) -> Result<PoolConnection<Postgres>, StoreError> {
+        const LOCK_ID: i64 = 0x4845_524D_4553_4748;
+        let mut connection = self.pool.acquire().await?;
+        let acquired = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
+            .bind(LOCK_ID)
+            .fetch_one(&mut *connection)
+            .await?;
+        if !acquired {
+            return Err(StoreError::Invalid(
+                "another Hermes GitHub MCP controller already holds the singleton lock".to_owned(),
+            ));
         }
+        Ok(connection)
+    }
 
-        let id = Uuid::new_v4();
-        let row = sqlx::query_as::<_, JobRow>(
-            "INSERT INTO coding_jobs (\
-                 id, repository_id, repository_owner, repository_name, issue_number, \
-                 installation_id, base_branch, status\
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending') \
-             ON CONFLICT DO NOTHING \
-             RETURNING *",
+    pub async fn record_audit(&self, event: &AuditEvent) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO audit_events \
+             (actor, tool, owner, repository, target, outcome, details) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
-        .bind(id)
-        .bind(to_i64("repository_id", new_job.repository_id)?)
-        .bind(&new_job.repository_owner)
-        .bind(&new_job.repository_name)
-        .bind(to_i64("issue_number", new_job.issue_number)?)
-        .bind(to_i64("installation_id", new_job.installation_id)?)
-        .bind(&new_job.base_branch)
-        .fetch_optional(&mut *transaction)
+        .bind(&event.actor)
+        .bind(&event.tool)
+        .bind(&event.owner)
+        .bind(&event.repository)
+        .bind(&event.target)
+        .bind(&event.outcome)
+        .bind(&event.details)
+        .execute(&self.pool)
         .await?;
+        Ok(())
+    }
 
-        transaction.commit().await?;
-        row.map(TryInto::try_into).transpose().map(|job| {
-            job.map_or(EnqueueResult::DuplicateActiveJob, |job| {
-                EnqueueResult::Queued(Box::new(job))
-            })
+    pub async fn prepare_confirmation(
+        &self,
+        scope: &ConfirmationScope,
+        ttl: Duration,
+        summary: String,
+    ) -> Result<PreparedConfirmation, StoreError> {
+        let ttl = chrono::Duration::from_std(ttl)
+            .map_err(|_| StoreError::Invalid("confirmation TTL is out of range".to_owned()))?;
+        let expires_at = Utc::now() + ttl;
+        let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let token_hash = hash_token(&token);
+        sqlx::query(
+            "INSERT INTO confirmation_challenges \
+             (id, token_hash, actor, action, owner, repository, target_number, \
+              expected_head_sha, qualifier, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(token_hash.as_slice())
+        .bind(&scope.actor)
+        .bind(scope.action.as_str())
+        .bind(&scope.owner)
+        .bind(&scope.repository)
+        .bind(to_i64(scope.target_number)?)
+        .bind(&scope.expected_head_sha)
+        .bind(&scope.qualifier)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(PreparedConfirmation {
+            confirmation_token: token,
+            expires_at,
+            summary,
         })
     }
 
-    pub async fn claim(
+    /// Atomically consumes a challenge. A token can authorize exactly one matching action.
+    pub async fn consume_confirmation(
         &self,
-        worker_id: &str,
-        lease_duration: Duration,
-    ) -> Result<Option<CodingJob>, StoreError> {
-        let lease_seconds = duration_seconds(lease_duration)?;
-        let mut transaction = self.pool.begin().await?;
-
-        sqlx::query(
-            "UPDATE coding_jobs SET status = 'cancelled', finished_at = now(), \
-                 lease_expires_at = NULL \
-             WHERE status = 'running' AND cancel_requested AND lease_expires_at < now()",
+        token: &str,
+        scope: &ConfirmationScope,
+    ) -> Result<bool, StoreError> {
+        if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Ok(false);
+        }
+        let token_hash = hash_token(token);
+        let consumed = sqlx::query_scalar::<_, Uuid>(
+            "UPDATE confirmation_challenges SET consumed_at = now() \
+             WHERE token_hash = $1 AND consumed_at IS NULL AND expires_at > now() \
+               AND actor = $2 AND action = $3 AND owner = $4 AND repository = $5 \
+               AND target_number = $6 AND expected_head_sha IS NOT DISTINCT FROM $7 \
+               AND qualifier IS NOT DISTINCT FROM $8 \
+             RETURNING id",
         )
-        .execute(&mut *transaction)
+        .bind(token_hash.as_slice())
+        .bind(&scope.actor)
+        .bind(scope.action.as_str())
+        .bind(&scope.owner)
+        .bind(&scope.repository)
+        .bind(to_i64(scope.target_number)?)
+        .bind(&scope.expected_head_sha)
+        .bind(&scope.qualifier)
+        .fetch_optional(&self.pool)
         .await?;
-
-        let row = sqlx::query_as::<_, JobRow>(
-            "WITH candidate AS (\
-                 SELECT id FROM coding_jobs \
-                 WHERE status = 'pending' \
-                    OR (status = 'running' AND lease_expires_at < now() AND NOT cancel_requested) \
-                 ORDER BY created_at, id \
-                 FOR UPDATE SKIP LOCKED \
-                 LIMIT 1\
-             ) \
-             UPDATE coding_jobs AS jobs SET \
-                 status = 'running', \
-                 attempt = jobs.attempt + 1, \
-                 started_at = COALESCE(jobs.started_at, now()), \
-                 lease_expires_at = now() + ($1 * interval '1 second'), \
-                 error_message = NULL \
-             FROM candidate \
-             WHERE jobs.id = candidate.id \
-             RETURNING jobs.*",
-        )
-        .bind(lease_seconds)
-        .fetch_optional(&mut *transaction)
-        .await?;
-
-        let Some(row) = row else {
-            self.heartbeat_in(&mut transaction, worker_id, None).await?;
-            transaction.commit().await?;
-            return Ok(None);
-        };
-
-        self.heartbeat_in(&mut transaction, worker_id, Some(row.id))
-            .await?;
-        transaction.commit().await?;
-        Ok(Some(row.try_into()?))
+        Ok(consumed.is_some())
     }
 
-    pub async fn renew_lease(
+    pub async fn record_workspace(
         &self,
-        worker_id: &str,
-        job_id: Uuid,
-        attempt: u32,
-        lease_duration: Duration,
-    ) -> Result<bool, StoreError> {
-        let mut transaction = self.pool.begin().await?;
-        let result = sqlx::query(
-            "UPDATE coding_jobs SET lease_expires_at = now() + ($1 * interval '1 second') \
-             WHERE id = $2 AND attempt = $3 AND status = 'running' AND NOT cancel_requested",
+        workspace: &WorkspaceDescriptor,
+        installation_id: u64,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO mcp_workspaces \
+             (id, actor, owner, repository, installation_id, base_ref, base_sha, \
+              branch_name, created_at, expires_at, status) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'active')",
         )
-        .bind(duration_seconds(lease_duration)?)
-        .bind(job_id)
-        .bind(to_i32("attempt", attempt)?)
-        .execute(&mut *transaction)
+        .bind(workspace.id)
+        .bind(&workspace.actor)
+        .bind(&workspace.owner)
+        .bind(&workspace.repository)
+        .bind(to_i64(installation_id)?)
+        .bind(&workspace.base_ref)
+        .bind(&workspace.base_sha)
+        .bind(&workspace.branch_name)
+        .bind(workspace.created_at)
+        .bind(workspace.expires_at)
+        .execute(&self.pool)
         .await?;
-        self.heartbeat_in(&mut transaction, worker_id, Some(job_id))
-            .await?;
-        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn touch_workspace(&self, id: Uuid) -> Result<bool, StoreError> {
+        let result = sqlx::query(
+            "UPDATE mcp_workspaces SET last_active_at = now() \
+             WHERE id = $1 AND status = 'active' AND expires_at > now()",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         Ok(result.rows_affected() == 1)
     }
 
-    pub async fn heartbeat(
-        &self,
-        worker_id: &str,
-        current_job_id: Option<Uuid>,
-    ) -> Result<(), StoreError> {
-        let mut transaction = self.pool.begin().await?;
-        self.heartbeat_in(&mut transaction, worker_id, current_job_id)
-            .await?;
-        transaction.commit().await?;
-        Ok(())
-    }
-
-    async fn heartbeat_in(
-        &self,
-        transaction: &mut Transaction<'_, Postgres>,
-        worker_id: &str,
-        current_job_id: Option<Uuid>,
-    ) -> Result<(), StoreError> {
+    pub async fn finish_workspace(&self, id: Uuid, status: &str) -> Result<(), StoreError> {
+        if !matches!(status, "published" | "closed" | "expired" | "failed") {
+            return Err(StoreError::Invalid("invalid workspace status".to_owned()));
+        }
         sqlx::query(
-            "INSERT INTO worker_heartbeats (worker_id, last_seen_at, current_job_id) \
-             VALUES ($1, now(), $2) \
-             ON CONFLICT (worker_id) DO UPDATE SET \
-                 last_seen_at = EXCLUDED.last_seen_at, \
-                 current_job_id = EXCLUDED.current_job_id",
+            "UPDATE mcp_workspaces SET status = $1, finished_at = now() \
+             WHERE id = $2 AND status = 'active'",
         )
-        .bind(worker_id)
-        .bind(current_job_id)
-        .execute(&mut **transaction)
-        .await?;
-        Ok(())
-    }
-
-    pub async fn worker_available(&self, maximum_age: Duration) -> Result<bool, StoreError> {
-        let available = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS (\
-                 SELECT 1 FROM worker_heartbeats \
-                 WHERE last_seen_at >= now() - ($1 * interval '1 second')\
-             )",
-        )
-        .bind(duration_seconds(maximum_age)?)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(available)
-    }
-
-    pub async fn remove_worker(&self, worker_id: &str) -> Result<(), StoreError> {
-        sqlx::query("DELETE FROM worker_heartbeats WHERE worker_id = $1")
-            .bind(worker_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    pub async fn get(&self, id: Uuid) -> Result<Option<CodingJob>, StoreError> {
-        sqlx::query_as::<_, JobRow>("SELECT * FROM coding_jobs WHERE id = $1")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?
-            .map(TryInto::try_into)
-            .transpose()
-    }
-
-    pub async fn cancel(&self, id: Uuid) -> Result<Option<CodingJob>, StoreError> {
-        sqlx::query_as::<_, JobRow>(
-            "UPDATE coding_jobs SET \
-                 cancel_requested = TRUE, \
-                 status = CASE WHEN status = 'pending' THEN 'cancelled' ELSE status END, \
-                 finished_at = CASE WHEN status = 'pending' THEN now() ELSE finished_at END, \
-                 lease_expires_at = CASE WHEN status = 'pending' THEN NULL ELSE lease_expires_at END \
-             WHERE id = $1 AND status IN ('pending', 'running') \
-             RETURNING *",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?
-        .map(TryInto::try_into)
-        .transpose()
-    }
-
-    pub async fn cancellation_requested(&self, id: Uuid) -> Result<bool, StoreError> {
-        let requested = sqlx::query_scalar::<_, bool>(
-            "SELECT cancel_requested OR status = 'cancelled' FROM coding_jobs WHERE id = $1",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(StoreError::NotFound(id))?;
-        Ok(requested)
-    }
-
-    pub async fn record_branch(&self, id: Uuid, branch: &str) -> Result<(), StoreError> {
-        update_text(&self.pool, id, "branch_name", branch).await
-    }
-
-    pub async fn record_pull_request(&self, id: Uuid, number: u64) -> Result<(), StoreError> {
-        let result = sqlx::query(
-            "UPDATE coding_jobs SET pull_request_number = $1 WHERE id = $2 AND status = 'running'",
-        )
-        .bind(to_i64("pull_request_number", number)?)
+        .bind(status)
         .bind(id)
         .execute(&self.pool)
         .await?;
-        ensure_updated(result.rows_affected(), id)
-    }
-
-    pub async fn succeed(&self, id: Uuid, attempt: u32) -> Result<(), StoreError> {
-        self.finish(id, attempt, JobStatus::Succeeded, None).await
-    }
-
-    pub async fn fail(&self, id: Uuid, attempt: u32, public_error: &str) -> Result<(), StoreError> {
-        self.finish(id, attempt, JobStatus::Failed, Some(public_error))
-            .await
-    }
-
-    pub async fn finish_cancelled(&self, id: Uuid, attempt: u32) -> Result<(), StoreError> {
-        self.finish(id, attempt, JobStatus::Cancelled, None).await
-    }
-
-    async fn finish(
-        &self,
-        id: Uuid,
-        attempt: u32,
-        status: JobStatus,
-        error_message: Option<&str>,
-    ) -> Result<(), StoreError> {
-        let result = sqlx::query(
-            "UPDATE coding_jobs SET status = $1, finished_at = now(), lease_expires_at = NULL, \
-                 error_message = $2 \
-             WHERE id = $3 AND attempt = $4 AND status = 'running'",
-        )
-        .bind(status.as_str())
-        .bind(error_message)
-        .bind(id)
-        .bind(to_i32("attempt", attempt)?)
-        .execute(&self.pool)
-        .await?;
-        ensure_updated(result.rows_affected(), id)
-    }
-}
-
-async fn update_text(
-    pool: &PgPool,
-    id: Uuid,
-    column: &'static str,
-    value: &str,
-) -> Result<(), StoreError> {
-    let sql = match column {
-        "branch_name" => {
-            "UPDATE coding_jobs SET branch_name = $1 WHERE id = $2 AND status = 'running'"
-        }
-        _ => {
-            return Err(StoreError::InvalidData(format!(
-                "unsupported update column {column}"
-            )))
-        }
-    };
-    let result = sqlx::query(sql).bind(value).bind(id).execute(pool).await?;
-    ensure_updated(result.rows_affected(), id)
-}
-
-fn ensure_updated(rows: u64, id: Uuid) -> Result<(), StoreError> {
-    if rows == 1 {
         Ok(())
-    } else {
-        Err(StoreError::StaleJob(id))
+    }
+
+    /// A fresh controller has no in-memory handle for workspaces from an older
+    /// process, so all formerly active rows are unrecoverable and must expire.
+    pub async fn recover_abandoned_workspaces(&self) -> Result<Vec<Uuid>, StoreError> {
+        Ok(sqlx::query_scalar::<_, Uuid>(
+            "UPDATE mcp_workspaces SET status = 'expired', finished_at = now() \
+             WHERE status = 'active' RETURNING id",
+        )
+        .fetch_all(&self.pool)
+        .await?)
     }
 }
 
-fn duration_seconds(duration: Duration) -> Result<i64, StoreError> {
-    i64::try_from(duration.as_secs())
-        .map_err(|_| StoreError::InvalidData("duration exceeds PostgreSQL range".to_owned()))
+fn hash_token(token: &str) -> [u8; 32] {
+    Sha256::digest(token.as_bytes()).into()
 }
 
-fn to_i64(field: &'static str, value: u64) -> Result<i64, StoreError> {
-    i64::try_from(value).map_err(|_| StoreError::NumericOverflow { field, value })
-}
-
-fn to_i32(field: &'static str, value: u32) -> Result<i32, StoreError> {
-    i32::try_from(value).map_err(|_| StoreError::NumericOverflow {
-        field,
-        value: u64::from(value),
-    })
-}
-
-fn from_i64(field: &'static str, value: i64) -> Result<u64, StoreError> {
-    u64::try_from(value)
-        .map_err(|_| StoreError::InvalidData(format!("negative {field} in database")))
-}
-
-fn from_i32(field: &'static str, value: i32) -> Result<u32, StoreError> {
-    u32::try_from(value)
-        .map_err(|_| StoreError::InvalidData(format!("negative {field} in database")))
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EnqueueResult {
-    Queued(Box<CodingJob>),
-    DuplicateDelivery,
-    DuplicateActiveJob,
-}
-
-#[derive(Debug, FromRow)]
-struct JobRow {
-    id: Uuid,
-    repository_id: i64,
-    repository_owner: String,
-    repository_name: String,
-    issue_number: i64,
-    installation_id: i64,
-    base_branch: String,
-    status: String,
-    attempt: i32,
-    created_at: DateTime<Utc>,
-    started_at: Option<DateTime<Utc>>,
-    finished_at: Option<DateTime<Utc>>,
-    lease_expires_at: Option<DateTime<Utc>>,
-    cancel_requested: bool,
-    error_message: Option<String>,
-    branch_name: Option<String>,
-    pull_request_number: Option<i64>,
-}
-
-impl TryFrom<JobRow> for CodingJob {
-    type Error = StoreError;
-
-    fn try_from(row: JobRow) -> Result<Self, Self::Error> {
-        Ok(Self {
-            id: row.id,
-            repository_id: from_i64("repository_id", row.repository_id)?,
-            repository_owner: row.repository_owner,
-            repository_name: row.repository_name,
-            issue_number: from_i64("issue_number", row.issue_number)?,
-            installation_id: from_i64("installation_id", row.installation_id)?,
-            base_branch: row.base_branch,
-            status: JobStatus::from_str(&row.status)
-                .map_err(|error| StoreError::InvalidData(error.to_string()))?,
-            attempt: from_i32("attempt", row.attempt)?,
-            created_at: row.created_at,
-            started_at: row.started_at,
-            finished_at: row.finished_at,
-            lease_expires_at: row.lease_expires_at,
-            cancel_requested: row.cancel_requested,
-            error_message: row.error_message,
-            branch_name: row.branch_name,
-            pull_request_number: row
-                .pull_request_number
-                .map(|value| from_i64("pull_request_number", value))
-                .transpose()?,
-        })
-    }
+fn to_i64(value: u64) -> Result<i64, StoreError> {
+    i64::try_from(value)
+        .map_err(|_| StoreError::Invalid("number exceeds PostgreSQL range".to_owned()))
 }
 
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error(transparent)]
-    Sqlx(#[from] sqlx::Error),
+    Database(#[from] sqlx::Error),
     #[error(transparent)]
-    Migration(#[from] sqlx::migrate::MigrateError),
-    #[error("{field} value {value} exceeds the PostgreSQL BIGINT range")]
-    NumericOverflow { field: &'static str, value: u64 },
-    #[error("invalid database data: {0}")]
-    InvalidData(String),
-    #[error("job {0} was not found")]
-    NotFound(Uuid),
-    #[error("job {0} is no longer owned by this worker attempt")]
-    StaleJob(Uuid),
+    Migrate(#[from] sqlx::migrate::MigrateError),
+    #[error("invalid store input: {0}")]
+    Invalid(String),
 }
 
 #[cfg(test)]
@@ -430,10 +215,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rejects_github_ids_outside_postgres_range() {
-        assert!(matches!(
-            to_i64("repository_id", u64::MAX),
-            Err(StoreError::NumericOverflow { .. })
-        ));
+    fn confirmation_tokens_are_high_entropy_and_stored_as_hashes() {
+        let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        assert_eq!(token.len(), 64);
+        assert_ne!(hash_token(&token).as_slice(), token.as_bytes());
     }
 }

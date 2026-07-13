@@ -1,72 +1,50 @@
 # Security model
 
-Repository content, issues, comments, model output, tests, compilers, and build
-scripts are untrusted.
+Sonar messages, GitHub text, repository files, patches, tests, compilers, and
+build scripts are untrusted.
 
-## Trust boundaries
+## Authorization and credentials
 
-The API/controller owns GitHub App, webhook, LLM, database, and administrative
-credentials. Sandbox containers receive none of them. The only repository token
-is a short-lived installation token injected into one Git process for clone or
-push. It is never embedded in a URL, Git config, model context, or log.
+The authenticated Sonar gateway supplies a sender identity that Hermes passes
+as `actor`. The service independently checks `SONAR_AUTHORIZED_SENDERS` and
+`REPOSITORY_ALLOWLIST` on every call; a sender written inside message text is
+not proof of identity. Stdio access must also be limited to the Hermes operator.
+The Hermes Sonar gateway must enforce its own authenticated-sender allowlist;
+use the MCP `actor` check as a second gate.
 
-The controller has Docker daemon access and is therefore privileged. Compromise
-of that container is host-impacting. Restrict its image, operators, network, and
-socket; do not expose administrative endpoints publicly. Sandbox containers
-never receive the Docker socket or host filesystem mounts.
+The trusted MCP controller owns the GitHub App key, PostgreSQL credentials, and
+Docker socket. GitHub installation tokens never enter model context, URLs, Git
+config, logs, or the sandbox environment generally. They are process-scoped to
+one API session or clone/push command and output is redacted.
 
-## Sandbox controls
+The Docker socket is host-privileged. Harden and restrict the MCP image and host;
+never mount that socket, secrets, or host paths into a repository sandbox.
 
-- temporary Docker tmpfs workspace and read-only root filesystem;
-- untrusted tools run as UID 10001 while controller-owned Git metadata and
-  publication run as UID 10002; all Linux capabilities are dropped and
-  `no-new-privileges` is enabled;
-- CPU, memory, PID, output, command, and total-job limits;
-- network `none` during all model-driven tools and validation;
-- no SSH agent, cloud credentials, production secrets, Docker CLI/socket, curl,
-  wget, or privilege-escalation tools;
-- fixed executable/argument allowlist with no shell, pipelines, substitution,
-  or arbitrary command strings;
-- lexical traversal rejection, canonical path checks, escaping-symlink scan,
-  and changed-symlink/binary rejection;
-- protected path checks both before `git apply` and against the controller-owned
-  final diff, including untracked files.
+## Sandbox
 
-Git metadata lives on a separate tmpfs that UID 10001 can read but cannot
-modify. Publication uses the configured repository URL directly rather than an
-untrusted `origin` setting. Before either network window, the controller checks
-that the sandbox contains only its inert PID 1; any residual process terminates
-the sandbox and the job.
+- read-only root and temporary tmpfs worktree;
+- all capabilities dropped, `no-new-privileges`, non-root UIDs, CPU/RAM/PID and
+  output/time limits;
+- UID 10001 handles untrusted files/tests; UID 10002 owns separate Git metadata
+  and publication;
+- network `none` except controller-owned clone/push windows, which require an
+  idle-process check and fail closed if network removal fails;
+- no shell-command tool: validation is an exact program+argument allowlist;
+- traversal/canonical-path checks, escaping/changed symlink rejection, binary
+  rejection, protected-path checks before patch and again on final diff;
+- file-count and diff-line limits enforced before publication.
 
-An optional repository `.ai-fix.toml` is itself protected. Because repository
-content is untrusted, it can only add blocked paths and choose exact commands
-from the controller's existing allowlist. It cannot enable a command, remove a
-blocked path, add network access, or change a hard limit.
+Validation still executes arbitrary repository code. Its safety comes from the
+isolation boundary, not the command name.
 
-Validation commands still execute arbitrary repository code. Their safety comes
-from isolation and resource bounds, not from the command name.
+## Destructive actions
 
-## Prompt injection
+Issue close and PR merge require a durable two-phase confirmation. The database
+stores only a SHA-256 token hash. Tokens expire, are single-use, and are bound to
+actor/action/repository/target. Merge also binds current head SHA and method, so
+a new commit or method change invalidates prior consent. GitHub branch
+protection and required checks still apply. There are no force-push, branch
+delete, workflow edit, or history-rewrite tools.
 
-Issue and repository text is marked as untrusted data. Policy and tool schemas
-are controller-owned. Invalid/repeated calls count against budgets. The model
-cannot change network state, request secrets, alter command policy, publish, or
-merge. A controller-owned final gate decides whether a proposal may be pushed.
-
-## Webhook and API controls
-
-- SHA-256 HMAC verification covers the exact raw body.
-- Delivery IDs are persisted uniquely to reject replay.
-- Only `issues:labeled` with exact `ai-fix`, open issue, allowlisted repository,
-  non-bot sender, installation ID, and trusted labeler can enqueue.
-- Active jobs are unique per numeric repository ID and issue number.
-- Administrative bearer tokens are compared through constant-time SHA-256
-  digests.
-- Request bodies are capped at 1 MiB.
-
-## Secret handling
-
-`.env`, private keys, and `secrets/` are ignored. `Debug` implementations redact
-secret values. Logs contain job/repository identifiers and operation results,
-but never tokens, keys, LLM credentials, full private repository contents, or
-environment dumps.
+Audit records store actors, operations, targets, outcomes, and bounded metadata,
+never message bodies, patches, private repository contents, keys, or tokens.
