@@ -657,30 +657,52 @@ private fun DeleteChatSheet(name: String, isGroup: Boolean, onDelete: () -> Unit
 @Composable
 private fun ConnectivitySheet(online: Boolean, meshCount: Int, onClose: () -> Unit) {
     val s = sonar
+    var showRelayStatus by remember { mutableStateOf(false) }
     Box(
         Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
         contentAlignment = Alignment.BottomCenter
     ) {
-        Surface(color = s.surface, shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)) {
+        Surface(
+            color = s.surface,
+            shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp),
+            modifier = Modifier.clickable(
+                indication = null,
+                interactionSource = remember { MutableInteractionSource() },
+                onClick = {},
+            ),
+        ) {
             Column(Modifier.fillMaxWidth().padding(vertical = 16.dp)) {
-                Text(
-                    "Connections", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold,
-                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp)
-                )
-                Spacer(Modifier.height(6.dp))
-                chat.bitchat.sonar.ui.SNSettingsRow(
-                    icon = SNIconName.Globe, tone = if (online) SNTone.Cyan else SNTone.Default,
-                    label = "Internet",
-                    sub = if (online) "Connected · Nostr relays" else "Offline — messages wait or travel over Bluetooth",
-                    value = if (online) "Online" else "Offline", trail = SNTrail.None,
-                )
-                chat.bitchat.sonar.ui.SNSettingsRow(
-                    icon = SNIconName.Mesh, tone = SNTone.Cyan, label = "Bluetooth mesh",
-                    sub = "$meshCount people in range", trail = SNTrail.None, divider = false,
-                )
-                Spacer(Modifier.height(10.dp))
-                Box(Modifier.fillMaxWidth().height(44.dp).clickable(onClick = onClose), contentAlignment = Alignment.Center) {
-                    Text("Done", color = s.text2, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                if (showRelayStatus) {
+                    Text(
+                        "Internet", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp)
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    chat.bitchat.sonar.screens.SonarRelayStatusSheetContent(
+                        online = online,
+                        onClose = { showRelayStatus = false },
+                    )
+                } else {
+                    Text(
+                        "Connections", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp)
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    chat.bitchat.sonar.ui.SNSettingsRow(
+                        icon = SNIconName.Globe, tone = if (online) SNTone.Cyan else SNTone.Default,
+                        label = "Internet",
+                        sub = if (online) "Connected · Nostr relays" else "Offline — messages wait or travel over Bluetooth",
+                        value = if (online) "Online" else "Offline",
+                        trail = SNTrail.Chevron,
+                    ) { showRelayStatus = true }
+                    chat.bitchat.sonar.ui.SNSettingsRow(
+                        icon = SNIconName.Mesh, tone = SNTone.Cyan, label = "Bluetooth mesh",
+                        sub = "$meshCount people in range", trail = SNTrail.None, divider = false,
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    Box(Modifier.fillMaxWidth().height(44.dp).clickable(onClick = onClose), contentAlignment = Alignment.Center) {
+                        Text("Done", color = s.text2, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                    }
                 }
             }
         }

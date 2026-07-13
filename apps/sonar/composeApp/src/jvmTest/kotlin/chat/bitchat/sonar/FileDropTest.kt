@@ -114,6 +114,15 @@ class FileDropTest {
             effectiveAttachmentMime("application/octet-stream", "receipt.pdf", fakePdf),
         )
         assertFalse(isVerifiedPdfAttachment("application/octet-stream", "receipt.pdf", fakePdf))
+        // Declared PDF MIME still requires a plaintext signature.
+        assertEquals(
+            "application/octet-stream",
+            effectiveAttachmentMime("application/pdf", "receipt.bin", fakePdf),
+        )
+        assertEquals(
+            "application/pdf",
+            effectiveAttachmentMime("application/pdf", "receipt.bin", realPdf),
+        )
         assertEquals("text/plain", effectiveAttachmentMime("text/plain; charset=utf-8", "receipt.pdf", realPdf))
     }
 }

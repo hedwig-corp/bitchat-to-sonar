@@ -931,7 +931,14 @@ func snEffectiveAttachmentMime(declaredMime: String, filename: String, plaintext
         .map(String.init)?
         .trimmingCharacters(in: .whitespacesAndNewlines)
         .lowercased() ?? ""
-    guard normalized.isEmpty || normalized == snGenericAttachmentMime else { return normalized }
+    // Sender-declared application/pdf must still pass the plaintext signature
+    // check. Other explicit MIME types remain authoritative for non-PDF media.
+    if normalized == snPdfAttachmentMime {
+        return snIsVerifiedPDFAttachment(declaredMime: declaredMime, filename: filename, plaintext: plaintext)
+            ? snPdfAttachmentMime
+            : snGenericAttachmentMime
+    }
+    if !normalized.isEmpty && normalized != snGenericAttachmentMime { return normalized }
     return snIsVerifiedPDFAttachment(declaredMime: declaredMime, filename: filename, plaintext: plaintext)
         ? snPdfAttachmentMime
         : (normalized.isEmpty ? snGenericAttachmentMime : normalized)

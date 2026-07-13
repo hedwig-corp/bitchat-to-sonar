@@ -34,6 +34,15 @@ internal fun effectiveAttachmentMime(
     plaintext: ByteArray,
 ): String {
     val normalized = declaredMime.substringBefore(';').trim().lowercase()
+    // Sender-declared application/pdf must still pass the plaintext signature
+    // check. Other explicit MIME types remain authoritative for non-PDF media.
+    if (normalized == PDF_ATTACHMENT_MIME) {
+        return if (isVerifiedPdfAttachment(declaredMime, filename, plaintext)) {
+            PDF_ATTACHMENT_MIME
+        } else {
+            GENERIC_ATTACHMENT_MIME
+        }
+    }
     if (normalized.isNotEmpty() && normalized != GENERIC_ATTACHMENT_MIME) return normalized
     return if (isVerifiedPdfAttachment(declaredMime, filename, plaintext)) {
         PDF_ATTACHMENT_MIME
