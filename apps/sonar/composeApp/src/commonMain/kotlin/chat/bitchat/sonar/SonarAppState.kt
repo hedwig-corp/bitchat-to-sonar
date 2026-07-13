@@ -406,8 +406,7 @@ internal fun shouldWaitForCapabilities(
 internal fun shouldExposeCachedStickerPack(
     coordinate: String,
     installedCoordinates: Set<String>,
-    installedCoordinatesLoaded: Boolean,
-): Boolean = !installedCoordinatesLoaded || coordinate.lowercase() in installedCoordinates
+): Boolean = coordinate.lowercase() in installedCoordinates
 
 internal fun hasRecentMarmotActivityForCapabilitySettle(
     latestMessageTsSecs: Long?,
@@ -4414,9 +4413,9 @@ class SonarAppState(private val scope: CoroutineScope) {
     private var nextMediaDownloadGeneration = 0L
     private val stickerPackCache = linkedMapOf<String, SonarStickerPack>()
     private val stickerImageCache = linkedMapOf<String, ByteArray>()
+    /** Last locally-authoritative installed set. Generic pack metadata also
+     *  contains previews/transcript packs and must never grant picker access. */
     private val installedPackCoordinates = mutableSetOf<String>()
-    /** Distinguishes an unhydrated relay-backed list from a known empty list. */
-    private var installedPackCoordinatesLoaded = false
     private var stickerCacheGeneration = 0L
     private val pendingMediaUrlPrefix = "pending-media-"
 
@@ -4951,7 +4950,6 @@ class SonarAppState(private val scope: CoroutineScope) {
             shouldExposeCachedStickerPack(
                 coordinate = it,
                 installedCoordinates = installedPackCoordinates,
-                installedCoordinatesLoaded = installedPackCoordinatesLoaded,
             )
         }
         .values
@@ -5011,7 +5009,6 @@ class SonarAppState(private val scope: CoroutineScope) {
         stickerPackCache.clear()
         stickerImageCache.clear()
         installedPackCoordinates.clear()
-        installedPackCoordinatesLoaded = false
     }
 
     fun isPackInstalled(coordinate: String): Boolean =
@@ -5030,7 +5027,6 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun replaceInstalledPacks(coords: List<String>) {
         installedPackCoordinates.clear()
         installedPackCoordinates.addAll(coords.map { it.lowercase() })
-        installedPackCoordinatesLoaded = true
     }
 
     suspend fun installStickerPack(coordinate: String): Boolean {

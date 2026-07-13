@@ -26,25 +26,23 @@ final class MarmotStickerOptimisticTests: XCTestCase {
     func testCachedStickerPacksFollowInstalledAuthority() {
         let coordinate = "30031:author:pack"
 
-        XCTAssertTrue(MarmotChatModel.shouldExposeCachedStickerPack(
+        // Preview/transcript metadata is not installed authority. Before the
+        // local installed set is known, the composer must expose nothing.
+        XCTAssertFalse(MarmotChatModel.shouldExposeCachedStickerPack(
             coordinate: coordinate,
-            installedCoordinates: [],
-            installedCoordinatesLoaded: false
+            installedCoordinates: []
         ))
         XCTAssertTrue(MarmotChatModel.shouldExposeCachedStickerPack(
             coordinate: coordinate,
-            installedCoordinates: [coordinate],
-            installedCoordinatesLoaded: true
+            installedCoordinates: [coordinate]
         ))
         XCTAssertFalse(MarmotChatModel.shouldExposeCachedStickerPack(
             coordinate: coordinate,
-            installedCoordinates: [],
-            installedCoordinatesLoaded: true
+            installedCoordinates: []
         ))
         XCTAssertFalse(MarmotChatModel.shouldExposeCachedStickerPack(
             coordinate: coordinate,
-            installedCoordinates: ["30031:author:other"],
-            installedCoordinatesLoaded: true
+            installedCoordinates: ["30031:author:other"]
         ))
     }
 

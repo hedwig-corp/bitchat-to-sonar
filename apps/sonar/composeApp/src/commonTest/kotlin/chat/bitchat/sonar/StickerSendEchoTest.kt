@@ -15,25 +15,20 @@ class StickerSendEchoTest {
     @Test fun cachedStickerPacksFollowInstalledAuthority() {
         val coordinate = "30031:author:pack"
 
-        assertTrue(shouldExposeCachedStickerPack(
-            coordinate,
-            emptySet(),
-            installedCoordinatesLoaded = false,
-        ))
+        // Preview/transcript metadata is not installed authority. Before the
+        // local installed set is known, the composer must expose nothing.
+        assertFalse(shouldExposeCachedStickerPack(coordinate, emptySet()))
         assertTrue(shouldExposeCachedStickerPack(
             coordinate,
             setOf(coordinate),
-            installedCoordinatesLoaded = true,
         ))
         assertFalse(shouldExposeCachedStickerPack(
             coordinate,
             emptySet(),
-            installedCoordinatesLoaded = true,
         ))
         assertFalse(shouldExposeCachedStickerPack(
             coordinate,
             setOf("30031:author:other"),
-            installedCoordinatesLoaded = true,
         ))
     }
 
