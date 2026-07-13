@@ -575,6 +575,10 @@ expect object SonarCore {
     /** Poll the relays once (welcomes + group messages). */
     suspend fun sync()
 
+    /** Prefer cold-start historical catch-up for the open chat (MLS group id).
+     *  Empty/null clears. Local-first: never blocks paint/send. */
+    suspend fun preferCatchupGroup(mlsGroupIdHex: String?)
+
     /** Re-subscribe with current watermark + group set to self-heal after
      *  relay disconnects. May perform one bounded chat repair fetch; call from
      *  background/IO work and never before local chat paint. */

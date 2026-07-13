@@ -292,6 +292,7 @@ final class MarmotChatModel: ObservableObject {
             return message.media.isEmpty ? "Sending" : "Uploading"
         }
         if message.deliveryState == "failed" { return "Couldn't send" }
+        if message.deliveryState == "pending" { return message.media.isEmpty ? "Sending" : "Uploading" }
         return "Sent"
     }
 
@@ -589,6 +590,12 @@ final class MarmotChatModel: ObservableObject {
             try? await service.drainPending()
             await loadLocalSummaries()
         }
+    }
+
+    /// Prefer cold-start historical catch-up for the open chat (MLS group id).
+    /// Local-first: never blocks paint/send. Empty/nil clears preference.
+    func preferCatchupGroup(_ groupId: String?) async {
+        await service.preferCatchupGroup(groupId)
     }
 
     /// Best-effort local hydration for screen open paths. This never waits for
