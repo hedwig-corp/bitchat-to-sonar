@@ -57,6 +57,19 @@ func (client *SonarClient) Connect(ctx context.Context) {
 	if err == nil {
 		client.process, err = sonaripc.Start(client.connector.ipcConfig(), stateDir)
 	}
+	if err == nil {
+		var identity sonaripc.Identity
+		identityContext, cancel := context.WithTimeout(ctx, 10*time.Second)
+		err = client.process.Call(identityContext, "identity", map[string]any{}, &identity)
+		cancel()
+		if err == nil && !metadata.matchesIdentity(&identity) {
+			err = fmt.Errorf("Sonar daemon identity does not match login metadata")
+		}
+		if err != nil {
+			_ = client.process.Close()
+			client.process = nil
+		}
+	}
 	if err != nil {
 		client.UserLogin.BridgeState.Send(status.BridgeState{
 			StateEvent: status.StateTransientDisconnect,
@@ -167,6 +180,13 @@ func (client *SonarClient) ResolveIdentifier(ctx context.Context, identifier str
 
 func (client *SonarClient) metadata() *UserLoginMetadata {
 	return client.UserLogin.Metadata.(*UserLoginMetadata)
+}
+
+func (metadata *UserLoginMetadata) matchesIdentity(identity *sonaripc.Identity) bool {
+	return identity != nil &&
+		metadata.AccountID == identity.AccountID &&
+		metadata.Npub == identity.Npub &&
+		metadata.PubkeyHex == identity.PubkeyHex
 }
 
 func (client *SonarClient) selfUserID() networkid.UserID {

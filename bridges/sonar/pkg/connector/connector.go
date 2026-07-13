@@ -76,7 +76,7 @@ func (connector *SonarConnector) GetDBMetaTypes() database.MetaTypes {
 
 func (connector *SonarConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLogin) error {
 	metadata, ok := login.Metadata.(*UserLoginMetadata)
-	if !ok || metadata.AccountID == "" || metadata.StateID == "" || metadata.PubkeyHex == "" {
+	if !ok || metadata.AccountID == "" || metadata.StateID == "" || metadata.Npub == "" || metadata.PubkeyHex == "" {
 		return fmt.Errorf("Sonar login metadata is incomplete")
 	}
 	login.Client = newSonarClient(login, connector)

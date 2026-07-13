@@ -6,7 +6,7 @@ import (
 )
 
 func TestResolveStateDirRejectsTraversal(t *testing.T) {
-	for _, stateID := range []string{"", ".", "../escape", "nested/account"} {
+	for _, stateID := range []string{"", ".", "..", "../escape", "nested/account"} {
 		if _, err := ResolveStateDir(t.TempDir(), stateID); err == nil {
 			t.Fatalf("accepted unsafe state ID %q", stateID)
 		}

@@ -219,7 +219,7 @@ func (client *Client) Close() error {
 }
 
 func ResolveStateDir(root, stateID string) (string, error) {
-	if filepath.Base(stateID) != stateID || stateID == "." || stateID == "" {
+	if filepath.Base(stateID) != stateID || stateID == "." || stateID == ".." || stateID == "" {
 		return "", errors.New("invalid Sonar account state ID")
 	}
 	root, err := filepath.Abs(root)
