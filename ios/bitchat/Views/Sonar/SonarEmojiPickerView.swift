@@ -34,6 +34,14 @@ func snStickerPackInstalledState(
     } ?? cachedInstalled
 }
 
+func snFilterCachedStickerPacks(
+    _ packs: [StickerPackInfo],
+    installedCoordinates: [String]
+) -> [StickerPackInfo] {
+    let installed = Set(installedCoordinates.map { $0.lowercased() })
+    return packs.filter { installed.contains($0.packCoordinate.lowercased()) }
+}
+
 struct SonarEmojiPickerView: View {
     let onEmoji: (String) -> Void
     let onSticker: (StickerInfo, String) -> Void
@@ -298,6 +306,7 @@ private struct StickerTabContent: View {
             loading = false
             return
         }
+        packs = snFilterCachedStickerPacks(packs, installedCoordinates: coordinates)
         var loaded: [StickerPackInfo] = []
         for coord in coordinates {
             let parts = coord.split(separator: ":", maxSplits: 2).map(String.init)
@@ -312,7 +321,7 @@ private struct StickerTabContent: View {
         } else if coordinates.isEmpty {
             packs = []
             error = nil
-        } else if !hadCachedPacks {
+        } else if packs.isEmpty {
             error = "Failed to load sticker packs"
         }
         loading = false

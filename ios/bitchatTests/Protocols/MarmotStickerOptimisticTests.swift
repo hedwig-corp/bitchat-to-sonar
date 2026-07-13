@@ -5,6 +5,7 @@
 
 import XCTest
 @testable import Sonar
+import SonarCore
 
 @MainActor
 final class MarmotStickerOptimisticTests: XCTestCase {
@@ -69,6 +70,31 @@ final class MarmotStickerOptimisticTests: XCTestCase {
             refreshedCoordinates: ["30031:AUTHOR:PACK"],
             cachedInstalled: false
         ))
+    }
+
+    func testSuccessfulInstalledRefreshFiltersCachedPickerPacks() {
+        let removed = StickerPackInfo(
+            packCoordinate: "30031:author:removed",
+            title: "Removed",
+            description: nil,
+            coverUrl: nil,
+            stickers: []
+        )
+        let installed = StickerPackInfo(
+            packCoordinate: "30031:author:installed",
+            title: "Installed",
+            description: nil,
+            coverUrl: nil,
+            stickers: []
+        )
+
+        XCTAssertEqual(
+            snFilterCachedStickerPacks(
+                [removed, installed],
+                installedCoordinates: ["30031:AUTHOR:INSTALLED"]
+            ),
+            [installed]
+        )
     }
 
     func testStickerEchoMatchesOnlyTheSameSticker() {

@@ -1,5 +1,6 @@
 package chat.bitchat.sonar
 
+import chat.bitchat.sonar.screens.filterCachedStickerPacksByInstalledCoordinates
 import chat.bitchat.sonar.screens.shouldPreserveCachedStickerPacks
 import kotlin.test.Test
 import kotlin.test.assertFalse
@@ -30,6 +31,19 @@ class StickerSendEchoTest {
             coordinate,
             setOf("30031:author:other"),
         ))
+    }
+
+    @Test fun successfulInstalledRefreshFiltersCachedPickerPacks() {
+        val removed = SonarStickerPack("30031:author:removed", "Removed", null, null, emptyList())
+        val installed = SonarStickerPack("30031:author:installed", "Installed", null, null, emptyList())
+
+        assertEquals(
+            listOf(installed),
+            filterCachedStickerPacksByInstalledCoordinates(
+                packs = listOf(removed, installed),
+                installedCoordinates = listOf("30031:AUTHOR:INSTALLED"),
+            ),
+        )
     }
 
     @Test fun stickerEchoMatchesOnlyTheSameSticker() {

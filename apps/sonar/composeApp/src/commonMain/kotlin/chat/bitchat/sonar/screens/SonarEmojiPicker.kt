@@ -52,6 +52,14 @@ internal fun shouldPreserveCachedStickerPacks(
     installedCoordinates: List<String>?,
 ): Boolean = hadCachedPacks && installedCoordinates == null
 
+internal fun filterCachedStickerPacksByInstalledCoordinates(
+    packs: List<SonarStickerPack>,
+    installedCoordinates: List<String>,
+): List<SonarStickerPack> {
+    val installed = installedCoordinates.mapTo(mutableSetOf()) { it.lowercase() }
+    return packs.filter { it.packCoordinate.lowercase() in installed }
+}
+
 private enum class PickerTab { Emoji, Gif, Sticker }
 
 private val frequentEmojis = listOf("👍", "❤️", "😂", "🔥", "🙏", "👏", "🎉", "👀", "💯", "⚡")
@@ -397,6 +405,11 @@ private fun ColumnScope.StickerTabContent(
             loading = false
             return@LaunchedEffect
         }
+        val filteredCachedPacks = filterCachedStickerPacksByInstalledCoordinates(packs, coordinates)
+        if (filteredCachedPacks != packs) {
+            packs = filteredCachedPacks
+            onStickerPacksLoaded(filteredCachedPacks)
+        }
         val loaded = mutableListOf<SonarStickerPack>()
         for (coord in coordinates) {
             val parts = coord.split(":", limit = 3)
@@ -413,7 +426,7 @@ private fun ColumnScope.StickerTabContent(
             packs = emptyList()
             onStickerPacksLoaded(emptyList())
             error = null
-        } else if (!hadCachedPacks) {
+        } else if (packs.isEmpty()) {
             error = "Failed to load sticker packs"
         }
         loading = false
