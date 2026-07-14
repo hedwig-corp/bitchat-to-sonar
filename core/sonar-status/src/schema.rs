@@ -55,6 +55,16 @@ pub enum IncidentLevel {
     Down,
 }
 
+impl IncidentLevel {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Degraded => "degraded",
+            Self::Maintenance => "maintenance",
+            Self::Down => "down",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IncidentUpdate {
     pub t: String,

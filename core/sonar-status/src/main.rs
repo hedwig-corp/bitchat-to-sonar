@@ -43,6 +43,11 @@ use schema::{
 const STATUS_EVENT_KIND: u16 = 30078;
 /// `d` tag — must match `web/src/lib/status-data.js` `STATUS_EVENT_D`.
 const STATUS_EVENT_D: &str = "sonar-status";
+/// Parameterized event kind for per-incident history.
+/// Must match `web/src/lib/status-incidents.js` `INCIDENT_KIND`.
+const INCIDENT_EVENT_KIND: u16 = 30080;
+/// `d` tag prefix for incident events.
+const INCIDENT_EVENT_D_PREFIX: &str = "sonar-incident-";
 
 /// Sonar client bootstrap relays — union of iOS `NostrRelayManager.defaultRelays`
 /// and Android/JVM `SonarCore` defaults. Keep in sync with
@@ -178,6 +183,9 @@ struct PublishArgs {
     /// Dry-run: probe + sign but do not send to relays.
     #[arg(long)]
     dry_run: bool,
+    /// Also publish a per-incident Nostr event (kind 30080) for each incident.
+    #[arg(long, env = "SONAR_STATUS_PUBLISH_INCIDENTS", default_value_t = true)]
+    publish_incidents: bool,
     /// Run Marmot KeyPackage chat probe (requires probe nsec).
     #[arg(long, env = "SONAR_STATUS_CHAT_PROBE")]
     chat_probe: bool,
@@ -329,7 +337,7 @@ async fn run() -> Result<()> {
                 return Ok(());
             }
 
-            let client = NostrClient::new(keys);
+            let client = NostrClient::new(keys.clone());
             for relay in &publish_relays {
                 client
                     .add_relay(relay.clone())
@@ -346,6 +354,38 @@ async fn run() -> Result<()> {
                 publish_relays.len(),
                 publish_relays.join(", ")
             );
+
+            // Publish per-incident history events.
+            if args.publish_incidents {
+                for (idx, incident) in payload.incidents.iter().enumerate().rev() {
+                    let incident_content = serde_json::to_string(&incident)?;
+                    let d_tag = format!("{INCIDENT_EVENT_D_PREFIX}{idx}");
+                    let incident_event = EventBuilder::new(Kind::Custom(INCIDENT_EVENT_KIND), incident_content)
+                        .tag(Tag::identifier(d_tag))
+                        .tag(Tag::custom(
+                            TagKind::Custom("title".into()),
+                            [incident.title.as_str()],
+                        ))
+                        .tag(Tag::custom(
+                            TagKind::Custom("level".into()),
+                            [incident.level.as_str()],
+                        ))
+                        .tag(Tag::custom(
+                            TagKind::Custom("client".into()),
+                            ["sonar-status"],
+                        ))
+                        .sign_with_keys(&keys)?;
+                    client
+                        .send_event(&incident_event)
+                        .await
+                        .map_err(|e| Error::Msg(format!("publish incident {idx}: {e}")))?;
+                    println!(
+                        "published incident kind={INCIDENT_EVENT_KIND} d={INCIDENT_EVENT_D_PREFIX}{idx} id={}",
+                        incident_event.id
+                    );
+                }
+            }
+
             println!(
                 "website: set STATUS_PUBKEY_HEX={pubkey_hex} and STATUS_NPUB={npub} in web/src/lib/status-data.js"
             );
