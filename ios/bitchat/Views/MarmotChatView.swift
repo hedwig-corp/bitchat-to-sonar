@@ -1049,7 +1049,10 @@ final class MarmotChatModel: ObservableObject {
             }
             var byGroup = messagesByGroup
             byGroup[groupId] = Self.mergeMessages(existing: canonical, incoming: echoes)
-            self.messagesByGroup = reconcileOptimistic(into: byGroup)
+            self.messagesByGroup = reconcileOptimistic(
+                into: byGroup,
+                freshRowsByGroup: [groupId: page]
+            )
             transcriptLoaded = true
             let groups = try await service.groups()
             let invites = try await service.pendingGroupInvites()
@@ -1146,7 +1149,10 @@ final class MarmotChatModel: ObservableObject {
             let echoes = latestExisting.filter(Self.isLocalTranscriptEcho)
             var byGroup = messagesByGroup
             byGroup[groupId] = Self.mergeMessages(existing: canonical, incoming: echoes)
-            messagesByGroup = reconcileOptimistic(into: byGroup)
+            messagesByGroup = reconcileOptimistic(
+                into: byGroup,
+                freshRowsByGroup: [groupId: page]
+            )
             return added
         } catch {
             if !preservedOlderEdgeBeforeLoad {
@@ -1226,7 +1232,9 @@ final class MarmotChatModel: ObservableObject {
             // one main-actor segment. A summary refresh can therefore never
             // publish a stale dictionary over a page/open/new-message update.
             var byGroup = messagesByGroup
+            var freshRowsByGroup: [String: [MarmotService.MarmotMessage]] = [:]
             for page in pages {
+                freshRowsByGroup[page.groupId] = page.messages
                 let merged = Self.mergeMessages(
                     existing: byGroup[page.groupId] ?? [],
                     incoming: page.messages
@@ -1262,7 +1270,10 @@ final class MarmotChatModel: ObservableObject {
             self.groups = groups
             dropResolvedPendingDirectChats()
             self.pendingGroupInvites = invites
-            self.messagesByGroup = reconcileOptimistic(into: byGroup)
+            self.messagesByGroup = reconcileOptimistic(
+                into: byGroup,
+                freshRowsByGroup: freshRowsByGroup
+            )
             SNMarmotChatSnapshotCache.save(
                 groups: groups,
                 messagesByGroup: self.messagesByGroup,
@@ -1596,7 +1607,8 @@ final class MarmotChatModel: ObservableObject {
     /// echoed-back copy never duplicates; otherwise it stays visible until
     /// the round-trip completes.
     private func reconcileOptimistic(
-        into byGroup: [String: [MarmotService.MarmotMessage]]
+        into byGroup: [String: [MarmotService.MarmotMessage]],
+        freshRowsByGroup: [String: [MarmotService.MarmotMessage]] = [:]
     ) -> [String: [MarmotService.MarmotMessage]] {
         guard !pendingOptimistic.isEmpty else { return byGroup }
         var merged = byGroup
@@ -1604,7 +1616,8 @@ final class MarmotChatModel: ObservableObject {
             let reconciliation = Self.reconciledOptimisticMessages(
                 source: byGroup[groupId] ?? [],
                 pending: pending,
-                exclusionsByOptimisticID: preexistingCanonicalMessageIDsByOptimisticID
+                exclusionsByOptimisticID: preexistingCanonicalMessageIDsByOptimisticID,
+                freshCanonical: freshRowsByGroup[groupId] ?? []
             )
             for echo in pending where !reconciliation.survivors.contains(where: { $0.id == echo.id }) {
                 preexistingCanonicalMessageIDsByOptimisticID[echo.id] = nil
@@ -1663,14 +1676,27 @@ final class MarmotChatModel: ObservableObject {
 
     /// Reconcile only canonical rows; [source] can contain local echoes from a
     /// previous local-first paint, but those are re-added exactly once below.
+    ///
+    /// [freshCanonical] carries the rows just read from the local database. A
+    /// group pinned to its older historical edge admits no new rows into
+    /// [source], so without it the relay copy of an outgoing send never reaches
+    /// this match and the echo stays "Sending" forever. An echo fulfilled by an
+    /// out-of-window row is replaced by that row so the sent message stays
+    /// visible with its real delivery state.
     static func reconciledOptimisticMessages(
         source: [MarmotService.MarmotMessage],
         pending: [MarmotService.MarmotMessage],
-        exclusionsByOptimisticID: [String: Set<String>] = [:]
+        exclusionsByOptimisticID: [String: Set<String>] = [:],
+        freshCanonical: [MarmotService.MarmotMessage] = []
     ) -> OptimisticReconciliation {
         let canonical = source.filter { !isLocalTranscriptEcho($0) }
-        var unmatchedCanonical = canonical
+        let windowedIDs = Set(canonical.map(\.id))
+        let outOfWindow = freshCanonical.filter {
+            !isLocalTranscriptEcho($0) && !windowedIDs.contains($0.id)
+        }
+        var unmatchedCanonical = canonical + outOfWindow
         var survivors: [MarmotService.MarmotMessage] = []
+        var admitted: [MarmotService.MarmotMessage] = []
         for optimistic in pending {
             if let match = unmatchedCanonical.firstIndex(where: {
                 serverMessage(
@@ -1679,14 +1705,17 @@ final class MarmotChatModel: ObservableObject {
                     excludingServerIDs: exclusionsByOptimisticID[optimistic.id] ?? []
                 )
             }) {
-                unmatchedCanonical.remove(at: match)
+                let fulfilled = unmatchedCanonical.remove(at: match)
+                if !windowedIDs.contains(fulfilled.id) {
+                    admitted.append(fulfilled)
+                }
             } else {
                 survivors.append(optimistic)
             }
         }
         return OptimisticReconciliation(
             survivors: survivors,
-            visible: mergeMessages(existing: canonical, incoming: survivors)
+            visible: mergeMessages(existing: canonical + admitted, incoming: survivors)
         )
     }
 

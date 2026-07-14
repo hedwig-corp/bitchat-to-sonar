@@ -517,7 +517,22 @@ final class ConversationViewState: ObservableObject {
             try? await Task.sleep(nanoseconds: 20_000_000)
         }
         guard needsNewestReload else { return }
-        let loaded = await store.loadNewestDM(conversationId)
+        // A send-triggered conversation refresh can own the per-group loader
+        // for more than the loader's own busy-retry budget. Giving up here
+        // stranded the pinned historical window: new canonical rows (including
+        // the user's own send) stayed invisible until another bottom-edge
+        // event happened to fire. Retry bounded instead of failing silently.
+        var loaded = await store.loadNewestDM(conversationId)
+        var retriesLeft = 3
+        while !loaded, retriesLeft > 0 {
+            retriesLeft -= 1
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            while isLoadingOlder {
+                try? await Task.sleep(nanoseconds: 20_000_000)
+            }
+            guard needsNewestReload else { return }
+            loaded = await store.loadNewestDM(conversationId)
+        }
         guard loaded else { return }
         needsNewestReload = false
         meshNewestOffset = 0
