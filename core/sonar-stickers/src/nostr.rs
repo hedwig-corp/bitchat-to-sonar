@@ -6,6 +6,12 @@ use crate::model::{
     STICKER_PACK_KIND, USER_STICKER_PACKS_KIND,
 };
 
+// Sonar briefly shipped sticker message references with kind 30030 before
+// moving packs away from NIP-51's custom-emoji kind. Keep this compatibility
+// scoped to immutable chat references: pack discovery and installed-pack lists
+// must remain strict about the current 30031 kind.
+const LEGACY_STICKER_PACK_PREFIX: &str = "30030:";
+
 pub fn build_pack_tags(pack: &StickerPack) -> Vec<Tag> {
     let mut tags = vec![
         d_tag(&pack.address.identifier),
@@ -120,10 +126,17 @@ pub fn parse_sticker_ref_tag(tag: &Tag) -> Result<StickerRef> {
         });
     }
     StickerRef::new(
-        PackAddress::parse(&fields[0])?,
+        parse_sticker_ref_pack_address(&fields[0])?,
         fields[1].clone(),
         fields[2].clone(),
     )
+}
+
+fn parse_sticker_ref_pack_address(value: &str) -> Result<PackAddress> {
+    if let Some(legacy_address) = value.strip_prefix(LEGACY_STICKER_PACK_PREFIX) {
+        return PackAddress::parse(&format!("{STICKER_PACK_KIND}:{legacy_address}"));
+    }
+    PackAddress::parse(value)
 }
 
 fn sticker_tag(sticker: &Sticker) -> Tag {
@@ -331,6 +344,63 @@ mod tests {
         assert_eq!(parsed.pack, pack);
         assert_eq!(parsed.shortcode, "cat_wave");
         assert_eq!(parsed.plaintext_sha256, HASH_A);
+    }
+
+    #[test]
+    fn legacy_sticker_ref_tag_normalizes_to_current_pack_kind() {
+        let keys = Keys::parse(SECRET).unwrap();
+        let pubkey = keys.public_key().to_hex();
+        let tag = Tag::custom(
+            TagKind::Custom("sticker".into()),
+            [
+                format!("{LEGACY_STICKER_PACK_PREFIX}{pubkey}:sonar-cats-v1"),
+                "cat_wave".into(),
+                HASH_A.into(),
+            ],
+        );
+
+        let parsed = parse_sticker_ref_tag(&tag).unwrap();
+
+        assert_eq!(
+            parsed.pack.coordinate(),
+            format!("{STICKER_PACK_KIND}:{pubkey}:sonar-cats-v1")
+        );
+        assert_eq!(parsed.shortcode, "cat_wave");
+        assert_eq!(parsed.plaintext_sha256, HASH_A);
+    }
+
+    #[test]
+    fn installed_pack_list_does_not_accept_legacy_emoji_coordinates() {
+        let keys = Keys::parse(SECRET).unwrap();
+        let pubkey = keys.public_key().to_hex();
+        let tag = Tag::custom(
+            TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::A)),
+            [format!(
+                "{LEGACY_STICKER_PACK_PREFIX}{pubkey}:sonar-cats-v1"
+            )],
+        );
+        let event = EventBuilder::new(Kind::Custom(USER_STICKER_PACKS_KIND), "")
+            .tags([tag])
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        assert!(parse_installed_pack_list(&event).unwrap().packs.is_empty());
+    }
+
+    #[test]
+    fn sticker_ref_tag_rejects_unrelated_pack_kinds() {
+        let keys = Keys::parse(SECRET).unwrap();
+        let pubkey = keys.public_key().to_hex();
+        let tag = Tag::custom(
+            TagKind::Custom("sticker".into()),
+            [
+                format!("30032:{pubkey}:sonar-cats-v1"),
+                "cat_wave".into(),
+                HASH_A.into(),
+            ],
+        );
+
+        assert!(parse_sticker_ref_tag(&tag).is_err());
     }
 
     #[test]

@@ -179,6 +179,12 @@ current pack still contains a sticker with both the referenced shortcode and the
 referenced plaintext hash. If it does not, the client should render a missing or
 untrusted sticker state instead of substituting a different image.
 
+For transcript compatibility only, Sonar clients accept historical sent
+sticker references whose coordinate starts with `30030:` and normalize them to
+the current `30031:` coordinate before resolution. Pack discovery and installed
+pack lists remain strict about `30031`; this narrow read path does not treat
+NIP-51 custom-emoji events as Sonar sticker packs.
+
 Local-first clients may render verified cached image bytes without relay access
 only when their latest locally validated pack metadata still authorizes the
 exact pack coordinate, shortcode, and plaintext hash. Pack metadata and image
