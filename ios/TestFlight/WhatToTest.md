@@ -1,12 +1,12 @@
 # TestFlight — What to Test
 
-Build: **Sonar 1.7.0 (22)** · release tag **v0.1-alpha.7**
+Build: **Sonar 1.8.0 (23)** · release tag **v0.1-alpha.8**
 
-This build is a cross-platform alpha cut after the Signal-grade conversation
-work, multi-photo media, Android↔iOS parity batch, and a pile of sync/crash
-fixes. Opening a chat should paint from local storage first; missed messages
-should catch up in the background; payments and notifications should stay
-stable when the phone is locked or the app is killed.
+This build is a cross-platform alpha cut after local-first attachment previews,
+sticker disk cache, Marmot send prioritization, mesh identity preservation, and
+folded-chat history fixes. Opening a chat should paint from local storage first;
+missed messages should catch up in the background; payments and notifications
+should stay stable when the phone is locked or the app is killed.
 
 If something crashes on launch, while locked, or right after sending a message,
 photo, or payment — that is the highest-priority report. If sync feels slow or
@@ -49,6 +49,10 @@ activity must never hold back another’s resync.
 - Animated GIFs still **animate** (not a frozen frame).
 - Stickers still send/receive (sticker kinds were moved to 30031/10031 — old
   packs may need a re-publish if something looks empty).
+- Reopen a chat with stickers / attachments: previews should appear from
+  **local cache** immediately, not wait on Blossom/network.
+- In a **folded** mesh+relay chat, scroll up to load older history — older
+  pages must keep loading (not stop after the first window).
 
 ## 4. Stability / crash fixes
 
