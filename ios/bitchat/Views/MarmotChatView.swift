@@ -332,8 +332,10 @@ final class MarmotChatModel: ObservableObject {
     private var localTranscriptPreservesOlderEdgeGroups: Set<String> = []
     /// Serializes outgoing sends so rapid-fire messages arrive in order.
     private var sendChain: Task<Void, Never>?
-    private static let optimisticIDPrefix = "optimistic-"
-    private static let failedOptimisticIDPrefix = "failed-"
+    /// Shared with the render window (`SNConversationTranscriptWindow`) so a
+    /// reconciled echo can be recognized and dropped at that layer too.
+    nonisolated static let optimisticIDPrefix = "optimistic-"
+    nonisolated static let failedOptimisticIDPrefix = "failed-"
 
     static func stateText(for message: MarmotService.MarmotMessage) -> String? {
         guard message.isMine else { return nil }

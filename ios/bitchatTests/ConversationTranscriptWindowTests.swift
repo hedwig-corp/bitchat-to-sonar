@@ -390,4 +390,90 @@ struct ConversationTranscriptWindowTests {
         #expect(refreshed.first?.id == "marmot-0000")
         #expect(refreshed.last?.id == "marmot-0060")
     }
+
+    /// Regression: a message sent at the live edge, followed by scrolling deep
+    /// into history before the relay ack lands, pins the render window while it
+    /// still contains the optimistic echo. Once the Marmot model reconciles the
+    /// echo with its canonical database row, the echo vanishes from candidates;
+    /// the pinned window must drop the stale "Sending" copy and admit the
+    /// sender's own canonical row in its place.
+    @Test func pinnedWindowSwapsReconciledEchoForOwnCanonicalRow() {
+        let history = (0..<30).map { message($0, source: "internet") }
+        var echo = message(31, source: "internet")
+        echo.id = "optimistic-abc"
+        echo.mine = true
+        echo.state = "Sending"
+        echo.transcriptSourceID = nil
+        var canonical = message(30, source: "internet")
+        canonical.mine = true
+        canonical.state = "Sent"
+
+        let refreshed = SNConversationTranscriptWindow.refreshing(
+            history + [echo],
+            from: history + [canonical],
+            limit: 500,
+            preservingOlderEdge: true
+        )
+
+        #expect(refreshed.contains(where: { $0.id == echo.id }) == false)
+        #expect(refreshed.last?.id == canonical.id)
+        #expect(refreshed.last?.state == "Sent")
+        #expect(refreshed.count == history.count + 1)
+    }
+
+    /// An echo still present in candidates is still pending: the pinned window
+    /// must keep it (updated in place), not drop it.
+    @Test func pinnedWindowKeepsStillPendingEcho() {
+        let history = (0..<30).map { message($0, source: "internet") }
+        var echo = message(31, source: "internet")
+        echo.id = "optimistic-abc"
+        echo.mine = true
+        echo.state = "Sending"
+        echo.transcriptSourceID = nil
+
+        let refreshed = SNConversationTranscriptWindow.refreshing(
+            history + [echo],
+            from: history + [echo],
+            limit: 500,
+            preservingOlderEdge: true
+        )
+
+        #expect(refreshed.last?.id == echo.id)
+        #expect(refreshed.count == history.count + 1)
+    }
+
+    /// Foreign live rows must keep waiting at the unseen newer edge of a
+    /// pinned window: only the sender's own rows are admitted.
+    @Test func pinnedWindowStillExcludesForeignLiveRows() {
+        let history = (0..<30).map { message($0, source: "internet") }
+        let foreignLive = message(40, source: "internet")
+
+        let refreshed = SNConversationTranscriptWindow.refreshing(
+            history,
+            from: history + [foreignLive],
+            limit: 500,
+            preservingOlderEdge: true
+        )
+
+        #expect(refreshed.contains(where: { $0.id == foreignLive.id }) == false)
+        #expect(refreshed.map(\.id) == history.map(\.id))
+    }
+
+    /// Own candidate rows older than the pinned window's newest kept row are
+    /// history, not replacements — they must not be injected into the window.
+    @Test func pinnedWindowDoesNotAdmitOwnOlderHistoryRows() {
+        let history = (10..<40).map { message($0, source: "internet") }
+        var ownOlder = message(5, source: "internet")
+        ownOlder.mine = true
+
+        let refreshed = SNConversationTranscriptWindow.refreshing(
+            history,
+            from: history + [ownOlder],
+            limit: 500,
+            preservingOlderEdge: true
+        )
+
+        #expect(refreshed.contains(where: { $0.id == ownOlder.id }) == false)
+        #expect(refreshed.map(\.id) == history.map(\.id))
+    }
 }
