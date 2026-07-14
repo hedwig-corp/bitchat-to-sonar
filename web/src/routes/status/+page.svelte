@@ -35,8 +35,10 @@
 	let relays = [];
 	/** @type {StatusIncident[]} */
 	let incidents = [];
-
-	const INCIDENT_DAYS = 2;
+	// The kind-30080 historical feed is the authoritative "Past incidents"
+	// source. Once it loads, the live status-doc's inline incidents (which may
+	// be empty) must not clobber it.
+	let historicalIncidentsLoaded = false;
 
 	/** @type {'waiting' | 'nostr'} */
 	let dataSource = 'waiting';
@@ -225,7 +227,8 @@
 			// Feed data replaces empty state directly.
 			const prevRelayKey = relays.map((r) => r.url).join('|');
 			services = payload.services;
-			incidents = payload.incidents;
+			// Don't let the status doc overwrite the historical feed once it loaded.
+			if (!historicalIncidentsLoaded) incidents = payload.incidents;
 			relays = payload.relays;
 			const nextRelayKey = relays.map((r) => r.url).join('|');
 			if (nextRelayKey !== prevRelayKey) {
@@ -240,8 +243,11 @@
 			dataSource = 'nostr';
 			refreshUpdatedLabel();
 		});
-		fetchIncidentsFromNostr(INCIDENT_DAYS).then((/** @type {StatusIncident[]} */ hist) => {
+		// Fetch all historical incidents (no lookback window) so past incidents
+		// persist across the 2-day boundary the first cut used.
+		fetchIncidentsFromNostr().then((/** @type {StatusIncident[]} */ hist) => {
 			if (hist.length > 0) {
+				historicalIncidentsLoaded = true;
 				incidents = hist;
 				refreshUpdatedLabel();
 			}
