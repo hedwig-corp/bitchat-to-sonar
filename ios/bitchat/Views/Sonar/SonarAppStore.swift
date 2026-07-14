@@ -6179,7 +6179,8 @@ final class SonarAppStore: ObservableObject {
                     scannedCallMessageIDs.insert(m.id)
                     continue
                 }
-                if handleCallControl(ctrl, convId: peerID.id, via: .mesh, messageId: m.id) {
+                let via: SNVia = m.receivedViaInternet == true ? .internet : .mesh
+                if handleCallControl(ctrl, convId: peerID.id, via: via, messageId: m.id) {
                     scannedCallMessageIDs.insert(m.id)
                 }
             }

@@ -886,16 +886,22 @@ extension ChatViewModel {
             meshService.sendReadReceipt(receipt, to: peerID)
             sentReadReceipts.insert(message.id)
         } else {
-            // Notify
+            // Notify — skip ☎CALL / ⚡PAY control lines; SonarAppStore owns those
+            // specialized alerts so we don't double-fire BLE sounds.
             unreadPrivateMessages.insert(peerID)
-            let notifBody = meshParseStickerContent(content: message.content) != nil
-                ? "Sticker" : message.content
-            NotificationService.shared.sendPrivateMessageNotification(
-                from: message.sender,
-                message: notifBody,
-                peerID: peerID,
-                sound: .ble
-            )
+            let isSpecializedControl =
+                SonarPayMessage.decode(message.content) != nil
+                || message.content.drop(while: \.isWhitespace).hasPrefix("☎CALL")
+            if !isSpecializedControl {
+                let notifBody = meshParseStickerContent(content: message.content) != nil
+                    ? "Sticker" : message.content
+                NotificationService.shared.sendPrivateMessageNotification(
+                    from: message.sender,
+                    message: notifBody,
+                    peerID: peerID,
+                    sound: .ble
+                )
+            }
         }
         
         objectWillChange.send()
