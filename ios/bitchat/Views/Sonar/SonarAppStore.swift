@@ -5608,7 +5608,8 @@ final class SonarAppStore: ObservableObject {
                             conversationId: peerID.id,
                             conversationTitle: peerDisplayName(peerID.id),
                             senderName: peerDisplayName(peerID.id),
-                            preview: m.content
+                            preview: m.content,
+                            sound: .ble
                         )
                     }
                     handlePayLine(line, convId: peerID.id, via: dmTransport(peerID.id))
