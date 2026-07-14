@@ -876,10 +876,6 @@ impl SonarNode {
         Ok(())
     }
 
-    /// Re-subscribe with the current watermark and group set to self-heal
-    /// after relay disconnects. Hosts call this on the idle timeout path
-    /// instead of `sync_once()`. It may run one bounded per-chat repair fetch,
-    /// so hosts must keep it off the local-first chat-open path.
     /// Prefer catch-up for the open chat. Pass the MLS group id hex (same id
     /// hosts use for send_text / messages). Empty clears. Local-first: does not
     /// block paint or send. Core maps MLS to nostr group id for the catch-up queue.
@@ -888,10 +884,15 @@ impl SonarNode {
         if preferred.is_empty() {
             self.client.prefer_catchup_group(None);
         } else {
-            self.client.prefer_catchup_group(Some(preferred.to_string()));
+            self.client
+                .prefer_catchup_group(Some(preferred.to_string()));
         }
     }
 
+    /// Re-subscribe with the current watermark and group set to self-heal
+    /// after relay disconnects. Hosts call this on the idle timeout path
+    /// instead of `sync_once()`. It may run one bounded per-chat repair fetch,
+    /// so hosts must keep it off the local-first chat-open path.
     pub fn ensure_subscriptions(&self) -> FfiResult<()> {
         self.runtime.block_on(self.client.ensure_subscriptions())?;
         Ok(())

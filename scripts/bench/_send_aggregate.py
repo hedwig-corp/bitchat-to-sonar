@@ -33,9 +33,11 @@ def percentile(values: list[int], fraction: float) -> float:
     return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
 
 
-def parse_lines(lines: list[str]) -> tuple[list[dict[str, int | str]], int, int]:
+def parse_lines(
+    lines: list[str], excluded_ids: set[str] | None = None
+) -> tuple[list[dict[str, int | str]], set[str]]:
     sends: dict[str, dict[str, int | str]] = {}
-    failed = 0
+    excluded_ids = excluded_ids or set()
 
     for line in lines:
         marker_match = MARKER_RE.search(line)
@@ -44,7 +46,7 @@ def parse_lines(lines: list[str]) -> tuple[list[dict[str, int | str]], int, int]
         marker = marker_match.group(0)
         fields = dict(FIELD_RE.findall(line))
         message_id = fields.get("message_id")
-        if not message_id:
+        if not message_id or message_id in excluded_ids:
             continue
         send = sends.setdefault(message_id, {"message_id": message_id})
         if "event_id" in fields:
@@ -55,7 +57,6 @@ def parse_lines(lines: list[str]) -> tuple[list[dict[str, int | str]], int, int]
             send["rtt_ms"] = int(fields["rtt_ms"])
         elif marker == "send_publish_failed":
             send["failed"] = 1
-            failed += 1
 
     complete: list[dict[str, int | str]] = []
     for send in sends.values():
@@ -63,7 +64,7 @@ def parse_lines(lines: list[str]) -> tuple[list[dict[str, int | str]], int, int]
             continue
         send["total_ms"] = int(send["local_ms"]) + int(send["rtt_ms"])
         complete.append(send)
-    return complete, len(sends), failed
+    return complete, set(sends)
 
 
 def phase_summary(values: list[int]) -> dict[str, float | int]:
@@ -92,6 +93,16 @@ def main() -> int:
         help="aggregate only the last N complete sends (pass rotated logs oldest first)",
     )
     parser.add_argument("--json-out", type=Path)
+    parser.add_argument(
+        "--exclude-json",
+        action="append",
+        type=Path,
+        default=[],
+        help=(
+            "exclude every message ID observed by an earlier JSON result; "
+            "repeat for multiple pre-run snapshots"
+        ),
+    )
     args = parser.parse_args()
 
     if args.last is not None and args.last < 1:
@@ -104,7 +115,16 @@ def main() -> int:
         else:
             lines.extend(Path(name).read_text(errors="replace").splitlines())
 
-    complete, observed, failed = parse_lines(lines)
+    excluded_ids: set[str] = set()
+    for path in args.exclude_json:
+        payload = json.loads(path.read_text())
+        observed_ids = payload.get("observed_message_ids")
+        if observed_ids is None:
+            observed_ids = [send["message_id"] for send in payload.get("sends", [])]
+        excluded_ids.update(str(message_id) for message_id in observed_ids)
+
+    complete, observed_ids = parse_lines(lines, excluded_ids)
+    observed = len(observed_ids)
     if args.last is not None:
         complete = complete[-args.last :]
     if not complete:
@@ -114,6 +134,7 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
+    failure_marked = sum(1 for send in complete if "failed" in send)
 
     phases = [
         ("local persist", "local_ms"),
@@ -129,7 +150,7 @@ def main() -> int:
     print("=" * 78)
     print(
         f"  Sonar {args.label} — {len(complete)} complete / "
-        f"{observed} observed / {failed} failed"
+        f"{observed} observed / {failure_marked} failure-marked"
     )
     print("=" * 78)
     print(f"  {'phase':32} {'min':>9} {'median':>9} {'p95':>9} {'max':>9}   (ms)")
@@ -147,7 +168,8 @@ def main() -> int:
             "label": args.label,
             "complete": len(complete),
             "observed": observed,
-            "failed": failed,
+            "observed_message_ids": sorted(observed_ids),
+            "failure_marked": failure_marked,
             "phases_ms": summaries,
             "sends": complete,
         }

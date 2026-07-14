@@ -999,6 +999,12 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      */
     func drainPendingMarmot() throws  -> [DrainNotificationInfo]
     
+    /**
+     * Re-subscribe with the current watermark and group set to self-heal
+     * after relay disconnects. Hosts call this on the idle timeout path
+     * instead of `sync_once()`. It may run one bounded per-chat repair fetch,
+     * so hosts must keep it off the local-first chat-open path.
+     */
     func ensureSubscriptions() throws 
     
     func fetchInstalledPacks() throws  -> [String]
@@ -1094,10 +1100,6 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func pendingJoinRequests(groupIdHex: String) throws  -> [JoinRequestInfo]
     
     /**
-     * Re-subscribe with the current watermark and group set to self-heal
-     * after relay disconnects. Hosts call this on the idle timeout path
-     * instead of `sync_once()`. It may run one bounded per-chat repair fetch,
-     * so hosts must keep it off the local-first chat-open path.
      * Prefer catch-up for the open chat. Pass the MLS group id hex (same id
      * hosts use for send_text / messages). Empty clears. Local-first: does not
      * block paint or send. Core maps MLS to nostr group id for the catch-up queue.
@@ -1603,6 +1605,12 @@ open func drainPendingMarmot()throws  -> [DrainNotificationInfo]  {
 })
 }
     
+    /**
+     * Re-subscribe with the current watermark and group set to self-heal
+     * after relay disconnects. Hosts call this on the idle timeout path
+     * instead of `sync_once()`. It may run one bounded per-chat repair fetch,
+     * so hosts must keep it off the local-first chat-open path.
+     */
 open func ensureSubscriptions()throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_ensure_subscriptions(
             self.uniffiCloneHandle(),$0
@@ -1844,10 +1852,6 @@ open func pendingJoinRequests(groupIdHex: String)throws  -> [JoinRequestInfo]  {
 }
     
     /**
-     * Re-subscribe with the current watermark and group set to self-heal
-     * after relay disconnects. Hosts call this on the idle timeout path
-     * instead of `sync_once()`. It may run one bounded per-chat repair fetch,
-     * so hosts must keep it off the local-first chat-open path.
      * Prefer catch-up for the open chat. Pass the MLS group id hex (same id
      * hosts use for send_text / messages). Empty clears. Local-first: does not
      * block paint or send. Core maps MLS to nostr group id for the catch-up queue.
@@ -6436,7 +6440,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_drain_pending_marmot() != 2299) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_ensure_subscriptions() != 514) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_ensure_subscriptions() != 49920) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_fetch_installed_packs() != 62453) {
@@ -6496,7 +6500,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_pending_join_requests() != 43500) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_prefer_catchup_group() != 47202) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_prefer_catchup_group() != 37980) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_blossom_servers() != 35600) {

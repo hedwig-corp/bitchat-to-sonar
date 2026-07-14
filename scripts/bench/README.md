@@ -102,7 +102,7 @@ send on every app surface:
 | `send_local_pending` | `local_ms` | MLS event creation, local transcript processing, and durable pending-outbox write |
 | `send_publish_start` | — | background relay fan-out started |
 | `send_first_ack` | `rtt_ms` | first relay accepted the event; the row can flip from **Sending** to **Sent** |
-| `send_publish_failed` | `rtt_ms` | every configured relay failed |
+| `send_publish_failed` | `rtt_ms` | every configured relay failed on this attempt; the outbox may retry it later |
 
 Capture the platform log while sending a fixed number of text messages, then
 feed it to the same parser:
@@ -113,8 +113,59 @@ scripts/bench/_send_aggregate.py --label "macOS native" /tmp/macos-send.log
 scripts/bench/_send_aggregate.py --label "Android emulator" /tmp/android-send.log
 ```
 
+### Native Apple send automation
+
+A signed **Debug** Apple build can run the normal `MarmotChatModel.send` path
+without traversing a large transcript accessibility tree. The trigger is
+compiled out of Release builds, requires an exact local conversation title,
+aborts if that title is ambiguous, and paces sends one second apart:
+
+```bash
+xcrun devicectl device process launch \
+  --device <coredevice-id> \
+  --terminate-existing \
+  --environment-variables \
+  '{"SONAR_BENCH_SEND_COUNT":"50","SONAR_BENCH_SEND_TARGET":"Sonar agent DM","SONAR_BENCH_SEND_PREFIX":"device-send"}' \
+  sh.hedwig.sonar
+```
+
+For the native macOS app, supply the same three variables when launching the
+signed Debug executable:
+
+```bash
+SONAR_BENCH_SEND_COUNT=50 \
+SONAR_BENCH_SEND_TARGET='Sonar agent DM' \
+SONAR_BENCH_SEND_PREFIX='mac-device-send' \
+  /path/to/Sonar.app/Contents/MacOS/Sonar
+```
+
+`SONAR_BENCH_SEND_COUNT` is bounded to 1–500. The app waits for relay setup,
+resolves `SONAR_BENCH_SEND_TARGET` against the bounded local conversation
+summaries, and sends through the same serialized model/service path as the
+composer. On iOS the explicit Debug task temporarily disables the idle timer,
+then restores it after the final queued send, so a physical-device batch does
+not require XCTest or a manual keep-awake tap. `SONAR_BENCH
+send_batch_finished` reports requested/dispatched counts without logging
+message content.
+
 Apple writes the core markers to `os_log` (subsystem `chat.bitchat`, category
 `core`), Android writes them to logcat tag `SonarCore`, and Compose Desktop
 writes them to stderr. The parser uses the structured duration fields rather
 than host timestamps, so the three results are directly comparable. Message
 content and private keys are never logged.
+
+An accepted sample has both `send_local_pending local_ms=` and
+`send_first_ack rtt_ms=` for the same message ID. `failure-marked` is the
+number of accepted messages that first exhausted every relay and later reached
+an ACK through outbox retry. Rotated or overlapping snapshots are safe to pass
+together: marker and failure counts are deduplicated by message ID.
+
+For a fresh run in an append-only device log, save a pre-run JSON snapshot and
+exclude every ID it observed from the post-run result (including rows that were
+still awaiting an ACK at the snapshot boundary):
+
+```bash
+scripts/bench/_send_aggregate.py --json-out /tmp/pre.json /tmp/pre.log
+scripts/bench/_send_aggregate.py --exclude-json /tmp/pre.json \
+  --json-out /tmp/fresh.json /tmp/post.log
+```

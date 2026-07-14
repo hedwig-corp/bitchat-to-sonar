@@ -11,6 +11,9 @@ import Combine
 import BitLogger
 import CryptoKit
 import SonarCore
+#if os(iOS)
+import UIKit
+#endif
 
 enum SNMarmotProfileCache {
     static let defaultsKey = "marmot.profilesByNpub.v1"
@@ -241,6 +244,9 @@ final class MarmotChatModel: ObservableObject {
     /// "first drain" (T4) markers. DEBUG-only (benchmark harness).
     private var benchFirstWakeLogged = false
     private var benchFirstDrainLogged = false
+    /// Explicitly opt-in physical-device text-send benchmark task. The trigger
+    /// is compiled out of Release builds and requires all benchmark env vars.
+    private var benchSendTask: Task<Void, Never>?
     #endif
     private var installedPackCoordinates: Set<String> = []
     /// npubs whose profile fetch is in flight or done. Entries older than
@@ -267,6 +273,10 @@ final class MarmotChatModel: ObservableObject {
     /// payment state.
     private var descriptorBolt12Offer: String?
     private var conversationChangeSub: AnyCancellable?
+    /// Coalesce core invalidations by group so rapid pending/ACK transitions
+    /// refresh one bounded transcript page instead of rescanning every chat.
+    private var pendingConversationRefreshGroups: Set<String> = []
+    private var conversationRefreshTask: Task<Void, Never>?
     /// Per-group database cursor state. Folded conversations may contain more
     /// than one Marmot group, so a visible chat must never share one cursor.
     private struct LocalTranscriptCursor: Equatable {
@@ -310,10 +320,11 @@ final class MarmotChatModel: ObservableObject {
         self.messagesByGroup = cached.1
         self.conversationChangeSub = service.conversationChanged
             .receive(on: DispatchQueue.main)
-            .debounce(for: .milliseconds(50), scheduler: DispatchQueue.main)
-            .sink { [weak self] _ in
-                guard let self else { return }
-                Task { await self.loadLocalSummaries(resolveMembers: false) }
+            .collect(.byTimeOrCount(DispatchQueue.main, .milliseconds(50), 128))
+            .sink { [weak self] groupIds in
+                Task { @MainActor [weak self] in
+                    self?.scheduleConversationRefresh(groupIds: groupIds)
+                }
             }
     }
 
@@ -546,6 +557,7 @@ final class MarmotChatModel: ObservableObject {
                 // marker now measures event creation, not relay OK acks (see
                 // docs/PERFORMANCE.md).
                 SecureLogger.info("SONAR_BENCH t3a_published", category: .session)
+                self.startSendBenchmarkIfRequested()
                 #endif
             } catch MarmotService.ServiceError.cancelled {
                 self.relayConnected = false
@@ -570,6 +582,95 @@ final class MarmotChatModel: ObservableObject {
         }
         return service.isRelayConnected()
     }
+
+    #if DEBUG
+    /// Run an explicitly requested text-send benchmark through the same model
+    /// path as the composer. CoreDevice can supply these variables with
+    /// `devicectl device process launch --environment-variables`; Release
+    /// builds contain neither the trigger nor its message loop.
+    private func startSendBenchmarkIfRequested() {
+        guard benchSendTask == nil else { return }
+        let environment = ProcessInfo.processInfo.environment
+        guard
+            let rawCount = environment["SONAR_BENCH_SEND_COUNT"],
+            let count = Int(rawCount),
+            (1...500).contains(count),
+            let rawTarget = environment["SONAR_BENCH_SEND_TARGET"]
+        else { return }
+
+        let target = rawTarget.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !target.isEmpty else { return }
+        let prefix = environment["SONAR_BENCH_SEND_PREFIX"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let safePrefix = prefix.flatMap { $0.isEmpty ? nil : $0 } ?? "SONAR_BENCH_SEND"
+
+        benchSendTask = Task { [weak self] in
+            guard let self else { return }
+            #if os(iOS)
+            UIApplication.shared.isIdleTimerDisabled = true
+            defer { UIApplication.shared.isIdleTimerDisabled = false }
+            #endif
+            // Let KeyPackage/profile background publishes leave the fast relay
+            // path before measuring user messages.
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+
+            let deadline = Date().addingTimeInterval(30)
+            var destination: MarmotService.MarmotGroup?
+            while destination == nil, Date() < deadline, !Task.isCancelled {
+                await self.loadLocalSummaries(resolveMembers: true)
+                let matches = self.groups.filter { group in
+                    group.name.localizedCaseInsensitiveCompare(target) == .orderedSame
+                        || self.title(for: group)
+                            .localizedCaseInsensitiveCompare(target) == .orderedSame
+                }
+                guard matches.count < 2 else {
+                    SecureLogger.warning(
+                        "SONAR_BENCH send_batch_target_ambiguous",
+                        category: .session
+                    )
+                    return
+                }
+                destination = matches.first
+                if destination == nil {
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                }
+            }
+
+            guard let destination else {
+                SecureLogger.warning(
+                    "SONAR_BENCH send_batch_target_not_found",
+                    category: .session
+                )
+                return
+            }
+
+            let runID = String(UUID().uuidString.prefix(8))
+            var dispatched = 0
+            for sample in 1...count where !Task.isCancelled {
+                let label = String(
+                    format: "%@ %@ %02d/%02d",
+                    safePrefix,
+                    runID,
+                    sample,
+                    count
+                )
+                // Match the composer path exactly. Completion is determined from
+                // the core local-persist + first-ACK markers, not the model's
+                // shared errorText (which can also be changed by background sync).
+                self.send(label, to: destination.id)
+                dispatched += 1
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+            if let finalSend = self.sendChain {
+                _ = await finalSend.result
+            }
+            SecureLogger.info(
+                "SONAR_BENCH send_batch_finished requested=\(count) dispatched=\(dispatched)",
+                category: .session
+            )
+        }
+    }
+    #endif
 
     /// Re-establish relay subscriptions and catch up on missed events after the
     /// app returns to foreground. iOS tears down TCP connections in background;
@@ -652,6 +753,38 @@ final class MarmotChatModel: ObservableObject {
         await loadLocalSummaries()
     }
 
+    private func scheduleConversationRefresh(groupIds: [String]) {
+        pendingConversationRefreshGroups.formUnion(groupIds)
+        guard conversationRefreshTask == nil else { return }
+        conversationRefreshTask = Task { [weak self] in
+            guard let self else { return }
+            while !self.pendingConversationRefreshGroups.isEmpty, !Task.isCancelled {
+                let groups = self.pendingConversationRefreshGroups
+                self.pendingConversationRefreshGroups.removeAll(keepingCapacity: true)
+                var deferredBusyGroup = false
+                for changedGroupId in groups {
+                    if self.localTranscriptLoadingGroups.contains(changedGroupId) {
+                        self.pendingConversationRefreshGroups.insert(changedGroupId)
+                        deferredBusyGroup = true
+                        continue
+                    }
+                    if self.groups.contains(where: { $0.id == changedGroupId })
+                        || self.messagesByGroup[changedGroupId] != nil {
+                        _ = await self.loadLocalPage(groupId: changedGroupId)
+                    } else {
+                        // A newly-created/received group is not in the host cache
+                        // yet, so only that case needs the wider summary hydrate.
+                        await self.loadLocalSummaries(resolveMembers: false)
+                    }
+                }
+                if deferredBusyGroup {
+                    try? await Task.sleep(nanoseconds: 50_000_000)
+                }
+            }
+            self.conversationRefreshTask = nil
+        }
+    }
+
     /// Load the latest local transcript window for one group. Used by chat open
     /// so existing conversations paint from the encrypted DB without scanning
     /// all groups or all messages.
@@ -691,6 +824,18 @@ final class MarmotChatModel: ObservableObject {
             self.messagesByGroup = reconcileOptimistic(into: byGroup)
             let groups = try await service.groups()
             let invites = try await service.pendingGroupInvites()
+            let summaries = await service.conversationSummaries()
+            let activeGroupIds = Set(groups.map(\.id))
+            self.conversationSummariesByGroup = Dictionary(
+                uniqueKeysWithValues: summaries
+                    .filter { activeGroupIds.contains($0.groupIdHex) }
+                    .map { ($0.groupIdHex, $0) }
+            )
+            var unread: [String: UInt64] = [:]
+            for summary in summaries where summary.unreadCount > 0 {
+                unread[summary.groupIdHex] = summary.unreadCount
+            }
+            self.unreadByGroup = unread
             self.groups = groups
             dropResolvedPendingDirectChats()
             self.pendingGroupInvites = invites
@@ -1341,12 +1486,9 @@ final class MarmotChatModel: ObservableObject {
                 self.errorText = Self.describe(error)
                 return
             }
-            // UI refresh + subscriptions run outside the send chain so the
-            // next queued message doesn't wait for them.
-            Task { [weak self] in
-                await self?.loadLocalPage(groupId: groupId)
-                try? await self?.service.ensureSubscriptions()
-            }
+            // The core conversation-change callback refreshes this one bounded
+            // local page. Periodic connection healing owns re-subscription; a
+            // user send must not rescan every chat or repair subscriptions.
         }
     }
 
@@ -1809,6 +1951,9 @@ final class MarmotChatModel: ObservableObject {
     /// in-memory state. Called from the emergency-wipe path.
     func wipeDatabase() {
         stopPolling()
+        conversationRefreshTask?.cancel()
+        conversationRefreshTask = nil
+        pendingConversationRefreshGroups = []
         let service = self.service
         Task { await service.wipeDatabase() }
         relayConnected = false
@@ -1840,6 +1985,9 @@ final class MarmotChatModel: ObservableObject {
     func eraseChatsKeepIdentity() async {
         let wasPolling = syncTask != nil
         stopPolling()
+        conversationRefreshTask?.cancel()
+        conversationRefreshTask = nil
+        pendingConversationRefreshGroups = []
         relayConnected = false
         await service.wipeDatabase()
         npub = nil

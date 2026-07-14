@@ -299,10 +299,8 @@ fn take_catchup_entry(
     queue.pop_front()
 }
 
-fn map_mls_hex_to_nostr_hex(
-    mls_hex: &str,
-    pairs: &[(String, String)],
-) -> Option<String> {
+#[cfg(test)]
+fn map_mls_hex_to_nostr_hex(mls_hex: &str, pairs: &[(String, String)]) -> Option<String> {
     let clean = mls_hex.trim().to_ascii_lowercase();
     if clean.is_empty() {
         return None;
@@ -1918,12 +1916,21 @@ impl SonarClient {
         let tokens = self.push_token_cache.lock().unwrap().clone();
         tokio::spawn(async move {
             // Push traffic shares the relay pool with the encrypted message.
-            // Give the user-visible send priority and only notify after at least
-            // one relay has accepted the message, so the notification cannot
-            // outrun the content it announces.
-            if !matches!(publish_ack.await, Ok(true)) {
-                tracing::debug!("push notify skipped: message publish was not acknowledged");
-                return;
+            // Give the user-visible send priority and wait until its first ACK
+            // or until every content publish attempt has failed. The failure
+            // case still preserves the previous best-effort push behavior while
+            // the durable outbox owns later content retries.
+            match publish_ack.await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::debug!(
+                        "message publish was not acknowledged; sending best-effort push"
+                    );
+                }
+                Err(_) => {
+                    tracing::debug!("push notify skipped: message publish did not start");
+                    return;
+                }
             }
             for member in &members {
                 if member == &my_pubkey {
@@ -2634,15 +2641,14 @@ impl SonarClient {
         Ok(())
     }
 
-    /// Open persistent Marmot subscriptions with watermark-based `since`:
+    /// Open persistent Marmot subscriptions:
     /// welcomes (kind-1059 → us) and group messages (kind-445 on our `#h`).
     /// The relay delivers historical events (EOSE burst) then pushes new ones.
     /// Events flow to the notification handler → buffer → `drain_pending_marmot`.
     ///
-    /// When the watermark is 0 (first session), no `since` filter is applied —
-    /// the relay delivers full history via EOSE, same as the first `sync()`.
-    /// For returning users, the watermark-based `since` catches up missed events
-    /// without a blocking `fetch_events_from` call.
+    /// Welcomes use the durable watermark lookback. Group messages use a thin
+    /// live tail; bounded per-group catch-up owns older history so cold start
+    /// cannot flood the live buffer or compete with a user send.
     pub async fn subscribe_marmot(&self) -> Result<()> {
         let since_secs = self.sync_watermark_secs();
         let mut wraps = Filter::new()
@@ -2874,12 +2880,6 @@ impl SonarClient {
         self.subscribe_group_messages().await
     }
 
-    /// Re-subscribe with the current watermark and group set. Idempotent:
-    /// `subscribe_with_id` replaces existing filters. Hosts call this
-    /// periodically (every 25-60s) to self-heal after relay disconnects,
-    /// replacing the heavy `sync()` poll on the idle path. It may also run one
-    /// bounded per-chat repair fetch for existing installs, so callers must keep
-    /// it on a background/IO queue and never in the local-first chat-open path.
     /// Prefer catch-up for the open chat.
     ///
     /// Hosts pass the MLS group id hex (same id used by send_text / messages).
@@ -2911,6 +2911,12 @@ impl SonarClient {
         *self.preferred_catchup_group.lock().unwrap() = preferred;
     }
 
+    /// Re-subscribe with the current watermark and group set. Idempotent:
+    /// `subscribe_with_id` replaces existing filters. Hosts call this
+    /// periodically (every 25-60s) to self-heal after relay disconnects,
+    /// replacing the heavy `sync()` poll on the idle path. It may also run one
+    /// bounded per-chat repair fetch for existing installs, so callers must keep
+    /// it on a background/IO queue and never in the local-first chat-open path.
     pub async fn ensure_subscriptions(&self) -> Result<()> {
         if !*self.live_marmot_enabled.lock().unwrap() {
             return Ok(());
@@ -4512,7 +4518,10 @@ mod tests {
             classification: crate::marmot::MessageClassification::Text,
         };
         // Caption/text always wins.
-        assert_eq!(index_preview(&msg("hi", vec![media_ref("image/jpeg", "a.jpg")])), "hi");
+        assert_eq!(
+            index_preview(&msg("hi", vec![media_ref("image/jpeg", "a.jpg")])),
+            "hi"
+        );
         // Caption-less media previews by kind — an album never shows blank.
         assert_eq!(
             index_preview(&msg("", vec![media_ref("image/jpeg", "a.jpg")])),
@@ -4888,11 +4897,11 @@ mod tests {
 
     #[test]
     fn map_mls_hex_to_nostr_hex_finds_pair() {
-        let pairs = vec![
-            ("aa".into(), "n1".into()),
-            ("bb".into(), "n2".into()),
-        ];
-        assert_eq!(map_mls_hex_to_nostr_hex("BB", &pairs).as_deref(), Some("n2"));
+        let pairs = vec![("aa".into(), "n1".into()), ("bb".into(), "n2".into())];
+        assert_eq!(
+            map_mls_hex_to_nostr_hex("BB", &pairs).as_deref(),
+            Some("n2")
+        );
         assert_eq!(map_mls_hex_to_nostr_hex("", &pairs), None);
         assert_eq!(map_mls_hex_to_nostr_hex("zz", &pairs), None);
     }
