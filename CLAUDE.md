@@ -199,3 +199,41 @@ export GITHUB_TOKEN="$(gh auth token)"
 scripts/zapstore-publish.sh --local   # build + sign + publish
 # scripts/zapstore-publish.sh --check  # fetch-only dry run
 ```
+
+## Blog Posting Process
+
+The website blog (`web/src/routes/blog/`) renders NIP-23 (kind 30023) long-form
+posts published to Nostr by the blog author key (`BLOG_PUBKEY_HEX` in
+`web/src/lib/blog-data.js`). Posts are authored as Markdown under
+`docs/blog/<slug>/README.md` with YAML front-matter (`title`, `cat`, `date`,
+`summary`, `author`, `read`, `feature`). Every post MUST carry the
+`sonarblogpost` marker `t` tag — the site loads only events with it, so other
+long-form content from the same key never appears — which
+`scripts/blog/publish.sh` adds automatically.
+
+**Every time you post or update a blog post, run all of these steps** (they are
+the operation that makes a post actually show up on the site):
+
+1. Write/edit `docs/blog/<slug>/README.md` (front-matter + Markdown body).
+2. Publish to Nostr — adds the marker tag; NIP-23 is addressable, so
+   re-publishing the same slug **replaces** the existing event, it does not
+   duplicate it:
+   ```sh
+   SONAR_BLOG_NSEC='nsec1…' scripts/blog/publish.sh <slug>   # --dry-run to preview
+   ```
+   Or configure the signer once in gitignored `scripts/blog/.env`
+   (`SONAR_BLOG_NSEC` or `SONAR_BLOG_BUNKER`; see `scripts/blog/.env.example`).
+   nak is invoked via `go run`, so no binary install is needed.
+3. Bake the published posts + author profile into the build:
+   ```sh
+   cd web && npm run fetch-blog   # regenerates web/src/lib/blog-content.js
+   ```
+4. Commit the regenerated `web/src/lib/blog-content.js` together with
+   `docs/blog/<slug>/README.md`. **Never commit `scripts/blog/.env`** (it holds
+   the signer secret and is gitignored).
+
+The page also refreshes from the live feed at runtime, but step 3 is what makes
+a post render from the static build — so `https://sonarprivacy.xyz/blog/#<slug>`
+works before any relay round-trip. Relay-sourced Markdown is rendered through the
+shared sanitizing renderer (`web/src/lib/markdown.js`); keep its HTML-escaping
+and href scheme allow-list intact when touching that file.
