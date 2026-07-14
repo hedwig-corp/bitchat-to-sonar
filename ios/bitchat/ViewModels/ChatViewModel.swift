@@ -3379,6 +3379,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
                         isPrivate: msg.isPrivate,
                         recipientNickname: msg.recipientNickname,
                         senderPeerID: msg.senderPeerID == meshService.myPeerID ? meshService.myPeerID : stableKeyHex,
+                        receivedViaInternet: msg.receivedViaInternet,
                         mentions: msg.mentions,
                         deliveryStatus: msg.deliveryStatus
                     )
