@@ -744,6 +744,51 @@ fn take_catchup_entry(
     queue.pop_front()
 }
 
+/// Drain up to `max` entries from the catch-up queue for ONE batched `#h`
+/// fetch. The preferred (open-chat) group always leads the batch when queued.
+/// Batching is the anti-starvation lever: one group per pass meant N groups
+/// needed N wake/sync cycles to repair; a batch clears the queue in ceil(N/max)
+/// passes at the same single bounded fetch per pass.
+fn take_catchup_batch(
+    queue: &mut VecDeque<(String, u64)>,
+    preferred: Option<&str>,
+    max: usize,
+) -> Vec<(String, u64)> {
+    let mut batch = Vec::new();
+    if max == 0 {
+        return batch;
+    }
+    if let Some(first) = take_catchup_entry(queue, preferred) {
+        batch.push(first);
+    }
+    while batch.len() < max {
+        match queue.pop_front() {
+            Some(entry) => batch.push(entry),
+            None => break,
+        }
+    }
+    batch
+}
+
+/// `since` for a catch-up batch: the lowest floor in the batch minus the
+/// catch-up lookback. Any zero floor (a group with no remote peer row stored)
+/// needs full history, so the whole batch fetches unbounded — same shape as the
+/// empty-transcript repair batch, one bounded-timeout request either way.
+fn catchup_batch_since(batch: &[(String, u64)]) -> Option<u64> {
+    let mut min_floor = u64::MAX;
+    for (_, floor) in batch {
+        if *floor == 0 {
+            return None;
+        }
+        min_floor = min_floor.min(*floor);
+    }
+    if min_floor == u64::MAX {
+        None
+    } else {
+        Some(min_floor.saturating_sub(GROUP_CATCHUP_FLOOR_LOOKBACK_SECS))
+    }
+}
+
 #[cfg(test)]
 fn map_mls_hex_to_nostr_hex(mls_hex: &str, pairs: &[(String, String)]) -> Option<String> {
     let clean = mls_hex.trim().to_ascii_lowercase();
@@ -816,6 +861,29 @@ const BACKFILL_TIMEOUT: Duration = Duration::from_secs(3);
 /// cases with dozens of empty-transcript groups from stacking serial timeouts.
 /// Excess groups are re-queued for the next sync.
 const MAX_BACKFILLS_PER_SYNC: usize = 8;
+
+/// Extra lookback below a group's catch-up floor. The floor is the newest
+/// LOCALLY stored peer chat row, whose `created_at` is sender-clock based, so a
+/// missed event can legitimately be OLDER than the floor: sender clock skew, or
+/// out-of-order delivery where a relay-delayed event arrives after a newer one
+/// was already persisted. The previous margin was only `SYNC_OVERLAP_SECS`
+/// (5 min); an event more than 5 min below an already-stored newer peer row was
+/// permanently skipped once it also aged past the 30-min live tail. One hour is
+/// bounded (MDK dedups replayed events, one batched fetch either way) and
+/// covers realistic skew/reordering; gaps beyond it remain the job of the
+/// watermark-rewind safety net.
+const GROUP_CATCHUP_FLOOR_LOOKBACK_SECS: u64 = 60 * 60;
+
+/// Groups drained from the catch-up queue per pass, batched into ONE `#h`
+/// fetch. Reuses the empty-transcript repair cap: same shape, same reason.
+const GROUP_CATCHUP_BATCH: usize = MAX_BACKFILLS_PER_SYNC;
+
+/// Minimum spacing between catch-up passes. Wake-driven hosts run the pass on
+/// every drain/ensure cycle; during a live event burst that would stack a
+/// bounded relay fetch onto every tick of the serialized engine queue. The
+/// preferred (open-chat) group bypasses the throttle so chat-open repair is
+/// never delayed by it.
+const GROUP_CATCHUP_MIN_INTERVAL: Duration = Duration::from_secs(5);
 
 const SYNC_STATE_VERSION: u32 = 1;
 const SYNC_STATE_PROCESSED_EVENT_CAP: usize = 20_000;
@@ -1284,6 +1352,9 @@ pub struct SonarClient {
     /// through the shared processed-ID set, so a message delivered by both the
     /// sync fetch and the live buffer notifies at most once.
     pending_sync_notifications: Arc<Mutex<Vec<DrainNotification>>>,
+    /// Last time a per-group catch-up pass actually ran; throttles wake-driven
+    /// callers to `GROUP_CATCHUP_MIN_INTERVAL`.
+    last_group_catchup_at: Arc<Mutex<Option<Instant>>>,
 }
 
 impl SonarClient {
@@ -1728,6 +1799,7 @@ impl SonarClient {
             sticker_prefetch_registry: Arc::new(Mutex::new(HashMap::new())),
             own_push_registration: Arc::new(Mutex::new(None)),
             pending_sync_notifications: Arc::new(Mutex::new(Vec::new())),
+            last_group_catchup_at: Arc::new(Mutex::new(None)),
         };
         // Open the live Marmot subscriptions for real sessions. In-memory test
         // sessions (allow_geo_relays=false) stay on the explicit `sync()` path so
@@ -3659,10 +3731,25 @@ impl SonarClient {
         );
     }
 
-    fn take_initial_group_message_catchup(&self) -> Option<(String, u64)> {
+    fn take_initial_group_message_catchup_batch(&self) -> Vec<(String, u64)> {
         let preferred = self.preferred_catchup_group.lock().unwrap().clone();
         let mut queue = self.initial_group_message_catchups.lock().unwrap();
-        take_catchup_entry(&mut queue, preferred.as_deref())
+        take_catchup_batch(&mut queue, preferred.as_deref(), GROUP_CATCHUP_BATCH)
+    }
+
+    /// Whether the preferred (open-chat) group is still waiting in the catch-up
+    /// queue. Used to bypass the pass throttle so chat-open repair runs now.
+    fn preferred_catchup_pending(&self) -> bool {
+        let preferred = self.preferred_catchup_group.lock().unwrap().clone();
+        match preferred {
+            None => false,
+            Some(pref) => self
+                .initial_group_message_catchups
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(id, _)| id == &pref),
+        }
     }
 
     fn requeue_initial_group_message_catchup(&self, group_id: String, floor: u64) {
@@ -3701,27 +3788,45 @@ impl SonarClient {
             return Ok(MarmotProcessReport::default());
         }
         self.populate_initial_group_message_catchups_once();
-        let Some((group_id, floor)) = self.take_initial_group_message_catchup() else {
+        // Throttle wake-driven passes so a live event burst cannot stack a relay
+        // fetch onto every tick of the serialized engine queue. The preferred
+        // (open-chat) group bypasses the throttle: chat-open repair runs now.
+        if !self.preferred_catchup_pending() {
+            let last = *self.last_group_catchup_at.lock().unwrap();
+            if let Some(prev) = last {
+                if prev.elapsed() < GROUP_CATCHUP_MIN_INTERVAL {
+                    return Ok(MarmotProcessReport::default());
+                }
+            }
+        }
+        let batch = self.take_initial_group_message_catchup_batch();
+        if batch.is_empty() {
             return Ok(MarmotProcessReport::default());
-        };
+        }
+        *self.last_group_catchup_at.lock().unwrap() = Some(Instant::now());
 
-        let group_ids = vec![group_id.clone()];
+        // Batched: one `#h` fetch for the whole slice. `since` is the lowest
+        // floor minus GROUP_CATCHUP_FLOOR_LOOKBACK_SECS — the widened lookback
+        // covers clock-skewed / out-of-order events below a group's newest
+        // stored peer row that the old 5-min overlap permanently skipped.
+        let group_ids: Vec<String> = batch.iter().map(|(id, _)| id.clone()).collect();
+        let since = catchup_batch_since(&batch);
         match self
-            .backfill_groups_since(
-                &group_ids,
-                Some(floor),
-                "initial per-group message catch-up",
-            )
+            .backfill_groups_since(&group_ids, since, "initial per-group message catch-up")
             .await
         {
             Ok(report) => {
                 if report.retryable_failures > 0 {
-                    self.requeue_initial_group_message_catchup(group_id, floor);
+                    for (group_id, floor) in batch {
+                        self.requeue_initial_group_message_catchup(group_id, floor);
+                    }
                 }
                 Ok(report)
             }
             Err(err) => {
-                self.requeue_initial_group_message_catchup(group_id, floor);
+                for (group_id, floor) in batch {
+                    self.requeue_initial_group_message_catchup(group_id, floor);
+                }
                 Err(err)
             }
         }
@@ -6198,6 +6303,48 @@ mod tests {
         let got = take_catchup_entry(&mut q, Some("ccc")).expect("preferred");
         assert_eq!(got.0, "ccc");
         assert_eq!(q.front().map(|e| e.0.as_str()), Some("aaa"));
+    }
+
+    #[test]
+    fn catchup_batch_leads_with_preferred_and_respects_cap() {
+        let mut q = VecDeque::from([
+            ("aaa".into(), 1u64),
+            ("bbb".into(), 2u64),
+            ("ccc".into(), 3u64),
+            ("ddd".into(), 4u64),
+        ]);
+        let batch = take_catchup_batch(&mut q, Some("ccc"), 3);
+        // Preferred group leads; the rest fill in queue order up to the cap.
+        assert_eq!(
+            batch.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            vec!["ccc", "aaa", "bbb"]
+        );
+        assert_eq!(q.front().map(|e| e.0.as_str()), Some("ddd"));
+        // Draining the remainder empties the queue; further takes are empty.
+        assert_eq!(take_catchup_batch(&mut q, None, 8).len(), 1);
+        assert!(take_catchup_batch(&mut q, None, 8).is_empty());
+        assert!(take_catchup_batch(&mut q, None, 0).is_empty());
+    }
+
+    #[test]
+    fn catchup_batch_since_uses_min_floor_with_widened_lookback() {
+        // The batch `since` must reach GROUP_CATCHUP_FLOOR_LOOKBACK_SECS below
+        // the LOWEST floor: the floor is the newest locally stored peer row
+        // (sender-clock based), and a 5-min overlap permanently skipped
+        // clock-skewed / out-of-order events once past the 30-min live tail.
+        let now = 1_700_000_000u64;
+        let batch = vec![("a".to_string(), now), ("b".to_string(), now - 900)];
+        assert_eq!(
+            catchup_batch_since(&batch),
+            Some(now - 900 - GROUP_CATCHUP_FLOOR_LOOKBACK_SECS)
+        );
+        // Any zero floor (no remote peer row stored) needs full history.
+        let with_zero = vec![("a".to_string(), now), ("b".to_string(), 0)];
+        assert_eq!(catchup_batch_since(&with_zero), None);
+        assert_eq!(catchup_batch_since(&[]), None);
+        // The widened lookback must cover at least the live tail, so an event
+        // the live subscription could have delivered is always re-fetchable.
+        assert!(GROUP_CATCHUP_FLOOR_LOOKBACK_SECS >= LIVE_GROUP_TAIL_SECS);
     }
 
     #[test]

@@ -2501,6 +2501,14 @@ final class MarmotChatModel: ObservableObject {
                     if !notifications.isEmpty {
                         await self.loadLocalSummaries()
                     }
+                    // Advance the historical per-group catch-up on live cycles
+                    // too. Steady live traffic keeps woke==true, so an idle-only
+                    // catch-up starves and repair never finishes. The core
+                    // throttles the pass (GROUP_CATCHUP_MIN_INTERVAL) and the
+                    // resubscribe (MIN_ENSURE_INTERVAL), so this is a cheap
+                    // no-op on most ticks; errors here are non-fatal (the idle
+                    // branch keeps the full reconnect handling).
+                    try? await self.service.ensureSubscriptions()
                 } else {
                     #if DEBUG
                     // SONAR_BENCH: first wait cycle resolved with no buffered events
