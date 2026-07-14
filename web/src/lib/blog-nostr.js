@@ -44,20 +44,33 @@ export async function fetchPostsFromNostr() {
 	const filter = { kinds: [BLOG_EVENT_KIND], authors: [author], limit: FETCH_LIMIT };
 
 	const responses = await Promise.all(relays.map((relay) => queryRelay(relay, filter)));
+	const posts = postsFromEvents(responses.flatMap((r) => r.events), author);
 
-	// Keep the newest event per `d` tag across all relays.
+	if (posts.length === 0) {
+		return { posts: [], source: 'seed' };
+	}
+	return { posts, source: 'nostr' };
+}
+
+/**
+ * Project raw NIP-23 events onto sorted BlogPosts: filter to the author, keep
+ * the newest event per `d` tag (addressable-replaceable), parse, and sort newest
+ * first. Shared by the runtime fetch and the build-time bake (web/scripts/fetch-blog.mjs).
+ * @param {NostrEvent[]} events
+ * @param {string} author lowercased hex pubkey
+ * @returns {(BlogPost & { _ts: number })[]}
+ */
+export function postsFromEvents(events, author) {
 	/** @type {Map<string, NostrEvent>} */
 	const latestByD = new Map();
-	for (const res of responses) {
-		for (const ev of res.events) {
-			if (ev.kind !== BLOG_EVENT_KIND) continue;
-			if (typeof ev.pubkey !== 'string' || ev.pubkey.toLowerCase() !== author) continue;
-			const d = tagValue(ev.tags, 'd');
-			if (!d) continue;
-			const prev = latestByD.get(d);
-			if (!prev || (ev.created_at ?? 0) > (prev.created_at ?? 0)) {
-				latestByD.set(d, ev);
-			}
+	for (const ev of events) {
+		if (ev.kind !== BLOG_EVENT_KIND) continue;
+		if (typeof ev.pubkey !== 'string' || ev.pubkey.toLowerCase() !== author) continue;
+		const d = tagValue(ev.tags, 'd');
+		if (!d) continue;
+		const prev = latestByD.get(d);
+		if (!prev || (ev.created_at ?? 0) > (prev.created_at ?? 0)) {
+			latestByD.set(d, ev);
 		}
 	}
 
@@ -68,13 +81,9 @@ export async function fetchPostsFromNostr() {
 		if (post) posts.push(post);
 	}
 
-	if (posts.length === 0) {
-		return { posts: [], source: 'seed' };
-	}
-
 	// Newest first by published_at (falls back to created_at via _ts).
 	posts.sort((a, b) => (b._ts ?? 0) - (a._ts ?? 0));
-	return { posts, source: 'nostr' };
+	return posts;
 }
 
 /**
