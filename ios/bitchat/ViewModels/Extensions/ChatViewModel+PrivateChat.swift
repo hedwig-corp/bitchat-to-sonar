@@ -232,6 +232,7 @@ extension ChatViewModel {
             isPrivate: true,
             recipientNickname: nickname,
             senderPeerID: convKey,
+            receivedViaInternet: true,
             deliveryStatus: .delivered(to: nickname, at: Date())
         )
         
@@ -761,6 +762,7 @@ extension ChatViewModel {
             isPrivate: true,
             recipientNickname: nickname,
             senderPeerID: targetPeerID,
+            receivedViaInternet: true,
             deliveryStatus: .delivered(to: nickname, at: Date())
         )
         
@@ -1051,6 +1053,7 @@ extension ChatViewModel {
                 isPrivate: message.isPrivate,
                 recipientNickname: message.recipientNickname,
                 senderPeerID: message.senderPeerID,
+                receivedViaInternet: message.receivedViaInternet,
                 mentions: message.mentions,
                 deliveryStatus: message.deliveryStatus
             )

@@ -42,6 +42,7 @@ final class MessageStoreTests: XCTestCase {
         sender: String = "alice",
         content: String,
         senderPeerID: PeerID? = nil,
+        receivedViaInternet: Bool? = nil,
         status: DeliveryStatus? = nil
     ) -> BitchatMessage {
         clock += 1
@@ -53,6 +54,7 @@ final class MessageStoreTests: XCTestCase {
             isRelay: false,
             isPrivate: senderPeerID != nil,
             senderPeerID: senderPeerID,
+            receivedViaInternet: receivedViaInternet,
             mentions: ["bob"],
             deliveryStatus: status
         )
@@ -91,6 +93,20 @@ final class MessageStoreTests: XCTestCase {
         store.appendPrivate(peerID: peer, message: m)
         store.appendPrivate(peerID: peer, message: m)
         XCTAssertEqual(store.load(peerID: peer).count, 1)
+    }
+
+    func testPrivateRoundTripPreservesInternetArrivalTransport() {
+        let peer = PeerID(str: "a1b2c3d4e5f60718")
+        store.appendPrivate(
+            peerID: peer,
+            message: message(
+                content: "over Nostr",
+                senderPeerID: peer,
+                receivedViaInternet: true
+            )
+        )
+
+        XCTAssertEqual(store.load(peerID: peer).first?.receivedViaInternet, true)
     }
 
     func testSavePrivateReplacesTranscript() {
