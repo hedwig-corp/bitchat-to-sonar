@@ -83,6 +83,10 @@ Local.xcconfig
 # Local deployment secrets (APNs keys, signing material) — never commit
 deploy/secrets/
 
+# Blog publisher signer config (bunker URL / nsec) — never commit; template is
+# scripts/blog/.env.example
+scripts/blog/.env
+
 # Android Rust core build outputs (regenerate with core/build-android.sh)
 core/android-out/
 ios/bitchat/GoogleService-Info.plist
