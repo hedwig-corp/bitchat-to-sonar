@@ -6067,6 +6067,15 @@ class SonarAppState(private val scope: CoroutineScope) {
         )
         if (conversationVisibleRowLimit >= TRANSCRIPT_RETAINED_ROWS) {
             conversationPinnedToOlderEdge = true
+            // A folded source must not keep moving its own cursor toward live
+            // rows while the conversation-wide window stays on older history.
+            // Pin every source in the same transition; newest reload resets all
+            // of them through beginTranscriptSession().
+            meshTranscriptPinnedToOlderEdge = true
+            for (groupId in transcriptWindows.keys.toList()) {
+                val window = transcriptWindows[groupId] ?: continue
+                transcriptWindows[groupId] = window.copy(pinnedToOlderEdge = true)
+            }
         }
         return true
     }

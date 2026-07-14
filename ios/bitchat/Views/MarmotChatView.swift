@@ -195,6 +195,9 @@ final class MarmotChatModel: ObservableObject {
     private static let profileRefreshTTL: TimeInterval = 30 * 60
     private static let localTranscriptPageLimit = TransportConfig.sonarTranscriptPageCount
     private static let localTranscriptRetainedLimit = TransportConfig.sonarTranscriptRetainedCount
+    /// A summary invalidation may briefly own the same per-group loader as an
+    /// edge gesture. Retry only that coalescing case for up to one second.
+    private static let localTranscriptBusyRetryLimit = 21
     private static let localSummaryPageLimit: UInt32 = 20
     private static let localSummaryGroupLimit: UInt32 = 50
     private static let relayReconnectRetryDelaySeconds: Double = 10
@@ -734,14 +737,23 @@ final class MarmotChatModel: ObservableObject {
                 self.errorText = Self.describe(error)
             }
             let notifications = (try? await service.drainPending()) ?? []
-            if !notifications.isEmpty { await loadLocalWindow(groupId: groupId) ; return }
+            if !notifications.isEmpty {
+                await loadLocalWindow(groupId: groupId, preserveHistoricalWindow: true)
+                return
+            }
         }
-        await loadLocalWindow(groupId: groupId)
+        await loadLocalWindow(groupId: groupId, preserveHistoricalWindow: true)
     }
 
-    private func loadLocalWindow(groupId: String?) async {
+    private func loadLocalWindow(
+        groupId: String?,
+        preserveHistoricalWindow: Bool = false
+    ) async {
         if let groupId {
-            await loadLocalPage(groupId: groupId)
+            await loadLocalPage(
+                groupId: groupId,
+                preserveHistoricalWindow: preserveHistoricalWindow
+            )
         } else {
             await loadLocalSummaries()
         }
@@ -770,7 +782,10 @@ final class MarmotChatModel: ObservableObject {
                     }
                     if self.groups.contains(where: { $0.id == changedGroupId })
                         || self.messagesByGroup[changedGroupId] != nil {
-                        _ = await self.loadLocalPage(groupId: changedGroupId)
+                        _ = await self.loadLocalPage(
+                            groupId: changedGroupId,
+                            preserveHistoricalWindow: true
+                        )
                     } else {
                         // A newly-created/received group is not in the host cache
                         // yet, so only that case needs the wider summary hydrate.
@@ -789,9 +804,13 @@ final class MarmotChatModel: ObservableObject {
     /// so existing conversations paint from the encrypted DB without scanning
     /// all groups or all messages.
     @discardableResult
-    func loadLocalPage(groupId: String) async -> Bool {
+    func loadLocalPage(
+        groupId: String,
+        preserveHistoricalWindow: Bool = false
+    ) async -> Bool {
         guard localTranscriptLoadingGroups.insert(groupId).inserted else { return false }
         defer { localTranscriptLoadingGroups.remove(groupId) }
+        var transcriptLoaded = false
         do {
             // Transcript first: group metadata and invites are unrelated to the
             // first visible frame and must not sit ahead of the selected page.
@@ -803,25 +822,48 @@ final class MarmotChatModel: ObservableObject {
             let existing = messagesByGroup[groupId] ?? []
             let existingCanonical = existing.filter { !Self.isLocalTranscriptEcho($0) }
             let echoes = existing.filter(Self.isLocalTranscriptEcho)
-            let oldestPageDate = page.map(\.createdAt).min()
-            // Returning from a historical cache window must replace it with a
-            // contiguous newest page. Preserve only rows at/after this page's
-            // boundary in case a local summary landed after the database read.
-            let concurrentNewest = existingCanonical.filter { message in
-                guard let oldestPageDate else { return false }
-                return message.createdAt >= oldestPageDate
+            let shouldPreserveHistoricalWindow = preserveHistoricalWindow
+                && !existingCanonical.isEmpty
+            let canonical: [MarmotService.MarmotMessage]
+            if shouldPreserveHistoricalWindow {
+                let pinnedToOlderEdge = localTranscriptPreservesOlderEdgeGroups.contains(groupId)
+                let merged = Self.mergeMessages(existing: existingCanonical, incoming: page)
+                // Match Signal's same-location reload: keep every local page
+                // already loaded. Before the retained cap, merge in live rows;
+                // once the conversation pins this source, update membership in
+                // place so an unseen tail cannot move its historical cursor.
+                canonical = Self.refreshLocalMessages(
+                    existing: existingCanonical,
+                    newest: page,
+                    retainedLimit: Self.localTranscriptRetainedLimit,
+                    preservingOlderEdge: pinnedToOlderEdge
+                )
+                localTranscriptCursorByGroup[groupId] = Self.oldestCursor(in: canonical)
+                localTranscriptHasOlderByGroup[groupId] =
+                    localTranscriptHasOlderByGroup[groupId] == true
+                    || rawPage.count > Self.localTranscriptPageLimit
+                    || merged.count > Self.localTranscriptRetainedLimit
+            } else {
+                let oldestPageDate = page.map(\.createdAt).min()
+                // Returning from a historical cache window must replace it with a
+                // contiguous newest page. Preserve only rows at/after this page's
+                // boundary in case a local summary landed after the database read.
+                let concurrentNewest = existingCanonical.filter { message in
+                    guard let oldestPageDate else { return false }
+                    return message.createdAt >= oldestPageDate
+                }
+                canonical = Array(
+                    Self.mergeMessages(existing: concurrentNewest, incoming: page)
+                        .suffix(Self.localTranscriptRetainedLimit)
+                )
+                localTranscriptCursorByGroup[groupId] = Self.oldestCursor(in: canonical)
+                localTranscriptHasOlderByGroup[groupId] = rawPage.count > Self.localTranscriptPageLimit
+                localTranscriptPreservesOlderEdgeGroups.remove(groupId)
             }
-            let canonical = Array(
-                Self.mergeMessages(existing: concurrentNewest, incoming: page)
-                    .suffix(Self.localTranscriptRetainedLimit)
-            )
             var byGroup = messagesByGroup
             byGroup[groupId] = Self.mergeMessages(existing: canonical, incoming: echoes)
-            localTranscriptCursorByGroup[groupId] = Self.oldestCursor(in: canonical)
-            let initialHasOlder = rawPage.count > Self.localTranscriptPageLimit
-            localTranscriptHasOlderByGroup[groupId] = initialHasOlder
-            localTranscriptPreservesOlderEdgeGroups.remove(groupId)
             self.messagesByGroup = reconcileOptimistic(into: byGroup)
+            transcriptLoaded = true
             let groups = try await service.groups()
             let invites = try await service.pendingGroupInvites()
             let summaries = await service.conversationSummaries()
@@ -856,7 +898,10 @@ final class MarmotChatModel: ObservableObject {
             return true
         } catch {
             self.errorText = Self.describe(error)
-            return false
+            // The transcript is the operation this method promises. Metadata
+            // hydration follows it but must not make a successful newest-page
+            // reset look coalesced/failed to the edge loader.
+            return transcriptLoaded
         }
     }
 
@@ -923,6 +968,34 @@ final class MarmotChatModel: ObservableObject {
             self.errorText = Self.describe(error)
             return false
         }
+    }
+
+    func loadOlderLocalPageWhenAvailable(groupId: String) async -> Bool {
+        for attempt in 0..<Self.localTranscriptBusyRetryLimit {
+            if await loadOlderLocalPage(groupId: groupId) { return true }
+            guard localTranscriptLoadingGroups.contains(groupId),
+                  attempt + 1 < Self.localTranscriptBusyRetryLimit else { return false }
+            do {
+                try await Task.sleep(nanoseconds: 50_000_000)
+            } catch {
+                return false
+            }
+        }
+        return false
+    }
+
+    func loadNewestLocalPageWhenAvailable(groupId: String) async -> Bool {
+        for attempt in 0..<Self.localTranscriptBusyRetryLimit {
+            if await loadLocalPage(groupId: groupId) { return true }
+            guard localTranscriptLoadingGroups.contains(groupId),
+                  attempt + 1 < Self.localTranscriptBusyRetryLimit else { return false }
+            do {
+                try await Task.sleep(nanoseconds: 50_000_000)
+            } catch {
+                return false
+            }
+        }
+        return false
     }
 
     func hasOlderLocalMessages(groupId: String) -> Bool {
@@ -1033,6 +1106,51 @@ final class MarmotChatModel: ObservableObject {
             if $0.createdAt == $1.createdAt { return $0.id < $1.id }
             return $0.createdAt < $1.createdAt
         }
+    }
+
+    /// Apply updates to rows already retained in a historical source window
+    /// without admitting unseen tail rows or changing the window boundaries.
+    static func refreshHistoricalMessages(
+        existing: [MarmotService.MarmotMessage],
+        newest: [MarmotService.MarmotMessage]
+    ) -> [MarmotService.MarmotMessage] {
+        refreshLocalMessages(
+            existing: existing,
+            newest: newest,
+            retainedLimit: existing.count,
+            preservingOlderEdge: true
+        )
+    }
+
+    /// Refresh a locally paged source without collapsing it to the newest
+    /// database page. Live rows are admitted until the retained cap; a source
+    /// pinned by the conversation-wide window receives retained-row updates
+    /// only until the user explicitly returns to newest.
+    static func refreshLocalMessages(
+        existing: [MarmotService.MarmotMessage],
+        newest: [MarmotService.MarmotMessage],
+        retainedLimit: Int,
+        preservingOlderEdge: Bool
+    ) -> [MarmotService.MarmotMessage] {
+        if preservingOlderEdge {
+            let existingIDs = Set(existing.map(\.id))
+            return mergeMessages(
+                existing: existing,
+                incoming: newest.filter { existingIDs.contains($0.id) }
+            )
+        }
+        return Array(
+            mergeMessages(existing: existing, incoming: newest)
+                .suffix(max(0, retainedLimit))
+        )
+    }
+
+    /// Pin one source when its folded conversation reaches the retained cap.
+    /// The explicit newest-page load clears this marker again.
+    func preserveLocalTranscriptWindow(groupId: String) {
+        guard messagesByGroup[groupId]?.contains(where: { !Self.isLocalTranscriptEcho($0) }) == true
+        else { return }
+        localTranscriptPreservesOlderEdgeGroups.insert(groupId)
     }
 
     private static func isLocalTranscriptEcho(_ message: MarmotService.MarmotMessage) -> Bool {

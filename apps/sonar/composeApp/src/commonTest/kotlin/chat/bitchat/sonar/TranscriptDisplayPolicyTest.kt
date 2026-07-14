@@ -101,6 +101,24 @@ class TranscriptDisplayPolicyTest {
     }
 
     @Test
+    fun olderFoldedSourceAdvancesFullHistoricalWindow() {
+        val olderSource = (0 until 500).map { message("internet-$it", it.toLong()) }
+        val visibleNewerSource = (500 until 1000).map { message("mesh-$it", it.toLong()) }
+
+        val page = nearestOlderTranscriptPage(
+            olderSource + visibleNewerSource,
+            visibleNewerSource.first(),
+        )
+        val moved = prependTranscriptRows(visibleNewerSource, page)
+
+        assertEquals("internet-470", page.first().id)
+        assertEquals("internet-499", page.last().id)
+        assertEquals("internet-470", moved.first().id)
+        assertEquals("mesh-969", moved.last().id)
+        assertEquals(TRANSCRIPT_RETAINED_ROWS, moved.size)
+    }
+
+    @Test
     fun liveRefreshDoesNotEvictOlderWindowAnchor() {
         val existing = (70 until 570).map { message(it.toString(), it.toLong()) }
         val refreshed = refreshTranscriptRows(

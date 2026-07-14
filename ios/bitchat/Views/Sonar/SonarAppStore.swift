@@ -3455,7 +3455,7 @@ final class SonarAppStore: ObservableObject {
     func loadOlderDM(_ id: String) async -> Bool {
         var added = false
         for group in localTranscriptGroups(for: id) {
-            if await marmot.loadOlderLocalPage(groupId: group.id) {
+            if await marmot.loadOlderLocalPageWhenAvailable(groupId: group.id) {
                 added = true
             }
         }
@@ -3465,12 +3465,20 @@ final class SonarAppStore: ObservableObject {
         return added
     }
 
+    /// Keep every folded local source at the same historical edge as the
+    /// conversation-wide render window while background updates continue.
+    func preserveHistoricalDM(_ id: String) {
+        for group in localTranscriptGroups(for: id) {
+            marmot.preserveLocalTranscriptWindow(groupId: group.id)
+        }
+    }
+
     /// Move every folded source back to its newest local page. Used when a user
     /// who paged into a bounded historical window scrolls back to its bottom.
     func loadNewestDM(_ id: String) async -> Bool {
         var loaded = true
         for group in localTranscriptGroups(for: id) {
-            if !(await marmot.loadLocalPage(groupId: group.id)) {
+            if !(await marmot.loadNewestLocalPageWhenAvailable(groupId: group.id)) {
                 loaded = false
             }
         }
@@ -3587,20 +3595,15 @@ final class SonarAppStore: ObservableObject {
         return rows[..<end].suffix(max(0, limit))
     }
 
-    private static func boundedTranscript(_ rows: [SNMessage], limit: Int?) -> [SNMessage] {
-        guard let limit else { return rows }
-        return Array(rows.suffix(max(0, limit)))
-    }
-
     /// Build the render-ready transcript for one conversation. O(page) with
     /// parsing/sorting — call it from `ConversationViewState` (per data
     /// change), NEVER from a SwiftUI `body` (per render).
     ///
     /// `limit` is applied to every folded local source before expensive
-    /// formatting and again after the chronological merge. This is important
-    /// for mesh + Marmot conversations: a 30-row first paint must not format an
-    /// entire persisted mesh transcript merely because the second source is
-    /// already page-bounded.
+    /// formatting. The caller applies the one conversation-wide render budget
+    /// after the chronological merge; keeping the bounded source candidates is
+    /// required to page into an older transport when another transport owns the
+    /// newer edge.
     func dmMsgs(_ id: String, limit: Int? = nil, meshNewestOffset: Int = 0) -> [SNMessage] {
         if let groupId = marmotGroupId(id) {
             let groups = directMarmotGroups(matchingGroupId: groupId)
@@ -3688,21 +3691,21 @@ final class SonarAppStore: ObservableObject {
             }
             let transcriptPayIDs = Set(dated.compactMap { $0.1.pay?.id })
             dated += paymentActivityRows(for: id, transcriptPayIDs: transcriptPayIDs, limit: limit)
-            return Self.boundedTranscript(mergeCallLogs(into: dated, id: id), limit: limit)
+            return mergeCallLogs(into: dated, id: id, limit: limit)
         }
         if pendingMarmotNpub(for: id) != nil {
             let dated = Self.transcriptSource(
                 pendingMarmotMessagesByChat[id] ?? [],
                 limit: limit
             ).map { ($0.sortDate ?? Date(), $0) }
-            return Self.boundedTranscript(mergeCallLogs(into: dated, id: id), limit: limit)
+            return mergeCallLogs(into: dated, id: id, limit: limit)
         }
         if isPendingMarmotGroup(id) {
             let dated = Self.transcriptSource(
                 pendingMarmotMessagesByChat[id] ?? [],
                 limit: limit
             ).map { ($0.sortDate ?? Date(), $0) }
-            return Self.boundedTranscript(mergeCallLogs(into: dated, id: id), limit: limit)
+            return mergeCallLogs(into: dated, id: id, limit: limit)
         }
         let peerID = PeerID(str: id)
         let via = dmTransport(id)
@@ -3779,22 +3782,32 @@ final class SonarAppStore: ObservableObject {
         }
         let transcriptPayIDs = Set(dated.compactMap { $0.1.pay?.id })
         dated += paymentActivityRows(for: id, transcriptPayIDs: transcriptPayIDs, limit: limit)
-        return Self.boundedTranscript(mergeCallLogs(into: dated, id: id), limit: limit)
+        return mergeCallLogs(into: dated, id: id, limit: limit)
     }
 
     /// Fold local call records for `id` into the transcript chronologically
     /// (stable sort keeps same-instant messages in place). A no-op when this
     /// peer has no recorded calls.
-    private func mergeCallLogs(into dated: [(Date, SNMessage)], id: String) -> [SNMessage] {
+    private func mergeCallLogs(
+        into dated: [(Date, SNMessage)],
+        id: String,
+        limit: Int?
+    ) -> [SNMessage] {
         let calls = callLogs[id] ?? []
         var combined = dated
-        for c in calls { combined.append((c.date, c.message)) }
+        for c in Self.transcriptSource(calls, limit: limit) {
+            combined.append((c.date, c.message))
+        }
         return combined.enumerated()
             .sorted {
                 if $0.element.0 == $1.element.0 { return $0.offset < $1.offset }
                 return $0.element.0 < $1.element.0
             }
-            .map { $0.element.1 }
+            .map {
+                var message = $0.element.1
+                message.sortDate = $0.element.0
+                return message
+            }
     }
 
     /// DM routing uses Bluetooth only while a Sonar peer is directly connected;
