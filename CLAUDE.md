@@ -63,6 +63,15 @@ How to run the analysis:
 
 Constraints and gotchas (all detailed in `docs/PERFORMANCE.md`): the build must be **Debug** (markers are private in Release) and **arm64-only** (Arti/sonarffi sim slices are arm64). CLI sim builds are unsigned and cannot get a Keychain entitlement for the `sh.hedwig.sonar` bundle id, so the benchmark path is **Keychain-independent** — adopt the `SONAR_BENCH_NSEC` identity and derive the DB key from it. All such hooks are `#if DEBUG` and gated on `SONAR_BENCH_NSEC`; never add a benchmark hook that changes behavior in Release. When reporting, quote `launch→t4`/`t0→t4` (cold → synced), `t2→t4` (relay path), `t3→t3a` (publish), and `t3b→t4` (drain) against the baseline, and treat any regression that moves sync onto the critical path as a violation of the Signal-Comparable Performance Rule.
 
+## Notification-Sync — Known Watch Items (verify with a real device push)
+
+The notif-sync stack (#252 / #254 / #255) is unit-tested and code-reviewed, and cold-start / catch-up / local-first were device-validated on a real 43-group account. The forced-sync path, "Catching up…" UX, send-under-load, and push-while-refreshing could not be exercised via CLI (no background→foreground or real push-tap injection) and **must** be verified with a real APNs push on a physical device before trusting them in production:
+
+- Forced-sync + "Catching up…" UX on a real device push (#262)
+- Send-while-forced-sync contention on the serial engine queue (#263)
+- Push arriving while `refreshAfterForeground` is in flight may wait a cycle (#264)
+- Cold-start `t3→t4` dominated by `t3a_published` (KeyPackage/profile publish) (#265)
+
 ## Local Secrets Rule
 
 Do not commit payment, wallet, relay, signing, or API secrets. The Breez wallet key must stay in gitignored local configuration (`ios/Configs/Local.xcconfig` with `BREEZ_API_KEY = ...`) or an equivalent CI secret. When creating a new workspace/worktree or rebuilding for device testing, preserve the local secret by recreating/copying the gitignored config or passing the key through the build environment; verify presence without printing the value.
