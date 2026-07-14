@@ -15,11 +15,12 @@ export const BLOG_EVENT_KIND = 30023;
 /**
  * Hex pubkey of the blog author. Empty string ⇒ no relay query (static-only).
  *
- * This is the Sonar blog account (npub1h0hcmfe3nadcrrkqtpsyst07345w79e0lccfwv7yekpgka3d6e4qj3zn70),
- * signed via the NIP-46 bunker in scripts/blog/publish.sh. It MUST equal the
- * pubkey the bunker signs as, or the reader will filter the posts out.
+ * This is the Sonar blog author account
+ * (npub1wg2m9ku823y5l5699dlj6294dc3cvwu4g34ldrtelxq20t27clxsd7dzaw). It MUST
+ * equal the pubkey the posts are signed with (scripts/blog/publish.sh), or the
+ * reader will filter the posts out.
  */
-export const BLOG_PUBKEY_HEX = 'bbef8da7319f5b818ec05860482dfe8d68ef172ffe309733c4cd828b762dd66a';
+export const BLOG_PUBKEY_HEX = '7215b2db8754494fd3452b7f2d28b56e23863b95446bf68d79f980a7ad5ec7cd';
 
 /** Relays queried for the blog feed. Same public set the status feed uses. */
 export const BLOG_FEED_RELAYS = [
