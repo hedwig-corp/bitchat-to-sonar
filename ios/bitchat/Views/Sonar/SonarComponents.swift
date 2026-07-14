@@ -140,9 +140,15 @@ struct SNPlaceTile: View {
 struct SNStatusChip: View {
     let online: Bool
     let meshCount: Int
+    var syncing: Bool = false
     let onTap: () -> Void
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private var subtitle: String {
+        guard online else { return "\(meshCount) nearby on Bluetooth" }
+        return syncing ? "Catching up…" : "reaches anyone"
+    }
 
     var body: some View {
         HStack {
@@ -154,7 +160,7 @@ struct SNStatusChip: View {
                         Text(online ? "Online" : "Offline")
                             .fontWeight(.bold)
                             .foregroundColor(SonarTheme.text)
-                        + Text(verbatim: " · \(online ? "reaches anyone" : "\(meshCount) nearby on Bluetooth")")
+                        + Text(verbatim: " · \(subtitle)")
                     )
                     .font(SonarTheme.uiFont(size: 13))
                     .foregroundColor(SonarTheme.text2)

@@ -612,6 +612,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         private set
     var connecting by mutableStateOf(false)
         private set
+    /** True while a foreground/push-tap catch-up sync is running. Passive UI
+     *  signal only (status chip subtitle); never gates paint or sending. */
+    var syncing by mutableStateOf(false)
+        private set
     /** True only after mesh storage and the encrypted Marmot database have been
      *  combined into one coherent local Home model. Relay state is irrelevant. */
     var homeMessagesHydrated by mutableStateOf(false)
@@ -3080,16 +3084,21 @@ class SonarAppState(private val scope: CoroutineScope) {
                 startRelayConnection()
                 if (SonarCore.isRelayConnected()) refreshKnownContactDescriptors(clearMisses = false)
                 scope.launch {
-                    if (SonarCore.isRelayConnected()) {
-                        publishSonarDescriptorIfNeeded(force = true)
-                        // Foreground resume is a real wake event: force the
-                        // batched gap-recovery fetch (a message may have arrived
-                        // while the socket was torn down in the background).
-                        runCatching { SonarCore.syncForce() }
+                    syncing = true
+                    try {
+                        if (SonarCore.isRelayConnected()) {
+                            publishSonarDescriptorIfNeeded(force = true)
+                            // Foreground resume is a real wake event: force the
+                            // batched gap-recovery fetch (a message may have arrived
+                            // while the socket was torn down in the background).
+                            runCatching { SonarCore.syncForce() }
+                        }
+                        drainDirectDms()
+                        refreshChats()
+                        recomputeConversations()
+                    } finally {
+                        syncing = false
                     }
-                    drainDirectDms()
-                    refreshChats()
-                    recomputeConversations()
                     (screen as? Screen.Channel)?.let { refreshChannel(it.geohash) }
                     refreshPresenceCounts()
                 }
@@ -3106,21 +3115,26 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (!started) return
         startRelayConnection()
         scope.launch {
-            // Explicit immediate sync (chat open / manual refresh) is a wake-like
-            // event: force the gap-recovery fetch, don't let it short-circuit.
-            if (SonarCore.isRelayConnected()) runCatching { SonarCore.syncForce() }
-            drainDirectDms()
-            refreshChats()
-            recomputeConversations()
-            (screen as? Screen.Chat)?.let { sc ->
-                if (isMeshChat(sc.id)) refreshOpenDm(meshPeerId(sc.id))
-                else {
-                    setCurrentVisibleMessages(
-                        sc.id,
-                        withSendEchoes(sc.id, mergePendingMediaUploads(sc.id, marmotMessagesPageForChat(sc.id))),
-                        processCalls = true,
-                    )
+            syncing = true
+            try {
+                // Explicit immediate sync (chat open / manual refresh) is a wake-like
+                // event: force the gap-recovery fetch, don't let it short-circuit.
+                if (SonarCore.isRelayConnected()) runCatching { SonarCore.syncForce() }
+                drainDirectDms()
+                refreshChats()
+                recomputeConversations()
+                (screen as? Screen.Chat)?.let { sc ->
+                    if (isMeshChat(sc.id)) refreshOpenDm(meshPeerId(sc.id))
+                    else {
+                        setCurrentVisibleMessages(
+                            sc.id,
+                            withSendEchoes(sc.id, mergePendingMediaUploads(sc.id, marmotMessagesPageForChat(sc.id))),
+                            processCalls = true,
+                        )
+                    }
                 }
+            } finally {
+                syncing = false
             }
         }
     }

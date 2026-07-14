@@ -307,7 +307,7 @@ private fun HomeScreen(state: SonarAppState) {
 
             // status chip — centered pill
             Box(Modifier.fillMaxWidth().padding(bottom = 10.dp), contentAlignment = Alignment.Center) {
-                StatusChipPill(state.started, state.connecting, meshCount) { connSheet = true }
+                StatusChipPill(state.started, state.connecting, meshCount, syncing = state.syncing) { connSheet = true }
             }
 
             LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 120.dp)) {
@@ -476,7 +476,7 @@ private fun channelName(geohash: String): String =
 
 /** bc-chip — centered status pill: dot + "<b>Online</b> · reaches anyone". */
 @Composable
-private fun StatusChipPill(online: Boolean, connecting: Boolean, meshCount: Int, onClick: () -> Unit) {
+private fun StatusChipPill(online: Boolean, connecting: Boolean, meshCount: Int, syncing: Boolean = false, onClick: () -> Unit) {
     val s = sonar
     Row(
         Modifier.clip(RoundedCornerShape(999.dp)).background(s.surface)
@@ -488,6 +488,7 @@ private fun StatusChipPill(online: Boolean, connecting: Boolean, meshCount: Int,
         Spacer(Modifier.width(8.dp))
         val label = if (online) "Online" else "Offline"
         val desc = when {
+            online && syncing -> "catching up…"
             online -> "reaches anyone"
             connecting -> "connecting…"
             else -> "$meshCount nearby on Bluetooth"

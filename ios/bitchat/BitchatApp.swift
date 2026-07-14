@@ -67,6 +67,7 @@ struct BitchatApp: App {
                 .environmentObject(sonarStore)
                 .onAppear {
                     NotificationDelegate.shared.chatViewModel = chatViewModel
+                    NotificationDelegate.shared.sonarStore = sonarStore
                     // Inject live Noise service into VerificationService to avoid creating new BLE instances
                     VerificationService.shared.configure(with: chatViewModel.meshService.getNoiseService())
                     // Prewarm Nostr identity and QR to make first VERIFY sheet fast
@@ -360,6 +361,22 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate {
 final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
     static let shared = NotificationDelegate()
     weak var chatViewModel: ChatViewModel?
+    weak var sonarStore: SonarAppStore?
+
+    /// True when the tapped notification came from the Transponder/Marmot chat
+    /// push path. The NSE copies the push userInfo onto the delivered content,
+    /// so these keys survive to the tap.
+    private static func isTransponderChatPush(_ userInfo: [AnyHashable: Any]) -> Bool {
+        if userInfo["mip05"] != nil || userInfo["transponder"] != nil || userInfo["wn_nse_prototype"] != nil {
+            return true
+        }
+        if let source = userInfo["source"] as? String, source == "transponder" || source == "marmot" {
+            return true
+        }
+        if let kind = userInfo["kind"] as? Int, kind == 446 { return true }
+        if let kind = userInfo["kind"] as? String, kind == "446" { return true }
+        return false
+    }
 
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse, withCompletionHandler completionHandler: @escaping () -> Void) {
         let identifier = response.notification.request.identifier
@@ -381,6 +398,13 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
             #else
             DispatchQueue.main.async { NSWorkspace.shared.open(url) }
             #endif
+        }
+        // Tapping a Transponder/Marmot chat push: kick an immediate catch-up
+        // sync so the user sees the pushed message instead of a stale list.
+        if Self.isTransponderChatPush(userInfo) {
+            Task { @MainActor in
+                self.sonarStore?.marmot.refreshAfterForeground()
+            }
         }
 
         completionHandler()
