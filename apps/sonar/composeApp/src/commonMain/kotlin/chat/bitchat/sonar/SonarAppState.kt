@@ -760,10 +760,18 @@ class SonarAppState(private val scope: CoroutineScope) {
         private set
     var connecting by mutableStateOf(false)
         private set
+    /** Number of catch-up syncs in flight. Overlap-safe: concurrent
+     *  foreground-cycle + immediate-sync jobs each increment/decrement so the
+     *  first one to finish cannot clear the chip while another still runs. */
+    private var activeCatchupSyncs by mutableStateOf(0)
     /** True while a foreground/push-tap catch-up sync is running. Passive UI
      *  signal only (status chip subtitle); never gates paint or sending. */
-    var syncing by mutableStateOf(false)
-        private set
+    val syncing: Boolean get() = activeCatchupSyncs > 0
+    /** Single-flight guard for the forced gap-recovery sync so overlapping
+     *  foreground/immediate-sync requests don't double-enqueue syncForce on the
+     *  serial engine queue (which is shared with sends). Confined to the Main
+     *  dispatcher (all callers run on `scope`, which is a UI scope). */
+    private var forcedCatchupInFlight = false
     /** True only after mesh storage and the encrypted Marmot database have been
      *  combined into one coherent local Home model. Relay state is irrelevant. */
     var homeMessagesHydrated by mutableStateOf(false)
@@ -3711,20 +3719,19 @@ class SonarAppState(private val scope: CoroutineScope) {
                 startRelayConnection()
                 if (SonarCore.isRelayConnected()) refreshKnownContactDescriptors(clearMisses = false)
                 scope.launch {
-                    syncing = true
+                    activeCatchupSyncs++
                     try {
-                        if (SonarCore.isRelayConnected()) {
-                            publishSonarDescriptorIfNeeded(force = true)
-                            // Foreground resume is a real wake event: force the
-                            // batched gap-recovery fetch (a message may have arrived
-                            // while the socket was torn down in the background).
-                            runCatching { SonarCore.syncForce() }
-                        }
+                        // Foreground resume is a real wake event: force the batched
+                        // gap-recovery fetch (a message may have arrived while the
+                        // socket was torn down in the background). If relays are
+                        // still detached, wait bounded for reconnect before forcing
+                        // so the chip reflects a sync that actually ran.
+                        forcedCatchupSync(awaitRelay = true)
                         drainDirectDms()
                         refreshChats()
                         recomputeConversations()
                     } finally {
-                        syncing = false
+                        activeCatchupSyncs--
                     }
                     (screen as? Screen.Channel)?.let { refreshChannel(it.geohash) }
                     refreshPresenceCounts()
@@ -3742,11 +3749,13 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (!started) return
         startRelayConnection()
         scope.launch {
-            syncing = true
+            activeCatchupSyncs++
             try {
                 // Explicit immediate sync (chat open / manual refresh) is a wake-like
                 // event: force the gap-recovery fetch, don't let it short-circuit.
-                if (SonarCore.isRelayConnected()) runCatching { SonarCore.syncForce() }
+                // Single-flight-guarded so it coalesces with a concurrent
+                // foreground-cycle catch-up instead of double-enqueuing syncForce.
+                forcedCatchupSync(awaitRelay = false)
                 drainDirectDms()
                 refreshChats()
                 recomputeConversations()
@@ -3761,7 +3770,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                     }
                 }
             } finally {
-                syncing = false
+                activeCatchupSyncs--
             }
         }
     }
@@ -4190,6 +4199,42 @@ class SonarAppState(private val scope: CoroutineScope) {
         startRelayConnection()
         while (started && !SonarCore.isRelayConnected()) delay(100)
         return started && SonarCore.isRelayConnected()
+    }
+
+    /** Bounded variant used by the catch-up path: kick relay reconnection and
+     *  wait up to [timeoutMs] for it to attach. Never blocks paint/send — this
+     *  only runs inside a background catch-up job whose sole visible effect is
+     *  the passive "catching up…" chip. Returns false on timeout so the chip
+     *  clears instead of hanging while offline. */
+    private suspend fun awaitRelayConnectionBounded(timeoutMs: Long = 8_000): Boolean {
+        if (!started) return false
+        startRelayConnection()
+        var waited = 0L
+        while (started && !SonarCore.isRelayConnected() && waited < timeoutMs) {
+            delay(100)
+            waited += 100
+        }
+        return started && SonarCore.isRelayConnected()
+    }
+
+    /** Single-flight forced gap-recovery sync. If [awaitRelay] is set and relays
+     *  are down, wait bounded for reconnection before forcing the batched fetch
+     *  (fixes the "chip shows Online while catch-up never ran" race when relays
+     *  are disconnected at foreground time). Returns immediately if a forced
+     *  catch-up is already running so overlapping requests don't double-enqueue
+     *  syncForce on the serial engine queue. */
+    private suspend fun forcedCatchupSync(awaitRelay: Boolean) {
+        if (forcedCatchupInFlight) return
+        forcedCatchupInFlight = true
+        try {
+            val connected = SonarCore.isRelayConnected() || (awaitRelay && awaitRelayConnectionBounded())
+            if (connected) {
+                publishSonarDescriptorIfNeeded(force = true)
+                runCatching { SonarCore.syncForce() }
+            }
+        } finally {
+            forcedCatchupInFlight = false
+        }
     }
 
     private suspend fun completeRelayStartup() {

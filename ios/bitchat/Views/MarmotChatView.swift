@@ -331,6 +331,11 @@ final class MarmotChatModel: ObservableObject {
     /// True while a foreground/push-tap catch-up sync is running. Passive UI
     /// signal only: it must never gate paint, sending, or scrolling.
     @Published private(set) var syncingInFlight = false
+    /// The single in-flight foreground/push-tap catch-up refresh. Coalesces the
+    /// scenePhase-driven and notification-tap-driven refresh paths so they don't
+    /// both enqueue `syncForce()` on the serial engine queue (shared with sends)
+    /// and so `syncingInFlight` is owned by exactly one run. @MainActor-isolated.
+    private var refreshTask: Task<Void, Never>?
     /// True after the first local encrypted-DB hydration attempt finishes.
     /// Home uses this as its atomic reveal boundary; relay state is irrelevant.
     @Published private(set) var initialLocalHomeReady = false
@@ -1324,9 +1329,17 @@ final class MarmotChatModel: ObservableObject {
     /// is single-flight in the background; `conversationChanged` + the polling
     /// drain loop repaint as rows land in local storage.
     func refreshAfterForeground() {
-        foregroundRefreshTask?.cancel()
-        foregroundRefreshTask = Task { [weak self] in
+        // Single-flight: if a foreground/push-tap catch-up is already running,
+        // let it finish instead of starting a second one. Both the scenePhase
+        // transition and a notification tap can call this; without coalescing
+        // they double-enqueue syncForce() on the serial engine queue and the
+        // first completion clears syncingInFlight while the other still runs.
+        if let existing = refreshTask, !existing.isCancelled {
+            return
+        }
+        refreshTask = Task { @MainActor [weak self] in
             guard let self else { return }
+            defer { self.refreshTask = nil }
             guard await self.ensureConnected() else { return }
             self.syncingInFlight = true
             defer { self.syncingInFlight = false }
@@ -1337,6 +1350,9 @@ final class MarmotChatModel: ObservableObject {
             try? await self.service.ensureSubscriptions()
             try? await self.service.drainPending()
             await self.loadLocalSummaries()
+            // Route the actual gap-recovery sync through the shared
+            // single-flight gate so a concurrent push-wake `refresh()` cannot
+            // double-enqueue `syncForce()` on the serial engine queue.
             _ = self.ensureGapRecovery()
         }
     }
