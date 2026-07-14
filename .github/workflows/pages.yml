@@ -6,12 +6,16 @@ on:
       - main
     paths:
       - 'web/**'
+      - 'docs/blog/**'
+      - 'scripts/blog/**'
       - '.github/workflows/pages.yml'
   pull_request:
     branches:
       - main
     paths:
       - 'web/**'
+      - 'docs/blog/**'
+      - 'scripts/blog/**'
       - '.github/workflows/pages.yml'
   workflow_dispatch:
 
@@ -44,6 +48,17 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Generate blog data from Nostr
+        # Reads the author's NIP-23 articles from relays into
+        # web/src/lib/blog-content.js. Falls back to docs/blog if BLOG_NPUB is
+        # unset or relays return nothing, so the build never fails on this.
+        working-directory: scripts/blog
+        env:
+          BLOG_NPUB: ${{ vars.BLOG_NPUB }}
+        run: |
+          npm ci
+          npm run fetch
 
       - name: Build
         env:
