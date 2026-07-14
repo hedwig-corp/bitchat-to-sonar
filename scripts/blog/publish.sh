@@ -41,7 +41,11 @@ RELAYS=(
   wss://nostr.relay.hedwig.sh
 )
 
-command -v nak >/dev/null 2>&1 || { echo "error: nak not found (go install github.com/fiatjaf/nak@latest)" >&2; exit 1; }
+# nak invocation. Defaults to `go run` so no binary install is needed (Go does
+# need to be on PATH). Override with e.g. NAK=nak to use an installed binary.
+# shellcheck disable=SC2206
+NAK=(${NAK:-go run github.com/fiatjaf/nak@latest})
+command -v "${NAK[0]}" >/dev/null 2>&1 || { echo "error: ${NAK[0]} not found (needed to run nak)" >&2; exit 1; }
 command -v node >/dev/null 2>&1 || { echo "error: node not found" >&2; exit 1; }
 
 DRY_RUN=0
@@ -97,11 +101,11 @@ for readme in "${READMES[@]}"; do
 
   if [[ "$DRY_RUN" -eq 1 ]]; then
     echo "── dry-run: $slug ──" >&2
-    printf '%s' "$event_json" | nak "${nak_args[@]}"
+    printf '%s' "$event_json" | "${NAK[@]}" "${nak_args[@]}"
     echo
   else
     echo "── publishing: $slug ──" >&2
-    printf '%s' "$event_json" | nak "${nak_args[@]}" "${RELAYS[@]}"
+    printf '%s' "$event_json" | "${NAK[@]}" "${nak_args[@]}" "${RELAYS[@]}"
     echo
   fi
 done
