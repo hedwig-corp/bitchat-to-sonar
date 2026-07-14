@@ -123,6 +123,44 @@ class MainActivity : ComponentActivity() {
         }
         handleInviteIntent(intent)
         handleShareIntent(intent)
+        maybeDebugNotificationSound(intent)
+    }
+
+    /** Debug-only: `adb shell am start -n chat.bitchat.sonar/.MainActivity \
+     *  -f 0x14000000 --ez sonar.debug.notify_sound true` posts both channel
+     *  sounds and plays each resource through RingtoneManager. */
+    private fun maybeDebugNotificationSound(intent: Intent?) {
+        if (!BuildConfig.DEBUG) return
+        if (intent?.getBooleanExtra("sonar.debug.notify_sound", false) != true) return
+        intent.removeExtra("sonar.debug.notify_sound")
+        Notifier.ensureChannel()
+        // Cancel first so an update of the same id does not suppress the alert.
+        val nm = getSystemService(android.app.NotificationManager::class.java)
+        nm.cancel(990_001)
+        nm.cancel(990_002)
+        Notifier.notify(
+            id = 990_001,
+            title = "Sonar sound test",
+            body = "Default / Internet channel",
+            sound = SonarNotificationSound.Default,
+        )
+        Notifier.notify(
+            id = 990_002,
+            title = "Sonar BLE sound test",
+            body = "Bluetooth channel",
+            sound = SonarNotificationSound.Ble,
+        )
+        // Also play via Ringtone so a silent NotificationPlayer path is obvious.
+        val defaultUri = android.net.Uri.parse(
+            "${android.content.ContentResolver.SCHEME_ANDROID_RESOURCE}://$packageName/raw/sonar_notification"
+        )
+        val bleUri = android.net.Uri.parse(
+            "${android.content.ContentResolver.SCHEME_ANDROID_RESOURCE}://$packageName/raw/sonar_ble_notification"
+        )
+        android.media.RingtoneManager.getRingtone(this, defaultUri)?.play()
+        window.decorView.postDelayed({
+            android.media.RingtoneManager.getRingtone(this, bleUri)?.play()
+        }, 1800)
     }
 
     /** Explicit Debug-only device benchmark input. It never installs the pack
@@ -152,6 +190,7 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         handleInviteIntent(intent)
         handleShareIntent(intent)
+        maybeDebugNotificationSound(intent)
     }
 
     private fun handleInviteIntent(intent: Intent?) {

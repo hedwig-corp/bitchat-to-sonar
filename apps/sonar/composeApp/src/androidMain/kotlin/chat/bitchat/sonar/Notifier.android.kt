@@ -9,22 +9,31 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
+import android.media.RingtoneManager
 import android.net.Uri
 import android.os.Build
 
 /** Android `actual`: transport-specific channels with sound, vibration, and badges. */
 actual object Notifier {
-    private const val MESSAGE_CHANNEL = "messages_v4"
-    private const val BLE_CHANNEL = "ble_notifications_v2"
+    private const val MESSAGE_CHANNEL = "messages_v5"
+    private const val BLE_CHANNEL = "ble_notifications_v3"
     private val LEGACY_CHANNELS = listOf(
         "messages",
         "messages_v2",
         "messages_v3",
+        "messages_v4",
         "ble_notifications_v1",
+        "ble_notifications_v2",
     )
 
     private val ctx: Context get() = AppContextHolder.ctx
     private fun manager() = ctx.getSystemService(NotificationManager::class.java)
+
+    /**
+     * Stable type/name URI so channel sound survives resource-id renumbering.
+     * Android notification playback is most reliable with MP3/OGG in res/raw;
+     * WAVs with LIST/INFO metadata chunks often fail silently on NotificationPlayer.
+     */
     private fun soundUri(resourceId: Int): Uri {
         val resourceType = ctx.resources.getResourceTypeName(resourceId)
         val resourceName = ctx.resources.getResourceEntryName(resourceId)
@@ -43,7 +52,6 @@ actual object Notifier {
                 name = "Messages",
                 description = "Incoming Sonar messages",
                 soundResourceId = R.raw.sonar_notification,
-                audioUsage = AudioAttributes.USAGE_NOTIFICATION_COMMUNICATION_INSTANT,
             )
             ensureChannel(
                 nm = nm,
@@ -51,7 +59,6 @@ actual object Notifier {
                 name = "Bluetooth notifications",
                 description = "Notifications received over Bluetooth",
                 soundResourceId = R.raw.sonar_ble_notification,
-                audioUsage = AudioAttributes.USAGE_NOTIFICATION,
             )
         }
     }
@@ -62,25 +69,25 @@ actual object Notifier {
         name: String,
         description: String,
         soundResourceId: Int,
-        audioUsage: Int,
     ) {
-        if (nm.getNotificationChannel(id) == null) {
-            nm.createNotificationChannel(
-                NotificationChannel(id, name, NotificationManager.IMPORTANCE_HIGH).apply {
-                    this.description = description
-                    enableVibration(true)
-                    vibrationPattern = longArrayOf(0, 250, 200, 250)
-                    setSound(
-                        soundUri(soundResourceId),
-                        AudioAttributes.Builder()
-                            .setUsage(audioUsage)
-                            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                            .build()
-                    )
-                    setShowBadge(true)
-                }
-            )
+        if (nm.getNotificationChannel(id) != null) return
+        val uri = soundUri(soundResourceId)
+        val audioAttributes = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_NOTIFICATION)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+            .build()
+        if (RingtoneManager.getRingtone(ctx, uri) == null) {
+            sonarLog("Notifier", "Notification sound unreadable for $id uri=$uri")
         }
+        nm.createNotificationChannel(
+            NotificationChannel(id, name, NotificationManager.IMPORTANCE_HIGH).apply {
+                this.description = description
+                enableVibration(true)
+                vibrationPattern = longArrayOf(0, 250, 200, 250)
+                setSound(uri, audioAttributes)
+                setShowBadge(true)
+            }
+        )
     }
 
     actual fun canNotify(): Boolean {
@@ -127,6 +134,7 @@ actual object Notifier {
             .setContentText(body)
             .setAutoCancel(true)
             .setNumber(1)
+            .setCategory(Notification.CATEGORY_MESSAGE)
             .apply { if (pi != null) setContentIntent(pi) }
             .build()
         manager().notify(id, n)

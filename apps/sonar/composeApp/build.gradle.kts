@@ -240,7 +240,9 @@ android {
     // The Rust core .so per ABI lives in src/androidMain/jniLibs (produced by
     // core/build-android.sh). Map it onto the Android main source set.
     sourceSets["main"].jniLibs.srcDirs("src/androidMain/jniLibs")
-    sourceSets["main"].res.srcDir(notificationResourcesDir)
+    // Android packages MP3 copies under src/androidMain/res/raw — NotificationPlayer
+    // often fails silently on WAV files that carry LIST/INFO metadata chunks.
+    // Desktop/JVM still loads the shared PCM WAVs from assets/notifications/raw.
 
     packaging {
         jniLibs {
