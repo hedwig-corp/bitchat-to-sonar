@@ -6183,6 +6183,20 @@ public func meshParseStickerContent(content: String) -> StickerRefInfo?  {
 })
 }
 /**
+ * Decode a Sonar discovery/profile announce only when its Ed25519 signature
+ * verifies against the signing key from that sender's verified identity
+ * announce. The full wire packet is required because the signature covers the
+ * packet header and payload (with TTL canonicalized to zero).
+ */
+public func meshParseVerifiedSonarAnnounce(packetBytes: Data, signingPublicKeyHex: String) -> Data?  {
+    return try!  FfiConverterOptionData.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_func_mesh_parse_verified_sonar_announce(
+        FfiConverterData.lower(packetBytes),
+        FfiConverterString.lower(signingPublicKeyHex),$0
+    )
+})
+}
+/**
  * Ed25519 mesh signing public key (hex) for a 32-byte seed (hex).
  */
 public func meshSigningPublicKey(seedHex: String)throws  -> String  {
@@ -6336,6 +6350,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_func_mesh_parse_sticker_content() != 19934) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_mesh_parse_verified_sonar_announce() != 51138) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_func_mesh_signing_public_key() != 29933) {

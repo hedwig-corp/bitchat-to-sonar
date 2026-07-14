@@ -63,6 +63,37 @@ internal enum class BleScanRestartReason(val logValue: String) {
 }
 
 /**
+ * Classifies a verified announce by its relationship to the physical BLE link.
+ *
+ * A mesh relay legitimately forwards announces from peers other than itself, so
+ * only a full-TTL announce may bind the relay's BLE address. Announcements that
+ * originated here can loop back over a second central/peripheral connection and
+ * must not be published as a nearby peer.
+ */
+internal enum class MeshAnnounceRoute {
+    SelfEcho,
+    Direct,
+    Relayed,
+}
+
+internal fun meshAnnounceRoute(
+    localPeerIdHex: String,
+    senderPeerIdHex: String,
+    ttl: UByte,
+    directTtl: UByte = 7u,
+): MeshAnnounceRoute = when {
+    senderPeerIdHex.equals(localPeerIdHex, ignoreCase = true) -> MeshAnnounceRoute.SelfEcho
+    ttl == directTtl -> MeshAnnounceRoute.Direct
+    else -> MeshAnnounceRoute.Relayed
+}
+
+/** Once a sender ID has established an Ed25519 signing key, later announces
+ * must not replace it. Reinstall/reset rotates the Noise key and therefore the
+ * sender ID as well, so an in-place signing-key change is an impersonation. */
+internal fun meshSigningKeyMatches(existingKeyHex: String?, announcedKeyHex: String): Boolean =
+    existingKeyHex == null || existingKeyHex.equals(announcedKeyHex, ignoreCase = true)
+
+/**
  * Decide whether Android's BLE scan needs recovery without confusing repeated
  * advertisements from a connected peer with scanner starvation.
  */
