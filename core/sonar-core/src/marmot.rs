@@ -306,6 +306,13 @@ macro_rules! dispatch {
 pub struct MarmotEngine {
     storage: Storage,
     identity: Identity,
+    /// Serializes MLS-mutating storage operations (message/commit creation,
+    /// incoming processing, group membership changes) so hosts may run sends
+    /// concurrently with sync/drain instead of funneling every engine call
+    /// through one serial queue. Guarded sections are synchronous — the lock
+    /// is never held across an await, so a concurrent send waits for at most
+    /// one in-flight mutation, never for a relay fetch.
+    write_lock: std::sync::Mutex<()>,
 }
 
 impl MarmotEngine {
@@ -315,6 +322,7 @@ impl MarmotEngine {
         Self {
             storage: Storage::Memory(Box::new(MDK::new(MdkMemoryStorage::default()))),
             identity,
+            write_lock: std::sync::Mutex::new(()),
         }
     }
 
@@ -362,11 +370,21 @@ impl MarmotEngine {
         Ok(Self {
             storage: Storage::Sqlite(Box::new(MDK::new(storage))),
             identity,
+            write_lock: std::sync::Mutex::new(()),
         })
     }
 
     pub fn identity(&self) -> &Identity {
         &self.identity
+    }
+
+    /// Take the MLS write lock. A poisoned lock only means another thread
+    /// panicked mid-call; MDK/SQLite transactions keep the store consistent,
+    /// so recover the guard instead of propagating the poison.
+    fn mls_write(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Erase the on-disk SQLCipher database at `db_path` and its sidecar files.
@@ -389,6 +407,7 @@ impl MarmotEngine {
     /// Build a signed kind-30443 KeyPackage event, ready to publish to
     /// `relays` (which are also advertised inside the event tags).
     pub fn key_package_event(&self, relays: Vec<RelayUrl>) -> Result<Event> {
+        let _mls = self.mls_write();
         let kp = dispatch!(&self.storage, |mdk| mdk
             .create_key_package_for_event(&self.identity.public_key(), relays))?;
         let event = EventBuilder::new(Kind::Custom(KEY_PACKAGE_KIND), kp.content)
@@ -422,6 +441,7 @@ impl MarmotEngine {
         member_key_packages: Vec<Event>,
         relays: Vec<RelayUrl>,
     ) -> Result<GroupCreation> {
+        let _mls = self.mls_write();
         let mut admins: Vec<PublicKey> = member_key_packages.iter().map(|e| e.pubkey).collect();
         admins.push(self.identity.public_key());
         let member_pubkeys: Vec<PublicKey> = member_key_packages.iter().map(|e| e.pubkey).collect();
@@ -461,6 +481,7 @@ impl MarmotEngine {
         group_id: &GroupId,
         member_key_packages: Vec<Event>,
     ) -> Result<GroupMembershipUpdate> {
+        let _mls = self.mls_write();
         let member_pubkeys: Vec<PublicKey> = member_key_packages.iter().map(|e| e.pubkey).collect();
         let result = dispatch!(&self.storage, |mdk| mdk
             .add_members(group_id, &member_key_packages))?;
@@ -473,30 +494,35 @@ impl MarmotEngine {
         group_id: &GroupId,
         members: &[PublicKey],
     ) -> Result<GroupMembershipUpdate> {
+        let _mls = self.mls_write();
         let result = dispatch!(&self.storage, |mdk| mdk.remove_members(group_id, members))?;
         Ok(Self::to_membership_update(result, Vec::new(), true))
     }
 
     /// Create a self-demotion commit. Required before an admin leaves.
     pub fn self_demote(&self, group_id: &GroupId) -> Result<GroupMembershipUpdate> {
+        let _mls = self.mls_write();
         let result = dispatch!(&self.storage, |mdk| mdk.self_demote(group_id))?;
         Ok(Self::to_membership_update(result, Vec::new(), true))
     }
 
     /// Create a leave proposal for the current member.
     pub fn leave_group(&self, group_id: &GroupId) -> Result<GroupMembershipUpdate> {
+        let _mls = self.mls_write();
         let result = dispatch!(&self.storage, |mdk| mdk.leave_group(group_id))?;
         Ok(Self::to_membership_update(result, Vec::new(), false))
     }
 
     /// Merge a pending local commit after the caller has published it.
     pub fn merge_pending_commit(&self, group_id: &GroupId) -> Result<()> {
+        let _mls = self.mls_write();
         Ok(dispatch!(&self.storage, |mdk| mdk.merge_pending_commit(group_id))?)
     }
 
     /// Roll back a pending local commit when publish fails before it reaches the
     /// relays. This keeps the group usable for a later retry.
     pub fn clear_pending_commit(&self, group_id: &GroupId) -> Result<()> {
+        let _mls = self.mls_write();
         Ok(dispatch!(&self.storage, |mdk| mdk.clear_pending_commit(group_id))?)
     }
 
@@ -536,6 +562,12 @@ impl MarmotEngine {
     /// The returned event is signed by an MDK-generated ephemeral key and is
     /// already recorded as "ours" in storage once processed back.
     pub fn create_text_message(&self, group_id: &GroupId, text: &str) -> Result<Event> {
+        let _mls = self.mls_write();
+        self.create_text_event_inner(group_id, text)
+    }
+
+    /// Requires the caller to hold the MLS write guard.
+    fn create_text_event_inner(&self, group_id: &GroupId, text: &str) -> Result<Event> {
         let rumor = EventBuilder::new(Kind::Custom(CHAT_RUMOR_KIND), text)
             .build(self.identity.public_key());
         let event = dispatch!(&self.storage, |mdk| mdk
@@ -543,10 +575,35 @@ impl MarmotEngine {
         Ok(event)
     }
 
+    /// Create an outgoing text message AND write its local transcript row under
+    /// ONE MLS write guard. Without the shared guard, a concurrently drained
+    /// commit could advance the group epoch between encryption and local
+    /// processing and strand the just-sent row.
+    pub fn create_and_process_text_message(
+        &self,
+        group_id: &GroupId,
+        text: &str,
+    ) -> Result<(Event, Incoming)> {
+        let _mls = self.mls_write();
+        let event = self.create_text_event_inner(group_id, text)?;
+        let incoming = self.process_group_message(&event)?;
+        Ok((event, incoming))
+    }
+
     /// Encrypt a sticker message into a signed kind-445 event for `group_id`.
     /// The rumor carries the sticker ref tag so the receiver can resolve the
     /// sticker image from the pack's Blossom URL.
     pub fn create_sticker_message(
+        &self,
+        group_id: &GroupId,
+        sticker_ref: &StickerRef,
+    ) -> Result<Event> {
+        let _mls = self.mls_write();
+        self.create_sticker_event_inner(group_id, sticker_ref)
+    }
+
+    /// Requires the caller to hold the MLS write guard.
+    fn create_sticker_event_inner(
         &self,
         group_id: &GroupId,
         sticker_ref: &StickerRef,
@@ -558,6 +615,19 @@ impl MarmotEngine {
         let event = dispatch!(&self.storage, |mdk| mdk
             .create_message(group_id, rumor, None))?;
         Ok(event)
+    }
+
+    /// Sticker variant of [`Self::create_and_process_text_message`]: create and
+    /// locally process under one MLS write guard.
+    pub fn create_and_process_sticker_message(
+        &self,
+        group_id: &GroupId,
+        sticker_ref: &StickerRef,
+    ) -> Result<(Event, Incoming)> {
+        let _mls = self.mls_write();
+        let event = self.create_sticker_event_inner(group_id, sticker_ref)?;
+        let incoming = self.process_group_message(&event)?;
+        Ok((event, incoming))
     }
 
     // ── Encrypted media (Marmot MIP-04) ───────────────────────────────────
@@ -608,6 +678,34 @@ impl MarmotEngine {
         if uploads.is_empty() {
             return Err(Error::Media("no media uploads for message".into()));
         }
+        let _mls = self.mls_write();
+        self.create_media_event_multi_inner(group_id, uploads, caption)
+    }
+
+    /// Media variant of [`Self::create_and_process_text_message`]: create and
+    /// locally process under one MLS write guard.
+    pub fn create_and_process_media_event_multi(
+        &self,
+        group_id: &GroupId,
+        uploads: &[(&EncryptedMediaUpload, &str)],
+        caption: &str,
+    ) -> Result<(Event, Incoming)> {
+        if uploads.is_empty() {
+            return Err(Error::Media("no media uploads for message".into()));
+        }
+        let _mls = self.mls_write();
+        let event = self.create_media_event_multi_inner(group_id, uploads, caption)?;
+        let incoming = self.process_group_message(&event)?;
+        Ok((event, incoming))
+    }
+
+    /// Requires the caller to hold the MLS write guard.
+    fn create_media_event_multi_inner(
+        &self,
+        group_id: &GroupId,
+        uploads: &[(&EncryptedMediaUpload, &str)],
+        caption: &str,
+    ) -> Result<Event> {
         let event = dispatch!(&self.storage, |mdk| {
             // One imeta tag per attachment, in send order. A fresh media_manager
             // per item mirrors the single-item path exactly.
@@ -681,6 +779,9 @@ impl MarmotEngine {
                 if unwrapped.rumor.kind != Kind::MlsWelcome {
                     return Ok(Incoming::None);
                 }
+                // Taken after the gift-wrap unwrap await: the lock must never
+                // span an await, only the synchronous MLS mutation below.
+                let _mls = self.mls_write();
                 let welcome = dispatch!(&self.storage, |mdk| mdk
                     .process_welcome(&event.id, &unwrapped.rumor))?;
                 if welcome.member_count <= 2 {
@@ -699,25 +800,32 @@ impl MarmotEngine {
                 }
             }
             Kind::MlsGroupMessage => {
-                match dispatch!(&self.storage, |mdk| mdk.process_message(event))? {
-                    MessageProcessingResult::ApplicationMessage(msg) => {
-                        Ok(Incoming::Message(self.to_chat_message(msg)))
-                    }
-                    MessageProcessingResult::Commit { mls_group_id }
-                    | MessageProcessingResult::PendingProposal { mls_group_id } => {
-                        Ok(Incoming::GroupUpdated(mls_group_id))
-                    }
-                    MessageProcessingResult::Proposal(update) => Ok(Incoming::GroupProposal(
-                        Self::to_membership_update(update, Vec::new(), true),
-                    )),
-                    // MDK persists a Failed processing record on the first
-                    // failure and short-circuits every re-delivery with the
-                    // same result, so these are terminal for the sync layer.
-                    MessageProcessingResult::Unprocessable { .. }
-                    | MessageProcessingResult::PreviouslyFailed => Ok(Incoming::Failed),
-                    _ => Ok(Incoming::None),
-                }
+                let _mls = self.mls_write();
+                self.process_group_message(event)
             }
+            _ => Ok(Incoming::None),
+        }
+    }
+
+    /// Process a kind-445 group message into the local store. Synchronous MLS
+    /// mutation — requires the caller to hold the MLS write guard.
+    fn process_group_message(&self, event: &Event) -> Result<Incoming> {
+        match dispatch!(&self.storage, |mdk| mdk.process_message(event))? {
+            MessageProcessingResult::ApplicationMessage(msg) => {
+                Ok(Incoming::Message(self.to_chat_message(msg)))
+            }
+            MessageProcessingResult::Commit { mls_group_id }
+            | MessageProcessingResult::PendingProposal { mls_group_id } => {
+                Ok(Incoming::GroupUpdated(mls_group_id))
+            }
+            MessageProcessingResult::Proposal(update) => Ok(Incoming::GroupProposal(
+                Self::to_membership_update(update, Vec::new(), true),
+            )),
+            // MDK persists a Failed processing record on the first
+            // failure and short-circuits every re-delivery with the
+            // same result, so these are terminal for the sync layer.
+            MessageProcessingResult::Unprocessable { .. }
+            | MessageProcessingResult::PreviouslyFailed => Ok(Incoming::Failed),
             _ => Ok(Incoming::None),
         }
     }
@@ -743,6 +851,7 @@ impl MarmotEngine {
 
     /// Accept a pending group invite by its kind-444 welcome event id.
     pub fn accept_group_invite(&self, welcome_id: &EventId) -> Result<GroupId> {
+        let _mls = self.mls_write();
         let welcome = dispatch!(&self.storage, |mdk| mdk.get_welcome(welcome_id))?
             .ok_or_else(|| Error::InvalidInput(format!("unknown group invite {welcome_id}")))?;
         let group_id = welcome.mls_group_id.clone();
@@ -752,6 +861,7 @@ impl MarmotEngine {
 
     /// Decline a pending group invite by its kind-444 welcome event id.
     pub fn decline_group_invite(&self, welcome_id: &EventId) -> Result<()> {
+        let _mls = self.mls_write();
         let welcome = dispatch!(&self.storage, |mdk| mdk.get_welcome(welcome_id))?
             .ok_or_else(|| Error::InvalidInput(format!("unknown group invite {welcome_id}")))?;
         dispatch!(&self.storage, |mdk| mdk.decline_welcome(&welcome))?;
@@ -1144,6 +1254,7 @@ impl MarmotEngine {
     /// the peer is NOT notified (this is "delete this chat from my device", like
     /// deleting a conversation in Signal/iMessage). Idempotent.
     pub fn delete_group(&self, group_id: &GroupId) -> Result<()> {
+        let _mls = self.mls_write();
         Ok(dispatch!(&self.storage, |mdk| mdk.delete_group(group_id))?)
     }
 

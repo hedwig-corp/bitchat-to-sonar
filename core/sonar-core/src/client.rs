@@ -1169,6 +1169,15 @@ pub struct SonarClient {
     /// Count of outbox publish tasks in flight. Historical catch-up yields while
     /// this is non-zero so user sends keep relay/runtime priority (P0).
     send_inflight: Arc<AtomicUsize>,
+    /// Excludes sends from OUR in-flight membership changes. A membership flow
+    /// (add/remove/leave/auto-commit) holds write from commit creation through
+    /// publish+merge; send paths hold read around encrypt+local-write, so a
+    /// message can never be encrypted at a pre-removal epoch while our own
+    /// removal commit is on the wire. Deliberately client-wide, not per-group:
+    /// membership changes are rare and the write window is bounded by the
+    /// relay publish. (Incoming membership commits from OTHERS are inherently
+    /// racy with sends across the network and are not gated.)
+    membership_gate: Arc<tokio::sync::RwLock<()>>,
     /// How many times the live pending buffer dropped its oldest half.
     buffer_drops_total: Arc<AtomicUsize>,
     /// True after the real-session Marmot live tail is opened. Local group
@@ -1388,6 +1397,7 @@ impl SonarClient {
         let pending_marmot_groups: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
         let marmot_notify = Arc::new(tokio::sync::Notify::new());
         let send_inflight = Arc::new(AtomicUsize::new(0));
+        let membership_gate = Arc::new(tokio::sync::RwLock::new(()));
         let buffer_drops_total = Arc::new(AtomicUsize::new(0));
         let live_marmot_enabled = Arc::new(Mutex::new(false));
         let marmot_group_subscriptions = Arc::new(Mutex::new(HashSet::new()));
@@ -1640,6 +1650,7 @@ impl SonarClient {
             pending_marmot_groups,
             marmot_notify,
             send_inflight,
+            membership_gate,
             buffer_drops_total,
             live_marmot_enabled,
             marmot_group_subscriptions,
@@ -2093,6 +2104,7 @@ impl SonarClient {
         members: Vec<PublicKey>,
     ) -> Result<()> {
         let key_packages = self.fetch_key_packages_for_members(members).await?;
+        let _epoch = self.membership_gate.write().await;
         let update = self.engine.add_members(group_id, key_packages)?;
         self.publish_membership_update(update).await
     }
@@ -2108,6 +2120,11 @@ impl SonarClient {
                 "remove_group_members requires at least one member".into(),
             ));
         }
+        // Write-hold the gate from commit creation through publish+merge so no
+        // send can encrypt at the pre-removal epoch while the commit is on the
+        // wire — the removed member must not be able to read anything sent
+        // after the removal was initiated.
+        let _epoch = self.membership_gate.write().await;
         let update = self.engine.remove_members(group_id, &members)?;
         self.publish_membership_update(update).await
     }
@@ -2115,6 +2132,7 @@ impl SonarClient {
     /// Notify the group that this member is leaving, then remove the group from
     /// local storage so it disappears from the chat list.
     pub async fn leave_group(&self, group_id: &GroupId) -> Result<()> {
+        let _epoch = self.membership_gate.write().await;
         let leave_update = match self.engine.leave_group(group_id) {
             Ok(update) => update,
             Err(err) if err.to_string().contains("self-demote") => {
@@ -2271,8 +2289,13 @@ impl SonarClient {
     /// state; it does not gate transcript visibility.
     pub async fn send_text(&self, group_id: &GroupId, text: &str) -> Result<()> {
         let local_started = Instant::now();
-        let event = self.engine.create_text_message(group_id, text)?;
-        let incoming = self.engine.process_incoming(&event).await?;
+        // One MLS write guard covers encrypt + local-row write, so a
+        // concurrently drained commit cannot land in between now that sends
+        // no longer share the host's serialized engine queue with sync.
+        let (event, incoming) = {
+            let _epoch = self.membership_gate.read().await;
+            self.engine.create_and_process_text_message(group_id, text)?
+        };
         let Incoming::Message(message) = incoming else {
             return Err(Error::Storage(
                 "created text message did not produce a local transcript row".into(),
@@ -2439,8 +2462,11 @@ impl SonarClient {
     /// Send a sticker message to a group. Follows the same Signal-style
     /// local-first sequencing as `send_text`.
     pub async fn send_sticker(&self, group_id: &GroupId, sticker_ref: &StickerRef) -> Result<()> {
-        let event = self.engine.create_sticker_message(group_id, sticker_ref)?;
-        let incoming = self.engine.process_incoming(&event).await?;
+        let (event, incoming) = {
+            let _epoch = self.membership_gate.read().await;
+            self.engine
+                .create_and_process_sticker_message(group_id, sticker_ref)?
+        };
         let Incoming::Message(message) = incoming else {
             return Err(Error::Storage(
                 "created sticker message did not produce a local transcript row".into(),
@@ -3066,20 +3092,31 @@ impl SonarClient {
             uploads.push((upload, url));
         }
         let refs: Vec<_> = uploads.iter().map(|(u, url)| (u, url.as_str())).collect();
-        let event = self
-            .engine
-            .create_media_event_multi(group_id, &refs, caption)?;
-        self.nostr.send_event(&event).await?;
-        let incoming = self.engine.process_incoming(&event).await?;
-        if let Incoming::Message(message) = incoming {
-            let group_id_hex = hex::encode(group_id.as_slice());
-            let group_name = self.resolve_group_name(group_id);
-            self.notify_conversation_changed(&group_id_hex);
-            self.spawn_send_bookkeeping(group_name, message, event.id);
-        }
-        let (publish_result_tx, publish_result_rx) = tokio::sync::oneshot::channel();
-        let _ = publish_result_tx.send(true);
-        self.spawn_push_notification(group_id.clone(), publish_result_rx);
+        // Local-first, same sequencing as `send_text`: encrypt + write the
+        // local row under one MLS guard, mark the durable outbox pending, and
+        // publish in the background with first-ACK delivery state. Media rows
+        // previously published inline and skipped the outbox entirely, so a
+        // relay failure either surfaced as a send error (pre-refactor) or
+        // could have stranded a false-Sent row.
+        let (event, incoming) = {
+            let _epoch = self.membership_gate.read().await;
+            self.engine
+                .create_and_process_media_event_multi(group_id, &refs, caption)?
+        };
+        let Incoming::Message(message) = incoming else {
+            return Err(Error::Storage(
+                "created media message did not produce a local transcript row".into(),
+            ));
+        };
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let group_name = self.resolve_group_name(group_id);
+        self.mark_outbox_pending(group_id, &message, &event)?;
+        let event_id = event.id;
+        let publish_ack =
+            self.spawn_outbox_publish(message.id.to_hex(), group_id_hex.clone(), event);
+        self.notify_conversation_changed(&group_id_hex);
+        self.spawn_send_bookkeeping(group_name, message, event_id);
+        self.spawn_push_notification(group_id.clone(), publish_ack);
         Ok(())
     }
 
@@ -4025,6 +4062,9 @@ impl SonarClient {
                     // proposal changes local membership, which the conversation
                     // listener must see (same silent-miss class as welcomes).
                     let proposal_group_hex = hex::encode(update.group_id.as_slice());
+                    // Auto-committing a peer proposal is a membership change
+                    // like any other: exclude sends until publish+merge done.
+                    let _epoch = self.membership_gate.write().await;
                     match self.publish_membership_update(update).await {
                         Ok(()) => {
                             changed_groups.insert(proposal_group_hex);
@@ -5367,6 +5407,237 @@ mod tests {
             first.0.unwrap_err().to_string(),
             second.0.unwrap_err().to_string()
         );
+    }
+
+    /// Mixed-operation stress: concurrent sends, incoming processing, and
+    /// transcript reads on one engine, followed by a member removal, then a
+    /// post-removal send. Verifies (a) no row is lost under contention,
+    /// (b) the removed member cannot read a message sent after the removal
+    /// commit merged, while a remaining member can.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stress_mixed_ops_and_removal_epoch_boundary() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = std::sync::Arc::new(MarmotEngine::in_memory(Identity::generate()));
+        let bob = MarmotEngine::in_memory(Identity::generate());
+        let carol = MarmotEngine::in_memory(Identity::generate());
+        let bob_kp = bob.key_package_event(relays.clone()).expect("bob kp");
+        let carol_kp = carol.key_package_event(relays.clone()).expect("carol kp");
+
+        let creation = alice
+            .create_group("alice, bob & carol", vec![bob_kp, carol_kp], relays)
+            .expect("alice creates group");
+        let group_id = creation.group.mls_group_id.clone();
+        for (member, engine) in [
+            (bob.identity().public_key(), &bob),
+            (carol.identity().public_key(), &carol),
+        ] {
+            let (_, welcome) = creation
+                .welcomes
+                .iter()
+                .find(|(pubkey, _)| *pubkey == member)
+                .cloned()
+                .expect("welcome");
+            let wrapped = alice
+                .gift_wrap_welcome(&member, welcome)
+                .await
+                .expect("wrap welcome");
+            // A >2-member group welcome lands as a pending invite that the
+            // member must accept explicitly (White Noise semantics).
+            match engine
+                .process_incoming(&wrapped)
+                .await
+                .expect("member processes welcome")
+            {
+                Incoming::GroupUpdated(_) => {}
+                Incoming::GroupInvitePending(_) => {
+                    let invite = engine.pending_group_invites().expect("pending invites")[0].id;
+                    engine
+                        .accept_group_invite(&invite)
+                        .expect("member accepts invite");
+                }
+                other => panic!("unexpected welcome result: {other:?}"),
+            }
+        }
+        alice
+            .merge_pending_commit(&group_id)
+            .expect("alice merges creation commit");
+
+        let bob_group_id = bob.groups().expect("bob groups")[0].mls_group_id.clone();
+        let incoming_events: Vec<Event> = (0..10)
+            .map(|i| {
+                bob.create_text_message(&bob_group_id, &format!("bob under load {i}"))
+                    .expect("bob creates message")
+            })
+            .collect();
+
+        // Phase 1: sends + incoming + reads all concurrent.
+        let sender = {
+            let alice = alice.clone();
+            let group_id = group_id.clone();
+            tokio::task::spawn_blocking(move || {
+                for i in 0..20 {
+                    alice
+                        .create_and_process_text_message(&group_id, &format!("alice load {i}"))
+                        .expect("alice sends under load");
+                }
+            })
+        };
+        let receiver = {
+            let alice = alice.clone();
+            tokio::spawn(async move {
+                for event in incoming_events {
+                    assert!(matches!(
+                        alice
+                            .process_incoming(&event)
+                            .await
+                            .expect("alice processes incoming under load"),
+                        Incoming::Message(_)
+                    ));
+                }
+            })
+        };
+        let reader = {
+            let alice = alice.clone();
+            let group_id = group_id.clone();
+            tokio::task::spawn_blocking(move || {
+                for _ in 0..50 {
+                    let _ = alice.messages(&group_id).expect("read under load");
+                    let _ = alice.groups().expect("groups under load");
+                }
+            })
+        };
+        sender.await.expect("send task");
+        receiver.await.expect("receive task");
+        reader.await.expect("read task");
+
+        let transcript = alice.messages(&group_id).expect("alice transcript");
+        assert_eq!(transcript.iter().filter(|m| m.mine).count(), 20);
+        assert_eq!(transcript.iter().filter(|m| !m.mine).count(), 10);
+
+        // Phase 2: remove carol, merge, then send. Carol processes the removal
+        // commit (learning she is out); bob processes it and must still read
+        // the post-removal message, carol must not.
+        let removal = alice
+            .remove_members(&group_id, &[carol.identity().public_key()])
+            .expect("alice removes carol");
+        assert!(removal.requires_commit_merge);
+        let carol_group_id = carol.groups().expect("carol groups")[0].mls_group_id.clone();
+        bob.process_incoming(&removal.evolution_event)
+            .await
+            .expect("bob processes removal commit");
+        carol
+            .process_incoming(&removal.evolution_event)
+            .await
+            .expect("carol processes removal commit");
+        alice
+            .merge_pending_commit(&group_id)
+            .expect("alice merges removal");
+        assert!(
+            !alice
+                .members(&group_id)
+                .expect("alice members")
+                .contains(&carol.identity().public_key()),
+            "carol must be out of the group after the merge"
+        );
+
+        let (post_removal_event, _) = alice
+            .create_and_process_text_message(&group_id, "after carol removal")
+            .expect("alice sends post-removal");
+        assert!(matches!(
+            bob.process_incoming(&post_removal_event)
+                .await
+                .expect("bob still reads post-removal message"),
+            Incoming::Message(_)
+        ));
+        let carol_result = carol.process_incoming(&post_removal_event).await;
+        let carol_readable = matches!(carol_result, Ok(Incoming::Message(_)));
+        assert!(
+            !carol_readable,
+            "removed member must not be able to read a post-removal message, got {carol_result:?}"
+        );
+        // Guard against a silent DB write: carol's transcript must not contain it.
+        let carol_rows = carol.messages(&carol_group_id).unwrap_or_default();
+        assert!(
+            !carol_rows.iter().any(|m| m.content == "after carol removal"),
+            "post-removal message must not appear in carol's transcript"
+        );
+    }
+
+    /// Sends now run on a dedicated host lane concurrent with sync/drain; the
+    /// engine's internal MLS write lock is what keeps that safe. Hammer one
+    /// engine with parallel outgoing sends and incoming processing and verify
+    /// every row lands in the transcript.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_sends_and_incoming_processing_land_every_row() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = std::sync::Arc::new(MarmotEngine::in_memory(Identity::generate()));
+        let bob = MarmotEngine::in_memory(Identity::generate());
+        let bob_kp = bob.key_package_event(relays.clone()).expect("bob kp");
+
+        let creation = alice
+            .create_group("alice & bob", vec![bob_kp], relays)
+            .expect("alice creates group");
+        let group_id = creation.group.mls_group_id.clone();
+        let (bob_pubkey, bob_welcome) = creation
+            .welcomes
+            .into_iter()
+            .find(|(pubkey, _)| *pubkey == bob.identity().public_key())
+            .expect("bob welcome");
+        let bob_wrapped = alice
+            .gift_wrap_welcome(&bob_pubkey, bob_welcome)
+            .await
+            .expect("wrap bob welcome");
+        assert!(matches!(
+            bob.process_incoming(&bob_wrapped)
+                .await
+                .expect("bob processes welcome"),
+            Incoming::GroupUpdated(_)
+        ));
+        alice
+            .merge_pending_commit(&group_id)
+            .expect("alice merges pending commit");
+
+        let bob_group_id = bob.groups().expect("bob groups")[0].mls_group_id.clone();
+        let incoming_events: Vec<Event> = (0..10)
+            .map(|i| {
+                bob.create_text_message(&bob_group_id, &format!("from bob {i}"))
+                    .expect("bob creates message")
+            })
+            .collect();
+
+        let sender = {
+            let alice = alice.clone();
+            let group_id = group_id.clone();
+            tokio::task::spawn_blocking(move || {
+                for i in 0..10 {
+                    alice
+                        .create_and_process_text_message(&group_id, &format!("from alice {i}"))
+                        .expect("alice sends");
+                }
+            })
+        };
+        let receiver = {
+            let alice = alice.clone();
+            tokio::spawn(async move {
+                for event in incoming_events {
+                    assert!(matches!(
+                        alice
+                            .process_incoming(&event)
+                            .await
+                            .expect("alice processes incoming"),
+                        Incoming::Message(_)
+                    ));
+                }
+            })
+        };
+        sender.await.expect("send task");
+        receiver.await.expect("receive task");
+
+        let transcript = alice.messages(&group_id).expect("alice transcript");
+        let mine = transcript.iter().filter(|m| m.mine).count();
+        let theirs = transcript.iter().filter(|m| !m.mine).count();
+        assert_eq!(mine, 10, "every concurrent send must land");
+        assert_eq!(theirs, 10, "every concurrent incoming must land");
     }
 
     #[test]

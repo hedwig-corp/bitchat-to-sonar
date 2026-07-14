@@ -134,7 +134,29 @@ enum SNConversationTranscriptWindow {
         }
         var updates: [String: SNMessage] = [:]
         for candidate in candidates { updates[candidate.id] = candidate }
-        return ordered(existing.map { updates[$0.id] ?? $0 })
+        // Local echoes are ephemeral rows without a persisted source (see
+        // SNMessage.transcriptSourceID): once the Marmot model reconciles an
+        // echo with its canonical database row it vanishes from candidates,
+        // and keeping the stale copy here would freeze a bubble at "Sending"
+        // in a pinned historical window until the user returns to the bottom.
+        // Drop reconciled echoes and admit the sender's own newer rows in
+        // their place — foreign live rows still wait at the unseen newer edge.
+        let kept = existing.compactMap { row in
+            updates[row.id] ?? (isLocalEchoID(row.id) ? nil : row)
+        }
+        let existingIDs = Set(existing.map(\.id))
+        let newestKept = kept.max(by: isOrderedBefore)
+        let ownReplacements = candidates.filter { candidate in
+            candidate.mine
+                && !existingIDs.contains(candidate.id)
+                && (newestKept.map { isOrderedBefore($0, candidate) } ?? true)
+        }
+        return ordered(kept + ownReplacements)
+    }
+
+    static func isLocalEchoID(_ id: String) -> Bool {
+        id.hasPrefix(MarmotChatModel.optimisticIDPrefix)
+            || id.hasPrefix(MarmotChatModel.failedOptimisticIDPrefix)
     }
 
     static func hasRowsOlder(than oldestVisible: SNMessage?, in source: [SNMessage]) -> Bool {
@@ -517,7 +539,22 @@ final class ConversationViewState: ObservableObject {
             try? await Task.sleep(nanoseconds: 20_000_000)
         }
         guard needsNewestReload else { return }
-        let loaded = await store.loadNewestDM(conversationId)
+        // A send-triggered conversation refresh can own the per-group loader
+        // for more than the loader's own busy-retry budget. Giving up here
+        // stranded the pinned historical window: new canonical rows (including
+        // the user's own send) stayed invisible until another bottom-edge
+        // event happened to fire. Retry bounded instead of failing silently.
+        var loaded = await store.loadNewestDM(conversationId)
+        var retriesLeft = 3
+        while !loaded, retriesLeft > 0 {
+            retriesLeft -= 1
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            while isLoadingOlder {
+                try? await Task.sleep(nanoseconds: 20_000_000)
+            }
+            guard needsNewestReload else { return }
+            loaded = await store.loadNewestDM(conversationId)
+        }
         guard loaded else { return }
         needsNewestReload = false
         meshNewestOffset = 0
