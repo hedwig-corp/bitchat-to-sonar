@@ -1,7 +1,8 @@
-# Performance: cold-start + relay-sync benchmark
+# Performance: cold-start, relay-sync, and message-send benchmarks
 
-Status: harness implemented under `scripts/bench/`; simulator and physical iPhone supported.
-Last updated: 2026-06-29.
+Status: harnesses implemented under `scripts/bench/`; native Apple and Compose
+Multiplatform app surfaces supported.
+Last updated: 2026-07-14.
 
 Reproducible measurement of how long a **cold start** of the iOS Sonar app takes
 to become usable and to finish its first **Nostr/Marmot relay sync**, broken down
@@ -200,6 +201,104 @@ post-connect relay path after the PR.
 > directly comparable with newer runs; `startPolling()` also no longer waits
 > for t3a, so first-drain timings improved independently of publish latency.
 
+## PR #220 replacement: text-send latency evaluation
+
+Run on 2026-07-13/14 for the replacement of accidentally merged PR #220. Each
+surface sent **50 accepted text messages** to the same Sonar agent DM using a
+signed Debug build and the account's live relay set. An accepted sample has
+both `send_local_pending local_ms=` and `send_first_ack rtt_ms=` for the same
+message ID; UI actions that never reached the shared core are not samples.
+Overlapping device-log snapshots are deduplicated by message ID.
+
+The baseline already includes PR #220's local-first durable outbox, per-relay
+fan-out, first-ACK delivery state, and content-free timing markers. In that
+build, best-effort push notification events started concurrently with the
+encrypted message. The optimized build gives content priority: push work waits
+until the message receives its first relay ACK, or until every content publish
+attempt has finished. The UI still returns immediately after the durable local
+pending write is queued: its optimistic row paints immediately, and neither
+relay ACKs nor push work gate transcript paint.
+
+Devices and automation:
+
+- **macOS native:** signed SwiftUI Debug app using the explicit environment
+  trigger documented in `scripts/bench/README.md`.
+- **iPhone:** iPhone 14 Pro Max (`Vincenzo`), iOS 26.5, CoreDevice over Wi-Fi,
+  using the same Debug trigger. The task temporarily disables idle sleep and
+  restores it after the final queued send; XCTest is not required.
+- **Android:** Pixel 10 Pro over USB, automated with ADB/UIAutomator against the
+  Compose app.
+
+The final macOS and iPhone rows below were rerun after rebasing onto
+`origin/main` at `9ca6a25c`. The Pixel optimized row was captured immediately
+before that rebase. The only new base commit was web-only PR #238, and the
+post-rebase Compose `assembleDebug` reported all 46 APK inputs/tasks up to date,
+so the Android send binary was unchanged. The Pixel was no longer connected
+when the post-rebase repeat was attempted; this limitation is recorded rather
+than presenting an unexecuted run as fresh data.
+
+All values are milliseconds. `total` is the sum of the sequential local-persist
+and publish-to-first-ACK phases, not a host wall-clock timestamp.
+
+| surface | run | accepted / observed | failure-marked | local persist min / median / p95 / max | first ACK min / median / p95 / max | total min / median / p95 / max |
+|---|---|---:|---:|---:|---:|---:|
+| macOS native | concurrent-push baseline | 50 / 54 | 0 | 7 / 9 / 20 / 58 | 18 / 20 / 44.6 / 59 | 26 / 30 / 65.6 / 78 |
+| macOS native | content-first + bounded refresh | 50 / 50 | 0 | 7 / 21.5 / 39.1 / 52 | 18 / 24 / 31 / 50 | 27 / 45.5 / 65.1 / 77 |
+| iPhone 14 Pro Max | concurrent-push baseline | 50 / 50 | 13 | 10 / 31 / 42 / 43 | 20 / 24 / 2181 / 2182 | 36 / 64 / 2191.6 / 2209 |
+| iPhone 14 Pro Max | content-first + bounded refresh | 50 / 50 | 0 | 10 / 38.5 / 43 / 45 | 20 / 24 / 44.9 / 71 | 33 / 61.5 / 76.1 / 89 |
+| Pixel 10 Pro | concurrent-push baseline | 50 / 50 | 0 | 32 / 66.5 / 87.6 / 134 | 37 / 212.5 / 471.6 / 829 | 78 / 282.5 / 542.1 / 893 |
+| Pixel 10 Pro | content-first optimized | 50 / 51 | 0 | 30 / 60.5 / 89.5 / 98 | 22 / 31 / 54.3 / 59 | 59 / 98 / 124.6 / 133 |
+
+The Pixel result is the clearest improvement: median first-ACK latency fell
+from 212.5 ms to 31 ms (**85.4% faster**) and median local-to-ACK total fell
+from 282.5 ms to 98 ms (**65.3% faster**). Its first-ACK p95 fell from 471.6 ms
+to 54.3 ms (**88.5% faster**).
+
+The iPhone first-ACK median remained 24 ms, but its first-ACK p95 fell from
+2181 ms to 44.9 ms (**97.9% faster**) and total p95 fell from 2191.6 ms to
+76.1 ms (**96.5% faster**). Failure-marked samples fell from 13 to zero. This
+removes the long user-visible `Sending` tail that motivated the device run;
+median total also improved from 64 ms to 61.5 ms.
+
+The device run also exposed a separate native UI stall: each core invalidation
+was rebuilding recent pages for every conversation, and every send requested a
+subscription repair. Apple now coalesces invalidations by changed group,
+refreshes one bounded local transcript page, and leaves subscription healing to
+the existing periodic connection path. The physical-iPhone smoke batch's
+median interval between consecutive `send_local_pending` markers was 998 ms
+(the driver's requested cadence); all 50 sends reached the core over 110.9 s.
+Live transcript contention still produced a 6.65 s p95 dispatch gap and a
+19.33 s maximum, so those UI tails remain an explicit follow-up signal even
+though core send/ACK latency is now bounded.
+
+macOS already had a 20 ms first-ACK baseline median; the rerun measured 24 ms,
+while first-ACK p95 improved from 44.6 ms to 31 ms (**30.5% faster**) and total
+p95 was effectively unchanged (65.6 ms to 65.1 ms). Local/total medians were
+slower under live agent replies. This result does not support claiming a
+universal median speedup on an already-fast local/network path.
+
+These are live-relay, non-interleaved before/after runs, not a network-isolated
+microbenchmark. Relay conditions and concurrent incoming agent replies can move
+the tails. The cross-platform invariant is nevertheless preserved: local
+storage owns the visible message first, content is the first relay work, the row
+becomes **Sent** on the first relay ACK, and slower relay fan-out continues in
+the background. `failure-marked` means every relay failed on an earlier attempt
+before the same durable message later received an ACK through retry; those
+accepted samples remain in the distribution.
+
+### Repeatable send smoke coverage
+
+The Debug-only Apple batch driver is now the repeatable smoke-test path for the
+normal composer send flow. It can run 1–500 exact-target messages on a signed
+physical iPhone or iOS simulator without XCTest/UI automation and logs only
+content-free timing markers. A functional 50-message pass requires 50
+dispatched/accepted messages and zero `failure-marked` samples. The simulator
+is suitable for functional CI/nightly smoke coverage; a signed physical-device
+run should remain the nightly latency monitor because simulator timing cannot
+model live radio, TLS, device scheduling, or native UI contention. Exact
+build, log-capture, launch, and validation commands are in
+[`scripts/bench/README.md`](../scripts/bench/README.md#repeatable-send-smoke-checks).
+
 ## Where to speed up (highest impact first)
 
 1. ~~**Don't block sync on the publishes.**~~ **DONE (2026-07):**
@@ -208,9 +307,10 @@ post-connect relay path after the PR.
    / `publish_profile_background` (event created synchronously, relay send
    spawned). The drain loop no longer waits on relay OK acks; `t3→t3a` measures
    event creation only.
-2. **Bound `send_event` publish latency.** Cap the per-publish timeout / return
-   after the first relay OK so one slow/unreachable relay can't stall ~28 s.
-   Same path backs message sends, so this also speeds up sending.
+2. ~~**Bound message publish latency.**~~ **DONE in the PR #220 replacement:**
+   message events fan out per relay, the delivery row flips on the first relay
+   OK, and best-effort push work waits behind the content attempt. Slow relays
+   continue in the background and no longer hold the user-visible send state.
 3. **Secondary:** opening the encrypted DB + local paint scales with group
    count: ~0.19 s for 1 group on the sim, ~1.3 s for the old 24-group device
    baseline, and 2.44 s median for the 28-group after-PR run. Window it if it

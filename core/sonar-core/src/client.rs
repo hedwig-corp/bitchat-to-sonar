@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -244,10 +244,72 @@ const SUB_MARMOT_GROUPS: &str = "sonar-marmot-groups";
 /// events are recovered by the watermarked `sync()` safety net, so capping never
 /// loses a message permanently. When full, the oldest half is dropped (amortizes
 /// the shift cost vs dropping one-at-a-time).
-const MARMOT_BUFFER_CAP: usize = 1024;
+/// Combined live buffer budget. Split so giftwrap floods cannot wipe group
+/// commits and vice versa (P1).
+const MARMOT_GROUP_BUFFER_CAP: usize = 768;
+const MARMOT_GIFTWRAP_BUFFER_CAP: usize = 512;
+#[allow(dead_code)]
+const MARMOT_BUFFER_CAP: usize = MARMOT_GROUP_BUFFER_CAP + MARMOT_GIFTWRAP_BUFFER_CAP;
 const DIRECT_DM_BUFFER_CAP: usize = 1024;
 const LIVE_EVENT_DEDUP_TTL: Duration = Duration::from_secs(60);
 const LIVE_EVENT_DEDUP_CAP: usize = 4096;
+
+/// Live kind-445 subscription tail. Historical recovery is owned by the
+/// per-group catch-up queue; the live sub must stay thin so cold start does
+/// not flood the pending buffer (and steal CPU/network from sends).
+const LIVE_GROUP_TAIL_SECS: u64 = 30 * 60;
+
+/// Compute the live kind-445 `since` floor.
+///
+/// - watermark 0 (first session): still bound by the live tail so cold start
+///   does not open an unbounded historical flood.
+/// - otherwise: max(watermark - overlap, now - live_tail).
+fn live_group_since_secs(watermark_secs: u64, now_secs: u64) -> u64 {
+    let live_floor = now_secs.saturating_sub(LIVE_GROUP_TAIL_SECS);
+    if watermark_secs == 0 {
+        live_floor
+    } else {
+        watermark_secs
+            .saturating_sub(SYNC_OVERLAP_SECS)
+            .max(live_floor)
+    }
+}
+
+/// Push into a live buffer with half-drop overflow. Returns true if a drop ran.
+fn push_live_buffer<T>(buf: &mut Vec<T>, item: T, cap: usize) -> bool {
+    let mut dropped = false;
+    if buf.len() >= cap {
+        let n = (cap / 2).max(1);
+        buf.drain(0..n.min(buf.len()));
+        dropped = true;
+    }
+    buf.push(item);
+    dropped
+}
+
+fn take_catchup_entry(
+    queue: &mut VecDeque<(String, u64)>,
+    preferred: Option<&str>,
+) -> Option<(String, u64)> {
+    if let Some(pref) = preferred {
+        if let Some(idx) = queue.iter().position(|(id, _)| id == pref) {
+            return queue.remove(idx);
+        }
+    }
+    queue.pop_front()
+}
+
+#[cfg(test)]
+fn map_mls_hex_to_nostr_hex(mls_hex: &str, pairs: &[(String, String)]) -> Option<String> {
+    let clean = mls_hex.trim().to_ascii_lowercase();
+    if clean.is_empty() {
+        return None;
+    }
+    pairs
+        .iter()
+        .find(|(mls, _)| mls == &clean)
+        .map(|(_, nostr)| nostr.clone())
+}
 
 /// Minimum number of relays that must be connected before `connect()` returns.
 /// Modeled after whitenoise-rs `min_connected_relays = 2`. A quorum of 2
@@ -379,6 +441,12 @@ pub struct SyncStateSnapshot {
     pub live_marmot_enabled: bool,
     pub subscribed_group_count: usize,
     pub pending_marmot_buffered: usize,
+    /// Outbox publishes currently in flight (P0 send-priority signal).
+    pub send_inflight: usize,
+    /// Cumulative live-buffer half-drops (giftwraps + group messages).
+    pub buffer_drops_total: usize,
+    /// Groups still queued for initial historical catch-up.
+    pub catchup_queue_len: usize,
     pub relays: Vec<RelaySnapshot>,
     pub group_floors: Vec<GroupFloorSnapshot>,
 }
@@ -681,14 +749,19 @@ pub struct SonarClient {
     /// The actual decrypted message body stays in MDK storage; this sidecar
     /// records pending/sent/failed state and the encrypted relay event to retry.
     outbox_state: Arc<Mutex<OutboxState>>,
-    /// Live Marmot events (welcomes 1059→us + group 445s) pushed by the
-    /// notification handler. Drained + MLS-processed on the host's serialized
-    /// engine thread via `drain_pending_marmot` — the handler NEVER touches the
-    /// engine, so MLS state mutation stays single-threaded (the MLS invariant).
-    pending_marmot: Arc<Mutex<Vec<Event>>>,
+    /// Live giftwraps (1059→us) buffered by the notification handler.
+    pending_marmot_giftwraps: Arc<Mutex<Vec<Event>>>,
+    /// Live MLS group messages (kind 445) buffered by the notification handler.
+    /// Split from giftwraps so one flood cannot wipe the other (P1).
+    pending_marmot_groups: Arc<Mutex<Vec<Event>>>,
     /// Fired whenever a live Marmot event is buffered, so `wait_for_marmot_event`
     /// wakes the host to drain in real time (push) instead of polling.
     marmot_notify: Arc<tokio::sync::Notify>,
+    /// Count of outbox publish tasks in flight. Historical catch-up yields while
+    /// this is non-zero so user sends keep relay/runtime priority (P0).
+    send_inflight: Arc<AtomicUsize>,
+    /// How many times the live pending buffer dropped its oldest half.
+    buffer_drops_total: Arc<AtomicUsize>,
     /// True after the real-session Marmot live tail is opened. Local group
     /// changes use this to decide whether to refresh the live kind-445 filter.
     live_marmot_enabled: Arc<Mutex<bool>>,
@@ -709,6 +782,10 @@ pub struct SonarClient {
     /// repair work bounded and avoid one flaky chat starving the rest.
     initial_group_message_catchups: Arc<Mutex<VecDeque<(String, u64)>>>,
     initial_group_message_catchup_scanned: Arc<AtomicBool>,
+    /// Host can mark the open conversation so cold-start catch-up services it first.
+    preferred_catchup_group: Arc<Mutex<Option<String>>>,
+    /// Rate-limit ensure_subscriptions welcome/group resubscribes (P2 churn).
+    last_ensure_subscriptions_at: Arc<Mutex<Option<Instant>>>,
     /// Whether to join geohash-nearest relays on subscribe (real sessions); off
     /// for in-memory/test sessions so they stay network-free against a MockRelay.
     allow_geo_relays: bool,
@@ -876,22 +953,29 @@ impl SonarClient {
         let geo_subscribed: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let identity_secret = identity.keys().secret_key().to_secret_bytes();
 
-        let pending_marmot: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
+        let pending_marmot_giftwraps: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
+        let pending_marmot_groups: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
         let marmot_notify = Arc::new(tokio::sync::Notify::new());
+        let send_inflight = Arc::new(AtomicUsize::new(0));
+        let buffer_drops_total = Arc::new(AtomicUsize::new(0));
         let live_marmot_enabled = Arc::new(Mutex::new(false));
         let marmot_group_subscriptions = Arc::new(Mutex::new(HashSet::new()));
         let initial_empty_transcript_backfills = Arc::new(Mutex::new(HashSet::new()));
         let initial_backfill_scanned = Arc::new(AtomicBool::new(false));
         let initial_group_message_catchups = Arc::new(Mutex::new(VecDeque::new()));
         let initial_group_message_catchup_scanned = Arc::new(AtomicBool::new(false));
+        let preferred_catchup_group = Arc::new(Mutex::new(None));
+        let last_ensure_subscriptions_at = Arc::new(Mutex::new(None));
         let push_token_cache = crate::push::load_push_token_cache(push_token_cache_path.as_deref());
 
         let handler_geo = geo.clone();
         let handler_dm = geo_dm.clone();
         let handler_presence = geo_presence.clone();
         let handler_subs = geo_subscribed.clone();
-        let handler_pending = pending_marmot.clone();
+        let handler_giftwraps = pending_marmot_giftwraps.clone();
+        let handler_groups = pending_marmot_groups.clone();
         let handler_notify = marmot_notify.clone();
+        let handler_buffer_drops = buffer_drops_total.clone();
         // Our MAIN identity pubkey hex: a kind-1059 with this `p` tag is a Marmot
         // welcome (vs a geohash DM, whose `p` is a per-geohash ephemeral key).
         let my_pubkey_hex = identity.keys().public_key().to_hex();
@@ -1000,13 +1084,14 @@ impl SonarClient {
                         // process_marmot_events before the MLS engine sees it.
                         if p_hex == my_pubkey_hex {
                             {
-                                let mut buf = handler_pending.lock().unwrap();
-                                if buf.len() >= MARMOT_BUFFER_CAP {
+                                let mut buf = handler_giftwraps.lock().unwrap();
+                                if buf.len() >= MARMOT_GIFTWRAP_BUFFER_CAP {
                                     tracing::warn!(
-                                        dropped = MARMOT_BUFFER_CAP / 2,
+                                        dropped = MARMOT_GIFTWRAP_BUFFER_CAP / 2,
                                         "pending marmot buffer overflow — dropping oldest gift wraps"
                                     );
-                                    buf.drain(0..MARMOT_BUFFER_CAP / 2);
+                                    buf.drain(0..MARMOT_GIFTWRAP_BUFFER_CAP / 2);
+                                    handler_buffer_drops.fetch_add(1, Ordering::Relaxed);
                                 }
                                 buf.push((*event).clone());
                             }
@@ -1073,13 +1158,14 @@ impl SonarClient {
                         // Buffer + wake; processing happens on the host's engine
                         // thread via drain_pending_marmot.
                         {
-                            let mut buf = handler_pending.lock().unwrap();
-                            if buf.len() >= MARMOT_BUFFER_CAP {
+                            let mut buf = handler_groups.lock().unwrap();
+                            if buf.len() >= MARMOT_GROUP_BUFFER_CAP {
                                 tracing::warn!(
-                                    dropped = MARMOT_BUFFER_CAP / 2,
+                                    dropped = MARMOT_GROUP_BUFFER_CAP / 2,
                                     "pending marmot buffer overflow — dropping oldest group messages"
                                 );
-                                buf.drain(0..MARMOT_BUFFER_CAP / 2);
+                                buf.drain(0..MARMOT_GROUP_BUFFER_CAP / 2);
+                                handler_buffer_drops.fetch_add(1, Ordering::Relaxed);
                             }
                             buf.push((*event).clone());
                         }
@@ -1119,14 +1205,19 @@ impl SonarClient {
             identity_secret,
             sync_state,
             outbox_state,
-            pending_marmot,
+            pending_marmot_giftwraps,
+            pending_marmot_groups,
             marmot_notify,
+            send_inflight,
+            buffer_drops_total,
             live_marmot_enabled,
             marmot_group_subscriptions,
             initial_empty_transcript_backfills,
             initial_backfill_scanned,
             initial_group_message_catchups,
             initial_group_message_catchup_scanned,
+            preferred_catchup_group,
+            last_ensure_subscriptions_at,
             allow_geo_relays,
             conversation_index,
             change_listener: Arc::new(Mutex::new(None)),
@@ -1744,6 +1835,7 @@ impl SonarClient {
     /// in the background. Publish success/failure only updates local delivery
     /// state; it does not gate transcript visibility.
     pub async fn send_text(&self, group_id: &GroupId, text: &str) -> Result<()> {
+        let local_started = Instant::now();
         let event = self.engine.create_text_message(group_id, text)?;
         let incoming = self.engine.process_incoming(&event).await?;
         let Incoming::Message(message) = incoming else {
@@ -1755,12 +1847,20 @@ impl SonarClient {
         let group_name = self.resolve_group_name(group_id);
         self.mark_outbox_pending(group_id, &message, &event)?;
         let event_id = event.id;
-        self.spawn_outbox_publish(message.id.to_hex(), group_id_hex.clone(), event);
+        let local_ms = local_started.elapsed().as_millis() as u64;
+        tracing::info!(
+            message_id = %message.id.to_hex(),
+            event_id = %event_id.to_hex(),
+            local_ms,
+            "send_local_pending"
+        );
+        let publish_ack =
+            self.spawn_outbox_publish(message.id.to_hex(), group_id_hex.clone(), event);
         self.notify_conversation_changed(&group_id_hex);
         // Deferred bookkeeping: index + sync-state disk writes don't block
         // the caller so the next send can start immediately.
         self.spawn_send_bookkeeping(group_name, message, event_id);
-        self.spawn_push_notification(group_id.clone());
+        self.spawn_push_notification(group_id.clone(), publish_ack);
         Ok(())
     }
 
@@ -1798,7 +1898,11 @@ impl SonarClient {
         });
     }
 
-    fn spawn_push_notification(&self, group_id: GroupId) {
+    fn spawn_push_notification(
+        &self,
+        group_id: GroupId,
+        publish_ack: tokio::sync::oneshot::Receiver<bool>,
+    ) {
         let members = match self.engine.members(&group_id) {
             Ok(m) => m,
             Err(e) => {
@@ -1811,6 +1915,23 @@ impl SonarClient {
         let nostr = self.nostr.clone();
         let tokens = self.push_token_cache.lock().unwrap().clone();
         tokio::spawn(async move {
+            // Push traffic shares the relay pool with the encrypted message.
+            // Give the user-visible send priority and wait until its first ACK
+            // or until every content publish attempt has failed. The failure
+            // case still preserves the previous best-effort push behavior while
+            // the durable outbox owns later content retries.
+            match publish_ack.await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::debug!(
+                        "message publish was not acknowledged; sending best-effort push"
+                    );
+                }
+                Err(_) => {
+                    tracing::debug!("push notify skipped: message publish did not start");
+                    return;
+                }
+            }
             for member in &members {
                 if member == &my_pubkey {
                     continue;
@@ -1894,10 +2015,11 @@ impl SonarClient {
         let group_name = self.resolve_group_name(group_id);
         self.mark_outbox_pending(group_id, &message, &event)?;
         let event_id = event.id;
-        self.spawn_outbox_publish(message.id.to_hex(), group_id_hex.clone(), event);
+        let publish_ack =
+            self.spawn_outbox_publish(message.id.to_hex(), group_id_hex.clone(), event);
         self.notify_conversation_changed(&group_id_hex);
         self.spawn_send_bookkeeping(group_name, message, event_id);
-        self.spawn_push_notification(group_id.clone());
+        self.spawn_push_notification(group_id.clone(), publish_ack);
         Ok(())
     }
 
@@ -2003,15 +2125,32 @@ impl SonarClient {
     /// [group_id_hex] must be the **MLS** group id hosts use for
     /// `conversationChanged` / `messages_page` — not the Nostr `#h` tag
     /// (`nostr_group_id`). Kind-445 `#h` is for relay filtering only.
-    fn spawn_outbox_publish(&self, message_id_hex: String, group_id_hex: String, event: Event) {
+    fn spawn_outbox_publish(
+        &self,
+        message_id_hex: String,
+        group_id_hex: String,
+        event: Event,
+    ) -> tokio::sync::oneshot::Receiver<bool> {
+        let (publish_result_tx, publish_result_rx) = tokio::sync::oneshot::channel();
         if self.relays.is_empty() {
-            return;
+            return publish_result_rx;
         }
         let nostr = self.nostr.clone();
         let outbox_state = self.outbox_state.clone();
         let change_listener = self.change_listener.clone();
         let relays = self.relays.clone();
+        let send_inflight = self.send_inflight.clone();
+        send_inflight.fetch_add(1, Ordering::Relaxed);
+        let publish_started = Instant::now();
+        let event_id_hex = event.id.to_hex();
+        tracing::info!(
+            message_id = %message_id_hex,
+            event_id = %event_id_hex,
+            relays = relays.len(),
+            "send_publish_start"
+        );
         tokio::spawn(async move {
+            let mut publish_result_tx = Some(publish_result_tx);
             let notify = || {
                 if let Some(listener) = change_listener.lock().unwrap().clone() {
                     listener.on_conversation_changed(group_id_hex.clone());
@@ -2029,9 +2168,11 @@ impl SonarClient {
                 let nostr = nostr.clone();
                 let event = event.clone();
                 let tx = tx.clone();
+                let url_log = url.to_string();
                 tokio::spawn(async move {
+                    let started = Instant::now();
                     let outcome = match nostr.send_event_to([url], &event).await {
-                        Ok(output) if !output.success.is_empty() => Ok(()),
+                        Ok(output) if !output.success.is_empty() => Ok(url_log),
                         Ok(output) => Err(output
                             .failed
                             .values()
@@ -2040,19 +2181,31 @@ impl SonarClient {
                             .unwrap_or_else(|| "relay rejected event".to_string())),
                         Err(err) => Err(err.to_string()),
                     };
-                    let _ = tx.send(outcome);
+                    let _ = tx.send((outcome, started.elapsed().as_millis() as u64));
                 });
             }
             drop(tx);
             let mut failures: Vec<String> = Vec::new();
-            while let Some(outcome) = rx.recv().await {
+            while let Some((outcome, _relay_ms)) = rx.recv().await {
                 match outcome {
-                    Ok(()) => {
+                    Ok(relay_url) => {
+                        let rtt_ms = publish_started.elapsed().as_millis() as u64;
                         let _ = outbox_state
                             .lock()
                             .unwrap()
                             .mark_sent_by_message_id(&message_id_hex, Timestamp::now().as_secs());
+                        tracing::info!(
+                            message_id = %message_id_hex,
+                            event_id = %event_id_hex,
+                            relay = %relay_url,
+                            rtt_ms,
+                            "send_first_ack"
+                        );
+                        if let Some(tx) = publish_result_tx.take() {
+                            let _ = tx.send(true);
+                        }
                         notify();
+                        send_inflight.fetch_sub(1, Ordering::Relaxed);
                         return;
                     }
                     Err(err) => failures.push(err),
@@ -2064,13 +2217,26 @@ impl SonarClient {
             } else {
                 failures.join(", ")
             };
+            let rtt_ms = publish_started.elapsed().as_millis() as u64;
+            tracing::warn!(
+                message_id = %message_id_hex,
+                event_id = %event_id_hex,
+                rtt_ms,
+                %reason,
+                "send_publish_failed"
+            );
             let _ = outbox_state.lock().unwrap().mark_failed_by_message_id(
                 &message_id_hex,
                 reason,
                 Timestamp::now().as_secs(),
             );
+            if let Some(tx) = publish_result_tx.take() {
+                let _ = tx.send(false);
+            }
             notify();
+            send_inflight.fetch_sub(1, Ordering::Relaxed);
         });
+        publish_result_rx
     }
 
     pub async fn reload_outbox_and_retry(&self) {
@@ -2199,7 +2365,9 @@ impl SonarClient {
             self.notify_conversation_changed(&group_id_hex);
             self.spawn_send_bookkeeping(group_name, message, event.id);
         }
-        self.spawn_push_notification(group_id.clone());
+        let (publish_result_tx, publish_result_rx) = tokio::sync::oneshot::channel();
+        let _ = publish_result_tx.send(true);
+        self.spawn_push_notification(group_id.clone(), publish_result_rx);
         Ok(())
     }
 
@@ -2473,15 +2641,14 @@ impl SonarClient {
         Ok(())
     }
 
-    /// Open persistent Marmot subscriptions with watermark-based `since`:
+    /// Open persistent Marmot subscriptions:
     /// welcomes (kind-1059 → us) and group messages (kind-445 on our `#h`).
     /// The relay delivers historical events (EOSE burst) then pushes new ones.
     /// Events flow to the notification handler → buffer → `drain_pending_marmot`.
     ///
-    /// When the watermark is 0 (first session), no `since` filter is applied —
-    /// the relay delivers full history via EOSE, same as the first `sync()`.
-    /// For returning users, the watermark-based `since` catches up missed events
-    /// without a blocking `fetch_events_from` call.
+    /// Welcomes use the durable watermark lookback. Group messages use a thin
+    /// live tail; bounded per-group catch-up owns older history so cold start
+    /// cannot flood the live buffer or compete with a user send.
     pub async fn subscribe_marmot(&self) -> Result<()> {
         let since_secs = self.sync_watermark_secs();
         let mut wraps = Filter::new()
@@ -2529,20 +2696,22 @@ impl SonarClient {
             }
         }
 
-        let since_secs = self.sync_watermark_secs();
+        // Live tail is intentionally thin. Historical recovery is the catch-up
+        // queue's job; using the full watermark here re-floods cold start.
+        let watermark_secs = self.sync_watermark_secs();
+        let now_secs = Timestamp::now().as_secs();
+        let since_secs = live_group_since_secs(watermark_secs, now_secs);
         let mut group_id_list: Vec<String> = group_ids.iter().cloned().collect();
         group_id_list.sort();
         let mut filter = Filter::new()
             .kind(Kind::MlsGroupMessage)
             .custom_tags(SingleLetterTag::lowercase(Alphabet::H), group_id_list);
-        if since_secs > 0 {
-            filter = filter.since(Timestamp::from_secs(
-                since_secs.saturating_sub(SYNC_OVERLAP_SECS),
-            ));
-        }
+        filter = filter.since(Timestamp::from_secs(since_secs));
         self.nostr.subscribe_with_id(sub_id, filter, None).await?;
         tracing::info!(
             since_secs,
+            watermark_secs,
+            live_tail_secs = LIVE_GROUP_TAIL_SECS,
             groups = group_ids.len(),
             "marmot group subscription opened"
         );
@@ -2636,10 +2805,9 @@ impl SonarClient {
     }
 
     fn take_initial_group_message_catchup(&self) -> Option<(String, u64)> {
-        self.initial_group_message_catchups
-            .lock()
-            .unwrap()
-            .pop_front()
+        let preferred = self.preferred_catchup_group.lock().unwrap().clone();
+        let mut queue = self.initial_group_message_catchups.lock().unwrap();
+        take_catchup_entry(&mut queue, preferred.as_deref())
     }
 
     fn requeue_initial_group_message_catchup(&self, group_id: String, floor: u64) {
@@ -2665,6 +2833,16 @@ impl SonarClient {
 
     async fn run_initial_group_message_catchup(&self) -> Result<MarmotProcessReport> {
         if self.relays.is_empty() {
+            return Ok(MarmotProcessReport::default());
+        }
+        // P0: never compete with an in-flight user send. Live drain still runs;
+        // only historical catch-up yields. This cannot break MLS groups because
+        // send encrypts against current local epoch and publish is network-only.
+        if self.send_inflight.load(Ordering::Relaxed) > 0 {
+            tracing::debug!(
+                inflight = self.send_inflight.load(Ordering::Relaxed),
+                "deferring group catch-up while send publish is in flight"
+            );
             return Ok(MarmotProcessReport::default());
         }
         self.populate_initial_group_message_catchups_once();
@@ -2702,6 +2880,37 @@ impl SonarClient {
         self.subscribe_group_messages().await
     }
 
+    /// Prefer catch-up for the open chat.
+    ///
+    /// Hosts pass the MLS group id hex (same id used by send_text / messages).
+    /// We map it to the public nostr group id used by the catch-up queue (#h tag).
+    /// Unknown/empty clears the preference.
+    pub fn prefer_catchup_group(&self, mls_group_id_hex: Option<String>) {
+        let preferred = match mls_group_id_hex {
+            None => None,
+            Some(raw) => {
+                let clean = raw.trim().to_ascii_lowercase();
+                if clean.is_empty() {
+                    None
+                } else if let Ok(groups) = self.engine.groups() {
+                    groups.into_iter().find_map(|g| {
+                        let mls = hex::encode(g.mls_group_id.as_slice());
+                        if mls == clean {
+                            Some(hex::encode(g.nostr_group_id))
+                        } else {
+                            None
+                        }
+                    })
+                } else {
+                    // Fall back to treating the input as already-nostr hex so
+                    // tests/tools can still target the queue key directly.
+                    Some(clean)
+                }
+            }
+        };
+        *self.preferred_catchup_group.lock().unwrap() = preferred;
+    }
+
     /// Re-subscribe with the current watermark and group set. Idempotent:
     /// `subscribe_with_id` replaces existing filters. Hosts call this
     /// periodically (every 25-60s) to self-heal after relay disconnects,
@@ -2712,7 +2921,23 @@ impl SonarClient {
         if !*self.live_marmot_enabled.lock().unwrap() {
             return Ok(());
         }
-        self.subscribe_marmot().await?;
+        // P2: hosts call this every 25-60s. Avoid thrashing welcome/group REQs
+        // when nothing changed and we recently ensured.
+        const MIN_ENSURE_INTERVAL: Duration = Duration::from_secs(20);
+        let now = Instant::now();
+        let should_resub = {
+            let mut last = self.last_ensure_subscriptions_at.lock().unwrap();
+            match *last {
+                Some(prev) if now.duration_since(prev) < MIN_ENSURE_INTERVAL => false,
+                _ => {
+                    *last = Some(now);
+                    true
+                }
+            }
+        };
+        if should_resub {
+            self.subscribe_marmot().await?;
+        }
         match self.run_initial_group_message_catchup().await {
             Ok(report) => self.save_or_rewind_without_advancing_watermark(report)?,
             Err(err) => tracing::debug!(%err, "initial Marmot per-group catch-up failed"),
@@ -2760,7 +2985,11 @@ impl SonarClient {
             watermark_secs: self.sync_watermark_secs(),
             live_marmot_enabled: *self.live_marmot_enabled.lock().unwrap(),
             subscribed_group_count: self.marmot_group_subscriptions.lock().unwrap().len(),
-            pending_marmot_buffered: self.pending_marmot.lock().unwrap().len(),
+            pending_marmot_buffered: self.pending_marmot_giftwraps.lock().unwrap().len()
+                + self.pending_marmot_groups.lock().unwrap().len(),
+            send_inflight: self.send_inflight.load(Ordering::Relaxed),
+            buffer_drops_total: self.buffer_drops_total.load(Ordering::Relaxed),
+            catchup_queue_len: self.initial_group_message_catchups.lock().unwrap().len(),
             relays,
             group_floors,
         }
@@ -2916,7 +3145,8 @@ impl SonarClient {
                 context,
                 "relay fetch returned before all relays completed"
             );
-            let pending = self.pending_marmot.clone();
+            let pending = self.pending_marmot_groups.clone();
+            let buffer_drops = self.buffer_drops_total.clone();
             let notify = self.marmot_notify.clone();
             let mut late_seen = seen.clone();
             tokio::spawn(async move {
@@ -2931,10 +3161,9 @@ impl SonarClient {
                                 }
                                 {
                                     let mut buf = pending.lock().unwrap();
-                                    if buf.len() >= MARMOT_BUFFER_CAP {
-                                        buf.drain(0..MARMOT_BUFFER_CAP / 2);
+                                    if push_live_buffer(&mut buf, event, MARMOT_GROUP_BUFFER_CAP) {
+                                        buffer_drops.fetch_add(1, Ordering::Relaxed);
                                     }
-                                    buf.push(event);
                                 }
                                 accepted += 1;
                                 late_events += 1;
@@ -3231,7 +3460,9 @@ impl SonarClient {
     /// push" primitive — it touches NO engine state, so it is the one Marmot call
     /// the host may run OFF its serialized engine queue.
     pub async fn wait_for_marmot_event(&self, timeout_secs: u64) -> bool {
-        if !self.pending_marmot.lock().unwrap().is_empty() {
+        if !self.pending_marmot_giftwraps.lock().unwrap().is_empty()
+            || !self.pending_marmot_groups.lock().unwrap().is_empty()
+        {
             return true;
         }
         tokio::time::timeout(
@@ -3248,11 +3479,14 @@ impl SonarClient {
     /// (it mutates MLS state); the notification handler only ever BUFFERS.
     pub async fn drain_pending_marmot(&self) -> Result<Vec<DrainNotification>> {
         let mut events: Vec<Event> = {
-            let mut buf = self.pending_marmot.lock().unwrap();
-            if buf.is_empty() {
+            let mut giftwraps = self.pending_marmot_giftwraps.lock().unwrap();
+            let mut groups = self.pending_marmot_groups.lock().unwrap();
+            if giftwraps.is_empty() && groups.is_empty() {
                 return Ok(Vec::new());
             }
-            std::mem::take(&mut *buf)
+            let mut out = std::mem::take(&mut *giftwraps);
+            out.append(&mut *groups);
+            out
         };
         sort_marmot_events_in_place(&mut events);
         let ids_before = self.current_group_ids()?;
@@ -4284,7 +4518,10 @@ mod tests {
             classification: crate::marmot::MessageClassification::Text,
         };
         // Caption/text always wins.
-        assert_eq!(index_preview(&msg("hi", vec![media_ref("image/jpeg", "a.jpg")])), "hi");
+        assert_eq!(
+            index_preview(&msg("hi", vec![media_ref("image/jpeg", "a.jpg")])),
+            "hi"
+        );
         // Caption-less media previews by kind — an album never shows blank.
         assert_eq!(
             index_preview(&msg("", vec![media_ref("image/jpeg", "a.jpg")])),
@@ -4634,6 +4871,88 @@ mod tests {
         assert_eq!(descriptor.published_at_secs, 30);
         assert!(descriptor.bolt12_offer.is_none());
         assert!(descriptor.payment_receipts.is_empty());
+    }
+
+    #[test]
+    fn p3_catchup_priority_and_live_since_are_cheap() {
+        use std::time::Instant;
+        let now = 1_700_000_000u64;
+        let start = Instant::now();
+        for i in 0..50_000u64 {
+            let _ = live_group_since_secs(now.saturating_sub(i % 10_000), now);
+            let mut q = VecDeque::from([
+                ("a".into(), 1u64),
+                ("b".into(), 2u64),
+                ("active".into(), 3u64),
+            ]);
+            let _ = take_catchup_entry(&mut q, Some("active"));
+        }
+        let elapsed = start.elapsed();
+        // Pure policy helpers must stay negligible vs network RTT.
+        assert!(
+            elapsed.as_millis() < 500,
+            "policy helpers too slow: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn map_mls_hex_to_nostr_hex_finds_pair() {
+        let pairs = vec![("aa".into(), "n1".into()), ("bb".into(), "n2".into())];
+        assert_eq!(
+            map_mls_hex_to_nostr_hex("BB", &pairs).as_deref(),
+            Some("n2")
+        );
+        assert_eq!(map_mls_hex_to_nostr_hex("", &pairs), None);
+        assert_eq!(map_mls_hex_to_nostr_hex("zz", &pairs), None);
+    }
+
+    #[test]
+    fn prefer_catchup_promotes_active_group() {
+        let mut q = VecDeque::from([
+            ("aaa".into(), 1u64),
+            ("bbb".into(), 2u64),
+            ("ccc".into(), 3u64),
+        ]);
+        let got = take_catchup_entry(&mut q, Some("ccc")).expect("preferred");
+        assert_eq!(got.0, "ccc");
+        assert_eq!(q.front().map(|e| e.0.as_str()), Some("aaa"));
+    }
+
+    #[test]
+    fn split_buffers_keep_group_events_when_giftwraps_flood() {
+        let mut giftwraps: Vec<u32> = Vec::new();
+        let mut groups: Vec<u32> = Vec::new();
+        for i in 0..(MARMOT_GIFTWRAP_BUFFER_CAP as u32 + 10) {
+            let _ = push_live_buffer(&mut giftwraps, i, MARMOT_GIFTWRAP_BUFFER_CAP);
+        }
+        let dropped = push_live_buffer(&mut groups, 42u32, MARMOT_GROUP_BUFFER_CAP);
+        assert!(!dropped);
+        assert_eq!(groups, vec![42]);
+        assert!(giftwraps.len() <= MARMOT_GIFTWRAP_BUFFER_CAP);
+        assert!(giftwraps.len() >= MARMOT_GIFTWRAP_BUFFER_CAP / 2);
+    }
+
+    #[test]
+    fn live_group_since_secs_prefers_thin_tail_over_ancient_watermark() {
+        let now = 1_700_000_000u64;
+        let ancient = now - 30 * 24 * 60 * 60;
+        let since = live_group_since_secs(ancient, now);
+        assert_eq!(since, now - LIVE_GROUP_TAIL_SECS);
+    }
+
+    #[test]
+    fn live_group_since_secs_keeps_recent_watermark_with_overlap() {
+        let now = 1_700_000_000u64;
+        let watermark = now - 60;
+        let since = live_group_since_secs(watermark, now);
+        assert_eq!(since, watermark - SYNC_OVERLAP_SECS);
+    }
+
+    #[test]
+    fn live_group_since_secs_first_session_still_bounded() {
+        let now = 1_700_000_000u64;
+        let since = live_group_since_secs(0, now);
+        assert_eq!(since, now - LIVE_GROUP_TAIL_SECS);
     }
 
     #[test]

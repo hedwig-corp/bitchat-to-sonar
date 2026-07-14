@@ -1019,7 +1019,7 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * progress and observing host cancellation throughout the blocking call.
      */
     func fetchMediaToFile(groupIdHex: String, url: String, destinationPath: String, listener: MediaDownloadListener) throws  -> UInt64
-
+    
     /**
      * Fetch a peer's kind-0 profile (npub or hex pubkey). `None` if they have
      * not published one. Used to resolve a Marmot member's display name.
@@ -1098,6 +1098,13 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func pendingGroupInvites() throws  -> [GroupInviteInfo]
     
     func pendingJoinRequests(groupIdHex: String) throws  -> [JoinRequestInfo]
+    
+    /**
+     * Prefer catch-up for the open chat. Pass the MLS group id hex (same id
+     * hosts use for send_text / messages). Empty clears. Local-first: does not
+     * block paint or send. Core maps MLS to nostr group id for the catch-up queue.
+     */
+    func preferCatchupGroup(mlsGroupIdHex: String) 
     
     /**
      * Publish the user's Blossom server list (kind-10063).
@@ -1647,7 +1654,7 @@ open func fetchMediaToFile(groupIdHex: String, url: String, destinationPath: Str
     )
 })
 }
-
+    
     /**
      * Fetch a peer's kind-0 profile (npub or hex pubkey). `None` if they have
      * not published one. Used to resolve a Marmot member's display name.
@@ -1842,6 +1849,19 @@ open func pendingJoinRequests(groupIdHex: String)throws  -> [JoinRequestInfo]  {
         FfiConverterString.lower(groupIdHex),$0
     )
 })
+}
+    
+    /**
+     * Prefer catch-up for the open chat. Pass the MLS group id hex (same id
+     * hosts use for send_text / messages). Empty clears. Local-first: does not
+     * block paint or send. Core maps MLS to nostr group id for the catch-up queue.
+     */
+open func preferCatchupGroup(mlsGroupIdHex: String)  {try! rustCall() {
+    uniffi_sonar_ffi_fn_method_sonarnode_prefer_catchup_group(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(mlsGroupIdHex),$0
+    )
+}
 }
     
     /**
@@ -5028,11 +5048,11 @@ public func FfiConverterCallbackInterfaceConversationChangeListener_lower(_ v: C
  * keep this object alive until the blocking `fetch_media_to_file` call exits.
  */
 public protocol MediaDownloadListener: AnyObject, Sendable {
-
-    func onProgress(bytesReceived: UInt64, totalBytes: UInt64?)
-
+    
+    func onProgress(bytesReceived: UInt64, totalBytes: UInt64?) 
+    
     func isCancelled()  -> Bool
-
+    
 }
 
 
@@ -5076,7 +5096,7 @@ fileprivate struct UniffiCallbackInterfaceMediaDownloadListener {
                 )
             }
 
-
+            
             let writeReturn = { () }
             uniffiTraitInterfaceCall(
                 callStatus: uniffiCallStatus,
@@ -5098,7 +5118,7 @@ fileprivate struct UniffiCallbackInterfaceMediaDownloadListener {
                 )
             }
 
-
+            
             let writeReturn = { uniffiOutReturn.pointee = FfiConverterBool.lower($0) }
             uniffiTraitInterfaceCall(
                 callStatus: uniffiCallStatus,
@@ -6478,6 +6498,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_pending_join_requests() != 43500) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_prefer_catchup_group() != 37980) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_blossom_servers() != 35600) {

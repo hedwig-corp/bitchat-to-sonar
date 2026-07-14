@@ -876,6 +876,19 @@ impl SonarNode {
         Ok(())
     }
 
+    /// Prefer catch-up for the open chat. Pass the MLS group id hex (same id
+    /// hosts use for send_text / messages). Empty clears. Local-first: does not
+    /// block paint or send. Core maps MLS to nostr group id for the catch-up queue.
+    pub fn prefer_catchup_group(&self, mls_group_id_hex: String) {
+        let preferred = mls_group_id_hex.trim();
+        if preferred.is_empty() {
+            self.client.prefer_catchup_group(None);
+        } else {
+            self.client
+                .prefer_catchup_group(Some(preferred.to_string()));
+        }
+    }
+
     /// Re-subscribe with the current watermark and group set to self-heal
     /// after relay disconnects. Hosts call this on the idle timeout path
     /// instead of `sync_once()`. It may run one bounded per-chat repair fetch,
