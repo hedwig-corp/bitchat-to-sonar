@@ -742,6 +742,15 @@ fn relay_fetch_quorum(total_relays: usize) -> usize {
     }
 }
 
+/// Whether a push-token share pass should run given how many relays are
+/// currently connected. The share sends a gift-wrapped DM per group member
+/// through the nostr client, which fails with "no relays specified" when no
+/// relay is live. Since the share re-runs on every sync/wake, skipping while
+/// disconnected costs nothing and avoids one logged failure per recipient.
+fn should_share_push_tokens(connected_relays: usize) -> bool {
+    connected_relays > 0
+}
+
 fn parse_mesh_id8_hex(value: &str, label: &'static str) -> Result<[u8; 8]> {
     let bytes = hex::decode(value.trim())
         .map_err(|e| Error::InvalidInput(format!("{label} must be 8-byte hex: {e}")))?;
@@ -4869,6 +4878,31 @@ impl SonarClient {
     /// via a NIP-44 encrypted DM (kind 447). Group members cache this to send
     /// sender-side notifications to us.
     async fn share_push_token_with_groups(&self) {
+        // Relay guard: the per-recipient gift-wrapped DM below goes out through
+        // `self.nostr.send_event`, which fails with "no relays specified" when
+        // the nostr client has no live relays. This runs at the end of every
+        // sync/wake (`sync_inner`, the live short-circuit, and the token-update
+        // path), often BEFORE relays attach — with many groups that floods the
+        // log with one failure per member (~275/session on a real 43-group
+        // account). Skip the whole pass when no relay is connected: it re-runs
+        // on the next sync once relays are up, so deferring is free and this
+        // never blocks chat open/send/scroll/paint. Take the relay map from the
+        // `.await` before touching any std Mutex so no guard is held across it.
+        let connected_relays = self
+            .nostr
+            .relays()
+            .await
+            .values()
+            .filter(|handle| handle.status() == RelayStatus::Connected)
+            .count();
+        if !should_share_push_tokens(connected_relays) {
+            tracing::debug!(
+                connected_relays,
+                "push token share: no connected relays, deferring to next sync"
+            );
+            return;
+        }
+
         let own_reg = self.own_push_registration.lock().unwrap().clone();
         let Some(reg) = own_reg else { return };
 
@@ -5301,6 +5335,16 @@ mod tests {
             "doc.pdf"
         );
         assert_eq!(index_preview(&msg("", vec![])), "");
+    }
+
+    #[test]
+    fn push_token_share_skips_until_a_relay_is_connected() {
+        // No live relay: skip so the per-recipient gift-wrapped DM never fires
+        // "no relays specified" (the ~275/session flood on a real account).
+        assert!(!should_share_push_tokens(0));
+        // At least one connected relay: the DM can actually go out.
+        assert!(should_share_push_tokens(1));
+        assert!(should_share_push_tokens(5));
     }
 
     #[test]
