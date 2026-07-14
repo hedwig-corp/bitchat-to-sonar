@@ -116,6 +116,9 @@ APNS with an alert, `mutable-content: 1`, and a marker Sonar's extension
 recognizes. With upstream Transponder, set `[apns].payload_mode =
 "nse_prototype_alert"`; this sends `wn_nse_prototype`. Sonar also recognizes
 `source=transponder`, `source=marmot`, `mip05`, `transponder`, and `kind=446`.
+On Android/FCM the upstream transponder sends a data-only message whose only
+key is `content_available=true` — the Sonar FCM service treats that key as the
+transponder marker too (the alert/`wn_nse_prototype` shape is APNs-only).
 Silent `content-available`-only APNS will not relaunch a user-force-quit app.
 
 ### Relay selection
