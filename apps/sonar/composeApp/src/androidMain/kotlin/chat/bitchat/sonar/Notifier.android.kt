@@ -9,38 +9,42 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
+import android.media.AudioDeviceInfo
+import android.media.AudioManager
+import android.media.MediaPlayer
 import android.media.RingtoneManager
 import android.net.Uri
 import android.os.Build
+import java.util.concurrent.Executors
 
 /** Android `actual`: transport-specific channels with sound, vibration, and badges. */
 actual object Notifier {
-    private const val MESSAGE_CHANNEL = "messages_v5"
-    private const val BLE_CHANNEL = "ble_notifications_v3"
+    private const val MESSAGE_CHANNEL = "messages_v6"
+    private const val BLE_CHANNEL = "ble_notifications_v4"
     private val LEGACY_CHANNELS = listOf(
         "messages",
         "messages_v2",
         "messages_v3",
         "messages_v4",
+        "messages_v5",
         "ble_notifications_v1",
         "ble_notifications_v2",
+        "ble_notifications_v3",
     )
 
     private val ctx: Context get() = AppContextHolder.ctx
     private fun manager() = ctx.getSystemService(NotificationManager::class.java)
+    private val soundExecutor = Executors.newSingleThreadExecutor { task ->
+        Thread(task, "sonar-notification-sound").apply { isDaemon = true }
+    }
 
     /**
-     * Stable type/name URI so channel sound survives resource-id renumbering.
-     * Android notification playback is most reliable with MP3/OGG in res/raw;
-     * WAVs with LIST/INFO metadata chunks often fail silently on NotificationPlayer.
+     * Numeric resource URI — Discord/Snapchat style. Kept on the channel so
+     * Settings can preview the tone; local posts play via [playSound] so we can
+     * force the builtin speaker when USB-dock invents a silent wired route.
      */
-    private fun soundUri(resourceId: Int): Uri {
-        val resourceType = ctx.resources.getResourceTypeName(resourceId)
-        val resourceName = ctx.resources.getResourceEntryName(resourceId)
-        return Uri.parse(
-            "${ContentResolver.SCHEME_ANDROID_RESOURCE}://${ctx.packageName}/$resourceType/$resourceName"
-        )
-    }
+    private fun soundUri(resourceId: Int): Uri =
+        Uri.parse("${ContentResolver.SCHEME_ANDROID_RESOURCE}://${ctx.packageName}/$resourceId")
 
     actual fun ensureChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -84,7 +88,11 @@ actual object Notifier {
                 this.description = description
                 enableVibration(true)
                 vibrationPattern = longArrayOf(0, 250, 200, 250)
-                setSound(uri, audioAttributes)
+                // Channel sound is disabled: NotificationPlayer on this device was
+                // routing to a phantom TYPE_WIRED_HEADPHONES sink (silent) while
+                // USB-debugging. We play via MediaPlayer in [playSound] instead.
+                // URI is still validated above so packaging regressions stay visible.
+                setSound(null, null)
                 setShowBadge(true)
             }
         )
@@ -138,5 +146,62 @@ actual object Notifier {
             .apply { if (pi != null) setContentIntent(pi) }
             .build()
         manager().notify(id, n)
+        playSound(sound)
+    }
+
+    private fun playSound(sound: SonarNotificationSound) {
+        val resourceId = when (sound) {
+            SonarNotificationSound.Default -> R.raw.sonar_notification
+            SonarNotificationSound.Ble -> R.raw.sonar_ble_notification
+        }
+        soundExecutor.execute {
+            var player: MediaPlayer? = null
+            try {
+                val afd = ctx.resources.openRawResourceFd(resourceId) ?: run {
+                    sonarLog("Notifier", "Missing notification sound resource $resourceId")
+                    return@execute
+                }
+                val am = ctx.getSystemService(AudioManager::class.java)
+                val outputs = am?.getDevices(AudioManager.GET_DEVICES_OUTPUTS).orEmpty()
+                val speaker = outputs.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
+                val hasExternalAudio = am?.isBluetoothA2dpOn == true ||
+                    outputs.any {
+                        it.type == AudioDeviceInfo.TYPE_USB_HEADSET ||
+                            it.type == AudioDeviceInfo.TYPE_USB_DEVICE ||
+                            it.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
+                            it.type == AudioDeviceInfo.TYPE_BLE_SPEAKER
+                    }
+                // Pixel USB-dock / adb often registers a silent TYPE_WIRED_HEADPHONES
+                // sink with no real headset. Prefer the builtin speaker unless a
+                // real external audio device (BT / USB headset) is active.
+                val forceSpeaker = speaker != null && !hasExternalAudio
+                player = MediaPlayer().apply {
+                    setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
+                    afd.close()
+                    setAudioAttributes(
+                        AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_NOTIFICATION)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                            .build()
+                    )
+                    if (forceSpeaker) setPreferredDevice(speaker)
+                    setOnCompletionListener { it.release() }
+                    setOnErrorListener { mp, what, extra ->
+                        sonarLog("Notifier", "MediaPlayer error what=$what extra=$extra")
+                        mp.release()
+                        true
+                    }
+                    prepare()
+                    start()
+                }
+                sonarLog(
+                    "Notifier",
+                    "Playing notification sound res=$resourceId forceSpeaker=$forceSpeaker",
+                )
+            } catch (t: Throwable) {
+                sonarLog("Notifier", "Failed to play notification sound: ${t.message}")
+                player?.release()
+            }
+        }
     }
 }
