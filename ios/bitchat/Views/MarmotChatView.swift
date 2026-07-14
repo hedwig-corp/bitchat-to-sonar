@@ -187,6 +187,11 @@ enum SNMarmotChatSnapshotCache {
 /// identity in the keychain (wiped by emergency wipe like everything else).
 @MainActor
 final class MarmotChatModel: ObservableObject {
+    enum LocalTranscriptLoadMode {
+        case newestPage
+        case preserveHistoricalWindow
+    }
+
     private static let nsecKeychainKey = "marmot-nsec"
     private static let sonarDescriptorRefreshInterval: TimeInterval = 15 * 60
     private static let sonarDescriptorMissRetryInterval: TimeInterval = 60
@@ -710,7 +715,7 @@ final class MarmotChatModel: ObservableObject {
             connectIfNeeded()
             return
         }
-        await loadLocalWindow(groupId: groupId)
+        await loadLocalWindow(groupId: groupId, mode: .newestPage)
     }
 
     /// Wait only for the local Marmot node/DB to open, then hydrate local state.
@@ -718,7 +723,7 @@ final class MarmotChatModel: ObservableObject {
     @discardableResult
     func loadLocalWhenConnected(groupId: String? = nil, timeoutSeconds: Double = 10) async -> Bool {
         guard await ensureConnected(timeoutSeconds: timeoutSeconds) else { return false }
-        await loadLocalWindow(groupId: groupId)
+        await loadLocalWindow(groupId: groupId, mode: .newestPage)
         return true
     }
 
@@ -727,7 +732,7 @@ final class MarmotChatModel: ObservableObject {
     func refreshWhenConnected(groupId: String? = nil, hydrateBeforeSync: Bool = true) async {
         guard await ensureConnected() else { return }
         if hydrateBeforeSync {
-            await loadLocalWindow(groupId: groupId)
+            await loadLocalWindow(groupId: groupId, mode: .newestPage)
         }
         if await ensureRelayConnected() {
             do {
@@ -738,22 +743,19 @@ final class MarmotChatModel: ObservableObject {
             }
             let notifications = (try? await service.drainPending()) ?? []
             if !notifications.isEmpty {
-                await loadLocalWindow(groupId: groupId, preserveHistoricalWindow: true)
+                await loadLocalWindow(groupId: groupId, mode: .preserveHistoricalWindow)
                 return
             }
         }
-        await loadLocalWindow(groupId: groupId, preserveHistoricalWindow: true)
+        await loadLocalWindow(groupId: groupId, mode: .preserveHistoricalWindow)
     }
 
     private func loadLocalWindow(
         groupId: String?,
-        preserveHistoricalWindow: Bool = false
+        mode: LocalTranscriptLoadMode
     ) async {
         if let groupId {
-            await loadLocalPage(
-                groupId: groupId,
-                preserveHistoricalWindow: preserveHistoricalWindow
-            )
+            await loadLocalPage(groupId: groupId, mode: mode)
         } else {
             await loadLocalSummaries()
         }
@@ -784,7 +786,7 @@ final class MarmotChatModel: ObservableObject {
                         || self.messagesByGroup[changedGroupId] != nil {
                         _ = await self.loadLocalPage(
                             groupId: changedGroupId,
-                            preserveHistoricalWindow: true
+                            mode: .preserveHistoricalWindow
                         )
                     } else {
                         // A newly-created/received group is not in the host cache
@@ -806,7 +808,7 @@ final class MarmotChatModel: ObservableObject {
     @discardableResult
     func loadLocalPage(
         groupId: String,
-        preserveHistoricalWindow: Bool = false
+        mode: LocalTranscriptLoadMode
     ) async -> Bool {
         guard localTranscriptLoadingGroups.insert(groupId).inserted else { return false }
         defer { localTranscriptLoadingGroups.remove(groupId) }
@@ -822,7 +824,7 @@ final class MarmotChatModel: ObservableObject {
             let existing = messagesByGroup[groupId] ?? []
             let existingCanonical = existing.filter { !Self.isLocalTranscriptEcho($0) }
             let echoes = existing.filter(Self.isLocalTranscriptEcho)
-            let shouldPreserveHistoricalWindow = preserveHistoricalWindow
+            let shouldPreserveHistoricalWindow = mode == .preserveHistoricalWindow
                 && !existingCanonical.isEmpty
             let canonical: [MarmotService.MarmotMessage]
             if shouldPreserveHistoricalWindow {
@@ -986,7 +988,7 @@ final class MarmotChatModel: ObservableObject {
 
     func loadNewestLocalPageWhenAvailable(groupId: String) async -> Bool {
         for attempt in 0..<Self.localTranscriptBusyRetryLimit {
-            if await loadLocalPage(groupId: groupId) { return true }
+            if await loadLocalPage(groupId: groupId, mode: .newestPage) { return true }
             guard localTranscriptLoadingGroups.contains(groupId),
                   attempt + 1 < Self.localTranscriptBusyRetryLimit else { return false }
             do {
@@ -1566,7 +1568,7 @@ final class MarmotChatModel: ObservableObject {
         }
         do {
             let groupId = try await service.startDirectMessage(with: npub, name: "")
-            await loadLocalPage(groupId: groupId)
+            await loadLocalPage(groupId: groupId, mode: .newestPage)
             Task { [weak self] in
                 await self?.refreshWhenConnected(groupId: groupId, hydrateBeforeSync: false)
             }
@@ -1661,7 +1663,7 @@ final class MarmotChatModel: ObservableObject {
                 guard await ensureConnected() else {
                     throw MarmotService.ServiceError.notConnected
                 }
-                await loadLocalPage(groupId: groupId)
+                await loadLocalPage(groupId: groupId, mode: .preserveHistoricalWindow)
                 appendOptimistic(echo, to: groupId)
                 echoVisible = true
                 guard await ensureRelayConnected() else {
@@ -1728,7 +1730,7 @@ final class MarmotChatModel: ObservableObject {
                 guard await ensureConnected() else {
                     throw MarmotService.ServiceError.notConnected
                 }
-                await loadLocalPage(groupId: groupId)
+                await loadLocalPage(groupId: groupId, mode: .preserveHistoricalWindow)
                 appendOptimistic(echo, to: groupId)
                 echoVisible = true
                 guard await ensureRelayConnected() else {
@@ -1768,14 +1770,14 @@ final class MarmotChatModel: ObservableObject {
                 guard await ensureConnected() else {
                     throw MarmotService.ServiceError.notConnected
                 }
-                await loadLocalPage(groupId: groupId)
+                await loadLocalPage(groupId: groupId, mode: .preserveHistoricalWindow)
                 try await service.sendSticker(
                     groupId: groupId,
                     packCoordinate: packCoordinate,
                     shortcode: shortcode,
                     plaintextSha256: plaintextSha256
                 )
-                await loadLocalPage(groupId: groupId)
+                await loadLocalPage(groupId: groupId, mode: .preserveHistoricalWindow)
                 await refreshWhenConnected(groupId: groupId, hydrateBeforeSync: false)
             } catch {
                 self.errorText = Self.describe(error)

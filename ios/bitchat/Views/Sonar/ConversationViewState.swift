@@ -16,6 +16,14 @@
 import Combine
 import Foundation
 
+struct SNConversationTranscriptSource {
+    static let meshID = "$mesh"
+
+    let id: String
+    let rows: [SNMessage]
+    let hasMore: Bool
+}
+
 /// Pure conversation-wide window operations shared by the Apple transcript
 /// coordinator and its regression tests. Source windows are bounded
 /// independently; this layer is what prevents a newer transport from hiding an
@@ -60,7 +68,7 @@ enum SNConversationTranscriptWindow {
         previous: [SNMessage],
         next: [SNMessage]
     ) -> Bool {
-        if visibleLimit >= retainedLimit { return true }
+        if visibleLimit >= retainedLimit, next.count >= retainedLimit { return true }
         let nextIDs = Set(next.map(\.id))
         return previous.contains { !nextIDs.contains($0.id) }
     }
@@ -84,7 +92,27 @@ enum SNConversationTranscriptWindow {
         return source.contains { isOrderedBefore($0, oldestVisible) }
     }
 
-    private static func isOrderedBefore(_ lhs: SNMessage, _ rhs: SNMessage) -> Bool {
+    /// A global page is safe only after every pageable source has one complete
+    /// page behind the visible anchor. This preserves the k-way merge frontier:
+    /// a far-older source must not fill the page while a newer source still has
+    /// unloaded rows that belong before it.
+    static func sourceIDsNeedingExpansion(
+        _ sources: [SNConversationTranscriptSource],
+        before oldestVisible: SNMessage,
+        pageSize: Int
+    ) -> Set<String> {
+        guard pageSize > 0 else { return [] }
+        return Set(sources.compactMap { source in
+            guard source.hasMore else { return nil }
+            let olderCount = source.rows.lazy
+                .filter { isOrderedBefore($0, oldestVisible) }
+                .prefix(pageSize)
+                .count
+            return olderCount < pageSize ? source.id : nil
+        })
+    }
+
+    static func isOrderedBefore(_ lhs: SNMessage, _ rhs: SNMessage) -> Bool {
         let lhsDate = lhs.sortDate ?? .distantPast
         let rhsDate = rhs.sortDate ?? .distantPast
         if lhsDate == rhsDate { return lhs.id < rhs.id }
@@ -227,16 +255,17 @@ final class ConversationViewState: ObservableObject {
                 pageSize: pageSize
             )
             guard !older.isEmpty else { return false }
-            let sourcesCanLoadMore = store.canLoadOlderDM(conversationId)
-                || store.hasCachedMeshOlderDM(
-                    conversationId,
-                    visibleLimit: sourceMessageLimit,
-                    newestOffset: meshNewestOffset
-                )
-            // Do not publish only the single look-ahead row from a source. Grow
-            // that source window first so one top-edge gesture still advances a
-            // normal page and reliably moves the old anchor off the trigger.
-            guard older.count == pageSize || !sourcesCanLoadMore else { return false }
+            let sources = store.dmTranscriptSources(
+                conversationId,
+                candidates: candidates,
+                sourceLimit: sourceMessageLimit,
+                meshNewestOffset: meshNewestOffset
+            )
+            guard SNConversationTranscriptWindow.sourceIDsNeedingExpansion(
+                sources,
+                before: oldest,
+                pageSize: pageSize
+            ).isEmpty else { return false }
 
             let previous = messages
             visibleMessageLimit = min(retained, visibleMessageLimit + pageSize)
@@ -275,18 +304,37 @@ final class ConversationViewState: ObservableObject {
         if prependClosestCandidatePage() { return true }
 
         for attempt in 0..<Self.olderSourceLoadAttemptLimit {
+            guard let oldest = messages.first else { return false }
+            let candidates = store.dmMsgs(
+                conversationId,
+                limit: min(retained, sourceMessageLimit + 1),
+                meshNewestOffset: meshNewestOffset
+            )
+            let sourceIDs = SNConversationTranscriptWindow.sourceIDsNeedingExpansion(
+                store.dmTranscriptSources(
+                    conversationId,
+                    candidates: candidates,
+                    sourceLimit: sourceMessageLimit,
+                    meshNewestOffset: meshNewestOffset
+                ),
+                before: oldest,
+                pageSize: pageSize
+            )
             let meshCount = store.cachedMeshMessageCount(conversationId)
             let currentMeshEnd = max(0, meshCount - meshNewestOffset)
             let currentMeshStart = max(0, currentMeshEnd - sourceMessageLimit)
-            let meshRowsLoaded = min(pageSize, currentMeshStart)
-            let databaseCanLoad = store.canLoadOlderDM(conversationId)
+            let meshRowsLoaded = sourceIDs.contains(SNConversationTranscriptSource.meshID)
+                ? min(pageSize, currentMeshStart)
+                : 0
+            let groupIDs = sourceIDs.subtracting([SNConversationTranscriptSource.meshID])
+            let databaseCanLoad = !groupIDs.isEmpty
             guard meshRowsLoaded > 0 || databaseCanLoad else {
                 rebuildNow()
                 return false
             }
 
             let addedFromDatabase = databaseCanLoad
-                ? await store.loadOlderDM(conversationId)
+                ? await store.loadOlderDM(conversationId, groupIDs: groupIDs)
                 : false
             let sourceGrowth = max(addedFromDatabase ? pageSize : 0, meshRowsLoaded)
             let meshOverflow = max(0, sourceMessageLimit + meshRowsLoaded - retained)

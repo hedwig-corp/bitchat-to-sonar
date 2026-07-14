@@ -68,6 +68,43 @@ struct ConversationTranscriptWindowTests {
         #expect(moved.count == 500)
     }
 
+    @Test func foldedSourcesAdvanceOnlyTheIncompleteGlobalFrontier() {
+        let farOlder = (970..<1000).map { message($0, source: "internet") }
+        let visibleNewer = (1970..<2000).map { message($0, source: "mesh") }
+        let oldestVisible = visibleNewer[0]
+        let initialSources = [
+            SNConversationTranscriptSource(id: "internet", rows: farOlder, hasMore: true),
+            SNConversationTranscriptSource(id: SNConversationTranscriptSource.meshID, rows: visibleNewer, hasMore: true),
+        ]
+
+        let initialNeeds = SNConversationTranscriptWindow.sourceIDsNeedingExpansion(
+            initialSources,
+            before: oldestVisible,
+            pageSize: 30
+        )
+        #expect(initialNeeds == [SNConversationTranscriptSource.meshID])
+
+        let expandedNewer = (1940..<2000).map { message($0, source: "mesh") }
+        let readySources = [
+            SNConversationTranscriptSource(id: "internet", rows: farOlder, hasMore: true),
+            SNConversationTranscriptSource(id: SNConversationTranscriptSource.meshID, rows: expandedNewer, hasMore: true),
+        ]
+        let readyNeeds = SNConversationTranscriptWindow.sourceIDsNeedingExpansion(
+            readySources,
+            before: oldestVisible,
+            pageSize: 30
+        )
+        let page = SNConversationTranscriptWindow.nearestOlderPage(
+            in: farOlder + expandedNewer,
+            before: oldestVisible,
+            pageSize: 30
+        )
+
+        #expect(readyNeeds.isEmpty)
+        #expect(page.first?.id == "mesh-1940")
+        #expect(page.last?.id == "mesh-1969")
+    }
+
     @Test func historicalRefreshDoesNotSnapBackToNewerSource() {
         let historical = (0..<500).map { message($0, source: "internet") }
         var updated = historical[499]
@@ -113,6 +150,34 @@ struct ConversationTranscriptWindowTests {
         #expect(refreshed.first?.id == "internet-0000")
         #expect(refreshed.last?.id == "internet-0499")
         #expect(refreshed.contains(where: { $0.id == "mesh-0500" }) == false)
+    }
+
+    @Test func partialFinalPageLeavesRoomForLiveRows() {
+        let older = (0..<15).map { message($0, source: "internet") }
+        let previous = (15..<485).map { message($0, source: "internet") }
+        let partialWindow = SNConversationTranscriptWindow.prepending(
+            older,
+            to: previous,
+            limit: 500
+        )
+        let shouldPreserve = SNConversationTranscriptWindow.shouldPreserveOlderEdge(
+            afterGrowingTo: 500,
+            retainedLimit: 500,
+            previous: previous,
+            next: partialWindow
+        )
+        let live = message(485, source: "mesh")
+        let refreshed = SNConversationTranscriptWindow.refreshing(
+            partialWindow,
+            from: partialWindow + [live],
+            limit: 500,
+            preservingOlderEdge: shouldPreserve
+        )
+
+        #expect(partialWindow.count == 485)
+        #expect(shouldPreserve == false)
+        #expect(refreshed.last?.id == live.id)
+        #expect(refreshed.count == 486)
     }
 
     @Test @MainActor func backgroundSourceRefreshKeepsHistoricalCursorWindow() {

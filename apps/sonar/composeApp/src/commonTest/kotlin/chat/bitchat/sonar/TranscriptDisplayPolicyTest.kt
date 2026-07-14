@@ -119,6 +119,54 @@ class TranscriptDisplayPolicyTest {
     }
 
     @Test
+    fun foldedSourcesAdvanceOnlyTheIncompleteGlobalFrontier() {
+        val farOlder = (970 until 1000).map { message("internet-$it", it.toLong()) }
+        val visibleNewer = (1970 until 2000).map { message("mesh-$it", it.toLong()) }
+        val oldestVisible = visibleNewer.first()
+
+        val initialNeeds = transcriptSourceIdsNeedingExpansion(
+            listOf(
+                TranscriptSourceWindow("internet", farOlder, hasMore = true),
+                TranscriptSourceWindow(MESH_TRANSCRIPT_SOURCE_ID, visibleNewer, hasMore = true),
+            ),
+            oldestVisible,
+        )
+        assertEquals(setOf(MESH_TRANSCRIPT_SOURCE_ID), initialNeeds)
+
+        val expandedNewer = (1940 until 2000).map { message("mesh-$it", it.toLong()) }
+        val readyNeeds = transcriptSourceIdsNeedingExpansion(
+            listOf(
+                TranscriptSourceWindow("internet", farOlder, hasMore = true),
+                TranscriptSourceWindow(MESH_TRANSCRIPT_SOURCE_ID, expandedNewer, hasMore = true),
+            ),
+            oldestVisible,
+        )
+        val page = nearestOlderTranscriptPage(farOlder + expandedNewer, oldestVisible)
+
+        assertTrue(readyNeeds.isEmpty())
+        assertEquals("mesh-1940", page.first().id)
+        assertEquals("mesh-1969", page.last().id)
+    }
+
+    @Test
+    fun partialFinalPageLeavesRoomForLiveRows() {
+        val existing = (15 until 485).map { message(it.toString(), it.toLong()) }
+        val partialOlder = (0 until 15).map { message(it.toString(), it.toLong()) }
+        val historical = prependTranscriptRows(existing, partialOlder)
+
+        assertEquals(485, historical.size)
+        assertFalse(shouldPinOlderTranscriptEdge(historical.size))
+
+        val refreshed = refreshTranscriptRows(
+            existing = historical,
+            newest = listOf(message("live", 485)),
+            pinnedToOlderEdge = shouldPinOlderTranscriptEdge(historical.size),
+        )
+        assertEquals("live", refreshed.last().id)
+        assertEquals(486, refreshed.size)
+    }
+
+    @Test
     fun liveRefreshDoesNotEvictOlderWindowAnchor() {
         val existing = (70 until 570).map { message(it.toString(), it.toLong()) }
         val refreshed = refreshTranscriptRows(

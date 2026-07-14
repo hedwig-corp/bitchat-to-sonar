@@ -909,6 +909,10 @@ private struct MacConversationPane: View {
                     store.sendCh(id, text)
                 } else {
                     store.sendDm(id, text)
+                    let convo = store.conversationViewState(id)
+                    Task { @MainActor in
+                        await convo.loadNewestIfNeeded()
+                    }
                 }
             },
             onPlus: { actionSheet = true },
@@ -3604,7 +3608,9 @@ private struct MacDMTranscript: View {
                     loadLocal: { await store.mediaData($0) }
                 ),
                 loadSticker: { await store.stickerImageData(for: $0) },
-                onTapPack: onTapPack
+                onTapPack: onTapPack,
+                loadOlder: { await convo.loadOlder() },
+                loadNewest: { await convo.loadNewestIfNeeded() }
             )
         }
     }

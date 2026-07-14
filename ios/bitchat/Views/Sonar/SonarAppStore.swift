@@ -3431,6 +3431,47 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
+    /// Preserve source identity while the conversation coordinator decides
+    /// which cursor must move next. Rows are already render-filtered by
+    /// `dmMsgs`, so hidden control lines cannot falsely satisfy a 30-row source
+    /// frontier.
+    func dmTranscriptSources(
+        _ id: String,
+        candidates: [SNMessage],
+        sourceLimit: Int,
+        meshNewestOffset: Int
+    ) -> [SNConversationTranscriptSource] {
+        let candidateByID = Dictionary(candidates.map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
+        var sources = localTranscriptGroups(for: id).map { group in
+            let ids = Set((marmot.messagesByGroup[group.id] ?? []).map(\.id))
+            return SNConversationTranscriptSource(
+                id: group.id,
+                rows: ids.compactMap { candidateByID[$0] },
+                hasMore: marmot.hasOlderLocalMessages(groupId: group.id)
+            )
+        }
+        if !id.hasPrefix(Self.marmotIDPrefix),
+           pendingMarmotNpub(for: id) == nil,
+           !isPendingMarmotGroup(id) {
+            let meshRows = chatViewModel.privateChats[PeerID(str: id)] ?? []
+            let end = max(0, meshRows.count - max(0, meshNewestOffset))
+            let start = max(0, end - max(0, sourceLimit + 1))
+            let ids = Set(meshRows[start..<end].map(\.id))
+            sources.append(
+                SNConversationTranscriptSource(
+                    id: SNConversationTranscriptSource.meshID,
+                    rows: ids.compactMap { candidateByID[$0] },
+                    hasMore: hasCachedMeshOlderDM(
+                        id,
+                        visibleLimit: sourceLimit,
+                        newestOffset: meshNewestOffset
+                    )
+                )
+            )
+        }
+        return sources
+    }
+
     /// Mesh history is already local and in memory, but it still participates
     /// in the same directional render window as Marmot. Counting it is cheap and
     /// avoids formatting rows merely to discover a lookahead item.
@@ -3449,12 +3490,12 @@ final class SonarAppStore: ObservableObject {
         return chatViewModel.privateChats[PeerID(str: id)]?.count ?? 0
     }
 
-    /// Load one older local page for every folded Marmot source and rebuild the
-    /// immutable render projection before returning so the list can restore its
-    /// pre-prepend anchor deterministically.
-    func loadOlderDM(_ id: String) async -> Bool {
+    /// Load one older local page for the folded Marmot sources selected by the
+    /// global merge frontier, then rebuild the immutable render projection so
+    /// the list can restore its pre-prepend anchor deterministically.
+    func loadOlderDM(_ id: String, groupIDs: Set<String>) async -> Bool {
         var added = false
-        for group in localTranscriptGroups(for: id) {
+        for group in localTranscriptGroups(for: id) where groupIDs.contains(group.id) {
             if await marmot.loadOlderLocalPageWhenAvailable(groupId: group.id) {
                 added = true
             }
@@ -5063,7 +5104,7 @@ final class SonarAppStore: ObservableObject {
                     // `loadLocalWhenConnected(groupId:)` already painted the
                     // known source. Only hydrate additional folded groups here.
                     if groupId == nil || group.id != groupId {
-                        await self.marmot.loadLocalPage(groupId: group.id)
+                        await self.marmot.loadLocalPage(groupId: group.id, mode: .newestPage)
                     }
                     self.marmot.markConversationRead(groupId: group.id)
                 }
