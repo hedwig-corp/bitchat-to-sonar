@@ -2,8 +2,9 @@
   import { onMount } from 'svelte';
   import { base } from '$app/paths';
   import SonarMark from '$lib/components/SonarMark.svelte';
-  import { SONAR_BLOG } from '$lib/blog-content.js';
+  import { SONAR_BLOG, SONAR_BLOG_AUTHOR } from '$lib/blog-content.js';
   import { fetchPostsFromNostr } from '$lib/blog-nostr.js';
+  import { fetchAuthorProfile } from '$lib/blog-author.js';
   import { renderMarkdown } from '$lib/markdown.js';
   import { DOWNLOAD_HREF } from '$lib/links.js';
 
@@ -20,6 +21,10 @@
   let posts = $state(SONAR_BLOG.posts);
   const feature = $derived(posts.find((p) => p.feature) ?? posts[0] ?? null);
   const rest = $derived(posts.filter((p) => p !== feature));
+
+  // Author byline (Nostr kind-0 profile): baked-in copy first, refreshed live.
+  let author = $state(SONAR_BLOG_AUTHOR);
+  let avatarBroken = $state(false);
 
   let currentId = $state('');
 
@@ -59,6 +64,11 @@
   const artHtml = $derived(post ? renderMarkdown(post.md, { resolveLink }).html : '');
   const more = $derived(post ? posts.filter((p) => p.id !== post.id).slice(0, 2) : []);
 
+  // Byline name: profile display name, else the post's author tag.
+  const authorName = $derived(author?.name || post?.author || 'The Sonar team');
+  const avatarUrl = $derived(!avatarBroken ? (author?.picture ?? '') : '');
+  const authorInitial = $derived((authorName.trim()[0] ?? 'S').toUpperCase());
+
   function syncFromHash() {
     const id = decodeURIComponent(location.hash.slice(1));
     if (!id) {
@@ -89,6 +99,18 @@
       })
       .catch(() => {
         /* keep the static fallback on any failure */
+      });
+
+    // Refresh the author byline (name + avatar) from the live kind-0 profile.
+    fetchAuthorProfile()
+      .then((profile) => {
+        if (profile) {
+          author = profile;
+          avatarBroken = false;
+        }
+      })
+      .catch(() => {
+        /* keep the baked-in profile on any failure */
       });
 
     return () => window.removeEventListener('hashchange', onHash);
@@ -168,8 +190,19 @@
       <a class="backlink" href="#top" onclick={(e) => { e.preventDefault(); history.replaceState(null, '', '#'); syncFromHash(); }}>← All posts</a>
       <div class="arthead">
         <div class="artmeta">
-          <span class="cat {catClass(post.cat)}">{post.cat}</span> ·
-          <b>{post.author}</b> · {post.date} · {post.read}
+          <span class="cat {catClass(post.cat)}">{post.cat}</span>
+          <span class="byline">
+            <span class="avatar" aria-hidden="true">
+              {#if avatarUrl}
+                <img src={avatarUrl} alt="" loading="lazy" referrerpolicy="no-referrer" onerror={() => (avatarBroken = true)} />
+              {:else}
+                {authorInitial}
+              {/if}
+            </span>
+            <b>{authorName}</b>
+          </span>
+          <span class="sep">·</span>{post.date}
+          <span class="sep">·</span>{post.read}
         </div>
       </div>
       <div class="md">{@html artHtml}</div>
@@ -564,6 +597,35 @@
   .artmeta b {
     color: var(--text2);
     font-weight: 600;
+  }
+  .artmeta .byline {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .artmeta .avatar {
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    overflow: hidden;
+    flex: none;
+    display: grid;
+    place-items: center;
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--text2);
+    background: var(--surface2, rgba(255, 255, 255, 0.06));
+    border: 1px solid var(--hair, rgba(255, 255, 255, 0.1));
+  }
+  .artmeta .avatar img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+  }
+  .artmeta .sep {
+    color: var(--text3);
+    opacity: 0.6;
   }
   .md {
     max-width: 720px;
