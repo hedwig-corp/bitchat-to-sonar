@@ -457,7 +457,17 @@ actual object SonarCore {
         }.getOrNull()
     }
 
+    // Routine heartbeat sync: syncOnce() short-circuits while live subscriptions
+    // are active, so a periodic tick does NOT force the batched all-groups fetch.
+    // Real wake events call syncForce() below.
     actual suspend fun sync() = withContext(Dispatchers.IO) {
+        runCatching { node?.syncOnce() }
+        Unit
+    }
+
+    // Push-wake / foreground-resume catch-up: bypasses the live short-circuit and
+    // runs the batched all-groups gap-recovery fetch. Keep OFF the heartbeat.
+    actual suspend fun syncForce() = withContext(Dispatchers.IO) {
         runCatching { node?.syncForce() }
         Unit
     }

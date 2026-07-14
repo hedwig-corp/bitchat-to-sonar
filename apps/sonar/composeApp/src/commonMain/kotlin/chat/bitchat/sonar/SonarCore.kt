@@ -575,8 +575,18 @@ expect object SonarCore {
         limit: Int,
     ): List<SonarMsg>
 
-    /** Poll the relays once (welcomes + group messages). */
+    /** Poll the relays once (welcomes + group messages). Short-circuits while
+     *  live subscriptions are active, so it is the routine-heartbeat variant:
+     *  the live tail already delivers new events, and forcing the batched
+     *  all-groups fetch on every tick is wasted battery/relay traffic. */
     suspend fun sync()
+
+    /** Like [sync] but bypasses the live-subscription short-circuit and runs the
+     *  batched all-groups gap-recovery fetch. Use ONLY on real wake events
+     *  (foreground resume, push wake, explicit user refresh) where a message may
+     *  have arrived while the socket was torn down — not on the routine
+     *  heartbeat. Mirrors iOS `MarmotChatView.refresh()` / `syncForce()`. */
+    suspend fun syncForce()
 
     /** Prefer cold-start historical catch-up for the open chat (MLS group id).
      *  Empty/null clears. Local-first: never blocks paint/send. */
