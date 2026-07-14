@@ -328,6 +328,9 @@ final class MarmotChatModel: ObservableObject {
     @Published private(set) var sonarDescriptorMissesByNpub: [String: Date] = [:]
     /// True when the current node is relay-backed, not just the local DB node.
     @Published private(set) var relayConnected = false
+    /// True while a foreground/push-tap catch-up sync is running. Passive UI
+    /// signal only: it must never gate paint, sending, or scrolling.
+    @Published private(set) var syncingInFlight = false
     /// True after the first local encrypted-DB hydration attempt finishes.
     /// Home uses this as its atomic reveal boundary; relay state is irrelevant.
     @Published private(set) var initialLocalHomeReady = false
@@ -1325,6 +1328,8 @@ final class MarmotChatModel: ObservableObject {
         foregroundRefreshTask = Task { [weak self] in
             guard let self else { return }
             guard await self.ensureConnected() else { return }
+            self.syncingInFlight = true
+            defer { self.syncingInFlight = false }
             guard await self.ensureRelayConnected() else {
                 await self.loadLocalSummaries()
                 return
