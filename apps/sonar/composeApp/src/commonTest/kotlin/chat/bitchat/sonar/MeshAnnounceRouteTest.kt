@@ -2,6 +2,8 @@ package chat.bitchat.sonar
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertTrue
 
 class MeshAnnounceRouteTest {
     @Test
@@ -22,5 +24,12 @@ class MeshAnnounceRouteTest {
             MeshAnnounceRoute.Relayed,
             meshAnnounceRoute("local", "remote", ttl = 6u),
         )
+    }
+
+    @Test
+    fun verifiedSenderCannotReplaceItsSigningKey() {
+        assertTrue(meshSigningKeyMatches(null, "aabb"))
+        assertTrue(meshSigningKeyMatches("AABB", "aabb"))
+        assertFalse(meshSigningKeyMatches("aabb", "ccdd"))
     }
 }

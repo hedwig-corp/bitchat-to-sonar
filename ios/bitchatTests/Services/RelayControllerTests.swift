@@ -32,21 +32,29 @@ struct RelayControllerTests {
     }
 
     @Test
-    func linkSenderPolicy_rebindsOnlyVerifiedFullTtlAnnounces() {
-        #expect(MeshLinkSenderPolicy.allowsDirectIdentityRebind(
+    func linkSenderPolicy_neverTreatsFullTtlAsRelayedIdentity() {
+        #expect(!MeshLinkSenderPolicy.allowsRelayedIdentityPacket(
             type: MessageType.announce.rawValue,
-            ttl: TransportConfig.messageTTLDefault,
-            identityVerified: true
+            ttl: TransportConfig.messageTTLDefault
         ))
-        #expect(!MeshLinkSenderPolicy.allowsDirectIdentityRebind(
+        #expect(!MeshLinkSenderPolicy.allowsRelayedIdentityPacket(
+            type: SonarAnnouncePacket.packetType,
+            ttl: TransportConfig.messageTTLDefault
+        ))
+        #expect(!MeshLinkSenderPolicy.allowsRelayedIdentityPacket(
             type: MessageType.announce.rawValue,
-            ttl: TransportConfig.messageTTLDefault,
-            identityVerified: false
+            ttl: 0
         ))
-        #expect(!MeshLinkSenderPolicy.allowsDirectIdentityRebind(
-            type: MessageType.noiseHandshake.rawValue,
-            ttl: TransportConfig.messageTTLDefault,
-            identityVerified: true
+    }
+
+    @Test
+    func linkSenderPolicy_pinsSigningKeyForKnownIdentity() {
+        let original = Data([0x01, 0x02])
+        #expect(MeshLinkSenderPolicy.preservesSigningIdentity(existing: nil, announced: original))
+        #expect(MeshLinkSenderPolicy.preservesSigningIdentity(existing: original, announced: original))
+        #expect(!MeshLinkSenderPolicy.preservesSigningIdentity(
+            existing: original,
+            announced: Data([0x03, 0x04])
         ))
     }
 

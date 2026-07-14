@@ -87,6 +87,12 @@ internal fun meshAnnounceRoute(
     else -> MeshAnnounceRoute.Relayed
 }
 
+/** Once a sender ID has established an Ed25519 signing key, later announces
+ * must not replace it. Reinstall/reset rotates the Noise key and therefore the
+ * sender ID as well, so an in-place signing-key change is an impersonation. */
+internal fun meshSigningKeyMatches(existingKeyHex: String?, announcedKeyHex: String): Boolean =
+    existingKeyHex == null || existingKeyHex.equals(announcedKeyHex, ignoreCase = true)
+
 /**
  * Decide whether Android's BLE scan needs recovery without confusing repeated
  * advertisements from a connected peer with scanner starvation.

@@ -12,10 +12,8 @@ struct RelayDecision {
 /// claimed sender at the protocol layer, so a decremented-TTL copy is a valid
 /// relay candidate rather than an attempt to impersonate the direct neighbour.
 struct MeshLinkSenderPolicy {
-    static func allowsDirectIdentityRebind(type: UInt8, ttl: UInt8, identityVerified: Bool) -> Bool {
-        type == MessageType.announce.rawValue &&
-            ttl == TransportConfig.messageTTLDefault &&
-            identityVerified
+    static func preservesSigningIdentity(existing: Data?, announced: Data) -> Bool {
+        existing == nil || existing == announced
     }
 
     static func allowsRelayedIdentityPacket(type: UInt8, ttl: UInt8) -> Bool {

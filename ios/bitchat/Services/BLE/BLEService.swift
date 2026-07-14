@@ -1071,20 +1071,6 @@ final class BLEService: NSObject {
         return true
     }
 
-    /// A direct neighbour may legitimately replace its persisted mesh identity
-    /// (for example after reinstalling) while CoreBluetooth keeps the same link
-    /// identifier. Rebinding is safe only after the self-contained announce
-    /// proves both its sender derivation and signature.
-    private func isVerifiedIdentityAnnounce(_ packet: BitchatPacket, from peerID: PeerID) -> Bool {
-        guard packet.type == MessageType.announce.rawValue,
-              packet.signature != nil,
-              let announcement = AnnouncementPacket.decode(from: packet.payload),
-              PeerID(publicKey: announcement.noisePublicKey) == peerID else {
-            return false
-        }
-        return noiseService.verifyPacketSignature(packet, publicKey: announcement.signingPublicKey)
-    }
-
     // MARK: - Packet Broadcasting
     
     private func broadcastPacket(_ packet: BitchatPacket, transferId: String? = nil) {
@@ -2480,24 +2466,7 @@ extension BLEService: CBPeripheralDelegate {
             let trustedSenderID: PeerID?
             if let knownPeerID = boundPeerID {
                 if knownPeerID != claimedSenderID {
-                    let verifiedDirectRebind =
-                        validatePacket(packet, from: claimedSenderID, connectionSource: .peripheral(peripheralUUID)) &&
-                        isVerifiedIdentityAnnounce(packet, from: claimedSenderID)
-                    if MeshLinkSenderPolicy.allowsDirectIdentityRebind(
-                        type: packet.type,
-                        ttl: packet.ttl,
-                        identityVerified: verifiedDirectRebind
-                    ) {
-                        if peerToPeripheralUUID[knownPeerID] == peripheralUUID {
-                            peerToPeripheralUUID.removeValue(forKey: knownPeerID)
-                        }
-                        boundPeerID = claimedSenderID
-                        state.peerID = claimedSenderID
-                        peripherals[peripheralUUID] = state
-                        refreshPeerConnectionFlag(knownPeerID)
-                        refreshLocalTopology()
-                        trustedSenderID = claimedSenderID
-                    } else if MeshLinkSenderPolicy.allowsRelayedIdentityPacket(type: packet.type, ttl: packet.ttl) {
+                    if MeshLinkSenderPolicy.allowsRelayedIdentityPacket(type: packet.type, ttl: packet.ttl) {
                         trustedSenderID = nil
                     } else {
                         SecureLogger.warning("🚫 SECURITY: Sender ID spoofing attempt detected! Peripheral \(peripheralUUID.prefix(8))… claimed to be \(claimedSenderID.id.prefix(8))… but is bound to \(knownPeerID.id.prefix(8))…", category: .security)
@@ -2946,19 +2915,7 @@ extension BLEService: CBPeripheralManagerDelegate {
                 let trustedSenderID: PeerID?
                 if let knownPeerID = centralToPeerID[centralUUID] {
                     if knownPeerID != claimedSenderID {
-                        let verifiedDirectRebind =
-                            validatePacket(packet, from: claimedSenderID, connectionSource: .central(centralUUID)) &&
-                            isVerifiedIdentityAnnounce(packet, from: claimedSenderID)
-                        if MeshLinkSenderPolicy.allowsDirectIdentityRebind(
-                            type: packet.type,
-                            ttl: packet.ttl,
-                            identityVerified: verifiedDirectRebind
-                        ) {
-                            centralToPeerID[centralUUID] = claimedSenderID
-                            refreshPeerConnectionFlag(knownPeerID)
-                            refreshLocalTopology()
-                            trustedSenderID = claimedSenderID
-                        } else if MeshLinkSenderPolicy.allowsRelayedIdentityPacket(type: packet.type, ttl: packet.ttl) {
+                        if MeshLinkSenderPolicy.allowsRelayedIdentityPacket(type: packet.type, ttl: packet.ttl) {
                             trustedSenderID = nil
                         } else {
                             SecureLogger.warning("🚫 SECURITY: Sender ID spoofing attempt detected! Central \(centralUUID.prefix(8))… claimed to be \(claimedSenderID.id.prefix(8))… but is bound to \(knownPeerID.id.prefix(8))…", category: .security)
@@ -3203,16 +3160,6 @@ extension BLEService {
         }
     }
 
-    private func refreshPeerConnectionFlag(_ peerID: PeerID) {
-        let state = linkState(for: peerID)
-        collectionsQueue.sync(flags: .barrier) {
-            guard var info = peers[peerID] else { return }
-            info.isConnected = state.hasPeripheral || state.hasCentral
-            peers[peerID] = info
-        }
-        requestPeerDataPublish()
-    }
-    
     private func configureNoiseServiceCallbacks(for service: NoiseEncryptionService) {
         service.onPeerAuthenticated = { [weak self] peerID, fingerprint in
             SecureLogger.debug("🔐 Noise session authenticated with \(peerID), fingerprint: \(fingerprint.prefix(16))...")
@@ -4315,6 +4262,13 @@ extension BLEService {
         }
         if let existingKey = existingPeerForVerify?.noisePublicKey, existingKey != announcement.noisePublicKey {
             SecureLogger.warning("⚠️ Announce key mismatch for \(peerID.id.prefix(8))… — keeping unverified", category: .security)
+            verifiedAnnounce = false
+        }
+        if !MeshLinkSenderPolicy.preservesSigningIdentity(
+            existing: existingPeerForVerify?.signingPublicKey,
+            announced: announcement.signingPublicKey
+        ) {
+            SecureLogger.warning("⚠️ Announce signing-key change for \(peerID.id.prefix(8))… — keeping unverified", category: .security)
             verifiedAnnounce = false
         }
 

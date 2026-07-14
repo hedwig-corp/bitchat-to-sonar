@@ -24,6 +24,9 @@ pub mod msg_type {
     /// Payload is a [`super::file_packet::FilePacket`] TLV; large files ride as
     /// 0x20 fragments with `original_type = 0x22`.
     pub const FILE_TRANSFER: u8 = 0x22;
+    /// Sonar discovery/profile announce. It is signed with the same Ed25519
+    /// identity key carried by the peer's verified `ANNOUNCE` packet.
+    pub const SONAR_ANNOUNCE: u8 = 0x53;
 }
 
 const V1_HEADER_SIZE: usize = 14;
