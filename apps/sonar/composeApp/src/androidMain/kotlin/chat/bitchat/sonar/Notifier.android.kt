@@ -20,9 +20,13 @@ actual object Notifier {
 
     private val ctx: Context get() = AppContextHolder.ctx
     private fun manager() = ctx.getSystemService(NotificationManager::class.java)
-    private fun soundUri(resourceId: Int): Uri = Uri.parse(
-        "${ContentResolver.SCHEME_ANDROID_RESOURCE}://${ctx.packageName}/$resourceId"
-    )
+    private fun soundUri(resourceId: Int): Uri {
+        val resourceType = ctx.resources.getResourceTypeName(resourceId)
+        val resourceName = ctx.resources.getResourceEntryName(resourceId)
+        return Uri.parse(
+            "${ContentResolver.SCHEME_ANDROID_RESOURCE}://${ctx.packageName}/$resourceType/$resourceName"
+        )
+    }
 
     actual fun ensureChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
