@@ -348,8 +348,43 @@ the existing periodic connection path. The physical-iPhone smoke batch's
 median interval between consecutive `send_local_pending` markers was 998 ms
 (the driver's requested cadence); all 50 sends reached the core over 110.9 s.
 Live transcript contention still produced a 6.65 s p95 dispatch gap and a
-19.33 s maximum, so those UI tails remain an explicit follow-up signal even
-though core send/ACK latency is now bounded.
+19.33 s maximum, so those UI tails remained an explicit follow-up signal even
+though core send/ACK latency was bounded. **Resolved by the send fast-lane
+(2026-07-14, `eb06d6f4`)** — see the next section.
+
+### Send fast-lane: engine MLS write lock + dedicated iOS send queue
+
+The dispatch tail's root cause was host-side queueing, not core send work:
+`sendText` shared the serial `workQueue` with `syncOnce`/`syncForce`/
+`drainPending`/`ensureSubscriptions`, each of which parks that queue for
+stacked relay quorum fetches (`FETCH_TIMEOUT` = 10 s each). A send tapped
+during a cold-start or foreground sync waited for the whole chain.
+
+Fix (commit `eb06d6f4`): `MarmotEngine` now serializes MLS-mutating sections
+internally (`write_lock`, per-operation granularity, never held across an
+await), send paths encrypt + write the local row under one guard
+(`create_and_process_*`), and iOS routes text/sticker sends through a
+dedicated serial `sendQueue` (leased-node machinery, same as `readQueue`).
+A send now waits for at most one in-flight MLS mutation, never a relay fetch.
+Media sends also moved onto the durable outbox + first-ACK path.
+
+Before/after on the same iPhone 14 Pro Max, same 40-send composer-path smoke
+batch (driver cadence ~1 s), fresh cold relaunch each run:
+
+| metric (ms) | before (shared queue) | after (fast-lane) |
+|---|---|---|
+| local persist min/med/p95/max | 10 / 38.5 / 42 / 44 | 16 / 22 / 24 / 37 |
+| first ACK min/med/p95/max | 20 / 28.5 / 69 / 89 | 21 / 32 / 64 / 594* |
+| first-send gap after cold launch | **6445–13411** | **1055** (= cadence) |
+| steady-state dispatch gap med/p95/max | 800 / 2755 / bursty 2.3–2.8 s stalls | 1015 / 1055 / 1069 |
+| publish failures | 0 | 0 |
+
+*the two first sends pay a relay round-trip warmup (498/594 ms), then
+20–64 ms. The cold-launch first-send stall and the mid-batch bursty stalls
+are gone; every inter-send gap in the after run sits within 978–1069 ms of
+the driver cadence. Incoming processing stayed intact (no Unprocessable /
+Failed markers), covered by the core test
+`concurrent_sends_and_incoming_processing_land_every_row`.
 
 macOS already had a 20 ms first-ACK baseline median; the rerun measured 24 ms,
 while first-ACK p95 improved from 44.6 ms to 31 ms (**30.5% faster**) and total
