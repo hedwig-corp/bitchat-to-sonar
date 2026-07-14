@@ -286,6 +286,19 @@ the background. `failure-marked` means every relay failed on an earlier attempt
 before the same durable message later received an ACK through retry; those
 accepted samples remain in the distribution.
 
+### Repeatable send smoke coverage
+
+The Debug-only Apple batch driver is now the repeatable smoke-test path for the
+normal composer send flow. It can run 1–500 exact-target messages on a signed
+physical iPhone or iOS simulator without XCTest/UI automation and logs only
+content-free timing markers. A functional 50-message pass requires 50
+dispatched/accepted messages and zero `failure-marked` samples. The simulator
+is suitable for functional CI/nightly smoke coverage; a signed physical-device
+run should remain the nightly latency monitor because simulator timing cannot
+model live radio, TLS, device scheduling, or native UI contention. Exact
+build, log-capture, launch, and validation commands are in
+[`scripts/bench/README.md`](../scripts/bench/README.md#repeatable-send-smoke-checks).
+
 ## Where to speed up (highest impact first)
 
 1. ~~**Don't block sync on the publishes.**~~ **DONE (2026-07):**
