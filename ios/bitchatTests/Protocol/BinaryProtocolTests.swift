@@ -422,6 +422,23 @@ struct BinaryProtocolTests {
         let timeDiff = abs(decodedMessage.timestamp.timeIntervalSince(message.timestamp))
         #expect(timeDiff < 1)
     }
+
+    @Test func localArrivalMetadataIsExcludedFromWirePayload() throws {
+        let message = BitchatMessage(
+            sender: TestConstants.testNickname1,
+            content: TestConstants.testMessage1,
+            timestamp: Date(),
+            isRelay: false,
+            isPrivate: true,
+            recipientNickname: TestConstants.testNickname2,
+            receivedViaInternet: true
+        )
+
+        let payload = try #require(message.toBinaryPayload(), "Failed to encode message to binary")
+        let decodedMessage = try #require(BitchatMessage(payload), "Failed to decode message from binary")
+
+        #expect(decodedMessage.receivedViaInternet == nil)
+    }
     
     func testPrivateMessageEncoding() throws {
         let message = TestHelpers.createTestMessage(

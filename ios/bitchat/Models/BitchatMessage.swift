@@ -22,8 +22,9 @@ final class BitchatMessage: Codable {
     let isPrivate: Bool
     let recipientNickname: String?
     let senderPeerID: PeerID?
-    /// Local-only arrival metadata. `nil` keeps persisted pre-migration and
-    /// mesh/wire-decoded messages backward compatible.
+    /// Local arrival metadata persisted by `MessageStore` through `Codable`.
+    /// The binary wire codec below intentionally omits it, so mesh-decoded and
+    /// pre-migration messages remain backward compatible with a `nil` value.
     let receivedViaInternet: Bool?
     let mentions: [String]?  // Array of mentioned nicknames
     var deliveryStatus: DeliveryStatus? // Delivery tracking
