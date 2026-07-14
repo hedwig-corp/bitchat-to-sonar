@@ -684,6 +684,21 @@ fn live_group_since_secs(watermark_secs: u64, now_secs: u64) -> u64 {
     }
 }
 
+/// Whether `sync_inner` must run the batched all-groups kind-445 fetch.
+///
+/// On a plain poll the fetch is redundant while the live subscription tail is
+/// active — the tail already delivers new events, and the watermarked fetch
+/// would just stack a relay timeout onto every poll. A FORCED sync (foreground
+/// resume, push wake) must fetch even when live: the live tail only reaches
+/// back `max(watermark − SYNC_OVERLAP_SECS, now − LIVE_GROUP_TAIL_SECS)`, so a
+/// message that arrived while the app was suspended/killed for longer than the
+/// tail is NOT in the resubscribe EOSE burst. Without this fetch, recovering it
+/// falls to the one-group-per-pass catch-up queue and a push-notified message
+/// can stay invisible long after the user opens the app.
+fn should_fetch_group_messages_on_sync(is_live: bool, force: bool) -> bool {
+    !is_live || force
+}
+
 /// Push into a live buffer with half-drop overflow. Returns true if a drop ran.
 fn push_live_buffer<T>(buf: &mut Vec<T>, item: T, cap: usize) -> bool {
     let mut dropped = false;
@@ -3352,12 +3367,12 @@ impl SonarClient {
         }
 
         // Fetch kind-445 for ALL known groups in one request (batched `#h`),
-        // including any group a welcome just added above. Skip when the live
-        // subscription tail is active — it already delivers these events, and
-        // the watermarked fetch is redundant work that stacks a 10s timeout.
+        // including any group a welcome just added above. See
+        // `should_fetch_group_messages_on_sync` for why a forced sync must run
+        // this even while the live subscription tail is active.
         let is_live = *self.live_marmot_enabled.lock().unwrap();
         let group_ids: Vec<String> = self.current_group_ids()?.into_iter().collect();
-        if !group_ids.is_empty() && !is_live {
+        if !group_ids.is_empty() && should_fetch_group_messages_on_sync(is_live, force) {
             let mut filter = Filter::new()
                 .kind(Kind::MlsGroupMessage)
                 .custom_tags(SingleLetterTag::lowercase(Alphabet::H), group_ids);
@@ -6000,6 +6015,20 @@ mod tests {
         let now = 1_700_000_000u64;
         let since = live_group_since_secs(0, now);
         assert_eq!(since, now - LIVE_GROUP_TAIL_SECS);
+    }
+
+    #[test]
+    fn forced_sync_fetches_group_messages_even_when_live() {
+        // The live tail's since floor never reaches further back than
+        // LIVE_GROUP_TAIL_SECS, so a foreground/push sync_force after a long
+        // suspend must run the batched watermark fetch itself — a pushed
+        // message older than the tail is otherwise invisible until the
+        // one-group-per-pass catch-up queue happens to reach its group.
+        assert!(should_fetch_group_messages_on_sync(true, true));
+        assert!(should_fetch_group_messages_on_sync(false, true));
+        assert!(should_fetch_group_messages_on_sync(false, false));
+        // Plain polls stay cheap while live subscriptions cover new events.
+        assert!(!should_fetch_group_messages_on_sync(true, false));
     }
 
     #[test]
