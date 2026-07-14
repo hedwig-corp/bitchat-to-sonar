@@ -1,4 +1,4 @@
-# Performance: cold-start, relay-sync, and message-send benchmarks
+# Performance: cold-start, relay-sync, message-send, and sticker-cache benchmarks
 
 Status: harnesses implemented under `scripts/bench/`; native Apple and Compose
 Multiplatform app surfaces supported.
@@ -54,6 +54,9 @@ cost.
   `[HH:MM:SS.mmm]` BitLogger timestamps. Splits the post-connect window into
   publish / wait / drain via the `t3a`/`t3b` markers.
 - `README.md` — usage + design notes.
+- `_sticker_aggregate.py` — cross-platform sticker pack/image benchmark parser.
+  It reports relay metadata fetch, HTTPS miss phases, verified disk/reference
+  hits, detached prefetch completion, and the observed network-to-cache speedup.
 
 ## How to run
 
@@ -104,6 +107,83 @@ Raw per-run logs land in `/tmp/sonar-bench/runs/run_*.ndjson`.
 - **`sonar-cli init --force`** rewrites `config.json` (new DB key) but not the old
   encrypted `marmot.sqlite` → "Wrong encryption key"; wipe the agent home first
   (the provision script does this).
+
+## Sticker pack/cache device benchmark
+
+Sticker timing is emitted by the shared core, so the same phase definitions are
+used on native Apple and Compose devices. The explicit Debug-only device
+launcher temporarily enables debug-level `SONAR_BENCH` telemetry, exercises the
+same foreground ladder on each platform, and restores the user's diagnostics
+setting when it completes:
+
+```bash
+scripts/bench/_sticker_aggregate.py --label 'iPhone' /tmp/iphone-stickers.log
+scripts/bench/_sticker_aggregate.py --label 'Android' /tmp/android-stickers.log
+```
+
+The headline comparison is HTTPS image total versus verified disk hit and
+validated transcript hit (median and p95). Pack metadata relay time and the
+first-20/four-task prefetch batch are reported separately so relay variability
+is not mistaken for filesystem/cache cost. Exact capture commands and marker
+fields are documented in `scripts/bench/README.md`. The parser requires exactly
+one completed device batch, proves the final durable pass used verified disk
+hits, and validates its success and marker schema so an incomplete or mixed
+capture cannot silently produce misleading numbers.
+
+Pack metadata refresh remains network-first. If that refresh is unavailable,
+the shared core falls back to its last cryptographically validated local pack
+definition instead of failing the picker/benchmark; `source=network` and
+`source=fallback_disk` keep those timing populations separate. A concurrent
+caller that joins the same in-flight request is reported as `source=shared`.
+
+Physical Apple and Android builds also expose an explicit Debug-only launcher
+benchmark. It drives the real production cache ladder (initial image load →
+host LRU → verified disk → validated transcript lookup) without installing a
+pack, clearing an account, or changing a conversation. This is the preferred
+per-device comparison because the same public pack and image count can be used
+on both devices; the initial pass itself reports whether that device was cold
+(`source=network`) or already warm (`source=disk`).
+
+### Physical-device result — 2026-07-14
+
+Live public pack: `Herecomesbitcoin.org`, 103 stickers. These are observational
+device samples, not CI thresholds; relay and HTTPS time include current network
+conditions.
+
+| device/path | n | median | p95 | notes |
+|---|---:|---:|---:|---|
+| Pixel 10 Pro relay pack refresh | 1 | 10,023.5 ms | 10,023.5 ms | same 8-image offset-60 ladder |
+| Pixel 10 Pro validated pack fallback | 1 | 1.25 ms | 1.25 ms | intentionally unavailable loopback relay |
+| Pixel 10 Pro verified disk hit | 16 | 0.93 ms | 2.63 ms | 8 initial + 8 post-memory reads |
+| Pixel 10 Pro host LRU hit | 8 | 0.001 ms | 0.01 ms | 8/8 successful |
+| Pixel 10 Pro validated transcript hit | 8 | 1.43 ms | 2.85 ms | 8/8 coordinate + shortcode + SHA authorizations |
+| iPhone 14 Pro Max relay pack refresh | 1 | 229.9 ms | 229.9 ms | same 8-image offset-60 ladder |
+| iPhone 14 Pro Max verified disk hit | 16 | 0.92 ms | 1.70 ms | 8 initial + 8 post-memory reads |
+| iPhone 14 Pro Max host LRU hit | 8 | 0.005 ms | 0.009 ms | 8/8 successful |
+| iPhone 14 Pro Max validated transcript hit | 8 | 1.09 ms | 1.32 ms | 8/8 successful |
+
+Every reported ladder completed with matching initial/memory/disk/reference
+counts. Both devices were warm for the final matched run: the iPhone's existing
+account already had offsets 0, 20, 40, and 60 of the public pack, and the Pixel
+had the selected offset-60 images from its earlier smoke run. No honest cold
+HTTPS sample was available without deleting user cache data; the benchmark
+preserved that data.
+Fresh offset-68/80 download attempts encountered unavailable public image
+responses after pack fetch and were rejected by the completeness checks rather
+than being reported as performance samples.
+
+Pack metadata remains network-bound and variable (229.9 ms–10.02 s in the final
+matched-device run), while the forced validated-local fallback completed in
+1.25 ms on Pixel. The cache itself is not the bottleneck. This change therefore keeps a
+25 MiB/100-entry host LRU on each app
+surface, a verified content-addressed disk cache with a strict 5 MiB per-image
+foreground/prefetch limit, shared per-pack/per-SHA single-flight fetch gates,
+and bounded first-20/four-task install prefetch detached from the UI/FFI path.
+Identity replacement and wipe first stop new sticker work and drain active
+reads on Apple, Android, and desktop before deleting the database/cache. When a
+relay refresh fails, every host now receives the persisted validated pack
+metadata rather than losing an otherwise usable warm cache. Moving refresh fully
+behind the first local paint remains a separate UI lifecycle optimization.
 
 ## Baseline result
 

@@ -67,6 +67,14 @@ enum SonarDiagnostics {
         }
     }
 
+    /// Change only the Rust core filter for an explicit Debug benchmark. This
+    /// deliberately does not persist a diagnostics preference or broaden the
+    /// app log sink; callers restore the user's normal setting afterward.
+    static func setCoreBenchmarkVerbose(_ verbose: Bool) {
+        guard let dir = coreLogDirectory() else { return }
+        try? setupLogging(dir: dir.path, verbose: verbose)
+    }
+
     // MARK: - Sink installation
 
     /// Configure the SecureLogger file tee. Call once at app start.

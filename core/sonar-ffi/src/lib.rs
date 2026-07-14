@@ -808,16 +808,27 @@ impl SonarNode {
         let expected_sha256 = expected_sha256.to_ascii_lowercase();
         sonar_stickers::validate_sha256_hex(&expected_sha256)
             .map_err(|e| SonarFfiError::InvalidInput(format!("bad sticker sha256: {e}")))?;
-        let bytes = self
-            .runtime
-            .block_on(sonar_core::client::http_get_public(&url))?;
-        let actual_sha256 = sonar_stickers::sha256_hex(&bytes);
-        if actual_sha256 != expected_sha256 {
-            return Err(SonarFfiError::InvalidInput(format!(
-                "sticker image sha256 mismatch: expected {expected_sha256}, got {actual_sha256}"
-            )));
-        }
-        Ok(bytes)
+        self.runtime
+            .block_on(self.client.fetch_sticker_image(&url, &expected_sha256))
+            .map_err(Into::into)
+    }
+
+    /// Return verified local bytes only when the latest locally cached pack
+    /// definition authorizes the exact sticker reference. Never contacts relays
+    /// or HTTP; `None` is an ordinary cache or validation miss.
+    pub fn cached_sticker_image_for_ref(
+        &self,
+        pack_coordinate: String,
+        shortcode: String,
+        plaintext_sha256: String,
+    ) -> FfiResult<Option<Vec<u8>>> {
+        let pack = sonar_stickers::PackAddress::parse(&pack_coordinate)
+            .map_err(|e| SonarFfiError::InvalidInput(format!("bad pack coordinate: {e}")))?;
+        let sticker_ref = sonar_stickers::StickerRef::new(pack, shortcode, plaintext_sha256)
+            .map_err(|e| SonarFfiError::InvalidInput(format!("bad sticker ref: {e}")))?;
+        self.client
+            .cached_sticker_image_for_ref(&sticker_ref)
+            .map_err(Into::into)
     }
 
     pub fn fetch_installed_packs(&self) -> FfiResult<Vec<String>> {

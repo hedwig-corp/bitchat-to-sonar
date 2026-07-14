@@ -41,11 +41,39 @@ import chat.bitchat.sonar.SonarGifItem
 import chat.bitchat.sonar.SonarStickerItem
 import chat.bitchat.sonar.SonarStickerPack
 import chat.bitchat.sonar.decodeImageBitmap
+import chat.bitchat.sonar.normalizeStickerPackCoordinate
 import chat.bitchat.sonar.ui.SNEmptyState
 import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconName
 import chat.bitchat.sonar.ui.SNSectionLabel
 import chat.bitchat.sonar.ui.sonar
+
+internal fun shouldPreserveCachedStickerPacks(
+    hadCachedPacks: Boolean,
+    installedCoordinates: List<String>?,
+): Boolean = hadCachedPacks && installedCoordinates == null
+
+internal fun filterCachedStickerPacksByInstalledCoordinates(
+    packs: List<SonarStickerPack>,
+    installedCoordinates: List<String>,
+): List<SonarStickerPack> {
+    val installed = installedCoordinates.mapTo(mutableSetOf(), ::normalizeStickerPackCoordinate)
+    return packs.filter { normalizeStickerPackCoordinate(it.packCoordinate) in installed }
+}
+
+internal fun mergeRefreshedStickerPacks(
+    cachedPacks: List<SonarStickerPack>,
+    refreshedPacks: List<SonarStickerPack>,
+    installedCoordinates: List<String>,
+): List<SonarStickerPack> {
+    val cachedByCoordinate = cachedPacks.associateBy { normalizeStickerPackCoordinate(it.packCoordinate) }
+    val refreshedByCoordinate = refreshedPacks.associateBy { normalizeStickerPackCoordinate(it.packCoordinate) }
+    val added = mutableSetOf<String>()
+    return installedCoordinates.mapNotNull { coordinate ->
+        val key = normalizeStickerPackCoordinate(coordinate)
+        if (!added.add(key)) null else refreshedByCoordinate[key] ?: cachedByCoordinate[key]
+    }
+}
 
 private enum class PickerTab { Emoji, Gif, Sticker }
 
@@ -117,21 +145,6 @@ private val emojiCategories = listOf(
     )),
 )
 
-/**
- * Default sticker pack loaded on first Sticker tab open when the user has no
- * installed packs (kind 10031). Must be the kind-30031 publisher pubkey —
- * see [docs/SONAR-STICKERS.md](https://sonarprivacy.xyz/docs/#SONAR-STICKERS).
- * Older kind-30030 publishes for the same Signal pack id are not used.
- */
-private const val TEST_PACK_AUTHOR = "7215b2db8754494fd3452b7f2d28b56e23863b95446bf68d79f980a7ad5ec7cd"
-private const val TEST_PACK_ID = "signal-8fa42aa13ec8f0efebe4b038f41afbd1"
-private val TEST_PACK_RELAYS = listOf(
-    "wss://relay.damus.io",
-    "wss://nos.lol",
-    "wss://relay.primal.net",
-    "wss://nostr.relay.hedwig.sh",
-)
-
 @Composable
 fun SonarEmojiPicker(
     onEmoji: (String) -> Unit,
@@ -143,6 +156,11 @@ fun SonarEmojiPicker(
     loadStickerImage: suspend (String, String) -> ByteArray? = { url, expectedSha256 ->
         runCatching { SonarCore.fetchStickerImage(url, expectedSha256) }.getOrNull()
     },
+    fetchInstalledPacks: suspend () -> List<String>? = {
+        runCatching { SonarCore.fetchInstalledPacks() }.getOrNull()
+    },
+    initialStickerPacks: List<SonarStickerPack> = emptyList(),
+    onStickerPacksLoaded: (List<SonarStickerPack>) -> Unit = {},
     onClose: () -> Unit,
 ) {
     val s = sonar
@@ -180,7 +198,14 @@ fun SonarEmojiPicker(
         when (tab) {
             PickerTab.Emoji -> EmojiTabContent(onEmoji)
             PickerTab.Gif -> GifTabContent()
-            PickerTab.Sticker -> StickerTabContent(onSticker, loadStickerPack, loadStickerImage)
+            PickerTab.Sticker -> StickerTabContent(
+                onSticker,
+                loadStickerPack,
+                loadStickerImage,
+                fetchInstalledPacks,
+                initialStickerPacks,
+                onStickerPacksLoaded,
+            )
         }
     }
 }
@@ -371,27 +396,55 @@ private fun ColumnScope.StickerTabContent(
     onSticker: (SonarStickerItem, String) -> Unit,
     loadStickerPack: suspend (String, String, List<String>) -> SonarStickerPack?,
     loadStickerImage: suspend (String, String) -> ByteArray?,
+    fetchInstalledPacks: suspend () -> List<String>?,
+    initialStickerPacks: List<SonarStickerPack>,
+    onStickerPacksLoaded: (List<SonarStickerPack>) -> Unit,
 ) {
     val s = sonar
-    var packs by remember { mutableStateOf<List<SonarStickerPack>>(emptyList()) }
-    var loading by remember { mutableStateOf(true) }
+    var packs by remember { mutableStateOf(initialStickerPacks) }
+    var loading by remember { mutableStateOf(initialStickerPacks.isEmpty()) }
     var error by remember { mutableStateOf<String?>(null) }
 
     LaunchedEffect(Unit) {
-        val coordinates = try { SonarCore.fetchInstalledPacks() } catch (_: Throwable) { emptyList() }
-        val toFetch = coordinates.ifEmpty { listOf("30031:$TEST_PACK_AUTHOR:$TEST_PACK_ID") }
+        // ChatScreen owns the loaded packs, so closing/reopening the tray can
+        // paint immediately while app-level caches refresh metadata behind it.
+        val hadCachedPacks = packs.isNotEmpty()
+        if (hadCachedPacks) {
+            loading = false
+        }
+        val coordinates = try { fetchInstalledPacks() } catch (_: Throwable) { null }
+        if (coordinates == null) {
+            if (!shouldPreserveCachedStickerPacks(hadCachedPacks, coordinates)) {
+                error = "Failed to load sticker packs"
+            }
+            loading = false
+            return@LaunchedEffect
+        }
+        val filteredCachedPacks = filterCachedStickerPacksByInstalledCoordinates(packs, coordinates)
+        if (filteredCachedPacks != packs) {
+            packs = filteredCachedPacks
+            onStickerPacksLoaded(filteredCachedPacks)
+        }
         val loaded = mutableListOf<SonarStickerPack>()
-        for (coord in toFetch) {
+        for (coord in coordinates) {
             val parts = coord.split(":", limit = 3)
             if (parts.size != 3) continue
-            val relays = if (coord.contains(TEST_PACK_AUTHOR)) TEST_PACK_RELAYS else emptyList()
-            loadStickerPack(parts[1], parts[2], relays)?.takeIf { it.stickers.isNotEmpty() }?.let { loaded += it }
+            loadStickerPack(parts[1], parts[2], emptyList())
+                ?.takeIf { it.stickers.isNotEmpty() }
+                ?.let { loaded += it }
         }
-        if (loaded.isEmpty()) {
-            loadStickerPack(TEST_PACK_AUTHOR, TEST_PACK_ID, TEST_PACK_RELAYS)?.let { loaded += it }
+        val merged = mergeRefreshedStickerPacks(filteredCachedPacks, loaded, coordinates)
+        if (merged.isNotEmpty()) {
+            packs = merged
+            onStickerPacksLoaded(merged)
+            error = null
+        } else if (coordinates.isEmpty()) {
+            packs = emptyList()
+            onStickerPacksLoaded(emptyList())
+            error = null
+        } else if (packs.isEmpty()) {
+            error = "Failed to load sticker packs"
         }
-        packs = loaded
-        if (loaded.isEmpty()) error = "Failed to load sticker packs"
         loading = false
     }
 
@@ -409,11 +462,18 @@ private fun ColumnScope.StickerTabContent(
             Spacer(Modifier.height(8.dp))
             Text("Loading stickers…", color = s.text3, fontSize = 13.sp)
         }
-    } else if (error != null || packs.isEmpty()) {
+    } else if (error != null) {
         SNEmptyState(
             icon = SNIconName.Sticker,
             title = "Couldn't load stickers",
             desc = error ?: "Try again later",
+        )
+        Spacer(Modifier.weight(1f))
+    } else if (packs.isEmpty()) {
+        SNEmptyState(
+            icon = SNIconName.Sticker,
+            title = "No sticker packs installed",
+            desc = "Install a pack from a shared sticker link to use it here.",
         )
         Spacer(Modifier.weight(1f))
     } else {

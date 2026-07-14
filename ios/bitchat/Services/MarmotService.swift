@@ -25,6 +25,43 @@ import SonarCore
 ///   and call into this service.
 final class MarmotService: @unchecked Sendable {
 
+    private final class NodeLifecycleLease: @unchecked Sendable {
+        private let lock = NSLock()
+        private var group: DispatchGroup?
+
+        init(group: DispatchGroup) {
+            self.group = group
+            group.enter()
+        }
+
+        func release() {
+            lock.lock()
+            let group = self.group
+            self.group = nil
+            lock.unlock()
+            group?.leave()
+        }
+
+        deinit { release() }
+    }
+
+    private final class OperationCancellation: @unchecked Sendable {
+        private let lock = NSLock()
+        private var cancelled = false
+
+        var isCancelled: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return cancelled
+        }
+
+        func cancel() {
+            lock.lock()
+            cancelled = true
+            lock.unlock()
+        }
+    }
+
     // MARK: - Public model types (UI layers must not import SonarCore)
 
     struct MarmotGroup: Sendable, Equatable, Codable {
@@ -251,6 +288,11 @@ final class MarmotService: @unchecked Sendable {
     /// concurrent `ffiQueue`.
     private let readQueue = DispatchQueue(label: "chat.bitchat.marmot-ffi-read", qos: .userInitiated, attributes: .concurrent)
 
+    /// Installed-pack fetch/modify/publish is a separate FIFO network lane.
+    /// It must stay ordered without parking MLS text/sticker sends for the
+    /// relay timeout or blocking unrelated concurrent image reads.
+    private let installedPackQueue = DispatchQueue(label: "chat.bitchat.marmot-installed-packs", qos: .utility)
+
     /// Relay connection setup can be slow and must not block local transcript
     /// reads on `workQueue`. Build the relay-backed node here, then swap it in
     /// under `workQueue` once ready.
@@ -281,6 +323,7 @@ final class MarmotService: @unchecked Sendable {
     func connect(nsec: String? = nil) async throws -> String {
         let relayUrls = self.relayUrls
         let (identity, generation) = try await run { service in
+            guard !service.nodeClosing else { throw ServiceError.cancelled }
             let identity: SonarIdentity
             if let nsec {
                 identity = try SonarIdentity.import(nsec: nsec)
@@ -294,12 +337,13 @@ final class MarmotService: @unchecked Sendable {
             return (identity, service.sessionGeneration)
         }
         let (dbPath, dbKeyHex) = try Self.databaseConfig()
-        let node = try await connectNode(
+        let (node, nodeLease) = try await connectNode(
             identity: identity,
             relayUrls: relayUrls,
             dbPath: dbPath,
             dbKeyHex: dbKeyHex
         )
+        defer { nodeLease.release() }
         let installed = await runNonThrowing { service in
             guard service.sessionGeneration == generation,
                   service.identity?.npub() == identity.npub()
@@ -330,6 +374,7 @@ final class MarmotService: @unchecked Sendable {
     @discardableResult
     func connectLocal(nsec: String? = nil) async throws -> String {
         try await run { service in
+            guard !service.nodeClosing else { throw ServiceError.cancelled }
             let identity: SonarIdentity
             if let nsec {
                 identity = try SonarIdentity.import(nsec: nsec)
@@ -653,14 +698,15 @@ final class MarmotService: @unchecked Sendable {
         }
     }
 
-    /// Fetch a sticker pack from relays by author and identifier.
+    /// Fetch a sticker pack from relays by author and identifier. This can park
+    /// for the relay timeout, so it must not occupy the serialized MLS queue.
     func fetchStickerPack(
         authorPubkeyHex: String,
         identifier: String,
         relayUrls: [String]
     ) async throws -> StickerPackInfo {
-        try await run {
-            try $0.requireNode().fetchStickerPack(
+        try await readOnly { node in
+            try node.fetchStickerPack(
                 authorPubkeyHex: authorPubkeyHex,
                 identifier: identifier,
                 relayUrls: relayUrls
@@ -671,22 +717,37 @@ final class MarmotService: @unchecked Sendable {
     /// Download a public sticker image by its plaintext HTTPS URL.
     /// Runs off the serial workQueue to avoid blocking sends and message reads.
     func fetchStickerImage(url: String, expectedSha256: String) async throws -> Data {
-        let nodeRef: SonarNode = try await run { try $0.requireNode() }
-        return try await Task.detached {
-            try nodeRef.fetchStickerImage(url: url, expectedSha256: expectedSha256)
-        }.value
+        try await readOnly { node in
+            try node.fetchStickerImage(url: url, expectedSha256: expectedSha256)
+        }
+    }
+
+    /// Read verified sticker bytes only when cached pack metadata authorizes the
+    /// full reference. A nil result is an ordinary local validation/cache miss.
+    func cachedStickerImage(for ref: MarmotStickerRef) async throws -> Data? {
+        try await readOnly { node in
+            try node.cachedStickerImageForRef(
+                packCoordinate: ref.packCoordinate,
+                shortcode: ref.shortcode,
+                plaintextSha256: ref.plaintextSha256
+            )
+        }
     }
 
     func fetchInstalledPacks() async throws -> [String] {
-        try await readOnly { try $0.fetchInstalledPacks() }
+        try await leasedNodeOperation(on: installedPackQueue) { try $0.fetchInstalledPacks() }
     }
 
     func installStickerPack(coordinate: String) async throws {
-        try await run { try $0.requireNode().installStickerPack(coordinate: coordinate) }
+        try await leasedNodeOperation(on: installedPackQueue) {
+            try $0.installStickerPack(coordinate: coordinate)
+        }
     }
 
     func uninstallStickerPack(coordinate: String) async throws {
-        try await run { try $0.requireNode().uninstallStickerPack(coordinate: coordinate) }
+        try await leasedNodeOperation(on: installedPackQueue) {
+            try $0.uninstallStickerPack(coordinate: coordinate)
+        }
     }
 
     /// Download + decrypt the media blob at `url` for the group. This read-only
@@ -768,21 +829,24 @@ final class MarmotService: @unchecked Sendable {
     /// not block syncs/sends; `SonarNode` is internally Send+Sync, so calling it
     /// from `waitQueue` with a reference grabbed race-free on `workQueue` is safe.
     func waitForMarmotEvent(timeoutSeconds: UInt64) async -> Bool {
-        guard let node = await runNonThrowing({ service -> SonarNode? in
-            guard service.relayConnected else { return nil }
-            return service.node
-        }) else {
-            // Local-only startup is intentionally disconnected from relays.
-            // Wait out the timeout so polling loops do not busy-spin or call
-            // generated non-throwing FFI wait wrappers on a local-only node.
-            try? await Task.sleep(nanoseconds: timeoutSeconds * 1_000_000_000)
-            return false
-        }
-        return await withCheckedContinuation { continuation in
-            waitQueue.async {
-                continuation.resume(returning: node.waitForMarmotEvent(timeoutSecs: timeoutSeconds))
+        var remaining = timeoutSeconds
+        while remaining > 0 && !Task.isCancelled {
+            let slice = min(remaining, 1)
+            let woke = try? await leasedNodeOperation(
+                on: waitQueue,
+                requireRelay: true
+            ) { node in
+                node.waitForMarmotEvent(timeoutSecs: slice)
             }
+            guard let woke else {
+                try? await Task.sleep(nanoseconds: slice * 1_000_000_000)
+                remaining -= slice
+                continue
+            }
+            if woke { return true }
+            remaining -= slice
         }
+        return false
     }
 
     /// Process buffered live Marmot events through the MLS engine on the serial
@@ -1034,18 +1098,39 @@ final class MarmotService: @unchecked Sendable {
 
     /// Panic-wipe: drop the open node, erase the encrypted database (and its
     /// SQLite sidecars), and forget the Keychain DB key. Idempotent.
-    func wipeDatabase() async {
+    func wipeDatabase() async throws {
+        let url = try Self.databaseURL()
         await runNonThrowing { service in
             service.sessionGeneration = service.sessionGeneration &+ 1
+            #if os(iOS)
+            SonarPushRegistration.shared.clearSonarNode()
+            #endif
             service.nodeLock.lock()
+            service.nodeClosing = true
             service.node = nil
             service.relayConnected = false
             service.nodeLock.unlock()
             service.identity = nil
-            if let url = try? Self.databaseURL() {
-                try? wipeMarmotDatabase(dbPath: url.path)
+            return ()
+        }
+        // Do not block workQueue while draining: an off-queue relay connect may
+        // need that queue once to reject its stale generation and release its
+        // lease. New leases are already rejected by `nodeClosing`.
+        await withCheckedContinuation { continuation in
+            nodeLifecycleGroup.notify(queue: workQueue) {
+                continuation.resume()
             }
-            _ = KeychainManager().deleteIdentityKey(forKey: Self.dbKeychainKey)
+        }
+        try await run { service in
+            defer {
+                service.nodeLock.lock()
+                service.nodeClosing = false
+                service.nodeLock.unlock()
+            }
+            try wipeMarmotDatabase(dbPath: url.path)
+            guard KeychainManager().deleteIdentityKey(forKey: Self.dbKeychainKey) else {
+                throw ServiceError.core("failed to delete Marmot database key")
+            }
             return ()
         }
     }
@@ -1055,20 +1140,29 @@ final class MarmotService: @unchecked Sendable {
         relayUrls: [String],
         dbPath: String,
         dbKeyHex: String
-    ) async throws -> SonarNode {
+    ) async throws -> (SonarNode, NodeLifecycleLease) {
         try await withCheckedThrowingContinuation { continuation in
+            nodeLock.lock()
+            guard !nodeClosing else {
+                nodeLock.unlock()
+                continuation.resume(throwing: ServiceError.cancelled)
+                return
+            }
+            let lease = NodeLifecycleLease(group: nodeLifecycleGroup)
             relayConnectQueue.async {
                 do {
                     // Diagnostics file sink must exist before the node spins
                     // up so relay connect/EOSE/watermark events are captured.
                     SonarDiagnostics.installCoreLoggingIfNeeded()
-                    continuation.resume(returning: try SonarNode.connect(
+                    let node = try SonarNode.connect(
                         identity: identity,
                         relayUrls: relayUrls,
                         dbPath: dbPath,
                         dbKeyHex: dbKeyHex
-                    ))
+                    )
+                    continuation.resume(returning: (node, lease))
                 } catch let error as SonarFfiError {
+                    lease.release()
                     switch error {
                     case .InvalidInput(let message):
                         continuation.resume(throwing: ServiceError.invalidInput(message))
@@ -1076,9 +1170,11 @@ final class MarmotService: @unchecked Sendable {
                         continuation.resume(throwing: ServiceError.core(message))
                     }
                 } catch {
+                    lease.release()
                     continuation.resume(throwing: error)
                 }
             }
+            nodeLock.unlock()
         }
     }
 
@@ -1111,18 +1207,23 @@ final class MarmotService: @unchecked Sendable {
     /// Park up to `timeoutSeconds` for the next call state change (off the engine
     /// + action queues), mirroring `waitForMarmotEvent`.
     func callWaitEvent(timeoutSeconds: UInt64) async -> CallEventInfo? {
-        guard let node = await runNonThrowing({ service -> SonarNode? in
-            guard service.relayConnected else { return nil }
-            return service.node
-        }) else {
-            try? await Task.sleep(nanoseconds: timeoutSeconds * 1_000_000_000)
-            return nil
-        }
-        return await withCheckedContinuation { continuation in
-            callWaitQueue.async {
-                continuation.resume(returning: node.callWaitEvent(timeoutSecs: timeoutSeconds))
+        var remaining = timeoutSeconds
+        while remaining > 0 && !Task.isCancelled {
+            let slice = min(remaining, 1)
+            do {
+                let event: CallEventInfo? = try await leasedNodeOperation(
+                    on: callWaitQueue,
+                    requireRelay: true
+                ) { node in
+                    node.callWaitEvent(timeoutSecs: slice)
+                }
+                if let event { return event }
+            } catch {
+                try? await Task.sleep(nanoseconds: slice * 1_000_000_000)
             }
+            remaining -= slice
         }
+        return nil
     }
 
     /// Run a blocking call op on `queue`, with the node grabbed race-free on the
@@ -1131,23 +1232,7 @@ final class MarmotService: @unchecked Sendable {
         _ queue: DispatchQueue,
         _ body: @escaping @Sendable (SonarNode) throws -> T
     ) async throws -> T {
-        guard let node = await runNonThrowing({ $0.node }) else { throw ServiceError.notConnected }
-        return try await withCheckedThrowingContinuation { continuation in
-            queue.async {
-                do {
-                    continuation.resume(returning: try body(node))
-                } catch let error as SonarFfiError {
-                    switch error {
-                    case .InvalidInput(let message):
-                        continuation.resume(throwing: ServiceError.invalidInput(message))
-                    case .Core(let message):
-                        continuation.resume(throwing: ServiceError.core(message))
-                    }
-                } catch {
-                    continuation.resume(throwing: error)
-                }
-            }
-        }
+        try await leasedNodeOperation(on: queue, body)
     }
 
     // MARK: - Conversation index (Signal-style summary table)
@@ -1239,39 +1324,65 @@ final class MarmotService: @unchecked Sendable {
     /// from the concurrent queue is safe. This never blocks behind serial
     /// workQueue tasks.
     private let nodeLock = NSLock()
-    private func currentNode() -> SonarNode? {
-        nodeLock.lock()
-        defer { nodeLock.unlock() }
-        return node
+    private let nodeLifecycleGroup = DispatchGroup()
+    private var nodeClosing = false
+
+    private func leasedNodeOperation<T: Sendable>(
+        on queue: DispatchQueue,
+        requireRelay: Bool = false,
+        _ body: @escaping @Sendable (SonarNode) throws -> T
+    ) async throws -> T {
+        let cancellation = OperationCancellation()
+        return try await withTaskCancellationHandler(operation: {
+            guard !Task.isCancelled else { throw ServiceError.cancelled }
+            let result: T = try await withCheckedThrowingContinuation { continuation in
+                // Snapshot + lease reservation is atomic with the wipe's close.
+                nodeLock.lock()
+                guard !cancellation.isCancelled else {
+                    nodeLock.unlock()
+                    continuation.resume(throwing: ServiceError.cancelled)
+                    return
+                }
+                guard !nodeClosing, let nodeRef = node, !requireRelay || relayConnected else {
+                    nodeLock.unlock()
+                    continuation.resume(throwing: ServiceError.notConnected)
+                    return
+                }
+                let lease = NodeLifecycleLease(group: nodeLifecycleGroup)
+                queue.async {
+                    defer { lease.release() }
+                    guard !cancellation.isCancelled else {
+                        continuation.resume(throwing: ServiceError.cancelled)
+                        return
+                    }
+                    do {
+                        continuation.resume(returning: try body(nodeRef))
+                    } catch let error as SonarFfiError {
+                        switch error {
+                        case .InvalidInput(let message):
+                            continuation.resume(throwing: ServiceError.invalidInput(message))
+                        case .Core(let message):
+                            continuation.resume(throwing: ServiceError.core(message))
+                        }
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
+                }
+                nodeLock.unlock()
+            }
+            guard !Task.isCancelled else { throw ServiceError.cancelled }
+            return result
+        }, onCancel: {
+            cancellation.cancel()
+        })
     }
 
     private func readOnly<T: Sendable>(_ body: @escaping @Sendable (SonarNode) throws -> T) async throws -> T {
-        guard let nodeRef = currentNode() else { throw ServiceError.notConnected }
-        return try await withCheckedThrowingContinuation { continuation in
-            readQueue.async {
-                do {
-                    continuation.resume(returning: try body(nodeRef))
-                } catch let error as SonarFfiError {
-                    switch error {
-                    case .InvalidInput(let message):
-                        continuation.resume(throwing: ServiceError.invalidInput(message))
-                    case .Core(let message):
-                        continuation.resume(throwing: ServiceError.core(message))
-                    }
-                } catch {
-                    continuation.resume(throwing: error)
-                }
-            }
-        }
+        try await leasedNodeOperation(on: readQueue, body)
     }
 
     private func readOnlyNonThrowing<T: Sendable>(_ body: @escaping @Sendable (SonarNode) -> T, default defaultValue: T) async -> T {
-        guard let nodeRef = currentNode() else { return defaultValue }
-        return await withCheckedContinuation { continuation in
-            readQueue.async {
-                continuation.resume(returning: body(nodeRef))
-            }
-        }
+        (try? await leasedNodeOperation(on: readQueue, body)) ?? defaultValue
     }
 }
 

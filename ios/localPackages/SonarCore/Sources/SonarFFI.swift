@@ -908,6 +908,13 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func blossomServers() throws  -> [String]
     
     /**
+     * Return verified local bytes only when the latest locally cached pack
+     * definition authorizes the exact sticker reference. Never contacts relays
+     * or HTTP; `None` is an ordinary cache or validation miss.
+     */
+    func cachedStickerImageForRef(packCoordinate: String, shortcode: String, plaintextSha256: String) throws  -> Data?
+
+    /**
      * The user accepted an incoming call: we are the dialer. Dials the offerer
      * and starts media. Blocks on the QUIC connect.
      */
@@ -1344,7 +1351,7 @@ public static func connect(identity: SonarIdentity, relayUrls: [String], dbPath:
     )
 })
 }
-    
+
 
     
     /**
@@ -1403,6 +1410,22 @@ open func blossomServers()throws  -> [String]  {
 })
 }
     
+    /**
+     * Return verified local bytes only when the latest locally cached pack
+     * definition authorizes the exact sticker reference. Never contacts relays
+     * or HTTP; `None` is an ordinary cache or validation miss.
+     */
+open func cachedStickerImageForRef(packCoordinate: String, shortcode: String, plaintextSha256: String)throws  -> Data?  {
+    return try  FfiConverterOptionData.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_cached_sticker_image_for_ref(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(packCoordinate),
+        FfiConverterString.lower(shortcode),
+        FfiConverterString.lower(plaintextSha256),$0
+    )
+})
+}
+
     /**
      * The user accepted an incoming call: we are the dialer. Dials the offerer
      * and starts media. Blocks on the QUIC connect.
@@ -6404,6 +6427,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_blossom_servers() != 8214) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_cached_sticker_image_for_ref() != 15827) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_call_accept() != 7250) {

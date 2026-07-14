@@ -3851,12 +3851,12 @@ final class SonarAppStore: ObservableObject {
     }
 
     func sendSticker(_ id: String, sticker: StickerInfo, packCoordinate: String) {
+        let content = meshStickerContent(
+            packCoordinate: packCoordinate,
+            shortcode: sticker.shortcode,
+            plaintextSha256: sticker.sha256
+        )
         if meshReachable(id) {
-            let content = meshStickerContent(
-                packCoordinate: packCoordinate,
-                shortcode: sticker.shortcode,
-                plaintextSha256: sticker.sha256
-            )
             chatViewModel.sendPrivateMessage(content, to: PeerID(str: id))
             return
         }
@@ -3869,9 +3869,21 @@ final class SonarAppStore: ObservableObject {
             )
             return
         }
+        if let pendingNpub = pendingMarmotNpub(for: id) {
+            sendPendingMarmot(content, chatId: id, npub: pendingNpub)
+            return
+        }
+        if isPendingMarmotGroup(id) {
+            sendPendingMarmotGroup(content, chatId: id)
+            return
+        }
         if let profile = resolvedSonarProfile(id) {
             sendOverMarmotSticker(npub: profile.npub, packCoordinate: packCoordinate, sticker: sticker)
+            return
         }
+        // Match text routing: let the mesh router queue/fail visibly instead
+        // of silently discarding a sticker when contact metadata is incomplete.
+        chatViewModel.sendPrivateMessage(content, to: PeerID(str: id))
     }
 
     private func sendOverMarmotSticker(npub: String, packCoordinate: String, sticker: StickerInfo) {
@@ -3910,15 +3922,7 @@ final class SonarAppStore: ObservableObject {
         if pendingMarmotChats[chatId] == nil, pendingMarmotNpub(for: chatId) == clean {
             pendingMarmotChats[chatId] = SNPendingMarmotChat(npub: clean, createdAt: createdAt)
         }
-        let message = SNMessage(
-            id: "echo-\(UUID().uuidString)",
-            mine: true,
-            text: text,
-            time: Self.clock(createdAt),
-            sortDate: createdAt,
-            via: .internet,
-            state: "Sending"
-        )
+        let message = pendingMarmotEcho(text: text, createdAt: createdAt)
         pendingMarmotMessagesByChat[chatId, default: []].append(message)
         var queue = pendingDirectMarmotSends[clean, default: []]
         queue.append(SNPendingMarmotSend(chatId: chatId, text: text, messageId: message.id))
@@ -3936,15 +3940,7 @@ final class SonarAppStore: ObservableObject {
     private func sendPendingMarmotGroup(_ text: String, chatId: String) {
         guard isPendingMarmotGroup(chatId) else { return }
         let createdAt = Date()
-        let message = SNMessage(
-            id: "echo-\(UUID().uuidString)",
-            mine: true,
-            text: text,
-            time: Self.clock(createdAt),
-            sortDate: createdAt,
-            via: .internet,
-            state: "Sending"
-        )
+        let message = pendingMarmotEcho(text: text, createdAt: createdAt)
         pendingMarmotMessagesByChat[chatId, default: []].append(message)
         var queue = pendingMarmotGroupSends[chatId, default: []]
         queue.append(SNPendingMarmotGroupSend(text: text, messageId: message.id))
@@ -3956,6 +3952,31 @@ final class SonarAppStore: ObservableObject {
             showToast("Still setting up this group - wait before sending more.")
         }
         pendingMarmotGroupSends[chatId] = queue
+    }
+
+    private func pendingMarmotEcho(
+        text: String,
+        id: String = "echo-\(UUID().uuidString)",
+        createdAt: Date,
+        state: String = "Sending"
+    ) -> SNMessage {
+        let stickerRef = meshParseStickerContent(content: text).map {
+            MarmotService.MarmotStickerRef(
+                packCoordinate: $0.packCoordinate,
+                shortcode: $0.shortcode,
+                plaintextSha256: $0.plaintextSha256
+            )
+        }
+        return SNMessage(
+            id: id,
+            mine: true,
+            text: stickerRef == nil ? text : "",
+            time: Self.clock(createdAt),
+            sortDate: createdAt,
+            via: .internet,
+            state: state,
+            stickerRef: stickerRef
+        )
     }
 
     private func startSecureChatInBackground(npub: String, pendingId: String) {
@@ -4174,17 +4195,19 @@ final class SonarAppStore: ObservableObject {
         Task { @MainActor in
             for item in queued {
                 let fallbackDate = Date()
-                let echo = pendingMarmotMessagesByChat[realId]?.first { $0.id == item.messageId } ?? SNMessage(
-                    id: item.messageId,
-                    mine: true,
+                let echo = pendingMarmotMessagesByChat[realId]?.first { $0.id == item.messageId } ?? pendingMarmotEcho(
                     text: item.text,
-                    time: Self.clock(fallbackDate),
-                    sortDate: fallbackDate,
-                    via: .internet,
-                    state: "Sending"
+                    id: item.messageId,
+                    createdAt: fallbackDate
                 )
-                pendingMarmotMessagesByChat[realId]?.removeAll { $0.id == item.messageId }
-                let ok = await marmot.send([item.text], to: groupId)
+                let isSticker = meshParseStickerContent(content: item.text) != nil
+                if !isSticker {
+                    pendingMarmotMessagesByChat[realId]?.removeAll { $0.id == item.messageId }
+                }
+                let ok = await sendQueuedMarmotContent(item.text, to: groupId)
+                if isSticker {
+                    pendingMarmotMessagesByChat[realId]?.removeAll { $0.id == item.messageId }
+                }
                 if !ok {
                     pendingMarmotMessagesByChat[realId, default: []].append(
                         failedPendingMessage(echo)
@@ -4200,17 +4223,19 @@ final class SonarAppStore: ObservableObject {
         Task { @MainActor in
             for item in queued {
                 let fallbackDate = Date()
-                let echo = pendingMarmotMessagesByChat[realId]?.first { $0.id == item.messageId } ?? SNMessage(
-                    id: item.messageId,
-                    mine: true,
+                let echo = pendingMarmotMessagesByChat[realId]?.first { $0.id == item.messageId } ?? pendingMarmotEcho(
                     text: item.text,
-                    time: Self.clock(fallbackDate),
-                    sortDate: fallbackDate,
-                    via: .internet,
-                    state: "Sending"
+                    id: item.messageId,
+                    createdAt: fallbackDate
                 )
-                pendingMarmotMessagesByChat[realId]?.removeAll { $0.id == item.messageId }
-                let ok = await marmot.send([item.text], to: groupId)
+                let isSticker = meshParseStickerContent(content: item.text) != nil
+                if !isSticker {
+                    pendingMarmotMessagesByChat[realId]?.removeAll { $0.id == item.messageId }
+                }
+                let ok = await sendQueuedMarmotContent(item.text, to: groupId)
+                if isSticker {
+                    pendingMarmotMessagesByChat[realId]?.removeAll { $0.id == item.messageId }
+                }
                 if !ok {
                     pendingMarmotMessagesByChat[realId, default: []].append(
                         failedPendingMessage(echo)
@@ -4218,6 +4243,18 @@ final class SonarAppStore: ObservableObject {
                 }
             }
         }
+    }
+
+    private func sendQueuedMarmotContent(_ text: String, to groupId: String) async -> Bool {
+        if let ref = meshParseStickerContent(content: text) {
+            return await marmot.sendQueuedSticker(
+                groupId: groupId,
+                packCoordinate: ref.packCoordinate,
+                shortcode: ref.shortcode,
+                plaintextSha256: ref.plaintextSha256
+            )
+        }
+        return await marmot.send([text], to: groupId)
     }
 
     private func flushPendingMarmotSends() {
@@ -4935,6 +4972,10 @@ final class SonarAppStore: ObservableObject {
         )
     }
 
+    func cachedStickerPacks() -> [StickerPackInfo] {
+        marmot.cachedStickerPacksSnapshot()
+    }
+
     func stickerImageData(url: String, expectedSha256: String) async -> Data? {
         await marmot.fetchStickerImage(url: url, expectedSha256: expectedSha256)
     }
@@ -4943,8 +4984,12 @@ final class SonarAppStore: ObservableObject {
         await marmot.stickerData(for: ref)
     }
 
-    func fetchInstalledPacks() async -> [String] {
+    func fetchInstalledPacks() async -> [String]? {
         await marmot.fetchInstalledPacks()
+    }
+
+    func isStickerPackInstalled(_ coordinate: String) -> Bool {
+        marmot.isStickerPackInstalled(coordinate)
     }
 
     func installStickerPack(coordinate: String) async -> Bool {

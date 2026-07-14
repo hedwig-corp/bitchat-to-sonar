@@ -14,6 +14,15 @@ import androidx.activity.result.contract.ActivityResultContracts
 
 class MainActivity : ComponentActivity() {
 
+    private companion object {
+        const val STICKER_BENCHMARK_ENABLED = "sonar_sticker_benchmark"
+        const val STICKER_BENCHMARK_AUTHOR = "sonar_sticker_author"
+        const val STICKER_BENCHMARK_IDENTIFIER = "sonar_sticker_identifier"
+        const val STICKER_BENCHMARK_IMAGE_LIMIT = "sonar_sticker_image_limit"
+        const val STICKER_BENCHMARK_IMAGE_OFFSET = "sonar_sticker_image_offset"
+        const val STICKER_BENCHMARK_RELAYS = "sonar_sticker_relays"
+    }
+
     @Volatile
     private var firstLocalStateReady = false
     private var postFirstDrawStartupScheduled = false
@@ -107,10 +116,36 @@ class MainActivity : ComponentActivity() {
         deferFirstDrawUntilLocalStateReady()
         ActivityBridge.requestUnlock = { cb -> confirmDeviceCredential(cb) }
         setContent {
-            App(onFirstLocalStateReady = { firstLocalStateReady = true })
+            App(
+                onFirstLocalStateReady = { firstLocalStateReady = true },
+                stickerBenchmarkRequest = stickerBenchmarkRequest(intent),
+            )
         }
         handleInviteIntent(intent)
         handleShareIntent(intent)
+    }
+
+    /** Explicit Debug-only device benchmark input. It never installs the pack
+     * or clears account data; the shared app state only exercises verified
+     * metadata/image caches after the normal relay attach completes. */
+    private fun stickerBenchmarkRequest(intent: Intent?): StickerBenchmarkRequest? {
+        if (!BuildConfig.DEBUG || intent?.getBooleanExtra(STICKER_BENCHMARK_ENABLED, false) != true) {
+            return null
+        }
+        val author = intent.getStringExtra(STICKER_BENCHMARK_AUTHOR)?.trim().orEmpty()
+        val identifier = intent.getStringExtra(STICKER_BENCHMARK_IDENTIFIER)?.trim().orEmpty()
+        if (author.isEmpty() || identifier.isEmpty()) return null
+        return StickerBenchmarkRequest(
+            authorPubkeyHex = author,
+            identifier = identifier,
+            imageLimit = intent.getIntExtra(STICKER_BENCHMARK_IMAGE_LIMIT, 8).coerceIn(1, 20),
+            imageOffset = intent.getIntExtra(STICKER_BENCHMARK_IMAGE_OFFSET, 0).coerceAtLeast(0),
+            relayUrls = intent.getStringExtra(STICKER_BENCHMARK_RELAYS)
+                ?.split(',')
+                ?.map(String::trim)
+                ?.filter(String::isNotEmpty)
+                .orEmpty(),
+        )
     }
 
     override fun onNewIntent(intent: Intent) {
