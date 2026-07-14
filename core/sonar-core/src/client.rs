@@ -1024,13 +1024,25 @@ fn take_catchup_batch(
     batch
 }
 
-/// `since` for a catch-up batch: the lowest floor in the batch minus the
-/// catch-up lookback. Any zero floor (a group with no remote peer row stored)
-/// needs full history, so the whole batch fetches unbounded — same shape as the
-/// empty-transcript repair batch, one bounded-timeout request either way.
-fn catchup_batch_since(batch: &[(String, u64)]) -> Option<u64> {
+/// One era-bucket of catch-up groups fetched in a single batched `#h` request.
+#[derive(Debug, PartialEq, Eq)]
+struct CatchupBucket {
+    /// `(group_id, floor)` entries in this bucket, kept whole so a retryable
+    /// failure can requeue each group with its own floor.
+    entries: Vec<(String, u64)>,
+    /// Exact relay filter floor (lowest floor in the bucket minus the catch-up
+    /// lookback), or `None` for an unbounded full-history fetch. This value is
+    /// applied to `Filter::since` VERBATIM by `backfill_groups_since` (no
+    /// further overlap subtraction), so it equals the on-wire `since`.
+    since: Option<u64>,
+}
+
+/// Exact `since` for one bucket: the lowest floor minus `lookback`, applied
+/// once. Any zero floor (a group with no remote peer row stored) needs full
+/// history, so the bucket fetches unbounded.
+fn catchup_bucket_since(entries: &[(String, u64)], lookback: u64) -> Option<u64> {
     let mut min_floor = u64::MAX;
-    for (_, floor) in batch {
+    for (_, floor) in entries {
         if *floor == 0 {
             return None;
         }
@@ -1039,8 +1051,90 @@ fn catchup_batch_since(batch: &[(String, u64)]) -> Option<u64> {
     if min_floor == u64::MAX {
         None
     } else {
-        Some(min_floor.saturating_sub(GROUP_CATCHUP_FLOOR_LOOKBACK_SECS))
+        Some(min_floor.saturating_sub(lookback))
     }
+}
+
+/// Partition a drained catch-up batch into per-era buckets. A single relay `#h`
+/// filter carries ONE `since`, so batching groups with distant floors into one
+/// fetch would force the newest group to replay the OLDEST group's history —
+/// e.g. one dormant group with a two-year-old floor dragging seven recent
+/// groups through a full-history scan. Bucketing bounds that: two groups share
+/// a bucket only when their floors are within `span` seconds (so intra-bucket
+/// over-fetch is at most `span`), and all zero-floor groups (genuine full
+/// history) share one unbounded bucket.
+///
+/// At most `max_buckets` buckets run this pass so per-pass relay work stays
+/// bounded and non-blocking. The bucket holding the FIRST (preferred/open-chat)
+/// batch entry is always kept; remaining slots go to the oldest-floor buckets
+/// (the most starved). Groups in dropped buckets are returned for requeue and
+/// make progress on a later pass, preserving the anti-starvation property.
+fn plan_catchup_buckets(
+    batch: Vec<(String, u64)>,
+    span: u64,
+    lookback: u64,
+    max_buckets: usize,
+) -> (Vec<CatchupBucket>, Vec<(String, u64)>) {
+    if batch.is_empty() || max_buckets == 0 {
+        return (Vec::new(), batch);
+    }
+    let lead_id = batch[0].0.clone();
+
+    // Zero floors need full history; bounded floors bucket by proximity.
+    let mut zero: Vec<(String, u64)> = Vec::new();
+    let mut bounded: Vec<(String, u64)> = Vec::new();
+    for entry in batch {
+        if entry.1 == 0 {
+            zero.push(entry);
+        } else {
+            bounded.push(entry);
+        }
+    }
+
+    // Greedy proximity buckets over floors, oldest first. Sorted ascending, so a
+    // bucket spans `[min, min + span]`.
+    bounded.sort_by_key(|(_, floor)| *floor);
+    let mut buckets: Vec<Vec<(String, u64)>> = Vec::new();
+    for entry in bounded {
+        let extend = buckets
+            .last()
+            .map(|cur| entry.1.saturating_sub(cur[0].1) <= span)
+            .unwrap_or(false);
+        if extend {
+            buckets.last_mut().unwrap().push(entry);
+        } else {
+            buckets.push(vec![entry]);
+        }
+    }
+    // All zero-floor groups share one unbounded bucket, appended last (most
+    // expensive, so lowest priority unless it holds the lead group).
+    if !zero.is_empty() {
+        buckets.push(zero);
+    }
+
+    // Order the lead group's bucket first, then the rest in oldest-first order.
+    let lead_pos = buckets
+        .iter()
+        .position(|b| b.iter().any(|(id, _)| id == &lead_id));
+    let mut order: Vec<usize> = (0..buckets.len()).collect();
+    if let Some(li) = lead_pos {
+        let at = order.iter().position(|&i| i == li).unwrap();
+        order.remove(at);
+        order.insert(0, li);
+    }
+
+    let mut kept: Vec<CatchupBucket> = Vec::new();
+    let mut requeue: Vec<(String, u64)> = Vec::new();
+    for (rank, idx) in order.into_iter().enumerate() {
+        let entries = std::mem::take(&mut buckets[idx]);
+        if rank < max_buckets {
+            let since = catchup_bucket_since(&entries, lookback);
+            kept.push(CatchupBucket { entries, since });
+        } else {
+            requeue.extend(entries);
+        }
+    }
+    (kept, requeue)
 }
 
 #[cfg(test)]
@@ -1128,16 +1222,102 @@ const MAX_BACKFILLS_PER_SYNC: usize = 8;
 /// watermark-rewind safety net.
 const GROUP_CATCHUP_FLOOR_LOOKBACK_SECS: u64 = 60 * 60;
 
-/// Groups drained from the catch-up queue per pass, batched into ONE `#h`
-/// fetch. Reuses the empty-transcript repair cap: same shape, same reason.
+/// Groups drained from the catch-up queue per pass, then partitioned into
+/// per-era buckets. Reuses the empty-transcript repair cap: same shape.
 const GROUP_CATCHUP_BATCH: usize = MAX_BACKFILLS_PER_SYNC;
+
+/// Max floor spread within one catch-up bucket. Two groups fetch together only
+/// when their floors are within this window, bounding the intra-bucket
+/// over-fetch to the same magnitude as the lookback itself. Cleanly separates
+/// recently-active groups from dormant ones (whose floors are days/years older),
+/// so a dormant group's floor can never widen a recent group's scan.
+const GROUP_CATCHUP_BUCKET_SPAN_SECS: u64 = GROUP_CATCHUP_FLOOR_LOOKBACK_SECS;
+
+/// Max relay fetches per catch-up pass. A single `#h` filter carries one
+/// `since`, so distinct floor eras need distinct fetches; this caps them so a
+/// pass cannot stack `GROUP_CATCHUP_BATCH` bounded fetches onto the serialized
+/// engine queue. Two lets the common "active era + full-history/dormant era"
+/// split both progress in one pass; deeper fragmentation drains over successive
+/// throttled passes. Same-era batching still folds up to `GROUP_CATCHUP_BATCH`
+/// groups into a single fetch, so the batching win is preserved.
+const GROUP_CATCHUP_MAX_BUCKETS: usize = 2;
 
 /// Minimum spacing between catch-up passes. Wake-driven hosts run the pass on
 /// every drain/ensure cycle; during a live event burst that would stack a
 /// bounded relay fetch onto every tick of the serialized engine queue. The
-/// preferred (open-chat) group bypasses the throttle so chat-open repair is
-/// never delayed by it.
+/// preferred (open-chat) group bypasses the throttle ONCE per preference change
+/// (see `GroupCatchupGate`) so chat-open repair runs now without a persistently
+/// failing preferred group defeating the throttle forever.
 const GROUP_CATCHUP_MIN_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Atomic gate for the per-group catch-up pass. Wake-driven hosts (heartbeat,
+/// wake loop, foreground sync, push) can call the pass concurrently — Compose
+/// does not serialize them the way iOS does — so the interval check and the
+/// single-flight claim must happen under ONE lock, or two callers both see an
+/// expired timestamp and start overlapping relay fetches.
+#[derive(Debug, Default)]
+struct GroupCatchupGate {
+    /// When the last pass that issued a relay fetch started; drives the interval
+    /// throttle. Only advanced by fetching passes, so an empty-queue pass does
+    /// not delay the next one.
+    last_started: Option<Instant>,
+    /// A pass is currently running; a second concurrent caller is rejected.
+    in_progress: bool,
+    /// The preferred (open-chat) group id that already spent its one-shot
+    /// interval bypass. Reset when the host changes the preferred chat, so a
+    /// newly opened chat gets exactly one immediate repair; a persistently
+    /// failing preferred group then falls back under the interval throttle
+    /// instead of forcing a fetch on every live wake.
+    bypass_consumed_for: Option<String>,
+}
+
+impl GroupCatchupGate {
+    /// Atomic check-and-claim. Returns true (claiming single-flight ownership via
+    /// `in_progress`) only if no pass is running AND either the interval elapsed
+    /// or the pending preferred group still has its one-shot bypass. Claiming a
+    /// bypass consumes it.
+    fn try_begin(
+        &mut self,
+        preferred_pending: Option<&str>,
+        now: Instant,
+        min_interval: Duration,
+    ) -> bool {
+        if self.in_progress {
+            return false;
+        }
+        let bypass = match preferred_pending {
+            Some(pref) => self.bypass_consumed_for.as_deref() != Some(pref),
+            None => false,
+        };
+        if !bypass {
+            if let Some(prev) = self.last_started {
+                if now.saturating_duration_since(prev) < min_interval {
+                    return false;
+                }
+            }
+        }
+        self.in_progress = true;
+        if bypass {
+            self.bypass_consumed_for = preferred_pending.map(|s| s.to_string());
+        }
+        true
+    }
+
+    /// Release single-flight ownership. `did_fetch` advances the throttle clock
+    /// only when the pass actually issued a relay fetch.
+    fn finish(&mut self, did_fetch: bool, now: Instant) {
+        self.in_progress = false;
+        if did_fetch {
+            self.last_started = Some(now);
+        }
+    }
+
+    /// The preferred (open) chat changed: grant the new chat a fresh one-shot
+    /// bypass.
+    fn reset_bypass(&mut self) {
+        self.bypass_consumed_for = None;
+    }
+}
 
 const SYNC_STATE_VERSION: u32 = 1;
 const SYNC_STATE_PROCESSED_EVENT_CAP: usize = 20_000;
@@ -1673,9 +1853,9 @@ pub struct SonarClient {
     claimed_handle: Arc<Mutex<Option<String>>>,
     /// Durable path for the claimed handle (None for in-memory sessions).
     handle_state_path: Option<PathBuf>,
-    /// Last time a per-group catch-up pass actually ran; throttles wake-driven
-    /// callers to `GROUP_CATCHUP_MIN_INTERVAL`.
-    last_group_catchup_at: Arc<Mutex<Option<Instant>>>,
+    /// Atomic throttle + single-flight gate for the per-group catch-up pass;
+    /// see `GroupCatchupGate`.
+    group_catchup_gate: Arc<Mutex<GroupCatchupGate>>,
 }
 
 impl Drop for SonarClient {
@@ -2189,7 +2369,7 @@ impl SonarClient {
             pending_sync_notifications: Arc::new(Mutex::new(Vec::new())),
             claimed_handle: Arc::new(Mutex::new(None)),
             handle_state_path: None,
-            last_group_catchup_at: Arc::new(Mutex::new(None)),
+            group_catchup_gate: Arc::new(Mutex::new(GroupCatchupGate::default())),
         };
         // Open the live Marmot subscriptions for real sessions. In-memory test
         // sessions (allow_geo_relays=false) stay on the explicit `sync()` path so
@@ -5513,19 +5693,34 @@ impl SonarClient {
         take_catchup_batch(&mut queue, preferred.as_deref(), GROUP_CATCHUP_BATCH)
     }
 
-    /// Whether the preferred (open-chat) group is still waiting in the catch-up
-    /// queue. Used to bypass the pass throttle so chat-open repair runs now.
-    fn preferred_catchup_pending(&self) -> bool {
-        let preferred = self.preferred_catchup_group.lock().unwrap().clone();
-        match preferred {
-            None => false,
-            Some(pref) => self
-                .initial_group_message_catchups
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|(id, _)| id == &pref),
+    /// The preferred (open-chat) group id, if it is still waiting in the
+    /// catch-up queue. Used to spend its one-shot throttle bypass so chat-open
+    /// repair runs now.
+    fn pending_preferred_catchup(&self) -> Option<String> {
+        let pref = self.preferred_catchup_group.lock().unwrap().clone()?;
+        let queue = self.initial_group_message_catchups.lock().unwrap();
+        if queue.iter().any(|(id, _)| id == &pref) {
+            Some(pref)
+        } else {
+            None
         }
+    }
+
+    /// Atomic check-and-claim wrapper around `GroupCatchupGate::try_begin`.
+    fn try_begin_catchup_pass(&self, preferred_pending: Option<&str>) -> bool {
+        self.group_catchup_gate.lock().unwrap().try_begin(
+            preferred_pending,
+            Instant::now(),
+            GROUP_CATCHUP_MIN_INTERVAL,
+        )
+    }
+
+    /// Release the catch-up pass claim; `did_fetch` advances the throttle clock.
+    fn finish_catchup_pass(&self, did_fetch: bool) {
+        self.group_catchup_gate
+            .lock()
+            .unwrap()
+            .finish(did_fetch, Instant::now());
     }
 
     fn requeue_initial_group_message_catchup(&self, group_id: String, floor: u64) {
@@ -5564,48 +5759,78 @@ impl SonarClient {
             return Ok(MarmotProcessReport::default());
         }
         self.populate_initial_group_message_catchups_once();
-        // Throttle wake-driven passes so a live event burst cannot stack a relay
-        // fetch onto every tick of the serialized engine queue. The preferred
-        // (open-chat) group bypasses the throttle: chat-open repair runs now.
-        if !self.preferred_catchup_pending() {
-            let last = *self.last_group_catchup_at.lock().unwrap();
-            if let Some(prev) = last {
-                if prev.elapsed() < GROUP_CATCHUP_MIN_INTERVAL {
-                    return Ok(MarmotProcessReport::default());
-                }
-            }
-        }
-        let batch = self.take_initial_group_message_catchup_batch();
-        if batch.is_empty() {
+        // Atomic check-and-claim: enforce the inter-pass interval AND
+        // single-flight under one lock, so concurrent wake-driven callers
+        // (heartbeat, wake loop, foreground sync, push) cannot both start a
+        // pass. A pending preferred (open-chat) group bypasses the interval
+        // ONCE per preference change, so a persistently-failing preferred group
+        // cannot force a relay fetch on every live wake.
+        let preferred_pending = self.pending_preferred_catchup();
+        if !self.try_begin_catchup_pass(preferred_pending.as_deref()) {
             return Ok(MarmotProcessReport::default());
         }
-        *self.last_group_catchup_at.lock().unwrap() = Some(Instant::now());
+        // From here the pass is claimed; every early return must release it.
+        let batch = self.take_initial_group_message_catchup_batch();
+        if batch.is_empty() {
+            self.finish_catchup_pass(false);
+            return Ok(MarmotProcessReport::default());
+        }
 
-        // Batched: one `#h` fetch for the whole slice. `since` is the lowest
-        // floor minus GROUP_CATCHUP_FLOOR_LOOKBACK_SECS — the widened lookback
-        // covers clock-skewed / out-of-order events below a group's newest
-        // stored peer row that the old 5-min overlap permanently skipped.
-        let group_ids: Vec<String> = batch.iter().map(|(id, _)| id.clone()).collect();
-        let since = catchup_batch_since(&batch);
-        match self
-            .backfill_groups_since(&group_ids, since, "initial per-group message catch-up")
-            .await
-        {
-            Ok(report) => {
-                if report.retryable_failures > 0 {
-                    for (group_id, floor) in batch {
+        // Partition into per-era buckets so one group's floor can never widen
+        // another era's scan, and cap the number of relay fetches this pass.
+        // Each bucket's `since` is its lowest floor minus the (single) catch-up
+        // lookback — the widened lookback covers clock-skewed / out-of-order
+        // events below a group's newest stored peer row.
+        let (buckets, dropped) = plan_catchup_buckets(
+            batch,
+            GROUP_CATCHUP_BUCKET_SPAN_SECS,
+            GROUP_CATCHUP_FLOOR_LOOKBACK_SECS,
+            GROUP_CATCHUP_MAX_BUCKETS,
+        );
+        // Groups that didn't fit this pass go back to the queue immediately.
+        for (group_id, floor) in dropped {
+            self.requeue_initial_group_message_catchup(group_id, floor);
+        }
+
+        let mut aggregate = MarmotProcessReport::default();
+        let mut buckets = buckets.into_iter();
+        while let Some(bucket) = buckets.next() {
+            let group_ids: Vec<String> = bucket.entries.iter().map(|(id, _)| id.clone()).collect();
+            match self
+                .backfill_groups_since(
+                    &group_ids,
+                    bucket.since,
+                    "initial per-group message catch-up",
+                )
+                .await
+            {
+                Ok(report) => {
+                    if report.retryable_failures > 0 {
+                        for (group_id, floor) in bucket.entries {
+                            self.requeue_initial_group_message_catchup(group_id, floor);
+                        }
+                    }
+                    aggregate.absorb(report);
+                }
+                Err(err) => {
+                    // A fetch error is almost certainly transient (relay/network);
+                    // requeue this bucket and every bucket we haven't tried yet,
+                    // then stop stacking fetches this pass.
+                    for (group_id, floor) in bucket.entries {
                         self.requeue_initial_group_message_catchup(group_id, floor);
                     }
+                    for remaining in buckets.by_ref() {
+                        for (group_id, floor) in remaining.entries {
+                            self.requeue_initial_group_message_catchup(group_id, floor);
+                        }
+                    }
+                    self.finish_catchup_pass(true);
+                    return Err(err);
                 }
-                Ok(report)
-            }
-            Err(err) => {
-                for (group_id, floor) in batch {
-                    self.requeue_initial_group_message_catchup(group_id, floor);
-                }
-                Err(err)
             }
         }
+        self.finish_catchup_pass(true);
+        Ok(aggregate)
     }
 
     async fn resubscribe_marmot_groups_if_live(&self) -> Result<()> {
@@ -5680,7 +5905,12 @@ impl SonarClient {
                 }
             }
         };
-        *self.preferred_catchup_group.lock().unwrap() = preferred;
+        let mut cur = self.preferred_catchup_group.lock().unwrap();
+        if *cur != preferred {
+            *cur = preferred;
+            // A newly opened chat gets a fresh one-shot throttle bypass.
+            self.group_catchup_gate.lock().unwrap().reset_bypass();
+        }
     }
 
     /// Re-subscribe with the current watermark and group set. Idempotent:
@@ -6301,7 +6531,11 @@ impl SonarClient {
             group_id_hexes.to_vec(),
         );
         if let Some(secs) = since_secs.filter(|secs| *secs > 0) {
-            filter = filter.since(Timestamp::from_secs(secs.saturating_sub(SYNC_OVERLAP_SECS)));
+            // Applied VERBATIM: the caller owns any overlap/lookback margin (the
+            // per-group catch-up already reaches GROUP_CATCHUP_FLOOR_LOOKBACK_SECS
+            // below the group floor). Subtracting SYNC_OVERLAP_SECS again here
+            // would double the intended lookback.
+            filter = filter.since(Timestamp::from_secs(secs));
         }
         let events = self
             .fetch_marmot_events_from_relay_quorum(filter, BACKFILL_TIMEOUT, context)
@@ -8586,24 +8820,197 @@ mod tests {
     }
 
     #[test]
-    fn catchup_batch_since_uses_min_floor_with_widened_lookback() {
-        // The batch `since` must reach GROUP_CATCHUP_FLOOR_LOOKBACK_SECS below
-        // the LOWEST floor: the floor is the newest locally stored peer row
-        // (sender-clock based), and a 5-min overlap permanently skipped
-        // clock-skewed / out-of-order events once past the 30-min live tail.
+    fn catchup_bucket_since_applies_lookback_exactly_once() {
+        // The bucket `since` reaches `lookback` below the LOWEST floor, applied
+        // once. `backfill_groups_since` uses this VERBATIM (no extra
+        // SYNC_OVERLAP_SECS subtraction), so this equals the on-wire filter
+        // `since`: effective floor is floor - lookback, not floor - lookback -
+        // SYNC_OVERLAP_SECS.
         let now = 1_700_000_000u64;
-        let batch = vec![("a".to_string(), now), ("b".to_string(), now - 900)];
+        let entries = vec![("a".to_string(), now), ("b".to_string(), now - 900)];
         assert_eq!(
-            catchup_batch_since(&batch),
+            catchup_bucket_since(&entries, GROUP_CATCHUP_FLOOR_LOOKBACK_SECS),
             Some(now - 900 - GROUP_CATCHUP_FLOOR_LOOKBACK_SECS)
         );
         // Any zero floor (no remote peer row stored) needs full history.
         let with_zero = vec![("a".to_string(), now), ("b".to_string(), 0)];
-        assert_eq!(catchup_batch_since(&with_zero), None);
-        assert_eq!(catchup_batch_since(&[]), None);
+        assert_eq!(
+            catchup_bucket_since(&with_zero, GROUP_CATCHUP_FLOOR_LOOKBACK_SECS),
+            None
+        );
+        assert_eq!(
+            catchup_bucket_since(&[], GROUP_CATCHUP_FLOOR_LOOKBACK_SECS),
+            None
+        );
         // The widened lookback must cover at least the live tail, so an event
         // the live subscription could have delivered is always re-fetchable.
         assert!(GROUP_CATCHUP_FLOOR_LOOKBACK_SECS >= LIVE_GROUP_TAIL_SECS);
+    }
+
+    #[test]
+    fn catchup_buckets_isolate_distant_floors() {
+        // HIGH-1: a dormant group's old floor must NOT widen the scan of recent
+        // groups. Three groups active within the last few minutes plus one
+        // group whose newest stored row is a year old.
+        let now = 1_700_000_000u64;
+        let year = 365 * 24 * 60 * 60;
+        let batch = vec![
+            ("recent1".to_string(), now),
+            ("dormant".to_string(), now - year),
+            ("recent2".to_string(), now - 120),
+            ("recent3".to_string(), now - 300),
+        ];
+        let (buckets, dropped) = plan_catchup_buckets(
+            batch,
+            GROUP_CATCHUP_BUCKET_SPAN_SECS,
+            GROUP_CATCHUP_FLOOR_LOOKBACK_SECS,
+            GROUP_CATCHUP_MAX_BUCKETS,
+        );
+        assert!(dropped.is_empty(), "two eras fit within the bucket cap");
+        assert_eq!(buckets.len(), 2);
+
+        // The lead group ("recent1") leads its bucket; the three recent groups
+        // share ONE bucket whose since is anchored on the recent floor, never on
+        // the year-old dormant floor.
+        let recent = &buckets[0];
+        let recent_ids: Vec<&str> = recent.entries.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(recent_ids.contains(&"recent1"));
+        assert!(recent_ids.contains(&"recent2"));
+        assert!(recent_ids.contains(&"recent3"));
+        assert!(!recent_ids.contains(&"dormant"));
+        assert_eq!(
+            recent.since,
+            Some(now - 300 - GROUP_CATCHUP_FLOOR_LOOKBACK_SECS),
+            "recent bucket floor is the recent minimum, not the dormant floor"
+        );
+
+        // The dormant group is alone, scanned only from its own floor.
+        let dormant = &buckets[1];
+        assert_eq!(
+            dormant
+                .entries
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["dormant"]
+        );
+        assert_eq!(
+            dormant.since,
+            Some(now - year - GROUP_CATCHUP_FLOOR_LOOKBACK_SECS)
+        );
+    }
+
+    #[test]
+    fn catchup_buckets_zero_floor_isolated_and_capped() {
+        // Zero-floor (full-history) groups share one unbounded bucket, and the
+        // per-pass fetch count is capped: extra eras are dropped for requeue,
+        // never widening another era. Lead ("a") must always be kept.
+        let now = 1_700_000_000u64;
+        let hour = 60 * 60;
+        let batch = vec![
+            ("a".to_string(), now),             // lead, era 0
+            ("b".to_string(), now - 5 * hour),  // era 1
+            ("c".to_string(), now - 10 * hour), // era 2
+            ("z1".to_string(), 0),              // full history
+            ("z2".to_string(), 0),              // full history
+        ];
+        let (buckets, dropped) = plan_catchup_buckets(
+            batch,
+            GROUP_CATCHUP_BUCKET_SPAN_SECS,
+            GROUP_CATCHUP_FLOOR_LOOKBACK_SECS,
+            GROUP_CATCHUP_MAX_BUCKETS,
+        );
+        assert_eq!(buckets.len(), GROUP_CATCHUP_MAX_BUCKETS);
+        // Lead bucket first and holds "a".
+        assert!(buckets[0].entries.iter().any(|(id, _)| id == "a"));
+        // Every dropped group is requeued, and no bucket mixes eras (each kept
+        // bucket's since stays anchored on its own members).
+        assert!(!dropped.is_empty());
+        for b in &buckets {
+            if let Some(since) = b.since {
+                // No kept bucket reaches back to a zero-floor / unrelated era.
+                assert!(since >= now - 10 * hour - GROUP_CATCHUP_FLOOR_LOOKBACK_SECS);
+            }
+        }
+        // The two zero-floor groups, if kept, are together in one unbounded
+        // bucket; otherwise both are dropped together.
+        let kept_zero: Vec<&str> = buckets
+            .iter()
+            .flat_map(|b| b.entries.iter())
+            .filter(|(_, f)| *f == 0)
+            .map(|(id, _)| id.as_str())
+            .collect();
+        let dropped_zero: Vec<&str> = dropped
+            .iter()
+            .filter(|(_, f)| *f == 0)
+            .map(|(id, _)| id.as_str())
+            .collect();
+        assert!(kept_zero.len() == 2 || dropped_zero.len() == 2);
+    }
+
+    #[test]
+    fn catchup_gate_one_shot_preferred_bypass() {
+        // HIGH-2: a persistently-failing preferred group bypasses the interval
+        // at most ONCE, then falls back under the throttle.
+        let mut gate = GroupCatchupGate::default();
+        let t0 = Instant::now();
+        let interval = Duration::from_secs(5);
+
+        // First pass: preferred pending, bypasses the (unset) interval, claims.
+        assert!(gate.try_begin(Some("open"), t0, interval));
+        gate.finish(true, t0); // simulates a fetch that failed and requeued.
+
+        // Second pass 1s later, preferred STILL pending (failure requeued it):
+        // the one-shot bypass is spent, so the interval now applies and rejects.
+        let t1 = t0 + Duration::from_secs(1);
+        assert!(!gate.try_begin(Some("open"), t1, interval));
+
+        // Once the interval elapses, the pass runs again under the throttle.
+        let t2 = t0 + Duration::from_secs(6);
+        assert!(gate.try_begin(Some("open"), t2, interval));
+        gate.finish(true, t2);
+
+        // Switching to a different open chat grants a fresh one-shot bypass.
+        gate.reset_bypass();
+        let t3 = t2 + Duration::from_secs(1);
+        assert!(gate.try_begin(Some("other"), t3, interval));
+        gate.finish(true, t3);
+    }
+
+    #[test]
+    fn catchup_gate_rejects_concurrent_pass() {
+        // MEDIUM: the check-and-claim is atomic — a second caller that arrives
+        // while a pass is in flight is rejected even though the interval looks
+        // expired, and can only proceed after the first releases.
+        let mut gate = GroupCatchupGate::default();
+        let t0 = Instant::now();
+        let interval = Duration::from_secs(5);
+
+        assert!(gate.try_begin(None, t0, interval));
+        // Concurrent caller, well past the interval: still rejected (in-flight).
+        let t1 = t0 + Duration::from_secs(60);
+        assert!(!gate.try_begin(None, t1, interval));
+
+        // After the first pass releases, the interval clock started at t1's
+        // finish; a caller inside the interval is throttled, one past it runs.
+        gate.finish(true, t1);
+        assert!(!gate.try_begin(None, t1 + Duration::from_secs(1), interval));
+        assert!(gate.try_begin(None, t1 + Duration::from_secs(6), interval));
+    }
+
+    #[test]
+    fn catchup_gate_empty_pass_does_not_throttle_next() {
+        // An empty-queue pass claims and releases without a fetch, so it must
+        // not advance the throttle clock and delay the next real pass.
+        let mut gate = GroupCatchupGate::default();
+        let t0 = Instant::now();
+        let interval = Duration::from_secs(5);
+
+        assert!(gate.try_begin(None, t0, interval));
+        gate.finish(false, t0); // empty queue, no fetch.
+
+        // Immediately after, a real pass is allowed (clock was not advanced).
+        assert!(gate.try_begin(None, t0 + Duration::from_millis(1), interval));
     }
 
     #[test]
