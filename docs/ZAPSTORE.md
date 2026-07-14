@@ -11,7 +11,7 @@ Publish Sonar’s Android alpha to [Zapstore](https://zapstore.dev) with
 | `zapstore.yaml` | App metadata + GitHub source + phone-APK match |
 | `scripts/zapstore-publish.sh` | Check / build+sign local / publish |
 | Release APK signing (Gradle) | Optional via env or `local.properties` |
-| GitHub release assets | Phone + universal APKs on `v0.1-alpha.8` (pre-release) |
+| GitHub release assets | Phone + universal APKs on `v0.1-alpha.9` (pre-release) |
 | `zsp` CLI | Install: `go install github.com/zapstore/zsp@latest` |
 
 ## What you must provide (secrets — never commit)

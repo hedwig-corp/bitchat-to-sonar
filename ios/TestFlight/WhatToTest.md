@@ -1,12 +1,14 @@
 # TestFlight — What to Test
 
-Build: **Sonar 1.8.0 (23)** · release tag **v0.1-alpha.8**
+Build: **Sonar 1.9.0 (24)** · release tag **v0.1-alpha.9**
 
 This build is a cross-platform alpha cut after local-first attachment previews,
-sticker disk cache, Marmot send prioritization, mesh identity preservation, and
-folded-chat history fixes. Opening a chat should paint from local storage first;
-missed messages should catch up in the background; payments and notifications
-should stay stable when the phone is locked or the app is killed.
+sticker disk cache, Marmot send prioritization, mesh identity preservation,
+folded-chat history fixes, and push/notif-sync catch-up so killed-app wakes and
+forced sync actually surface missed group messages. Opening a chat should paint
+from local storage first; missed messages should catch up in the background;
+payments and notifications should stay stable when the phone is locked or the
+app is killed.
 
 If something crashes on launch, while locked, or right after sending a message,
 photo, or payment — that is the highest-priority report. If sync feels slow or
