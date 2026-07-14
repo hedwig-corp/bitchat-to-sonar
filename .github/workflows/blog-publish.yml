@@ -1,0 +1,53 @@
+name: Publish blog to Nostr
+
+# Publishes docs/blog/<slug>/README.md as NIP-23 (kind 30023) articles when they
+# change on main. Signing is delegated to a NIP-46 bunker — the raw key never
+# enters CI; only the BLOG_BUNKER_URI secret does. See scripts/blog/README.md.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'docs/blog/**'
+      - 'scripts/blog/**'
+      - '.github/workflows/blog-publish.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: blog-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish NIP-23 articles
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: scripts/blog
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: scripts/blog/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Publish / replace changed posts
+        env:
+          BLOG_BUNKER_URI: ${{ secrets.BLOG_BUNKER_URI }}
+        run: |
+          if [ -z "$BLOG_BUNKER_URI" ]; then
+            echo "BLOG_BUNKER_URI secret is not set — skipping publish (add it to enable)."
+            exit 0
+          fi
+          npm run publish-posts
