@@ -2271,8 +2271,10 @@ impl SonarClient {
     /// state; it does not gate transcript visibility.
     pub async fn send_text(&self, group_id: &GroupId, text: &str) -> Result<()> {
         let local_started = Instant::now();
-        let event = self.engine.create_text_message(group_id, text)?;
-        let incoming = self.engine.process_incoming(&event).await?;
+        // One MLS write guard covers encrypt + local-row write, so a
+        // concurrently drained commit cannot land in between now that sends
+        // no longer share the host's serialized engine queue with sync.
+        let (event, incoming) = self.engine.create_and_process_text_message(group_id, text)?;
         let Incoming::Message(message) = incoming else {
             return Err(Error::Storage(
                 "created text message did not produce a local transcript row".into(),
@@ -2439,8 +2441,9 @@ impl SonarClient {
     /// Send a sticker message to a group. Follows the same Signal-style
     /// local-first sequencing as `send_text`.
     pub async fn send_sticker(&self, group_id: &GroupId, sticker_ref: &StickerRef) -> Result<()> {
-        let event = self.engine.create_sticker_message(group_id, sticker_ref)?;
-        let incoming = self.engine.process_incoming(&event).await?;
+        let (event, incoming) = self
+            .engine
+            .create_and_process_sticker_message(group_id, sticker_ref)?;
         let Incoming::Message(message) = incoming else {
             return Err(Error::Storage(
                 "created sticker message did not produce a local transcript row".into(),
@@ -3066,20 +3069,29 @@ impl SonarClient {
             uploads.push((upload, url));
         }
         let refs: Vec<_> = uploads.iter().map(|(u, url)| (u, url.as_str())).collect();
-        let event = self
+        // Local-first, same sequencing as `send_text`: encrypt + write the
+        // local row under one MLS guard, mark the durable outbox pending, and
+        // publish in the background with first-ACK delivery state. Media rows
+        // previously published inline and skipped the outbox entirely, so a
+        // relay failure either surfaced as a send error (pre-refactor) or
+        // could have stranded a false-Sent row.
+        let (event, incoming) = self
             .engine
-            .create_media_event_multi(group_id, &refs, caption)?;
-        self.nostr.send_event(&event).await?;
-        let incoming = self.engine.process_incoming(&event).await?;
-        if let Incoming::Message(message) = incoming {
-            let group_id_hex = hex::encode(group_id.as_slice());
-            let group_name = self.resolve_group_name(group_id);
-            self.notify_conversation_changed(&group_id_hex);
-            self.spawn_send_bookkeeping(group_name, message, event.id);
-        }
-        let (publish_result_tx, publish_result_rx) = tokio::sync::oneshot::channel();
-        let _ = publish_result_tx.send(true);
-        self.spawn_push_notification(group_id.clone(), publish_result_rx);
+            .create_and_process_media_event_multi(group_id, &refs, caption)?;
+        let Incoming::Message(message) = incoming else {
+            return Err(Error::Storage(
+                "created media message did not produce a local transcript row".into(),
+            ));
+        };
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let group_name = self.resolve_group_name(group_id);
+        self.mark_outbox_pending(group_id, &message, &event)?;
+        let event_id = event.id;
+        let publish_ack =
+            self.spawn_outbox_publish(message.id.to_hex(), group_id_hex.clone(), event);
+        self.notify_conversation_changed(&group_id_hex);
+        self.spawn_send_bookkeeping(group_name, message, event_id);
+        self.spawn_push_notification(group_id.clone(), publish_ack);
         Ok(())
     }
 
@@ -5367,6 +5379,83 @@ mod tests {
             first.0.unwrap_err().to_string(),
             second.0.unwrap_err().to_string()
         );
+    }
+
+    /// Sends now run on a dedicated host lane concurrent with sync/drain; the
+    /// engine's internal MLS write lock is what keeps that safe. Hammer one
+    /// engine with parallel outgoing sends and incoming processing and verify
+    /// every row lands in the transcript.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_sends_and_incoming_processing_land_every_row() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = std::sync::Arc::new(MarmotEngine::in_memory(Identity::generate()));
+        let bob = MarmotEngine::in_memory(Identity::generate());
+        let bob_kp = bob.key_package_event(relays.clone()).expect("bob kp");
+
+        let creation = alice
+            .create_group("alice & bob", vec![bob_kp], relays)
+            .expect("alice creates group");
+        let group_id = creation.group.mls_group_id.clone();
+        let (bob_pubkey, bob_welcome) = creation
+            .welcomes
+            .into_iter()
+            .find(|(pubkey, _)| *pubkey == bob.identity().public_key())
+            .expect("bob welcome");
+        let bob_wrapped = alice
+            .gift_wrap_welcome(&bob_pubkey, bob_welcome)
+            .await
+            .expect("wrap bob welcome");
+        assert!(matches!(
+            bob.process_incoming(&bob_wrapped)
+                .await
+                .expect("bob processes welcome"),
+            Incoming::GroupUpdated(_)
+        ));
+        alice
+            .merge_pending_commit(&group_id)
+            .expect("alice merges pending commit");
+
+        let bob_group_id = bob.groups().expect("bob groups")[0].mls_group_id.clone();
+        let incoming_events: Vec<Event> = (0..10)
+            .map(|i| {
+                bob.create_text_message(&bob_group_id, &format!("from bob {i}"))
+                    .expect("bob creates message")
+            })
+            .collect();
+
+        let sender = {
+            let alice = alice.clone();
+            let group_id = group_id.clone();
+            tokio::task::spawn_blocking(move || {
+                for i in 0..10 {
+                    alice
+                        .create_and_process_text_message(&group_id, &format!("from alice {i}"))
+                        .expect("alice sends");
+                }
+            })
+        };
+        let receiver = {
+            let alice = alice.clone();
+            tokio::spawn(async move {
+                for event in incoming_events {
+                    assert!(matches!(
+                        alice
+                            .process_incoming(&event)
+                            .await
+                            .expect("alice processes incoming"),
+                        Incoming::Message(_)
+                    ));
+                }
+            })
+        };
+        sender.await.expect("send task");
+        receiver.await.expect("receive task");
+
+        let transcript = alice.messages(&group_id).expect("alice transcript");
+        let mine = transcript.iter().filter(|m| m.mine).count();
+        let theirs = transcript.iter().filter(|m| !m.mine).count();
+        assert_eq!(mine, 10, "every concurrent send must land");
+        assert_eq!(theirs, 10, "every concurrent incoming must land");
     }
 
     #[test]

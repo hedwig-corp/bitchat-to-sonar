@@ -275,11 +275,21 @@ final class MarmotService: @unchecked Sendable {
 
     private let relayUrls: [String]
 
-    /// Serial queue: serializes MLS-mutating operations (send, connect, sync,
-    /// drain, group management) and `node`/`identity` writes. Keeps the
-    /// blocking Rust calls off the main thread and off the Swift concurrency
-    /// cooperative pool.
+    /// Serial queue: serializes engine maintenance (connect, sync, drain,
+    /// group management) and `node`/`identity` writes. Keeps the blocking
+    /// Rust calls off the main thread and off the Swift concurrency
+    /// cooperative pool. Text/sticker sends run on `sendQueue` instead —
+    /// see its doc for why they must not share this lane.
     private let workQueue = DispatchQueue(label: "chat.bitchat.marmot-service", qos: .userInitiated)
+
+    /// Serial send lane for text/sticker sends: they must stay ordered with
+    /// each other, but must never FIFO-queue behind sync/drain relay quorum
+    /// fetches on `workQueue` (each can park it for a 10s timeout — the
+    /// documented 6.6s p95 / 19.3s max send dispatch tail). The core engine
+    /// serializes MLS mutations internally (`MarmotEngine::write_lock`), so a
+    /// send here runs concurrently with an in-flight sync and waits at most
+    /// for one in-flight MLS mutation, never for a relay fetch.
+    private let sendQueue = DispatchQueue(label: "chat.bitchat.marmot-send", qos: .userInitiated)
 
     /// Concurrent queue for read-only FFI calls (groups, messages, summaries).
     /// SQLCipher supports concurrent readers; these never touch MLS state, so
@@ -627,7 +637,7 @@ final class MarmotService: @unchecked Sendable {
 
     /// Encrypt and publish a text message to the group.
     func sendText(groupId: String, text: String) async throws {
-        try await run { try $0.requireNode().sendText(groupIdHex: groupId, text: text) }
+        try await sendLane { try $0.sendText(groupIdHex: groupId, text: text) }
     }
 
     /// Encrypt `data`, upload the ciphertext to a Blossom server, and publish a
@@ -688,8 +698,8 @@ final class MarmotService: @unchecked Sendable {
         shortcode: String,
         plaintextSha256: String
     ) async throws {
-        try await run {
-            try $0.requireNode().sendSticker(
+        try await sendLane {
+            try $0.sendSticker(
                 groupIdHex: groupId,
                 packCoordinate: packCoordinate,
                 shortcode: shortcode,
@@ -1379,6 +1389,13 @@ final class MarmotService: @unchecked Sendable {
 
     private func readOnly<T: Sendable>(_ body: @escaping @Sendable (SonarNode) throws -> T) async throws -> T {
         try await leasedNodeOperation(on: readQueue, body)
+    }
+
+    /// Text/sticker sends on the dedicated serial send lane. Same leased node
+    /// snapshot as `readOnly`; MLS-mutation ordering against sync/drain is the
+    /// core engine's `write_lock` responsibility.
+    private func sendLane<T: Sendable>(_ body: @escaping @Sendable (SonarNode) throws -> T) async throws -> T {
+        try await leasedNodeOperation(on: sendQueue, body)
     }
 
     private func readOnlyNonThrowing<T: Sendable>(_ body: @escaping @Sendable (SonarNode) -> T, default defaultValue: T) async -> T {
