@@ -3505,10 +3505,11 @@ final class MarmotChatModel: ObservableObject {
                     if !notifications.isEmpty {
                         await self.loadLocalSummaries()
                     }
-                    // Do not call retryOutbox here: it republishes in-flight
-                    // Pending and can stack fanouts / burn attempt budget.
-                    // Failed rows self-heal via core auto-retry; stranded
-                    // Pending is flushed on connect and idle ensureSubscriptions.
+                    // Advance historical per-group catch-up on live cycles too.
+                    // Steady live traffic keeps woke true; core throttles this
+                    // pass, so most ticks are a cheap no-op. Do not retry the
+                    // outbox here: that can republish in-flight Pending rows.
+                    try? await self.service.ensureSubscriptions()
                 } else {
                     #if DEBUG
                     // SONAR_BENCH: first wait cycle resolved with no buffered events
