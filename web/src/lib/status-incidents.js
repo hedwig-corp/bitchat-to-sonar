@@ -126,23 +126,42 @@ function queryRelay(relay, filter) {
 }
 
 /**
+ * Read the `d` tag value from an event (empty string if absent).
+ * @param {NostrEvent} ev
+ * @returns {string}
+ */
+function incidentDTag(ev) {
+	for (const tag of ev.tags) {
+		if (Array.isArray(tag) && tag[0] === 'd' && typeof tag[1] === 'string') return tag[1];
+	}
+	return '';
+}
+
+/**
  * Fetch historical incidents from Nostr (kind 30080, author=status publisher, d tag prefix).
- * @param {number} sinceDaysAgo
+ *
+ * Each incident is its own parameterized-replaceable event with a distinct
+ * `d` (e.g. `sonar-incident-<id>`). Nostr `#d` tag filters are exact-match
+ * (NIP-01), so we cannot ask the relay for a prefix — we query by kind+author
+ * and filter the `sonar-incident-` prefix client-side.
+ *
+ * @param {number | null} [sinceDaysAgo] Lookback window in days; null/omitted fetches all incidents.
  * @returns {Promise<StatusIncident[]>}
  */
-export async function fetchIncidentsFromNostr(sinceDaysAgo = 2) {
+export async function fetchIncidentsFromNostr(sinceDaysAgo = null) {
 	const author = STATUS_PUBKEY_HEX.toLowerCase();
-	const since = Math.floor(Date.now() / 1000) - sinceDaysAgo * 24 * 60 * 60;
 	const relays = STATUS_FEED_RELAYS.filter(isWssUrl);
 	if (relays.length === 0) return [];
 
+	/** @type {{ kinds: number[], authors: string[], limit: number, since?: number }} */
 	const filter = {
 		kinds: [INCIDENT_KIND],
 		authors: [author],
-		'#d': [INCIDENT_D_PREFIX],
-		since,
-		limit: 100
+		limit: 500
 	};
+	if (typeof sinceDaysAgo === 'number' && sinceDaysAgo > 0) {
+		filter.since = Math.floor(Date.now() / 1000) - sinceDaysAgo * 24 * 60 * 60;
+	}
 
 	const results = await Promise.all(relays.map((r) => queryRelay(r, filter)));
 	/** @type {Map<string, NostrEvent>} */
@@ -151,6 +170,7 @@ export async function fetchIncidentsFromNostr(sinceDaysAgo = 2) {
 		for (const ev of events) {
 			if (ev.kind !== INCIDENT_KIND) continue;
 			if (typeof ev.pubkey !== 'string' || ev.pubkey.toLowerCase() !== author) continue;
+			if (!incidentDTag(ev).startsWith(INCIDENT_D_PREFIX)) continue;
 			const existing = byId.get(ev.id);
 			if (!existing || ev.created_at > existing.created_at) byId.set(ev.id, ev);
 		}
