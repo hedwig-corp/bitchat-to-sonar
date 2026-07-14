@@ -36,6 +36,14 @@ export const BLOG_MAX_CONTENT_BYTES = 200_000;
 /** Topic (`t` tag) that marks a post as the featured card. */
 export const BLOG_FEATURED_TAG = 'featured';
 
+/**
+ * Required `t` tag that marks a NIP-23 event as a Sonar website blog post. The
+ * reader only loads events carrying this tag, so other long-form content the
+ * author publishes from the same key never shows up on the site. Publishers add
+ * it via scripts/blog/publish.sh.
+ */
+export const BLOG_MARKER_TAG = 'sonarblogpost';
+
 /** @returns {boolean} whether a live query is configured. */
 export function isBlogFeedConfigured() {
 	return /^[0-9a-fA-F]{64}$/.test(BLOG_PUBKEY_HEX);

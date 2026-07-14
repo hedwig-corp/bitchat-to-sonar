@@ -14,7 +14,12 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { writeFileSync } from 'node:fs';
-import { BLOG_EVENT_KIND, BLOG_FEED_RELAYS, BLOG_PUBKEY_HEX } from '../src/lib/blog-data.js';
+import {
+	BLOG_EVENT_KIND,
+	BLOG_FEED_RELAYS,
+	BLOG_MARKER_TAG,
+	BLOG_PUBKEY_HEX
+} from '../src/lib/blog-data.js';
 import { postsFromEvents } from '../src/lib/blog-nostr.js';
 import { parseProfileEvent } from '../src/lib/blog-author.js';
 
@@ -31,12 +36,13 @@ const nak = (process.env.NAK ?? 'go run github.com/fiatjaf/nak@latest').split(/\
 const author = BLOG_PUBKEY_HEX.toLowerCase();
 
 /**
- * Run `nak req -k <kind> -a <author> <relays…>` and return the parsed events.
+ * Run `nak req -k <kind> -a <author> [extra…] <relays…>` and return the parsed events.
  * @param {number} kind
+ * @param {string[]} [extra] extra nak req args (e.g. tag filters)
  * @returns {import('../src/lib/nostr-req.js').NostrEvent[]}
  */
-function reqEvents(kind) {
-	const args = [...nak.slice(1), 'req', '-k', String(kind), '-a', author, ...relays];
+function reqEvents(kind, extra = []) {
+	const args = [...nak.slice(1), 'req', '-k', String(kind), '-a', author, ...extra, ...relays];
 	const res = spawnSync(nak[0], args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: 60_000 });
 	if (res.error) {
 		console.error(`fetch-blog: failed to run ${nak[0]}: ${res.error.message}`);
@@ -56,8 +62,9 @@ function reqEvents(kind) {
 	return events;
 }
 
-console.error(`fetch-blog: querying ${relays.length} relays for kind ${BLOG_EVENT_KIND} + profile by ${BLOG_PUBKEY_HEX.slice(0, 12)}…`);
-const posts = postsFromEvents(reqEvents(BLOG_EVENT_KIND), author).map(({ _ts, ...p }) => p);
+console.error(`fetch-blog: querying ${relays.length} relays for kind ${BLOG_EVENT_KIND} (#t=${BLOG_MARKER_TAG}) + profile by ${BLOG_PUBKEY_HEX.slice(0, 12)}…`);
+const postEvents = reqEvents(BLOG_EVENT_KIND, ['-t', `t=${BLOG_MARKER_TAG}`]);
+const posts = postsFromEvents(postEvents, author).map(({ _ts, ...p }) => p);
 
 if (posts.length === 0) {
 	console.error('fetch-blog: no posts returned — leaving blog-content.js unchanged.');

@@ -11,6 +11,7 @@ import {
 	BLOG_EVENT_KIND,
 	BLOG_FEATURED_TAG,
 	BLOG_FEED_RELAYS,
+	BLOG_MARKER_TAG,
 	BLOG_MAX_CONTENT_BYTES,
 	BLOG_PUBKEY_HEX,
 	categoryFromTopics,
@@ -41,7 +42,12 @@ export async function fetchPostsFromNostr() {
 	}
 
 	/** @type {import('./nostr-req.js').NostrFilter} */
-	const filter = { kinds: [BLOG_EVENT_KIND], authors: [author], limit: FETCH_LIMIT };
+	const filter = {
+		kinds: [BLOG_EVENT_KIND],
+		authors: [author],
+		'#t': [BLOG_MARKER_TAG],
+		limit: FETCH_LIMIT
+	};
 
 	const responses = await Promise.all(relays.map((relay) => queryRelay(relay, filter)));
 	const posts = postsFromEvents(responses.flatMap((r) => r.events), author);
@@ -108,6 +114,10 @@ export function parseArticleEvent(ev) {
 	const topics = ev.tags
 		.filter((t) => t[0] === 't' && typeof t[1] === 'string')
 		.map((t) => t[1].toLowerCase());
+
+	// Only events explicitly marked as Sonar blog posts are shown, so other
+	// long-form content from the same author key is ignored.
+	if (!topics.includes(BLOG_MARKER_TAG)) return null;
 
 	const publishedAt = Number.parseInt(tagValue(ev.tags, 'published_at') ?? '', 10);
 	const ts = Number.isFinite(publishedAt) && publishedAt > 0 ? publishedAt : (ev.created_at ?? 0);
