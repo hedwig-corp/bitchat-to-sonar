@@ -40,6 +40,8 @@
  * @property {IncidentUpdate[]} updates
  */
 
+/** @typedef {StatusIncident & {_created_at?: number}} InternalIncident */
+
 /**
  * @typedef {Object} StatusPayload
  * @property {StatusService[]} services
