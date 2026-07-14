@@ -52,25 +52,27 @@ actual object Notifier {
 
     actual fun notify(id: Int, title: String, body: String, sound: SonarNotificationSound) {
         val icon = trayIcon ?: run { ensureChannel(); trayIcon } ?: return
-        runCatching {
-            icon.displayMessage(title, body, TrayIcon.MessageType.INFO)
-            playNotificationSound(sound)
-        }
+        runCatching { icon.displayMessage(title, body, TrayIcon.MessageType.INFO) }
+            .onFailure { sonarLog("Notifier", "Failed to display desktop notification: ${it.message}") }
+        playNotificationSound(sound)
     }
 
     private fun playNotificationSound(sound: SonarNotificationSound) {
         val generation = soundGeneration.incrementAndGet()
         soundExecutor.execute {
             if (generation != soundGeneration.get()) return@execute
-            runCatching {
-                val resource = when (sound) {
-                    SonarNotificationSound.Default -> "/sonar_notification.wav"
-                    SonarNotificationSound.Ble -> "/sonar_ble_notification.wav"
+            val resource = when (sound) {
+                SonarNotificationSound.Default -> "/sonar_notification.wav"
+                SonarNotificationSound.Ble -> "/sonar_ble_notification.wav"
+            }
+            val bytes = Notifier::class.java
+                .getResourceAsStream(resource)
+                ?.buffered()
+                ?: run {
+                    sonarLog("Notifier", "Missing desktop notification sound: $resource")
+                    return@execute
                 }
-                val bytes = Notifier::class.java
-                    .getResourceAsStream(resource)
-                    ?.buffered()
-                    ?: return@runCatching
+            runCatching {
                 bytes.use { input ->
                     AudioSystem.getAudioInputStream(input).use { audio ->
                         AudioSystem.getClip().use { clip ->
@@ -83,6 +85,8 @@ actual object Notifier {
                         }
                     }
                 }
+            }.onFailure {
+                sonarLog("Notifier", "Failed to play desktop notification sound $resource: ${it.message}")
             }
         }
     }

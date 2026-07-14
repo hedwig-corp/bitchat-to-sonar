@@ -34,6 +34,7 @@ actual object Notifier {
                 name = "Messages",
                 description = "Incoming Sonar messages",
                 soundResourceId = R.raw.sonar_notification,
+                audioUsage = AudioAttributes.USAGE_NOTIFICATION_COMMUNICATION_INSTANT,
             )
             ensureChannel(
                 nm = nm,
@@ -41,6 +42,7 @@ actual object Notifier {
                 name = "Bluetooth notifications",
                 description = "Notifications received over Bluetooth",
                 soundResourceId = R.raw.sonar_ble_notification,
+                audioUsage = AudioAttributes.USAGE_NOTIFICATION,
             )
         }
     }
@@ -51,6 +53,7 @@ actual object Notifier {
         name: String,
         description: String,
         soundResourceId: Int,
+        audioUsage: Int,
     ) {
         if (nm.getNotificationChannel(id) == null) {
             nm.createNotificationChannel(
@@ -61,7 +64,7 @@ actual object Notifier {
                     setSound(
                         soundUri(soundResourceId),
                         AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_NOTIFICATION)
+                            .setUsage(audioUsage)
                             .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
                             .build()
                     )
