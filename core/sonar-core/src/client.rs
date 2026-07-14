@@ -742,11 +742,12 @@ fn relay_fetch_quorum(total_relays: usize) -> usize {
     }
 }
 
-/// Whether a push-token share pass should run given how many relays are
-/// currently connected. The share sends a gift-wrapped DM per group member
-/// through the nostr client, which fails with "no relays specified" when no
-/// relay is live. Since the share re-runs on every sync/wake, skipping while
-/// disconnected costs nothing and avoids one logged failure per recipient.
+/// Whether a push-token share pass should run given how many relays report
+/// `RelayStatus::Connected`. Skip when that count is zero — covering both an
+/// empty write-relay set (`NoRelaysSpecified` in nostr-relay-pool) and the
+/// connected-but-degraded startup window — so we never walk groups × members
+/// to send gift-wrapped DMs before a relay can accept them. The share re-runs
+/// on every sync/wake, so deferring costs nothing.
 fn should_share_push_tokens(connected_relays: usize) -> bool {
     connected_relays > 0
 }
@@ -2303,7 +2304,8 @@ impl SonarClient {
         // no longer share the host's serialized engine queue with sync.
         let (event, incoming) = {
             let _epoch = self.membership_gate.read().await;
-            self.engine.create_and_process_text_message(group_id, text)?
+            self.engine
+                .create_and_process_text_message(group_id, text)?
         };
         let Incoming::Message(message) = incoming else {
             return Err(Error::Storage(
@@ -4878,16 +4880,16 @@ impl SonarClient {
     /// via a NIP-44 encrypted DM (kind 447). Group members cache this to send
     /// sender-side notifications to us.
     async fn share_push_token_with_groups(&self) {
-        // Relay guard: the per-recipient gift-wrapped DM below goes out through
-        // `self.nostr.send_event`, which fails with "no relays specified" when
-        // the nostr client has no live relays. This runs at the end of every
-        // sync/wake (`sync_inner`, the live short-circuit, and the token-update
-        // path), often BEFORE relays attach — with many groups that floods the
-        // log with one failure per member (~275/session on a real 43-group
-        // account). Skip the whole pass when no relay is connected: it re-runs
-        // on the next sync once relays are up, so deferring is free and this
-        // never blocks chat open/send/scroll/paint. Take the relay map from the
-        // `.await` before touching any std Mutex so no guard is held across it.
+        // Relay guard: skip when zero relays report `RelayStatus::Connected`
+        // (empty write-relay set → `NoRelaysSpecified`, or configured relays
+        // not yet attached). The per-recipient gift-wrapped DM below goes
+        // through `self.nostr.send_event`; walking groups × members before a
+        // relay can accept floods the log (~275/session on a real 43-group
+        // account). This runs at the end of every sync/wake (`sync_inner`, the
+        // live short-circuit, and the token-update path), often before relays
+        // attach — deferring is free and never blocks chat open/send/scroll/
+        // paint. Take the relay map from the `.await` before touching any std
+        // Mutex so no guard is held across it.
         let connected_relays = self
             .nostr
             .relays()
@@ -5339,12 +5341,40 @@ mod tests {
 
     #[test]
     fn push_token_share_skips_until_a_relay_is_connected() {
-        // No live relay: skip so the per-recipient gift-wrapped DM never fires
-        // "no relays specified" (the ~275/session flood on a real account).
+        // Zero Connected relays: skip the groups × members DM walk.
         assert!(!should_share_push_tokens(0));
-        // At least one connected relay: the DM can actually go out.
+        // At least one Connected relay: the DM can actually go out.
         assert!(should_share_push_tokens(1));
         assert!(should_share_push_tokens(5));
+    }
+
+    #[tokio::test]
+    async fn share_push_token_with_groups_noops_when_no_relay_connected() {
+        // Behavioral coverage for the Connected-status guard on
+        // `share_push_token_with_groups` itself (not just the pure helper).
+        // An in-memory client with no relays must return without attempting
+        // gift-wrapped DMs. Full register-while-disconnected → reconnect →
+        // sync → kind-447 round-trip is covered by device/integration testing.
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client without relays");
+        let server_pubkey = Keys::generate().public_key();
+        *client.own_push_registration.lock().unwrap() = Some(crate::push::OwnPushRegistration {
+            encrypted_token_b64: "dGVzdA==".to_owned(),
+            server_pubkey,
+        });
+
+        let connected = client
+            .nostr
+            .relays()
+            .await
+            .values()
+            .filter(|handle| handle.status() == RelayStatus::Connected)
+            .count();
+        assert_eq!(connected, 0);
+        assert!(!should_share_push_tokens(connected));
+
+        client.share_push_token_with_groups().await;
     }
 
     #[test]
@@ -5565,7 +5595,9 @@ mod tests {
             .remove_members(&group_id, &[carol.identity().public_key()])
             .expect("alice removes carol");
         assert!(removal.requires_commit_merge);
-        let carol_group_id = carol.groups().expect("carol groups")[0].mls_group_id.clone();
+        let carol_group_id = carol.groups().expect("carol groups")[0]
+            .mls_group_id
+            .clone();
         bob.process_incoming(&removal.evolution_event)
             .await
             .expect("bob processes removal commit");
@@ -5602,7 +5634,9 @@ mod tests {
         // Guard against a silent DB write: carol's transcript must not contain it.
         let carol_rows = carol.messages(&carol_group_id).unwrap_or_default();
         assert!(
-            !carol_rows.iter().any(|m| m.content == "after carol removal"),
+            !carol_rows
+                .iter()
+                .any(|m| m.content == "after carol removal"),
             "post-removal message must not appear in carol's transcript"
         );
     }
