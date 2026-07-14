@@ -14,6 +14,10 @@ import uniffi.sonar_ffi.SonarNode
 import uniffi.sonar_ffi.wipeMarmotDatabase
 import java.io.File
 import java.security.SecureRandom
+import java.util.concurrent.locks.ReentrantLock
+import java.util.concurrent.locks.ReentrantReadWriteLock
+import kotlin.concurrent.read
+import kotlin.concurrent.write
 
 /**
  * Desktop (JVM) `actual`: drive the Rust core (Marmot / White Noise) through the
@@ -40,6 +44,10 @@ actual object SonarCore {
     )
 
     private val lock = Mutex()
+    // Fairness prevents a wipe/import writer from starving behind a stream of
+    // picker/transcript reads while still allowing unrelated images in parallel.
+    private val stickerOperationLock = ReentrantReadWriteLock(true)
+    private val installedStickerMutationLock = ReentrantLock(true)
     private var node: SonarNode? = null
     @Volatile private var relayConnected = false
     @Volatile private var npub: String = ""
@@ -83,6 +91,7 @@ actual object SonarCore {
             val connected = SonarNode.connect(identity, relayUrls, dbPath, dbKeyHex)
             node = connected
             relayConnected = true
+            installConversationListener()
             runCatching { connected.retryOutbox() }
             runCatching { connected.publishKeyPackageBackground() }
             npub
@@ -205,7 +214,9 @@ actual object SonarCore {
         shortcode: String,
         plaintextSha256: String,
     ) = withContext(Dispatchers.IO) {
-        requireNode().sendSticker(chatId, packCoordinate, shortcode, plaintextSha256)
+        stickerOperationLock.read {
+            requireNode().sendSticker(chatId, packCoordinate, shortcode, plaintextSha256)
+        }
     }
 
     actual suspend fun fetchStickerPack(
@@ -213,29 +224,64 @@ actual object SonarCore {
         identifier: String,
         relayUrls: List<String>,
     ): SonarStickerPack = withContext(Dispatchers.IO) {
-        requireNode().fetchStickerPack(authorPubkeyHex, identifier, relayUrls).toCommon()
+        stickerOperationLock.read {
+            requireNode().fetchStickerPack(authorPubkeyHex, identifier, relayUrls).toCommon()
+        }
     }
 
     actual suspend fun fetchStickerImage(url: String, expectedSha256: String): ByteArray =
-        withContext(Dispatchers.IO) { requireNode().fetchStickerImage(url, expectedSha256) }
+        withContext(Dispatchers.IO) {
+            stickerOperationLock.read {
+                requireNode().fetchStickerImage(url, expectedSha256)
+            }
+        }
 
     actual suspend fun cachedStickerImageForRef(ref: SonarStickerRef): ByteArray? =
         withContext(Dispatchers.IO) {
-            requireNode().cachedStickerImageForRef(
-                ref.packCoordinate,
-                ref.shortcode,
-                ref.plaintextSha256,
-            )
+            stickerOperationLock.read {
+                requireNode().cachedStickerImageForRef(
+                    ref.packCoordinate,
+                    ref.shortcode,
+                    ref.plaintextSha256,
+                )
+            }
         }
 
     actual suspend fun fetchInstalledPacks(): List<String> =
-        withContext(Dispatchers.IO) { requireNode().fetchInstalledPacks() }
+        withContext(Dispatchers.IO) {
+            stickerOperationLock.read {
+                installedStickerMutationLock.lock()
+                try {
+                    requireNode().fetchInstalledPacks()
+                } finally {
+                    installedStickerMutationLock.unlock()
+                }
+            }
+        }
 
     actual suspend fun installStickerPack(coordinate: String) =
-        withContext(Dispatchers.IO) { requireNode().installStickerPack(coordinate) }
+        withContext(Dispatchers.IO) {
+            stickerOperationLock.read {
+                installedStickerMutationLock.lock()
+                try {
+                    requireNode().installStickerPack(coordinate)
+                } finally {
+                    installedStickerMutationLock.unlock()
+                }
+            }
+        }
 
     actual suspend fun uninstallStickerPack(coordinate: String) =
-        withContext(Dispatchers.IO) { requireNode().uninstallStickerPack(coordinate) }
+        withContext(Dispatchers.IO) {
+            stickerOperationLock.read {
+                installedStickerMutationLock.lock()
+                try {
+                    requireNode().uninstallStickerPack(coordinate)
+                } finally {
+                    installedStickerMutationLock.unlock()
+                }
+            }
+        }
 
     actual suspend fun fetchMedia(chatId: String, url: String): ByteArray =
         withContext(Dispatchers.IO) { requireNode().fetchMedia(chatId, url) }
@@ -645,15 +691,34 @@ actual object SonarCore {
         SonarNativeLoader.ensureLoaded()
         val identity = SonarIdentity.import(nsec.trim())
         lock.withLock {
-            node = null
-            relayConnected = false
-            npub = identity.npub()
-            pubkeyHex = identity.pubkeyHex()
-            val marmotDir = marmotDir()
-            runCatching { wipeMarmotDatabase(File(marmotDir, "marmot.sqlite").absolutePath) }
-            marmotDir.deleteRecursively()
-            DesktopSecrets.put("nsec", identity.nsec())
-            npub
+            stickerOperationLock.write {
+                val previousIdentity = DesktopSecrets
+                    .get("nsec")
+                    ?.let { saved -> runCatching { SonarIdentity.import(saved) }.getOrNull() }
+                node = null
+                relayConnected = false
+                val marmotDir = marmotDir()
+                try {
+                    wipeMarmotStorage(marmotDir)
+                    DesktopSecrets.put("nsec", identity.nsec())
+                    npub = identity.npub()
+                    pubkeyHex = identity.pubkeyHex()
+                    npub
+                } catch (importError: Throwable) {
+                    if (previousIdentity != null) {
+                        try {
+                            node = connectLocalIdentity(previousIdentity)
+                            relayConnected = false
+                            npub = previousIdentity.npub()
+                            pubkeyHex = previousIdentity.pubkeyHex()
+                            installConversationListener()
+                        } catch (recoveryError: Throwable) {
+                            importError.addSuppressed(recoveryError)
+                        }
+                    }
+                    throw importError
+                }
+            }
         }
     }
 
@@ -677,33 +742,37 @@ actual object SonarCore {
 
     actual suspend fun wipe() = withContext(Dispatchers.IO) {
         lock.withLock {
-            node = null
-            relayConnected = false
-            npub = ""; pubkeyHex = ""
-            // marmotDir() covers the DB + diagnostics logs (sonar-marmot/logs);
-            // the exported diagnostics zips live in a sibling dir, so drop them
-            // too — at verbose level they can contain peer npubs and must not
-            // survive a wipe (Account Key Durability / privacy rule).
-            val marmotDir = marmotDir()
-            runCatching { wipeMarmotDatabase(File(marmotDir, "marmot.sqlite").absolutePath) }
-            marmotDir.deleteRecursively()
-            DesktopEnv.file("diagnostics").deleteRecursively()
-            DesktopSecrets.clear("nsec", "dbKeyHex")
-            DesktopEnv.clear()
+            stickerOperationLock.write {
+                node = null
+                relayConnected = false
+                npub = ""; pubkeyHex = ""
+                // marmotDir() covers the DB + diagnostics logs (sonar-marmot/logs);
+                // the exported diagnostics zips live in a sibling dir, so drop them
+                // too — at verbose level they can contain peer npubs and must not
+                // survive a wipe (Account Key Durability / privacy rule).
+                val marmotDir = marmotDir()
+                val wipeFailure = runCatching { wipeMarmotStorage(marmotDir) }.exceptionOrNull()
+                DesktopEnv.file("diagnostics").deleteRecursively()
+                DesktopSecrets.clear("nsec", "dbKeyHex")
+                DesktopEnv.clear()
+                wipeFailure?.let { throw it }
+                Unit
+            }
         }
     }
 
     actual suspend fun eraseChats() {
         withContext(Dispatchers.IO) {
             lock.withLock {
-                node = null
-                relayConnected = false
-                // Delete ONLY the encrypted Marmot DB — keep nsec, DB key,
-                // nickname and prefs. start() reopens a fresh empty DB with the
-                // SAME identity + key.
-                val marmotDir = marmotDir()
-                runCatching { wipeMarmotDatabase(File(marmotDir, "marmot.sqlite").absolutePath) }
-                marmotDir.deleteRecursively()
+                stickerOperationLock.write {
+                    node = null
+                    relayConnected = false
+                    // Delete ONLY the encrypted Marmot DB — keep nsec, DB key,
+                    // nickname and prefs. start() reopens a fresh empty DB with the
+                    // SAME identity + key.
+                    val marmotDir = marmotDir()
+                    wipeMarmotStorage(marmotDir)
+                }
             }
         }
         start()
@@ -717,6 +786,24 @@ actual object SonarCore {
 
     private fun requireNode(): SonarNode =
         node ?: error("SonarCore not started — call start() first")
+
+    /** Reopen the previous account locally when a fallible identity wipe fails. */
+    private fun connectLocalIdentity(identity: SonarIdentity): SonarNode {
+        val dir = marmotDir()
+        installCoreLogging(diagnosticsVerbose())
+        return SonarNode.connect(
+            identity,
+            emptyList(),
+            File(dir, "marmot.sqlite").absolutePath,
+            loadOrCreateDbKey(),
+        )
+    }
+
+    /** Preserve the FFI wipe tombstone if deleting the cache fails midway. */
+    private fun wipeMarmotStorage(marmotDir: File) {
+        wipeMarmotDatabase(File(marmotDir, "marmot.sqlite").absolutePath)
+        check(marmotDir.deleteRecursively()) { "failed to remove Marmot storage" }
+    }
 
     private fun loadOrCreateIdentity(): SonarIdentity {
         // Stored in the OS keystore (macOS Keychain), NOT plaintext prefs — the nsec

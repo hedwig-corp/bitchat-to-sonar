@@ -18,6 +18,7 @@ pub(crate) const MAX_STICKER_CACHE_BYTES: usize = 5 * 1024 * 1024;
 const MAX_STICKER_CACHE_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
 const VALIDATED_PACKS_DIR: &str = "validated-packs";
 const FAILED_WIPE_TOMBSTONE_SUFFIX: &str = ".wipe-incomplete";
+const FAILED_WIPE_QUARANTINE_SUFFIX: &str = ".wipe-quarantine";
 const MAX_VALIDATED_PACK_BYTES: u64 = 512 * 1024;
 const MAX_VALIDATED_PACK_CACHE_BYTES: u64 = 10 * 1024 * 1024;
 /// Bound install prefetch to the leading window that can fit even when every
@@ -67,6 +68,7 @@ pub fn sticker_cache_dir_for_db(db_path: &Path) -> PathBuf {
 pub(crate) struct StickerCache {
     root: Option<PathBuf>,
     generation: u64,
+    active: bool,
 }
 
 impl StickerCache {
@@ -74,23 +76,38 @@ impl StickerCache {
         Self {
             root: None,
             generation: 0,
+            active: false,
         }
     }
 
     pub(crate) fn for_db(db_path: &Path) -> Result<Self> {
         let root = sticker_cache_dir_for_db(db_path);
         let mut state = lock_cache()?;
-        if state.failed_wipes.contains(&root) || failed_wipe_tombstone_exists(&root)? {
-            tracing::warn!(
-                cache_dir = %root.display(),
-                "sticker cache disabled until an incomplete wipe is retried"
-            );
-            return Ok(Self::disabled());
+        if state.failed_wipes.contains(&root)
+            || failed_wipe_tombstone_exists(&root)?
+            || failed_wipe_quarantine_path(&root).exists()
+        {
+            state.failed_wipes.insert(root.clone());
+            if let Err(error) = retry_failed_wipe(&root) {
+                tracing::warn!(
+                    %error,
+                    cache_dir = %root.display(),
+                    "sticker cache disabled until an incomplete wipe can be retried"
+                );
+                let generation = *state.generations.entry(root.clone()).or_default();
+                return Ok(Self {
+                    root: Some(root),
+                    generation,
+                    active: false,
+                });
+            }
+            state.failed_wipes.remove(&root);
         }
         let generation = *state.generations.entry(root.clone()).or_default();
         Ok(Self {
             root: Some(root),
             generation,
+            active: true,
         })
     }
 
@@ -98,8 +115,22 @@ impl StickerCache {
         state.generations.get(root).copied().unwrap_or_default() == self.generation
     }
 
+    /// Whether this handle still belongs to the live node generation. Detached
+    /// prefetch loops use this to stop scheduling work promptly after an
+    /// identity wipe instead of relying only on write rejection at completion.
+    pub(crate) fn session_is_current(&self) -> Result<bool> {
+        let Some(root) = self.root.as_deref() else {
+            return Ok(true);
+        };
+        let state = lock_cache()?;
+        Ok(self.is_current(&state, root))
+    }
+
     /// Read verified bytes from disk if present and SHA256 matches.
     pub(crate) fn read(&self, expected_sha256: &str) -> Result<Option<Vec<u8>>> {
+        if !self.active {
+            return Ok(None);
+        }
         let Some(root) = self.root.as_deref() else {
             return Ok(None);
         };
@@ -120,6 +151,9 @@ impl StickerCache {
     /// cache hits are authorized against this metadata before any image bytes
     /// are returned, matching Signal's local-database source-of-truth model.
     pub(crate) fn remember_validated_pack(&self, pack: &StickerPack) -> Result<bool> {
+        if !self.active {
+            return Ok(true);
+        }
         let Some(root) = self.root.as_deref() else {
             return Ok(true);
         };
@@ -131,6 +165,24 @@ impl StickerCache {
         Ok(true)
     }
 
+    /// Read the latest locally validated definition for a pack. Foreground
+    /// callers use this only after waiting behind an in-flight relay refresh,
+    /// so concurrent views share the first result without turning ordinary
+    /// picker refreshes into permanently stale local-only reads.
+    pub(crate) fn read_validated_pack(&self, coordinate: &str) -> Result<Option<StickerPack>> {
+        if !self.active {
+            return Ok(None);
+        }
+        let Some(root) = self.root.as_deref() else {
+            return Ok(None);
+        };
+        let state = lock_cache()?;
+        if !self.is_current(&state, root) {
+            return Ok(None);
+        }
+        read_validated_pack(root, coordinate)
+    }
+
     /// Return verified image bytes only when the latest locally validated pack
     /// still contains the exact coordinate + shortcode + plaintext hash.
     pub(crate) fn read_validated_image(
@@ -139,6 +191,9 @@ impl StickerCache {
         shortcode: &str,
         expected_sha256: &str,
     ) -> Result<Option<Vec<u8>>> {
+        if !self.active {
+            return Ok(None);
+        }
         let Some(root) = self.root.as_deref() else {
             return Ok(None);
         };
@@ -158,6 +213,9 @@ impl StickerCache {
         bytes: &[u8],
         total_budget: u64,
     ) -> Result<bool> {
+        if !self.active {
+            return Ok(true);
+        }
         let Some(root) = self.root.as_deref() else {
             return Ok(true);
         };
@@ -178,7 +236,47 @@ pub(crate) fn wipe_sticker_cache_for_db(db_path: &Path) -> Result<()> {
     state.failed_wipes.insert(dir.clone());
 
     let tombstone = failed_wipe_tombstone_path(&dir);
-    persist_failed_wipe_tombstone(&tombstone)?;
+    if let Err(tombstone_error) = persist_failed_wipe_tombstone(&tombstone) {
+        // If the filesystem cannot create/sync the durable tombstone (for
+        // example ENOSPC), atomically move the cache out of the live path.
+        // The quarantine directory itself is then the durable fail-closed
+        // marker seen by `for_db` after restart.
+        let quarantine = failed_wipe_quarantine_path(&dir);
+        match fs::rename(&dir, &quarantine) {
+            Ok(()) => {
+                fs::remove_dir_all(&quarantine).map_err(|error| {
+                    crate::Error::Storage(format!(
+                        "remove quarantined sticker cache {} after tombstone failure ({tombstone_error}): {error}",
+                        quarantine.display()
+                    ))
+                })?;
+                remove_failed_wipe_tombstone(&tombstone)?;
+                state.failed_wipes.remove(&dir);
+                return Ok(());
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match fs::remove_dir_all(&quarantine) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(crate::Error::Storage(format!(
+                            "remove quarantined sticker cache {} after tombstone failure ({tombstone_error}): {error}",
+                            quarantine.display()
+                        )))
+                    }
+                }
+                remove_failed_wipe_tombstone(&tombstone)?;
+                state.failed_wipes.remove(&dir);
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(crate::Error::Storage(format!(
+                    "persist sticker cache wipe tombstone ({tombstone_error}) and quarantine {}: {error}",
+                    dir.display()
+                )))
+            }
+        }
+    }
     match fs::remove_dir_all(&dir) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -189,9 +287,44 @@ pub(crate) fn wipe_sticker_cache_for_db(db_path: &Path) -> Result<()> {
             )))
         }
     }
+    let quarantine = failed_wipe_quarantine_path(&dir);
+    match fs::remove_dir_all(&quarantine) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(crate::Error::Storage(format!(
+                "remove quarantined sticker cache {}: {e}",
+                quarantine.display()
+            )))
+        }
+    }
     remove_failed_wipe_tombstone(&tombstone)?;
     state.failed_wipes.remove(&dir);
     Ok(())
+}
+
+fn failed_wipe_quarantine_path(root: &Path) -> PathBuf {
+    let file_name = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("marmot.sqlite.sonar-stickers");
+    root.with_file_name(format!("{file_name}{FAILED_WIPE_QUARANTINE_SUFFIX}"))
+}
+
+fn retry_failed_wipe(root: &Path) -> Result<()> {
+    for path in [root.to_path_buf(), failed_wipe_quarantine_path(root)] {
+        match fs::remove_dir_all(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(crate::Error::Storage(format!(
+                    "retry sticker cache wipe {}: {error}",
+                    path.display()
+                )))
+            }
+        }
+    }
+    remove_failed_wipe_tombstone(&failed_wipe_tombstone_path(root))
 }
 
 fn failed_wipe_tombstone_path(root: &Path) -> PathBuf {
@@ -232,7 +365,22 @@ fn persist_failed_wipe_tombstone(path: &Path) -> Result<()> {
 }
 
 fn remove_failed_wipe_tombstone(path: &Path) -> Result<()> {
-    match fs::remove_file(path) {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(crate::Error::Storage(format!(
+                "inspect sticker cache wipe tombstone {}: {error}",
+                path.display()
+            )))
+        }
+    };
+    let result = if metadata.file_type().is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    };
+    match result {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(crate::Error::Storage(format!(
@@ -329,6 +477,45 @@ fn write_validated_pack(root: &Path, pack: &StickerPack) -> Result<()> {
     enforce_cache_budget(parent, MAX_VALIDATED_PACK_CACHE_BYTES, &path)
 }
 
+fn read_validated_pack(root: &Path, coordinate: &str) -> Result<Option<StickerPack>> {
+    let address = PackAddress::parse(coordinate)
+        .map_err(|e| crate::Error::InvalidInput(format!("invalid sticker pack coordinate: {e}")))?;
+    let coordinate = address.coordinate();
+    let path = validated_pack_file_path(root, &coordinate);
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(crate::Error::Storage(format!(
+                "inspect sticker pack cache {}: {error}",
+                path.display()
+            )))
+        }
+    };
+    if metadata.len() > MAX_VALIDATED_PACK_BYTES {
+        let _ = fs::remove_file(&path);
+        return Ok(None);
+    }
+    let bytes = fs::read(&path).map_err(|error| {
+        crate::Error::Storage(format!(
+            "read sticker pack cache {}: {error}",
+            path.display()
+        ))
+    })?;
+    let pack: StickerPack = match serde_json::from_slice(&bytes) {
+        Ok(pack) => pack,
+        Err(_) => {
+            let _ = fs::remove_file(&path);
+            return Ok(None);
+        }
+    };
+    if pack.address != address || pack.validate().is_err() {
+        let _ = fs::remove_file(&path);
+        return Ok(None);
+    }
+    Ok(Some(pack))
+}
+
 fn validated_pack_contains(
     root: &Path,
     pack_coordinate: &str,
@@ -355,23 +542,9 @@ fn validated_pack_contains(
         let _ = fs::remove_file(&path);
         return Ok(false);
     }
-    let bytes = fs::read(&path).map_err(|error| {
-        crate::Error::Storage(format!(
-            "read sticker pack cache {}: {error}",
-            path.display()
-        ))
-    })?;
-    let pack: StickerPack = match serde_json::from_slice(&bytes) {
-        Ok(pack) => pack,
-        Err(_) => {
-            let _ = fs::remove_file(&path);
-            return Ok(false);
-        }
-    };
-    if pack.address != address || pack.validate().is_err() {
-        let _ = fs::remove_file(&path);
+    let Some(pack) = read_validated_pack(root, &coordinate)? else {
         return Ok(false);
-    }
+    };
     Ok(pack.stickers.iter().any(|sticker| {
         sticker.shortcode == shortcode && sticker.sha256.eq_ignore_ascii_case(&expected)
     }))
@@ -611,12 +784,12 @@ mod tests {
         assert!(wipe_sticker_cache_for_db(&db).is_err());
         assert!(tombstone.is_file());
         assert!(stale.read(&sha256_hex(b"old")).unwrap().is_none());
-        assert!(StickerCache::for_db(&db).unwrap().root.is_none());
+        assert!(!StickerCache::for_db(&db).unwrap().active);
 
         // Simulate a process restart: the durable tombstone remains sufficient
         // even after the in-memory failed-wipe record is gone.
         lock_cache().unwrap().failed_wipes.remove(&cache_root);
-        assert!(StickerCache::for_db(&db).unwrap().root.is_none());
+        assert!(!StickerCache::for_db(&db).unwrap().active);
 
         fs::remove_file(&cache_root).unwrap();
         wipe_sticker_cache_for_db(&db).unwrap();
@@ -629,6 +802,48 @@ mod tests {
             fresh.read(&sha256_hex(bytes)).unwrap().as_deref(),
             Some(bytes.as_slice())
         );
+    }
+
+    #[test]
+    fn startup_retries_a_recoverable_incomplete_wipe() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("marmot.sqlite");
+        let cache_root = sticker_cache_dir_for_db(&db);
+        let tombstone = failed_wipe_tombstone_path(&cache_root);
+        fs::create_dir_all(&cache_root).unwrap();
+        fs::write(cache_root.join("stale"), b"old account bytes").unwrap();
+        persist_failed_wipe_tombstone(&tombstone).unwrap();
+        lock_cache().unwrap().failed_wipes.remove(&cache_root);
+
+        let fresh = StickerCache::for_db(&db).unwrap();
+
+        assert!(fresh.root.is_some());
+        assert!(!cache_root.exists());
+        assert!(!tombstone.exists());
+    }
+
+    #[test]
+    fn tombstone_create_failure_still_removes_existing_quarantine() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("marmot.sqlite");
+        let cache_root = sticker_cache_dir_for_db(&db);
+        let quarantine = failed_wipe_quarantine_path(&cache_root);
+        let tombstone = failed_wipe_tombstone_path(&cache_root);
+
+        fs::create_dir_all(&quarantine).unwrap();
+        fs::write(quarantine.join("old-account"), b"stale").unwrap();
+        // File::create must fail, exercising the quarantine fallback with no
+        // live root and a pre-existing quarantine from an interrupted wipe.
+        fs::create_dir_all(&tombstone).unwrap();
+
+        wipe_sticker_cache_for_db(&db).unwrap();
+
+        assert!(!cache_root.exists());
+        assert!(!quarantine.exists());
+        assert!(!tombstone.exists());
+        let fresh = StickerCache::for_db(&db).unwrap();
+        let bytes = b"fresh-session";
+        assert!(fresh.write(&sha256_hex(bytes), bytes).unwrap());
     }
 
     #[test]

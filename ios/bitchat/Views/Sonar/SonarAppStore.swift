@@ -4200,8 +4200,14 @@ final class SonarAppStore: ObservableObject {
                     id: item.messageId,
                     createdAt: fallbackDate
                 )
-                pendingMarmotMessagesByChat[realId]?.removeAll { $0.id == item.messageId }
+                let isSticker = meshParseStickerContent(content: item.text) != nil
+                if !isSticker {
+                    pendingMarmotMessagesByChat[realId]?.removeAll { $0.id == item.messageId }
+                }
                 let ok = await sendQueuedMarmotContent(item.text, to: groupId)
+                if isSticker {
+                    pendingMarmotMessagesByChat[realId]?.removeAll { $0.id == item.messageId }
+                }
                 if !ok {
                     pendingMarmotMessagesByChat[realId, default: []].append(
                         failedPendingMessage(echo)
@@ -4222,8 +4228,14 @@ final class SonarAppStore: ObservableObject {
                     id: item.messageId,
                     createdAt: fallbackDate
                 )
-                pendingMarmotMessagesByChat[realId]?.removeAll { $0.id == item.messageId }
+                let isSticker = meshParseStickerContent(content: item.text) != nil
+                if !isSticker {
+                    pendingMarmotMessagesByChat[realId]?.removeAll { $0.id == item.messageId }
+                }
                 let ok = await sendQueuedMarmotContent(item.text, to: groupId)
+                if isSticker {
+                    pendingMarmotMessagesByChat[realId]?.removeAll { $0.id == item.messageId }
+                }
                 if !ok {
                     pendingMarmotMessagesByChat[realId, default: []].append(
                         failedPendingMessage(echo)
@@ -4235,13 +4247,12 @@ final class SonarAppStore: ObservableObject {
 
     private func sendQueuedMarmotContent(_ text: String, to groupId: String) async -> Bool {
         if let ref = meshParseStickerContent(content: text) {
-            marmot.sendSticker(
+            return await marmot.sendQueuedSticker(
                 groupId: groupId,
                 packCoordinate: ref.packCoordinate,
                 shortcode: ref.shortcode,
                 plaintextSha256: ref.plaintextSha256
             )
-            return true
         }
         return await marmot.send([text], to: groupId)
     }

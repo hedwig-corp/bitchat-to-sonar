@@ -156,7 +156,10 @@ object SonarLifecycle {
 }
 
 @Composable
-fun App(onFirstLocalStateReady: () -> Unit = {}) {
+fun App(
+    onFirstLocalStateReady: () -> Unit = {},
+    stickerBenchmarkRequest: StickerBenchmarkRequest? = null,
+) {
     val scope = rememberCoroutineScope()
     val state = remember { SonarAppState(scope) }
     LaunchedEffect(state) {
@@ -166,6 +169,9 @@ fun App(onFirstLocalStateReady: () -> Unit = {}) {
     }
     LaunchedEffect(state.onboarded) {
         if (state.onboarded) state.boot()
+    }
+    LaunchedEffect(state, stickerBenchmarkRequest) {
+        stickerBenchmarkRequest?.let { state.runStickerBenchmark(it) }
     }
     val firstLocalStateReady = isFirstLocalStateReady(
         onboarded = state.onboarded,

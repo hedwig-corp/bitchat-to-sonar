@@ -204,6 +204,12 @@ final class MarmotChatModel: ObservableObject {
     }
 
     private static let nsecKeychainKey = "marmot-nsec"
+    /// Raw encoded sticker bytes stay bounded independently from the 100 MiB
+    /// disk cache. Decoded SwiftUI images have their own framework caches, so
+    /// retaining hundreds of multi-megabyte Data values here only adds memory
+    /// pressure without improving transcript paint.
+    private static let stickerImageMemoryBudgetBytes = 25 * 1024 * 1024
+    private static let stickerImageMemoryEntryLimit = 100
     private static let sonarDescriptorRefreshInterval: TimeInterval = 15 * 60
     private static let sonarDescriptorMissRetryInterval: TimeInterval = 60
     /// Re-fetch kind-0 profiles older than this so alias/name updates are
@@ -263,6 +269,10 @@ final class MarmotChatModel: ObservableObject {
     /// Explicitly opt-in physical-device text-send benchmark task. The trigger
     /// is compiled out of Release builds and requires all benchmark env vars.
     private var benchSendTask: Task<Void, Never>?
+    /// Explicitly opt-in physical-device sticker cache benchmark task.
+    private var benchStickerTask: Task<Void, Never>?
+    /// Prevent ordinary Debug picker hits from polluting benchmark captures.
+    private var stickerBenchmarkRecording = false
     #endif
     /// Last locally-authoritative installed set. Generic pack metadata also
     /// contains previews/transcript packs and must never grant picker access.
@@ -285,7 +295,10 @@ final class MarmotChatModel: ObservableObject {
     /// They must not be mistaken for the relay copy of a later identical send.
     private var preexistingCanonicalMessageIDsByOptimisticID: [String: Set<String>] = [:]
     private var stickerPacksByCoordinate: [String: StickerPackInfo] = [:]
+    private var stickerPackLRU: [String] = []
     private var stickerImagesBySHA256: [String: Data] = [:]
+    private var stickerImageLRU: [String] = []
+    private var stickerImageMemoryBytes = 0
     private var stickerCacheGeneration: UInt64 = 0
     /// Last desired payment offer metadata for our public descriptor. Reused
     /// when other descriptor refreshes publish capabilities without changing
@@ -517,17 +530,25 @@ final class MarmotChatModel: ObservableObject {
         // caches are invalidated and the replacement identity is connected.
         busy = true
         defer { busy = false }
-        guard keychain.saveIdentityKey(Data(nsec.utf8), forKey: Self.nsecKeychainKey) else {
-            throw MarmotService.ServiceError.core("failed to persist restored identity")
-        }
         // Identity restore is an account replacement, not a reconnect. Match
         // the Compose import path: invalidate memory first, then wipe the old
         // core database (including its sticker caches) before opening the new
         // account. The generation bump prevents an in-flight image read from
         // repopulating old bytes while the disk wipe is awaiting completion.
         let service = self.service
-        await prepareForIdentityReplacement {
-            await service.wipeDatabase()
+        do {
+            try await prepareForIdentityReplacement {
+                try await service.wipeDatabase()
+            }
+        } catch {
+            _ = await performConnect()
+            throw error
+        }
+        // Commit the replacement identity only after the old account's durable
+        // state has been removed successfully.
+        guard keychain.saveIdentityKey(Data(nsec.utf8), forKey: Self.nsecKeychainKey) else {
+            _ = await performConnect()
+            throw MarmotService.ServiceError.core("failed to persist restored identity")
         }
         // Drive the full local-first connect sequence directly; performConnect
         // reads the nsec persisted above and opens a fresh encrypted database.
@@ -609,6 +630,7 @@ final class MarmotChatModel: ObservableObject {
                 // docs/PERFORMANCE.md).
                 SecureLogger.info("SONAR_BENCH t3a_published", category: .session)
                 self.startSendBenchmarkIfRequested()
+                self.startStickerBenchmarkIfRequested()
                 #endif
             } catch MarmotService.ServiceError.cancelled {
                 self.relayConnected = false
@@ -717,6 +739,118 @@ final class MarmotChatModel: ObservableObject {
             }
             SecureLogger.info(
                 "SONAR_BENCH send_batch_finished requested=\(count) dispatched=\(dispatched)",
+                category: .session
+            )
+        }
+    }
+
+    /// Exercise the production host/core cache ladder without installing a
+    /// pack or erasing account data. The exact pack address must be supplied by
+    /// the Debug launcher so this cannot become a user-visible fallback pack.
+    private func startStickerBenchmarkIfRequested() {
+        guard benchStickerTask == nil else { return }
+        let environment = ProcessInfo.processInfo.environment
+        guard
+            environment["SONAR_BENCH_STICKERS"] == "1",
+            let rawAuthor = environment["SONAR_BENCH_STICKER_AUTHOR"],
+            let rawIdentifier = environment["SONAR_BENCH_STICKER_IDENTIFIER"]
+        else { return }
+        let author = rawAuthor.trimmingCharacters(in: .whitespacesAndNewlines)
+        let identifier = rawIdentifier.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !author.isEmpty, !identifier.isEmpty else { return }
+        let imageLimit = min(
+            max(Int(environment["SONAR_BENCH_STICKER_IMAGE_LIMIT"] ?? "8") ?? 8, 1),
+            20
+        )
+        let imageOffset = max(
+            Int(environment["SONAR_BENCH_STICKER_IMAGE_OFFSET"] ?? "0") ?? 0,
+            0
+        )
+        let relayUrls = environment["SONAR_BENCH_STICKER_RELAYS"]?
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty } ?? []
+
+        let restoreCoreVerbose = SonarDiagnostics.verboseEnabled
+        SonarDiagnostics.setCoreBenchmarkVerbose(true)
+        benchStickerTask = Task { [weak self] in
+            defer { SonarDiagnostics.setCoreBenchmarkVerbose(restoreCoreVerbose) }
+            guard let self else { return }
+            #if os(iOS)
+            UIApplication.shared.isIdleTimerDisabled = true
+            defer { UIApplication.shared.isIdleTimerDisabled = false }
+            #endif
+            let totalStarted = DispatchTime.now().uptimeNanoseconds
+            SecureLogger.info(
+                "SONAR_BENCH device_sticker_batch_begin image_limit=\(imageLimit) " +
+                    "image_offset=\(imageOffset)",
+                category: .session
+            )
+
+            let cacheKey = "30031:\(author.lowercased()):\(identifier)"
+            self.stickerPacksByCoordinate.removeValue(forKey: cacheKey)
+            self.stickerPackLRU.removeAll { $0 == cacheKey }
+            self.clearStickerImageMemoryCache()
+            let pack: StickerPackInfo
+            do {
+                pack = try await self.service.fetchStickerPack(
+                    authorPubkeyHex: author,
+                    identifier: identifier,
+                    relayUrls: relayUrls
+                )
+                self.rememberStickerPack(pack, cacheKey: cacheKey)
+            } catch {
+                SecureLogger.warning(
+                    "SONAR_BENCH device_sticker_batch_failed phase=pack_fetch " +
+                        "error=\(String(describing: type(of: error)))",
+                    category: .session
+                )
+                return
+            }
+            let stickers = Array(pack.stickers.dropFirst(imageOffset).prefix(imageLimit))
+            guard !stickers.isEmpty else {
+                SecureLogger.warning(
+                    "SONAR_BENCH device_sticker_batch_failed phase=empty_pack",
+                    category: .session
+                )
+                return
+            }
+
+            func fetchPass() async -> Int {
+                var loaded = 0
+                for sticker in stickers {
+                    if await self.fetchStickerImage(
+                        url: sticker.url,
+                        expectedSha256: sticker.sha256
+                    ) != nil {
+                        loaded += 1
+                    }
+                }
+                return loaded
+            }
+
+            self.stickerBenchmarkRecording = true
+            defer { self.stickerBenchmarkRecording = false }
+            let initial = await fetchPass() // network on cold cache, disk otherwise
+            let memory = await fetchPass()  // host LRU
+            self.clearStickerImageMemoryCache()
+            let disk = await fetchPass()    // verified Rust disk cache
+            self.clearStickerImageMemoryCache()
+            var refs = 0
+            for sticker in stickers {
+                let ref = MarmotService.MarmotStickerRef(
+                    packCoordinate: pack.packCoordinate,
+                    shortcode: sticker.shortcode,
+                    plaintextSha256: sticker.sha256
+                )
+                if await self.stickerData(for: ref) != nil { refs += 1 }
+            }
+            let totalMicroseconds = (DispatchTime.now().uptimeNanoseconds - totalStarted) / 1_000
+            SecureLogger.info(
+                "SONAR_BENCH device_sticker_batch_finished stickers=\(stickers.count) " +
+                    "image_offset=\(imageOffset) " +
+                    "initial=\(initial) memory=\(memory) disk=\(disk) refs=\(refs) " +
+                    "total_us=\(totalMicroseconds)",
                 category: .session
             )
         }
@@ -1713,8 +1847,7 @@ final class MarmotChatModel: ObservableObject {
                 plaintextSha256: plaintextSha256
             )
         )
-        pendingOptimistic[groupId, default: []].append(echo)
-        messagesByGroup[groupId, default: []].append(echo)
+        appendOptimistic(echo, to: groupId)
 
         let previous = sendChain
         sendChain = Task { [weak self] in
@@ -1757,6 +1890,45 @@ final class MarmotChatModel: ObservableObject {
         }
     }
 
+    /// Flush a sticker that already owns an optimistic echo in the pending-chat
+    /// queue. Unlike `sendSticker`, this must not create a second echo, and it
+    /// reports the actual local-core send result so Apple matches Compose.
+    func sendQueuedSticker(
+        groupId: String,
+        packCoordinate: String,
+        shortcode: String,
+        plaintextSha256: String
+    ) async -> Bool {
+        var succeeded = false
+        let previous = sendChain
+        let queuedSend = Task { [weak self] in
+            _ = await previous?.result
+            guard let self else { return }
+            do {
+                guard await self.ensureConnected(timeoutSeconds: 2) else {
+                    throw MarmotService.ServiceError.notConnected
+                }
+                try await self.service.sendSticker(
+                    groupId: groupId,
+                    packCoordinate: packCoordinate,
+                    shortcode: shortcode,
+                    plaintextSha256: plaintextSha256
+                )
+                succeeded = true
+            } catch {
+                self.errorText = Self.describe(error)
+            }
+        }
+        sendChain = queuedSend
+        await queuedSend.value
+        guard succeeded else { return false }
+        // Keep the transferred pending echo visible until this bounded local
+        // hydration observes the canonical row written by the core.
+        await loadLocalPage(groupId: groupId)
+        Task { [weak self] in try? await self?.service.ensureSubscriptions() }
+        return true
+    }
+
     func fetchStickerPack(
         authorPubkeyHex: String,
         identifier: String,
@@ -1764,10 +1936,10 @@ final class MarmotChatModel: ObservableObject {
         expectedGeneration: UInt64? = nil
     ) async -> StickerPackInfo? {
         let generation = expectedGeneration ?? stickerCacheGeneration
-        guard stickerCacheGeneration == generation else { return nil }
+        guard !Task.isCancelled, stickerCacheGeneration == generation else { return nil }
         let cacheKey = "30031:\(authorPubkeyHex.lowercased()):\(identifier)"
-        if let cached = stickerPacksByCoordinate.removeValue(forKey: cacheKey) {
-            stickerPacksByCoordinate[cacheKey] = cached
+        if let cached = stickerPacksByCoordinate[cacheKey] {
+            touchStickerPack(cacheKey)
             return cached
         }
         do {
@@ -1779,11 +1951,16 @@ final class MarmotChatModel: ObservableObject {
                 identifier: identifier,
                 relayUrls: relayUrls
             )
-            guard stickerCacheGeneration == generation else { return nil }
+            guard !Task.isCancelled, stickerCacheGeneration == generation else { return nil }
             rememberStickerPack(pack, cacheKey: cacheKey)
             return pack
+        } catch MarmotService.ServiceError.cancelled {
+            return nil
         } catch {
-            self.errorText = Self.describe(error)
+            SecureLogger.debug(
+                "sticker pack lookup failed: \(Self.describe(error))",
+                category: .session
+            )
             return nil
         }
     }
@@ -1791,8 +1968,9 @@ final class MarmotChatModel: ObservableObject {
     /// App-lifetime pack metadata already verified/fetched by the core.
     /// Picker views use this synchronously for a zero-spinner first frame.
     func cachedStickerPacksSnapshot() -> [StickerPackInfo] {
-        stickerPacksByCoordinate.compactMap { coordinate, pack in
-            Self.shouldExposeCachedStickerPack(
+        stickerPackLRU.compactMap { coordinate in
+            guard let pack = stickerPacksByCoordinate[coordinate] else { return nil }
+            return Self.shouldExposeCachedStickerPack(
                 coordinate: coordinate,
                 installedCoordinates: installedPackCoordinates
             ) ? pack : nil
@@ -1805,17 +1983,20 @@ final class MarmotChatModel: ObservableObject {
         expectedGeneration: UInt64? = nil
     ) async -> Data? {
         let generation = expectedGeneration ?? stickerCacheGeneration
-        guard stickerCacheGeneration == generation else { return nil }
+        guard !Task.isCancelled, stickerCacheGeneration == generation else { return nil }
         if let cached = stickerImageFromMemory(expectedSha256: expectedSha256) { return cached }
         do {
             let data = try await service.fetchStickerImage(url: url, expectedSha256: expectedSha256)
-            guard stickerCacheGeneration == generation else { return nil }
+            guard !Task.isCancelled, stickerCacheGeneration == generation else { return nil }
             rememberStickerImage(data, expectedSha256: expectedSha256)
             return data
         } catch MarmotService.ServiceError.cancelled {
             return nil
         } catch {
-            self.errorText = Self.describe(error)
+            SecureLogger.debug(
+                "sticker image lookup failed: \(Self.describe(error))",
+                category: .session
+            )
             return nil
         }
     }
@@ -1872,25 +2053,57 @@ final class MarmotChatModel: ObservableObject {
     }
 
     private func stickerImageFromMemory(expectedSha256: String) -> Data? {
+        #if DEBUG
+        let started = stickerBenchmarkRecording ? DispatchTime.now().uptimeNanoseconds : nil
+        #endif
         let cacheKey = expectedSha256.lowercased()
-        guard let cached = stickerImagesBySHA256.removeValue(forKey: cacheKey) else { return nil }
-        stickerImagesBySHA256[cacheKey] = cached
+        guard let cached = stickerImagesBySHA256[cacheKey] else { return nil }
+        stickerImageLRU.removeAll { $0 == cacheKey }
+        stickerImageLRU.append(cacheKey)
+        #if DEBUG
+        if let started {
+            let elapsedMicroseconds = (DispatchTime.now().uptimeNanoseconds - started) / 1_000
+            SecureLogger.info(
+                "SONAR_BENCH sticker_image_fetch purpose=foreground source=memory " +
+                    "bytes=\(cached.count) total_us=\(elapsedMicroseconds)",
+                category: .session
+            )
+        }
+        #endif
         return cached
     }
 
     private func rememberStickerImage(_ data: Data, expectedSha256: String) {
         let cacheKey = expectedSha256.lowercased()
-        stickerImagesBySHA256.removeValue(forKey: cacheKey)
-        if stickerImagesBySHA256.count >= 500, let oldest = stickerImagesBySHA256.keys.first {
-            stickerImagesBySHA256.removeValue(forKey: oldest)
+        if let replaced = stickerImagesBySHA256.removeValue(forKey: cacheKey) {
+            stickerImageMemoryBytes -= replaced.count
+        }
+        stickerImageLRU.removeAll { $0 == cacheKey }
+        guard data.count <= Self.stickerImageMemoryBudgetBytes else { return }
+        while stickerImagesBySHA256.count >= Self.stickerImageMemoryEntryLimit
+            || stickerImageMemoryBytes + data.count > Self.stickerImageMemoryBudgetBytes {
+            guard !stickerImageLRU.isEmpty else { break }
+            let oldest = stickerImageLRU.removeFirst()
+            if let removed = stickerImagesBySHA256.removeValue(forKey: oldest) {
+                stickerImageMemoryBytes -= removed.count
+            }
         }
         stickerImagesBySHA256[cacheKey] = data
+        stickerImageLRU.append(cacheKey)
+        stickerImageMemoryBytes += data.count
+    }
+
+    private func clearStickerImageMemoryCache() {
+        stickerImagesBySHA256 = [:]
+        stickerImageLRU = []
+        stickerImageMemoryBytes = 0
     }
 
     private func clearStickerCaches() {
         stickerCacheGeneration = stickerCacheGeneration &+ 1
         stickerPacksByCoordinate = [:]
-        stickerImagesBySHA256 = [:]
+        stickerPackLRU = []
+        clearStickerImageMemoryCache()
         installedPackCoordinates = []
     }
 
@@ -1899,10 +2112,18 @@ final class MarmotChatModel: ObservableObject {
     func rememberStickerPack(_ pack: StickerPackInfo, cacheKey: String) {
         let normalized = snNormalizeStickerPackCoordinate(cacheKey)
         stickerPacksByCoordinate.removeValue(forKey: normalized)
-        if stickerPacksByCoordinate.count >= 20, let oldest = stickerPacksByCoordinate.keys.first {
+        stickerPackLRU.removeAll { $0 == normalized }
+        if stickerPacksByCoordinate.count >= 20, let oldest = stickerPackLRU.first {
             stickerPacksByCoordinate.removeValue(forKey: oldest)
+            stickerPackLRU.removeFirst()
         }
         stickerPacksByCoordinate[normalized] = pack
+        stickerPackLRU.append(normalized)
+    }
+
+    private func touchStickerPack(_ cacheKey: String) {
+        stickerPackLRU.removeAll { $0 == cacheKey }
+        stickerPackLRU.append(cacheKey)
     }
 
     func replaceInstalledPackCoordinates(_ coordinates: [String]) {
@@ -1910,11 +2131,14 @@ final class MarmotChatModel: ObservableObject {
     }
 
     func fetchInstalledPacks() async -> [String]? {
+        let generation = stickerCacheGeneration
         do {
             let coords = try await service.fetchInstalledPacks()
+            guard stickerCacheGeneration == generation else { return nil }
             replaceInstalledPackCoordinates(coords)
             return coords
         } catch {
+            guard stickerCacheGeneration == generation else { return nil }
             self.errorText = Self.describe(error)
             return nil
         }
@@ -1925,26 +2149,33 @@ final class MarmotChatModel: ObservableObject {
     }
 
     func installStickerPack(coordinate: String) async -> Bool {
+        let generation = stickerCacheGeneration
         do {
             try await service.installStickerPack(coordinate: coordinate)
+            guard stickerCacheGeneration == generation else { return false }
             installedPackCoordinates.insert(snNormalizeStickerPackCoordinate(coordinate))
             return true
         } catch {
+            guard stickerCacheGeneration == generation else { return false }
             self.errorText = Self.describe(error)
             return false
         }
     }
 
     func uninstallStickerPack(coordinate: String) async -> Bool {
+        let generation = stickerCacheGeneration
         do {
             try await service.uninstallStickerPack(coordinate: coordinate)
+            guard stickerCacheGeneration == generation else { return false }
             let normalized = snNormalizeStickerPackCoordinate(coordinate)
             installedPackCoordinates.remove(normalized)
             // Signal separates saved/available metadata from installed packs;
             // the composer cache only represents the installed picker surface.
             stickerPacksByCoordinate.removeValue(forKey: normalized)
+            stickerPackLRU.removeAll { $0 == normalized }
             return true
         } catch {
+            guard stickerCacheGeneration == generation else { return false }
             self.errorText = Self.describe(error)
             return false
         }
@@ -2131,18 +2362,24 @@ final class MarmotChatModel: ObservableObject {
         conversationRefreshTask = nil
         pendingConversationRefreshGroups = []
         let service = self.service
-        Task { await service.wipeDatabase() }
         clearIdentityScopedState()
+        Task {
+            do {
+                try await service.wipeDatabase()
+            } catch {
+                SecureLogger.error(error, context: "Marmot panic wipe failed", category: .session)
+            }
+        }
     }
 
     /// Reset every account-bound in-memory/cache value through the same path as
     /// panic wipe, then await deletion of the old persistent database. The wipe
     /// operation is injected so tests can verify ordering without touching the
     /// developer's real application-support directory.
-    func prepareForIdentityReplacement(wipeDatabase: () async -> Void) async {
+    func prepareForIdentityReplacement(wipeDatabase: () async throws -> Void) async throws {
         stopPolling()
         clearIdentityScopedState()
-        await wipeDatabase()
+        try await wipeDatabase()
     }
 
     private func clearIdentityScopedState() {
@@ -2178,25 +2415,13 @@ final class MarmotChatModel: ObservableObject {
         conversationRefreshTask?.cancel()
         conversationRefreshTask = nil
         pendingConversationRefreshGroups = []
-        relayConnected = false
-        await service.wipeDatabase()
-        npub = nil
-        groups = []
-        pendingGroupInvites = []
-        messagesByGroup = [:]
-        conversationSummariesByGroup = [:]
-        pendingOptimistic = [:]
-        preexistingCanonicalMessageIDsByOptimisticID = [:]
-        localTranscriptCursorByGroup = [:]
-        localTranscriptHasOlderByGroup = [:]
-        localTranscriptLoadingGroups = []
-        localTranscriptPreservesOlderEdgeGroups = []
-        profilesByNpub = [:]
-        profileFetches = []
-        profileFetchedAt = [:]
-        clearStickerCaches()
-        SNMarmotProfileCache.clear(from: defaults)
-        SNMarmotChatSnapshotCache.clear(from: defaults)
+        clearIdentityScopedState()
+        do {
+            try await service.wipeDatabase()
+        } catch {
+            errorText = Self.describe(error)
+            return
+        }
         errorText = nil
         // Reopen a fresh DB with the SAME identity and republish our KeyPackage.
         // Await a FORCED reconnect (not `connectIfNeeded()`, whose busy/npub

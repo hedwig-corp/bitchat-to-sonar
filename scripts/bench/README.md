@@ -237,3 +237,125 @@ scripts/bench/_send_aggregate.py --json-out /tmp/pre.json /tmp/pre.log
 scripts/bench/_send_aggregate.py --exclude-json /tmp/pre.json \
   --json-out /tmp/fresh.json /tmp/post.log
 ```
+
+## Sticker pack download and cache flow
+
+The shared Rust core emits content-free `SONAR_BENCH` markers at debug level on
+every app surface. The Debug-only launcher temporarily enables those markers
+for its run, then restores the user's diagnostics setting. Normal production
+use therefore pays no info-level logging cost. The markers separate relay pack
+metadata fetches, HTTPS image misses, verified disk hits, full-reference
+transcript hits, and detached install-prefetch batches:
+
+| marker | key fields | meaning |
+|---|---|---|
+| `sticker_pack_fetch` | `purpose`, `source`, `stickers`, `total_us` | kind-30031 relay lookup + validation + local metadata persistence on `source=network`, the last validated local definition on `source=fallback_disk` after a failed refresh, or the same in-flight result on `source=shared` |
+| `sticker_image_fetch` | `purpose`, `source`, `bytes`, phase timings | HTTPS/verify/write on `source=network`, verified SHA disk read on `source=disk`, a coalesced in-flight result on `source=shared`, or host picker LRU hit on `source=memory` |
+| `sticker_ref_cache_lookup` | `purpose`, `outcome`, `bytes`, `total_us` | local-only coordinate + shortcode + SHA authorization and image read used by transcripts |
+| `sticker_pack_prefetch_finished` | `purpose`, `attempted`, `succeeded`, `failed`, `pack_us`, `total_us` | bounded first-20/four-task install prefetch batch |
+
+### Automated physical-device cache ladder
+
+Debug builds have an explicit launcher trigger that waits for the normal relay
+attachment and runs the production host/core path in this order:
+
+1. kind-30031 pack metadata relay fetch, with validated local metadata fallback if the refresh is unavailable;
+2. initial image pass (`source=network` on a cold disk cache, otherwise disk);
+3. host 25 MiB/100-entry LRU pass (`source=memory`);
+4. host-memory reset followed by the verified Rust disk-cache pass;
+5. host-memory reset followed by the coordinate + shortcode + SHA transcript
+   authorization lookup.
+
+The trigger does not install the pack, publish an installed-pack list, clear the
+account, or alter chats. It only adds successfully verified public images to the
+normal bounded cache. The pack address is mandatory launcher input so benchmark
+data cannot silently become a user-visible fallback pack.
+
+Android (force-stop preserves app data):
+
+```bash
+adb logcat -c
+adb shell am start -S -n chat.bitchat.sonar/.MainActivity \
+  --ez sonar_sticker_benchmark true \
+  --es sonar_sticker_author <64-char-author-hex> \
+  --es sonar_sticker_identifier <pack-identifier> \
+  --es sonar_sticker_relays wss://relay.damus.io,wss://nos.lol \
+  --ei sonar_sticker_image_limit 8 \
+  --ei sonar_sticker_image_offset 0
+
+# Wait for device_sticker_batch_finished, then capture and aggregate.
+adb logcat -d -v threadtime SonarCore:I '*:S' > /tmp/android-stickers.log
+scripts/bench/_sticker_aggregate.py \
+  --label 'Pixel 10 Pro' /tmp/android-stickers.log
+```
+
+Apple (an optimized benchmark build may still define `DEBUG` for this hook):
+
+```bash
+xcrun devicectl device process launch \
+  --device <coredevice-id> \
+  --terminate-existing \
+  --environment-variables \
+  '{"SONAR_BENCH_STICKERS":"1","SONAR_BENCH_STICKER_AUTHOR":"<64-char-author-hex>","SONAR_BENCH_STICKER_IDENTIFIER":"<pack-identifier>","SONAR_BENCH_STICKER_RELAYS":"wss://relay.damus.io,wss://nos.lol","SONAR_BENCH_STICKER_IMAGE_LIMIT":"8","SONAR_BENCH_STICKER_IMAGE_OFFSET":"0"}' \
+  sh.hedwig.sonar
+```
+
+With a USB syslog stream, use the capture command below. For a paired
+network-only iPhone, copy the bounded app/core diagnostic logs after
+`device_sticker_batch_finished` instead:
+
+```bash
+xcrun devicectl device copy from \
+  --device <coredevice-id> \
+  --domain-type appDataContainer \
+  --domain-identifier sh.hedwig.sonar \
+  --source 'Library/Application Support/sonar-marmot/logs' \
+  --destination /tmp/iphone-sticker-logs
+
+scripts/bench/_sticker_aggregate.py --latest-completed \
+  --label 'iPhone 14 Pro Max' \
+  /tmp/iphone-sticker-logs/core/sonar-core.log* \
+  /tmp/iphone-sticker-logs/ios/sonar-ios.log*
+```
+
+Apple's host and Rust markers live in separate rolling files. The aggregator
+merges their RFC3339 device timestamps; `--latest-completed` explicitly selects
+the newest successful launcher run when older batches are still present, but
+rejects a newer failed or incomplete run. Without that option it remains strict
+and rejects captures containing anything other than exactly one completed batch.
+
+`device_sticker_batch_finished` also reports the expected/loaded count for each
+pass. The parser accepts exactly one completed launcher batch per invocation,
+checks that `initial`, `memory`, `disk`, and `refs` all equal `stickers`, and
+verifies each required timing field and the expected per-phase marker counts
+before reporting comparable median/p95 timings. Foreground is the default
+purpose, so overlapping detached prefetch markers cannot contaminate the device
+comparison; pass `--purpose prefetch` explicitly to inspect them. If the first
+window is already warm, advance `image_offset` instead of deleting a real
+account's cache. The final durable pass must contain exactly `stickers` verified
+`source=disk` markers; a second network download cannot masquerade as a disk
+cache hit. Prefetch reports additionally require balanced attempted/succeeded/
+failed counts and zero failures.
+
+```bash
+# Alternate USB captures for the same explicit launcher batch.
+idevicesyslog -u <iphone-udid> -m SONAR_BENCH -o /tmp/iphone-stickers.log &
+
+# Android device
+adb logcat -c
+adb logcat -v threadtime SonarCore:I '*:S' > /tmp/android-stickers.log &
+
+# Aggregate one completed batch; --purpose can isolate overlapping prefetch.
+scripts/bench/_sticker_aggregate.py \
+  --label 'iPhone 14 Pro Max' /tmp/iphone-stickers.log
+scripts/bench/_sticker_aggregate.py \
+  --label 'Pixel 10 Pro' /tmp/android-stickers.log
+scripts/bench/_sticker_aggregate.py \
+  --purpose prefetch --label 'Pixel 10 Pro prefetch' /tmp/android-stickers.log
+```
+
+Compare devices by the parser's median/p95 rows, not by host timestamps. The
+core records microsecond durations inside each operation, so Apple os_log,
+Android logcat, and desktop stderr formatting do not affect the result. Live
+relay/HTTPS timings are observational and must not become a latency CI gate;
+cache-hit correctness and prefetch completion counts are suitable smoke checks.

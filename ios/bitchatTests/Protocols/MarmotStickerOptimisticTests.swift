@@ -32,7 +32,7 @@ final class MarmotStickerOptimisticTests: XCTestCase {
         ), .hit)
     }
 
-    func testIdentityReplacementClearsPickerAuthorityBeforeDatabaseWipe() async {
+    func testIdentityReplacementClearsPickerAuthorityBeforeDatabaseWipe() async throws {
         let suiteName = "MarmotStickerOptimisticTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -54,7 +54,7 @@ final class MarmotStickerOptimisticTests: XCTestCase {
         XCTAssertEqual(model.cachedStickerPacksSnapshot(), [pack])
 
         var wipeObservedClearedMemory = false
-        await model.prepareForIdentityReplacement {
+        try await model.prepareForIdentityReplacement {
             wipeObservedClearedMemory = model.cachedStickerPacksSnapshot().isEmpty
                 && !model.isStickerPackInstalled(coordinate)
         }
@@ -62,6 +62,88 @@ final class MarmotStickerOptimisticTests: XCTestCase {
         XCTAssertTrue(wipeObservedClearedMemory)
         XCTAssertTrue(model.cachedStickerPacksSnapshot().isEmpty)
         XCTAssertFalse(model.isStickerPackInstalled(coordinate))
+    }
+
+    func testIdentityReplacementStaysRedactedWhenDatabaseWipeFails() async {
+        let suiteName = "MarmotStickerOptimisticTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let model = MarmotChatModel(
+            service: MarmotService(relayUrls: []),
+            keychain: MockKeychain(),
+            defaults: defaults
+        )
+        let coordinate = "30031:author:old-account-pack"
+        let pack = StickerPackInfo(
+            packCoordinate: coordinate,
+            title: "Old account",
+            description: nil,
+            coverUrl: nil,
+            stickers: []
+        )
+        model.rememberStickerPack(pack, cacheKey: coordinate)
+        model.replaceInstalledPackCoordinates([coordinate])
+
+        do {
+            try await model.prepareForIdentityReplacement {
+                throw MarmotService.ServiceError.core("injected wipe failure")
+            }
+            XCTFail("expected injected wipe failure")
+        } catch {}
+
+        XCTAssertTrue(model.cachedStickerPacksSnapshot().isEmpty)
+        XCTAssertFalse(model.isStickerPackInstalled(coordinate))
+    }
+
+    func testStickerPackCacheUsesDeterministicLRUEviction() async {
+        let suiteName = "MarmotStickerOptimisticTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let model = MarmotChatModel(
+            service: MarmotService(relayUrls: []),
+            keychain: MockKeychain(),
+            defaults: defaults
+        )
+        let author = "author"
+        var coordinates: [String] = []
+        for index in 0..<20 {
+            let coordinate = "30031:\(author):pack-\(index)"
+            coordinates.append(coordinate)
+            model.rememberStickerPack(
+                StickerPackInfo(
+                    packCoordinate: coordinate,
+                    title: "Pack \(index)",
+                    description: nil,
+                    coverUrl: nil,
+                    stickers: []
+                ),
+                cacheKey: coordinate
+            )
+        }
+        model.replaceInstalledPackCoordinates(coordinates)
+        _ = await model.fetchStickerPack(
+            authorPubkeyHex: author,
+            identifier: "pack-0",
+            relayUrls: []
+        )
+
+        let newest = "30031:\(author):pack-20"
+        model.rememberStickerPack(
+            StickerPackInfo(
+                packCoordinate: newest,
+                title: "Pack 20",
+                description: nil,
+                coverUrl: nil,
+                stickers: []
+            ),
+            cacheKey: newest
+        )
+        model.replaceInstalledPackCoordinates(coordinates + [newest])
+        let visible = model.cachedStickerPacksSnapshot().map(\.packCoordinate)
+
+        XCTAssertTrue(visible.contains(coordinates[0]))
+        XCTAssertFalse(visible.contains(coordinates[1]))
+        XCTAssertEqual(visible.last, newest)
     }
 
     func testFailedInstalledRefreshPreservesCachedPacks() {

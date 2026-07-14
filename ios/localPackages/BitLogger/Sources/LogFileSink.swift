@@ -25,9 +25,12 @@ public final class LogFileSink {
     public static let shared = LogFileSink()
 
     private let queue = DispatchQueue(label: "chat.bitchat.logfilesink", qos: .utility)
-    private let fullTimestamp: ISO8601DateFormatter = {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    private let timestampPrefix: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .iso8601)
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
         return formatter
     }()
 
@@ -86,7 +89,10 @@ public final class LogFileSink {
             guard self.directory != nil else { return }
             if isDebug && !self.verbose { return }
             let scrubbed = Self.scrubSecrets(message)
-            let stamp = self.fullTimestamp.string(from: Date())
+            let now = Date()
+            let epoch = now.timeIntervalSince1970
+            let micros = Int((epoch - floor(epoch)) * 1_000_000)
+            let stamp = "\(self.timestampPrefix.string(from: now)).\(String(format: "%06d", micros))Z"
             let line = "\(stamp) [\(category)] [\(level)] \(scrubbed)\n"
             self.appendLocked(line)
         }

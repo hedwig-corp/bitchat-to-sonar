@@ -35,6 +35,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.time.TimeSource
 
 private const val SONAR_DESCRIPTOR_TTL_SECS = 15 * 60L
 private const val SONAR_DESCRIPTOR_MISS_TTL_SECS = 60L
@@ -47,6 +49,16 @@ private const val BACKGROUND_TRANSCRIPT_SCAN_LIMIT = 100
 private const val LOCAL_SUMMARY_PAGE_LIMIT = 20
 private const val LOCAL_SUMMARY_CHAT_LIMIT = 5
 private const val RELAY_RECONNECT_RETRY_MS = 10_000L
+
+/** Debug-device benchmark input supplied by the platform launcher. Keeping the
+ * pack address explicit avoids shipping a user-visible fallback pack. */
+data class StickerBenchmarkRequest(
+    val authorPubkeyHex: String,
+    val identifier: String,
+    val imageLimit: Int = 8,
+    val imageOffset: Int = 0,
+    val relayUrls: List<String> = emptyList(),
+)
 
 // ── Event-driven refresh cadence ──
 // The old poll ran a full cycle every 4 s. Now the cycle is driven by the core
@@ -430,6 +442,9 @@ internal fun stickerPackInstalledState(
 
 internal enum class StickerCacheLookupState { HIT, MISS, INVALIDATED }
 
+private const val STICKER_IMAGE_MEMORY_BUDGET_BYTES = 25 * 1024 * 1024
+private const val STICKER_IMAGE_MEMORY_ENTRY_LIMIT = 100
+
 internal fun stickerCacheLookupState(
     hasBytes: Boolean,
     startedGeneration: Long,
@@ -658,22 +673,28 @@ class SonarAppState(private val scope: CoroutineScope) {
             pendingMarmotGroupSends.clear()
             outbox.clear()
             MessageStore.wipe()
-            SonarCore.wipe()
+            // Redact all visible/account-bound host state before the fallible
+            // durable wipe. A filesystem error must never leave old chats or
+            // sticker bytes painted after credentials have been cleared.
             stack = listOf(Screen.Home)
             chats = emptyList(); chatSnapshotMessagesByChat = emptyMap(); pendingMarmotChatNpubs = emptyMap(); pendingMarmotGroups = emptyMap(); groupInvites = emptyList(); messages = emptyList()
             clearChatSnapshot()
+            cancelAllMediaDownloads(); MediaCache.wipe()
+            mediaCache.clear(); clearStickerCaches()
+            val coreWipeFailure = runCatching { SonarCore.wipe() }.exceptionOrNull()
             onboarded = false; nick = ""; npub = ""; started = false
             localCoreReady = false; homeMessagesHydrated = false
             walletState = WalletState.NotConfigured
             presenceByGeohash = emptyMap()
             payLedger = SonarPayLedger(); payVersion++
             PaymentActivityStore.wipe() // iOS wipes both payment ledgers together
-            cancelAllMediaDownloads(); MediaCache.wipe()
-            mediaCache.clear(); clearStickerCaches()
             callLogs.clear(); callVersion++
             resetCallState()
             pollJob?.cancel(); pollJob = null
             stopMarmotWakeLoop()
+            if (coreWipeFailure != null) {
+                toast = "Local storage wipe was incomplete; Sonar will retry before reusing caches."
+            }
         }
     }
 
@@ -874,6 +895,9 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  invalidation, don't busy-poll). */
     private val housekeepingTrigger = Channel<Unit>(Channel.CONFLATED)
     private val refreshMutex = Mutex()
+    /** Match Apple's sendChain: preserve composer order across text, sticker,
+     * control, receipt, and queued Marmot sends without serializing downloads. */
+    private val marmotSendMutex = Mutex()
     private var refreshRunning = false
     private var refreshPending = false
     private var refreshCompletion: CompletableDeferred<Unit>? = null
@@ -2274,7 +2298,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         refreshPeerId: String?,
     ): Boolean = try {
         for (line in lines) {
-            SonarCore.send(groupId, line)
+            sendMarmotTextOrdered(groupId, line)
         }
         if (refreshPeerId != null) {
             refreshOpenDm(refreshPeerId)
@@ -3849,14 +3873,29 @@ class SonarAppState(private val scope: CoroutineScope) {
     private suspend fun sendQueuedMarmotContent(chatId: String, text: String) {
         val sticker = meshParseStickerContent(text)
         if (sticker != null) {
-            SonarCore.sendSticker(
+            sendMarmotStickerOrdered(
                 chatId,
                 sticker.packCoordinate,
                 sticker.shortcode,
                 sticker.plaintextSha256,
             )
         } else {
-            SonarCore.send(chatId, text)
+            sendMarmotTextOrdered(chatId, text)
+        }
+    }
+
+    private suspend fun sendMarmotTextOrdered(chatId: String, text: String) {
+        marmotSendMutex.withLock { SonarCore.send(chatId, text) }
+    }
+
+    private suspend fun sendMarmotStickerOrdered(
+        chatId: String,
+        packCoordinate: String,
+        shortcode: String,
+        plaintextSha256: String,
+    ) {
+        marmotSendMutex.withLock {
+            SonarCore.sendSticker(chatId, packCoordinate, shortcode, plaintextSha256)
         }
     }
 
@@ -4174,7 +4213,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         messages = (messages + echo).sortedBy { it.tsSecs }
         scope.launch {
             try {
-                SonarCore.send(chatId, t)
+                sendMarmotTextOrdered(chatId, t)
                 val refreshGeneration = transcriptGeneration
                 val published = mergePendingMediaUploads(
                     chatId,
@@ -4445,6 +4484,8 @@ class SonarAppState(private val scope: CoroutineScope) {
     private var nextMediaDownloadGeneration = 0L
     private val stickerPackCache = linkedMapOf<String, SonarStickerPack>()
     private val stickerImageCache = linkedMapOf<String, ByteArray>()
+    private var stickerImageMemoryBytes = 0
+    private var stickerBenchmarkRecording = false
     /** Last locally-authoritative installed set. Generic pack metadata also
      *  contains previews/transcript packs and must never grant picker access. */
     private val installedPackCoordinates = mutableSetOf<String>()
@@ -4941,16 +4982,16 @@ class SonarAppState(private val scope: CoroutineScope) {
             sendPendingMarmotGroup(chatId, encoded)
             return
         }
+        val groupId = resolveMarmotGroupId(chatId)
+        if (groupId == null) {
+            toast = "Stickers require an encrypted chat"
+            return
+        }
+        val echo = createSendEcho(chatId, encoded)
+        messages = (messages + echo).sortedBy { it.tsSecs }
         scope.launch {
-            val groupId = resolveMarmotGroupId(chatId)
-            if (groupId == null) {
-                toast = "Stickers require an encrypted chat"
-                return@launch
-            }
-            val echo = createSendEcho(chatId, encoded)
-            messages = (messages + echo).sortedBy { it.tsSecs }
             try {
-                SonarCore.sendSticker(groupId, packCoordinate, sticker.shortcode, sticker.sha256)
+                sendMarmotStickerOrdered(groupId, packCoordinate, sticker.shortcode, sticker.sha256)
                 clearSendEcho(chatId, echo.id)
                 val generation = transcriptGeneration
                 val local = withSendEchoes(
@@ -5042,6 +5083,109 @@ class SonarAppState(private val scope: CoroutineScope) {
         )
     }
 
+    /** Run one representative device cache ladder through the production host
+     * APIs: relay metadata, initial image load, memory hit, disk hit, then the
+     * full-reference local transcript lookup. The launcher only supplies this
+     * request in Debug builds. No pack is installed and no account data is
+     * erased. */
+    suspend fun runStickerBenchmark(request: StickerBenchmarkRequest) {
+        val restoreVerbose = prefBool("diagVerbose")
+        SonarCore.setDiagnosticsVerbose(true)
+        try {
+            runStickerBenchmarkRecording(request)
+        } finally {
+            SonarCore.setDiagnosticsVerbose(restoreVerbose)
+        }
+    }
+
+    private suspend fun runStickerBenchmarkRecording(request: StickerBenchmarkRequest) {
+        val connected = withTimeoutOrNull(60_000) {
+            while (!started) delay(100)
+            while (!SonarCore.isRelayConnected()) {
+                startRelayConnection()
+                delay(100)
+            }
+            true
+        } == true
+        if (!connected) {
+            sonarLog("SonarCore", "SONAR_BENCH device_sticker_batch_failed phase=relay_timeout")
+            return
+        }
+
+        val imageLimit = request.imageLimit.coerceIn(1, 20)
+        val imageOffset = request.imageOffset.coerceAtLeast(0)
+        val cacheKey = "30031:${request.authorPubkeyHex.lowercase()}:${request.identifier}"
+        val totalStarted = TimeSource.Monotonic.markNow()
+        sonarLog(
+            "SonarCore",
+            "SONAR_BENCH device_sticker_batch_begin image_limit=$imageLimit " +
+                "image_offset=$imageOffset",
+        )
+
+        // Force the benchmark's metadata call through the relay path, while
+        // retaining every installed-authority value and all durable data.
+        stickerPackCache.remove(cacheKey)
+        clearStickerImageMemoryCache()
+        val pack = try {
+            SonarCore.fetchStickerPack(
+                request.authorPubkeyHex,
+                request.identifier,
+                request.relayUrls,
+            ).also {
+                if (stickerPackCache.size >= 20) {
+                    stickerPackCache.remove(stickerPackCache.keys.first())
+                }
+                stickerPackCache[cacheKey] = it
+            }
+        } catch (error: Throwable) {
+            sonarLog(
+                "SonarCore",
+                "SONAR_BENCH device_sticker_batch_failed phase=pack_fetch " +
+                    "error=${error::class.simpleName}",
+            )
+            return
+        }
+        val stickers = pack.stickers.drop(imageOffset).take(imageLimit)
+        if (stickers.isEmpty()) {
+            sonarLog("SonarCore", "SONAR_BENCH device_sticker_batch_failed phase=empty_pack")
+            return
+        }
+
+        suspend fun fetchPass(): Int {
+            var loaded = 0
+            for (sticker in stickers) {
+                if (stickerImage(sticker.url, sticker.sha256) != null) loaded++
+            }
+            return loaded
+        }
+
+        stickerBenchmarkRecording = true
+        try {
+            val initial = fetchPass()       // network on cold cache, disk otherwise
+            val memory = fetchPass()        // host LRU
+            clearStickerImageMemoryCache()
+            val disk = fetchPass()          // verified Rust disk cache
+            clearStickerImageMemoryCache()
+            var refs = 0
+            for (sticker in stickers) {
+                if (stickerImage(
+                    SonarStickerRef(pack.packCoordinate, sticker.shortcode, sticker.sha256),
+                ) != null) {
+                    refs++
+                }
+            }
+            sonarLog(
+                "SonarCore",
+                "SONAR_BENCH device_sticker_batch_finished stickers=${stickers.size} " +
+                    "image_offset=$imageOffset " +
+                    "initial=$initial memory=$memory disk=$disk refs=$refs " +
+                    "total_us=${totalStarted.elapsedNow().inWholeMicroseconds}",
+            )
+        } finally {
+            stickerBenchmarkRecording = false
+        }
+    }
+
     private suspend fun cachedStickerImage(
         ref: SonarStickerRef,
         generation: Long,
@@ -5069,21 +5213,44 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private fun stickerImageFromMemory(expectedSha256: String): ByteArray? {
+        val started = if (stickerBenchmarkRecording) TimeSource.Monotonic.markNow() else null
         val cacheKey = expectedSha256.lowercase()
-        return stickerImageCache.remove(cacheKey)?.also { stickerImageCache[cacheKey] = it }
+        return stickerImageCache.remove(cacheKey)?.also {
+            stickerImageCache[cacheKey] = it
+            started?.let { mark ->
+                sonarLog(
+                    "SonarCore",
+                    "SONAR_BENCH sticker_image_fetch purpose=foreground source=memory " +
+                        "bytes=${it.size} total_us=${mark.elapsedNow().inWholeMicroseconds}",
+                )
+            }
+        }
     }
 
     private fun rememberStickerImage(expectedSha256: String, bytes: ByteArray) {
         val cacheKey = expectedSha256.lowercase()
-        stickerImageCache.remove(cacheKey)
-        if (stickerImageCache.size >= 500) stickerImageCache.remove(stickerImageCache.keys.first())
+        stickerImageCache.remove(cacheKey)?.let { stickerImageMemoryBytes -= it.size }
+        if (bytes.size > STICKER_IMAGE_MEMORY_BUDGET_BYTES) return
+        while (
+            stickerImageCache.size >= STICKER_IMAGE_MEMORY_ENTRY_LIMIT ||
+            stickerImageMemoryBytes + bytes.size > STICKER_IMAGE_MEMORY_BUDGET_BYTES
+        ) {
+            val oldest = stickerImageCache.keys.firstOrNull() ?: break
+            stickerImageCache.remove(oldest)?.let { stickerImageMemoryBytes -= it.size }
+        }
         stickerImageCache[cacheKey] = bytes
+        stickerImageMemoryBytes += bytes.size
+    }
+
+    private fun clearStickerImageMemoryCache() {
+        stickerImageCache.clear()
+        stickerImageMemoryBytes = 0
     }
 
     private fun clearStickerCaches() {
         stickerCacheGeneration++
         stickerPackCache.clear()
-        stickerImageCache.clear()
+        clearStickerImageMemoryCache()
         installedPackCoordinates.clear()
     }
 
@@ -5091,10 +5258,14 @@ class SonarAppState(private val scope: CoroutineScope) {
         installedPackCoordinates.contains(normalizeStickerPackCoordinate(coordinate))
 
     suspend fun fetchInstalledPacks(): List<String>? {
+        val generation = stickerCacheGeneration
         return try {
             val coordinates = SonarCore.fetchInstalledPacks()
+            if (stickerCacheGeneration != generation) return null
             replaceInstalledPacks(coordinates)
             coordinates
+        } catch (e: CancellationException) {
+            throw e
         } catch (_: Throwable) {
             null
         }
@@ -5106,22 +5277,30 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     suspend fun installStickerPack(coordinate: String): Boolean {
+        val generation = stickerCacheGeneration
         return try {
             SonarCore.installStickerPack(coordinate)
+            if (stickerCacheGeneration != generation) return false
             installedPackCoordinates.add(normalizeStickerPackCoordinate(coordinate))
             true
+        } catch (e: CancellationException) {
+            throw e
         } catch (_: Throwable) {
             false
         }
     }
 
     suspend fun uninstallStickerPack(coordinate: String): Boolean {
+        val generation = stickerCacheGeneration
         return try {
             SonarCore.uninstallStickerPack(coordinate)
+            if (stickerCacheGeneration != generation) return false
             val normalized = normalizeStickerPackCoordinate(coordinate)
             installedPackCoordinates.remove(normalized)
             stickerPackCache.remove(normalized)
             true
+        } catch (e: CancellationException) {
+            throw e
         } catch (_: Throwable) {
             false
         }
@@ -5318,7 +5497,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private suspend fun sendCallOverMarmot(groupId: String, text: String): Boolean =
         try {
-            SonarCore.send(groupId, text)
+            sendMarmotTextOrdered(groupId, text)
             true
         } catch (e: Throwable) {
             toast = "call signaling failed: ${e.message}"
@@ -5336,7 +5515,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 refreshChats()
                 recomputeConversations()
             }
-            SonarCore.send(groupId, text)
+            sendMarmotTextOrdered(groupId, text)
             refreshOpenDm(peerId)
             true
         } catch (e: Throwable) {
@@ -5622,7 +5801,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             messages = (messages + echo).sortedBy { it.tsSecs }
             scope.launch {
                 try {
-                    SonarCore.send(group.id, text)
+                    sendMarmotTextOrdered(group.id, text)
                     clearSendEcho(chatId, echo.id)
                     processPayLines(group.id, marmotMessagesPage(group.id))
                     refreshOpenDm(peerId)
@@ -5659,7 +5838,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             val echo = createSendEcho(chatId, encoded)
             messages = (messages + echo).sortedBy { it.tsSecs }
             scope.launch {
-                runCatching { SonarCore.sendSticker(group.id, packCoordinate, sticker.shortcode, sticker.sha256) }
+                runCatching { sendMarmotStickerOrdered(group.id, packCoordinate, sticker.shortcode, sticker.sha256) }
                     .onSuccess {
                         clearSendEcho(chatId, echo.id)
                         refreshOpenDm(peerId)
@@ -5694,12 +5873,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             pendingMarmotSends.remove(npubHex)
             scope.launch {
                 for (tx in texts) {
-                    val ref = meshParseStickerContent(tx)
-                    if (ref != null) {
-                        runCatching { SonarCore.sendSticker(group.id, ref.packCoordinate, ref.shortcode, ref.plaintextSha256) }
-                    } else {
-                        runCatching { SonarCore.send(group.id, tx) }
-                    }
+                    runCatching { sendQueuedMarmotContent(group.id, tx) }
                 }
             }
         }
@@ -5813,7 +5987,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     private suspend fun sendOutboxOverMarmot(peerId: String, groupId: String, text: String): Boolean {
         if (isMeshContactBlocked(peerId)) return false
         return try {
-            SonarCore.send(groupId, text)
+            sendMarmotTextOrdered(groupId, text)
             refreshOpenDm(peerId)
             true
         } catch (e: Throwable) {
