@@ -16,6 +16,17 @@ The complete design handoff bundle lives in `design/handoff/`. It is **vendored*
   `$lib/markdown.js`; the site ships with an **empty post list**
   (`web/src/lib/blog-content.js`) by request — the design's sample posts are not
   published. A **Blog** link was added to the site Nav.
+  The same refresh also UPDATES `project/Sonar Landing.html`: the nav gains
+  `Blog` + `Fight Chat Control` links (the latter points at a
+  `Fight Chat Control.html` page that does not exist in the design project yet),
+  and a new **"From the blog"** teaser section (`section#blog` / `.blogteaser`)
+  sits before the download band. Implemented on the site landing
+  (`web/src/routes/+page.svelte` + `.blogteaser`/`.bt` styles in
+  `web/src/app.css`): the teaser is driven by the same `SONAR_BLOG.posts` and
+  the whole section is omitted while the post list is empty (no dead links); the
+  `Fight Chat Control` nav link is intentionally NOT added yet — no such page
+  exists. The vendored landing HTML was also brought up to date (it had drifted
+  to an old "Open the prototype" nav).
 - **Docs refresh (2026-07-07)** — Claude Design project
   `c6936a45-1fde-470e-9d0b-56b04428e60b`
   ([open](https://claude.ai/design/p/c6936a45-1fde-470e-9d0b-56b04428e60b?file=Sonar+Docs.html)):

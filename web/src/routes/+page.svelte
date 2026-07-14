@@ -1,7 +1,9 @@
 <script>
+  import { base } from '$app/paths';
   import Nav from '$lib/components/Nav.svelte';
   import Radar from '$lib/components/Radar.svelte';
   import Footer from '$lib/components/Footer.svelte';
+  import { SONAR_BLOG } from '$lib/blog-content.js';
   import {
     DOWNLOAD_HREF,
     TESTFLIGHT_URL,
@@ -9,6 +11,26 @@
     ANDROID_APK_URL,
     ZAPSTORE_URL
   } from '$lib/links.js';
+
+  // "From the blog" teaser — reproduced from the Claude Design handoff
+  //   design/handoff/project/Sonar Landing.html (section#blog / .blogteaser).
+  // The design hardcodes three sample cards; the site's blog ships with an
+  // empty post list, so the teaser is driven by the same SONAR_BLOG.posts and
+  // the whole section is omitted when there are no posts (no dead links). The
+  // featured post leads, then up to two more — matching the design order.
+  const feature = SONAR_BLOG.posts.find((p) => p.feature) ?? SONAR_BLOG.posts[0] ?? null;
+  const teaser = [feature, ...SONAR_BLOG.posts.filter((p) => p !== feature)]
+    .filter(Boolean)
+    .slice(0, 3);
+
+  /** @param {string} cat */
+  function glyph(cat) {
+    if (cat === 'Policy')
+      return '<svg width="46" height="46" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 3.2l7 2.6v5.1c0 4.3-2.9 7.3-7 8.9-4.1-1.6-7-4.6-7-8.9V5.8z"></path><path d="M9 11.5l2 2 4-4.2"></path></svg>';
+    if (cat === 'Design')
+      return '<svg width="46" height="46" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="2" fill="currentColor" stroke="none"></circle><circle cx="12" cy="12" r="6"></circle><circle cx="12" cy="12" r="9.6"></circle></svg>';
+    return '<svg width="46" height="46" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"></circle><path d="M8.7 8.7a4.7 4.7 0 000 6.6M15.3 8.7a4.7 4.7 0 010 6.6M6.2 6.2a8.2 8.2 0 000 11.6M17.8 6.2a8.2 8.2 0 010 11.6"></path></svg>';
+  }
 </script>
 
 <svelte:head>
@@ -180,6 +202,33 @@
     <span class="mono-card">$ accounts found: 0 &nbsp;·&nbsp; servers contacted: 0</span>
   </div>
 </section>
+
+{#if teaser.length}
+  <section id="blog">
+    <div class="wrap">
+      <div class="bloghead">
+        <div>
+          <p class="label">From the blog</p>
+          <h2>Why this matters now</h2>
+          <p class="lede">Privacy you have to trust a company to honor is privacy you can lose overnight. We write about the policy fights and the architecture that outlasts them.</p>
+        </div>
+        <a class="btn ghost" href="{base}/blog">All posts →</a>
+      </div>
+      <div class="blogteaser">
+        {#each teaser as p (p.id)}
+          <a class="bt {p.cat === 'Policy' ? 'policy' : ''}" href="{base}/blog#{p.id}">
+            <span class="btart">{@html glyph(p.cat)}</span>
+            <span class="btbody">
+              <span class="btcat">{p.cat}</span>
+              <h4>{p.title}</h4>
+              <span class="btmeta">{p.date} · {p.read}</span>
+            </span>
+          </a>
+        {/each}
+      </div>
+    </div>
+  </section>
+{/if}
 
 <section class="alt band" id="download">
   <div class="wrap">
