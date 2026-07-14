@@ -276,16 +276,16 @@ run_exchange() {
   local lat_min lat_med lat_p95 lat_max
   read -r lat_min lat_med lat_p95 lat_max <<< "$(latency_stats < "$latfile")"
 
+  local _filter
+  _filter='{"name":$name,"sent":$sent,"received":$received,"lost":$lost,"loss_pct":$loss_pct,"latency_ms":{"min":$lat_min,"median":$lat_med,"p95":$lat_p95,"max":$lat_max},"errors":$errors}'
   jq -n \
-    --arg label "$LABEL" \
+    --arg name "$LABEL" \
     --argjson sent "$sent" --argjson received "$received" --argjson lost "$lost" \
     --argjson loss_pct "$loss_pct" \
     --argjson lat_min "$lat_min" --argjson lat_med "$lat_med" \
     --argjson lat_p95 "$lat_p95" --argjson lat_max "$lat_max" \
     --argjson errors "$errors" \
-    '{label:$label, sent:$sent, received:$received, lost:$lost, loss_pct:$loss_pct,
-      latency_ms:{min:$lat_min,median:$lat_med,p95:$lat_p95,max:$lat_max},
-      errors:$errors}'
+    "$_filter"
 }
 
 # pass/fail for a single relay-set given thresholds. Gates on absolute lost-message
@@ -398,8 +398,8 @@ report_if_needed() {
   fi
   cli "$SONAR_CLI" --home "$rhome" "${RELAY_ARGS[@]}" publish >/dev/null || true
   local summary
-  summary=$(jq -r '"[relay-smoke] " + .overall +
-    " | target " + .target.label + " loss=" + (.target.loss_pct|tostring) + "%" +
+  summary=$(printf '%s' "$METRICS_JSON" | jq -r '"[relay-smoke] " + .overall +
+    " | target " + .target.name + " loss=" + (.target.loss_pct|tostring) + "%" +
     " (" + (.target.lost|tostring) + "/" + (.target.sent|tostring) + ")" +
     " | control loss=" + (.control.loss_pct|tostring) + "%" +
     " | seed=" + (.seed|tostring)' "$METRICS_JSON")
