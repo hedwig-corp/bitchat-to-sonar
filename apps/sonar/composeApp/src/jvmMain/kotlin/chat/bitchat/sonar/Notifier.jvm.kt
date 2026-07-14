@@ -5,6 +5,7 @@ import java.awt.SystemTray
 import java.awt.TrayIcon
 import java.awt.image.BufferedImage
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 import javax.sound.sampled.AudioSystem
 
@@ -78,7 +79,14 @@ actual object Notifier {
                         AudioSystem.getClip().use { clip ->
                             clip.open(audio)
                             clip.start()
-                            while (clip.isRunning && generation == soundGeneration.get()) {
+                            val deadlineNanos = System.nanoTime() +
+                                TimeUnit.MICROSECONDS.toNanos(clip.microsecondLength) +
+                                TimeUnit.SECONDS.toNanos(1)
+                            while (
+                                generation == soundGeneration.get() &&
+                                clip.microsecondPosition < clip.microsecondLength &&
+                                System.nanoTime() < deadlineNanos
+                            ) {
                                 Thread.sleep(25)
                             }
                             if (clip.isRunning) clip.stop()
