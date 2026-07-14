@@ -11,6 +11,24 @@ function esc(s) {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+// esc() runs on the whole line first, so &<> are already entity-encoded by the
+// time a link href is extracted; quotes are not, so escape them here to prevent
+// attribute breakout. Content is trusted for Docs but relay-sourced for the blog.
+/** @param {string} s */
+function escQuotes(s) {
+  return s.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+// Only allow hrefs we know can't execute script. Anything else (javascript:,
+// data:, vbscript:, …) collapses to a no-op anchor.
+/** @param {string} href */
+function safeHref(href) {
+  const v = href.trim();
+  return /^#/.test(v) || /^\//.test(v) || /^https?:\/\//i.test(v) || /^mailto:/i.test(v)
+    ? v
+    : '#';
+}
+
 /**
  * @param {string} s
  * @param {(href: string) => string} resolve maps a relative markdown link to a real href
@@ -28,7 +46,7 @@ function inline(s, resolve) {
         const id = h.replace(/^.*\//, '').replace(/\.md$/i, '');
         href = '#' + id;
       } else href = resolve(h);
-      return '<a href="' + href + '"' + cls + '>' + t + '</a>';
+      return '<a href="' + escQuotes(safeHref(href)) + '"' + cls + '>' + t + '</a>';
     });
 }
 

@@ -45,6 +45,14 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # Refresh the baked blog posts from Nostr so every deploy reflects the
+      # latest published posts. Best-effort (Node-only, global WebSocket): if the
+      # relays are unreachable it leaves the committed snapshot in place and never
+      # fails the build.
+      - name: Bake blog posts from Nostr
+        continue-on-error: true
+        run: npm run fetch-blog
+
       - name: Build
         env:
           # Project sites are served from /<repo>; relative asset paths make this

@@ -87,7 +87,10 @@ const tags = [
 	['d', slug],
 	['title', title],
 	['published_at', String(publishedAt)],
-	['t', topic]
+	['t', topic],
+	// Marker the website filters on (BLOG_MARKER_TAG in web/src/lib/blog-data.js):
+	// only events with this tag are loaded onto the site.
+	['t', 'sonarblogpost']
 ];
 if (fm.summary) tags.push(['summary', fm.summary]);
 if (fm.author) tags.push(['author', fm.author]);
