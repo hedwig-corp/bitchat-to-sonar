@@ -228,12 +228,18 @@ the operation that makes a post actually show up on the site):
    ```sh
    cd web && npm run fetch-blog   # regenerates web/src/lib/blog-content.js
    ```
+   `fetch-blog` is Node-only (global WebSocket, no nak/Go) and best-effort: if
+   the relays are unreachable or no marked post is found, it leaves
+   `blog-content.js` untouched and exits 0.
 4. Commit the regenerated `web/src/lib/blog-content.js` together with
    `docs/blog/<slug>/README.md`. **Never commit `scripts/blog/.env`** (it holds
    the signer secret and is gitignored).
 
-The page also refreshes from the live feed at runtime, but step 3 is what makes
-a post render from the static build — so `https://sonarprivacy.xyz/blog/#<slug>`
-works before any relay round-trip. Relay-sourced Markdown is rendered through the
-shared sanitizing renderer (`web/src/lib/markdown.js`); keep its HTML-escaping
-and href scheme allow-list intact when touching that file.
+You do not strictly need to run step 3 by hand for production: the Pages CI
+build runs `npm run fetch-blog` before `npm run build` on every deploy, so the
+live site always re-bakes the latest published posts. Committing `blog-content.js`
+keeps a fresh local/offline fallback and makes `/blog/#<slug>` work in `npm run
+dev` and as the CI fallback when relays are down. The page also refreshes from
+the live feed at runtime. Relay-sourced Markdown is rendered through the shared
+sanitizing renderer (`web/src/lib/markdown.js`); keep its HTML-escaping and href
+scheme allow-list intact when touching that file.

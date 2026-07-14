@@ -26,6 +26,7 @@ const INCIDENT_D_PREFIX = 'sonar-incident-';
  * }} NostrEvent
  */
 
+/** @param {string} value */
 function isWssUrl(value) {
 	try {
 		return new URL(value).protocol === 'wss:';
