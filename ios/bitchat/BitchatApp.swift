@@ -361,16 +361,45 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate {
 final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
     static let shared = NotificationDelegate()
     weak var chatViewModel: ChatViewModel?
-    weak var sonarStore: SonarAppStore?
+    weak var sonarStore: SonarAppStore? {
+        didSet {
+            // A cold-launch notification tap can fire `didReceive` before the
+            // root view's `.onAppear` wires `sonarStore`. When that happens we
+            // stash `pendingPushRefresh`; consume it as soon as the store lands
+            // so the catch-up refresh isn't silently dropped. Hop to @MainActor
+            // because SonarAppStore/MarmotChatModel are main-actor-isolated (and
+            // `pendingPushRefresh` is only ever touched from @MainActor here and
+            // in `didReceive`).
+            guard sonarStore != nil else { return }
+            Task { @MainActor in
+                guard self.pendingPushRefresh, let store = self.sonarStore else { return }
+                self.pendingPushRefresh = false
+                store.marmot.refreshAfterForeground()
+            }
+        }
+    }
+    /// Set when a Transponder/Marmot chat push is tapped before `sonarStore`
+    /// has been wired (cold launch). Consumed in `sonarStore.didSet`. Only
+    /// touched from @MainActor contexts (the tap callback and onAppear both
+    /// run on the main thread).
+    private var pendingPushRefresh = false
 
     /// True when the tapped notification came from the Transponder/Marmot chat
     /// push path. The NSE copies the push userInfo onto the delivered content,
-    /// so these keys survive to the tap.
+    /// so these keys survive to the tap. Mirrors
+    /// `SonarNotificationService/NotificationService.isTransponderPush` — the
+    /// Breez exclusion and lowercased source comparison must match so a Breez
+    /// payment push can never trigger a Marmot chat refresh.
+    private static func isBreezPush(_ userInfo: [AnyHashable: Any]) -> Bool {
+        let source = (userInfo["source"] as? String)?.lowercased()
+        return source == "breez" || userInfo["notification_type"] != nil
+    }
+
     private static func isTransponderChatPush(_ userInfo: [AnyHashable: Any]) -> Bool {
+        if isBreezPush(userInfo) { return false }
+        let source = (userInfo["source"] as? String)?.lowercased()
+        if source == "transponder" || source == "marmot" { return true }
         if userInfo["mip05"] != nil || userInfo["transponder"] != nil || userInfo["wn_nse_prototype"] != nil {
-            return true
-        }
-        if let source = userInfo["source"] as? String, source == "transponder" || source == "marmot" {
             return true
         }
         if let kind = userInfo["kind"] as? Int, kind == 446 { return true }
@@ -403,7 +432,13 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
         // sync so the user sees the pushed message instead of a stale list.
         if Self.isTransponderChatPush(userInfo) {
             Task { @MainActor in
-                self.sonarStore?.marmot.refreshAfterForeground()
+                if let store = self.sonarStore {
+                    store.marmot.refreshAfterForeground()
+                } else {
+                    // Cold-launch tap: the store isn't wired yet. Record intent;
+                    // `sonarStore.didSet` consumes it once onAppear wires the store.
+                    self.pendingPushRefresh = true
+                }
             }
         }
 
