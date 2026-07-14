@@ -453,12 +453,21 @@ actual object SonarCore {
         }.getOrNull()
     }
 
-    // Push-wake catch-up must use syncForce(), not syncOnce() — syncOnce() can
-    // short-circuit when live subscriptions are marked active even if the relay
-    // socket was torn down while backgrounded. syncForce() bypasses the
-    // short-circuit so the missed-while-backgrounded window is fetched
-    // deterministically. Mirrors the iOS fix in MarmotChatView.refresh().
+    // Routine heartbeat sync: syncOnce() short-circuits while live subscriptions
+    // are active, so a periodic tick does NOT force the batched all-groups fetch
+    // (that would be wasted battery/relay traffic every interval). Real wake
+    // events call syncForce() instead — see below.
     actual suspend fun sync() = withContext(Dispatchers.IO) {
+        runCatching { node?.syncOnce() }
+        Unit
+    }
+
+    // Push-wake / foreground-resume catch-up: syncForce() bypasses the
+    // live-subscription short-circuit and runs the batched all-groups fetch so a
+    // message that arrived while the relay socket was torn down (longer than the
+    // live tail) is fetched deterministically. Mirrors the iOS fix in
+    // MarmotChatView.refresh(). Keep this OFF the routine heartbeat.
+    actual suspend fun syncForce() = withContext(Dispatchers.IO) {
         runCatching { node?.syncForce() }
         Unit
     }

@@ -82,7 +82,11 @@ class SonarPushProcessingService : Service() {
             withTimeoutOrNull(MARMOT_PUSH_SYNC_TIMEOUT_MS) {
                 SonarCore.start()
                 SonarCore.connectRelays()
-                SonarCore.sync()
+                // Push wake: force the batched gap-recovery fetch. A routine
+                // sync() would short-circuit while live subscriptions are marked
+                // active even though the socket was torn down while backgrounded,
+                // leaving the pushed message unfetched.
+                SonarCore.syncForce()
             } ?: run {
                 Log.w(TAG, "Marmot sync timed out, showing fallback")
                 notifyFallback(prefs)

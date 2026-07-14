@@ -660,6 +660,10 @@ const MARMOT_GIFTWRAP_BUFFER_CAP: usize = 512;
 #[allow(dead_code)]
 const MARMOT_BUFFER_CAP: usize = MARMOT_GROUP_BUFFER_CAP + MARMOT_GIFTWRAP_BUFFER_CAP;
 const DIRECT_DM_BUFFER_CAP: usize = 1024;
+/// Bound on parked sync-path gap-recovery notifications. Hosts drain after every
+/// forced sync, so this only guards a host that stops draining; drop the oldest
+/// half on overflow (same half-drop shape as the live buffers).
+const SYNC_NOTIFICATION_CAP: usize = 256;
 const LIVE_EVENT_DEDUP_TTL: Duration = Duration::from_secs(60);
 const LIVE_EVENT_DEDUP_CAP: usize = 4096;
 
@@ -695,8 +699,21 @@ fn live_group_since_secs(watermark_secs: u64, now_secs: u64) -> u64 {
 /// tail is NOT in the resubscribe EOSE burst. Without this fetch, recovering it
 /// falls to the one-group-per-pass catch-up queue and a push-notified message
 /// can stay invisible long after the user opens the app.
-fn should_fetch_group_messages_on_sync(is_live: bool, force: bool) -> bool {
-    !is_live || force
+///
+/// The forced-while-live fetch is gated on an established watermark
+/// (`since_secs > 0`). With a watermark the fetch carries a `since` floor, so it
+/// is bounded to the gap since the last sync; without one (first session, before
+/// any watermark) it would be an unbounded full-history scan on the serial engine
+/// queue during a wake — delaying sends — for no gap-recovery benefit, since a
+/// zero watermark means there is no defined suspend gap yet. Bootstrap history is
+/// owned by the non-live path and the per-group catch-up queue. The non-live path
+/// itself is unchanged (it still fetches at `since==0` to establish the
+/// watermark), because there is no live tail delivering events for it.
+fn should_fetch_group_messages_on_sync(is_live: bool, force: bool, since_secs: u64) -> bool {
+    if !is_live {
+        return true;
+    }
+    force && since_secs > 0
 }
 
 /// Push into a live buffer with half-drop overflow. Returns true if a drop ran.
@@ -1245,6 +1262,14 @@ pub struct SonarClient {
     sticker_prefetch_registry: StickerPrefetchRegistry,
     /// This device's own push registration (set after `register_push_token`).
     own_push_registration: Arc<Mutex<Option<crate::push::OwnPushRegistration>>>,
+    /// Incoming-message notifications produced by the forced-sync gap-recovery
+    /// fetch in `sync_inner`. A push-wake host calls `sync_force()` then
+    /// `drain_pending_marmot()`; the recovered messages are stored by the sync
+    /// call, so their notifications are parked here and returned by the drain so
+    /// the host still surfaces a precise local notification. Deduped by event id
+    /// through the shared processed-ID set, so a message delivered by both the
+    /// sync fetch and the live buffer notifies at most once.
+    pending_sync_notifications: Arc<Mutex<Vec<DrainNotification>>>,
 }
 
 impl SonarClient {
@@ -1688,6 +1713,7 @@ impl SonarClient {
             sticker_image_fetch_gates: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             sticker_prefetch_registry: Arc::new(Mutex::new(HashMap::new())),
             own_push_registration: Arc::new(Mutex::new(None)),
+            pending_sync_notifications: Arc::new(Mutex::new(Vec::new())),
         };
         // Open the live Marmot subscriptions for real sessions. In-memory test
         // sessions (allow_geo_relays=false) stay on the explicit `sync()` path so
@@ -3372,7 +3398,8 @@ impl SonarClient {
         // this even while the live subscription tail is active.
         let is_live = *self.live_marmot_enabled.lock().unwrap();
         let group_ids: Vec<String> = self.current_group_ids()?.into_iter().collect();
-        if !group_ids.is_empty() && should_fetch_group_messages_on_sync(is_live, force) {
+        if !group_ids.is_empty() && should_fetch_group_messages_on_sync(is_live, force, since_secs)
+        {
             let mut filter = Filter::new()
                 .kind(Kind::MlsGroupMessage)
                 .custom_tags(SingleLetterTag::lowercase(Alphabet::H), group_ids);
@@ -3387,10 +3414,22 @@ impl SonarClient {
             if !events.completed_quorum() {
                 process_report.record_retryable(started);
             }
-            let (msg_report, _) = self
+            let (msg_report, msg_notifications) = self
                 .process_marmot_events(events.events, "group message")
                 .await;
             process_report.absorb(msg_report);
+            // Route this fetch's incoming-message notifications to the drain
+            // queue so a push-wake host (sync_force → drain_pending_marmot) still
+            // surfaces a precise notification for a message recovered here rather
+            // than via the live buffer. Gated on since_secs > 0: the batched
+            // fetch only carries a bounded `since` floor with an established
+            // watermark, so this cannot fire the whole history as notifications
+            // on a first-session bootstrap. Ancient new-group / empty-transcript
+            // backfills above deliberately keep discarding their notifications
+            // (they are old history, not fresh arrivals).
+            if since_secs > 0 && !msg_notifications.is_empty() {
+                self.queue_sync_notifications(msg_notifications);
+            }
         }
 
         if process_report.retryable_failures == 0 {
@@ -4240,16 +4279,33 @@ impl SonarClient {
         .is_ok()
     }
 
+    /// Park incoming-message notifications produced by the forced-sync
+    /// gap-recovery fetch, bounded with a half-drop so a host that stops draining
+    /// cannot grow this unboundedly (see `SYNC_NOTIFICATION_CAP`).
+    fn queue_sync_notifications(&self, notifications: Vec<DrainNotification>) {
+        let mut queue = self.pending_sync_notifications.lock().unwrap();
+        for n in notifications {
+            push_live_buffer(&mut queue, n, SYNC_NOTIFICATION_CAP);
+        }
+    }
+
     /// Process every buffered live Marmot event through the MLS engine, then
     /// widen the group subscription if a welcome just added a group. Returns true
     /// if anything was drained. MUST run on the host's serialized engine thread
     /// (it mutates MLS state); the notification handler only ever BUFFERS.
     pub async fn drain_pending_marmot(&self) -> Result<Vec<DrainNotification>> {
+        // Notifications parked by the forced-sync gap-recovery fetch. Returned
+        // alongside any live-buffered drains so a push-wake host that ran
+        // sync_force() before draining still surfaces the recovered message.
+        let mut notifications: Vec<DrainNotification> = {
+            let mut queue = self.pending_sync_notifications.lock().unwrap();
+            std::mem::take(&mut *queue)
+        };
         let mut events: Vec<Event> = {
             let mut giftwraps = self.pending_marmot_giftwraps.lock().unwrap();
             let mut groups = self.pending_marmot_groups.lock().unwrap();
             if giftwraps.is_empty() && groups.is_empty() {
-                return Ok(Vec::new());
+                return Ok(notifications);
             }
             let mut out = std::mem::take(&mut *giftwraps);
             out.append(&mut *groups);
@@ -4257,9 +4313,10 @@ impl SonarClient {
         };
         sort_marmot_events_in_place(&mut events);
         let ids_before = self.current_group_ids()?;
-        let (mut process_report, notifications) = self
+        let (mut process_report, live_notifications) = self
             .process_marmot_events(events, "live marmot event")
             .await;
+        notifications.extend(live_notifications);
         // A welcome may have joined new group(s): backfill each one's history
         // (predates the watermark + the since-now sub) and widen the live sub.
         let new_ids: Vec<String> = self
@@ -6024,11 +6081,75 @@ mod tests {
         // suspend must run the batched watermark fetch itself — a pushed
         // message older than the tail is otherwise invisible until the
         // one-group-per-pass catch-up queue happens to reach its group.
-        assert!(should_fetch_group_messages_on_sync(true, true));
-        assert!(should_fetch_group_messages_on_sync(false, true));
-        assert!(should_fetch_group_messages_on_sync(false, false));
+        assert!(should_fetch_group_messages_on_sync(true, true, 1_000));
+        assert!(should_fetch_group_messages_on_sync(false, true, 1_000));
+        assert!(should_fetch_group_messages_on_sync(false, false, 1_000));
         // Plain polls stay cheap while live subscriptions cover new events.
-        assert!(!should_fetch_group_messages_on_sync(true, false));
+        assert!(!should_fetch_group_messages_on_sync(true, false, 1_000));
+    }
+
+    #[test]
+    fn forced_live_sync_skips_unbounded_bootstrap_fetch() {
+        // A forced sync while live with NO established watermark (since==0)
+        // would run an unbounded full-history kind-445 scan on the serial engine
+        // queue during a wake, delaying sends, with no gap to recover (a zero
+        // watermark means no defined suspend gap). Skip it; the non-live path and
+        // the per-group catch-up queue own bootstrap history.
+        assert!(!should_fetch_group_messages_on_sync(true, true, 0));
+        assert!(!should_fetch_group_messages_on_sync(true, false, 0));
+        // The non-live path is unchanged: it still fetches at since==0 to
+        // establish the very first watermark (no live tail delivers for it).
+        assert!(should_fetch_group_messages_on_sync(false, true, 0));
+        assert!(should_fetch_group_messages_on_sync(false, false, 0));
+    }
+
+    fn test_notification(preview: &str) -> DrainNotification {
+        DrainNotification {
+            sender_pubkey: "npub-test".to_string(),
+            group_name: "group".to_string(),
+            content_preview: preview.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn forced_sync_notifications_surface_through_drain() {
+        // The forced-sync gap-recovery fetch parks its incoming-message
+        // notifications so a push-wake host (sync_force → drain_pending_marmot)
+        // still gets a precise notification even though the message was stored by
+        // the sync call and never entered the live buffer.
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("in-memory client");
+        client.queue_sync_notifications(vec![test_notification("hi"), test_notification("there")]);
+
+        // Live buffers are empty, so drain returns exactly the parked ones.
+        let drained = client.drain_pending_marmot().await.expect("drain succeeds");
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].content_preview, "hi");
+        assert_eq!(drained[1].content_preview, "there");
+
+        // The queue is consumed: a second drain yields nothing.
+        let drained_again = client
+            .drain_pending_marmot()
+            .await
+            .expect("second drain succeeds");
+        assert!(drained_again.is_empty());
+    }
+
+    #[test]
+    fn queue_sync_notifications_caps_with_half_drop() {
+        let client = tokio::runtime::Runtime::new().unwrap().block_on(async {
+            SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+                .await
+                .expect("in-memory client")
+        });
+        // Overfill past the cap; the oldest half is dropped so the queue stays
+        // bounded for a host that stops draining.
+        for i in 0..(SYNC_NOTIFICATION_CAP + 10) {
+            client.queue_sync_notifications(vec![test_notification(&i.to_string())]);
+        }
+        let len = client.pending_sync_notifications.lock().unwrap().len();
+        assert!(len <= SYNC_NOTIFICATION_CAP, "queue stayed bounded: {len}");
     }
 
     #[test]

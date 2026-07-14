@@ -2938,7 +2938,10 @@ class SonarAppState(private val scope: CoroutineScope) {
                 scope.launch {
                     if (SonarCore.isRelayConnected()) {
                         publishSonarDescriptorIfNeeded(force = true)
-                        runCatching { SonarCore.sync() }
+                        // Foreground resume is a real wake event: force the
+                        // batched gap-recovery fetch (a message may have arrived
+                        // while the socket was torn down in the background).
+                        runCatching { SonarCore.syncForce() }
                     }
                     drainDirectDms()
                     refreshChats()
@@ -2959,7 +2962,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (!started) return
         startRelayConnection()
         scope.launch {
-            if (SonarCore.isRelayConnected()) runCatching { SonarCore.sync() }
+            // Explicit immediate sync (chat open / manual refresh) is a wake-like
+            // event: force the gap-recovery fetch, don't let it short-circuit.
+            if (SonarCore.isRelayConnected()) runCatching { SonarCore.syncForce() }
             drainDirectDms()
             refreshChats()
             recomputeConversations()
