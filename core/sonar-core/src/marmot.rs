@@ -39,6 +39,30 @@ pub const CHAT_RUMOR_KIND: u16 = 9;
 /// for the modern addressable kind (Kind::MlsKeyPackage is the legacy 443).
 pub const KEY_PACKAGE_KIND: u16 = 30443;
 
+/// LeafNode extension id (`marmot.account-identity-proof.v2`) advertised in
+/// the `mls_extensions` tag of KeyPackages published by the next-generation
+/// Marmot runtime (MDK >= 0.9 "Dark Matter", shipped by the native White
+/// Noise iOS app). Groups on that runtime require capabilities our pinned
+/// MDK 0.8 leaves cannot provide, and its clients reject welcomes from
+/// leaves that lack this proof extension, so interop is impossible in both
+/// directions until Sonar migrates to the new runtime (tracked gap: the
+/// MDK 0.9 migration; see the PR that introduced this guard for the full
+/// incompatibility analysis).
+const NEXT_GEN_ACCOUNT_IDENTITY_PROOF_EXT: &str = "0xf2f1";
+
+/// True when a fetched KeyPackage event was published by the next-generation
+/// Marmot runtime. Consuming such a KeyPackage would create a group the peer
+/// can never join, so chat-start paths surface a typed
+/// [`Error::PeerProtocolTooNew`] instead.
+pub fn key_package_is_next_generation(event: &Event) -> bool {
+    event
+        .tags
+        .iter()
+        .filter(|tag| tag.kind() == TagKind::MlsExtensions)
+        .flat_map(|tag| tag.as_slice().iter().skip(1))
+        .any(|value| value.eq_ignore_ascii_case(NEXT_GEN_ACCOUNT_IDENTITY_PROOF_EXT))
+}
+
 /// Sidecar file suffix for Sonar's relay-sync cursor beside the MDK database.
 pub(crate) const SYNC_STATE_FILE_SUFFIX: &str = ".sonar-sync.json";
 
@@ -1336,6 +1360,56 @@ mod message_cursor_tests {
             None
         ));
         assert!(is_before_message_cursor(101, &event_id(0x00), None, None));
+    }
+}
+
+#[cfg(test)]
+mod key_package_generation_tests {
+    use super::*;
+
+    /// A KeyPackage event shaped like the next-generation Marmot runtime's
+    /// (MDK 0.9 / native White Noise iOS): `mls_extensions` advertises the
+    /// account-identity-proof extension `0xf2f1` and there is no
+    /// `encoding` tag.
+    fn next_gen_key_package_event() -> Event {
+        let keys = Keys::generate();
+        EventBuilder::new(Kind::Custom(KEY_PACKAGE_KIND), "AQIDBA==")
+            .tags([
+                Tag::identifier("slot"),
+                Tag::custom(TagKind::MlsProtocolVersion, ["1.0"]),
+                Tag::custom(TagKind::MlsCiphersuite, ["0x0001"]),
+                Tag::custom(TagKind::MlsExtensions, ["0x0006", "0xF2F1", "0x000a"]),
+            ])
+            .sign_with_keys(&keys)
+            .expect("sign next-gen key package")
+    }
+
+    #[test]
+    fn flags_next_generation_key_package() {
+        assert!(key_package_is_next_generation(&next_gen_key_package_event()));
+    }
+
+    #[test]
+    fn accepts_our_own_generation_key_package() {
+        let engine = MarmotEngine::in_memory(Identity::generate());
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let event = engine.key_package_event(relays).expect("key package event");
+        assert!(!key_package_is_next_generation(&event));
+    }
+
+    #[test]
+    fn ignores_extension_values_in_other_tags() {
+        // 0xf2f1 appearing outside `mls_extensions` (e.g. in `mls_proposals`)
+        // must not trigger the incompatibility path.
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::Custom(KEY_PACKAGE_KIND), "AQIDBA==")
+            .tags([
+                Tag::custom(TagKind::MlsExtensions, ["0xf2ee"]),
+                Tag::custom(TagKind::Custom("mls_proposals".into()), ["0xf2f1"]),
+            ])
+            .sign_with_keys(&keys)
+            .expect("sign key package");
+        assert!(!key_package_is_next_generation(&event));
     }
 }
 

@@ -1747,6 +1747,9 @@ impl SonarClient {
         key_package: Event,
         name: &str,
     ) -> Result<GroupId> {
+        if crate::marmot::key_package_is_next_generation(&key_package) {
+            return Err(Error::PeerProtocolTooNew(key_package.pubkey));
+        }
         let creation = self.engine.create_group_with_description(
             name,
             SONAR_DIRECT_DM_DESCRIPTION,
@@ -1781,16 +1784,26 @@ impl SonarClient {
     }
 
     /// Fetch the freshest KeyPackage event for `author` from the relays.
+    ///
+    /// A peer whose freshest KeyPackage comes from the next-generation Marmot
+    /// runtime (native White Noise iOS) is on a protocol this build cannot
+    /// join or invite — creating a group with that event would leave the peer
+    /// with a chat they can never see. Surface [`Error::PeerProtocolTooNew`]
+    /// instead so both apps show an actionable failure.
     pub async fn fetch_key_package(&self, author: PublicKey) -> Result<Event> {
         let filter = Filter::new()
             .kind(Kind::Custom(KEY_PACKAGE_KIND))
             .author(author)
             .limit(1);
         let events = self.nostr.fetch_events(filter, FETCH_TIMEOUT).await?;
-        events
+        let event = events
             .into_iter()
             .next()
-            .ok_or(Error::KeyPackageNotFound(author))
+            .ok_or(Error::KeyPackageNotFound(author))?;
+        if crate::marmot::key_package_is_next_generation(&event) {
+            return Err(Error::PeerProtocolTooNew(author));
+        }
+        Ok(event)
     }
 
     /// Publish our kind-0 profile (NIP-01 metadata) so peers can resolve our
