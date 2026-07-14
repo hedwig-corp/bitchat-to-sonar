@@ -1,0 +1,85 @@
+// Sonar blog feed configuration.
+//
+// The blog list/article view (web/src/routes/blog/+page.svelte) renders the
+// static SONAR_BLOG.posts (web/src/lib/blog-content.js) first, then — when
+// BLOG_PUBKEY_HEX is set — REQs NIP-23 long-form events (kind 30023) authored
+// by that pubkey from BLOG_FEED_RELAYS and replaces the list with the live
+// feed. An unset/empty pubkey disables the query and keeps the static fallback,
+// so the site never hard-depends on relays being reachable.
+//
+// Posts are published from docs/blog/<slug>/README.md via scripts/blog/publish.sh.
+
+/** NIP-23 long-form content kind. */
+export const BLOG_EVENT_KIND = 30023;
+
+/**
+ * Hex pubkey of the blog author. Empty string ⇒ no relay query (static-only).
+ *
+ * This is the Sonar blog author account
+ * (npub1wg2m9ku823y5l5699dlj6294dc3cvwu4g34ldrtelxq20t27clxsd7dzaw). It MUST
+ * equal the pubkey the posts are signed with (scripts/blog/publish.sh), or the
+ * reader will filter the posts out.
+ */
+export const BLOG_PUBKEY_HEX = '7215b2db8754494fd3452b7f2d28b56e23863b95446bf68d79f980a7ad5ec7cd';
+
+/** Relays queried for the blog feed. Same public set the status feed uses. */
+export const BLOG_FEED_RELAYS = [
+	'wss://relay.damus.io',
+	'wss://nos.lol',
+	'wss://relay.primal.net',
+	'wss://nostr.relay.hedwig.sh'
+];
+
+/** Max markdown body size accepted from a relay event (defensive bound). */
+export const BLOG_MAX_CONTENT_BYTES = 200_000;
+
+/** Topic (`t` tag) that marks a post as the featured card. */
+export const BLOG_FEATURED_TAG = 'featured';
+
+/** @returns {boolean} whether a live query is configured. */
+export function isBlogFeedConfigured() {
+	return /^[0-9a-fA-F]{64}$/.test(BLOG_PUBKEY_HEX);
+}
+
+/**
+ * Map lowercase `t` topics to the display category used by the design
+ * (Policy = gold, Design = indigo, else Engineering = cyan).
+ * @param {string[]} topics lowercased topic tags
+ * @returns {'Policy' | 'Design' | 'Engineering'}
+ */
+export function categoryFromTopics(topics) {
+	if (topics.includes('policy')) return 'Policy';
+	if (topics.includes('design')) return 'Design';
+	return 'Engineering';
+}
+
+/**
+ * Format a unix timestamp (seconds) as the design's date string, e.g.
+ * "July 14, 2026". Falls back to an empty string on bad input.
+ * @param {number} unixSeconds
+ * @returns {string}
+ */
+export function formatBlogDate(unixSeconds) {
+	if (!Number.isFinite(unixSeconds) || unixSeconds <= 0) return '';
+	try {
+		return new Date(unixSeconds * 1000).toLocaleDateString('en-US', {
+			month: 'long',
+			day: 'numeric',
+			year: 'numeric',
+			timeZone: 'UTC'
+		});
+	} catch {
+		return '';
+	}
+}
+
+/**
+ * Estimate reading time from markdown body at ~200 words/min, min 1 minute.
+ * @param {string} md
+ * @returns {string} e.g. "8 min read"
+ */
+export function estimateReadTime(md) {
+	const words = md.trim().split(/\s+/).filter(Boolean).length;
+	const minutes = Math.max(1, Math.round(words / 200));
+	return `${minutes} min read`;
+}

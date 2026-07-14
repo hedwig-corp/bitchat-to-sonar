@@ -2459,13 +2459,22 @@ extension BLEService: CBPeripheralDelegate {
 
             let claimedSenderID = PeerID(hexData: packet.senderID)
 
+            if MeshLinkSenderPolicy.isSelfEcho(senderIsSelf: claimedSenderID == myPeerID, ttl: packet.ttl) {
+                continue
+            }
+
             let trustedSenderID: PeerID?
             if let knownPeerID = boundPeerID {
                 if knownPeerID != claimedSenderID {
-                    SecureLogger.warning("🚫 SECURITY: Sender ID spoofing attempt detected! Peripheral \(peripheralUUID.prefix(8))… claimed to be \(claimedSenderID.id.prefix(8))… but is bound to \(knownPeerID.id.prefix(8))…", category: .security)
-                    continue
+                    if MeshLinkSenderPolicy.allowsRelayedIdentityPacket(type: packet.type, ttl: packet.ttl) {
+                        trustedSenderID = nil
+                    } else {
+                        SecureLogger.warning("🚫 SECURITY: Sender ID spoofing attempt detected! Peripheral \(peripheralUUID.prefix(8))… claimed to be \(claimedSenderID.id.prefix(8))… but is bound to \(knownPeerID.id.prefix(8))…", category: .security)
+                        continue
+                    }
+                } else {
+                    trustedSenderID = knownPeerID
                 }
-                trustedSenderID = knownPeerID
             } else {
                 trustedSenderID = nil
             }
@@ -2899,13 +2908,22 @@ extension BLEService: CBPeripheralManagerDelegate {
 
                 let claimedSenderID = PeerID(hexData: packet.senderID)
 
+                if MeshLinkSenderPolicy.isSelfEcho(senderIsSelf: claimedSenderID == myPeerID, ttl: packet.ttl) {
+                    continue
+                }
+
                 let trustedSenderID: PeerID?
                 if let knownPeerID = centralToPeerID[centralUUID] {
                     if knownPeerID != claimedSenderID {
-                        SecureLogger.warning("🚫 SECURITY: Sender ID spoofing attempt detected! Central \(centralUUID.prefix(8))… claimed to be \(claimedSenderID.id.prefix(8))… but is bound to \(knownPeerID.id.prefix(8))…", category: .security)
-                        continue
+                        if MeshLinkSenderPolicy.allowsRelayedIdentityPacket(type: packet.type, ttl: packet.ttl) {
+                            trustedSenderID = nil
+                        } else {
+                            SecureLogger.warning("🚫 SECURITY: Sender ID spoofing attempt detected! Central \(centralUUID.prefix(8))… claimed to be \(claimedSenderID.id.prefix(8))… but is bound to \(knownPeerID.id.prefix(8))…", category: .security)
+                            continue
+                        }
+                    } else {
+                        trustedSenderID = knownPeerID
                     }
-                    trustedSenderID = knownPeerID
                 } else {
                     trustedSenderID = nil
                 }
@@ -3141,7 +3159,7 @@ extension BLEService {
             return bleQueue.sync { computeState() }
         }
     }
-    
+
     private func configureNoiseServiceCallbacks(for service: NoiseEncryptionService) {
         service.onPeerAuthenticated = { [weak self] peerID, fingerprint in
             SecureLogger.debug("🔐 Noise session authenticated with \(peerID), fingerprint: \(fingerprint.prefix(16))...")
@@ -4244,6 +4262,13 @@ extension BLEService {
         }
         if let existingKey = existingPeerForVerify?.noisePublicKey, existingKey != announcement.noisePublicKey {
             SecureLogger.warning("⚠️ Announce key mismatch for \(peerID.id.prefix(8))… — keeping unverified", category: .security)
+            verifiedAnnounce = false
+        }
+        if !MeshLinkSenderPolicy.preservesSigningIdentity(
+            existing: existingPeerForVerify?.signingPublicKey,
+            announced: announcement.signingPublicKey
+        ) {
+            SecureLogger.warning("⚠️ Announce signing-key change for \(peerID.id.prefix(8))… — keeping unverified", category: .security)
             verifiedAnnounce = false
         }
 

@@ -80,6 +80,25 @@ struct NotificationStreamAssemblerTests {
         #expect(decoded2.timestamp == packet2.timestamp)
     }
 
+    @Test func consumesAndroidStylePaddingWithoutStreamNoise() throws {
+        var assembler = NotificationStreamAssembler()
+        let packet1 = makePacket(timestamp: 0xA11)
+        let packet2 = makePacket(timestamp: 0xA12)
+        let padded1 = try #require(packet1.toBinaryData(padding: true), "Failed to encode padded packet")
+        let padded2 = try #require(packet2.toBinaryData(padding: true), "Failed to encode padded packet")
+
+        var combined = Data()
+        combined.append(padded1)
+        combined.append(padded2)
+
+        let result = assembler.append(combined)
+        #expect(result.frames.count == 2)
+        #expect(result.droppedPrefixes.isEmpty)
+        #expect(!result.reset)
+        #expect(BinaryProtocol.decode(result.frames[0])?.timestamp == packet1.timestamp)
+        #expect(BinaryProtocol.decode(result.frames[1])?.timestamp == packet2.timestamp)
+    }
+
     @Test func dropsInvalidPrefixByte() throws {
         var assembler = NotificationStreamAssembler()
         let packet = makePacket(timestamp: 0xF00)

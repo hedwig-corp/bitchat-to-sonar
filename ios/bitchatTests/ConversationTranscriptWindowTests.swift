@@ -11,12 +11,20 @@ import Testing
 @testable import Sonar
 
 struct ConversationTranscriptWindowTests {
-    private func message(_ index: Int, source: String) -> SNMessage {
+    private func message(
+        _ index: Int,
+        source: String,
+        paymentID: String? = nil
+    ) -> SNMessage {
         SNMessage(
             id: "\(source)-\(String(format: "%04d", index))",
             text: "\(source) \(index)",
             time: "",
-            sortDate: Date(timeIntervalSince1970: TimeInterval(index))
+            sortDate: Date(timeIntervalSince1970: TimeInterval(index)),
+            transcriptSourceID: source,
+            pay: paymentID.map {
+                SNPayInfo(id: $0, sats: 1, state: .sealed)
+            }
         )
     }
 
@@ -152,6 +160,60 @@ struct ConversationTranscriptWindowTests {
         #expect(refreshed.contains(where: { $0.id == "mesh-0500" }) == false)
     }
 
+    @Test func batchedLiveRowsCannotEvictAnchorWhileCrossingRetainedBudget() {
+        let historical = (0..<499).map { message($0, source: "internet") }
+        let firstLive = message(499, source: "mesh")
+        let excessLive = message(500, source: "mesh")
+
+        let filled = SNConversationTranscriptWindow.refreshing(
+            historical,
+            from: historical + [firstLive, excessLive],
+            limit: 500,
+            preservingOlderEdge: false,
+            pinningOlderEdgeAtCapacity: true
+        )
+
+        #expect(filled.count == 500)
+        #expect(filled.first?.id == "internet-0000")
+        #expect(filled.last?.id == firstLive.id)
+        #expect(filled.contains(where: { $0.id == excessLive.id }) == false)
+    }
+
+    @Test func liveRefreshTreatsCoveredCandidateRangeAsAuthoritative() {
+        let existing = [
+            message(0, source: "internet"),
+            message(
+                1,
+                source: SNConversationTranscriptSource.paymentActivityID,
+                paymentID: "replaced"
+            ),
+            message(
+                3,
+                source: SNConversationTranscriptSource.paymentActivityID,
+                paymentID: "retained"
+            ),
+        ]
+        let candidates = [
+            message(0, source: "internet"),
+            message(1, source: "internet", paymentID: "replaced"),
+            message(
+                3,
+                source: SNConversationTranscriptSource.paymentActivityID,
+                paymentID: "retained"
+            ),
+        ]
+
+        let refreshed = SNConversationTranscriptWindow.refreshing(
+            existing,
+            from: candidates,
+            limit: 30,
+            preservingOlderEdge: false
+        )
+
+        #expect(refreshed.map(\.id) == candidates.map(\.id))
+        #expect(refreshed.contains(where: { $0.id == "$payment-activity-0001" }) == false)
+    }
+
     @Test func partialFinalPageLeavesRoomForLiveRows() {
         let older = (0..<15).map { message($0, source: "internet") }
         let previous = (15..<485).map { message($0, source: "internet") }
@@ -178,6 +240,123 @@ struct ConversationTranscriptWindowTests {
         #expect(shouldPreserve == false)
         #expect(refreshed.last?.id == live.id)
         #expect(refreshed.count == 486)
+
+        // The coordinator formats only sourceLimit + 1 candidates. Reproduce
+        // successive live invalidations with that fixed 486-row lookahead; the
+        // render window must still accumulate to 500 without losing its anchor.
+        var canonical = partialWindow + [live]
+        var filled = refreshed
+        for index in 486..<500 {
+            canonical.append(message(index, source: "mesh"))
+            filled = SNConversationTranscriptWindow.refreshing(
+                filled,
+                from: Array(canonical.suffix(486)),
+                limit: 500,
+                preservingOlderEdge: false
+            )
+        }
+        #expect(filled.count == 500)
+        #expect(filled.first?.id == "internet-0000")
+        #expect(SNConversationTranscriptWindow.shouldPreserveOlderEdge(
+            afterGrowingTo: 500,
+            retainedLimit: 500,
+            previous: refreshed,
+            next: filled
+        ))
+    }
+
+    @Test func foldedPartialSourceWindowsGrowIndependently() {
+        let oldInternet = message(0, source: "internet")
+        var meshCanonical = (100..<585).map { message($0, source: "mesh") }
+        var visible = [oldInternet] + meshCanonical
+
+        for index in 585..<599 {
+            meshCanonical.append(message(index, source: "mesh"))
+            let independentlyBoundedCandidates = [oldInternet] + Array(meshCanonical.suffix(486))
+            visible = SNConversationTranscriptWindow.refreshing(
+                visible,
+                from: independentlyBoundedCandidates,
+                limit: 500,
+                preservingOlderEdge: false
+            )
+        }
+
+        #expect(visible.count == 500)
+        #expect(visible.first?.id == oldInternet.id)
+        #expect(visible[1].id == "mesh-0100")
+        #expect(visible.last?.id == "mesh-0598")
+    }
+
+    @Test func renderOnlyLocalSourceContinuesPastLookahead() {
+        let calls = (0..<100).map {
+            message($0, source: SNConversationTranscriptSource.callLogID)
+        }
+        let visible = Array(calls.suffix(30))
+        let initialCandidates = Array(calls.suffix(31))
+        let initialNeeds = SNConversationTranscriptWindow.sourceIDsNeedingExpansion(
+            [
+                SNConversationTranscriptSource(
+                    id: SNConversationTranscriptSource.callLogID,
+                    rows: initialCandidates,
+                    hasMore: true
+                )
+            ],
+            before: visible[0],
+            pageSize: 30
+        )
+
+        #expect(initialNeeds == [SNConversationTranscriptSource.callLogID])
+        #expect(SNConversationTranscriptWindow.localPageGrowth(
+            totalRows: 100,
+            sourceLimit: 30,
+            newestOffset: 0,
+            pageSize: 30
+        ) == 30)
+
+        let expandedCandidates = Array(calls.suffix(61))
+        let expandedNeeds = SNConversationTranscriptWindow.sourceIDsNeedingExpansion(
+            [
+                SNConversationTranscriptSource(
+                    id: SNConversationTranscriptSource.callLogID,
+                    rows: expandedCandidates,
+                    hasMore: true
+                )
+            ],
+            before: visible[0],
+            pageSize: 30
+        )
+        let page = SNConversationTranscriptWindow.nearestOlderPage(
+            in: expandedCandidates,
+            before: visible[0],
+            pageSize: 30
+        )
+
+        #expect(expandedNeeds.isEmpty)
+        #expect(page.first?.id == "$call-log-0040")
+        #expect(page.last?.id == "$call-log-0069")
+    }
+
+    @Test func partialSourceLoadReportsActualGrowthWithoutEviction() {
+        let before = Set((0..<480).map { "message-\($0)" })
+        let after = Set((0..<485).map { "message-\($0)" })
+        var result = SNConversationTranscriptLoadResult.none
+
+        result.record(before: before, after: after)
+
+        #expect(result.added)
+        #expect(result.maxSourceGrowth == 5)
+        #expect(result.movedRetainedWindow == false)
+    }
+
+    @Test func fullSourceLoadReportsActualRetainedWindowMovement() {
+        let before = Set((30..<530).map { "message-\($0)" })
+        let after = Set((0..<500).map { "message-\($0)" })
+        var result = SNConversationTranscriptLoadResult.none
+
+        result.record(before: before, after: after)
+
+        #expect(result.maxSourceGrowth == 30)
+        #expect(result.movedRetainedWindow)
     }
 
     @Test @MainActor func backgroundSourceRefreshKeepsHistoricalCursorWindow() {

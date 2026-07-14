@@ -17,13 +17,61 @@ import UIKit
 import AppKit
 #endif
 
+func snShouldPreserveCachedStickerPacks(
+    hadCachedPacks: Bool,
+    installedCoordinates: [String]?
+) -> Bool {
+    hadCachedPacks && installedCoordinates == nil
+}
+
+func snStickerPackInstalledState(
+    coordinate: String,
+    refreshedCoordinates: [String]?,
+    cachedInstalled: Bool
+) -> Bool {
+    refreshedCoordinates?.contains {
+        snNormalizeStickerPackCoordinate($0) == snNormalizeStickerPackCoordinate(coordinate)
+    } ?? cachedInstalled
+}
+
+func snFilterCachedStickerPacks(
+    _ packs: [StickerPackInfo],
+    installedCoordinates: [String]
+) -> [StickerPackInfo] {
+    let installed = Set(installedCoordinates.map(snNormalizeStickerPackCoordinate))
+    return packs.filter { installed.contains(snNormalizeStickerPackCoordinate($0.packCoordinate)) }
+}
+
+func snMergeRefreshedStickerPacks(
+    cachedPacks: [StickerPackInfo],
+    refreshedPacks: [StickerPackInfo],
+    installedCoordinates: [String]
+) -> [StickerPackInfo] {
+    let cachedByCoordinate = Dictionary(
+        cachedPacks.map { (snNormalizeStickerPackCoordinate($0.packCoordinate), $0) },
+        uniquingKeysWith: { first, _ in first }
+    )
+    let refreshedByCoordinate = Dictionary(
+        refreshedPacks.map { (snNormalizeStickerPackCoordinate($0.packCoordinate), $0) },
+        uniquingKeysWith: { _, latest in latest }
+    )
+    var added = Set<String>()
+    return installedCoordinates.compactMap { coordinate in
+        let key = snNormalizeStickerPackCoordinate(coordinate)
+        guard added.insert(key).inserted else { return nil }
+        return refreshedByCoordinate[key] ?? cachedByCoordinate[key]
+    }
+}
+
 struct SonarEmojiPickerView: View {
     let onEmoji: (String) -> Void
     let onSticker: (StickerInfo, String) -> Void
     let loadStickerPack: (String, String, [String]) async -> StickerPackInfo?
     let loadStickerImage: (String, String) async -> Data?
-    let fetchInstalledPacks: () async -> [String]
+    let fetchInstalledPacks: () async -> [String]?
     let onClose: () -> Void
+
+    @Binding var stickerPacks: [StickerPackInfo]
 
     @State private var tab = 0
     @State private var search = ""
@@ -71,6 +119,7 @@ struct SonarEmojiPickerView: View {
             case 0: emojiTab
             case 1: placeholderTab("GIF search coming soon")
             default: StickerTabContent(
+                packs: $stickerPacks,
                 onSticker: onSticker,
                 loadPack: loadStickerPack,
                 loadImage: loadStickerImage,
@@ -180,26 +229,19 @@ struct SonarEmojiPickerView: View {
 
 // MARK: - Sticker tab
 
-// Default kind-30031 pack when the user has no installed packs (10031).
-// Older kind-30030 publishes for this Signal pack id are not used.
-// https://sonarprivacy.xyz/docs/#SONAR-STICKERS
-private let testPackAuthor = "7215b2db8754494fd3452b7f2d28b56e23863b95446bf68d79f980a7ad5ec7cd"
-private let testPackId = "signal-8fa42aa13ec8f0efebe4b038f41afbd1"
-private let testPackRelays = ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net"]
-
 private struct StickerTabContent: View {
+    @Binding var packs: [StickerPackInfo]
     let onSticker: (StickerInfo, String) -> Void
     let loadPack: (String, String, [String]) async -> StickerPackInfo?
     let loadImage: (String, String) async -> Data?
-    let fetchInstalledPacks: () async -> [String]
+    let fetchInstalledPacks: () async -> [String]?
 
-    @State private var packs: [StickerPackInfo] = []
     @State private var loading = true
     @State private var error: String?
 
     var body: some View {
         Group {
-            if loading {
+            if loading && packs.isEmpty {
                 VStack(spacing: 8) {
                     Spacer()
                     ProgressView()
@@ -246,6 +288,20 @@ private struct StickerTabContent: View {
                     .padding(.horizontal, 8)
                     .padding(.bottom, 8)
                 }
+            } else {
+                VStack(spacing: 8) {
+                    Spacer()
+                    Text("No sticker packs installed")
+                        .font(SonarTheme.uiFont(size: 14, weight: .semibold))
+                        .foregroundColor(SonarTheme.text)
+                    Text("Install a pack from a shared sticker link to use it here.")
+                        .font(SonarTheme.uiFont(size: 12))
+                        .foregroundColor(SonarTheme.text3)
+                        .multilineTextAlignment(.center)
+                    Spacer()
+                }
+                .padding(.horizontal, 24)
+                .frame(maxWidth: .infinity)
             }
         }
         .task {
@@ -254,24 +310,46 @@ private struct StickerTabContent: View {
     }
 
     private func loadPacks() async {
-        let coordinates = await fetchInstalledPacks()
-        let toFetch = coordinates.isEmpty ? ["30031:\(testPackAuthor):\(testPackId)"] : coordinates
+        // SNComposer owns the loaded packs, so closing/reopening the tray can
+        // paint immediately while app-level caches refresh metadata behind it.
+        let hadCachedPacks = !packs.isEmpty
+        if hadCachedPacks {
+            loading = false
+        }
+        let installedCoordinates = await fetchInstalledPacks()
+        guard let coordinates = installedCoordinates else {
+            if !snShouldPreserveCachedStickerPacks(
+                hadCachedPacks: hadCachedPacks,
+                installedCoordinates: installedCoordinates
+            ) {
+                error = "Failed to load sticker packs"
+            }
+            loading = false
+            return
+        }
+        packs = snFilterCachedStickerPacks(packs, installedCoordinates: coordinates)
         var loaded: [StickerPackInfo] = []
-        for coord in toFetch {
+        for coord in coordinates {
             let parts = coord.split(separator: ":", maxSplits: 2).map(String.init)
             guard parts.count == 3 else { continue }
-            let relays = coord.contains(testPackAuthor) ? testPackRelays : []
-            if let p = await loadPack(parts[1], parts[2], relays), !p.stickers.isEmpty {
+            if let p = await loadPack(parts[1], parts[2], []), !p.stickers.isEmpty {
                 loaded.append(p)
             }
         }
-        if loaded.isEmpty {
-            if let fallback = await loadPack(testPackAuthor, testPackId, testPackRelays) {
-                loaded.append(fallback)
-            }
+        let merged = snMergeRefreshedStickerPacks(
+            cachedPacks: packs,
+            refreshedPacks: loaded,
+            installedCoordinates: coordinates
+        )
+        if !merged.isEmpty {
+            packs = merged
+            error = nil
+        } else if coordinates.isEmpty {
+            packs = []
+            error = nil
+        } else if packs.isEmpty {
+            error = "Failed to load sticker packs"
         }
-        packs = loaded
-        if loaded.isEmpty { self.error = "Failed to load sticker packs" }
         loading = false
     }
 }

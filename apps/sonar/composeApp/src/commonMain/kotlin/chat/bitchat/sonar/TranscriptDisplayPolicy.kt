@@ -77,7 +77,9 @@ internal fun refreshTranscriptRows(
     newest: List<SonarMsg>,
     pinnedToOlderEdge: Boolean,
     retainedRows: Int = TRANSCRIPT_RETAINED_ROWS,
+    pinOlderEdgeAtCapacity: Boolean = false,
 ): List<SonarMsg> {
+    if (pinOlderEdgeAtCapacity) return prependTranscriptRows(existing, newest, retainedRows)
     if (!pinnedToOlderEdge) return mergeTranscriptRows(existing, newest, retainedRows)
     val retainedIds = existing.mapTo(hashSetOf()) { it.id }
     return mergeTranscriptRows(existing, newest.filter { it.id in retainedIds }, retainedRows)

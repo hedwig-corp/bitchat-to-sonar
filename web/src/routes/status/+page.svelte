@@ -16,6 +16,7 @@
 		worstServiceState
 	} from '$lib/status-data.js';
 	import { fetchStatusFromNostr, isStatusFeedConfigured } from '$lib/status-nostr.js';
+	import { fetchIncidentsFromNostr } from '$lib/status-incidents.js';
 
 	/** @typedef {import('$lib/status-data.js').StatusService} StatusService */
 	/** @typedef {import('$lib/status-data.js').StatusIncident} StatusIncident */
@@ -34,6 +35,8 @@
 	let relays = [];
 	/** @type {StatusIncident[]} */
 	let incidents = [];
+
+	const INCIDENT_DAYS = 2;
 
 	/** @type {'waiting' | 'nostr'} */
 	let dataSource = 'waiting';
@@ -236,6 +239,12 @@
 			}
 			dataSource = 'nostr';
 			refreshUpdatedLabel();
+		});
+		fetchIncidentsFromNostr(INCIDENT_DAYS).then((/** @type {StatusIncident[]} */ hist) => {
+			if (hist.length > 0) {
+				incidents = hist;
+				refreshUpdatedLabel();
+			}
 		});
 	});
 </script>

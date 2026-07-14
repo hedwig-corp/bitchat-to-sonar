@@ -3,6 +3,7 @@
   import { base } from '$app/paths';
   import SonarMark from '$lib/components/SonarMark.svelte';
   import { SONAR_BLOG } from '$lib/blog-content.js';
+  import { fetchPostsFromNostr } from '$lib/blog-nostr.js';
   import { renderMarkdown } from '$lib/markdown.js';
   import { DOWNLOAD_HREF } from '$lib/links.js';
 
@@ -13,9 +14,12 @@
   // (web/src/lib/blog-content.js), so the list renders an empty-state card the
   // design does not need — same card/hairline language as the post grid.
 
-  const posts = SONAR_BLOG.posts;
-  const feature = posts.find((p) => p.feature) ?? posts[0] ?? null;
-  const rest = posts.filter((p) => p !== feature);
+  // Posts render from the static list first (instant, offline-safe), then the
+  // live NIP-23 feed replaces them on mount if it delivers anything. Reactive so
+  // the list/article views update once relays answer.
+  let posts = $state(SONAR_BLOG.posts);
+  const feature = $derived(posts.find((p) => p.feature) ?? posts[0] ?? null);
+  const rest = $derived(posts.filter((p) => p !== feature));
 
   let currentId = $state('');
 
@@ -72,6 +76,21 @@
     syncFromHash();
     const onHash = () => syncFromHash();
     window.addEventListener('hashchange', onHash);
+
+    // Live feed: NIP-23 posts win; static posts fill in any id the feed omits.
+    fetchPostsFromNostr()
+      .then(({ posts: live, source }) => {
+        if (source !== 'nostr' || live.length === 0) return;
+        const liveIds = new Set(live.map((p) => p.id));
+        const fallback = SONAR_BLOG.posts.filter((p) => !liveIds.has(p.id));
+        posts = [...live, ...fallback];
+        // A hash that named a post only present in the live feed can now resolve.
+        syncFromHash();
+      })
+      .catch(() => {
+        /* keep the static fallback on any failure */
+      });
+
     return () => window.removeEventListener('hashchange', onHash);
   });
 </script>

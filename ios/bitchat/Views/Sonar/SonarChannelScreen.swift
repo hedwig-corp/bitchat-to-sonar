@@ -121,6 +121,7 @@ struct SonarChannelScreen: View {
                 },
                 loadStickerImage: { await store.stickerImageData(url: $0, expectedSha256: $1) },
                 fetchInstalledPacks: { await store.fetchInstalledPacks() },
+                cachedStickerPacks: { store.cachedStickerPacks() },
                 voiceEnabled: false
             )
         }
@@ -137,7 +138,11 @@ struct SonarChannelScreen: View {
                     uninstallPack: { await store.uninstallStickerPack(coordinate: $0) },
                     isInstalled: { packCoord in
                         let installed = await store.fetchInstalledPacks()
-                        return installed.contains(where: { $0.lowercased() == packCoord.lowercased() })
+                        return snStickerPackInstalledState(
+                            coordinate: packCoord,
+                            refreshedCoordinates: installed,
+                            cachedInstalled: store.isStickerPackInstalled(packCoord)
+                        )
                     },
                     onClose: { previewPackCoordinate = nil }
                 )

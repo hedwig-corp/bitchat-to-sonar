@@ -123,6 +123,7 @@ final class SonarPushRegistration: @unchecked Sendable {
             self.inFlightWebhookMarker = nil
             self.inFlightWebhookStartedAt = nil
             self.inFlightWebhookGeneration &+= 1
+            self.sonarNode = nil
         }
         // Force a fresh subscribe next time (e.g. after a wallet/seed change).
         UserDefaults.standard.removeObject(forKey: Self.webhookMarkerKey)
@@ -142,6 +143,15 @@ final class SonarPushRegistration: @unchecked Sendable {
             if let token = self.cachedAPNSToken {
                 self.registerTransponderIfReady(token: token)
             }
+        }
+    }
+
+    /// Release the core node when the owning Marmot session is erased. The core
+    /// cache generation guard also rejects late writes, but retaining a wiped
+    /// session here would keep its runtime and other sensitive state alive.
+    func clearSonarNode() {
+        queue.sync {
+            self.sonarNode = nil
         }
     }
 

@@ -164,6 +164,34 @@ class TranscriptDisplayPolicyTest {
         )
         assertEquals("live", refreshed.last().id)
         assertEquals(486, refreshed.size)
+
+        val filled = refreshTranscriptRows(
+            existing = refreshed,
+            newest = (486 until 500).map { message("live-$it", it.toLong()) },
+            pinnedToOlderEdge = false,
+        )
+        assertEquals(500, filled.size)
+        assertTrue(shouldPinOlderTranscriptEdge(filled.size))
+    }
+
+    @Test
+    fun batchedLiveRowsCannotEvictAnchorWhileCrossingRetainedBudget() {
+        val historical = (0 until 499).map { message("internet-$it", it.toLong()) }
+        val firstLive = message("mesh-499", 499)
+        val excessLive = message("mesh-500", 500)
+
+        val filled = refreshTranscriptRows(
+            existing = historical,
+            newest = historical + firstLive + excessLive,
+            pinnedToOlderEdge = false,
+            retainedRows = 500,
+            pinOlderEdgeAtCapacity = true,
+        )
+
+        assertEquals(500, filled.size)
+        assertEquals("internet-0", filled.first().id)
+        assertEquals(firstLive.id, filled.last().id)
+        assertFalse(filled.any { it.id == excessLive.id })
     }
 
     @Test

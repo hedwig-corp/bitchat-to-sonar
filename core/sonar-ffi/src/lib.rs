@@ -808,16 +808,27 @@ impl SonarNode {
         let expected_sha256 = expected_sha256.to_ascii_lowercase();
         sonar_stickers::validate_sha256_hex(&expected_sha256)
             .map_err(|e| SonarFfiError::InvalidInput(format!("bad sticker sha256: {e}")))?;
-        let bytes = self
-            .runtime
-            .block_on(sonar_core::client::http_get_public(&url))?;
-        let actual_sha256 = sonar_stickers::sha256_hex(&bytes);
-        if actual_sha256 != expected_sha256 {
-            return Err(SonarFfiError::InvalidInput(format!(
-                "sticker image sha256 mismatch: expected {expected_sha256}, got {actual_sha256}"
-            )));
-        }
-        Ok(bytes)
+        self.runtime
+            .block_on(self.client.fetch_sticker_image(&url, &expected_sha256))
+            .map_err(Into::into)
+    }
+
+    /// Return verified local bytes only when the latest locally cached pack
+    /// definition authorizes the exact sticker reference. Never contacts relays
+    /// or HTTP; `None` is an ordinary cache or validation miss.
+    pub fn cached_sticker_image_for_ref(
+        &self,
+        pack_coordinate: String,
+        shortcode: String,
+        plaintext_sha256: String,
+    ) -> FfiResult<Option<Vec<u8>>> {
+        let pack = sonar_stickers::PackAddress::parse(&pack_coordinate)
+            .map_err(|e| SonarFfiError::InvalidInput(format!("bad pack coordinate: {e}")))?;
+        let sticker_ref = sonar_stickers::StickerRef::new(pack, shortcode, plaintext_sha256)
+            .map_err(|e| SonarFfiError::InvalidInput(format!("bad sticker ref: {e}")))?;
+        self.client
+            .cached_sticker_image_for_ref(&sticker_ref)
+            .map_err(Into::into)
     }
 
     pub fn fetch_installed_packs(&self) -> FfiResult<Vec<String>> {
@@ -1883,6 +1894,9 @@ pub fn mesh_parse_announce(packet_bytes: Vec<u8>) -> Option<MeshAnnounceInfo> {
         return None;
     }
     let announce = mesh::Announce::decode(&packet.payload)?;
+    if mesh::peer_id_from_noise_key(&announce.noise_public_key) != hex::encode(packet.sender_id) {
+        return None;
+    }
     if !mesh::verify_packet(&packet, &announce.signing_public_key) {
         return None;
     }
@@ -1906,6 +1920,28 @@ pub fn mesh_decode_packet(packet_bytes: Vec<u8>) -> Option<MeshPacketInfo> {
         payload: p.payload,
         has_signature: p.signature.is_some(),
     })
+}
+
+/// Decode a Sonar discovery/profile announce only when its Ed25519 signature
+/// verifies against the signing key from that sender's verified identity
+/// announce. The full wire packet is required because the signature covers the
+/// packet header and payload (with TTL canonicalized to zero).
+#[uniffi::export]
+pub fn mesh_parse_verified_sonar_announce(
+    packet_bytes: Vec<u8>,
+    signing_public_key_hex: String,
+) -> Option<Vec<u8>> {
+    let signing_public_key = hex::decode(signing_public_key_hex).ok()?;
+    if signing_public_key.len() != 32 {
+        return None;
+    }
+    let packet = mesh::Packet::decode(&packet_bytes)?;
+    if packet.type_ != mesh::msg_type::SONAR_ANNOUNCE
+        || !mesh::verify_packet(&packet, &signing_public_key)
+    {
+        return None;
+    }
+    Some(packet.payload)
 }
 
 /// Build a directed packet of `packet_type` (e.g. 0x10 handshake / 0x11
@@ -2359,6 +2395,79 @@ fn sticker_pack_info(pack: sonar_stickers::StickerPack) -> StickerPackInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mesh_announce_requires_sender_derived_from_noise_key() {
+        let seed_hex = "11".repeat(32);
+        let noise_public_key = vec![0x22; 32];
+        let valid_sender = mesh::peer_id_from_noise_key(&noise_public_key);
+        let valid = mesh_build_announce(
+            seed_hex.clone(),
+            valid_sender,
+            "alice".into(),
+            hex::encode(&noise_public_key),
+            7,
+            123,
+        )
+        .expect("announce builds");
+        assert!(mesh_parse_announce(valid).is_some());
+
+        let forged = mesh_build_announce(
+            seed_hex,
+            "0000000000000000".into(),
+            "mallory".into(),
+            hex::encode(noise_public_key),
+            7,
+            123,
+        )
+        .expect("self-signed forged announce builds");
+        assert!(mesh_parse_announce(forged).is_none());
+    }
+
+    #[test]
+    fn verified_sonar_announce_rejects_forgery_and_accepts_relayed_ttl() {
+        let seed_hex = "33".repeat(32);
+        let signing_public_key = mesh_signing_public_key(seed_hex.clone()).expect("public key");
+        let payload = b"npub profile".to_vec();
+        let packet = mesh_build_signed_packet(
+            seed_hex,
+            mesh::msg_type::SONAR_ANNOUNCE,
+            "0102030405060708".into(),
+            String::new(),
+            7,
+            456,
+            payload.clone(),
+        )
+        .expect("signed Sonar announce builds");
+
+        assert_eq!(
+            mesh_parse_verified_sonar_announce(packet.clone(), signing_public_key.clone()),
+            Some(payload)
+        );
+
+        let mut relayed = packet.clone();
+        relayed[2] = 6;
+        assert!(mesh_parse_verified_sonar_announce(relayed, signing_public_key.clone()).is_some());
+
+        let wrong_key = mesh_signing_public_key("44".repeat(32)).expect("other public key");
+        assert!(mesh_parse_verified_sonar_announce(packet.clone(), wrong_key).is_none());
+
+        let mut decoded = mesh::Packet::decode(&packet).expect("packet decodes");
+        decoded.payload[0] ^= 0x01;
+        let tampered = decoded.encode().expect("tampered packet encodes");
+        assert!(mesh_parse_verified_sonar_announce(tampered, signing_public_key.clone()).is_none());
+
+        let unsigned = mesh_build_packet(
+            mesh::msg_type::SONAR_ANNOUNCE,
+            "0102030405060708".into(),
+            String::new(),
+            7,
+            456,
+            b"unsigned".to_vec(),
+        )
+        .expect("unsigned packet builds");
+        assert!(mesh_parse_verified_sonar_announce(unsigned, signing_public_key).is_none());
+    }
 
     #[test]
     fn identity_roundtrip() {

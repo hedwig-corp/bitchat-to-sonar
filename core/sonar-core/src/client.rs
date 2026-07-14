@@ -7,11 +7,14 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+use futures_util::future::{BoxFuture, Shared};
+use futures_util::FutureExt;
 use mdk_core::prelude::*;
 use nostr::prelude::*;
 use nostr_blossom::prelude::*;
@@ -19,8 +22,9 @@ use nostr_sdk::{Client, RelayPoolNotification, RelayStatus};
 use serde::{Deserialize, Serialize};
 
 use sonar_stickers::{
-    build_installed_packs_tags, parse_installed_pack_list, parse_pack_event, InstalledPackList,
-    PackAddress, StickerPack, StickerRef, STICKER_PACK_KIND, USER_STICKER_PACKS_KIND,
+    build_installed_packs_tags, parse_installed_pack_list, parse_pack_event, sha256_hex,
+    validate_sha256_hex, InstalledPackList, PackAddress, StickerPack, StickerRef,
+    STICKER_PACK_KIND, USER_STICKER_PACKS_KIND,
 };
 
 use crate::conversation_index::{
@@ -38,6 +42,10 @@ use crate::push::{push_token_cache_path_for_db, wipe_push_token_cache_for_db, Pu
 use crate::sonar_descriptor::{
     descriptor_d_tags, descriptor_events, descriptor_tags, parse_descriptor_event, SonarDescriptor,
     SONAR_DESCRIPTOR_KIND, SONAR_META_DESCRIPTOR_D_TAG,
+};
+use crate::sticker_cache::{
+    wipe_sticker_cache_for_db, StickerCache, MAX_STICKER_CACHE_BYTES,
+    STICKER_CACHE_PREFETCH_IMAGE_LIMIT,
 };
 use crate::{Error, Result};
 
@@ -73,6 +81,8 @@ const MEDIA_DOWNLOAD_ATTEMPTS: usize = 3;
 const MEDIA_DOWNLOAD_RETRY_DELAY: Duration = Duration::from_millis(350);
 const MEDIA_DOWNLOAD_CANCEL_POLL: Duration = Duration::from_millis(100);
 const MEDIA_DOWNLOAD_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+const STICKER_PREFETCH_CONCURRENCY: usize = 4;
+const STICKER_PREFETCH_DOWNLOAD_BYTES: usize = MAX_STICKER_CACHE_BYTES;
 const SONAR_DIRECT_DM_DESCRIPTION: &str = "sonar.direct-dm.v1";
 
 /// Shared HTTP client for Blossom media downloads. Built once so every blob
@@ -105,7 +115,16 @@ fn media_download_cancelled(observer: Option<&dyn MediaDownloadObserver>) -> boo
     observer.is_some_and(MediaDownloadObserver::is_cancelled)
 }
 
+#[cfg(test)]
 async fn http_get(url: &str, observer: Option<&dyn MediaDownloadObserver>) -> Result<Vec<u8>> {
+    http_get_with_limit_observer(url, MAX_MEDIA_DOWNLOAD_BYTES, observer).await
+}
+
+async fn http_get_with_limit_observer(
+    url: &str,
+    max_bytes: usize,
+    observer: Option<&dyn MediaDownloadObserver>,
+) -> Result<Vec<u8>> {
     if media_download_cancelled(observer) {
         return Err(Error::MediaDownloadCancelled);
     }
@@ -129,9 +148,9 @@ async fn http_get(url: &str, observer: Option<&dyn MediaDownloadObserver>) -> Re
     }
     let total = resp.content_length();
     if let Some(len) = total {
-        if len as usize > MAX_MEDIA_DOWNLOAD_BYTES {
+        if len > max_bytes as u64 {
             return Err(Error::Http(format!(
-                "media too large: {len} bytes (cap {MAX_MEDIA_DOWNLOAD_BYTES})"
+                "media too large: {len} bytes (cap {max_bytes})"
             )));
         }
     }
@@ -154,7 +173,7 @@ async fn http_get(url: &str, observer: Option<&dyn MediaDownloadObserver>) -> Re
             }
         };
         let Some(chunk) = chunk else { break };
-        if out.len() + chunk.len() > MAX_MEDIA_DOWNLOAD_BYTES {
+        if chunk.len() > max_bytes.saturating_sub(out.len()) {
             return Err(Error::Http("media exceeds size cap".into()));
         }
         out.extend_from_slice(&chunk);
@@ -177,12 +196,402 @@ pub async fn http_get_public(url: &str) -> Result<Vec<u8>> {
     http_get_with_retries(url, None).await
 }
 
+#[derive(Clone, Debug)]
+struct StickerImageFetchOutcome {
+    bytes: Vec<u8>,
+    source: &'static str,
+    cache_read_us: u64,
+    download_us: u64,
+    verify_us: u64,
+    cache_write_us: u64,
+}
+
+async fn fetch_sticker_image_with_cache(
+    sticker_cache: &StickerCache,
+    url: &str,
+    expected_sha256: &str,
+    max_download_bytes: usize,
+) -> Result<StickerImageFetchOutcome> {
+    let expected = expected_sha256.to_ascii_lowercase();
+    validate_sha256_hex(&expected).map_err(|e| Error::Http(format!("bad sticker sha256: {e}")))?;
+    let cache_started = Instant::now();
+    match sticker_cache.read(&expected) {
+        Ok(Some(cached)) => {
+            return Ok(StickerImageFetchOutcome {
+                bytes: cached,
+                source: "disk",
+                cache_read_us: cache_started.elapsed().as_micros() as u64,
+                download_us: 0,
+                verify_us: 0,
+                cache_write_us: 0,
+            });
+        }
+        Ok(None) => {}
+        Err(err) => {
+            tracing::debug!(%err, "sticker cache read failed; falling back to HTTPS");
+        }
+    }
+    if !url.starts_with("https://") {
+        return Err(Error::Http("sticker URL must be HTTPS".into()));
+    }
+    let download_started = Instant::now();
+    let bytes = http_get_with_retries_limit(url, max_download_bytes).await?;
+    let download_us = download_started.elapsed().as_micros() as u64;
+    let verify_started = Instant::now();
+    let actual = sha256_hex(&bytes);
+    let verify_us = verify_started.elapsed().as_micros() as u64;
+    if actual != expected {
+        return Err(Error::Http(format!(
+            "sticker image sha256 mismatch: expected {expected}, got {actual}"
+        )));
+    }
+    let cache_write_started = Instant::now();
+    match sticker_cache.write(&expected, &bytes) {
+        Ok(false) => {
+            return Err(Error::Storage("sticker cache session invalidated".into()));
+        }
+        Ok(true) => {}
+        Err(err) => {
+            // The cache is best-effort. Rendering verified bytes should still
+            // succeed when storage is temporarily unavailable.
+            tracing::debug!(%err, "sticker cache write failed");
+        }
+    }
+    Ok(StickerImageFetchOutcome {
+        bytes,
+        source: "network",
+        download_us,
+        verify_us,
+        cache_write_us: cache_write_started.elapsed().as_micros() as u64,
+        cache_read_us: 0,
+    })
+}
+
+#[derive(Clone, Debug)]
+enum SharedStickerFetchError {
+    InvalidInput(String),
+    Storage(String),
+    Http(String),
+    RelayFetch(String),
+    NoRelayConnected,
+    Other(String),
+}
+
+impl SharedStickerFetchError {
+    fn from_error(error: Error) -> Self {
+        match error {
+            Error::InvalidInput(message) => Self::InvalidInput(message),
+            Error::Storage(message) => Self::Storage(message),
+            Error::Http(message) => Self::Http(message),
+            Error::RelayFetch(message) => Self::RelayFetch(message),
+            Error::NoRelayConnected => Self::NoRelayConnected,
+            other => Self::Other(other.to_string()),
+        }
+    }
+
+    fn into_error(self) -> Error {
+        match self {
+            Self::InvalidInput(message) => Error::InvalidInput(message),
+            Self::Storage(message) => Error::Storage(message),
+            Self::Http(message) => Error::Http(message),
+            Self::RelayFetch(message) => Error::RelayFetch(message),
+            Self::NoRelayConnected => Error::NoRelayConnected,
+            Self::Other(message) => Error::RelayFetch(message),
+        }
+    }
+}
+
+type SharedStickerFetchResult<T> = std::result::Result<Arc<T>, SharedStickerFetchError>;
+type SharedStickerFetchFuture<T> = Shared<BoxFuture<'static, SharedStickerFetchResult<T>>>;
+type SharedStickerFetchGates<T> =
+    Arc<tokio::sync::Mutex<HashMap<String, Weak<SharedStickerFetchFuture<T>>>>>;
+
+async fn shared_sticker_fetch<T, F>(
+    gates: &SharedStickerFetchGates<T>,
+    key: String,
+    fetch: F,
+) -> (Result<Arc<T>>, bool)
+where
+    T: Send + Sync + 'static,
+    F: Future<Output = Result<T>> + Send + 'static,
+{
+    let (future, reused) = {
+        let mut gates = gates.lock().await;
+        if let Some(future) = gates.get(&key).and_then(Weak::upgrade) {
+            (future, true)
+        } else {
+            // Weak values bound the table to requests that are actually in
+            // flight. `Shared` lets every follower receive the same success or
+            // error, including verified bytes that could not be persisted.
+            gates.retain(|_, future| future.strong_count() > 0);
+            let future = Arc::new(
+                fetch
+                    .map(|result| {
+                        result
+                            .map(Arc::new)
+                            .map_err(SharedStickerFetchError::from_error)
+                    })
+                    .boxed()
+                    .shared(),
+            );
+            gates.insert(key, Arc::downgrade(&future));
+            (future, false)
+        }
+    };
+    let result = future
+        .as_ref()
+        .clone()
+        .await
+        .map_err(SharedStickerFetchError::into_error);
+    // The shared future retains its completed Arc result. Drop our future
+    // handle before handing the result back so an uncontended caller can
+    // recover the original buffer without a full allocation/copy.
+    drop(future);
+    (result, reused)
+}
+
+type StickerImageFetchGates = SharedStickerFetchGates<StickerImageFetchOutcome>;
+
+#[derive(Clone, Debug)]
+struct StickerPackFetchOutcome {
+    pack: StickerPack,
+    source: &'static str,
+}
+
+type StickerPackFetchGates = SharedStickerFetchGates<StickerPackFetchOutcome>;
+
+#[derive(Debug)]
+struct StickerPrefetchCancellation {
+    cancelled: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl StickerPrefetchCancellation {
+    fn new() -> Self {
+        Self {
+            cancelled: AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    async fn cancelled(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+type StickerPrefetchRegistry = Arc<Mutex<HashMap<String, Arc<StickerPrefetchCancellation>>>>;
+
+struct StickerPrefetchRegistration {
+    coordinate: String,
+    cancellation: Arc<StickerPrefetchCancellation>,
+    registry: StickerPrefetchRegistry,
+}
+
+impl Drop for StickerPrefetchRegistration {
+    fn drop(&mut self) {
+        if let Ok(mut registry) = self.registry.lock() {
+            if registry
+                .get(&self.coordinate)
+                .is_some_and(|current| Arc::ptr_eq(current, &self.cancellation))
+            {
+                registry.remove(&self.coordinate);
+            }
+        }
+    }
+}
+
+async fn fetch_sticker_pack_singleflight(
+    gates: &StickerPackFetchGates,
+    sticker_cache: &StickerCache,
+    nostr: &Client,
+    default_relays: &[RelayUrl],
+    author_pubkey_hex: &str,
+    identifier: &str,
+    relay_urls: &[String],
+    coordinate: &str,
+) -> Result<(Arc<StickerPackFetchOutcome>, bool)> {
+    let cache = sticker_cache.clone();
+    let nostr = nostr.clone();
+    let default_relays = default_relays.to_vec();
+    let author_pubkey_hex = author_pubkey_hex.to_owned();
+    let identifier = identifier.to_owned();
+    let relay_urls = relay_urls.to_vec();
+    let coordinate_owned = coordinate.to_owned();
+    let mut source_relays = if relay_urls.is_empty() {
+        default_relays.iter().map(ToString::to_string).collect()
+    } else {
+        relay_urls.to_vec()
+    };
+    source_relays.sort_unstable();
+    source_relays.dedup();
+    let fetch_key = format!("{}\0{}", coordinate, source_relays.join("\0"));
+    let (result, reused) = shared_sticker_fetch(gates, fetch_key, async move {
+        match SonarClient::fetch_sticker_pack_with_client(
+            &nostr,
+            &default_relays,
+            &author_pubkey_hex,
+            &identifier,
+            &relay_urls,
+        )
+        .await
+        {
+            Ok(pack) => {
+                match cache.remember_validated_pack(&pack) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Err(Error::Storage("sticker cache session invalidated".into()));
+                    }
+                    Err(err) => tracing::debug!(
+                        %err,
+                        coordinate = %pack.address,
+                        "sticker pack metadata cache write failed"
+                    ),
+                }
+                Ok(StickerPackFetchOutcome {
+                    pack,
+                    source: "network",
+                })
+            }
+            Err(network_err) => match cache.read_validated_pack(&coordinate_owned) {
+                Ok(Some(pack)) => {
+                    tracing::debug!(
+                        err = %network_err,
+                        coordinate = %coordinate_owned,
+                        "sticker pack relay refresh failed; using validated local metadata"
+                    );
+                    Ok(StickerPackFetchOutcome {
+                        pack,
+                        source: "fallback_disk",
+                    })
+                }
+                Ok(None) => Err(network_err),
+                Err(cache_err) => {
+                    tracing::debug!(
+                        err = %cache_err,
+                        coordinate = %coordinate_owned,
+                        "sticker pack metadata fallback read failed"
+                    );
+                    Err(network_err)
+                }
+            },
+        }
+    })
+    .await;
+    Ok((result?, reused))
+}
+
+async fn fetch_sticker_image_singleflight(
+    gates: &StickerImageFetchGates,
+    sticker_cache: &StickerCache,
+    url: &str,
+    expected_sha256: &str,
+    max_download_bytes: usize,
+    purpose: &'static str,
+) -> Result<Vec<u8>> {
+    let started = Instant::now();
+    let key = format!("{}\0{}", expected_sha256.to_ascii_lowercase(), url);
+    let cache = sticker_cache.clone();
+    let url = url.to_owned();
+    let expected_sha256 = expected_sha256.to_owned();
+    let (result, reused) = shared_sticker_fetch(gates, key, async move {
+        fetch_sticker_image_with_cache(&cache, &url, &expected_sha256, max_download_bytes).await
+    })
+    .await;
+    let shared_outcome = result?;
+    let outcome =
+        Arc::try_unwrap(shared_outcome).unwrap_or_else(|outcome| outcome.as_ref().clone());
+    let StickerImageFetchOutcome {
+        bytes,
+        source,
+        cache_read_us,
+        download_us,
+        verify_us,
+        cache_write_us,
+    } = outcome;
+    if reused {
+        tracing::debug!(
+            purpose,
+            source = "shared",
+            bytes = bytes.len(),
+            total_us = started.elapsed().as_micros() as u64,
+            "SONAR_BENCH sticker_image_fetch"
+        );
+    } else if source == "disk" {
+        tracing::debug!(
+            purpose,
+            source = "disk",
+            bytes = bytes.len(),
+            cache_read_us,
+            total_us = started.elapsed().as_micros() as u64,
+            "SONAR_BENCH sticker_image_fetch"
+        );
+    } else {
+        tracing::debug!(
+            purpose,
+            source = "network",
+            bytes = bytes.len(),
+            download_us,
+            verify_us,
+            cache_write_us,
+            total_us = started.elapsed().as_micros() as u64,
+            "SONAR_BENCH sticker_image_fetch"
+        );
+    }
+    Ok(bytes)
+}
+
+type StickerPrefetchTaskResult = (String, Result<Vec<u8>>);
+type StickerPrefetchJoinResult =
+    std::result::Result<StickerPrefetchTaskResult, tokio::task::JoinError>;
+
+fn log_sticker_prefetch_result(outcome: Option<StickerPrefetchJoinResult>) -> (usize, usize) {
+    match outcome {
+        Some(Ok((url, Err(err)))) => {
+            tracing::debug!(%err, %url, "sticker prefetch: image failed");
+            (0, 1)
+        }
+        Some(Err(err)) => {
+            tracing::debug!(%err, "sticker prefetch: image task failed");
+            (0, 1)
+        }
+        Some(Ok((_, Ok(_)))) => (1, 0),
+        None => (0, 0),
+    }
+}
+
 async fn http_get_with_retries(
     url: &str,
     observer: Option<&dyn MediaDownloadObserver>,
 ) -> Result<Vec<u8>> {
+    http_get_with_retries_limit_observer(url, MAX_MEDIA_DOWNLOAD_BYTES, observer).await
+}
+
+async fn http_get_with_retries_limit(url: &str, max_bytes: usize) -> Result<Vec<u8>> {
+    http_get_with_retries_limit_observer(url, max_bytes, None).await
+}
+
+async fn http_get_with_retries_limit_observer(
+    url: &str,
+    max_bytes: usize,
+    observer: Option<&dyn MediaDownloadObserver>,
+) -> Result<Vec<u8>> {
     for attempt in 1..=MEDIA_DOWNLOAD_ATTEMPTS {
-        match http_get(url, observer).await {
+        match http_get_with_limit_observer(url, max_bytes, observer).await {
             Ok(bytes) => return Ok(bytes),
             Err(error)
                 if attempt < MEDIA_DOWNLOAD_ATTEMPTS && retryable_media_http_error(&error) =>
@@ -799,6 +1208,17 @@ pub struct SonarClient {
     push_token_cache: PushTokenCache,
     /// Durable path for cached member push tokens (None for in-memory tests).
     push_token_cache_path: Option<PathBuf>,
+    /// Directory for content-addressed sticker image bytes (None for in-memory tests).
+    sticker_cache: StickerCache,
+    /// Per-pack and per-image single-flight gates shared by foreground and
+    /// prefetch paths. These are process-local; durable results live in
+    /// `sticker_cache` and remain identical across every host platform.
+    sticker_pack_fetch_gates: StickerPackFetchGates,
+    sticker_image_fetch_gates: StickerImageFetchGates,
+    /// Per-coordinate install prefetch cancellation. Uninstall cancels the
+    /// matching task immediately; the cache generation separately cancels all
+    /// old-session tasks during identity wipe.
+    sticker_prefetch_registry: StickerPrefetchRegistry,
     /// This device's own push registration (set after `register_push_token`).
     own_push_registration: Arc<Mutex<Option<crate::push::OwnPushRegistration>>>,
 }
@@ -836,6 +1256,7 @@ impl SonarClient {
             Some(outbox_state_path_for_db(db_path)),
             Some(invite_link_state_path_for_db(db_path)),
             Some(push_token_cache_path_for_db(db_path)),
+            StickerCache::for_db(db_path)?,
             index.map(|idx| Arc::new(Mutex::new(idx))),
         )
         .await?;
@@ -848,7 +1269,16 @@ impl SonarClient {
     pub async fn connect_in_memory(identity: Identity, relays: Vec<RelayUrl>) -> Result<Self> {
         let engine = MarmotEngine::in_memory(identity.clone());
         Self::with_engine(
-            identity, relays, engine, false, None, None, None, None, None,
+            identity,
+            relays,
+            engine,
+            false,
+            None,
+            None,
+            None,
+            None,
+            StickerCache::disabled(),
+            None,
         )
         .await
     }
@@ -862,6 +1292,7 @@ impl SonarClient {
         outbox_state_path: Option<PathBuf>,
         invite_link_state_path: Option<PathBuf>,
         push_token_cache_path: Option<PathBuf>,
+        sticker_cache: StickerCache,
         conversation_index: Option<Arc<Mutex<ConversationIndex>>>,
     ) -> Result<Self> {
         let boot_start = std::time::Instant::now();
@@ -1226,6 +1657,10 @@ impl SonarClient {
             )),
             push_token_cache,
             push_token_cache_path,
+            sticker_cache,
+            sticker_pack_fetch_gates: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            sticker_image_fetch_gates: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            sticker_prefetch_registry: Arc::new(Mutex::new(HashMap::new())),
             own_push_registration: Arc::new(Mutex::new(None)),
         };
         // Open the live Marmot subscriptions for real sessions. In-memory test
@@ -2030,6 +2465,41 @@ impl SonarClient {
         identifier: &str,
         relay_urls: &[String],
     ) -> Result<StickerPack> {
+        let coordinate = format!(
+            "30031:{}:{}",
+            author_pubkey_hex.to_ascii_lowercase(),
+            identifier
+        );
+        let started = Instant::now();
+        let (outcome, reused) = fetch_sticker_pack_singleflight(
+            &self.sticker_pack_fetch_gates,
+            &self.sticker_cache,
+            &self.nostr,
+            &self.relays,
+            author_pubkey_hex,
+            identifier,
+            relay_urls,
+            &coordinate,
+        )
+        .await?;
+        let source = if reused { "shared" } else { outcome.source };
+        tracing::debug!(
+            purpose = "foreground",
+            source,
+            stickers = outcome.pack.stickers.len(),
+            total_us = started.elapsed().as_micros() as u64,
+            "SONAR_BENCH sticker_pack_fetch"
+        );
+        Ok(outcome.pack.clone())
+    }
+
+    async fn fetch_sticker_pack_with_client(
+        nostr: &Client,
+        default_relays: &[RelayUrl],
+        author_pubkey_hex: &str,
+        identifier: &str,
+        relay_urls: &[String],
+    ) -> Result<StickerPack> {
         let author = PublicKey::from_hex(author_pubkey_hex)
             .map_err(|e| Error::InvalidInput(format!("invalid pack author pubkey: {e}")))?;
         let filter = Filter::new()
@@ -2042,20 +2512,253 @@ impl SonarClient {
             .limit(1);
 
         let relays: Vec<String> = if relay_urls.is_empty() {
-            self.relays.iter().map(|u| u.to_string()).collect()
+            default_relays.iter().map(|u| u.to_string()).collect()
         } else {
             relay_urls.to_vec()
         };
         let timeout = Duration::from_secs(10);
-        let events = self
-            .nostr
-            .fetch_events_from(relays, filter, timeout)
-            .await?;
+        let events = nostr.fetch_events_from(relays, filter, timeout).await?;
         let event = events
             .into_iter()
             .next()
             .ok_or_else(|| Error::Http("sticker pack not found on relays".into()))?;
         parse_pack_event(&event).map_err(|e| Error::Http(format!("invalid sticker pack: {e}")))
+    }
+
+    /// Download a public sticker image (HTTPS), verify SHA256, and persist to the
+    /// content-addressed disk cache when configured.
+    pub async fn fetch_sticker_image(&self, url: &str, expected_sha256: &str) -> Result<Vec<u8>> {
+        fetch_sticker_image_singleflight(
+            &self.sticker_image_fetch_gates,
+            &self.sticker_cache,
+            url,
+            expected_sha256,
+            MAX_STICKER_CACHE_BYTES,
+            "foreground",
+        )
+        .await
+    }
+
+    /// Return a verified local sticker only if the latest locally validated pack
+    /// still authorizes the exact coordinate + shortcode + plaintext hash.
+    /// Never consults relays or HTTP.
+    pub fn cached_sticker_image_for_ref(
+        &self,
+        sticker_ref: &StickerRef,
+    ) -> Result<Option<Vec<u8>>> {
+        let started = Instant::now();
+        let result = self.sticker_cache.read_validated_image(
+            &sticker_ref.pack.coordinate(),
+            &sticker_ref.shortcode,
+            &sticker_ref.plaintext_sha256,
+        );
+        match &result {
+            Ok(Some(bytes)) => tracing::debug!(
+                purpose = "foreground",
+                outcome = "hit",
+                bytes = bytes.len(),
+                total_us = started.elapsed().as_micros() as u64,
+                "SONAR_BENCH sticker_ref_cache_lookup"
+            ),
+            Ok(None) => tracing::debug!(
+                purpose = "foreground",
+                outcome = "miss",
+                bytes = 0,
+                total_us = started.elapsed().as_micros() as u64,
+                "SONAR_BENCH sticker_ref_cache_lookup"
+            ),
+            Err(err) => tracing::debug!(%err, "sticker reference cache lookup failed"),
+        }
+        result
+    }
+
+    /// Schedule bounded best-effort prefetch without holding the install/FFI
+    /// call or the host's serialized Marmot queue open on network I/O.
+    fn spawn_sticker_pack_prefetch(&self, coordinate: String) {
+        let cancellation = Arc::new(StickerPrefetchCancellation::new());
+        let registration = {
+            let mut registry = match self.sticker_prefetch_registry.lock() {
+                Ok(registry) => registry,
+                Err(_) => {
+                    tracing::debug!(coordinate, "sticker prefetch registry lock poisoned");
+                    return;
+                }
+            };
+            if let Some(previous) = registry.insert(coordinate.clone(), cancellation.clone()) {
+                previous.cancel();
+            }
+            StickerPrefetchRegistration {
+                coordinate: coordinate.clone(),
+                cancellation: cancellation.clone(),
+                registry: self.sticker_prefetch_registry.clone(),
+            }
+        };
+        let nostr = self.nostr.clone();
+        let relays = self.relays.clone();
+        let sticker_cache = self.sticker_cache.clone();
+        let sticker_pack_fetch_gates = self.sticker_pack_fetch_gates.clone();
+        let sticker_image_fetch_gates = self.sticker_image_fetch_gates.clone();
+        let _prefetch = tokio::spawn(async move {
+            let _registration = registration;
+            if cancellation.is_cancelled() {
+                return;
+            }
+            let prefetch_started = Instant::now();
+            let address = match PackAddress::parse(&coordinate) {
+                Ok(address) => address,
+                Err(err) => {
+                    tracing::debug!(%err, coordinate, "sticker prefetch: bad coordinate");
+                    return;
+                }
+            };
+            let pack_started = Instant::now();
+            let coordinate = address.coordinate();
+            let pack_fetch = fetch_sticker_pack_singleflight(
+                &sticker_pack_fetch_gates,
+                &sticker_cache,
+                &nostr,
+                &relays,
+                &address.author_pubkey_hex,
+                &address.identifier,
+                &[],
+                &coordinate,
+            );
+            tokio::pin!(pack_fetch);
+            let pack_result = loop {
+                tokio::select! {
+                    result = &mut pack_fetch => break Some(result),
+                    _ = cancellation.cancelled() => break None,
+                    _ = tokio::time::sleep(Duration::from_millis(25)) => {
+                        if !matches!(sticker_cache.session_is_current(), Ok(true)) {
+                            break None;
+                        }
+                    }
+                }
+            };
+            let (outcome, reused) = match pack_result {
+                None => return,
+                Some(result) => match result {
+                    Ok(result) => result,
+                    Err(err) => {
+                        tracing::debug!(%err, coordinate, "sticker prefetch: pack fetch failed");
+                        return;
+                    }
+                },
+            };
+            let source = if reused { "shared" } else { outcome.source };
+            let pack = outcome.pack.clone();
+            let pack_us = pack_started.elapsed().as_micros() as u64;
+            tracing::debug!(
+                purpose = "prefetch",
+                source,
+                stickers = pack.stickers.len(),
+                total_us = pack_us,
+                "SONAR_BENCH sticker_pack_fetch"
+            );
+            let mut tasks = tokio::task::JoinSet::new();
+            let mut attempted = 0usize;
+            let mut succeeded = 0usize;
+            let mut failed = 0usize;
+            let mut invalidated = false;
+            'stickers: for sticker in pack
+                .stickers
+                .into_iter()
+                .take(STICKER_CACHE_PREFETCH_IMAGE_LIMIT)
+            {
+                if cancellation.is_cancelled() {
+                    invalidated = true;
+                    break;
+                }
+                match sticker_cache.session_is_current() {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        invalidated = true;
+                        break;
+                    }
+                    Err(err) => {
+                        tracing::debug!(%err, coordinate, "sticker prefetch: cache session check failed");
+                        invalidated = true;
+                        break;
+                    }
+                }
+                while tasks.len() >= STICKER_PREFETCH_CONCURRENCY {
+                    tokio::select! {
+                        outcome = tasks.join_next() => {
+                            let counts = log_sticker_prefetch_result(outcome);
+                            succeeded += counts.0;
+                            failed += counts.1;
+                        }
+                        _ = cancellation.cancelled() => {
+                            invalidated = true;
+                            break 'stickers;
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(25)) => {
+                            if !matches!(sticker_cache.session_is_current(), Ok(true)) {
+                                invalidated = true;
+                                break 'stickers;
+                            }
+                        }
+                    }
+                }
+                attempted += 1;
+                let cache = sticker_cache.clone();
+                let image_gates = sticker_image_fetch_gates.clone();
+                tasks.spawn(async move {
+                    let url = sticker.url;
+                    let result = fetch_sticker_image_singleflight(
+                        &image_gates,
+                        &cache,
+                        &url,
+                        &sticker.sha256,
+                        STICKER_PREFETCH_DOWNLOAD_BYTES,
+                        "prefetch",
+                    )
+                    .await;
+                    (url, result)
+                });
+            }
+            if invalidated {
+                tracing::debug!(
+                    coordinate,
+                    "sticker prefetch: cache session invalidated; cancelling remaining downloads"
+                );
+                tasks.abort_all();
+            }
+            while !tasks.is_empty() {
+                if invalidated {
+                    let counts = log_sticker_prefetch_result(tasks.join_next().await);
+                    succeeded += counts.0;
+                    failed += counts.1;
+                    continue;
+                }
+                tokio::select! {
+                    outcome = tasks.join_next() => {
+                        let counts = log_sticker_prefetch_result(outcome);
+                        succeeded += counts.0;
+                        failed += counts.1;
+                    }
+                    _ = cancellation.cancelled() => {
+                        invalidated = true;
+                        tasks.abort_all();
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(25)) => {
+                        if !matches!(sticker_cache.session_is_current(), Ok(true)) {
+                            invalidated = true;
+                            tasks.abort_all();
+                        }
+                    }
+                }
+            }
+            tracing::debug!(
+                purpose = "prefetch",
+                attempted,
+                succeeded,
+                failed,
+                pack_us,
+                total_us = prefetch_started.elapsed().as_micros() as u64,
+                "SONAR_BENCH sticker_pack_prefetch_finished"
+            );
+        });
     }
 
     pub async fn fetch_installed_packs(&self) -> Result<Vec<PackAddress>> {
@@ -2090,18 +2793,27 @@ impl SonarClient {
     pub async fn install_sticker_pack(&self, coordinate: &str) -> Result<()> {
         let address = PackAddress::parse(coordinate)
             .map_err(|e| Error::Http(format!("invalid pack coordinate: {e}")))?;
+        let coordinate = address.coordinate();
         let mut packs = self.fetch_installed_packs().await?;
-        if !packs.iter().any(|p| p.coordinate() == address.coordinate()) {
+        if !packs.iter().any(|p| p.coordinate() == coordinate) {
             packs.push(address);
         }
-        self.publish_installed_packs(packs).await
+        self.publish_installed_packs(packs).await?;
+        self.spawn_sticker_pack_prefetch(coordinate);
+        Ok(())
     }
 
     pub async fn uninstall_sticker_pack(&self, coordinate: &str) -> Result<()> {
         let address = PackAddress::parse(coordinate)
             .map_err(|e| Error::Http(format!("invalid pack coordinate: {e}")))?;
+        let coordinate = address.coordinate();
+        if let Ok(registry) = self.sticker_prefetch_registry.lock() {
+            if let Some(cancellation) = registry.get(&coordinate) {
+                cancellation.cancel();
+            }
+        }
         let mut packs = self.fetch_installed_packs().await?;
-        packs.retain(|p| p.coordinate() != address.coordinate());
+        packs.retain(|p| p.coordinate() != coordinate);
         self.publish_installed_packs(packs).await
     }
 
@@ -4075,9 +4787,11 @@ impl SonarClient {
         let db_result = MarmotEngine::wipe(db_path);
         let index_result = wipe_index_for_db(db_path);
         let push_result = wipe_push_token_cache_for_db(db_path);
+        let sticker_result = wipe_sticker_cache_for_db(db_path);
         db_result?;
         index_result?;
-        push_result
+        push_result?;
+        sticker_result
     }
 
     /// MIP-05: encrypt a device push token to the transponder's public key.
@@ -4591,6 +5305,68 @@ mod tests {
         assert!(!retryable_media_http_error(&Error::Http(
             "media exceeds size cap".into()
         )));
+    }
+
+    #[test]
+    fn sticker_prefetch_download_cap_is_cacheable() {
+        let prefetch_limit = std::hint::black_box(STICKER_PREFETCH_DOWNLOAD_BYTES);
+        assert_eq!(prefetch_limit, MAX_STICKER_CACHE_BYTES);
+        assert!(prefetch_limit < MAX_MEDIA_DOWNLOAD_BYTES);
+    }
+
+    #[tokio::test]
+    async fn sticker_singleflight_shares_nonpersistent_success() {
+        let gates: SharedStickerFetchGates<Vec<u8>> =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let first_calls = calls.clone();
+        let second_calls = calls.clone();
+
+        let (first, second) = tokio::join!(
+            shared_sticker_fetch(&gates, "same-sha".into(), async move {
+                first_calls.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Ok(vec![1, 2, 3])
+            }),
+            shared_sticker_fetch(&gates, "same-sha".into(), async move {
+                second_calls.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Ok(vec![4, 5, 6])
+            }),
+        );
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_ne!(first.1, second.1);
+        assert_eq!(first.0.unwrap().as_slice(), second.0.unwrap().as_slice());
+    }
+
+    #[tokio::test]
+    async fn sticker_singleflight_shares_fetch_error() {
+        let gates: SharedStickerFetchGates<Vec<u8>> =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let first_calls = calls.clone();
+        let second_calls = calls.clone();
+
+        let (first, second) = tokio::join!(
+            shared_sticker_fetch(&gates, "same-sha".into(), async move {
+                first_calls.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Err(Error::Http("offline".into()))
+            }),
+            shared_sticker_fetch(&gates, "same-sha".into(), async move {
+                second_calls.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Err(Error::Http("unexpected retry".into()))
+            }),
+        );
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_ne!(first.1, second.1);
+        assert_eq!(
+            first.0.unwrap_err().to_string(),
+            second.0.unwrap_err().to_string()
+        );
     }
 
     #[test]

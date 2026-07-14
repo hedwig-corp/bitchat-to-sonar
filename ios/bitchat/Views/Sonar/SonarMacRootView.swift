@@ -679,7 +679,11 @@ private struct MacConversationPane: View {
                     uninstallPack: { await store.uninstallStickerPack(coordinate: $0) },
                     isInstalled: { packCoord in
                         let installed = await store.fetchInstalledPacks()
-                        return installed.contains(where: { $0.lowercased() == packCoord.lowercased() })
+                        return snStickerPackInstalledState(
+                            coordinate: packCoord,
+                            refreshedCoordinates: installed,
+                            cachedInstalled: store.isStickerPackInstalled(packCoord)
+                        )
                     },
                     onClose: { previewPackCoordinate = nil }
                 )
@@ -933,6 +937,10 @@ private struct MacConversationPane: View {
                     }
                 } else {
                     store.sendSticker(id, sticker: sticker, packCoordinate: coord)
+                    let convo = store.conversationViewState(id)
+                    Task { @MainActor in
+                        await convo.loadNewestIfNeeded()
+                    }
                 }
             },
             loadStickerPack: { author, identifier, relays in
@@ -940,6 +948,7 @@ private struct MacConversationPane: View {
             },
             loadStickerImage: { await store.stickerImageData(url: $0, expectedSha256: $1) },
             fetchInstalledPacks: { await store.fetchInstalledPacks() },
+            cachedStickerPacks: { store.cachedStickerPacks() },
             voiceEnabled: !isChannel && store.canSendMedia(id),
             onVoice: { store.sendVoiceNote(id, url: $0) }
         )

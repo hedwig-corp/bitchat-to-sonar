@@ -20,6 +20,22 @@ struct NotificationStreamAssembler {
         pendingFrameExpectedLength = 0
     }
 
+    /// Android encodes GATT values with the protocol's PKCS#7-style BLE
+    /// padding. The frame header describes the logical length, so consume the
+    /// verified pad run after extracting a frame instead of treating every pad
+    /// byte as a corrupt stream prefix.
+    private mutating func discardPadding(afterFrameLength frameLength: Int) {
+        let paddedLength = MessagePadding.optimalBlockSize(for: frameLength)
+        let paddingLength = paddedLength - frameLength
+        guard paddingLength > 0,
+              paddingLength <= Int(UInt8.max),
+              buffer.count >= paddingLength else { return }
+
+        let expected = UInt8(paddingLength)
+        guard buffer.prefix(paddingLength).allSatisfy({ $0 == expected }) else { return }
+        buffer.removeFirst(paddingLength)
+    }
+
     mutating func append(_ chunk: Data) -> (frames: [Data], droppedPrefixes: [UInt8], reset: Bool) {
         guard !chunk.isEmpty else { return ([], [], false) }
 
@@ -132,6 +148,7 @@ struct NotificationStreamAssembler {
             let frame = Data(buffer.prefix(frameLength))
             frames.append(frame)
             buffer.removeFirst(frameLength)
+            discardPadding(afterFrameLength: frameLength)
         }
 
         if !buffer.isEmpty, buffer.allSatisfy({ $0 == 0 }) {
