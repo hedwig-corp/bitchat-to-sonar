@@ -12,38 +12,62 @@ import android.media.AudioAttributes
 import android.net.Uri
 import android.os.Build
 
-/** Android `actual`: "Messages" channel with sound, vibration, and badges — parity with iOS. */
+/** Android `actual`: transport-specific channels with sound, vibration, and badges. */
 actual object Notifier {
-    private const val CHANNEL = "messages_v3"
+    private const val MESSAGE_CHANNEL = "messages_v3"
+    private const val BLE_CHANNEL = "ble_notifications_v1"
     private val LEGACY_CHANNELS = listOf("messages", "messages_v2")
 
     private val ctx: Context get() = AppContextHolder.ctx
     private fun manager() = ctx.getSystemService(NotificationManager::class.java)
-    private fun soundUri(): Uri = Uri.parse(
-        "${ContentResolver.SCHEME_ANDROID_RESOURCE}://${ctx.packageName}/${R.raw.sonar_notification}"
+    private fun soundUri(resourceId: Int): Uri = Uri.parse(
+        "${ContentResolver.SCHEME_ANDROID_RESOURCE}://${ctx.packageName}/$resourceId"
     )
 
     actual fun ensureChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val nm = manager()
             LEGACY_CHANNELS.forEach(nm::deleteNotificationChannel)
-            if (nm.getNotificationChannel(CHANNEL) == null) {
-                nm.createNotificationChannel(
-                    NotificationChannel(CHANNEL, "Messages", NotificationManager.IMPORTANCE_HIGH).apply {
-                        description = "Incoming Sonar messages"
-                        enableVibration(true)
-                        vibrationPattern = longArrayOf(0, 250, 200, 250)
-                        setSound(
-                            soundUri(),
-                            AudioAttributes.Builder()
-                                .setUsage(AudioAttributes.USAGE_NOTIFICATION)
-                                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                                .build()
-                        )
-                        setShowBadge(true)
-                    }
-                )
-            }
+            ensureChannel(
+                nm = nm,
+                id = MESSAGE_CHANNEL,
+                name = "Messages",
+                description = "Incoming Sonar messages",
+                soundResourceId = R.raw.sonar_notification,
+            )
+            ensureChannel(
+                nm = nm,
+                id = BLE_CHANNEL,
+                name = "Bluetooth notifications",
+                description = "Notifications received over Bluetooth",
+                soundResourceId = R.raw.sonar_ble_notification,
+            )
+        }
+    }
+
+    private fun ensureChannel(
+        nm: NotificationManager,
+        id: String,
+        name: String,
+        description: String,
+        soundResourceId: Int,
+    ) {
+        if (nm.getNotificationChannel(id) == null) {
+            nm.createNotificationChannel(
+                NotificationChannel(id, name, NotificationManager.IMPORTANCE_HIGH).apply {
+                    this.description = description
+                    enableVibration(true)
+                    vibrationPattern = longArrayOf(0, 250, 200, 250)
+                    setSound(
+                        soundUri(soundResourceId),
+                        AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_NOTIFICATION)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                            .build()
+                    )
+                    setShowBadge(true)
+                }
+            )
         }
     }
 
@@ -71,7 +95,7 @@ actual object Notifier {
         }
     }
 
-    actual fun notify(id: Int, title: String, body: String) {
+    actual fun notify(id: Int, title: String, body: String, sound: SonarNotificationSound) {
         if (!canNotify()) return
         val open = ctx.packageManager.getLaunchIntentForPackage(ctx.packageName)
             ?.apply { flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP }
@@ -81,7 +105,11 @@ actual object Notifier {
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
             )
         }
-        val n = Notification.Builder(ctx, CHANNEL)
+        val channel = when (sound) {
+            SonarNotificationSound.Default -> MESSAGE_CHANNEL
+            SonarNotificationSound.Ble -> BLE_CHANNEL
+        }
+        val n = Notification.Builder(ctx, channel)
             .setSmallIcon(android.R.drawable.stat_notify_chat)
             .setContentTitle(title)
             .setContentText(body)

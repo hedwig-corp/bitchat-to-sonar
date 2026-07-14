@@ -14,10 +14,18 @@ import UIKit
 import AppKit
 #endif
 
+enum SonarNotificationSound {
+    case standard
+    case ble
+}
+
 final class NotificationService {
     static let shared = NotificationService()
-    private static let notificationSound = UNNotificationSound(
+    private static let standardNotificationSound = UNNotificationSound(
         named: UNNotificationSoundName(rawValue: "sonar_notification.wav")
+    )
+    private static let bleNotificationSound = UNNotificationSound(
+        named: UNNotificationSoundName(rawValue: "sonar_ble_notification.wav")
     )
 
     /// Returns true if running in test environment (XCTest, Swift Testing, or CI)
@@ -48,13 +56,17 @@ final class NotificationService {
         body: String,
         identifier: String,
         userInfo: [String: Any]? = nil,
-        interruptionLevel: UNNotificationInterruptionLevel = .active
+        interruptionLevel: UNNotificationInterruptionLevel = .active,
+        sound: SonarNotificationSound = .standard
     ) {
         guard !isRunningTests else { return }
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
-        content.sound = Self.notificationSound
+        content.sound = switch sound {
+        case .standard: Self.standardNotificationSound
+        case .ble: Self.bleNotificationSound
+        }
         content.interruptionLevel = interruptionLevel
 
         if let userInfo = userInfo {
@@ -70,21 +82,36 @@ final class NotificationService {
         UNUserNotificationCenter.current().add(request)
     }
     
-    func sendMentionNotification(from sender: String, message: String) {
+    func sendMentionNotification(
+        from sender: String,
+        message: String,
+        sound: SonarNotificationSound = .standard
+    ) {
         let title = "You were mentioned"
         let body = "Open Sonar to read it."
         let identifier = "mention-\(UUID().uuidString)"
 
-        sendLocalNotification(title: title, body: body, identifier: identifier)
+        sendLocalNotification(title: title, body: body, identifier: identifier, sound: sound)
     }
 
-    func sendPrivateMessageNotification(from sender: String, message: String, peerID: PeerID) {
+    func sendPrivateMessageNotification(
+        from sender: String,
+        message: String,
+        peerID: PeerID,
+        sound: SonarNotificationSound = .standard
+    ) {
         let title = "New Sonar message"
         let body = "Open Sonar to read it."
         let identifier = "private-\(UUID().uuidString)"
         let userInfo = ["peerID": peerID.id, "senderName": sender]
 
-        sendLocalNotification(title: title, body: body, identifier: identifier, userInfo: userInfo)
+        sendLocalNotification(
+            title: title,
+            body: body,
+            identifier: identifier,
+            userInfo: userInfo,
+            sound: sound
+        )
     }
     
     // Geohash public chat notification with deep link to a specific geohash
@@ -106,7 +133,8 @@ final class NotificationService {
             title: title,
             body: body,
             identifier: identifier,
-            interruptionLevel: .timeSensitive
+            interruptionLevel: .timeSensitive,
+            sound: .ble
         )
     }
 }

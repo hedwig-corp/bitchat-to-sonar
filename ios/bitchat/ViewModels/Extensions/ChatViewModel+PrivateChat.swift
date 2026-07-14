@@ -891,7 +891,8 @@ extension ChatViewModel {
             NotificationService.shared.sendPrivateMessageNotification(
                 from: message.sender,
                 message: notifBody,
-                peerID: peerID
+                peerID: peerID,
+                sound: .ble
             )
         }
         

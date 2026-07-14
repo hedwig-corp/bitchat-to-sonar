@@ -10,6 +10,8 @@
 		A11D50000000000000000001 /* sonar_notification.wav in Resources */ = {isa = PBXBuildFile; fileRef = A11D50000000000000000004 /* sonar_notification.wav */; };
 		A11D50000000000000000002 /* sonar_notification.wav in Resources */ = {isa = PBXBuildFile; fileRef = A11D50000000000000000004 /* sonar_notification.wav */; };
 		A11D50000000000000000003 /* sonar_notification.wav in Resources */ = {isa = PBXBuildFile; fileRef = A11D50000000000000000004 /* sonar_notification.wav */; };
+		A11D51000000000000000001 /* sonar_ble_notification.wav in Resources */ = {isa = PBXBuildFile; fileRef = A11D51000000000000000004 /* sonar_ble_notification.wav */; };
+		A11D51000000000000000002 /* sonar_ble_notification.wav in Resources */ = {isa = PBXBuildFile; fileRef = A11D51000000000000000004 /* sonar_ble_notification.wav */; };
 		17901751FD8010AFC8E750F2 /* bitchatShareExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 61F92EBA29C47C0FCC482F1F /* bitchatShareExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		3EE336D150427F736F32B56C /* P256K in Frameworks */ = {isa = PBXBuildFile; productRef = B1D9136AA0083366353BFA2F /* P256K */; };
 		44AA8F6F653CD2B2A28DA1BB /* BreezSDKLiquid in Frameworks */ = {isa = PBXBuildFile; productRef = F758224FFCADDAB1B95B5A73 /* BreezSDKLiquid */; };
@@ -84,6 +86,7 @@
 
 /* Begin PBXFileReference section */
 		A11D50000000000000000004 /* sonar_notification.wav */ = {isa = PBXFileReference; lastKnownFileType = audio.wav; name = sonar_notification.wav; path = ../assets/notifications/raw/sonar_notification.wav; sourceTree = "<group>"; };
+		A11D51000000000000000004 /* sonar_ble_notification.wav */ = {isa = PBXFileReference; lastKnownFileType = audio.wav; name = sonar_ble_notification.wav; path = ../assets/notifications/raw/sonar_ble_notification.wav; sourceTree = "<group>"; };
 		03C57F452B55FD0FD8F51421 /* bitchatTests_macOS.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = bitchatTests_macOS.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		04C92AF74AFC20D92B2BAD0A /* Info.plist */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		3CCA5BD63046ACF8E7086F97 /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS18.0.sdk/System/Library/Frameworks/Foundation.framework; sourceTree = DEVELOPER_DIR; };
@@ -237,6 +240,7 @@
 			isa = PBXGroup;
 			children = (
 				A11D50000000000000000004 /* sonar_notification.wav */,
+				A11D51000000000000000004 /* sonar_ble_notification.wav */,
 				A6E32C972E762EA70032EA8A /* bitchat */,
 				E0A1B2C3D4E5F6012345678A /* ../relays/online_relays_gps.csv */,
 				A6E32D212E762EAB0032EA8A /* bitchatShareExtension */,
@@ -463,6 +467,7 @@
 			isa = PBXResourcesBuildPhase;
 			files = (
 				A11D50000000000000000002 /* sonar_notification.wav in Resources */,
+				A11D51000000000000000002 /* sonar_ble_notification.wav in Resources */,
 				E0A1B2C3D4E5F6012345678D /* ../relays/online_relays_gps.csv in Resources */,
 			);
 		};
@@ -486,6 +491,7 @@
 			isa = PBXResourcesBuildPhase;
 			files = (
 				A11D50000000000000000001 /* sonar_notification.wav in Resources */,
+				A11D51000000000000000001 /* sonar_ble_notification.wav in Resources */,
 				E0A1B2C3D4E5F6012345678E /* ../relays/online_relays_gps.csv in Resources */,
 			);
 		};

@@ -1842,7 +1842,8 @@ final class SonarAppStore: ObservableObject {
         senderName: String? = nil,
         groupName: String? = nil,
         preview: String? = nil,
-        unreadCount: UInt64 = 1
+        unreadCount: UInt64 = 1,
+        sound: SonarNotificationSound = .standard
     ) {
         guard !isForeground else { return }
         let userInfo: [String: Any] = conversationId.map { ["sonarConversationId": $0] } ?? [:]
@@ -1861,7 +1862,8 @@ final class SonarAppStore: ObservableObject {
             title: notification.title,
             body: notification.body,
             identifier: notification.identifier,
-            userInfo: notification.userInfo
+            userInfo: notification.userInfo,
+            sound: sound
         )
     }
 
@@ -6266,7 +6268,8 @@ final class SonarAppStore: ObservableObject {
                             idKey: "call-\(callId)-\(messageId)",
                             conversationId: conversationId,
                             conversationTitle: name,
-                            senderName: name
+                            senderName: name,
+                            sound: via == .mesh ? .ble : .standard
                         )
                         self.push(.call(conversationId, video: video))
                     }

@@ -50,21 +50,25 @@ actual object Notifier {
 
     actual fun setPushEnabled(enabled: Boolean) { /* no push on desktop */ }
 
-    actual fun notify(id: Int, title: String, body: String) {
+    actual fun notify(id: Int, title: String, body: String, sound: SonarNotificationSound) {
         val icon = trayIcon ?: run { ensureChannel(); trayIcon } ?: return
         runCatching {
             icon.displayMessage(title, body, TrayIcon.MessageType.INFO)
-            playNotificationSound()
+            playNotificationSound(sound)
         }
     }
 
-    private fun playNotificationSound() {
+    private fun playNotificationSound(sound: SonarNotificationSound) {
         val generation = soundGeneration.incrementAndGet()
         soundExecutor.execute {
             if (generation != soundGeneration.get()) return@execute
             runCatching {
+                val resource = when (sound) {
+                    SonarNotificationSound.Default -> "/sonar_notification.wav"
+                    SonarNotificationSound.Ble -> "/sonar_ble_notification.wav"
+                }
                 val bytes = Notifier::class.java
-                    .getResourceAsStream("/sonar_notification.wav")
+                    .getResourceAsStream(resource)
                     ?.buffered()
                     ?: return@runCatching
                 bytes.use { input ->

@@ -1196,6 +1196,11 @@ class SonarAppState(private val scope: CoroutineScope) {
                     content = m.content,
                     forcedKind = SonarNotificationKind.Call,
                     senderName = name,
+                    sound = if (isMeshChat(chatId) && !m.viaInternet) {
+                        SonarNotificationSound.Ble
+                    } else {
+                        SonarNotificationSound.Default
+                    },
                 )
                 push(Screen.Call(callChatId, name, ctrl.video))
             }
@@ -3000,6 +3005,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         senderName: String? = null,
         groupName: String? = null,
         unreadCount: Long = 1,
+        sound: SonarNotificationSound = SonarNotificationSound.Default,
     ) {
         if (foreground) return
         val kind = forcedKind ?: SonarNotificationRouter.classifyContent(content, ::isCallNotificationContent)
@@ -3013,7 +3019,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             unreadCount = unreadCount,
             prefs = notificationPrefs(),
         ) ?: return
-        Notifier.notify(notification.id, notification.title, notification.body)
+        Notifier.notify(notification.id, notification.title, notification.body, sound)
     }
 
     /** Notify for any chat whose newest incoming message is newer than last seen.
@@ -6826,6 +6832,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 conversationTitle = sender,
                 content = preview,
                 senderName = sender,
+                sound = SonarNotificationSound.Ble,
             )
         }
         touched.forEach { persistMesh(it) } // write-through so received DMs survive restart
@@ -6929,7 +6936,12 @@ class SonarAppState(private val scope: CoroutineScope) {
             val msg = SonarMsg(id, m.peerId, "", mine = false, tsSecs = m.tsSecs, media = listOf(media))
             meshChats[m.peerId] = meshChats[m.peerId].orEmpty() + msg
             touched += m.peerId
-            notifyIncoming(meshChatId(m.peerId), meshPeerName(m.peerId), mediaPreviewLabel(m.mimeType, m.filename))
+            notifyIncoming(
+                meshChatId(m.peerId),
+                meshPeerName(m.peerId),
+                mediaPreviewLabel(m.mimeType, m.filename),
+                sound = SonarNotificationSound.Ble,
+            )
         }
         if (touched.isEmpty()) return false
         touched.forEach { persistMesh(it) }

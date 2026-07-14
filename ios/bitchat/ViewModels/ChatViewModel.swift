@@ -3095,7 +3095,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
             }
             
             // Post-processing
-            checkForMentions(message)
+            checkForMentions(message, sound: .ble)
             sendHapticFeedback(for: message)
         }
     }
@@ -3208,7 +3208,8 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
                             NotificationService.shared.sendLocalNotification(
                                 title: "Mutual verification",
                                 body: "You and \(name) verified each other",
-                                identifier: "verify-mutual-\(peerID)-\(UUID().uuidString)"
+                                identifier: "verify-mutual-\(peerID)-\(UUID().uuidString)",
+                                sound: .ble
                             )
                         }
                     }
@@ -3234,7 +3235,8 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
                         NotificationService.shared.sendLocalNotification(
                             title: "Verified",
                             body: "You verified \(name)",
-                            identifier: "verify-success-\(peerID)-\(UUID().uuidString)"
+                            identifier: "verify-success-\(peerID)-\(UUID().uuidString)",
+                            sound: .ble
                         )
                         // If we also recently responded to their challenge, flag mutual and toast (initiator side)
                         if let t = lastInboundVerifyChallengeAt[fp], Date().timeIntervalSince(t) < 600 {
@@ -3245,7 +3247,8 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
                                 NotificationService.shared.sendLocalNotification(
                                     title: "Mutual verification",
                                     body: "You and \(name) verified each other",
-                                    identifier: "verify-mutual-\(peerID)-\(UUID().uuidString)"
+                                    identifier: "verify-mutual-\(peerID)-\(UUID().uuidString)",
+                                    sound: .ble
                                 )
                             }
                         }
@@ -3273,7 +3276,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
                 mentions: publicMentions.isEmpty ? nil : publicMentions
             )
             handlePublicMessage(msg)
-            checkForMentions(msg)
+            checkForMentions(msg, sound: .ble)
             sendHapticFeedback(for: msg)
         }
     }
@@ -3875,7 +3878,10 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
     
         /// Check for mentions and send notifications
         
-        func checkForMentions(_ message: BitchatMessage) {    // Determine our acceptable mention token. If any connected peer shares our nickname,
+        func checkForMentions(
+            _ message: BitchatMessage,
+            sound: SonarNotificationSound = .standard
+        ) {    // Determine our acceptable mention token. If any connected peer shares our nickname,
     // require the disambiguated form '<nickname>#<peerIDprefix>' to trigger.
     var myTokens: Set<String> = [nickname]
     let meshPeers = meshService.getPeerNicknames()
@@ -3888,7 +3894,11 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
 
     if isMentioned && message.sender != nickname {
         SecureLogger.info("🔔 Mention from \(message.sender)", category: .session)
-        NotificationService.shared.sendMentionNotification(from: message.sender, message: message.content)
+        NotificationService.shared.sendMentionNotification(
+            from: message.sender,
+            message: message.content,
+            sound: sound
+        )
     }
 }
 
