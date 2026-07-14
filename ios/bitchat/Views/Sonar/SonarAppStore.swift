@@ -344,6 +344,10 @@ struct SNMessage: Identifiable, Equatable {
     var text: String
     var time: String
     var sortDate: Date?
+    /// Persisted local transcript source used only by the bounded k-way pager.
+    /// Optimistic/ephemeral rows intentionally have no source and are always
+    /// rebuilt from the authoritative projection.
+    var transcriptSourceID: String? = nil
     var via: SNVia?
     var state: String?
     /// Non-nil = render as a PayBubble instead of a text bubble.
@@ -3431,6 +3435,69 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
+    /// Preserve source identity while the conversation coordinator decides
+    /// which cursor must move next. Rows are already render-filtered by
+    /// `dmMsgs`, so hidden control lines cannot falsely satisfy a 30-row source
+    /// frontier.
+    func dmTranscriptSources(
+        _ id: String,
+        candidates: [SNMessage],
+        sourceLimit: Int,
+        meshNewestOffset: Int,
+        paymentNewestOffset: Int,
+        callNewestOffset: Int
+    ) -> [SNConversationTranscriptSource] {
+        var sources = localTranscriptGroups(for: id).map { group in
+            return SNConversationTranscriptSource(
+                id: group.id,
+                rows: candidates.filter { $0.transcriptSourceID == group.id },
+                hasMore: marmot.hasOlderLocalMessages(groupId: group.id)
+            )
+        }
+        if !id.hasPrefix(Self.marmotIDPrefix),
+           pendingMarmotNpub(for: id) == nil,
+           !isPendingMarmotGroup(id) {
+            sources.append(
+                SNConversationTranscriptSource(
+                    id: SNConversationTranscriptSource.meshID,
+                    rows: candidates.filter {
+                        $0.transcriptSourceID == SNConversationTranscriptSource.meshID
+                    },
+                    hasMore: hasCachedMeshOlderDM(
+                        id,
+                        visibleLimit: sourceLimit,
+                        newestOffset: meshNewestOffset
+                    )
+                )
+            )
+        }
+        let paymentCount = cachedPaymentActivityCount(id)
+        if paymentCount > 0 {
+            sources.append(
+                SNConversationTranscriptSource(
+                    id: SNConversationTranscriptSource.paymentActivityID,
+                    rows: candidates.filter {
+                        $0.transcriptSourceID == SNConversationTranscriptSource.paymentActivityID
+                    },
+                    hasMore: paymentCount > sourceLimit + paymentNewestOffset
+                )
+            )
+        }
+        let callCount = cachedCallRecordCount(id)
+        if callCount > 0 {
+            sources.append(
+                SNConversationTranscriptSource(
+                    id: SNConversationTranscriptSource.callLogID,
+                    rows: candidates.filter {
+                        $0.transcriptSourceID == SNConversationTranscriptSource.callLogID
+                    },
+                    hasMore: callCount > sourceLimit + callNewestOffset
+                )
+            )
+        }
+        return sources
+    }
+
     /// Mesh history is already local and in memory, but it still participates
     /// in the same directional render window as Marmot. Counting it is cheap and
     /// avoids formatting rows merely to discover a lookahead item.
@@ -3449,20 +3516,53 @@ final class SonarAppStore: ObservableObject {
         return chatViewModel.privateChats[PeerID(str: id)]?.count ?? 0
     }
 
-    /// Load one older local page for every folded Marmot source and rebuild the
-    /// immutable render projection before returning so the list can restore its
-    /// pre-prepend anchor deterministically.
-    func loadOlderDM(_ id: String) async -> Bool {
-        var added = false
-        for group in localTranscriptGroups(for: id) {
-            if await marmot.loadOlderLocalPage(groupId: group.id) {
-                added = true
+    func cachedPaymentActivityCount(_ id: String) -> Int {
+        paymentActivityLedger.activities(peerKey: id).count
+    }
+
+    func cachedCallRecordCount(_ id: String) -> Int {
+        callLogs[id]?.count ?? 0
+    }
+
+    func hasCachedRenderOnlyOlderDM(
+        _ id: String,
+        visibleLimit: Int,
+        paymentNewestOffset: Int,
+        callNewestOffset: Int
+    ) -> Bool {
+        cachedPaymentActivityCount(id) > visibleLimit + paymentNewestOffset
+            || cachedCallRecordCount(id) > visibleLimit + callNewestOffset
+    }
+
+    /// Load one older local page for the folded Marmot sources selected by the
+    /// global merge frontier, then rebuild the immutable render projection so
+    /// the list can restore its pre-prepend anchor deterministically.
+    func loadOlderDM(
+        _ id: String,
+        groupIDs: Set<String>
+    ) async -> SNConversationTranscriptLoadResult {
+        var result = SNConversationTranscriptLoadResult.none
+        for group in localTranscriptGroups(for: id) where groupIDs.contains(group.id) {
+            let before = marmot.localTranscriptCanonicalMessageIDs(groupId: group.id)
+            if await marmot.loadOlderLocalPageWhenAvailable(groupId: group.id) {
+                result.record(
+                    before: before,
+                    after: marmot.localTranscriptCanonicalMessageIDs(groupId: group.id)
+                )
             }
         }
-        if added {
+        if result.added {
             conversationViewStates[id]?.rebuildNow()
         }
-        return added
+        return result
+    }
+
+    /// Keep every folded local source at the same historical edge as the
+    /// conversation-wide render window while background updates continue.
+    func preserveHistoricalDM(_ id: String) {
+        for group in localTranscriptGroups(for: id) {
+            marmot.preserveLocalTranscriptWindow(groupId: group.id)
+        }
     }
 
     /// Move every folded source back to its newest local page. Used when a user
@@ -3470,7 +3570,7 @@ final class SonarAppStore: ObservableObject {
     func loadNewestDM(_ id: String) async -> Bool {
         var loaded = true
         for group in localTranscriptGroups(for: id) {
-            if !(await marmot.loadLocalPage(groupId: group.id)) {
+            if !(await marmot.loadNewestLocalPageWhenAvailable(groupId: group.id)) {
                 loaded = false
             }
         }
@@ -3548,12 +3648,19 @@ final class SonarAppStore: ObservableObject {
     private func paymentActivityRows(
         for id: String,
         transcriptPayIDs: Set<String>,
-        limit: Int? = nil
+        limit: Int? = nil,
+        newestOffset: Int = 0
     ) -> [(Date, SNMessage)] {
         let relevant = paymentActivityLedger.activities(peerKey: id).filter { activity in
             payLedger.entry(for: activity.id) == nil || !transcriptPayIDs.contains(activity.id)
+        }.sorted { lhs, rhs in
+            (lhs.settledAt ?? lhs.createdAt) < (rhs.settledAt ?? rhs.createdAt)
         }
-        return Self.transcriptSource(relevant, limit: limit).map { activity in
+        return Self.transcriptSource(
+            relevant,
+            limit: limit,
+            newestOffset: newestOffset
+        ).map { activity in
             let displayDate = activity.settledAt ?? activity.createdAt
             let state: SonarPayEntry.State = activity.status == .paid ? .claimed : .settling
             let via = SNVia(rawValue: activity.via) ?? .internet
@@ -3564,6 +3671,7 @@ final class SonarAppStore: ObservableObject {
                     mine: activity.direction == .outgoing,
                     text: "",
                     time: Self.clock(displayDate),
+                    transcriptSourceID: SNConversationTranscriptSource.paymentActivityID,
                     via: via,
                     pay: SNPayInfo(
                         id: activity.id,
@@ -3587,21 +3695,22 @@ final class SonarAppStore: ObservableObject {
         return rows[..<end].suffix(max(0, limit))
     }
 
-    private static func boundedTranscript(_ rows: [SNMessage], limit: Int?) -> [SNMessage] {
-        guard let limit else { return rows }
-        return Array(rows.suffix(max(0, limit)))
-    }
-
     /// Build the render-ready transcript for one conversation. O(page) with
     /// parsing/sorting — call it from `ConversationViewState` (per data
     /// change), NEVER from a SwiftUI `body` (per render).
     ///
     /// `limit` is applied to every folded local source before expensive
-    /// formatting and again after the chronological merge. This is important
-    /// for mesh + Marmot conversations: a 30-row first paint must not format an
-    /// entire persisted mesh transcript merely because the second source is
-    /// already page-bounded.
-    func dmMsgs(_ id: String, limit: Int? = nil, meshNewestOffset: Int = 0) -> [SNMessage] {
+    /// formatting. The caller applies the one conversation-wide render budget
+    /// after the chronological merge; keeping the bounded source candidates is
+    /// required to page into an older transport when another transport owns the
+    /// newer edge.
+    func dmMsgs(
+        _ id: String,
+        limit: Int? = nil,
+        meshNewestOffset: Int = 0,
+        paymentNewestOffset: Int = 0,
+        callNewestOffset: Int = 0
+    ) -> [SNMessage] {
         if let groupId = marmotGroupId(id) {
             let groups = directMarmotGroups(matchingGroupId: groupId)
             let sourceGroups = groups.isEmpty
@@ -3622,7 +3731,10 @@ final class SonarAppStore: ObservableObject {
                     case .bubble(let pay, let payVia):
                         return (m.createdAt, SNMessage(
                             id: m.id, mine: m.isMine, text: m.content,
-                            time: Self.clock(m.createdAt), via: payVia, pay: pay
+                            time: Self.clock(m.createdAt),
+                            transcriptSourceID: group.id,
+                            via: payVia,
+                            pay: pay
                         ))
                     case .notPay:
                         return (m.createdAt, SNMessage(
@@ -3631,6 +3743,7 @@ final class SonarAppStore: ObservableObject {
                             author: marmot.marmotAuthorName(m),
                             text: m.content,
                             time: Self.clock(m.createdAt),
+                            transcriptSourceID: group.id,
                             via: .internet,
                             state: MarmotChatModel.stateText(for: m),
                             media: Self.mediaItems(m, groupId: group.id),
@@ -3655,7 +3768,10 @@ final class SonarAppStore: ObservableObject {
                     case .bubble(let pay, let payVia):
                         return (m.timestamp, SNMessage(
                             id: m.id, mine: mine, text: m.content,
-                            time: Self.clock(m.timestamp), via: payVia, pay: pay
+                            time: Self.clock(m.timestamp),
+                            transcriptSourceID: SNConversationTranscriptSource.meshID,
+                            via: payVia,
+                            pay: pay
                         ))
                     case .notPay:
                         let mediaItem = meshMediaItem(m.content)
@@ -3668,6 +3784,7 @@ final class SonarAppStore: ObservableObject {
                             author: m.sender,
                             text: (mediaItem != nil || meshSticker != nil) ? "" : m.content,
                             time: Self.clock(m.timestamp),
+                            transcriptSourceID: SNConversationTranscriptSource.meshID,
                             via: via,
                             state: mine ? Self.stateText(m.deliveryStatus) : nil,
                             media: mediaItem.map { [$0] } ?? [],
@@ -3687,22 +3804,42 @@ final class SonarAppStore: ObservableObject {
                 ).map { ($0.sortDate ?? Date(), $0) }
             }
             let transcriptPayIDs = Set(dated.compactMap { $0.1.pay?.id })
-            dated += paymentActivityRows(for: id, transcriptPayIDs: transcriptPayIDs, limit: limit)
-            return Self.boundedTranscript(mergeCallLogs(into: dated, id: id), limit: limit)
+            dated += paymentActivityRows(
+                for: id,
+                transcriptPayIDs: transcriptPayIDs,
+                limit: limit,
+                newestOffset: paymentNewestOffset
+            )
+            return mergeCallLogs(
+                into: dated,
+                id: id,
+                limit: limit,
+                newestOffset: callNewestOffset
+            )
         }
         if pendingMarmotNpub(for: id) != nil {
             let dated = Self.transcriptSource(
                 pendingMarmotMessagesByChat[id] ?? [],
                 limit: limit
             ).map { ($0.sortDate ?? Date(), $0) }
-            return Self.boundedTranscript(mergeCallLogs(into: dated, id: id), limit: limit)
+            return mergeCallLogs(
+                into: dated,
+                id: id,
+                limit: limit,
+                newestOffset: callNewestOffset
+            )
         }
         if isPendingMarmotGroup(id) {
             let dated = Self.transcriptSource(
                 pendingMarmotMessagesByChat[id] ?? [],
                 limit: limit
             ).map { ($0.sortDate ?? Date(), $0) }
-            return Self.boundedTranscript(mergeCallLogs(into: dated, id: id), limit: limit)
+            return mergeCallLogs(
+                into: dated,
+                id: id,
+                limit: limit,
+                newestOffset: callNewestOffset
+            )
         }
         let peerID = PeerID(str: id)
         let via = dmTransport(id)
@@ -3719,7 +3856,10 @@ final class SonarAppStore: ObservableObject {
             case .bubble(let pay, let payVia):
                 return (m.timestamp, SNMessage(
                     id: m.id, mine: mine, text: m.content,
-                    time: Self.clock(m.timestamp), via: payVia, pay: pay
+                    time: Self.clock(m.timestamp),
+                    transcriptSourceID: SNConversationTranscriptSource.meshID,
+                    via: payVia,
+                    pay: pay
                 ))
             case .notPay:
                 // BLE-mesh media (bitchat file transfer) arrives as an
@@ -3734,6 +3874,7 @@ final class SonarAppStore: ObservableObject {
                     author: m.sender,
                     text: (mediaItem != nil || meshSticker != nil) ? "" : m.content,
                     time: Self.clock(m.timestamp),
+                    transcriptSourceID: SNConversationTranscriptSource.meshID,
                     via: via,
                     state: mine ? Self.stateText(m.deliveryStatus) : nil,
                     media: mediaItem.map { [$0] } ?? [],
@@ -3759,7 +3900,10 @@ final class SonarAppStore: ObservableObject {
                 case .bubble(let pay, let payVia):
                     return (m.createdAt, SNMessage(
                         id: m.id, mine: m.isMine, text: m.content,
-                        time: Self.clock(m.createdAt), via: payVia, pay: pay
+                        time: Self.clock(m.createdAt),
+                        transcriptSourceID: group.id,
+                        via: payVia,
+                        pay: pay
                     ))
                 case .notPay:
                     return (m.createdAt, SNMessage(
@@ -3768,6 +3912,7 @@ final class SonarAppStore: ObservableObject {
                         author: m.isMine ? nil : peerDisplayName(id),
                         text: m.content,
                         time: Self.clock(m.createdAt),
+                        transcriptSourceID: group.id,
                         via: .internet,
                         state: MarmotChatModel.stateText(for: m),
                         media: Self.mediaItems(m, groupId: group.id),
@@ -3778,23 +3923,46 @@ final class SonarAppStore: ObservableObject {
             dated.sort { $0.0 < $1.0 }
         }
         let transcriptPayIDs = Set(dated.compactMap { $0.1.pay?.id })
-        dated += paymentActivityRows(for: id, transcriptPayIDs: transcriptPayIDs, limit: limit)
-        return Self.boundedTranscript(mergeCallLogs(into: dated, id: id), limit: limit)
+        dated += paymentActivityRows(
+            for: id,
+            transcriptPayIDs: transcriptPayIDs,
+            limit: limit,
+            newestOffset: paymentNewestOffset
+        )
+        return mergeCallLogs(
+            into: dated,
+            id: id,
+            limit: limit,
+            newestOffset: callNewestOffset
+        )
     }
 
     /// Fold local call records for `id` into the transcript chronologically
     /// (stable sort keeps same-instant messages in place). A no-op when this
     /// peer has no recorded calls.
-    private func mergeCallLogs(into dated: [(Date, SNMessage)], id: String) -> [SNMessage] {
+    private func mergeCallLogs(
+        into dated: [(Date, SNMessage)],
+        id: String,
+        limit: Int?,
+        newestOffset: Int
+    ) -> [SNMessage] {
         let calls = callLogs[id] ?? []
         var combined = dated
-        for c in calls { combined.append((c.date, c.message)) }
+        for c in Self.transcriptSource(calls, limit: limit, newestOffset: newestOffset) {
+            var message = c.message
+            message.transcriptSourceID = SNConversationTranscriptSource.callLogID
+            combined.append((c.date, message))
+        }
         return combined.enumerated()
             .sorted {
                 if $0.element.0 == $1.element.0 { return $0.offset < $1.offset }
                 return $0.element.0 < $1.element.0
             }
-            .map { $0.element.1 }
+            .map {
+                var message = $0.element.1
+                message.sortDate = $0.element.0
+                return message
+            }
     }
 
     /// DM routing uses Bluetooth only while a Sonar peer is directly connected;
@@ -5095,7 +5263,7 @@ final class SonarAppStore: ObservableObject {
                     // `loadLocalWhenConnected(groupId:)` already painted the
                     // known source. Only hydrate additional folded groups here.
                     if groupId == nil || group.id != groupId {
-                        await self.marmot.loadLocalPage(groupId: group.id)
+                        await self.marmot.loadLocalPage(groupId: group.id, mode: .newestPage)
                     }
                     self.marmot.markConversationRead(groupId: group.id)
                 }

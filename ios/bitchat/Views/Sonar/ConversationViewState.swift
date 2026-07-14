@@ -16,6 +16,171 @@
 import Combine
 import Foundation
 
+struct SNConversationTranscriptSource {
+    static let meshID = "$mesh"
+    static let paymentActivityID = "$payment-activity"
+    static let callLogID = "$call-log"
+
+    let id: String
+    let rows: [SNMessage]
+    let hasMore: Bool
+}
+
+struct SNConversationTranscriptLoadResult {
+    static let none = SNConversationTranscriptLoadResult()
+
+    private(set) var maxSourceGrowth = 0
+    private(set) var movedRetainedWindow = false
+
+    var added: Bool { maxSourceGrowth > 0 }
+
+    mutating func record(before: Set<String>, after: Set<String>) {
+        maxSourceGrowth = max(maxSourceGrowth, after.subtracting(before).count)
+        movedRetainedWindow = movedRetainedWindow || !before.subtracting(after).isEmpty
+    }
+}
+
+/// Pure conversation-wide window operations shared by the Apple transcript
+/// coordinator and its regression tests. Source windows are bounded
+/// independently; this layer is what prevents a newer transport from hiding an
+/// older folded transport forever once the 500-row render budget is full.
+enum SNConversationTranscriptWindow {
+    static func ordered(_ source: [SNMessage]) -> [SNMessage] {
+        var byID: [String: SNMessage] = [:]
+        for message in source { byID[message.id] = message }
+        return byID.values.sorted(by: isOrderedBefore)
+    }
+
+    static func newest(_ source: [SNMessage], limit: Int) -> [SNMessage] {
+        Array(ordered(source).suffix(max(0, limit)))
+    }
+
+    static func nearestOlderPage(
+        in source: [SNMessage],
+        before oldestVisible: SNMessage,
+        pageSize: Int
+    ) -> [SNMessage] {
+        Array(
+            ordered(source)
+                .filter { isOrderedBefore($0, oldestVisible) }
+                .suffix(max(0, pageSize))
+        )
+    }
+
+    static func prepending(
+        _ older: [SNMessage],
+        to existing: [SNMessage],
+        limit: Int
+    ) -> [SNMessage] {
+        Array(ordered(existing + older).prefix(max(0, limit)))
+    }
+
+    /// A full retained window is historical even before the next prepend has
+    /// to evict a row. Pin it at that boundary so a concurrent live append
+    /// cannot discard the oldest visible row while the reader is at the top.
+    static func shouldPreserveOlderEdge(
+        afterGrowingTo visibleLimit: Int,
+        retainedLimit: Int,
+        previous: [SNMessage],
+        next: [SNMessage]
+    ) -> Bool {
+        if visibleLimit >= retainedLimit, next.count >= retainedLimit { return true }
+        let nextIDs = Set(next.map(\.id))
+        return previous.contains { !nextIDs.contains($0.id) }
+    }
+
+    static func refreshing(
+        _ existing: [SNMessage],
+        from candidates: [SNMessage],
+        limit: Int,
+        preservingOlderEdge: Bool,
+        pinningOlderEdgeAtCapacity: Bool = false
+    ) -> [SNMessage] {
+        guard preservingOlderEdge, !existing.isEmpty else {
+            // A final database page can be shorter than the retained budget.
+            // Retain the uncovered prefix of EACH independently bounded source
+            // so one older folded source cannot make another source's rolling
+            // candidate boundary look authoritative. Ephemeral rows without a
+            // persisted local source are always rebuilt from candidates.
+            let orderedCandidates = ordered(candidates)
+            guard !orderedCandidates.isEmpty else { return [] }
+            let candidatesBySource = Dictionary(
+                grouping: orderedCandidates.compactMap { message in
+                    message.transcriptSourceID.map { ($0, message) }
+                },
+                by: { $0.0 }
+            )
+            let candidatePayIDs = Set(orderedCandidates.compactMap { $0.pay?.id })
+            var uncoveredPrefixes: [SNMessage] = []
+            for (sourceID, sourceCandidates) in candidatesBySource {
+                guard let sourceStart = sourceCandidates.map(\.1).min(by: isOrderedBefore) else {
+                    continue
+                }
+                uncoveredPrefixes += existing.filter {
+                    $0.transcriptSourceID == sourceID
+                        && isOrderedBefore($0, sourceStart)
+                        && ($0.pay.map { !candidatePayIDs.contains($0.id) } ?? true)
+                }
+            }
+            let merged = ordered(uncoveredPrefixes + orderedCandidates)
+            if pinningOlderEdgeAtCapacity {
+                // The historical render budget can be one row short when a
+                // debounced refresh delivers several live rows together. Keep
+                // only the remaining capacity from the older edge so the
+                // anchor cannot be evicted before the coordinator pins it.
+                return Array(merged.prefix(max(0, limit)))
+            }
+            return Array(merged.suffix(max(0, limit)))
+        }
+        var updates: [String: SNMessage] = [:]
+        for candidate in candidates { updates[candidate.id] = candidate }
+        return ordered(existing.map { updates[$0.id] ?? $0 })
+    }
+
+    static func hasRowsOlder(than oldestVisible: SNMessage?, in source: [SNMessage]) -> Bool {
+        guard let oldestVisible else { return false }
+        return source.contains { isOrderedBefore($0, oldestVisible) }
+    }
+
+    static func localPageGrowth(
+        totalRows: Int,
+        sourceLimit: Int,
+        newestOffset: Int,
+        pageSize: Int
+    ) -> Int {
+        let currentEnd = max(0, totalRows - max(0, newestOffset))
+        let currentStart = max(0, currentEnd - max(0, sourceLimit))
+        return min(max(0, pageSize), currentStart)
+    }
+
+    /// A global page is safe only after every pageable source has one complete
+    /// page behind the visible anchor. This preserves the k-way merge frontier:
+    /// a far-older source must not fill the page while a newer source still has
+    /// unloaded rows that belong before it.
+    static func sourceIDsNeedingExpansion(
+        _ sources: [SNConversationTranscriptSource],
+        before oldestVisible: SNMessage,
+        pageSize: Int
+    ) -> Set<String> {
+        guard pageSize > 0 else { return [] }
+        return Set(sources.compactMap { source in
+            guard source.hasMore else { return nil }
+            let olderCount = source.rows.lazy
+                .filter { isOrderedBefore($0, oldestVisible) }
+                .prefix(pageSize)
+                .count
+            return olderCount < pageSize ? source.id : nil
+        })
+    }
+
+    static func isOrderedBefore(_ lhs: SNMessage, _ rhs: SNMessage) -> Bool {
+        let lhsDate = lhs.sortDate ?? .distantPast
+        let rhsDate = rhs.sortDate ?? .distantPast
+        if lhsDate == rhsDate { return lhs.id < rhs.id }
+        return lhsDate < rhsDate
+    }
+}
+
 /// Precomputed transcript for ONE open conversation.
 ///
 /// Rebuilds are triggered by the store's (already throttled) invalidation
@@ -46,14 +211,25 @@ final class ConversationViewState: ObservableObject {
     /// Marmot database cache window. It therefore bounds pure mesh and folded
     /// mesh + Marmot conversations too, not only the paged source.
     private var visibleMessageLimit = TransportConfig.sonarTranscriptPageCount
+    /// Each folded transport also owns a bounded source window. Keeping this
+    /// separate from the conversation-wide budget lets the global window page
+    /// into an older source even while another source still has newer rows.
+    private var sourceMessageLimit = TransportConfig.sonarTranscriptPageCount
     private var meshNewestOffset = 0
+    private var paymentNewestOffset = 0
+    private var callNewestOffset = 0
     private var needsNewestReload = false
     private var lastMeshMessageCount = 0
+    private var lastPaymentActivityCount = 0
+    private var lastCallRecordCount = 0
+    private static let olderSourceLoadAttemptLimit = 3
 
     init(conversationId: String, store: SonarAppStore) {
         self.conversationId = conversationId
         self.store = store
         self.lastMeshMessageCount = store.cachedMeshMessageCount(conversationId)
+        self.lastPaymentActivityCount = store.cachedPaymentActivityCount(conversationId)
+        self.lastCallRecordCount = store.cachedCallRecordCount(conversationId)
         // First build is synchronous so the opening chat paints from local
         // state immediately (local-first rule) instead of after a debounce.
         rebuildNow()
@@ -81,31 +257,74 @@ final class ConversationViewState: ObservableObject {
     func rebuildNow() {
         guard let store else { return }
         let meshCount = store.cachedMeshMessageCount(conversationId)
+        let paymentCount = store.cachedPaymentActivityCount(conversationId)
+        let callCount = store.cachedCallRecordCount(conversationId)
         if needsNewestReload, meshCount > lastMeshMessageCount {
             // Keep the historical mesh boundary anchored while live rows append
             // at the unseen newer edge. They become visible on return-to-newest.
             meshNewestOffset += meshCount - lastMeshMessageCount
         }
+        if needsNewestReload, paymentCount > lastPaymentActivityCount {
+            paymentNewestOffset += paymentCount - lastPaymentActivityCount
+        }
+        if needsNewestReload, callCount > lastCallRecordCount {
+            callNewestOffset += callCount - lastCallRecordCount
+        }
         lastMeshMessageCount = meshCount
-        let lookaheadLimit = min(
+        lastPaymentActivityCount = paymentCount
+        lastCallRecordCount = callCount
+        if needsNewestReload {
+            // Keep all folded source cursors aligned with the global historical
+            // window. Otherwise background refresh could reset one source to
+            // its newest page while the visible anchor remains much older.
+            store.preserveHistoricalDM(conversationId)
+        }
+        let sourceLookaheadLimit = min(
             TransportConfig.sonarTranscriptRetainedCount,
-            visibleMessageLimit + 1
+            sourceMessageLimit + 1
         )
-        let built = store.dmMsgs(
+        let candidates = store.dmMsgs(
             conversationId,
-            limit: lookaheadLimit,
-            meshNewestOffset: meshNewestOffset
+            limit: sourceLookaheadLimit,
+            meshNewestOffset: meshNewestOffset,
+            paymentNewestOffset: paymentNewestOffset,
+            callNewestOffset: callNewestOffset
         )
-        let visible = Array(built.suffix(visibleMessageLimit))
+        let visible = SNConversationTranscriptWindow.refreshing(
+            messages,
+            from: candidates,
+            limit: visibleMessageLimit,
+            preservingOlderEdge: needsNewestReload,
+            pinningOlderEdgeAtCapacity: !needsNewestReload
+                && visibleMessageLimit >= TransportConfig.sonarTranscriptRetainedCount
+        )
         if visible != messages {
             messages = visible
         }
-        hasOlderMessages = built.count > visibleMessageLimit
+        if !needsNewestReload,
+           visibleMessageLimit >= TransportConfig.sonarTranscriptRetainedCount,
+           visible.count >= TransportConfig.sonarTranscriptRetainedCount {
+            // A partial final page may later fill with live rows. Pin exactly
+            // when the actual retained window becomes full, before the next
+            // append can evict the historical anchor.
+            needsNewestReload = true
+            store.preserveHistoricalDM(conversationId)
+        }
+        hasOlderMessages = SNConversationTranscriptWindow.hasRowsOlder(
+            than: messages.first,
+            in: candidates
+        )
             || store.canLoadOlderDM(conversationId)
             || store.hasCachedMeshOlderDM(
                 conversationId,
-                visibleLimit: visibleMessageLimit,
+                visibleLimit: sourceMessageLimit,
                 newestOffset: meshNewestOffset
+            )
+            || store.hasCachedRenderOnlyOlderDM(
+                conversationId,
+                visibleLimit: sourceMessageLimit,
+                paymentNewestOffset: paymentNewestOffset,
+                callNewestOffset: callNewestOffset
             )
     }
 
@@ -116,29 +335,175 @@ final class ConversationViewState: ObservableObject {
         guard !isLoadingOlder, hasOlderMessages, let store else { return false }
         isLoadingOlder = true
         defer { isLoadingOlder = false }
-        let previous = messages
         let pageSize = TransportConfig.sonarTranscriptPageCount
         let retained = TransportConfig.sonarTranscriptRetainedCount
-        let meshCount = store.cachedMeshMessageCount(conversationId)
-        let currentMeshEnd = max(0, meshCount - meshNewestOffset)
-        let currentMeshStart = max(0, currentMeshEnd - visibleMessageLimit)
-        let meshRowsLoaded = min(pageSize, currentMeshStart)
-        let databaseCanLoad = store.canLoadOlderDM(conversationId)
-        let requestedGrowth = max(databaseCanLoad ? pageSize : 0, meshRowsLoaded)
-        let meshOverflow = max(0, visibleMessageLimit + meshRowsLoaded - retained)
-        let databaseMovesWindow = databaseCanLoad
-            && visibleMessageLimit + pageSize > retained
-        if meshOverflow > 0 || databaseMovesWindow {
-            needsNewestReload = true
+
+        func prependClosestCandidatePage() -> Bool {
+            guard let oldest = messages.first else { return false }
+            let candidates = store.dmMsgs(
+                conversationId,
+                limit: min(retained, sourceMessageLimit + 1),
+                meshNewestOffset: meshNewestOffset,
+                paymentNewestOffset: paymentNewestOffset,
+                callNewestOffset: callNewestOffset
+            )
+            let older = SNConversationTranscriptWindow.nearestOlderPage(
+                in: candidates,
+                before: oldest,
+                pageSize: pageSize
+            )
+            guard !older.isEmpty else { return false }
+            let sources = store.dmTranscriptSources(
+                conversationId,
+                candidates: candidates,
+                sourceLimit: sourceMessageLimit,
+                meshNewestOffset: meshNewestOffset,
+                paymentNewestOffset: paymentNewestOffset,
+                callNewestOffset: callNewestOffset
+            )
+            guard SNConversationTranscriptWindow.sourceIDsNeedingExpansion(
+                sources,
+                before: oldest,
+                pageSize: pageSize
+            ).isEmpty else { return false }
+
+            let previous = messages
+            visibleMessageLimit = min(retained, visibleMessageLimit + pageSize)
+            let next = SNConversationTranscriptWindow.prepending(
+                older,
+                to: previous,
+                limit: visibleMessageLimit
+            )
+            if SNConversationTranscriptWindow.shouldPreserveOlderEdge(
+                afterGrowingTo: visibleMessageLimit,
+                retainedLimit: retained,
+                previous: previous,
+                next: next
+            ) {
+                needsNewestReload = true
+                store.preserveHistoricalDM(conversationId)
+            }
+            if next != previous { messages = next }
+
+            hasOlderMessages = SNConversationTranscriptWindow.hasRowsOlder(
+                than: messages.first,
+                in: candidates
+            )
+                || store.canLoadOlderDM(conversationId)
+                || store.hasCachedMeshOlderDM(
+                    conversationId,
+                    visibleLimit: sourceMessageLimit,
+                    newestOffset: meshNewestOffset
+                )
+                || store.hasCachedRenderOnlyOlderDM(
+                    conversationId,
+                    visibleLimit: sourceMessageLimit,
+                    paymentNewestOffset: paymentNewestOffset,
+                    callNewestOffset: callNewestOffset
+                )
+            return next != previous
         }
-        meshNewestOffset += meshOverflow
-        visibleMessageLimit = min(
-            retained,
-            visibleMessageLimit + requestedGrowth
-        )
-        let addedFromDatabase = await store.loadOlderDM(conversationId)
+
+        // Folded sources can already contain a globally adjacent page even
+        // though each source is independently bounded. Consume that page before
+        // issuing another local database read.
+        if prependClosestCandidatePage() { return true }
+
+        for attempt in 0..<Self.olderSourceLoadAttemptLimit {
+            guard let oldest = messages.first else { return false }
+            let candidates = store.dmMsgs(
+                conversationId,
+                limit: min(retained, sourceMessageLimit + 1),
+                meshNewestOffset: meshNewestOffset,
+                paymentNewestOffset: paymentNewestOffset,
+                callNewestOffset: callNewestOffset
+            )
+            let sourceIDs = SNConversationTranscriptWindow.sourceIDsNeedingExpansion(
+                store.dmTranscriptSources(
+                    conversationId,
+                    candidates: candidates,
+                    sourceLimit: sourceMessageLimit,
+                    meshNewestOffset: meshNewestOffset,
+                    paymentNewestOffset: paymentNewestOffset,
+                    callNewestOffset: callNewestOffset
+                ),
+                before: oldest,
+                pageSize: pageSize
+            )
+            let meshCount = store.cachedMeshMessageCount(conversationId)
+            let meshRowsLoaded = sourceIDs.contains(SNConversationTranscriptSource.meshID)
+                ? SNConversationTranscriptWindow.localPageGrowth(
+                    totalRows: meshCount,
+                    sourceLimit: sourceMessageLimit,
+                    newestOffset: meshNewestOffset,
+                    pageSize: pageSize
+                )
+                : 0
+            let paymentRowsLoaded = sourceIDs.contains(SNConversationTranscriptSource.paymentActivityID)
+                ? SNConversationTranscriptWindow.localPageGrowth(
+                    totalRows: store.cachedPaymentActivityCount(conversationId),
+                    sourceLimit: sourceMessageLimit,
+                    newestOffset: paymentNewestOffset,
+                    pageSize: pageSize
+                )
+                : 0
+            let callRowsLoaded = sourceIDs.contains(SNConversationTranscriptSource.callLogID)
+                ? SNConversationTranscriptWindow.localPageGrowth(
+                    totalRows: store.cachedCallRecordCount(conversationId),
+                    sourceLimit: sourceMessageLimit,
+                    newestOffset: callNewestOffset,
+                    pageSize: pageSize
+                )
+                : 0
+            let localSourceIDs: Set<String> = [
+                SNConversationTranscriptSource.meshID,
+                SNConversationTranscriptSource.paymentActivityID,
+                SNConversationTranscriptSource.callLogID,
+            ]
+            let groupIDs = sourceIDs.subtracting(localSourceIDs)
+            let databaseCanLoad = !groupIDs.isEmpty
+            guard meshRowsLoaded > 0 || paymentRowsLoaded > 0 || callRowsLoaded > 0 || databaseCanLoad else {
+                rebuildNow()
+                return false
+            }
+
+            let databaseLoad = databaseCanLoad
+                ? await store.loadOlderDM(conversationId, groupIDs: groupIDs)
+                : .none
+            let sourceGrowth = [
+                databaseLoad.maxSourceGrowth,
+                meshRowsLoaded,
+                paymentRowsLoaded,
+                callRowsLoaded
+            ].max() ?? 0
+            let meshOverflow = max(0, sourceMessageLimit + meshRowsLoaded - retained)
+            let paymentOverflow = max(0, sourceMessageLimit + paymentRowsLoaded - retained)
+            let callOverflow = max(0, sourceMessageLimit + callRowsLoaded - retained)
+            if meshOverflow > 0 || paymentOverflow > 0 || callOverflow > 0 || databaseLoad.movedRetainedWindow {
+                needsNewestReload = true
+                store.preserveHistoricalDM(conversationId)
+            }
+            meshNewestOffset += meshOverflow
+            paymentNewestOffset += paymentOverflow
+            callNewestOffset += callOverflow
+            sourceMessageLimit = min(retained, sourceMessageLimit + sourceGrowth)
+
+            if prependClosestCandidatePage() { return true }
+
+            // A summary refresh can momentarily own the same group loader. Give
+            // that bounded local read a chance to finish rather than consuming
+            // the top-edge appearance permanently.
+            if !databaseLoad.added,
+               meshRowsLoaded == 0,
+               paymentRowsLoaded == 0,
+               callRowsLoaded == 0,
+               attempt + 1 < Self.olderSourceLoadAttemptLimit {
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+        }
+
         rebuildNow()
-        return addedFromDatabase || messages != previous
+        return false
     }
 
     /// Return a movable historical window to the live edge. Below the retained
@@ -156,8 +521,13 @@ final class ConversationViewState: ObservableObject {
         guard loaded else { return }
         needsNewestReload = false
         meshNewestOffset = 0
+        paymentNewestOffset = 0
+        callNewestOffset = 0
         visibleMessageLimit = TransportConfig.sonarTranscriptPageCount
+        sourceMessageLimit = TransportConfig.sonarTranscriptPageCount
         lastMeshMessageCount = store.cachedMeshMessageCount(conversationId)
+        lastPaymentActivityCount = store.cachedPaymentActivityCount(conversationId)
+        lastCallRecordCount = store.cachedCallRecordCount(conversationId)
         rebuildNow()
     }
 }

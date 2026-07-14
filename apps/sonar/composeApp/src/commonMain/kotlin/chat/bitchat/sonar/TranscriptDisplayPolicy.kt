@@ -3,12 +3,19 @@ package chat.bitchat.sonar
 internal const val TRANSCRIPT_PAGE_SIZE = 30
 internal const val TRANSCRIPT_PAGE_FETCH_SIZE = TRANSCRIPT_PAGE_SIZE + 1
 internal const val TRANSCRIPT_RETAINED_ROWS = 500
+internal const val MESH_TRANSCRIPT_SOURCE_ID = "\$mesh"
 internal const val TRANSCRIPT_PREVIEW_GRAPHEMES = 512
 internal const val TRANSCRIPT_PREVIEW_NEWLINES = 15
 
 internal data class TranscriptPreview(
     val text: String,
     val truncated: Boolean,
+)
+
+internal data class TranscriptSourceWindow(
+    val id: String,
+    val rows: List<SonarMsg>,
+    val hasMore: Boolean,
 )
 
 internal fun transcriptDisplayText(source: String, expanded: Boolean): String {
@@ -70,7 +77,9 @@ internal fun refreshTranscriptRows(
     newest: List<SonarMsg>,
     pinnedToOlderEdge: Boolean,
     retainedRows: Int = TRANSCRIPT_RETAINED_ROWS,
+    pinOlderEdgeAtCapacity: Boolean = false,
 ): List<SonarMsg> {
+    if (pinOlderEdgeAtCapacity) return prependTranscriptRows(existing, newest, retainedRows)
     if (!pinnedToOlderEdge) return mergeTranscriptRows(existing, newest, retainedRows)
     val retainedIds = existing.mapTo(hashSetOf()) { it.id }
     return mergeTranscriptRows(existing, newest.filter { it.id in retainedIds }, retainedRows)
@@ -89,6 +98,35 @@ internal fun prependTranscriptRows(
     return byId.values
         .sortedWith(compareBy<SonarMsg>({ it.tsSecs }, { it.id }))
         .take(retainedRows)
+}
+
+/** Pin only when the actual conversation window has filled its retained budget. */
+internal fun shouldPinOlderTranscriptEdge(
+    retainedRowCount: Int,
+    retainedRows: Int = TRANSCRIPT_RETAINED_ROWS,
+): Boolean = retainedRows > 0 && retainedRowCount >= retainedRows
+
+/**
+ * Preserve the k-way merge frontier: every pageable source needs one complete
+ * candidate page behind the visible anchor before the global page is selected.
+ */
+internal fun transcriptSourceIdsNeedingExpansion(
+    sources: List<TranscriptSourceWindow>,
+    oldestVisible: SonarMsg,
+    pageSize: Int = TRANSCRIPT_PAGE_SIZE,
+): Set<String> {
+    if (pageSize <= 0) return emptySet()
+    return sources.mapNotNullTo(linkedSetOf()) { source ->
+        if (!source.hasMore) return@mapNotNullTo null
+        val olderCount = source.rows.asSequence()
+            .filter { candidate ->
+                candidate.tsSecs < oldestVisible.tsSecs ||
+                    (candidate.tsSecs == oldestVisible.tsSecs && candidate.id < oldestVisible.id)
+            }
+            .take(pageSize)
+            .count()
+        source.id.takeIf { olderCount < pageSize }
+    }
 }
 
 /** Apply the one conversation-wide render budget after all transport sources are merged. */

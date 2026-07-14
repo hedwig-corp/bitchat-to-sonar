@@ -101,6 +101,100 @@ class TranscriptDisplayPolicyTest {
     }
 
     @Test
+    fun olderFoldedSourceAdvancesFullHistoricalWindow() {
+        val olderSource = (0 until 500).map { message("internet-$it", it.toLong()) }
+        val visibleNewerSource = (500 until 1000).map { message("mesh-$it", it.toLong()) }
+
+        val page = nearestOlderTranscriptPage(
+            olderSource + visibleNewerSource,
+            visibleNewerSource.first(),
+        )
+        val moved = prependTranscriptRows(visibleNewerSource, page)
+
+        assertEquals("internet-470", page.first().id)
+        assertEquals("internet-499", page.last().id)
+        assertEquals("internet-470", moved.first().id)
+        assertEquals("mesh-969", moved.last().id)
+        assertEquals(TRANSCRIPT_RETAINED_ROWS, moved.size)
+    }
+
+    @Test
+    fun foldedSourcesAdvanceOnlyTheIncompleteGlobalFrontier() {
+        val farOlder = (970 until 1000).map { message("internet-$it", it.toLong()) }
+        val visibleNewer = (1970 until 2000).map { message("mesh-$it", it.toLong()) }
+        val oldestVisible = visibleNewer.first()
+
+        val initialNeeds = transcriptSourceIdsNeedingExpansion(
+            listOf(
+                TranscriptSourceWindow("internet", farOlder, hasMore = true),
+                TranscriptSourceWindow(MESH_TRANSCRIPT_SOURCE_ID, visibleNewer, hasMore = true),
+            ),
+            oldestVisible,
+        )
+        assertEquals(setOf(MESH_TRANSCRIPT_SOURCE_ID), initialNeeds)
+
+        val expandedNewer = (1940 until 2000).map { message("mesh-$it", it.toLong()) }
+        val readyNeeds = transcriptSourceIdsNeedingExpansion(
+            listOf(
+                TranscriptSourceWindow("internet", farOlder, hasMore = true),
+                TranscriptSourceWindow(MESH_TRANSCRIPT_SOURCE_ID, expandedNewer, hasMore = true),
+            ),
+            oldestVisible,
+        )
+        val page = nearestOlderTranscriptPage(farOlder + expandedNewer, oldestVisible)
+
+        assertTrue(readyNeeds.isEmpty())
+        assertEquals("mesh-1940", page.first().id)
+        assertEquals("mesh-1969", page.last().id)
+    }
+
+    @Test
+    fun partialFinalPageLeavesRoomForLiveRows() {
+        val existing = (15 until 485).map { message(it.toString(), it.toLong()) }
+        val partialOlder = (0 until 15).map { message(it.toString(), it.toLong()) }
+        val historical = prependTranscriptRows(existing, partialOlder)
+
+        assertEquals(485, historical.size)
+        assertFalse(shouldPinOlderTranscriptEdge(historical.size))
+
+        val refreshed = refreshTranscriptRows(
+            existing = historical,
+            newest = listOf(message("live", 485)),
+            pinnedToOlderEdge = shouldPinOlderTranscriptEdge(historical.size),
+        )
+        assertEquals("live", refreshed.last().id)
+        assertEquals(486, refreshed.size)
+
+        val filled = refreshTranscriptRows(
+            existing = refreshed,
+            newest = (486 until 500).map { message("live-$it", it.toLong()) },
+            pinnedToOlderEdge = false,
+        )
+        assertEquals(500, filled.size)
+        assertTrue(shouldPinOlderTranscriptEdge(filled.size))
+    }
+
+    @Test
+    fun batchedLiveRowsCannotEvictAnchorWhileCrossingRetainedBudget() {
+        val historical = (0 until 499).map { message("internet-$it", it.toLong()) }
+        val firstLive = message("mesh-499", 499)
+        val excessLive = message("mesh-500", 500)
+
+        val filled = refreshTranscriptRows(
+            existing = historical,
+            newest = historical + firstLive + excessLive,
+            pinnedToOlderEdge = false,
+            retainedRows = 500,
+            pinOlderEdgeAtCapacity = true,
+        )
+
+        assertEquals(500, filled.size)
+        assertEquals("internet-0", filled.first().id)
+        assertEquals(firstLive.id, filled.last().id)
+        assertFalse(filled.any { it.id == excessLive.id })
+    }
+
+    @Test
     fun liveRefreshDoesNotEvictOlderWindowAnchor() {
         val existing = (70 until 570).map { message(it.toString(), it.toLong()) }
         val refreshed = refreshTranscriptRows(
