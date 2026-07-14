@@ -1,6 +1,6 @@
 # TestFlight — What to Test
 
-Build: **Sonar 1.9.0 (24)** · release tag **v0.1-alpha.9**
+Build: **Sonar 1.9.0 (25)** · release tag **v0.1-alpha.9**
 
 This build is a cross-platform alpha cut after local-first attachment previews,
 sticker disk cache, Marmot send prioritization, mesh identity preservation,
