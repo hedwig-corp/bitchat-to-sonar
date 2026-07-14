@@ -12,6 +12,52 @@ import Foundation
 struct RelayControllerTests {
 
     @Test
+    func linkSenderPolicy_acceptsOnlyRelayedIdentityPackets() {
+        #expect(MeshLinkSenderPolicy.allowsRelayedIdentityPacket(
+            type: MessageType.announce.rawValue,
+            ttl: TransportConfig.messageTTLDefault - 1
+        ))
+        #expect(MeshLinkSenderPolicy.allowsRelayedIdentityPacket(
+            type: SonarAnnouncePacket.packetType,
+            ttl: TransportConfig.messageTTLDefault - 1
+        ))
+        #expect(!MeshLinkSenderPolicy.allowsRelayedIdentityPacket(
+            type: MessageType.noiseHandshake.rawValue,
+            ttl: TransportConfig.messageTTLDefault - 1
+        ))
+        #expect(!MeshLinkSenderPolicy.allowsRelayedIdentityPacket(
+            type: MessageType.announce.rawValue,
+            ttl: TransportConfig.messageTTLDefault
+        ))
+    }
+
+    @Test
+    func linkSenderPolicy_rebindsOnlyVerifiedFullTtlAnnounces() {
+        #expect(MeshLinkSenderPolicy.allowsDirectIdentityRebind(
+            type: MessageType.announce.rawValue,
+            ttl: TransportConfig.messageTTLDefault,
+            identityVerified: true
+        ))
+        #expect(!MeshLinkSenderPolicy.allowsDirectIdentityRebind(
+            type: MessageType.announce.rawValue,
+            ttl: TransportConfig.messageTTLDefault,
+            identityVerified: false
+        ))
+        #expect(!MeshLinkSenderPolicy.allowsDirectIdentityRebind(
+            type: MessageType.noiseHandshake.rawValue,
+            ttl: TransportConfig.messageTTLDefault,
+            identityVerified: true
+        ))
+    }
+
+    @Test
+    func linkSenderPolicy_dropsLoopedPacketsButDoesNotMisclassifySyncReplay() {
+        #expect(MeshLinkSenderPolicy.isSelfEcho(senderIsSelf: true, ttl: 6))
+        #expect(!MeshLinkSenderPolicy.isSelfEcho(senderIsSelf: true, ttl: 0))
+        #expect(!MeshLinkSenderPolicy.isSelfEcho(senderIsSelf: false, ttl: 6))
+    }
+
+    @Test
     func ttlOne_doesNotRelay() async {
         let decision = RelayController.decide(
             ttl: 1,

@@ -79,6 +79,7 @@ object MeshGatt {
     private const val FRAGMENT_CHUNK_SIZE: UInt = 350u
     private const val MAX_FILE_TRANSFER_BYTES = 1024 * 1024
     private const val MAX_V1_FILE_PAYLOAD_BYTES = 0xFFFF
+    private const val MAX_PENDING_SONAR_PROFILES = 128
 
     private val ctx: Context get() = AppContextHolder.ctx
     private fun manager() = ctx.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
@@ -134,9 +135,9 @@ object MeshGatt {
      *  stays one identity across peerID + MAC rotation (issue #12). */
     private val fingerprintByAddr = ConcurrentHashMap<String, String>()
     private val fingerprintByPeerId = ConcurrentHashMap<String, String>()
-    /** A 0x53 can arrive before the 0x01 announce on a fresh GATT link. Keep the
-     *  raw payload until the announce supplies the stable fingerprint. */
-    private val pendingSonarByAddr = ConcurrentHashMap<String, ByteArray>()
+    /** A 0x53 can arrive before its 0x01 announce. Key by the packet sender, not
+     *  the ingress BLE address: relays carry profiles for multiple mesh peers. */
+    private val pendingSonarByPeerId = ConcurrentHashMap<String, ByteArray>()
     private val reassembler = MeshReassembler()
     @Volatile private var knownOnlyPeerAllowlist: Set<String>? = null
 
@@ -164,6 +165,15 @@ object MeshGatt {
     /** Stable fingerprint for a peer = SHA256(noise static pubkey), full hex. */
     private fun fingerprintOf(noisePublicKeyHex: String): String =
         runCatching { Sha256.hash(noisePublicKeyHex.hexToBytes()).toHex() }.getOrDefault("")
+
+    private fun queuePendingSonar(senderPeerId: String, payload: ByteArray) {
+        if (pendingSonarByPeerId.size >= MAX_PENDING_SONAR_PROFILES &&
+            !pendingSonarByPeerId.containsKey(senderPeerId)
+        ) {
+            pendingSonarByPeerId.keys.firstOrNull()?.let(pendingSonarByPeerId::remove)
+        }
+        pendingSonarByPeerId[senderPeerId] = payload
+    }
     /** Fired for an incoming public broadcast (Mesh channel) message. */
     fun addBroadcastListener(cb: (senderFingerprint: String, message: MeshPublicMessage) -> Unit) { onBroadcast.add(cb) }
     /** Fired for an incoming private file transfer. The first arg is the peer's
@@ -315,7 +325,7 @@ object MeshGatt {
         clientGatt.clear(); clientChar.clear(); clientLinks.clear(); clientPending.clear(); clientConnected.clear()
         serverLinks.clear(); serverDevices.clear(); peerIdByAddr.clear(); fingerprintByAddr.clear()
         fingerprintByPeerId.clear(); recentDials.clear()
-        pendingSonarByAddr.clear()
+        pendingSonarByPeerId.clear()
         pendingSends.clear()
         seenFileIds.clear()
     }
@@ -359,7 +369,6 @@ object MeshGatt {
         serverLinks.remove(addr)
         peerIdByAddr.remove(addr)
         fingerprintByAddr.remove(addr)
-        pendingSonarByAddr.remove(addr)
         serverNotifyQueue.remove(addr)
         serverNotifying.remove(addr)
     }
@@ -555,7 +564,6 @@ object MeshGatt {
 
     private fun cleanupClient(addr: String) {
         clientLinks.remove(addr); clientChar.remove(addr); peerIdByAddr.remove(addr); fingerprintByAddr.remove(addr)
-        pendingSonarByAddr.remove(addr)
         clientPending.remove(addr); clientConnected.remove(addr)
         clientWriteQueue.remove(addr); clientWriting.remove(addr)
         clientGatt.remove(addr)?.let { runCatching { it.disconnect(); it.close() } }
@@ -577,23 +585,34 @@ object MeshGatt {
             TYPE_ANNOUNCE -> {
                 val ann = runCatching { meshParseAnnounce(value) }.getOrNull()
                 if (ann == null) { android.util.Log.w(TAG, "announce verify FAILED from $addr"); return }
+                val route = meshAnnounceRoute(myPeerIdHex, ann.senderIdHex, info.ttl, DEFAULT_TTL)
+                if (route == MeshAnnounceRoute.SelfEcho) {
+                    android.util.Log.i(TAG, "ignoring self announce echoed by $addr")
+                    return
+                }
                 val fp = fingerprintOf(ann.noisePublicKeyHex)
-                android.util.Log.i(TAG, "ANNOUNCE from $addr → '${ann.nickname}' peerId=${ann.senderIdHex} fp=${fp.take(8)}…")
-                peerIdByAddr[addr] = ann.senderIdHex
+                android.util.Log.i(TAG, "ANNOUNCE from $addr → '${ann.nickname}' peerId=${ann.senderIdHex} fp=${fp.take(8)}… route=$route")
                 if (fp.isNotEmpty()) {
-                    fingerprintByAddr[addr] = fp
                     fingerprintByPeerId[ann.senderIdHex] = fp
                 }
                 if (!peerAllowedByPolicy(fp)) {
-                    android.util.Log.i(TAG, "dropping non-allowlisted announce from $addr fp=${fp.take(8)}")
-                    disconnectAddr(addr)
+                    android.util.Log.i(TAG, "dropping non-allowlisted $route announce from $addr fp=${fp.take(8)}")
+                    if (route == MeshAnnounceRoute.Direct) disconnectAddr(addr)
                     return
                 }
-                clientPending.remove(addr) // a real peer answered — keep this link
+                if (route == MeshAnnounceRoute.Direct) {
+                    // Only the physical neighbour may own address-scoped link
+                    // state. A relayed announce still belongs in the radar, but
+                    // must never replace the neighbour used for Noise routing.
+                    peerIdByAddr[addr] = ann.senderIdHex
+                    if (fp.isNotEmpty()) fingerprintByAddr[addr] = fp
+                    clientPending.remove(addr) // a real peer answered — keep this link
+                }
                 onAnnounce.forEach { it(addr, ann, fp) }
-                pendingSonarByAddr.remove(addr)?.let { pending ->
+                pendingSonarByPeerId.remove(ann.senderIdHex)?.let { pending ->
                     if (fp.isNotEmpty()) onSonar.forEach { it(fp, pending) }
                 }
+                if (route == MeshAnnounceRoute.Relayed) return
                 // Central: now that we know the peer's peerID, open a Noise link
                 // for DMs (initiator). Peripheral waits for the peer's 0x10.
                 // Re-handshake if there is no link OR the current one is still
@@ -637,11 +656,12 @@ object MeshGatt {
             TYPE_SONAR_0X53 -> {
                 // Tag the 0x53 with the peer's STABLE fingerprint (from its 0x01
                 // announce) so its Sonar profile/npub stays correlated to the
-                // peer across peerID + BLE rotation. Packet order is not
-                // guaranteed, so cache until the announce lands.
-                val fp = fingerprintByAddr[addr]
+                // peer across peerID, BLE rotation, and relay hops. Packet order
+                // is not guaranteed, so cache by sender until the announce lands.
+                if (info.senderIdHex.equals(myPeerIdHex, ignoreCase = true)) return
+                val fp = fingerprintByPeerId[info.senderIdHex]
                 if (fp == null) {
-                    pendingSonarByAddr[addr] = info.payload
+                    queuePendingSonar(info.senderIdHex, info.payload)
                     return
                 }
                 if (!peerAllowedByPolicy(fp)) return

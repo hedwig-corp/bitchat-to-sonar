@@ -7,6 +7,27 @@ struct RelayDecision {
     let delayMs: Int
 }
 
+/// Keeps physical-link authentication separate from identities carried through
+/// that link by the mesh. Announce and Sonar profile packets authenticate their
+/// claimed sender at the protocol layer, so a decremented-TTL copy is a valid
+/// relay candidate rather than an attempt to impersonate the direct neighbour.
+struct MeshLinkSenderPolicy {
+    static func allowsDirectIdentityRebind(type: UInt8, ttl: UInt8, identityVerified: Bool) -> Bool {
+        type == MessageType.announce.rawValue &&
+            ttl == TransportConfig.messageTTLDefault &&
+            identityVerified
+    }
+
+    static func allowsRelayedIdentityPacket(type: UInt8, ttl: UInt8) -> Bool {
+        guard ttl > 0, ttl < TransportConfig.messageTTLDefault else { return false }
+        return type == MessageType.announce.rawValue || type == SonarAnnouncePacket.packetType
+    }
+
+    static func isSelfEcho(senderIsSelf: Bool, ttl: UInt8) -> Bool {
+        senderIsSelf && ttl > 0
+    }
+}
+
 // RelayController centralizes flood control policy for relays.
 struct RelayController {
     static func decide(ttl: UInt8,
