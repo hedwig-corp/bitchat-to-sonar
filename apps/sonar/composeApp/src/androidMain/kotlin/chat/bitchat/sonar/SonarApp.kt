@@ -43,6 +43,9 @@ class SonarApp : Application() {
         // Publish JavaVM + app Context to Rust's ndk_context BEFORE any FFI call
         // (iroh DNS on bind, cpal/oboe audio read it). Once per process.
         NdkContext.install(this)
+        // FCM can render notification-payload fallbacks before the shared UI is
+        // created, so its custom-sound channel must exist at process startup.
+        Notifier.ensureChannel()
         SonarPushRegistration.ensureRegistered()
     }
 }

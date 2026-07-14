@@ -16,6 +16,9 @@ import AppKit
 
 final class NotificationService {
     static let shared = NotificationService()
+    private static let notificationSound = UNNotificationSound(
+        named: UNNotificationSoundName(rawValue: "sonar_notification.wav")
+    )
 
     /// Returns true if running in test environment (XCTest, Swift Testing, or CI)
     private var isRunningTests: Bool {
@@ -51,7 +54,7 @@ final class NotificationService {
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
-        content.sound = .default
+        content.sound = Self.notificationSound
         content.interruptionLevel = interruptionLevel
 
         if let userInfo = userInfo {

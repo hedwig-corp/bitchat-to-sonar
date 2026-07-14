@@ -4,6 +4,9 @@ import java.awt.Color
 import java.awt.SystemTray
 import java.awt.TrayIcon
 import java.awt.image.BufferedImage
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicLong
+import javax.sound.sampled.AudioSystem
 
 /**
  * Desktop (JVM) `actual`: incoming-message notifications via the AWT system tray
@@ -12,6 +15,10 @@ import java.awt.image.BufferedImage
  */
 actual object Notifier {
     @Volatile private var trayIcon: TrayIcon? = null
+    private val soundGeneration = AtomicLong()
+    private val soundExecutor = Executors.newSingleThreadExecutor { task ->
+        Thread(task, "sonar-notification-sound").apply { isDaemon = true }
+    }
 
     /** A small accent dot for the tray slot (we only use the tray for
      *  displayMessage balloons, not as a primary, persistent UI surface). */
@@ -45,6 +52,34 @@ actual object Notifier {
 
     actual fun notify(id: Int, title: String, body: String) {
         val icon = trayIcon ?: run { ensureChannel(); trayIcon } ?: return
-        runCatching { icon.displayMessage(title, body, TrayIcon.MessageType.INFO) }
+        runCatching {
+            icon.displayMessage(title, body, TrayIcon.MessageType.INFO)
+            playNotificationSound()
+        }
+    }
+
+    private fun playNotificationSound() {
+        val generation = soundGeneration.incrementAndGet()
+        soundExecutor.execute {
+            if (generation != soundGeneration.get()) return@execute
+            runCatching {
+                val bytes = Notifier::class.java
+                    .getResourceAsStream("/sonar_notification.wav")
+                    ?.buffered()
+                    ?: return@runCatching
+                bytes.use { input ->
+                    AudioSystem.getAudioInputStream(input).use { audio ->
+                        AudioSystem.getClip().use { clip ->
+                            clip.open(audio)
+                            clip.start()
+                            while (clip.isRunning && generation == soundGeneration.get()) {
+                                Thread.sleep(25)
+                            }
+                            if (clip.isRunning) clip.stop()
+                        }
+                    }
+                }
+            }
+        }
     }
 }

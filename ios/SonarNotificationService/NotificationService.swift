@@ -29,6 +29,9 @@ class NotificationService: SDKNotificationService {
     private static let appGroupId = "group.sh.hedwig.sonar"
     private static let notificationsEnabledKey = "sonar.notifications.enabled"
     private static let log = OSLog(subsystem: "sh.hedwig.sonar", category: "NSE")
+    private static let notificationSound = UNNotificationSound(
+        named: UNNotificationSoundName(rawValue: "sonar_notification.wav")
+    )
 
     override func didReceive(
         _ request: UNNotificationRequest,
@@ -191,7 +194,7 @@ class NotificationService: SDKNotificationService {
         // pushes are plaintext-free wakeups; the app renders precise copy after open.
         content.title = "New Sonar message"
         content.body = "Open Sonar to read it."
-        content.sound = .default
+        content.sound = notificationSound
         content.categoryIdentifier = "sonar.message"
         if #available(iOS 15.0, *) {
             content.interruptionLevel = .active

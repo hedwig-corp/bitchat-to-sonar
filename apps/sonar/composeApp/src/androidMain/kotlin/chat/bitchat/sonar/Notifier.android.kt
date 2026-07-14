@@ -4,25 +4,29 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.ContentResolver
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
+import android.net.Uri
 import android.os.Build
-import android.provider.Settings
 
 /** Android `actual`: "Messages" channel with sound, vibration, and badges — parity with iOS. */
 actual object Notifier {
-    private const val CHANNEL = "messages_v2"
-    private const val LEGACY_CHANNEL = "messages"
+    private const val CHANNEL = "messages_v3"
+    private val LEGACY_CHANNELS = listOf("messages", "messages_v2")
 
     private val ctx: Context get() = AppContextHolder.ctx
     private fun manager() = ctx.getSystemService(NotificationManager::class.java)
+    private fun soundUri(): Uri = Uri.parse(
+        "${ContentResolver.SCHEME_ANDROID_RESOURCE}://${ctx.packageName}/${R.raw.sonar_notification}"
+    )
 
     actual fun ensureChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val nm = manager()
-            nm.deleteNotificationChannel(LEGACY_CHANNEL)
+            LEGACY_CHANNELS.forEach(nm::deleteNotificationChannel)
             if (nm.getNotificationChannel(CHANNEL) == null) {
                 nm.createNotificationChannel(
                     NotificationChannel(CHANNEL, "Messages", NotificationManager.IMPORTANCE_HIGH).apply {
@@ -30,9 +34,9 @@ actual object Notifier {
                         enableVibration(true)
                         vibrationPattern = longArrayOf(0, 250, 200, 250)
                         setSound(
-                            Settings.System.DEFAULT_NOTIFICATION_URI,
+                            soundUri(),
                             AudioAttributes.Builder()
-                                .setUsage(AudioAttributes.USAGE_NOTIFICATION_COMMUNICATION_INSTANT)
+                                .setUsage(AudioAttributes.USAGE_NOTIFICATION)
                                 .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
                                 .build()
                         )
