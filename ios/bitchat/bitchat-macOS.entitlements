@@ -26,5 +26,9 @@
 	<true/>
 	<key>com.apple.security.assets.pictures.read-only</key>
 	<true/>
+	<!-- Same APNs topic as iOS (`sh.hedwig.sonar`). Debug/Release map via
+	     $(APS_ENVIRONMENT) in Configs/*.xcconfig (development / production). -->
+	<key>aps-environment</key>
+	<string>$(APS_ENVIRONMENT)</string>
 </dict>
 </plist>

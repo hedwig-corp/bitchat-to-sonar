@@ -13,7 +13,7 @@ import os
 import BitLogger
 #endif
 import UserNotifications
-#if os(iOS)
+#if os(iOS) || os(macOS)
 import FirebaseCore
 import FirebaseMessaging
 #endif
@@ -83,7 +83,7 @@ struct BitchatApp: App {
                     }
 
                     appDelegate.chatViewModel = chatViewModel
-                    #if os(iOS)
+                    #if os(iOS) || os(macOS)
                     appDelegate.sonarStore = sonarStore
                     #endif
 
@@ -335,7 +335,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate, MessagingDelegate {
                 userInfo: userInfo,
                 marmot: sonarStore?.marmot,
                 wallet: sonarStore?.wallet,
-                fetchCompletionHandler: completionHandler
+                completion: { completionHandler($0.uiResult) }
             )
         }
     }
@@ -349,8 +349,84 @@ final class AppDelegate: NSObject, UIApplicationDelegate, MessagingDelegate {
 #if os(macOS)
 import AppKit
 
-final class MacAppDelegate: NSObject, NSApplicationDelegate {
+final class MacAppDelegate: NSObject, NSApplicationDelegate, MessagingDelegate {
+    private static let pushLog = Logger(subsystem: "sh.hedwig.sonar", category: "push")
+
     weak var chatViewModel: ChatViewModel?
+    weak var sonarStore: SonarAppStore?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // Mirror iOS: Firebase is only required for Breez NDS (FCM→APNs).
+        // Transponder chat/call wakes use the raw APNs token.
+        if Bundle.main.path(forResource: "GoogleService-Info", ofType: "plist") != nil {
+            FirebaseApp.configure()
+            Messaging.messaging().delegate = self
+            Self.pushLog.info("Firebase configured for Breez NDS (macOS)")
+        } else {
+            Self.pushLog.warning("GoogleService-Info.plist missing; Breez NDS offline receive disabled on macOS")
+        }
+        // Ask for notification permission so APNs alerts can display when the
+        // app is quit. Registration for the device token is independent of the
+        // grant result (silent/content-available still needs the token).
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { granted, error in
+            if let error {
+                Self.pushLog.warning("Notification authorization error: \(error.localizedDescription, privacy: .public)")
+            } else {
+                Self.pushLog.info("Notification authorization granted=\(granted, privacy: .public)")
+            }
+            DispatchQueue.main.async {
+                NSApplication.shared.registerForRemoteNotifications()
+            }
+        }
+    }
+
+    func application(_ application: NSApplication, didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) {
+        SonarPushRegistration.shared.didRegisterForRemoteNotifications(deviceToken: deviceToken)
+        if FirebaseApp.app() != nil {
+            Messaging.messaging().apnsToken = deviceToken
+            refreshFCMToken(reason: "apns-token")
+        }
+    }
+
+    func application(_ application: NSApplication, didFailToRegisterForRemoteNotificationsWithError error: Error) {
+        Self.pushLog.error("APNS registration FAILED (macOS): \(error.localizedDescription, privacy: .public)")
+    }
+
+    func application(_ application: NSApplication, didReceiveRemoteNotification userInfo: [String: Any]) {
+        Task { @MainActor in
+            SonarPushProcessor.process(
+                userInfo: userInfo,
+                marmot: sonarStore?.marmot,
+                wallet: sonarStore?.wallet,
+                completion: { _ in }
+            )
+        }
+    }
+
+    func messaging(_ messaging: Messaging, didReceiveRegistrationToken fcmToken: String?) {
+        guard let fcmToken else { return }
+        handleFCMToken(fcmToken, source: "delegate")
+    }
+
+    private func refreshFCMToken(reason: String) {
+        Messaging.messaging().token { [weak self] token, error in
+            if let error {
+                Self.pushLog.warning("FCM token fetch failed after \(reason, privacy: .public): \(String(describing: error), privacy: .public)")
+                return
+            }
+            guard let token else {
+                Self.pushLog.warning("FCM token fetch returned nil after \(reason, privacy: .public)")
+                return
+            }
+            self?.handleFCMToken(token, source: reason)
+        }
+    }
+
+    private func handleFCMToken(_ fcmToken: String, source: String) {
+        Self.pushLog.info("FCM token available from \(source, privacy: .public)")
+        let wallet = (sonarStore?.wallet as? BridgedWallet)?.walletService
+        SonarPushRegistration.shared.didReceiveFCMToken(fcmToken, wallet: wallet)
+    }
 
     func applicationWillTerminate(_ notification: Notification) {
         chatViewModel?.applicationWillTerminate()

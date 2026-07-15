@@ -3,9 +3,11 @@
 ## Scope
 
 Complete notification support for Sonar, covering both local (process-alive)
-and remote (killed-app) delivery on the native Apple app (`ios/`) and the
-Compose Multiplatform app (`apps/sonar/`). Desktop remains local/tray-only
-(issue #54).
+and remote (killed-app) delivery on the native Apple app (`ios/` — iOS and
+macOS Sonar.app) and the Compose Multiplatform app (`apps/sonar/`). Compose
+Desktop/JVM remains local/tray-only (issue #54); native macOS uses the same
+Transponder APNs + Breez NDS path as iPhone (asleep/lid-closed delivery is
+best-effort).
 
 ## Architecture Overview
 
@@ -259,7 +261,10 @@ Production sizing: 1 vCPU / 512 MB RAM.
 - BLE mesh DMs, calls, and payments -- no server visibility.
 - Unify nearby payments -- Bluetooth-only.
 - Geohash public channels -- needs a separate privacy/noise design.
-- Desktop -- tracked by issue #54.
+- Compose Desktop / JVM tray app -- local-only; tracked by issue #54.
+  Native macOS Sonar.app uses APNs/Transponder + Breez NDS (same as iOS).
+  macOS Notification Service Extension (killed-app rich copy / offline Breez
+  answer) is deferred — tracked follow-up under #54.
 
 ## Alternative: Backend Wallet (Lexe)
 
@@ -272,15 +277,16 @@ that configuration. Track this alternative under issue #65.
 
 | Feature | Server | User-visible? | Platform |
 | --- | --- | --- | --- |
-| Marmot DMs/groups/invites | Transponder | Yes -- sender/group-aware local router copy | iOS, Android |
-| Marmot call offer | Transponder | Yes -- "Incoming call from <sender>" | iOS, Android |
-| Marmot payment receipt (`⚡PAY`) | Transponder | Yes -- amount shown by default | iOS, Android |
-| BOLT12 receive (wallet settle) | Breez NDS | No -- silent wakeup | iOS, Android |
-| Swap updates | Breez NDS | No -- silent wakeup | iOS, Android |
-| LNURL-pay invoice | Breez NDS | No -- silent wakeup | iOS, Android |
-| BLE mesh DMs/calls/payments | None | Yes -- local router | iOS, Android, Desktop |
-| Geohash public channels | None | Yes -- local router | iOS, Android, Desktop |
-| Desktop background | None | Local tray only | Desktop (issue #54) |
+| Marmot DMs/groups/invites | Transponder | Yes -- sender/group-aware local router copy | iOS, macOS, Android |
+| Marmot call offer | Transponder | Yes -- "Incoming call from <sender>" | iOS, macOS, Android |
+| Marmot payment receipt (`⚡PAY`) | Transponder | Yes -- amount shown by default | iOS, macOS, Android |
+| BOLT12 receive (wallet settle) | Breez NDS | No -- silent wakeup | iOS, macOS, Android |
+| Swap updates | Breez NDS | No -- silent wakeup | iOS, macOS, Android |
+| LNURL-pay invoice | Breez NDS | No -- silent wakeup | iOS, macOS, Android |
+| BLE mesh DMs/calls/payments | None | Yes -- local router | iOS, macOS, Android, Compose Desktop |
+| Geohash public channels | None | Yes -- local router | iOS, macOS, Android, Compose Desktop |
+| Compose Desktop background | None | Local tray only | Compose Desktop (issue #54) |
+| Native macOS background | Transponder + NDS | Yes (APNs; best-effort when asleep) | macOS Sonar.app |
 
 ## Production Readiness Gates
 
