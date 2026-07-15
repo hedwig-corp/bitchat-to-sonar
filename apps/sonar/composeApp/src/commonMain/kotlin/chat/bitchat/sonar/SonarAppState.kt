@@ -531,6 +531,11 @@ data class MarmotRowModel(
  * encrypted DMs through [SonarCore]; the same logic will back the iOS app once
  * it shifts to Compose Multiplatform.
  */
+class SonarAccountRestoreException(
+    message: String,
+    cause: Throwable? = null,
+) : Exception(message, cause)
+
 class SonarAppState(private val scope: CoroutineScope) {
     private val initialChatSnapshotBlob = SonarCore.loadBlob(CHAT_SNAPSHOT_BLOB_KEY)
     private val initialChatSnapshot = decodeChatSnapshot(initialChatSnapshotBlob)
@@ -649,7 +654,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             relayStartupCompleted = false
             cancelPendingMarmotSetups()
             cancelPendingMarmotGroupSetups()
-            WalletBridge.shutdown()
+            val walletShutdownFailure = runCatching { WalletBridge.shutdown() }.exceptionOrNull()
+            val walletWipeFailure = runCatching { WalletBridge.wipeLocalStorage() }.exceptionOrNull()
             UnifyRadio.stopScanning()
             UnifyRadio.stopAdvertising()
             unifyOffer = null; unifyPeers = emptyList()
@@ -688,11 +694,12 @@ class SonarAppState(private val scope: CoroutineScope) {
             presenceByGeohash = emptyMap()
             payLedger = SonarPayLedger(); payVersion++
             PaymentActivityStore.wipe() // iOS wipes both payment ledgers together
+            bip353 = ""
             callLogs.clear(); callVersion++
             resetCallState()
             pollJob?.cancel(); pollJob = null
             stopMarmotWakeLoop()
-            if (coreWipeFailure != null) {
+            if (coreWipeFailure != null || walletShutdownFailure != null || walletWipeFailure != null) {
                 toast = "Local storage wipe was incomplete; Sonar will retry before reusing caches."
             }
         }
@@ -2664,9 +2671,35 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun restoreAccount(nsec: String, onResult: (Result<Unit>) -> Unit) {
         scope.launch {
             val result = runCatching {
-                val restoredNpub = SonarCore.importIdentity(nsec)
+                val key = nsec.trim()
+                val expectedNpub = try {
+                    SonarCore.validateIdentity(key)
+                } catch (error: Throwable) {
+                    throw SonarAccountRestoreException(
+                        "That key couldn't be imported. Check you pasted the full nsec1... key.",
+                        error,
+                    )
+                }
 
-                WalletBridge.shutdown()
+                // Unregister the old offer while its node is still available, but
+                // preserve the device token for immediate registration by the new
+                // account. Wallet teardown/storage removal are strict: no identity
+                // mutation happens unless the previous database is definitely gone.
+                Notifier.prepareForAccountReplacement()
+                try {
+                    WalletBridge.shutdown()
+                    WalletBridge.wipeLocalStorage()
+                } catch (error: Throwable) {
+                    throw SonarAccountRestoreException(
+                        "Wallet storage couldn't be cleared. Restart Sonar and try again.",
+                        error,
+                    )
+                }
+
+                // Clear every account-bound host cache before committing the new
+                // nsec. A crash after import must never paint the previous account's
+                // chats, contacts, payment rows, offers, or local-first snapshot.
+                endTranscriptSession()
                 UnifyRadio.stopScanning()
                 UnifyRadio.stopAdvertising()
                 unifyOffer = null; unifyPeers = emptyList()
@@ -2680,8 +2713,10 @@ class SonarAppState(private val scope: CoroutineScope) {
 
                 MessageStore.wipe()
                 meshChats.clear(); meshChatNames.clear(); pendingMarmotSends.clear(); pendingDirectMarmotSends.clear(); pendingMarmotGroupSends.clear(); outbox.clear()
+                persistMeshNames()
                 pendingMarmotChatNpubs = emptyMap()
                 pendingMarmotGroups = emptyMap()
+                pendingInviteTokens.clear()
                 linkByFp.clear(); linkCapsByFp.clear(); groupFoldMap.clear()
                 persistLinks(); persistLinkCaps(); persistGroupFolds()
                 updateBleDiscoveryPolicy()
@@ -2689,32 +2724,70 @@ class SonarAppState(private val scope: CoroutineScope) {
                 sonarPeerProfiles = emptyMap()
                 sonarDescriptorsByNpubHex = emptyMap()
                 sonarDescriptorFetches.clear(); sonarDescriptorFetchedAt.clear(); sonarDescriptorMissedAt.clear()
+                publishedSonarDescriptor = false
+                publishedSonarDescriptorBolt12Offer = null
+                publishingSonarDescriptor = false
+                needsSonarDescriptorPublish = false
+                rawMeshPeerIds = emptySet(); meshPeerFirstSeenMs.clear(); pendingCapabilityRefreshPeers.clear()
+                profilesByNpub = emptyMap(); profileFetches.clear(); profileFetchedAt.clear(); profileMissedAt.clear(); persistProfileCache()
+                socialState = SonarSocialState(); persistSocialState()
+                bip353 = ""; SonarCore.saveBlob("bip353", "")
                 meshBroadcast = emptyList(); meshDmRows = emptyList()
-                chats = emptyList(); pendingMarmotChatNpubs = emptyMap(); pendingMarmotGroups = emptyMap(); messages = emptyList(); channelMsgs = emptyList()
+                verifiedChatIds.forEach { SonarCore.saveBlob("verified.$it", "") }
+                verifiedChatIds.clear(); verifiedVersion++
+                chats = emptyList(); chatSnapshotMessagesByChat = emptyMap(); pendingMarmotChatNpubs = emptyMap(); pendingMarmotGroups = emptyMap(); groupInvites = emptyList(); messages = emptyList(); channelMsgs = emptyList()
+                clearChatSnapshot()
                 lastWnGroups = -1; lastWnMsgs = -1
                 payLedger = SonarPayLedger(); persistPay(); payVersion++
                 PaymentActivityStore.wipe()
                 cancelAllMediaDownloads(); MediaCache.wipe()
                 mediaCache.clear(); clearStickerCaches()
                 callLogs.clear(); callVersion++
+                lastSeenTs.clear(); lastNotifiedTs.clear(); seededSeen = false
+                scanWatermark.clear()
+                SonarCore.saveBlob(NPUB_BLOB_KEY, "")
+                npub = ""
+                started = false
+                connecting = false
+                localCoreReady = false
+                homeMessagesHydrated = false
+
+                val restoredNpub = try {
+                    SonarCore.importIdentity(key)
+                } catch (error: Throwable) {
+                    // The core restores the prior durable identity when it can. Its
+                    // chats were intentionally erased above, so restart that clean
+                    // account and reconstruct its deterministic wallet.
+                    boot()
+                    throw SonarAccountRestoreException(
+                        "Account storage couldn't be replaced. Restart Sonar and try again.",
+                        error,
+                    )
+                }
+                if (restoredNpub != expectedNpub) {
+                    throw SonarAccountRestoreException(
+                        "Account storage couldn't be replaced. Restart Sonar and try again.",
+                    )
+                }
 
                 npub = restoredNpub
                 // Keep the persisted npub consistent with the restored identity
                 // now, so a crash before start()'s re-save can't restore the OLD
                 // npub as "me" on the next launch's local-first paint.
                 SonarCore.saveBlob(NPUB_BLOB_KEY, restoredNpub)
-                started = false
-                connecting = false
-                localCoreReady = false
-                homeMessagesHydrated = false
                 SonarCore.setOnboardingComplete(true)
                 retryPushRegistrationAfterAccountReady()
+                val needsExplicitBoot = onboarded
                 onboarded = true
                 nick = SonarCore.nickname()
                 stack = listOf(Screen.Home)
-                walletState = WalletBridge.state()
+                walletState = WalletState.NotConfigured
                 refreshMeshIdentity()
-                boot()
+                // From Settings, onboarded was already true so LaunchedEffect(onboarded)
+                // will not re-fire — boot explicitly. From onboarding, false→true
+                // triggers App.kt's LaunchedEffect; avoid a concurrent double boot.
+                if (needsExplicitBoot) boot()
+                toast = "Account restored"
             }
             onResult(result.map { Unit })
         }

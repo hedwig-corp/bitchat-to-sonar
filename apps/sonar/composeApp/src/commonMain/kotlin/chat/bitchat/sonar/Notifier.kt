@@ -25,6 +25,9 @@ expect object Notifier {
     /** Called after a BOLT12 receive offer is published so mobile push can bind
      *  the Breez NDS webhook to the exact offer used by offline payers. */
     fun onPaymentOfferReady(offer: String)
+    /** Clear account-bound push and wallet-offer state while preserving the
+     *  device token so the replacement account can register immediately. */
+    suspend fun prepareForAccountReplacement()
     /** Re-register or unregister push tokens when the user toggles push in settings. */
     fun setPushEnabled(enabled: Boolean)
 }

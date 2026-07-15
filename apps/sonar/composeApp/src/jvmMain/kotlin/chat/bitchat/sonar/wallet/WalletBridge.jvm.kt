@@ -18,11 +18,14 @@ import breez_sdk_liquid.connect
 import breez_sdk_liquid.defaultConfig
 import chat.bitchat.sonar.DesktopEnv
 import chat.bitchat.sonar.crypto.Bech32
+import java.io.File
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -48,6 +51,8 @@ import kotlinx.coroutines.withTimeoutOrNull
  * degrades exactly like a keyless build.
  */
 actual object WalletBridge {
+
+    private const val CLEANUP_MARKER_NAME = "wallet-cleanup.pending"
 
     private val lock = Mutex()
     @Volatile private var sdk: BindingLiquidSdk? = null
@@ -83,6 +88,7 @@ actual object WalletBridge {
 
     actual suspend fun setupIfNeeded(nsec: String): Unit = withContext(Dispatchers.IO) {
         lock.withLock {
+            recoverPendingCleanupLocked()
             if (sdk != null) return@withContext
             val key = apiKey
             if (key.isEmpty()) { current = WalletState.NotConfigured; return@withContext }
@@ -101,8 +107,19 @@ actual object WalletBridge {
                         val dir = DesktopEnv.file("sonar-wallet/mainnet").apply { mkdirs() }
                         workingDir = dir.absolutePath
                     }
-                    val node = connect(ConnectRequest(config, null, null, seed.map { it.toUByte() }))
-                    node to node.getInfo().walletInfo.balanceSat.toLong()
+                    var node: BindingLiquidSdk? = null
+                    var handedOff = false
+                    try {
+                        val connected = connect(ConnectRequest(config, null, null, seed.map { it.toUByte() }))
+                        node = connected
+                        currentCoroutineContext().ensureActive()
+                        val balanceSats = connected.getInfo().walletInfo.balanceSat.toLong()
+                        currentCoroutineContext().ensureActive()
+                        handedOff = true
+                        connected to balanceSats
+                    } finally {
+                        if (!handedOff) runCatching { node?.disconnect() }
+                    }
                 }
                 runCatching { withTimeoutOrNull(20_000) { work.await() } }
                     .also { if (it.getOrNull() == null) work.cancel() }
@@ -265,17 +282,65 @@ actual object WalletBridge {
 
     actual suspend fun shutdown(): Unit = withContext(Dispatchers.IO) {
         lock.withLock {
-            walletEpoch += 1 // invalidate in-flight refreshBalance() writes
-            val node = sdk
-            balanceListenerId?.let { id -> runCatching { node?.removeEventListener(id) } }
-            balanceListenerId = null
-            try { node?.disconnect() } catch (_: Throwable) {}
-            sdk = null
-            current = WalletState.NotConfigured
-            balance.value = 0L
-            rates = emptyMap()
-            receiveOffer = null
+            disconnectLocked()
+        }
+    }
+
+    actual suspend fun wipeLocalStorage(): Unit = withContext(Dispatchers.IO) {
+        lock.withLock {
+            markCleanupPendingLocked()
+            disconnectLocked()
+            deleteStorageLocked()
+            completeCleanupLocked()
+        }
+    }
+
+    private fun cleanupMarker(): File = DesktopEnv.file(CLEANUP_MARKER_NAME)
+
+    /** Complete an interrupted destructive wipe before any seed can be opened. */
+    private fun recoverPendingCleanupLocked() {
+        if (!cleanupMarker().exists()) return
+        disconnectLocked()
+        deleteStorageLocked()
+        completeCleanupLocked()
+    }
+
+    private fun markCleanupPendingLocked() {
+        val marker = cleanupMarker()
+        marker.parentFile?.mkdirs()
+        check(marker.exists() || marker.createNewFile()) {
+            "wallet cleanup marker could not be persisted"
+        }
+    }
+
+    private fun completeCleanupLocked() {
+        val marker = cleanupMarker()
+        check(!marker.exists() || marker.delete()) {
+            "wallet cleanup marker could not be cleared"
+        }
+    }
+
+    private fun disconnectLocked() {
+        walletEpoch += 1
+        val node = sdk
+        balanceListenerId?.let { id -> runCatching { node?.removeEventListener(id) } }
+        balanceListenerId = null
+        val disconnectFailure = runCatching { node?.disconnect() }.exceptionOrNull()
+        if (disconnectFailure != null) {
+            current = WalletState.Failed("wallet node did not disconnect cleanly")
+            throw IllegalStateException("wallet node did not disconnect cleanly", disconnectFailure)
+        }
+        sdk = null
+        current = WalletState.NotConfigured
+        balance.value = 0L
+        rates = emptyMap()
+        receiveOffer = null
+    }
+
+    private fun deleteStorageLocked() {
+        val root = DesktopEnv.file("sonar-wallet")
+        if (root.exists() && (!root.deleteRecursively() || root.exists())) {
+            throw IllegalStateException("wallet storage could not be removed")
         }
     }
 }
-

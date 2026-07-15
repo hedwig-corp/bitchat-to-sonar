@@ -41,6 +41,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import chat.bitchat.sonar.SonarAccountRestoreException
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.ui.SNFingerprintCard
 import chat.bitchat.sonar.ui.SNGhostButton
@@ -128,8 +129,9 @@ fun SonarOnboardingScreen(state: SonarAppState) {
                     restoreError = null
                     state.restoreAccount(key) { result ->
                         restoreInFlight = false
-                        result.exceptionOrNull()?.let {
-                            restoreError = "That key couldn't be imported. Check you pasted the full nsec1... key."
+                        result.exceptionOrNull()?.let { failure ->
+                            restoreError = (failure as? SonarAccountRestoreException)?.message
+                                ?: "Account restore failed. Restart Sonar and try again."
                         }
                     }
                 }
@@ -141,11 +143,31 @@ fun SonarOnboardingScreen(state: SonarAppState) {
             } else {
                 when (step) {
                     0 -> {
-                        SNPrimaryButton("Get started") { step = 1 }
-                        SNGhostButton("I already have a key") {
-                            nsec = ""
-                            restoreError = null
-                            restoring = true
+                        // Keep both first-run paths in one bounded row. A stacked
+                        // secondary action was clipped below the viewport on the
+                        // API 36 medium-phone layout, making restore undiscoverable.
+                        Row(
+                            Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            SNPrimaryButton("Get started", Modifier.weight(1f)) { step = 1 }
+                            Box(
+                                Modifier.weight(1f).height(52.dp)
+                                    .clip(RoundedCornerShape(15.dp)).background(s.accentSoft)
+                                    .clickable {
+                                        nsec = ""
+                                        restoreError = null
+                                        restoring = true
+                                    },
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Text(
+                                    "Restore account",
+                                    color = s.accentDeep,
+                                    fontSize = 15.sp,
+                                    fontWeight = FontWeight.Bold,
+                                )
+                            }
                         }
                     }
                     1 -> SNPrimaryButton("Continue", disabled = !can) { if (can) step = 2 }
@@ -253,7 +275,10 @@ private fun StepRestore(
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.Center) {
         Text("Restore account", color = s.text, fontSize = 30.sp, fontWeight = FontWeight.Black)
         Spacer(Modifier.height(10.dp))
-        Text("Paste your nsec private key to bring this Sonar identity and wallet onto this device.", color = s.text2, fontSize = 16.sp, lineHeight = 21.sp)
+        Text(
+            "Paste your nsec private key. This restores your Sonar identity and Lightning wallet. Chat history on this device starts fresh until backup ships.",
+            color = s.text2, fontSize = 16.sp, lineHeight = 21.sp,
+        )
         Spacer(Modifier.height(22.dp))
         Box(
             Modifier.fillMaxWidth().heightIn(min = 116.dp).clip(RoundedCornerShape(16.dp)).background(s.surface2)

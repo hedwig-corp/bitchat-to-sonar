@@ -248,6 +248,28 @@ object SonarPushRegistration {
         Log.d(TAG, "Unregistered from push servers")
     }
 
+    /**
+     * Identity replacement keeps the device FCM token but must forget every
+     * offer-scoped marker from the previous deterministic wallet. Best-effort
+     * unregister while the old node is still connected; the new wallet always
+     * force-registers its own offer after setup.
+     */
+    suspend fun prepareForAccountReplacement() {
+        try { WalletBridge.unregisterWebhook() } catch (_: Exception) {}
+        cachedOffer = null
+        synchronized(webhookLock) {
+            completedSessionWebhookMarker = null
+            inFlightWebhookMarker = null
+            inFlightWebhookStartedAtMs = 0L
+            inFlightWebhookGeneration += 1
+        }
+        runCatching {
+            kotlinx.coroutines.withContext(Dispatchers.IO) {
+                prefs().edit().remove(WEBHOOK_MARKER_PREF_KEY).commit()
+            }
+        }
+    }
+
     internal fun normalizedNdsUrl(rawValue: String?): String {
         val raw = rawValue?.trim().orEmpty()
         if (raw.isEmpty() || raw == "https:" || raw == "http:") return "https://$DEFAULT_NDS_HOST"

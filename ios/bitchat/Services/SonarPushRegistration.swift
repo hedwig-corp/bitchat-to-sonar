@@ -135,6 +135,29 @@ final class SonarPushRegistration: @unchecked Sendable {
         Self.log.info("Unregistered from push servers")
     }
 
+    /// Account replacement keeps the device APNs/FCM tokens but invalidates the
+    /// previous wallet's offer-scoped Breez markers. Unregister the old offer
+    /// while its wallet is still connected; the replacement wallet can then
+    /// register immediately without waiting for another token callback.
+    ///
+    /// Do not clear `sonarNode` here: wallet cleanup can still fail before the
+    /// identity is mutated, in which case the old account must keep receiving
+    /// push registrations. `MarmotService.wipeDatabase()` clears the node at the
+    /// actual identity-replacement commit point.
+    func prepareForAccountReplacement(wallet: WalletBridgeService?) async {
+        if let wallet {
+            try? await wallet.unregisterWebhook()
+        }
+        queue.sync {
+            cachedOffer = nil
+            completedSessionWebhookMarker = nil
+            inFlightWebhookMarker = nil
+            inFlightWebhookStartedAt = nil
+            inFlightWebhookGeneration &+= 1
+        }
+        UserDefaults.standard.removeObject(forKey: Self.webhookMarkerKey)
+    }
+
     /// Set the SonarNode once it's initialized. Retries transponder registration
     /// if an APNS token was already collected.
     func setSonarNode(_ node: SonarNode) {

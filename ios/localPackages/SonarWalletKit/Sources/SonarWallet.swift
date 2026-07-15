@@ -246,7 +246,9 @@ public final class SonarWallet {
         guard let seed = Self.bytes(fromHex: entropyHex), seed.count >= 16 else {
             throw WalletError.core("bad entropy")
         }
-        storage.putData(Self.seedKey, Data(seed))
+        guard storage.putData(Self.seedKey, Data(seed)) else {
+            throw WalletError.core("failed to persist deterministic wallet seed")
+        }
         return entropyHex
     }
 
@@ -255,8 +257,12 @@ public final class SonarWallet {
     public func createWallet() async throws -> String {
         try ensureConfigured()
         var seed = [UInt8](repeating: 0, count: 32)
-        _ = SecRandomCopyBytes(kSecRandomDefault, seed.count, &seed)
-        storage.putData(Self.seedKey, Data(seed))
+        guard SecRandomCopyBytes(kSecRandomDefault, seed.count, &seed) == errSecSuccess else {
+            throw WalletError.core("failed to generate wallet seed")
+        }
+        guard storage.putData(Self.seedKey, Data(seed)) else {
+            throw WalletError.core("failed to persist wallet seed")
+        }
         return Self.hex(seed)
     }
 
@@ -288,8 +294,11 @@ public final class SonarWallet {
 
     public func stopNode() async throws {
         let node = sdk
-        sdk = nil
         try await run { try node?.disconnect() }
+        // Retain the native owner when disconnect throws. Destructive callers
+        // must not lose the only handle capable of retrying teardown and then
+        // delete or reopen the same SQLite store underneath it.
+        sdk = nil
     }
 
     // MARK: - Observation

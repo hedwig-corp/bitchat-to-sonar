@@ -303,6 +303,27 @@ final class WalletBridgeService: ObservableObject {
         state = .notConfigured
     }
 
+    /// Strict teardown used before deleting or replacing wallet storage. Unlike
+    /// the lifecycle shutdown above, a disconnect error is propagated so an
+    /// account restore cannot continue while the native SDK may still own the
+    /// Breez database.
+    func shutdownForStorageMutation() async throws {
+        if let running = setupTask {
+            _ = try? await running.value
+        }
+        setupTask = nil
+        balanceTask?.cancel()
+        balanceTask = nil
+        ratesTask?.cancel()
+        ratesTask = nil
+        defer { state = .notConfigured }
+        do {
+            try await wallet.stopNode()
+        } catch let error as SonarWallet.WalletError {
+            throw Self.map(error)
+        }
+    }
+
     // MARK: - Background lifecycle
 
     #if canImport(UIKit)

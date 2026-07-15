@@ -11,6 +11,7 @@
 
 import Combine
 import CryptoKit
+import BitLogger
 import Foundation
 import Security
 
@@ -64,6 +65,7 @@ enum SonarWalletDerivation {
 final class BridgedWallet: SonarWalletProviding {
     /// Keychain key holding the chat identity nsec (written by MarmotChatModel).
     private static let nsecKeychainKey = "marmot-nsec"
+    private static let cleanupPendingKey = "sonar.wallet.cleanupPending"
 
     private let bridge: WalletBridgeService
     var walletService: WalletBridgeService { bridge }
@@ -85,8 +87,7 @@ final class BridgedWallet: SonarWalletProviding {
         }
 
         // With no BREEZ_API_KEY this settles to .notConfigured immediately.
-        let bridge = self.bridge
-        Task { try? await bridge.setupIfNeeded() }
+        Task { [weak self] in try? await self?.setupAfterPendingCleanupIfNeeded() }
         // NOTE: incoming-payment observation must NOT be started here. The
         // receive flow should subscribe only after the wallet is ready.
     }
@@ -94,8 +95,48 @@ final class BridgedWallet: SonarWalletProviding {
     /// Re-attempt setup once the chat identity exists (the entropy provider
     /// started returning non-nil). Called by the store when the npub lands.
     func retrySetup() {
-        let bridge = self.bridge
-        Task { try? await bridge.setupIfNeeded() }
+        Task { [weak self] in try? await self?.setupAfterPendingCleanupIfNeeded() }
+    }
+
+    /// A crash or native disconnect failure may interrupt a destructive wipe.
+    /// Finish it before deriving/opening any wallet for the current identity.
+    private func setupAfterPendingCleanupIfNeeded() async throws {
+        if UserDefaults.standard.bool(forKey: Self.cleanupPendingKey) {
+            try await bridge.shutdownForStorageMutation()
+            try Self.wipeWalletStorage()
+        }
+        try await bridge.setupIfNeeded()
+    }
+
+    /// Stop the old wallet and prove its seed/database are absent before the
+    /// caller commits a replacement identity. This is intentionally strict:
+    /// restore must not report success while stale wallet material survives.
+    func prepareForIdentityReplacement() async throws {
+        clearCachedReceiveOffer()
+        try Self.beginWalletStorageMutation()
+        try await bridge.shutdownForStorageMutation()
+        try Self.wipeWalletStorage()
+    }
+
+    /// Panic wipe remains best-effort overall, but never deletes a database whose
+    /// native owner failed to disconnect. The durable marker makes the next setup
+    /// finish cleanup before any new identity can open the wallet.
+    func wipeForEmergency() async -> Bool {
+        clearCachedReceiveOffer()
+        do {
+            try Self.beginWalletStorageMutation()
+            try await bridge.shutdownForStorageMutation()
+        } catch {
+            SecureLogger.error("Wallet shutdown before emergency wipe failed: \(error)", category: .session)
+            return false
+        }
+        do {
+            try Self.wipeWalletStorage()
+        } catch {
+            SecureLogger.error("Wallet emergency storage wipe failed: \(error)", category: .session)
+            return false
+        }
+        return true
     }
 
     private static func map(_ state: WalletBridgeService.State) -> SonarWalletState {
@@ -181,16 +222,83 @@ final class BridgedWallet: SonarWalletProviding {
             .eraseToAnyPublisher()
     }
 
-    /// Emergency wipe: forget the wallet seed along with everything else.
-    /// (The keychain service is owned by SonarWalletKit's storage.) The seed
-    /// stays reconstructable from the nsec — until that is wiped too.
-    static func wipeWalletStorage() {
+    /// Emergency wipe / identity restore: forget the wallet seed and on-disk
+    /// Breez state. (Keychain service is owned by SonarWalletKit's storage.)
+    /// The seed stays reconstructable from the nsec — until that is wiped too.
+    static func wipeWalletStorage() throws {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: "chat.bitchat.sonar.wallet",
         ]
-        SecItemDelete(query as CFDictionary)
+        let status = SecItemDelete(query as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw WalletStorageWipeError.keychain(status)
+        }
+
+        let fm = FileManager.default
+        try wipeWalletFilesAndDefaults(
+            fileManager: fm,
+            appGroupContainer: fm.containerURL(forSecurityApplicationGroupIdentifier: "group.sh.hedwig.sonar"),
+            applicationSupportDirectory: fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first,
+            sharedDefaults: UserDefaults(suiteName: "group.sh.hedwig.sonar")
+        )
+        try completeWalletStorageMutation()
     }
+
+    /// Persist before disconnect/delete so an interrupted wipe is recovered on
+    /// the next setup rather than pairing a new nsec with a stale Breez store.
+    static func beginWalletStorageMutation() throws {
+        UserDefaults.standard.set(true, forKey: cleanupPendingKey)
+        guard UserDefaults.standard.synchronize() else {
+            throw WalletStorageWipeError.cleanupMarker
+        }
+    }
+
+    private static func completeWalletStorageMutation() throws {
+        UserDefaults.standard.removeObject(forKey: cleanupPendingKey)
+        guard UserDefaults.standard.synchronize() else {
+            throw WalletStorageWipeError.cleanupMarker
+        }
+    }
+
+    /// Testable file/defaults half of the destructive wipe. Both the shared
+    /// App Group database and the legacy per-app fallback must be absent before
+    /// restore is allowed to commit another nsec.
+    static func wipeWalletFilesAndDefaults(
+        fileManager: FileManager,
+        appGroupContainer: URL?,
+        applicationSupportDirectory: URL?,
+        sharedDefaults: UserDefaults?
+    ) throws {
+        let roots = [
+            appGroupContainer?.appendingPathComponent("breez-sdk", isDirectory: true),
+            applicationSupportDirectory?.appendingPathComponent("sonar-wallet", isDirectory: true),
+        ].compactMap { $0 }
+        for root in roots where fileManager.fileExists(atPath: root.path) {
+            do {
+                try fileManager.removeItem(at: root)
+            } catch {
+                throw WalletStorageWipeError.filesystem(error)
+            }
+            guard !fileManager.fileExists(atPath: root.path) else {
+                throw WalletStorageWipeError.storageStillPresent
+            }
+        }
+        // NSE / App Group mirrored connect creds (seed hex) must not outlive wipe.
+        if let sharedDefaults {
+            sharedDefaults.removeObject(forKey: "breez_api_key")
+            sharedDefaults.removeObject(forKey: "breez_seed_hex")
+            sharedDefaults.removeObject(forKey: "breez_mainnet")
+            _ = sharedDefaults.synchronize()
+        }
+    }
+}
+
+private enum WalletStorageWipeError: Error {
+    case keychain(OSStatus)
+    case filesystem(Error)
+    case storageStillPresent
+    case cleanupMarker
 }
 
 #endif

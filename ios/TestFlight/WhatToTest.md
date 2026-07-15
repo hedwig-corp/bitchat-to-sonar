@@ -97,6 +97,15 @@ activity must never hold back another’s resync.
 - Updating must **not** mint a new account / nsec. If prefs are lost but the
   keychain key remains, you should recover into the same account, not onboarding.
 
+## 8b. Restore account (nsec)
+
+- Fresh install: onboarding shows a clear **Restore account with private key**
+  button (not easy to miss). Paste a valid `nsec1…` → same identity + wallet
+  balance after Breez sync. Local chats start empty (backup not shipped yet).
+- Settings → **Restore account**: replace the current account with a pasted
+  nsec; confirm wipe; wallet rebuilds from that key.
+- Invalid nsec shows an error and does not corrupt the current account.
+
 ## Regression pass (still expected)
 
 - Group invite links (QR / share / paste / join).

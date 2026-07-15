@@ -112,6 +112,14 @@ expect object WalletBridge {
     /** Remove the push webhook (sign-out or push disable). */
     suspend fun unregisterWebhook()
 
-    /** Disconnect (on wipe). */
+    /** Disconnect before a destructive storage mutation. Throws if the native
+     *  node cannot release its database cleanly. */
     suspend fun shutdown()
+
+    /**
+     * Delete on-disk Breez wallet state after [shutdown]. Throws unless the
+     * complete wallet root is absent on return, so restore can never report
+     * success while retaining a previous identity's database.
+     */
+    suspend fun wipeLocalStorage()
 }

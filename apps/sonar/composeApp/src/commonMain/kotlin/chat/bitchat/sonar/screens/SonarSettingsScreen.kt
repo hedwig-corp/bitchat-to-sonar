@@ -13,11 +13,14 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -31,9 +34,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -41,6 +46,7 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import chat.bitchat.sonar.Screen
+import chat.bitchat.sonar.SonarAccountRestoreException
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.SonarClock
 import chat.bitchat.sonar.SonarCore
@@ -77,8 +83,9 @@ fun SonarSettingsScreen(state: SonarAppState) {
     val s = sonar
     var wipeAsk by remember { mutableStateOf(false) }
     var eraseAsk by remember { mutableStateOf(false) }
-    var currencyPick by remember { mutableStateOf(false) }
     var exportKey by remember { mutableStateOf(false) }
+    var restoreKey by remember { mutableStateOf(false) }
+    var currencyPick by remember { mutableStateOf(false) }
     var notif by remember { mutableStateOf(false) }
     var appicon by remember { mutableStateOf(false) }
     var requests by remember { mutableStateOf(false) }
@@ -192,10 +199,16 @@ fun SonarSettingsScreen(state: SonarAppState) {
                 ) { state.push(Screen.Nearby) }
                 SNXSettingsRow(
                     label = "Export private key",
-                    sub = "Move your account to another wallet",
+                    sub = "Back up your nsec — needed to restore on another phone",
                     chevron = true,
                     icon = { SNXIcon(SNXIconName.ImportKey, 18.dp, it) },
                 ) { exportKey = true }
+                SNXSettingsRow(
+                    label = "Restore account",
+                    sub = "Replace this account with an nsec from a backup",
+                    chevron = true,
+                    icon = { SNXIcon(SNXIconName.ImportKey, 18.dp, it) },
+                ) { restoreKey = true }
                 SNSettingsRow(
                     icon = SNIconName.Trash, tone = SNTone.Cyan, label = "Erase all chats",
                     sub = "Clears conversations — keeps your identity",
@@ -259,6 +272,7 @@ fun SonarSettingsScreen(state: SonarAppState) {
     if (wipeAsk) WipeSheet(onWipe = { wipeAsk = false; state.wipe() }, onClose = { wipeAsk = false })
     if (eraseAsk) EraseChatsSheet(onErase = { eraseAsk = false; state.eraseAllChats() }, onClose = { eraseAsk = false })
     if (exportKey) ExportKeySheet(state, onClose = { exportKey = false })
+    if (restoreKey) RestoreAccountSheet(state, onClose = { restoreKey = false })
     if (currencyPick) CurrencySheet(
         selected = state.currency,
         onPick = { state.selectCurrency(it); currencyPick = false },
@@ -455,6 +469,95 @@ private fun ExportKeySheet(state: SonarAppState, onClose: () -> Unit) {
             color = s.text3, fontSize = 13.sp, lineHeight = 19.5.sp, textAlign = TextAlign.Center,
             modifier = Modifier.fillMaxWidth().padding(start = 18.dp, end = 18.dp, top = 12.dp, bottom = 4.dp),
         )
+    }
+}
+
+@Composable
+private fun RestoreAccountSheet(state: SonarAppState, onClose: () -> Unit) {
+    val s = sonar
+    val clipboard = LocalClipboardManager.current
+    var nsec by remember { mutableStateOf("") }
+    var confirmed by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    var inFlight by remember { mutableStateOf(false) }
+    val nsecOk = nsec.trim().matches(Regex("^nsec1[0-9a-z]{20,}$"))
+    Sheet("Restore account", onClose) {
+        Row(
+            Modifier.fillMaxWidth().padding(start = 8.dp, end = 8.dp, top = 2.dp, bottom = 12.dp)
+                .clip(RoundedCornerShape(14.dp))
+                .background(Color(s.danger.value).copy(alpha = 0.10f))
+                .padding(horizontal = 15.dp, vertical = 13.dp),
+        ) {
+            SNIcon(SNIconName.Shield, 18.dp, s.danger, weight = 2f)
+            Spacer(Modifier.width(11.dp))
+            Text(
+                "This replaces the account on this phone. Chats stored here are erased. Your Lightning wallet is rebuilt from the nsec you paste.",
+                color = s.text, fontSize = 13.sp, lineHeight = 19.5.sp,
+            )
+        }
+        Box(
+            Modifier.fillMaxWidth().padding(horizontal = 8.dp).heightIn(min = 84.dp)
+                .clip(RoundedCornerShape(14.dp)).background(s.surface2)
+                .padding(horizontal = 15.dp, vertical = 14.dp),
+        ) {
+            if (nsec.isEmpty()) {
+                Text("nsec1...", color = s.text3, fontSize = 15.sp)
+            }
+            BasicTextField(
+                value = nsec,
+                onValueChange = { nsec = it },
+                textStyle = TextStyle(color = s.text, fontSize = 15.sp, lineHeight = 20.sp),
+                cursorBrush = SolidColor(s.accent),
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+        Spacer(Modifier.height(10.dp))
+        Row(
+            Modifier.padding(horizontal = 8.dp).clip(CircleShape).background(s.accentSoft)
+                .clickable { clipboard.getText()?.text?.let { nsec = it.trim() } }
+                .padding(horizontal = 14.dp, vertical = 9.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            SNXIcon(SNXIconName.Copy, 16.dp, s.accentDeep, weight = 2f)
+            Spacer(Modifier.width(7.dp))
+            Text("Paste from clipboard", color = s.accentDeep, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+        }
+        Spacer(Modifier.height(8.dp))
+        SNSettingsRow(
+            icon = SNIconName.ShieldCheck,
+            label = "I understand chats on this phone will be erased",
+            toggle = confirmed,
+            divider = false,
+        ) { confirmed = !confirmed }
+        if (error != null) {
+            Text(
+                error!!,
+                color = s.danger,
+                fontSize = 13.sp,
+                lineHeight = 17.sp,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+            )
+        }
+        Column(
+            Modifier.padding(start = 8.dp, end = 8.dp, top = 6.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            SNPrimaryButton(
+                if (inFlight) "Restoring..." else "Restore account",
+                disabled = !nsecOk || !confirmed || inFlight,
+            ) {
+                inFlight = true
+                error = null
+                state.restoreAccount(nsec.trim()) { result ->
+                    inFlight = false
+                    result.exceptionOrNull()?.let { failure ->
+                        error = (failure as? SonarAccountRestoreException)?.message
+                            ?: "Account restore failed. Restart Sonar and try again."
+                    } ?: onClose()
+                }
+            }
+            SNGhostButton("Cancel") { onClose() }
+        }
     }
 }
 
