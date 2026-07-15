@@ -1,6 +1,9 @@
 package chat.bitchat.sonar
 
+import android.content.ClipData
 import android.content.Context
+import android.content.Intent
+import android.net.Uri
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -19,6 +22,14 @@ import java.util.concurrent.locks.ReentrantLock
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import kotlin.concurrent.read
 import kotlin.concurrent.write
+
+internal fun diagnosticsShareIntent(uri: Uri): Intent =
+    Intent(Intent.ACTION_SEND).apply {
+        type = "application/zip"
+        clipData = ClipData.newRawUri("Sonar diagnostics", uri)
+        putExtra(Intent.EXTRA_STREAM, uri)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
 
 /**
  * Android `actual`: drive the Rust core (Marmot/White Noise) through the
@@ -592,13 +603,8 @@ actual object SonarCore {
         val uri = androidx.core.content.FileProvider.getUriForFile(
             ctx, "${ctx.packageName}.fileprovider", zip
         )
-        val send = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
-            type = "application/zip"
-            putExtra(android.content.Intent.EXTRA_STREAM, uri)
-            addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        }
-        val chooser = android.content.Intent.createChooser(send, "Share diagnostics")
-            .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+        val chooser = Intent.createChooser(diagnosticsShareIntent(uri), "Share diagnostics")
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         runCatching { ctx.startActivity(chooser) }.isSuccess
     }
 

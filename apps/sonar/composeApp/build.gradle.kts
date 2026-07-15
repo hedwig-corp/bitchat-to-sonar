@@ -226,6 +226,12 @@ kotlin {
             implementation(libs.junit)
             implementation(libs.okhttp.mockwebserver)
         }
+        val androidUnitTest by getting {
+            dependencies {
+                implementation(kotlin("test"))
+                implementation("org.robolectric:robolectric:4.16.1")
+            }
+        }
         val jvmMain by getting {
             // The desktop Breez API key is written here by `generateBreezKeyResource`
             // (gitignored generated dir), mirroring Android's BuildConfig field.
