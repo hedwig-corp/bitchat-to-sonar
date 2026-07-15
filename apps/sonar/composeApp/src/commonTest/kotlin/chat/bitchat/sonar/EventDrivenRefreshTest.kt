@@ -73,105 +73,108 @@ class EventDrivenRefreshTest {
         assertEquals(emptySet(), chatsNeedingPageScan(latest, watermark))
     }
 
-    // ── shouldNotifyIncoming: matches the old notifyChatIfNew guard exactly ──
+    @Test
+    fun stagedConversationChangePageIsConsumedEvenAtEqualWatermark() {
+        val latest = mapOf("chat" to m(200, count = 6))
+        val watermark = mapOf("chat" to m(200, count = 6))
+
+        assertEquals(
+            setOf("chat"),
+            chatsNeedingPageScan(latest, watermark, stagedPageChatIds = setOf("chat")),
+        )
+    }
+
+    // ── stable-ID notification selection over the bounded changed page ──
+
+    private fun msg(
+        id: String,
+        secs: Long,
+        mine: Boolean = false,
+        sender: String = "peer",
+    ) = SonarMsg(id, sender, id, mine, secs)
 
     @Test
-    fun notifiesOnNewerIncoming() {
-        assertTrue(
-            shouldNotifyIncoming(
-                latestAtSecs = 200,
-                latestMine = false,
-                prevSeenSecs = 100,
-                lastNotifiedSecs = 100,
-                seeded = true,
-                isOpen = false,
-            )
+    fun notifiesForSecondIncomingMessageInSameSecond() {
+        val candidate = newestUnseenIncoming(
+            messages = listOf(msg("first", 200), msg("second", 200)),
+            seenMessageIds = setOf("first"),
+            previousLatestSecs = 200,
+            isOpen = false,
+        )
+        assertEquals("second", candidate?.id)
+    }
+
+    @Test
+    fun oldBackfillDoesNotRenotifyCachedLatest() {
+        val candidate = newestUnseenIncoming(
+            messages = listOf(msg("old-backfill", 100), msg("latest", 200)),
+            seenMessageIds = setOf("latest"),
+            previousLatestSecs = 200,
+            isOpen = false,
+        )
+        assertEquals(null, candidate)
+    }
+
+    @Test
+    fun incomingBeforeOwnLatestStillNotifies() {
+        val candidate = newestUnseenIncoming(
+            messages = listOf(msg("incoming", 200), msg("mine", 200, mine = true)),
+            seenMessageIds = emptySet(),
+            previousLatestSecs = 100,
+            isOpen = false,
+        )
+        assertEquals("incoming", candidate?.id)
+    }
+
+    @Test
+    fun incomingBeforeBlockedLatestStillNotifies() {
+        val candidate = newestUnseenIncoming(
+            messages = listOf(
+                msg("allowed", 200, sender = "friend"),
+                msg("blocked", 201, sender = "blocked-peer"),
+            ),
+            seenMessageIds = emptySet(),
+            previousLatestSecs = 100,
+            isOpen = false,
+            allowsMessage = { it.senderNpub != "blocked-peer" },
+        )
+        assertEquals("allowed", candidate?.id)
+    }
+
+    @Test
+    fun seedPassAndOpenChatDoNotNotify() {
+        val messages = listOf(msg("incoming", 200))
+        assertEquals(
+            null,
+            newestUnseenIncoming(messages, emptySet(), previousLatestSecs = null, isOpen = false),
+        )
+        assertEquals(
+            null,
+            newestUnseenIncoming(messages, emptySet(), previousLatestSecs = 100, isOpen = true),
         )
     }
 
     @Test
-    fun doesNotNotifyForOwnMessage() {
-        assertFalse(
-            shouldNotifyIncoming(
-                latestAtSecs = 200,
-                latestMine = true,
-                prevSeenSecs = 100,
-                lastNotifiedSecs = 100,
-                seeded = true,
-                isOpen = false,
-            )
+    fun firstMessageAfterEmptyChatSeedNotifies() {
+        val candidate = newestUnseenIncoming(
+            messages = listOf(msg("first", 200)),
+            seenMessageIds = emptySet(),
+            previousLatestSecs = 0,
+            isOpen = false,
         )
+        assertEquals("first", candidate?.id)
     }
 
     @Test
-    fun doesNotNotifyBeforeSeedPass() {
-        assertFalse(
-            shouldNotifyIncoming(
-                latestAtSecs = 200,
-                latestMine = false,
-                prevSeenSecs = 100,
-                lastNotifiedSecs = 100,
-                seeded = false,
+    fun seenAndOwnMessagesDoNotNotify() {
+        assertEquals(
+            null,
+            newestUnseenIncoming(
+                messages = listOf(msg("seen", 200), msg("mine", 201, mine = true)),
+                seenMessageIds = setOf("seen"),
+                previousLatestSecs = 100,
                 isOpen = false,
-            )
-        )
-    }
-
-    @Test
-    fun doesNotNotifyForOpenChat() {
-        assertFalse(
-            shouldNotifyIncoming(
-                latestAtSecs = 200,
-                latestMine = false,
-                prevSeenSecs = 100,
-                lastNotifiedSecs = 100,
-                seeded = true,
-                isOpen = true,
-            )
-        )
-    }
-
-    @Test
-    fun doesNotNotifyWhenNotNewerThanSeen() {
-        assertFalse(
-            shouldNotifyIncoming(
-                latestAtSecs = 100,
-                latestMine = false,
-                prevSeenSecs = 100,
-                lastNotifiedSecs = 0,
-                seeded = true,
-                isOpen = false,
-            )
-        )
-    }
-
-    @Test
-    fun doesNotDoubleNotifyAlreadyNotified() {
-        assertFalse(
-            shouldNotifyIncoming(
-                latestAtSecs = 200,
-                latestMine = false,
-                prevSeenSecs = 100,
-                lastNotifiedSecs = 200,
-                seeded = true,
-                isOpen = false,
-            )
-        )
-    }
-
-    @Test
-    fun doesNotNotifyWithoutPriorSeen() {
-        // prev == null means we have never recorded a baseline for the chat, so
-        // the very first observed message must not fire (matches old `prev != null`).
-        assertFalse(
-            shouldNotifyIncoming(
-                latestAtSecs = 200,
-                latestMine = false,
-                prevSeenSecs = null,
-                lastNotifiedSecs = 0,
-                seeded = true,
-                isOpen = false,
-            )
+            ),
         )
     }
 

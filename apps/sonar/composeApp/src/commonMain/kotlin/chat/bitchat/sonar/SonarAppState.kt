@@ -46,6 +46,8 @@ private const val MESH_REALTIME_HOT_WINDOW_MS = 30_000L
 private const val PROFILE_REFRESH_TTL_SECS = 30 * 60L
 /** Non-render scan budget used by pay/call reconciliation and media matching. */
 private const val BACKGROUND_TRANSCRIPT_SCAN_LIMIT = 100
+/** Two local pages of IDs cover overlap between incremental notification scans. */
+private const val NOTIFICATION_SEEN_MESSAGE_LIMIT = BACKGROUND_TRANSCRIPT_SCAN_LIMIT * 2
 private const val LOCAL_SUMMARY_PAGE_LIMIT = 20
 private const val LOCAL_SUMMARY_CHAT_LIMIT = 5
 private const val RELAY_RECONNECT_RETRY_MS = 10_000L
@@ -347,6 +349,7 @@ internal data class ScanMark(val secs: Long, val count: Long)
 internal fun chatsNeedingPageScan(
     latestByChat: Map<String, ScanMark>,
     scannedWatermark: Map<String, ScanMark>,
+    stagedPageChatIds: Set<String> = emptySet(),
 ): Set<String> = buildSet {
     for ((chatId, latest) in latestByChat) {
         val seen = scannedWatermark[chatId] ?: ScanMark(Long.MIN_VALUE, Long.MIN_VALUE)
@@ -356,25 +359,29 @@ internal fun chatsNeedingPageScan(
             add(chatId)
         }
     }
+    // The event-driven fast path may already have fetched the changed page.
+    // Consume it even if an older implementation/predecessor advanced the
+    // scan mark first, and avoid a duplicate local FFI page read.
+    addAll(stagedPageChatIds.intersect(latestByChat.keys))
 }
 
-/** Whether a per-chat notification should fire, derived purely from the cheap
- *  `conversationSummaries()` probe. Mirrors the guard inside `notifyChatIfNew`:
- *  the newest message must be incoming, strictly newer than what we last saw
- *  AND last notified, the seed pass must be done, and the chat must not be the
- *  one currently open. Kept pure for unit tests. */
-internal fun shouldNotifyIncoming(
-    latestAtSecs: Long,
-    latestMine: Boolean,
-    prevSeenSecs: Long?,
-    lastNotifiedSecs: Long,
-    seeded: Boolean,
+/** Newest eligible message in a bounded local page that was not present in a
+ * previous page. The timestamp floor rejects old out-of-order/backfilled rows;
+ * stable message IDs still distinguish two real arrivals in the same second. */
+internal fun newestUnseenIncoming(
+    messages: List<SonarMsg>,
+    seenMessageIds: Set<String>,
+    previousLatestSecs: Long?,
     isOpen: Boolean,
-): Boolean {
-    if (!seeded || isOpen || latestMine) return false
-    if (latestAtSecs <= 0L) return false
-    val prev = prevSeenSecs ?: return false
-    return latestAtSecs > prev && latestAtSecs > lastNotifiedSecs
+    allowsMessage: (SonarMsg) -> Boolean = { true },
+): SonarMsg? {
+    if (isOpen || previousLatestSecs == null) return null
+    return messages.asSequence()
+        .filter { !it.mine }
+        .filter { it.id !in seenMessageIds }
+        .filter { it.tsSecs >= previousLatestSecs }
+        .filter(allowsMessage)
+        .maxWithOrNull(compareBy<SonarMsg> { it.tsSecs }.thenBy { it.id })
 }
 
 /** Immutable fingerprint of every input `visibleChats` depends on. The getter
@@ -740,8 +747,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             cancelAllMediaDownloads(); MediaCache.wipe()
             mediaCache.clear(); clearStickerCaches()
             callLogs.clear(); callVersion++
-            lastSeenTs.clear(); lastNotifiedTs.clear(); seededSeen = false
-            scanWatermark.clear()
+            notificationSeenMessageIds.clear(); notificationLatestSecs.clear()
+            scanWatermark.clear(); stagedChangedPages.clear(); failedChangedPageReads.clear()
             // White Noise / Marmot DB: wipe + reconnect with the SAME identity.
             runCatching { SonarCore.eraseChats() }
             relayStartupCompleted = false
@@ -911,6 +918,12 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  `conversationSummaries()` probe compares against this to skip the
      *  expensive `messagesPage` fetch for chats whose latest ts hasn't moved. */
     private val scanWatermark = HashMap<String, ScanMark>()
+    /** Pages fetched by the immediate conversationChanged path, handed to the
+     * next housekeeping pass for notification selection without a second FFI read. */
+    private val stagedChangedPages = HashMap<String, List<SonarMsg>>()
+    /** Newer invalidations whose fast-path page read failed. These force a
+     * fresh scan so an older staged page/watermark cannot mask the failure. */
+    private val failedChangedPageReads = HashSet<String>()
 
     /** Bind the iroh endpoint once + start the event loop (idempotent). */
     private suspend fun ensureCallStarted() {
@@ -2729,9 +2742,10 @@ class SonarAppState(private val scope: CoroutineScope) {
     private var isNearbyVisible = false
     /** Copies scan callbacks' radio cache into Compose state only while useful. */
     private var nearbyPeerRefreshJob: Job? = null
-    private val lastSeenTs = HashMap<String, Long>()
-    private val lastNotifiedTs = HashMap<String, Long>()
-    private var seededSeen = false
+    /** Bounded stable-ID history for background notification dedupe. */
+    private val notificationSeenMessageIds = HashMap<String, LinkedHashSet<String>>()
+    /** Latest timestamp observed per chat; older backfills must not notify. */
+    private val notificationLatestSecs = HashMap<String, Long>()
 
     // ── App lock ──
     val appLockAvailable: Boolean = AppLock.isAvailable()
@@ -3016,14 +3030,13 @@ class SonarAppState(private val scope: CoroutineScope) {
         Notifier.notify(notification.id, notification.title, notification.body)
     }
 
-    /** Notify for any chat whose newest incoming message is newer than last seen.
-     *  Uses [lastNotifiedTs] to prevent double-fire when the conversationChanged
-     *  flow and poll loop both process the same message within one cycle.
-     *
-     *  Driven by the single `conversationSummaries()` probe passed in as
-     *  [summaryByChat] — one FFI call for every chat's newest message, replacing
-     *  the old per-chat `messagesPage(chatId, 1)` (O(chats) FFI calls per cycle). */
-    private fun maybeNotify(summaryByChat: Map<String, SonarConversationSummary>) {
+    /** Notify from pages already fetched by the incremental call/pay scan.
+     * Stable message IDs avoid timestamp-only false dedupe, while scanning the
+     * bounded page preserves an incoming message followed by an own/blocked row. */
+    private fun maybeNotify(
+        changedPages: Map<String, List<SonarMsg>>,
+        summaryByChat: Map<String, SonarConversationSummary>,
+    ) {
         val openChatId = (screen as? Screen.Chat)?.id
         val knownChatIds = chats.map { it.id }.toSet()
         val snapshot = visibleChats.filter { it.id in knownChatIds }
@@ -3036,6 +3049,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 openChatId = openChatId,
                 idKey = c.id,
                 title = chatTitle(c),
+                changedPages = changedPages,
                 summaryByChat = summaryByChat,
             )
         }
@@ -3055,10 +3069,21 @@ class SonarAppState(private val scope: CoroutineScope) {
                 openChatId = openChatId,
                 idKey = meshId,
                 title = meshPeerName(peerId),
+                changedPages = changedPages,
                 summaryByChat = summaryByChat,
             )
         }
-        seededSeen = true
+        // Seed hidden/blocked/newly-removed rows too. Otherwise the first later
+        // visible change could be mistaken for a never-seen chat and suppressed.
+        for ((chatId, page) in changedPages) {
+            rememberNotificationPage(
+                chatId = chatId,
+                page = page,
+                observedLatestSecs = summaryByChat[chatId]?.latestAtSecs ?: 0L,
+            )
+        }
+        notificationSeenMessageIds.keys.retainAll(knownChatIds)
+        notificationLatestSecs.keys.retainAll(knownChatIds)
     }
 
     private fun notifyChatIfNew(
@@ -3068,34 +3093,35 @@ class SonarAppState(private val scope: CoroutineScope) {
         openChatId: String?,
         idKey: String,
         title: String?,
+        changedPages: Map<String, List<SonarMsg>>,
         summaryByChat: Map<String, SonarConversationSummary>,
     ) {
-        val prev = scanIds.mapNotNull { lastSeenTs[it] }.maxOrNull()
-        val alreadyNotified = scanIds.map { lastNotifiedTs[it] ?: 0L }.maxOrNull() ?: 0L
-        // Reconstruct the newest incoming message per chat from the summary
-        // probe (the summary's latest == what messagesPage(chatId, 1) returned).
-        // A summary whose newest line is our own send, or from a blocked sender,
-        // yields no incoming — matching the old visibleMessagesForChat filter.
         var newestIncoming: SonarMsg? = null
+        val isOpen = openChatId != null && openChatId in suppressIds
         for (chatId in scanIds) {
-            val s = summaryByChat[chatId] ?: continue
-            lastSeenTs[chatId] = s.latestAtSecs
-            if (s.latestMine) continue
-            if (!socialState.allowsChatMessage(chatId, s.latestSenderNpub, mine = false)) continue
-            if (newestIncoming == null || s.latestAtSecs > newestIncoming!!.tsSecs) {
-                newestIncoming = SonarMsg(
-                    id = chatId,
-                    senderNpub = s.latestSenderNpub,
-                    content = s.latestContent,
-                    mine = false,
-                    tsSecs = s.latestAtSecs,
-                )
+            val page = changedPages[chatId] ?: continue
+            val candidate = newestUnseenIncoming(
+                messages = page,
+                seenMessageIds = notificationSeenMessageIds[chatId].orEmpty(),
+                previousLatestSecs = notificationLatestSecs[chatId],
+                isOpen = isOpen,
+                allowsMessage = { message ->
+                    socialState.allowsChatMessage(chatId, message.senderNpub, message.mine)
+                },
+            )
+            rememberNotificationPage(
+                chatId = chatId,
+                page = page,
+                observedLatestSecs = summaryByChat[chatId]?.latestAtSecs ?: 0L,
+            )
+            if (candidate != null && (newestIncoming == null ||
+                    candidate.tsSecs > newestIncoming!!.tsSecs ||
+                    (candidate.tsSecs == newestIncoming!!.tsSecs && candidate.id > newestIncoming!!.id))
+            ) {
+                newestIncoming = candidate
             }
         }
-        if (seededSeen && prev != null && newestIncoming != null &&
-            newestIncoming.tsSecs > prev && newestIncoming.tsSecs > alreadyNotified &&
-            (openChatId == null || openChatId !in suppressIds)
-        ) {
+        if (newestIncoming != null) {
             val groupName = c.name.takeIf { c.members.size > 2 && it.isNotBlank() }
             notifyIncoming(
                 idKey = idKey,
@@ -3105,10 +3131,29 @@ class SonarAppState(private val scope: CoroutineScope) {
                 groupName = groupName,
                 unreadCount = unreadForChat(idKey).coerceAtLeast(1L),
             )
-            for (chatId in scanIds) {
-                lastNotifiedTs[chatId] = newestIncoming.tsSecs
-            }
         }
+    }
+
+    private fun rememberNotificationPage(
+        chatId: String,
+        page: List<SonarMsg>,
+        observedLatestSecs: Long,
+    ) {
+        val seen = notificationSeenMessageIds.getOrPut(chatId) { LinkedHashSet() }
+        for (message in page) {
+            // Refresh insertion order so the bounded set retains IDs that are
+            // still present in the newest local window.
+            seen.remove(message.id)
+            seen.add(message.id)
+        }
+        while (seen.size > NOTIFICATION_SEEN_MESSAGE_LIMIT) {
+            val iterator = seen.iterator()
+            if (!iterator.hasNext()) break
+            iterator.next()
+            iterator.remove()
+        }
+        val latest = maxOf(observedLatestSecs, page.maxOfOrNull { it.tsSecs } ?: 0L)
+        notificationLatestSecs[chatId] = maxOf(notificationLatestSecs[chatId] ?: latest, latest)
     }
 
     private fun notificationSenderName(chat: SonarChat, message: SonarMsg): String? {
@@ -3540,7 +3585,12 @@ class SonarAppState(private val scope: CoroutineScope) {
         val deleteIds = if (isGroup) listOf(chatId) else directMarmotChatIds(chatId)
         val deleteIdSet = deleteIds.toSet()
         chats = chats.filterNot { it.id in deleteIdSet }
-        for (id in deleteIds) { lastSeenTs.remove(id); lastNotifiedTs.remove(id) }
+        for (id in deleteIds) {
+            notificationSeenMessageIds.remove(id)
+            notificationLatestSecs.remove(id)
+            stagedChangedPages.remove(id)
+            failedChangedPageReads.remove(id)
+        }
         if (wasOpen && stack.size > 1) {
             endTranscriptSession()
             stack = stack.dropLast(1) // pop WITHOUT refresh
@@ -3585,8 +3635,10 @@ class SonarAppState(private val scope: CoroutineScope) {
             foldedGroupPeerIds = foldedGroupPeerIds.filterKeys { it !in foldedGroupIdsToDelete }
             foldedGroupIdsToDelete.forEach {
                 groupFoldMap.remove(it)
-                lastSeenTs.remove(it)
-                lastNotifiedTs.remove(it)
+                notificationSeenMessageIds.remove(it)
+                notificationLatestSecs.remove(it)
+                stagedChangedPages.remove(it)
+                failedChangedPageReads.remove(it)
                 unreadByChat = unreadByChat - it
             }
             persistGroupFolds()
@@ -7234,19 +7286,36 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // immediately so a call rings / pay processes / the open
                 // transcript updates without waiting for the heartbeat.
                 refreshChats()
-                val changedMessages = marmotMessagesPage(groupIdHex)
+                val freshChangedMessages = runCatching {
+                    SonarCore.messagesPage(groupIdHex, BACKGROUND_TRANSCRIPT_SCAN_LIMIT)
+                }.getOrNull()
+                val changedMessages = if (freshChangedMessages == null ||
+                    (!started && freshChangedMessages.isEmpty())
+                ) {
+                    chatSnapshotMessagesByChat[groupIdHex]
+                        .orEmpty()
+                        .takeLast(BACKGROUND_TRANSCRIPT_SCAN_LIMIT)
+                } else {
+                    freshChangedMessages
+                }
                 val visibleChangedMessages = visibleMessagesForChat(groupIdHex, changedMessages)
                 processPayLines(groupIdHex, visibleChangedMessages)
                 processCallLines(groupIdHex, visibleChangedMessages)
-                // The changed chat's newest ts is now handled; advance its scan
-                // watermark (secs + processed count) so the housekeeping cycle
-                // won't re-fetch its page for content we just processed.
-                changedMessages.lastOrNull()?.tsSecs?.let { ts ->
-                    val mark = ScanMark(ts, changedMessages.size.toLong())
-                    val prev = scanWatermark[groupIdHex]
-                    if (prev == null || mark.secs > prev.secs ||
-                        (mark.secs == prev.secs && mark.count > prev.count)
-                    ) scanWatermark[groupIdHex] = mark
+                // Hand the page to housekeeping before requesting it. That pass
+                // owns the shared scan watermark so call/pay and notification
+                // consumers cannot race by independently marking work complete.
+                // A snapshot fallback is suitable for immediate UI/call replay,
+                // but never counts as a successful read of this change. Only a
+                // fresh core page may advance the shared scan watermark.
+                if (freshChangedMessages != null) {
+                    stagedChangedPages[groupIdHex] = freshChangedMessages
+                    failedChangedPageReads.remove(groupIdHex)
+                } else {
+                    // Supersede any older staged page. The next housekeeping
+                    // pass must read the newer invalidation from core before it
+                    // is allowed to advance this chat's watermark.
+                    stagedChangedPages.remove(groupIdHex)
+                    failedChangedPageReads.add(groupIdHex)
                 }
                 (screen as? Screen.Chat)?.let { sc ->
                     if (!isMeshChat(sc.id) && (sc.id == groupIdHex || isSameDirectMarmotChat(sc.id, groupIdHex))) {
@@ -7383,12 +7452,12 @@ class SonarAppState(private val scope: CoroutineScope) {
         // Incremental scan: only chats whose newest ts moved past the watermark
         // need a page fetch + ☎CALL / pay re-scan. Everything else is skipped —
         // this replaces the old O(chats) messagesPage()+re-parse every 4 s.
-        scanChangedChatsForCallPay(summaryByChat)
+        val changedPages = scanChangedChatsForCallPay(summaryByChat)
         // Resolve kind-0 profiles for chat members so chats show names, not npubs.
         for (c in chats) c.members.forEach { if (it != npub) ensureProfile(it) }
         flushPendingMarmot() // a queued out-of-range send whose group just landed
         flushAllOutbox() // retry any outbox messages whose peer is now reachable
-        maybeNotify(summaryByChat)
+        maybeNotify(changedPages, summaryByChat)
         // Marmot/Nostr chats refresh from the core; mesh chats are local and
         // refreshed by drainMeshDms(). A mesh-route DM merges both legs.
         (screen as? Screen.Chat)?.let {
@@ -7427,14 +7496,19 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  single summaries() probe. Also emits the White Noise observability log. */
     private suspend fun scanChangedChatsForCallPay(
         summaryByChat: Map<String, SonarConversationSummary>,
-    ) {
+    ): Map<String, List<SonarMsg>> {
         val latestByChat = chats.associate { c ->
             val s = summaryByChat[c.id]
             c.id to ScanMark(s?.latestAtSecs ?: 0L, s?.messageCount ?: 0L)
         }
-        val toScan = chatsNeedingPageScan(latestByChat, scanWatermark)
+        val toScan = chatsNeedingPageScan(
+            latestByChat,
+            scanWatermark,
+            stagedPageChatIds = stagedChangedPages.keys + failedChangedPageReads,
+        )
         var wnMsgs = 0
         val senders = mutableSetOf<String>()
+        val changedPages = mutableMapOf<String, List<SonarMsg>>()
         for (c in chats) {
             val summaryCount = summaryByChat[c.id]?.messageCount?.toInt()
             if (c.id !in toScan) {
@@ -7443,7 +7517,29 @@ class SonarAppState(private val scope: CoroutineScope) {
                 wnMsgs += summaryCount ?: 0
                 continue
             }
-            val ms = runCatching { SonarCore.messagesPage(c.id, BACKGROUND_TRANSCRIPT_SCAN_LIMIT) }.getOrDefault(emptyList())
+            val forceFreshRead = c.id in failedChangedPageReads
+            val stagedPage = if (forceFreshRead) null else stagedChangedPages.remove(c.id)
+            val pageResult = if (stagedPage != null) {
+                Result.success(stagedPage)
+            } else {
+                runCatching { SonarCore.messagesPage(c.id, BACKGROUND_TRANSCRIPT_SCAN_LIMIT) }
+            }
+            val ms = pageResult.getOrNull()
+            if (ms == null) {
+                // Preserve the watermark so a transient local read failure is
+                // retried instead of permanently losing call/pay/notification.
+                wnMsgs += summaryCount ?: 0
+                continue
+            }
+            if (ms.isEmpty() && (summaryCount ?: 0) > 0) {
+                // The index is ahead of the transcript read. Treat this like a
+                // transient failure so the newly indexed row is retried.
+                failedChangedPageReads.add(c.id)
+                wnMsgs += summaryCount ?: 0
+                continue
+            }
+            failedChangedPageReads.remove(c.id)
+            changedPages[c.id] = ms
             val visibleMs = visibleMessagesForChat(c.id, ms)
             wnMsgs += summaryCount ?: ms.size
             processCallLines(c.id, visibleMs)
@@ -7459,11 +7555,14 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (scanWatermark.size > latestByChat.size) {
             scanWatermark.keys.retainAll(latestByChat.keys)
         }
+        stagedChangedPages.keys.retainAll(latestByChat.keys)
+        failedChangedPageReads.retainAll(latestByChat.keys)
         senders.forEach { ensureProfile(it) }
         if (chats.size != lastWnGroups || wnMsgs != lastWnMsgs) {
             sonarLog("SonarWN", "White Noise: ${chats.size} group(s), $wnMsgs message(s)")
             lastWnGroups = chats.size; lastWnMsgs = wnMsgs
         }
+        return changedPages
     }
 
     /** Live Marmot delivery (iOS `MarmotChatView.startPolling` parity): the
