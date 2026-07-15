@@ -76,7 +76,9 @@ import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -2226,8 +2228,27 @@ private fun MediaBubble(
             val bytes = mediaBytes
             val failed = transfer.phase == MediaTransferPhase.Failed ||
                 (transfer.phase == MediaTransferPhase.Available && loadResult.first && bytes == null)
+            // Signal pre-sizes media cells from stored attachment dimensions so
+            // the decoded image never reflows the transcript (Signal-Android
+            // ThumbnailView measures EXACTLY from DB width/height; Signal-iOS
+            // CVMediaAlbumView measures from sourceMediaSizePixels). MediaImage
+            // lays out at intrinsic pixels coerced per-axis into the 240×300
+            // maxes, so the same coercion here reserves the final box before
+            // any bytes arrive. Dimension-less media keeps the legacy skeleton.
+            val density = LocalDensity.current
+            val reservedSize = remember(media.width, media.height, maxBubbleWidth, density) {
+                val w = media.width ?: 0
+                val h = media.height ?: 0
+                if (w > 0 && h > 0) with(density) {
+                    DpSize(
+                        w.toDp().coerceAtMost(minOf(240.dp, maxBubbleWidth)),
+                        h.toDp().coerceAtMost(300.dp),
+                    )
+                } else null
+            }
             Box(
-                Modifier.widthIn(max = minOf(240.dp, maxBubbleWidth)).clip(bubbleShape).background(s.surface2)
+                (if (reservedSize != null) Modifier.size(reservedSize) else Modifier.widthIn(max = minOf(240.dp, maxBubbleWidth)))
+                    .clip(bubbleShape).background(s.surface2)
                     .clickable {
                         when (transfer.phase) {
                             MediaTransferPhase.NotDownloaded, MediaTransferPhase.Failed ->
@@ -2251,7 +2272,11 @@ private fun MediaBubble(
                     }
                     bytes != null -> InlineMediaFileChip(media, transfer) { onOpen(media) }
                     failed -> MediaUnavailable(media)
-                    else -> MediaLoadingSkeleton(media)
+                    else -> MediaLoadingSkeleton(
+                        media,
+                        if (reservedSize != null) Modifier.fillMaxSize()
+                        else Modifier.size(width = 216.dp, height = 150.dp),
+                    )
                 }
                 if (transfer.phase == MediaTransferPhase.Downloading) {
                     MediaTransferOverlay(transfer, Modifier.align(Alignment.Center))
@@ -2496,13 +2521,15 @@ private fun MediaMetaChip(tsSecs: Long, mesh: Boolean, modifier: Modifier = Modi
  *  shown while the encrypted blob downloads. Hue is the filename hash, exactly
  *  like the prototype's `--ph`/`--ph2`. */
 @Composable
-private fun MediaLoadingSkeleton(media: SonarMedia) {
+private fun MediaLoadingSkeleton(
+    media: SonarMedia,
+    modifier: Modifier = Modifier.size(width = 216.dp, height = 150.dp),
+) {
     val phue = remember(media.filename) { bcHue(media.filename) }
     val ph = Color.hsl(phue, 0.34f, 0.52f)
     val ph2 = Color.hsl((phue + 36f) % 360f, 0.38f, 0.42f)
     Box(
-        Modifier.size(width = 216.dp, height = 150.dp)
-            .background(Brush.linearGradient(listOf(ph, ph2))),
+        modifier.background(Brush.linearGradient(listOf(ph, ph2))),
         contentAlignment = Alignment.Center
     ) {
         Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
