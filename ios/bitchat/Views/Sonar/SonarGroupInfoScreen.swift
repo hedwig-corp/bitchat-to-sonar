@@ -20,6 +20,7 @@ struct SonarGroupInfoScreen: View {
     @State private var addDraft = ""
     @State private var leaveSheet = false
     @State private var inviteLink: String? = nil
+    @State private var creatingInviteLink = false
     @State private var pendingJoinRequests: [JoinRequestInfo] = []
     @State private var toast: String? = nil
 
@@ -97,24 +98,15 @@ struct SonarGroupInfoScreen: View {
                         SNSettingsCard {
                             SNSettingsRow(
                                 icon: .link, tone: .cyan,
-                                label: "Create invite link",
-                                sub: "Share a link or QR code to let people request to join",
-                                trail: .chevron, divider: false
+                                label: creatingInviteLink ? "Creating invite link…" : "Create invite link",
+                                sub: creatingInviteLink
+                                    ? "Opening your secure group locally"
+                                    : "Share a link or QR code to let people request to join",
+                                trail: creatingInviteLink ? .none : .chevron, divider: false
                             ) {
-                                guard let groupId = store.marmotGroupId(peerId) else { return }
-                                Task { @MainActor in
-                                    do {
-                                        let link = try await store.marmot.createInviteLink(
-                                            groupId: groupId, groupName: groupTitle
-                                        )
-                                        inviteLink = link
-                                        copyInviteLink(link)
-                                        showToast("Invite link created and copied")
-                                    } catch {
-                                        showToast("Couldn't create link: \(error.localizedDescription)")
-                                    }
-                                }
+                                createInviteLink()
                             }
+                            .disabled(creatingInviteLink)
                         }
                     }
 
@@ -317,6 +309,27 @@ struct SonarGroupInfoScreen: View {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(url, forType: .string)
         #endif
+    }
+
+    private func createInviteLink() {
+        guard let groupId = store.marmotGroupId(peerId) else {
+            showToast("Group is still setting up")
+            return
+        }
+        creatingInviteLink = true
+        Task { @MainActor in
+            defer { creatingInviteLink = false }
+            do {
+                let link = try await store.marmot.createInviteLink(
+                    groupId: groupId, groupName: groupTitle
+                )
+                inviteLink = link
+                copyInviteLink(link)
+                showToast("Invite link created and copied")
+            } catch {
+                showToast("Couldn't create link: \(error.localizedDescription)")
+            }
+        }
     }
 
     @MainActor

@@ -1326,7 +1326,12 @@ final class MarmotChatModel: ObservableObject {
     /// instead of immediately surfacing "not connected yet".
     func ensureConnected(timeoutSeconds: Double = 10) async -> Bool {
         if service.isConnected() { return true }
-        if !busy { connectIfNeeded() }
+        if !busy {
+            busy = true
+            let connected = await performConnect()
+            busy = false
+            return connected && service.isConnected()
+        }
         let start = Date()
         while Date().timeIntervalSince(start) < timeoutSeconds {
             // Honor cancellation: the push-wake rerun deadline relies on it
@@ -4842,7 +4847,10 @@ final class MarmotChatModel: ObservableObject {
     }
 
     func createInviteLink(groupId: String, groupName: String) async throws -> String {
-        try await service.createInviteLink(groupId: groupId, groupName: groupName)
+        guard await ensureConnected() else {
+            throw MarmotService.ServiceError.notConnected
+        }
+        return try await service.createInviteLink(groupId: groupId, groupName: groupName)
     }
 
     func pendingJoinRequests(groupId: String) async throws -> [JoinRequestInfo] {

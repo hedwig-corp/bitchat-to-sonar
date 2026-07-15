@@ -270,7 +270,7 @@ final class MarmotService: @unchecked Sendable {
         }
     }
 
-    enum ServiceError: Error, Equatable {
+    enum ServiceError: LocalizedError, Equatable {
         /// `connect()` has not completed successfully yet.
         case notConnected
         /// A newer session change superseded this async operation.
@@ -281,6 +281,19 @@ final class MarmotService: @unchecked Sendable {
         case invalidInput(String)
         /// Failure inside the Rust core (relay I/O, MLS, MDK...).
         case core(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .notConnected:
+                return "Not connected yet — try again in a moment."
+            case .cancelled:
+                return "Operation cancelled."
+            case .invalidInput(let detail):
+                return "Invalid input: \(detail)"
+            case .core(let detail):
+                return detail
+            }
+        }
     }
 
     let conversationChanged = PassthroughSubject<String, Never>()
