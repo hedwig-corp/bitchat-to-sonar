@@ -509,6 +509,8 @@ struct SNSearchSheetContent: View {
 
     @State private var query = ""
     @FocusState private var focused: Bool
+    @State private var resolvingHandle = false
+    @State private var handleMissQuery: String?
 
     private var trimmedQuery: String {
         query.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -520,6 +522,14 @@ struct SNSearchSheetContent: View {
 
     private var canStartSecureChat: Bool {
         trimmedQuery.hasPrefix("npub1")
+    }
+
+    /// Show a "start chat by handle" action for plausible handle input (never
+    /// npubs). Purely a string gate — resolution happens only on tap.
+    private var canStartHandleChat: Bool {
+        !canStartSecureChat
+            && trimmedQuery.count >= 2
+            && MarmotService.handleLooksValid(trimmedQuery)
     }
 
     private var uniqueChannels: [SNChannelItem] {
@@ -546,7 +556,7 @@ struct SNSearchSheetContent: View {
     }
 
     private var hasResults: Bool {
-        canStartSecureChat || !filteredChannels.isEmpty || !filteredDMs.isEmpty || !filteredPeers.isEmpty
+        canStartSecureChat || canStartHandleChat || !filteredChannels.isEmpty || !filteredDMs.isEmpty || !filteredPeers.isEmpty
     }
 
     var body: some View {
@@ -556,6 +566,9 @@ struct SNSearchSheetContent: View {
                 VStack(spacing: 0) {
                     if canStartSecureChat {
                         npubResult
+                    }
+                    if canStartHandleChat {
+                        handleResult
                     }
                     if !filteredChannels.isEmpty {
                         section("Channels")
@@ -617,6 +630,9 @@ struct SNSearchSheetContent: View {
             store.resolveSavedChannelNames()
             DispatchQueue.main.async { focused = true }
         }
+        .onChange(of: query) { _ in
+            handleMissQuery = nil
+        }
     }
 
     private var searchField: some View {
@@ -651,6 +667,70 @@ struct SNSearchSheetContent: View {
         ) {
             store.startSecureChat(npub: trimmedQuery)
             onClose()
+        }
+    }
+
+    /// Handle action row — mirrors the npub row's layout, with a trailing
+    /// spinner while the tapped handle resolves over the internet.
+    private var handleResult: some View {
+        Button(action: resolveHandleAndStartChat) {
+            HStack(spacing: 13) {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(SonarTheme.accentSoft)
+                    .frame(width: 38, height: 38)
+                    .overlay(
+                        SNIcon(name: .key, size: 19)
+                            .foregroundColor(SonarTheme.accentDeep)
+                    )
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(verbatim: "Start secure chat with \(trimmedQuery)")
+                        .font(SonarTheme.uiFont(size: 16, weight: .semibold))
+                        .foregroundColor(SonarTheme.text)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    if handleMissQuery == trimmedQuery {
+                        Text(verbatim: "No one found for \(trimmedQuery)")
+                            .font(SonarTheme.uiFont(size: 12.5))
+                            .foregroundColor(SonarTheme.danger)
+                    } else {
+                        Text(resolvingHandle ? "Looking up this handle\u{2026}" : "Encrypted chat over the internet")
+                            .font(SonarTheme.uiFont(size: 12.5))
+                            .foregroundColor(SonarTheme.text2)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                if resolvingHandle {
+                    ProgressView()
+                        .progressViewStyle(CircularProgressViewStyle(tint: SonarTheme.text3))
+                        .scaleEffect(0.8)
+                } else {
+                    SNIcon(name: .chevron, size: 14, weight: 2.2)
+                        .foregroundColor(SonarTheme.text3)
+                }
+            }
+            .padding(EdgeInsets(top: 11, leading: 10, bottom: 11, trailing: 10))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(SNRowPressStyle(cornerRadius: 14))
+        .disabled(resolvingHandle)
+    }
+
+    /// Resolve on tap only — never per keystroke, and local results always
+    /// paint regardless of this network lookup.
+    private func resolveHandleAndStartChat() {
+        guard !resolvingHandle else { return }
+        let handle = trimmedQuery
+        resolvingHandle = true
+        handleMissQuery = nil
+        Task { @MainActor in
+            let npub = await store.resolveHandleForChat(handle)
+            resolvingHandle = false
+            if let npub {
+                store.startSecureChat(npub: npub)
+                onClose()
+            } else {
+                handleMissQuery = handle
+            }
         }
     }
 

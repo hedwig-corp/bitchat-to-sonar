@@ -699,6 +699,15 @@ data class ActiveCall(
 /** Verify-sheet model: the safety groups (empty ⇒ show [note]) + verified flag. */
 data class SonarVerify(val safety: List<String>, val verified: Boolean, val note: String?)
 
+/** Lifecycle of a handle claim (`vincenzo@sonarprivacy.xyz`) driven from the
+ *  profile screen. One state machine, no concurrent claims. */
+sealed interface HandleClaimState {
+    data object Idle : HandleClaimState
+    data object Claiming : HandleClaimState
+    data class Claimed(val address: String) : HandleClaimState
+    data class Failed(val message: String) : HandleClaimState
+}
+
 /** Precomputed home chat-list row (Signal-style cached row view model): all the
  *  fields the design ConvRow needs, resolved off the render path so the home
  *  LazyColumn reads O(1) per row instead of walking `chats` + hitting disk. */
@@ -2965,6 +2974,54 @@ class SonarAppState(private val scope: CoroutineScope) {
         bip353 = t
     }
 
+    // ── Unified handle claim (NIP-05 chat + BIP-353 payments) ──
+    var handleClaimState by mutableStateOf<HandleClaimState>(HandleClaimState.Idle)
+        private set
+
+    /** Claim (or refresh) `handle` at the Sonar registrar. Chat-only claims are
+     *  supported: when the wallet isn't ready the BIP-353 payment record is
+     *  skipped and a later re-claim adds the offer. On success the address is
+     *  persisted (core sidecar + bip353 blob), announced over BLE, and the
+     *  kind-0 profile republishes so peers see the handle immediately. */
+    fun claimHandle(handle: String) {
+        val name = handle.trim().lowercase()
+        if (name.isEmpty() || handleClaimState is HandleClaimState.Claiming) return
+        handleClaimState = HandleClaimState.Claiming
+        scope.launch {
+            val offer = if (walletState is WalletState.Ready) {
+                runCatching { WalletBridge.createOffer() }.getOrNull()
+            } else null
+            runCatching { SonarCore.claimHandle(name, offer) }
+                .onSuccess { address ->
+                    updateBip353(address)
+                    refreshMeshIdentity()
+                    runCatching { SonarCore.publishProfile(nick) }
+                    handleClaimState = HandleClaimState.Claimed(address)
+                }
+                .onFailure { e ->
+                    val msg = e.message.orEmpty()
+                    handleClaimState = HandleClaimState.Failed(
+                        when {
+                            msg.contains("handle taken:") -> "That name is already taken"
+                            msg.contains("invalid handle") -> "Names can use a-z, 0-9, dots, dashes"
+                            else -> "Couldn't claim the name — check your connection and try again"
+                        }
+                    )
+                }
+        }
+    }
+
+    /** Reset the claim state machine (e.g. when the user edits the input). */
+    fun resetHandleClaimState() {
+        handleClaimState = HandleClaimState.Idle
+    }
+
+    /** Resolve a typed handle (`vincenzo` / `alice@example.com`) to an npub for
+     *  starting a chat. null when unregistered or offline. Network-bounded;
+     *  call only from a user-initiated action, never per keystroke. */
+    suspend fun resolveHandleForChat(input: String): String? =
+        SonarCore.resolveHandle(input)?.npub
+
     /** Capabilities this node advertises in its Sonar announce (0x53). This build
      *  speaks Sonar voice/video calls, so it always advertises CAP_CALLS. */
     private fun capabilities(): Int =
@@ -3699,6 +3756,10 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // Local usability begins here. These services must work through
                 // a relay outage; relay attach/retry runs independently below.
                 started = true
+                // Adopt a core-claimed handle when the bip353 blob is blank
+                // (fresh install restored from nsec, or lost prefs): the core
+                // sidecar is the durable record, prefs are a mirror.
+                if (bip353.isBlank()) SonarCore.claimedHandle()?.let { updateBip353(it) }
                 refreshMeshIdentity()
                 updateBleDiscoveryPolicy()
                 setupWallet()

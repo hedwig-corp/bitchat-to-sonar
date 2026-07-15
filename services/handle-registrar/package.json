@@ -1,0 +1,23 @@
+{
+  "name": "sonar-handle-registrar",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Unified handle registrar for sonarprivacy.xyz: BIP-353 payment addresses (DNS TXT) + NIP-05 Nostr identities from one signed-event claim.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "check": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@noble/curves": "^1.9.2",
+    "@noble/hashes": "^1.8.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260710.1",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4",
+    "wrangler": "^4.24.0"
+  }
+}

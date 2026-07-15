@@ -44,10 +44,13 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import chat.bitchat.sonar.HandleClaimState
 import chat.bitchat.sonar.SonarAppState
+import chat.bitchat.sonar.SonarCore
 import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconName
 import chat.bitchat.sonar.ui.SNNavHeader
+import chat.bitchat.sonar.ui.SNPrimaryButton
 import chat.bitchat.sonar.ui.SNSectionLabel
 import chat.bitchat.sonar.ui.SNSettingsCard
 import chat.bitchat.sonar.ui.SNSettingsRow
@@ -149,35 +152,117 @@ fun SonarProfileScreen(state: SonarAppState) {
                 modifier = Modifier.padding(start = 24.dp, end = 24.dp, bottom = 4.dp),
             )
 
-            // Platform addition (no design counterpart): BIP-353 payment address.
-            SNSectionLabel("Payments")
-            Column(
-                Modifier.fillMaxWidth().padding(horizontal = 14.dp)
-                    .clip(RoundedCornerShape(18.dp)).background(s.surface).padding(14.dp)
+            // Platform addition (no design counterpart): unified handle claim.
+            // One claimed name serves chat (NIP-05 → this key) and payments
+            // (BIP-353 → the wallet's BOLT12 offer).
+            SNSectionLabel("Handle")
+            HandleCard(state, payDraft, onDraftChange = { payDraft = it })
+            Spacer(Modifier.height(40.dp))
+        }
+    }
+}
+
+/**
+ * Handle claim card. Three shapes:
+ * - claimed: show the address with a check + "Change" affordance
+ * - editing: name field, live `name@sonarprivacy.xyz` preview, Claim button
+ * - external: a pasted full `name@domain` address is stored as-is (a payment
+ *   address from another wallet), without hitting the Sonar registrar
+ */
+@Composable
+private fun HandleCard(
+    state: SonarAppState,
+    payDraft: String,
+    onDraftChange: (String) -> Unit,
+) {
+    val s = sonar
+    val claim = state.handleClaimState
+    var editing by remember { mutableStateOf(false) }
+    val claimed = state.bip353
+    val showClaimed = claimed.isNotBlank() && !editing
+    // Claim finished while editing: fold back to the claimed row.
+    LaunchedEffect(claim) { if (claim is HandleClaimState.Claimed) editing = false }
+
+    Column(
+        Modifier.fillMaxWidth().padding(horizontal = 14.dp)
+            .clip(RoundedCornerShape(18.dp)).background(s.surface).padding(14.dp)
+    ) {
+        Text("Sonar handle", color = s.text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.height(4.dp))
+        Text(
+            "Claim a name — friends can start a chat or pay you with it. Optional.",
+            color = s.text3, fontSize = 12.5.sp, lineHeight = 16.sp
+        )
+        Spacer(Modifier.height(10.dp))
+        if (showClaimed) {
+            Row(
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(s.surface2)
+                    .padding(horizontal = 12.dp, vertical = 11.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Text("Payment address (BIP-353)", color = s.text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
-                Spacer(Modifier.height(4.dp))
+                SNIcon(SNIconName.Check, 16.dp, s.accent, weight = 2f)
+                Spacer(Modifier.width(8.dp))
+                Text(claimed, color = s.text, fontSize = 14.sp, modifier = Modifier.weight(1f))
                 Text(
-                    "Shared with Sonar peers nearby so they can pay you. Optional.",
+                    "Change",
+                    color = s.accent, fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.clickable {
+                        editing = true
+                        state.resetHandleClaimState()
+                        onDraftChange(claimed.substringBefore('@'))
+                    }
+                )
+            }
+        } else {
+            val draft = payDraft.trim()
+            val isExternal = '@' in draft
+            Box(
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(s.surface2)
+                    .padding(horizontal = 12.dp, vertical = 11.dp)
+            ) {
+                if (payDraft.isEmpty()) Text("yourname", color = s.text3, fontSize = 14.sp)
+                BasicTextField(
+                    value = payDraft,
+                    onValueChange = { onDraftChange(it); state.resetHandleClaimState() },
+                    singleLine = true,
+                    textStyle = TextStyle(color = s.text, fontSize = 14.sp),
+                    cursorBrush = SolidColor(s.goldDeep),
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+            Spacer(Modifier.height(8.dp))
+            when {
+                claim is HandleClaimState.Failed -> Text(
+                    claim.message, color = s.danger, fontSize = 12.5.sp, lineHeight = 16.sp
+                )
+                draft.isNotEmpty() && !isExternal -> Text(
+                    "${draft.lowercase()}@sonarprivacy.xyz",
+                    color = s.text3, fontSize = 12.5.sp
+                )
+                isExternal -> Text(
+                    "External address — saved as your payment address only.",
                     color = s.text3, fontSize = 12.5.sp, lineHeight = 16.sp
                 )
-                Spacer(Modifier.height(10.dp))
-                Box(
-                    Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(s.surface2)
-                        .padding(horizontal = 12.dp, vertical = 11.dp)
-                ) {
-                    if (payDraft.isEmpty()) Text("you@example.com", color = s.text3, fontSize = 14.sp)
-                    BasicTextField(
-                        value = payDraft,
-                        onValueChange = { payDraft = it; state.updateBip353(it) },
-                        singleLine = true,
-                        textStyle = TextStyle(color = s.text, fontSize = 14.sp),
-                        cursorBrush = SolidColor(s.goldDeep),
-                        modifier = Modifier.fillMaxWidth()
-                    )
+            }
+            Spacer(Modifier.height(10.dp))
+            val claiming = claim is HandleClaimState.Claiming
+            val valid = draft.isNotEmpty() && SonarCore.handleLooksValid(draft)
+            SNPrimaryButton(
+                label = when {
+                    claiming -> "Claiming…"
+                    isExternal -> "Save address"
+                    else -> "Claim handle"
+                },
+                disabled = claiming || !valid,
+                net = !isExternal,
+            ) {
+                if (isExternal) {
+                    state.updateBip353(draft)
+                    editing = false
+                } else {
+                    state.claimHandle(draft)
                 }
             }
-            Spacer(Modifier.height(40.dp))
         }
     }
 }

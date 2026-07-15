@@ -1,0 +1,49 @@
+// Sonar handle registrar — Cloudflare Worker config (wrangler v4).
+//
+// Before the FIRST deploy you must:
+//   1. Fill ZONE_ID below with the Cloudflare zone id for sonarprivacy.xyz
+//      (Dashboard -> sonarprivacy.xyz -> Overview -> API section -> Zone ID).
+//      The deploy script refuses to deploy while the placeholder is present.
+//   2. Set the DNS API token secret (Zone.DNS:Edit on sonarprivacy.xyz only):
+//        npx wrangler secret put CF_DNS_TOKEN
+//   3. (Optional, closed pilot) require a shared secret on /v1/register:
+//        npx wrangler secret put REGISTER_SECRET
+//   4. (Optional) root NIP-05 identity served for name=_ :
+//        add "ROOT_PUBKEY": "<64-hex pubkey>" to "vars".
+//   5. Enable DNSSEC on the sonarprivacy.xyz zone — BIP-353 clients MUST
+//      validate DNSSEC, unsigned TXT answers will be rejected by wallets.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "sonar-handle-registrar",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-10-01",
+  "observability": {
+    "enabled": true
+  },
+  "vars": {
+    "BIP353_DOMAIN": "sonarprivacy.xyz",
+    // REQUIRED: replace with the real zone id before deploying (see header).
+    "ZONE_ID": "FILL_ME_SONARPRIVACY_XYZ_ZONE_ID"
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "HANDLE_REGISTRY",
+        "class_name": "HandleRegistry"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      // SQLite-backed DO storage: handle records + per-IP rate counters.
+      "new_sqlite_classes": ["HandleRegistry"]
+    }
+  ],
+  "routes": [
+    // Registrar API (register / resolve / health) on its own subdomain.
+    { "pattern": "bip353.sonarprivacy.xyz/*", "zone_name": "sonarprivacy.xyz" },
+    // NIP-05 must live on the identity domain itself (alice@sonarprivacy.xyz).
+    { "pattern": "sonarprivacy.xyz/.well-known/nostr.json*", "zone_name": "sonarprivacy.xyz" }
+  ]
+}

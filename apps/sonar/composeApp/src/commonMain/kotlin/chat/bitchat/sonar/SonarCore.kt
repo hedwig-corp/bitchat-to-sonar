@@ -163,6 +163,14 @@ data class SonarProfile(
         displayName?.takeIf { it.isNotBlank() } ?: name?.takeIf { it.isNotBlank() }
 }
 
+/** A handle (`vincenzo` / `alice@example.com`) resolved to its owner via
+ *  NIP-05. `address` is the canonical lowercased `name@domain` that resolved. */
+data class SonarResolvedHandle(
+    val address: String,
+    val npub: String,
+    val pubkeyHex: String,
+)
+
 /** Public Sonar app descriptor advertised on Nostr so account-level peers can
  *  discover which Sonar capabilities are safe to offer when BLE is unavailable. */
 data class SonarDescriptor(
@@ -630,6 +638,30 @@ expect object SonarCore {
 
     /** Fetch a peer's kind-0 profile (npub or hex). null if they have none. */
     suspend fun fetchProfile(npub: String): SonarProfile?
+
+    /** The claimed human-readable handle (`name@domain`), if any. Local read. */
+    suspend fun claimedHandle(): String?
+
+    /** Claim (or refresh) a handle at the Sonar registrar. One claim registers
+     *  both NIP-05 (chat) and — when [offer] is present — BIP-353 (payments).
+     *  Returns the claimed address; throws with a message starting
+     *  "handle taken:" when the name belongs to another key. Callers should
+     *  republish the kind-0 profile afterwards so peers see it immediately. */
+    suspend fun claimHandle(handle: String, offer: String? = null): String
+
+    /** Resolve `vincenzo` (default Sonar domain) or `alice@any-domain.com` to
+     *  its owner via NIP-05. null when unregistered, offline, or invalid.
+     *  Bounded network work — call from a background scope only. */
+    suspend fun resolveHandle(input: String): SonarResolvedHandle?
+
+    /** True if [address] (full `name@domain`) currently resolves to [npub] via
+     *  NIP-05. null when the check could not run (offline), so callers can show
+     *  "unverified" instead of "fake". */
+    suspend fun verifyNip05(address: String, npub: String): Boolean?
+
+    /** Pure string gate: input plausibly a handle (`vincenzo` / `a@b.com`).
+     *  No network — safe per keystroke. False for npub/lno/invite strings. */
+    fun handleLooksValid(input: String): Boolean
 
     /** Publish this build's public Sonar descriptor. */
     suspend fun publishSonarDescriptor(callsEnabled: Boolean = true, bolt12Offer: String? = null)

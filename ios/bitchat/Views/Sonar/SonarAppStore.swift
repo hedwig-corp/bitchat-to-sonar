@@ -608,6 +608,8 @@ final class SonarAppStore: ObservableObject {
     private static let pendingMarmotGroupSendQueueLimit = 100
 
     static let marmotIDPrefix = "marmot:"
+    /// Default domain for unified handles claimed through the app.
+    static let handleDomain = "sonarprivacy.xyz"
     static let pendingMarmotIDPrefix = "marmot-pending:"
     static let pendingMarmotGroupIDPrefix = "marmot-group-pending:"
     /// SNPeerItem id prefix for a Unify Wallet peer discovered over Bluetooth.
@@ -666,6 +668,16 @@ final class SonarAppStore: ObservableObject {
     private var marmotGroupIdsByConversationId: [String: String] = [:]
     /// Our optional BIP-353 payment address ("" = unset, TLV omitted).
     @Published private(set) var bip353: String
+    /// Lifecycle of the unified handle claim (name@sonarprivacy.xyz). The
+    /// registrar POST runs in the core off the main thread; this mirrors it
+    /// for the profile screen only.
+    enum HandleClaimState: Equatable {
+        case idle
+        case claiming
+        case claimed(String)
+        case failed(String)
+    }
+    @Published private(set) var handleClaimState: HandleClaimState = .idle
     /// Mirrors wallet.state for the UI (balance row and PaySheet).
     @Published private(set) var walletState: SonarWalletState
     /// Radar "Send sats" quick-pay: the DM screen opens with the PaySheet up.
@@ -1273,6 +1285,7 @@ final class SonarAppStore: ObservableObject {
                 // Relay-dependent work starts only after the delayed background
                 // attach, never as a side effect of publishing the local Home.
                 self.marmot.publishProfile(name: self.chatViewModel.nickname)
+                self.adoptClaimedHandleIfNeeded()
                 self.ensureCallStarted()
                 self.publishPaymentMetadataIfNeeded(force: true)
                 self.drainPendingInviteLinks()
@@ -2397,6 +2410,94 @@ final class SonarAppStore: ObservableObject {
         } else {
             defaults.set(trimmed, forKey: Keys.bip353)
         }
+    }
+
+    /// Claim a unified handle (`name` → name@sonarprivacy.xyz) at the Sonar
+    /// registrar. Best-effort BOLT12 offer: when the wallet is ready the
+    /// handle doubles as a BIP-353 payment address; otherwise a chat-only
+    /// claim (nil offer) is made — that is a supported path. On success the
+    /// claimed address reuses the existing BIP-353 persistence + BLE announce
+    /// (`setBip353`) and the kind-0 profile is republished so peers see the
+    /// nip05 immediately. All network work runs off the main thread.
+    func claimHandle(_ handle: String) {
+        let name = handle.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard MarmotService.handleLooksValid(name) else {
+            handleClaimState = .failed("That name can't be used.")
+            return
+        }
+        guard handleClaimState != .claiming else { return }
+        // A full external address (alice@other-wallet.com) is not claimable at
+        // the Sonar registrar — it's a payment address minted elsewhere. Keep
+        // the pre-claim behavior: store + announce it as-is, no network.
+        if name.contains("@"), !name.hasSuffix("@\(Self.handleDomain)") {
+            setBip353(name)
+            handleClaimState = .claimed(name)
+            return
+        }
+        handleClaimState = .claiming
+        Task { [weak self] in
+            guard let self else { return }
+            // Offer fetch is tolerated to fail: wallet not ready = chat-only claim.
+            var offer: String?
+            if case .ready = self.walletState {
+                offer = try? await self.wallet.createOffer()
+            }
+            do {
+                let address = try await self.marmot.claimHandle(handle: name, offer: offer)
+                self.setBip353(address)
+                self.marmot.publishProfile(name: self.chatViewModel.nickname)
+                self.handleClaimState = .claimed(address)
+            } catch {
+                self.handleClaimState = .failed(Self.describeHandleClaimError(error))
+            }
+        }
+    }
+
+    private static func describeHandleClaimError(_ error: Error) -> String {
+        let detail: String
+        switch error {
+        case MarmotService.ServiceError.notConnected:
+            return "Not connected yet — try again in a moment."
+        case MarmotService.ServiceError.cancelled:
+            return "Claim cancelled — try again."
+        case MarmotService.ServiceError.invalidInput(let message),
+             MarmotService.ServiceError.core(let message):
+            detail = message
+        default:
+            detail = error.localizedDescription
+        }
+        if detail.hasPrefix("handle taken:") {
+            return "That name is taken — try another."
+        }
+        return detail
+    }
+
+    /// If lightweight prefs lost the BIP-353 address but the core still holds
+    /// a claimed handle, adopt it back (core persistence is the durable copy).
+    /// Local DB read only — never blocks or touches the network.
+    private func adoptClaimedHandleIfNeeded() {
+        guard bip353.isEmpty else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            guard let address = await self.marmot.claimedHandle(),
+                  !address.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            else { return }
+            guard self.bip353.isEmpty else { return }
+            self.setBip353(address)
+            if self.handleClaimState == .idle {
+                self.handleClaimState = .claimed(address)
+            }
+        }
+    }
+
+    /// Resolve a handle (`vincenzo` / `alice@domain`) to an npub for starting
+    /// a secure chat. Bounded network lookup in the core; nil on any failure —
+    /// callers show a soft miss state and never see an error thrown.
+    func resolveHandleForChat(_ input: String) async -> String? {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard MarmotService.handleLooksValid(trimmed) else { return nil }
+        guard let resolved = try? await marmot.resolveHandle(trimmed), !resolved.npub.isEmpty else { return nil }
+        return resolved.npub
     }
 
     private func handleSonarProfileNotification(_ note: Notification) {

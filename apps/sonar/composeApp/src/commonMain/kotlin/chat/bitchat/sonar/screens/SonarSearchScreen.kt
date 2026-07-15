@@ -22,6 +22,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -34,6 +35,8 @@ import androidx.compose.ui.unit.sp
 import chat.bitchat.sonar.GeoChannel
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.SonarChat
+import chat.bitchat.sonar.SonarCore
+import kotlinx.coroutines.launch
 import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconButton
 import chat.bitchat.sonar.ui.SNIconName
@@ -92,6 +95,16 @@ fun SonarSearchScreen(state: SonarAppState) {
     val looksLikeGeohash = !looksLikeInvite && ql.isNotEmpty() && ql.length in 2..9 &&
         ql.all { it in "0123456789bcdefghjkmnpqrstuvwxyz" } &&
         channels.none { it.geohash == ql }
+    // A typed nickname (`vincenzo`) or full handle (`alice@example.com`) can be
+    // resolved to an npub via NIP-05. Pure string gate per keystroke; the
+    // network lookup happens only when the user taps the action row, so local
+    // results always paint immediately.
+    val looksLikeHandle = !looksLikeInvite && !looksLikeNpub && query.length >= 2 &&
+        SonarCore.handleLooksValid(query)
+    val handleAddress = if ('@' in ql) ql else "$ql@sonarprivacy.xyz"
+    val scope = rememberCoroutineScope()
+    var resolvingHandle by remember(query) { mutableStateOf(false) }
+    var handleMiss by remember(query) { mutableStateOf(false) }
 
     Column(Modifier.fillMaxSize().background(s.bg)) {
         // header: back + search field
@@ -108,7 +121,7 @@ fun SonarSearchScreen(state: SonarAppState) {
                 SNIcon(SNIconName.Search, 16.dp, s.text3, weight = 2f)
                 Spacer(Modifier.width(9.dp))
                 Box(Modifier.weight(1f)) {
-                    if (query.isEmpty()) Text("Search chats, channels, npub…", color = s.text3, fontSize = 15.sp)
+                    if (query.isEmpty()) Text("Search chats, channels, name, npub…", color = s.text3, fontSize = 15.sp)
                     BasicTextField(
                         value = q, onValueChange = { q = it }, singleLine = true,
                         textStyle = TextStyle(color = s.text, fontSize = 15.sp),
@@ -140,6 +153,37 @@ fun SonarSearchScreen(state: SonarAppState) {
                     state.joinChannel(query)
                 }
             }
+            // Start-a-chat-by-handle: resolve the typed name via NIP-05 on tap.
+            if (looksLikeHandle) item {
+                val current = query
+                ActionResult(
+                    SNIconName.Key,
+                    when {
+                        resolvingHandle -> "Looking up $handleAddress…"
+                        handleMiss -> "No one found for $handleAddress"
+                        else -> "Start secure chat"
+                    },
+                    handleAddress,
+                    net = true,
+                ) {
+                    if (!resolvingHandle) {
+                        resolvingHandle = true
+                        handleMiss = false
+                        scope.launch {
+                            val npub = state.resolveHandleForChat(current)
+                            resolvingHandle = false
+                            if (npub != null) {
+                                startSecureChatFromSearch(
+                                    closeSearch = state::back,
+                                    startChat = { state.startChat(npub) },
+                                )
+                            } else {
+                                handleMiss = true
+                            }
+                        }
+                    }
+                }
+            }
 
             if (channels.isNotEmpty()) {
                 item { chat.bitchat.sonar.ui.SNSectionLabel("Channels") }
@@ -162,8 +206,8 @@ fun SonarSearchScreen(state: SonarAppState) {
             if (channels.isEmpty() && chats.isEmpty() && !looksLikeNpub && !looksLikeGeohash && !looksLikeInvite) {
                 item {
                     Text(
-                        if (query.isEmpty()) "Search your chats and channels, or paste an npub to start a secure chat."
-                        else "No matches. Paste an npub to start a chat, or a geohash to join a channel.",
+                        if (query.isEmpty()) "Search your chats and channels, or type a name (vincenzo, alice@example.com) or npub to start a secure chat."
+                        else "No matches. Type a name or npub to start a chat, or a geohash to join a channel.",
                         color = s.text3, fontSize = 13.5.sp, lineHeight = 18.sp,
                         modifier = Modifier.fillMaxWidth().padding(24.dp)
                     )

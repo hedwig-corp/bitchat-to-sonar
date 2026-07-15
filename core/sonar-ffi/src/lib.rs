@@ -144,6 +144,16 @@ pub fn setup_logging(dir: String, verbose: bool) -> FfiResult<()> {
         .map_err(|e| SonarFfiError::Core(format!("setup_logging: {e}")))
 }
 
+/// True if `input` is plausibly a human-readable handle (`vincenzo` or
+/// `alice@example.com`). Pure string check — no network, safe to call per
+/// keystroke from search UIs to decide whether to offer a resolve action.
+/// Bech32 keys/events and Lightning strings return `false` so the npub and
+/// invite search paths keep priority.
+#[uniffi::export]
+pub fn handle_looks_valid(input: String) -> bool {
+    sonar_core::handles::looks_like_handle(&input)
+}
+
 /// A Nostr identity (secp256k1 keypair). Wraps `sonar_core::identity::Identity`.
 #[derive(uniffi::Object)]
 pub struct SonarIdentity {
@@ -327,6 +337,15 @@ pub struct ProfileInfo {
     pub about: Option<String>,
     pub picture: Option<String>,
     pub nip05: Option<String>,
+}
+
+/// A handle (`vincenzo` / `alice@example.com`) resolved to its owner via
+/// NIP-05. `address` is the canonical lowercased `name@domain` that resolved.
+#[derive(uniffi::Record)]
+pub struct ResolvedHandleInfo {
+    pub address: String,
+    pub npub: String,
+    pub pubkey_hex: String,
 }
 
 /// Info about an incoming message discovered during drain, used by hosts to
@@ -593,6 +612,51 @@ impl SonarNode {
             picture: p.picture,
             nip05: p.nip05,
         }))
+    }
+
+    /// The claimed human-readable handle (`name@domain`), if any. Local read,
+    /// safe on any thread — never touches the network.
+    pub fn claimed_handle(&self) -> Option<String> {
+        self.client.claimed_handle()
+    }
+
+    /// Claim (or refresh) a handle at the Sonar registrar. One claim registers
+    /// both resolutions: NIP-05 (chat) always, BIP-353 (payments) when `offer`
+    /// is present. Signed with the identity key, so restoring the nsec
+    /// re-claims the same name. A taken handle surfaces as an error whose
+    /// message starts with "handle taken:". Callers should republish the
+    /// kind-0 profile afterwards so peers see the handle immediately.
+    pub fn claim_handle(&self, handle: String, offer: Option<String>) -> FfiResult<String> {
+        Ok(self
+            .runtime
+            .block_on(self.client.claim_handle(&handle, offer.as_deref()))?)
+    }
+
+    /// Resolve a handle to its owner. Bare nicknames (`vincenzo`) resolve on
+    /// the default Sonar domain; full addresses (`alice@example.com`) resolve
+    /// against any NIP-05 host. Bounded network work — call from a background
+    /// context, never on the chat-open or startup path.
+    pub fn resolve_handle(&self, input: String) -> FfiResult<ResolvedHandleInfo> {
+        let resolved = self.runtime.block_on(self.client.resolve_handle(&input))?;
+        Ok(ResolvedHandleInfo {
+            address: resolved.address,
+            npub: resolved
+                .pubkey
+                .to_bech32()
+                .map_err(|e| SonarFfiError::Core(e.to_string()))?,
+            pubkey_hex: resolved.pubkey.to_hex(),
+        })
+    }
+
+    /// True if `address` (full `name@domain`) currently resolves to `npub` via
+    /// NIP-05. `false` covers both "not registered" and "registered to someone
+    /// else"; network failures are errors so callers can show "unverified"
+    /// instead of "fake" when offline.
+    pub fn verify_nip05(&self, address: String, npub: String) -> FfiResult<bool> {
+        let pubkey = PublicKey::parse(&npub).map_err(invalid("nip05 pubkey"))?;
+        Ok(self
+            .runtime
+            .block_on(self.client.verify_nip05(&address, &pubkey))?)
     }
 
     /// Publish this identity's public Sonar descriptor. `signaling` should list

@@ -438,6 +438,29 @@ actual object SonarCore {
         }.getOrNull()
     }
 
+    actual suspend fun claimedHandle(): String? = withContext(Dispatchers.IO) {
+        runCatching { node?.claimedHandle() }.getOrNull()
+    }
+
+    actual suspend fun claimHandle(handle: String, offer: String?): String = withContext(Dispatchers.IO) {
+        requireNode().claimHandle(handle, offer)
+    }
+
+    actual suspend fun resolveHandle(input: String): SonarResolvedHandle? = withContext(Dispatchers.IO) {
+        val n = node ?: return@withContext null
+        runCatching {
+            n.resolveHandle(input).let { SonarResolvedHandle(it.address, it.npub, it.pubkeyHex) }
+        }.getOrNull()
+    }
+
+    actual suspend fun verifyNip05(address: String, npub: String): Boolean? = withContext(Dispatchers.IO) {
+        val n = node ?: return@withContext null
+        runCatching { n.verifyNip05(address, npub) }.getOrNull()
+    }
+
+    actual fun handleLooksValid(input: String): Boolean =
+        runCatching { uniffi.sonar_ffi.handleLooksValid(input) }.getOrDefault(false)
+
     actual suspend fun publishSonarDescriptor(callsEnabled: Boolean, bolt12Offer: String?) = withContext(Dispatchers.IO) {
         runCatching { node?.publishSonarDescriptor(callsEnabled, listOf("marmot"), bolt12Offer) }
         Unit

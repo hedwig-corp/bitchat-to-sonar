@@ -1689,6 +1689,8 @@ private struct MacCommandPalette: View {
     @State private var selectedGroupNpubs: Set<String> = []
     @State private var groupEntry = false
     @State private var walletSheet = false
+    @State private var resolvingHandle = false
+    @State private var handleMissQuery: String?
     @FocusState private var focused: Bool
 
     private var walletReady: Bool {
@@ -1737,6 +1739,19 @@ private struct MacCommandPalette: View {
                         ForEach(filteredCommands) { command in
                             MacPaletteRow(icon: command.icon, title: command.title, sub: command.sub) {
                                 choose(command)
+                            }
+                        }
+                        if canStartHandleChatFromQuery {
+                            MacPaletteRow(
+                                icon: .key,
+                                title: resolvingHandle
+                                    ? "Looking up \(trimmedQuery)\u{2026}"
+                                    : "Start secure chat with \(trimmedQuery)",
+                                sub: handleMissQuery == trimmedQuery
+                                    ? "No one found for \(trimmedQuery)"
+                                    : "Encrypted chat over the internet"
+                            ) {
+                                resolveHandleAndStartChat()
                             }
                         }
                         if npubEntry || canStartSecureChatFromQuery {
@@ -1798,6 +1813,9 @@ private struct MacCommandPalette: View {
         .onAppear {
             DispatchQueue.main.async { focused = true }
         }
+        .onChange(of: query) { _ in
+            handleMissQuery = nil
+        }
         .onChange(of: isPresented) { open in
             if !open {
                 npubEntry = false
@@ -1823,6 +1841,14 @@ private struct MacCommandPalette: View {
 
     private var canStartSecureChatFromQuery: Bool {
         trimmedQuery.hasPrefix("npub1")
+    }
+
+    /// Handle action mirror of the mobile search sheet: string gate only —
+    /// resolution happens on activation, never per keystroke.
+    private var canStartHandleChatFromQuery: Bool {
+        !canStartSecureChatFromQuery
+            && trimmedQuery.count >= 2
+            && MarmotService.handleLooksValid(trimmedQuery)
     }
 
     private var secureChatBinding: Binding<String> {
@@ -1955,6 +1981,24 @@ private struct MacCommandPalette: View {
         guard npub.hasPrefix("npub1") else { return }
         store.startSecureChat(npub: npub)
         isPresented = false
+    }
+
+    /// Resolve the typed handle over the internet, then reuse the npub path.
+    private func resolveHandleAndStartChat() {
+        guard !resolvingHandle else { return }
+        let handle = trimmedQuery
+        resolvingHandle = true
+        handleMissQuery = nil
+        Task { @MainActor in
+            let npub = await store.resolveHandleForChat(handle)
+            resolvingHandle = false
+            if let npub {
+                store.startSecureChat(npub: npub)
+                isPresented = false
+            } else {
+                handleMissQuery = handle
+            }
+        }
     }
 
     private func startGroupFromDraft() {
