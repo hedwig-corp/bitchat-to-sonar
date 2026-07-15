@@ -13,6 +13,25 @@
 
 import SwiftUI
 
+/// Tracks only rows SwiftUI has actually placed on screen. Keeping this as a
+/// small value type makes the profile-demand boundary independently testable:
+/// constructing a home row must not itself schedule relay work.
+struct SNVisibleRowDemand {
+    private(set) var rowIDs: Set<String> = []
+
+    mutating func appeared(_ rowID: String) -> Bool {
+        rowIDs.insert(rowID).inserted
+    }
+
+    mutating func disappeared(_ rowID: String) {
+        rowIDs.remove(rowID)
+    }
+
+    func contains(_ rowID: String) -> Bool {
+        rowIDs.contains(rowID)
+    }
+}
+
 struct SonarHomeScreen: View {
     @EnvironmentObject private var store: SonarAppStore
     // NB: do NOT add @ObservedObject GeohashBookmarksStore.shared here — that
@@ -41,6 +60,7 @@ struct SonarHomeScreen: View {
     @State private var groupMembersDraft = ""
     @State private var selectedGroupNpubs: Set<String> = []
     @State private var titleTaps: [Date] = []
+    @State private var visibleProfileRows = SNVisibleRowDemand()
 
     /// Triple-tap on the "sonar" title (taps within 1.2 s) triggers the wipe sheet.
     private func titleTap() {
@@ -61,7 +81,7 @@ struct SonarHomeScreen: View {
                     connSheet = true
                 }
                 ScrollView {
-                    VStack(spacing: 0) {
+                    LazyVStack(spacing: 0) {
                         SNSectionLabel("Around you")
                         channelList
                         let saved = store.savedChannels
@@ -140,6 +160,12 @@ struct SonarHomeScreen: View {
                 selectedGroupNpubs = []
             }
         }
+        .onChange(of: store.marmot.relayConnected) { ready in
+            guard ready else { return }
+            for row in store.dmRows where visibleProfileRows.contains(row.id) {
+                store.rearmRelayMetadataForVisibleHomeRow(row)
+            }
+        }
     }
 
     // bc-header: settings avatar · "sonar" title · radar button
@@ -166,7 +192,7 @@ struct SonarHomeScreen: View {
     }
 
     private var channelList: some View {
-        return VStack(spacing: 0) {
+        return LazyVStack(spacing: 0) {
             // "Around you" collapses the geohash precision ladder (+ Mesh) into one
             // card with a tier picker (design: HereCard) instead of a flat list.
             SNHereCard(channels: store.channels) { store.openChannel($0) }
@@ -212,7 +238,7 @@ struct SonarHomeScreen: View {
     private var dmList: some View {
         let rows = store.dmRows
         let invites = store.marmot.pendingGroupInvites
-        return VStack(spacing: 0) {
+        return LazyVStack(spacing: 0) {
             if rows.isEmpty && invites.isEmpty {
                 SNEmptyState(
                     icon: .lock,
@@ -251,6 +277,12 @@ struct SonarHomeScreen: View {
                         avatar: { SonarAvatar(name: d.title, size: 52, presence: d.presence) },
                         sub: { SNLockedPreview(preview: d.preview) }
                     )
+                    .onAppear {
+                        if visibleProfileRows.appeared(d.id) {
+                            store.ensureProfileForHomeRow(d)
+                        }
+                    }
+                    .onDisappear { visibleProfileRows.disappeared(d.id) }
                     .contextMenu {
                         Button { muteRow = d } label: {
                             Label(d.muted ? "Muted" : "Mute", systemImage: d.muted ? "bell.slash.fill" : "bell.slash")

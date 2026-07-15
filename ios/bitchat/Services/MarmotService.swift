@@ -211,6 +211,11 @@ final class MarmotService: @unchecked Sendable {
         let unreadCount: UInt64
     }
 
+    struct LocalConversationRow: Sendable, Equatable {
+        let group: MarmotGroup
+        let summary: ConversationSummary
+    }
+
     /// A peer's Nostr profile (kind-0 metadata, NIP-01). A Marmot member's
     /// identity is a Nostr pubkey, so this resolves a human name + avatar
     /// instead of a raw npub.
@@ -1097,6 +1102,38 @@ final class MarmotService: @unchecked Sendable {
         try await readOnly {
             try $0.groups().map {
                 MarmotGroup(id: $0.idHex, name: $0.name, memberNpubs: $0.memberNpubs)
+            }
+        }
+    }
+
+    /// Reconcile complete local group visibility after the UI has published
+    /// its bounded first frame. This is local-only and does not scan history.
+    func reconcileConversationIndex() async throws {
+        try await run { try $0.requireNode().reconcileConversationIndex() }
+    }
+
+    /// Recency-ordered local Home page. The Rust side applies LIMIT/OFFSET in
+    /// the summary index and resolves membership only for selected rows.
+    func localConversationPage(limit: UInt32, offset: UInt32 = 0) async throws -> [LocalConversationRow] {
+        try await readOnly {
+            try $0.localConversationPage(limit: limit, offset: offset).map { row in
+                LocalConversationRow(
+                    group: MarmotGroup(
+                        id: row.group.idHex,
+                        name: row.group.name,
+                        memberNpubs: row.group.memberNpubs
+                    ),
+                    summary: ConversationSummary(
+                        groupIdHex: row.summary.groupIdHex,
+                        name: row.summary.name,
+                        latestContent: row.summary.latestContent,
+                        latestSenderNpub: row.summary.latestSenderNpub,
+                        latestAt: Date(timeIntervalSince1970: TimeInterval(row.summary.latestAtSecs)),
+                        latestMine: row.summary.latestMine,
+                        messageCount: row.summary.messageCount,
+                        unreadCount: row.summary.unreadCount
+                    )
+                )
             }
         }
     }

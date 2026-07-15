@@ -34,6 +34,10 @@ use crate::conversation_index::{
 };
 use crate::identity::Identity;
 use crate::invite_link::invite_link_state_path_for_db;
+use crate::live_event_spool::{
+    live_event_spool_now_ms, live_event_spool_path_for_db, wipe_live_event_spool_for_db,
+    LiveEventSpool, SpoolAppendOutcome,
+};
 use crate::marmot::{
     ChatMessage, DeliveryState, GroupCreation, GroupInvite, GroupMembershipUpdate, Incoming,
     MarmotEngine, RecentMessagePage, KEY_PACKAGE_KIND, SYNC_STATE_FILE_SUFFIX,
@@ -907,16 +911,24 @@ const SUB_MARMOT_GROUPS: &str = "sonar-marmot-groups";
 
 /// Hard cap on the live Marmot event buffer. The handler pushes here while the
 /// host drains via `drain_pending_marmot`; if a host has not wired draining yet
-/// (e.g. a platform still on the poll path), this bounds memory — dropped live
-/// events are recovered by the watermarked `sync()` safety net, so capping never
-/// loses a message permanently. When full, the oldest half is dropped (amortizes
-/// the shift cost vs dropping one-at-a-time).
+/// (e.g. a platform still on the poll path), this bounds memory. When full, the
+/// oldest half is durably spooled before leaving RAM; upstream SDK lag is
+/// recovered by the watermarked `sync()` safety net.
 /// Combined live buffer budget. Split so giftwrap floods cannot wipe group
 /// commits and vice versa (P1).
 const MARMOT_GROUP_BUFFER_CAP: usize = 768;
 const MARMOT_GIFTWRAP_BUFFER_CAP: usize = 512;
 #[allow(dead_code)]
 const MARMOT_BUFFER_CAP: usize = MARMOT_GROUP_BUFFER_CAP + MARMOT_GIFTWRAP_BUFFER_CAP;
+/// One bounded disk-spool window per drain. Spool rows are processed before
+/// newer in-memory rows so MLS/welcome ordering stays conservative.
+const LIVE_EVENT_SPOOL_DRAIN_BATCH: usize = 512;
+const LIVE_RECOVERY_RETRY_BASE_MS: u64 = 1_000;
+const LIVE_RECOVERY_RETRY_MAX_MS: u64 = 30_000;
+/// Maximum number of missing conversation summaries repaired from local
+/// transcript windows during one bounded Home hydration. Startup only inserts
+/// placeholders, so a first upgrade never scans every chat before returning.
+const CONVERSATION_INDEX_MATERIALIZE_PAGE: usize = 16;
 const DIRECT_DM_BUFFER_CAP: usize = 1024;
 /// Bound on parked sync-path gap-recovery notifications. Hosts drain after every
 /// forced sync, so this only guards a host that stops draining; drop the oldest
@@ -924,6 +936,13 @@ const DIRECT_DM_BUFFER_CAP: usize = 1024;
 const SYNC_NOTIFICATION_CAP: usize = 256;
 const LIVE_EVENT_DEDUP_TTL: Duration = Duration::from_secs(60);
 const LIVE_EVENT_DEDUP_CAP: usize = 4096;
+
+fn live_recovery_backoff_ms(failures: usize) -> u64 {
+    let shift = failures.saturating_sub(1).min(5) as u32;
+    LIVE_RECOVERY_RETRY_BASE_MS
+        .saturating_mul(1_u64 << shift)
+        .min(LIVE_RECOVERY_RETRY_MAX_MS)
+}
 
 /// Live kind-445 subscription tail. Historical recovery is owned by the
 /// per-group catch-up queue; the live sub must stay thin so cold start does
@@ -974,6 +993,43 @@ fn should_fetch_group_messages_on_sync(is_live: bool, force: bool, since_secs: u
     force && since_secs > 0
 }
 
+/// A forced recovery at watermark zero deliberately avoids one unbounded
+/// all-group history fetch. Its existing bootstrap repair queues cover the same
+/// groups in bounded passes instead, so the durable loss generation may be
+/// acknowledged only after both queues have completed a full cycle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoverySyncCompletion {
+    Complete,
+    BoundedCatchupPending,
+    RetryableFailure,
+}
+
+fn recovery_sync_completion(
+    retryable_failures: usize,
+    force: bool,
+    is_live: bool,
+    since_secs: u64,
+    group_catchup_scan_complete: bool,
+    empty_transcript_scan_complete: bool,
+    pending_group_catchups: usize,
+    pending_empty_transcript_backfills: usize,
+) -> RecoverySyncCompletion {
+    let bounded_bootstrap_pending = force
+        && is_live
+        && since_secs == 0
+        && (!group_catchup_scan_complete
+            || !empty_transcript_scan_complete
+            || pending_group_catchups > 0
+            || pending_empty_transcript_backfills > 0);
+    if retryable_failures > 0 {
+        RecoverySyncCompletion::RetryableFailure
+    } else if bounded_bootstrap_pending {
+        RecoverySyncCompletion::BoundedCatchupPending
+    } else {
+        RecoverySyncCompletion::Complete
+    }
+}
+
 /// Push into a live buffer with half-drop overflow. Returns true if a drop ran.
 fn push_live_buffer<T>(buf: &mut Vec<T>, item: T, cap: usize) -> bool {
     let mut dropped = false;
@@ -984,6 +1040,160 @@ fn push_live_buffer<T>(buf: &mut Vec<T>, item: T, cap: usize) -> bool {
     }
     buf.push(item);
     dropped
+}
+
+/// Move the oldest half of a full live queue to durable storage before the
+/// caller appends another row. If neither the rows nor a recovery marker can be
+/// persisted, the caller drops the incoming row (never an already-buffered row)
+/// and forces a conservative relay recovery. This keeps the RAM queue hard-
+/// bounded even while storage is unavailable.
+#[derive(Debug)]
+enum LiveEventSpill {
+    NotNeeded,
+    Persisted(usize),
+    Volatile,
+    Backpressured { retained: usize, reason: String },
+    RecoveryRequired { dropped: usize, reason: String },
+}
+
+fn spill_oldest_live_events(
+    buf: &mut Vec<Event>,
+    cap: usize,
+    spool: &mut LiveEventSpool,
+) -> LiveEventSpill {
+    if buf.len() < cap {
+        return LiveEventSpill::NotNeeded;
+    }
+    let count = (cap / 2).max(1).min(buf.len());
+    match spool.append_events(&buf[..count]) {
+        Ok(SpoolAppendOutcome::Persisted) => {
+            buf.drain(0..count);
+            LiveEventSpill::Persisted(count)
+        }
+        Ok(SpoolAppendOutcome::Volatile) => LiveEventSpill::Volatile,
+        Ok(SpoolAppendOutcome::Full) => {
+            // The queue has a hard disk bound. Stored relay events are
+            // recoverable through the watermarked sync path, so keep RAM
+            // bounded and make the fallback explicit/observable.
+            buf.drain(0..count);
+            LiveEventSpill::RecoveryRequired {
+                dropped: count,
+                reason: "durable queue reached hard capacity".into(),
+            }
+        }
+        Err(err) => {
+            match spool.mark_recovery_required() {
+                Ok(_) => {
+                    buf.drain(0..count);
+                    LiveEventSpill::RecoveryRequired {
+                        dropped: count,
+                        reason: err.to_string(),
+                    }
+                }
+                Err(marker_err) => {
+                    // Neither the rows nor recovery intent reached durable
+                    // storage. Keep every bounded candidate in RAM and expose
+                    // backpressure; dropping here would become silent loss if
+                    // the process exits before the in-memory recovery flag runs.
+                    LiveEventSpill::Backpressured {
+                        retained: count,
+                        reason: format!("{err}; persist recovery marker: {marker_err}"),
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn mark_live_event_recovery(
+    spool: &Mutex<LiveEventSpool>,
+    recovery_required: &AtomicBool,
+    context: &'static str,
+) {
+    if let Err(err) = spool.lock().unwrap().mark_recovery_required() {
+        tracing::error!(%err, context, "failed to persist live-event recovery marker");
+    }
+    recovery_required.store(true, Ordering::Release);
+}
+
+fn record_live_event_spill(
+    spill: LiveEventSpill,
+    queue: &'static str,
+    spills_total: &AtomicUsize,
+    drops_total: &AtomicUsize,
+    recovery_required: &AtomicBool,
+) -> bool {
+    match spill {
+        LiveEventSpill::NotNeeded => true,
+        LiveEventSpill::Persisted(count) => {
+            spills_total.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                count,
+                queue,
+                "pending Marmot events moved to bounded durable queue"
+            );
+            true
+        }
+        LiveEventSpill::Volatile => {
+            drops_total.fetch_add(1, Ordering::Relaxed);
+            recovery_required.store(true, Ordering::Release);
+            tracing::error!(
+                queue,
+                "volatile live-event queue reached cap; dropping newest row and forcing relay recovery"
+            );
+            false
+        }
+        LiveEventSpill::Backpressured { retained, reason } => {
+            drops_total.fetch_add(1, Ordering::Relaxed);
+            recovery_required.store(true, Ordering::Release);
+            tracing::error!(
+                retained,
+                %reason,
+                queue,
+                "live-event persistence unavailable; preserving bounded RAM rows, dropping newest row, and forcing relay recovery"
+            );
+            false
+        }
+        LiveEventSpill::RecoveryRequired { dropped, reason } => {
+            drops_total.fetch_add(1, Ordering::Relaxed);
+            recovery_required.store(true, Ordering::Release);
+            tracing::error!(dropped, %reason, queue, "bounded live-event queue fallback requires relay recovery");
+            true
+        }
+    }
+}
+
+/// Buffer one relay event without ever exceeding `cap`. Returning false means
+/// the incoming (newest) event was deliberately dropped after durable spill and
+/// durable recovery-intent writes both failed. The already-buffered ordering is
+/// preserved, and `record_live_event_spill` leaves the persisted sync watermark
+/// untouched while arming process-local forced recovery.
+fn buffer_live_event(
+    buf: &mut Vec<Event>,
+    event: Event,
+    cap: usize,
+    spool: &mut LiveEventSpool,
+    queue: &'static str,
+    spills_total: &AtomicUsize,
+    drops_total: &AtomicUsize,
+    recovery_required: &AtomicBool,
+) -> bool {
+    let should_append = if buf.len() >= cap {
+        record_live_event_spill(
+            spill_oldest_live_events(buf, cap, spool),
+            queue,
+            spills_total,
+            drops_total,
+            recovery_required,
+        )
+    } else {
+        true
+    };
+    if should_append {
+        buf.push(event);
+    }
+    debug_assert!(buf.len() <= cap);
+    should_append
 }
 
 fn take_catchup_entry(
@@ -1400,8 +1610,11 @@ pub struct SyncStateSnapshot {
     pub pending_marmot_buffered: usize,
     /// Outbox publishes currently in flight (P0 send-priority signal).
     pub send_inflight: usize,
-    /// Cumulative live-buffer half-drops (giftwraps + group messages).
+    /// Cumulative upstream notification lag incidents. Stored Marmot rows are
+    /// recovered by a forced watermarked fetch on the next drain.
     pub buffer_drops_total: usize,
+    /// Cumulative batches moved from bounded RAM to the durable overflow spool.
+    pub buffer_spills_total: usize,
     /// Groups still queued for initial historical catch-up.
     pub catchup_queue_len: usize,
     pub relays: Vec<RelaySnapshot>,
@@ -1785,6 +1998,9 @@ pub struct SonarClient {
     /// Live MLS group messages (kind 445) buffered by the notification handler.
     /// Split from giftwraps so one flood cannot wipe the other (P1).
     pending_marmot_groups: Arc<Mutex<Vec<Event>>>,
+    /// Disk-backed overflow rows. Persistent clients spill here before removing
+    /// anything from bounded RAM; the MLS drain consumes this older queue first.
+    pending_live_event_spool: Arc<Mutex<LiveEventSpool>>,
     /// Fired whenever a live Marmot event is buffered, so `wait_for_marmot_event`
     /// wakes the host to drain in real time (push) instead of polling.
     marmot_notify: Arc<tokio::sync::Notify>,
@@ -1800,8 +2016,18 @@ pub struct SonarClient {
     /// relay publish. (Incoming membership commits from OTHERS are inherently
     /// racy with sends across the network and are not gated.)
     membership_gate: Arc<tokio::sync::RwLock<()>>,
-    /// How many times the live pending buffer dropped its oldest half.
+    /// How many times upstream relay notifications were lost before reaching
+    /// the bounded queue/spool (recovered by a forced watermarked fetch).
     buffer_drops_total: Arc<AtomicUsize>,
+    /// How many full-buffer batches were durably spooled instead of dropped.
+    buffer_spills_total: Arc<AtomicUsize>,
+    /// The upstream nostr-sdk broadcast receiver reported lag before an event
+    /// reached our spool. The next drain performs a forced watermarked fetch.
+    live_recovery_required: Arc<AtomicBool>,
+    /// Failed recovery fetches are retried on a bounded exponential deadline;
+    /// the wait primitive observes this instead of waking in a tight loop.
+    live_recovery_retry_after_ms: Arc<AtomicU64>,
+    live_recovery_failures: Arc<AtomicUsize>,
     /// True after the real-session Marmot live tail is opened. Local group
     /// changes use this to decide whether to refresh the live kind-445 filter.
     live_marmot_enabled: Arc<Mutex<bool>>,
@@ -1933,6 +2159,7 @@ impl SonarClient {
             engine,
             true,
             Some(sync_state_path_for_db(db_path)),
+            Some(live_event_spool_path_for_db(db_path)),
             Some(outbox_state_path_for_db(db_path)),
             Some((media_staging_state, media_staging_dir)),
             Some(invite_link_state_path_for_db(db_path)),
@@ -1946,7 +2173,6 @@ impl SonarClient {
             *client.claimed_handle.lock().unwrap() = Some(address);
         }
         client.handle_state_path = Some(handle_path);
-        client.materialize_index_if_empty();
         Ok(client)
     }
 
@@ -1976,6 +2202,7 @@ impl SonarClient {
         engine: MarmotEngine,
         allow_geo_relays: bool,
         sync_state_path: Option<PathBuf>,
+        live_event_spool_path: Option<PathBuf>,
         outbox_state_path: Option<PathBuf>,
         media_staging_paths: Option<(PathBuf, PathBuf)>,
         invite_link_state_path: Option<PathBuf>,
@@ -1998,7 +2225,9 @@ impl SonarClient {
         // their connection futures and return once MIN_CONNECTED_RELAYS are
         // live. Mirrors whitenoise-rs `prepare_relay_urls` which uses
         // FuturesUnordered and returns at the quorum threshold.
-        nostr.connect().await;
+        if !relays.is_empty() {
+            nostr.connect().await;
+        }
         let quorum = MIN_CONNECTED_RELAYS.min(relays.len());
         if quorum > 0 {
             let relay_handles: Vec<_> = {
@@ -2072,12 +2301,45 @@ impl SonarClient {
         let geo_subscribed: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let identity_secret = identity.keys().secret_key().to_secret_bytes();
 
+        // Load durable dedup before the relay collector starts. A welcome
+        // subscription deliberately overlaps seven days for NIP-59 timestamp
+        // randomization; filtering already-processed IDs here prevents that
+        // historical replay from filling the live queue on every launch.
+        // The empty-relay node is the hosts' local first-paint path. Computing
+        // a conservative relay watermark enumerates every group (and may read a
+        // bounded history page per group), so leave that work to the later
+        // relay-backed replacement which both hosts start in the background.
+        let (resume_watermark, storage_empty) = if relays.is_empty() {
+            (0, false)
+        } else {
+            let groups_empty = engine
+                .groups()
+                .map(|groups| groups.is_empty())
+                .unwrap_or(true);
+            (
+                engine.latest_remote_event_secs(),
+                groups_empty && engine.latest_message_secs() == 0,
+            )
+        };
+        let sync_state = Arc::new(Mutex::new(SyncState::load(
+            sync_state_path,
+            resume_watermark,
+            storage_empty,
+        )));
+
         let pending_marmot_giftwraps: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
         let pending_marmot_groups: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
+        let live_event_spool = LiveEventSpool::load(live_event_spool_path)?;
+        let spool_recovery_required = live_event_spool.recovery_required();
+        let pending_live_event_spool = Arc::new(Mutex::new(live_event_spool));
         let marmot_notify = Arc::new(tokio::sync::Notify::new());
         let send_inflight = Arc::new(AtomicUsize::new(0));
         let membership_gate = Arc::new(tokio::sync::RwLock::new(()));
         let buffer_drops_total = Arc::new(AtomicUsize::new(0));
+        let buffer_spills_total = Arc::new(AtomicUsize::new(0));
+        let live_recovery_required = Arc::new(AtomicBool::new(spool_recovery_required));
+        let live_recovery_retry_after_ms = Arc::new(AtomicU64::new(0));
+        let live_recovery_failures = Arc::new(AtomicUsize::new(0));
         let live_marmot_enabled = Arc::new(Mutex::new(false));
         let marmot_group_subscriptions = Arc::new(Mutex::new(HashSet::new()));
         let marmot_group_resub_generation = Arc::new(AtomicU64::new(0));
@@ -2095,8 +2357,12 @@ impl SonarClient {
         let handler_subs = geo_subscribed.clone();
         let handler_giftwraps = pending_marmot_giftwraps.clone();
         let handler_groups = pending_marmot_groups.clone();
+        let handler_spool = pending_live_event_spool.clone();
+        let handler_sync_state = sync_state.clone();
         let handler_notify = marmot_notify.clone();
         let handler_buffer_drops = buffer_drops_total.clone();
+        let handler_buffer_spills = buffer_spills_total.clone();
+        let handler_recovery_required = live_recovery_required.clone();
         // Our MAIN identity pubkey hex: a kind-1059 with this `p` tag is a Marmot
         // welcome (vs a geohash DM, whose `p` is a per-geohash ephemeral key).
         let my_pubkey_hex = identity.keys().public_key().to_hex();
@@ -2114,7 +2380,24 @@ impl SonarClient {
                     // collector permanently on the first lag, so Android stopped
                     // seeing ANY participants/messages while iOS (no such loop)
                     // kept working.
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        // This is upstream of our durable spool, so these rows
+                        // were not available to persist. Keep the explicit loss
+                        // metric/log; the relay watermark safety net recovers
+                        // stored Marmot events on the next forced sync.
+                        handler_buffer_drops.fetch_add(1, Ordering::Relaxed);
+                        mark_live_event_recovery(
+                            handler_spool.as_ref(),
+                            handler_recovery_required.as_ref(),
+                            "relay-notification-lag",
+                        );
+                        handler_notify.notify_one();
+                        tracing::warn!(
+                            skipped,
+                            "relay notification stream lagged; recovery sync required"
+                        );
+                        continue;
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 };
                 let event = match notification {
@@ -2163,6 +2446,14 @@ impl SonarClient {
                     continue;
                 }
                 if !live_dedup.should_accept(&event.id, Instant::now()) {
+                    continue;
+                }
+                if matches!(kind, 1059 | 445)
+                    && handler_sync_state
+                        .lock()
+                        .unwrap()
+                        .has_processed(&event.id.to_hex())
+                {
                     continue;
                 }
 
@@ -2229,15 +2520,17 @@ impl SonarClient {
                         if p_hex == my_pubkey_hex {
                             {
                                 let mut buf = handler_giftwraps.lock().unwrap();
-                                if buf.len() >= MARMOT_GIFTWRAP_BUFFER_CAP {
-                                    tracing::warn!(
-                                        dropped = MARMOT_GIFTWRAP_BUFFER_CAP / 2,
-                                        "pending marmot buffer overflow — dropping oldest gift wraps"
-                                    );
-                                    buf.drain(0..MARMOT_GIFTWRAP_BUFFER_CAP / 2);
-                                    handler_buffer_drops.fetch_add(1, Ordering::Relaxed);
-                                }
-                                buf.push((*event).clone());
+                                let mut spool = handler_spool.lock().unwrap();
+                                buffer_live_event(
+                                    &mut buf,
+                                    (*event).clone(),
+                                    MARMOT_GIFTWRAP_BUFFER_CAP,
+                                    &mut spool,
+                                    "gift-wrap",
+                                    &handler_buffer_spills,
+                                    &handler_buffer_drops,
+                                    &handler_recovery_required,
+                                );
                             }
                             handler_notify.notify_one();
                             continue;
@@ -2303,15 +2596,17 @@ impl SonarClient {
                         // thread via drain_pending_marmot.
                         {
                             let mut buf = handler_groups.lock().unwrap();
-                            if buf.len() >= MARMOT_GROUP_BUFFER_CAP {
-                                tracing::warn!(
-                                    dropped = MARMOT_GROUP_BUFFER_CAP / 2,
-                                    "pending marmot buffer overflow — dropping oldest group messages"
-                                );
-                                buf.drain(0..MARMOT_GROUP_BUFFER_CAP / 2);
-                                handler_buffer_drops.fetch_add(1, Ordering::Relaxed);
-                            }
-                            buf.push((*event).clone());
+                            let mut spool = handler_spool.lock().unwrap();
+                            buffer_live_event(
+                                &mut buf,
+                                (*event).clone(),
+                                MARMOT_GROUP_BUFFER_CAP,
+                                &mut spool,
+                                "group-message",
+                                &handler_buffer_spills,
+                                &handler_buffer_drops,
+                                &handler_recovery_required,
+                            );
                         }
                         handler_notify.notify_one();
                     }
@@ -2320,22 +2615,6 @@ impl SonarClient {
             }
         });
 
-        // Resume incremental sync across restarts from the newest REMOTE event
-        // already in the store. Local sends and local-only bookkeeping can be
-        // newer than peer messages missed while offline; they must not seed the
-        // relay cursor or a restart can subscribe from beyond the missing peer
-        // messages. The gift-wrap fetch still applies its 7-day NIP-59 lookback.
-        let resume_watermark = engine.latest_remote_event_secs();
-        let groups_empty = engine
-            .groups()
-            .map(|groups| groups.is_empty())
-            .unwrap_or(true);
-        let storage_empty = groups_empty && engine.latest_message_secs() == 0;
-        let sync_state = Arc::new(Mutex::new(SyncState::load(
-            sync_state_path,
-            resume_watermark,
-            storage_empty,
-        )));
         let outbox_state = Arc::new(Mutex::new(OutboxState::load(outbox_state_path)));
         let (media_staging_state_path, media_staging_dir_path) = match media_staging_paths {
             Some((state, dir)) => (Some(state), Some(dir)),
@@ -2366,10 +2645,15 @@ impl SonarClient {
             media_upload_cancel_all,
             pending_marmot_giftwraps,
             pending_marmot_groups,
+            pending_live_event_spool,
             marmot_notify,
             send_inflight,
             membership_gate,
             buffer_drops_total,
+            buffer_spills_total,
+            live_recovery_required,
+            live_recovery_retry_after_ms,
+            live_recovery_failures,
             live_marmot_enabled,
             marmot_group_subscriptions,
             marmot_group_resub_generation,
@@ -2407,7 +2691,7 @@ impl SonarClient {
         // Open the live Marmot subscriptions for real sessions. In-memory test
         // sessions (allow_geo_relays=false) stay on the explicit `sync()` path so
         // the e2e tests remain deterministic and network-shaped.
-        if allow_geo_relays {
+        if allow_geo_relays && !client.relays.is_empty() {
             if let Err(err) = client.subscribe_marmot().await {
                 tracing::debug!(%err, "marmot live subscribe failed (sync() still covers it)");
             }
@@ -5350,17 +5634,20 @@ impl SonarClient {
     /// the same `last_synced_at` + batched-subscription pattern the White Noise
     /// reference client uses. Duplicate/already-processed events are tolerated.
     pub async fn sync(&self) -> Result<()> {
-        self.sync_inner(false).await
+        self.sync_inner(false).await.map(|_| ())
     }
 
     /// Like `sync()` but bypasses the live-subscription short-circuit. Use after
     /// a foreground resume or relay reconnect to catch events that arrived while
     /// the subscription was dead.
     pub async fn sync_force(&self) -> Result<()> {
-        self.sync_inner(true).await
+        self.sync_inner(true).await.map(|_| ())
     }
 
-    async fn sync_inner(&self, force: bool) -> Result<()> {
+    /// Classifies whether the fetch and Marmot processing may acknowledge a
+    /// durable live-event recovery generation, still have bounded bootstrap
+    /// work, or encountered a retryable failure.
+    async fn sync_inner(&self, force: bool) -> Result<RecoverySyncCompletion> {
         // Watermark from the previous successful sync (0 on the first poll of a
         // session → an unbounded backfill, bounded only by the `#p`/`#h` scope).
         let since_secs = self.sync_watermark_secs();
@@ -5385,7 +5672,7 @@ impl SonarClient {
             self.save_or_rewind_without_advancing_watermark(process_report)?;
             self.retry_outbox().await;
             self.share_push_token_with_groups().await;
-            return Ok(());
+            return Ok(RecoverySyncCompletion::Complete);
         }
 
         // Capture the start time as the next watermark BEFORE fetching, so any
@@ -5414,7 +5701,7 @@ impl SonarClient {
         if !wraps.completed_quorum() {
             process_report.record_retryable(started);
         }
-        let (wrap_report, _) = self.process_marmot_events(wraps.events, "gift wrap").await;
+        let (wrap_report, _, _) = self.process_marmot_events(wraps.events, "gift wrap").await;
         process_report.absorb(wrap_report);
 
         // A welcome processed during sync can add group(s). Backfill all new
@@ -5450,12 +5737,16 @@ impl SonarClient {
             }
             let batch_ids: Vec<String> = batch.into_iter().map(|(_, id)| id).collect();
             match self.backfill_groups(&batch_ids).await {
-                Ok(report) => process_report.absorb(report),
+                Ok(report) => {
+                    self.requeue_initial_empty_transcript_backfill_batch_if_retryable(
+                        &batch_ids,
+                        report.retryable_failures,
+                    );
+                    process_report.absorb(report);
+                }
                 Err(err) => {
                     tracing::debug!(%err, "batched empty transcript backfill failed");
-                    for id in &batch_ids {
-                        self.requeue_initial_empty_transcript_backfill(id);
-                    }
+                    self.requeue_initial_empty_transcript_backfill_batch(&batch_ids);
                     process_report.record_retryable(Timestamp::now().as_secs());
                 }
             }
@@ -5486,7 +5777,7 @@ impl SonarClient {
             if !events.completed_quorum() {
                 process_report.record_retryable(started);
             }
-            let (msg_report, msg_notifications) = self
+            let (msg_report, msg_notifications, _) = self
                 .process_marmot_events(events.events, "group message")
                 .await;
             process_report.absorb(msg_report);
@@ -5504,7 +5795,36 @@ impl SonarClient {
             }
         }
 
-        if process_report.retryable_failures == 0 {
+        let pending_group_catchups = self.initial_group_message_catchups.lock().unwrap().len();
+        let pending_empty_transcript_backfills = self
+            .initial_empty_transcript_backfills
+            .lock()
+            .unwrap()
+            .len();
+        let group_catchup_scan_complete = self
+            .initial_group_message_catchup_scanned
+            .load(Ordering::Acquire);
+        let empty_transcript_scan_complete = self.initial_backfill_scanned.load(Ordering::Acquire);
+        let recovery_completion = recovery_sync_completion(
+            process_report.retryable_failures,
+            force,
+            is_live,
+            since_secs,
+            group_catchup_scan_complete,
+            empty_transcript_scan_complete,
+            pending_group_catchups,
+            pending_empty_transcript_backfills,
+        );
+        if recovery_completion == RecoverySyncCompletion::BoundedCatchupPending {
+            tracing::info!(
+                pending_group_catchups,
+                pending_empty_transcript_backfills,
+                group_catchup_scan_complete,
+                empty_transcript_scan_complete,
+                "zero-watermark recovery generation retained for bounded catch-up cycle"
+            );
+        }
+        if recovery_completion == RecoverySyncCompletion::Complete {
             self.advance_sync_watermark(started)?;
         } else if let Some(secs) = process_report.oldest_retryable_secs {
             self.rewind_sync_watermark_for_retry(secs)?;
@@ -5513,7 +5833,7 @@ impl SonarClient {
         }
         self.retry_outbox().await;
         self.share_push_token_with_groups().await;
-        Ok(())
+        Ok(recovery_completion)
     }
 
     /// Open persistent Marmot subscriptions:
@@ -5636,6 +5956,9 @@ impl SonarClient {
     }
 
     fn current_group_ids(&self) -> Result<HashSet<String>> {
+        #[cfg(test)]
+        self.group_subscription_enumerations
+            .fetch_add(1, Ordering::Relaxed);
         Ok(self
             .engine
             .groups()?
@@ -5680,6 +6003,20 @@ impl SonarClient {
             .lock()
             .unwrap()
             .insert(group_id_hex.to_string());
+    }
+
+    fn requeue_initial_empty_transcript_backfill_batch_if_retryable(
+        &self,
+        group_ids: &[String],
+        retryable_failures: usize,
+    ) {
+        let mut pending = self.initial_empty_transcript_backfills.lock().unwrap();
+        requeue_empty_transcript_batch_if_retryable(&mut pending, group_ids, retryable_failures);
+    }
+
+    fn requeue_initial_empty_transcript_backfill_batch(&self, group_ids: &[String]) {
+        let mut pending = self.initial_empty_transcript_backfills.lock().unwrap();
+        pending.extend(group_ids.iter().cloned());
     }
 
     fn group_message_catchup_floors(engine: &MarmotEngine) -> HashMap<String, u64> {
@@ -6027,9 +6364,11 @@ impl SonarClient {
             live_marmot_enabled: *self.live_marmot_enabled.lock().unwrap(),
             subscribed_group_count: self.marmot_group_subscriptions.lock().unwrap().len(),
             pending_marmot_buffered: self.pending_marmot_giftwraps.lock().unwrap().len()
-                + self.pending_marmot_groups.lock().unwrap().len(),
+                + self.pending_marmot_groups.lock().unwrap().len()
+                + self.pending_live_event_spool.lock().unwrap().pending_len(),
             send_inflight: self.send_inflight.load(Ordering::Relaxed),
             buffer_drops_total: self.buffer_drops_total.load(Ordering::Relaxed),
+            buffer_spills_total: self.buffer_spills_total.load(Ordering::Relaxed),
             catchup_queue_len: self.initial_group_message_catchups.lock().unwrap().len(),
             relays,
             group_floors,
@@ -6258,7 +6597,10 @@ impl SonarClient {
                 "relay fetch returned before all relays completed"
             );
             let pending = self.pending_marmot_groups.clone();
+            let spool = self.pending_live_event_spool.clone();
+            let buffer_spills = self.buffer_spills_total.clone();
             let buffer_drops = self.buffer_drops_total.clone();
+            let recovery_required = self.live_recovery_required.clone();
             let notify = self.marmot_notify.clone();
             let mut late_seen = seen.clone();
             tokio::spawn(async move {
@@ -6271,13 +6613,21 @@ impl SonarClient {
                                 if !late_seen.insert(event.id.to_hex()) {
                                     continue;
                                 }
-                                {
+                                let buffered = {
                                     let mut buf = pending.lock().unwrap();
-                                    if push_live_buffer(&mut buf, event, MARMOT_GROUP_BUFFER_CAP) {
-                                        buffer_drops.fetch_add(1, Ordering::Relaxed);
-                                    }
-                                }
-                                accepted += 1;
+                                    let mut spool = spool.lock().unwrap();
+                                    buffer_live_event(
+                                        &mut buf,
+                                        event,
+                                        MARMOT_GROUP_BUFFER_CAP,
+                                        &mut spool,
+                                        "late-group-message",
+                                        &buffer_spills,
+                                        &buffer_drops,
+                                        &recovery_required,
+                                    )
+                                };
+                                accepted += usize::from(buffered);
                                 late_events += 1;
                             }
                             tracing::debug!(
@@ -6323,9 +6673,15 @@ impl SonarClient {
         &self,
         events: impl IntoIterator<Item = Event>,
         context: &'static str,
-    ) -> (MarmotProcessReport, Vec<DrainNotification>) {
+    ) -> (MarmotProcessReport, Vec<DrainNotification>, HashSet<String>) {
         let mut report = MarmotProcessReport::default();
         let mut notifications: Vec<DrainNotification> = Vec::new();
+        // IDs handled for this delivery but deliberately omitted from the
+        // durable relay-dedup set. MDK's `Failed` record can become retryable
+        // after an MLS rollback, so future relay catch-up must still reach it;
+        // a durable overflow row from this batch can nevertheless be removed
+        // to avoid retrying the same terminal-for-now record forever.
+        let mut ephemeral_spool_ack_ids = HashSet::new();
         let mut changed_groups: HashSet<String> = HashSet::new();
         let mut sticker_refs: Vec<StickerRef> = Vec::new();
         let group_names: HashMap<Vec<u8>, String> = self
@@ -6419,6 +6775,7 @@ impl SonarClient {
                         context,
                         "marmot event failed in MDK; preserving rollback retry"
                     );
+                    ephemeral_spool_ack_ids.insert(event.id.to_hex());
                     report.record_processed();
                 }
                 Ok(Incoming::GroupProposal(update)) => {
@@ -6529,7 +6886,7 @@ impl SonarClient {
             sticker_refs,
             STICKER_REF_PREFETCH_BATCH_LIMIT,
         ));
-        (report, notifications)
+        (report, notifications, ephemeral_spool_ack_ids)
     }
 
     /// One-off fetch of a single group's full kind-445 history (no `since`),
@@ -6574,7 +6931,7 @@ impl SonarClient {
             .fetch_marmot_events_from_relay_quorum(filter, BACKFILL_TIMEOUT, context)
             .await?;
         let partial = !events.completed_quorum();
-        let (mut report, _) = self
+        let (mut report, _, _) = self
             .process_marmot_events(events.events, "backfilled group message")
             .await;
         if partial {
@@ -6593,12 +6950,73 @@ impl SonarClient {
         {
             return true;
         }
-        tokio::time::timeout(
-            Duration::from_secs(timeout_secs.max(1)),
-            self.marmot_notify.notified(),
-        )
-        .await
-        .is_ok()
+        let now_ms = live_event_spool_now_ms();
+        let recovery_ready_in = self
+            .live_recovery_required
+            .load(Ordering::Acquire)
+            .then(|| {
+                Duration::from_millis(
+                    self.live_recovery_retry_after_ms
+                        .load(Ordering::Acquire)
+                        .saturating_sub(now_ms),
+                )
+            });
+        if recovery_ready_in.is_some_and(|delay| delay.is_zero()) {
+            return true;
+        }
+        let (pending_spool, ready_in) = {
+            let spool = self.pending_live_event_spool.lock().unwrap();
+            let pending = spool.pending_len() > 0;
+            let ready = spool.next_ready_in(now_ms);
+            (pending, ready)
+        };
+        let ready_in = match ready_in {
+            Ok(delay) => delay,
+            Err(err) => {
+                tracing::error!(%err, "durable live-event queue deadline read failed");
+                mark_live_event_recovery(
+                    self.pending_live_event_spool.as_ref(),
+                    self.live_recovery_required.as_ref(),
+                    "durable-queue-deadline-read",
+                );
+                return true;
+            }
+        };
+        if pending_spool && ready_in.is_some_and(|delay| delay.is_zero()) {
+            return true;
+        }
+
+        let host_timeout = Duration::from_secs(timeout_secs.max(1));
+        let spool_wait = ready_in
+            .filter(|_| pending_spool)
+            .map(|delay| delay.min(host_timeout))
+            .unwrap_or(host_timeout);
+        let recovery_wait = recovery_ready_in
+            .map(|delay| delay.min(host_timeout))
+            .unwrap_or(host_timeout);
+        let wait_for = spool_wait.min(recovery_wait);
+        if tokio::time::timeout(wait_for, self.marmot_notify.notified())
+            .await
+            .is_ok()
+        {
+            return true;
+        }
+
+        // The timer may have been shortened to the durable-row retry deadline.
+        // Re-check it so the host drains without waiting for a relay wake.
+        let now_ms = live_event_spool_now_ms();
+        if self.live_recovery_required.load(Ordering::Acquire)
+            && self.live_recovery_retry_after_ms.load(Ordering::Acquire) <= now_ms
+        {
+            return true;
+        }
+        let spool = self.pending_live_event_spool.lock().unwrap();
+        spool.pending_len() > 0
+            && spool
+                .next_ready_in(now_ms)
+                .ok()
+                .flatten()
+                .is_some_and(|delay| delay.is_zero())
     }
 
     /// Park incoming-message notifications produced by the forced-sync
@@ -6609,6 +7027,108 @@ impl SonarClient {
         for n in notifications {
             push_live_buffer(&mut queue, n, SYNC_NOTIFICATION_CAP);
         }
+    }
+
+    fn retain_live_recovery_for_retry(&self) -> u64 {
+        let failures = self
+            .live_recovery_failures
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        let retry_ms = live_recovery_backoff_ms(failures);
+        self.live_recovery_retry_after_ms.store(
+            live_event_spool_now_ms().saturating_add(retry_ms),
+            Ordering::Release,
+        );
+        self.live_recovery_required.store(true, Ordering::Release);
+        retry_ms
+    }
+
+    fn retain_live_recovery_for_bounded_catchup(&self) -> u64 {
+        self.live_recovery_failures.store(0, Ordering::Release);
+        self.live_recovery_retry_after_ms.store(
+            live_event_spool_now_ms().saturating_add(LIVE_RECOVERY_RETRY_BASE_MS),
+            Ordering::Release,
+        );
+        self.live_recovery_required.store(true, Ordering::Release);
+        LIVE_RECOVERY_RETRY_BASE_MS
+    }
+
+    async fn recover_lagged_live_events(&self, notifications: &mut Vec<DrainNotification>) {
+        let now_ms = live_event_spool_now_ms();
+        if self.live_recovery_retry_after_ms.load(Ordering::Acquire) > now_ms {
+            return;
+        }
+        // A local-only bootstrap node can observe the marker to wake the host,
+        // but it must leave it intact for the relay-backed replacement node.
+        if self.relays.is_empty() {
+            // Do not turn a durable marker into a busy drain loop while the
+            // app is offline. A replacement node reloads the marker with a
+            // fresh process-local deadline as soon as relays are configured.
+            self.live_recovery_retry_after_ms.store(
+                now_ms.saturating_add(LIVE_RECOVERY_RETRY_MAX_MS),
+                Ordering::Release,
+            );
+            return;
+        }
+        let claimed = self.live_recovery_required.swap(false, Ordering::AcqRel);
+        let recovery_generation = self
+            .pending_live_event_spool
+            .lock()
+            .unwrap()
+            .pending_recovery_generation();
+        if !claimed && recovery_generation.is_none() {
+            return;
+        }
+        tracing::warn!("recovering lagged live Marmot events with forced watermarked sync");
+        match self.sync_inner(true).await {
+            Ok(RecoverySyncCompletion::Complete) => {}
+            Ok(RecoverySyncCompletion::BoundedCatchupPending) => {
+                let retry_ms = self.retain_live_recovery_for_bounded_catchup();
+                tracing::info!(
+                    retry_ms,
+                    "lagged live-event recovery made bounded catch-up progress; generation retained"
+                );
+                return;
+            }
+            Ok(RecoverySyncCompletion::RetryableFailure) => {
+                let retry_ms = self.retain_live_recovery_for_retry();
+                tracing::warn!(
+                    retry_ms,
+                    "lagged live-event recovery was incomplete; retry retained"
+                );
+                return;
+            }
+            Err(err) => {
+                let retry_ms = self.retain_live_recovery_for_retry();
+                tracing::warn!(%err, retry_ms, "lagged live-event recovery sync failed; retry retained");
+                return;
+            }
+        }
+        if let Some(generation) = recovery_generation {
+            let clear_result = self
+                .pending_live_event_spool
+                .lock()
+                .unwrap()
+                .complete_recovery(generation);
+            match clear_result {
+                Ok(true) => {}
+                Ok(false) => {
+                    // A newer generation arrived while the relay fetch was in
+                    // flight. Keep it pending for a subsequent forced sync.
+                    self.live_recovery_required.store(true, Ordering::Release);
+                }
+                Err(err) => {
+                    let retry_ms = self.retain_live_recovery_for_retry();
+                    tracing::error!(%err, retry_ms, "failed to persist successful live-event recovery");
+                    return;
+                }
+            }
+        }
+        self.live_recovery_failures.store(0, Ordering::Release);
+        self.live_recovery_retry_after_ms
+            .store(0, Ordering::Release);
+        let mut recovered = self.pending_sync_notifications.lock().unwrap();
+        notifications.append(&mut *recovered);
     }
 
     /// Process every buffered live Marmot event through the MLS engine, then
@@ -6623,19 +7143,64 @@ impl SonarClient {
             let mut queue = self.pending_sync_notifications.lock().unwrap();
             std::mem::take(&mut *queue)
         };
-        let mut events: Vec<Event> = {
-            let mut giftwraps = self.pending_marmot_giftwraps.lock().unwrap();
-            let mut groups = self.pending_marmot_groups.lock().unwrap();
-            if giftwraps.is_empty() && groups.is_empty() {
-                return Ok(notifications);
-            }
-            let mut out = std::mem::take(&mut *giftwraps);
-            out.append(&mut *groups);
-            out
+        // The durable queue orders all ready welcomes ahead of group traffic,
+        // regardless of insertion position, then rotates retryable rows behind
+        // fresh work. This avoids welcome/dependency head-of-line starvation.
+        let spool_now_ms = live_event_spool_now_ms();
+        let (spool_batch, spool_recovery_required) = {
+            let mut spool = self.pending_live_event_spool.lock().unwrap();
+            let batch = spool.read_batch(LIVE_EVENT_SPOOL_DRAIN_BATCH, spool_now_ms);
+            let recovery_required = spool.recovery_required();
+            (batch, recovery_required)
         };
+        if spool_recovery_required {
+            // Parsing failures are transactionally quarantined/deleted, so the
+            // next valid row can drain. Recovery is separately backoff-gated by
+            // `recover_lagged_live_events`, avoiding a malformed-row hot loop.
+            self.live_recovery_required.store(true, Ordering::Release);
+        }
+        let mut spool_ids = Vec::new();
+        let mut events = match spool_batch {
+            Ok(events) if !events.is_empty() => {
+                spool_ids = events.iter().map(|event| event.id.to_hex()).collect();
+                // A spooled group message can depend on a welcome that still
+                // fits in the separate gift-wrap RAM budget. Include welcomes
+                // in this bounded pass, while leaving newer group traffic for
+                // the next drain.
+                let mut events = events;
+                let mut giftwraps = self.pending_marmot_giftwraps.lock().unwrap();
+                events.append(&mut *giftwraps);
+                events
+            }
+            Ok(_) => Vec::new(),
+            Err(err) => {
+                mark_live_event_recovery(
+                    self.pending_live_event_spool.as_ref(),
+                    self.live_recovery_required.as_ref(),
+                    "durable-queue-read",
+                );
+                tracing::error!(%err, "durable live-event queue read failed; recovery required");
+                Vec::new()
+            }
+        };
+        if events.is_empty() {
+            events = {
+                let mut giftwraps = self.pending_marmot_giftwraps.lock().unwrap();
+                let mut groups = self.pending_marmot_groups.lock().unwrap();
+                if giftwraps.is_empty() && groups.is_empty() {
+                    drop(groups);
+                    drop(giftwraps);
+                    self.recover_lagged_live_events(&mut notifications).await;
+                    return Ok(notifications);
+                }
+                let mut out = std::mem::take(&mut *giftwraps);
+                out.append(&mut *groups);
+                out
+            };
+        }
         sort_marmot_events_in_place(&mut events);
         let ids_before = self.current_group_ids()?;
-        let (mut process_report, live_notifications) = self
+        let (mut process_report, live_notifications, ephemeral_spool_ack_ids) = self
             .process_marmot_events(events, "live marmot event")
             .await;
         notifications.extend(live_notifications);
@@ -6669,6 +7234,36 @@ impl SonarClient {
         } else {
             self.save_sync_state()?;
         }
+        if !spool_ids.is_empty() {
+            let acknowledged_ids: HashSet<String> = {
+                let state = self.sync_state.lock().unwrap();
+                spool_ids
+                    .iter()
+                    .filter(|id| state.has_processed(id) || ephemeral_spool_ack_ids.contains(*id))
+                    .cloned()
+                    .collect()
+            };
+            let (remaining, ready_in) = {
+                let mut spool = self.pending_live_event_spool.lock().unwrap();
+                let remaining = spool.complete_batch(
+                    &spool_ids,
+                    &acknowledged_ids,
+                    live_event_spool_now_ms(),
+                )?;
+                let ready_in = spool.next_ready_in(live_event_spool_now_ms())?;
+                (remaining, ready_in)
+            };
+            tracing::info!(
+                remaining,
+                acknowledged = acknowledged_ids.len(),
+                deferred = spool_ids.len().saturating_sub(acknowledged_ids.len()),
+                "durable live-event queue page completed"
+            );
+            if remaining > 0 && ready_in.is_some_and(|delay| delay.is_zero()) {
+                self.marmot_notify.notify_one();
+            }
+        }
+        self.recover_lagged_live_events(&mut notifications).await;
         Ok(notifications)
     }
 
@@ -6704,6 +7299,81 @@ impl SonarClient {
         group_limit: usize,
         page_limit: usize,
     ) -> Result<Vec<RecentMessagePage>> {
+        if group_limit == 0 || page_limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Persistent clients own a recency-ordered summary table. Select the
+        // requested conversations there FIRST, then hydrate only those bounded
+        // transcript windows. The old engine helper loaded a page for every
+        // group and truncated afterward, making a five-row Home request O(all
+        // conversations) on real accounts.
+        if let Some(ref index) = self.conversation_index {
+            let index = index.lock().unwrap();
+            match index.materialize_next_page(&self.engine, CONVERSATION_INDEX_MATERIALIZE_PAGE) {
+                Ok(materialized) if materialized > 0 => {
+                    tracing::info!(
+                        materialized,
+                        "bounded local conversation-index page repaired"
+                    );
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    // Membership placeholders still preserve complete chat
+                    // visibility. Keep this read bounded and retry the local
+                    // page on a later hydration instead of falling back to an
+                    // all-conversation transcript scan.
+                    tracing::warn!(%err, "bounded conversation-index repair page failed");
+                }
+            }
+            let summaries = index.summaries_ordered_limit(Some(group_limit))?;
+            drop(index);
+            let mut pages = Vec::with_capacity(summaries.len());
+            for summary in summaries {
+                let bytes = match hex::decode(&summary.group_id_hex) {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        tracing::warn!(
+                            group_id = %summary.group_id_hex,
+                            %err,
+                            "conversation index contains invalid group id"
+                        );
+                        continue;
+                    }
+                };
+                let group_id = GroupId::from_slice(&bytes);
+                let messages = self.messages_page(&group_id, page_limit, 0)?;
+                let Some(latest_created_at) = messages.iter().map(|m| m.created_at).max() else {
+                    continue;
+                };
+                pages.push(RecentMessagePage {
+                    group_id,
+                    latest_created_at,
+                    messages,
+                });
+            }
+            tracing::info!(
+                requested_groups = group_limit,
+                hydrated_groups = pages.len(),
+                page_limit,
+                "bounded local summary window hydrated"
+            );
+            return Ok(pages);
+        }
+
+        // A persistent client with an unavailable index must still avoid the
+        // old O(all conversations) scan. Hosts retain complete group rows and
+        // their local snapshot; previews remain empty/stale until the sidecar
+        // can be repaired on the next launch.
+        if self.allow_geo_relays {
+            tracing::warn!(
+                "conversation index unavailable; skipping unbounded persistent transcript scan"
+            );
+            return Ok(Vec::new());
+        }
+
+        // In-memory/test clients have no summary index. Keep the engine path so
+        // deterministic recency semantics remain available for small fixtures.
         self.engine
             .recent_message_pages(group_limit, page_limit)
             .map(|pages| {
@@ -6774,6 +7444,37 @@ impl SonarClient {
             return Vec::new();
         };
         idx.lock().unwrap().summaries_ordered().unwrap_or_default()
+    }
+
+    /// Reconcile complete group visibility after the host has published its
+    /// bounded first local frame. This enumerates local group metadata but does
+    /// not scan transcripts or touch the network; keeping it explicit prevents
+    /// `connect()` latency from growing with account size.
+    pub fn reconcile_conversation_index(&self) -> Result<()> {
+        let Some(ref idx) = self.conversation_index else {
+            return Ok(());
+        };
+        idx.lock().unwrap().reconcile_from(&self.engine)
+    }
+
+    /// Newest-first local summary page. SQL applies both bounds before rows
+    /// cross the core/host boundary, keeping cold Home paint independent of
+    /// total conversation count.
+    pub fn conversation_summaries_page(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Vec<ConversationSummary> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let Some(ref idx) = self.conversation_index else {
+            return Vec::new();
+        };
+        idx.lock()
+            .unwrap()
+            .summaries_ordered_page(Some(limit), offset)
+            .unwrap_or_default()
     }
 
     pub fn conversation_summary(&self, group_id_hex: &str) -> Option<ConversationSummary> {
@@ -6865,19 +7566,6 @@ impl SonarClient {
             for id in group_ids {
                 l.on_conversation_changed(id.clone());
             }
-        }
-    }
-
-    fn materialize_index_if_empty(&mut self) {
-        let Some(ref idx) = self.conversation_index else {
-            return;
-        };
-        let idx_guard = idx.lock().unwrap();
-        if !idx_guard.is_empty() {
-            return;
-        }
-        if let Err(e) = idx_guard.materialize_from(&self.engine) {
-            tracing::warn!(%e, "index materialize failed");
         }
     }
 
@@ -7636,6 +8324,7 @@ fn require_relay_success(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nostr_relay_builder::MockRelay;
 
     /// R: a gift wrap's outer `created_at` is unauthenticated and arbitrary per
     /// NIP-59, and four inbound paths feed it straight into the retry watermark.
@@ -8137,6 +8826,104 @@ mod tests {
         assert!(!should_share_push_tokens(connected));
 
         client.share_push_token_with_groups().await;
+    }
+
+    #[tokio::test]
+    async fn persistent_empty_relay_startup_skips_live_subscription_and_group_enumeration() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let client = SonarClient::connect(
+            Identity::generate(),
+            Vec::new(),
+            dir.path().join("marmot.sqlite"),
+            [7; 32],
+        )
+        .await
+        .expect("local-only persistent client");
+
+        assert!(client.nostr.relays().await.is_empty());
+        assert!(!*client.live_marmot_enabled.lock().unwrap());
+        assert!(client.marmot_group_subscriptions.lock().unwrap().is_empty());
+        assert_eq!(
+            client
+                .group_subscription_enumerations
+                .load(Ordering::Relaxed),
+            0,
+            "connectLocal must not enumerate groups for a live subscription",
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_marker_survives_local_node_then_relay_node_clears_it_after_sync() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("marmot.sqlite");
+        let spool_path = live_event_spool_path_for_db(&db_path);
+        let identity = Identity::generate();
+        let db_key = [19; 32];
+        let mut seeded = LiveEventSpool::load(Some(spool_path.clone())).expect("seed spool");
+        let generation = seeded.mark_recovery_required().expect("seed recovery");
+        drop(seeded);
+
+        let local = SonarClient::connect(identity.clone(), Vec::new(), &db_path, db_key)
+            .await
+            .expect("local-only persistent client");
+        assert!(local.live_recovery_required.load(Ordering::Acquire));
+        assert_eq!(
+            local
+                .pending_live_event_spool
+                .lock()
+                .unwrap()
+                .pending_recovery_generation(),
+            Some(generation)
+        );
+        assert!(local
+            .drain_pending_marmot()
+            .await
+            .expect("local drain")
+            .is_empty());
+        assert!(
+            local.live_recovery_retry_after_ms.load(Ordering::Acquire) > live_event_spool_now_ms(),
+            "local-only observation must not create a busy drain loop"
+        );
+        assert_eq!(
+            local
+                .pending_live_event_spool
+                .lock()
+                .unwrap()
+                .pending_recovery_generation(),
+            Some(generation),
+            "local-only startup must not consume relay recovery state"
+        );
+        drop(local);
+        tokio::task::yield_now().await;
+
+        let relay = MockRelay::run().await.expect("mock relay starts");
+        let relay_url = relay.url().await;
+        let relay_backed = tokio::time::timeout(
+            Duration::from_secs(20),
+            SonarClient::connect(identity, vec![relay_url], &db_path, db_key),
+        )
+        .await
+        .expect("relay-backed replacement connect must stay bounded")
+        .expect("relay-backed replacement client");
+        assert!(relay_backed.live_recovery_required.load(Ordering::Acquire));
+        tokio::time::timeout(Duration::from_secs(20), relay_backed.drain_pending_marmot())
+            .await
+            .expect("forced recovery must stay bounded")
+            .expect("forced relay-backed recovery");
+        assert!(!relay_backed.live_recovery_required.load(Ordering::Acquire));
+        assert_eq!(
+            relay_backed
+                .pending_live_event_spool
+                .lock()
+                .unwrap()
+                .pending_recovery_generation(),
+            None,
+            "successful relay-backed forced sync clears the covered generation"
+        );
+        drop(relay_backed);
+
+        let reopened = LiveEventSpool::load(Some(spool_path)).expect("reopen cleared spool");
+        assert_eq!(reopened.pending_recovery_generation(), None);
     }
 
     #[test]
@@ -9210,11 +9997,170 @@ mod tests {
         for i in 0..(MARMOT_GIFTWRAP_BUFFER_CAP as u32 + 10) {
             let _ = push_live_buffer(&mut giftwraps, i, MARMOT_GIFTWRAP_BUFFER_CAP);
         }
-        let dropped = push_live_buffer(&mut groups, 42u32, MARMOT_GROUP_BUFFER_CAP);
-        assert!(!dropped);
-        assert_eq!(groups, vec![42]);
+
         assert!(giftwraps.len() <= MARMOT_GIFTWRAP_BUFFER_CAP);
-        assert!(giftwraps.len() >= MARMOT_GIFTWRAP_BUFFER_CAP / 2);
+        assert_eq!(spool.pending_len() + giftwraps.len(), total);
+        assert_eq!(
+            spool
+                .read_batch(MARMOT_GIFTWRAP_BUFFER_CAP, live_event_spool_now_ms())
+                .expect("spooled rows")
+                .len(),
+            MARMOT_GIFTWRAP_BUFFER_CAP / 2
+        );
+    }
+
+    #[test]
+    fn append_and_recovery_marker_failure_retains_every_ram_row() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut spool = LiveEventSpool::load(Some(dir.path().join("live.db"))).expect("spool");
+        spool.fail_writes_for_test();
+        let keys = Keys::generate();
+        let mut buffered = (0..4)
+            .map(|index| signed_event(&keys, index + 1, &format!("event-{index}")))
+            .collect::<Vec<_>>();
+        let ids_before = buffered.iter().map(|event| event.id).collect::<Vec<_>>();
+
+        let spill = spill_oldest_live_events(&mut buffered, 4, &mut spool);
+
+        assert!(matches!(
+            spill,
+            LiveEventSpill::Backpressured { retained: 2, .. }
+        ));
+        assert_eq!(
+            buffered.iter().map(|event| event.id).collect::<Vec<_>>(),
+            ids_before,
+            "no RAM row may be removed without durable rows or durable recovery intent"
+        );
+        assert_eq!(spool.pending_len(), 0);
+    }
+
+    #[test]
+    fn sustained_append_and_marker_failure_keeps_ram_bounded_and_signals_recovery() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut spool = LiveEventSpool::load(Some(dir.path().join("live.db"))).expect("spool");
+        spool.fail_writes_for_test();
+        let keys = Keys::generate();
+        let cap = 4usize;
+        let mut buffered = (0..cap)
+            .map(|index| signed_event(&keys, index as u64 + 1, &format!("retained-{index}")))
+            .collect::<Vec<_>>();
+        let retained_ids = buffered.iter().map(|event| event.id).collect::<Vec<_>>();
+        let spills = AtomicUsize::new(0);
+        let drops = AtomicUsize::new(0);
+        let recovery_required = AtomicBool::new(false);
+
+        for index in 0..1_000 {
+            assert!(!buffer_live_event(
+                &mut buffered,
+                signed_event(&keys, index + 10, &format!("dropped-{index}")),
+                cap,
+                &mut spool,
+                "test",
+                &spills,
+                &drops,
+                &recovery_required,
+            ));
+            assert_eq!(buffered.len(), cap, "RAM buffer must remain hard-bounded");
+        }
+
+        assert_eq!(
+            buffered.iter().map(|event| event.id).collect::<Vec<_>>(),
+            retained_ids,
+            "double failure deterministically preserves older buffered work and drops newest"
+        );
+        assert_eq!(drops.load(Ordering::Relaxed), 1_000);
+        assert_eq!(spills.load(Ordering::Relaxed), 0);
+        assert!(recovery_required.load(Ordering::Acquire));
+        assert_eq!(spool.pending_len(), 0);
+    }
+
+    #[test]
+    fn zero_watermark_recovery_retains_generation_until_second_group_cycle_completes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut spool = LiveEventSpool::load(Some(dir.path().join("live.db"))).expect("spool");
+        let generation = spool.mark_recovery_required().expect("mark recovery");
+        let mut pending_groups = VecDeque::from(["first", "second"]);
+        let mut recovered_groups = Vec::new();
+
+        assert_eq!(
+            recovery_sync_completion(0, true, true, 0, false, true, 0, 0),
+            RecoverySyncCompletion::BoundedCatchupPending,
+            "an in-flight send that defers queue population may not make recovery look complete"
+        );
+
+        recovered_groups.push(pending_groups.pop_front().expect("first bounded pass"));
+        let first_pass_completion =
+            recovery_sync_completion(0, true, true, 0, true, true, pending_groups.len(), 0);
+        assert_eq!(
+            first_pass_completion,
+            RecoverySyncCompletion::BoundedCatchupPending
+        );
+        assert_eq!(
+            spool.pending_recovery_generation(),
+            Some(generation),
+            "the global generation must survive while the second group is pending"
+        );
+
+        recovered_groups.push(pending_groups.pop_front().expect("second bounded pass"));
+        let second_pass_completion =
+            recovery_sync_completion(0, true, true, 0, true, true, pending_groups.len(), 0);
+        assert_eq!(second_pass_completion, RecoverySyncCompletion::Complete);
+        assert_eq!(recovered_groups, vec!["first", "second"]);
+        assert!(spool
+            .complete_recovery(generation)
+            .expect("complete covered generation"));
+        assert_eq!(spool.pending_recovery_generation(), None);
+    }
+
+    #[test]
+    fn zero_watermark_empty_transcript_partial_quorum_retries_before_generation_clear() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut spool = LiveEventSpool::load(Some(dir.path().join("live.db"))).expect("spool");
+        let generation = spool.mark_recovery_required().expect("mark recovery");
+        let batch = vec!["alpha".to_string(), "beta".to_string()];
+        let mut pending = HashSet::new();
+
+        assert!(requeue_empty_transcript_batch_if_retryable(
+            &mut pending,
+            &batch,
+            1,
+        ));
+        assert!(requeue_empty_transcript_batch_if_retryable(
+            &mut pending,
+            &batch,
+            1,
+        ));
+        assert_eq!(
+            pending,
+            batch.iter().cloned().collect(),
+            "partial-quorum retries must retain the exact batch without duplicates"
+        );
+        assert_eq!(
+            recovery_sync_completion(1, true, true, 0, true, true, 0, pending.len()),
+            RecoverySyncCompletion::RetryableFailure,
+        );
+        assert_eq!(spool.pending_recovery_generation(), Some(generation));
+
+        let retried = batch
+            .iter()
+            .filter(|group_id| pending.remove(*group_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(retried, batch, "the complete failed batch must be retried");
+        assert!(!requeue_empty_transcript_batch_if_retryable(
+            &mut pending,
+            &retried,
+            0,
+        ));
+        assert!(pending.is_empty());
+        assert_eq!(
+            recovery_sync_completion(0, true, true, 0, true, true, 0, pending.len()),
+            RecoverySyncCompletion::Complete,
+        );
+        assert!(spool
+            .complete_recovery(generation)
+            .expect("complete recovered generation"));
+        assert_eq!(spool.pending_recovery_generation(), None);
     }
 
     #[test]
@@ -9326,6 +10272,15 @@ mod tests {
         assert_eq!(conservative_watermark(500, 1_000), 500);
         assert_eq!(conservative_watermark(0, 1_000), 0);
         assert_eq!(conservative_watermark(1_000, 0), 0);
+    }
+
+    #[test]
+    fn live_recovery_backoff_is_bounded_exponential() {
+        assert_eq!(live_recovery_backoff_ms(1), 1_000);
+        assert_eq!(live_recovery_backoff_ms(2), 2_000);
+        assert_eq!(live_recovery_backoff_ms(5), 16_000);
+        assert_eq!(live_recovery_backoff_ms(6), 30_000);
+        assert_eq!(live_recovery_backoff_ms(100), 30_000);
     }
 
     #[test]
@@ -9482,7 +10437,7 @@ mod tests {
                 bob.accept_group_invite(&invite.id)
                     .expect("bob accepts invite");
             } else {
-                let (report, _) = charlie
+                let (report, _, _) = charlie
                     .process_marmot_events([wrapped], "test charlie welcome")
                     .await;
                 assert_eq!(report.processed, 1);
@@ -9536,19 +10491,20 @@ mod tests {
             .create_text_message(&bob_group_id, "message recovered after rollback")
             .expect("bob creates message in winning epoch");
 
-        let (wrong_commit, _) = charlie
+        let (wrong_commit, _, _) = charlie
             .process_marmot_events([alice_update.evolution_event], "test losing commit first")
             .await;
         assert_eq!(wrong_commit.processed, 1);
 
-        let (first_failure, _) = charlie
+        let (first_failure, _, first_failure_spool_acks) = charlie
             .process_marmot_events([bob_message.clone()], "test initial message failure")
             .await;
         assert_eq!(first_failure.retryable_failures, 1);
+        assert!(first_failure_spool_acks.is_empty());
 
         // A duplicate relay delivery reaches MDK's Incoming::Failed branch.
         // Sonar used to add the event to its own durable processed-ID set here.
-        let (failed_redelivery, _) = charlie
+        let (failed_redelivery, _, failed_spool_acks) = charlie
             .process_marmot_events([bob_message.clone()], "test failed redelivery")
             .await;
         assert_eq!(failed_redelivery.processed, 1);
@@ -9556,13 +10512,44 @@ mod tests {
             !charlie.is_sync_event_processed(&bob_message.id),
             "Sonar dedup must not hide an MDK Failed event that a later MLS rollback can make Retryable"
         );
+        assert_eq!(
+            failed_spool_acks,
+            HashSet::from([bob_message.id.to_hex()]),
+            "terminal-for-now MDK rows acknowledge only their current durable spool delivery"
+        );
 
-        let (winning_commit, _) = charlie
+        let spool_dir = tempfile::tempdir().expect("spool tempdir");
+        let mut spool = LiveEventSpool::load(Some(spool_dir.path().join("live.db")))
+            .expect("open durable overflow spool");
+        spool
+            .append_events(&[bob_message.clone()])
+            .expect("append failed delivery to spool");
+        let spool_batch = spool.read_batch(1, 0).expect("read failed delivery once");
+        assert_eq!(spool_batch, vec![bob_message.clone()]);
+        assert_eq!(
+            spool
+                .complete_batch(
+                    &[bob_message.id.to_hex()],
+                    &failed_spool_acks,
+                    live_event_spool_now_ms(),
+                )
+                .expect("ack terminal-for-now spool row"),
+            0,
+        );
+        assert!(
+            spool
+                .read_batch(1, u64::MAX)
+                .expect("no retry loop")
+                .is_empty(),
+            "ephemeral spool acknowledgement removes the local overflow row"
+        );
+
+        let (winning_commit, _, _) = charlie
             .process_marmot_events([bob_update.evolution_event], "test winning commit rollback")
             .await;
         assert_eq!(winning_commit.processed, 1);
 
-        let (recovered, _) = charlie
+        let (recovered, _, _) = charlie
             .process_marmot_events([bob_message], "test retry after rollback")
             .await;
         assert_eq!(recovered.processed, 1);
@@ -9664,7 +10651,7 @@ mod tests {
             .await
             .expect("wrap bob welcome");
 
-        let (report, _) = bob.process_marmot_events([wrapped], "test welcome").await;
+        let (report, _, _) = bob.process_marmot_events([wrapped], "test welcome").await;
         assert_eq!(report.processed, 1);
 
         let bob_groups = bob.engine.groups().expect("bob groups");
@@ -9716,7 +10703,7 @@ mod tests {
             .await
             .expect("wrap bob welcome");
 
-        let (report, _) = bob
+        let (report, _, _) = bob
             .process_marmot_events([wrapped], "test pending invite")
             .await;
         assert_eq!(report.processed, 1);

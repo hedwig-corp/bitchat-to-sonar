@@ -91,8 +91,15 @@ internal fun hydrateLocalConversationRows(
     summaries: List<SonarConversationSummary>,
     pages: List<SonarRecentTranscriptPage>,
 ): LocalConversationHydration {
-    val messages = existingMessagesByChat.filterKeys { it in activeChatIds }.toMutableMap()
-    val latest = existingLatestByChat.filterKeys { it in activeChatIds }.toMutableMap()
+    // Iterate the requested visible window, not every retained snapshot row.
+    // This keeps cold hydration O(active page) even when the crash fallback
+    // cache contains thousands of conversations.
+    val messages = mutableMapOf<String, List<SonarMsg>>()
+    val latest = mutableMapOf<String, Long>()
+    for (chatId in activeChatIds) {
+        existingMessagesByChat[chatId]?.let { messages[chatId] = it }
+        existingLatestByChat[chatId]?.let { latest[chatId] = it }
+    }
 
     for (summary in summaries) {
         if (summary.groupIdHex !in activeChatIds || summary.latestAtSecs <= 0L) continue

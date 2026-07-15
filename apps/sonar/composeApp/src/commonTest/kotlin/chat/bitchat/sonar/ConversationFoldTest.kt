@@ -8,6 +8,30 @@ import kotlin.test.assertTrue
 
 class ConversationFoldTest {
     @Test
+    fun visibleMetadataDemandWaitsForRelayReadinessWithoutCreatingAMiss() {
+        assertFalse(relayMetadataDemandAllowed(isRelayConnected = false))
+        assertTrue(relayMetadataDemandAllowed(isRelayConnected = true))
+    }
+
+    @Test
+    fun relayReconnectClearsRecentMissAndInFlightThrottleForImmediateRedemand() {
+        val profileKey = "npub-test"
+        val descriptorKey = "ab".repeat(32)
+        val profileMisses = mutableMapOf(profileKey to 1_000L)
+        val profileInFlight = mutableSetOf(profileKey)
+        val descriptorMisses = mutableMapOf(descriptorKey to 1_000L)
+        val descriptorInFlight = mutableSetOf(descriptorKey)
+
+        clearRelayMetadataThrottle(profileKey, profileMisses, profileInFlight)
+        clearRelayMetadataThrottle(descriptorKey, descriptorMisses, descriptorInFlight)
+
+        assertNull(profileMisses[profileKey])
+        assertNull(descriptorMisses[descriptorKey])
+        assertTrue(profileInFlight.add(profileKey), "profile demand can restart immediately")
+        assertTrue(descriptorInFlight.add(descriptorKey), "descriptor demand can restart immediately")
+    }
+
+    @Test
     fun foldedDirectDmTitleComesFromMarmotCounterpart() {
         assertEquals(
             "Sara D",
@@ -305,6 +329,18 @@ class ConversationFoldTest {
         assertEquals(mapOf(newest.id to 42L), decodeChatSnapshotLatest(
             encodeChatSnapshot(listOf(newest, older), mapOf(newest.id to messages)),
         ))
+    }
+
+    @Test
+    fun chatSnapshotCanBoundLegacyAndNewRowsForColdPaint() {
+        val chats = (0 until 32).map { index ->
+            SonarChat("group-$index", "Chat $index", listOf("peer-$index"))
+        }
+        val fullLegacyBlob = encodeChatSnapshot(chats, emptyMap())
+        val boundedBlob = encodeChatSnapshot(chats, emptyMap(), rowLimit = 5)
+
+        assertEquals(chats.take(5), decodeChatSnapshot(fullLegacyBlob, rowLimit = 5).first)
+        assertEquals(chats.take(5), decodeChatSnapshot(boundedBlob).first)
     }
 
     @Test

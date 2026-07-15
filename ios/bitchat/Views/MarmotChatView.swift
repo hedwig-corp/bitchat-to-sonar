@@ -209,6 +209,7 @@ func snMarmotHomeRowMessage(
 
 enum SNMarmotChatSnapshotCache {
     private static let defaultsKey = "marmot.chatSnapshot.v1"
+    private static let rowLimit = 5
 
     private struct Snapshot: Codable {
         let groups: [MarmotService.MarmotGroup]
@@ -230,13 +231,40 @@ enum SNMarmotChatSnapshotCache {
         to defaults: UserDefaults
     ) {
         _ = messagesByGroup
-        let snapshot = Snapshot(groups: groups)
+        let snapshot = Snapshot(groups: Array(groups.prefix(rowLimit)))
         guard let data = try? JSONEncoder().encode(snapshot) else { return }
         defaults.set(data, forKey: defaultsKey)
     }
 
     static func clear(from defaults: UserDefaults) {
         defaults.removeObject(forKey: defaultsKey)
+    }
+}
+
+/// Monotonic per-key request tokens for relay-backed metadata. Re-arming a
+/// visible row supersedes any older request for that peer; only the latest
+/// token may mutate cache, miss, or in-flight state when its await completes.
+struct SNMetadataDemandTokens {
+    private var nextToken: UInt64 = 0
+    private var activeByKey: [String: UInt64] = [:]
+
+    mutating func begin(for key: String) -> UInt64 {
+        nextToken &+= 1
+        activeByKey[key] = nextToken
+        return nextToken
+    }
+
+    mutating func invalidate(_ key: String) {
+        _ = begin(for: key)
+    }
+
+    mutating func invalidateAll() {
+        nextToken &+= 1
+        activeByKey.removeAll(keepingCapacity: true)
+    }
+
+    func isCurrent(_ token: UInt64, for key: String) -> Bool {
+        activeByKey[key] == token
     }
 }
 
@@ -271,13 +299,16 @@ final class MarmotChatModel: ObservableObject {
     /// Re-fetch kind-0 profiles older than this so alias/name updates are
     /// noticed during long sessions (mirrors Android PROFILE_REFRESH_TTL_SECS).
     private static let profileRefreshTTL: TimeInterval = 30 * 60
+    /// A missing kind-0 is normal. Keep visible-row recomputation from turning
+    /// that miss into an immediate relay query loop (Compose parity).
+    private static let profileMissRetryInterval: TimeInterval = 60
     private static let localTranscriptPageLimit = TransportConfig.sonarTranscriptPageCount
     private static let localTranscriptRetainedLimit = TransportConfig.sonarTranscriptRetainedCount
     /// A summary invalidation may briefly own the same per-group loader as an
     /// edge gesture. Retry only that coalescing case for up to one second.
     private static let localTranscriptBusyRetryLimit = 21
     private static let localSummaryPageLimit: UInt32 = 20
-    private static let localSummaryGroupLimit: UInt32 = 50
+    private static let localSummaryGroupLimit: UInt32 = 5
     private static let relayReconnectRetryDelaySeconds: Double = 10
 
     @Published var npub: String?
@@ -420,8 +451,13 @@ final class MarmotChatModel: ObservableObject {
     private var profileFetches: Set<String> = []
     /// Last successful kind-0 profile fetch time per npub.
     private var profileFetchedAt: [String: Date] = [:]
+    /// Last unsuccessful kind-0 lookup per npub. Misses are retried after a
+    /// short TTL, not on every visible-row body recomputation.
+    private var profileMissedAt: [String: Date] = [:]
+    private var profileDemandTokens = SNMetadataDemandTokens()
     /// npubs whose Sonar descriptor fetch is currently in flight.
     private var descriptorFetches: Set<String> = []
+    private var descriptorDemandTokens = SNMetadataDemandTokens()
     /// Last successful relay lookup time per npub. A successful nil response is
     /// tracked via `sonarDescriptorMissesByNpub`.
     private var sonarDescriptorFetchedAtByNpub: [String: Date] = [:]
@@ -719,6 +755,8 @@ final class MarmotChatModel: ObservableObject {
             // Publish one coherent, bounded local Home model before the root
             // view becomes visible. This reads no relay and performs no sync.
             await loadLocalSummaries(resolveMembers: false)
+            initialLocalHomeReady = true
+            scheduleLocalConversationIndexReconciliation()
             #if DEBUG
             // SONAR_BENCH: local-first paint ready — row previews/order hydrated
             // from the encrypted DB before any relay attach (T1).
@@ -732,6 +770,27 @@ final class MarmotChatModel: ObservableObject {
             SecureLogger.warning("⚠️ Marmot local open failed: \(desc)", category: .session)
             self.errorText = desc
             return false
+        }
+    }
+
+    /// Defer O(all groups) metadata reconciliation until after the bounded
+    /// local frame has crossed the Home reveal boundary.
+    private func scheduleLocalConversationIndexReconciliation() {
+        localIndexReconcileTask?.cancel()
+        localIndexReconcileTask = Task { [weak self] in
+            await Task.yield()
+            guard let self, !Task.isCancelled else { return }
+            do {
+                try await self.service.reconcileConversationIndex()
+                guard !Task.isCancelled else { return }
+                await self.loadLocalSummaries(resolveMembers: false)
+            } catch {
+                SecureLogger.warning(
+                    "Conversation index reconciliation deferred: \(Self.describe(error))",
+                    category: .session
+                )
+            }
+            self.localIndexReconcileTask = nil
         }
     }
 
@@ -1791,13 +1850,32 @@ final class MarmotChatModel: ObservableObject {
     @discardableResult
     func loadLocalSummaries(resolveMembers: Bool = true) async -> Bool {
         do {
-            let groups = try await service.groups()
-            let invites = try await service.pendingGroupInvites()
+            let coldLocalPaint = !initialLocalHomeReady
+            // This bounded read materializes only the selected incomplete
+            // summaries. Fetch rows afterwards so the first publication has a
+            // coherent preview/unread projection.
             let pages = try await service.recentMessagePages(
                 groupLimit: Self.localSummaryGroupLimit,
                 pageLimit: Self.localSummaryPageLimit
             )
-            let summaries = await service.conversationSummaries()
+            let localRows = coldLocalPaint
+                ? try await service.localConversationPage(limit: Self.localSummaryGroupLimit)
+                : []
+            let groups: [MarmotService.MarmotGroup]
+            if coldLocalPaint {
+                // Keep the fallback bounded too. The cache is already in last
+                // local recency order and remains untouched on disk until a
+                // later reconciliation has the complete model.
+                groups = localRows.isEmpty
+                    ? Array(self.groups.prefix(Int(Self.localSummaryGroupLimit)))
+                    : localRows.map(\.group)
+            } else {
+                groups = try await service.groups()
+            }
+            let invites = try await service.pendingGroupInvites()
+            let summaries = coldLocalPaint
+                ? localRows.map(\.summary)
+                : await service.conversationSummaries()
             let activeGroupIds = Set(groups.map(\.id))
             self.conversationSummariesByGroup = Dictionary(
                 uniqueKeysWithValues: summaries
@@ -1847,15 +1925,26 @@ final class MarmotChatModel: ObservableObject {
             self.groups = groups
             dropResolvedPendingDirectChats()
             self.pendingGroupInvites = invites
-            self.messagesByGroup = reconcileOptimistic(
+            let reconciledMessages = reconcileOptimistic(
                 into: byGroup,
                 freshRowsByGroup: freshRowsByGroup
             )
-            SNMarmotChatSnapshotCache.save(
-                groups: groups,
-                messagesByGroup: self.messagesByGroup,
-                to: defaults
-            )
+            if coldLocalPaint {
+                // Preserve the complete crash fallback without a full-map copy;
+                // update only rows selected for the first visible window.
+                for (groupId, rows) in reconciledMessages {
+                    self.messagesByGroup[groupId] = rows
+                }
+            } else {
+                self.messagesByGroup = reconciledMessages
+            }
+            if !coldLocalPaint {
+                SNMarmotChatSnapshotCache.save(
+                    groups: groups,
+                    messagesByGroup: self.messagesByGroup,
+                    to: defaults
+                )
+            }
             if resolveMembers {
                 let relayReady = service.isRelayConnected()
                 for group in groups {
@@ -2264,19 +2353,39 @@ final class MarmotChatModel: ObservableObject {
         let key = SNMarmotProfileCache.canonicalKey(npubToFetch)
         let ownKey = npub.map(SNMarmotProfileCache.canonicalKey)
         guard !key.isEmpty, key != ownKey else { return }
+        // Local Home rows can materialize before relay attach. An attempted
+        // lookup in that window is not a real negative result and must not
+        // poison visible-row demand with a one-minute MISS marker.
+        guard Self.relayMetadataDemandAllowed(isRelayConnected: service.isRelayConnected()) else { return }
+        let now = Date()
+        guard Self.profileFetchAllowed(
+            key: key,
+            ownKey: ownKey,
+            inFlightOrFresh: profileFetches,
+            missedAt: profileMissedAt,
+            now: now,
+            missRetryInterval: Self.profileMissRetryInterval
+        ) else { return }
         let hadCachedProfile = profilesByNpub[key] != nil || profilesByNpub[npubToFetch] != nil
         guard profileFetches.insert(key).inserted else { return } // in flight
+        let demandToken = profileDemandTokens.begin(for: key)
         Task {
             let profile = try? await service.fetchProfile(npub: key)
+            let relayReadyAfterFetch = service.isRelayConnected()
             await MainActor.run {
+                guard self.profileDemandTokens.isCurrent(demandToken, for: key) else {
+                    return
+                }
                 if let profile, profile.bestName != nil {
                     self.profilesByNpub[key] = profile
                     self.profileFetchedAt[key] = Date()
+                    self.profileMissedAt.removeValue(forKey: key)
                     if key != npubToFetch {
                         self.profilesByNpub.removeValue(forKey: npubToFetch)
                     }
                     SNMarmotProfileCache.save(self.profilesByNpub, to: self.defaults)
-                } else {
+                } else if relayReadyAfterFetch {
+                    self.profileMissedAt[key] = Date()
                     if !hadCachedProfile {
                         self.profileFetches.remove(key) // not published yet — allow retry
                     } else {
@@ -2285,6 +2394,9 @@ final class MarmotChatModel: ObservableObject {
                         // after TTL instead of leaving the entry stuck forever.
                         self.profileFetchedAt[key] = Date()
                     }
+                } else {
+                    // Relay loss during the fetch is not a real negative result.
+                    self.profileFetches.remove(key)
                 }
             }
         }
@@ -2314,12 +2426,30 @@ final class MarmotChatModel: ObservableObject {
         fetchedAt.filter { $0.value < cutoff }.map { $0.key }
     }
 
+    nonisolated static func profileFetchAllowed(
+        key: String,
+        ownKey: String?,
+        inFlightOrFresh: Set<String>,
+        missedAt: [String: Date],
+        now: Date,
+        missRetryInterval: TimeInterval
+    ) -> Bool {
+        guard !key.isEmpty, key != ownKey, !inFlightOrFresh.contains(key) else { return false }
+        guard let miss = missedAt[key] else { return true }
+        return now.timeIntervalSince(miss) >= missRetryInterval
+    }
+
+    nonisolated static func relayMetadataDemandAllowed(isRelayConnected: Bool) -> Bool {
+        isRelayConnected
+    }
+
     /// Fetch + cache a peer's public Sonar descriptor. Not finding one keeps the
     /// npub usable for White Noise/Marmot chat, but it does not unlock calls.
     /// Positive results are periodically refreshed so protocol upgrades or
     /// capability changes are noticed during long-running sessions.
     func ensureSonarDescriptor(_ npubToFetch: String) {
         guard !npubToFetch.isEmpty, npubToFetch != npub else { return }
+        guard Self.relayMetadataDemandAllowed(isRelayConnected: service.isRelayConnected()) else { return }
         if sonarDescriptorsByNpub[npubToFetch] != nil,
            let fetchedAt = sonarDescriptorFetchedAtByNpub[npubToFetch],
            Date().timeIntervalSince(fetchedAt) < Self.sonarDescriptorRefreshInterval {
@@ -2330,8 +2460,9 @@ final class MarmotChatModel: ObservableObject {
             return
         }
         guard descriptorFetches.insert(npubToFetch).inserted else { return }
+        let demandToken = descriptorDemandTokens.begin(for: npubToFetch)
         Task {
-            await performDescriptorFetch(npubToFetch)
+            await performDescriptorFetch(npubToFetch, demandToken: demandToken)
         }
     }
 
@@ -2357,40 +2488,37 @@ final class MarmotChatModel: ObservableObject {
             return sonarDescriptorsByNpub[npubToFetch]
         }
         descriptorFetches.insert(npubToFetch)
-        await performDescriptorFetch(npubToFetch)
+        let demandToken = descriptorDemandTokens.begin(for: npubToFetch)
+        await performDescriptorFetch(npubToFetch, demandToken: demandToken)
         return sonarDescriptorsByNpub[npubToFetch]
     }
 
-    private func performDescriptorFetch(_ npubToFetch: String) async {
+    private func performDescriptorFetch(_ npubToFetch: String, demandToken: UInt64) async {
         do {
             let descriptor = try await service.fetchSonarDescriptor(npub: npubToFetch)
+            let relayReadyAfterFetch = service.isRelayConnected()
             await MainActor.run {
+                guard self.descriptorDemandTokens.isCurrent(demandToken, for: npubToFetch) else {
+                    return
+                }
                 self.descriptorFetches.remove(npubToFetch)
-                self.sonarDescriptorFetchedAtByNpub[npubToFetch] = Date()
                 if let descriptor {
+                    self.sonarDescriptorFetchedAtByNpub[npubToFetch] = Date()
                     self.sonarDescriptorsByNpub[npubToFetch] = descriptor
                     self.sonarDescriptorMissesByNpub[npubToFetch] = nil
-                } else {
+                } else if relayReadyAfterFetch {
+                    self.sonarDescriptorFetchedAtByNpub[npubToFetch] = Date()
                     self.sonarDescriptorsByNpub.removeValue(forKey: npubToFetch)
                     self.sonarDescriptorMissesByNpub[npubToFetch] = Date()
                 }
             }
         } catch {
             await MainActor.run {
+                guard self.descriptorDemandTokens.isCurrent(demandToken, for: npubToFetch) else {
+                    return
+                }
                 _ = self.descriptorFetches.remove(npubToFetch)
             }
-        }
-    }
-
-    /// Proactively refresh Sonar descriptors for a set of known npubs (e.g. all
-    /// persisted fingerprint↔npub links). Only the relay-ready startup pass clears
-    /// miss timestamps; foreground refreshes preserve the miss retry cooldown.
-    func refreshDescriptors(forKnownNpubs npubs: [String], clearMisses: Bool = false) {
-        for npub in npubs {
-            if clearMisses {
-                sonarDescriptorMissesByNpub[npub] = nil
-            }
-            ensureSonarDescriptor(npub)
         }
     }
 
@@ -3597,6 +3725,8 @@ final class MarmotChatModel: ObservableObject {
         // Do not nil/cancel `gapRecoveryTask` here: UniFFI `syncForce` is not
         // abortable, and clearing the slot would allow a stacked second fetch.
         // Wipe paths bump generation explicitly below.
+        localIndexReconcileTask?.cancel()
+        localIndexReconcileTask = nil
     }
 
     // MARK: - P2P calls (pass-throughs to the call engine in MarmotService)
@@ -3670,6 +3800,7 @@ final class MarmotChatModel: ObservableObject {
         }
         profileFetches = []
         profileFetchedAt = [:]
+        profileMissedAt = [:]
         installedPackCoordinates = []
     }
 
@@ -3733,6 +3864,7 @@ final class MarmotChatModel: ObservableObject {
         localTranscriptPreservesOlderEdgeGroups = []
         descriptorBolt12Offer = nil
         profilesByNpub = [:]
+        profileDemandTokens.invalidateAll()
         profileFetches = []
         profileFetchedAt = [:]
         // Invalidate any in-flight syncForce slot so a post-wipe wake cannot
@@ -3790,6 +3922,39 @@ final class MarmotChatModel: ObservableObject {
         if let name = displayName(forNpub: other) { return name }
         ensureProfile(other)
         return group.name.isEmpty ? String(other.prefix(12)) + "…" : group.name
+    }
+
+    func ensureProfileForGroup(_ groupId: String) {
+        guard let group = groups.first(where: { $0.id == groupId }), group.name.isEmpty else {
+            return
+        }
+        let others = otherMembers(in: group)
+        guard others.count == 1, let other = others.first else { return }
+        ensureProfile(other)
+        ensureSonarDescriptor(other)
+    }
+
+    /// Re-arm metadata only for a row that is still visible when relay attach
+    /// completes. Clearing prior-session/pre-fix misses here avoids waiting for
+    /// their cooldown without returning to an all-contact startup sweep.
+    func rearmRelayMetadataForGroup(_ groupId: String) {
+        guard let group = groups.first(where: { $0.id == groupId }) else { return }
+        for other in otherMembers(in: group) {
+            rearmRelayMetadata(other)
+        }
+    }
+
+    func rearmRelayMetadata(_ npubToFetch: String) {
+        let key = SNMarmotProfileCache.canonicalKey(npubToFetch)
+        guard !key.isEmpty else { return }
+        profileDemandTokens.invalidate(key)
+        descriptorDemandTokens.invalidate(npubToFetch)
+        profileMissedAt.removeValue(forKey: key)
+        profileFetches.remove(key)
+        sonarDescriptorMissesByNpub.removeValue(forKey: npubToFetch)
+        descriptorFetches.remove(npubToFetch)
+        ensureProfile(key)
+        ensureSonarDescriptor(npubToFetch)
     }
 
     func otherMembers(in group: MarmotService.MarmotGroup) -> [String] {
