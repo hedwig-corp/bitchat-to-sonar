@@ -61,4 +61,20 @@ struct SonarAttachmentImportTests {
             routeReplacement: replacement
         ))
     }
+
+    @Test func normalizesUnsupportedEncryptedMediaMetadata() {
+        #expect(snEncryptedAttachmentMime("application/zip") == "application/octet-stream")
+        #expect(snEncryptedAttachmentMime("application/json; charset=utf-8") == "application/octet-stream")
+        #expect(snEncryptedAttachmentMime("application/pdf") == "application/pdf")
+        #expect(snEncryptedAttachmentMime("IMAGE/WEBP") == "image/webp")
+
+        #expect(snEncryptedAttachmentFilename("../../diagnostic.zip") == "diagnostic.zip")
+        #expect(snEncryptedAttachmentFilename("..\\..\\diagnostic.zip") == "diagnostic.zip")
+        #expect(snEncryptedAttachmentFilename("..") == "attachment")
+        #expect(snEncryptedAttachmentFilename("report\u{0000}.txt") == "report.txt")
+
+        let bounded = snEncryptedAttachmentFilename(String(repeating: "a", count: 240) + ".zip")
+        #expect(bounded.hasSuffix(".zip"))
+        #expect(bounded.utf8.count <= 210)
+    }
 }

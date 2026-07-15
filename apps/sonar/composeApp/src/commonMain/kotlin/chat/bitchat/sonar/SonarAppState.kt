@@ -4783,11 +4783,13 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /** Send an arbitrary file through the same encrypted media transport. */
     private fun sendAttachment(chatId: String, data: ByteArray, filename: String, mime: String) {
+        val safeFilename = encryptedAttachmentFilename(filename)
+        val safeMime = encryptedAttachmentMime(mime)
         sendMediaAttachment(
             chatId = chatId,
             data = data,
-            filename = filename,
-            mime = mime,
+            filename = safeFilename,
+            mime = safeMime,
             missingRouteMessage = "Start the secure chat first, then send a file.",
             failureLabel = "file",
         )

@@ -29,6 +29,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.core.content.FileProvider
 import androidx.compose.ui.viewinterop.AndroidView
 import kotlinx.coroutines.CancellableContinuation
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -109,7 +110,15 @@ private fun Context.readPickedFiles(uris: List<Uri>, maxTotalBytes: Long): Dropp
     var rejectedCount = (uris.size - MAX_DROPPED_FILES).coerceAtLeast(0)
     var remainingBytes = maxTotalBytes
     for (uri in uris.take(MAX_DROPPED_FILES)) {
-        val file = readPickedFile(uri, remainingBytes)
+        // Every URI is backed by provider IPC. A grant can be revoked or a
+        // provider can fail while querying metadata/MIME, so isolate failures
+        // per item instead of cancelling the whole picker coroutine.
+        val file = try {
+            readPickedFile(uri, remainingBytes)
+        } catch (error: Exception) {
+            if (error is CancellationException) throw error
+            null
+        }
         if (file == null) {
             rejectedCount += 1
         } else {
