@@ -2439,8 +2439,8 @@ impl SonarClient {
     /// about to fetch the KeyPackage) use this.
     pub async fn publish_key_package(&self) -> Result<()> {
         let event = self.engine.key_package_event(self.relays.clone())?;
-        self.nostr.send_event(&event).await?;
-        Ok(())
+        let output = self.nostr.send_event(&event).await?;
+        require_relay_success(&output, "KeyPackage publish")
     }
 
     /// Like [`Self::publish_key_package`], but the relay send is spawned, not
@@ -2455,8 +2455,12 @@ impl SonarClient {
         let event = self.engine.key_package_event(self.relays.clone())?;
         let nostr = self.nostr.clone();
         tokio::spawn(async move {
-            if let Err(err) = nostr.send_event(&event).await {
-                tracing::warn!(%err, "background KeyPackage publish failed");
+            let result = match nostr.send_event(&event).await {
+                Ok(output) => require_relay_success(&output, "background KeyPackage publish"),
+                Err(err) => Err(err.into()),
+            };
+            if let Err(err) = result {
+                tracing::warn!(%err, event_id = %event.id, "background KeyPackage publish failed");
             }
         });
         Ok(())
@@ -2522,16 +2526,73 @@ impl SonarClient {
     }
 
     /// Fetch the freshest KeyPackage event for `author` from the relays.
+    ///
+    /// Current White Noise clients publish KeyPackages to their NIP-65 write
+    /// relays, which need not overlap with our account relays. Preserve the
+    /// common fast path first; only after that misses do a bounded two-hop
+    /// lookup via the peer's kind-10002 relay list.
     pub async fn fetch_key_package(&self, author: PublicKey) -> Result<Event> {
         let filter = Filter::new()
             .kind(Kind::Custom(KEY_PACKAGE_KIND))
             .author(author)
             .limit(1);
         let events = self.nostr.fetch_events(filter, FETCH_TIMEOUT).await?;
-        events
-            .into_iter()
-            .next()
-            .ok_or(Error::KeyPackageNotFound(author))
+        if let Some(event) = newest_event(events) {
+            return Ok(event);
+        }
+
+        if let Some(event) = self.fetch_key_package_from_nip65(author).await? {
+            return Ok(event);
+        }
+
+        Err(Error::KeyPackageNotFound(author))
+    }
+
+    async fn fetch_key_package_from_nip65(&self, author: PublicKey) -> Result<Option<Event>> {
+        let relay_lists = self
+            .nostr
+            .fetch_events(
+                Filter::new().kind(Kind::RelayList).author(author).limit(1),
+                FETCH_TIMEOUT,
+            )
+            .await?;
+        let peer_relays = peer_key_package_relays(relay_lists, &self.relays);
+        if peer_relays.is_empty() {
+            return Ok(None);
+        }
+
+        tracing::debug!(
+            relay_count = peer_relays.len(),
+            "retrying KeyPackage fetch on peer NIP-65 relays"
+        );
+        // Carry our signer so NIP-42-protected peer relays can authenticate the
+        // bounded lookup; the client is still short-lived and fetch-only.
+        let peer_client = Client::new(self.identity().keys().clone());
+        let mut added_relays = 0usize;
+        for relay in peer_relays {
+            match peer_client.add_relay(relay).await {
+                Ok(true) => added_relays += 1,
+                Ok(false) => {}
+                Err(err) => tracing::debug!(%err, "skipping unusable peer NIP-65 relay"),
+            }
+        }
+        if added_relays == 0 {
+            return Ok(None);
+        }
+        peer_client.connect().await;
+
+        let events = peer_client
+            .fetch_events(
+                Filter::new()
+                    .kind(Kind::Custom(KEY_PACKAGE_KIND))
+                    .author(author)
+                    .limit(1),
+                FETCH_TIMEOUT,
+            )
+            .await;
+        peer_client.shutdown().await;
+        let events = events?;
+        Ok(newest_event(events))
     }
 
     /// Publish our kind-0 profile (NIP-01 metadata) so peers can resolve our
@@ -7601,6 +7662,42 @@ fn sort_marmot_events_in_place(events: &mut [Event]) {
     });
 }
 
+fn newest_event(events: impl IntoIterator<Item = Event>) -> Option<Event> {
+    events.into_iter().max_by(|a, b| {
+        a.created_at
+            .cmp(&b.created_at)
+            .then_with(|| a.id.to_hex().cmp(&b.id.to_hex()))
+    })
+}
+
+fn peer_key_package_relays(
+    relay_lists: impl IntoIterator<Item = Event>,
+    already_tried: &[RelayUrl],
+) -> Vec<RelayUrl> {
+    let Some(latest) = newest_event(relay_lists) else {
+        return Vec::new();
+    };
+    if latest.kind != Kind::RelayList {
+        return Vec::new();
+    }
+
+    let already_tried: HashSet<&RelayUrl> = already_tried.iter().collect();
+    let mut seen = HashSet::new();
+    nostr::nips::nip65::extract_owned_relay_list(latest)
+        .filter_map(|(relay, metadata)| {
+            if metadata == Some(nostr::nips::nip65::RelayMetadata::Read)
+                || already_tried.contains(&relay)
+                || !seen.insert(relay.clone())
+            {
+                None
+            } else {
+                Some(relay)
+            }
+        })
+        .take(MAX_PEER_KEY_PACKAGE_RELAYS)
+        .collect()
+}
+
 fn require_relay_success(
     output: &nostr_sdk::pool::Output<EventId>,
     context: &'static str,
@@ -9596,6 +9693,67 @@ mod tests {
         assert!(err
             .to_string()
             .contains("test publish: no relay accepted event"));
+
+        let second_relay = RelayUrl::parse("wss://second.example.com").expect("relay url");
+        let partially_accepted = nostr_sdk::pool::Output {
+            val: EventId::all_zeros(),
+            success: HashSet::from([second_relay]),
+            failed: HashMap::from([(
+                RelayUrl::parse("wss://failed.example.com").expect("relay url"),
+                "blocked".to_string(),
+            )]),
+        };
+        assert!(require_relay_success(&partially_accepted, "test publish").is_ok());
+
+        let no_responses = nostr_sdk::pool::Output {
+            val: EventId::all_zeros(),
+            success: HashSet::new(),
+            failed: HashMap::new(),
+        };
+        let err = require_relay_success(&no_responses, "test publish")
+            .expect_err("an empty relay response must fail");
+        assert!(err.to_string().contains("no relay accepted the event"));
+    }
+
+    #[test]
+    fn peer_key_package_relays_use_latest_nip65_write_relays_with_a_cap() {
+        let keys = Keys::generate();
+        let old = EventBuilder::relay_list([(
+            RelayUrl::parse("wss://old.example.com").expect("relay url"),
+            Some(nostr::nips::nip65::RelayMetadata::Write),
+        )])
+        .custom_created_at(Timestamp::from(100))
+        .sign_with_keys(&keys)
+        .expect("sign old relay list");
+        let already_tried = RelayUrl::parse("wss://local.example.com").expect("relay url");
+        let accepted: Vec<RelayUrl> = (0..7)
+            .map(|index| {
+                RelayUrl::parse(&format!("wss://write-{index}.example.com")).expect("relay url")
+            })
+            .collect();
+        let latest = EventBuilder::relay_list(
+            [
+                vec![(
+                    RelayUrl::parse("wss://read-only.example.com").expect("relay url"),
+                    Some(nostr::nips::nip65::RelayMetadata::Read),
+                )],
+                vec![(already_tried.clone(), None)],
+                accepted
+                    .iter()
+                    .cloned()
+                    .map(|relay| (relay, Some(nostr::nips::nip65::RelayMetadata::Write)))
+                    .collect(),
+                vec![(accepted[0].clone(), None)],
+            ]
+            .concat(),
+        )
+        .custom_created_at(Timestamp::from(200))
+        .sign_with_keys(&keys)
+        .expect("sign latest relay list");
+
+        let relays = peer_key_package_relays([old, latest], &[already_tried]);
+
+        assert_eq!(relays, accepted[..MAX_PEER_KEY_PACKAGE_RELAYS]);
     }
 
     #[tokio::test]

@@ -4,7 +4,9 @@
 //! This is the M1 acceptance test: KeyPackage publication → group creation →
 //! gift-wrapped welcome → bidirectional encrypted messages.
 
+use nostr::prelude::{EventBuilder, RelayMetadata};
 use nostr_relay_builder::MockRelay;
+use nostr_sdk::Client;
 use sonar_core::client::SonarClient;
 use sonar_core::identity::Identity;
 use tokio::time::{timeout, Duration};
@@ -110,6 +112,55 @@ async fn two_instances_exchange_dms_through_a_relay() {
     // Both sides agree on membership.
     let members = bob.groups().unwrap()[0].clone();
     assert_eq!(members.mls_group_id, *bob_group);
+}
+
+#[tokio::test]
+async fn start_dm_discovers_key_package_on_peer_nip65_relay() {
+    let discovery_relay = MockRelay::run().await.expect("discovery relay starts");
+    let discovery_url = discovery_relay.url().await;
+    let key_package_relay = MockRelay::run().await.expect("KeyPackage relay starts");
+    let key_package_url = key_package_relay.url().await;
+
+    let alice = SonarClient::connect_in_memory(Identity::generate(), vec![discovery_url.clone()])
+        .await
+        .expect("alice connects to the discovery relay");
+    let bob_identity = Identity::generate();
+    let bob = SonarClient::connect_in_memory(bob_identity.clone(), vec![key_package_url.clone()])
+        .await
+        .expect("bob connects to his NIP-65 relay");
+    bob.publish_key_package()
+        .await
+        .expect("bob publishes only on his NIP-65 relay");
+
+    let directory = Client::new(bob_identity.keys().clone());
+    directory
+        .add_relay(discovery_url)
+        .await
+        .expect("directory relay is valid");
+    directory.connect().await;
+    let relay_list = EventBuilder::relay_list([(key_package_url, Some(RelayMetadata::Write))])
+        .sign_with_keys(bob_identity.keys())
+        .expect("bob signs his NIP-65 list");
+    let published = directory
+        .send_event(&relay_list)
+        .await
+        .expect("bob publishes his NIP-65 list");
+    assert!(
+        !published.success.is_empty(),
+        "the discovery relay must accept Bob's NIP-65 list"
+    );
+    directory.shutdown().await;
+
+    let group = timeout(
+        Duration::from_secs(10),
+        alice.start_dm(bob.identity().public_key(), "alice & bob"),
+    )
+    .await
+    .expect("NIP-65 fallback remains bounded")
+    .expect("alice finds Bob's KeyPackage through his NIP-65 relay");
+
+    assert_eq!(alice.groups().expect("alice groups").len(), 1);
+    assert_eq!(alice.groups().expect("alice groups")[0].mls_group_id, group);
 }
 
 #[tokio::test]
