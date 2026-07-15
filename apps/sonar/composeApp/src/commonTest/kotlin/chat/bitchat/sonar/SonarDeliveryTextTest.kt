@@ -11,6 +11,7 @@ class SonarDeliveryTextTest {
         assertNull(sonarDeliveryLabel(null))
         assertNull(sonarDeliveryLabel("  "))
         assertEquals("Sending", sonarDeliveryLabel("sending"))
+        assertEquals("Sending", sonarDeliveryLabel("accepted"))
         assertEquals("Uploading", sonarDeliveryLabel("Uploading"))
         assertEquals("Couldn't send", sonarDeliveryLabel("couldnt send"))
         assertEquals("Delivered", sonarDeliveryLabel("delivered"))
@@ -18,6 +19,7 @@ class SonarDeliveryTextTest {
 
     @Test fun pendingAndFailedClassifiersUseNormalizedState() {
         assertTrue(sonarDeliveryPending("sending"))
+        assertTrue(sonarDeliveryPending("accepted"))
         assertTrue(sonarDeliveryPending("Uploading"))
         assertFalse(sonarDeliveryPending("Delivered"))
         assertTrue(sonarDeliveryFailed("failed"))

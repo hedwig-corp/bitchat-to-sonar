@@ -5,7 +5,7 @@ internal fun sonarDeliveryLabel(state: String?): String? {
     if (trimmed.isEmpty()) return null
     sonarPartialDeliveryLabel(trimmed)?.let { return it }
     return when (trimmed.lowercase()) {
-        "sending" -> "Sending"
+        "sending", "accepted" -> "Sending"
         "uploading" -> "Uploading"
         "sent" -> "Sent"
         "delivered" -> "Delivered"

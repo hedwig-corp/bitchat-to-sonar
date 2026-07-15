@@ -359,4 +359,87 @@ class TranscriptDisplayPolicyTest {
             ).isEmpty(),
         )
     }
+
+    @Test
+    fun terminalAcceptedEchoStaysVisibleUntilCanonicalRowExists() {
+        val echo = message("echo-1", 100, "hello", mine = true, viaInternet = true, state = "Accepted")
+
+        val plan = planSendEchoDisplay(
+            echoes = listOf(echo),
+            published = emptyList(),
+            excludedPublishedIdsByEcho = emptyMap(),
+        )
+
+        assertEquals(listOf(echo), plan.visibleEchoes)
+        assertTrue(plan.terminalAcceptedEchoIds.isEmpty())
+    }
+
+    @Test
+    fun delayedCanonicalRowFulfillsTerminalAcceptedEchoAndPermitsCleanup() {
+        val echo = message("echo-1", 100, "hello", mine = true, viaInternet = true, state = "Accepted")
+        val canonical = message("event-1", 180, "hello", mine = true, viaInternet = true)
+
+        val plan = planSendEchoDisplay(
+            echoes = listOf(echo),
+            published = listOf(canonical),
+            excludedPublishedIdsByEcho = emptyMap(),
+        )
+
+        assertTrue(plan.visibleEchoes.isEmpty())
+        assertEquals(setOf(echo.id), plan.terminalAcceptedEchoIds)
+    }
+
+    @Test
+    fun reservedCanonicalRowDoesNotCleanUpOlderTerminalAcceptedDuplicate() {
+        val older = message("echo-1", 100, "hello", mine = true, viaInternet = true, state = "Accepted")
+        val canonicalForNewerSend = message("event-2", 101, "hello", mine = true, viaInternet = true)
+
+        val plan = planSendEchoDisplay(
+            echoes = listOf(older),
+            published = listOf(canonicalForNewerSend),
+            excludedPublishedIdsByEcho = mapOf(older.id to setOf(canonicalForNewerSend.id)),
+        )
+
+        assertEquals(listOf(older), plan.visibleEchoes)
+        assertTrue(plan.terminalAcceptedEchoIds.isEmpty())
+    }
+
+    @Test
+    fun fulfilledSendingEchoIsHiddenButKeptPendingUntilExactOutcome() {
+        val echo = message("echo-1", 100, "hello", mine = true, viaInternet = true, state = "Sending")
+        val canonical = message("event-1", 100, "hello", mine = true, viaInternet = true)
+
+        val plan = planSendEchoDisplay(
+            echoes = listOf(echo),
+            published = listOf(canonical),
+            excludedPublishedIdsByEcho = emptyMap(),
+        )
+
+        assertTrue(plan.visibleEchoes.isEmpty())
+        assertTrue(plan.terminalAcceptedEchoIds.isEmpty())
+    }
+
+    @Test
+    fun failedEchoStaysVisibleEvenWhenMatchingCanonicalRowExists() {
+        val echo = message("echo-1", 100, "hello", mine = true, viaInternet = true, state = "Couldn't send")
+        val canonical = message("event-1", 100, "hello", mine = true, viaInternet = true)
+
+        val plan = planSendEchoDisplay(
+            echoes = listOf(echo),
+            published = listOf(canonical),
+            excludedPublishedIdsByEcho = emptyMap(),
+        )
+
+        assertEquals(listOf(echo), plan.visibleEchoes)
+        assertTrue(plan.terminalAcceptedEchoIds.isEmpty())
+    }
+
+    @Test
+    fun onlyNonFailedEchoesAwaitCanonicalReservation() {
+        val echo = message("echo-1", 100, "hello", mine = true, viaInternet = true)
+
+        assertTrue(sendEchoAwaitsCanonicalRow(echo.copy(state = "Sending")))
+        assertTrue(sendEchoAwaitsCanonicalRow(echo.copy(state = "Accepted")))
+        assertFalse(sendEchoAwaitsCanonicalRow(echo.copy(state = "Couldn't send")))
+    }
 }

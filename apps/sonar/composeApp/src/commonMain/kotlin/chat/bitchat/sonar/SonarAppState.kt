@@ -105,6 +105,52 @@ internal fun <T> CoroutineScope.launchNearbyPeerRefresh(
     }
 }
 
+/** The core send decides whether a message reached the durable local outbox.
+ * Transcript reconciliation is best-effort and must not turn a queued send
+ * into a failed send. */
+internal suspend fun runMarmotSendWithBestEffortReconciliation(
+    send: suspend () -> Unit,
+    reconcile: suspend () -> Unit,
+    onSendFailure: (Throwable) -> Unit,
+    onReconciliationFailure: (Throwable) -> Unit,
+) {
+    try {
+        send()
+    } catch (error: Throwable) {
+        onSendFailure(error)
+        return
+    }
+
+    try {
+        reconcile()
+    } catch (error: Throwable) {
+        onReconciliationFailure(error)
+    }
+}
+
+internal data class SendEchoDisplayPlan(
+    val visibleEchoes: List<SonarMsg>,
+    val terminalAcceptedEchoIds: Set<String>,
+)
+
+internal fun planSendEchoDisplay(
+    echoes: List<SonarMsg>,
+    published: List<SonarMsg>,
+    excludedPublishedIdsByEcho: Map<String, Set<String>> = emptyMap(),
+): SendEchoDisplayPlan {
+    val fulfilled = fulfilledSendEchoIds(echoes, published, excludedPublishedIdsByEcho)
+    return SendEchoDisplayPlan(
+        visibleEchoes = echoes.filterNot { it.id in fulfilled },
+        terminalAcceptedEchoIds = echoes
+            .asSequence()
+            .filter { it.state == "Accepted" && it.id in fulfilled }
+            .mapTo(mutableSetOf()) { it.id },
+    )
+}
+
+internal fun sendEchoAwaitsCanonicalRow(echo: SonarMsg): Boolean =
+    echo.state == "Sending" || echo.state == "Accepted"
+
 /** A media drop may wait for a direct White Noise group that chat startup has
  * already begun creating. This is deliberately separate from send readiness:
  * it keeps the desktop drop target usable without duplicating group setup. */
@@ -4220,23 +4266,32 @@ class SonarAppState(private val scope: CoroutineScope) {
         val echo = createSendEcho(chatId, t)
         messages = (messages + echo).sortedBy { it.tsSecs }
         scope.launch {
-            try {
-                sendMarmotTextOrdered(chatId, t)
-                val refreshGeneration = transcriptGeneration
-                val published = mergePendingMediaUploads(
-                    chatId,
-                    marmotMessagesPageForChat(chatId, refreshGeneration),
-                )
-                reserveSuccessfulEchoCanonicalRows(chatId, echo, published)
-                clearSendEcho(chatId, echo.id)
-                val local = withSendEchoes(chatId, published)
-                if (isCurrentTranscriptSession(chatId, refreshGeneration)) {
-                    setCurrentVisibleMessages(chatId, local, processCalls = true)
-                }
-            } catch (e: Throwable) {
-                failSendEcho(chatId, echo.id)
-                toast = "send failed: ${e.message}"
-            }
+            runMarmotSendWithBestEffortReconciliation(
+                send = { sendMarmotTextOrdered(chatId, t) },
+                reconcile = {
+                    val refreshGeneration = transcriptGeneration
+                    val published = mergePendingMediaUploads(
+                        chatId,
+                        marmotMessagesPageForChat(chatId, refreshGeneration),
+                    )
+                    val hasCanonicalRow = reserveSuccessfulEchoCanonicalRows(chatId, echo, published)
+                    if (!hasCanonicalRow) {
+                        markSendEchoAccepted(chatId, echo.id)
+                    }
+                    val local = withSendEchoes(chatId, published)
+                    if (isCurrentTranscriptSession(chatId, refreshGeneration)) {
+                        setCurrentVisibleMessages(chatId, local, processCalls = true)
+                    }
+                    if (hasCanonicalRow) {
+                        clearSendEcho(chatId, echo.id)
+                    }
+                },
+                onSendFailure = { error ->
+                    failSendEcho(chatId, echo.id)
+                    toast = "send failed: ${error.message}"
+                },
+                onReconciliationFailure = { markSendEchoAccepted(chatId, echo.id) },
+            )
         }
         reloadNewestAfterSendIfNeeded(chatId)
     }
@@ -4285,6 +4340,14 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
+    private fun markSendEchoAccepted(chatId: String, echoId: String) {
+        val list = pendingSendEchoes[chatId] ?: return
+        val idx = list.indexOfFirst { it.id == echoId }
+        if (idx < 0) return
+        list[idx] = list[idx].copy(state = "Accepted")
+        messages = messages.map { if (it.id == echoId) it.copy(state = "Accepted") else it }
+    }
+
     /**
      * A successful send's local canonical copy can appear before an older,
      * identical send completes. Reserve every eligible new row for the older
@@ -4295,19 +4358,19 @@ class SonarAppState(private val scope: CoroutineScope) {
         chatId: String,
         succeededEcho: SonarMsg,
         published: List<SonarMsg>,
-    ) {
+    ): Boolean {
         val canonicalIds = eligibleCanonicalRowsForSendEcho(
             echo = succeededEcho,
             published = published,
             excludedPublishedIds = previouslyPublishedMessageIdsByEcho[succeededEcho.id].orEmpty(),
         ).mapTo(mutableSetOf()) { it.id }
-        if (canonicalIds.isEmpty()) return
+        if (canonicalIds.isEmpty()) return false
 
         pendingSendEchoes[chatId].orEmpty()
             .asSequence()
             .filter {
                 it.id != succeededEcho.id &&
-                    it.state == "Sending" &&
+                    sendEchoAwaitsCanonicalRow(it) &&
                     it.content == succeededEcho.content &&
                     it.viaInternet == succeededEcho.viaInternet
             }
@@ -4315,6 +4378,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 previouslyPublishedMessageIdsByEcho[pendingEcho.id] =
                     previouslyPublishedMessageIdsByEcho[pendingEcho.id].orEmpty() + canonicalIds
             }
+        return true
     }
 
     private fun failSendEcho(chatId: String, echoId: String) {
@@ -4333,13 +4397,17 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private fun withSendEchoes(chatId: String, published: List<SonarMsg>): List<SonarMsg> {
         val echoes = pendingSendEchoes[chatId] ?: return published
-        val fulfilled = fulfilledSendEchoIds(echoes, published, previouslyPublishedMessageIdsByEcho)
+        val plan = planSendEchoDisplay(echoes, published, previouslyPublishedMessageIdsByEcho)
+        if (plan.terminalAcceptedEchoIds.isNotEmpty()) {
+            echoes.removeAll { it.id in plan.terminalAcceptedEchoIds }
+            plan.terminalAcceptedEchoIds.forEach(previouslyPublishedMessageIdsByEcho::remove)
+            if (echoes.isEmpty()) pendingSendEchoes.remove(chatId)
+        }
         // A canonical row can suppress a duplicate bubble before the send
         // coroutine reports its exact outcome. Keep the echo pending until
         // clearSendEcho/failSendEcho receives that outcome so a late failure
         // still renders "Couldn't send" instead of disappearing.
-        val visibleEchoes = echoes.filterNot { it.id in fulfilled }
-        return (published.filterNot { it.id.startsWith(echoIdPrefix) } + visibleEchoes)
+        return (published.filterNot { it.id.startsWith(echoIdPrefix) } + plan.visibleEchoes)
             .distinctBy { it.id }
             .sortedBy { it.tsSecs }
     }
