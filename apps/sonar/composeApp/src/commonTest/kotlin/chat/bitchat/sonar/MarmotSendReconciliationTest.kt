@@ -1,8 +1,10 @@
 package chat.bitchat.sonar
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 
 class MarmotSendReconciliationTest {
     @Test
@@ -14,6 +16,7 @@ class MarmotSendReconciliationTest {
         runMarmotSendWithBestEffortReconciliation(
             send = {},
             reconcile = { throw reconciliationError },
+            onSendAccepted = {},
             onSendFailure = { sendFailures += 1 },
             onReconciliationFailure = { reportedReconciliationError = it },
         )
@@ -32,6 +35,7 @@ class MarmotSendReconciliationTest {
         runMarmotSendWithBestEffortReconciliation(
             send = { throw sendError },
             reconcile = { reconciliationAttempts += 1 },
+            onSendAccepted = {},
             onSendFailure = { reportedSendError = it },
             onReconciliationFailure = { reconciliationFailures += 1 },
         )
@@ -50,12 +54,68 @@ class MarmotSendReconciliationTest {
         runMarmotSendWithBestEffortReconciliation(
             send = {},
             reconcile = { reconciliationAttempts += 1 },
+            onSendAccepted = {},
             onSendFailure = { sendFailures += 1 },
             onReconciliationFailure = { reconciliationFailures += 1 },
         )
 
         assertEquals(1, reconciliationAttempts)
         assertEquals(0, sendFailures)
+        assertEquals(0, reconciliationFailures)
+    }
+
+    @Test
+    fun successfulSendIsAcceptedBeforeReconciliation() = runTest {
+        val calls = mutableListOf<String>()
+
+        runMarmotSendWithBestEffortReconciliation(
+            send = { calls += "send" },
+            reconcile = { calls += "reconcile" },
+            onSendAccepted = { calls += "accepted" },
+            onSendFailure = { calls += "send failure" },
+            onReconciliationFailure = { calls += "reconciliation failure" },
+        )
+
+        assertEquals(listOf("send", "accepted", "reconcile"), calls)
+    }
+
+    @Test
+    fun sendCancellationRemainsStructuredAndDoesNotReportFailure() = runTest {
+        var sendFailures = 0
+        var accepted = 0
+        var reconciliationAttempts = 0
+
+        assertFailsWith<CancellationException> {
+            runMarmotSendWithBestEffortReconciliation(
+                send = { throw CancellationException("cancelled before acceptance") },
+                reconcile = { reconciliationAttempts += 1 },
+                onSendAccepted = { accepted += 1 },
+                onSendFailure = { sendFailures += 1 },
+                onReconciliationFailure = {},
+            )
+        }
+
+        assertEquals(0, sendFailures)
+        assertEquals(0, accepted)
+        assertEquals(0, reconciliationAttempts)
+    }
+
+    @Test
+    fun reconciliationCancellationKeepsAcceptedStateAndRemainsStructured() = runTest {
+        var accepted = 0
+        var reconciliationFailures = 0
+
+        assertFailsWith<CancellationException> {
+            runMarmotSendWithBestEffortReconciliation(
+                send = {},
+                reconcile = { throw CancellationException("cancelled after acceptance") },
+                onSendAccepted = { accepted += 1 },
+                onSendFailure = {},
+                onReconciliationFailure = { reconciliationFailures += 1 },
+            )
+        }
+
+        assertEquals(1, accepted)
         assertEquals(0, reconciliationFailures)
     }
 }

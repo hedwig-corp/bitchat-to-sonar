@@ -111,18 +111,24 @@ internal fun <T> CoroutineScope.launchNearbyPeerRefresh(
 internal suspend fun runMarmotSendWithBestEffortReconciliation(
     send: suspend () -> Unit,
     reconcile: suspend () -> Unit,
+    onSendAccepted: () -> Unit,
     onSendFailure: (Throwable) -> Unit,
     onReconciliationFailure: (Throwable) -> Unit,
 ) {
     try {
         send()
+    } catch (error: CancellationException) {
+        throw error
     } catch (error: Throwable) {
         onSendFailure(error)
         return
     }
+    onSendAccepted()
 
     try {
         reconcile()
+    } catch (error: CancellationException) {
+        throw error
     } catch (error: Throwable) {
         onReconciliationFailure(error)
     }
@@ -4268,6 +4274,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         scope.launch {
             runMarmotSendWithBestEffortReconciliation(
                 send = { sendMarmotTextOrdered(chatId, t) },
+                onSendAccepted = { markSendEchoAccepted(chatId, echo.id) },
                 reconcile = {
                     val refreshGeneration = transcriptGeneration
                     val published = mergePendingMediaUploads(
