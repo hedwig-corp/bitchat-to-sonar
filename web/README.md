@@ -129,8 +129,11 @@ Status of the three activation inputs:
    `ios/bitchat/bitchat.entitlements`, and the `.onContinueUserActivity` handler in
    `BitchatApp.swift` consumes it. Verified: device builds still sign (Xcode
    auto-provisions the Associated Domains capability under automatic signing).
-3. **Android — assetlinks**: filled with the **debug** keystore SHA-256 so App
-   Links verify for the current alpha/debug installs. **Before a Play release, add
-   the release / Play App Signing fingerprint** to the `sha256_cert_fingerprints`
-   array (`keytool -list -v -keystore <release.keystore> | grep SHA256`). The
-   `autoVerify` intent-filter is already in `AndroidManifest.xml`.
+3. **Android — assetlinks**: filled with both the debug keystore SHA-256 and the
+   sideload release certificate used by the published alpha APKs, so App Links
+   verify for both install types. The landing page also uses a package-targeted
+   Android intent for its explicit **Open in Sonar** fallback. **Before a Play
+   release, add the Play App Signing fingerprint** to the
+   `sha256_cert_fingerprints` array
+   (`keytool -list -v -keystore <release.keystore> | grep SHA256`). The `autoVerify`
+   intent-filter is already in `AndroidManifest.xml`.
