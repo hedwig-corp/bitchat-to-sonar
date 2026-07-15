@@ -22,6 +22,10 @@ final class BitchatMessage: Codable {
     let isPrivate: Bool
     let recipientNickname: String?
     let senderPeerID: PeerID?
+    /// Local arrival metadata persisted by `MessageStore` through `Codable`.
+    /// The binary wire codec below intentionally omits it, so mesh-decoded and
+    /// pre-migration messages remain backward compatible with a `nil` value.
+    let receivedViaInternet: Bool?
     let mentions: [String]?  // Array of mentioned nicknames
     var deliveryStatus: DeliveryStatus? // Delivery tracking
     
@@ -39,7 +43,8 @@ final class BitchatMessage: Codable {
     // Codable implementation
     enum CodingKeys: String, CodingKey {
         case id, sender, content, timestamp, isRelay, originalSender
-        case isPrivate, recipientNickname, senderPeerID, mentions, deliveryStatus
+        case isPrivate, recipientNickname, senderPeerID, receivedViaInternet
+        case mentions, deliveryStatus
     }
     
     init(
@@ -52,6 +57,7 @@ final class BitchatMessage: Codable {
         isPrivate: Bool = false,
         recipientNickname: String? = nil,
         senderPeerID: PeerID? = nil,
+        receivedViaInternet: Bool? = nil,
         mentions: [String]? = nil,
         deliveryStatus: DeliveryStatus? = nil
     ) {
@@ -64,6 +70,7 @@ final class BitchatMessage: Codable {
         self.isPrivate = isPrivate
         self.recipientNickname = recipientNickname
         self.senderPeerID = senderPeerID
+        self.receivedViaInternet = receivedViaInternet
         self.mentions = mentions
         self.deliveryStatus = deliveryStatus ?? (isPrivate ? .sending : nil)
     }
@@ -82,6 +89,7 @@ extension BitchatMessage: Equatable {
                lhs.isPrivate == rhs.isPrivate &&
                lhs.recipientNickname == rhs.recipientNickname &&
                lhs.senderPeerID == rhs.senderPeerID &&
+               lhs.receivedViaInternet == rhs.receivedViaInternet &&
                lhs.mentions == rhs.mentions &&
                lhs.deliveryStatus == rhs.deliveryStatus
     }

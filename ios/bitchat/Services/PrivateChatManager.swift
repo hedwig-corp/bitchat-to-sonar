@@ -106,6 +106,7 @@ final class PrivateChatManager: ObservableObject {
                             isPrivate: message.isPrivate,
                             recipientNickname: message.recipientNickname,
                             senderPeerID: message.senderPeerID == meshService.myPeerID ? meshService.myPeerID : peerID,
+                            receivedViaInternet: message.receivedViaInternet,
                             mentions: message.mentions,
                             deliveryStatus: message.deliveryStatus
                         )
@@ -174,6 +175,7 @@ final class PrivateChatManager: ObservableObject {
                                 isPrivate: message.isPrivate,
                                 recipientNickname: message.recipientNickname,
                                 senderPeerID: peerID,
+                                receivedViaInternet: message.receivedViaInternet,
                                 mentions: message.mentions,
                                 deliveryStatus: message.deliveryStatus
                             )

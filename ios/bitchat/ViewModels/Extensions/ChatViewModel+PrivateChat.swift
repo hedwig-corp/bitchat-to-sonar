@@ -13,6 +13,11 @@ import SwiftUI
 
 extension ChatViewModel {
 
+    nonisolated static func shouldSendGenericPrivateMessageNotification(for content: String) -> Bool {
+        SonarPayMessage.decode(content) == nil
+            && !content.drop(while: \.isWhitespace).hasPrefix("☎CALL")
+    }
+
     // MARK: - Private Chat Sending
 
     /// Sends an encrypted private message to a specific peer.
@@ -232,6 +237,7 @@ extension ChatViewModel {
             isPrivate: true,
             recipientNickname: nickname,
             senderPeerID: convKey,
+            receivedViaInternet: true,
             deliveryStatus: .delivered(to: nickname, at: Date())
         )
         
@@ -254,7 +260,9 @@ extension ChatViewModel {
         }
         
         // Notify for truly unread and recent messages when not viewing
-        if !isViewing && shouldMarkUnread {
+        if !isViewing,
+           shouldMarkUnread,
+           Self.shouldSendGenericPrivateMessageNotification(for: pm.content) {
             NotificationService.shared.sendPrivateMessageNotification(
                 from: senderName,
                 message: pm.content,
@@ -761,6 +769,7 @@ extension ChatViewModel {
             isPrivate: true,
             recipientNickname: nickname,
             senderPeerID: targetPeerID,
+            receivedViaInternet: true,
             deliveryStatus: .delivered(to: nickname, at: Date())
         )
         
@@ -884,15 +893,19 @@ extension ChatViewModel {
             meshService.sendReadReceipt(receipt, to: peerID)
             sentReadReceipts.insert(message.id)
         } else {
-            // Notify
+            // Notify — skip ☎CALL / ⚡PAY control lines; SonarAppStore owns those
+            // specialized alerts so we don't double-fire BLE sounds.
             unreadPrivateMessages.insert(peerID)
-            let notifBody = meshParseStickerContent(content: message.content) != nil
-                ? "Sticker" : message.content
-            NotificationService.shared.sendPrivateMessageNotification(
-                from: message.sender,
-                message: notifBody,
-                peerID: peerID
-            )
+            if Self.shouldSendGenericPrivateMessageNotification(for: message.content) {
+                let notifBody = meshParseStickerContent(content: message.content) != nil
+                    ? "Sticker" : message.content
+                NotificationService.shared.sendPrivateMessageNotification(
+                    from: message.sender,
+                    message: notifBody,
+                    peerID: peerID,
+                    sound: .ble
+                )
+            }
         }
         
         objectWillChange.send()
@@ -981,7 +994,8 @@ extension ChatViewModel {
            ephemeralPeerID != targetPeerID {
             unreadPrivateMessages.insert(ephemeralPeerID)
         }
-        if isRecentMessage {
+        if isRecentMessage,
+           Self.shouldSendGenericPrivateMessageNotification(for: messageContent) {
             NotificationService.shared.sendPrivateMessageNotification(
                 from: senderNickname,
                 message: messageContent,
@@ -1050,6 +1064,7 @@ extension ChatViewModel {
                 isPrivate: message.isPrivate,
                 recipientNickname: message.recipientNickname,
                 senderPeerID: message.senderPeerID,
+                receivedViaInternet: message.receivedViaInternet,
                 mentions: message.mentions,
                 deliveryStatus: message.deliveryStatus
             )

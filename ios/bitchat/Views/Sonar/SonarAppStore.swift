@@ -867,7 +867,7 @@ final class SonarAppStore: ObservableObject {
     private var scannedPayMessageIDs = Set<String>()
     private let localNotificationStartedAt = Date()
     private var seenMarmotNotificationMessageIDs = Set<String>()
-    private var seenMeshPaymentNotificationMessageIDs = Set<String>()
+    private var seenPrivateChatPaymentNotificationMessageIDs = Set<String>()
     /// Stable mesh peer key -> first sighting time. We briefly hold unresolved
     /// fresh peers so their 0x53 Sonar capabilities can arrive before the UI
     /// commits to a plain Bitchat row.
@@ -1842,7 +1842,8 @@ final class SonarAppStore: ObservableObject {
         senderName: String? = nil,
         groupName: String? = nil,
         preview: String? = nil,
-        unreadCount: UInt64 = 1
+        unreadCount: UInt64 = 1,
+        sound: SonarNotificationSound = .standard
     ) {
         guard !isForeground else { return }
         let userInfo: [String: Any] = conversationId.map { ["sonarConversationId": $0] } ?? [:]
@@ -1861,7 +1862,8 @@ final class SonarAppStore: ObservableObject {
             title: notification.title,
             body: notification.body,
             identifier: notification.identifier,
-            userInfo: notification.userInfo
+            userInfo: notification.userInfo,
+            sound: sound
         )
     }
 
@@ -5596,20 +5598,22 @@ final class SonarAppStore: ObservableObject {
                 guard !scannedPayMessageIDs.contains(m.id) else { continue }
                 scannedPayMessageIDs.insert(m.id)
                 if let line = SonarPayMessage.decode(m.content) {
+                    let via: SNVia = m.receivedViaInternet == true ? .internet : .mesh
                     if m.timestamp <= localNotificationStartedAt {
-                        seenMeshPaymentNotificationMessageIDs.insert(m.id)
+                        seenPrivateChatPaymentNotificationMessageIDs.insert(m.id)
                     } else if case .pay = line,
-                              seenMeshPaymentNotificationMessageIDs.insert(m.id).inserted {
+                              seenPrivateChatPaymentNotificationMessageIDs.insert(m.id).inserted {
                         sendSonarNotification(
                             kind: .payment,
                             idKey: m.id,
                             conversationId: peerID.id,
                             conversationTitle: peerDisplayName(peerID.id),
                             senderName: peerDisplayName(peerID.id),
-                            preview: m.content
+                            preview: m.content,
+                            sound: via == .mesh ? .ble : .standard
                         )
                     }
-                    handlePayLine(line, convId: peerID.id, via: dmTransport(peerID.id))
+                    handlePayLine(line, convId: peerID.id, via: via)
                 }
             }
         }
@@ -6175,7 +6179,8 @@ final class SonarAppStore: ObservableObject {
                     scannedCallMessageIDs.insert(m.id)
                     continue
                 }
-                if handleCallControl(ctrl, convId: peerID.id, via: .mesh, messageId: m.id) {
+                let via: SNVia = m.receivedViaInternet == true ? .internet : .mesh
+                if handleCallControl(ctrl, convId: peerID.id, via: via, messageId: m.id) {
                     scannedCallMessageIDs.insert(m.id)
                 }
             }
@@ -6266,7 +6271,8 @@ final class SonarAppStore: ObservableObject {
                             idKey: "call-\(callId)-\(messageId)",
                             conversationId: conversationId,
                             conversationTitle: name,
-                            senderName: name
+                            senderName: name,
+                            sound: via == .mesh ? .ble : .standard
                         )
                         self.push(.call(conversationId, video: video))
                     }

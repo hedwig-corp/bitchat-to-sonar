@@ -37,6 +37,7 @@ val generateBreezKeyResource = tasks.register("generateBreezKeyResource") {
 }
 
 val repoRootDir = rootProject.projectDir.parentFile.parentFile
+val notificationResourcesDir = repoRootDir.resolve("assets/notifications")
 val androidMainDir = layout.projectDirectory.dir("src/androidMain")
 val androidBindingsFile = androidMainDir.file("kotlin/uniffi/sonar_ffi/sonar_ffi.kt")
 val androidJniLibsDir = androidMainDir.dir("jniLibs")
@@ -129,6 +130,7 @@ kotlin {
             // The desktop Breez API key is written here by `generateBreezKeyResource`
             // (gitignored generated dir), mirroring Android's BuildConfig field.
             resources.srcDir(breezKeyResDir)
+            resources.srcDir(notificationResourcesDir.resolve("raw"))
             dependencies {
                 implementation(compose.desktop.currentOs)
                 // Swing/AWT EDT main dispatcher for Dispatchers.Main on desktop.
@@ -238,6 +240,9 @@ android {
     // The Rust core .so per ABI lives in src/androidMain/jniLibs (produced by
     // core/build-android.sh). Map it onto the Android main source set.
     sourceSets["main"].jniLibs.srcDirs("src/androidMain/jniLibs")
+    // Android packages MP3 copies under src/androidMain/res/raw — NotificationPlayer
+    // often fails silently on WAV files that carry LIST/INFO metadata chunks.
+    // Desktop/JVM still loads the shared PCM WAVs from assets/notifications/raw.
 
     packaging {
         jniLibs {

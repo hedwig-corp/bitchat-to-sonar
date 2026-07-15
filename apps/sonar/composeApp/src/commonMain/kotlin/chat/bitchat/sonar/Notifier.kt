@@ -1,5 +1,10 @@
 package chat.bitchat.sonar
 
+enum class SonarNotificationSound {
+    Default,
+    Ble,
+}
+
 /**
  * Local notifications for incoming messages — the Android twin of the iOS
  * local-notification path (no push server; fires while the process is alive,
@@ -8,7 +13,12 @@ package chat.bitchat.sonar
 expect object Notifier {
     fun ensureChannel()
     fun canNotify(): Boolean
-    fun notify(id: Int, title: String, body: String)
+    fun notify(
+        id: Int,
+        title: String,
+        body: String,
+        sound: SonarNotificationSound = SonarNotificationSound.Default,
+    )
     /** Called after the wallet reaches Ready — retries push webhook registration
      *  that was deferred because the wallet was not connected at startup. */
     fun onWalletReady()

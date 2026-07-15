@@ -80,6 +80,22 @@ final class SonarPayTests: XCTestCase {
         }
     }
 
+    func testPrivateNotificationRoutingSuppressesSpecializedControls() {
+        XCTAssertFalse(
+            ChatViewModel.shouldSendGenericPrivateMessageNotification(
+                for: SonarPayMessage.pay(id: uuid, sats: 21_000).encoded()
+            )
+        )
+        XCTAssertFalse(
+            ChatViewModel.shouldSendGenericPrivateMessageNotification(
+                for: SonarPayMessage.done(id: uuid).encoded()
+            )
+        )
+        XCTAssertFalse(ChatViewModel.shouldSendGenericPrivateMessageNotification(for: "  \n☎CALL|1|offer"))
+        XCTAssertTrue(ChatViewModel.shouldSendGenericPrivateMessageNotification(for: "hello"))
+        XCTAssertTrue(ChatViewModel.shouldSendGenericPrivateMessageNotification(for: "⚡PAY|1|malformed"))
+    }
+
     // MARK: - Ledger
 
     private func freshLedger() -> (SonarPayLedger, UserDefaults) {
