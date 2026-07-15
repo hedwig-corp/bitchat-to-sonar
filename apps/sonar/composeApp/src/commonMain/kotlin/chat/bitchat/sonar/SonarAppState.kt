@@ -4734,7 +4734,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         return AttachmentRoutePreparation.Ready(groupId)
     }
 
-    /** Import results arrive after desktop file IO. Queue the first dropped
+    /** Import results arrive after platform file IO. Queue the first selected
      * attachment behind the pre-existing direct-chat setup, then send using the
      * resolved group id rather than the transient pending chat id. */
     internal fun sendDroppedAttachments(chatId: String, dropped: DroppedFiles) {
@@ -4746,7 +4746,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             when (val route = prepareMediaRoute(chatId)) {
                 is AttachmentRoutePreparation.Ready -> {
                     dropped.files.forEach { file ->
-                        sendImage(route.chatId, file.bytes, file.filename, file.mime)
+                        sendAttachment(route.chatId, file.bytes, file.filename, file.mime)
                     }
                     if (dropped.rejectedCount > 0) {
                         toast = "Some files couldn't be attached."
@@ -4771,6 +4771,36 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /** Send an image to a White Noise chat: encrypt + Blossom upload + publish. */
     fun sendImage(chatId: String, data: ByteArray, filename: String, mime: String) {
+        sendMediaAttachment(
+            chatId = chatId,
+            data = data,
+            filename = filename,
+            mime = mime,
+            missingRouteMessage = "Start the secure chat first, then send a photo.",
+            failureLabel = "photo",
+        )
+    }
+
+    /** Send an arbitrary file through the same encrypted media transport. */
+    private fun sendAttachment(chatId: String, data: ByteArray, filename: String, mime: String) {
+        sendMediaAttachment(
+            chatId = chatId,
+            data = data,
+            filename = filename,
+            mime = mime,
+            missingRouteMessage = "Start the secure chat first, then send a file.",
+            failureLabel = "file",
+        )
+    }
+
+    private fun sendMediaAttachment(
+        chatId: String,
+        data: ByteArray,
+        filename: String,
+        mime: String,
+        missingRouteMessage: String,
+        failureLabel: String,
+    ) {
         if (isContactBlocked(chatId)) { toast = "Unblock this contact before sending."; return }
         if (isMeshChat(chatId) && liveMeshRoutePeerId(meshPeerId(chatId)) != null) {
             if (sendMeshMedia(meshPeerId(chatId), data, filename, mime)) return
@@ -4778,7 +4808,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         scope.launch {
             val groupId = resolveMarmotGroupId(chatId)
-            if (groupId == null) { toast = "Start the secure chat first, then send a photo."; return@launch }
+            if (groupId == null) { toast = missingRouteMessage; return@launch }
             val pendingId = "pending-media-${randomMeshId()}"
             val pendingUrl = "$pendingMediaUrlPrefix${randomMeshId()}"
             val startedAtSecs = SonarClock.nowSecs()
@@ -4836,7 +4866,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 if ((screen as? Screen.Chat)?.id == chatId) {
                     messages = visibleMessagesForChat(chatId, mergePendingMediaUploads(chatId, messages))
                 }
-                toast = "couldn't send photo: ${e.message}"
+                toast = "couldn't send $failureLabel: ${e.message}"
             }
         }
     }

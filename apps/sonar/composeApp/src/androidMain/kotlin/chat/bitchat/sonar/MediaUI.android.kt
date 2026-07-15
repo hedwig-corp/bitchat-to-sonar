@@ -78,6 +78,102 @@ actual fun rememberPhotoPicker(
     }
 }
 
+@Composable
+internal actual fun rememberFilePicker(
+    maxTotalBytes: Long,
+    onPicked: (DroppedFiles) -> Unit,
+): () -> Unit {
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val launcher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris ->
+        if (uris.isEmpty()) return@rememberLauncherForActivityResult
+        scope.launch(Dispatchers.IO) {
+            val result = ctx.readPickedFiles(uris, maxTotalBytes)
+            withContext(Dispatchers.Main) { onPicked(result) }
+        }
+    }
+    return { launcher.launch(arrayOf("*/*")) }
+}
+
+private data class PickedFileMetadata(
+    val displayName: String,
+    val size: Long?,
+)
+
+private fun Context.readPickedFiles(uris: List<Uri>, maxTotalBytes: Long): DroppedFiles {
+    if (maxTotalBytes <= 0L) return DroppedFiles(emptyList(), rejectedCount = uris.size)
+
+    val files = mutableListOf<DroppedFile>()
+    var rejectedCount = (uris.size - MAX_DROPPED_FILES).coerceAtLeast(0)
+    var remainingBytes = maxTotalBytes
+    for (uri in uris.take(MAX_DROPPED_FILES)) {
+        val file = readPickedFile(uri, remainingBytes)
+        if (file == null) {
+            rejectedCount += 1
+        } else {
+            files += file
+            remainingBytes -= file.bytes.size.toLong()
+        }
+    }
+    return DroppedFiles(files, rejectedCount)
+}
+
+private fun Context.readPickedFile(uri: Uri, maxBytes: Long): DroppedFile? {
+    if (maxBytes <= 0L) return null
+    val metadata = pickedFileMetadata(uri)
+    if (metadata.size != null && metadata.size > maxBytes) return null
+    val bytes = runCatching {
+        contentResolver.openInputStream(uri)?.use { input ->
+            val readLimit = maxBytes.coerceAtMost(Int.MAX_VALUE.toLong() - 1L).toInt()
+            val output = ByteArrayOutputStream(minOf(metadata.size ?: 0L, maxBytes).toInt())
+            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+            var total = 0
+            while (true) {
+                val remaining = readLimit - total
+                if (remaining < 0) return@use null
+                val read = input.read(buffer, 0, minOf(buffer.size, remaining + 1))
+                if (read < 0) break
+                total += read
+                if (total > readLimit) return@use null
+                output.write(buffer, 0, read)
+            }
+            output.toByteArray()
+        }
+    }.getOrNull() ?: return null
+    if (bytes.size.toLong() > maxBytes) return null
+    val filename = metadata.displayName.ifBlank { "attachment" }
+    val declaredMime = contentResolver.getType(uri).orEmpty()
+    return DroppedFile(
+        bytes = bytes,
+        filename = filename,
+        mime = effectiveAttachmentMime(declaredMime, filename, bytes),
+    )
+}
+
+private fun Context.pickedFileMetadata(uri: Uri): PickedFileMetadata {
+    val projection = arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE)
+    return contentResolver.query(uri, projection, null, null, null)?.use { cursor ->
+        if (!cursor.moveToFirst()) return@use null
+        val displayNameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+        val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
+        val displayName = if (displayNameIndex >= 0) {
+            cursor.getString(displayNameIndex).orEmpty()
+                .substringAfterLast('/')
+                .substringAfterLast('\\')
+        } else {
+            ""
+        }
+        val size = if (sizeIndex >= 0 && !cursor.isNull(sizeIndex)) {
+            cursor.getLong(sizeIndex).takeIf { it >= 0L }
+        } else {
+            null
+        }
+        PickedFileMetadata(displayName.ifBlank { "attachment" }, size)
+    } ?: PickedFileMetadata("attachment", null)
+}
+
 private fun android.content.Context.displayNameForUri(uri: android.net.Uri): String? =
     contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
         if (cursor.moveToFirst()) {

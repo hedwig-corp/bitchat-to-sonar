@@ -25,6 +25,17 @@ expect fun rememberPhotoPicker(
     onPicked: (items: List<PickedPhoto>) -> Unit
 ): () -> Unit
 
+/**
+ * Platform document picker for arbitrary files. Implementations must copy the
+ * selected content immediately while the picker grant is valid and enforce the
+ * aggregate [maxTotalBytes] limit before invoking [onPicked].
+ */
+@Composable
+internal expect fun rememberFilePicker(
+    maxTotalBytes: Long,
+    onPicked: (DroppedFiles) -> Unit,
+): () -> Unit
+
 @Composable
 expect fun MediaImage(
     bytes: ByteArray,

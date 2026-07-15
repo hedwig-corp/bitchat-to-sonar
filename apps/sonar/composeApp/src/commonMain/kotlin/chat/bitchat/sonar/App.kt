@@ -964,6 +964,9 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     } else {
         MAX_INTERNET_ATTACHMENT_BYTES
     }
+    val pickFile = rememberFilePicker(attachmentLimit) { files ->
+        state.sendDroppedAttachments(screen.id, files)
+    }
 
     Box(
         Modifier.fillMaxSize().fileDropTarget(
@@ -1345,11 +1348,13 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         onRemovePeople = { addSheet = false; removePeopleSheet = true },
         onClose = { addSheet = false },
         canSendPhoto = state.canSendMedia(screen.id),
+        canSendFile = state.canPrepareMedia(screen.id),
         canSendPayment = state.hasDirectPaymentRoute(screen.id),
         canVerify = !state.isMultiMemberChat(screen.id),
         canShareLocation = !state.isMultiMemberChat(screen.id),
         canManageGroup = canManageGroup,
-        onPhoto = { addSheet = false; pickPhoto() }
+        onPhoto = { addSheet = false; pickPhoto() },
+        onFile = { addSheet = false; pickFile() },
     )
     if (addPeopleSheet) GroupAddPeopleSheet(
         state = state,
@@ -1395,11 +1400,13 @@ private fun AddToMessageSheet(
     onRemovePeople: () -> Unit,
     onClose: () -> Unit,
     canSendPhoto: Boolean = false,
+    canSendFile: Boolean = false,
     canSendPayment: Boolean = true,
     canVerify: Boolean = true,
     canShareLocation: Boolean = true,
     canManageGroup: Boolean = false,
     onPhoto: () -> Unit = {},
+    onFile: () -> Unit = {},
 ) {
     val s = sonar
     Box(
@@ -1416,6 +1423,9 @@ private fun AddToMessageSheet(
                 Spacer(Modifier.height(8.dp))
                 if (canSendPhoto) {
                     ActionRow(SNIconName.Lock, "Send photo or GIF", "Encrypted end-to-end over White Noise", onPhoto)
+                }
+                if (canSendFile) {
+                    ActionRow(SNIconName.Data, "Send file", "PDFs, documents, and other files", onFile)
                 }
                 if (canSendPayment) ActionRow(SNIconName.Coin, "Send bitcoin", "Instant over Lightning", onBitcoin)
                 if (canShareLocation) ActionRow(SNIconName.NavArrow, "Share location", "Only $peerName will see it", onLocation)
