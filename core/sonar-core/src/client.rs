@@ -75,8 +75,11 @@ pub struct MediaUpload {
 
 /// Hard ceiling on a single downloaded media blob. The URL comes from the
 /// SENDER (untrusted), so this bounds memory use against a malicious/huge blob.
-/// Comfortably above any real image while well under MDK's 100 MB MIP-04 limit.
-const MAX_MEDIA_DOWNLOAD_BYTES: usize = 25 * 1024 * 1024;
+/// Hosts accept 25 MiB of plaintext; MIP-04 ChaCha20-Poly1305 appends its
+/// 16-byte authentication tag to the uploaded ciphertext.
+const MAX_MEDIA_PLAINTEXT_BYTES: usize = 25 * 1024 * 1024;
+const MIP04_AEAD_TAG_BYTES: usize = 16;
+const MAX_MEDIA_DOWNLOAD_BYTES: usize = MAX_MEDIA_PLAINTEXT_BYTES + MIP04_AEAD_TAG_BYTES;
 const MEDIA_DOWNLOAD_ATTEMPTS: usize = 3;
 const MEDIA_DOWNLOAD_RETRY_DELAY: Duration = Duration::from_millis(350);
 const MEDIA_DOWNLOAD_CANCEL_POLL: Duration = Duration::from_millis(100);
@@ -5513,6 +5516,15 @@ mod tests {
         assert!(!retryable_media_http_error(&Error::Http(
             "media exceeds size cap".into()
         )));
+    }
+
+    #[test]
+    fn media_download_cap_includes_mip04_aead_overhead() {
+        assert_eq!(
+            MAX_MEDIA_DOWNLOAD_BYTES,
+            (25 * 1024 * 1024) + MIP04_AEAD_TAG_BYTES
+        );
+        assert_eq!(MAX_MEDIA_DOWNLOAD_BYTES - MAX_MEDIA_PLAINTEXT_BYTES, 16);
     }
 
     #[test]

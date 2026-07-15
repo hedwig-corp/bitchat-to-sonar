@@ -500,110 +500,6 @@ func snAcceptsMacFileDrop(isChannel: Bool, urls: [URL]) -> Bool {
     !isChannel && urls.contains(where: \.isFileURL)
 }
 
-/// A pending secure chat is replaced with its resolved group while the first
-/// attachment may still be reading or awaiting that route. Preserve that one
-/// import; every other disappearance still invalidates its in-flight import.
-func snPreservesMacAttachmentImport(
-    conversationID: String,
-    routeReplacement: SNMarmotRouteReplacement?
-) -> Bool {
-    routeReplacement?.pendingId == conversationID
-}
-
-private let macMaxDroppedAttachments = 10
-
-private struct MacImportedAttachment: Sendable {
-    let data: Data
-    let filename: String
-    let mime: String
-}
-
-private struct MacAttachmentImportResult: Sendable {
-    let attachments: [MacImportedAttachment]
-    let rejectedCount: Int
-    let oversizedCount: Int
-}
-
-private enum MacAttachmentReadResult: Sendable {
-    case attachment(MacImportedAttachment)
-    case tooLarge
-    case unreadable
-}
-
-private func readMacAttachment(_ url: URL, maxBytes: Int) -> MacAttachmentReadResult {
-    guard url.isFileURL, maxBytes > 0 else { return .unreadable }
-    let scoped = url.startAccessingSecurityScopedResource()
-    defer {
-        if scoped { url.stopAccessingSecurityScopedResource() }
-    }
-
-    let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey, .contentTypeKey])
-    guard values?.isRegularFile == true else { return .unreadable }
-    if let size = values?.fileSize, size > maxBytes { return .tooLarge }
-
-    do {
-        let handle = try FileHandle(forReadingFrom: url)
-        defer { try? handle.close() }
-        let readLimit = min(maxBytes, Int.max - 1) + 1
-        var data = Data()
-        data.reserveCapacity(min(values?.fileSize ?? 0, maxBytes))
-        var remainingRead = readLimit
-        while remainingRead > 0 {
-            guard let chunk = try handle.read(upToCount: min(64 * 1024, remainingRead)),
-                  !chunk.isEmpty else { break }
-            data.append(chunk)
-            remainingRead -= chunk.count
-        }
-        guard data.count <= maxBytes else { return .tooLarge }
-        let filename = url.lastPathComponent.isEmpty ? "attachment" : url.lastPathComponent
-        let detectedMime = values?.contentType?.preferredMIMEType
-            ?? UTType(filenameExtension: url.pathExtension)?.preferredMIMEType
-            ?? "application/octet-stream"
-        let mime = snEffectiveAttachmentMime(
-            declaredMime: detectedMime,
-            filename: filename,
-            plaintext: data
-        )
-        return .attachment(MacImportedAttachment(data: data, filename: filename, mime: mime))
-    } catch {
-        return .unreadable
-    }
-}
-
-private func readMacAttachments(_ urls: [URL], maxTotalBytes: Int) -> MacAttachmentImportResult {
-    let fileURLs = urls.filter(\.isFileURL)
-    var rejectedCount = urls.count - fileURLs.count
-    rejectedCount += max(0, fileURLs.count - macMaxDroppedAttachments)
-    guard maxTotalBytes > 0 else {
-        return MacAttachmentImportResult(
-            attachments: [],
-            rejectedCount: rejectedCount + min(fileURLs.count, macMaxDroppedAttachments),
-            oversizedCount: min(fileURLs.count, macMaxDroppedAttachments)
-        )
-    }
-
-    var attachments: [MacImportedAttachment] = []
-    var oversizedCount = 0
-    var remainingBytes = maxTotalBytes
-    for url in fileURLs.prefix(macMaxDroppedAttachments) {
-        switch readMacAttachment(url, maxBytes: remainingBytes) {
-        case .attachment(let attachment):
-            attachments.append(attachment)
-            remainingBytes -= attachment.data.count
-        case .tooLarge:
-            rejectedCount += 1
-            oversizedCount += 1
-        case .unreadable:
-            rejectedCount += 1
-        }
-    }
-    return MacAttachmentImportResult(
-        attachments: attachments,
-        rejectedCount: rejectedCount,
-        oversizedCount: oversizedCount
-    )
-}
-
 private struct MacConversationPane: View {
     @EnvironmentObject private var store: SonarAppStore
     let mode: MacConversationMode
@@ -1147,7 +1043,7 @@ private struct MacConversationPane: View {
     private func disappeared() {
         let preservesImport: Bool
         if case .dm(let conversationID) = mode {
-            preservesImport = snPreservesMacAttachmentImport(
+            preservesImport = snPreservesAttachmentImport(
                 conversationID: conversationID,
                 routeReplacement: store.pendingMarmotRouteReplacement
             )
@@ -1197,7 +1093,7 @@ private struct MacConversationPane: View {
             let limit = attachmentLimitBytes
             Task { @MainActor in
                 let result = await Task.detached(priority: .userInitiated) {
-                    readMacAttachments(urls, maxTotalBytes: limit)
+                    snReadAttachments(urls, maxTotalBytes: limit)
                 }.value
                 guard attachmentImportGeneration == generation else { return }
                 guard !result.attachments.isEmpty else {

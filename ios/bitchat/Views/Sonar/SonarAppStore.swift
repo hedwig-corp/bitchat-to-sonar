@@ -5215,11 +5215,13 @@ final class SonarAppStore: ObservableObject {
     /// allowlist and falls back to a generic file for unsupported types.
     @discardableResult
     func sendAttachment(_ id: String, data: Data, filename: String, mime: String) -> Bool {
+        let safeName = snEncryptedAttachmentFilename(filename)
+        let safeMime = snEncryptedAttachmentMime(mime)
         if meshReachable(id) {
             guard FileTransferLimits.isValidPayload(data.count) else { return false }
             chatViewModel.selectedPrivateChatPeer = PeerID(str: id)
-            let meshMime = MimeType(mime)?.mimeString ?? "application/octet-stream"
-            chatViewModel.sendFile(data: data, filename: filename, mime: meshMime)
+            let meshMime = MimeType(safeMime)?.mimeString ?? "application/octet-stream"
+            chatViewModel.sendFile(data: data, filename: safeName, mime: meshMime)
             return true
         }
 
@@ -5233,9 +5235,6 @@ final class SonarAppStore: ObservableObject {
         }
         guard let gid = groupId else { return false }
 
-        let finalName = (filename as NSString).lastPathComponent
-        let safeName = finalName.isEmpty ? "attachment" : finalName
-        let safeMime = mime.isEmpty ? "application/octet-stream" : mime
         let pendingURL = Self.pendingMediaURL()
         rememberPendingUploadMedia(
             groupId: gid,

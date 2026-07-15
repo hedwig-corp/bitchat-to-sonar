@@ -125,4 +125,23 @@ class FileDropTest {
         )
         assertEquals("text/plain", effectiveAttachmentMime("text/plain; charset=utf-8", "receipt.pdf", realPdf))
     }
+
+    @Test
+    fun mapsUnsupportedEncryptedMediaMimeToBinaryEscapeHatch() {
+        assertEquals("application/octet-stream", encryptedAttachmentMime("application/zip"))
+        assertEquals("application/octet-stream", encryptedAttachmentMime("application/json; charset=utf-8"))
+        assertEquals("application/pdf", encryptedAttachmentMime("application/pdf"))
+        assertEquals("image/webp", encryptedAttachmentMime("IMAGE/WEBP"))
+    }
+
+    @Test
+    fun sanitizesAndBoundsEncryptedAttachmentFilename() {
+        assertEquals("diagnostic.zip", encryptedAttachmentFilename("../../diagnostic.zip"))
+        assertEquals("attachment", encryptedAttachmentFilename(".."))
+        assertEquals("report.txt", encryptedAttachmentFilename("report\u0000.txt"))
+
+        val bounded = encryptedAttachmentFilename("a".repeat(240) + ".zip")
+        assertTrue(bounded.endsWith(".zip"))
+        assertTrue(bounded.encodeToByteArray().size <= 210)
+    }
 }

@@ -13,6 +13,7 @@
 
 import SwiftUI
 import PhotosUI
+import UniformTypeIdentifiers
 #if os(iOS)
 import ImageIO
 #endif
@@ -55,7 +56,11 @@ struct SonarDMScreenContent: View {
     @State private var selectedAddNpubs: Set<String> = []
     @State private var pickPhoto = false
     @State private var photoItems: [PhotosPickerItem] = []
+    @State private var pickFile = false
+    @State private var attachmentImportGeneration = 0
     @State private var previewPackCoordinate: String?
+
+    private static let maxInternetAttachmentBytes = 25 * 1024 * 1024
 
     private var peer: SNPeerItem { store.peerItem(peerId) }
     private var isMarmot: Bool { store.marmotGroupId(peerId) != nil || store.isPendingSecureChat(peerId) }
@@ -206,7 +211,15 @@ struct SonarDMScreenContent: View {
                 openPaySheetOrWallet()
             }
         }
-        .onDisappear { store.closedDM(peerId) }
+        .onDisappear {
+            if !snPreservesAttachmentImport(
+                conversationID: peerId,
+                routeReplacement: store.pendingMarmotRouteReplacement
+            ) {
+                attachmentImportGeneration += 1
+            }
+            store.closedDM(peerId)
+        }
         .snSheet(isPresented: $sheet, title: "Add to your message") {
             VStack(spacing: 0) {
                 if store.paymentCapable(peerId) {
@@ -222,6 +235,12 @@ struct SonarDMScreenContent: View {
                     SNActionRow(icon: .lock, label: "Send photo or GIF", desc: "Encrypted end-to-end over White Noise") {
                         sheet = false
                         pickPhoto = true
+                    }
+                }
+                if store.canPrepareMedia(peerId) {
+                    SNActionRow(icon: .data, label: "Send file", desc: "PDFs, documents, and other files") {
+                        sheet = false
+                        pickFile = true
                     }
                 }
                 if isMultiMemberMarmot && store.marmotGroupId(peerId) != nil {
@@ -270,6 +289,13 @@ struct SonarDMScreenContent: View {
                     photoItems = []
                 }
             }
+        }
+        .fileImporter(
+            isPresented: $pickFile,
+            allowedContentTypes: [.item],
+            allowsMultipleSelection: true
+        ) { result in
+            importAttachments(result)
         }
         .snSheet(isPresented: $verifySheet, title: "Verify \(peer.name)") {
             verifyContent
@@ -383,6 +409,81 @@ struct SonarDMScreenContent: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.6) {
             if toast == text { toast = nil }
         }
+    }
+
+    private func importAttachments(_ result: Result<[URL], Error>) {
+        switch result {
+        case .success(let urls):
+            guard urls.contains(where: \.isFileURL) else {
+                showToast("Couldn't attach that file")
+                return
+            }
+            attachmentImportGeneration += 1
+            let generation = attachmentImportGeneration
+            let conversationID = peerId
+            let limit = attachmentLimitBytes
+            Task { @MainActor in
+                let result = await Task.detached(priority: .userInitiated) {
+                    snReadAttachments(urls, maxTotalBytes: limit)
+                }.value
+                guard attachmentImportGeneration == generation else { return }
+                guard !result.attachments.isEmpty else {
+                    if result.oversizedCount > 0 {
+                        showToast("File is too large")
+                    } else {
+                        showToast("Couldn't attach that file")
+                    }
+                    return
+                }
+
+                switch await store.prepareMediaRoute(conversationID) {
+                case .ready:
+                    break
+                case .unavailable:
+                    guard attachmentImportGeneration == generation else { return }
+                    showToast("This contact must be online to receive files")
+                    return
+                case .failed:
+                    guard attachmentImportGeneration == generation else { return }
+                    showToast("Couldn't set up a secure file transfer")
+                    return
+                }
+                guard attachmentImportGeneration == generation else { return }
+
+                var imported = 0
+                var rejected = result.rejectedCount
+                for attachment in result.attachments {
+                    if store.sendAttachment(
+                        conversationID,
+                        data: attachment.data,
+                        filename: attachment.filename,
+                        mime: attachment.mime
+                    ) {
+                        imported += 1
+                    } else {
+                        rejected += 1
+                    }
+                }
+
+                if imported > 0, rejected > 0 {
+                    showToast("\(imported) attached; some files couldn't be attached")
+                } else if imported > 0 {
+                    showToast(imported == 1 ? "Attachment added" : "\(imported) attachments added")
+                } else if result.oversizedCount > 0 {
+                    showToast("File is too large")
+                } else {
+                    showToast("Couldn't attach that file")
+                }
+            }
+        case .failure:
+            showToast("Couldn't attach that file")
+        }
+    }
+
+    private var attachmentLimitBytes: Int {
+        store.dmTransport(peerId) == .mesh
+            ? FileTransferLimits.maxPayloadBytes
+            : Self.maxInternetAttachmentBytes
     }
 
     @ViewBuilder

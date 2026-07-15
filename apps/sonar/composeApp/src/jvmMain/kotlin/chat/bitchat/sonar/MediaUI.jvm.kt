@@ -63,6 +63,27 @@ actual fun rememberPhotoPicker(
     }
 }
 
+@Composable
+internal actual fun rememberFilePicker(
+    maxTotalBytes: Long,
+    onPicked: (DroppedFiles) -> Unit,
+): () -> Unit {
+    val scope = rememberCoroutineScope()
+    return {
+        scope.launch {
+            val picked = pickFiles("Choose files")
+            if (picked.isEmpty()) return@launch
+            val result = withContext(Dispatchers.IO) {
+                readDroppedFiles(
+                    picked.map { it.toURI().toString() },
+                    maxTotalBytes,
+                )
+            }
+            onPicked(result)
+        }
+    }
+}
+
 private fun pickImageFiles(): List<File> {
     // Limit to formats the stock JDK ImageIO can actually decode (no WebP reader),
     // so a picked file always re-encodes rather than silently failing.
@@ -80,6 +101,18 @@ private fun pickImageFiles(): List<File> {
         dialog.files.orEmpty().toList().take(MAX_ALBUM_PHOTOS)
     } finally {
         dialog.dispose() // release the native AWT peer
+    }
+}
+
+private fun pickFiles(title: String): List<File> {
+    val dialog = FileDialog(null as Frame?, title, FileDialog.LOAD).apply {
+        isMultipleMode = true
+        isVisible = true
+    }
+    return try {
+        dialog.files.orEmpty().toList()
+    } finally {
+        dialog.dispose()
     }
 }
 

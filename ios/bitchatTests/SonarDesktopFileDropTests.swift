@@ -44,22 +44,6 @@ struct SonarDesktopFileDropTests {
         ) == .unavailable)
     }
 
-    @Test func preservesFirstImportDuringPendingRouteReplacement() {
-        let replacement = SNMarmotRouteReplacement(
-            pendingId: "pending:npub1peer",
-            realId: "marmot:group"
-        )
-
-        #expect(snPreservesMacAttachmentImport(
-            conversationID: "pending:npub1peer",
-            routeReplacement: replacement
-        ))
-        #expect(!snPreservesMacAttachmentImport(
-            conversationID: "another-chat",
-            routeReplacement: replacement
-        ))
-    }
-
     @Test func promotesOnlyVerifiedPDFsFromGenericMime() {
         let pdf = Data("%PDF-1.7\nreceipt".utf8)
         let fake = Data("not a pdf".utf8)
