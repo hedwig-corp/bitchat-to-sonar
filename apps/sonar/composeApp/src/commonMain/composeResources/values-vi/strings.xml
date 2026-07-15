@@ -52,7 +52,6 @@
     <string name="content_accessibility_location_channels">kênh theo vị trí</string>
     <string name="content_accessibility_location_notes">ghi chú vị trí cho nơi này</string>
     <string name="content_accessibility_open_unread">mở chat riêng chưa đọc</string>
-    <string name="content_accessibility_people_count">%#@people@</string>
     <string name="content_accessibility_private_chat">chat riêng với %s</string>
     <string name="content_accessibility_reachable_mesh">liên hệ được qua mesh</string>
     <string name="content_accessibility_remove_favorite">xóa khỏi yêu thích</string>
@@ -141,7 +140,6 @@
     <string name="location_channels_loading_nearby">đang tìm kênh gần…</string>
     <string name="location_channels_mesh_label">mesh</string>
     <string name="location_channels_permission_denied">bị từ chối quyền vị trí. hãy bật trong cài đặt để dùng kênh vị trí.</string>
-    <string name="location_channels_row_title">%1$s [%2$#@people_count@]</string>
     <string name="location_channels_subtitle_prefix">#%1$s • %2$s</string>
     <string name="location_channels_subtitle_with_name">%1$s • %2$s</string>
     <string name="location_channels_title">#kênh vị trí</string>
@@ -160,7 +158,6 @@
     <string name="location_notes_empty_title">chưa có ghi chú</string>
     <string name="location_notes_error_failed_to_send">gửi ghi chú thất bại. %s</string>
     <string name="location_notes_error_no_relays">không có relay địa lý gần khu vực này. thử lại sau.</string>
-    <string name="location_notes_header">#%1$s • %2$#@note_count@</string>
     <string name="location_notes_loading_notes">đang tải ghi chú…</string>
     <string name="location_notes_loading_recent">đang tải ghi chú gần đây…</string>
     <string name="location_notes_no_relays_nearby">không có relay địa lý gần đó</string>

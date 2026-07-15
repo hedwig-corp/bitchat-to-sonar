@@ -52,7 +52,6 @@
     <string name="content_accessibility_location_channels">位置頻道</string>
     <string name="content_accessibility_location_notes">此位置的筆記</string>
     <string name="content_accessibility_open_unread">打開未讀私聊</string>
-    <string name="content_accessibility_people_count">%#@people@</string>
     <string name="content_accessibility_private_chat">與 %s 的私聊</string>
     <string name="content_accessibility_reachable_mesh">可透過 mesh 到達</string>
     <string name="content_accessibility_remove_favorite">移出收藏</string>
@@ -141,7 +140,6 @@
     <string name="location_channels_loading_nearby">正在尋找附近頻道…</string>
     <string name="location_channels_mesh_label">mesh</string>
     <string name="location_channels_permission_denied">位置權限被拒。請在設定中啟用以使用位置頻道。</string>
-    <string name="location_channels_row_title">%1$s [%2$#@people_count@]</string>
     <string name="location_channels_subtitle_prefix">#%s • %s</string>
     <string name="location_channels_subtitle_with_name">%1$s • %2$s</string>
     <string name="location_channels_title">#位置頻道</string>
@@ -160,7 +158,6 @@
     <string name="location_notes_empty_title">尚無筆記</string>
     <string name="location_notes_error_failed_to_send">無法發送筆記。%s</string>
     <string name="location_notes_error_no_relays">附近沒有可用的地理中繼。稍後再試。</string>
-    <string name="location_notes_header">#%1$s • %2$#@note_count@</string>
     <string name="location_notes_loading_notes">正在加載筆記…</string>
     <string name="location_notes_loading_recent">正在加載最新筆記…</string>
     <string name="location_notes_no_relays_nearby">附近沒有地理中繼</string>

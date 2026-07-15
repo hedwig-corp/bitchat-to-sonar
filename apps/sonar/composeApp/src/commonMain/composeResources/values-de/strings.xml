@@ -52,7 +52,6 @@
     <string name="content_accessibility_location_channels">kanäle für standorte</string>
     <string name="content_accessibility_location_notes">standortnotizen für diesen ort</string>
     <string name="content_accessibility_open_unread">ungelesene privatnachricht öffnen</string>
-    <string name="content_accessibility_people_count">%#@people@</string>
     <string name="content_accessibility_private_chat">privatchat mit %s</string>
     <string name="content_accessibility_reachable_mesh">erreichbar über mesh</string>
     <string name="content_accessibility_remove_favorite">aus favoriten entfernen</string>
@@ -141,7 +140,6 @@
     <string name="location_channels_loading_nearby">suche nach kanälen in der nähe…</string>
     <string name="location_channels_mesh_label">mesh</string>
     <string name="location_channels_permission_denied">standortberechtigung verweigert. aktiviere sie in den einstellungen für standortkanäle.</string>
-    <string name="location_channels_row_title">%1$s [%2$#@people_count@]</string>
     <string name="location_channels_subtitle_prefix">#%s • %s</string>
     <string name="location_channels_subtitle_with_name">%1$s • %2$s</string>
     <string name="location_channels_title">#standort-kanäle</string>
@@ -160,7 +158,6 @@
     <string name="location_notes_empty_title">noch keine notizen</string>
     <string name="location_notes_error_failed_to_send">notiz konnte nicht gesendet werden. %s</string>
     <string name="location_notes_error_no_relays">keine geo-relays in der nähe verfügbar. versuch es später erneut.</string>
-    <string name="location_notes_header">#%1$s • %2$#@note_count@</string>
     <string name="location_notes_loading_notes">notizen werden geladen…</string>
     <string name="location_notes_loading_recent">aktuelle notizen werden geladen…</string>
     <string name="location_notes_no_relays_nearby">keine geo-relays in der nähe</string>

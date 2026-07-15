@@ -52,7 +52,6 @@
     <string name="content_accessibility_location_channels">ערוצי מיקום</string>
     <string name="content_accessibility_location_notes">הערות מיקום למקום הזה</string>
     <string name="content_accessibility_open_unread">פתח צ\'אט פרטי שלא נקרא</string>
-    <string name="content_accessibility_people_count">%#@people@</string>
     <string name="content_accessibility_private_chat">צ\'אט פרטי עם %s</string>
     <string name="content_accessibility_reachable_mesh">זמין דרך mesh</string>
     <string name="content_accessibility_remove_favorite">הסר מהמועדפים</string>
@@ -141,7 +140,6 @@
     <string name="location_channels_loading_nearby">מחפש ערוצים קרובים…</string>
     <string name="location_channels_mesh_label">mesh</string>
     <string name="location_channels_permission_denied">הרשאת מיקום נדחתה. אפשר בהגדרות כדי להשתמש בערוצי מיקום.</string>
-    <string name="location_channels_row_title">%1$s [%2$#@people_count@]</string>
     <string name="location_channels_subtitle_prefix">#%s • %s</string>
     <string name="location_channels_subtitle_with_name">%1$s • %2$s</string>
     <string name="location_channels_title">#ערוצי מיקום</string>
@@ -160,7 +158,6 @@
     <string name="location_notes_empty_title">אין הערות עדיין</string>
     <string name="location_notes_error_failed_to_send">לא ניתן לשלוח את ההערה. %s</string>
     <string name="location_notes_error_no_relays">אין ממסרי geo זמינים בקרבת מקום. נסה שוב מאוחר יותר.</string>
-    <string name="location_notes_header">#%1$s • %2$#@note_count@</string>
     <string name="location_notes_loading_notes">טוען הערות…</string>
     <string name="location_notes_loading_recent">טוען הערות אחרונות…</string>
     <string name="location_notes_no_relays_nearby">אין ממסרי geo קרובים</string>

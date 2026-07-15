@@ -52,7 +52,6 @@
     <string name="content_accessibility_location_channels">لوکیشن چینلز</string>
     <string name="content_accessibility_location_notes">اس جگہ کیلئے لوکیشن نوٹس</string>
     <string name="content_accessibility_open_unread">نہ پڑھی گئی نجی چیٹ کھولیں</string>
-    <string name="content_accessibility_people_count">%#@people@</string>
     <string name="content_accessibility_private_chat">%s کے ساتھ نجی چیٹ</string>
     <string name="content_accessibility_reachable_mesh">mesh کے ذریعے قابل رسائی</string>
     <string name="content_accessibility_remove_favorite">پسندیدہ سے ہٹائیں</string>
@@ -141,7 +140,6 @@
     <string name="location_channels_loading_nearby">قریب کے چینلز تلاش ہو رہے ہیں…</string>
     <string name="location_channels_mesh_label">mesh</string>
     <string name="location_channels_permission_denied">لوکیشن کی اجازت مسترد کر دی گئی۔ لوکیشن چینلز استعمال کرنے کیلئے سیٹنگز میں فعال کریں۔</string>
-    <string name="location_channels_row_title">%1$s [%2$#@people_count@]</string>
     <string name="location_channels_subtitle_prefix">#%1$s • %2$s</string>
     <string name="location_channels_subtitle_with_name">%1$s • %2$s</string>
     <string name="location_channels_title">#لوکیشن چینلز</string>
@@ -160,7 +158,6 @@
     <string name="location_notes_empty_title">ابھی تک کوئی نوٹس نہیں</string>
     <string name="location_notes_error_failed_to_send">نوٹ بھیجنا ناکام۔ %s</string>
     <string name="location_notes_error_no_relays">اس جگہ کے قریب کوئی geo relay دستیاب نہیں۔ کچھ دیر بعد دوبارہ کوشش کریں۔</string>
-    <string name="location_notes_header">#%1$s • %2$#@note_count@</string>
     <string name="location_notes_loading_notes">نوٹس لوڈ ہو رہے ہیں…</string>
     <string name="location_notes_loading_recent">حالیہ نوٹس لوڈ ہو رہے ہیں…</string>
     <string name="location_notes_no_relays_nearby">قریب کوئی geo relay نہیں</string>

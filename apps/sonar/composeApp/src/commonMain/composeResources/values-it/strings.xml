@@ -52,7 +52,6 @@
     <string name="content_accessibility_location_channels">canali posizione</string>
     <string name="content_accessibility_location_notes">note di posizione per questo posto</string>
     <string name="content_accessibility_open_unread">apri chat privata non letta</string>
-    <string name="content_accessibility_people_count">%#@people@</string>
     <string name="content_accessibility_private_chat">chat privata con %s</string>
     <string name="content_accessibility_reachable_mesh">raggiungibile via mesh</string>
     <string name="content_accessibility_remove_favorite">rimuovi dai preferiti</string>
@@ -141,7 +140,6 @@
     <string name="location_channels_loading_nearby">ricerca canali vicini…</string>
     <string name="location_channels_mesh_label">mesh</string>
     <string name="location_channels_permission_denied">autorizzazione posizione negata. abilitala nelle impostazioni per usare i canali.</string>
-    <string name="location_channels_row_title">%1$s [%2$#@people_count@]</string>
     <string name="location_channels_subtitle_prefix">#%s • %s</string>
     <string name="location_channels_subtitle_with_name">%1$s • %2$s</string>
     <string name="location_channels_title">#canali posizione</string>
@@ -160,7 +158,6 @@
     <string name="location_notes_empty_title">ancora nessuna nota</string>
     <string name="location_notes_error_failed_to_send">impossibile inviare la nota. %s</string>
     <string name="location_notes_error_no_relays">nessun relay geo disponibile qui vicino. riprova presto.</string>
-    <string name="location_notes_header">#%1$s • %2$#@note_count@</string>
     <string name="location_notes_loading_notes">caricamento note…</string>
     <string name="location_notes_loading_recent">caricamento note recenti…</string>
     <string name="location_notes_no_relays_nearby">nessun relay geo vicino</string>

@@ -52,7 +52,6 @@
     <string name="content_accessibility_location_channels">kanal lokasi</string>
     <string name="content_accessibility_location_notes">catatan lokasi untuk tempat ini</string>
     <string name="content_accessibility_open_unread">buka chat pribadi belum dibaca</string>
-    <string name="content_accessibility_people_count">%#@people@</string>
     <string name="content_accessibility_private_chat">chat pribadi dengan %s</string>
     <string name="content_accessibility_reachable_mesh">dapat dijangkau lewat mesh</string>
     <string name="content_accessibility_remove_favorite">hapus dari favorit</string>
@@ -141,7 +140,6 @@
     <string name="location_channels_loading_nearby">mencari kanal sekitar…</string>
     <string name="location_channels_mesh_label">mesh</string>
     <string name="location_channels_permission_denied">izin lokasi ditolak. aktifkan di pengaturan untuk memakai kanal lokasi.</string>
-    <string name="location_channels_row_title">%1$s [%2$#@people_count@]</string>
     <string name="location_channels_subtitle_prefix">#%s • %s</string>
     <string name="location_channels_subtitle_with_name">%1$s • %2$s</string>
     <string name="location_channels_title">#kanal lokasi</string>
@@ -160,7 +158,6 @@
     <string name="location_notes_empty_title">belum ada catatan</string>
     <string name="location_notes_error_failed_to_send">tidak bisa mengirim catatan. %s</string>
     <string name="location_notes_error_no_relays">tidak ada relay geo tersedia dekat sini. coba lagi nanti.</string>
-    <string name="location_notes_header">#%1$s • %2$#@note_count@</string>
     <string name="location_notes_loading_notes">memuat catatan…</string>
     <string name="location_notes_loading_recent">memuat catatan terbaru…</string>
     <string name="location_notes_no_relays_nearby">tidak ada relay geo di dekatmu</string>

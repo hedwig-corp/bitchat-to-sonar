@@ -52,7 +52,6 @@
     <string name="content_accessibility_location_channels">konum kanalları</string>
     <string name="content_accessibility_location_notes">bu yer için konum notları</string>
     <string name="content_accessibility_open_unread">okunmamış özel sohbeti aç</string>
-    <string name="content_accessibility_people_count">%#@people@</string>
     <string name="content_accessibility_private_chat">%s ile özel sohbet</string>
     <string name="content_accessibility_reachable_mesh">mesh üzerinden ulaşılabilir</string>
     <string name="content_accessibility_remove_favorite">favorilerden kaldır</string>
@@ -141,7 +140,6 @@
     <string name="location_channels_loading_nearby">yakındaki kanallar aranıyor…</string>
     <string name="location_channels_mesh_label">mesh</string>
     <string name="location_channels_permission_denied">konum izni reddedildi. konum kanallarını kullanmak için ayarlardan etkinleştirin.</string>
-    <string name="location_channels_row_title">%1$s [%2$#@people_count@]</string>
     <string name="location_channels_subtitle_prefix">#%1$s • %2$s</string>
     <string name="location_channels_subtitle_with_name">%1$s • %2$s</string>
     <string name="location_channels_title">#konum kanalları</string>
@@ -160,7 +158,6 @@
     <string name="location_notes_empty_title">henüz not yok</string>
     <string name="location_notes_error_failed_to_send">not gönderilemedi. %s</string>
     <string name="location_notes_error_no_relays">bu konuma yakın geo röle yok. birazdan yeniden deneyin.</string>
-    <string name="location_notes_header">#%1$s • %2$#@note_count@</string>
     <string name="location_notes_loading_notes">notlar yükleniyor…</string>
     <string name="location_notes_loading_recent">son notlar yükleniyor…</string>
     <string name="location_notes_no_relays_nearby">yakında geo röle yok</string>

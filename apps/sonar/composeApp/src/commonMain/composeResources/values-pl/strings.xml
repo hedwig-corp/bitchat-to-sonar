@@ -52,7 +52,6 @@
     <string name="content_accessibility_location_channels">kanały lokalizacyjne</string>
     <string name="content_accessibility_location_notes">notatki lokalizacyjne dla tego miejsca</string>
     <string name="content_accessibility_open_unread">otwórz nieprzeczytany czat prywatny</string>
-    <string name="content_accessibility_people_count">%#@people@</string>
     <string name="content_accessibility_private_chat">czat prywatny z %s</string>
     <string name="content_accessibility_reachable_mesh">osiągalny przez mesh</string>
     <string name="content_accessibility_remove_favorite">usuń z ulubionych</string>
@@ -141,7 +140,6 @@
     <string name="location_channels_loading_nearby">wyszukiwanie kanałów w pobliżu…</string>
     <string name="location_channels_mesh_label">mesh</string>
     <string name="location_channels_permission_denied">odmówiono dostępu do lokalizacji. włącz w ustawieniach, aby korzystać z kanałów lokalizacji.</string>
-    <string name="location_channels_row_title">%1$s [%2$#@people_count@]</string>
     <string name="location_channels_subtitle_prefix">#%1$s • %2$s</string>
     <string name="location_channels_subtitle_with_name">%1$s • %2$s</string>
     <string name="location_channels_title">#kanały lokalizacji</string>
@@ -160,7 +158,6 @@
     <string name="location_notes_empty_title">brak notatek</string>
     <string name="location_notes_error_failed_to_send">nie udało się wysłać notatki. %s</string>
     <string name="location_notes_error_no_relays">brak geo relay w pobliżu tej lokalizacji. spróbuj ponownie wkrótce.</string>
-    <string name="location_notes_header">#%1$s • %2$#@note_count@</string>
     <string name="location_notes_loading_notes">ładowanie notatek…</string>
     <string name="location_notes_loading_recent">ładowanie ostatnich notatek…</string>
     <string name="location_notes_no_relays_nearby">brak pobliskich geo relay</string>

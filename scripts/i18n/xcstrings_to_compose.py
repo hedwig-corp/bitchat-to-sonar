@@ -87,6 +87,13 @@ _KOTLIN_HARD_KEYWORDS = frozenset({
 _FORMAT_POSITIONAL = re.compile(r"%(\d+)\$@")
 _VALID_ID = re.compile(r"^[a-z][a-z0-9_]*$")
 
+# Apple stringsdict plural/variable reference, e.g. %#@people@ or %2$#@count@.
+# This syntax is meaningless on Android/Java formatting (it would render
+# literally or throw IllegalFormatException), so such keys are skipped rather
+# than emitted as broken resources. Proper handling means Android <plurals>,
+# which is tracked follow-up work.
+_APPLE_VAR_REF = re.compile(r"%(?:\d+\$)?#@")
+
 
 def slugify(english_key: str) -> str:
     """Derive a snake_case resource id stub from the English key text."""
@@ -187,6 +194,10 @@ def escape_android_value(value: str) -> str:
         .replace("\n", r"\n")
         .replace("\r", r"\n")
     )
+    # A leading @ or ? makes Android read the value as a resource / theme-attr
+    # reference; escape it so the literal character survives.
+    if value[:1] in ("@", "?"):
+        value = "\\" + value
     if value[:1].isspace() or value[-1:].isspace():
         value = f'"{value}"'
     return value
@@ -289,6 +300,21 @@ def generate(out_root: Path, id_map_path: Path) -> tuple[list[Path], dict[str, s
     with XCSTRINGS_PATH.open(encoding="utf-8") as f:
         catalog = json.load(f)
     strings: dict[str, dict] = catalog["strings"]
+
+    # Drop keys carrying Apple plural/variable references — they cannot be
+    # represented as a flat Android string resource. Skipping keeps broken
+    # format syntax out of the generated files; migrating them to <plurals> is
+    # tracked follow-up work.
+    skipped = sorted(
+        k for k, e in strings.items() if _APPLE_VAR_REF.search(english_value(k, e))
+    )
+    if skipped:
+        strings = {k: v for k, v in strings.items() if k not in skipped}
+        print(
+            f"skipped {len(skipped)} key(s) with Apple plural/variable refs "
+            f"(need Android <plurals>): {', '.join(repr(k) for k in skipped)}",
+            file=sys.stderr,
+        )
     keys = sorted(strings.keys())
     existing = load_id_map(id_map_path)
     # When generating into a temp tree for --check, still load the committed map.

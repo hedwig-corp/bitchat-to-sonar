@@ -49,9 +49,12 @@ val checkI18nStringsInSync = tasks.register<Exec>("checkI18nStringsInSync") {
     group = "verification"
 
     val generator = repoRootDir.resolve("scripts/i18n/xcstrings_to_compose.py")
+    val stamp = layout.buildDirectory.file("i18n/strings-in-sync.stamp")
     inputs.file(repoRootDir.resolve("ios/bitchat/Localizable.xcstrings"))
     inputs.file(generator)
     inputs.dir(layout.projectDirectory.dir("src/commonMain/composeResources"))
+    // Output stamp lets Gradle mark the task UP-TO-DATE when nothing changed.
+    outputs.file(stamp)
 
     workingDir(repoRootDir)
     isIgnoreExitValue = true
@@ -66,6 +69,9 @@ val checkI18nStringsInSync = tasks.register<Exec>("checkI18nStringsInSync") {
                     "Run: python3 scripts/i18n/xcstrings_to_compose.py",
             )
         }
+        val stampFile = stamp.get().asFile
+        stampFile.parentFile.mkdirs()
+        stampFile.writeText("in-sync")
     }
 }
 

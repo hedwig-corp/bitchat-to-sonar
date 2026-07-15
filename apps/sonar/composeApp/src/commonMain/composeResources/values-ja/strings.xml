@@ -13,7 +13,7 @@
     <string name="app_info_features_favorites_title">お気に入り</string>
     <string name="app_info_features_geohash_description">geohashチャンネルで近くの人と匿名分散リレー越しにチャット</string>
     <string name="app_info_features_geohash_title">ローカルチャンネル</string>
-    <string name="app_info_features_mentions_description">@nicknameで特定の人に通知</string>
+    <string name="app_info_features_mentions_description">\@nicknameで特定の人に通知</string>
     <string name="app_info_features_mentions_title">メンション</string>
     <string name="app_info_features_offline_description">bluetooth low energyでインターネットなしでも動作</string>
     <string name="app_info_features_offline_title">オフライン通信</string>
@@ -52,7 +52,6 @@
     <string name="content_accessibility_location_channels">ロケーションチャンネル</string>
     <string name="content_accessibility_location_notes">この場所のロケーションノート</string>
     <string name="content_accessibility_open_unread">未読のプライベートチャットを開く</string>
-    <string name="content_accessibility_people_count">%#@people@</string>
     <string name="content_accessibility_private_chat">%sとのプライベートチャット</string>
     <string name="content_accessibility_reachable_mesh">meshで到達可能</string>
     <string name="content_accessibility_remove_favorite">お気に入りから削除</string>
@@ -141,7 +140,6 @@
     <string name="location_channels_loading_nearby">近くのチャンネルを検索中…</string>
     <string name="location_channels_mesh_label">mesh</string>
     <string name="location_channels_permission_denied">位置情報の許可が拒否されました。チャンネルを使うには設定で許可してください。</string>
-    <string name="location_channels_row_title">%1$s [%2$#@people_count@]</string>
     <string name="location_channels_subtitle_prefix">#%s • %s</string>
     <string name="location_channels_subtitle_with_name">%1$s • %2$s</string>
     <string name="location_channels_title">#ロケーションチャンネル</string>
@@ -160,7 +158,6 @@
     <string name="location_notes_empty_title">ノートはまだありません</string>
     <string name="location_notes_error_failed_to_send">ノートを送信できませんでした。%s</string>
     <string name="location_notes_error_no_relays">近くに利用できるジオリレーがありません。後で再試行してください。</string>
-    <string name="location_notes_header">#%1$s • %2$#@note_count@</string>
     <string name="location_notes_loading_notes">ノートを読み込み中…</string>
     <string name="location_notes_loading_recent">最新ノートを読み込み中…</string>
     <string name="location_notes_no_relays_nearby">近くにジオリレーなし</string>

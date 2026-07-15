@@ -52,7 +52,6 @@
     <string name="content_accessibility_location_channels">लोकेशन चैनल</string>
     <string name="content_accessibility_location_notes">इस स्थान के लोकेशन नोट</string>
     <string name="content_accessibility_open_unread">अपठित निजी चैट खोलें</string>
-    <string name="content_accessibility_people_count">%#@people@</string>
     <string name="content_accessibility_private_chat">%s के साथ निजी चैट</string>
     <string name="content_accessibility_reachable_mesh">मेश के माध्यम से पहुंच योग्य</string>
     <string name="content_accessibility_remove_favorite">पसंदीदा से हटाएँ</string>
@@ -141,7 +140,6 @@
     <string name="location_channels_loading_nearby">पास के चैनल खोजे जा रहे हैं…</string>
     <string name="location_channels_mesh_label">मेश</string>
     <string name="location_channels_permission_denied">लोकेशन अनुमति अस्वीकृत। लोकेशन चैनल उपयोग करने के लिए सेटिंग्स में सक्षम करें।</string>
-    <string name="location_channels_row_title">%1$s [%2$#@people_count@]</string>
     <string name="location_channels_subtitle_prefix">#%1$s • %2$s</string>
     <string name="location_channels_subtitle_with_name">%1$s • %2$s</string>
     <string name="location_channels_title">#लोकेशन चैनल</string>
@@ -160,7 +158,6 @@
     <string name="location_notes_empty_title">अभी कोई नोट नहीं</string>
     <string name="location_notes_error_failed_to_send">नोट भेजने में विफल। %s</string>
     <string name="location_notes_error_no_relays">इस स्थान के पास कोई जियो रिले उपलब्ध नहीं। कुछ देर बाद फिर प्रयास करें।</string>
-    <string name="location_notes_header">#%1$s • %2$#@note_count@</string>
     <string name="location_notes_loading_notes">नोट लोड हो रहे हैं…</string>
     <string name="location_notes_loading_recent">हाल के नोट लोड हो रहे हैं…</string>
     <string name="location_notes_no_relays_nearby">पास कोई जियो रिले नहीं</string>

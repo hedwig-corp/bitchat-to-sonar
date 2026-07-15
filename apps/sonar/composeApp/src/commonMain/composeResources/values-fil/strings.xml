@@ -52,7 +52,6 @@
     <string name="content_accessibility_location_channels">mga channel batay sa lokasyon</string>
     <string name="content_accessibility_location_notes">mga tala para sa lugar na ito</string>
     <string name="content_accessibility_open_unread">buksan ang hindi pa nababasang pribadong chat</string>
-    <string name="content_accessibility_people_count">%#@people@</string>
     <string name="content_accessibility_private_chat">pribadong chat kasama si %s</string>
     <string name="content_accessibility_reachable_mesh">maabot sa pamamagitan ng mesh</string>
     <string name="content_accessibility_remove_favorite">alisin sa mga paborito</string>
@@ -141,7 +140,6 @@
     <string name="location_channels_loading_nearby">naghahanap ng mga kalapit na channel…</string>
     <string name="location_channels_mesh_label">mesh</string>
     <string name="location_channels_permission_denied">tinanggihan ang pahintulot sa lokasyon. i-enable sa settings para magamit ang mga channel ng lokasyon.</string>
-    <string name="location_channels_row_title">%1$s [%2$#@people_count@]</string>
     <string name="location_channels_subtitle_prefix">#%1$s • %2$s</string>
     <string name="location_channels_subtitle_with_name">%1$s • %2$s</string>
     <string name="location_channels_title">#mga channel ng lokasyon</string>
@@ -160,7 +158,6 @@
     <string name="location_notes_empty_title">wala pang tala</string>
     <string name="location_notes_error_failed_to_send">nabigong magpadala ng tala. %s</string>
     <string name="location_notes_error_no_relays">walang geo relay malapit sa lokasyong ito. subukan muli maya-maya.</string>
-    <string name="location_notes_header">#%1$s • %2$#@note_count@</string>
     <string name="location_notes_loading_notes">nagse-load ng mga tala…</string>
     <string name="location_notes_loading_recent">nagse-load ng pinakahuling mga tala…</string>
     <string name="location_notes_no_relays_nearby">walang malapit na geo relay</string>

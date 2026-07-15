@@ -52,7 +52,6 @@
     <string name="content_accessibility_location_channels">قنوات الموقع</string>
     <string name="content_accessibility_location_notes">ملاحظات الموقع لهذا المكان</string>
     <string name="content_accessibility_open_unread">فتح دردشة خاصة غير مقروءة</string>
-    <string name="content_accessibility_people_count">%#@people@</string>
     <string name="content_accessibility_private_chat">دردشة خاصة مع %s</string>
     <string name="content_accessibility_reachable_mesh">قابل للوصول عبر mesh</string>
     <string name="content_accessibility_remove_favorite">إزالة من المفضلة</string>
@@ -141,7 +140,6 @@
     <string name="location_channels_loading_nearby">جار البحث عن قنوات قريبة…</string>
     <string name="location_channels_mesh_label">mesh</string>
     <string name="location_channels_permission_denied">تم رفض إذن الموقع. فعّله في الإعدادات لاستخدام قنوات الموقع.</string>
-    <string name="location_channels_row_title">%1$s [%2$#@people_count@]</string>
     <string name="location_channels_subtitle_prefix">#%s • %s</string>
     <string name="location_channels_subtitle_with_name">%1$s • %2$s</string>
     <string name="location_channels_title">#قنوات الموقع</string>
@@ -160,7 +158,6 @@
     <string name="location_notes_empty_title">لا توجد ملاحظات بعد</string>
     <string name="location_notes_error_failed_to_send">تعذر إرسال الملاحظة. %s</string>
     <string name="location_notes_error_no_relays">لا توجد مرحلات جغرافية قريبة من هذا المكان. حاول لاحقاً.</string>
-    <string name="location_notes_header">#%1$s • %2$#@note_count@</string>
     <string name="location_notes_loading_notes">جار تحميل الملاحظات…</string>
     <string name="location_notes_loading_recent">جار تحميل الملاحظات الحديثة…</string>
     <string name="location_notes_no_relays_nearby">لا مرحلات جغرافية قريبة</string>

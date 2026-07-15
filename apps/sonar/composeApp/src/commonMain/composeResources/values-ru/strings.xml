@@ -52,7 +52,6 @@
     <string name="content_accessibility_location_channels">каналы локации</string>
     <string name="content_accessibility_location_notes">заметки для этого места</string>
     <string name="content_accessibility_open_unread">открыть непрочитанный приватный чат</string>
-    <string name="content_accessibility_people_count">%#@people@</string>
     <string name="content_accessibility_private_chat">приватный чат с %s</string>
     <string name="content_accessibility_reachable_mesh">достижим через mesh</string>
     <string name="content_accessibility_remove_favorite">убрать из избранного</string>
@@ -141,7 +140,6 @@
     <string name="location_channels_loading_nearby">поиск каналов рядом…</string>
     <string name="location_channels_mesh_label">mesh</string>
     <string name="location_channels_permission_denied">доступ к локации запрещён. включи разрешение в настройках, чтобы использовать каналы.</string>
-    <string name="location_channels_row_title">%1$s [%2$#@people_count@]</string>
     <string name="location_channels_subtitle_prefix">#%s • %s</string>
     <string name="location_channels_subtitle_with_name">%1$s • %2$s</string>
     <string name="location_channels_title">#каналы локации</string>
@@ -160,7 +158,6 @@
     <string name="location_notes_empty_title">заметок пока нет</string>
     <string name="location_notes_error_failed_to_send">не удалось отправить заметку. %s</string>
     <string name="location_notes_error_no_relays">рядом нет георелеев. попробуй позже.</string>
-    <string name="location_notes_header">#%1$s • %2$#@note_count@</string>
     <string name="location_notes_loading_notes">загрузка заметок…</string>
     <string name="location_notes_loading_recent">загрузка свежих заметок…</string>
     <string name="location_notes_no_relays_nearby">рядом нет георелеев</string>

@@ -52,7 +52,6 @@
     <string name="content_accessibility_location_channels">platskanaler</string>
     <string name="content_accessibility_location_notes">platsanteckningar för den här platsen</string>
     <string name="content_accessibility_open_unread">öppna oläst privat chatt</string>
-    <string name="content_accessibility_people_count">%#@people@</string>
     <string name="content_accessibility_private_chat">privat chatt med %s</string>
     <string name="content_accessibility_reachable_mesh">nåbar via mesh</string>
     <string name="content_accessibility_remove_favorite">ta bort från favoriter</string>
@@ -141,7 +140,6 @@
     <string name="location_channels_loading_nearby">söker efter kanaler i närheten…</string>
     <string name="location_channels_mesh_label">mesh</string>
     <string name="location_channels_permission_denied">platsbehörighet nekad. aktivera i inställningar för att använda platskanaler.</string>
-    <string name="location_channels_row_title">%1$s [%2$#@people_count@]</string>
     <string name="location_channels_subtitle_prefix">#%1$s • %2$s</string>
     <string name="location_channels_subtitle_with_name">%1$s • %2$s</string>
     <string name="location_channels_title">#platskanaler</string>
@@ -160,7 +158,6 @@
     <string name="location_notes_empty_title">inga anteckningar än</string>
     <string name="location_notes_error_failed_to_send">kunde inte skicka anteckning. %s</string>
     <string name="location_notes_error_no_relays">inga geo-reläer nära denna plats. försök igen senare.</string>
-    <string name="location_notes_header">#%1$s • %2$#@note_count@</string>
     <string name="location_notes_loading_notes">laddar anteckningar…</string>
     <string name="location_notes_loading_recent">laddar senaste anteckningar…</string>
     <string name="location_notes_no_relays_nearby">inga geo-reläer i närheten</string>

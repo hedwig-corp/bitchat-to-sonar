@@ -52,7 +52,6 @@
     <string name="content_accessibility_location_channels">অবস্থান চ্যানেল</string>
     <string name="content_accessibility_location_notes">এই স্থানের লোকেশন নোট</string>
     <string name="content_accessibility_open_unread">না পড়া ব্যক্তিগত চ্যাট খুলুন</string>
-    <string name="content_accessibility_people_count">%#@people@</string>
     <string name="content_accessibility_private_chat">%s-এর সঙ্গে ব্যক্তিগত চ্যাট</string>
     <string name="content_accessibility_reachable_mesh">মেশের মাধ্যমে পৌঁছানো সম্ভব</string>
     <string name="content_accessibility_remove_favorite">প্রিয় থেকে সরান</string>
@@ -141,7 +140,6 @@
     <string name="location_channels_loading_nearby">কাছাকাছি চ্যানেল খোঁজা হচ্ছে…</string>
     <string name="location_channels_mesh_label">মেশ</string>
     <string name="location_channels_permission_denied">লোকেশন অনুমতি অস্বীকৃত। লোকেশন চ্যানেল ব্যবহার করতে সেটিংসে সক্রিয় করুন।</string>
-    <string name="location_channels_row_title">%1$s [%2$#@people_count@]</string>
     <string name="location_channels_subtitle_prefix">#%1$s • %2$s</string>
     <string name="location_channels_subtitle_with_name">%1$s • %2$s</string>
     <string name="location_channels_title">#লোকেশন চ্যানেল</string>
@@ -160,7 +158,6 @@
     <string name="location_notes_empty_title">এখনও কোনো নোট নেই</string>
     <string name="location_notes_error_failed_to_send">নোট পাঠাতে ব্যর্থ। %s</string>
     <string name="location_notes_error_no_relays">এই স্থানের কাছে কোনো জিও রিলে নেই। কিছুক্ষণ পরে আবার চেষ্টা করুন।</string>
-    <string name="location_notes_header">#%1$s • %2$#@note_count@</string>
     <string name="location_notes_loading_notes">নোট লোড হচ্ছে…</string>
     <string name="location_notes_loading_recent">সাম্প্রতিক নোট লোড হচ্ছে…</string>
     <string name="location_notes_no_relays_nearby">কাছে কোনো জিও রিলে নেই</string>

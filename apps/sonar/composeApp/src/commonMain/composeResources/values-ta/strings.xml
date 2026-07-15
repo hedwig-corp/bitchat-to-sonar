@@ -52,7 +52,6 @@
     <string name="content_accessibility_location_channels">இட சேனல்கள்</string>
     <string name="content_accessibility_location_notes">இந்த இடத்திற்கான குறிப்புகள்</string>
     <string name="content_accessibility_open_unread">படிக்காத தனியுரையாடலைத் திறக்கவும்</string>
-    <string name="content_accessibility_people_count">%#@people@</string>
     <string name="content_accessibility_private_chat">%s உடன் தனியுரையாடல்</string>
     <string name="content_accessibility_reachable_mesh">mesh மூலம் அணுகலாம்</string>
     <string name="content_accessibility_remove_favorite">பிரியப்பட்டதை நீக்கு</string>
@@ -141,7 +140,6 @@
     <string name="location_channels_loading_nearby">அருகிலுள்ள சேனல்கள் தேடப்படுகின்றன…</string>
     <string name="location_channels_mesh_label">mesh</string>
     <string name="location_channels_permission_denied">இட அனுமதி மறுக்கப்பட்டது. இட சேனல்களைப் பயன்படுத்த அமைப்பில் இயக்கவும்.</string>
-    <string name="location_channels_row_title">%1$s [%2$#@people_count@]</string>
     <string name="location_channels_subtitle_prefix">#%1$s • %2$s</string>
     <string name="location_channels_subtitle_with_name">%1$s • %2$s</string>
     <string name="location_channels_title">#இட சேனல்கள்</string>
@@ -160,7 +158,6 @@
     <string name="location_notes_empty_title">இன்னும் குறிப்புகள் இல்லை</string>
     <string name="location_notes_error_failed_to_send">குறிப்பை அனுப்ப முடியவில்லை. %s</string>
     <string name="location_notes_error_no_relays">இந்த இடத்துக்கு அருகில் geo relay இல்லை. கொஞ்சம் நேரம் கழித்து முயற்சி செய்யவும்.</string>
-    <string name="location_notes_header">#%1$s • %2$#@note_count@</string>
     <string name="location_notes_loading_notes">குறிப்புகள் ஏற்றப்படுகின்றன…</string>
     <string name="location_notes_loading_recent">சமீபத்திய குறிப்புகள் ஏற்றப்படுகின்றன…</string>
     <string name="location_notes_no_relays_nearby">அருகில் geo relay இல்லை</string>
