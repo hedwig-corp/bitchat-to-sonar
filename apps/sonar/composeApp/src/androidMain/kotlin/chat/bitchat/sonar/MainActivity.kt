@@ -26,6 +26,9 @@ class MainActivity : ComponentActivity() {
     @Volatile
     private var firstLocalStateReady = false
     private var postFirstDrawStartupScheduled = false
+    private var postFirstDrawStartupReady = false
+    private var activityStarted = false
+    private var onboarded = false
 
     /** Every runtime permission the app needs, requested together so Android
      *  shows them in one sequence (firing three separate launchers in onCreate
@@ -46,16 +49,29 @@ class MainActivity : ComponentActivity() {
 
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
-            // Whatever the user granted, (re)try starting the mesh radio.
-            startMeshRadio()
+            // A permission result may arrive after onStop; the lifecycle policy
+            // keeps the radio off until this Activity is visible again.
+            reconcileMeshRadio()
         }
 
-    private fun startMeshRadio() {
+    private fun reconcileMeshRadio() {
+        val shouldRun = shouldRunAndroidMeshRadio(
+            activityStarted = activityStarted,
+            postFirstDrawStartupReady = postFirstDrawStartupReady,
+            onboarded = onboarded,
+            radioAvailable = MeshRadio.available(),
+        )
+        if (!shouldRun) {
+            setAndroidMeshLifecycleAllowed(false)
+            return
+        }
+
         MeshRadio.setMeshNickname(SonarCore.nickname())
         val pref = SonarCore.loadBlob("pref.$BLE_DISCOVER_NEW_PEOPLE_PREF")
         val discoverNewPeople = pref.isEmpty() || pref == "1"
         val restricted = BatterySaver.enabled() || !discoverNewPeople
         MeshRadio.setDiscoveryMode(if (restricted) BleDiscoveryMode.KnownOnly else BleDiscoveryMode.Normal)
+        setAndroidMeshLifecycleAllowed(true)
         MeshRadio.start()
     }
 
@@ -64,7 +80,8 @@ class MainActivity : ComponentActivity() {
         val missing = requiredPermissions.filter {
             checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED
         }
-        if (missing.isEmpty()) startMeshRadio() else permissionLauncher.launch(missing.toTypedArray())
+        postFirstDrawStartupReady = true
+        if (missing.isEmpty()) reconcileMeshRadio() else permissionLauncher.launch(missing.toTypedArray())
     }
 
     private var unlockCb: ((Boolean) -> Unit)? = null
@@ -117,7 +134,14 @@ class MainActivity : ComponentActivity() {
         ActivityBridge.requestUnlock = { cb -> confirmDeviceCredential(cb) }
         setContent {
             App(
-                onFirstLocalStateReady = { firstLocalStateReady = true },
+                onFirstLocalStateReady = {
+                    firstLocalStateReady = true
+                    reconcileMeshRadio()
+                },
+                onOnboardingStateChanged = {
+                    onboarded = it
+                    reconcileMeshRadio()
+                },
                 stickerBenchmarkRequest = stickerBenchmarkRequest(intent),
             )
         }
@@ -236,8 +260,18 @@ class MainActivity : ComponentActivity() {
         SonarLifecycle.onForeground?.invoke(false)
     }
 
-    override fun onDestroy() {
-        MeshRadio.stop()
-        super.onDestroy()
+    override fun onStart() {
+        super.onStart()
+        activityStarted = true
+        reconcileMeshRadio()
+    }
+
+    override fun onStop() {
+        activityStarted = false
+        // Android background mesh is intentionally unsupported without a
+        // visible connectedDevice foreground service. Internet sync and the
+        // durable outbox remain available while BLE is stopped.
+        setAndroidMeshLifecycleAllowed(false)
+        super.onStop()
     }
 }

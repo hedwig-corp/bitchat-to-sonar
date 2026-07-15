@@ -163,6 +163,7 @@ object SonarLifecycle {
 @Composable
 fun App(
     onFirstLocalStateReady: () -> Unit = {},
+    onOnboardingStateChanged: (Boolean) -> Unit = {},
     stickerBenchmarkRequest: StickerBenchmarkRequest? = null,
 ) {
     val scope = rememberCoroutineScope()
@@ -173,6 +174,7 @@ fun App(
         SonarLifecycle.installSharedTextHandler { state.handleSharedText(it) }
     }
     LaunchedEffect(state.onboarded) {
+        onOnboardingStateChanged(state.onboarded)
         if (state.onboarded) state.boot()
     }
     LaunchedEffect(state, stickerBenchmarkRequest) {

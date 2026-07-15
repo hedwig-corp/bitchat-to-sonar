@@ -20,6 +20,21 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
 /**
+ * Process-wide guard for every Android mesh start path, including policy changes
+ * from common code. Background mesh is not supported without a user-visible
+ * `connectedDevice` foreground service; internet sync/outbox delivery is separate.
+ */
+private object AndroidMeshLifecycleGate {
+    @Volatile var allowed: Boolean = false
+}
+
+internal fun setAndroidMeshLifecycleAllowed(allowed: Boolean) {
+    val wasAllowed = AndroidMeshLifecycleGate.allowed
+    AndroidMeshLifecycleGate.allowed = allowed
+    if (wasAllowed && !allowed) MeshRadio.stop()
+}
+
+/**
  * Android BLE mesh radio: scans for and advertises the bitchat mesh service
  * UUID so nearby Sonar/bitchat phones discover each other. Wire-compatible
  * with the iOS BLEService service UUID.
@@ -136,7 +151,9 @@ actual object MeshRadio {
 
     private fun permitted(): Boolean =
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            hasPerm(Manifest.permission.BLUETOOTH_SCAN) && hasPerm(Manifest.permission.BLUETOOTH_ADVERTISE)
+            hasPerm(Manifest.permission.BLUETOOTH_SCAN) &&
+                hasPerm(Manifest.permission.BLUETOOTH_ADVERTISE) &&
+                hasPerm(Manifest.permission.BLUETOOTH_CONNECT)
         } else {
             hasPerm(Manifest.permission.ACCESS_FINE_LOCATION)
         }
@@ -177,6 +194,10 @@ actual object MeshRadio {
     }
 
     actual fun start() {
+        if (!AndroidMeshLifecycleGate.allowed) {
+            android.util.Log.i(TAG, "start skipped: visible Activity lifecycle is not active")
+            return
+        }
         if (scanning || !available()) {
             android.util.Log.i(TAG, "start skipped: scanning=$scanning available=${available()}")
             return
@@ -189,27 +210,32 @@ actual object MeshRadio {
         val a = adapter() ?: return
         scanning = true
         try {
+            // Bring the GATT callback owner up before scan results can dial.
+            MeshGatt.startServer()
             scanner = a.bluetoothLeScanner
             startScanInternal()
             handler.postDelayed(scanWatchdog, WATCHDOG_TICK_MS)
 
             startAdvertisingInternal(a)
-            MeshGatt.startServer()
             android.util.Log.i(TAG, "scanning + advertising $SERVICE_UUID (advertiser=${advertiser != null})")
         } catch (e: SecurityException) {
-            scanning = false
             android.util.Log.e(TAG, "start failed (permission)", e)
+            stop()
         } catch (e: Throwable) {
-            scanning = false
             android.util.Log.e(TAG, "start failed", e)
+            stop()
         }
     }
 
     actual fun stop() {
         scanning = false
-        handler.removeCallbacks(scanWatchdog)
-        try { scanner?.stopScan(scanCallback) } catch (_: Throwable) {}
-        try { advertiser?.stopAdvertising(advCallback) } catch (_: Throwable) {}
+        // This handler also owns delayed soft-election dials, so cancelling only
+        // the watchdog can reconnect GATT after onStop.
+        handler.removeCallbacksAndMessages(null)
+        val activeScanner = scanner.also { scanner = null }
+        val activeAdvertiser = advertiser.also { advertiser = null }
+        try { activeScanner?.stopScan(scanCallback) } catch (_: Throwable) {}
+        try { activeAdvertiser?.stopAdvertising(advCallback) } catch (_: Throwable) {}
         MeshGatt.stop()
         seen.clear(); lastSeen.clear(); announcedPeers.clear(); announcedSeen.clear()
     }
@@ -391,6 +417,7 @@ actual object MeshRadio {
 
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
+            if (!scanning || !AndroidMeshLifecycleGate.allowed) return
             scanResultCount++
             lastScanCallbackMs = SystemClock.elapsedRealtime()
             val id = result.device.address
@@ -423,7 +450,11 @@ actual object MeshRadio {
                 if (dialNow) {
                     runCatching { MeshGatt.connect(result.device) }
                 } else {
-                    handler.postDelayed({ runCatching { MeshGatt.connect(result.device) } }, FALLBACK_DIAL_MS)
+                    handler.postDelayed({
+                        if (scanning && AndroidMeshLifecycleGate.allowed) {
+                            runCatching { MeshGatt.connect(result.device) }
+                        }
+                    }, FALLBACK_DIAL_MS)
                 }
             } else if (!MeshGatt.isLinkedAddr(id)) {
                 // RE-DIAL a known peer we have NO live link to. The first dial can

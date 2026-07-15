@@ -13,6 +13,30 @@ import kotlin.test.assertTrue
 
 class NearbyDiscoveryPolicyTest {
     @Test
+    fun androidMeshRequiresVisibleStartedActivityAfterFirstDrawAndOnboarding() {
+        assertTrue(
+            shouldRunAndroidMeshRadio(
+                activityStarted = true,
+                postFirstDrawStartupReady = true,
+                onboarded = true,
+                radioAvailable = true,
+            ),
+        )
+    }
+
+    @Test
+    fun androidMeshStopsForEveryLifecycleOrAccountGate() {
+        val allowed = listOf(
+            shouldRunAndroidMeshRadio(false, true, true, true),
+            shouldRunAndroidMeshRadio(true, false, true, true),
+            shouldRunAndroidMeshRadio(true, true, false, true),
+            shouldRunAndroidMeshRadio(true, true, true, false),
+        )
+
+        assertFalse(allowed.any { it })
+    }
+
+    @Test
     fun nearbyScanRequiresVisibleForegroundOnboardedRadarAndOpenDiscovery() {
         assertTrue(shouldScanForNearbyPayments(true, true, true, false))
         assertFalse(shouldScanForNearbyPayments(false, true, true, false))

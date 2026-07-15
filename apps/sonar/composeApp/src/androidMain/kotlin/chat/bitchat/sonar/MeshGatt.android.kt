@@ -119,6 +119,7 @@ object MeshGatt {
     private var server: BluetoothGattServer? = null
     private var characteristic: BluetoothGattCharacteristic? = null
     private val handler = android.os.Handler(android.os.Looper.getMainLooper())
+    @Volatile private var active = false
 
     /** Per-link Noise state (DMs only), keyed by remote BLE address. [startedMs]
      *  is when the current handshake attempt began, so a half-open handshake (m1
@@ -278,6 +279,7 @@ object MeshGatt {
 
     private fun broadcastDiscoveryNow(reason: String) {
         handler.post {
+            if (!active) return@post
             val ann = announceBytes()
             val sonar = sonarBytes()
             android.util.Log.i(
@@ -287,11 +289,11 @@ object MeshGatt {
             clientGatt.forEach { (_, gatt) ->
                 val ch = clientChar[gatt.device.address] ?: return@forEach
                 ann?.let { writePacket(gatt, ch, it) }
-                sonar?.let { p -> handler.postDelayed({ writePacket(gatt, ch, p) }, 150) }
+                sonar?.let { p -> handler.postDelayed({ if (active) writePacket(gatt, ch, p) }, 150) }
             }
             serverDevices.forEach { (_, device) ->
                 ann?.let { notify(device, it) }
-                sonar?.let { p -> handler.postDelayed({ notify(device, p) }, 150) }
+                sonar?.let { p -> handler.postDelayed({ if (active) notify(device, p) }, 150) }
             }
         }
     }
@@ -318,7 +320,9 @@ object MeshGatt {
 
     // ── GATT server (peripheral) ──
 
+    @Synchronized
     fun startServer() {
+        active = true
         if (server != null) return
         android.util.Log.i(TAG, "MY node id = $myPeerIdHex  nickname='$nickname'")
         val mgr = manager() ?: return
@@ -340,7 +344,13 @@ object MeshGatt {
         characteristic = ch
     }
 
+    @Synchronized
     fun stop() {
+        active = false
+        // Cancel pending dials, discovery bursts, and writes before closing the
+        // Binder-backed GATT objects. Otherwise delayed work can recreate traffic
+        // after the Activity has entered the cached/frozen state.
+        handler.removeCallbacksAndMessages(null)
         try { server?.close() } catch (_: Throwable) {}
         server = null; characteristic = null
         clientGatt.values.forEach { runCatching { it.disconnect(); it.close() } }
@@ -349,6 +359,8 @@ object MeshGatt {
         fingerprintByPeerId.clear(); signingKeyByPeerId.clear(); recentDials.clear()
         clearPendingSonar()
         pendingSends.clear()
+        clientWriteQueue.clear(); clientWriting.clear()
+        serverNotifyQueue.clear(); serverNotifying.clear()
         seenFileIds.clear()
     }
 
@@ -397,6 +409,7 @@ object MeshGatt {
 
     private val serverCallback = object : BluetoothGattServerCallback() {
         override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
+            if (!active) return
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 serverDevices[device.address] = device
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
@@ -405,6 +418,7 @@ object MeshGatt {
         }
 
         override fun onNotificationSent(device: BluetoothDevice, status: Int) {
+            if (!active) return
             // Slot free → drain the next queued notify (one outstanding at a time).
             serverNotifying.remove(device.address)
             pumpServerNotify(device.address)
@@ -414,6 +428,7 @@ object MeshGatt {
             device: BluetoothDevice, requestId: Int, descriptor: BluetoothGattDescriptor,
             preparedWrite: Boolean, responseNeeded: Boolean, offset: Int, value: ByteArray,
         ) {
+            if (!active) return
             if (responseNeeded) server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
             // The central just subscribed → send a short discovery burst. iOS only
             // accepts 0x53 after it has verified the base 0x01 announce, and the
@@ -426,6 +441,7 @@ object MeshGatt {
             device: BluetoothDevice, requestId: Int, ch: BluetoothGattCharacteristic,
             preparedWrite: Boolean, responseNeeded: Boolean, offset: Int, value: ByteArray,
         ) {
+            if (!active) return
             if (responseNeeded) server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
             handlePacket(device.address, value, fromServer = true, device = device)
         }
@@ -465,6 +481,7 @@ object MeshGatt {
     /** Connect to a discovered peer to exchange announces (and enable DMs).
      *  Bounded + timed-out so a rotating-MAC advertiser can't churn the radio. */
     fun connect(device: BluetoothDevice) {
+        if (!active) return
         val addr = device.address
         if (clientGatt.containsKey(addr) || clientPending.contains(addr)) return
         val now = System.currentTimeMillis()
@@ -477,7 +494,7 @@ object MeshGatt {
         // callback's binder thread is a classic cause of status 133 (every dial
         // failing immediately). Hop to the main looper.
         handler.post {
-            if (!clientPending.contains(addr)) return@post
+            if (!active || !clientPending.contains(addr)) return@post
             android.util.Log.i(TAG, "dialing $addr (TRANSPORT_LE) [${clientGatt.size}/$MAX_CLIENTS]")
             val gatt = runCatching {
                 device.connectGatt(ctx, false, clientCallback, BluetoothDevice.TRANSPORT_LE)
@@ -488,6 +505,7 @@ object MeshGatt {
         // Fail fast if the connection never ESTABLISHES (rotated-away RPA hangs
         // with no callback) — frees the slot to dial the peer's live address.
         handler.postDelayed({
+            if (!active) return@postDelayed
             if (clientPending.contains(addr) && !clientConnected.contains(addr)) {
                 android.util.Log.i(TAG, "dial $addr not established in ${CONNECT_ESTABLISH_MS}ms — closing")
                 cleanupClient(addr)
@@ -495,6 +513,7 @@ object MeshGatt {
         }, CONNECT_ESTABLISH_MS)
         // For a connection that DID establish, drop it if no announce arrives.
         handler.postDelayed({
+            if (!active) return@postDelayed
             if (clientPending.contains(addr)) {
                 android.util.Log.i(TAG, "dial $addr timed out (no announce) — closing")
                 cleanupClient(addr)
@@ -505,6 +524,10 @@ object MeshGatt {
     private val clientCallback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             val addr = gatt.device.address
+            if (!active) {
+                runCatching { gatt.close() }
+                return
+            }
             android.util.Log.i(TAG, "client $addr: state=$newState status=$status")
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 clientGatt[addr] = gatt
@@ -522,11 +545,13 @@ object MeshGatt {
         }
 
         override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+            if (!active) return
             android.util.Log.i(TAG, "client ${gatt.device.address}: mtu=$mtu status=$status → discoverServices")
             gatt.discoverServices()
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+            if (!active) return
             val svc = gatt.getService(SERVICE)
             val ch = svc?.getCharacteristic(CHAR)
             android.util.Log.i(TAG, "client ${gatt.device.address}: servicesDiscovered status=$status svc=${svc != null} char=${ch != null}")
@@ -536,6 +561,7 @@ object MeshGatt {
             // Subscribe on the MAIN thread (like connectGatt) — GATT ops issued
             // from the discovery callback thread can silently fail to queue.
             handler.post {
+                if (!active) return@post
                 gatt.setCharacteristicNotification(ch, true)
                 val d = ch.getDescriptor(CCC)
                 if (d == null) {
@@ -556,16 +582,18 @@ object MeshGatt {
         }
 
         override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
+            if (!active) return
             // Notifications enabled → send our announce, then (deferred, so the
             // back-to-back GATT writes don't collide) our 0x53.
             val ch = clientChar[gatt.device.address] ?: return
             val ann = announceBytes()
             android.util.Log.i(TAG, "client ${gatt.device.address}: notify enabled (status=$status) → send announce (${ann?.size}B)")
             ann?.let { writePacket(gatt, ch, it) }
-            sonarBytes()?.let { p -> handler.postDelayed({ writePacket(gatt, ch, p) }, 150) }
+            sonarBytes()?.let { p -> handler.postDelayed({ if (active) writePacket(gatt, ch, p) }, 150) }
         }
 
         override fun onCharacteristicWrite(gatt: BluetoothGatt, ch: BluetoothGattCharacteristic, status: Int) {
+            if (!active) return
             // status 0 = GATT_SUCCESS. Either way the slot is now free → drain the
             // next queued write (one outstanding write at a time is the hard limit
             // that was dropping our handshake m1).
@@ -575,11 +603,13 @@ object MeshGatt {
         }
 
         override fun onCharacteristicChanged(gatt: BluetoothGatt, ch: BluetoothGattCharacteristic, value: ByteArray) {
+            if (!active) return
             handlePacket(gatt.device.address, value, fromServer = false, gatt = gatt)
         }
 
         @Deprecated("compat")
         override fun onCharacteristicChanged(gatt: BluetoothGatt, ch: BluetoothGattCharacteristic) {
+            if (!active) return
             @Suppress("DEPRECATION") handlePacket(gatt.device.address, ch.value ?: return, fromServer = false, gatt = gatt)
         }
     }
@@ -1110,7 +1140,9 @@ object MeshGatt {
     private val clientWriteQueue = ConcurrentHashMap<String, java.util.concurrent.ConcurrentLinkedQueue<ByteArray>>()
     private val clientWriting = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
+    @Synchronized
     private fun writePacket(gatt: BluetoothGatt, ch: BluetoothGattCharacteristic, packet: ByteArray) {
+        if (!active) return
         clientWriteQueue.getOrPut(gatt.device.address) { java.util.concurrent.ConcurrentLinkedQueue() }.add(packet)
         pumpClientWrites(gatt.device.address)
     }
@@ -1118,12 +1150,20 @@ object MeshGatt {
     /** Issue the next queued write for [addr] iff none is in flight. */
     @Synchronized
     private fun pumpClientWrites(addr: String) {
+        if (!active) return
         if (clientWriting.contains(addr)) return
         val q = clientWriteQueue[addr] ?: return
         val next = q.poll() ?: return
         val gatt = clientGatt[addr] ?: return
         val ch = clientChar[addr] ?: return
         clientWriting.add(addr)
+        // stop(), enqueue, and both pumps share this object's monitor. Keep this
+        // final lifecycle check next to the Binder call so once stop() returns no
+        // queued write can reach a closed GATT object.
+        if (!active) {
+            clientWriting.remove(addr)
+            return
+        }
         if (!issueWrite(gatt, ch, next)) {
             // The write wasn't accepted ⇒ onCharacteristicWrite won't fire; don't
             // stall the queue — drop it and move on.
@@ -1151,7 +1191,9 @@ object MeshGatt {
     private val serverNotifyQueue = ConcurrentHashMap<String, java.util.concurrent.ConcurrentLinkedQueue<ByteArray>>()
     private val serverNotifying = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
+    @Synchronized
     private fun notify(device: BluetoothDevice, packet: ByteArray) {
+        if (!active) return
         serverNotifyQueue.getOrPut(device.address) { java.util.concurrent.ConcurrentLinkedQueue() }.add(packet)
         pumpServerNotify(device.address)
     }
@@ -1159,6 +1201,7 @@ object MeshGatt {
     private fun notifyDiscoveryBurst(device: BluetoothDevice) {
         listOf(0L, 350L, 1_200L).forEach { delayMs ->
             handler.postDelayed({
+                if (!active) return@postDelayed
                 val ann = announceBytes()
                 val sonar = sonarBytes()
                 android.util.Log.i(
@@ -1166,13 +1209,14 @@ object MeshGatt {
                     "server ${device.address}: discovery notify announce=${ann?.size ?: 0}B sonar=${sonar?.size ?: 0}B delay=${delayMs}ms",
                 )
                 ann?.let { notify(device, it) }
-                sonar?.let { p -> handler.postDelayed({ notify(device, p) }, 150) }
+                sonar?.let { p -> handler.postDelayed({ if (active) notify(device, p) }, 150) }
             }, delayMs)
         }
     }
 
     @Synchronized
     private fun pumpServerNotify(addr: String) {
+        if (!active) return
         if (serverNotifying.contains(addr)) return
         val q = serverNotifyQueue[addr] ?: return
         val next = q.poll() ?: return
@@ -1180,6 +1224,12 @@ object MeshGatt {
         val ch = characteristic ?: return
         val device = serverDevices[addr] ?: return
         serverNotifying.add(addr)
+        // See pumpClientWrites(): this check and the platform notify are atomic
+        // with respect to stop() under the shared object monitor.
+        if (!active) {
+            serverNotifying.remove(addr)
+            return
+        }
         if (!issueNotify(s, device, ch, next)) {
             serverNotifying.remove(addr)
             pumpServerNotify(addr)

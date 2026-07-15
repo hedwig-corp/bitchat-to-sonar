@@ -57,6 +57,18 @@ enum class BleDiscoveryMode {
     KnownOnly,
 }
 
+/**
+ * Android keeps the mesh radio process-local and foreground-only. A background
+ * radio would need a user-visible `connectedDevice` foreground service; without
+ * one, BLE Binder callbacks can keep targeting a cached/frozen process.
+ */
+internal fun shouldRunAndroidMeshRadio(
+    activityStarted: Boolean,
+    postFirstDrawStartupReady: Boolean,
+    onboarded: Boolean,
+    radioAvailable: Boolean,
+): Boolean = activityStarted && postFirstDrawStartupReady && onboarded && radioAvailable
+
 internal enum class BleScanRestartReason(val logValue: String) {
     NoCallbacks("no_callbacks"),
     RepeatingKnownWithoutUsableLink("no_new_address_no_link"),
