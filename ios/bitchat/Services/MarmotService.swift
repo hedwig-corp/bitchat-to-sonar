@@ -288,6 +288,8 @@ final class MarmotService: @unchecked Sendable {
                 return "Not connected yet — try again in a moment."
             case .cancelled:
                 return "Operation cancelled."
+            case .backupAlreadyInProgress:
+                return "Backup already in progress."
             case .invalidInput(let detail):
                 return "Invalid input: \(detail)"
             case .core(let detail):
@@ -365,6 +367,12 @@ final class MarmotService: @unchecked Sendable {
     /// and takes them off the critical path — same reasoning that gave send,
     /// media and drain their own lanes.
     private let publishQueue = DispatchQueue(label: "chat.bitchat.marmot-publish", qos: .utility)
+
+    /// Membership approvals can include a bounded relay fetch plus commit and
+    /// Welcome publication. Keep that network wait off `workQueue` so sync,
+    /// reconnect, and unrelated group operations remain responsive. The Rust
+    /// core's membership gate + MLS write lock preserve mutation ordering.
+    private let membershipQueue = DispatchQueue(label: "chat.bitchat.marmot-membership", qos: .userInitiated)
 
     /// Concurrent queue for read-only FFI calls (groups, messages, summaries).
     /// SQLCipher supports concurrent readers; these never touch MLS state, so
@@ -864,7 +872,9 @@ final class MarmotService: @unchecked Sendable {
 
     /// Approve a pending join request.
     func approveJoinRequest(groupId: String, requesterNpub: String) async throws {
-        try await run { try $0.requireNode().approveJoinRequest(groupIdHex: groupId, requesterNpub: requesterNpub) }
+        try await membershipLane {
+            try $0.approveJoinRequest(groupIdHex: groupId, requesterNpub: requesterNpub)
+        }
     }
 
     /// Decline a pending join request.
@@ -2257,6 +2267,12 @@ final class MarmotService: @unchecked Sendable {
     /// (#265).
     private func publishLane<T: Sendable>(_ body: @escaping @Sendable (SonarNode) throws -> T) async throws -> T {
         try await leasedNodeOperation(on: publishQueue, body)
+    }
+
+    /// MLS membership changes on their own lifecycle-safe lane. The Rust core
+    /// serializes these against sends and competing membership commits.
+    private func membershipLane<T: Sendable>(_ body: @escaping @Sendable (SonarNode) throws -> T) async throws -> T {
+        try await leasedNodeOperation(on: membershipQueue, body)
     }
 
     private func readOnlyNonThrowing<T: Sendable>(_ body: @escaping @Sendable (SonarNode) -> T, default defaultValue: T) async -> T {

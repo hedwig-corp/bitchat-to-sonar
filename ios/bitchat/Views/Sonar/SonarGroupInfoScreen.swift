@@ -22,6 +22,7 @@ struct SonarGroupInfoScreen: View {
     @State private var inviteLink: String? = nil
     @State private var creatingInviteLink = false
     @State private var pendingJoinRequests: [JoinRequestInfo] = []
+    @State private var approvingJoinRequests: Set<String> = []
     @State private var toast: String? = nil
 
     private var peer: SNPeerItem { store.peerItem(peerId) }
@@ -117,6 +118,7 @@ struct SonarGroupInfoScreen: View {
                                 PendingJoinRequestRow(
                                     request: request,
                                     divider: index < pendingJoinRequests.count - 1,
+                                    isApproving: approvingJoinRequests.contains(request.requesterNpub),
                                     approve: { approveJoinRequest(request) },
                                     decline: { declineJoinRequest(request) }
                                 )
@@ -347,7 +349,9 @@ struct SonarGroupInfoScreen: View {
 
     private func approveJoinRequest(_ request: JoinRequestInfo) {
         guard let groupId = store.marmotGroupId(peerId) else { return }
+        guard approvingJoinRequests.insert(request.requesterNpub).inserted else { return }
         Task { @MainActor in
+            defer { approvingJoinRequests.remove(request.requesterNpub) }
             do {
                 try await store.marmot.approveJoinRequest(groupId: groupId, requesterNpub: request.requesterNpub)
                 pendingJoinRequests.removeAll { $0.requesterNpub == request.requesterNpub }
@@ -376,6 +380,7 @@ struct SonarGroupInfoScreen: View {
 private struct PendingJoinRequestRow: View {
     let request: JoinRequestInfo
     let divider: Bool
+    let isApproving: Bool
     let approve: () -> Void
     let decline: () -> Void
 
@@ -403,7 +408,14 @@ private struct PendingJoinRequestRow: View {
 
                 HStack(spacing: 8) {
                     SNSmallButton(label: "Decline", expand: false, action: decline)
-                    SNSmallButton(label: "Approve", primary: true, expand: false, action: approve)
+                        .disabled(isApproving)
+                    SNSmallButton(
+                        label: isApproving ? "Approving…" : "Approve",
+                        primary: true,
+                        expand: false,
+                        action: approve
+                    )
+                    .disabled(isApproving)
                 }
             }
             .padding(EdgeInsets(top: 9, leading: 14, bottom: 9, trailing: 14))

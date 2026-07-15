@@ -2568,6 +2568,23 @@ impl SonarClient {
             .ok_or(Error::KeyPackageNotFound(author))
     }
 
+    /// Fetch the exact KeyPackage advertised by a join request. Invite joins
+    /// publish a fresh package immediately before the request, so using its
+    /// event id avoids a broad author lookup and cannot accidentally select a
+    /// newer stale/invalid package from another device slot.
+    async fn fetch_key_package_by_id(&self, author: PublicKey, event_id: EventId) -> Result<Event> {
+        let filter = Filter::new()
+            .id(event_id)
+            .kind(Kind::Custom(KEY_PACKAGE_KIND))
+            .author(author)
+            .limit(1);
+        let events = self.nostr.fetch_events(filter, FETCH_TIMEOUT).await?;
+        events
+            .into_iter()
+            .find(|event| event.id == event_id && event.pubkey == author)
+            .ok_or(Error::KeyPackageNotFound(author))
+    }
+
     /// Publish our kind-0 profile (NIP-01 metadata) so peers can resolve our
     /// display name + avatar. `name` is used for both `name` and `display_name`;
     /// `about`/`picture` are optional (a bad picture URL is dropped, not fatal).
@@ -3202,15 +3219,21 @@ impl SonarClient {
         group_id: &GroupId,
         requester: &PublicKey,
     ) -> Result<()> {
-        if !self
+        let request = self
             .invite_links
             .pending_join_requests(group_id)
-            .iter()
-            .any(|r| r.requester == *requester)
-        {
-            return Err(Error::InvalidInput("no pending join request".into()));
-        }
-        self.add_group_members(group_id, vec![*requester]).await?;
+            .into_iter()
+            .find(|request| request.requester == *requester)
+            .ok_or_else(|| Error::InvalidInput("no pending join request".into()))?;
+        let key_package = match request.key_package_event_id {
+            Some(event_id) => self.fetch_key_package_by_id(*requester, event_id).await?,
+            // Backward compatibility for requests created before the event id
+            // was added to the invite payload.
+            None => self.fetch_key_package(*requester).await?,
+        };
+        let _epoch = self.membership_gate.write().await;
+        let update = self.engine.add_members(group_id, vec![key_package])?;
+        self.publish_membership_update(update).await?;
         self.invite_links.remove_join_request(group_id, requester)?;
         Ok(())
     }

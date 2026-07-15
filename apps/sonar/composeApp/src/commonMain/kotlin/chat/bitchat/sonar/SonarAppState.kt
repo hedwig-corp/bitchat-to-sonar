@@ -9894,9 +9894,15 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
-    fun approveJoinRequest(chatId: String, requesterNpub: String, onDone: () -> Unit = {}) {
+    fun approveJoinRequest(
+        chatId: String,
+        requesterNpub: String,
+        onDone: () -> Unit = {},
+        onComplete: () -> Unit = {},
+    ) {
         if (!canManageGroup(chatId)) {
             toast = "Group is still setting up."
+            onComplete()
             return
         }
         scope.launch {
@@ -9907,6 +9913,8 @@ class SonarAppState(private val scope: CoroutineScope) {
                 onDone()
             } catch (e: Throwable) {
                 toast = "couldn't approve: ${e.message}"
+            } finally {
+                onComplete()
             }
         }
     }
