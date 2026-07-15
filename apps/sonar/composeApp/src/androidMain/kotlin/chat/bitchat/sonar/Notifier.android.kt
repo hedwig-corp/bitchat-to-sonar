@@ -59,6 +59,10 @@ actual object Notifier {
         chat.bitchat.sonar.push.SonarPushRegistration.ensureBreezWebhook(offer)
     }
 
+    actual suspend fun prepareForAccountReplacement() {
+        chat.bitchat.sonar.push.SonarPushRegistration.prepareForAccountReplacement()
+    }
+
     actual fun setPushEnabled(enabled: Boolean) {
         if (enabled) {
             chat.bitchat.sonar.push.SonarPushRegistration.ensureRegistered()

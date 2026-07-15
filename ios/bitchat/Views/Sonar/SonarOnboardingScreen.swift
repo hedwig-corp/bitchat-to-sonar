@@ -373,7 +373,8 @@ struct SonarOnboardingScreen: View {
                 try await store.restoreAccount(nsec: key)
                 // store.restoreAccount flips `onboarded`; the root view swaps to home.
             } catch {
-                restoreError = "That key couldn\u{2019}t be imported. Check you pasted the full nsec1\u{2026} key."
+                restoreError = (error as? SonarAccountRestoreError)?.localizedDescription
+                    ?? "That key couldn\u{2019}t be imported. Check you pasted the full nsec1\u{2026} key."
                 restoreInFlight = false
             }
         }

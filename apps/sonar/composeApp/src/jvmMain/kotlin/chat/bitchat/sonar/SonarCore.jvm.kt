@@ -89,9 +89,11 @@ actual object SonarCore {
             installCoreLogging(diagnosticsVerbose())
 
             val connected = SonarNode.connect(identity, relayUrls, dbPath, dbKeyHex)
+            val previousNode = node
             node = connected
             relayConnected = true
             installConversationListener()
+            previousNode?.close()
             runCatching { connected.retryOutbox() }
             runCatching { connected.publishKeyPackageBackground() }
             npub
@@ -697,6 +699,11 @@ actual object SonarCore {
         }
     }
 
+    actual suspend fun validateIdentity(nsec: String): String = withContext(Dispatchers.IO) {
+        SonarNativeLoader.ensureLoaded()
+        SonarIdentity.import(nsec.trim()).npub()
+    }
+
     actual suspend fun importIdentity(nsec: String): String = withContext(Dispatchers.IO) {
         SonarNativeLoader.ensureLoaded()
         val identity = SonarIdentity.import(nsec.trim())
@@ -705,8 +712,7 @@ actual object SonarCore {
                 val previousIdentity = DesktopSecrets
                     .get("nsec")
                     ?.let { saved -> runCatching { SonarIdentity.import(saved) }.getOrNull() }
-                node = null
-                relayConnected = false
+                closeNode()
                 val marmotDir = marmotDir()
                 try {
                     wipeMarmotStorage(marmotDir)
@@ -753,8 +759,7 @@ actual object SonarCore {
     actual suspend fun wipe() = withContext(Dispatchers.IO) {
         lock.withLock {
             stickerOperationLock.write {
-                node = null
-                relayConnected = false
+                closeNode()
                 npub = ""; pubkeyHex = ""
                 // marmotDir() covers the DB + diagnostics logs (sonar-marmot/logs);
                 // the exported diagnostics zips live in a sibling dir, so drop them
@@ -775,8 +780,7 @@ actual object SonarCore {
         withContext(Dispatchers.IO) {
             lock.withLock {
                 stickerOperationLock.write {
-                    node = null
-                    relayConnected = false
+                    closeNode()
                     // Delete ONLY the encrypted Marmot DB — keep nsec, DB key,
                     // nickname and prefs. start() reopens a fresh empty DB with the
                     // SAME identity + key.
@@ -796,6 +800,14 @@ actual object SonarCore {
 
     private fun requireNode(): SonarNode =
         node ?: error("SonarCore not started — call start() first")
+
+    /** Release the UniFFI/Rust owner before deleting or replacing its SQLite store. */
+    private fun closeNode() {
+        val previousNode = node
+        node = null
+        relayConnected = false
+        previousNode?.close()
+    }
 
     /** Reopen the previous account locally when a fallible identity wipe fails. */
     private fun connectLocalIdentity(identity: SonarIdentity): SonarNode {

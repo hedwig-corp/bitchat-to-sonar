@@ -476,7 +476,8 @@ struct SNRestoreAccountSheetContent: View {
                 try await store.restoreAccount(nsec: key)
                 onClose()
             } catch {
-                errorText = "That key couldn\u{2019}t be imported. Check you pasted the full nsec1\u{2026} key."
+                errorText = (error as? SonarAccountRestoreError)?.localizedDescription
+                    ?? "That key couldn\u{2019}t be imported. Check you pasted the full nsec1\u{2026} key."
                 inFlight = false
             }
         }

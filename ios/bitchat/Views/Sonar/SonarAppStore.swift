@@ -524,6 +524,20 @@ struct SNVerifyInfo {
 
 // MARK: - Store
 
+enum SonarAccountRestoreError: LocalizedError {
+    case walletCleanupFailed
+    case accountReplacementFailed
+
+    var errorDescription: String? {
+        switch self {
+        case .walletCleanupFailed:
+            return "Wallet storage couldn't be cleared. Restart Sonar and try again."
+        case .accountReplacementFailed:
+            return "Account storage couldn't be replaced. Restart Sonar and try again."
+        }
+    }
+}
+
 @MainActor
 final class SonarAppStore: ObservableObject {
     private enum Keys {
@@ -1464,18 +1478,104 @@ final class SonarAppStore: ObservableObject {
     /// wipe any prior wallet on this device, rebuild the Lightning wallet from
     /// the restored nsec, then finish onboarding. Throws on an invalid key.
     func restoreAccount(nsec: String) async throws {
-        try await marmot.restoreIdentity(nsec: nsec)
+        let key = nsec.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Validate before any destructive work. An invalid paste must leave the
+        // current identity, chats, wallet, and push registrations untouched.
+        _ = try SonarIdentity.import(nsec: key)
+
         #if os(iOS) || os(macOS)
-        if let bridged = wallet as? BridgedWallet {
-            await bridged.rebuildFromIdentity()
-        } else {
-            BridgedWallet.wipeWalletStorage()
+        let bridged = wallet as? BridgedWallet
+        #if os(iOS)
+        await SonarPushRegistration.shared.prepareForAccountReplacement(wallet: bridged?.walletService)
+        #endif
+        do {
+            if let bridged {
+                try await bridged.prepareForIdentityReplacement()
+            } else {
+                try BridgedWallet.beginWalletStorageMutation()
+                try BridgedWallet.wipeWalletStorage()
+            }
+        } catch {
+            throw SonarAccountRestoreError.walletCleanupFailed
         }
+        #endif
+
+        // Clear host-owned local-first caches before committing the new nsec. A
+        // crash after identity import must never paint the previous account's
+        // mesh chats, contacts, payment rows, media, or wallet offer.
+        clearAccountBoundLocalStateForRestore()
+        do {
+            try await marmot.restoreIdentity(nsec: key)
+        } catch {
+            #if os(iOS) || os(macOS)
+            bridged?.retrySetup()
+            #endif
+            throw SonarAccountRestoreError.accountReplacementFailed
+        }
+        #if os(iOS) || os(macOS)
+        bridged?.retrySetup()
         #endif
         onboarded = true
         defaults.set(true, forKey: Keys.onboarded)
         path = []
         toast = "Account restored"
+    }
+
+    private func clearAccountBoundLocalStateForRestore() {
+        path = []
+        chatViewModel.clearAllConversations()
+        openingDMTasks.values.forEach { $0.cancel() }
+        openingDMTasks = [:]
+        refreshingDMTasks.values.forEach { $0.cancel() }
+        refreshingDMTasks = [:]
+        pendingMarmotSends = [:]
+        pendingMarmotChats = [:]
+        pendingMarmotGroups = [:]
+        pendingMarmotMessagesByChat = [:]
+        pendingMarmotRouteReplacement = nil
+        pendingMarmotRouteFailure = nil
+        pendingDirectMarmotSends = [:]
+        pendingMarmotGroupSends = [:]
+        cancelPendingSecureChatSetups()
+        cancelPendingMarmotGroupSetups()
+        localHydratingDMs = []
+        clearMarmotConversationGroups()
+        marmot.groups = []
+        marmot.messagesByGroup = [:]
+
+        marmotVerified = [:]
+        defaults.removeObject(forKey: Keys.marmotVerified)
+        defaults.removeObject(forKey: Keys.bleKnownChatKeys)
+        sonarProfiles = [:]
+        sonarProfilesByFingerprint = [:]
+        meshPeerFirstSeenAt = [:]
+        pendingCapabilityRefreshKeys = []
+        defaults.removeObject(forKey: Keys.sonarProfiles)
+        applyBLEDiscoveryPolicy()
+
+        unify.stop()
+        unifyReceiver.stop()
+        incomingWalletTask?.cancel()
+        incomingWalletTask = nil
+        publishedBolt12Offer = nil
+        publishedCallDescriptor = false
+        publishingPaymentMetadata = false
+        needsPaymentMetadataPublish = false
+        refreshedKnownDescriptorsForRelaySession = false
+
+        scannedPayMessageIDs = []
+        pendingPayPeer = nil
+        payLedger.wipe()
+        paymentActivityLedger.wipe()
+        cancelAllMediaDownloads()
+        mediaImageCache = [:]
+        pendingUploadMediaCache = [:]
+        clearMediaDiskCache()
+        clearCallLogs()
+        resetCallState()
+        bip353 = ""
+        defaults.removeObject(forKey: Keys.bip353)
+        objectWillChange.send()
     }
 
     /// Start Unify scanning while the Nearby/radar screen is visible; stop it
@@ -6449,7 +6549,29 @@ final class SonarAppStore: ObservableObject {
     // MARK: Emergency wipe (the real panic path)
 
     func wipe() {
+        Task { @MainActor [weak self] in
+            await self?.performWipe()
+        }
+    }
+
+    private func performWipe() async {
         path = []
+        // The Breez node must release its SQLite store before wallet files are
+        // deleted. Await this before revealing onboarding so a fast re-onboard
+        // cannot race a still-running destructive wallet task.
+        var walletWipeComplete = true
+        #if os(iOS) || os(macOS)
+        if let bridged = wallet as? BridgedWallet {
+            walletWipeComplete = await bridged.wipeForEmergency()
+        } else {
+            do {
+                try BridgedWallet.beginWalletStorageMutation()
+                try BridgedWallet.wipeWalletStorage()
+            } catch {
+                walletWipeComplete = false
+            }
+        }
+        #endif
         marmot.stopPolling()
         // Wipes Noise/Nostr keys, all keychain data (incl. marmot-nsec),
         // messages, favorites, verified fingerprints and the nickname.
@@ -6511,12 +6633,8 @@ final class SonarAppStore: ObservableObject {
         pendingMarmotGroupSends = [:]
         cancelPendingSecureChatSetups()
         cancelPendingMarmotGroupSetups()
-        // Forget every ⚡PAY coin and the Lightning wallet seed (separate
-        // keychain service owned by SonarWalletKit).
-        #if os(iOS) || os(macOS)
-        (wallet as? BridgedWallet)?.clearCachedReceiveOffer()
-        BridgedWallet.wipeWalletStorage()
-        #endif
+        // Wallet seed and Breez state were shut down and removed at the start
+        // of this async wipe, before any new onboarding can begin.
         payLedger.wipe()
         paymentActivityLedger.wipe()
         cancelAllMediaDownloads()
@@ -6531,6 +6649,9 @@ final class SonarAppStore: ObservableObject {
         defaults.removeObject(forKey: Keys.bip353)
         onboarded = false
         defaults.set(false, forKey: Keys.onboarded)
+        if !walletWipeComplete {
+            toast = "Wallet cleanup is incomplete. Restart Sonar before creating or restoring an account."
+        }
     }
 
     // MARK: Time formatting

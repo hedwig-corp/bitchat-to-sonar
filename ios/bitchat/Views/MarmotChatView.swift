@@ -536,6 +536,12 @@ final class MarmotChatModel: ObservableObject {
         // Validate without mutating the live service. A failed import must leave
         // the currently connected identity and its local database untouched.
         _ = try SonarIdentity.import(nsec: nsec)
+        // Retain the previous account key only in memory until the replacement
+        // local database is open. If that final commit step fails, restore the
+        // old identity instead of returning an error with a half-switched account.
+        let previousNsec = await service.exportNsec()
+            ?? keychain.getIdentityKey(forKey: Self.nsecKeychainKey)
+                .flatMap { String(data: $0, encoding: .utf8) }
         // Block connectIfNeeded while the old node, database, and identity-bound
         // caches are invalidated and the replacement identity is connected.
         busy = true
@@ -563,7 +569,35 @@ final class MarmotChatModel: ObservableObject {
         // Drive the full local-first connect sequence directly; performConnect
         // reads the nsec persisted above and opens a fresh encrypted database.
         guard await performConnect() else {
-            throw MarmotService.ServiceError.core(errorText ?? "failed to connect restored identity")
+            let replacementError = errorText ?? "failed to connect restored identity"
+            // A failed local open may have installed the replacement identity in
+            // memory or left a partial SQLite store. Tear it down before restoring
+            // the prior key so callers never observe an account/key mismatch.
+            do {
+                try await prepareForIdentityReplacement {
+                    try await service.wipeDatabase()
+                }
+            } catch {
+                throw MarmotService.ServiceError.core(
+                    "\(replacementError); failed to roll back replacement storage"
+                )
+            }
+            let keyRestored: Bool
+            if let previousNsec {
+                keyRestored = keychain.saveIdentityKey(
+                    Data(previousNsec.utf8),
+                    forKey: Self.nsecKeychainKey
+                )
+            } else {
+                keyRestored = keychain.deleteIdentityKey(forKey: Self.nsecKeychainKey)
+            }
+            guard keyRestored else {
+                throw MarmotService.ServiceError.core(
+                    "\(replacementError); failed to restore the previous account key"
+                )
+            }
+            _ = await performConnect()
+            throw MarmotService.ServiceError.core(replacementError)
         }
     }
 

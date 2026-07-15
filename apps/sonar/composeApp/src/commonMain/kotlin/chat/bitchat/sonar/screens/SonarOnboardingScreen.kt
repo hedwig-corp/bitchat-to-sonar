@@ -41,6 +41,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import chat.bitchat.sonar.SonarAccountRestoreException
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.ui.SNFingerprintCard
 import chat.bitchat.sonar.ui.SNGhostButton
@@ -128,8 +129,9 @@ fun SonarOnboardingScreen(state: SonarAppState) {
                     restoreError = null
                     state.restoreAccount(key) { result ->
                         restoreInFlight = false
-                        result.exceptionOrNull()?.let {
-                            restoreError = "That key couldn't be imported. Check you pasted the full nsec1... key."
+                        result.exceptionOrNull()?.let { failure ->
+                            restoreError = (failure as? SonarAccountRestoreException)?.message
+                                ?: "Account restore failed. Restart Sonar and try again."
                         }
                     }
                 }
@@ -141,24 +143,31 @@ fun SonarOnboardingScreen(state: SonarAppState) {
             } else {
                 when (step) {
                     0 -> {
-                        SNPrimaryButton("Get started") { step = 1 }
-                        Spacer(Modifier.height(8.dp))
-                        Box(
-                            Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(s.accentSoft)
-                                .clickable {
-                                    nsec = ""
-                                    restoreError = null
-                                    restoring = true
-                                }
-                                .padding(vertical = 14.dp),
-                            contentAlignment = Alignment.Center,
+                        // Keep both first-run paths in one bounded row. A stacked
+                        // secondary action was clipped below the viewport on the
+                        // API 36 medium-phone layout, making restore undiscoverable.
+                        Row(
+                            Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
                         ) {
-                            Text(
-                                "Restore account with private key",
-                                color = s.accentDeep,
-                                fontSize = 16.sp,
-                                fontWeight = FontWeight.Bold,
-                            )
+                            SNPrimaryButton("Get started", Modifier.weight(1f)) { step = 1 }
+                            Box(
+                                Modifier.weight(1f).height(52.dp)
+                                    .clip(RoundedCornerShape(15.dp)).background(s.accentSoft)
+                                    .clickable {
+                                        nsec = ""
+                                        restoreError = null
+                                        restoring = true
+                                    },
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Text(
+                                    "Restore account",
+                                    color = s.accentDeep,
+                                    fontSize = 15.sp,
+                                    fontWeight = FontWeight.Bold,
+                                )
+                            }
                         }
                     }
                     1 -> SNPrimaryButton("Continue", disabled = !can) { if (can) step = 2 }

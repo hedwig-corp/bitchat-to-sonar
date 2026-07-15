@@ -46,6 +46,7 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import chat.bitchat.sonar.Screen
+import chat.bitchat.sonar.SonarAccountRestoreException
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.SonarClock
 import chat.bitchat.sonar.SonarCore
@@ -549,8 +550,9 @@ private fun RestoreAccountSheet(state: SonarAppState, onClose: () -> Unit) {
                 error = null
                 state.restoreAccount(nsec.trim()) { result ->
                     inFlight = false
-                    result.exceptionOrNull()?.let {
-                        error = "That key couldn't be imported. Check you pasted the full nsec1... key."
+                    result.exceptionOrNull()?.let { failure ->
+                        error = (failure as? SonarAccountRestoreException)?.message
+                            ?: "Account restore failed. Restart Sonar and try again."
                     } ?: onClose()
                 }
             }

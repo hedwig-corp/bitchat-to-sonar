@@ -31,12 +31,15 @@ public final class KeychainWalletStorage {
     }
 
     public func putString(_ key: String, _ value: String) {
-        write(key, Data(value.utf8))
+        _ = write(key, Data(value.utf8))
     }
 
     public func getData(_ key: String) -> Data? { read(key) }
 
-    public func putData(_ key: String, _ value: Data) { write(key, value) }
+    /// Returns false when Keychain persistence fails. Wallet seed creation must
+    /// never report success unless this durable write actually landed.
+    @discardableResult
+    public func putData(_ key: String, _ value: Data) -> Bool { write(key, value) }
 
     public func remove(_ key: String) {
         SecItemDelete(query(key) as CFDictionary)
@@ -76,7 +79,7 @@ public final class KeychainWalletStorage {
         return result as? Data
     }
 
-    private func write(_ key: String, _ data: Data) {
+    private func write(_ key: String, _ data: Data) -> Bool {
         let attrs: [String: Any] = [
             kSecValueData as String: data,
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
@@ -85,8 +88,9 @@ public final class KeychainWalletStorage {
         attrs.forEach { add[$0] = $1 }
         let status = SecItemAdd(add as CFDictionary, nil)
         if status == errSecDuplicateItem {
-            SecItemUpdate(query(key) as CFDictionary, attrs as CFDictionary)
+            return SecItemUpdate(query(key) as CFDictionary, attrs as CFDictionary) == errSecSuccess
         }
+        return status == errSecSuccess
     }
 }
 

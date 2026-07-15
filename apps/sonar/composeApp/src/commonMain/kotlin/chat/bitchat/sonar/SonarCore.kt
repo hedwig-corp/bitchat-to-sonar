@@ -689,6 +689,9 @@ expect object SonarCore {
     /** Ensure the local account key exists before first-run onboarding completes. */
     suspend fun prepareIdentityForOnboarding(): String
 
+    /** Validate an identity without mutating the active account or local storage. */
+    suspend fun validateIdentity(nsec: String): String
+
     /** Validate and persist an existing identity. Returns the restored npub. */
     suspend fun importIdentity(nsec: String): String
 
