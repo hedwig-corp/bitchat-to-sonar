@@ -13,6 +13,11 @@ import SwiftUI
 
 extension ChatViewModel {
 
+    nonisolated static func shouldSendGenericPrivateMessageNotification(for content: String) -> Bool {
+        SonarPayMessage.decode(content) == nil
+            && !content.drop(while: \.isWhitespace).hasPrefix("☎CALL")
+    }
+
     // MARK: - Private Chat Sending
 
     /// Sends an encrypted private message to a specific peer.
@@ -255,7 +260,9 @@ extension ChatViewModel {
         }
         
         // Notify for truly unread and recent messages when not viewing
-        if !isViewing && shouldMarkUnread {
+        if !isViewing,
+           shouldMarkUnread,
+           Self.shouldSendGenericPrivateMessageNotification(for: pm.content) {
             NotificationService.shared.sendPrivateMessageNotification(
                 from: senderName,
                 message: pm.content,
@@ -889,10 +896,7 @@ extension ChatViewModel {
             // Notify — skip ☎CALL / ⚡PAY control lines; SonarAppStore owns those
             // specialized alerts so we don't double-fire BLE sounds.
             unreadPrivateMessages.insert(peerID)
-            let isSpecializedControl =
-                SonarPayMessage.decode(message.content) != nil
-                || message.content.drop(while: \.isWhitespace).hasPrefix("☎CALL")
-            if !isSpecializedControl {
+            if Self.shouldSendGenericPrivateMessageNotification(for: message.content) {
                 let notifBody = meshParseStickerContent(content: message.content) != nil
                     ? "Sticker" : message.content
                 NotificationService.shared.sendPrivateMessageNotification(
@@ -990,7 +994,8 @@ extension ChatViewModel {
            ephemeralPeerID != targetPeerID {
             unreadPrivateMessages.insert(ephemeralPeerID)
         }
-        if isRecentMessage {
+        if isRecentMessage,
+           Self.shouldSendGenericPrivateMessageNotification(for: messageContent) {
             NotificationService.shared.sendPrivateMessageNotification(
                 from: senderNickname,
                 message: messageContent,
