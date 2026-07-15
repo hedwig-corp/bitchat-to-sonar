@@ -650,6 +650,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             cancelPendingMarmotSetups()
             cancelPendingMarmotGroupSetups()
             WalletBridge.shutdown()
+            WalletBridge.wipeLocalStorage()
             UnifyRadio.stopScanning()
             UnifyRadio.stopAdvertising()
             unifyOffer = null; unifyPeers = emptyList()
@@ -2662,6 +2663,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 val restoredNpub = SonarCore.importIdentity(nsec)
 
                 WalletBridge.shutdown()
+                WalletBridge.wipeLocalStorage()
                 UnifyRadio.stopScanning()
                 UnifyRadio.stopAdvertising()
                 unifyOffer = null; unifyPeers = emptyList()
@@ -2707,9 +2709,10 @@ class SonarAppState(private val scope: CoroutineScope) {
                 onboarded = true
                 nick = SonarCore.nickname()
                 stack = listOf(Screen.Home)
-                walletState = WalletBridge.state()
+                walletState = WalletState.NotConfigured
                 refreshMeshIdentity()
                 boot()
+                toast = "Account restored"
             }
             onResult(result.map { Unit })
         }

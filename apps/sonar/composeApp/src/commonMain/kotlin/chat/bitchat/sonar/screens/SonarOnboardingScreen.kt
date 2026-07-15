@@ -142,10 +142,23 @@ fun SonarOnboardingScreen(state: SonarAppState) {
                 when (step) {
                     0 -> {
                         SNPrimaryButton("Get started") { step = 1 }
-                        SNGhostButton("I already have a key") {
-                            nsec = ""
-                            restoreError = null
-                            restoring = true
+                        Spacer(Modifier.height(8.dp))
+                        Box(
+                            Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(s.accentSoft)
+                                .clickable {
+                                    nsec = ""
+                                    restoreError = null
+                                    restoring = true
+                                }
+                                .padding(vertical = 14.dp),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text(
+                                "Restore account with private key",
+                                color = s.accentDeep,
+                                fontSize = 16.sp,
+                                fontWeight = FontWeight.Bold,
+                            )
                         }
                     }
                     1 -> SNPrimaryButton("Continue", disabled = !can) { if (can) step = 2 }
@@ -253,7 +266,10 @@ private fun StepRestore(
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.Center) {
         Text("Restore account", color = s.text, fontSize = 30.sp, fontWeight = FontWeight.Black)
         Spacer(Modifier.height(10.dp))
-        Text("Paste your nsec private key to bring this Sonar identity and wallet onto this device.", color = s.text2, fontSize = 16.sp, lineHeight = 21.sp)
+        Text(
+            "Paste your nsec private key. This restores your Sonar identity and Lightning wallet. Chat history on this device starts fresh until backup ships.",
+            color = s.text2, fontSize = 16.sp, lineHeight = 21.sp,
+        )
         Spacer(Modifier.height(22.dp))
         Box(
             Modifier.fillMaxWidth().heightIn(min = 116.dp).clip(RoundedCornerShape(16.dp)).background(s.surface2)

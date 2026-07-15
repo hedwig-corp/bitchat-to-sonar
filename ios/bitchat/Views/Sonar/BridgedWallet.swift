@@ -98,6 +98,17 @@ final class BridgedWallet: SonarWalletProviding {
         Task { try? await bridge.setupIfNeeded() }
     }
 
+    /// Account restore / identity replacement: drop any prior wallet seed and
+    /// Breez working dir, then create the deterministic wallet from the
+    /// (already persisted) restored nsec. Always wipe — never reopen a stale
+    /// Keychain wallet that belonged to a previous identity on this device.
+    func rebuildFromIdentity() async {
+        clearCachedReceiveOffer()
+        await bridge.shutdown()
+        Self.wipeWalletStorage()
+        try? await bridge.setupIfNeeded()
+    }
+
     private static func map(_ state: WalletBridgeService.State) -> SonarWalletState {
         switch state {
         case .notConfigured: return .notConfigured
@@ -181,15 +192,30 @@ final class BridgedWallet: SonarWalletProviding {
             .eraseToAnyPublisher()
     }
 
-    /// Emergency wipe: forget the wallet seed along with everything else.
-    /// (The keychain service is owned by SonarWalletKit's storage.) The seed
-    /// stays reconstructable from the nsec — until that is wiped too.
+    /// Emergency wipe / identity restore: forget the wallet seed and on-disk
+    /// Breez state. (Keychain service is owned by SonarWalletKit's storage.)
+    /// The seed stays reconstructable from the nsec — until that is wiped too.
     static func wipeWalletStorage() {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: "chat.bitchat.sonar.wallet",
         ]
         SecItemDelete(query as CFDictionary)
+
+        let fm = FileManager.default
+        if let group = fm.containerURL(forSecurityApplicationGroupIdentifier: "group.sh.hedwig.sonar") {
+            let breez = group.appendingPathComponent("breez-sdk", isDirectory: true)
+            try? fm.removeItem(at: breez)
+        }
+        if let support = try? fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false) {
+            try? fm.removeItem(at: support.appendingPathComponent("sonar-wallet", isDirectory: true))
+        }
+        // NSE / App Group mirrored connect creds (seed hex) must not outlive wipe.
+        if let defaults = UserDefaults(suiteName: "group.sh.hedwig.sonar") {
+            defaults.removeObject(forKey: "breez_api_key")
+            defaults.removeObject(forKey: "breez_seed_hex")
+            defaults.removeObject(forKey: "breez_mainnet")
+        }
     }
 }
 

@@ -28,6 +28,7 @@ struct SonarSettingsScreen: View {
     @State private var walletSheet = false
     @State private var currencySheet = false
     @State private var exportKeySheet = false
+    @State private var restoreKeySheet = false
     @State private var diagnosticsSheet = false
 
     var body: some View {
@@ -138,9 +139,15 @@ struct SonarSettingsScreen: View {
                         }
                         SNSettingsRow(
                             icon: .importKey, tone: .cyan, label: "Export private key",
-                            sub: "Move your account to another wallet"
+                            sub: "Back up your nsec — needed to restore on another phone"
                         ) {
                             exportKeySheet = true
+                        }
+                        SNSettingsRow(
+                            icon: .importKey, tone: .cyan, label: "Restore account",
+                            sub: "Replace this account with an nsec from a backup"
+                        ) {
+                            restoreKeySheet = true
                         }
                         SNSettingsRow(
                             icon: .trash, tone: .cyan, label: "Erase all chats",
@@ -215,6 +222,9 @@ struct SonarSettingsScreen: View {
         }
         .snSheet(isPresented: $exportKeySheet, title: "Export private key") {
             SNExportKeySheetContent()
+        }
+        .snSheet(isPresented: $restoreKeySheet, title: "Restore account") {
+            SNRestoreAccountSheetContent(onClose: { restoreKeySheet = false })
         }
         .snSheet(isPresented: $diagnosticsSheet, title: "Diagnostics") {
             SNDiagnosticsSheetContent()
@@ -366,6 +376,110 @@ struct SNExportKeySheetContent: View {
                 .padding(EdgeInsets(top: 12, leading: 18, bottom: 4, trailing: 18))
         }
         .task { nsec = await store.exportNsec() }
+    }
+}
+
+/// Settings → Restore account: paste an `nsec1…` to replace the local identity
+/// and rebuild the Lightning wallet from that key. Destructive for chats on
+/// this device (Marmot DB wipe); wallet is always rebuilt from the pasted nsec.
+struct SNRestoreAccountSheetContent: View {
+    @EnvironmentObject private var store: SonarAppStore
+    var onClose: () -> Void
+
+    @State private var nsec = ""
+    @State private var errorText: String?
+    @State private var inFlight = false
+    @State private var confirmed = false
+    @FocusState private var focused: Bool
+
+    private var nsecOk: Bool {
+        let t = nsec.trimmingCharacters(in: .whitespacesAndNewlines)
+        return t.range(of: "^nsec1[0-9a-z]{20,}$", options: .regularExpression) != nil
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(alignment: .top, spacing: 11) {
+                SNIcon(name: .shield, size: 18, weight: 2)
+                    .foregroundColor(SonarTheme.danger)
+                Text("This replaces the account on this phone. Chats stored here are erased. Your Lightning wallet is rebuilt from the nsec you paste (same key = same balance after sync).")
+                    .font(SonarTheme.uiFont(size: 13))
+                    .lineSpacing(13 * 0.5)
+                    .foregroundColor(SonarTheme.text)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(EdgeInsets(top: 13, leading: 15, bottom: 13, trailing: 15))
+            .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(SonarTheme.danger.opacity(0.10)))
+            .padding(EdgeInsets(top: 2, leading: 8, bottom: 12, trailing: 8))
+
+            ZStack(alignment: .topLeading) {
+                if nsec.isEmpty {
+                    Text(verbatim: "nsec1\u{2026}")
+                        .font(SonarTheme.monoFont(size: 15))
+                        .foregroundColor(SonarTheme.text3)
+                        .padding(EdgeInsets(top: 14, leading: 16, bottom: 0, trailing: 16))
+                        .allowsHitTesting(false)
+                }
+                TextEditor(text: $nsec)
+                    .font(SonarTheme.monoFont(size: 15))
+                    .foregroundColor(SonarTheme.text)
+                    .focused($focused)
+                    .frame(minHeight: 72)
+                    .scrollContentBackground(.hidden)
+                    .padding(EdgeInsets(top: 6, leading: 11, bottom: 6, trailing: 11))
+                    #if os(iOS)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    #endif
+            }
+            .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(SonarTheme.surface2))
+            .padding(.horizontal, 8)
+
+            Toggle(isOn: $confirmed) {
+                Text("I understand chats on this phone will be erased")
+                    .font(SonarTheme.uiFont(size: 13, weight: .semibold))
+                    .foregroundColor(SonarTheme.text)
+            }
+            .toggleStyle(.switch)
+            .padding(EdgeInsets(top: 14, leading: 12, bottom: 8, trailing: 12))
+
+            if let errorText {
+                Text(verbatim: errorText)
+                    .font(SonarTheme.uiFont(size: 13))
+                    .foregroundColor(SonarTheme.danger)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 8)
+            }
+
+            SNPrimaryButton(
+                label: inFlight ? "Restoring\u{2026}" : "Restore account",
+                danger: true,
+                disabled: !nsecOk || !confirmed || inFlight
+            ) {
+                restore()
+            }
+            .padding(.horizontal, 8)
+            SNGhostButton(label: "Cancel", action: onClose)
+                .padding(.top, 4)
+        }
+    }
+
+    private func restore() {
+        let key = nsec.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard nsecOk, confirmed, !inFlight else { return }
+        inFlight = true
+        errorText = nil
+        Task { @MainActor in
+            do {
+                try await store.restoreAccount(nsec: key)
+                onClose()
+            } catch {
+                errorText = "That key couldn\u{2019}t be imported. Check you pasted the full nsec1\u{2026} key."
+                inFlight = false
+            }
+        }
     }
 }
 

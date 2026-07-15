@@ -114,4 +114,11 @@ expect object WalletBridge {
 
     /** Disconnect (on wipe). */
     suspend fun shutdown()
+
+    /**
+     * Delete on-disk Breez wallet state after [shutdown]. Call on account
+     * restore / panic wipe so the next [setupIfNeeded] cannot reopen a stale
+     * working directory from a previous identity.
+     */
+    suspend fun wipeLocalStorage()
 }

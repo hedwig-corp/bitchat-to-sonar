@@ -100,11 +100,25 @@ struct SonarOnboardingScreen: View {
                     switch step {
                     case 0:
                         SNPrimaryButton(label: "Get started") { advance(to: 1) }
-                        SNGhostButton(label: "I already have a key") {
+                        // Full-width accent soft CTA — ghost text was too easy to miss
+                        // for returning users restoring with an nsec.
+                        Button(action: {
                             nsec = ""
                             restoreError = nil
                             withAnimation(reduceMotion ? nil : .easeOut(duration: 0.35)) { restoring = true }
+                        }) {
+                            Text("Restore account with private key")
+                                .font(SonarTheme.uiFont(size: 16, weight: .bold))
+                                .foregroundColor(SonarTheme.accentDeep)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 14)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                        .fill(SonarTheme.accentSoft)
+                                )
                         }
+                        .buttonStyle(SNScaleStyle(scale: 0.98))
+                        .padding(.top, 4)
                     case 1:
                         SNPrimaryButton(label: "Continue", disabled: !can) { advance(to: 2) }
                     default:
@@ -277,8 +291,8 @@ struct SonarOnboardingScreen: View {
                 .kerning(-30 * 0.02)
                 .foregroundColor(SonarTheme.text)
                 .padding(.bottom, 10)
-            (Text("Paste the ") + Text("nsec").fontWeight(.bold)
-                + Text(" private key from your old device or another Nostr app. Your nickname, contacts and balance come back with it."))
+            (Text("Paste your ") + Text("nsec").fontWeight(.bold)
+                + Text(" private key. This restores your Sonar identity and Lightning wallet on this phone. Chat history on this device starts fresh until backup ships."))
                 .font(SonarTheme.uiFont(size: 16))
                 .lineSpacing(16 * 0.3)
                 .foregroundColor(SonarTheme.text2)

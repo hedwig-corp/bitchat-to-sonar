@@ -273,4 +273,24 @@ actual object WalletBridge {
             receiveOffer = null
         }
     }
+
+    actual suspend fun wipeLocalStorage(): Unit = withContext(Dispatchers.IO) {
+        lock.withLock {
+            // Caller should [shutdown] first; still force-clear if a node lingered.
+            if (sdk != null) {
+                walletEpoch += 1
+                val node = sdk
+                balanceListenerId?.let { id -> runCatching { node?.removeEventListener(id) } }
+                balanceListenerId = null
+                try { node?.disconnect() } catch (_: Throwable) {}
+                sdk = null
+                current = WalletState.NotConfigured
+                balance.value = 0L
+                receiveOffer = null
+            }
+            runCatching {
+                File(ctx.filesDir, "sonar-wallet").deleteRecursively()
+            }
+        }
+    }
 }

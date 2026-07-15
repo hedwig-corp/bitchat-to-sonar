@@ -1459,14 +1459,23 @@ final class SonarAppStore: ObservableObject {
         return await SonarDiagnostics.buildDebugBundle(snapshotJson: snapshot)
     }
 
-    /// Restore an existing account from a pasted `nsec1…` backup on the
-    /// "I already have a key" onboarding path: import the identity, then finish
-    /// onboarding. Throws on an invalid key.
+    /// Restore an existing account from a pasted `nsec1…` backup (onboarding
+    /// "Restore account" or Settings → Restore account): import the identity,
+    /// wipe any prior wallet on this device, rebuild the Lightning wallet from
+    /// the restored nsec, then finish onboarding. Throws on an invalid key.
     func restoreAccount(nsec: String) async throws {
         try await marmot.restoreIdentity(nsec: nsec)
+        #if os(iOS) || os(macOS)
+        if let bridged = wallet as? BridgedWallet {
+            await bridged.rebuildFromIdentity()
+        } else {
+            BridgedWallet.wipeWalletStorage()
+        }
+        #endif
         onboarded = true
         defaults.set(true, forKey: Keys.onboarded)
         path = []
+        toast = "Account restored"
     }
 
     /// Start Unify scanning while the Nearby/radar screen is visible; stop it
