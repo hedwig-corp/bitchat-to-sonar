@@ -35,6 +35,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.heightIn
@@ -188,14 +189,16 @@ fun App(
             if (state.locked) {
                 LockScreen(onUnlock = { state.unlock() })
             } else if (!state.onboarded) {
-                Box(Modifier.statusBarsPadding().imePadding()) { SonarOnboardingScreen(state) }
+                Box(Modifier.statusBarsPadding().navigationBarsPadding().imePadding()) {
+                    SonarOnboardingScreen(state)
+                }
             } else if (!state.homeMessagesHydrated) {
                 // Never paint an incomplete Home shell. Android keeps its native
                 // launch window above this branch; it remains as a safe fallback
                 // for older Android versions and any future commonMain host.
                 LocalStateLaunchSurface()
             } else {
-                Box(Modifier.statusBarsPadding().imePadding()) {
+                Box(Modifier.statusBarsPadding().navigationBarsPadding().imePadding()) {
                     SonarScreenHost(state)
                 }
             }
