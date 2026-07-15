@@ -3801,12 +3801,12 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private fun failPendingMarmotChat(npubHex: String, pendingChatId: String, setupToken: Long? = null): Boolean {
         if (!isActivePendingMarmotSetup(pendingChatId, pendingMarmotChatNpubs[pendingChatId]?.peerNpub, setupToken)) return false
-        pendingMarmotChatNpubs = pendingMarmotChatNpubs - pendingChatId
         pendingDirectMarmotSends.remove(npubHex)
         pendingSendEchoes[pendingChatId].orEmpty().map { it.id }.forEach { echoId ->
             failSendEcho(pendingChatId, echoId)
         }
-        pendingSendEchoes.remove(pendingChatId)
+        // Keep the pending route + failed echoes. Tapping Retry replaces just
+        // that echo, rebuilds the queue, and starts secure-chat setup again.
         return true
     }
 
@@ -4318,6 +4318,236 @@ class SonarAppState(private val scope: CoroutineScope) {
             }
         }
         reloadNewestAfterSendIfNeeded(chatId)
+    }
+
+    /** Signal-style retry for one failed outgoing row. Core-backed messages
+     *  republish their original encrypted event; optimistic setup/media rows
+     *  reuse the local plaintext/bytes that are already held for that row. */
+    fun retryMessage(chatId: String, message: SonarMsg) {
+        if (!sonarCanRetryMessage(message)) return
+        val mediaUploads = pendingMediaUploads[chatId]
+            ?.filter { it.message.id == message.id }
+            .orEmpty()
+        if (mediaUploads.isNotEmpty()) {
+            retryPendingMedia(chatId, message.id)
+            return
+        }
+
+        if (message.id.startsWith(echoIdPrefix)) {
+            retrySendEcho(chatId, message.id)
+            return
+        }
+
+        val current = messages.firstOrNull { it.id == message.id } ?: return
+        val retrying = sonarMessageForRetry(current, "Sending") ?: return
+        messages = messages.map {
+            if (it.id == message.id) retrying else it
+        }
+        scope.launch {
+            runCatching { SonarCore.retryMessage(message.id) }
+                .onSuccess { refreshRetriedMarmotMessage(chatId) }
+                .onFailure { error ->
+                    if ((screen as? Screen.Chat)?.id == chatId) {
+                        messages = messages.map {
+                            if (it.id == message.id) it.copy(state = "Couldn't send") else it
+                        }
+                    }
+                    toast = "retry failed: ${error.message}"
+                }
+        }
+    }
+
+    private fun retryPendingMedia(
+        chatId: String,
+        pendingId: String,
+    ) {
+        val pending = pendingMediaUploads[chatId] ?: return
+        val matchingIndices = pending.indices.filter { pending[it].message.id == pendingId }
+        val firstIndex = matchingIndices.firstOrNull() ?: return
+        val retryingMessage = sonarMessageForRetry(pending[firstIndex].message, "Uploading") ?: return
+        for (index in matchingIndices) {
+            pending[index] = pending[index].copy(
+                message = retryingMessage,
+                completedOrder = null,
+            )
+        }
+        messages = messages.map {
+            if (it.id == pendingId) retryingMessage else it
+        }
+        val uploads = matchingIndices.map { pending[it] }
+        scope.launch {
+            val groupId = resolveMarmotGroupId(chatId)
+            if (groupId == null) {
+                markPendingMediaFailed(chatId, pendingId)
+                toast = "This media is no longer available to retry."
+                return@launch
+            }
+            try {
+                if (uploads.size == 1) {
+                    val upload = uploads.single()
+                    SonarCore.sendMedia(groupId, upload.data, upload.filename, upload.mime, upload.message.content)
+                } else {
+                    SonarCore.sendMediaMulti(
+                        groupId,
+                        uploads.map { AlbumUpload(it.data, it.filename, it.mime) },
+                        uploads.first().message.content,
+                    )
+                }
+                markPendingMediaCompleted(chatId, pendingId)
+                refreshRetriedMarmotMessage(chatId)
+            } catch (error: Throwable) {
+                markPendingMediaFailed(chatId, pendingId)
+                if ((screen as? Screen.Chat)?.id == chatId) {
+                    messages = visibleMessagesForChat(
+                        chatId,
+                        mergePendingMediaUploads(chatId, messages),
+                    )
+                }
+                toast = "retry failed: ${error.message}"
+            }
+        }
+    }
+
+    /** Retry a platform-local echo in place. Keeping the same retained row as
+     * the authority makes retry consume-once and prevents a transcript gap if
+     * route setup or the replacement send fails. */
+    private fun retrySendEcho(chatId: String, echoId: String) {
+        val echoes = pendingSendEchoes[chatId] ?: return
+        val index = echoes.indexOfFirst { it.id == echoId }
+        if (index < 0) return
+        val source = echoes[index]
+        val content = sonarRetryContent(source)
+        if (content == null) {
+            toast = "This message is no longer available to retry."
+            return
+        }
+        val retrying = sonarMessageForRetry(source, "Sending") ?: return
+        val matchEcho = retrying.copy(tsSecs = SonarClock.nowSecs())
+
+        // Replace the retained row before any asynchronous work. A stale second
+        // tap now sees Sending and cannot enqueue another replacement.
+        echoes[index] = retrying
+        messages = messages.map { if (it.id == echoId) retrying else it }
+        previouslyPublishedMessageIdsByEcho[echoId] = messages
+            .asSequence()
+            .filter { candidate ->
+                candidate.mine &&
+                    candidate.id != echoId &&
+                    candidate.content == retrying.content &&
+                    candidate.stickerRef == retrying.stickerRef &&
+                    candidate.viaInternet == retrying.viaInternet &&
+                    !candidate.id.startsWith(echoIdPrefix)
+            }
+            .map { it.id }
+            .toSet()
+
+        pendingMarmotNpub(chatId)?.let { pendingNpub ->
+            val npubHex = canonicalNpubHex(pendingNpub)
+            if (npubHex == null) {
+                failSendEcho(chatId, echoId)
+                toast = "This message is no longer available to retry."
+                return
+            }
+            val queue = pendingDirectMarmotSends.getOrPut(npubHex) { mutableListOf() }
+            queue.removeAll { it.echoId == echoId }
+            queue.add(PendingDirectMarmotSend(chatId, content, echoId))
+            if (queue.size > PENDING_MARMOT_DIRECT_SEND_QUEUE_LIMIT) {
+                val dropped = queue.removeAt(0)
+                failSendEcho(dropped.pendingChatId, dropped.echoId)
+                toast = "Still setting up this chat — wait before retrying more."
+            }
+            startPendingMarmotChat(pendingNpub, chatId)
+            return
+        }
+
+        if (isPendingMarmotGroup(chatId)) {
+            val queue = pendingMarmotGroupSends.getOrPut(chatId) { mutableListOf() }
+            queue.removeAll { it.echoId == echoId }
+            queue.add(PendingMarmotGroupSend(content, echoId))
+            if (queue.size > PENDING_MARMOT_GROUP_SEND_QUEUE_LIMIT) {
+                val dropped = queue.removeAt(0)
+                failSendEcho(chatId, dropped.echoId)
+                toast = "Still setting up this group — wait before retrying more."
+            }
+            startPendingMarmotGroupCreation(chatId)
+            return
+        }
+
+        val groupId = resolveMarmotGroupId(chatId)
+        if (groupId != null) {
+            scope.launch {
+                try {
+                    sendQueuedMarmotContent(groupId, content)
+                    val generation = transcriptGeneration
+                    val published = if (isMeshChat(chatId)) {
+                        marmotMessagesForPeer(meshPeerId(chatId), chatId, generation)
+                    } else {
+                        marmotMessagesPageForChat(chatId, generation)
+                    }
+                    reserveSuccessfulEchoCanonicalRows(chatId, matchEcho, published)
+                    clearSendEcho(chatId, echoId)
+                    refreshRetriedMarmotMessage(chatId)
+                } catch (error: Throwable) {
+                    failSendEcho(chatId, echoId)
+                    toast = "retry failed: ${error.message}"
+                }
+            }
+            return
+        }
+
+        // A failed direct NIP-17 echo has no Marmot group. Reuse the retained
+        // payload and clear it only after the replacement row is persisted.
+        if (isMeshChat(chatId)) {
+            val peerId = meshPeerId(chatId)
+            val raw = npubRawFor(peerId)
+            if (raw != null && canUseDirectNip17(peerId, raw)) {
+                scope.launch {
+                    val messageId = randomMeshId()
+                    if (sendDirectNip17Now(peerId, raw, messageId, content)) {
+                        val sent = privateDmMessage(
+                            id = messageId,
+                            senderNpub = npub,
+                            text = content,
+                            mine = true,
+                            tsSecs = SonarClock.nowSecs(),
+                            viaInternet = true,
+                        )
+                        appendMeshMessage(peerId, sent)
+                        processPayLines(chatId, listOf(sent))
+                        clearSendEcho(chatId, echoId)
+                        refreshOpenDm(peerId)
+                    } else {
+                        failSendEcho(chatId, echoId)
+                    }
+                }
+                return
+            }
+        }
+
+        failSendEcho(chatId, echoId)
+        toast = "This message is no longer available to retry."
+    }
+
+    private suspend fun refreshRetriedMarmotMessage(chatId: String) {
+        if ((screen as? Screen.Chat)?.id != chatId) return
+        val generation = transcriptGeneration
+        val fresh = if (isMeshChat(chatId)) {
+            val peerId = meshPeerId(chatId)
+            refreshConversationRows(
+                refreshMeshTranscriptWindow(peerId) + marmotMessagesForPeer(peerId, chatId, generation),
+                chatId,
+                generation,
+            )
+        } else {
+            marmotMessagesPageForChat(chatId, generation)
+        }
+        if (isCurrentTranscriptSession(chatId, generation)) {
+            setCurrentVisibleMessages(
+                chatId,
+                withSendEchoes(chatId, mergePendingMediaUploads(chatId, fresh)),
+                processCalls = true,
+            )
+        }
     }
 
     // ── Optimistic send echoes ──

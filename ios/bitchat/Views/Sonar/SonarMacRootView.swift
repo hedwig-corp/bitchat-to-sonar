@@ -897,6 +897,7 @@ private struct MacConversationPane: View {
         } else {
             MacDMTranscript(
                 convo: store.conversationViewState(id),
+                peerId: id,
                 peerName: peer.name,
                 isMultiMemberMarmot: isMultiMemberMarmot,
                 onTapPack: { previewPackCoordinate = $0 }
@@ -3575,17 +3576,20 @@ private struct MacPrimaryRailButton: View {
 private struct MacDMTranscript: View {
     @EnvironmentObject private var store: SonarAppStore
     @ObservedObject private var convo: ConversationViewState
+    let peerId: String
     let peerName: String
     let isMultiMemberMarmot: Bool
     let onTapPack: (String) -> Void
 
     init(
         convo: ConversationViewState,
+        peerId: String,
         peerName: String,
         isMultiMemberMarmot: Bool,
         onTapPack: @escaping (String) -> Void
     ) {
         self._convo = ObservedObject(wrappedValue: convo)
+        self.peerId = peerId
         self.peerName = peerName
         self.isMultiMemberMarmot = isMultiMemberMarmot
         self.onTapPack = onTapPack
@@ -3618,6 +3622,7 @@ private struct MacDMTranscript: View {
                 ),
                 loadSticker: { await store.stickerImageData(for: $0) },
                 onTapPack: onTapPack,
+                onRetry: { store.retryDm(peerId, message: $0) },
                 loadOlder: { await convo.loadOlder() },
                 loadNewest: { await convo.loadNewestIfNeeded() }
             )

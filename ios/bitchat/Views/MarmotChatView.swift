@@ -370,6 +370,10 @@ final class MarmotChatModel: ObservableObject {
         case invalidated
     }
 
+    static func isFailedOptimisticMessageId(_ id: String) -> Bool {
+        id.hasPrefix(failedOptimisticIDPrefix)
+    }
+
     init(
         service: MarmotService = MarmotService(),
         keychain: KeychainManagerProtocol = KeychainManager(),
@@ -1841,7 +1845,12 @@ final class MarmotChatModel: ObservableObject {
         }
     }
 
-    func send(_ text: String, to groupId: String) {
+    func send(
+        _ text: String,
+        to groupId: String,
+        onEchoVisible: (() -> Void)? = nil,
+        onFailure: (() -> Void)? = nil
+    ) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         errorText = nil
@@ -1854,6 +1863,7 @@ final class MarmotChatModel: ObservableObject {
             media: []
         )
         appendOptimistic(echo, to: groupId)
+        onEchoVisible?()
         let prev = sendChain
         sendChain = Task { [weak self] in
             _ = await prev?.result
@@ -1865,6 +1875,7 @@ final class MarmotChatModel: ObservableObject {
                 try await self.service.sendText(groupId: groupId, text: trimmed)
             } catch {
                 self.discardOptimistic(id: echo.id, from: groupId)
+                onFailure?()
                 self.errorText = Self.describe(error)
                 return
             }
@@ -1890,6 +1901,32 @@ final class MarmotChatModel: ObservableObject {
         return errorText == nil
     }
 
+    /// Retry a core-backed failed row without creating a second transcript row
+    /// or re-running MLS encryption. The core flips the durable row back to
+    /// pending before republishing the original encrypted wrapper event.
+    func retryMessage(messageId: String) {
+        errorText = nil
+        Task {
+            do {
+                guard await ensureConnected(timeoutSeconds: 2) else {
+                    throw MarmotService.ServiceError.notConnected
+                }
+                let groupId = try await service.retryMessage(messageId: messageId)
+                await loadLocalPage(groupId: groupId, mode: .preserveHistoricalWindow)
+            } catch {
+                errorText = Self.describe(error)
+            }
+        }
+    }
+
+    /// Remove a failed platform-local media echo after its replacement upload
+    /// echo is visible, so retry never leaves a gap in the transcript.
+    func removeFailedOptimisticMessage(groupId: String, messageId: String) {
+        guard Self.isFailedOptimisticMessageId(messageId) else { return }
+        pendingOptimistic[groupId]?.removeAll { $0.id == messageId }
+        messagesByGroup[groupId, default: []].removeAll { $0.id == messageId }
+    }
+
     /// Send a media attachment (encrypt with the group key, upload the ciphertext
     /// to Blossom, publish the kind-445 with the imeta tag). Refreshes on success.
     func sendMedia(
@@ -1899,6 +1936,7 @@ final class MarmotChatModel: ObservableObject {
         mime: String,
         caption: String = "",
         localPreviewURL: String? = nil,
+        onEchoVisible: (() -> Void)? = nil,
         onComplete: (() -> Void)? = nil,
         onFailure: (() -> Void)? = nil
     ) {
@@ -1928,6 +1966,7 @@ final class MarmotChatModel: ObservableObject {
                 await loadLocalPage(groupId: groupId, mode: .preserveHistoricalWindow)
                 appendOptimistic(echo, to: groupId)
                 echoVisible = true
+                onEchoVisible?()
                 guard await ensureRelayConnected() else {
                     throw MarmotService.ServiceError.notConnected
                 }
@@ -1965,6 +2004,7 @@ final class MarmotChatModel: ObservableObject {
         items: [MarmotService.MediaAlbumItem],
         caption: String = "",
         localPreviewURLs: [String],
+        onEchoVisible: (() -> Void)? = nil,
         onComplete: (() -> Void)? = nil,
         onFailure: (() -> Void)? = nil
     ) {
@@ -1995,6 +2035,7 @@ final class MarmotChatModel: ObservableObject {
                 await loadLocalPage(groupId: groupId, mode: .preserveHistoricalWindow)
                 appendOptimistic(echo, to: groupId)
                 echoVisible = true
+                onEchoVisible?()
                 guard await ensureRelayConnected() else {
                     throw MarmotService.ServiceError.notConnected
                 }
@@ -2025,7 +2066,10 @@ final class MarmotChatModel: ObservableObject {
         groupId: String,
         packCoordinate: String,
         shortcode: String,
-        plaintextSha256: String
+        plaintextSha256: String,
+        onEchoVisible: (() -> Void)? = nil,
+        onComplete: (() -> Void)? = nil,
+        onFailure: (() -> Void)? = nil
     ) {
         errorText = nil
         let echo = MarmotService.MarmotMessage(
@@ -2042,6 +2086,7 @@ final class MarmotChatModel: ObservableObject {
             )
         )
         appendOptimistic(echo, to: groupId)
+        onEchoVisible?()
 
         let previous = sendChain
         sendChain = Task { [weak self] in
@@ -2057,8 +2102,10 @@ final class MarmotChatModel: ObservableObject {
                     shortcode: shortcode,
                     plaintextSha256: plaintextSha256
                 )
+                onComplete?()
             } catch {
                 self.pendingOptimistic[groupId]?.removeAll { $0.id == echo.id }
+                self.messagesByGroup[groupId, default: []].removeAll { $0.id == echo.id }
                 let failed = MarmotService.MarmotMessage(
                     id: Self.failedOptimisticIDPrefix + UUID().uuidString,
                     senderNpub: echo.senderNpub,
@@ -2069,8 +2116,8 @@ final class MarmotChatModel: ObservableObject {
                     stickerRef: echo.stickerRef
                 )
                 self.pendingOptimistic[groupId, default: []].append(failed)
-                self.messagesByGroup[groupId, default: []].removeAll { $0.id == echo.id }
                 self.messagesByGroup[groupId, default: []].append(failed)
+                onFailure?()
                 self.errorText = Self.describe(error)
                 return
             }

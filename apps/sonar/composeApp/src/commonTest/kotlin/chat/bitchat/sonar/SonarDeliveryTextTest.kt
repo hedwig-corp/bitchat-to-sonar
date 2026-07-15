@@ -53,4 +53,38 @@ class SonarDeliveryTextTest {
         assertFalse(sonarDeliveryPending("partial:2:5"))
         assertFalse(sonarDeliveryFailed("partial:2:5"))
     }
+
+    @Test fun retryIsOnlyOfferedForFailedOutgoingInternetMessages() {
+        val failedInternet = SonarMsg(
+            id = "internet",
+            senderNpub = "me",
+            content = "hello",
+            mine = true,
+            tsSecs = 1,
+            viaInternet = true,
+            state = "failed",
+        )
+
+        assertTrue(sonarCanRetryMessage(failedInternet))
+        assertFalse(sonarCanRetryMessage(failedInternet.copy(viaInternet = false)))
+        assertFalse(sonarCanRetryMessage(failedInternet.copy(mine = false)))
+        assertFalse(sonarCanRetryMessage(failedInternet.copy(state = "Sending")))
+    }
+
+    @Test fun retryTransitionConsumesTheFailedStateOnce() {
+        val failed = SonarMsg(
+            id = "failed",
+            senderNpub = "me",
+            content = "hello",
+            mine = true,
+            tsSecs = 1,
+            viaInternet = true,
+            state = "Couldn't send",
+        )
+
+        val retrying = sonarMessageForRetry(failed, "Sending")
+
+        assertEquals("Sending", retrying?.state)
+        assertNull(retrying?.let { sonarMessageForRetry(it, "Sending") })
+    }
 }

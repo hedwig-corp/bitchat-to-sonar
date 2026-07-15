@@ -119,6 +119,16 @@ class StickerSendEchoTest {
         assertFalse(sonarSendEchoMatches(message("empty-text", 101, null), echo))
     }
 
+    @Test fun retryReconstructsStickerTransportContentFromTheRetainedReference() {
+        val ref = SonarStickerRef("30031:author:pack", "wave", "aabbcc")
+        val encoded = sonarRetryContent(message("failed-sticker", 100, ref))
+        val decoded = encoded?.let(::meshParseStickerContent)
+
+        assertEquals(ref.packCoordinate, decoded?.packCoordinate)
+        assertEquals(ref.shortcode, decoded?.shortcode)
+        assertEquals(ref.plaintextSha256, decoded?.plaintextSha256)
+    }
+
     private fun message(id: String, tsSecs: Long, stickerRef: SonarStickerRef?) = SonarMsg(
         id = id,
         senderNpub = "npub1test",

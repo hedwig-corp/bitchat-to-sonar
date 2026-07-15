@@ -361,6 +361,34 @@ struct SNMessage: Identifiable, Equatable {
     var stickerRef: MarmotService.MarmotStickerRef?
 }
 
+/// Internet and mesh failures use different resend pipelines. The retry
+/// affordance introduced here is backed only by Marmot's durable outbox.
+func snCanRetryFailedMessage(_ message: SNMessage) -> Bool {
+    message.mine && message.via == .internet && message.state == "Couldn't send"
+}
+
+/// Optimistic sticker rows intentionally keep their display text empty. Retry
+/// must rebuild the transport marker from the retained sticker reference.
+func snRetryContent(_ message: SNMessage) -> String? {
+    if let ref = message.stickerRef {
+        return meshStickerContent(
+            packCoordinate: ref.packCoordinate,
+            shortcode: ref.shortcode,
+            plaintextSha256: ref.plaintextSha256
+        )
+    }
+    return message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        ? nil
+        : message.text
+}
+
+@MainActor
+func snIsFailedOptimisticStickerMessage(_ message: SNMessage) -> Bool {
+    MarmotChatModel.isFailedOptimisticMessageId(message.id)
+        && message.media.isEmpty
+        && message.stickerRef != nil
+}
+
 /// A media attachment on a Sonar message. `url` is the Blossom URL of the
 /// CIPHERTEXT; `groupId` is the Marmot group needed to download + decrypt it.
 struct SNMediaItem: Equatable {
@@ -4108,6 +4136,152 @@ final class SonarAppStore: ObservableObject {
         chatViewModel.sendPrivateMessage(text, to: PeerID(str: id))
     }
 
+    /// Signal-style retry for one failed outgoing row. Durable Marmot rows
+    /// republish the original encrypted event; platform-local setup/media rows
+    /// reuse the content already retained for that exact bubble.
+    func retryDm(_ id: String, message: SNMessage) {
+        guard snCanRetryFailedMessage(message) else { return }
+        let groupId = message.media.first?.groupId
+            ?? marmotGroupId(id)
+            ?? resolvedSonarProfile(id).flatMap { marmotGroup(forNpub: $0.npub)?.id }
+
+        if let groupId,
+           MarmotChatModel.isFailedOptimisticMessageId(message.id),
+           !message.media.isEmpty {
+            retryFailedMedia(message, groupId: groupId)
+            return
+        }
+
+        if let groupId, snIsFailedOptimisticStickerMessage(message) {
+            retryFailedSticker(message, groupId: groupId)
+            return
+        }
+
+        if message.id.hasPrefix("echo-") {
+            retryFailedPendingText(id, message: message, groupId: groupId)
+            return
+        }
+
+        marmot.retryMessage(messageId: message.id)
+    }
+
+    /// Retry one setup-stage text without leaving a gap in the transcript. An
+    /// established Marmot chat removes the old failed row only after the new
+    /// optimistic echo is visible, then restores it if that replacement fails.
+    private func retryFailedPendingText(_ id: String, message: SNMessage, groupId: String?) {
+        guard let content = snRetryContent(message) else {
+            showToast("This message is no longer available to retry.")
+            return
+        }
+        guard let source = setPendingMarmotMessageState(
+            message.id,
+            from: "Couldn't send",
+            to: "Sending"
+        ) else {
+            showToast("This message is no longer available to retry.")
+            return
+        }
+
+        if let groupId {
+            let onEchoVisible: () -> Void = { [weak self] in
+                self?.removePendingMarmotMessage(message.id)
+            }
+            let onFailure: () -> Void = { [weak self] in
+                self?.restoreFailedPendingMarmotMessage(source.message, preferredKey: source.key)
+            }
+            if let ref = message.stickerRef {
+                marmot.sendSticker(
+                    groupId: groupId,
+                    packCoordinate: ref.packCoordinate,
+                    shortcode: ref.shortcode,
+                    plaintextSha256: ref.plaintextSha256,
+                    onEchoVisible: onEchoVisible
+                )
+            } else {
+                marmot.send(
+                    content,
+                    to: groupId,
+                    onEchoVisible: onEchoVisible,
+                    onFailure: onFailure
+                )
+            }
+            return
+        }
+
+        if let npub = pendingMarmotNpub(for: id) {
+            let clean = SNMarmotProfileCache.canonicalKey(npub)
+            pendingMarmotChats[id] = pendingMarmotChats[id]
+                ?? SNPendingMarmotChat(npub: clean, createdAt: source.message.sortDate ?? Date())
+            var queue = pendingDirectMarmotSends[clean, default: []]
+            queue.removeAll { $0.messageId == message.id }
+            queue.append(SNPendingMarmotSend(chatId: id, text: content, messageId: message.id))
+            if queue.count > Self.pendingMarmotDirectSendQueueLimit {
+                let dropped = queue.removeFirst()
+                pendingMarmotMessagesByChat[dropped.chatId] = pendingMarmotMessagesByChat[dropped.chatId]?.map {
+                    $0.id == dropped.messageId ? failedPendingMessage($0) : $0
+                }
+                showToast("Still setting up this chat - wait before retrying more.")
+            }
+            pendingDirectMarmotSends[clean] = queue
+            marmot.connectIfNeeded()
+            startSecureChatInBackground(npub: clean, pendingId: id)
+            return
+        }
+
+        if isPendingMarmotGroup(id) {
+            var queue = pendingMarmotGroupSends[id, default: []]
+            queue.removeAll { $0.messageId == message.id }
+            queue.append(SNPendingMarmotGroupSend(text: content, messageId: message.id))
+            if queue.count > Self.pendingMarmotGroupSendQueueLimit {
+                let dropped = queue.removeFirst()
+                pendingMarmotMessagesByChat[id] = pendingMarmotMessagesByChat[id]?.map {
+                    $0.id == dropped.messageId ? failedPendingMessage($0) : $0
+                }
+                showToast("Still setting up this group - wait before retrying more.")
+            }
+            pendingMarmotGroupSends[id] = queue
+            startPendingMarmotGroupCreation(pendingId: id)
+            return
+        }
+
+        restoreFailedPendingMarmotMessage(source.message, preferredKey: source.key)
+        showToast("This message is no longer available to retry.")
+    }
+
+    private func setPendingMarmotMessageState(
+        _ messageId: String,
+        from expectedState: String? = nil,
+        to state: String
+    ) -> (key: String, message: SNMessage)? {
+        for key in Array(pendingMarmotMessagesByChat.keys) {
+            guard let index = pendingMarmotMessagesByChat[key]?.firstIndex(where: { $0.id == messageId }),
+                  let original = pendingMarmotMessagesByChat[key]?[index]
+            else { continue }
+            guard expectedState == nil || original.state == expectedState else { return nil }
+            var updated = original
+            updated.state = state
+            pendingMarmotMessagesByChat[key]?[index] = updated
+            return (key, original)
+        }
+        return nil
+    }
+
+    private func removePendingMarmotMessage(_ messageId: String) {
+        for key in Array(pendingMarmotMessagesByChat.keys) {
+            pendingMarmotMessagesByChat[key]?.removeAll { $0.id == messageId }
+            if pendingMarmotMessagesByChat[key]?.isEmpty == true {
+                pendingMarmotMessagesByChat[key] = nil
+            }
+        }
+    }
+
+    private func restoreFailedPendingMarmotMessage(_ message: SNMessage, preferredKey: String) {
+        if setPendingMarmotMessageState(message.id, to: "Couldn't send") != nil {
+            return
+        }
+        pendingMarmotMessagesByChat[preferredKey, default: []].append(failedPendingMessage(message))
+    }
+
     private func sendPaymentReceiptLines(_ lines: [String], to id: String) async -> Bool {
         guard !lines.isEmpty else { return true }
         if meshReachable(id) {
@@ -4579,6 +4753,7 @@ final class SonarAppStore: ObservableObject {
     /// the real Blossom URL so the sent bubble does not briefly fall back to a
     /// download spinner.
     private var pendingUploadMediaCache: [String: [PendingUploadMedia]] = [:]
+    private var retryingFailedOptimisticMessageIDs: Set<String> = []
     private static let pendingMediaURLPrefix = "pending-media-"
 
     /// Map a Marmot message's attachments into UI items carrying the group id.
@@ -4699,6 +4874,136 @@ final class SonarAppStore: ObservableObject {
                 }
             }
         }
+    }
+
+    private func retryFailedMedia(_ message: SNMessage, groupId: String) {
+        let payloads: [(item: SNMediaItem, data: Data)] = message.media.compactMap { item in
+            mediaImageCache[item.url].map { (item, $0) }
+        }
+        guard payloads.count == message.media.count, !payloads.isEmpty else {
+            showToast("This media is no longer available to retry.")
+            return
+        }
+        guard retryingFailedOptimisticMessageIDs.insert(message.id).inserted else { return }
+
+        for payload in payloads {
+            rememberPendingUploadMedia(
+                groupId: groupId,
+                filename: payload.item.filename,
+                mime: payload.item.mime,
+                caption: message.text,
+                localURL: payload.item.url,
+                data: payload.data
+            )
+        }
+
+        if payloads.count == 1, let payload = payloads.first {
+            marmot.sendMedia(
+                groupId: groupId,
+                data: payload.data,
+                filename: payload.item.filename,
+                mime: payload.item.mime,
+                caption: message.text,
+                localPreviewURL: payload.item.url,
+                onEchoVisible: { [weak self] in
+                    self?.marmot.removeFailedOptimisticMessage(
+                        groupId: groupId,
+                        messageId: message.id
+                    )
+                },
+                onComplete: { [weak self] in
+                    self?.retryingFailedOptimisticMessageIDs.remove(message.id)
+                    self?.markPendingUploadMediaCompleted(
+                        groupId: groupId,
+                        filename: payload.item.filename,
+                        mime: payload.item.mime,
+                        caption: message.text,
+                        localURL: payload.item.url
+                    )
+                },
+                onFailure: { [weak self] in
+                    self?.retryingFailedOptimisticMessageIDs.remove(message.id)
+                    self?.forgetPendingUploadMedia(
+                        groupId: groupId,
+                        filename: payload.item.filename,
+                        mime: payload.item.mime,
+                        caption: message.text,
+                        localURL: payload.item.url
+                    )
+                }
+            )
+            return
+        }
+
+        let items = payloads.map {
+            MarmotService.MediaAlbumItem(
+                data: $0.data,
+                filename: $0.item.filename,
+                mime: $0.item.mime
+            )
+        }
+        marmot.sendMediaAlbum(
+            groupId: groupId,
+            items: items,
+            caption: message.text,
+            localPreviewURLs: payloads.map { $0.item.url },
+            onEchoVisible: { [weak self] in
+                self?.marmot.removeFailedOptimisticMessage(
+                    groupId: groupId,
+                    messageId: message.id
+                )
+            },
+            onComplete: { [weak self] in
+                self?.retryingFailedOptimisticMessageIDs.remove(message.id)
+                for payload in payloads {
+                    self?.markPendingUploadMediaCompleted(
+                        groupId: groupId,
+                        filename: payload.item.filename,
+                        mime: payload.item.mime,
+                        caption: message.text,
+                        localURL: payload.item.url
+                    )
+                }
+            },
+            onFailure: { [weak self] in
+                self?.retryingFailedOptimisticMessageIDs.remove(message.id)
+                for payload in payloads {
+                    self?.forgetPendingUploadMedia(
+                        groupId: groupId,
+                        filename: payload.item.filename,
+                        mime: payload.item.mime,
+                        caption: message.text,
+                        localURL: payload.item.url
+                    )
+                }
+            }
+        )
+    }
+
+    private func retryFailedSticker(_ message: SNMessage, groupId: String) {
+        guard let ref = message.stickerRef else {
+            showToast("This sticker is no longer available to retry.")
+            return
+        }
+        guard retryingFailedOptimisticMessageIDs.insert(message.id).inserted else { return }
+        marmot.sendSticker(
+            groupId: groupId,
+            packCoordinate: ref.packCoordinate,
+            shortcode: ref.shortcode,
+            plaintextSha256: ref.plaintextSha256,
+            onEchoVisible: { [weak self] in
+                self?.marmot.removeFailedOptimisticMessage(
+                    groupId: groupId,
+                    messageId: message.id
+                )
+            },
+            onComplete: { [weak self] in
+                self?.retryingFailedOptimisticMessageIDs.remove(message.id)
+            },
+            onFailure: { [weak self] in
+                self?.retryingFailedOptimisticMessageIDs.remove(message.id)
+            }
+        )
     }
 
     /// True if `id` is a chat that can carry media: an existing Marmot group, a

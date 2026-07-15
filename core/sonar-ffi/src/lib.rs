@@ -900,6 +900,15 @@ impl SonarNode {
         }
     }
 
+    /// Retry one failed outgoing message from the durable local outbox. The
+    /// original encrypted event is republished, so retry cannot duplicate the
+    /// plaintext transcript row or mutate MLS state a second time.
+    pub fn retry_message(&self, message_id_hex: String) -> FfiResult<String> {
+        Ok(self
+            .runtime
+            .block_on(self.client.retry_message(&message_id_hex))?)
+    }
+
     /// Re-subscribe with the current watermark and group set to self-heal
     /// after relay disconnects. Hosts call this on the idle timeout path
     /// instead of `sync_once()`. It may run one bounded per-chat repair fetch,

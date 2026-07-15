@@ -39,3 +39,23 @@ internal fun sonarDeliveryPending(state: String?): Boolean =
 
 internal fun sonarDeliveryFailed(state: String?): Boolean =
     sonarDeliveryLabel(state) == "Couldn't send"
+
+/** Retry is intentionally scoped to failed White Noise/Marmot sends. Mesh
+ * failures have a different resend pipeline and must not be routed into the
+ * durable Internet outbox. */
+internal fun sonarCanRetryMessage(message: SonarMsg): Boolean =
+    message.mine && message.viaInternet && sonarDeliveryFailed(message.state)
+
+/** Return the same row transitioned out of the retryable state. Callers must
+ * replace their retained row synchronously before starting network work; a
+ * stale second tap then observes Sending/Uploading and is rejected. */
+internal fun sonarMessageForRetry(message: SonarMsg, pendingState: String): SonarMsg? =
+    if (sonarCanRetryMessage(message)) message.copy(state = pendingState) else null
+
+/** Optimistic sticker rows intentionally carry no display text. Reconstruct
+ * their transport payload from the retained reference instead of retrying an
+ * empty string. */
+internal fun sonarRetryContent(message: SonarMsg): String? =
+    message.stickerRef?.let {
+        meshStickerContent(it.packCoordinate, it.shortcode, it.plaintextSha256)
+    } ?: message.content.takeIf { it.isNotBlank() }
