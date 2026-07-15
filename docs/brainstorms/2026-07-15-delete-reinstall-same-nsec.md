@@ -1,7 +1,8 @@
-# Delete app → reinstall → restore same nsec (same phone)
+# Delete app → reinstall → same nsec (Signal-like Blossom backup)
 
 Date: 2026-07-15
 Status: clarified (brainstorm; no code changes)
+Updated: 2026-07-15 — product direction: **Signal-style encrypted backup on Blossom**, with a **Hedwig-operated Blossom** in scope
 Answers: 1C (truth + fix plan), 2C (iOS + Android), 3A (explicit nsec paste), 4B (identity + wallet + Marmot history), 5A+B (TestFlight honesty + personal restore)
 
 ## Context (what the code does today)
@@ -27,66 +28,93 @@ Path: iOS `MarmotChatModel.restoreIdentity` / `SonarAppStore.restoreAccount`; Co
 
 Account Key Durability (CLAUDE.md) covers **update / prefs loss with key still present**, not uninstall. TestFlight `WhatToTest.md` §8 is the same class (update), not delete→reinstall.
 
+### Blossom already in Sonar
+- Media (MIP-04) already encrypts then uploads via BUD-02 (`SonarClient::blossom_upload`); user server list is kind-10063 (BUD-03).
+- Fallback today: `DEFAULT_BLOSSOM_SERVER = "https://nostr.download"` (`core/sonar-core/src/client.rs`) — third-party, media-oriented, **not** a retention/quota contract for account backups.
+- Stickers/status also probe Blossom; there is **no** account-backup blob path yet.
+
+### Signal analogy (what we want to match)
+Signal’s cloud backup is roughly: **encrypt local conversation state → upload to operator-controlled storage → restore on new install with account/backup key**. For Sonar: encrypt Marmot durable state (MLS + transcripts + db key material as needed) → upload ciphertext to **Blossom** → on restore after nsec paste, fetch + decrypt → open local DB first (Signal-Comparable / local-first), then background relay catch-up. The Blossom host must **not** be able to read plaintext (client-side encryption; nsec or a domain-separated backup key).
+
 ## Clarified Problem Statement
 
-**Goal:** Tell the truth about delete→reinstall→same-nsec restore on iOS and Android, then close the gap so Marmot chat list + decryptable history return without relying on Keychain surviving uninstall.
+**Goal:** After delete→reinstall→paste same `nsec`, restore Marmot chat list + decryptable history via a **Signal-like encrypted backup stored on Blossom**, with Hedwig able to run (and prefer) its own Blossom for reliable retention — without making Keychain survival the product path.
 
 **Constraints:**
-- Explicit nsec paste on onboarding is the restore trigger (3A); no silent Keychain resurrection as the product path.
+- Explicit nsec paste on onboarding is the restore trigger (3A).
 - Cross-platform parity (`ios/` + `apps/sonar/`).
-- Local-first: restore must not block first paint on full relay history; background repair only.
-- Panic wipe and “erase all chats” must still be able to destroy local material; a backup path must be user-driven or clearly gated.
-- Mesh/BLE DMs stay local-only (prior decision).
+- Local-first: restore paints from the decrypted local backup first; relay sync is background catch-up only.
+- Ciphertext only on Blossom; server never sees plaintext chats or `db_key` / nsec.
+- Panic wipe must cover local state; remote backup deletion (or tombstone) must be an explicit product decision.
+- Mesh/BLE DMs stay local-only (prior decision) unless later opted into the backup payload.
 - Do not commit secrets; never log nsec.
+- Reuse existing Blossom client/auth paths where possible; do not overload media CDN semantics without quotas.
 
-**Non-goals:**
-- Automatic Keychain/Keystore survival across uninstall as the primary story.
-- Recovering mesh/BLE transcripts after delete.
-- Full Signal-style multi-device fan-out in the first ship (can be a later approach).
-- Cloud vendor backup (iCloud/Drive) as the only mechanism.
+**Non-goals (v1):**
+- Keychain/Keystore surviving uninstall as the primary story.
+- Recovering mesh/BLE transcripts (unless explicitly added to the backup blob later).
+- Full Signal multi-device live sync (MIP-00 multi-KeyPackage) as a substitute for backup.
+- Relying on `nostr.download` alone for durable account backups without an SLA.
 
 **Success criteria:**
-- TestFlight / docs state clearly: nsec restore → same identity + wallet; Marmot history **today** does not (gap called out).
-- Personal wipe+restore with nsec: after the chosen fix, Home shows prior Marmot conversations and opens transcripts from local storage (rehydrated), wallet balance matches.
-- Fresh install without paste still starts a **new** account (no accidental reuse).
-- Panic wipe still leaves nothing useful on device; optional backup is explicit.
+- TestFlight honesty: today, nsec restore ≠ chat history (Approach A).
+- With backup enabled: wipe phone → reinstall → paste nsec → Home shows prior Marmot conversations from local restore; wallet still matches.
+- Hedwig Blossom (or staged equivalent) accepts authenticated BUD-02 uploads, retains backup blobs per published policy, and supports delete-on-wipe when we choose that semantics.
+- User can point kind-10063 at a self-hosted Blossom; Hedwig default is documented.
 
 ## Approaches Considered
 
 ### Approach A: Honesty layer only (docs + onboarding copy + test plan)
-- Sketch: Document the table above in TestFlight notes / restore UI: “Same key restores your account and wallet; chat history on this phone is wiped with the app until we ship backup.” No protocol change.
-- Affected: `ios/TestFlight/WhatToTest.md`, `SonarOnboardingScreen` (iOS + Compose), maybe `WHITEPAPER.md` / help if present.
-- Tradeoffs: Unblocks TestFlight expectations immediately; does **not** meet 4B.
+- Sketch: TestFlight / restore UI: “Same key restores account + wallet; chat history needs backup (coming).”
+- Affected: `ios/TestFlight/WhatToTest.md`, `SonarOnboardingScreen` (iOS + Compose), `WHITEPAPER.md` if needed.
+- Tradeoffs: Immediate; does not meet 4B.
 - Effort: S
 
-### Approach B: User-exported encrypted Marmot backup (file / QR chunk), restore with nsec
-- Sketch: Before delete (or from Settings), export SQLCipher DB + db_key (or a single blob wrapped with a key derived from nsec). On restore after paste, import blob → reopen same MLS state → chats + history paint local-first; relay sync is catch-up only.
-- Affected: `MarmotService` / `SonarCore` wipe+import paths, new export FFI, Settings + onboarding restore UI both apps, docs.
-- Tradeoffs: Meets 4B for deliberate personal restore; user must export before delete (easy to forget). No automatic multi-device.
+### Approach B: User-exported encrypted file (no Blossom)
+- Sketch: Settings export of encrypted Marmot blob; user saves to Files / AirDrop; import after restore.
+- Tradeoffs: Works offline; easy to forget before delete; no “Signal cloud” feel.
 - Effort: M
 
-### Approach C: Encrypted Nostr self-backup of MLS/conversation state (identity-keyed)
-- Sketch: Periodically (or on background) publish encrypted snapshots of Marmot durable state to relays (or a bounded event stream), decryptable only with nsec. Fresh DB after restore pulls snapshot then catches up. Aligns with earlier “multi-device door” in `2026-06-12-persistent-chats-across-restarts.md`.
-- Affected: `core/sonar-core` backup module, FFI, both hosts’ restore connect path, relay bandwidth/retention assumptions.
-- Tradeoffs: Best “delete phone app, paste nsec, chats return” UX; largest design surface (retention, size, conflict, wipe semantics, privacy).
-- Effort: L
+### Approach C (superseded shape): Encrypted events on relays
+- Sketch: Put MLS snapshots in Nostr events. Rejected as primary: size/retention poor vs blobs; Blossom already exists for large ciphertext.
 
-### Approach D: Treat reinstall as new MLS device (multi-KeyPackage / MIP-00)
-- Sketch: After restore, publish a new KeyPackage; somehow merge into existing groups as an additional device. Needs White Noise/Marmot multi-device semantics and peer/group cooperation; history still needs a device that still holds old epochs or a backup.
-- Affected: core MLS membership, KeyPackage lifecycle, both apps; docs parity matrix already notes multi-device KeyPackage fan-out as out of iOS v1.
-- Tradeoffs: Right long-term multi-device shape; **does not alone** recover history after the only device’s DB was wiped.
-- Effort: L (and insufficient alone for 4B)
+### Approach D: Multi-KeyPackage / new MLS device only
+- Sketch: Reinstall = new device. Insufficient alone when the sole device’s MLS state was wiped.
+- Effort: L (complementary later, not the reinstall fix)
+
+### Approach E: Signal-like encrypted backup on Blossom (**chosen product direction**)
+- Sketch:
+  1. **Client:** Periodically and/or on “Backup now”, build an encrypted backup package (Marmot SQLCipher DB + db_key, or a portable MLS+transcript format). Outer encryption keyed via domain-separated KDF from nsec (and/or optional user passphrase like Signal’s backup key). Upload ciphertext with existing BUD-02 auth. Publish a small **replaceable backup manifest** (Nostr event pointing at blob hash/URL + version + created_at) so restore can find the latest backup without scanning Blossom.
+  2. **Restore:** After nsec paste, fetch manifest → download blob → decrypt → replace/open local store → local-first Home paint → background relay catch-up.
+  3. **Server:** Run a **Hedwig Blossom** (dedicated or clearly quota’d for backups) so retention, auth, delete, and abuse controls are ours. Keep kind-10063 override for power users. Do **not** treat `https://nostr.download` as the backup SLA.
+- Affected (client): `core/sonar-core` backup module + FFI; `MarmotService` / `SonarCore` restore path; Settings + onboarding UI both apps; kind-10063 / default server selection.
+- Affected (server): new Hedwig Blossom deploy (BUD-01/02/03), retention policy, per-pubkey quota, delete API for panic-wipe, monitoring (can extend `sonar-status` Blossom probe).
+- Tradeoffs: Matches Signal mental model and 4B; needs infra + careful wipe/privacy semantics; backup size grows with history; must not block chat open on backup upload/download.
+- Effort: L (client M–L + server M)
 
 ## Recommendation
 
-Ship **Approach A immediately** for TestFlight (5A): stop implying update durability = uninstall durability.
+1. **Approach A now** (TestFlight / restore copy) so users are not surprised.
+2. **Approach E as the feature**: Signal-like encrypted backup on Blossom, with **Hedwig-operated Blossom** as the default/reliable target and self-hosted override via kind-10063.
+3. Keep **Approach B** as a power-user offline escape hatch (optional v1.1), not the primary path.
+4. **Approach D** remains a separate multi-device track; it does not replace backup.
 
-For 4B (personal restore + product bar), prefer **Approach B first** (explicit encrypted backup/restore), then evolve toward **Approach C** if “forgot to export” becomes the real failure mode. Do not sell Approach D as the reinstall fix—without a state backup, a wiped sole device cannot decrypt old epochs.
+## Infrastructure note (own Blossom)
+
+Today media falls back to a third-party host. Account backup needs:
+- Predictable **retention** (weeks/months; documented)
+- **Per-npub quota** and auth (BUD-02 signed uploads)
+- **Delete** on panic-wipe / disable-backup
+- Ops: uptime probe (extend status `media` / new `backup` check), backups-of-backups if we care about durability
+
+Prefer a **dedicated backup Blossom** (or path/quota class) separate from chat media CDN so a viral video upload cannot evict someone’s only reinstall lifeline. Happy to revisit if one hardened cluster with strict namespaces is enough.
 
 ## Open questions
 
-- Backup UX: Settings-only export, or prompt before “dangerous” flows / periodic reminder?
-- Should panic wipe also destroy any Nostr self-backups (C), or only local?
-- Wallet: confirm current Breez path still re-derives from nsec on both platforms after restore (regression test in CI).
-- Nickname / favorites: restore from profile kind-0 vs. leave blank?
-- How long do relays retain kind 445 / giftwraps needed for catch-up after B/C restore?
+- Auto backup cadence: on-by-default periodic (Signal-like) vs manual-first v1?
+- Backup encryption: nsec-only KDF vs additional user passphrase (Signal AEP-style)?
+- Panic wipe: delete remote Blossom backup automatically, or leave remote until explicit “delete backup”?
+- Include media ciphertext references only, or re-embed attachments in the backup blob?
+- Manifest event kind: new parameterized replaceable kind vs reuse an existing Sonar kind namespace?
+- Hostname: e.g. `blossom.sonar.hedwig.sh` / `backup.sonar.hedwig.sh` — confirm with ops.
+- Wallet: regression-test Breez re-derive from nsec after restore on both platforms.
