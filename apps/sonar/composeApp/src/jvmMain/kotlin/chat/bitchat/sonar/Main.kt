@@ -35,10 +35,10 @@ fun main() {
             DisposableEffect(window) {
                 val listener = object : WindowFocusListener {
                     override fun windowGainedFocus(e: WindowEvent?) {
-                        SonarLifecycle.onForeground?.invoke(true)
+                        SonarLifecycle.updateForeground(true)
                     }
                     override fun windowLostFocus(e: WindowEvent?) {
-                        SonarLifecycle.onForeground?.invoke(false)
+                        SonarLifecycle.updateForeground(false)
                     }
                 }
                 window.addWindowFocusListener(listener)

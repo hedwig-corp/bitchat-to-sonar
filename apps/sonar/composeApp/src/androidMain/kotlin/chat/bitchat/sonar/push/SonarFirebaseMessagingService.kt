@@ -1,10 +1,8 @@
 package chat.bitchat.sonar.push
 
 import android.content.Intent
+import android.os.SystemClock
 import android.util.Log
-import chat.bitchat.sonar.Notifier
-import chat.bitchat.sonar.SonarNotificationKind
-import chat.bitchat.sonar.SonarNotificationRouter
 import com.google.firebase.messaging.FirebaseMessagingService
 import com.google.firebase.messaging.RemoteMessage
 
@@ -37,6 +35,12 @@ class SonarFirebaseMessagingService : FirebaseMessagingService() {
         }
     }
 
+    override fun onDeletedMessages() {
+        if (!SonarPushPrefs.effectivePushEnabled(this)) return
+        Log.w(TAG, "FCM deleted pending messages; scheduling durable bounded notification recovery")
+        SonarNotificationWorkScheduler.scheduleDeletedMessages(this)
+    }
+
     private fun isTransponderPush(data: Map<String, String>, message: RemoteMessage): Boolean {
         if (isBreezPush(data)) return false
 
@@ -62,8 +66,34 @@ class SonarFirebaseMessagingService : FirebaseMessagingService() {
 
     private fun handleMarmotWakeup() {
         Log.d(TAG, "Transponder push — starting Marmot sync")
+        // Own the obligation before entering the foreground-service path. If
+        // Android kills this process after delivery, WorkManager resumes it.
+        val admission = try {
+            SonarNotificationWorkScheduler.scheduleBackup(this)
+        } catch (error: Exception) {
+            Log.e(TAG, "Could not persist Marmot wake obligation", error)
+            // Admission itself was synchronously committed before WorkManager.
+            // Still use the FCM execution window; the next process start will
+            // repair any request that did not reach WorkManager.
+            val state = SonarNotificationAdmission.current(this)
+            state.takeIf {
+                SonarNotificationAdmission.currentForWork(
+                    context = this,
+                    expectedOwnerId = it.ownerId,
+                    currentOwnerId = SonarPushPrefs.accountOwnerId(),
+                ) != null
+            } ?: return
+        }
+        val deadline = SystemClock.elapsedRealtime() +
+            SonarPushProcessingService.TOTAL_PUSH_DEADLINE_MS
         val intent = Intent(this, SonarPushProcessingService::class.java).apply {
             putExtra(SonarPushProcessingService.EXTRA_PUSH_TYPE, SonarPushProcessingService.TYPE_MARMOT)
+            putExtra(SonarPushProcessingService.EXTRA_DEADLINE_ELAPSED_MS, deadline)
+            putExtra(
+                SonarPushProcessingService.EXTRA_ADMISSION_GENERATION,
+                admission.generation,
+            )
+            putExtra(SonarPushProcessingService.EXTRA_ADMISSION_OWNER_ID, admission.ownerId)
         }
         try {
             startForegroundService(intent)
@@ -72,15 +102,10 @@ class SonarFirebaseMessagingService : FirebaseMessagingService() {
             // restriction or the Android 15 dataSync 6h/day budget. We are
             // still inside the high-priority FCM execution window, so surface
             // a generic notification instead of dropping the wake silently.
-            Log.w(TAG, "Push service start rejected, showing generic notification", e)
-            val prefs = SonarPushPrefs.notificationPrefs(this)
-            Notifier.ensureChannel()
-            SonarNotificationRouter.build(
-                idKey = "marmot-push",
-                kind = SonarNotificationKind.Message,
-                unreadCount = 1,
-                prefs = prefs.copy(showPreview = false),
-            )?.let { Notifier.notify(it.id, it.title, it.body) }
+            Log.w(TAG, "Push service start rejected; durable worker owns recovery/fallback", e)
+            SonarNotificationWorkScheduler.scheduleContinuation(this)
+            // The durable worker owns fallback/precise rendering. Rendering
+            // here would race it and could create a second generic alert.
         }
     }
 
@@ -90,6 +115,10 @@ class SonarFirebaseMessagingService : FirebaseMessagingService() {
             putExtra(SonarPushProcessingService.EXTRA_PUSH_TYPE, SonarPushProcessingService.TYPE_BREEZ)
             putExtra(SonarPushProcessingService.EXTRA_NOTIFICATION_TYPE,
                 data["notification_type"] ?: "")
+            putExtra(
+                SonarPushProcessingService.EXTRA_DEADLINE_ELAPSED_MS,
+                SystemClock.elapsedRealtime() + SonarPushProcessingService.TOTAL_PUSH_DEADLINE_MS,
+            )
         }
         try {
             startForegroundService(intent)

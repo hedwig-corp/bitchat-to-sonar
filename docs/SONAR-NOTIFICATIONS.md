@@ -104,9 +104,9 @@ Wire the iOS app to both servers. Full guide: [`docs/ios-push-integration.md`](i
       `SonarPushRegistration` registers the webhook, `SonarAppStore` retries
       when wallet reaches `.ready`.
 - [x] Push processing: `SonarPushProcessor` handles Marmot and Breez pushes
-      from AppDelegate's background fetch handler. Marmot path calls
-      `MarmotChatModel.refresh()` with 20s timeout and falls back to
-      generic notification. Breez path is silent.
+      from AppDelegate's background fetch handler. Marmot uses the Rust-bounded
+      notification-only sync lane and falls back promptly when precise recovery
+      is incomplete. Breez path is silent.
 - [x] Provider payloads are plaintext-free. The app, not the push server,
       decides user-visible copy.
 - [ ] Support push registration disable and token deletion in settings.
@@ -132,9 +132,10 @@ Wire the Compose app to both servers. Full guide: [`docs/android-push-integratio
 - [x] Breez SDK `registerWebhook()` wired into `SonarPushRegistration`
       via new `WalletBridge.registerWebhook(url)` expect/actual method.
 - [x] Marmot message sync wired into `SonarPushProcessingService`: starts
-      SonarCore, syncs relays, reads unread conversation summaries,
-      classifies each via `SonarNotificationRouter`, fires user-visible
-      notifications. Falls back to generic notification on error.
+      SonarCore, runs native-bounded notification-only recovery, and renders
+      only its precise newly-processed message delta. Stable message IDs dedupe
+      repeated wakes/watermark overlap. Falls back generically on incomplete
+      recovery instead of scanning all unread summaries.
 - [x] Breez wakeup path starts wallet SDK if needed, refreshes balance,
       stays silent (no user-visible notification).
 - [x] Implement MIP-05 token encryption for transponder registration through
@@ -144,6 +145,61 @@ Wire the Compose app to both servers. Full guide: [`docs/android-push-integratio
 - [x] Push registration disable in settings: "Background push" toggle in
       Compose NotifSheet calls `Notifier.setPushEnabled()` which
       registers/unregisters push tokens via `SonarPushRegistration`.
+
+### Native-bounded notification recovery
+
+`SonarNode.syncNotifications(deadlineMs:)` is the cross-platform push-wake API.
+It replaces a coroutine-only 25s wrapper that could not cancel blocking UniFFI:
+on the Pixel 10 reproduction, FCM processing began at `19:13:53.523` and logged
+the timeout fallback at `19:19:08.753` — 5m15.230s later.
+The Rust core clamps the requested deadline to 250ms–15s; Android and Apple ask
+for 12s. The lane first returns the encrypted, non-destructive notification
+outbox, then performs an overlapping batched kind-445 relay fetch capped at 128
+events. A first-watermark wake samples only the newest bounded page and leaves
+older history to foreground catch-up; established cursors checkpoint bounded
+continuation pages. Each successfully decrypted message is keyed by its stable
+message ID in the encrypted outbox. Hosts explicitly acknowledge it only after
+the platform post/cancel action succeeds, so a process death or duplicate relay
+delivery can replay safely. The conversation summary and notification row commit
+in one SQLCipher transaction. A bounded recent-message reconciliation pass heals
+the older crash window where MLS storage had committed before the notification
+journal, while acknowledged tombstones prevent that pass from resurrecting a
+notification. Structured call-control payloads are stored intact so endpoint and
+session metadata are never lost to the ordinary 100-byte text-preview limit.
+Results also include completion, timeout/truncation, processed count, and measured
+elapsed time.
+
+The notification lane never runs an unbounded first-session/full-history scan,
+welcome or empty-transcript backfills, unrelated group repair, proposal publication,
+subscription maintenance, outbox retry, KeyPackage publication, or push-token
+sharing. Each host owns one absolute end-to-end wake deadline (22s on Android,
+27s on iOS) and reserves two seconds for rendering. Relay connection and the
+12s native notification lane consume only the time remaining at each admission
+point, so queueing and cold-start latency cannot silently extend the OS wake.
+A generic privacy-preserving notification is rendered at most once per admitted
+wake generation whenever the bounded result contains no precise outbox entry,
+including a completed empty fetch. Persisted surfaced progress prevents an empty
+continuation from adding a fallback after a precise notification already
+succeeded. The host session generation and persisted account identity fence every
+surface, acknowledgement, fallback, wipe, and account replacement. Native sync
+is joined at its Rust safe point before either host may wipe or replace the node.
+
+Durable continuation is implemented on both mobile hosts. Android synchronously
+commits an admission record and a unique, network-constrained WorkManager request
+for every wake generation before entering the foreground service. FCM, the
+foreground service, WorkManager, and live delivery all serialize through one
+notification coordinator; incomplete work retries at most five times. iOS stores
+generation, dirty state, retry count, and surfaced/fallback progress as one
+encoded preferences value and synchronously flushes it before submitting a network-constrained
+`BGProcessingTask`; it also uses one process-wide `MarmotChatModel` and one
+single-flight renderer. iOS continuations are likewise capped at five attempts.
+Both paths resume from core-owned encrypted database/watermark state rather than
+persisting the plaintext-free provider payload. OS background scheduling remains
+best-effort, so killed-app delivery still requires device testing under real APNS/
+FCM conditions. Both hosts durably persist and load the canonical encrypted
+blocked-sender policy in the headless path. Blocked senders, disabled notification
+policy, and stale terminal call rows are explicitly acknowledged without
+rendering them.
 
 ### Phase 5: End-to-End Verification
 

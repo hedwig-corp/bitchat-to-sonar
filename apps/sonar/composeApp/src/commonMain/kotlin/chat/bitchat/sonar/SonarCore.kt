@@ -130,6 +130,32 @@ data class SonarRecentTranscriptPage(
     val messages: List<SonarMsg>,
 )
 
+/** Precise incoming-message data recovered during a notification wake. */
+data class SonarDrainNotification(
+    val messageId: String,
+    val groupId: String,
+    val createdAtSecs: Long,
+    val senderNpub: String,
+    val groupName: String,
+    val contentPreview: String,
+)
+
+/** Result of the native-bounded notification-only recovery lane. */
+data class SonarNotificationSyncResult(
+    val notifications: List<SonarDrainNotification> = emptyList(),
+    val completed: Boolean = false,
+    val timedOut: Boolean = false,
+    val truncated: Boolean = false,
+    val processedEvents: Long = 0,
+    val elapsedMs: Long = 0,
+)
+
+/** A generic wake notification is only useful when native recovery could not
+ *  produce a precise delta. Partial precise progress must never be duplicated
+ *  by a fallback notification. */
+internal fun SonarNotificationSyncResult.needsNotificationFallback(): Boolean =
+    notifications.isEmpty()
+
 /** A reference to an encrypted media attachment. [url] is the Blossom URL of the
  *  CIPHERTEXT; call [SonarCore.fetchMedia] to download + decrypt. */
 data class SonarMedia(
@@ -598,6 +624,21 @@ expect object SonarCore {
      *  have arrived while the socket was torn down — not on the routine
      *  heartbeat. Mirrors iOS `MarmotChatView.refresh()` / `syncForce()`. */
     suspend fun syncForce()
+
+    /** Recover precise push notifications inside a Rust-enforced deadline.
+     *  This excludes bootstrap history, unrelated group repair, outbox, and
+     *  token-sharing work. `completed == false` requests deferred catch-up. */
+    suspend fun syncNotifications(deadlineMs: Long): SonarNotificationSyncResult
+
+    /** Monotonic native-node ownership generation. Background notification
+     *  renderers fence every result against this before surfacing platform UI. */
+    fun notificationSessionGeneration(): Long
+
+    /** Non-destructive view of the encrypted core notification outbox. */
+    suspend fun pendingNotifications(): List<SonarDrainNotification>
+
+    /** Remove only notifications which the platform has successfully posted. */
+    suspend fun ackNotifications(messageIds: List<String>): Int
 
     /** Prefer cold-start historical catch-up for the open chat (MLS group id).
      *  Empty/null clears. Local-first: never blocks paint/send. */

@@ -139,8 +139,15 @@ import kotlin.math.sin
  *  pulling Android lifecycle APIs into commonMain. */
 object SonarLifecycle {
     @Volatile var onForeground: ((Boolean) -> Unit)? = null
+    @Volatile var isForeground: Boolean = false
+        private set
     @Volatile private var onInviteLink: ((String) -> Unit)? = null
     private val pendingInviteLinks = mutableListOf<String>()
+
+    fun updateForeground(value: Boolean) {
+        isForeground = value
+        onForeground?.invoke(value)
+    }
 
     fun submitInviteLink(token: String) {
         val handler = onInviteLink

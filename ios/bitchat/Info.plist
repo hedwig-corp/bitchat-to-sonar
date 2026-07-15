@@ -66,6 +66,11 @@
 		<string>audio</string>
 		<string>voip</string>
 		<string>remote-notification</string>
+		<string>processing</string>
+	</array>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>sh.hedwig.sonar.notification-catch-up</string>
 	</array>
 	<key>UILaunchStoryboardName</key>
 	<string>LaunchScreen</string>

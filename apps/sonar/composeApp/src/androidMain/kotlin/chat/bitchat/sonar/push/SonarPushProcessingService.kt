@@ -8,27 +8,24 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import android.os.SystemClock
 import android.util.Log
 import chat.bitchat.sonar.Notifier
-import chat.bitchat.sonar.PROFILE_CACHE_BLOB_KEY
-import chat.bitchat.sonar.SonarConversationSummary
 import chat.bitchat.sonar.SonarCore
-import chat.bitchat.sonar.SonarNotificationKind
-import chat.bitchat.sonar.SonarNotificationPrefs
-import chat.bitchat.sonar.SonarNotificationRouter
-import chat.bitchat.sonar.SonarProfile
-import chat.bitchat.sonar.canonicalProfileKey
-import chat.bitchat.sonar.decodeProfileCache
-import chat.bitchat.sonar.resolvePushSenderName
+import chat.bitchat.sonar.SonarPushWork
+import chat.bitchat.sonar.SonarPushWorkQueue
+import chat.bitchat.sonar.awaitPushPrerequisite
 import chat.bitchat.sonar.wallet.WalletBridge
 import chat.bitchat.sonar.wallet.WalletState
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * Short-lived foreground service that processes push wakeups.
@@ -39,6 +36,9 @@ import kotlinx.coroutines.withTimeoutOrNull
 class SonarPushProcessingService : Service() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val queueLock = Any()
+    private val workQueue = SonarPushWorkQueue()
+    private val workSignal = Channel<Unit>(Channel.CONFLATED)
 
     override fun onCreate() {
         super.onCreate()
@@ -62,200 +62,97 @@ class SonarPushProcessingService : Service() {
         } else {
             startForeground(FOREGROUND_ID, notification)
         }
+        scope.launch { processQueue() }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val type = intent?.getStringExtra(EXTRA_PUSH_TYPE)
-        Log.d(TAG, "Processing push type=$type")
-
-        scope.launch {
-            when (type) {
-                TYPE_MARMOT -> processMarmotWakeup()
-                TYPE_BREEZ -> processBreezWakeup(
-                    intent?.getStringExtra(EXTRA_NOTIFICATION_TYPE) ?: ""
-                )
-                else -> Log.w(TAG, "Unknown push type: $type")
-            }
-            stopSelf(startId)
+        val work = SonarPushWork(
+            startId = startId,
+            type = intent?.getStringExtra(EXTRA_PUSH_TYPE),
+            notificationType = intent?.getStringExtra(EXTRA_NOTIFICATION_TYPE) ?: "",
+            deadlineElapsedMs = intent?.getLongExtra(EXTRA_DEADLINE_ELAPSED_MS, 0L)
+                ?.takeIf { it > 0 }
+                ?: (SystemClock.elapsedRealtime() + TOTAL_PUSH_DEADLINE_MS),
+            admissionGeneration = intent?.getLongExtra(EXTRA_ADMISSION_GENERATION, 0L) ?: 0L,
+            admissionOwnerId = intent?.getStringExtra(EXTRA_ADMISSION_OWNER_ID).orEmpty(),
+        )
+        synchronized(queueLock) { workQueue.enqueue(work) }
+        if (workSignal.trySend(Unit).isFailure) {
+            Log.w(TAG, "Push actor unavailable for startId=$startId")
         }
-
         return START_NOT_STICKY
     }
 
-    private suspend fun processMarmotWakeup() {
-        try {
-            val prefs = notificationPrefs()
-            val synced = withTimeoutOrNull(MARMOT_PUSH_SYNC_TIMEOUT_MS) {
-                SonarCore.start()
-                SonarCore.connectRelays()
-                // Push wake: force the batched gap-recovery fetch. A routine
-                // sync() would short-circuit while live subscriptions are marked
-                // active even though the socket was torn down while backgrounded,
-                // leaving the pushed message unfetched.
-                SonarCore.syncForce()
-            } != null
-
-            if (!prefs.enabled) {
-                Log.d(TAG, "Marmot sync done (synced=$synced), notifications disabled")
-                return
-            }
-
-            // Even when syncForce overran its budget, the partial drain has
-            // usually already written the pushed message into local storage
-            // (relays EOSE well inside the window; the tail is engine work).
-            // So always try to render real titled notifications from local
-            // state, and only degrade to the generic fallback when nothing
-            // unread actually landed AND the sync was cut short.
-            val notified = notifyUnreadConversations(prefs)
-
-            when {
-                notified > 0 ->
-                    Log.d(TAG, "Marmot wakeup: notified for $notified conversation(s) (synced=$synced)")
-                synced ->
-                    Log.d(TAG, "Marmot sync complete, no unread messages")
-                else -> {
-                    Log.w(TAG, "Marmot sync timed out with nothing unread, showing fallback")
-                    notifyFallback(prefs)
+    private suspend fun processQueue() {
+        for (ignored in workSignal) {
+            while (true) {
+                val work = synchronized(queueLock) {
+                    workQueue.next()
+                } ?: break
+                var marmotCompleted = false
+                try {
+                    when (work.type) {
+                        TYPE_MARMOT -> marmotCompleted = processMarmotWakeup(
+                            work.deadlineElapsedMs,
+                            work.admissionGeneration,
+                            work.admissionOwnerId,
+                        )
+                        TYPE_BREEZ -> processBreezWakeup(work.notificationType, work.deadlineElapsedMs)
+                        else -> Log.w(TAG, "Unknown push type=${work.type}")
+                    }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Exception) {
+                    Log.e(TAG, "Push work failed type=${work.type}", error)
                 }
+                val completed = synchronized(queueLock) { workQueue.complete() }
+                if (work.type == TYPE_MARMOT) {
+                    // The pre-enqueued backup is deliberately not cancelled on
+                    // success: cancellation can race a newly admitted push and
+                    // erase its durable obligation. Its bounded, idempotent
+                    // verification run completes the unique WorkManager job.
+                    if (!marmotCompleted ||
+                        completed.coalescedWhileActive ||
+                        completed.hasPendingMarmot
+                    ) {
+                        SonarNotificationWorkScheduler.scheduleContinuation(this)
+                    }
+                }
+                stopSelfResult(completed.work.startId)
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "Marmot wakeup failed, showing fallback", e)
-            notifyFallback(notificationPrefs())
         }
     }
 
-    /** Render titled notifications for every unread conversation from local
-     *  storage. Returns how many conversations were notified. */
-    private suspend fun notifyUnreadConversations(prefs: SonarNotificationPrefs): Int {
-        val summaries = SonarCore.conversationSummaries()
-        val unread = summaries.filter { it.unreadCount > 0 }
-        if (unread.isEmpty()) return 0
-
-        // The drain runs while the UI may be dead, so resolve nicknames the
-        // same way the foreground path does: persisted kind-0 cache first,
-        // then a bounded relay fetch (relays are already connected here).
-        // Never title a notification with the raw npub when a name exists.
-        // Skip the network entirely when names are hidden -- the router
-        // discards senderName in that case, so the fetches would be wasted.
-        val cachedProfiles = decodeProfileCache(SonarCore.loadBlob(PROFILE_CACHE_BLOB_KEY))
-        val fetchedProfiles =
-            if (prefs.showNames) prefetchSenderProfiles(unread, cachedProfiles)
-            else emptyMap()
-
-        var notified = 0
-        for (summary in unread) {
-            val kind = SonarNotificationRouter.classifyContent(
-                summary.latestContent,
-                isCallControl = { SonarCore.callParseControl(it) != null },
+    private suspend fun processMarmotWakeup(
+        deadlineElapsedMs: Long,
+        admissionGeneration: Long,
+        admissionOwnerId: String,
+    ): Boolean {
+        val outcome = SonarNotificationRecovery.run(
+            this,
+            deadlineElapsedMs,
+            admissionGeneration,
+            admissionOwnerId,
+        )
+        if (outcome.completed) {
+            SonarNotificationAdmission.markCompleted(
+                this,
+                admissionOwnerId,
+                admissionGeneration,
             )
-            if (kind == SonarNotificationKind.Call) continue
-
-            val notif = SonarNotificationRouter.build(
-                idKey = summary.groupIdHex,
-                kind = kind,
-                conversationTitle = summary.name.ifBlank { null },
-                senderName = if (!prefs.showNames) null else summary.latestSenderNpub
-                    .takeIf { it.isNotBlank() }
-                    ?.let { npub ->
-                        // Everything is prefetched above under one budget, so
-                        // the fetch lambda is a pure map read (no network).
-                        resolvePushSenderName(npub, cachedProfiles) { missing ->
-                            fetchedProfiles[canonicalProfileKey(missing)]
-                        }
-                    },
-                preview = summary.latestContent,
-                unreadCount = summary.unreadCount,
-                prefs = prefs,
-            )
-            if (notif != null) {
-                Notifier.notify(
-                    id = notif.id,
-                    title = notif.title,
-                    body = notif.body,
-                    conversationId = summary.groupIdHex,
-                )
-                notified++
-            }
         }
-        return notified
+        return outcome.completed
     }
 
-    /**
-     * Resolve every uncached sender's kind-0 profile for this wakeup under ONE
-     * total budget, keyed by [canonicalProfileKey].
-     *
-     * Fetches run in parallel and, crucially, are launched on the service's own
-     * [scope] rather than as children of the timeout block: [SonarCore.fetchProfile]
-     * hops to `Dispatchers.IO` and makes a blocking UniFFI call (with its own
-     * ~10s core-internal timeout), so a `withTimeoutOrNull` wrapped directly
-     * around it could not actually cancel the blocking child and would wait the
-     * full core timeout anyway. By awaiting orphaned [scope] jobs inside the
-     * budget, the await is genuinely cancellable -- when the budget expires we
-     * fall back to the npub label immediately while the stragglers finish
-     * harmlessly in the background. A single budget also bounds total wall time
-     * regardless of how many distinct uncached senders are unread (otherwise it
-     * would grow as senderCount x timeout, delaying later notifications and
-     * stopSelf).
-     */
-    private suspend fun prefetchSenderProfiles(
-        unread: List<SonarConversationSummary>,
-        cachedProfiles: Map<String, SonarProfile>,
-    ): Map<String, SonarProfile?> {
-        // canonicalKey -> npub, de-duplicated and skipping cache hits.
-        val missing = LinkedHashMap<String, String>()
-        for (summary in unread) {
-            val npub = summary.latestSenderNpub.takeIf { it.isNotBlank() } ?: continue
-            val key = canonicalProfileKey(npub)
-            if (cachedProfiles[key]?.bestName != null) continue
-            missing.putIfAbsent(key, npub)
-        }
-        if (missing.isEmpty()) return emptyMap()
-
-        val jobs = missing.map { (key, npub) ->
-            scope.async { key to runCatching { SonarCore.fetchProfile(npub) }.getOrNull() }
-        }
-        val resolved = HashMap<String, SonarProfile?>()
-        withTimeoutOrNull(PROFILE_FETCH_BUDGET_MS) {
-            jobs.forEach { job ->
-                val (key, profile) = job.await()
-                resolved[key] = profile
-            }
-        }
-        return resolved
-    }
-
-    private fun notificationPrefs(): SonarNotificationPrefs =
-        SonarPushPrefs.notificationPrefs(this)
-
-    private fun notifyFallback(prefs: SonarNotificationPrefs) {
-        val notif = SonarNotificationRouter.build(
-            idKey = "marmot-push",
-            kind = SonarNotificationKind.Message,
-            unreadCount = 1,
-            prefs = prefs.copy(showPreview = false),
-        ) ?: return
-        Notifier.notify(notif.id, notif.title, notif.body)
-    }
-
-    private suspend fun processBreezWakeup(notificationType: String) {
+    private suspend fun processBreezWakeup(notificationType: String, deadlineElapsedMs: Long) {
         // Silent -- no user-visible notification. The payment amount
         // notification fires later through the transponder/chat path when the
         // ⚡PAY control line arrives.
-        try {
-            if (WalletBridge.state() !is WalletState.Ready) {
-                val nsec = SonarCore.identityNsec()
-                if (nsec.isNotBlank()) {
-                    withTimeoutOrNull(15_000) { WalletBridge.setupIfNeeded(nsec) }
-                }
-            }
-            WalletBridge.refreshBalance()
-            Log.d(TAG, "Breez wakeup processed (type=$notificationType, silent)")
-        } catch (e: Exception) {
-            Log.w(TAG, "Breez wakeup failed (silent)", e)
-        }
+        BreezPushRecovery.run(notificationType, deadlineElapsedMs)
     }
 
     override fun onDestroy() {
+        workSignal.close()
         scope.cancel()
         super.onDestroy()
     }
@@ -268,25 +165,50 @@ class SonarPushProcessingService : Service() {
         const val FOREGROUND_ID = 9001
         const val EXTRA_PUSH_TYPE = "push_type"
         const val EXTRA_NOTIFICATION_TYPE = "notification_type"
+        const val EXTRA_DEADLINE_ELAPSED_MS = "deadline_elapsed_ms"
+        const val EXTRA_ADMISSION_GENERATION = "admission_generation"
+        const val EXTRA_ADMISSION_OWNER_ID = "admission_owner_id"
         const val TYPE_MARMOT = "marmot"
         const val TYPE_BREEZ = "breez"
 
-        // Marmot push-triggered background sync budget.
-        // On a cold wake the core must start, connect relays, and reach EOSE
-        // inside this window before we render the local notification (otherwise
-        // the user gets the generic "New Sonar message" fallback). 20s was too
-        // tight on real devices; 25s uses more of the wakeup window while leaving
-        // headroom to render the notif. Kept in parity with iOS
-        // TransportConfig.marmotPushSyncTimeoutSeconds (PR #123 / F10 of #122).
-        // (Android has no Tor; if a bootstrap step is ever added, its latency
-        // must also fit inside this budget.)
-        private const val MARMOT_PUSH_SYNC_TIMEOUT_MS = 25_000L
+        const val TOTAL_PUSH_DEADLINE_MS = 22_000L
+    }
+}
 
-        // Total kind-0 lookup budget for the WHOLE wakeup (not per sender) when
-        // the persisted profile cache misses. All uncached senders are fetched
-        // in parallel under this single budget after the sync above, so the
-        // relay pool is already connected; whatever has not resolved when it
-        // expires falls back to the npub label.
-        private const val PROFILE_FETCH_BUDGET_MS = 5_000L
+/** Breez setup/refresh also crosses blocking native APIs. Own that work in a
+ * process scope and only bound the Service's await, so wallet latency can never
+ * starve a later Marmot wake or extend the foreground-service deadline. */
+private object BreezPushRecovery {
+    private const val TAG = "SonarBreezPush"
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val jobLock = Any()
+    private var activeJob: Deferred<Boolean>? = null
+
+    suspend fun run(notificationType: String, deadlineElapsedMs: Long) {
+        val job = synchronized(jobLock) {
+            activeJob?.takeIf { it.isActive } ?: scope.async {
+                runCatching {
+                    if (WalletBridge.state() !is WalletState.Ready) {
+                        val nsec = SonarCore.identityNsec()
+                        if (nsec.isNotBlank()) WalletBridge.setupIfNeeded(nsec)
+                    }
+                    WalletBridge.refreshBalance()
+                    true
+                }.getOrElse {
+                    Log.w(TAG, "Breez wakeup failed (silent)", it)
+                    false
+                }
+            }.also { activeJob = it }
+        }
+        val completed = awaitPushPrerequisite(
+            deadlineElapsedMs = deadlineElapsedMs,
+            nowElapsedMs = SystemClock::elapsedRealtime,
+            prerequisite = job,
+        )
+        if (completed) {
+            Log.d(TAG, "Breez wakeup processed (type=$notificationType, silent)")
+        } else {
+            Log.w(TAG, "Breez wakeup exceeded its host deadline (type=$notificationType)")
+        }
     }
 }

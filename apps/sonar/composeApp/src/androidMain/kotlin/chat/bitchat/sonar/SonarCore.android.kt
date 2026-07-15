@@ -38,6 +38,10 @@ actual object SonarCore {
     )
 
     private val lock = Mutex()
+    // Notification recovery crosses a non-cooperative blocking UniFFI call.
+    // Node replacement/wipe takes write and therefore joins every old native
+    // reader before deleting storage or installing another account.
+    private val nodeLifecycleLock = ReentrantReadWriteLock(true)
     // Fairness prevents a wipe/import writer from starving behind a stream of
     // picker/transcript reads while still allowing unrelated images in parallel.
     private val stickerOperationLock = ReentrantReadWriteLock(true)
@@ -46,6 +50,7 @@ actual object SonarCore {
     @Volatile private var relayConnected = false
     @Volatile private var npub: String = ""
     @Volatile private var pubkeyHex: String = ""
+    @Volatile private var nodeGeneration: Long = 0
 
     private val ctx: Context get() = AppContextHolder.ctx
     private fun prefs() = ctx.getSharedPreferences("sonar", Context.MODE_PRIVATE)
@@ -64,8 +69,12 @@ actual object SonarCore {
                 // Diagnostics file sink must exist before the node spins up so
                 // relay connect/EOSE/watermark events are captured. Non-fatal.
                 installCoreLogging(diagnosticsVerbose())
-                node = SonarNode.connect(identity, emptyList(), dbPath, dbKeyHex)
-                relayConnected = false
+                val opened = SonarNode.connect(identity, emptyList(), dbPath, dbKeyHex)
+                nodeLifecycleLock.write {
+                    node = opened
+                    relayConnected = false
+                    nodeGeneration += 1
+                }
             }
             npub
         }
@@ -86,9 +95,13 @@ actual object SonarCore {
             // Match iOS MarmotService.connect(): keep the local-only node usable
             // until the relay-backed replacement is fully connected.
             val connected = SonarNode.connect(identity, relayUrls, dbPath, dbKeyHex)
-            val previousNode = node
-            node = connected
-            relayConnected = true
+            val previousNode = nodeLifecycleLock.write {
+                val previous = node
+                node = connected
+                relayConnected = true
+                nodeGeneration += 1
+                previous
+            }
             installConversationListener()
             previousNode?.close()
             runCatching { connected.retryOutbox() }
@@ -507,6 +520,82 @@ actual object SonarCore {
         Unit
     }
 
+    actual suspend fun syncNotifications(deadlineMs: Long): SonarNotificationSyncResult =
+        withContext(Dispatchers.IO) {
+            val result = nodeLifecycleLock.read {
+                requireNode().syncNotifications(deadlineMs.coerceAtLeast(1).toULong())
+            }
+            SonarNotificationSyncResult(
+                notifications = result.notifications.map {
+                    SonarDrainNotification(
+                        messageId = it.messageId,
+                        groupId = it.groupId,
+                        createdAtSecs = it.createdAtSecs.toLong(),
+                        senderNpub = it.senderNpub,
+                        groupName = it.groupName,
+                        contentPreview = it.contentPreview,
+                    )
+                },
+                completed = result.completed,
+                timedOut = result.timedOut,
+                truncated = result.truncated,
+                processedEvents = result.processedEvents.toLong(),
+                elapsedMs = result.elapsedMs.toLong(),
+            )
+        }
+
+    actual fun notificationSessionGeneration(): Long = nodeGeneration
+
+    /**
+     * Hold the native-node read lease through an OS notification action.
+     * Account replacement/wipe takes the write lease, so an old wake cannot
+     * race a post/cancel past the generation check.
+     */
+    internal fun runIfNotificationSessionCurrent(
+        expectedGeneration: Long,
+        action: () -> Boolean,
+    ): Boolean = nodeLifecycleLock.read {
+        if (nodeGeneration != expectedGeneration) {
+            false
+        } else {
+            action()
+        }
+    }
+
+    actual suspend fun pendingNotifications(): List<SonarDrainNotification> =
+        withContext(Dispatchers.IO) {
+            nodeLifecycleLock.read {
+                val n = node ?: return@read emptyList()
+                n.pendingNotifications().map {
+                    SonarDrainNotification(
+                        messageId = it.messageId,
+                        groupId = it.groupId,
+                        createdAtSecs = it.createdAtSecs.toLong(),
+                        senderNpub = it.senderNpub,
+                        groupName = it.groupName,
+                        contentPreview = it.contentPreview,
+                    )
+                }
+            }
+        }
+
+    actual suspend fun ackNotifications(messageIds: List<String>): Int =
+        withContext(Dispatchers.IO) {
+            if (messageIds.isEmpty()) return@withContext 0
+            nodeLifecycleLock.read { node?.ackNotifications(messageIds)?.toInt() ?: 0 }
+        }
+
+    internal suspend fun ackNotificationsForSession(
+        messageIds: List<String>,
+        expectedGeneration: Long,
+    ): Int = withContext(Dispatchers.IO) {
+        if (messageIds.isEmpty()) return@withContext 0
+        nodeLifecycleLock.read {
+            if (nodeGeneration != expectedGeneration) 0
+            else node?.ackNotifications(messageIds)?.toInt() ?: 0
+        }
+    }
+
     actual suspend fun preferCatchupGroup(mlsGroupIdHex: String?) = withContext(Dispatchers.IO) {
         val value = mlsGroupIdHex?.trim().orEmpty()
         runCatching { node?.preferCatchupGroup(value) }
@@ -717,6 +806,19 @@ actual object SonarCore {
 
     actual fun identityNsec(): String = AndroidSecrets.getMigrating("nsec", durable = true) ?: ""
 
+    /** Public owner snapshot serialized with node/account replacement. A push
+     * arriving mid-import waits for the write boundary, then derives B's npub
+     * (or nil after wipe) instead of re-admitting stale work for A. */
+    internal fun notificationAccountOwnerId(): String? = nodeLifecycleLock.read {
+        val nsec = AndroidSecrets.getMigrating("nsec", durable = true)
+            ?.trim()
+            ?.takeIf(String::isNotEmpty)
+            ?: return@read null
+        runCatching { SonarIdentity.import(nsec).npub() }
+            .getOrNull()
+            ?.takeIf(String::isNotEmpty)
+    }
+
     actual fun hasIdentity(): Boolean =
         runCatching {
             val saved = AndroidSecrets.getMigrating("nsec", durable = true)?.trim()
@@ -744,31 +846,38 @@ actual object SonarCore {
     actual suspend fun importIdentity(nsec: String): String = withContext(Dispatchers.IO) {
         val identity = SonarIdentity.import(nsec.trim())
         lock.withLock {
-            stickerOperationLock.write {
-                val previousIdentity = AndroidSecrets
-                    .getMigrating("nsec", durable = true)
-                    ?.let { saved -> runCatching { SonarIdentity.import(saved) }.getOrNull() }
-                closeNode()
-                val marmotDir = File(ctx.filesDir, "sonar-marmot")
-                try {
-                    wipeMarmotStorage(marmotDir)
-                    AndroidSecrets.put("nsec", identity.nsec(), durable = true)
-                    npub = identity.npub()
-                    pubkeyHex = identity.pubkeyHex()
-                    npub
-                } catch (importError: Throwable) {
-                    if (previousIdentity != null) {
-                        try {
-                            node = connectLocalIdentity(previousIdentity)
-                            relayConnected = false
-                            npub = previousIdentity.npub()
-                            pubkeyHex = previousIdentity.pubkeyHex()
-                            installConversationListener()
-                        } catch (recoveryError: Throwable) {
-                            importError.addSuppressed(recoveryError)
+            nodeLifecycleLock.write {
+                stickerOperationLock.write {
+                    val previousIdentity = AndroidSecrets
+                        .getMigrating("nsec", durable = true)
+                        ?.let { saved -> runCatching { SonarIdentity.import(saved) }.getOrNull() }
+                    closeNode()
+                    nodeGeneration += 1
+                    // Generation invalidation and durable wake retirement share
+                    // the write boundary, so an old renderer cannot cross it.
+                    chat.bitchat.sonar.push.SonarNotificationWorkScheduler.invalidateAll(ctx)
+                    val marmotDir = File(ctx.filesDir, "sonar-marmot")
+                    try {
+                        wipeMarmotStorage(marmotDir)
+                        AndroidSecrets.put("nsec", identity.nsec(), durable = true)
+                        npub = identity.npub()
+                        pubkeyHex = identity.pubkeyHex()
+                        npub
+                    } catch (importError: Throwable) {
+                        if (previousIdentity != null) {
+                            try {
+                                node = connectLocalIdentity(previousIdentity)
+                                nodeGeneration += 1
+                                relayConnected = false
+                                npub = previousIdentity.npub()
+                                pubkeyHex = previousIdentity.pubkeyHex()
+                                installConversationListener()
+                            } catch (recoveryError: Throwable) {
+                                importError.addSuppressed(recoveryError)
+                            }
                         }
+                        throw importError
                     }
-                    throw importError
                 }
             }
         }
@@ -789,30 +898,42 @@ actual object SonarCore {
     actual fun loadBlob(key: String): String = prefs().getString("blob.$key", "") ?: ""
 
     actual fun saveBlob(key: String, value: String) {
-        prefs().edit().putString("blob.$key", value).apply()
+        val edit = prefs().edit().putString("blob.$key", value)
+        if (key == SOCIAL_STATE_BLOB_KEY) {
+            // Blocking is a security boundary consumed by cold headless
+            // notification workers. Return only after the canonical policy is
+            // durable so a process death cannot reopen a notification race.
+            edit.commit()
+        } else {
+            edit.apply()
+        }
     }
 
     actual suspend fun wipe() = withContext(Dispatchers.IO) {
         lock.withLock {
-            stickerOperationLock.write {
-                closeNode()
-                npub = ""; pubkeyHex = ""
-                // Drop the encrypted Marmot DB + all prefs. The diagnostics logs
-                // live under sonar-marmot/ (logs/), so this also removes them — at
-                // verbose level they can contain peer npubs and must not survive a
-                // wipe (Account Key Durability / privacy rule).
-                val marmotDir = File(ctx.filesDir, "sonar-marmot")
-                val wipeFailure = runCatching { wipeMarmotStorage(marmotDir) }.exceptionOrNull()
-                // Exported diagnostics bundles are staged in the FileProvider cache
-                // dir (not under sonar-marmot); drop them too — at verbose level
-                // they can contain peer npubs.
-                File(ctx.cacheDir, "media-share")
-                    .listFiles { f -> f.name.startsWith("sonar-diagnostics") }
-                    ?.forEach { it.delete() }
-                AndroidSecrets.clear()
-                prefs().edit().clear().apply()
-                wipeFailure?.let { throw it }
-                Unit
+            nodeLifecycleLock.write {
+                stickerOperationLock.write {
+                    closeNode()
+                    nodeGeneration += 1
+                    npub = ""; pubkeyHex = ""
+                    chat.bitchat.sonar.push.SonarNotificationWorkScheduler.invalidateAll(ctx)
+                    // Drop the encrypted Marmot DB + all prefs. The diagnostics logs
+                    // live under sonar-marmot/ (logs/), so this also removes them — at
+                    // verbose level they can contain peer npubs and must not survive a
+                    // wipe (Account Key Durability / privacy rule).
+                    val marmotDir = File(ctx.filesDir, "sonar-marmot")
+                    val wipeFailure = runCatching { wipeMarmotStorage(marmotDir) }.exceptionOrNull()
+                    // Exported diagnostics bundles are staged in the FileProvider cache
+                    // dir (not under sonar-marmot); drop them too — at verbose level
+                    // they can contain peer npubs.
+                    File(ctx.cacheDir, "media-share")
+                        .listFiles { f -> f.name.startsWith("sonar-diagnostics") }
+                        ?.forEach { it.delete() }
+                    AndroidSecrets.clear()
+                    prefs().edit().clear().apply()
+                    wipeFailure?.let { throw it }
+                    Unit
+                }
             }
         }
     }
@@ -820,13 +941,16 @@ actual object SonarCore {
     actual suspend fun eraseChats() {
         withContext(Dispatchers.IO) {
             lock.withLock {
-                stickerOperationLock.write {
-                    closeNode()
-                    // Delete ONLY the encrypted Marmot DB — keep nsec, the DB key,
-                    // nickname and every pref. start() (below) reopens a fresh empty
-                    // DB with the SAME identity + key.
-                    val marmotDir = File(ctx.filesDir, "sonar-marmot")
-                    wipeMarmotStorage(marmotDir)
+                nodeLifecycleLock.write {
+                    stickerOperationLock.write {
+                        closeNode()
+                        nodeGeneration += 1
+                        // Delete ONLY the encrypted Marmot DB — keep nsec, the DB key,
+                        // nickname and every pref. start() (below) reopens a fresh empty
+                        // DB with the SAME identity + key.
+                        val marmotDir = File(ctx.filesDir, "sonar-marmot")
+                        wipeMarmotStorage(marmotDir)
+                    }
                 }
             }
         }

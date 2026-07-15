@@ -3,6 +3,7 @@ package chat.bitchat.sonar
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertIs
 import kotlin.test.assertNull
 
 class SonarNotificationRouterTest {
@@ -132,4 +133,106 @@ class SonarNotificationRouterTest {
             SonarNotificationRouter.classifyContent("hello"),
         )
     }
+
+    @Test
+    fun freshParsedOfferIsTheOnlyDeltaThatRings() {
+        val now = 10_000L
+        val post = SonarNotificationRouter.actionForDelta(
+            delta = delta("call"), notificationsAllowed = true,
+            prefs = SonarNotificationPrefs(), nowSecs = now,
+            parseCallControl = { SonarCallControl.Offer("c", false, "addr", now) },
+        )
+        assertEquals(SonarNotificationKind.Call, assertIs<SonarDeltaNotificationAction.Post>(post).notification.kind)
+
+        listOf(now - 61, now + 61).forEach { timestamp ->
+            assertIs<SonarDeltaNotificationAction.Cancel>(
+                SonarNotificationRouter.actionForDelta(
+                    delta("call"), true, SonarNotificationPrefs(), now,
+                    parseCallControl = { SonarCallControl.Offer("c", false, "addr", timestamp) },
+                ),
+            )
+        }
+    }
+
+    @Test
+    fun terminalCallControlsCancelOnlyTheirCallNotification() {
+        val controls = listOf(
+            SonarCallControl.Answer("c", SonarAnswer.Accept, "addr"),
+            SonarCallControl.Cancel("c"),
+            SonarCallControl.End("c", "done"),
+        )
+        controls.forEach { control ->
+            val action = SonarNotificationRouter.actionForDelta(
+                delta("control"), false, SonarNotificationPrefs(enabled = false), 10_000,
+                parseCallControl = { control },
+            )
+            assertEquals(
+                SonarNotificationRouter.notificationId(
+                    SonarNotificationRouter.callNotificationKey("group", "c"),
+                ),
+                assertIs<SonarDeltaNotificationAction.Cancel>(action).notificationId,
+            )
+        }
+        assertEquals(
+            false,
+            SonarNotificationRouter.notificationId(
+                SonarNotificationRouter.callNotificationKey("group", "c"),
+            ) == SonarNotificationRouter.notificationId(
+                SonarNotificationRouter.callNotificationKey("group", "new-call"),
+            ),
+        )
+    }
+
+    @Test
+    fun staleTerminalCannotDismissAReusedGroupCall() {
+        val action = SonarNotificationRouter.actionForDelta(
+            delta("control").copy(createdAtSecs = 9_900),
+            true,
+            SonarNotificationPrefs(),
+            10_000,
+            parseCallControl = { SonarCallControl.End("old-call", "done") },
+        )
+
+        assertIs<SonarDeltaNotificationAction.Acknowledge>(action)
+    }
+
+    @Test
+    fun blockedSenderIsPolicyAcknowledgedWithoutPlatformUi() {
+        val action = SonarNotificationRouter.actionForDelta(
+            delta("secret"), true, SonarNotificationPrefs(), 10_000,
+            senderAllowed = false,
+        )
+
+        assertIs<SonarDeltaNotificationAction.Acknowledge>(action)
+    }
+
+    @Test
+    fun disabledNotificationPolicyAcknowledgesWithoutCreatingBacklog() {
+        val permissionDenied = SonarNotificationRouter.actionForDelta(
+            delta("secret"), false, SonarNotificationPrefs(), 10_000,
+        )
+        val preferenceDisabled = SonarNotificationRouter.actionForDelta(
+            delta("secret"), true, SonarNotificationPrefs(enabled = false), 10_000,
+        )
+
+        assertIs<SonarDeltaNotificationAction.Acknowledge>(permissionDenied)
+        assertIs<SonarDeltaNotificationAction.Acknowledge>(preferenceDisabled)
+    }
+
+    @Test
+    fun unparsedCallLookingTextIsRenderedAsMessageNotCall() {
+        val action = SonarNotificationRouter.actionForDelta(
+            delta("☎CALL|1|OFFER|forged|voice|addr|10000"), true,
+            SonarNotificationPrefs(), 10_000, parseCallControl = { null },
+        )
+        assertEquals(
+            SonarNotificationKind.Message,
+            assertIs<SonarDeltaNotificationAction.Post>(action).notification.kind,
+        )
+    }
+
+    private fun delta(content: String) = SonarDrainNotification(
+        messageId = "message", groupId = "group", createdAtSecs = 10_000,
+        senderNpub = "npub1alice", groupName = "Alice", contentPreview = content,
+    )
 }

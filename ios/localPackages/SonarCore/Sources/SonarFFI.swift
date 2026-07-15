@@ -1398,6 +1398,12 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func acceptGroupInvite(inviteIdHex: String) throws  -> String
 
     /**
+     * Acknowledge only stable message ids whose OS notification post (or call
+     * cancellation action) completed successfully.
+     */
+    func ackNotifications(messageIds: [String]) throws  -> UInt64
+
+    /**
      * Acknowledge direct NIP-17 DMs only after the host persisted or consumed
      * the drained records.
      */
@@ -1631,6 +1637,12 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func pendingJoinRequests(groupIdHex: String) throws  -> [JoinRequestInfo]
 
     /**
+     * Non-destructive peek of durable notification obligations. Rows remain
+     * across process death until the host confirms its platform action worked.
+     */
+    func pendingNotifications() throws  -> [DrainNotificationInfo]
+
+    /**
      * Prefer catch-up for the open chat. Pass the MLS group id hex (same id
      * hosts use for send_text / messages). Empty clears. Local-first: does not
      * block paint or send. Core maps MLS to nostr group id for the catch-up queue.
@@ -1789,6 +1801,13 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func syncForce() throws
 
     /**
+     * Notification-only recovery with a deadline enforced by Rust, below the
+     * blocking UniFFI boundary. Unlike `sync_force`, this never runs bootstrap
+     * history, group repair, outbox, token-sharing, or subscription phases.
+     */
+    func syncNotifications(deadlineMs: UInt64) throws  -> NotificationSyncResultInfo
+
+    /**
      * Poll the relays once: welcomes addressed to us, then group messages.
      */
     func syncOnce() throws
@@ -1909,6 +1928,19 @@ open func acceptGroupInvite(inviteIdHex: String)throws  -> String  {
     uniffi_sonar_ffi_fn_method_sonarnode_accept_group_invite(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(inviteIdHex),$0
+    )
+})
+}
+
+    /**
+     * Acknowledge only stable message ids whose OS notification post (or call
+     * cancellation action) completed successfully.
+     */
+open func ackNotifications(messageIds: [String])throws  -> UInt64  {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_ack_notifications(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceString.lower(messageIds),$0
     )
 })
 }
@@ -2452,6 +2484,18 @@ open func pendingJoinRequests(groupIdHex: String)throws  -> [JoinRequestInfo]  {
 }
 
     /**
+     * Non-destructive peek of durable notification obligations. Rows remain
+     * across process death until the host confirms its platform action worked.
+     */
+open func pendingNotifications()throws  -> [DrainNotificationInfo]  {
+    return try  FfiConverterSequenceTypeDrainNotificationInfo.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_pending_notifications(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+
+    /**
      * Prefer catch-up for the open chat. Pass the MLS group id hex (same id
      * hosts use for send_text / messages). Empty clears. Local-first: does not
      * block paint or send. Core maps MLS to nostr group id for the catch-up queue.
@@ -2796,6 +2840,20 @@ open func syncForce()throws   {try rustCallWithError(FfiConverterTypeSonarFfiErr
             self.uniffiCloneHandle(),$0
     )
 }
+}
+
+    /**
+     * Notification-only recovery with a deadline enforced by Rust, below the
+     * blocking UniFFI boundary. Unlike `sync_force`, this never runs bootstrap
+     * history, group repair, outbox, token-sharing, or subscription phases.
+     */
+open func syncNotifications(deadlineMs: UInt64)throws  -> NotificationSyncResultInfo  {
+    return try  FfiConverterTypeNotificationSyncResultInfo_lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_sync_notifications(
+            self.uniffiCloneHandle(),
+        FfiConverterUInt64.lower(deadlineMs),$0
+    )
+})
 }
 
     /**
@@ -3387,13 +3445,19 @@ public func FfiConverterTypeDirectDmInfo_lower(_ value: DirectDmInfo) -> RustBuf
  * fire rich local notifications (sender name + preview).
  */
 public struct DrainNotificationInfo: Equatable, Hashable {
+    public var messageId: String
+    public var groupId: String
+    public var createdAtSecs: UInt64
     public var senderNpub: String
     public var groupName: String
     public var contentPreview: String
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(senderNpub: String, groupName: String, contentPreview: String) {
+    public init(messageId: String, groupId: String, createdAtSecs: UInt64, senderNpub: String, groupName: String, contentPreview: String) {
+        self.messageId = messageId
+        self.groupId = groupId
+        self.createdAtSecs = createdAtSecs
         self.senderNpub = senderNpub
         self.groupName = groupName
         self.contentPreview = contentPreview
@@ -3415,6 +3479,9 @@ public struct FfiConverterTypeDrainNotificationInfo: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DrainNotificationInfo {
         return
             try DrainNotificationInfo(
+                messageId: FfiConverterString.read(from: &buf),
+                groupId: FfiConverterString.read(from: &buf),
+                createdAtSecs: FfiConverterUInt64.read(from: &buf),
                 senderNpub: FfiConverterString.read(from: &buf),
                 groupName: FfiConverterString.read(from: &buf),
                 contentPreview: FfiConverterString.read(from: &buf)
@@ -3422,6 +3489,9 @@ public struct FfiConverterTypeDrainNotificationInfo: FfiConverterRustBuffer {
     }
 
     public static func write(_ value: DrainNotificationInfo, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.messageId, into: &buf)
+        FfiConverterString.write(value.groupId, into: &buf)
+        FfiConverterUInt64.write(value.createdAtSecs, into: &buf)
         FfiConverterString.write(value.senderNpub, into: &buf)
         FfiConverterString.write(value.groupName, into: &buf)
         FfiConverterString.write(value.contentPreview, into: &buf)
@@ -4419,6 +4489,81 @@ public func FfiConverterTypeNoiseKeypairHex_lift(_ buf: RustBuffer) throws -> No
 #endif
 public func FfiConverterTypeNoiseKeypairHex_lower(_ value: NoiseKeypairHex) -> RustBuffer {
     return FfiConverterTypeNoiseKeypairHex.lower(value)
+}
+
+
+/**
+ * Native-bounded result for a push-notification recovery wake. Precise
+ * notifications may be present even when `completed` is false; the host should
+ * render those immediately and defer the remaining catch-up.
+ */
+public struct NotificationSyncResultInfo: Equatable, Hashable {
+    public var notifications: [DrainNotificationInfo]
+    public var completed: Bool
+    public var timedOut: Bool
+    public var truncated: Bool
+    public var processedEvents: UInt64
+    public var elapsedMs: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(notifications: [DrainNotificationInfo], completed: Bool, timedOut: Bool, truncated: Bool, processedEvents: UInt64, elapsedMs: UInt64) {
+        self.notifications = notifications
+        self.completed = completed
+        self.timedOut = timedOut
+        self.truncated = truncated
+        self.processedEvents = processedEvents
+        self.elapsedMs = elapsedMs
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension NotificationSyncResultInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeNotificationSyncResultInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> NotificationSyncResultInfo {
+        return
+            try NotificationSyncResultInfo(
+                notifications: FfiConverterSequenceTypeDrainNotificationInfo.read(from: &buf),
+                completed: FfiConverterBool.read(from: &buf),
+                timedOut: FfiConverterBool.read(from: &buf),
+                truncated: FfiConverterBool.read(from: &buf),
+                processedEvents: FfiConverterUInt64.read(from: &buf),
+                elapsedMs: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: NotificationSyncResultInfo, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeDrainNotificationInfo.write(value.notifications, into: &buf)
+        FfiConverterBool.write(value.completed, into: &buf)
+        FfiConverterBool.write(value.timedOut, into: &buf)
+        FfiConverterBool.write(value.truncated, into: &buf)
+        FfiConverterUInt64.write(value.processedEvents, into: &buf)
+        FfiConverterUInt64.write(value.elapsedMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNotificationSyncResultInfo_lift(_ buf: RustBuffer) throws -> NotificationSyncResultInfo {
+    return try FfiConverterTypeNotificationSyncResultInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNotificationSyncResultInfo_lower(_ value: NotificationSyncResultInfo) -> RustBuffer {
+    return FfiConverterTypeNotificationSyncResultInfo.lower(value)
 }
 
 
@@ -7701,6 +7846,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_accept_group_invite() != 50359) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_ack_notifications() != 44322) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_acknowledge_direct_dms() != 3185) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -7833,6 +7981,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_pending_join_requests() != 43500) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_pending_notifications() != 19538) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_prefer_catchup_group() != 37980) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -7909,6 +8060,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_sync_force() != 34432) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_sync_notifications() != 61960) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_sync_once() != 45718) {

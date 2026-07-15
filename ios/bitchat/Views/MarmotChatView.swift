@@ -196,6 +196,11 @@ enum SNMarmotChatSnapshotCache {
 /// interop path. Owns a `MarmotService` and persists the generated Nostr
 /// identity in the keychain (wiped by emergency wipe like everything else).
 @MainActor
+enum SonarMarmotOwner {
+    static let shared = MarmotChatModel()
+}
+
+@MainActor
 final class MarmotChatModel: ObservableObject {
     enum LocalTranscriptLoadMode {
         case newestPage
@@ -1508,21 +1513,15 @@ final class MarmotChatModel: ObservableObject {
     /// never hides already-persisted conversations. Returns notifications for
     /// incoming messages (empty if nothing new or relay offline).
     ///
-    /// Push-wake / manual refresh — Android-shaped receive path.
+    /// Manual refresh uses the complete forced-sync lane. Notification wakes use
+    /// `refreshForNotification`, whose smaller native-bounded contract excludes
+    /// history repair and maintenance work from the OS wake window.
     ///
-    /// Root cause of the ~10s banner→UI lag: `drainPending` shared the serial
-    /// `workQueue` with blocking UniFFI `syncForce` (FETCH_TIMEOUT). Android
-    /// never does that — drain and sync hop on independent `Dispatchers.IO`
-    /// threads and the UI repaints from `conversationChanged`.
-    ///
-    /// Production shape:
-    /// 1. Drain + paint on the dedicated receive lane first.
-    /// 2. If the live buffer already delivered: return those notifications for
-    ///    titled push; run single-flight `syncForce` in the background.
-    /// 3. If empty (socket was dead): await that same single-flight and merge
-    ///    its drain with any notifications the polling loop stole on
-    ///    `drainQueue` while `syncForce` was in flight (see
-    ///    `pushWakeDrainBuffer`). Mid-fetch, polling still paints the UI.
+    /// Root cause of the ~10s banner→UI lag this replaced: `drainPending`
+    /// shared the serial `workQueue` with blocking UniFFI `syncForce`
+    /// (FETCH_TIMEOUT). Android never does that — drain and sync hop on
+    /// independent `Dispatchers.IO` threads and the UI repaints from
+    /// `conversationChanged`.
     @discardableResult
     func refresh() async -> [DrainNotificationInfo] {
         guard await ensureConnected() else { return [] }
@@ -1605,6 +1604,67 @@ final class MarmotChatModel: ObservableObject {
         }
         gapRecoveryTask = task
         return task
+    }
+
+    /// Push-wake-only recovery lane. Unlike manual refresh, this is bounded in
+    /// native code and returns only the precise message delta processed by this
+    /// wake. A nil/incomplete result lets the push processor fall back promptly.
+    func refreshForNotification(deadline: Date, renderMarginSeconds: TimeInterval) async -> MarmotService.NotificationSyncSnapshot? {
+        let connectBudget = deadline.timeIntervalSinceNow - renderMarginSeconds
+        guard connectBudget > 0,
+              await ensureConnected(timeoutSeconds: connectBudget) else { return nil }
+        let relayBudget = deadline.timeIntervalSinceNow - renderMarginSeconds
+        guard relayBudget > 0,
+              await ensureRelayConnected(timeoutSeconds: relayBudget) else { return nil }
+        do {
+            let snapshot = try await service.syncNotifications(
+                deadline: deadline,
+                renderMarginSeconds: renderMarginSeconds
+            )
+            self.errorText = nil
+            return snapshot
+        } catch {
+            self.errorText = Self.describe(error)
+            return nil
+        }
+    }
+
+    func notificationSessionGeneration() async -> UInt64 {
+        await service.notificationSessionGeneration()
+    }
+
+    /// Stable public account owner for durable notification work. Prefer the
+    /// live service identity, then derive the same npub from the Keychain nsec
+    /// without ever persisting the secret in continuation metadata.
+    func notificationAccountOwner() async -> String? {
+        if let current = await service.currentNpub(), !current.isEmpty { return current }
+        guard let data = keychain.getIdentityKey(forKey: Self.nsecKeychainKey),
+              let nsec = String(data: data, encoding: .utf8),
+              let identity = try? SonarIdentity.import(nsec: nsec)
+        else { return nil }
+        return identity.npub()
+    }
+
+    func notificationRenderLease(
+        expectedSessionGeneration: UInt64
+    ) async -> SonarNotificationRenderLease? {
+        await service.notificationRenderLease(
+            expectedSessionGeneration: expectedSessionGeneration
+        )
+    }
+
+    func pendingNotifications() async -> [DrainNotificationInfo] {
+        (try? await service.pendingNotifications()) ?? []
+    }
+
+    func acknowledgeNotifications(
+        messageIds: [String],
+        expectedSessionGeneration: UInt64? = nil
+    ) async -> UInt64 {
+        (try? await service.acknowledgeNotifications(
+            messageIds: messageIds,
+            expectedSessionGeneration: expectedSessionGeneration
+        )) ?? 0
     }
 
     func markConversationRead(groupId: String) {
@@ -3141,10 +3201,19 @@ final class MarmotChatModel: ObservableObject {
 }
 
 /// List of Marmot secure chats + entry point to start one by npub.
+@MainActor
 struct MarmotChatsView: View {
-    @StateObject private var model = MarmotChatModel()
+    @StateObject private var model: MarmotChatModel
     @State private var newPeer = ""
     @Environment(\.dismiss) private var dismiss
+
+    init() {
+        _model = StateObject(wrappedValue: SonarMarmotOwner.shared)
+    }
+
+    init(model: MarmotChatModel) {
+        _model = StateObject(wrappedValue: model)
+    }
 
     var body: some View {
         NavigationStack {

@@ -271,6 +271,12 @@ final class AppDelegate: NSObject, UIApplicationDelegate, MessagingDelegate {
     weak var sonarStore: SonarAppStore?
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey : Any]? = nil) -> Bool {
+        SonarPushProcessor.registerBackgroundContinuation { [weak self] in
+            // A BGProcessing launch may never create the SwiftUI root view, so
+            // AppDelegate.sonarStore can still be nil. A headless model opens
+            // the same keychain identity and encrypted database for recovery.
+            self?.sonarStore?.marmot ?? SonarMarmotOwner.shared
+        }
         // Firebase powers the Breez wallet-wakeup push (breez/notify is FCM-only;
         // Firebase bridges FCM → APNs on iOS). The Transponder chat/call push stays
         // on the raw APNs token — see SonarPushRegistration. Guard on the (gitignored)
@@ -331,7 +337,10 @@ final class AppDelegate: NSObject, UIApplicationDelegate, MessagingDelegate {
         Task { @MainActor in
             SonarPushProcessor.process(
                 userInfo: userInfo,
-                marmot: sonarStore?.marmot,
+                // A cold silent-push launch may not construct/appear the
+                // SwiftUI store. Use the same process-wide owner as the UI and
+                // BG continuation so two models never open one SQLCipher DB.
+                marmot: sonarStore?.marmot ?? SonarMarmotOwner.shared,
                 wallet: sonarStore?.wallet,
                 fetchCompletionHandler: completionHandler
             )

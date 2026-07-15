@@ -3624,6 +3624,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                     )
                 }
             }
+            runCatching { Notifier.settlePendingMarmotNotifications(foreground) }
         }
     }
 
@@ -8861,7 +8862,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         for (c in chats) c.members.forEach { if (it != npub) ensureProfile(it) }
         flushPendingMarmot() // a queued out-of-range send whose group just landed
         flushAllOutbox() // retry any outbox messages whose peer is now reachable
-        maybeNotify(changedPages, summaryByChat)
+        if (!Notifier.ownsMarmotNotifications) maybeNotify(changedPages, summaryByChat)
         // Marmot/Nostr chats refresh from the core; mesh chats are local and
         // refreshed by drainMeshDms(). A mesh-route DM merges both legs.
         (screen as? Screen.Chat)?.let {
@@ -8872,6 +8873,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         (screen as? Screen.Channel)?.let { refreshChannel(it.geohash) }
         (screen as? Screen.GeoDm)?.let { refreshGeoDm(it.geohash, it.peerHex) }
+        // The foreground UI has now consumed the same local database rows;
+        // background hosts instead route the durable obligations through the
+        // platform notification API before acknowledging them.
+        runCatching { Notifier.settlePendingMarmotNotifications(foreground) }
         // Sonar Discovery (0x53): keep our announce current for outgoing links
         // and decode any peers' announces received over the mesh.
         refreshBatterySaving()

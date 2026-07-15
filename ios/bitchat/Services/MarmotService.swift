@@ -11,6 +11,107 @@ import CryptoKit
 import Foundation
 import SonarCore
 
+/// Account-scoped admission fence for asynchronous platform notification work.
+/// A lease is invalidated before the service generation advances, so a renderer
+/// suspended in UserNotifications settings/add callbacks cannot resume against
+/// a retired account.
+final class SonarNotificationRenderLease: @unchecked Sendable {
+    let generation: UInt64
+    private let lock = NSRecursiveLock()
+    private var current = true
+    private var invalidationCleanup: (() -> Void)?
+
+    init(generation: UInt64) {
+        self.generation = generation
+    }
+
+    var isCurrent: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return current
+    }
+
+    /// Serialize the final generation decision with the synchronous platform
+    /// submission call. If invalidation wins, `submit` is never invoked. If the
+    /// platform call wins, invalidation removes the pending/delivered request and
+    /// the completion path rechecks `isCurrent` before allowing an ACK.
+    func submitIfCurrent(
+        cleanupOnInvalidation: @escaping () -> Void,
+        _ submit: () -> Void
+    ) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard current else { return false }
+        invalidationCleanup = cleanupOnInvalidation
+        submit()
+        return true
+    }
+
+    func finishSubmission() {
+        lock.lock()
+        invalidationCleanup = nil
+        lock.unlock()
+    }
+
+    fileprivate func invalidate() {
+        lock.lock()
+        guard current else {
+            lock.unlock()
+            return
+        }
+        current = false
+        let cleanup = invalidationCleanup
+        invalidationCleanup = nil
+        lock.unlock()
+        cleanup?()
+    }
+}
+
+/// Small, independently testable owner for notification render generations.
+/// MarmotService advances it at every node/account replacement boundary.
+final class SonarNotificationSessionFence: @unchecked Sendable {
+    private final class WeakLease {
+        weak var value: SonarNotificationRenderLease?
+        init(_ value: SonarNotificationRenderLease) { self.value = value }
+    }
+
+    private let lock = NSLock()
+    private var value: UInt64 = 0
+    private var leases: [UUID: WeakLease] = [:]
+
+    var generation: UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    @discardableResult
+    func advance() -> UInt64 {
+        lock.lock()
+        let invalidated = leases.values.compactMap(\.value)
+        leases.removeAll()
+        // Keep the fence locked until every prior lease has been retired.
+        // A renderer that already entered its synchronous platform submission
+        // is allowed to finish first; otherwise invalidation wins and prevents
+        // the submission before the new generation becomes observable.
+        invalidated.forEach { $0.invalidate() }
+        value &+= 1
+        let next = value
+        lock.unlock()
+        return next
+    }
+
+    func lease(expectedGeneration: UInt64) -> SonarNotificationRenderLease? {
+        lock.lock()
+        defer { lock.unlock() }
+        leases = leases.filter { _, lease in lease.value != nil }
+        guard value == expectedGeneration else { return nil }
+        let lease = SonarNotificationRenderLease(generation: expectedGeneration)
+        leases[UUID()] = WeakLease(lease)
+        return lease
+    }
+}
+
 /// Swift-side facade over the Rust `sonar-core` engine (Marmot protocol:
 /// MLS-over-Nostr, White Noise interop) exposed through the SonarCore package.
 ///
@@ -164,6 +265,11 @@ final class MarmotService: @unchecked Sendable {
         let groupId: String
         let latestCreatedAt: Date
         let messages: [MarmotMessage]
+    }
+
+    struct NotificationSyncSnapshot: Sendable {
+        let result: NotificationSyncResultInfo
+        let sessionGeneration: UInt64
     }
 
     /// A reference to an encrypted media attachment. `url` is the Blossom URL of
@@ -335,7 +441,8 @@ final class MarmotService: @unchecked Sendable {
     private var identity: SonarIdentity?
     private var node: SonarNode?
     private var relayConnected = false
-    private var sessionGeneration: UInt64 = 0
+    private let notificationSessionFence = SonarNotificationSessionFence()
+    private var sessionGeneration: UInt64 { notificationSessionFence.generation }
 
     init(relayUrls: [String] = MarmotService.defaultRelayUrls) {
         self.relayUrls = relayUrls
@@ -360,8 +467,8 @@ final class MarmotService: @unchecked Sendable {
                 identity = SonarIdentity.generate()
             }
             service.identity = identity
-            service.sessionGeneration = service.sessionGeneration &+ 1
-            return (identity, service.sessionGeneration)
+            let generation = service.notificationSessionFence.advance()
+            return (identity, generation)
         }
         let (dbPath, dbKeyHex) = try Self.databaseConfig()
         let (node, nodeLease) = try await connectNode(
@@ -427,7 +534,7 @@ final class MarmotService: @unchecked Sendable {
             #if os(iOS)
             SonarPushRegistration.shared.setSonarNode(node)
             #endif
-            service.sessionGeneration = service.sessionGeneration &+ 1
+            service.notificationSessionFence.advance()
             return identity.npub()
         }
     }
@@ -448,7 +555,7 @@ final class MarmotService: @unchecked Sendable {
                 identity = SonarIdentity.generate()
             }
             service.identity = identity
-            service.sessionGeneration = service.sessionGeneration &+ 1
+            service.notificationSessionFence.advance()
             return identity.npub()
         }
     }
@@ -874,6 +981,63 @@ final class MarmotService: @unchecked Sendable {
         try await run { try $0.requireNode().syncForce() }
     }
 
+    /// Notification-only gap recovery. The deadline is enforced inside Rust,
+    /// below the blocking UniFFI boundary, and excludes history repair, outbox,
+    /// token sharing, and subscription maintenance.
+    func syncNotifications(deadline: Date, renderMarginSeconds: TimeInterval) async throws -> NotificationSyncSnapshot {
+        try await run {
+            let remaining = deadline.timeIntervalSinceNow - renderMarginSeconds
+            guard remaining > 0 else { throw ServiceError.cancelled }
+            let generation = $0.sessionGeneration
+            let result = try $0.requireNode().syncNotifications(
+                deadlineMs: UInt64(max(1, remaining * 1_000))
+            )
+            guard generation == $0.sessionGeneration else { throw ServiceError.cancelled }
+            return NotificationSyncSnapshot(result: result, sessionGeneration: generation)
+        }
+    }
+
+    func notificationSessionGeneration() async -> UInt64 {
+        await runNonThrowing { $0.sessionGeneration }
+    }
+
+    /// Acquire an account-generation lease before deriving or submitting any
+    /// sender/group notification UI. Account replacement invalidates it before
+    /// the service generation advances.
+    func notificationRenderLease(
+        expectedSessionGeneration: UInt64
+    ) async -> SonarNotificationRenderLease? {
+        await runNonThrowing { service in
+            service.nodeLock.lock()
+            let nodeClosing = service.nodeClosing
+            service.nodeLock.unlock()
+            guard !nodeClosing else { return nil }
+            return service.notificationSessionFence.lease(
+                expectedGeneration: expectedSessionGeneration
+            )
+        }
+    }
+
+    /// Non-destructive view of the encrypted core notification outbox.
+    func pendingNotifications() async throws -> [DrainNotificationInfo] {
+        try await run { try $0.requireNode().pendingNotifications() }
+    }
+
+    /// Remove only entries whose platform notification was accepted.
+    func acknowledgeNotifications(
+        messageIds: [String],
+        expectedSessionGeneration: UInt64? = nil
+    ) async throws -> UInt64 {
+        guard !messageIds.isEmpty else { return 0 }
+        return try await run {
+            if let expectedSessionGeneration,
+               expectedSessionGeneration != $0.sessionGeneration {
+                return 0
+            }
+            return try $0.requireNode().ackNotifications(messageIds: messageIds)
+        }
+    }
+
     /// Prefer this group for cold-start historical catch-up (open chat).
     /// Local-first: never blocks paint/send. Empty/nil clears preference.
     func preferCatchupGroup(_ groupId: String?) async {
@@ -1178,7 +1342,7 @@ final class MarmotService: @unchecked Sendable {
     func wipeDatabase() async throws {
         let url = try Self.databaseURL()
         await runNonThrowing { service in
-            service.sessionGeneration = service.sessionGeneration &+ 1
+            service.notificationSessionFence.advance()
             #if os(iOS)
             SonarPushRegistration.shared.clearSonarNode()
             #endif
@@ -1190,6 +1354,12 @@ final class MarmotService: @unchecked Sendable {
             service.identity = nil
             return ()
         }
+        #if os(iOS)
+        // Advance/invalidate render leases before clearing durable admission.
+        // A fallback suspended in UserNotifications can therefore never post
+        // in the gap between the two account-boundary operations.
+        await SonarPushProcessor.invalidateBackgroundContinuation()
+        #endif
         // Do not block workQueue while draining: an off-queue relay connect may
         // need that queue once to reject its stale generation and release its
         // lease. New leases are already rejected by `nodeClosing`.
