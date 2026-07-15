@@ -4329,20 +4329,19 @@ class SonarAppState(private val scope: CoroutineScope) {
             ?.filter { it.message.id == message.id }
             .orEmpty()
         if (mediaUploads.isNotEmpty()) {
-            retryPendingMedia(chatId, message.id, mediaUploads)
+            retryPendingMedia(chatId, message.id)
             return
         }
 
         if (message.id.startsWith(echoIdPrefix)) {
-            pendingSendEchoes[chatId]?.removeAll { it.id == message.id }
-            if (pendingSendEchoes[chatId].isNullOrEmpty()) pendingSendEchoes.remove(chatId)
-            messages = messages.filterNot { it.id == message.id }
-            send(chatId, message.content)
+            retrySendEcho(chatId, message.id)
             return
         }
 
+        val current = messages.firstOrNull { it.id == message.id } ?: return
+        val retrying = sonarMessageForRetry(current, "Sending") ?: return
         messages = messages.map {
-            if (it.id == message.id) it.copy(state = "Sending") else it
+            if (it.id == message.id) retrying else it
         }
         scope.launch {
             runCatching { SonarCore.retryMessage(message.id) }
@@ -4361,20 +4360,21 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun retryPendingMedia(
         chatId: String,
         pendingId: String,
-        uploads: List<PendingMediaUpload>,
     ) {
         val pending = pendingMediaUploads[chatId] ?: return
-        for (index in pending.indices) {
-            if (pending[index].message.id == pendingId) {
-                pending[index] = pending[index].copy(
-                    message = pending[index].message.copy(state = "Uploading"),
-                    completedOrder = null,
-                )
-            }
+        val matchingIndices = pending.indices.filter { pending[it].message.id == pendingId }
+        val firstIndex = matchingIndices.firstOrNull() ?: return
+        val retryingMessage = sonarMessageForRetry(pending[firstIndex].message, "Uploading") ?: return
+        for (index in matchingIndices) {
+            pending[index] = pending[index].copy(
+                message = retryingMessage,
+                completedOrder = null,
+            )
         }
         messages = messages.map {
-            if (it.id == pendingId) it.copy(state = "Uploading") else it
+            if (it.id == pendingId) retryingMessage else it
         }
+        val uploads = matchingIndices.map { pending[it] }
         scope.launch {
             val groupId = resolveMarmotGroupId(chatId)
             if (groupId == null) {
@@ -4406,6 +4406,126 @@ class SonarAppState(private val scope: CoroutineScope) {
                 toast = "retry failed: ${error.message}"
             }
         }
+    }
+
+    /** Retry a platform-local echo in place. Keeping the same retained row as
+     * the authority makes retry consume-once and prevents a transcript gap if
+     * route setup or the replacement send fails. */
+    private fun retrySendEcho(chatId: String, echoId: String) {
+        val echoes = pendingSendEchoes[chatId] ?: return
+        val index = echoes.indexOfFirst { it.id == echoId }
+        if (index < 0) return
+        val source = echoes[index]
+        val content = sonarRetryContent(source)
+        if (content == null) {
+            toast = "This message is no longer available to retry."
+            return
+        }
+        val retrying = sonarMessageForRetry(source, "Sending") ?: return
+        val matchEcho = retrying.copy(tsSecs = SonarClock.nowSecs())
+
+        // Replace the retained row before any asynchronous work. A stale second
+        // tap now sees Sending and cannot enqueue another replacement.
+        echoes[index] = retrying
+        messages = messages.map { if (it.id == echoId) retrying else it }
+        previouslyPublishedMessageIdsByEcho[echoId] = messages
+            .asSequence()
+            .filter { candidate ->
+                candidate.mine &&
+                    candidate.id != echoId &&
+                    candidate.content == retrying.content &&
+                    candidate.stickerRef == retrying.stickerRef &&
+                    candidate.viaInternet == retrying.viaInternet &&
+                    !candidate.id.startsWith(echoIdPrefix)
+            }
+            .map { it.id }
+            .toSet()
+
+        pendingMarmotNpub(chatId)?.let { pendingNpub ->
+            val npubHex = canonicalNpubHex(pendingNpub)
+            if (npubHex == null) {
+                failSendEcho(chatId, echoId)
+                toast = "This message is no longer available to retry."
+                return
+            }
+            val queue = pendingDirectMarmotSends.getOrPut(npubHex) { mutableListOf() }
+            queue.removeAll { it.echoId == echoId }
+            queue.add(PendingDirectMarmotSend(chatId, content, echoId))
+            if (queue.size > PENDING_MARMOT_DIRECT_SEND_QUEUE_LIMIT) {
+                val dropped = queue.removeAt(0)
+                failSendEcho(dropped.pendingChatId, dropped.echoId)
+                toast = "Still setting up this chat — wait before retrying more."
+            }
+            startPendingMarmotChat(pendingNpub, chatId)
+            return
+        }
+
+        if (isPendingMarmotGroup(chatId)) {
+            val queue = pendingMarmotGroupSends.getOrPut(chatId) { mutableListOf() }
+            queue.removeAll { it.echoId == echoId }
+            queue.add(PendingMarmotGroupSend(content, echoId))
+            if (queue.size > PENDING_MARMOT_GROUP_SEND_QUEUE_LIMIT) {
+                val dropped = queue.removeAt(0)
+                failSendEcho(chatId, dropped.echoId)
+                toast = "Still setting up this group — wait before retrying more."
+            }
+            startPendingMarmotGroupCreation(chatId)
+            return
+        }
+
+        val groupId = resolveMarmotGroupId(chatId)
+        if (groupId != null) {
+            scope.launch {
+                try {
+                    sendQueuedMarmotContent(groupId, content)
+                    val generation = transcriptGeneration
+                    val published = if (isMeshChat(chatId)) {
+                        marmotMessagesForPeer(meshPeerId(chatId), chatId, generation)
+                    } else {
+                        marmotMessagesPageForChat(chatId, generation)
+                    }
+                    reserveSuccessfulEchoCanonicalRows(chatId, matchEcho, published)
+                    clearSendEcho(chatId, echoId)
+                    refreshRetriedMarmotMessage(chatId)
+                } catch (error: Throwable) {
+                    failSendEcho(chatId, echoId)
+                    toast = "retry failed: ${error.message}"
+                }
+            }
+            return
+        }
+
+        // A failed direct NIP-17 echo has no Marmot group. Reuse the retained
+        // payload and clear it only after the replacement row is persisted.
+        if (isMeshChat(chatId)) {
+            val peerId = meshPeerId(chatId)
+            val raw = npubRawFor(peerId)
+            if (raw != null && canUseDirectNip17(peerId, raw)) {
+                scope.launch {
+                    val messageId = randomMeshId()
+                    if (sendDirectNip17Now(peerId, raw, messageId, content)) {
+                        val sent = privateDmMessage(
+                            id = messageId,
+                            senderNpub = npub,
+                            text = content,
+                            mine = true,
+                            tsSecs = SonarClock.nowSecs(),
+                            viaInternet = true,
+                        )
+                        appendMeshMessage(peerId, sent)
+                        processPayLines(chatId, listOf(sent))
+                        clearSendEcho(chatId, echoId)
+                        refreshOpenDm(peerId)
+                    } else {
+                        failSendEcho(chatId, echoId)
+                    }
+                }
+                return
+            }
+        }
+
+        failSendEcho(chatId, echoId)
+        toast = "This message is no longer available to retry."
     }
 
     private suspend fun refreshRetriedMarmotMessage(chatId: String) {

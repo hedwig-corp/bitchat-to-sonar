@@ -2066,7 +2066,10 @@ final class MarmotChatModel: ObservableObject {
         groupId: String,
         packCoordinate: String,
         shortcode: String,
-        plaintextSha256: String
+        plaintextSha256: String,
+        onEchoVisible: (() -> Void)? = nil,
+        onComplete: (() -> Void)? = nil,
+        onFailure: (() -> Void)? = nil
     ) {
         errorText = nil
         let echo = MarmotService.MarmotMessage(
@@ -2083,6 +2086,7 @@ final class MarmotChatModel: ObservableObject {
             )
         )
         appendOptimistic(echo, to: groupId)
+        onEchoVisible?()
 
         let previous = sendChain
         sendChain = Task { [weak self] in
@@ -2098,8 +2102,10 @@ final class MarmotChatModel: ObservableObject {
                     shortcode: shortcode,
                     plaintextSha256: plaintextSha256
                 )
+                onComplete?()
             } catch {
                 self.pendingOptimistic[groupId]?.removeAll { $0.id == echo.id }
+                self.messagesByGroup[groupId, default: []].removeAll { $0.id == echo.id }
                 let failed = MarmotService.MarmotMessage(
                     id: Self.failedOptimisticIDPrefix + UUID().uuidString,
                     senderNpub: echo.senderNpub,
@@ -2110,8 +2116,8 @@ final class MarmotChatModel: ObservableObject {
                     stickerRef: echo.stickerRef
                 )
                 self.pendingOptimistic[groupId, default: []].append(failed)
-                self.messagesByGroup[groupId, default: []].removeAll { $0.id == echo.id }
                 self.messagesByGroup[groupId, default: []].append(failed)
+                onFailure?()
                 self.errorText = Self.describe(error)
                 return
             }
