@@ -11,6 +11,7 @@
 WN_READY_TIMEOUT_SECS="${WN_READY_TIMEOUT_SECS:-30}"
 WN_KEYPACKAGE_TIMEOUT_SECS="${WN_KEYPACKAGE_TIMEOUT_SECS:-45}"
 WN_MESSAGE_TIMEOUT_SECS="${WN_MESSAGE_TIMEOUT_SECS:-30}"
+WN_PEER_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 wn_require_bins() {
   [[ -n "${WN_BIN:-}" && -x "$WN_BIN" ]] || {
@@ -254,7 +255,12 @@ wn_wait_relay_connected() {
 wn_start_notifications() {
   local home="$1" out="$2" err="$3" pubkey pid
   pubkey=$(cat "$home/pubkey.hex")
-  wn_json "$home" --account "$pubkey" notifications subscribe >"$out" 2>"$err" &
+  # Give the long-lived CLI a pseudo-terminal so each notification is flushed
+  # immediately. The adapter copies PTY bytes without the platform `script`
+  # utility's recorder buffering/control prefix.
+  python3 "$WN_PEER_LIB_DIR/pty-stream.py" "$WN_BIN" --json \
+    --socket "$(wn_socket_path "$home")" --account "$pubkey" \
+    notifications subscribe >"$out" 2>"$err" &
   pid=$!
   sleep "${WN_SUBSCRIPTION_SETTLE_SECS:-2}"
   if ! kill -0 "$pid" 2>/dev/null; then
@@ -549,9 +555,29 @@ EOF
 }
 
 wn_wait_for_message() {
-  local home="$1" expected="$2" deadline line content drained
+  local home="$1" expected="$2" notification_file="${3:-}"
+  local deadline line content drained notification
   deadline=$(( $(date +%s) + WN_MESSAGE_TIMEOUT_SECS ))
   while (( $(date +%s) < deadline )); do
+    # The daemon's notification stream is the authoritative live-delivery
+    # surface. A just-arrived invite/message can be emitted there before the
+    # group becomes visible through `groups list`, so consult it before the
+    # durable polling fallback.
+    if [[ -n "$notification_file" && -f "$notification_file" ]]; then
+      # The writer can be between JSON records; treat a transient partial parse
+      # as "not yet" and retry instead of misclassifying successful delivery.
+      if ! notification=$(jq -c --arg expected "$expected" '
+        select(.result.trigger == "NewMessage" and .result.content == $expected)
+        | {sender:(.result.sender.pubkey // ""), content:.result.content,
+           id:(.result.message_id // "notification")}' "$notification_file" \
+        2>/dev/null | tail -n 1); then
+        notification=""
+      fi
+      if [[ -n "$notification" ]]; then
+        printf '%s\n' "$notification"
+        return 0
+      fi
+    fi
     drained=$(wn_drain_new "$home") || return $?
     while IFS= read -r line; do
       [[ -n "$line" ]] || continue

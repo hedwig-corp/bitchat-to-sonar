@@ -25,7 +25,14 @@ async fn main() {
         .collect();
     }
 
-    let client = Client::default();
+    // Carry a signer so NIP-42 relays can authenticate diagnostic reads. By
+    // default this is an ephemeral key; an operator can set SONAR_QUERY_NSEC to
+    // inspect recipient-private relay behavior without printing the secret.
+    let query_keys = match std::env::var("SONAR_QUERY_NSEC") {
+        Ok(secret) => Keys::parse(&secret).expect("SONAR_QUERY_NSEC must be a valid nsec/secret"),
+        Err(_) => Keys::generate(),
+    };
+    let client = Client::new(query_keys);
     for r in &relays {
         client.add_relay(r).await.unwrap();
     }

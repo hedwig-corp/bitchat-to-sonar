@@ -55,6 +55,16 @@ METRICS_JSON="${METRICS_JSON:-}"
 WN_BIN="${WN_BIN:-$(command -v wn 2>/dev/null || true)}"
 WND_BIN="${WND_BIN:-$(command -v wnd 2>/dev/null || true)}"
 WN_RELAYS="${WN_RELAYS:-$TARGET_RELAY,wss://relay.damus.io,wss://nos.lol}"
+SONAR_RELAYS="${SONAR_RELAYS:-}"
+if [[ -z "$SONAR_RELAYS" ]]; then
+  if [[ "$WITH_WHITENOISE" == "1" ]]; then
+    # Use the same bounded relay set on both sides so each account advertises
+    # redundant KeyPackage/inbox routes. Hedwig remains the primary target.
+    SONAR_RELAYS="$WN_RELAYS"
+  else
+    SONAR_RELAYS="$TARGET_RELAY"
+  fi
+fi
 
 [[ -x "$SONAR_CLI" ]] || { echo "sonar-cli not found at $SONAR_CLI." >&2; \
   echo "Build it: cargo build -p sonar-cli --release (from $ROOT/core)" >&2; exit 2; }
@@ -78,6 +88,18 @@ require_uint RECEIVE_TIMEOUT_SECS "$RECEIVE_TIMEOUT_SECS" 1
 require_uint MAX_REPLY_CHARS "$MAX_REPLY_CHARS" 1
 require_uint INTEROP_CONNECT_DELAY_SECS "$INTEROP_CONNECT_DELAY_SECS" 0
 require_uint KEYPACKAGE_SEND_ATTEMPTS "$KEYPACKAGE_SEND_ATTEMPTS" 1
+
+SONAR_RELAY_VALUES=()
+SONAR_RELAY_ARGS=()
+IFS=',' read -r -a SONAR_RELAY_VALUES <<< "$SONAR_RELAYS"
+for relay in "${SONAR_RELAY_VALUES[@]}"; do
+  [[ "$relay" == wss://* ]] || {
+    echo "SONAR_RELAYS entries must use wss://: $relay" >&2
+    exit 2
+  }
+  SONAR_RELAY_ARGS+=(--relay "$relay")
+done
+(( ${#SONAR_RELAY_VALUES[@]} > 0 )) || { echo "SONAR_RELAYS must not be empty" >&2; exit 2; }
 
 if [[ "$WITH_WHITENOISE" == "1" ]]; then
   # shellcheck source=scripts/smoke/lib/wn-peer.sh
@@ -119,7 +141,9 @@ chmod 700 "$WORK"
 CONVO_LOG="$WORK/convo.log"; : > "$CONVO_LOG"
 [[ -n "$METRICS_JSON" ]] || METRICS_JSON="$WORK/metrics.json"
 WN_HOME=""
-CHILD_PIDS=()
+# Bash 3.2 + `set -u` treats an expanded zero-length array as unbound. Keep a
+# harmless sentinel so early provisioning failures still run cleanup safely.
+CHILD_PIDS=("")
 
 cleanup() {
   local rc=$?
@@ -168,11 +192,11 @@ provision() {
   for ((i = 0; i < IDENTITIES; i++)); do
     home="$WORK/agent-$i"; mkdir -p "$home"
     chmod 700 "$home"
-    "$SONAR_CLI" --home "$home" --relay "$TARGET_RELAY" init \
+    "$SONAR_CLI" --home "$home" "${SONAR_RELAY_ARGS[@]}" init \
       >"$WORK/agent-$i.init.out" 2>"$WORK/agent-$i.init.err"
-    "$SONAR_CLI" --home "$home" --relay "$TARGET_RELAY" publish \
+    "$SONAR_CLI" --home "$home" "${SONAR_RELAY_ARGS[@]}" publish \
       >"$WORK/agent-$i.publish.out" 2>"$WORK/agent-$i.publish.err"
-    out=$("$SONAR_CLI" --home "$home" --relay "$TARGET_RELAY" identity \
+    out=$("$SONAR_CLI" --home "$home" "${SONAR_RELAY_ARGS[@]}" identity \
       2>"$WORK/agent-$i.identity.err")
     npub=$(printf '%s' "$out" | jq -r '.npub // empty')
     [[ -n "$npub" ]] || { log "empty npub for agent-$i"; exit 1; }
@@ -186,7 +210,7 @@ provision() {
     HOMES[i]="$WN_HOME"; NPUBS[i]="$npub"; TRANSPORTS[i]="whitenoise"
     TOTAL_IDENTITIES=$((IDENTITIES + 1))
   fi
-  log "provisioned $TOTAL_IDENTITIES identities on $TARGET_RELAY (White Noise=$WITH_WHITENOISE)"
+  log "provisioned $TOTAL_IDENTITIES identities (primary=$TARGET_RELAY, Sonar relays=$SONAR_RELAYS, White Noise=$WITH_WHITENOISE)"
 }
 
 build_graph() {
@@ -241,7 +265,7 @@ send_msg() { # from_idx to_idx text
   if [[ "${TRANSPORTS[$from]}" == "whitenoise" ]]; then
     wn_send_to "${HOMES[$from]}" "${NPUBS[$to]}" "$text" 2>"$err"
   else
-    "$SONAR_CLI" --home "${HOMES[$from]}" --relay "$TARGET_RELAY" \
+    "$SONAR_CLI" --home "${HOMES[$from]}" "${SONAR_RELAY_ARGS[@]}" \
       send --to "${NPUBS[$to]}" --text "$text" >/dev/null 2>"$err"
   fi
 }
@@ -252,7 +276,7 @@ drain_new() {
   if [[ "${TRANSPORTS[$index]}" == "whitenoise" ]]; then
     wn_drain_new "${HOMES[$index]}" 2>>"$WORK/drain-$index.err" || true
   else
-    "$SONAR_CLI" --home "${HOMES[$index]}" --relay "$TARGET_RELAY" \
+    "$SONAR_CLI" --home "${HOMES[$index]}" "${SONAR_RELAY_ARGS[@]}" \
       listen --timeout-secs "$RECEIVE_TIMEOUT_SECS" --poll-secs 2 --no-publish \
       2>>"$WORK/drain-$index.err" || true
   fi
@@ -319,7 +343,7 @@ run_whitenoise_preflight() {
   while (( attempts < KEYPACKAGE_SEND_ATTEMPTS )); do
     attempts=$((attempts + 1))
     attempt_err="$WORK/preflight-sonar-to-wn-attempt-$attempts.err"
-    if "$SONAR_CLI" --home "${HOMES[$sonar_sender]}" --relay "$TARGET_RELAY" \
+    if "$SONAR_CLI" --home "${HOMES[$sonar_sender]}" "${SONAR_RELAY_ARGS[@]}" \
       send --to "${NPUBS[$wn_index]}" --text "$sonar_payload" \
       >"$WORK/preflight-sonar-to-wn-attempt-$attempts.out" 2>"$attempt_err"; then
       sent=1
@@ -338,7 +362,8 @@ run_whitenoise_preflight() {
       sonar_class="sonar_group_or_send"
     fi
     log "White Noise preflight direction failed: Sonar could not send"
-  elif received=$(wn_wait_for_message "${HOMES[$wn_index]}" "$sonar_payload" 2>>"$receive_err"); then
+  elif received=$(wn_wait_for_message "${HOMES[$wn_index]}" "$sonar_payload" \
+    "$notification_out" 2>>"$receive_err"); then
     printf '%s\n' "$received" > "$WORK/preflight-sonar-to-wn-received.json"
     sonar_status="passed"
   else
@@ -363,7 +388,7 @@ run_whitenoise_preflight() {
     listener_out="$WORK/preflight-wn-to-sonar-received.jsonl"
     listener_err="$WORK/preflight-wn-to-sonar-listen.err"
     listener_timeout=$((WN_MESSAGE_TIMEOUT_SECS + INTEROP_CONNECT_DELAY_SECS + 15))
-    "$SONAR_CLI" --home "${HOMES[$sonar_receiver]}" --relay "$TARGET_RELAY" \
+    "$SONAR_CLI" --home "${HOMES[$sonar_receiver]}" "${SONAR_RELAY_ARGS[@]}" \
       listen --timeout-secs "$listener_timeout" --poll-secs 2 --no-publish \
       >"$listener_out" 2>"$listener_err" &
     listener_pid=$!
@@ -418,7 +443,7 @@ main() {
   local started_at ended_at seed preflight_rc=0
   started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   seed="${SEED:-$(date +%s)}"
-  log "identities=$IDENTITIES fanout=$FANOUT rounds=$ROUNDS relay=$TARGET_RELAY seed=$seed"
+  log "identities=$IDENTITIES fanout=$FANOUT rounds=$ROUNDS primary_relay=$TARGET_RELAY sonar_relays=$SONAR_RELAYS seed=$seed"
   provision
   if [[ "$WITH_WHITENOISE" == "1" && "$WHITENOISE_PREFLIGHT" == "1" ]]; then
     if ! run_whitenoise_preflight; then
@@ -489,7 +514,8 @@ main() {
   preflight=$(cat "$PREFLIGHT_JSON")
   jq -n \
     --arg started_at "$started_at" --arg ended_at "$ended_at" \
-    --arg relay "$TARGET_RELAY" --arg reply_cmd "$AGENT_REPLY_CMD" \
+    --arg relay "$TARGET_RELAY" --arg sonar_relays "$SONAR_RELAYS" \
+    --arg reply_cmd "$AGENT_REPLY_CMD" \
     --argjson identities "$IDENTITIES" --argjson fanout "$FANOUT" \
     --argjson total_identities "$TOTAL_IDENTITIES" \
     --argjson with_whitenoise "$WITH_WHITENOISE" \
@@ -500,7 +526,8 @@ main() {
     --argjson avg_lat "$avg_lat" --argjson max_lat "$lat_max" --argjson lat_n "$lat_n" \
     --argjson preflight "$preflight" \
     '{kind:"ai-agents-chat", started_at:$started_at, ended_at:$ended_at,
-      config:{relay:$relay, identities:$identities, total_identities:$total_identities,
+      config:{relay:$relay, sonar_relays:($sonar_relays | split(",")),
+              identities:$identities, total_identities:$total_identities,
               with_whitenoise:($with_whitenoise == 1), fanout:$fanout, rounds:$rounds, seed:$seed,
                reply_cmd:$reply_cmd},
       metrics:{messages_sent:$messages_sent, messages_received:$messages_received,

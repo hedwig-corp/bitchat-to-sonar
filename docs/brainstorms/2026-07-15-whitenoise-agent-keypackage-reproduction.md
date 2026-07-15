@@ -59,8 +59,10 @@ Use **Approach A**, borrowing Approach B's deterministic two-peer phase at the s
 
 - Current White Noise publishes KeyPackages on the account's NIP-65 write relays; Sonar previously queried only its own configured relays. A deterministic two-relay regression test reproduces that miss and verifies the bounded peer-relay fallback.
 - The screenshot account currently advertises relay metadata but has no discoverable KeyPackage on either Sonar's bootstrap relays or its advertised NIP-65 relays, so the screenshot error is truthful for that account's current relay state.
-- Fresh White Noise accounts now get past KeyPackage lookup in the Hedwig preflight. The live run then exposes a later welcome/message-visibility failure in both directions. A Sonar-to-Sonar live smoke run also loses messages after successful sends, so that later live-relay problem is recorded separately rather than attributed to the KeyPackage fix.
-- Deterministic local MLS exchange and NIP-65 discovery tests pass. A completely green live Hedwig interop run remains a follow-up condition for claiming end-to-end White Noise compatibility.
+- The later reverse-direction failure exposed missing standard account routing state: Sonar published neither NIP-65 kind `10002` nor inbox kind `10050`, and sent welcomes only to its own relays. The shared core now bootstraps both relay lists and publishes each welcome to a bounded recipient inbox set without growing the long-lived relay pool.
+- The Sonar CLI polling listener now performs forced bounded catch-up, recovering relay-stored events missed by a live subscription. The White Noise adapter consumes its live notification stream through an unbuffered PTY and retains durable polling as a fallback.
+- Deterministic relay tests cover off-relay KeyPackage discovery, account relay-list bootstrap, and distinct recipient-inbox welcome delivery. The full Rust workspace passes.
+- A fresh Hedwig-primary run with one external White Noise account passed both directions in one attempt: Sonar→White Noise in 2.384 seconds and White Noise→Sonar in 9.958 seconds. Evidence is retained at `/tmp/relay-smoke-agents.Q2tQO8` for this development session.
 
 ## Open questions
 

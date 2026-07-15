@@ -59,7 +59,10 @@ the final stderr line names it. Use `KEEP_WORK=1` to retain a successful run.
 White Noise expects a relay quorum for live subscriptions. The CLI's relay
 status can be stale, so the preflight treats it as diagnostic and instead arms
 and verifies a long-lived account notification subscription before Sonar sends.
-Sonar itself continues to use Hedwig only.
+In White Noise mode, Sonar defaults to the same bounded relay set and advertises
+it through its NIP-65 and inbox lists; Hedwig remains the primary target while
+the extra routes prevent a single relay from losing an account-directed
+welcome. Set `SONAR_RELAYS=wss://nostr.relay.hedwig.sh` to isolate Hedwig.
 
 Each direction reports independently and the second direction still runs if the
 first fails. The graph also always contains at least one Sonar→White Noise and
@@ -101,6 +104,7 @@ TARGET_RELAY, IDENTITIES (3), FANOUT (1), ROUNDS (3), SEED_DELAY (3),
 RECEIVE_TIMEOUT_SECS (15), MAX_REPLY_CHARS (300), AGENT_REPLY_CMD, SEED,
 WITH_WHITENOISE (0), WHITENOISE_PREFLIGHT (1), WN_BIN, WND_BIN,
 WN_RELAYS (Hedwig plus two bootstrap relays),
+SONAR_RELAYS (WN_RELAYS in White Noise mode, otherwise TARGET_RELAY),
 KEYPACKAGE_SEND_ATTEMPTS (6), WN_KEYPACKAGE_TIMEOUT_SECS (45),
 WN_MESSAGE_TIMEOUT_SECS (30), INTEROP_CONNECT_DELAY_SECS (3), KEEP_WORK (0).
 
