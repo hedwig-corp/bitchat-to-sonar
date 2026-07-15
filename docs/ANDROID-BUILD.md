@@ -136,6 +136,7 @@ Publish signed phone APKs to [Zapstore](https://zapstore.dev): see
 
 - App overview: [`apps/sonar/README.md`](../apps/sonar/README.md)
 - Zapstore: [`docs/ZAPSTORE.md`](ZAPSTORE.md)
+- Isolated MDK v0.9.4 experiment: [`docs/DARKMATTER-ANDROID.md`](DARKMATTER-ANDROID.md)
 - Push / FCM: [`docs/android-push-integration.md`](android-push-integration.md)
 - Wallet: [`docs/WALLET-INTEGRATION.md`](WALLET-INTEGRATION.md)
 - iOS archive / secrets rules: `CLAUDE.md`

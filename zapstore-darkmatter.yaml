@@ -1,0 +1,36 @@
+# Zapstore metadata for the separately installable Sonar Darkmatter experiment.
+# Runtime/account state is isolated by package id and a separate signing cert.
+repository: https://github.com/hedwig-corp/bitchat-to-sonar
+match: "sonar-darkmatter-.*-android\\.apk$"
+
+name: Sonar Darkmatter
+summary: Isolated Android messenger powered by Darkmatter MDK v0.9.4
+description: |
+  Sonar Darkmatter is an experimental, separately installable Marmot messenger.
+  It uses the stable Darkmatter MDK v0.9.4 runtime with encrypted SQLCipher
+  storage, Android Keystore identity protection, local-first chat windows, and
+  Nostr relay transport.
+
+  This is not an update to Sonar. It creates its own identity and app sandbox;
+  it cannot read Sonar messages, wallet state, files, preferences, or push token.
+
+  Initial scope: Android text messaging and group invitations between
+  Darkmatter-compatible clients. Wallet, Bluetooth mesh, calls, and push
+  notifications are intentionally not included in this isolated experiment.
+
+tags:
+  - messaging
+  - privacy
+  - nostr
+  - marmot
+  - encrypted
+  - experimental
+
+license: Unlicense
+website: https://sonarprivacy.xyz
+icon: apps/sonar/darkmatterApp/src/androidMain/res/drawable-nodpi/sonar_darkmatter_icon.png
+metadata_sources: []
+
+# Same organizational Zapstore publisher; the Android signing certificate is
+# deliberately different and must be linked independently with `zsp identity`.
+pubkey: npub1wg2m9ku823y5l5699dlj6294dc3cvwu4g34ldrtelxq20t27clxsd7dzaw
