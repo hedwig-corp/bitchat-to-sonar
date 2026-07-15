@@ -2706,12 +2706,16 @@ class SonarAppState(private val scope: CoroutineScope) {
                 homeMessagesHydrated = false
                 SonarCore.setOnboardingComplete(true)
                 retryPushRegistrationAfterAccountReady()
+                val needsExplicitBoot = onboarded
                 onboarded = true
                 nick = SonarCore.nickname()
                 stack = listOf(Screen.Home)
                 walletState = WalletState.NotConfigured
                 refreshMeshIdentity()
-                boot()
+                // From Settings, onboarded was already true so LaunchedEffect(onboarded)
+                // will not re-fire — boot explicitly. From onboarding, false→true
+                // triggers App.kt's LaunchedEffect; avoid a concurrent double boot.
+                if (needsExplicitBoot) boot()
                 toast = "Account restored"
             }
             onResult(result.map { Unit })
