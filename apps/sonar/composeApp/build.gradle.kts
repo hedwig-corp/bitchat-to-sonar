@@ -38,6 +38,37 @@ val generateBreezKeyResource = tasks.register("generateBreezKeyResource") {
 
 val repoRootDir = rootProject.projectDir.parentFile.parentFile
 val notificationResourcesDir = repoRootDir.resolve("assets/notifications")
+
+// Verifies the committed Compose string resources are in sync with the iOS
+// localization catalog (ios/bitchat/Localizable.xcstrings), the single source
+// of truth. Run scripts/i18n/xcstrings_to_compose.py to regenerate after
+// editing the catalog. Best-effort: skips silently if python3 is unavailable so
+// it never blocks contributors without a Python toolchain.
+val checkI18nStringsInSync = tasks.register<Exec>("checkI18nStringsInSync") {
+    description = "Checks generated Compose string resources match the iOS xcstrings catalog."
+    group = "verification"
+
+    val generator = repoRootDir.resolve("scripts/i18n/xcstrings_to_compose.py")
+    inputs.file(repoRootDir.resolve("ios/bitchat/Localizable.xcstrings"))
+    inputs.file(generator)
+    inputs.dir(layout.projectDirectory.dir("src/commonMain/composeResources"))
+
+    workingDir(repoRootDir)
+    isIgnoreExitValue = true
+    commandLine("python3", generator.absolutePath, "--check")
+
+    doLast {
+        val result = executionResult.get()
+        if (result.exitValue != 0) {
+            throw GradleException(
+                "Compose string resources are out of sync with " +
+                    "ios/bitchat/Localizable.xcstrings. " +
+                    "Run: python3 scripts/i18n/xcstrings_to_compose.py",
+            )
+        }
+    }
+}
+
 val androidMainDir = layout.projectDirectory.dir("src/androidMain")
 val androidBindingsFile = androidMainDir.file("kotlin/uniffi/sonar_ffi/sonar_ffi.kt")
 val androidJniLibsDir = androidMainDir.dir("jniLibs")
@@ -198,6 +229,7 @@ tasks.named("jvmProcessResources") { dependsOn(generateBreezKeyResource) }
 tasks.named("compileKotlinJvm") { dependsOn(buildDesktopRustCore) }
 tasks.named("jvmProcessResources") { dependsOn(buildDesktopRustCore) }
 tasks.named("preBuild") { dependsOn(buildAndroidRustCore) }
+tasks.matching { it.name == "check" }.configureEach { dependsOn(checkI18nStringsInSync) }
 
 android {
     namespace = "chat.bitchat.sonar"

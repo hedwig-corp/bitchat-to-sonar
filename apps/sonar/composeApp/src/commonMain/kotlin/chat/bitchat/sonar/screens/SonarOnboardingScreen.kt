@@ -43,6 +43,33 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import chat.bitchat.sonar.SonarAccountRestoreException
 import chat.bitchat.sonar.SonarAppState
+import chat.bitchat.sonar.resources.Res
+import chat.bitchat.sonar.resources.anyone_with_this_key_controls_your
+import chat.bitchat.sonar.resources.bluetooth_finds_people_around_you_even
+import chat.bitchat.sonar.resources.continue_
+import chat.bitchat.sonar.resources.create_a_new_identity
+import chat.bitchat.sonar.resources.direct_messages_are_end_to_end
+import chat.bitchat.sonar.resources.friends_can_verify_this_fingerprint_in
+import chat.bitchat.sonar.resources.get_started
+import chat.bitchat.sonar.resources.it_s_just_what_people_see_change_it
+import chat.bitchat.sonar.resources.messages_travel_encrypted_over_the_open
+import chat.bitchat.sonar.resources.nickname
+import chat.bitchat.sonar.resources.no_account_was_created_anywhere_your
+import chat.bitchat.sonar.resources.no_signup_your_identity_is_a_private
+import chat.bitchat.sonar.resources.nsec1
+import chat.bitchat.sonar.resources.out_of_range_still_reachable
+import chat.bitchat.sonar.resources.paste_key
+import chat.bitchat.sonar.resources.pick_a_nickname
+import chat.bitchat.sonar.resources.private_by_design
+import chat.bitchat.sonar.resources.restore_account
+import chat.bitchat.sonar.resources.restoring
+import chat.bitchat.sonar.resources.sense_who_s_nearby_before_you_see_them
+import chat.bitchat.sonar.resources.sonar_connects_phones_directly_no_phone
+import chat.bitchat.sonar.resources.start_chatting
+import chat.bitchat.sonar.resources.surprise_me
+import chat.bitchat.sonar.resources.works_without_internet
+import chat.bitchat.sonar.resources.you_re_in
+import chat.bitchat.sonar.resources.your_key_fingerprint_2
 import chat.bitchat.sonar.ui.SNFingerprintCard
 import chat.bitchat.sonar.ui.SNGhostButton
 import chat.bitchat.sonar.ui.SNIcon
@@ -51,6 +78,7 @@ import chat.bitchat.sonar.ui.SNIconName
 import chat.bitchat.sonar.ui.SNPrimaryButton
 import chat.bitchat.sonar.ui.SonarAvatar
 import chat.bitchat.sonar.ui.sonar
+import org.jetbrains.compose.resources.stringResource
 
 private val SUGGESTIONS = listOf(
     "quietfox", "tram12", "lakeswim", "verdigris", "morningstatic", "papercrane", "northpine", "softsignal"
@@ -121,7 +149,7 @@ fun SonarOnboardingScreen(state: SonarAppState) {
             }
             if (restoring) {
                 SNPrimaryButton(
-                    if (restoreInFlight) "Restoring..." else "Restore account",
+                    if (restoreInFlight) stringResource(Res.string.restoring) else stringResource(Res.string.restore_account),
                     disabled = !nsecOk || restoreInFlight,
                 ) {
                     val key = nsec.trim()
@@ -135,7 +163,7 @@ fun SonarOnboardingScreen(state: SonarAppState) {
                         }
                     }
                 }
-                SNGhostButton("Create a new identity") {
+                SNGhostButton(stringResource(Res.string.create_a_new_identity)) {
                     restoring = false
                     restoreError = null
                     nsec = ""
@@ -150,7 +178,7 @@ fun SonarOnboardingScreen(state: SonarAppState) {
                             Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.spacedBy(8.dp),
                         ) {
-                            SNPrimaryButton("Get started", Modifier.weight(1f)) { step = 1 }
+                            SNPrimaryButton(stringResource(Res.string.get_started), Modifier.weight(1f)) { step = 1 }
                             Box(
                                 Modifier.weight(1f).height(52.dp)
                                     .clip(RoundedCornerShape(15.dp)).background(s.accentSoft)
@@ -162,7 +190,7 @@ fun SonarOnboardingScreen(state: SonarAppState) {
                                 contentAlignment = Alignment.Center,
                             ) {
                                 Text(
-                                    "Restore account",
+                                    stringResource(Res.string.restore_account),
                                     color = s.accentDeep,
                                     fontSize = 15.sp,
                                     fontWeight = FontWeight.Bold,
@@ -170,8 +198,8 @@ fun SonarOnboardingScreen(state: SonarAppState) {
                             }
                         }
                     }
-                    1 -> SNPrimaryButton("Continue", disabled = !can) { if (can) step = 2 }
-                    else -> SNPrimaryButton("Start chatting") { state.completeOnboarding(trimmed) }
+                    1 -> SNPrimaryButton(stringResource(Res.string.continue_), disabled = !can) { if (can) step = 2 }
+                    else -> SNPrimaryButton(stringResource(Res.string.start_chatting)) { state.completeOnboarding(trimmed) }
                 }
             }
         }
@@ -188,18 +216,18 @@ private fun StepIntro() {
         ) { SNIcon(SNIconName.Rings, 40.dp, s.onAccent, weight = 1.5f) }
         Spacer(Modifier.height(28.dp))
         Text(
-            "Sense who’s nearby before you see them.",
+            stringResource(Res.string.sense_who_s_nearby_before_you_see_them),
             color = s.text, fontSize = 30.sp, fontWeight = FontWeight.Black, lineHeight = 34.sp
         )
         Spacer(Modifier.height(10.dp))
         Text(
-            "Sonar connects phones directly — no phone number, no account, no servers.",
+            stringResource(Res.string.sonar_connects_phones_directly_no_phone),
             color = s.text2, fontSize = 16.sp, lineHeight = 21.sp
         )
         Spacer(Modifier.height(22.dp))
-        FeatureRow(SNIconName.Mesh, "Works without internet", "Bluetooth finds people around you, even offline.")
-        FeatureRow(SNIconName.Globe, "Out of range? Still reachable", "Messages travel encrypted over the open internet instead.")
-        FeatureRow(SNIconName.Lock, "Private by design", "Direct messages are end-to-end encrypted. Always.")
+        FeatureRow(SNIconName.Mesh, stringResource(Res.string.works_without_internet), stringResource(Res.string.bluetooth_finds_people_around_you_even))
+        FeatureRow(SNIconName.Globe, stringResource(Res.string.out_of_range_still_reachable), stringResource(Res.string.messages_travel_encrypted_over_the_open))
+        FeatureRow(SNIconName.Lock, stringResource(Res.string.private_by_design), stringResource(Res.string.direct_messages_are_end_to_end))
     }
 }
 
@@ -223,9 +251,9 @@ private fun FeatureRow(icon: SNIconName, title: String, desc: String) {
 private fun StepNickname(nick: String, trimmed: String, onChange: (String) -> Unit) {
     val s = sonar
     Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center) {
-        Text("Pick a nickname", color = s.text, fontSize = 30.sp, fontWeight = FontWeight.Black)
+        Text(stringResource(Res.string.pick_a_nickname), color = s.text, fontSize = 30.sp, fontWeight = FontWeight.Black)
         Spacer(Modifier.height(10.dp))
-        Text("It’s just what people see — change it anytime.", color = s.text2, fontSize = 16.sp, lineHeight = 21.sp)
+        Text(stringResource(Res.string.it_s_just_what_people_see_change_it), color = s.text2, fontSize = 16.sp, lineHeight = 21.sp)
         Spacer(Modifier.height(22.dp))
         Row(verticalAlignment = Alignment.CenterVertically) {
             SonarAvatar(trimmed.ifEmpty { "?" }, 72.dp)
@@ -234,7 +262,7 @@ private fun StepNickname(nick: String, trimmed: String, onChange: (String) -> Un
                 Modifier.weight(1f).clip(RoundedCornerShape(16.dp)).background(s.surface2)
                     .padding(horizontal = 16.dp, vertical = 15.dp)
             ) {
-                if (nick.isEmpty()) Text("nickname", color = s.text3, fontSize = 21.sp, fontWeight = FontWeight.Medium)
+                if (nick.isEmpty()) Text(stringResource(Res.string.nickname), color = s.text3, fontSize = 21.sp, fontWeight = FontWeight.Medium)
                 BasicTextField(
                     value = nick,
                     onValueChange = onChange,
@@ -254,11 +282,11 @@ private fun StepNickname(nick: String, trimmed: String, onChange: (String) -> Un
         ) {
             SNIcon(SNIconName.Dice, 16.dp, s.accentDeep, weight = 2f)
             Spacer(Modifier.width(7.dp))
-            Text("Surprise me", color = s.accentDeep, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+            Text(stringResource(Res.string.surprise_me), color = s.accentDeep, fontSize = 14.sp, fontWeight = FontWeight.Bold)
         }
         Spacer(Modifier.height(18.dp))
         Text(
-            "No signup. Your identity is a private key created on this phone — nobody else ever sees it.",
+            stringResource(Res.string.no_signup_your_identity_is_a_private),
             color = s.text3, fontSize = 13.sp, lineHeight = 17.sp
         )
     }
@@ -273,7 +301,7 @@ private fun StepRestore(
 ) {
     val s = sonar
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.Center) {
-        Text("Restore account", color = s.text, fontSize = 30.sp, fontWeight = FontWeight.Black)
+        Text(stringResource(Res.string.restore_account), color = s.text, fontSize = 30.sp, fontWeight = FontWeight.Black)
         Spacer(Modifier.height(10.dp))
         Text(
             "Paste your nsec private key. This restores your Sonar identity and Lightning wallet. Chat history on this device starts fresh until backup ships.",
@@ -284,7 +312,7 @@ private fun StepRestore(
             Modifier.fillMaxWidth().heightIn(min = 116.dp).clip(RoundedCornerShape(16.dp)).background(s.surface2)
                 .padding(horizontal = 16.dp, vertical = 14.dp)
         ) {
-            if (nsec.isEmpty()) Text("nsec1...", color = s.text3, fontSize = 16.sp)
+            if (nsec.isEmpty()) Text(stringResource(Res.string.nsec1), color = s.text3, fontSize = 16.sp)
             BasicTextField(
                 value = nsec,
                 onValueChange = { onChange(it.trim()) },
@@ -301,10 +329,10 @@ private fun StepRestore(
         ) {
             SNIcon(SNIconName.Key, 16.dp, s.accentDeep, weight = 2f)
             Spacer(Modifier.width(7.dp))
-            Text("Paste key", color = s.accentDeep, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+            Text(stringResource(Res.string.paste_key), color = s.accentDeep, fontSize = 14.sp, fontWeight = FontWeight.Bold)
         }
         Spacer(Modifier.height(18.dp))
-        Text("Anyone with this key controls your account and wallet. Only restore from your own backup.", color = s.text3, fontSize = 13.sp, lineHeight = 17.sp)
+        Text(stringResource(Res.string.anyone_with_this_key_controls_your), color = s.text3, fontSize = 13.sp, lineHeight = 17.sp)
         if (error != null) {
             Spacer(Modifier.height(14.dp))
             Text(error, color = s.danger, fontSize = 13.sp, lineHeight = 17.sp)
@@ -318,12 +346,12 @@ private fun StepDone(nick: String, fingerprint: String) {
     Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center) {
         SonarAvatar(nick.ifEmpty { "?" }, 92.dp)
         Spacer(Modifier.height(22.dp))
-        Text("You’re in, $nick.", color = s.text, fontSize = 30.sp, fontWeight = FontWeight.Black)
+        Text(stringResource(Res.string.you_re_in, nick), color = s.text, fontSize = 30.sp, fontWeight = FontWeight.Black)
         Spacer(Modifier.height(10.dp))
-        Text("No account was created anywhere — your identity lives on this phone.", color = s.text2, fontSize = 16.sp, lineHeight = 21.sp)
+        Text(stringResource(Res.string.no_account_was_created_anywhere_your), color = s.text2, fontSize = 16.sp, lineHeight = 21.sp)
         Spacer(Modifier.height(24.dp))
-        SNFingerprintCard("Your key fingerprint", fingerprint.ifEmpty { "generating…" })
+        SNFingerprintCard(stringResource(Res.string.your_key_fingerprint_2), fingerprint.ifEmpty { "generating…" })
         Spacer(Modifier.height(18.dp))
-        Text("Friends can verify this fingerprint in person to be sure it’s really you.", color = s.text3, fontSize = 13.sp, lineHeight = 17.sp)
+        Text(stringResource(Res.string.friends_can_verify_this_fingerprint_in), color = s.text3, fontSize = 13.sp, lineHeight = 17.sp)
     }
 }
