@@ -29,9 +29,10 @@ private object AndroidMeshLifecycleGate {
 }
 
 internal fun setAndroidMeshLifecycleAllowed(allowed: Boolean) {
-    val wasAllowed = AndroidMeshLifecycleGate.allowed
     AndroidMeshLifecycleGate.allowed = allowed
-    if (wasAllowed && !allowed) MeshRadio.stop()
+    // Idempotence is intentional: Activity.onStop must synchronously tear down
+    // a radio started by any earlier path even if the process-local flag drifted.
+    if (shouldStopAndroidMeshRadio(allowed)) MeshRadio.stop()
 }
 
 /**
@@ -162,8 +163,11 @@ actual object MeshRadio {
         (ctx.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
 
     actual fun available(): Boolean {
+        // On Android 12+ even BluetoothAdapter.isEnabled requires CONNECT.
+        // Check grants first and contain revocation races around the Binder call.
+        if (!permitted()) return false
         val a = adapter() ?: return false
-        return a.isEnabled && permitted()
+        return runCatching { a.isEnabled }.getOrDefault(false)
     }
 
     actual fun setDiscoveryMode(mode: BleDiscoveryMode) {
@@ -198,8 +202,9 @@ actual object MeshRadio {
             android.util.Log.i(TAG, "start skipped: visible Activity lifecycle is not active")
             return
         }
-        if (scanning || !available()) {
-            android.util.Log.i(TAG, "start skipped: scanning=$scanning available=${available()}")
+        val radioAvailable = available()
+        if (scanning || !radioAvailable) {
+            android.util.Log.i(TAG, "start skipped: scanning=$scanning available=$radioAvailable")
             return
         }
         if (discoveryMode == BleDiscoveryMode.KnownOnly && knownPeerIds.isEmpty()) {
@@ -238,6 +243,18 @@ actual object MeshRadio {
         try { activeAdvertiser?.stopAdvertising(advCallback) } catch (_: Throwable) {}
         MeshGatt.stop()
         seen.clear(); lastSeen.clear(); announcedPeers.clear(); announcedSeen.clear()
+    }
+
+    actual fun resetAccountState() {
+        AndroidMeshLifecycleGate.allowed = false
+        stop()
+        MeshGatt.resetAccountState()
+        discoveryMode = BleDiscoveryMode.Normal
+        knownPeerIds.clear()
+        sonarProfiles.clear()
+        meshDmInbox.clear()
+        meshMediaInbox.clear()
+        meshBroadcastInbox.clear()
     }
 
     private fun restartRadioForPolicy() {
@@ -308,7 +325,7 @@ actual object MeshRadio {
      *  Restarts stay spaced to remain under Android's scan-start throttle. */
     private val scanWatchdog = object : Runnable {
         override fun run() {
-            if (!scanning) return
+            if (!shouldRunAndroidMeshWatchdog(scanning, AndroidMeshLifecycleGate.allowed)) return
             val now = SystemClock.elapsedRealtime()
             val hasUsableLink = announcedPeers.keys.any { MeshGatt.hasLink(it) }
             val restartReason = bleScanRestartReason(
@@ -331,7 +348,9 @@ actual object MeshRadio {
                 runCatching { scanner?.stopScan(scanCallback) }
                 runCatching { startScanInternal() }
             }
-            handler.postDelayed(this, WATCHDOG_TICK_MS)
+            if (shouldRunAndroidMeshWatchdog(scanning, AndroidMeshLifecycleGate.allowed)) {
+                handler.postDelayed(this, WATCHDOG_TICK_MS)
+            }
         }
     }
 

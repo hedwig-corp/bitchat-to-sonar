@@ -37,6 +37,61 @@ class NearbyDiscoveryPolicyTest {
     }
 
     @Test
+    fun androidMeshDoesNotQueryBluetoothBeforePermissionIndependentGatesOpen() {
+        assertFalse(shouldQueryAndroidMeshAvailability(false, true, true))
+        assertFalse(shouldQueryAndroidMeshAvailability(true, false, true))
+        assertFalse(shouldQueryAndroidMeshAvailability(true, true, false))
+        assertTrue(shouldQueryAndroidMeshAvailability(true, true, true))
+    }
+
+    @Test
+    fun pixelStoppedActivityCannotRunOrRescheduleMeshWatchdog() {
+        // Pixel evidence showed scanning work every ~8s while MainActivity was
+        // STOPPED. Even if a stale tick still observes scanning=true, onStop's
+        // closed lifecycle gate must make that tick terminal.
+        assertFalse(shouldRunAndroidMeshRadio(false, true, true, true))
+        assertFalse(shouldRunAndroidMeshWatchdog(scanning = true, lifecycleAllowed = false))
+        assertTrue(shouldStopAndroidMeshRadio(allowed = false))
+        assertTrue(shouldRunAndroidMeshWatchdog(scanning = true, lifecycleAllowed = true))
+    }
+
+    @Test
+    fun staleGattCallbackCannotCrossStoppedOrRestartedLifecycle() {
+        assertFalse(acceptsMeshLifecycleCallback(false, 4, 4))
+        assertFalse(acceptsMeshLifecycleCallback(true, 5, 4))
+        assertFalse(acceptsMeshLifecycleCallback(true, 5, 5, expectedConnection = false))
+        assertTrue(acceptsMeshLifecycleCallback(true, 5, 5, expectedConnection = true))
+    }
+
+    @Test
+    fun lifecycleStopRetainsUnacknowledgedMeshDeliveryButAccountResetDropsIt() {
+        val deliveries = PendingMeshDeliveryTracker()
+        deliveries.enqueue("peer", "message-1", "hello")
+
+        assertEquals("message-1", deliveries.beginNext("peer")?.messageId)
+        deliveries.cancelInFlight()
+        assertEquals("message-1", deliveries.beginNext("peer")?.messageId)
+        deliveries.finish("peer", "message-1", delivered = true)
+        assertEquals(0, deliveries.pendingCount("peer"))
+
+        deliveries.enqueue("peer", "message-2", "next account must not send this")
+        deliveries.clear()
+        assertEquals(0, deliveries.pendingCount("peer"))
+    }
+
+    @Test
+    fun failedGattAcknowledgementRetainsDeliveryForTheNextLink() {
+        val deliveries = PendingMeshDeliveryTracker()
+        deliveries.enqueue("peer", "message-1", "hello")
+
+        assertEquals("message-1", deliveries.beginNext("peer")?.messageId)
+        deliveries.finish("peer", "message-1", delivered = false)
+
+        assertEquals(1, deliveries.pendingCount("peer"))
+        assertEquals("message-1", deliveries.beginNext("peer")?.messageId)
+    }
+
+    @Test
     fun nearbyScanRequiresVisibleForegroundOnboardedRadarAndOpenDiscovery() {
         assertTrue(shouldScanForNearbyPayments(true, true, true, false))
         assertFalse(shouldScanForNearbyPayments(false, true, true, false))

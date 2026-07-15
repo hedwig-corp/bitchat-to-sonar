@@ -69,6 +69,84 @@ internal fun shouldRunAndroidMeshRadio(
     radioAvailable: Boolean,
 ): Boolean = activityStarted && postFirstDrawStartupReady && onboarded && radioAvailable
 
+/** Avoid touching permission-protected Bluetooth APIs until every lifecycle and
+ * account gate that can be evaluated without them is open. */
+internal fun shouldQueryAndroidMeshAvailability(
+    activityStarted: Boolean,
+    postFirstDrawStartupReady: Boolean,
+    onboarded: Boolean,
+): Boolean = activityStarted && postFirstDrawStartupReady && onboarded
+
+/** A queued watchdog tick must neither touch BLE nor schedule another tick once
+ * Activity.onStop has closed the process-wide lifecycle gate. */
+internal fun shouldRunAndroidMeshWatchdog(
+    scanning: Boolean,
+    lifecycleAllowed: Boolean,
+): Boolean = scanning && lifecycleAllowed
+
+/** Closing the lifecycle gate is an idempotent teardown request, including when
+ * the process-local flag was already false but radio state drifted to running. */
+internal fun shouldStopAndroidMeshRadio(allowed: Boolean): Boolean = !allowed
+
+/** Pure callback fence shared by the Android GATT server/client callbacks. */
+internal fun acceptsMeshLifecycleCallback(
+    active: Boolean,
+    currentGeneration: Long,
+    callbackGeneration: Long,
+    expectedConnection: Boolean = true,
+): Boolean = active && currentGeneration == callbackGeneration && expectedConnection
+
+internal data class PendingMeshDelivery(
+    val messageId: String,
+    val text: String,
+)
+
+/**
+ * Logical mesh sends survive a foreground lifecycle stop, while byte-level GATT
+ * work does not. The head remains pending until the final reliable GATT write is
+ * acknowledged; an account reset is the only operation that discards it.
+ *
+ * Android serializes access with the MeshGatt monitor, so this deliberately
+ * stays platform-neutral and allocation-light rather than adding another lock.
+ */
+internal class PendingMeshDeliveryTracker {
+    private val queues = mutableMapOf<String, MutableList<PendingMeshDelivery>>()
+    private val inFlight = mutableMapOf<String, String>()
+
+    fun enqueue(peerId: String, messageId: String, text: String) {
+        queues.getOrPut(peerId) { mutableListOf() }.add(PendingMeshDelivery(messageId, text))
+    }
+
+    fun beginNext(peerId: String): PendingMeshDelivery? {
+        if (inFlight.containsKey(peerId)) return null
+        val next = queues[peerId]?.firstOrNull() ?: return null
+        inFlight[peerId] = next.messageId
+        return next
+    }
+
+    fun finish(peerId: String, messageId: String, delivered: Boolean) {
+        if (inFlight[peerId] != messageId) return
+        inFlight.remove(peerId)
+        if (!delivered) return
+        val queue = queues[peerId] ?: return
+        if (queue.firstOrNull()?.messageId == messageId) queue.removeAt(0)
+        if (queue.isEmpty()) queues.remove(peerId)
+    }
+
+    /** A lifecycle stop cancels raw I/O but retains every logical delivery. */
+    fun cancelInFlight() {
+        inFlight.clear()
+    }
+
+    /** Account teardown must not carry messages into the next identity. */
+    fun clear() {
+        queues.clear()
+        inFlight.clear()
+    }
+
+    fun pendingCount(peerId: String): Int = queues[peerId]?.size ?: 0
+}
+
 internal enum class BleScanRestartReason(val logValue: String) {
     NoCallbacks("no_callbacks"),
     RepeatingKnownWithoutUsableLink("no_new_address_no_link"),
@@ -145,6 +223,8 @@ expect object MeshRadio {
     fun start()
     /** Stop the radio. */
     fun stop()
+    /** Stop synchronously and discard all account-bound transport buffers. */
+    fun resetAccountState()
     /** Currently-visible mesh peers (pruned of stale entries). */
     fun peers(): List<MeshPeer>
 

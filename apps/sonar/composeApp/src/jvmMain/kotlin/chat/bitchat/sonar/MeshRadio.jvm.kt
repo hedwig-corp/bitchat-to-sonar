@@ -51,6 +51,17 @@ actual object MeshRadio {
         BleBridge.stopAdvertising()
     }
 
+    actual fun resetAccountState() {
+        stop()
+        // Discard packets already handed off by the native BLE callback before
+        // clearing protocol/account state so they cannot enter the next account.
+        BleBridge.drainRx()
+        MeshLink.wipe()
+        nick = "sonar"
+        discoveryMode = BleDiscoveryMode.Normal
+        knownPeerIds.clear()
+    }
+
     private fun refreshAnnounce() {
         runCatching { BleBridge.setAnnounce(MeshIdentity.announce(nick)) }
     }

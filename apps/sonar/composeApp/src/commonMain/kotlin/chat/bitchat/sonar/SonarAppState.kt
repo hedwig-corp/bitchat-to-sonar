@@ -717,6 +717,9 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun toggleDark() { dark = !dark; SonarCore.setDark(dark) }
 
     fun wipe() {
+        // Fence account-bound BLE callbacks and discard transport inbox/outbox
+        // state synchronously, before the coroutine reaches durable deletion.
+        MeshRadio.resetAccountState()
         scope.launch {
             endTranscriptSession()
             relayConnectJob?.cancel(); relayConnectJob = null

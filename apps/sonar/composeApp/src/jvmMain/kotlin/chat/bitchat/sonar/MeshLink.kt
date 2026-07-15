@@ -53,6 +53,7 @@ object MeshLink {
     @Volatile private var lastSonarSendMs = 0L
 
     @Volatile private var running = false
+    private val lifecycleLock = Any()
 
     /** Set/clear the SonarAnnounce payload broadcast as our 0x53 (from the app). */
     fun setSonarPayload(payload: ByteArray?) { sonarPayload = payload }
@@ -67,7 +68,7 @@ object MeshLink {
 
     private fun loop() {
         while (running) {
-            runCatching { pump() }
+            runCatching { synchronized(lifecycleLock) { if (running) pump() } }
             try { Thread.sleep(120) } catch (_: InterruptedException) { break }
         }
     }
@@ -233,8 +234,10 @@ object MeshLink {
         return out
     }
 
-    fun wipe() {
+    fun wipe() = synchronized(lifecycleLock) {
         sessions.clear(); fpByPeerId.clear(); peerIdByFp.clear()
         nameByFp.clear(); seenByFp.clear(); sonarByPeerId.clear(); sonarSeenAt.clear(); rxDms.clear(); pending.clear()
+        sonarPayload = null
+        lastSonarSendMs = 0L
     }
 }

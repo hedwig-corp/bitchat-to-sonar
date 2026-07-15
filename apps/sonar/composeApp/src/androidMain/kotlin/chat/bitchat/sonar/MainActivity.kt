@@ -55,6 +55,15 @@ class MainActivity : ComponentActivity() {
         }
 
     private fun reconcileMeshRadio() {
+        if (!shouldQueryAndroidMeshAvailability(
+                activityStarted = activityStarted,
+                postFirstDrawStartupReady = postFirstDrawStartupReady,
+                onboarded = onboarded,
+            )
+        ) {
+            setAndroidMeshLifecycleAllowed(false)
+            return
+        }
         val shouldRun = shouldRunAndroidMeshRadio(
             activityStarted = activityStarted,
             postFirstDrawStartupReady = postFirstDrawStartupReady,
