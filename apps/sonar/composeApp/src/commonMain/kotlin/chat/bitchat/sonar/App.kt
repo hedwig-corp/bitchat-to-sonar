@@ -803,6 +803,52 @@ private fun ChannelHint() {
 private fun transcriptFeedKey(item: Any): String =
     if (item is CallRecord) "c:${item.id}" else "m:${(item as SonarMsg).id}"
 
+/** One observed frame of transcript tail state for [TranscriptTailPinner].
+ *  [viewportHeight] keeps successive IME-resize frames distinct so a
+ *  `distinctUntilChanged` flow never swallows a shrink step. */
+internal data class TranscriptTailFrame(
+    val itemCount: Int,
+    val viewportHeight: Int,
+    val tailFullyVisible: Boolean,
+    val scrolling: Boolean,
+    val prepending: Boolean,
+)
+
+internal enum class TranscriptTailPin { None, Snap, Animate }
+
+/**
+ * Signal keeps a transcript bottom-anchored: a reader at the tail stays at the
+ * tail through keyboard and layout changes. A top-anchored LazyColumn instead
+ * keeps its first visible row, so the IME opening (viewport shrink) or a media
+ * skeleton swapping to the taller decoded image (tail rows growing) silently
+ * pushes the newest messages below the fold. This state machine watches layout
+ * frames and asks for a re-anchor only when layout — not the user's scroll and
+ * not a history prepend — steals a fully visible tail. [Snap] re-anchors
+ * instantly (mid keyboard animation); [Animate] follows a new appended row.
+ */
+internal class TranscriptTailPinner {
+    private var wasPinned = false
+    private var lastCount = -1
+
+    fun onFrame(frame: TranscriptTailFrame): TranscriptTailPin {
+        val countChanged = frame.itemCount != lastCount
+        lastCount = frame.itemCount
+        return when {
+            frame.prepending || frame.scrolling -> {
+                wasPinned = frame.tailFullyVisible
+                TranscriptTailPin.None
+            }
+            frame.tailFullyVisible -> {
+                wasPinned = true
+                TranscriptTailPin.None
+            }
+            wasPinned && frame.itemCount > 0 ->
+                if (countChanged) TranscriptTailPin.Animate else TranscriptTailPin.Snap
+            else -> TranscriptTailPin.None
+        }
+    }
+}
+
 @Composable
 private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     val s = sonar
@@ -935,6 +981,32 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                 didLeaveTail = false
             }
             isPrepending = false
+        }
+    }
+
+    // Bottom-anchor the tail (Signal parity): the IME opening shrinks the
+    // transcript viewport and decoded media grows tail rows after first paint;
+    // both would otherwise hide the newest messages behind the keyboard or
+    // below the fold. Re-anchor whenever layout — not the user — steals the tail.
+    LaunchedEffect(screen.id, listState) {
+        val pinner = TranscriptTailPinner()
+        snapshotFlow {
+            val info = listState.layoutInfo
+            val last = info.visibleItemsInfo.lastOrNull()
+            TranscriptTailFrame(
+                itemCount = info.totalItemsCount,
+                viewportHeight = info.viewportSize.height,
+                tailFullyVisible = last != null && last.index == info.totalItemsCount - 1 &&
+                    last.offset + last.size <= info.viewportEndOffset,
+                scrolling = listState.isScrollInProgress,
+                prepending = isPrepending,
+            )
+        }.distinctUntilChanged().collect { frame ->
+            when (pinner.onFrame(frame)) {
+                TranscriptTailPin.Snap -> listState.scrollToItem(frame.itemCount - 1)
+                TranscriptTailPin.Animate -> listState.animateScrollToItem(frame.itemCount - 1)
+                TranscriptTailPin.None -> Unit
+            }
         }
     }
     val currentChat = state.chats.firstOrNull { it.id == screen.id }
