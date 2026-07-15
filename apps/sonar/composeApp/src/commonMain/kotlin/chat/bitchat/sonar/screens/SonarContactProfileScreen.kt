@@ -172,7 +172,7 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
                     Spacer(Modifier.height(5.dp))
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text(
-                            if (nip05.endsWith("@sonarprivacy.xyz")) "@" + nip05.substringBefore('@') else nip05,
+                            if (nip05.endsWith("@${state.handleDomain}")) "@" + nip05.substringBefore('@') else nip05,
                             color = s.text3,
                             fontSize = 12.5.sp
                         )

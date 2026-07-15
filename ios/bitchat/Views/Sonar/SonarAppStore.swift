@@ -608,8 +608,10 @@ final class SonarAppStore: ObservableObject {
     private static let pendingMarmotGroupSendQueueLimit = 100
 
     static let marmotIDPrefix = "marmot:"
-    /// Default domain for unified handles claimed through the app.
-    static let handleDomain = "sonarprivacy.xyz"
+    /// Default domain for unified handles claimed through the app. Core owns
+    /// the constant (pure FFI read) — never inline the literal, the
+    /// external-vs-claim routing depends on this exact string.
+    static let handleDomain = defaultHandleDomain()
     static let pendingMarmotIDPrefix = "marmot-pending:"
     static let pendingMarmotGroupIDPrefix = "marmot-group-pending:"
     /// SNPeerItem id prefix for a Unify Wallet peer discovered over Bluetooth.
@@ -678,6 +680,11 @@ final class SonarAppStore: ObservableObject {
         case failed(String)
     }
     @Published private(set) var handleClaimState: HandleClaimState = .idle
+    /// The address actually claimed at the Sonar registrar (core sidecar is
+    /// the durable record). Distinct from `bip353`, which may also hold an
+    /// external payment address from another wallet: only a core-claimed
+    /// address gets the claim checkmark and kind-0 `nip05`.
+    @Published private(set) var coreClaimedHandle: String?
     /// Mirrors wallet.state for the UI (balance row and PaySheet).
     @Published private(set) var walletState: SonarWalletState
     /// Radar "Send sats" quick-pay: the DM screen opens with the PaySheet up.
@@ -1457,6 +1464,10 @@ final class SonarAppStore: ObservableObject {
         #if os(iOS) || os(macOS)
         (wallet as? BridgedWallet)?.retrySetup()
         #endif
+        // Local sidecar read — recover a claimed handle into prefs without
+        // waiting for a relay (Compose parity; the relay-connect sink stays
+        // as the online refresh).
+        adoptClaimedHandleIfNeeded()
     }
 
     #if DEBUG
@@ -2444,6 +2455,7 @@ final class SonarAppStore: ObservableObject {
             }
             do {
                 let address = try await self.marmot.claimHandle(handle: name, offer: offer)
+                self.coreClaimedHandle = address
                 self.setBip353(address)
                 self.marmot.publishProfile(name: self.chatViewModel.nickname)
                 self.handleClaimState = .claimed(address)
@@ -2476,12 +2488,12 @@ final class SonarAppStore: ObservableObject {
     /// a claimed handle, adopt it back (core persistence is the durable copy).
     /// Local DB read only — never blocks or touches the network.
     private func adoptClaimedHandleIfNeeded() {
-        guard bip353.isEmpty else { return }
         Task { [weak self] in
             guard let self else { return }
             guard let address = await self.marmot.claimedHandle(),
                   !address.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             else { return }
+            self.coreClaimedHandle = address
             guard self.bip353.isEmpty else { return }
             self.setBip353(address)
             if self.handleClaimState == .idle {

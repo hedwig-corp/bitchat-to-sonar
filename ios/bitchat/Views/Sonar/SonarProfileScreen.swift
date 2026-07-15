@@ -53,6 +53,13 @@ struct SonarProfileScreen: View {
         MarmotService.handleLooksValid(trimmedHandleDraft)
     }
 
+    /// A full non-default-domain address is an external payment address —
+    /// saved locally, never claimed at the registrar (matches the store path).
+    private var isExternalDraft: Bool {
+        trimmedHandleDraft.contains("@")
+            && !trimmedHandleDraft.hasSuffix("@\(SonarAppStore.handleDomain)")
+    }
+
     private func claimHandle() {
         guard handleDraftValid, !claimingHandle else { return }
         store.claimHandle(trimmedHandleDraft)
@@ -188,10 +195,14 @@ struct SonarProfileScreen: View {
     }
 
     private func claimedHandleRow(_ address: String) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: "checkmark.seal.fill")
+        // The seal marks a registrar-claimed handle only. An external payment
+        // address (from another wallet) is stored in the same field but is
+        // NOT a claimed identity — plain link glyph for it.
+        let isCoreClaimed = address == store.coreClaimedHandle
+        return HStack(spacing: 8) {
+            Image(systemName: isCoreClaimed ? "checkmark.seal.fill" : "link")
                 .font(.system(size: 15, weight: .semibold))
-                .foregroundColor(SonarTheme.green)
+                .foregroundColor(isCoreClaimed ? SonarTheme.green : SonarTheme.text3)
             Text(verbatim: address)
                 .font(SonarTheme.monoFont(size: 13))
                 .foregroundColor(SonarTheme.text)
@@ -233,9 +244,9 @@ struct SonarProfileScreen: View {
         .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(SonarTheme.surface2))
 
         if !trimmedHandleDraft.isEmpty {
-            Text(verbatim: trimmedHandleDraft.contains("@")
+            Text(verbatim: isExternalDraft
                 ? "External address — saved as your payment address only."
-                : "\(trimmedHandleDraft)@\(SonarAppStore.handleDomain)")
+                : "\(trimmedHandleDraft.components(separatedBy: "@")[0])@\(SonarAppStore.handleDomain)")
                 .font(SonarTheme.monoFont(size: 12))
                 .foregroundColor(SonarTheme.text2)
                 .lineLimit(1)
@@ -256,7 +267,9 @@ struct SonarProfileScreen: View {
                             .progressViewStyle(CircularProgressViewStyle(tint: SonarTheme.onAccent))
                             .scaleEffect(0.7)
                     }
-                    Text(claimingHandle ? "Claiming\u{2026}" : "Claim")
+                    Text(claimingHandle
+                        ? "Claiming\u{2026}"
+                        : (isExternalDraft ? "Save address" : "Claim"))
                         .font(SonarTheme.uiFont(size: 14, weight: .bold))
                 }
                 .foregroundColor(SonarTheme.onAccent)

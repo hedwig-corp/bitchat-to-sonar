@@ -663,6 +663,10 @@ expect object SonarCore {
      *  No network — safe per keystroke. False for npub/lno/invite strings. */
     fun handleLooksValid(input: String): Boolean
 
+    /** The default handle domain (core-owned constant; do not inline the
+     *  literal — external-vs-claim routing depends on this exact string). */
+    fun defaultHandleDomain(): String
+
     /** Publish this build's public Sonar descriptor. */
     suspend fun publishSonarDescriptor(callsEnabled: Boolean = true, bolt12Offer: String? = null)
 

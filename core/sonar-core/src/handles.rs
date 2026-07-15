@@ -123,6 +123,11 @@ impl ParsedHandle {
 /// True if `s` is a valid handle local part (already lowercased): the NIP-05
 /// charset `a-z0-9-_.`, must start and end alphanumeric, capped at the DNS
 /// label limit so the same name is claimable as a BIP-353 record.
+///
+/// Consecutive dots are rejected to match the registrar: the local part
+/// becomes DNS labels under `user._bitcoin-payment.<domain>`, and an empty
+/// label (`a..b`) is unservable — the app must not build and sign a claim the
+/// server will always refuse.
 pub fn is_valid_local_part(s: &str) -> bool {
     if s.is_empty() || s.len() > MAX_LOCAL_PART_LEN {
         return false;
@@ -132,18 +137,43 @@ pub fn is_valid_local_part(s: &str) -> bool {
     if !alnum(bytes[0]) || !alnum(bytes[bytes.len() - 1]) {
         return false;
     }
+    if s.split('.').any(|label| label.is_empty() || label.len() > 63) {
+        return false;
+    }
     bytes
         .iter()
         .all(|&b| alnum(b) || b == b'-' || b == b'_' || b == b'.')
 }
 
-/// True if `s` looks like a resolvable DNS name for a handle domain: ASCII
-/// letters/digits/hyphens in dot-separated labels, at least one dot.
+/// True if `s` looks like a resolvable *public* DNS name for a handle domain:
+/// ASCII letters/digits/hyphens in dot-separated labels, at least one dot.
+///
+/// SSRF hardening — the domain comes from attacker-controlled data (a peer's
+/// kind-0 `nip05` field, or typed input), and resolution auto-fires from the
+/// contact-profile screen. Reject IP literals (a numeric TLD is an IPv4
+/// address; `[` opens an IPv6 literal) and well-known internal suffixes so
+/// the client never GETs loopback/link-local/metadata or LAN hosts by name.
+/// (A public name that *resolves* to a private IP — DNS rebinding — is out of
+/// scope for a client-side string check; impact stays bounded by the GET-only,
+/// no-redirect, 64KB-capped fetch path.)
 fn is_valid_domain(s: &str) -> bool {
     if s.is_empty() || s.len() > 253 || !s.contains('.') {
         return false;
     }
-    s.split('.').all(|label| {
+    let labels: Vec<&str> = s.split('.').collect();
+    // Numeric TLD ⇒ IPv4 literal (1.2.3.4); bracket ⇒ IPv6 literal.
+    if s.starts_with('[') || labels.last().is_some_and(|tld| tld.bytes().all(|b| b.is_ascii_digit())) {
+        return false;
+    }
+    const INTERNAL_SUFFIXES: [&str; 5] = ["local", "internal", "localdomain", "home.arpa", "lan"];
+    if labels.first().is_some_and(|l| *l == "localhost")
+        || INTERNAL_SUFFIXES
+            .iter()
+            .any(|suffix| s == *suffix || s.ends_with(&format!(".{suffix}")))
+    {
+        return false;
+    }
+    labels.iter().all(|label| {
         !label.is_empty()
             && label.len() <= 63
             && !label.starts_with('-')
@@ -333,7 +363,32 @@ mod tests {
         assert!(!is_valid_local_part("Alice")); // caller lowercases first
         assert!(!is_valid_local_part(".dot"));
         assert!(!is_valid_local_part("dot."));
+        assert!(!is_valid_local_part("a..b")); // empty DNS label — registrar rejects
         assert!(!is_valid_local_part(""));
+    }
+
+    #[test]
+    fn domain_rejects_internal_and_ip_hosts() {
+        // The domain is attacker-controlled (peer kind-0 nip05) — IP literals
+        // and internal suffixes must never reach the HTTP client.
+        for bad in [
+            "169.254.169.254",
+            "10.0.0.1",
+            "127.0.0.1",
+            "printer.local",
+            "vault.internal",
+            "router.lan",
+            "box.home.arpa",
+            "host.localdomain",
+        ] {
+            assert!(
+                parse_handle_input(&format!("alice@{bad}"), DEFAULT_HANDLE_DOMAIN).is_err(),
+                "expected rejection: {bad}"
+            );
+        }
+        assert!(parse_handle_input("alice@example.com", DEFAULT_HANDLE_DOMAIN).is_ok());
+        // Numeric label is fine when it isn't the TLD.
+        assert!(parse_handle_input("alice@1password.com", DEFAULT_HANDLE_DOMAIN).is_ok());
     }
 
     #[test]

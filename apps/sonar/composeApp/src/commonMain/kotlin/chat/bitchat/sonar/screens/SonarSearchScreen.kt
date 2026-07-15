@@ -36,13 +36,13 @@ import chat.bitchat.sonar.GeoChannel
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.SonarChat
 import chat.bitchat.sonar.SonarCore
-import kotlinx.coroutines.launch
 import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconButton
 import chat.bitchat.sonar.ui.SNIconName
 import chat.bitchat.sonar.ui.SNPrimaryButton
 import chat.bitchat.sonar.ui.SonarAvatar
 import chat.bitchat.sonar.ui.sonar
+import kotlinx.coroutines.launch
 
 /** A `sinvite1` token followed by its hex payload, anywhere in the input. */
 private val INVITE_TOKEN_RE = Regex("sinvite1[0-9a-fA-F]{2,}")
@@ -100,8 +100,8 @@ fun SonarSearchScreen(state: SonarAppState) {
     // network lookup happens only when the user taps the action row, so local
     // results always paint immediately.
     val looksLikeHandle = !looksLikeInvite && !looksLikeNpub && query.length >= 2 &&
-        SonarCore.handleLooksValid(query)
-    val handleAddress = if ('@' in ql) ql else "$ql@sonarprivacy.xyz"
+        remember(query) { SonarCore.handleLooksValid(query) }
+    val handleAddress = if ('@' in ql) ql else "$ql@${state.handleDomain}"
     val scope = rememberCoroutineScope()
     var resolvingHandle by remember(query) { mutableStateOf(false) }
     var handleMiss by remember(query) { mutableStateOf(false) }

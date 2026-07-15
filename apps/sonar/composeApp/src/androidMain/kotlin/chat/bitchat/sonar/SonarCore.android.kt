@@ -461,6 +461,9 @@ actual object SonarCore {
     actual fun handleLooksValid(input: String): Boolean =
         runCatching { uniffi.sonar_ffi.handleLooksValid(input) }.getOrDefault(false)
 
+    actual fun defaultHandleDomain(): String =
+        runCatching { uniffi.sonar_ffi.defaultHandleDomain() }.getOrDefault("sonarprivacy.xyz")
+
     actual suspend fun publishSonarDescriptor(callsEnabled: Boolean, bolt12Offer: String?) = withContext(Dispatchers.IO) {
         runCatching { node?.publishSonarDescriptor(callsEnabled, listOf("marmot"), bolt12Offer) }
         Unit

@@ -2978,6 +2978,16 @@ class SonarAppState(private val scope: CoroutineScope) {
     var handleClaimState by mutableStateOf<HandleClaimState>(HandleClaimState.Idle)
         private set
 
+    /** The address actually claimed at the Sonar registrar (core sidecar is
+     *  the durable record). Distinct from [bip353], which may also hold an
+     *  external payment address from another wallet: only a core-claimed
+     *  address gets the verified-claim checkmark and kind-0 `nip05`. */
+    var coreClaimedHandle by mutableStateOf<String?>(null)
+        private set
+
+    /** Core-owned default handle domain, fetched once (pure FFI constant). */
+    val handleDomain: String by lazy { SonarCore.defaultHandleDomain() }
+
     /** Claim (or refresh) `handle` at the Sonar registrar. Chat-only claims are
      *  supported: when the wallet isn't ready the BIP-353 payment record is
      *  skipped and a later re-claim adds the offer. On success the address is
@@ -2993,6 +3003,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             } else null
             runCatching { SonarCore.claimHandle(name, offer) }
                 .onSuccess { address ->
+                    coreClaimedHandle = address
                     updateBip353(address)
                     refreshMeshIdentity()
                     runCatching { SonarCore.publishProfile(nick) }
@@ -3759,7 +3770,8 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // Adopt a core-claimed handle when the bip353 blob is blank
                 // (fresh install restored from nsec, or lost prefs): the core
                 // sidecar is the durable record, prefs are a mirror.
-                if (bip353.isBlank()) SonarCore.claimedHandle()?.let { updateBip353(it) }
+                coreClaimedHandle = SonarCore.claimedHandle()
+                if (bip353.isBlank()) coreClaimedHandle?.let { updateBip353(it) }
                 refreshMeshIdentity()
                 updateBleDiscoveryPolicy()
                 setupWallet()

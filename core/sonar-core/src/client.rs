@@ -125,6 +125,21 @@ static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
 const HANDLE_CLAIM_TIMEOUT: Duration = Duration::from_secs(15);
 const HANDLE_LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Dedicated client for handle registrar/NIP-05 traffic with redirects
+/// DISABLED. The NIP-05 host is attacker-controlled (a peer's kind-0 `nip05`
+/// field), and the shared client's default redirect policy would follow up to
+/// 10 hops — including https→http — letting a malicious server bounce the
+/// request at loopback/link-local/metadata targets. A 3xx answer is treated
+/// as a failed lookup instead.
+static HANDLE_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+});
+
 /// Read a response body with a hard size cap. The NIP-05 host is whatever
 /// domain the user typed, so the body must be treated as attacker-controlled:
 /// stream chunks and stop at the cap instead of trusting Content-Length.
@@ -2135,7 +2150,7 @@ impl SonarClient {
         let keys = self.engine.identity().keys().clone();
         let event = crate::handles::build_claim_event(&keys, &parsed, offer)?;
         let url = format!("{}/v1/register", crate::handles::DEFAULT_REGISTRAR_URL);
-        let resp = HTTP_CLIENT
+        let resp = HANDLE_HTTP_CLIENT
             .post(&url)
             .timeout(HANDLE_CLAIM_TIMEOUT)
             .json(&event)
@@ -2169,7 +2184,7 @@ impl SonarClient {
         let parsed =
             crate::handles::parse_handle_input(input, crate::handles::DEFAULT_HANDLE_DOMAIN)?;
         let url = crate::handles::nip05_url(&parsed);
-        let resp = HTTP_CLIENT
+        let resp = HANDLE_HTTP_CLIENT
             .get(&url)
             .timeout(HANDLE_LOOKUP_TIMEOUT)
             .send()

@@ -528,8 +528,13 @@ final class MarmotService: @unchecked Sendable {
     /// the core persists the handle and merges it as nip05 into every kind-0
     /// publish — republish the profile afterwards so peers see it immediately.
     /// A taken handle surfaces as `ServiceError.core("handle taken: ...")`.
+    ///
+    /// Concurrent read lane, NOT `run`: the claim doesn't mutate MLS state
+    /// (registrar POST + sidecar write + in-memory mutex in core), and its
+    /// 15s-capped network wait must never park connect/sync/drain on the
+    /// serial `workQueue`.
     func claimHandle(handle: String, offer: String?) async throws -> String {
-        try await run { try $0.requireNode().claimHandle(handle: handle, offer: offer) }
+        try await readOnly { try $0.claimHandle(handle: handle, offer: offer) }
     }
 
     /// Locally stored claimed handle address (nil when never claimed). Local

@@ -124,7 +124,8 @@ export class HandleRegistry implements DurableObject {
       CREATE TABLE IF NOT EXISTS rate (
         ip TEXT PRIMARY KEY,
         window_start INTEGER NOT NULL,
-        count INTEGER NOT NULL
+        count INTEGER NOT NULL,
+        prev_count INTEGER NOT NULL DEFAULT 0
       );
     `);
   }
@@ -151,32 +152,51 @@ export class HandleRegistry implements DurableObject {
     const ip = String(body.ip ?? "unknown").slice(0, 64);
     const now = Math.floor(Date.now() / 1000);
 
-    // Fixed-window counter; windows two generations old are dead weight.
+    // Windows two generations old are dead weight.
     this.sql.exec("DELETE FROM rate WHERE window_start < ?", now - 2 * RATE_LIMIT_WINDOW_S);
 
     const row = this.sql
-      .exec<{ window_start: number; count: number }>(
-        "SELECT window_start, count FROM rate WHERE ip = ?",
+      .exec<{ window_start: number; count: number; prev_count: number }>(
+        "SELECT window_start, count, prev_count FROM rate WHERE ip = ?",
         ip,
       )
       .toArray()[0];
 
-    if (!row || now - row.window_start >= RATE_LIMIT_WINDOW_S) {
-      this.sql.exec(
-        "INSERT INTO rate (ip, window_start, count) VALUES (?, ?, 1) " +
-          "ON CONFLICT(ip) DO UPDATE SET window_start = excluded.window_start, count = 1",
-        ip,
-        now,
-      );
-      return json({ allowed: true, retryAfterSeconds: 0 } satisfies DoRateLimitResponse);
+    // Sliding-window approximation over two adjacent fixed windows: weight the
+    // previous window by how much of it still overlaps the trailing 60s. A
+    // plain fixed window would allow a 2x burst across the boundary (5 at the
+    // end of one window + 5 at the start of the next).
+    let windowStart = now;
+    let count = 0;
+    let prevCount = 0;
+    if (row) {
+      const age = now - row.window_start;
+      if (age < RATE_LIMIT_WINDOW_S) {
+        windowStart = row.window_start;
+        count = row.count;
+        prevCount = row.prev_count;
+      } else if (age < 2 * RATE_LIMIT_WINDOW_S) {
+        // Rolled into the next window: current becomes previous.
+        prevCount = row.count;
+      }
     }
+    const overlap = 1 - (now - windowStart) / RATE_LIMIT_WINDOW_S;
+    const effective = count + prevCount * overlap;
 
-    if (row.count >= RATE_LIMIT_MAX) {
-      const retryAfterSeconds = Math.max(1, row.window_start + RATE_LIMIT_WINDOW_S - now);
+    if (effective >= RATE_LIMIT_MAX) {
+      const retryAfterSeconds = Math.max(1, windowStart + RATE_LIMIT_WINDOW_S - now);
       return json({ allowed: false, retryAfterSeconds } satisfies DoRateLimitResponse);
     }
 
-    this.sql.exec("UPDATE rate SET count = count + 1 WHERE ip = ?", ip);
+    this.sql.exec(
+      "INSERT INTO rate (ip, window_start, count, prev_count) VALUES (?, ?, ?, ?) " +
+        "ON CONFLICT(ip) DO UPDATE SET window_start = excluded.window_start, " +
+        "count = excluded.count, prev_count = excluded.prev_count",
+      ip,
+      windowStart,
+      count + 1,
+      prevCount,
+    );
     return json({ allowed: true, retryAfterSeconds: 0 } satisfies DoRateLimitResponse);
   }
 
@@ -206,6 +226,12 @@ export class HandleRegistry implements DurableObject {
     // an offer that DNS doesn't serve. (For a first-time claim that also
     // means the handle stays unclaimed — the client simply retries.)
     if (offer !== null) {
+      // Defense-in-depth: the Worker already ran OFFER_RE, but the DNS TXT
+      // write is the one irreversible fund-relevant side effect — re-assert
+      // the offer shape here so a future caller of this DO can't skip it.
+      if (!/^lno1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{12,2044}$/.test(offer)) {
+        return json({ error: "invalid_offer" }, 400);
+      }
       if (!this.env.CF_DNS_TOKEN) {
         return json({ error: "dns_not_configured" }, 502);
       }

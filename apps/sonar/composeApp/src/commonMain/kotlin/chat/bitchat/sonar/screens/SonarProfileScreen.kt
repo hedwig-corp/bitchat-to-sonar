@@ -195,12 +195,20 @@ private fun HandleCard(
         )
         Spacer(Modifier.height(10.dp))
         if (showClaimed) {
+            // The check marks a registrar-claimed handle only. An external
+            // payment address (from another wallet) is stored in the same
+            // field but is NOT a claimed identity — no check for it.
+            val isCoreClaimed = claimed == state.coreClaimedHandle
             Row(
                 Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(s.surface2)
                     .padding(horizontal = 12.dp, vertical = 11.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                SNIcon(SNIconName.Check, 16.dp, s.accent, weight = 2f)
+                if (isCoreClaimed) {
+                    SNIcon(SNIconName.Check, 16.dp, s.accent, weight = 2f)
+                } else {
+                    SNIcon(SNIconName.Coin, 16.dp, s.text3, weight = 2f)
+                }
                 Spacer(Modifier.width(8.dp))
                 Text(claimed, color = s.text, fontSize = 14.sp, modifier = Modifier.weight(1f))
                 Text(
@@ -215,7 +223,10 @@ private fun HandleCard(
             }
         } else {
             val draft = payDraft.trim()
-            val isExternal = '@' in draft
+            // A full default-domain address is still a registrar claim (iOS
+            // parity); only foreign domains are stored as external payment
+            // addresses without claiming.
+            val isExternal = '@' in draft && !draft.lowercase().endsWith("@${state.handleDomain}")
             Box(
                 Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(s.surface2)
                     .padding(horizontal = 12.dp, vertical = 11.dp)
@@ -236,7 +247,7 @@ private fun HandleCard(
                     claim.message, color = s.danger, fontSize = 12.5.sp, lineHeight = 16.sp
                 )
                 draft.isNotEmpty() && !isExternal -> Text(
-                    "${draft.lowercase()}@sonarprivacy.xyz",
+                    "${draft.lowercase().substringBefore('@')}@${state.handleDomain}",
                     color = s.text3, fontSize = 12.5.sp
                 )
                 isExternal -> Text(

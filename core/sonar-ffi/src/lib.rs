@@ -154,6 +154,14 @@ pub fn handle_looks_valid(input: String) -> bool {
     sonar_core::handles::looks_like_handle(&input)
 }
 
+/// The default handle domain (bare nicknames resolve here, and only handles
+/// on this domain are claimable). Core owns this constant — hosts must not
+/// re-declare the literal, because external-vs-claim routing depends on it.
+#[uniffi::export]
+pub fn default_handle_domain() -> String {
+    sonar_core::handles::DEFAULT_HANDLE_DOMAIN.to_owned()
+}
+
 /// A Nostr identity (secp256k1 keypair). Wraps `sonar_core::identity::Identity`.
 #[derive(uniffi::Object)]
 pub struct SonarIdentity {
