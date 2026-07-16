@@ -7,6 +7,9 @@ internal const val MESH_TRANSCRIPT_SOURCE_ID = "\$mesh"
 internal const val TRANSCRIPT_PREVIEW_GRAPHEMES = 512
 internal const val TRANSCRIPT_PREVIEW_NEWLINES = 15
 
+/** Marks a platform-local optimistic send row; never a canonical core row. */
+internal const val SEND_ECHO_ID_PREFIX = "echo-"
+
 internal data class TranscriptPreview(
     val text: String,
     val truncated: Boolean,
@@ -195,25 +198,64 @@ internal fun fulfilledSendEchoIds(
     echoes: List<SonarMsg>,
     published: List<SonarMsg>,
     excludedPublishedIdsByEcho: Map<String, Set<String>> = emptyMap(),
-): Set<String> {
+): Set<String> = reconcileSendEchoes(echoes, published, excludedPublishedIdsByEcho).fulfilledEchoIds
+
+/**
+ * Outcome of matching pending echoes against canonical rows.
+ *
+ * [admittedCanonical] are rows that fulfilled an echo but sit outside the
+ * visible window, so the caller must add them back or the sent message would
+ * disappear when its echo is retired.
+ */
+internal data class SendEchoReconciliation(
+    val fulfilledEchoIds: Set<String>,
+    val admittedCanonical: List<SonarMsg>,
+)
+
+/**
+ * Match pending echoes against canonical rows one-for-one (iOS parity:
+ * `MarmotChatModel.reconciledOptimisticMessages`).
+ *
+ * [published] is the bounded/pinned render window. [freshCanonical] carries the
+ * rows just read from local storage. Both are searched: a conversation pinned to
+ * its older historical edge — or one whose window is simply full — admits no new
+ * rows into [published], so without [freshCanonical] the canonical copy of an
+ * outgoing send never reaches this match and its echo stays "Sending" forever
+ * next to the real row. An echo fulfilled by an out-of-window row reports that
+ * row in [admittedCanonical] so the send stays visible with its real delivery
+ * state.
+ */
+internal fun reconcileSendEchoes(
+    echoes: List<SonarMsg>,
+    published: List<SonarMsg>,
+    excludedPublishedIdsByEcho: Map<String, Set<String>> = emptyMap(),
+    freshCanonical: List<SonarMsg> = emptyList(),
+): SendEchoReconciliation {
+    val windowedIds = published.mapTo(hashSetOf()) { it.id }
+    val outOfWindow = freshCanonical.filter {
+        !it.id.startsWith(SEND_ECHO_ID_PREFIX) && it.id !in windowedIds
+    }
+    val candidates = published.filterNot { it.id.startsWith(SEND_ECHO_ID_PREFIX) } + outOfWindow
     val fulfilled = mutableSetOf<String>()
+    val admitted = mutableListOf<SonarMsg>()
     val consumedPublished = mutableSetOf<String>()
-    val ownPublished = published.filter { it.mine }.groupBy { it.content }
+    val ownCandidates = candidates.filter { it.mine }.groupBy { it.content }
     // Prefer the most recent pending duplicate. A newer canonical row must not
     // hide an older send whose result is still unknown.
     for (echo in echoes.asReversed()) {
         if (echo.state == "Couldn't send") continue
         val match = eligibleCanonicalRowsForSendEcho(
             echo = echo,
-            published = ownPublished[echo.content].orEmpty(),
+            published = ownCandidates[echo.content].orEmpty(),
             excludedPublishedIds = excludedPublishedIdsByEcho[echo.id].orEmpty(),
         ).firstOrNull { it.id !in consumedPublished }
         if (match != null) {
             fulfilled.add(echo.id)
             consumedPublished.add(match.id)
+            if (match.id !in windowedIds) admitted.add(match)
         }
     }
-    return fulfilled
+    return SendEchoReconciliation(fulfilled, admitted)
 }
 
 private fun newlinePrefixEnd(source: String, maxNewlines: Int): Int {

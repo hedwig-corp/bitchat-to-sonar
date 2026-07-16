@@ -442,4 +442,104 @@ class TranscriptDisplayPolicyTest {
         assertTrue(sendEchoAwaitsCanonicalRow(echo.copy(state = "Accepted")))
         assertFalse(sendEchoAwaitsCanonicalRow(echo.copy(state = "Couldn't send")))
     }
+
+    // ── Out-of-window canonical rows (the duplicate-bubble regression) ──
+    // A pinned/full render window admits no new rows, so the canonical copy of
+    // an outgoing send never reaches the matcher via `published` alone. Before
+    // freshCanonical the echo stayed "Sending" forever beside the real row.
+
+    @Test
+    fun outOfWindowCanonicalRowFulfillsEchoAndIsAdmitted() {
+        val echo = message("echo-1", 100, "ciao", mine = true, viaInternet = true, state = "Sending")
+        val canonical = message("event-1", 100, "ciao", mine = true, viaInternet = true)
+
+        val result = reconcileSendEchoes(
+            echoes = listOf(echo),
+            published = emptyList(),
+            freshCanonical = listOf(canonical),
+        )
+
+        assertEquals(setOf("echo-1"), result.fulfilledEchoIds)
+        assertEquals(listOf(canonical), result.admittedCanonical)
+    }
+
+    @Test
+    fun windowedCanonicalRowIsNotAdmittedTwice() {
+        val echo = message("echo-1", 100, "ciao", mine = true, viaInternet = true, state = "Sending")
+        val canonical = message("event-1", 100, "ciao", mine = true, viaInternet = true)
+
+        val result = reconcileSendEchoes(
+            echoes = listOf(echo),
+            published = listOf(canonical),
+            freshCanonical = listOf(canonical),
+        )
+
+        assertEquals(setOf("echo-1"), result.fulfilledEchoIds)
+        assertTrue(result.admittedCanonical.isEmpty())
+    }
+
+    @Test
+    fun echoWithoutAnyCanonicalRowStaysVisible() {
+        val echo = message("echo-1", 100, "ciao", mine = true, viaInternet = true, state = "Sending")
+
+        val result = reconcileSendEchoes(
+            echoes = listOf(echo),
+            published = emptyList(),
+            freshCanonical = emptyList(),
+        )
+
+        assertTrue(result.fulfilledEchoIds.isEmpty())
+        assertTrue(result.admittedCanonical.isEmpty())
+    }
+
+    @Test
+    fun freshEchoRowsAreNeverTreatedAsCanonical() {
+        val echo = message("echo-1", 100, "ciao", mine = true, viaInternet = true, state = "Sending")
+        val staleEcho = message("echo-0", 100, "ciao", mine = true, viaInternet = true, state = "Sending")
+
+        val result = reconcileSendEchoes(
+            echoes = listOf(echo),
+            published = emptyList(),
+            freshCanonical = listOf(staleEcho),
+        )
+
+        assertTrue(result.fulfilledEchoIds.isEmpty())
+    }
+
+    @Test
+    fun identicalOutOfWindowRowsConsumeEchoesOneForOne() {
+        val echoes = listOf(
+            message("echo-1", 100, "ciao", mine = true, viaInternet = true, state = "Sending"),
+            message("echo-2", 101, "ciao", mine = true, viaInternet = true, state = "Sending"),
+        )
+        val fresh = listOf(
+            message("event-1", 100, "ciao", mine = true, viaInternet = true),
+            message("event-2", 101, "ciao", mine = true, viaInternet = true),
+        )
+
+        val result = reconcileSendEchoes(
+            echoes = echoes,
+            published = emptyList(),
+            freshCanonical = fresh,
+        )
+
+        assertEquals(setOf("echo-1", "echo-2"), result.fulfilledEchoIds)
+        assertEquals(2, result.admittedCanonical.size)
+    }
+
+    @Test
+    fun planSendEchoDisplaySurfacesAdmittedOutOfWindowRow() {
+        val echo = message("echo-1", 100, "ciao", mine = true, viaInternet = true, state = "Sending")
+        val canonical = message("event-1", 100, "ciao", mine = true, viaInternet = true)
+
+        val plan = planSendEchoDisplay(
+            echoes = listOf(echo),
+            published = emptyList(),
+            excludedPublishedIdsByEcho = emptyMap(),
+            freshCanonical = listOf(canonical),
+        )
+
+        assertTrue(plan.visibleEchoes.isEmpty())
+        assertEquals(listOf(canonical), plan.admittedCanonical)
+    }
 }

@@ -380,6 +380,9 @@ actual object SonarCore {
         content = content,
         mine = mine,
         tsSecs = createdAtSecs.toLong(),
+        // Core rows are White Noise/Marmot relay messages; send-echo
+        // reconciliation and retry eligibility match on this flag.
+        viaInternet = true,
         media = media.map { m ->
             SonarMedia(
                 url = m.url,
