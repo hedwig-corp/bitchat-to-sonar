@@ -6,6 +6,12 @@ the apps ship. No relay I/O: agents hand events to each other in process, in the
 order a relay would serialize them, so any failure here is a protocol failure,
 not a network flake.
 
+Part of the benchmark suite — the **protocol scale** track alongside the device
+latency harness in [`PERFORMANCE.md`](PERFORMANCE.md). Unlike the phone
+benchmarks, this one is **machine-independent**: the ratchet-tree and NIP-44
+sizes it measures are the same on any box, so it does not run on a device. Run it
+when you **bump the MDK rev** or touch the welcome/commit path.
+
 ```sh
 cargo run -p sonar-sim --release -- group-scale \
   --ramp 2,5,10,25,50,100,130,150 --mode incremental --chaos --out /tmp/scale.json
@@ -26,6 +32,72 @@ For each group size N: welcome size (the gift-wrapped kind-1059 the joiner must
 receive), evolution/commit size (kind-445), a text-message size, build and
 fan-out timings, member-set convergence across all agents, and message delivery
 to every member.
+
+## How to reproduce
+
+No device, no relay account, no secrets. Any machine with the Rust toolchain.
+
+```sh
+# 1. Ceiling + convergence + live relay limits (the headline run).
+#    Stops at the first hard failure; the last `ok` N is the ceiling.
+cargo run -p sonar-sim --release -- group-scale \
+  --ramp 2,5,10,25,50,100,110,120,130,140,150 \
+  --mode incremental --chaos --out /tmp/scale.json
+
+# 2. Narrow the exact welcome ceiling (offline, no NIP-11 fetch):
+cargo run -p sonar-sim --release -- group-scale \
+  --ramp 120,125,130,135,140 --batch 5 --no-nip11
+
+# 3. Unit tests for the pure logic (ceiling math, outcome summary):
+cargo test -p sonar-sim
+```
+
+Reading the output:
+
+- The per-N table prints `welcome(B)`, `evolution(B)`, `message(B)`,
+  `build(ms)`, `fanout(ms)`, and `ok`. The **largest N with `ok=true` is the
+  ceiling**; the first failing N prints its reason (`welcome too long`,
+  `never became active`, …).
+- With `--chaos`, each N also prints `converged=` and `post_race_fanout_ok=`.
+  `converged=false` means the group forked (rosters diverged); the finding line
+  reports the branch populations.
+- The `relay ceilings` block cross-checks each relay's NIP-11
+  `max_message_length` against the measured welcome sizes.
+- `--out` writes the full JSON (every error string, all sizes) for diffing.
+
+Interpreting a run against a previous one (the "numbers when updating" case):
+
+- **Structural regressions are what matter** and are deterministic: the ceiling
+  N dropped, a previously-`ok` size now fails, `converged` flipped to `false`, or
+  welcome bytes/member grew. These are safe to assert on / gate CI with.
+- **Timings (`build`, `fanout`) are machine-bound** — compare them only on the
+  same box, and treat them as report-only, never a CI gate.
+- A moved ceiling after an **MDK rev bump** is the signal to watch: it means the
+  wire format changed, which is exactly what can break White Noise interop.
+
+Baseline for comparison: the table under [Findings](#findings-2026-07-mdk-rev-e8cd584)
+below is the reference for MDK rev `e8cd584`. When you bump the rev, re-run
+command (1) and diff the ceiling and the welcome-size column against it.
+
+## Reproduce with an agent (prompt)
+
+Paste this to a coding agent (Claude Code / equivalent) in a checkout to
+re-measure and report:
+
+> Run the Marmot/MLS group-scale protocol benchmark and tell me if anything
+> regressed. Steps:
+> 1. `cargo build -p sonar-sim --release` from `core/`.
+> 2. Run `cargo run -p sonar-sim --release -- group-scale --ramp
+>    2,5,10,25,50,100,110,120,130,140,150 --mode incremental --chaos --out
+>    /tmp/scale.json`.
+> 3. Report: the group-size ceiling (largest N with `ok=true`) and the reason
+>    the first failing N failed; whether `--chaos` shows any `converged=false`
+>    (a fork) and at which N; and the welcome-bytes column.
+> 4. Compare against the baseline table in `docs/GROUP-SCALE-SIM.md` (MDK rev
+>    `e8cd584`). Flag any *structural* regression — ceiling dropped, a size that
+>    used to pass now fails, `converged` flipped, or welcome bytes/member grew.
+>    Ignore `build`/`fanout` timing differences (machine-bound). Note the current
+>    MDK rev from the workspace `core/Cargo.toml` in your report.
 
 ## Findings (2026-07, MDK rev `e8cd584`)
 
