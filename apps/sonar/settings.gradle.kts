@@ -29,3 +29,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "Sonar"
 include(":composeApp")
+include(":baselineprofile")

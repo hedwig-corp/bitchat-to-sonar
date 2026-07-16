@@ -12,6 +12,16 @@ google-services = "4.4.2"
 android-minSdk = "26"
 android-targetSdk = "35"
 android-compileSdk = "35"
+# Baseline Profiles / Macrobenchmark (chat-open first-composition cost, issue #305).
+# 1.4+ required: 1.3.x cannot parse API 35+ `pm dump-profiles` output
+# ("Waiting for app processes to flush profiles...").
+androidx-baselineprofile = "1.4.1"
+androidx-benchmark = "1.4.1"
+androidx-profileinstaller = "1.4.1"
+androidx-uiautomator = "2.3.0"
+androidx-test-runner = "1.6.2"
+androidx-test-ext-junit = "1.2.1"
+junit = "4.13.2"
 
 [libraries]
 androidx-activity-compose = { module = "androidx.activity:activity-compose", version.ref = "androidx-activityCompose" }
@@ -25,10 +35,19 @@ jna = { module = "net.java.dev.jna:jna", version.ref = "jna" }
 breez-sdk-liquid = { module = "technology.breez.liquid:breez-sdk-liquid-kmp", version.ref = "breez-sdk-liquid" }
 firebase-bom = { module = "com.google.firebase:firebase-bom", version.ref = "firebase-bom" }
 firebase-messaging = { module = "com.google.firebase:firebase-messaging" }
+androidx-benchmark-macro-junit4 = { module = "androidx.benchmark:benchmark-macro-junit4", version.ref = "androidx-benchmark" }
+androidx-profileinstaller = { module = "androidx.profileinstaller:profileinstaller", version.ref = "androidx-profileinstaller" }
+androidx-test-uiautomator = { module = "androidx.test.uiautomator:uiautomator", version.ref = "androidx-uiautomator" }
+androidx-test-runner = { module = "androidx.test:runner", version.ref = "androidx-test-runner" }
+androidx-test-ext-junit = { module = "androidx.test.ext:junit", version.ref = "androidx-test-ext-junit" }
+junit = { module = "junit:junit", version.ref = "junit" }
 
 [plugins]
 multiplatform = { id = "org.jetbrains.kotlin.multiplatform", version.ref = "kotlin" }
 compose-compiler = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
 compose = { id = "org.jetbrains.compose", version.ref = "compose" }
 android-application = { id = "com.android.application", version.ref = "agp" }
+# :baselineprofile applies com.android.test / kotlin.android by raw id (no
+# version) — they are already on the classpath via :composeApp's plugins.
+baselineprofile = { id = "androidx.baselineprofile", version.ref = "androidx-baselineprofile" }
 google-services = { id = "com.google.gms.google-services", version.ref = "google-services" }
