@@ -45,7 +45,6 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
-import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
@@ -997,7 +996,6 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         state.refreshDescriptorForChat(screen.id)
         if (screen.pay) openPaySheetOrRetry()
     }
-    val listState = rememberLazyListState()
     // Transcript feed = chat messages (pay control lines collapsed) + mocked
     // call-log records, merged chronologically.
     val visible = state.messages.filter {
@@ -1012,6 +1010,13 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     val feed: List<Any> = (visible + calls).sortedBy { if (it is CallRecord) it.tsSecs else (it as SonarMsg).tsSecs }
     val newestFeedKey = feed.lastOrNull()?.let(::transcriptFeedKey)
     val currentFeed by rememberUpdatedState(feed)
+    // Open pinned at the newest row (Signal parity): start the list state at the
+    // tail of the locally painted feed so the first frame never shows the oldest
+    // page and then visibly jumps down. anchorTranscriptTail below still corrects
+    // the pixel offset for tail rows taller than the viewport.
+    val listState = remember(screen.id) {
+        LazyListState(firstVisibleItemIndex = feed.lastIndex.coerceAtLeast(0))
+    }
     var isNearBottom by remember(screen.id) { mutableStateOf(true) }
     var didInitialScroll by remember(screen.id) { mutableStateOf(false) }
     var didLeaveTail by remember(screen.id) { mutableStateOf(false) }
@@ -1817,10 +1822,17 @@ private fun GeoDmScreen(state: SonarAppState, screen: Screen.GeoDm) {
     val s = sonar
     var draft by remember { mutableStateOf("") }
     val blocked = state.isGeoDmBlocked(screen.peerHex)
-    val listState = rememberLazyListState()
+    // Open pinned at the newest row and snap (not animate) the first local fill,
+    // exactly like ChatScreen: the transcript must not open at old history and
+    // visibly scroll down to the tail.
+    val listState = remember(screen.peerHex) {
+        LazyListState(firstVisibleItemIndex = (state.messages.size - 1).coerceAtLeast(0))
+    }
+    var didInitialGeoScroll by remember(screen.peerHex) { mutableStateOf(false) }
     LaunchedEffect(state.messages.size) {
         if (state.messages.isNotEmpty()) {
-            listState.anchorTranscriptTail(state.messages.size - 1, animate = true)
+            listState.anchorTranscriptTail(state.messages.size - 1, animate = didInitialGeoScroll)
+            didInitialGeoScroll = true
         }
     }
     // Same tail pinning as the main transcript: the IME opening must not hide
@@ -2312,24 +2324,10 @@ private fun MediaBubble(
             androidx.compose.runtime.LaunchedEffect(media.url, chatId) {
                 state.prepareMedia(chatId, media, autoDownload = true)
             }
-            val loadResult by androidx.compose.runtime.produceState<Pair<Boolean, ByteArray?>>(
-                false to null, media.url, chatId, transfer.localPath
-            ) {
-                value = if (transfer.phase == MediaTransferPhase.Available) {
-                    true to state.mediaData(chatId, media)
-                } else {
-                    false to null
-                }
-            }
-            val mediaBytes = loadResult.second
-            val img = androidx.compose.runtime.remember(mediaBytes) {
-                mediaBytes?.let { decodeImageBitmap(it) }
-            }
-            val renderAsGif = media.isGif && mediaBytes?.looksLikeGifBytes() == true
-            val bmp = img
-            val bytes = mediaBytes
+            val load = rememberTranscriptMediaLoad(state, chatId, media, transfer)
+            val decoded = (load as? TranscriptMediaLoad.Ready)?.decoded
             val failed = transfer.phase == MediaTransferPhase.Failed ||
-                (transfer.phase == MediaTransferPhase.Available && loadResult.first && bytes == null)
+                load is TranscriptMediaLoad.Missing
             // Signal pre-sizes media cells from stored attachment dimensions so
             // the decoded image never reflows the transcript (Signal-Android
             // ThumbnailView measures EXACTLY from DB width/height; Signal-iOS
@@ -2356,35 +2354,49 @@ private fun MediaBubble(
                             MediaTransferPhase.NotDownloaded, MediaTransferPhase.Failed ->
                                 state.requestMediaDownload(chatId, media)
                             MediaTransferPhase.Downloading -> state.cancelMediaDownload(media)
-                            MediaTransferPhase.Available -> if (bytes != null) onOpen(media)
+                            MediaTransferPhase.Available -> if (decoded != null) onOpen(media)
                         }
                     },
                 contentAlignment = Alignment.Center
             ) {
+                val placeholderModifier =
+                    if (reservedSize != null) Modifier.fillMaxSize()
+                    else Modifier.size(width = 216.dp, height = 150.dp)
                 when {
-                    bytes != null && (renderAsGif || bmp != null) -> {
+                    decoded?.gifBytes != null -> {
                         MediaImage(
-                            bytes = bytes,
-                            isGif = renderAsGif,
+                            bytes = decoded.gifBytes,
+                            isGif = true,
                             modifier = Modifier.widthIn(max = minOf(MAX_MEDIA_BUBBLE_WIDTH, maxBubbleWidth))
                                 .heightIn(max = MAX_MEDIA_BUBBLE_HEIGHT)
                         )
-                        if (renderAsGif) GifBadge(Modifier.align(Alignment.TopEnd).padding(8.dp))
+                        GifBadge(Modifier.align(Alignment.TopEnd).padding(8.dp))
                         // media-chip: glass time + via pill bottom-right.
                         MediaMetaChip(m.tsSecs, mesh, Modifier.align(Alignment.BottomEnd).padding(8.dp))
                     }
-                    bytes != null -> InlineMediaFileChip(media, transfer) { onOpen(media) }
+                    decoded?.bitmap != null -> {
+                        Image(
+                            decoded.bitmap,
+                            contentDescription = null,
+                            contentScale = ContentScale.Fit,
+                            modifier = Modifier.widthIn(max = minOf(MAX_MEDIA_BUBBLE_WIDTH, maxBubbleWidth))
+                                .heightIn(max = MAX_MEDIA_BUBBLE_HEIGHT)
+                        )
+                        // media-chip: glass time + via pill bottom-right.
+                        MediaMetaChip(m.tsSecs, mesh, Modifier.align(Alignment.BottomEnd).padding(8.dp))
+                    }
+                    decoded != null -> InlineMediaFileChip(media, transfer) { onOpen(media) }
                     failed -> MediaUnavailable(media)
-                    else -> MediaLoadingSkeleton(
-                        media,
-                        if (reservedSize != null) Modifier.fillMaxSize()
-                        else Modifier.size(width = 216.dp, height = 150.dp),
-                    )
+                    showsMediaDownloadSkeleton(state, media, transfer) ->
+                        MediaLoadingSkeleton(media, placeholderModifier)
+                    // Locally available image still decoding: keep the bubble a
+                    // quiet surface for the frame or two before pixels land.
+                    else -> Spacer(placeholderModifier)
                 }
                 if (transfer.phase == MediaTransferPhase.Downloading) {
                     MediaTransferOverlay(transfer, Modifier.align(Alignment.Center))
                 }
-                if (media.isGif && bytes == null) GifBadge(Modifier.align(Alignment.TopEnd).padding(8.dp))
+                if (media.isGif && decoded == null) GifBadge(Modifier.align(Alignment.TopEnd).padding(8.dp))
             }
         } else if (media.mimeType.startsWith("audio/")) {
             AudioBubble(m, state, chatId, media, mesh = mesh)
@@ -2505,20 +2517,10 @@ private fun MediaDeckCard(
     androidx.compose.runtime.LaunchedEffect(media.url, chatId) {
         state.prepareMedia(chatId, media, autoDownload = true)
     }
-    val loadResult by androidx.compose.runtime.produceState<Pair<Boolean, ByteArray?>>(
-        false to null, media.url, chatId, transfer.localPath
-    ) {
-        value = if (transfer.phase == MediaTransferPhase.Available) {
-            true to state.mediaData(chatId, media)
-        } else {
-            false to null
-        }
-    }
-    val bytes = loadResult.second
-    val img = remember(bytes) { if (media.isImage) bytes?.let { decodeImageBitmap(it) } else null }
-    val gifBytes = bytes?.takeIf { media.isGif && it.looksLikeGifBytes() }
+    val load = rememberTranscriptMediaLoad(state, chatId, media, transfer)
+    val decoded = (load as? TranscriptMediaLoad.Ready)?.decoded
     val failed = transfer.phase == MediaTransferPhase.Failed ||
-        (transfer.phase == MediaTransferPhase.Available && loadResult.first && bytes == null)
+        load is TranscriptMediaLoad.Missing
     Box(
         modifier.clip(RoundedCornerShape(18.dp)).background(s.surface2)
             .border(1.dp, Color.Black.copy(alpha = 0.08f), RoundedCornerShape(18.dp))
@@ -2529,7 +2531,7 @@ private fun MediaDeckCard(
                             MediaTransferPhase.NotDownloaded, MediaTransferPhase.Failed ->
                                 state.requestMediaDownload(chatId, media)
                             MediaTransferPhase.Downloading -> state.cancelMediaDownload(media)
-                            MediaTransferPhase.Available -> if (bytes != null) onOpen()
+                            MediaTransferPhase.Available -> if (decoded != null) onOpen()
                         }
                     }
                 } else m
@@ -2537,24 +2539,26 @@ private fun MediaDeckCard(
         contentAlignment = Alignment.Center
     ) {
         when {
-            gifBytes != null -> {
-                MediaImage(bytes = gifBytes, isGif = true, modifier = Modifier.fillMaxSize())
+            decoded?.gifBytes != null -> {
+                MediaImage(bytes = decoded.gifBytes, isGif = true, modifier = Modifier.fillMaxSize())
                 GifBadge(Modifier.align(Alignment.TopEnd).padding(8.dp))
             }
-            img != null -> Image(
-                img,
+            decoded?.bitmap != null -> Image(
+                decoded.bitmap,
                 contentDescription = null,
                 contentScale = ContentScale.Crop,
                 modifier = Modifier.fillMaxSize()
             )
-            bytes != null -> InlineMediaFileChip(media, transfer) { onOpen?.invoke() }
+            decoded != null -> InlineMediaFileChip(media, transfer) { onOpen?.invoke() }
             failed -> MediaUnavailable(media)
-            else -> MediaLoadingSkeleton(media)
+            showsMediaDownloadSkeleton(state, media, transfer) -> MediaLoadingSkeleton(media)
+            // Locally available image still decoding: stay a quiet surface.
+            else -> Spacer(Modifier.fillMaxSize())
         }
         if (transfer.phase == MediaTransferPhase.Downloading) {
             MediaTransferOverlay(transfer, Modifier.align(Alignment.Center))
         }
-        if (media.isGif && bytes == null) GifBadge(Modifier.align(Alignment.TopEnd).padding(8.dp))
+        if (media.isGif && decoded == null) GifBadge(Modifier.align(Alignment.TopEnd).padding(8.dp))
         if (dim > 0f) {
             Box(Modifier.matchParentSize().background(Color.Black.copy(alpha = dim)))
         }
@@ -2676,6 +2680,66 @@ private fun ByteArray.looksLikeGifBytes(): Boolean =
         this[3] == 0x38.toByte() &&
         (this[4] == 0x37.toByte() || this[4] == 0x39.toByte()) &&
         this[5] == 0x61.toByte()
+
+/** Transcript image load state: [Loading] while the local check/read/decode is
+ *  in flight, [Missing] when core reports the attachment Available but its
+ *  bytes cannot be read, [Ready] with the decoded result otherwise. */
+private sealed interface TranscriptMediaLoad {
+    data object Loading : TranscriptMediaLoad
+    data object Missing : TranscriptMediaLoad
+    data class Ready(val decoded: DecodedTranscriptMedia) : TranscriptMediaLoad
+}
+
+/**
+ * Load + decode a transcript image once, off the UI thread, and keep the result
+ * in [MediaImageMemoryCache] (Signal ThumbnailView parity). A cache hit paints
+ * on the FIRST frame of a reopened chat — no skeleton, no re-read, no re-decode.
+ */
+@Composable
+private fun rememberTranscriptMediaLoad(
+    state: SonarAppState,
+    chatId: String,
+    media: SonarMedia,
+    transfer: MediaTransferState,
+): TranscriptMediaLoad {
+    val cached = remember(media.url) { MediaImageMemoryCache.get(media.url) }
+    val load by androidx.compose.runtime.produceState<TranscriptMediaLoad>(
+        cached?.let { TranscriptMediaLoad.Ready(it) } ?: TranscriptMediaLoad.Loading,
+        media.url, chatId, transfer.localPath,
+    ) {
+        if (value is TranscriptMediaLoad.Ready) return@produceState
+        if (transfer.phase != MediaTransferPhase.Available) {
+            value = TranscriptMediaLoad.Loading
+            return@produceState
+        }
+        val bytes = state.mediaData(chatId, media)
+        if (bytes == null) {
+            value = TranscriptMediaLoad.Missing
+            return@produceState
+        }
+        val decoded = withContext(Dispatchers.Default) {
+            if (media.isGif && bytes.looksLikeGifBytes()) {
+                DecodedTranscriptMedia(bitmap = null, gifBytes = bytes)
+            } else {
+                DecodedTranscriptMedia(bitmap = decodeImageBitmap(bytes), gifBytes = null)
+            }
+        }
+        MediaImageMemoryCache.put(media.url, decoded)
+        value = TranscriptMediaLoad.Ready(decoded)
+    }
+    return load
+}
+
+/** True when the bubble should show the loud gradient download skeleton: the
+ *  attachment is genuinely remote (probed NotDownloaded) or downloading. While
+ *  the local check/decode is still pending the bubble stays a quiet surface —
+ *  locally available images must not flash a download card on chat open. */
+private fun showsMediaDownloadSkeleton(
+    state: SonarAppState,
+    media: SonarMedia,
+    transfer: MediaTransferState,
+): Boolean = transfer.phase == MediaTransferPhase.Downloading ||
+    (transfer.phase == MediaTransferPhase.NotDownloaded && state.mediaTransferKnown(media))
 
 @Composable
 private fun InlineMediaFileChip(

@@ -3596,9 +3596,18 @@ class SonarAppState(private val scope: CoroutineScope) {
         // Local-first paint (Signal-Comparable Performance Rule): show the
         // cached snapshot synchronously so the transcript never opens empty;
         // the bounded DB page + media/echo merge below replaces it async.
+        // boundedTranscriptRows applies the same (tsSecs, id) display order as
+        // that async page, so equal-second rows don't swap after first paint.
         messages = visibleMessagesForChat(
             chat.id,
-            withSendEchoes(chat.id, chatSnapshotMessagesByChat[chat.id].orEmpty().takeLast(TRANSCRIPT_PAGE_SIZE)),
+            withSendEchoes(
+                chat.id,
+                boundedTranscriptRows(
+                    chatSnapshotMessagesByChat[chat.id].orEmpty(),
+                    TRANSCRIPT_PAGE_SIZE,
+                    pinnedToOlderEdge = false,
+                ),
+            ),
         )
         scope.launch {
             for (readId in readChatIds) {
@@ -3670,7 +3679,14 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         messages = visibleMessagesForChat(
             chat.id,
-            withSendEchoes(chat.id, chatSnapshotMessagesByChat[chat.id].orEmpty().takeLast(TRANSCRIPT_PAGE_SIZE)),
+            withSendEchoes(
+                chat.id,
+                boundedTranscriptRows(
+                    chatSnapshotMessagesByChat[chat.id].orEmpty(),
+                    TRANSCRIPT_PAGE_SIZE,
+                    pinnedToOlderEdge = false,
+                ),
+            ),
         )
         scope.launch {
             val local = withSendEchoes(
@@ -5877,6 +5893,12 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun mediaTransferState(media: SonarMedia): MediaTransferState =
         mediaTransfers[media.url] ?: MediaTransferState.NotDownloaded
 
+    /** True once [prepareMedia] or a download has produced a definite phase for
+     *  this attachment. An un-probed attachment also reads NotDownloaded, but
+     *  should render a quiet placeholder — not the download skeleton — until
+     *  the local-cache check lands. */
+    fun mediaTransferKnown(media: SonarMedia): Boolean = mediaTransfers.containsKey(media.url)
+
     /** Check persistent state off-main, then optionally apply media auto-download
      * policy. Documents and videos pass false and remain tap-to-download. */
     fun prepareMedia(chatId: String, media: SonarMedia, autoDownload: Boolean) {
@@ -5888,6 +5910,10 @@ class SonarAppState(private val scope: CoroutineScope) {
                 setMediaTransfer(key, MediaTransferState.available(finalPath))
             } else if (autoDownload || mediaCache[key] != null) {
                 requestMediaDownload(chatId, media)
+            } else {
+                // Record the probe miss so the UI can distinguish "definitely
+                // remote" (download affordance) from "not checked yet" (quiet).
+                setMediaTransfer(key, MediaTransferState.NotDownloaded)
             }
         }
     }
@@ -5986,6 +6012,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         mediaDownloadJobs.clear()
         mediaDownloadGenerations.clear()
         mediaTransfers = emptyMap()
+        MediaImageMemoryCache.clear()
     }
 
     /** Read an already-local attachment for image decode or voice playback.

@@ -110,7 +110,10 @@ internal fun hydrateLocalConversationRows(
 
     for (page in pages) {
         if (page.chatId !in activeChatIds || page.messages.isEmpty()) continue
-        messages[page.chatId] = page.messages
+        // Normalize to the transcript display order (tsSecs, id) so the snapshot
+        // paint on chat open matches the async bounded-page refresh; otherwise
+        // equal-second messages visibly swap right after the transcript opens.
+        messages[page.chatId] = mergeAllTranscriptRows(page.messages)
         latest[page.chatId] = page.latestTsSecs.takeIf { it > 0L }
             ?: page.messages.maxOf { it.tsSecs }
     }

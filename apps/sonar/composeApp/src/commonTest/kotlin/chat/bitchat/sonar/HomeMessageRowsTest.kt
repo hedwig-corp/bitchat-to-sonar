@@ -170,6 +170,28 @@ class HomeMessageRowsTest {
     }
 
     @Test
+    fun hydratedPagesUseTranscriptDisplayOrderForEqualSecondRows() {
+        // The chat-open snapshot paint and the async bounded DB page must agree
+        // on (tsSecs, id) ordering, otherwise equal-second messages visibly
+        // swap right after the transcript opens (order flicker regression).
+        val later = SonarMsg("zz-fire", "peer", "🔥", true, 42L, viaInternet = true)
+        val earlier = SonarMsg("aa-yoyo", "peer", "Yo yo!", true, 42L, viaInternet = true)
+
+        val hydration = hydrateLocalConversationRows(
+            activeChatIds = setOf("chat"),
+            existingMessagesByChat = emptyMap(),
+            existingLatestByChat = emptyMap(),
+            summaries = emptyList(),
+            pages = listOf(SonarRecentTranscriptPage("chat", 42L, listOf(later, earlier))),
+        )
+
+        assertEquals(
+            listOf("aa-yoyo", "zz-fire"),
+            hydration.messagesByChat["chat"]?.map { it.id },
+        )
+    }
+
+    @Test
     fun matchingRealPageRowIsNotReplacedBySyntheticSummary() {
         val pageRow = SonarMsg("real-message", "peer", "same", false, 42L, viaInternet = true)
         val summary = SonarConversationSummary("chat", "", "same", "peer", 42L, false, 3L, 0L)
