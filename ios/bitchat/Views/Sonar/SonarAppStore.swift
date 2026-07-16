@@ -776,25 +776,32 @@ final class SonarAppStore: ObservableObject {
         (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? Int
     }
 
+    /// Outcome of finalizing a staged video: distinguishes "cannot fit under
+    /// the cap" from an I/O or export failure so the toast never lies.
+    private enum VideoFinalizeResult: Sendable {
+        case ready(data: Data, filename: String, mime: String)
+        case tooLarge
+        case failed
+    }
+
     /// Finalize a staged video on send confirmation (Signal-style lazy
     /// finalization): pass the original bytes through when they already fit
     /// under the receiver download cap, otherwise re-encode to a smaller
     /// H.264/AAC MP4 with `AVAssetExportSession` and send that if it fits.
-    /// Consumes (deletes) the staged temp file. Returns nil when the video
-    /// cannot be made to fit — the caller surfaces a "too large" toast.
+    /// Consumes (deletes) the staged temp file.
     private nonisolated static func finalizeVideoForSend(
         _ url: URL,
         filename: String,
         mime: String
-    ) async -> (data: Data, filename: String, mime: String)? {
+    ) async -> VideoFinalizeResult {
         defer { deleteTempMediaFile(url) }
         if let size = fileSize(url), size <= maxMediaPlaintextBytes {
-            guard let data = readTempMediaFile(url) else { return nil }
-            return (data, filename, mime)
+            guard let data = readTempMediaFile(url) else { return .failed }
+            return .ready(data: data, filename: filename, mime: mime)
         }
         let asset = AVURLAsset(url: url)
         guard let export = AVAssetExportSession(asset: asset, presetName: AVAssetExportPreset960x540) else {
-            return nil
+            return .failed
         }
         let outURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("sonar-preview")
@@ -805,7 +812,7 @@ final class SonarAppStore: ObservableObject {
             do {
                 try await export.export(to: outURL, as: .mp4)
             } catch {
-                return nil
+                return .failed
             }
         } else {
             export.outputURL = outURL
@@ -813,12 +820,13 @@ final class SonarAppStore: ObservableObject {
             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
                 export.exportAsynchronously { continuation.resume() }
             }
-            guard export.status == .completed else { return nil }
+            guard export.status == .completed else { return .failed }
         }
-        guard let outSize = fileSize(outURL), outSize <= maxMediaPlaintextBytes,
-              let data = readTempMediaFile(outURL) else { return nil }
+        guard let outSize = fileSize(outURL) else { return .failed }
+        guard outSize <= maxMediaPlaintextBytes else { return .tooLarge }
+        guard let data = readTempMediaFile(outURL) else { return .failed }
         let stem = (filename as NSString).deletingPathExtension
-        return (data, (stem.isEmpty ? "video" : stem) + ".mp4", "video/mp4")
+        return .ready(data: data, filename: (stem.isEmpty ? "video" : stem) + ".mp4", mime: "video/mp4")
     }
 
     private func deletePreviewTempFilesAsync(_ previews: [PendingMediaPreview]) {
@@ -888,7 +896,7 @@ final class SonarAppStore: ObservableObject {
                 Task.detached(priority: .utility) {
                     for (url, _, _) in written { Self.deleteTempMediaFile(url) }
                 }
-                showToast("Couldn't prepare image.")
+                showToast("Couldn't prepare media.")
                 return
             }
             guard mediaPreviewGeneration == generation, currentDMId == peerId else {
@@ -919,6 +927,7 @@ final class SonarAppStore: ObservableObject {
             var prepared: [(peerId: String, data: Data, filename: String, mime: String)] = []
             var encodeFailed = false
             var videoTooLarge = false
+            var videoFailed = false
             for preview in items {
                 if preview.mime.hasPrefix("video/") {
                     // Pass through when under the receiver download cap; else
@@ -930,10 +939,13 @@ final class SonarAppStore: ObservableObject {
                             mime: preview.mime
                         )
                     }).value
-                    if let finalized {
-                        prepared.append((preview.peerId, finalized.data, finalized.filename, finalized.mime))
-                    } else {
+                    switch finalized {
+                    case .ready(let data, let filename, let mime):
+                        prepared.append((preview.peerId, data, filename, mime))
+                    case .tooLarge:
                         videoTooLarge = true
+                    case .failed:
+                        videoFailed = true
                     }
                     continue
                 }
@@ -953,6 +965,7 @@ final class SonarAppStore: ObservableObject {
             }
             if encodeFailed { showToast("Couldn't encode image.") }
             if videoTooLarge { showToast("Video is too large to send (max 25 MB).") }
+            if videoFailed { showToast("Couldn't prepare video.") }
             // Group per peer: 2+ items to one peer send as ONE album message;
             // a single item keeps the exact pre-album behavior.
             let peersInOrder = prepared.map(\.peerId).reduce(into: [String]()) {
