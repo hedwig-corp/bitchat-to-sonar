@@ -4115,6 +4115,16 @@ final class SonarAppStore: ObservableObject {
         (pendingMarmotNpub(for: id) != nil && marmotGroupId(id) == nil) || isPendingMarmotGroup(id)
     }
 
+    /// Whether this conversation's transcript or send path depends on the
+    /// Marmot local store. Pure-mesh bitchat chats ride `privateChats` over
+    /// BLE, so an account-level Marmot storage failure must not relabel them
+    /// as locked (their transcript and sends keep working).
+    func dmDependsOnMarmot(_ id: String) -> Bool {
+        marmotGroupId(id) != nil
+            || isPendingSecureChat(id)
+            || resolvedSonarProfile(id) != nil
+    }
+
     func marmotGroupId(_ id: String) -> String? {
         if isPendingMarmotGroup(id) { return nil }
         if let pendingNpub = pendingMarmotNpub(for: id),

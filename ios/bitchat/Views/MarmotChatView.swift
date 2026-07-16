@@ -2669,25 +2669,43 @@ final class MarmotChatModel: ObservableObject {
                 }
                 try await self.service.sendText(groupId: groupId, text: trimmed)
             } catch {
-                self.discardOptimistic(id: echo.id, from: groupId)
                 if let onFailure {
                     // Setup-stage callers keep their own failed pending row.
+                    self.discardOptimistic(id: echo.id, from: groupId)
                     onFailure()
                 } else {
                     // A vanished bubble reads as "the app ate my message" — and
                     // when the local store failed to open, the whole chat is
                     // already blank around it. Keep the send visible as a
                     // retryable failed row, exactly like media and stickers.
-                    let failed = MarmotService.MarmotMessage(
-                        id: Self.failedOptimisticIDPrefix + UUID().uuidString,
-                        senderNpub: echo.senderNpub,
-                        content: echo.content,
-                        createdAt: echo.createdAt,
-                        isMine: true,
-                        media: []
-                    )
-                    self.pendingOptimistic[groupId, default: []].append(failed)
-                    self.messagesByGroup[groupId, default: []].append(failed)
+                    //
+                    // sendText can also throw AFTER the core committed the
+                    // canonical row (e.g. the durable-outbox sidecar write
+                    // failed post-commit). Failed platform-local rows are never
+                    // reconciled against canonical rows, so blindly adding one
+                    // would show two bubbles and Retry would duplicate the
+                    // message. Reload the bounded local page with the echo
+                    // still pending: reconcileOptimistic consumes it iff the
+                    // canonical copy exists (including out-of-window rows in a
+                    // pinned historical window). Only a still-unreconciled echo
+                    // becomes a failed row. With the store unopened the reload
+                    // fails fast and the failed row is kept — the right outcome.
+                    await self.loadLocalPage(groupId: groupId, mode: .preserveHistoricalWindow)
+                    let committed = !(self.pendingOptimistic[groupId] ?? [])
+                        .contains { $0.id == echo.id }
+                    self.discardOptimistic(id: echo.id, from: groupId)
+                    if !committed {
+                        let failed = MarmotService.MarmotMessage(
+                            id: Self.failedOptimisticIDPrefix + UUID().uuidString,
+                            senderNpub: echo.senderNpub,
+                            content: echo.content,
+                            createdAt: echo.createdAt,
+                            isMine: true,
+                            media: []
+                        )
+                        self.pendingOptimistic[groupId, default: []].append(failed)
+                        self.messagesByGroup[groupId, default: []].append(failed)
+                    }
                 }
                 self.errorText = Self.describe(error)
                 return

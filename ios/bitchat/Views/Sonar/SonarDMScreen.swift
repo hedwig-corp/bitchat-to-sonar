@@ -190,7 +190,7 @@ struct SonarDMScreenContent: View {
                 ProgressView()
                     .tint(SonarTheme.accent)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if msgs.isEmpty, store.marmot.localStoreFailure != nil {
+            } else if msgs.isEmpty, store.marmot.localStoreFailure != nil, store.dmDependsOnMarmot(peerId) {
                 // The transcript is empty because the encrypted store cannot be
                 // opened — "Say hi" would misread as a fresh empty chat.
                 SNEmptyState(
@@ -627,10 +627,11 @@ struct SonarDMScreenContent: View {
 
     @ViewBuilder
     private var banner: some View {
-        if let failure = store.marmot.localStoreFailure {
+        if let failure = store.marmot.localStoreFailure, store.dmDependsOnMarmot(peerId) {
             // Blocking storage/account failure: the transcript below cannot
             // load and sends cannot commit — say so instead of implying a
-            // healthy encrypted chat.
+            // healthy encrypted chat. Pure-mesh chats are unaffected and keep
+            // their normal banners.
             SNLocalStoreFailureBanner(detail: failure) {
                 store.marmot.connectIfNeeded()
             }

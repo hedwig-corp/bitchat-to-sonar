@@ -819,10 +819,11 @@ private struct MacConversationPane: View {
     }
 
     @ViewBuilder private var banner: some View {
-        if let failure = store.marmot.localStoreFailure, !isChannel {
+        if let failure = store.marmot.localStoreFailure, !isChannel, store.dmDependsOnMarmot(id) {
             // Blocking storage/account failure: the transcript below cannot
             // load and sends cannot commit — say so instead of implying a
-            // healthy encrypted chat.
+            // healthy encrypted chat. Pure-mesh chats are unaffected and keep
+            // their normal banners.
             SNLocalStoreFailureBanner(detail: failure) {
                 store.marmot.connectIfNeeded()
             }
@@ -3845,7 +3846,7 @@ private struct MacDMTranscript: View {
 
     var body: some View {
         let msgs = convo.messages
-        if msgs.isEmpty, store.marmot.localStoreFailure != nil {
+        if msgs.isEmpty, store.marmot.localStoreFailure != nil, store.dmDependsOnMarmot(peerId) {
             // The transcript is empty because the encrypted store cannot be
             // opened — "Say hi" would misread as a fresh empty chat.
             SNEmptyState(
