@@ -985,6 +985,23 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun latestKnownMessageSecs(chatId: String): Long =
         transcriptGroupIds(chatId).maxOfOrNull { chatSnapshotLatestByChat[it] ?: 0L } ?: 0L
 
+    /**
+     * Cached White Noise rows to seed a mesh chat's synchronous first paint,
+     * so it lands on the true tail instead of the BLE tail (see [openDm]).
+     *
+     * Synthetic chat-list placeholders are stripped: only the newest
+     * [LOCAL_SUMMARY_CHAT_LIMIT] chats carry real rows here, and a placeholder's
+     * id can never dedupe against the real row the async page brings, so
+     * seeding one renders a permanent duplicate bubble. A chat without real
+     * cached rows simply gets no seed and settles via the catch-up gate.
+     */
+    private fun meshWhiteNoiseSeed(chatId: String): List<SonarMsg> =
+        transcriptGroupIds(chatId).flatMap { groupId ->
+            chatSnapshotMessagesByChat[groupId].orEmpty()
+                .withoutSyntheticSummaryRows()
+                .map { it.copy(viaInternet = true) }
+        }
+
     // ── Mocked voice/video call log (in-memory only) ──
     /** Call records per chat id, merged into that DM's transcript by timestamp. */
     private val callLogs = mutableMapOf<String, MutableList<CallRecord>>()
@@ -3699,9 +3716,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         // same cached conversation snapshot the chat-list preview uses so the
         // first frame already holds the newest rows; the async refresh below
         // then replaces it with the full DB read.
-        val wnSnapshot = transcriptGroupIds(id).flatMap { groupId ->
-            chatSnapshotMessagesByChat[groupId].orEmpty().map { it.copy(viaInternet = true) }
-        }
+        val wnSnapshot = meshWhiteNoiseSeed(id)
         messages = visibleMessagesForChat(
             id,
             refreshConversationRows(
@@ -3732,9 +3747,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             // Seed the White Noise leg from the cached snapshot so the restored
             // paint is already complete (see openDm) — otherwise back-revealing
             // a mesh chat repeats the BLE-tail-then-jump on every navigation.
-            val wnSnapshot = transcriptGroupIds(chat.id).flatMap { groupId ->
-                chatSnapshotMessagesByChat[groupId].orEmpty().map { it.copy(viaInternet = true) }
-            }
+            val wnSnapshot = meshWhiteNoiseSeed(chat.id)
             messages = visibleMessagesForChat(
                 chat.id,
                 refreshConversationRows(

@@ -68,6 +68,22 @@ internal data class LocalConversationHydration(
     val latestByChat: Map<String, Long>,
 )
 
+/**
+ * Id prefix of a SYNTHETIC chat-list row: a stand-in minted from the core
+ * conversation index for a chat outside the bounded page window, carrying only
+ * the latest message's preview fields.
+ *
+ * These rows exist to render a chat-list subtitle. They are NOT transcript
+ * content: their id is not an event id, so it can never match — and therefore
+ * never dedupe against — the real row once the bounded page loads. Feeding one
+ * into a transcript renders a duplicate bubble forever. Always strip them with
+ * [withoutSyntheticSummaryRows] before seeding transcript state.
+ */
+internal const val SYNTHETIC_SUMMARY_ID_PREFIX = "summary:"
+
+internal fun List<SonarMsg>.withoutSyntheticSummaryRows(): List<SonarMsg> =
+    filterNot { it.id.startsWith(SYNTHETIC_SUMMARY_ID_PREFIX) }
+
 internal fun hydrateLocalConversationRows(
     activeChatIds: Set<String>,
     existingMessagesByChat: Map<String, List<SonarMsg>>,
@@ -83,13 +99,15 @@ internal fun hydrateLocalConversationRows(
         latest[summary.groupIdHex] = summary.latestAtSecs
         val existing = messages[summary.groupIdHex]
         val previous = existing?.lastOrNull()
-        val summaryId = "summary:${summary.groupIdHex}:${summary.latestAtSecs}:${summary.messageCount}"
+        val summaryId =
+            "$SYNTHETIC_SUMMARY_ID_PREFIX${summary.groupIdHex}:${summary.latestAtSecs}:${summary.messageCount}"
         val visibleFieldsMatch = previous != null &&
             previous.tsSecs == summary.latestAtSecs &&
             previous.content == summary.latestContent &&
             previous.senderNpub == summary.latestSenderNpub &&
             previous.mine == summary.latestMine
-        val staleSyntheticIdentity = previous?.id?.startsWith("summary:${summary.groupIdHex}:") == true &&
+        val staleSyntheticIdentity =
+            previous?.id?.startsWith("$SYNTHETIC_SUMMARY_ID_PREFIX${summary.groupIdHex}:") == true &&
             previous.id != summaryId
         // Preserve a real bounded-page row when it already represents the same
         // visible latest message. Synthetic summaries additionally track count,
