@@ -40,7 +40,9 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -76,7 +78,9 @@ import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -803,6 +807,145 @@ private fun ChannelHint() {
 private fun transcriptFeedKey(item: Any): String =
     if (item is CallRecord) "c:${item.id}" else "m:${(item as SonarMsg).id}"
 
+/** Bounds an image bubble renders within (design: .bc-msg media). */
+internal val MAX_MEDIA_BUBBLE_WIDTH = 240.dp
+internal val MAX_MEDIA_BUBBLE_HEIGHT = 300.dp
+
+/**
+ * The box a decoded image bubble occupies: [intrinsic] scaled down to fit
+ * [maxWidth]×[maxHeight] with the aspect ratio preserved, never upscaled.
+ * This mirrors how `MediaImage` lays out (ContentScale.Fit under widthIn/heightIn
+ * maxes) — reserving it up front keeps the transcript from reflowing when the
+ * bytes arrive. Coercing each axis independently would NOT match: a 360×803dp
+ * portrait fits to 135×300, not 240×300, and the extra width would show as
+ * background bars beside the image.
+ */
+internal fun mediaBubbleFittedSize(intrinsic: DpSize, maxWidth: Dp, maxHeight: Dp): DpSize {
+    if (intrinsic.width <= 0.dp || intrinsic.height <= 0.dp) return DpSize(0.dp, 0.dp)
+    val scale = minOf(maxWidth / intrinsic.width, maxHeight / intrinsic.height, 1f)
+    // Clamp: scaling by a Float can land a hair over the bound (800dp * 240/800
+    // = 240.00002dp), and the reserved box must never exceed what Fit renders.
+    return DpSize(
+        (intrinsic.width * scale).coerceAtMost(maxWidth),
+        (intrinsic.height * scale).coerceAtMost(maxHeight),
+    )
+}
+
+/** One observed frame of transcript tail state for [TranscriptTailPinner].
+ *  [viewportHeight] keeps successive IME-resize frames distinct so a
+ *  `distinctUntilChanged` flow never swallows a shrink step. */
+internal data class TranscriptTailFrame(
+    val itemCount: Int,
+    val viewportHeight: Int,
+    val tailFullyVisible: Boolean,
+    val scrolling: Boolean,
+    val prepending: Boolean,
+)
+
+internal enum class TranscriptTailPin { None, Snap, Animate }
+
+/**
+ * Signal keeps a transcript bottom-anchored: a reader at the tail stays at the
+ * tail through keyboard and layout changes. A top-anchored LazyColumn instead
+ * keeps its first visible row, so the IME opening (viewport shrink) or a media
+ * skeleton swapping to the taller decoded image (tail rows growing) silently
+ * pushes the newest messages below the fold. This state machine watches layout
+ * frames and asks for a re-anchor only when layout — not the user's scroll and
+ * not a history prepend — steals a fully visible tail. [Snap] re-anchors
+ * instantly (mid keyboard animation); [Animate] follows a new appended row.
+ */
+internal class TranscriptTailPinner {
+    private var wasPinned = false
+    private var lastCount = -1
+
+    fun onFrame(frame: TranscriptTailFrame): TranscriptTailPin {
+        val countChanged = frame.itemCount != lastCount
+        lastCount = frame.itemCount
+        return when {
+            frame.prepending || frame.scrolling -> {
+                wasPinned = frame.tailFullyVisible
+                TranscriptTailPin.None
+            }
+            frame.tailFullyVisible -> {
+                wasPinned = true
+                TranscriptTailPin.None
+            }
+            wasPinned && frame.itemCount > 0 ->
+                if (countChanged) TranscriptTailPin.Animate else TranscriptTailPin.Snap
+            else -> TranscriptTailPin.None
+        }
+    }
+}
+
+/** Pixels the tail row still hangs below the viewport's content area after a
+ *  scroll-to-tail (0 when its bottom edge is visible). Non-zero only when the
+ *  row is taller than the viewport — e.g. a large media bubble over an open
+ *  keyboard — because scrollToItem top-aligns the row. */
+internal fun transcriptTailOverflowPx(
+    lastOffset: Int,
+    lastSize: Int,
+    viewportEndOffset: Int,
+    afterContentPadding: Int,
+): Int = (lastOffset + lastSize - (viewportEndOffset - afterContentPadding)).coerceAtLeast(0)
+
+/** Anchor the newest transcript row bottom-aligned, Signal-style. scrollToItem
+ *  alone top-aligns the row; when the row is taller than the (keyboard-shrunk)
+ *  viewport that leaves the newest content hidden below the fold, so any
+ *  remaining overflow is corrected with a follow-up scroll. */
+internal suspend fun LazyListState.anchorTranscriptTail(index: Int, animate: Boolean) {
+    if (index < 0) return
+    if (animate) animateScrollToItem(index) else scrollToItem(index)
+    val info = layoutInfo
+    val last = info.visibleItemsInfo.lastOrNull() ?: return
+    if (last.index != index) return
+    val overflow = transcriptTailOverflowPx(
+        lastOffset = last.offset,
+        lastSize = last.size,
+        viewportEndOffset = info.viewportEndOffset,
+        afterContentPadding = info.afterContentPadding,
+    )
+    if (overflow > 0) scrollBy(overflow.toFloat())
+}
+
+/** Wire [TranscriptTailPinner] to a transcript list: re-anchor the newest row
+ *  whenever layout (IME shrink, media growth) — not the user's scroll and not
+ *  a history prepend — steals a fully visible tail. */
+@Composable
+internal fun TranscriptTailPinning(
+    listState: LazyListState,
+    key: Any? = null,
+    isPrepending: () -> Boolean = { false },
+) {
+    LaunchedEffect(key, listState) {
+        val pinner = TranscriptTailPinner()
+        snapshotFlow {
+            val info = listState.layoutInfo
+            val last = info.visibleItemsInfo.lastOrNull()
+            TranscriptTailFrame(
+                itemCount = info.totalItemsCount,
+                viewportHeight = info.viewportSize.height,
+                tailFullyVisible = last != null && last.index == info.totalItemsCount - 1 &&
+                    last.offset + last.size <= info.viewportEndOffset,
+                scrolling = listState.isScrollInProgress,
+                prepending = isPrepending(),
+            )
+        }.distinctUntilChanged().collect { frame ->
+            val pin = pinner.onFrame(frame)
+            if (pin == TranscriptTailPin.None) return@collect
+            // These frames are produced *during* layout, so scrolling straight
+            // from here can re-enter measure ("performMeasureAndLayout called
+            // during measure layout"). Land on the next frame boundary first,
+            // the way the history-prepend path does. The IME emits a frame per
+            // animation step, so the tail still tracks the keyboard.
+            withFrameNanos { }
+            listState.anchorTranscriptTail(
+                frame.itemCount - 1,
+                animate = pin == TranscriptTailPin.Animate,
+            )
+        }
+    }
+}
+
 @Composable
 private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     val s = sonar
@@ -882,10 +1025,10 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     LaunchedEffect(screen.id, newestFeedKey) {
         if (feed.isEmpty()) return@LaunchedEffect
         if (!didInitialScroll) {
-            listState.scrollToItem(feed.lastIndex)
+            listState.anchorTranscriptTail(feed.lastIndex, animate = false)
             didInitialScroll = true
         } else if (isNearBottom && !isPrepending) {
-            listState.animateScrollToItem(feed.lastIndex)
+            listState.anchorTranscriptTail(feed.lastIndex, animate = true)
         }
     }
 
@@ -931,12 +1074,20 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             isPrepending = true
             if (state.loadNewestMessages(screen.id)) {
                 withFrameNanos { }
-                if (currentFeed.isNotEmpty()) listState.scrollToItem(currentFeed.lastIndex)
+                if (currentFeed.isNotEmpty()) {
+                    listState.anchorTranscriptTail(currentFeed.lastIndex, animate = false)
+                }
                 didLeaveTail = false
             }
             isPrepending = false
         }
     }
+
+    // Bottom-anchor the tail (Signal parity): the IME opening shrinks the
+    // transcript viewport and decoded media grows tail rows after first paint;
+    // both would otherwise hide the newest messages behind the keyboard or
+    // below the fold. Re-anchor whenever layout — not the user — steals the tail.
+    TranscriptTailPinning(listState, key = screen.id, isPrepending = { isPrepending })
     val currentChat = state.chats.firstOrNull { it.id == screen.id }
     val isGroup = state.isMultiMemberChat(screen.id)
     val canManageGroup = state.canManageGroup(screen.id)
@@ -1648,8 +1799,13 @@ private fun GeoDmScreen(state: SonarAppState, screen: Screen.GeoDm) {
     val blocked = state.isGeoDmBlocked(screen.peerHex)
     val listState = rememberLazyListState()
     LaunchedEffect(state.messages.size) {
-        if (state.messages.isNotEmpty()) listState.animateScrollToItem(state.messages.size - 1)
+        if (state.messages.isNotEmpty()) {
+            listState.anchorTranscriptTail(state.messages.size - 1, animate = true)
+        }
     }
+    // Same tail pinning as the main transcript: the IME opening must not hide
+    // the newest rows behind the keyboard.
+    TranscriptTailPinning(listState, key = screen.peerHex)
     Column(Modifier.fillMaxSize()) {
         Row(
             Modifier.fillMaxWidth().padding(start = 6.dp, end = 16.dp, top = 12.dp, bottom = 8.dp),
@@ -2154,8 +2310,27 @@ private fun MediaBubble(
             val bytes = mediaBytes
             val failed = transfer.phase == MediaTransferPhase.Failed ||
                 (transfer.phase == MediaTransferPhase.Available && loadResult.first && bytes == null)
+            // Signal pre-sizes media cells from stored attachment dimensions so
+            // the decoded image never reflows the transcript (Signal-Android
+            // ThumbnailView measures EXACTLY from DB width/height; Signal-iOS
+            // CVMediaAlbumView measures from sourceMediaSizePixels). Reserve the
+            // box MediaImage will occupy once decoded, so it holds its place
+            // before any bytes arrive. Dimension-less media keeps the skeleton.
+            val density = LocalDensity.current
+            val reservedSize = remember(media.width, media.height, maxBubbleWidth, density) {
+                val w = media.width ?: 0
+                val h = media.height ?: 0
+                if (w > 0 && h > 0) with(density) {
+                    mediaBubbleFittedSize(
+                        intrinsic = DpSize(w.toDp(), h.toDp()),
+                        maxWidth = minOf(MAX_MEDIA_BUBBLE_WIDTH, maxBubbleWidth),
+                        maxHeight = MAX_MEDIA_BUBBLE_HEIGHT,
+                    )
+                } else null
+            }
             Box(
-                Modifier.widthIn(max = minOf(240.dp, maxBubbleWidth)).clip(bubbleShape).background(s.surface2)
+                (if (reservedSize != null) Modifier.size(reservedSize) else Modifier.widthIn(max = minOf(MAX_MEDIA_BUBBLE_WIDTH, maxBubbleWidth)))
+                    .clip(bubbleShape).background(s.surface2)
                     .clickable {
                         when (transfer.phase) {
                             MediaTransferPhase.NotDownloaded, MediaTransferPhase.Failed ->
@@ -2171,7 +2346,8 @@ private fun MediaBubble(
                         MediaImage(
                             bytes = bytes,
                             isGif = renderAsGif,
-                            modifier = Modifier.widthIn(max = minOf(240.dp, maxBubbleWidth)).heightIn(max = 300.dp)
+                            modifier = Modifier.widthIn(max = minOf(MAX_MEDIA_BUBBLE_WIDTH, maxBubbleWidth))
+                                .heightIn(max = MAX_MEDIA_BUBBLE_HEIGHT)
                         )
                         if (renderAsGif) GifBadge(Modifier.align(Alignment.TopEnd).padding(8.dp))
                         // media-chip: glass time + via pill bottom-right.
@@ -2179,7 +2355,11 @@ private fun MediaBubble(
                     }
                     bytes != null -> InlineMediaFileChip(media, transfer) { onOpen(media) }
                     failed -> MediaUnavailable(media)
-                    else -> MediaLoadingSkeleton(media)
+                    else -> MediaLoadingSkeleton(
+                        media,
+                        if (reservedSize != null) Modifier.fillMaxSize()
+                        else Modifier.size(width = 216.dp, height = 150.dp),
+                    )
                 }
                 if (transfer.phase == MediaTransferPhase.Downloading) {
                     MediaTransferOverlay(transfer, Modifier.align(Alignment.Center))
@@ -2424,13 +2604,15 @@ private fun MediaMetaChip(tsSecs: Long, mesh: Boolean, modifier: Modifier = Modi
  *  shown while the encrypted blob downloads. Hue is the filename hash, exactly
  *  like the prototype's `--ph`/`--ph2`. */
 @Composable
-private fun MediaLoadingSkeleton(media: SonarMedia) {
+private fun MediaLoadingSkeleton(
+    media: SonarMedia,
+    modifier: Modifier = Modifier.size(width = 216.dp, height = 150.dp),
+) {
     val phue = remember(media.filename) { bcHue(media.filename) }
     val ph = Color.hsl(phue, 0.34f, 0.52f)
     val ph2 = Color.hsl((phue + 36f) % 360f, 0.38f, 0.42f)
     Box(
-        Modifier.size(width = 216.dp, height = 150.dp)
-            .background(Brush.linearGradient(listOf(ph, ph2))),
+        modifier.background(Brush.linearGradient(listOf(ph, ph2))),
         contentAlignment = Alignment.Center
     ) {
         Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
