@@ -10,11 +10,15 @@ import android.os.Build
 import android.os.IBinder
 import android.util.Log
 import chat.bitchat.sonar.Notifier
+import chat.bitchat.sonar.PROFILE_CACHE_BLOB_KEY
 import chat.bitchat.sonar.SonarCore
 import chat.bitchat.sonar.SonarNotificationKind
 import chat.bitchat.sonar.SonarNotificationPrefs
 import chat.bitchat.sonar.SonarNotificationRouter
-import chat.bitchat.sonar.shortNpubLabel
+import chat.bitchat.sonar.SonarProfile
+import chat.bitchat.sonar.canonicalProfileKey
+import chat.bitchat.sonar.decodeProfileCache
+import chat.bitchat.sonar.resolvePushSenderName
 import chat.bitchat.sonar.wallet.WalletBridge
 import chat.bitchat.sonar.wallet.WalletState
 import kotlinx.coroutines.CoroutineScope
@@ -106,6 +110,13 @@ class SonarPushProcessingService : Service() {
                 return
             }
 
+            // The drain runs while the UI may be dead, so resolve nicknames the
+            // same way the foreground path does: persisted kind-0 cache first,
+            // then a bounded relay fetch (relays are already connected here).
+            // Never title a notification with the raw npub when a name exists.
+            val cachedProfiles = decodeProfileCache(SonarCore.loadBlob(PROFILE_CACHE_BLOB_KEY))
+            val fetchedProfiles = HashMap<String, SonarProfile?>()
+
             for (summary in unread) {
                 val kind = SonarNotificationRouter.classifyContent(
                     summary.latestContent,
@@ -119,7 +130,11 @@ class SonarPushProcessingService : Service() {
                     conversationTitle = summary.name.ifBlank { null },
                     senderName = summary.latestSenderNpub
                         .takeIf { it.isNotBlank() }
-                        ?.let(::shortNpubLabel),
+                        ?.let { npub ->
+                            resolvePushSenderName(npub, cachedProfiles) { missing ->
+                                fetchProfileOnce(missing, fetchedProfiles)
+                            }
+                        },
                     preview = summary.latestContent,
                     unreadCount = summary.unreadCount,
                     prefs = prefs,
@@ -133,6 +148,21 @@ class SonarPushProcessingService : Service() {
             Log.e(TAG, "Marmot wakeup failed, showing fallback", e)
             notifyFallback(notificationPrefs())
         }
+    }
+
+    /** One bounded profile fetch per sender per wakeup (a miss is memoized too,
+     *  so an unknown sender across several chats costs a single relay fetch). */
+    private suspend fun fetchProfileOnce(
+        npub: String,
+        fetched: MutableMap<String, SonarProfile?>,
+    ): SonarProfile? {
+        val key = canonicalProfileKey(npub)
+        if (!fetched.containsKey(key)) {
+            fetched[key] = withTimeoutOrNull(PROFILE_FETCH_TIMEOUT_MS) {
+                SonarCore.fetchProfile(npub)
+            }
+        }
+        return fetched[key]
     }
 
     private fun notificationPrefs(): SonarNotificationPrefs =
@@ -192,5 +222,10 @@ class SonarPushProcessingService : Service() {
         // (Android has no Tor; if a bootstrap step is ever added, its latency
         // must also fit inside this budget.)
         private const val MARMOT_PUSH_SYNC_TIMEOUT_MS = 25_000L
+
+        // Per-sender kind-0 lookup budget when the persisted profile cache
+        // misses. Runs after the sync above, so the relay pool is already
+        // connected; on expiry the notification falls back to the npub label.
+        private const val PROFILE_FETCH_TIMEOUT_MS = 5_000L
     }
 }

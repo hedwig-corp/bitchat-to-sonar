@@ -1,5 +1,6 @@
 package chat.bitchat.sonar
 
+import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
@@ -76,6 +77,44 @@ class SonarNotificationRouterTest {
         assertEquals("2,100 sats received from Alice.", payment?.body)
         assertEquals("Incoming call from Alice", call?.title)
         assertEquals("Tap to answer.", call?.body)
+    }
+
+    // Regression for the v0.1-alpha.9 push-drain path: notifications must be
+    // titled with the sender's nickname, not the truncated npub, whenever a
+    // kind-0 profile is available from the cache or a fetch.
+    @Test
+    fun pushSenderNamePrefersCachedProfileOverNpub() = runTest {
+        val npub = "npub1exampleexampleexampleexampleabcd"
+        val name = resolvePushSenderName(
+            npub = npub,
+            cachedProfiles = mapOf(npub to SonarProfile("alice", "Alice", null, null, null)),
+            fetchProfile = { error("must not fetch when the cache has a name") },
+        )
+
+        assertEquals("Alice", name)
+    }
+
+    @Test
+    fun pushSenderNameFetchesProfileOnCacheMiss() = runTest {
+        val name = resolvePushSenderName(
+            npub = "npub1exampleexampleexampleexampleabcd",
+            cachedProfiles = emptyMap(),
+            fetchProfile = { SonarProfile("bob", null, null, null, null) },
+        )
+
+        assertEquals("bob", name)
+    }
+
+    @Test
+    fun pushSenderNameFallsBackToNpubLabelOnlyWithoutProfile() = runTest {
+        val npub = "npub1exampleexampleexampleexampleabcd"
+        val name = resolvePushSenderName(
+            npub = npub,
+            cachedProfiles = emptyMap(),
+            fetchProfile = { null },
+        )
+
+        assertEquals(shortNpubLabel(npub), name)
     }
 
     @Test

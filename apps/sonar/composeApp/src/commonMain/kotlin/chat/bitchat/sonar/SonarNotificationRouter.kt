@@ -44,6 +44,20 @@ data class SonarNotification(
     val kind: SonarNotificationKind,
 )
 
+/** Sender label for a push-wake drain notification, mirroring the foreground
+ *  path (notificationSenderName) and iOS SonarPushProcessor.resolveSenderName:
+ *  persisted kind-0 profile cache first, then a fetched profile, and only when
+ *  no human name exists the truncated-npub label. */
+internal suspend fun resolvePushSenderName(
+    npub: String,
+    cachedProfiles: Map<String, SonarProfile>,
+    fetchProfile: suspend (String) -> SonarProfile?,
+): String {
+    cachedProfiles[canonicalProfileKey(npub)]?.bestName?.let { return it }
+    fetchProfile(npub)?.bestName?.let { return it }
+    return shortNpubLabel(npub)
+}
+
 object SonarNotificationRouter {
     fun classifyContent(
         content: String,
