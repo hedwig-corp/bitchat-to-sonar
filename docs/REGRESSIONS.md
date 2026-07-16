@@ -82,7 +82,7 @@ roughly halves it. The ranking is stable across all three.)
 
 **Also guarded by:** `TranscriptDisplayPolicyTest.outOfWindowCanonicalRowFulfillsEchoAndIsAdmitted`, `TranscriptDisplayPolicyTest.windowedCanonicalRowIsNotAdmittedTwice`, `TranscriptDisplayPolicyTest.identicalOutOfWindowRowsConsumeEchoesOneForOne`
 
-**Not guarded:** the Compose *call site*. Every Compose test above calls `reconcileSendEchoes` directly and passes `freshCanonical` itself. If `SonarAppState.withSendEchoes` stopped passing `freshCanonicalForChat(chatId)`, this exact regression would return with all of them green — and a missing argument at that call site **is** what #290 fixed. Pinning it needs an injectable `SonarCore`; tracked under Unguarded.
+**Enforced by the compiler:** `freshCanonical` has **no default** on `reconcileSendEchoes`/`planSendEchoDisplay`. Dropping it at the `withSendEchoes` call site — the exact shape of this regression — is a compile error (`No value passed for parameter 'freshCanonical'`), not a silent behaviour change. That default was what let the Compose port omit the argument while every helper-level test stayed green, so the hazard is removed rather than tested for. Restoring a default would re-open this entry.
 
 **History:** #215 fixed the same-second match -> #273 made cleanup conditional on the heuristic and regressed it -> #290 ported the iOS `freshCanonical` argument.
 
@@ -146,9 +146,9 @@ roughly halves it. The ranking is stable across all three.)
 
 **Also guarded by:** `EventDrivenRefreshTest.oldBackfillDoesNotRenotifyCachedLatest`, `EventDrivenRefreshTest.seedPassAndOpenChatDoNotNotify`, `EventDrivenRefreshTest.incomingBeforeOwnLatestStillNotifies`
 
-**Not guarded:** the account-wipe half. The cited tests only exercise `newestUnseenIncoming`; none runs a wipe path. On iOS this invariant appears **not implemented at all** — the long-lived `SonarAppStore` keeps `seenMarmotNotificationMessageIDs` across a restore/wipe in the same process (neither `clearAccountBoundLocalStateForRestore()` nor `performWipe()` clears it), which is the Compose bug #288 fixed. See Unguarded.
+**Not guarded:** the account-wipe half. The cited tests only exercise `newestUnseenIncoming`; none runs a wipe path. Both platforms now *implement* it — iOS clears `seenMarmotNotificationMessageIDs` in `clearAccountBoundLocalStateForRestore()` and `performWipe()`, next to the analogous `scannedPayMessageIDs = []` — but no test pins either. Pinning the iOS side needs a constructible `SonarAppStore`; no test builds one today. See Unguarded.
 
-**History:** #276 deduped by message id -> #288 cleared the dedup state on account wipe (stale state survived a wipe) — Compose only.
+**History:** #276 deduped by message id -> #288 cleared the dedup state on account wipe, Compose only -> the iOS half was found missing while writing this ledger (the store outlives a wipe, so a restored account's messages could be silently swallowed) and fixed the same way.
 
 **Rejected:** *Dedup on latest-timestamp only.* Drops a genuine second message in the same second.
 
@@ -178,9 +178,9 @@ Gaps we know about. Each line is a concrete backlog item; fold it into its `R-`
 entry once a test exists. Listing a gap is the point — an entry that overclaims
 its coverage is worse than an honest hole, because it stops people looking.
 
-- **R-001, the Compose call site.** The Compose tests exercise `reconcileSendEchoes` directly and pass `freshCanonical` themselves, so they cannot catch `SonarAppState.withSendEchoes` dropping `freshCanonicalForChat(chatId)` — which is precisely the shape of the bug #290 fixed. Needs an injectable `SonarCore` to drive `SonarAppState` in-process (see the Signal architecture notes: injectable core is the keystone). iOS is genuinely covered here by `MarmotOptimisticEchoTests`.
-- **R-003, the one-transcript half.** Cited tests pin chat-list dedup and identity routing, not "duplicate groups' messages merge into a single transcript". A test over the transcript-loading path would close it.
-- **R-004, account wipe.** Not guarded on either platform, and on iOS apparently not implemented: `SonarAppStore.seenMarmotNotificationMessageIDs` survives `clearAccountBoundLocalStateForRestore()` and `performWipe()` in-process. This is the Compose bug #288 fixed, still open on iOS — a Cross-Platform Feature Rule gap, not just a test gap.
+- **R-003, the one-transcript half.** Cited tests pin chat-list dedup and identity routing, not "duplicate groups' messages merge into a single transcript". The merge lives in `SonarAppState.duplicateDirectMarmotChats` (private, needs an instance); `dedupeDirectMarmotChats` — the pure seam the tests use — only covers the chat-list half. Closing it means extracting the transcript-source selection into a pure function, or an injectable `SonarCore`.
+- **R-004, account wipe, both platforms.** Now implemented on iOS and Compose, but pinned by no test. The Compose path needs an injectable `SonarCore`; the iOS path needs a constructible `SonarAppStore`, and no iOS test builds one today (`MarmotOptimisticEchoTests` only exercises static functions).
+- **Anything needing a `SonarAppState` / `SonarAppStore` instance.** The three gaps above share one root cause: neither app object can be constructed in a test, so only pure helpers are reachable. This is the single highest-leverage testing investment in the repo — see the injectable-core note in the Signal architecture notes. Until then, prefer removing a hazard (as R-001 does with a mandatory parameter) over testing for it.
 - **iOS tests do not run in CI.** No workflow invokes `xcodebuild test` / `ios/bitchatTests`, so `MarmotOptimisticEchoTests` guards R-001 only for someone running it locally. `scripts/check-regression-ledger.sh` verifies the test *exists*; nothing verifies it still *passes*. Until an iOS test job exists, treat Swift citations as weaker than Kotlin/Rust ones.
 - **Account key durability.** `CLAUDE.md`'s Account Key Durability Rule lists five blocking invariants (never delete-before-add, never regenerate on keychain error, ...) with no regression test cited here.
 - **Duplicate-send.** Nothing pins "one tap produces exactly one canonical row". Worth adding if the duplicate bubble in #290 ever proves to be two real canonical rows rather than an echo — that was investigated and left unproven.
