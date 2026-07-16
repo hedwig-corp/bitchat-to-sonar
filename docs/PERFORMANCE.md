@@ -10,6 +10,17 @@ by phase. Built to investigate "slow to sync / slow to send" by showing *where*
 the startup time actually goes, in line with the Signal-Comparable Performance
 Rule (local-first paint, sync in the background).
 
+This document covers **two benchmark tracks**:
+
+- **Device latency** (most of this doc): how fast a real phone starts, syncs, and
+  sends. Device- and network-bound; timings are the point.
+- **Protocol scale** ([`## Protocol scale benchmark`](#protocol-scale-benchmark-sonar-sim)
+  below → full detail in [`GROUP-SCALE-SIM.md`](GROUP-SCALE-SIM.md)):
+  device-independent structural limits of the MLS/Marmot group protocol — the
+  real group-size ceiling, welcome/commit growth, fork behavior. Run this when
+  you **bump the MDK rev** or change the welcome/commit path, to get before/after
+  numbers on the protocol itself.
+
 ## What it measures
 
 The app emits `SONAR_BENCH` markers to the unified log (`SecureLogger.info`,
@@ -461,3 +472,39 @@ measures **relay-side** Sonar/Marmot DM delivery (not app startup) against
 delivery/loss/latency/errors. It runs daily in CI
 (`.github/workflows/relay-smoke.yml`) and classifies each run as
 `pass` / `relay_issue` / `regression` / `target_fail`. See `docs/RELAY-SMOKE.md`.
+
+## Protocol scale benchmark (`sonar-sim`)
+
+A **different axis** from everything above: not device latency but the structural
+limits of the MLS/Marmot group protocol. `sonar-sim` swarms N in-process
+`MarmotEngine` agents (the exact code the apps ship), grows a group across a size
+ramp, and verifies member-set convergence + message fan-out at each size. No relay
+I/O — a failure here is a protocol failure, not a network flake. Because it
+measures ratchet-tree / NIP-44 structure, the numbers are **machine-independent**:
+run it on any dev box, not on a phone.
+
+**When to run:** on an **MDK rev bump** (the pinned rev is what makes White Noise
+interop work byte-for-byte — see the workspace `Cargo.toml` note) or any change to
+`create_group` / `add_members` / the welcome path. It gives a before/after delta on
+the protocol itself.
+
+```sh
+cargo run -p sonar-sim --release -- group-scale \
+  --ramp 2,5,10,25,50,100,110,120,130 --mode incremental --batch 25 --chaos --out /tmp/scale.json
+```
+
+Headline result (MDK rev `e8cd584`, 2026-07, `--batch 25`): the group-size
+ceiling is **~120 members**, gated by the **welcome, not the relay** —
+`gift_wrap_welcome` fails with `nip44 encryption error: message too long` once the
+welcome plaintext crosses NIP-44's 65535-byte cap (the welcome carries the full
+ratchet tree, ~1 KB/member). Every relay's `max_message_length` (131 KB smallest)
+sits far above the ~77 KB wrapped welcome, so relay size never binds first. The
+ceiling shifts with the add pattern (smaller batches reach ~135). `--chaos` also
+surfaces a concurrent-commit **fork** (two same-epoch adds strand the losing
+invitee on an orphan branch that can no longer decrypt).
+
+**What to assert vs report:** the **structural** outputs are deterministic and make
+good regression gates — ceiling N, `converged` yes/no, fork-heals yes/no, welcome
+bytes. The **wall-clock** build/fan-out timings are machine-bound and are
+**report-only** (do not fail CI on them). Full method, findings, reproduce steps,
+and an agent prompt: [`GROUP-SCALE-SIM.md`](GROUP-SCALE-SIM.md).

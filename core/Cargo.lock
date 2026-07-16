@@ -5349,6 +5349,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "sonar-sim"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "hex",
+ "nostr",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sonar-core",
+ "tokio",
+]
+
+[[package]]
 name = "sonar-status"
 version = "0.1.0"
 dependencies = [

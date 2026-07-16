@@ -55,6 +55,18 @@ method, markers, and baseline numbers. Use it whenever a change touches the
 startup path or conversation open/send/sync, and when investigating "slow to
 sync / slow to send" reports.
 
+Device latency is only one benchmark axis. **Protocol scale** — the MLS/Marmot
+group-size ceiling, welcome/commit growth, and concurrent-commit fork behavior —
+is measured by the device-independent `sonar-sim` harness
+(`cargo run -p sonar-sim --release -- group-scale …`); see
+`docs/GROUP-SCALE-SIM.md` for method, the baseline table, and reproduce steps.
+Run it whenever you **bump the MDK rev** or change the welcome/`create_group`/
+`add_members` path, and diff the ceiling + welcome-size column against the
+committed baseline — a moved ceiling after an MDK bump means the wire format
+changed and can break White Noise interop. Assert only on structural outputs
+(ceiling N, convergence, welcome bytes); wall-clock timings there are
+machine-bound and report-only.
+
 How to run the analysis:
 
 1. Build the dependencies once: `core/build-ios.sh` (Rust core → `sonarffi.xcframework`, incl. the simulator slice), `cargo build -p sonar-cli --release` (headless counterparty), then `APP=$(scripts/bench/build-sim.sh)` (Debug, arm64, unsigned `.app`).
