@@ -16,8 +16,11 @@ on:
       - 'docs/REGRESSIONS.md'
       - 'scripts/check-regression-ledger.sh'
       - '.github/workflows/regression-ledger.yml'
-      - 'apps/sonar/composeApp/src/**Test*/**'
+      - 'apps/sonar/composeApp/src/commonTest/**'
+      - 'apps/sonar/composeApp/src/jvmTest/**'
+      - 'apps/sonar/composeApp/src/androidUnitTest/**'
       - 'ios/bitchatTests/**'
+      - 'core/**/*.rs'
   pull_request:
     branches:
       - main
@@ -25,8 +28,11 @@ on:
       - 'docs/REGRESSIONS.md'
       - 'scripts/check-regression-ledger.sh'
       - '.github/workflows/regression-ledger.yml'
-      - 'apps/sonar/composeApp/src/**Test*/**'
+      - 'apps/sonar/composeApp/src/commonTest/**'
+      - 'apps/sonar/composeApp/src/jvmTest/**'
+      - 'apps/sonar/composeApp/src/androidUnitTest/**'
       - 'ios/bitchatTests/**'
+      - 'core/**/*.rs'
 
 jobs:
   check:
