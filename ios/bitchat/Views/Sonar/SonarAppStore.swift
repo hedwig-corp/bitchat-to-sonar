@@ -1784,6 +1784,10 @@ final class SonarAppStore: ObservableObject {
         refreshedKnownDescriptorsForRelaySession = false
 
         scannedPayMessageIDs = []
+        // Message-id dedup state is account-bound: this store outlives a
+        // restore, so the incoming account's messages must not be treated as
+        // already-notified. Compose fixed the same gap in #288.
+        seenMarmotNotificationMessageIDs = []
         pendingPayPeer = nil
         payLedger.wipe()
         paymentActivityLedger.wipe()
@@ -7156,6 +7160,9 @@ final class SonarAppStore: ObservableObject {
         pendingUploadMediaCache = [:]
         clearMediaDiskCache()
         scannedPayMessageIDs = []
+        // Message-id dedup state is account-bound: this store outlives a wipe,
+        // so a restored account whose ids collide would be silently swallowed.
+        seenMarmotNotificationMessageIDs = []
         pendingPayPeer = nil
         clearCallLogs()
         resetCallState()

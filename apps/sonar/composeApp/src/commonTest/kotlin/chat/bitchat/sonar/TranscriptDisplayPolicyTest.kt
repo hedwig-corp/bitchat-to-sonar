@@ -368,6 +368,7 @@ class TranscriptDisplayPolicyTest {
             echoes = listOf(echo),
             published = emptyList(),
             excludedPublishedIdsByEcho = emptyMap(),
+            freshCanonical = emptyList(),
         )
 
         assertEquals(listOf(echo), plan.visibleEchoes)
@@ -383,6 +384,7 @@ class TranscriptDisplayPolicyTest {
             echoes = listOf(echo),
             published = listOf(canonical),
             excludedPublishedIdsByEcho = emptyMap(),
+            freshCanonical = emptyList(),
         )
 
         assertTrue(plan.visibleEchoes.isEmpty())
@@ -398,6 +400,7 @@ class TranscriptDisplayPolicyTest {
             echoes = listOf(older),
             published = listOf(canonicalForNewerSend),
             excludedPublishedIdsByEcho = mapOf(older.id to setOf(canonicalForNewerSend.id)),
+            freshCanonical = emptyList(),
         )
 
         assertEquals(listOf(older), plan.visibleEchoes)
@@ -413,6 +416,7 @@ class TranscriptDisplayPolicyTest {
             echoes = listOf(echo),
             published = listOf(canonical),
             excludedPublishedIdsByEcho = emptyMap(),
+            freshCanonical = emptyList(),
         )
 
         assertTrue(plan.visibleEchoes.isEmpty())
@@ -428,6 +432,7 @@ class TranscriptDisplayPolicyTest {
             echoes = listOf(echo),
             published = listOf(canonical),
             excludedPublishedIdsByEcho = emptyMap(),
+            freshCanonical = emptyList(),
         )
 
         assertEquals(listOf(echo), plan.visibleEchoes)

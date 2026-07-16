@@ -147,7 +147,10 @@ internal fun planSendEchoDisplay(
     echoes: List<SonarMsg>,
     published: List<SonarMsg>,
     excludedPublishedIdsByEcho: Map<String, Set<String>> = emptyMap(),
-    freshCanonical: List<SonarMsg> = emptyList(),
+    // Deliberately NOT defaulted — see reconcileSendEchoes. `withSendEchoes`
+    // dropping this argument is the exact regression #290 fixed, and no
+    // helper-level test can catch it. Make the compiler catch it instead.
+    freshCanonical: List<SonarMsg>,
 ): SendEchoDisplayPlan {
     val reconciliation = reconcileSendEchoes(
         echoes,

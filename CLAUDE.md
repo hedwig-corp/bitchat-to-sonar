@@ -150,22 +150,26 @@ sites, and the approaches already tried and reverted.
 
 Read it **before** changing conversation, transcript, send/echo, dedup, or
 notification behaviour — and especially before editing the mirror pair
-`apps/sonar/.../SonarAppState.kt` (32 `fix:` commits) and
-`ios/bitchat/Views/Sonar/SonarAppStore.swift` (30), or
-`ios/bitchat/Views/MarmotChatView.swift` and `core/sonar-core/src/client.rs` (21
-each). These four files carry most of this project's repeat regressions. If a
-change there looks like an obvious simplification, check the `Rejected` notes
-first: it has often already been tried.
+`apps/sonar/.../SonarAppState.kt` and `ios/bitchat/Views/Sonar/SonarAppStore.swift`,
+or `ios/bitchat/Views/MarmotChatView.swift` and `core/sonar-core/src/client.rs`.
+These four attract the most fix commits in the repo (the ledger documents the
+command to re-derive the ranking), and the first two are the same conversation
+logic written twice. If a change there looks like an obvious simplification,
+check the `Rejected` notes first: it has often already been tried and reverted.
 
 When fixing a bug that has now happened twice, add an entry. Rules:
 
 1. Every entry names a `Guarded by:` test that **fails without the fix**. No test, no entry — put it under `## Unguarded` instead, which is the backlog.
-2. Every entry carries **both** platform call sites (`ios/` and `apps/sonar/`), or states why one does not apply. A fix landing on one platform and not its mirror is the most common way these bugs return — see the Cross-Platform Feature Rule.
-3. Record what you rejected and why, not just what you shipped.
+2. Prefer a test that pins the **real call site** over one that pins a helper it feeds itself. R-001 regressed through a missing argument at a call site while every helper-level test stayed green.
+3. Every entry carries **both** platform call sites (`ios/` and `apps/sonar/`), or states why one does not apply. A fix landing on one platform and not its mirror is the most common way these bugs return — see the Cross-Platform Feature Rule.
+4. Record what you rejected and why, not just what you shipped.
+5. State what is **not** guarded. An entry that overclaims coverage is worse than an admitted hole.
 
-`scripts/check-regression-ledger.sh` runs in CI and fails if a cited test no
-longer exists. It cannot tell whether a test is still meaningful — that is a
-review question.
+`scripts/check-regression-ledger.sh` runs in CI and fails if a citation does not
+resolve to a real, enabled test (declared in a test source set, annotated, not
+`@Ignore`d). It cannot tell whether a test is meaningful, whether it pins the
+real call site, or whether it runs in CI at all — iOS tests currently do not.
+Those stay review questions.
 
 ## Fix What We Break Rule
 

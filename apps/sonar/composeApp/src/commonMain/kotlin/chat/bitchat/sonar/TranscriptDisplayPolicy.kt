@@ -194,11 +194,21 @@ internal fun eligibleCanonicalRowsForSendEcho(
  * visible when an echo was created: same-second timestamps alone cannot
  * distinguish an earlier identical send from the new one.
  */
+/**
+ * Window-only match. Callers that can see freshly read rows must use
+ * [reconcileSendEchoes] and pass them: an echo whose canonical row sits outside
+ * the render window is unfulfillable here by construction.
+ */
 internal fun fulfilledSendEchoIds(
     echoes: List<SonarMsg>,
     published: List<SonarMsg>,
     excludedPublishedIdsByEcho: Map<String, Set<String>> = emptyMap(),
-): Set<String> = reconcileSendEchoes(echoes, published, excludedPublishedIdsByEcho).fulfilledEchoIds
+): Set<String> = reconcileSendEchoes(
+    echoes = echoes,
+    published = published,
+    excludedPublishedIdsByEcho = excludedPublishedIdsByEcho,
+    freshCanonical = emptyList(),
+).fulfilledEchoIds
 
 /**
  * Outcome of matching pending echoes against canonical rows.
@@ -229,7 +239,10 @@ internal fun reconcileSendEchoes(
     echoes: List<SonarMsg>,
     published: List<SonarMsg>,
     excludedPublishedIdsByEcho: Map<String, Set<String>> = emptyMap(),
-    freshCanonical: List<SonarMsg> = emptyList(),
+    // Deliberately NOT defaulted. A default is what let the Compose port drop
+    // this argument silently while every helper-level test stayed green; the
+    // omission was the bug (#290). Passing emptyList() must be a visible choice.
+    freshCanonical: List<SonarMsg>,
 ): SendEchoReconciliation {
     val windowedIds = published.mapTo(hashSetOf()) { it.id }
     val outOfWindow = freshCanonical.filter {

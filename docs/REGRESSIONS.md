@@ -14,22 +14,45 @@ behaviour. Adding an entry is cheaper than debugging the same bug a third time.
 - **When you fix a recurring bug**: add an entry. The `Guarded by:` test must fail without your fix.
 - **When you fix something on one platform**: fill in the other platform's call site, or say why it does not apply. This is the single most common way these bugs come back.
 
-`scripts/check-regression-ledger.sh` (run in CI) asserts every `Guarded by:` symbol
-still exists in the test sources, so entries cannot rot silently when a test is
-renamed. It does not check that the test is still *meaningful* — that is on review.
+`scripts/check-regression-ledger.sh` (run in CI) asserts every `Guarded by:`
+citation still resolves to a real, enabled test: declared in a test location,
+annotated (`@Test` / `#[test]` / `#[tokio::test]`), not `@Ignore`d, and inside the
+named class's body. Entries therefore cannot rot silently when a test is renamed.
+
+What it cannot check, and what review must:
+
+- whether the test is still **meaningful**;
+- whether it pins the **real call site** rather than a helper the test itself feeds (this is exactly how R-001 came back — see its `Not guarded` note);
+- whether the test actually **runs in CI** (iOS tests currently do not).
+
+Prefer `Not guarded:` / `Partly guarded:` notes over silence. A green checker on
+an overclaiming entry is worse than an admitted hole, because it stops people
+looking.
 
 ## Hotspot files
 
-Ranked by `fix:` commit count on `main`. The top two are the same conversation
-logic written twice; between them they account for ~60 fixes. Changes here have a
-measurably high chance of re-breaking something below.
+The files that attract the most fix commits. The top two are the same
+conversation logic written twice, and a fix landing on one but not its mirror is
+how most entries below came back.
 
-| File | `fix:` commits |
-|---|---|
-| `apps/sonar/composeApp/src/commonMain/kotlin/chat/bitchat/sonar/SonarAppState.kt` | 32 |
-| `ios/bitchat/Views/Sonar/SonarAppStore.swift` | 30 |
-| `ios/bitchat/Views/MarmotChatView.swift` | 21 |
-| `core/sonar-core/src/client.rs` | 21 |
+Re-derive the ranking rather than trusting a number in a doc — absolute counts
+depend on how you match "a fix" and go stale as `main` moves:
+
+```sh
+for f in \
+  apps/sonar/composeApp/src/commonMain/kotlin/chat/bitchat/sonar/SonarAppState.kt \
+  ios/bitchat/Views/Sonar/SonarAppStore.swift \
+  ios/bitchat/Views/MarmotChatView.swift \
+  core/sonar-core/src/client.rs
+do
+  printf '%4d  %s\n' "$(git log origin/main --follow --format='%s' -- "$f" | grep -cE '^fix(\(|!|:)')" "$f"
+done
+```
+
+As of `ac75ef820` that yields **19 / 18 / 12 / 12** — the ordering, not the
+magnitude, is the useful part. (Counting any subject starting with "fix"
+case-insensitively roughly doubles every figure; counting only literal `fix:`
+roughly halves it. The ranking is stable across all three.)
 
 ## Entry format
 
@@ -55,9 +78,11 @@ measurably high chance of re-breaking something below.
 
 **Call sites:** iOS `MarmotChatView.swift::reconciledOptimisticMessages(freshCanonical:)`; Compose `SonarAppState.withSendEchoes` -> `TranscriptDisplayPolicy.reconcileSendEchoes(freshCanonical=)`
 
-**Guarded by:** `TranscriptDisplayPolicyTest.outOfWindowCanonicalRowFulfillsEchoAndIsAdmitted`
+**Guarded by:** `MarmotOptimisticEchoTests.freshDatabaseRowOutsidePinnedWindowFulfillsEcho` (iOS, exercises `reconciledOptimisticMessages(freshCanonical:)`)
 
-**Also guarded by:** `TranscriptDisplayPolicyTest.windowedCanonicalRowIsNotAdmittedTwice`, `TranscriptDisplayPolicyTest.identicalOutOfWindowRowsConsumeEchoesOneForOne`
+**Also guarded by:** `TranscriptDisplayPolicyTest.outOfWindowCanonicalRowFulfillsEchoAndIsAdmitted`, `TranscriptDisplayPolicyTest.windowedCanonicalRowIsNotAdmittedTwice`, `TranscriptDisplayPolicyTest.identicalOutOfWindowRowsConsumeEchoesOneForOne`
+
+**Enforced by the compiler:** `freshCanonical` has **no default** on `reconcileSendEchoes`/`planSendEchoDisplay`. Dropping it at the `withSendEchoes` call site — the exact shape of this regression — is a compile error (`No value passed for parameter 'freshCanonical'`), not a silent behaviour change. That default was what let the Compose port omit the argument while every helper-level test stayed green, so the hazard is removed rather than tested for. Restoring a default would re-open this entry.
 
 **History:** #215 fixed the same-second match -> #273 made cleanup conditional on the heuristic and regressed it -> #290 ported the iOS `freshCanonical` argument.
 
@@ -99,6 +124,8 @@ measurably high chance of re-breaking something below.
 
 **Also guarded by:** `ConversationRegressionSmokeTest.saraMessageCannotRouteIntoVincenzoConversation`, `ConversationRegressionSmokeTest.rotatingVincenzoAliasesCollapseWithoutAbsorbingSara`, `ConversationFoldTest.foldIdentityRequiresMatchingNpub`
 
+**Partly guarded:** the cited tests pin *chat-list* dedup and identity routing. The "one transcript" half is not pinned: if duplicate groups still collapse to one row but transcript loading stopped merging every duplicate group's messages, all of them stay green. See Unguarded.
+
 **History:** #164 deduped direct Marmot chats by peer; re-asserted by the "Fix What We Break Rule" in `CLAUDE.md`.
 
 **Rejected:** *Splitting per transport.* This is the bug, not a feature — see the Fix What We Break Rule.
@@ -119,7 +146,9 @@ measurably high chance of re-breaking something below.
 
 **Also guarded by:** `EventDrivenRefreshTest.oldBackfillDoesNotRenotifyCachedLatest`, `EventDrivenRefreshTest.seedPassAndOpenChatDoNotNotify`, `EventDrivenRefreshTest.incomingBeforeOwnLatestStillNotifies`
 
-**History:** #276 deduped by message id -> #288 cleared the dedup state on account wipe (stale state survived a wipe).
+**Not guarded:** the account-wipe half. The cited tests only exercise `newestUnseenIncoming`; none runs a wipe path. Both platforms now *implement* it — iOS clears `seenMarmotNotificationMessageIDs` in `clearAccountBoundLocalStateForRestore()` and `performWipe()`, next to the analogous `scannedPayMessageIDs = []` — but no test pins either. Pinning the iOS side needs a constructible `SonarAppStore`; no test builds one today. See Unguarded.
+
+**History:** #276 deduped by message id -> #288 cleared the dedup state on account wipe, Compose only -> the iOS half was found missing while writing this ledger (the store outlives a wipe, so a restored account's messages could be silently swallowed) and fixed the same way.
 
 **Rejected:** *Dedup on latest-timestamp only.* Drops a genuine second message in the same second.
 
@@ -133,9 +162,11 @@ measurably high chance of re-breaking something below.
 
 **Call sites:** `core/sonar-core/src/client.rs` (sync watermark / per-group catch-up); consumed by both apps
 
-**Guarded by:** `ConversationRegressionSmokeTest.coldRestartPaintsPersistedOrderThenNewSaraMessageMovesOnlySara`
+**Guarded by:** `client.rs::group_message_catchup_floor_uses_peer_message_not_later_local_send`
 
-**History:** #177 (watermark pinning) -> #252 (forced sync skipped the batched fetch). Stated as a rule in `CLAUDE.md` under the Signal-Comparable Performance Rule.
+**History:** #160 added the per-group floor and its test -> #177 (watermark pinning) -> #252 (forced sync skipped the batched fetch). Stated as a rule in `CLAUDE.md` under the Signal-Comparable Performance Rule.
+
+**Note:** `ConversationRegressionSmokeTest.coldRestartPaintsPersistedOrderThenNewSaraMessageMovesOnlySara` looks related but only checks restored chat ordering; it stays green if the floor regresses. The Rust test above is the real guard.
 
 **Rejected:** *One global latest-timestamp floor.* Exactly the starvation above.
 
@@ -143,9 +174,13 @@ measurably high chance of re-breaking something below.
 
 ## Unguarded
 
-Invariants we believe in but that no test currently pins. Each line is a concrete
-backlog item; promote it to an `R-` entry when a test exists.
+Gaps we know about. Each line is a concrete backlog item; fold it into its `R-`
+entry once a test exists. Listing a gap is the point — an entry that overclaims
+its coverage is worse than an honest hole, because it stops people looking.
 
-- **iOS-side echo reconciliation.** R-001/R-002 are pinned by Compose tests only. `MarmotChatView.reconciledOptimisticMessages` has no Swift unit test, so an iOS-side regression would not be caught. iOS test infrastructure is thinner (`ios/bitchatTests/`); `SonarConversationRegressionSmokeTests.swift` is the natural home.
-- **Account key durability.** `CLAUDE.md`'s Account Key Durability Rule lists five invariants (never delete-before-add, never regenerate on keychain error, etc.). They are blocking correctness rules with no regression test cited here.
-- **Duplicate-send.** Nothing pins "one tap produces exactly one canonical row". Worth adding if the duplicate bubble reported in #290 ever proves to be two real rows rather than an echo — that was investigated and left unproven.
+- **R-003, the one-transcript half.** Cited tests pin chat-list dedup and identity routing, not "duplicate groups' messages merge into a single transcript". The merge lives in `SonarAppState.duplicateDirectMarmotChats` (private, needs an instance); `dedupeDirectMarmotChats` — the pure seam the tests use — only covers the chat-list half. Closing it means extracting the transcript-source selection into a pure function, or an injectable `SonarCore`.
+- **R-004, account wipe, both platforms.** Now implemented on iOS and Compose, but pinned by no test. The Compose path needs an injectable `SonarCore`; the iOS path needs a constructible `SonarAppStore`, and no iOS test builds one today (`MarmotOptimisticEchoTests` only exercises static functions).
+- **Anything needing a `SonarAppState` / `SonarAppStore` instance.** The three gaps above share one root cause: neither app object can be constructed in a test, so only pure helpers are reachable. This is the single highest-leverage testing investment in the repo — see the injectable-core note in the Signal architecture notes. Until then, prefer removing a hazard (as R-001 does with a mandatory parameter) over testing for it.
+- **iOS tests do not run in CI.** No workflow invokes `xcodebuild test` / `ios/bitchatTests`, so `MarmotOptimisticEchoTests` guards R-001 only for someone running it locally. `scripts/check-regression-ledger.sh` verifies the test *exists*; nothing verifies it still *passes*. Until an iOS test job exists, treat Swift citations as weaker than Kotlin/Rust ones.
+- **Account key durability.** `CLAUDE.md`'s Account Key Durability Rule lists five blocking invariants (never delete-before-add, never regenerate on keychain error, ...) with no regression test cited here.
+- **Duplicate-send.** Nothing pins "one tap produces exactly one canonical row". Worth adding if the duplicate bubble in #290 ever proves to be two real canonical rows rather than an echo — that was investigated and left unproven.
