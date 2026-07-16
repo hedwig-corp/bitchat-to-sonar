@@ -741,6 +741,16 @@ struct SNMsgList: View {
     /// marked read on open) must not drift the divider down the transcript.
     @State private var unreadAnchorId: String?
 
+    /// True once the visible rows have caught up with the newest message the
+    /// core index knows across the chat's folded sources. A mesh chat paints
+    /// the BLE window before the White Noise leg merges async, so before this
+    /// is true the feed is missing its newest (and unread) rows.
+    private var feedCaughtUp: Bool {
+        guard let expected = expectedNewestDate else { return true }
+        guard let newest = msgs.compactMap(\.sortDate).max() else { return false }
+        return newest >= expected
+    }
+
     /// The [unreadCountAtOpen]-th non-mine message from the tail — core
     /// unread_count increments only for incoming messages, so own sends
     /// interleave without consuming budget. Re-resolves only when the frozen
@@ -919,7 +929,14 @@ struct SNMsgList: View {
                     // rows to the bottom — the anchor scroll would lose the race.
                     if unreadCountAtOpen > 0, unreadAnchorId == nil { return }
                     guard isNearBottom else { return }
-                    if reduceMotion {
+                    // A mesh chat paints the BLE window before the White Noise
+                    // leg merges async; following that merge with an ANIMATED
+                    // scroll is the visible jump users see on open (a pure
+                    // Marmot chat never does it — its first page already holds
+                    // the newest rows). Re-pin instantly until the rows catch
+                    // up with the newest known message; animate only genuinely
+                    // new post-settle messages.
+                    if reduceMotion || !feedCaughtUp {
                         proxy.scrollTo("sn-bottom", anchor: .bottom)
                     } else {
                         withAnimation { proxy.scrollTo("sn-bottom", anchor: .bottom) }

@@ -3690,9 +3690,25 @@ class SonarAppState(private val scope: CoroutineScope) {
         resolveMarmotGroupId(id)?.let { groupId ->
             scope.launch { runCatching { SonarCore.preferCatchupGroup(groupId) } }
         }
+        // Complete local-first paint (Signal-Comparable Performance Rule): a
+        // mesh chat folds a BLE leg and a White Noise leg. Painting only the
+        // BLE window here would land the transcript on the BLE tail and then
+        // visibly jump when the async White Noise merge appends its (newer)
+        // rows — the exact open-scroll a pure Marmot chat never shows, because
+        // its snapshot is already complete. Seed the White Noise leg from the
+        // same cached conversation snapshot the chat-list preview uses so the
+        // first frame already holds the newest rows; the async refresh below
+        // then replaces it with the full DB read.
+        val wnSnapshot = transcriptGroupIds(id).flatMap { groupId ->
+            chatSnapshotMessagesByChat[groupId].orEmpty().map { it.copy(viaInternet = true) }
+        }
         messages = visibleMessagesForChat(
             id,
-            refreshConversationRows(refreshMeshTranscriptWindow(canonicalPeerId), id, generation),
+            refreshConversationRows(
+                refreshMeshTranscriptWindow(canonicalPeerId) + wnSnapshot,
+                id,
+                generation,
+            ),
         ) // bounded local-first mesh view
         processPayLines(id, messages)
         scope.launch {
@@ -3713,9 +3729,19 @@ class SonarAppState(private val scope: CoroutineScope) {
         val generation = beginTranscriptSession(chat.id)
         if (isMeshChat(chat.id)) {
             val peerId = meshPeerId(chat.id)
+            // Seed the White Noise leg from the cached snapshot so the restored
+            // paint is already complete (see openDm) — otherwise back-revealing
+            // a mesh chat repeats the BLE-tail-then-jump on every navigation.
+            val wnSnapshot = transcriptGroupIds(chat.id).flatMap { groupId ->
+                chatSnapshotMessagesByChat[groupId].orEmpty().map { it.copy(viaInternet = true) }
+            }
             messages = visibleMessagesForChat(
                 chat.id,
-                refreshConversationRows(refreshMeshTranscriptWindow(peerId), chat.id, generation),
+                refreshConversationRows(
+                    refreshMeshTranscriptWindow(peerId) + wnSnapshot,
+                    chat.id,
+                    generation,
+                ),
             )
             scope.launch { refreshOpenDm(peerId) }
             return

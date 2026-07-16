@@ -1107,7 +1107,13 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             }
             didInitialScroll = true
         } else if (isNearBottom && !isPrepending && !unreadAnchorPending()) {
-            listState.anchorTranscriptTail(feed.lastIndex, animate = true)
+            // A mesh open paints the BLE window before the White Noise leg
+            // merges async. Following that merge with an ANIMATED scroll is the
+            // visible jump users see on open — a pure Marmot chat never does it,
+            // because its snapshot already holds the newest rows. Re-pin
+            // instantly (invisibly) until the feed catches up with the newest
+            // known message; animate only genuinely new post-settle messages.
+            listState.anchorTranscriptTail(feed.lastIndex, animate = feedCaughtUp(feed))
         }
     }
 

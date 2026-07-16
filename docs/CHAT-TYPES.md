@@ -103,7 +103,16 @@ Consequence: **for a mesh chat, anything computed against the first published
 feed is computed against a transcript that is missing the White Noise rows —
 which are exactly the unread/newest ones.** The unread divider froze its anchor
 on an old BLE row, and the tail-following logic then chased the async merge to
-the bottom, leaving the divider off-screen.
+the bottom, leaving the divider off-screen. Even a *fully-read* mesh chat
+visibly jumped: it opened anchored at the BLE tail (an old message), then
+snapped down to the true tail when the White Noise leg merged.
+
+The primary fix is to make the mesh first paint **complete**, not partial:
+`openDm` (and `restoreTranscriptSession`) now seed the White Noise leg
+synchronously from the same `chatSnapshotMessagesByChat` snapshot the chat-list
+preview uses — merged with the BLE window — so the first frame already holds the
+newest rows, exactly like a pure Marmot open. The catch-up gate below remains as
+a safety net for a stale/incomplete snapshot.
 
 The guard for this is `latestKnownMessageSecs(chatId)` (Compose) /
 `expectedNewestMessageDate(_:)` (iOS): the newest timestamp the core index
