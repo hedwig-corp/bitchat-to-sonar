@@ -2514,6 +2514,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             // server's offer-scoped webhook can still need a per-launch
             // unregister -> register refresh.
             if (offer != null) Notifier.onPaymentOfferReady(offer)
+            if (offer != null) refreshHandleOfferIfNeeded(offer)
             if (!force && publishedSonarDescriptor && publishedSonarDescriptorBolt12Offer == offer) return
             val published = runCatching {
                 SonarCore.publishSonarDescriptor(callsEnabled = true, bolt12Offer = offer)
@@ -3004,6 +3005,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             runCatching { SonarCore.claimHandle(name, offer) }
                 .onSuccess { address ->
                     coreClaimedHandle = address
+                    if (offer != null) lastClaimedOffer = offer
                     updateBip353(address)
                     refreshMeshIdentity()
                     runCatching { SonarCore.publishProfile(nick) }
@@ -3025,6 +3027,20 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Reset the claim state machine (e.g. when the user edits the input). */
     fun resetHandleClaimState() {
         handleClaimState = HandleClaimState.Idle
+    }
+
+    /** The BOLT12 offer last registered with the handle this session. */
+    private var lastClaimedOffer: String? = null
+
+    /** Upgrade a chat-only claim once a wallet offer exists: a claim made
+     *  before the wallet was ready has no BIP-353 DNS record, so the handle
+     *  looks payable but isn't until re-registered. Re-claims from the same
+     *  key are idempotent; once per offer per session keeps this quiet. */
+    private suspend fun refreshHandleOfferIfNeeded(offer: String) {
+        val claimed = coreClaimedHandle ?: return
+        if (offer == lastClaimedOffer) return
+        runCatching { SonarCore.claimHandle(claimed.substringBefore('@'), offer) }
+            .onSuccess { lastClaimedOffer = offer }
     }
 
     /** Resolve a typed handle (`vincenzo` / `alice@example.com`) to an npub for

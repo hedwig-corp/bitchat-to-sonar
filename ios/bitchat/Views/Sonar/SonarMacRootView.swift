@@ -1846,8 +1846,10 @@ private struct MacCommandPalette: View {
     /// Handle action mirror of the mobile search sheet: string gate only —
     /// resolution happens on activation, never per keystroke.
     private var canStartHandleChatFromQuery: Bool {
+        // No extra length floor: the registrar accepts one-character handles,
+        // so the search gate must match the claim validator.
         !canStartSecureChatFromQuery
-            && trimmedQuery.count >= 2
+            && !trimmedQuery.isEmpty
             && MarmotService.handleLooksValid(trimmedQuery)
     }
 
@@ -1991,6 +1993,12 @@ private struct MacCommandPalette: View {
         handleMissQuery = nil
         Task { @MainActor in
             let npub = await store.resolveHandleForChat(handle)
+            // The user may have edited the query while the lookup was in
+            // flight — a stale result must not open the wrong chat.
+            guard trimmedQuery == handle else {
+                resolvingHandle = false
+                return
+            }
             resolvingHandle = false
             if let npub {
                 store.startSecureChat(npub: npub)
@@ -2186,7 +2194,6 @@ private struct MacProfilePane: View {
     @EnvironmentObject private var store: SonarAppStore
     @State private var editingName = false
     @State private var draftName = ""
-    @State private var bip353Draft = ""
     @State private var walletSheet = false
     @State private var currencySheet = false
     @State private var exportKeySheet = false
@@ -2218,7 +2225,6 @@ private struct MacProfilePane: View {
         .background(SonarTheme.bg.ignoresSafeArea())
         .onAppear {
             draftName = store.nick
-            bip353Draft = store.bip353
         }
         .snSheet(isPresented: $walletSheet, title: "Your wallet") {
             SNWalletSheetContent(onClose: { walletSheet = false })
@@ -2368,29 +2374,8 @@ private struct MacProfilePane: View {
         VStack(spacing: 0) {
             SNSectionLabel("Payments")
             SNSettingsCard {
-                VStack(alignment: .leading, spacing: 9) {
-                    HStack {
-                        Text("Payment address (BIP-353)")
-                            .font(SonarTheme.uiFont(size: 16, weight: .semibold))
-                            .foregroundColor(SonarTheme.text)
-                        Spacer(minLength: 0)
-                        SNIcon(name: .coin, size: 18, weight: 2)
-                            .foregroundColor(SonarTheme.goldDeep)
-                    }
-                    TextField("", text: $bip353Draft, prompt: Text("user@domain").foregroundColor(SonarTheme.text3))
-                        .textFieldStyle(.plain)
-                        .font(SonarTheme.monoFont(size: 13))
-                        .foregroundColor(SonarTheme.text)
-                        .onSubmit { store.setBip353(bip353Draft) }
-                        .onChange(of: bip353Draft) { store.setBip353($0) }
-                        .padding(EdgeInsets(top: 11, leading: 14, bottom: 11, trailing: 14))
-                        .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(SonarTheme.surface2))
-                    Text("Leave this empty if you do not want to announce a payment address to nearby Sonar peers.")
-                        .font(SonarTheme.uiFont(size: 12))
-                        .foregroundColor(SonarTheme.text3)
-                        .lineSpacing(3)
-                }
-                .padding(16)
+                SonarHandleClaimCard(store: store)
+                    .padding(16)
             }
         }
     }
@@ -2466,7 +2451,6 @@ private struct MacSettingsModal: View {
 
     @State private var editingName = false
     @State private var draftName = ""
-    @State private var bip353Draft = ""
     @State private var connSheet = false
     @State private var wipeAsk = false
     @State private var eraseAsk = false
@@ -2511,7 +2495,6 @@ private struct MacSettingsModal: View {
         }
         .onAppear {
             draftName = store.nick
-            bip353Draft = store.bip353
         }
         .snSheet(isPresented: $connSheet, title: "Connection") {
             SNConnectivitySheetContent(onClose: { connSheet = false })
@@ -2780,20 +2763,8 @@ private struct MacSettingsModal: View {
                 }
             }
             SNSettingsCard {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Payment address (BIP-353)")
-                        .font(SonarTheme.uiFont(size: 16, weight: .semibold))
-                        .foregroundColor(SonarTheme.text)
-                    TextField("", text: $bip353Draft, prompt: Text("user@domain").foregroundColor(SonarTheme.text3))
-                        .textFieldStyle(.plain)
-                        .font(SonarTheme.monoFont(size: 13))
-                        .foregroundColor(SonarTheme.text)
-                        .onSubmit { store.setBip353(bip353Draft) }
-                        .onChange(of: bip353Draft) { store.setBip353($0) }
-                        .padding(EdgeInsets(top: 10, leading: 13, bottom: 10, trailing: 13))
-                        .background(RoundedRectangle(cornerRadius: 13, style: .continuous).fill(SonarTheme.surface2))
-                }
-                .padding(14)
+                SonarHandleClaimCard(store: store)
+                    .padding(14)
             }
         }
     }

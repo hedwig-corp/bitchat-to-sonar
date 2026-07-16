@@ -527,8 +527,10 @@ struct SNSearchSheetContent: View {
     /// Show a "start chat by handle" action for plausible handle input (never
     /// npubs). Purely a string gate — resolution happens only on tap.
     private var canStartHandleChat: Bool {
+        // No extra length floor: the registrar accepts one-character handles,
+        // so the search gate must match the claim validator.
         !canStartSecureChat
-            && trimmedQuery.count >= 2
+            && !trimmedQuery.isEmpty
             && MarmotService.handleLooksValid(trimmedQuery)
     }
 
@@ -724,6 +726,12 @@ struct SNSearchSheetContent: View {
         handleMissQuery = nil
         Task { @MainActor in
             let npub = await store.resolveHandleForChat(handle)
+            // The user may have edited the query while the lookup was in
+            // flight — a stale result must not open the wrong chat.
+            guard trimmedQuery == handle else {
+                resolvingHandle = false
+                return
+            }
             resolvingHandle = false
             if let npub {
                 store.startSecureChat(npub: npub)

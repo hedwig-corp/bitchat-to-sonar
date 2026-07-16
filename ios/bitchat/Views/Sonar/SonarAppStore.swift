@@ -2456,6 +2456,7 @@ final class SonarAppStore: ObservableObject {
             do {
                 let address = try await self.marmot.claimHandle(handle: name, offer: offer)
                 self.coreClaimedHandle = address
+                if let offer { self.lastClaimedOffer = offer }
                 self.setBip353(address)
                 self.marmot.publishProfile(name: self.chatViewModel.nickname)
                 self.handleClaimState = .claimed(address)
@@ -2482,6 +2483,22 @@ final class SonarAppStore: ObservableObject {
             return "That name is taken — try another."
         }
         return detail
+    }
+
+    /// The BOLT12 offer last registered with the handle this session.
+    private var lastClaimedOffer: String?
+
+    /// Upgrade a chat-only claim once a wallet offer exists: a claim made
+    /// before the wallet was ready has no BIP-353 DNS record, so the handle
+    /// looks payable but isn't until re-registered. Re-claims from the same
+    /// key are idempotent; once per offer per session keeps this quiet.
+    private func refreshHandleOfferIfNeeded(_ offer: String) async {
+        guard let claimed = coreClaimedHandle, offer != lastClaimedOffer else { return }
+        let name = String(claimed.split(separator: "@").first ?? "")
+        guard !name.isEmpty else { return }
+        if (try? await marmot.claimHandle(handle: name, offer: offer)) != nil {
+            lastClaimedOffer = offer
+        }
     }
 
     /// If lightweight prefs lost the BIP-353 address but the core still holds
@@ -2905,6 +2922,9 @@ final class SonarAppStore: ObservableObject {
                 SonarPushRegistration.shared.ensureBreezWebhook(offer: offer, wallet: bridged.walletService)
             }
             #endif
+            if let offer {
+                await self.refreshHandleOfferIfNeeded(offer)
+            }
             guard self.marmot.npub != nil, self.marmot.relayConnected else { return }
             guard force || !self.publishedCallDescriptor || self.publishedBolt12Offer != offer else { return }
             do {

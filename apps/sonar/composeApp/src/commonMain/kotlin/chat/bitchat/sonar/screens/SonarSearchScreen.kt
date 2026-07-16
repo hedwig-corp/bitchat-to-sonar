@@ -99,7 +99,10 @@ fun SonarSearchScreen(state: SonarAppState) {
     // resolved to an npub via NIP-05. Pure string gate per keystroke; the
     // network lookup happens only when the user taps the action row, so local
     // results always paint immediately.
-    val looksLikeHandle = !looksLikeInvite && !looksLikeNpub && query.length >= 2 &&
+    // No extra length floor: the registrar accepts one-character handles, so
+    // the search gate must match the claim validator or valid handles become
+    // undiscoverable.
+    val looksLikeHandle = !looksLikeInvite && !looksLikeNpub && query.isNotEmpty() &&
         remember(query) { SonarCore.handleLooksValid(query) }
     val handleAddress = if ('@' in ql) ql else "$ql@${state.handleDomain}"
     val scope = rememberCoroutineScope()
@@ -171,6 +174,10 @@ fun SonarSearchScreen(state: SonarAppState) {
                         handleMiss = false
                         scope.launch {
                             val npub = state.resolveHandleForChat(current)
+                            // The user may have edited the query while the
+                            // lookup was in flight — a stale result must not
+                            // open a chat for the previously typed handle.
+                            if (q.trim() != current) return@launch
                             resolvingHandle = false
                             if (npub != null) {
                                 startSecureChatFromSearch(

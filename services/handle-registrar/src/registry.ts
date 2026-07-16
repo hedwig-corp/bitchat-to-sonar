@@ -107,8 +107,10 @@ function json(body: unknown, status = 200): Response {
 
 export class HandleRegistry implements DurableObject {
   private readonly sql: SqlStorage;
+  private readonly state: DurableObjectState;
 
   constructor(state: DurableObjectState, private readonly env: Env) {
+    this.state = state;
     this.sql = state.storage.sql;
     // created_at mirrors the latest accepted event's created_at (the
     // monotonic replay anchor); updated_at is server wall-clock seconds.
@@ -137,7 +139,14 @@ export class HandleRegistry implements DurableObject {
         return this.handleRateLimit(await request.json<{ ip: string }>());
       }
       if (request.method === "POST" && url.pathname === "/register") {
-        return await this.handleRegister(await request.json<DoRegisterRequest>());
+        // Registration performs an external DNS fetch mid-flight, and DO
+        // input gates do NOT block event delivery during outbound fetches —
+        // two same-handle claims could otherwise both pass the FCFS check
+        // and write divergent DNS/registry state. blockConcurrencyWhile
+        // restores strict serialization across the whole claim, including
+        // the DNS write.
+        const body = await request.json<DoRegisterRequest>();
+        return await this.state.blockConcurrencyWhile(() => this.handleRegister(body));
       }
       if (request.method === "GET" && url.pathname.startsWith("/lookup/")) {
         return this.handleLookup(decodeURIComponent(url.pathname.slice("/lookup/".length)));
@@ -176,8 +185,19 @@ export class HandleRegistry implements DurableObject {
         count = row.count;
         prevCount = row.prev_count;
       } else if (age < 2 * RATE_LIMIT_WINDOW_S) {
-        // Rolled into the next window: current becomes previous.
+        // Rolled into the next window: current becomes previous. Anchor the
+        // new window deterministically at the end of the old one (not `now`)
+        // and persist the rollover EVEN WHEN REJECTING — otherwise every
+        // retry in the second minute recomputes full overlap against the
+        // stale row and the 5/60s limit degrades into a 2-minute lockout.
+        windowStart = row.window_start + RATE_LIMIT_WINDOW_S;
         prevCount = row.count;
+        this.sql.exec(
+          "UPDATE rate SET window_start = ?, count = 0, prev_count = ? WHERE ip = ?",
+          windowStart,
+          prevCount,
+          ip,
+        );
       }
     }
     const overlap = 1 - (now - windowStart) / RATE_LIMIT_WINDOW_S;
