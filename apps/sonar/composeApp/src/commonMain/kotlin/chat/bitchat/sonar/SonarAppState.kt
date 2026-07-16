@@ -89,12 +89,60 @@ private const val PENDING_MARMOT_DIRECT_SEND_QUEUE_LIMIT = 100
 private const val PENDING_MARMOT_GROUP_SEND_QUEUE_LIMIT = 100
 internal const val BLE_DISCOVER_NEW_PEOPLE_PREF = "bleDiscoverNewPeople"
 
+/** One malformed/disk-failed mesh item must not permanently terminate the
+ * process-wide realtime receiver. Cancellation still propagates normally. */
+internal suspend fun safeMeshDrain(
+    onFailure: (Throwable) -> Unit,
+    block: suspend () -> Boolean,
+): Boolean = try {
+    block()
+} catch (cancelled: CancellationException) {
+    throw cancelled
+} catch (failure: Throwable) {
+    onFailure(failure)
+    false
+}
+
 internal fun shouldScanForNearbyPayments(
     isNearbyVisible: Boolean,
     isForeground: Boolean,
     isOnboarded: Boolean,
     isDiscoveryRestricted: Boolean,
 ): Boolean = isNearbyVisible && isForeground && isOnboarded && !isDiscoveryRestricted
+
+/** A host-admitted peer ACK is terminal even if the original send crossed TTL
+ * before the UI/storage drain ran. Delivery truth must win over local expiry. */
+internal fun meshDeliveryTerminalState(
+    record: MeshPendingDeliveryRecord,
+    nowSecs: Long,
+    acknowledged: Set<MeshDeliveryAck>,
+): String? = when {
+    MeshDeliveryAck(record.peerId, record.messageId) in acknowledged -> "Delivered"
+    nowSecs - record.timestampSecs > OUTBOX_TTL_SECS -> "Couldn't send"
+    else -> null
+}
+
+internal data class InitialWalletAccountState(
+    val state: WalletState,
+    val showFiat: Boolean,
+    val currency: FiatCurrency,
+    val rate: ExchangeRate?,
+)
+
+/** Keep every wallet singleton/preference read behind the panic-wipe fence. */
+internal inline fun loadInitialWalletAccountState(
+    panicWipePending: Boolean,
+    loadState: () -> WalletState,
+    loadShowFiat: () -> Boolean,
+    loadCurrency: () -> FiatCurrency,
+    loadRate: (FiatCurrency) -> ExchangeRate?,
+): InitialWalletAccountState {
+    if (panicWipePending) {
+        return InitialWalletAccountState(WalletState.NotConfigured, false, FiatCurrency.USD, null)
+    }
+    val currency = loadCurrency()
+    return InitialWalletAccountState(loadState(), loadShowFiat(), currency, loadRate(currency))
+}
 
 internal fun <T> CoroutineScope.launchNearbyPeerRefresh(
     intervalMs: Long = NEARBY_PEER_REFRESH_MS,
@@ -606,17 +654,30 @@ class SonarAccountRestoreException(
 ) : Exception(message, cause)
 
 class SonarAppState(private val scope: CoroutineScope) {
-    private val initialChatSnapshotBlob = SonarCore.loadBlob(CHAT_SNAPSHOT_BLOB_KEY)
+    /** Must be the first account-related read in this constructor. */
+    private val recoveringPanicWipeAtConstruction = PanicWipeIntent.isPending()
+    /**
+     * Keeps every account UI/service entry point closed until a cold-start wipe
+     * has crossed every durable barrier and removed its journal marker.
+     */
+    var panicWipeRecoveryPending by mutableStateOf(recoveringPanicWipeAtConstruction)
+        private set
+    private fun initialAccountBlob(key: String): String = loadInitialAccountState(
+        panicWipePending = recoveringPanicWipeAtConstruction,
+        redacted = "",
+    ) { SonarCore.loadBlob(key) }
+
+    private val initialChatSnapshotBlob = initialAccountBlob(CHAT_SNAPSHOT_BLOB_KEY)
     private val initialChatSnapshot = decodeChatSnapshot(initialChatSnapshotBlob)
     private val initialChatSnapshotLatest = decodeChatSnapshotLatest(initialChatSnapshotBlob)
-    private val initialGroupFoldMap = decodeGroupFoldMap(SonarCore.loadBlob(GROUP_FOLDS_BLOB_KEY))
+    private val initialGroupFoldMap = decodeGroupFoldMap(initialAccountBlob(GROUP_FOLDS_BLOB_KEY))
     private val initialFoldedGroupIds: Set<String> = initialChatSnapshot.first
         .mapTo(hashSetOf()) { it.id }
         .let { activeChatIds -> initialGroupFoldMap.keys.filterTo(hashSetOf()) { it in activeChatIds } }
     // Local-first: the account npub is public and stable — restore it from the
     // last session so chat titles/dedupe can identify "me" BEFORE the core
     // starts (SonarCore.start() re-derives and overwrites it authoritatively).
-    var npub by mutableStateOf(SonarCore.loadBlob(NPUB_BLOB_KEY))
+    var npub by mutableStateOf(initialAccountBlob(NPUB_BLOB_KEY))
         private set
     var started by mutableStateOf(false)
         private set
@@ -664,10 +725,13 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  Normalized on load so legacy key formats can't miss lookups (which would
      *  paint npubs until a relay re-fetch — a local-first violation). */
     var profilesByNpub by mutableStateOf(
-        normalizedProfileCache(decodeProfileCache(SonarCore.loadBlob(PROFILE_CACHE_BLOB_KEY)))
+        normalizedProfileCache(decodeProfileCache(initialAccountBlob(PROFILE_CACHE_BLOB_KEY)))
     )
         private set
-    private var socialStateBacking by mutableStateOf(decodeSonarSocialState(SonarCore.loadBlob(SOCIAL_STATE_BLOB_KEY)))
+    private val initialFavoriteRouteState = decodeFavoriteRouteState(initialAccountBlob(FAVORITE_ROUTE_STATE_BLOB_KEY))
+    private var socialStateBacking by mutableStateOf(
+        initialFavoriteRouteState?.first ?: decodeSonarSocialState(initialAccountBlob(SOCIAL_STATE_BLOB_KEY))
+    )
     /** Bumped on every [socialState] reassignment so memo keys can compare an
      *  Int instead of hashing the four favorite/blocked Sets on every read. */
     private var socialVersion = 0
@@ -692,11 +756,15 @@ class SonarAppState(private val scope: CoroutineScope) {
     private val sonarDescriptorFetchedAt = mutableMapOf<String, Long>()
     private val sonarDescriptorMissedAt = mutableMapOf<String, Long>()
     private var stack by mutableStateOf<List<Screen>>(listOf(Screen.Home))
+    private var channelOpenGeneration = 0L
+    private var geoDmOpenGeneration = 0L
     val screen: Screen get() = stack.last()
 
-    var dark by mutableStateOf(SonarCore.isDark())
+    var dark by mutableStateOf(
+        loadInitialAccountState(recoveringPanicWipeAtConstruction, true, SonarCore::isDark)
+    )
         private set
-    var discoverNewPeople by mutableStateOf(SonarCore.loadBlob("pref.$BLE_DISCOVER_NEW_PEOPLE_PREF").let { it.isEmpty() || it == "1" })
+    var discoverNewPeople by mutableStateOf(initialAccountBlob("pref.$BLE_DISCOVER_NEW_PEOPLE_PREF").let { it.isEmpty() || it == "1" })
         private set
     var batterySaving by mutableStateOf(BatterySaver.enabled())
         private set
@@ -716,25 +784,90 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
     fun toggleDark() { dark = !dark; SonarCore.setDark(dark) }
 
-    fun wipe() {
-        // Fence account-bound BLE callbacks and discard transport inbox/outbox
-        // state synchronously, before the coroutine reaches durable deletion.
+    /** Synchronous privacy boundary: no old account row, transcript, preview,
+     * balance, or transport callback remains renderable while fallible durable
+     * work is merely queued on the coroutine dispatcher. */
+    private fun redactAndFencePanicWipeNow() {
+        panicWipeRecoveryPending = true
+        // Serialized with platform publication: an old-account notification is
+        // either posted before this boundary and cancelled, or observes the
+        // durable panic marker and is refused.
+        Notifier.suspendAndCancelAll()
+        meshAccountGeneration++
         MeshRadio.resetAccountState()
+        endTranscriptSession()
+        relayConnectJob?.cancel(); relayConnectJob = null
+        pollJob?.cancel(); pollJob = null
+        stopMarmotWakeLoop()
+        stack = listOf(Screen.Home)
+        chats = emptyList(); chatSnapshotMessagesByChat = emptyMap(); messages = emptyList(); channelMsgs = emptyList()
+        meshChats.clear(); hydratedMeshTranscriptPeers.clear(); meshChatNames.clear(); meshDmRows = emptyList(); meshBroadcast = emptyList()
+        pendingMeshAckDeletes.clear(); pendingMarmotSends.clear(); pendingDirectMarmotSends.clear(); pendingMarmotGroupSends.clear()
+        pendingMarmotChatNpubs = emptyMap(); pendingMarmotGroups = emptyMap(); groupInvites = emptyList()
+        outbox.clear(); mediaCache.clear(); clearStickerCaches(); clearChatSnapshot()
+        sonarPeerProfiles = emptyMap(); sonarDescriptorsByNpubHex = emptyMap(); profilesByNpub = emptyMap()
+        onboarded = false; nick = ""; npub = ""; started = false
+        localCoreReady = false; homeMessagesHydrated = false
+        walletState = WalletState.NotConfigured; showFiat = false; currency = FiatCurrency.USD; rate = null
+        appLockOn = false; locked = false
+        presenceByGeohash = emptyMap()
+    }
+
+    fun wipe() {
+        val recovering = PanicWipeIntent.isPending()
+        if (connecting && recovering) return
+        if (!beginPanicWipeBeforeRedaction(
+                alreadyPending = recovering,
+                commitIntent = PanicWipeIntent::begin,
+                redact = ::redactAndFencePanicWipeNow,
+            )
+        ) {
+            toast = "Account removal could not be started safely; no account data was changed. Try again."
+            return
+        }
+        connecting = true
+        val messageStoreWipeRevision = nextMeshPersistRevision()
         scope.launch {
+            val messageStoreWipe = MessageStore.wipe(messageStoreWipeRevision)
+            if (!messageStoreWipe.quarantined) {
+                connecting = false
+                toast = "Local storage wipe is incomplete; account removal was not committed."
+                return@launch
+            }
+            if (!messageStoreWipe.cleanupComplete) {
+                // The privacy boundary committed and the epoch already fenced
+                // old work. Stay disconnected and retry tombstone cleanup; never
+                // pretend the old namespace is still the active account.
+                connecting = false
+                toast = "Local storage was quarantined, but cleanup is incomplete. Try account removal again."
+                return@launch
+            }
+            // The encrypted core/identity store is the second durable barrier.
+            // Do not clear visible account state unless it commits: on failure
+            // the app stays disconnected and the user can retry the same wipe,
+            // instead of being shown a false fresh-account/onboarding screen.
+            val coreWipeFailure = runCatching { SonarCore.wipe() }.exceptionOrNull()
+            if (coreWipeFailure != null) {
+                connecting = false
+                toast = "Local storage wipe is incomplete; Sonar remains disconnected. Try again."
+                return@launch
+            }
             endTranscriptSession()
             relayConnectJob?.cancel(); relayConnectJob = null
             relayStartupCompleted = false
             cancelPendingMarmotSetups()
             cancelPendingMarmotGroupSetups()
-            val walletShutdownFailure = runCatching { WalletBridge.shutdown() }.exceptionOrNull()
-            val walletWipeFailure = runCatching { WalletBridge.wipeLocalStorage() }.exceptionOrNull()
+            val walletWipeFailure = runCatching {
+                WalletBridge.shutdown()
+                WalletBridge.wipeLocalStorage()
+            }.exceptionOrNull()
             UnifyRadio.stopScanning()
             UnifyRadio.stopAdvertising()
             unifyOffer = null; unifyPeers = emptyList()
             MeshRadio.setMeshNickname("")
             MeshRadio.setLocalSonarAnnounce(null); sonarPeerProfiles = emptyMap()
             linkByFp.clear(); linkCapsByFp.clear(); groupFoldMap.clear()
-            meshChats.clear(); meshChatNames.clear(); meshDmRows = emptyList(); meshBroadcast = emptyList()
+            meshChats.clear(); hydratedMeshTranscriptPeers.clear(); meshChatNames.clear(); meshDmRows = emptyList(); meshBroadcast = emptyList(); pendingMeshAckDeletes.clear()
             foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
             persistLinks(); persistLinkCaps(); persistGroupFolds()
             updateBleDiscoveryPolicy()
@@ -750,19 +883,18 @@ class SonarAppState(private val scope: CoroutineScope) {
             pendingDirectMarmotSends.clear()
             pendingMarmotGroupSends.clear()
             outbox.clear()
-            MessageStore.wipe()
             // Redact all visible/account-bound host state before the fallible
             // durable wipe. A filesystem error must never leave old chats or
             // sticker bytes painted after credentials have been cleared.
             stack = listOf(Screen.Home)
             chats = emptyList(); chatSnapshotMessagesByChat = emptyMap(); pendingMarmotChatNpubs = emptyMap(); pendingMarmotGroups = emptyMap(); groupInvites = emptyList(); messages = emptyList()
             clearChatSnapshot()
-            cancelAllMediaDownloads(); MediaCache.wipe()
+            cancelAllMediaDownloads(); val mediaWiped = MediaCache.wipe()
             mediaCache.clear(); clearStickerCaches()
-            val coreWipeFailure = runCatching { SonarCore.wipe() }.exceptionOrNull()
             onboarded = false; nick = ""; npub = ""; started = false
             localCoreReady = false; homeMessagesHydrated = false
-            walletState = WalletState.NotConfigured
+            walletState = WalletState.NotConfigured; showFiat = false; currency = FiatCurrency.USD; rate = null
+            appLockOn = false; locked = false
             presenceByGeohash = emptyMap()
             payLedger = SonarPayLedger(); payVersion++
             PaymentActivityStore.wipe() // iOS wipes both payment ledgers together
@@ -771,10 +903,26 @@ class SonarAppState(private val scope: CoroutineScope) {
             resetCallState()
             pollJob?.cancel(); pollJob = null
             stopMarmotWakeLoop()
-            if (coreWipeFailure != null || walletShutdownFailure != null || walletWipeFailure != null) {
-                toast = "Local storage wipe was incomplete; Sonar will retry before reusing caches."
+            if (walletWipeFailure != null || !mediaWiped || !PanicWipeIntent.clear()) {
+                connecting = false
+                toast = "Local storage wipe is incomplete; Sonar remains disconnected. Try again."
+                return@launch
             }
+            // This is the only transition that may reveal onboarding/account
+            // activation after recovery. The durable marker is already absent.
+            panicWipeRecoveryPending = false
+            connecting = false
         }
+    }
+
+    /** Resume a crash-interrupted wipe before revealing onboarding or booting. */
+    fun recoverPendingPanicWipeOnLaunch() {
+        if (!PanicWipeIntent.isPending()) {
+            panicWipeRecoveryPending = false
+            return
+        }
+        panicWipeRecoveryPending = true
+        wipe()
     }
 
     /** Tear down call state on wipe so calling rebinds cleanly after re-onboarding
@@ -792,14 +940,35 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  message history is removed. Use this to start fresh (e.g. drop a broken
      *  Marmot group) without re-running onboarding. Mirrors iOS `eraseAllChats`. */
     fun eraseAllChats() {
+        meshAccountGeneration++
+        val messageStoreWipeRevision = nextMeshPersistRevision()
+        MeshRadio.resetAccountState()
         scope.launch {
             endTranscriptSession()
             cancelPendingMarmotSetups()
             cancelPendingMarmotGroupSetups()
             // Local transcripts on disk (mesh DMs, channels, geo DMs).
-            MessageStore.wipe()
+            val messageStoreWipe = MessageStore.wipe(messageStoreWipeRevision)
+            if (!messageStoreWipe.quarantined) {
+                // Fail closed: do not clear the core or reuse old files under a
+                // freshly reset transport generation. Rehydrate retry state and
+                // resume only when rollback proved the old namespace durable.
+                if (!messageStoreWipe.oldNamespaceDetached && !messageStoreWipe.rollbackAmbiguous) {
+                    MeshRadio.restorePendingDeliveries(MessageStore.loadMeshPending())
+                    refreshMeshIdentity()
+                    updateBleDiscoveryPolicy()
+                }
+                toast = "Chats could not be erased because local storage is unavailable."
+                return@launch
+            }
+            if (!messageStoreWipe.cleanupComplete) {
+                // Quarantine already committed. Continue clearing the active
+                // account view instead of resurrecting data from the old epoch;
+                // a later erase/wipe retries tombstone cleanup.
+                toast = "Chats were quarantined, but cleanup is incomplete. Try erase again."
+            }
             // In-memory conversation state.
-            meshChats.clear(); meshChatNames.clear(); pendingMarmotSends.clear(); pendingDirectMarmotSends.clear(); pendingMarmotGroupSends.clear(); outbox.clear()
+            meshChats.clear(); hydratedMeshTranscriptPeers.clear(); meshChatNames.clear(); pendingMeshAckDeletes.clear(); pendingMarmotSends.clear(); pendingDirectMarmotSends.clear(); pendingMarmotGroupSends.clear(); outbox.clear()
             persistMeshNames() // clear the on-disk name cache too, else boot resurrects erased names
             pendingMarmotChatNpubs = emptyMap()
             pendingMarmotGroups = emptyMap()
@@ -824,6 +993,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             // White Noise / Marmot DB: wipe + reconnect with the SAME identity.
             runCatching { SonarCore.eraseChats() }
             relayStartupCompleted = false
+            refreshMeshIdentity()
+            updateBleDiscoveryPolicy()
             localCoreReady = true
             homeMessagesHydrated = true
             // The node is recreated → re-bind the iroh call endpoint on next use.
@@ -979,6 +1150,7 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  invalidation, don't busy-poll). */
     private val housekeepingTrigger = Channel<Unit>(Channel.CONFLATED)
     private val refreshMutex = Mutex()
+    private val directDmDrainMutex = Mutex()
     /** Match Apple's sendChain: preserve composer order across text, sticker,
      * control, receipt, and queued Marmot sends without serializing downloads. */
     private val marmotSendMutex = Mutex()
@@ -1315,6 +1487,23 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  don't live in the Rust core (that's Marmot/Nostr) — they ride the Noise
      *  link, so the app holds them. Chat id on the nav stack is "mesh:<peerId>". */
     private var meshChats = mutableMapOf<String, List<SonarMsg>>()
+    /** Summary rows are not transcripts. A key enters this set only after its
+     * bounded per-peer file was read (including a proven empty/missing file). */
+    private val hydratedMeshTranscriptPeers = mutableSetOf<String>()
+    /** Assigned before launching any disk operation. Platform stores reject an
+     * older revision that arrives after a newer save/delete, so detached file IO
+     * cannot resurrect a stale transcript. State mutations are owned by this
+     * app-state scope, which is confined to the UI dispatcher. */
+    private var meshPersistRevision = 0L
+    private fun nextMeshPersistRevision(): Long = ++meshPersistRevision
+    private val meshConversationGeneration = mutableMapOf<String, Long>()
+    /** Fences every async plaintext admission across erase/logout/identity swap. */
+    private var meshAccountGeneration = 0L
+    private fun meshGeneration(peerId: String): Long = meshConversationGeneration[peerId] ?: 0L
+    /** ACK file deletes are retried in-process; a crash before success is also
+     * safe because boot restores the still-present stable-id delivery. */
+    private val pendingMeshAckDeletes = mutableSetOf<MeshDeliveryAck>()
+    private var nextMeshPendingExpiryCheckMs = 0L
     // Observability for the White Noise (Marmot) fallback (logged in poll()).
     private var lastWnGroups = -1
     private var lastWnMsgs = -1
@@ -1368,7 +1557,11 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
     /** Public BLE "Mesh" channel transcript (broadcast messages, not Nostr). */
     private var meshBroadcast = listOf<SonarChannelMsg>()
-    var channels by mutableStateOf(SonarCore.joinedChannels())
+    var channels by mutableStateOf(
+        loadInitialAccountState(recoveringPanicWipeAtConstruction, emptyList()) {
+            SonarCore.joinedChannels()
+        }
+    )
         private set
     var channelMsgs by mutableStateOf<List<SonarChannelMsg>>(emptyList())
         private set
@@ -1618,6 +1811,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private fun persistSocialState() {
         SonarCore.saveBlob(SOCIAL_STATE_BLOB_KEY, encodeSonarSocialState(socialState))
+        SonarCore.saveBlob(FAVORITE_ROUTE_STATE_BLOB_KEY, encodeFavoriteRouteState(socialState, linkByFp))
     }
 
     fun isFavorite(peerId: String): Boolean =
@@ -1676,7 +1870,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 append(it)
             }
         }
-        MeshRadio.sendMeshDm(liveMeshRoutePeerId(peerId) ?: peerId, randomMeshId(), payload)
+        scope.launch { sendMeshControl(liveMeshRoutePeerId(peerId) ?: peerId, payload) }
         val raw = npubRawFor(peerId) ?: return
         scope.launch {
             runCatching {
@@ -1691,6 +1885,28 @@ class SonarAppState(private val scope: CoroutineScope) {
                 sonarLog("SonarDirect", "favorite notify failed peer=${peerId.take(10)} err=${it.message}")
             }
         }
+    }
+
+    private suspend fun sendMeshControl(peerId: String, text: String): Boolean {
+        val accountGeneration = meshAccountGeneration
+        val conversationGeneration = meshGeneration(peerId)
+        val storageEpoch = MessageStore.storageEpoch()
+        val record = MeshPendingDeliveryRecord(
+            peerId = peerId,
+            messageId = randomMeshId(),
+            text = text,
+            timestampSecs = MeshRadio.nowSecs(),
+            surfaceInTranscript = false,
+        )
+        val admitted = MessageStore.saveMeshPending(record, storageEpoch) ?: return false
+        if (accountGeneration != meshAccountGeneration || conversationGeneration != meshGeneration(peerId)) {
+            MessageStore.deleteMeshPending(record.peerId, record.messageId, storageEpoch)
+            return false
+        }
+        if (!MeshRadio.sendMeshDm(admitted.peerId, admitted.messageId, admitted.text)) {
+            MeshRadio.restorePendingDeliveries(listOf(admitted))
+        }
+        return true
     }
 
     fun toggleFavoriteContact(chatId: String, name: String) {
@@ -2049,6 +2265,34 @@ class SonarAppState(private val scope: CoroutineScope) {
             .distinctBy { it.id }
             .sortedBy { it.tsSecs }
 
+    /** Merge a disk snapshot without overwriting messages/state received since
+     * the read began. The platform store caps each source transcript at 500. */
+    private fun mergeHydratedMeshTranscript(peerId: String, persisted: List<SonarMsg>) {
+        if (persisted.isEmpty()) return
+        val merged = LinkedHashMap<String, SonarMsg>()
+        persisted.forEach { merged[it.id] = it }
+        meshChats[peerId].orEmpty().forEach { merged[it.id] = it }
+        meshChats[peerId] = merged.values
+            .sortedWith(compareBy<SonarMsg>({ it.tsSecs }, { it.id }))
+            .takeLast(chat.bitchat.sonar.store.MESSAGE_STORE_CAP)
+    }
+
+    private suspend fun hydrateMeshTranscriptFromDisk(
+        peerId: String,
+        expectedAccountGeneration: Long,
+        expectedStorageEpoch: Long,
+    ) {
+        val aliases = meshPeerAliases(canonicalMeshPeerId(peerId))
+        val missing = aliases.filter { it !in hydratedMeshTranscriptPeers }
+        if (missing.isEmpty()) return
+        val loaded = missing.associateWith { alias -> MessageStore.loadMeshDm(alias) }
+        if (expectedAccountGeneration != meshAccountGeneration ||
+            expectedStorageEpoch != MessageStore.storageEpoch()
+        ) return
+        loaded.forEach(::mergeHydratedMeshTranscript)
+        hydratedMeshTranscriptPeers += missing
+    }
+
     private fun liveMeshRoutePeerId(peerId: String): String? =
         meshPeerAliases(peerId).firstOrNull { MeshRadio.hasMeshLink(it) }
 
@@ -2056,9 +2300,14 @@ class SonarAppState(private val scope: CoroutineScope) {
         npubRawFor(peerId)?.let { Bech32.encode("npub", it) }
 
     private fun loadLinks() {
-        SonarCore.loadBlob("sonar.links").lineSequence().forEach { line ->
-            val i = line.indexOf('=')
-            if (i > 0) linkByFp[line.substring(0, i)] = line.substring(i + 1).trim()
+        val combined = decodeFavoriteRouteState(SonarCore.loadBlob(FAVORITE_ROUTE_STATE_BLOB_KEY))
+        if (combined != null) {
+            linkByFp.putAll(combined.second)
+        } else {
+            SonarCore.loadBlob("sonar.links").lineSequence().forEach { line ->
+                val i = line.indexOf('=')
+                if (i > 0) linkByFp[line.substring(0, i)] = line.substring(i + 1).trim()
+            }
         }
         SonarCore.loadBlob("sonar.linkCaps").lineSequence().forEach { line ->
             val i = line.indexOf('=')
@@ -2070,6 +2319,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private fun persistLinks() {
         SonarCore.saveBlob("sonar.links", linkByFp.entries.joinToString("\n") { "${it.key}=${it.value}" })
+        SonarCore.saveBlob(FAVORITE_ROUTE_STATE_BLOB_KEY, encodeFavoriteRouteState(socialState, linkByFp))
     }
 
     private fun persistLinkCaps() {
@@ -2119,14 +2369,22 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     // ── Lightning wallet ──
-    val walletAvailable: Boolean = WalletBridge.isAvailable()
-    var walletState by mutableStateOf<WalletState>(WalletBridge.state())
+    private val initialWalletAccountState = loadInitialWalletAccountState(
+        panicWipePending = recoveringPanicWipeAtConstruction,
+        loadState = WalletBridge::state,
+        loadShowFiat = WalletBridge::showFiat,
+        loadCurrency = WalletBridge::currency,
+        loadRate = WalletBridge::cachedRate,
+    )
+    val walletAvailable: Boolean
+        get() = !panicWipeRecoveryPending && WalletBridge.isAvailable()
+    var walletState by mutableStateOf<WalletState>(initialWalletAccountState.state)
         private set
-    var showFiat by mutableStateOf(WalletBridge.showFiat())
+    var showFiat by mutableStateOf(initialWalletAccountState.showFiat)
         private set
-    var currency by mutableStateOf(WalletBridge.currency())
+    var currency by mutableStateOf(initialWalletAccountState.currency)
         private set
-    private var rate: ExchangeRate? = WalletBridge.cachedRate(currency)
+    private var rate: ExchangeRate? = initialWalletAccountState.rate
     private var publishedSonarDescriptor = false
     private var publishedSonarDescriptorBolt12Offer: String? = null
     private var publishingSonarDescriptor = false
@@ -2238,7 +2496,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     // ── ⚡PAY ledger (direct BOLT12 receipts, 1:1 with iOS) ──
-    private var payLedger = SonarPayLedger(SonarCore.loadBlob("pay.ledger"))
+    private var payLedger = SonarPayLedger(initialAccountBlob("pay.ledger"))
     /** Bumped whenever the ledger changes, so pay bubbles recompose. */
     var payVersion by mutableStateOf(0)
         private set
@@ -2420,6 +2678,12 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /** Start the BLE mesh radio (call once permissions are granted). */
     fun startMesh() {
+        if (!canStartAccountServices(
+                panicWipePending = panicWipeRecoveryPending || PanicWipeIntent.isPending(),
+                onboarded = onboarded,
+                accountStarted = started,
+            )
+        ) return
         refreshMeshIdentity()
         refreshBatterySaving()
         updateBleDiscoveryPolicy()
@@ -2549,8 +2813,13 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  so a stale refresh for a channel the user already left can't overwrite the
      *  visible list (that made different channels look "mixed"). */
     private fun isOpenChannel(geohash: String) = (screen as? Screen.Channel)?.geohash == geohash
+    private fun isOpenGeoDm(geohash: String, peerHex: String): Boolean =
+        (screen as? Screen.GeoDm)?.let { it.geohash == geohash && it.peerHex == peerHex } == true
 
     fun openChannel(geohash: String) {
+        val openGeneration = ++channelOpenGeneration
+        val accountGeneration = meshAccountGeneration
+        val storageEpoch = MessageStore.storageEpoch()
         push(Screen.Channel(geohash))
         channelMsgs = emptyList()
         // The "mesh" channel is the BLE Bluetooth mesh — NO geohash, NEVER Nostr
@@ -2559,8 +2828,11 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (geohash == "mesh") { channelMsgs = visibleChannelMessages(meshBroadcast); return }
         scope.launch {
             val disk = MessageStore.loadChannel(geohash) // disk hydrate (off-main), survives restart
-            if (isOpenChannel(geohash)) channelMsgs = visibleChannelMessages(disk)
-            refreshChannel(geohash)
+            if (accountGeneration != meshAccountGeneration || storageEpoch != MessageStore.storageEpoch()) return@launch
+            if (openGeneration == channelOpenGeneration && isOpenChannel(geohash)) {
+                channelMsgs = visibleChannelMessages(disk)
+            }
+            refreshChannel(geohash, openGeneration)
             // Announce our presence right away and pull the current count so the
             // header shows "N here now" without waiting for the next poll tick.
             beatPresence(geohash)
@@ -2569,13 +2841,22 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     /** Fetch the channel from the core, merge with what's on disk, persist. */
-    private suspend fun refreshChannel(geohash: String) {
+    private suspend fun refreshChannel(
+        geohash: String,
+        openGeneration: Long = channelOpenGeneration,
+    ) {
         if (geohash == "mesh") return // BLE mesh — not a Nostr channel
+        val accountGeneration = meshAccountGeneration
+        val storageEpoch = MessageStore.storageEpoch()
         val fresh = SonarCore.channelMessages(geohash)
+        if (accountGeneration != meshAccountGeneration || storageEpoch != MessageStore.storageEpoch()) return
         val merged = MessageMerge.channels(MessageStore.loadChannel(geohash), fresh)
-        MessageStore.saveChannel(geohash, merged)
+        if (accountGeneration != meshAccountGeneration || storageEpoch != MessageStore.storageEpoch()) return
+        MessageStore.saveChannel(geohash, merged, storageEpoch)
         // Only touch the visible list if THIS channel is still open.
-        if (isOpenChannel(geohash)) channelMsgs = visibleChannelMessages(merged)
+        if (accountGeneration == meshAccountGeneration && storageEpoch == MessageStore.storageEpoch() &&
+            openGeneration == channelOpenGeneration && isOpenChannel(geohash)
+        ) channelMsgs = visibleChannelMessages(merged)
     }
 
     fun sendChannelMsg(geohash: String, text: String) {
@@ -2603,19 +2884,36 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun openGeoDm(geohash: String, peerHex: String, name: String) {
         if (peerHex.isBlank()) return
+        val openGeneration = ++geoDmOpenGeneration
+        val accountGeneration = meshAccountGeneration
+        val storageEpoch = MessageStore.storageEpoch()
         push(Screen.GeoDm(geohash, peerHex, name))
         messages = emptyList()
         scope.launch {
-            messages = visibleGeoDmMessages(peerHex, MessageStore.loadGeoDm(geohash, peerHex)) // disk hydrate (off-main)
-            refreshGeoDm(geohash, peerHex)
+            val disk = MessageStore.loadGeoDm(geohash, peerHex)
+            if (accountGeneration != meshAccountGeneration || storageEpoch != MessageStore.storageEpoch()) return@launch
+            if (openGeneration == geoDmOpenGeneration && isOpenGeoDm(geohash, peerHex)) {
+                messages = visibleGeoDmMessages(peerHex, disk)
+            }
+            refreshGeoDm(geohash, peerHex, openGeneration)
         }
     }
 
-    private suspend fun refreshGeoDm(geohash: String, peerHex: String) {
+    private suspend fun refreshGeoDm(
+        geohash: String,
+        peerHex: String,
+        openGeneration: Long = geoDmOpenGeneration,
+    ) {
+        val accountGeneration = meshAccountGeneration
+        val storageEpoch = MessageStore.storageEpoch()
         val fresh = SonarCore.geoDmMessages(geohash, peerHex)
+        if (accountGeneration != meshAccountGeneration || storageEpoch != MessageStore.storageEpoch()) return
         val merged = MessageMerge.dms(MessageStore.loadGeoDm(geohash, peerHex), fresh)
-        MessageStore.saveGeoDm(geohash, peerHex, merged)
-        messages = visibleGeoDmMessages(peerHex, merged)
+        if (accountGeneration != meshAccountGeneration || storageEpoch != MessageStore.storageEpoch()) return
+        MessageStore.saveGeoDm(geohash, peerHex, merged, storageEpoch)
+        if (accountGeneration == meshAccountGeneration && storageEpoch == MessageStore.storageEpoch() &&
+            openGeneration == geoDmOpenGeneration && isOpenGeoDm(geohash, peerHex)
+        ) messages = visibleGeoDmMessages(peerHex, merged)
     }
 
     fun sendGeoDmMsg(geohash: String, peerHex: String, text: String) {
@@ -2636,22 +2934,25 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private fun initialOnboardingComplete(): Boolean {
-        val stored = SonarCore.onboardingComplete()
-        if (stored) return true
-        if (!SonarCore.hasIdentity()) return false
-        SonarCore.setOnboardingComplete(true)
-        return true
+        return recoverInitialOnboardingState(
+            panicWipePending = recoveringPanicWipeAtConstruction,
+            readStored = SonarCore::onboardingComplete,
+            hasIdentity = SonarCore::hasIdentity,
+            persistRecovered = { SonarCore.setOnboardingComplete(true) },
+        )
     }
 
     var onboarded by mutableStateOf(initialOnboardingComplete())
         private set
-    var nick by mutableStateOf(SonarCore.nickname())
+    var nick by mutableStateOf(
+        loadInitialAccountState(recoveringPanicWipeAtConstruction, "", SonarCore::nickname)
+    )
         private set
 
     fun fingerprint(): String = SonarCore.fingerprint()
 
     // ── Sonar Discovery profile (BIP-353 payment address) ──
-    var bip353 by mutableStateOf(SonarCore.loadBlob("bip353"))
+    var bip353 by mutableStateOf(initialAccountBlob("bip353"))
         private set
 
     fun updateBip353(value: String) {
@@ -2730,6 +3031,10 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     fun completeOnboarding(nickname: String) {
+        if (panicWipeRecoveryPending || PanicWipeIntent.isPending()) {
+            recoverPendingPanicWipeOnLaunch()
+            return
+        }
         scope.launch {
             val result = runCatching {
                 SonarCore.setNickname(nickname)
@@ -2749,6 +3054,11 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun exportNsec(): String = SonarCore.identityNsec()
 
     fun restoreAccount(nsec: String, onResult: (Result<Unit>) -> Unit) {
+        if (panicWipeRecoveryPending || PanicWipeIntent.isPending()) {
+            recoverPendingPanicWipeOnLaunch()
+            onResult(Result.failure(IllegalStateException("Account wipe recovery is still in progress")))
+            return
+        }
         scope.launch {
             val result = runCatching {
                 val key = nsec.trim()
@@ -2759,6 +3069,27 @@ class SonarAppState(private val scope: CoroutineScope) {
                         "That key couldn't be imported. Check you pasted the full nsec1... key.",
                         error,
                     )
+                }
+                meshAccountGeneration++
+                val messageStoreWipeRevision = nextMeshPersistRevision()
+                MeshRadio.resetAccountState()
+
+                // Never install a new identity while bytes owned by the old
+                // account remain addressable. A failed wipe leaves the existing
+                // account intact and eligible for a later retry.
+                val messageStoreWipe = MessageStore.wipe(messageStoreWipeRevision)
+                if (!messageStoreWipe.quarantined) {
+                    if (!messageStoreWipe.oldNamespaceDetached && !messageStoreWipe.rollbackAmbiguous) {
+                        MeshRadio.restorePendingDeliveries(MessageStore.loadMeshPending())
+                        refreshMeshIdentity()
+                        updateBleDiscoveryPolicy()
+                    }
+                    error("Previous-account local transcripts could not be erased")
+                }
+                if (!messageStoreWipe.cleanupComplete) {
+                    // The old namespace is gone and its epoch is fenced, so it
+                    // must not be restored. Defer identity import until cleanup.
+                    error("Previous-account transcripts were quarantined but cleanup is incomplete")
                 }
 
                 // Unregister the old offer while its node is still available, but
@@ -2791,8 +3122,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 cancelPendingMarmotSetups()
                 cancelPendingMarmotGroupSetups()
 
-                MessageStore.wipe()
-                meshChats.clear(); meshChatNames.clear(); pendingMarmotSends.clear(); pendingDirectMarmotSends.clear(); pendingMarmotGroupSends.clear(); outbox.clear()
+                meshChats.clear(); hydratedMeshTranscriptPeers.clear(); meshChatNames.clear(); pendingMeshAckDeletes.clear(); pendingMarmotSends.clear(); pendingDirectMarmotSends.clear(); pendingMarmotGroupSends.clear(); outbox.clear()
                 persistMeshNames()
                 pendingMarmotChatNpubs = emptyMap()
                 pendingMarmotGroups = emptyMap()
@@ -2869,6 +3199,10 @@ class SonarAppState(private val scope: CoroutineScope) {
                 if (needsExplicitBoot) boot()
                 toast = "Account restored"
             }
+            if (result.isFailure && onboarded) {
+                refreshMeshIdentity()
+                updateBleDiscoveryPolicy()
+            }
             onResult(result.map { Unit })
         }
     }
@@ -2893,10 +3227,15 @@ class SonarAppState(private val scope: CoroutineScope) {
     private val notificationLatestSecs = HashMap<String, Long>()
 
     // ── App lock ──
-    val appLockAvailable: Boolean = AppLock.isAvailable()
-    var appLockOn by mutableStateOf(AppLock.isEnabled())
+    val appLockAvailable: Boolean
+        get() = !panicWipeRecoveryPending && AppLock.isAvailable()
+    var appLockOn by mutableStateOf(
+        loadInitialAccountState(recoveringPanicWipeAtConstruction, false, AppLock::isEnabled)
+    )
         private set
-    var locked by mutableStateOf(AppLock.isEnabled())
+    var locked by mutableStateOf(
+        loadInitialAccountState(recoveringPanicWipeAtConstruction, false, AppLock::isEnabled)
+    )
         private set
 
     fun setAppLock(value: Boolean) {
@@ -3090,7 +3429,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         updateNearbyScanning()
         if (cameToForeground) {
             if (bypassRelock) bypassRelock = false        // return from our own unlock prompt
-            else if (AppLock.isEnabled()) locked = true   // genuine app-switch → re-lock
+            else if (!panicWipeRecoveryPending && AppLock.isEnabled()) locked = true // genuine app-switch → re-lock
             if (started) {
                 startRelayConnection()
                 if (SonarCore.isRelayConnected()) refreshKnownContactDescriptors(clearMisses = false)
@@ -3364,25 +3703,113 @@ class SonarAppState(private val scope: CoroutineScope) {
         requestHousekeeping()
     }
 
+    /** Rebuild any echo whose durable outbox record reached disk just before a
+     * process crash, then rehydrate the logical transport FIFO. No network or
+     * BLE work is needed for this local-first recovery step. */
+    private suspend fun restoreDurableMeshDeliveries(): List<MeshPendingDeliveryRecord> {
+        val accountGeneration = meshAccountGeneration
+        val storageEpoch = MessageStore.storageEpoch()
+        // A lifecycle restart can retain an already-admitted host ACK. Reconcile
+        // it before applying TTL so peer-confirmed delivery always wins.
+        drainMeshDeliveryAcks()
+        expireDurableMeshDeliveries(accountGeneration, storageEpoch)
+        val records = MessageStore.loadMeshPending().filter {
+            MeshRadio.nowSecs() - it.timestampSecs <= OUTBOX_TTL_SECS
+        }
+        if (records.isEmpty() || accountGeneration != meshAccountGeneration || storageEpoch != MessageStore.storageEpoch()) {
+            return emptyList()
+        }
+        records.asSequence().map { it.peerId }.distinct().forEach { peerId ->
+            hydrateMeshTranscriptFromDisk(peerId, accountGeneration, storageEpoch)
+        }
+        if (accountGeneration != meshAccountGeneration || storageEpoch != MessageStore.storageEpoch()) {
+            return emptyList()
+        }
+        val restorable = ArrayList<MeshPendingDeliveryRecord>(records.size)
+        restorable += records.filterNot { it.surfaceInTranscript }
+        records.filter { it.surfaceInTranscript }
+            .groupBy { it.peerId }
+            .forEach { (peerId, peerRecords) ->
+                val existing = meshChats[peerId].orEmpty()
+                val existingIds = existing.mapTo(hashSetOf()) { it.id }
+                val missing = peerRecords
+                    .sortedWith(compareBy<MeshPendingDeliveryRecord> { it.sequence }.thenBy { it.messageId })
+                    .filter { it.messageId !in existingIds }
+                    .map { record ->
+                        val stickerRef = meshParseStickerContent(record.text)?.let {
+                            SonarStickerRef(it.packCoordinate, it.shortcode, it.plaintextSha256)
+                        }
+                        SonarMsg(
+                            id = record.messageId,
+                            senderNpub = npub,
+                            content = if (stickerRef != null) "" else record.text,
+                            mine = true,
+                            tsSecs = record.timestampSecs,
+                            state = "Sending",
+                            stickerRef = stickerRef,
+                        )
+                    }
+                if (missing.isEmpty()) {
+                    restorable += peerRecords
+                    return@forEach
+                }
+                // Kotlin's sortedBy is stable: same-second recovered rows keep
+                // the durable per-peer sequence order from [missing].
+                val recoveredTranscript = (existing + missing)
+                    .distinctBy { it.id }
+                    .sortedBy { it.tsSecs }
+                meshChats[peerId] = recoveredTranscript
+                if (MessageStore.saveMeshDm(peerId, recoveredTranscript, nextMeshPersistRevision(), storageEpoch) &&
+                    accountGeneration == meshAccountGeneration
+                ) {
+                    restorable += peerRecords
+                } else {
+                    meshChats[peerId] = existing
+                }
+            }
+        return restorable.sortedWith(compareBy<MeshPendingDeliveryRecord> { it.peerId }.thenBy { it.sequence })
+    }
+
     fun boot() {
         if (started || connecting) return
+        if (PanicWipeIntent.isPending()) {
+            panicWipeRecoveryPending = true
+            wipe()
+            return
+        }
         connecting = true
         relayStartupCompleted = false
         homeMessagesHydrated = false
         localCoreReady = false
         Notifier.ensureChannel()
         scope.launch {
+            val bootAccountGeneration = meshAccountGeneration
+            val bootStorageEpoch = MessageStore.storageEpoch()
+            fun bootIsCurrent(): Boolean =
+                bootAccountGeneration == meshAccountGeneration && bootStorageEpoch == MessageStore.storageEpoch()
             // ── LOCAL-FIRST PAINT (Signal/iOS parity): hydrate disk state and
             // open the encrypted database without any relay dependency.
-            meshChats.putAll(MessageStore.loadAllMeshDms())
+            // Fixed-size metadata page only. Full transcript enumeration is a
+            // background migration/repair and can never hold the launch surface.
+            val localMeshSummaries = MessageStore.loadMeshDmSummaries()
+            if (!bootIsCurrent()) {
+                connecting = false
+                return@launch
+            }
+            localMeshSummaries.forEach { summary ->
+                meshChats[summary.peerKey] = listOf(summary.latest)
+            }
             loadLinks()
             loadMeshNames()
             seedVerifiedChatIds()
             try {
-                npub = SonarCore.start()
+                val startedNpub = SonarCore.start()
+                if (!bootIsCurrent()) return@launch
+                npub = startedNpub
                 SonarCore.saveBlob(NPUB_BLOB_KEY, npub)
                 localCoreReady = true
                 refreshChats()
+                if (!bootIsCurrent()) return@launch
                 recomputeConversations()
                 homeMessagesHydrated = true
 
@@ -3391,6 +3818,36 @@ class SonarAppState(private val scope: CoroutineScope) {
                 started = true
                 refreshMeshIdentity()
                 updateBleDiscoveryPolicy()
+                // Repair legacy installs that predate the summary index and
+                // hydrate non-visible transcripts only after first paint.
+                launch {
+                    MessageStore.repairMeshDmSummaries()
+                    if (!bootIsCurrent()) return@launch
+                    var cursor: String? = null
+                    do {
+                        val page = MessageStore.loadMeshDmSummaryPage(cursor)
+                        if (!bootIsCurrent()) return@launch
+                        page.summaries.forEach { summary ->
+                            mergeHydratedMeshTranscript(summary.peerKey, listOf(summary.latest))
+                        }
+                        cursor = page.nextCursor
+                    } while (cursor != null)
+                    refreshMeshDmRows()
+                    recomputeConversations()
+                }
+                // Durable retry scans are unrelated to first paint. Recover them
+                // after local chat state is usable, fenced to this account.
+                launch {
+                    if (bootAccountGeneration != meshAccountGeneration) return@launch
+                    replayDurableMeshReceiveEffects()
+                    if (bootAccountGeneration != meshAccountGeneration) return@launch
+                    outbox.restore(MessageStore.loadRoutePending())
+                    val pendingMeshDeliveries = restoreDurableMeshDeliveries()
+                    if (bootAccountGeneration != meshAccountGeneration) return@launch
+                    MeshRadio.restorePendingDeliveries(pendingMeshDeliveries)
+                    refreshMeshDmRows()
+                    flushAllOutbox()
+                }
                 setupWallet()
                 refreshLocationChannels()
                 startMeshRealtimeLoop()
@@ -3403,7 +3860,9 @@ class SonarAppState(private val scope: CoroutineScope) {
             } finally {
                 // If the encrypted DB itself failed to open, reveal the metadata
                 // snapshot instead of leaving the launch surface visible.
-                homeMessagesHydrated = true
+                if (bootIsCurrent()) {
+                    homeMessagesHydrated = true
+                }
                 connecting = false
             }
         }
@@ -3642,7 +4101,12 @@ class SonarAppState(private val scope: CoroutineScope) {
             refreshConversationRows(refreshMeshTranscriptWindow(canonicalPeerId), id, generation),
         ) // bounded local-first mesh view
         processPayLines(id, messages)
+        val openAccountGeneration = meshAccountGeneration
+        val openStorageEpoch = MessageStore.storageEpoch()
         scope.launch {
+            // O(1) per stable alias and capped at the store's 500-row window.
+            // The summary row above remains visible while disk hydration runs.
+            hydrateMeshTranscriptFromDisk(canonicalPeerId, openAccountGeneration, openStorageEpoch)
             refreshOpenDm(canonicalPeerId) // hydrate local Marmot transcript before chat list refresh
             refreshChats()
             // Reconcile the open transcript after chat-list refresh may discover
@@ -3760,6 +4224,14 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun deleteMeshDm(peerId: String) {
         val canonicalPeerId = canonicalMeshPeerId(peerId)
         val aliases = meshPeerAliases(canonicalPeerId)
+        aliases.forEach { alias ->
+            meshConversationGeneration[alias] = meshGeneration(alias) + 1
+        }
+        MeshRadio.discardPendingDeliveries(aliases.toSet())
+        // Reserve deletion revisions synchronously, before any older detached
+        // save can resume and overwrite this user action.
+        val deleteRevisions = aliases.associateWith { nextMeshPersistRevision() }
+        val storageEpoch = MessageStore.storageEpoch()
         val chatId = meshChatId(canonicalPeerId)
         val wasOpen = (stack.lastOrNull() as? Screen.Chat)?.id == chatId
         val foldedGroups = (
@@ -3772,7 +4244,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         val foldedGroupIdsToDelete = foldedGroups.mapTo(hashSetOf()) { it.id }
         aliases.forEach { alias ->
             meshChats.remove(alias)
+            hydratedMeshTranscriptPeers.remove(alias)
             meshChatNames.remove(alias)
+            outbox.remove(alias)
         }
         meshDmRows = meshDmRows.filterNot { row -> row.peerId in aliases }
         if (foldedGroupIdsToDelete.isNotEmpty()) {
@@ -3797,7 +4271,14 @@ class SonarAppState(private val scope: CoroutineScope) {
             restoreRevealedChatOrClear()
         }
         scope.launch {
-            aliases.forEach { MessageStore.deleteMeshDm(it) }
+            aliases.forEach { alias ->
+                val pendingDeleted = MessageStore.deleteMeshPendingForPeer(alias, storageEpoch)
+                val routePendingDeleted = MessageStore.deleteRoutePendingForPeer(alias, storageEpoch)
+                val transcriptDeleted = MessageStore.deleteMeshDm(alias, deleteRevisions.getValue(alias), storageEpoch)
+                if (!pendingDeleted || !routePendingDeleted || !transcriptDeleted) {
+                    toast = "Some local chat files could not be deleted."
+                }
+            }
             foldedGroups.forEach { group ->
                 runCatching { SonarCore.deleteChat(group.id) }
                     .onFailure { toast = "couldn't delete chat: ${it.message}" }
@@ -4342,13 +4823,22 @@ class SonarAppState(private val scope: CoroutineScope) {
                     toast = "Use Delete chat to remove White Noise history"
                     return
                 }
-                aliases.forEach { alias ->
-                    meshChats[alias] = emptyList()
-                    persistMesh(alias)
+                val accountGeneration = meshAccountGeneration
+                val storageEpoch = MessageStore.storageEpoch()
+                scope.launch {
+                    hydrateMeshTranscriptFromDisk(peerId, accountGeneration, storageEpoch)
+                    if (accountGeneration != meshAccountGeneration || storageEpoch != MessageStore.storageEpoch()) {
+                        return@launch
+                    }
+                    var cleared = true
+                    for (alias in aliases) {
+                        meshChats[alias] = emptyList()
+                        if (!persistMesh(alias)) cleared = false
+                    }
+                    messages = emptyList()
+                    refreshMeshDmRows()
+                    toast = if (cleared) "Cleared this chat on this device" else "Couldn't clear every local chat file."
                 }
-                messages = emptyList()
-                refreshMeshDmRows()
-                toast = "Cleared this chat on this device"
             }
             chatId != null -> {
                 toast = "Use Delete chat to remove White Noise history"
@@ -5184,12 +5674,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
-    /** True if [chatId] can carry media over live BLE mesh or an existing Marmot group. */
+    /** Private BLE file packets are legacy signed plaintext, so encrypted-chat
+     * media is offered only when the White Noise/Marmot rail is available. */
     fun canSendMedia(chatId: String): Boolean =
-        !isContactBlocked(chatId) && (
-            (isMeshChat(chatId) && liveMeshRoutePeerId(meshPeerId(chatId)) != null) ||
-                resolveMarmotGroupId(chatId) != null
-            )
+        !isContactBlocked(chatId) && resolveMarmotGroupId(chatId) != null
 
     /** Send an image to a White Noise chat: encrypt + Blossom upload + publish. */
     fun sendImage(chatId: String, data: ByteArray, filename: String, mime: String) {
@@ -5314,30 +5802,11 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         if (isContactBlocked(chatId)) { toast = "Unblock this contact before sending."; return }
         if (isMeshChat(chatId) && liveMeshRoutePeerId(meshPeerId(chatId)) != null) {
-            // Mesh has no album packet and its file packets cap at
-            // MAX_MESH_ATTACHMENT_BYTES. When an item (e.g. a video) exceeds
-            // that and a White Noise route exists, prefer the Marmot album
-            // path below instead of dropping items on the floor.
-            val oversize = items.count { it.bytes.size.toLong() > MAX_MESH_ATTACHMENT_BYTES }
-            if (oversize == 0 || resolveMarmotGroupId(chatId) == null) {
-                // Send each over mesh and return. Sending per-item (not
-                // `all {}`, which short-circuits mid-batch) avoids a partial
-                // mesh send that then double-sends via the Marmot album path.
-                var skipped = 0
-                for (item in items) {
-                    if (item.bytes.size.toLong() > MAX_MESH_ATTACHMENT_BYTES) {
-                        skipped += 1
-                        continue
-                    }
-                    sendMeshMedia(meshPeerId(chatId), item.bytes, item.filename, item.mime)
-                }
-                if (skipped > 0) {
-                    toast = if (skipped == 1) {
-                        "1 attachment is too large to send over Bluetooth."
-                    } else {
-                        "$skipped attachments are too large to send over Bluetooth."
-                    }
-                }
+            // BLE media framing is not Noise-encrypted yet. Route the whole
+            // album — including mixed video/oversize items — through Marmot so
+            // no prefix is partially sent and then duplicated by a fallback.
+            if (resolveMarmotGroupId(chatId) == null) {
+                toast = "Start the secure internet chat to send encrypted media."
                 return
             }
         }
@@ -5532,7 +6001,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         reloadNewestAfterSendIfNeeded(chatId)
         if (isMeshChat(chatId)) {
             val peerId = meshPeerId(chatId)
-            liveMeshRoutePeerId(peerId)?.let { route -> sendMesh(route, encoded); return }
+            liveMeshRoutePeerId(peerId)?.let { route ->
+                scope.launch { sendMesh(route, encoded) }
+                return
+            }
             val raw = npubRawFor(peerId)
             if (raw != null) {
                 when {
@@ -6012,13 +6484,15 @@ class SonarAppState(private val scope: CoroutineScope) {
             toast = "Unblock this contact before sending."
             return
         }
-        if (outbox.contains(peerId)) {
-            enqueueOutbox(peerId, text)
-            flushOutbox(peerId)
+        if (outbox.contains(peerId) || pendingOutboxAdmissions[peerId]?.first == meshAccountGeneration) {
+            enqueueOutbox(peerId, text, flushAfterAdmission = true)
             toast = "Message queued and will send in order."
             return
         }
-        liveMeshRoutePeerId(peerId)?.let { route -> sendMesh(route, text); return }
+        liveMeshRoutePeerId(peerId)?.let { route ->
+            scope.launch { sendMesh(route, text) }
+            return
+        }
         val raw = npubRawFor(peerId)
         if (raw != null) {
             when {
@@ -6096,23 +6570,97 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
-    /** Send a BLE-mesh DM over the Noise link + optimistically echo it. */
-    private fun sendMesh(peerId: String, text: String): Boolean {
+    /** Durably accept a BLE-mesh DM before any transport byte is emitted.
+     *
+     * The per-message outbox survives process death. The transcript echo is
+     * atomically committed before queueing the Noise send, and the outbox file
+     * is removed only when the peer's encrypted stable-id ACK is drained. */
+    private suspend fun sendMesh(
+        peerId: String,
+        text: String,
+        messageId: String = randomMeshId(),
+        timestampSecs: Long = MeshRadio.nowSecs(),
+    ): Boolean {
         if (isMeshContactBlocked(peerId)) {
             toast = "Unblock this contact before sending."
             return false
         }
-        val mid = randomMeshId()
-        val ok = MeshRadio.sendMeshDm(peerId, mid, text)
-        if (!ok) { toast = "Not connected over Bluetooth yet — stay close and try again"; return false }
+        val mid = messageId
+        val accountGeneration = meshAccountGeneration
+        val storageEpoch = MessageStore.storageEpoch()
+        val admissionGeneration = meshGeneration(peerId)
+        hydrateMeshTranscriptFromDisk(peerId, accountGeneration, storageEpoch)
+        if (accountGeneration != meshAccountGeneration || storageEpoch != MessageStore.storageEpoch() ||
+            admissionGeneration != meshGeneration(peerId)
+        ) return false
+        val pending = MeshPendingDeliveryRecord(peerId, mid, text, timestampSecs)
+        var admittedPending = MessageStore.saveMeshPending(pending, storageEpoch)
+        if (admittedPending == null) {
+            // Cap pressure must reconcile the peer's already-admitted ACKs before
+            // TTL retirement, otherwise a delivered head can be painted failed.
+            val acknowledged = drainMeshDeliveryAcks()
+            val expired = expireDurableMeshDeliveries(accountGeneration, storageEpoch)
+            if (acknowledged || expired) {
+                admittedPending = MessageStore.saveMeshPending(pending, storageEpoch)
+            }
+        }
+        if (admittedPending == null) {
+            toast = "Couldn't save this message locally. Try again."
+            return false
+        }
+        if (accountGeneration != meshAccountGeneration || meshGeneration(peerId) != admissionGeneration) {
+            MessageStore.deleteMeshPending(peerId, mid, storageEpoch)
+            return false
+        }
         val stickerRef = meshParseStickerContent(text)?.let {
             SonarStickerRef(it.packCoordinate, it.shortcode, it.plaintextSha256)
         }
-        val msg = SonarMsg(mid, npub, if (stickerRef != null) "" else text, mine = true, MeshRadio.nowSecs(), stickerRef = stickerRef)
-        meshChats[peerId] = meshChats[peerId].orEmpty() + msg
+        val existing = meshChats[peerId].orEmpty().firstOrNull { it.id == mid }
+        if (existing != null && existing.content != (if (stickerRef != null) "" else text)) {
+            MessageStore.deleteMeshPending(peerId, mid, storageEpoch)
+            return false
+        }
+        val msg = existing ?: SonarMsg(
+            mid, npub, if (stickerRef != null) "" else text,
+            mine = true, timestampSecs, state = "Sending", stickerRef = stickerRef,
+        )
+        val addedEcho = existing == null
+        if (addedEcho) meshChats[peerId] = meshChats[peerId].orEmpty() + msg
+        val committed = if (addedEcho) {
+            MessageStore.saveMeshDm(
+                peerId,
+                meshChats[peerId].orEmpty(),
+                nextMeshPersistRevision(),
+                storageEpoch,
+            )
+        } else {
+            true
+        }
+        if (!committed) {
+            if (MessageStore.deleteMeshPending(peerId, mid, storageEpoch)) {
+                if (addedEcho) meshChats[peerId] = meshChats[peerId].orEmpty().filterNot { it.id == mid }
+                toast = "Couldn't save this message locally. Try again."
+                refreshMeshDmRows()
+                return false
+            }
+            // The fsynced per-message record remains authoritative. Do not emit
+            // transport bytes without a transcript commit; boot will reconstruct
+            // the echo and retry safely from the stable id.
+            toast = "Message saved locally and will retry after restart."
+            refreshMeshDmRows()
+            return true
+        }
+        if (accountGeneration != meshAccountGeneration || meshGeneration(peerId) != admissionGeneration) {
+            MessageStore.deleteMeshPending(peerId, mid, storageEpoch)
+            return false
+        }
         val canonicalPeerId = canonicalMeshPeerId(peerId)
-        processPayLines(meshChatId(canonicalPeerId), listOf(msg))
-        persistMesh(peerId)
+        if (addedEcho) processPayLines(meshChatId(canonicalPeerId), listOf(msg))
+        // A route may disappear between selection and enqueue. Keep the durable
+        // record in the process tracker so the next fresh link retries it.
+        if (!MeshRadio.sendMeshDm(peerId, mid, text)) {
+            MeshRadio.restorePendingDeliveries(listOf(admittedPending))
+        }
         scope.launch { refreshOpenDm(canonicalPeerId) }
         refreshMeshDmRows()
         return true
@@ -6123,32 +6671,22 @@ class SonarAppState(private val scope: CoroutineScope) {
             toast = "Unblock this contact before sending."
             return false
         }
-        val routePeerId = liveMeshRoutePeerId(peerId) ?: peerId
-        val mid = randomMeshId()
-        val mediaUrl = meshMediaUrl(routePeerId, mid, filename)
-        val ok = MeshRadio.sendMeshMedia(routePeerId, mid, data, filename, mime)
-        if (!ok) {
-            toast = "Not connected over Bluetooth yet — stay close and try again"
-            return false
-        }
-        val media = SonarMedia(mediaUrl, mime, filename, null, null, null)
-        mediaCache[mediaUrl] = data
-        scope.launch { MessageStore.saveMeshMedia(mediaUrl, data) }
-        val msg = SonarMsg(mid, npub, "", mine = true, tsSecs = MeshRadio.nowSecs(), media = listOf(media))
-        meshChats[routePeerId] = meshChats[routePeerId].orEmpty() + msg
-        persistMesh(routePeerId)
-        scope.launch { refreshOpenDm(canonicalMeshPeerId(routePeerId)) }
-        refreshMeshDmRows()
-        return true
+        // Legacy type-0x22 private file packets expose filename, MIME, and bytes
+        // outside the Noise session. Fail closed until encrypted chunk framing,
+        // durable retry, and receiver post-persistence ACK ship together.
+        toast = "Bluetooth media is unavailable until end-to-end encryption is established."
+        return false
     }
 
     /** Write-through a peer's BLE-mesh transcript so it survives an app restart
      *  (parity with the iOS MessageStore). Marmot/White Noise legs are NOT written
      *  here — they already persist in the encrypted SQLCipher DB. */
-    private fun persistMesh(peerId: String) {
+    private suspend fun persistMesh(peerId: String): Boolean {
         val msgs = meshChats[peerId].orEmpty()
+        val revision = nextMeshPersistRevision()
+        val storageEpoch = MessageStore.storageEpoch()
         updateBleDiscoveryPolicy()
-        scope.launch { MessageStore.saveMeshDm(peerId, msgs) }
+        return MessageStore.saveMeshDm(peerId, msgs, revision, storageEpoch)
     }
 
     private fun shouldUseMarmotRoute(peerId: String, npubRaw: ByteArray): Boolean {
@@ -6225,11 +6763,18 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
-    private fun appendMeshMessage(peerId: String, msg: SonarMsg): Boolean {
+    private suspend fun appendMeshMessage(peerId: String, msg: SonarMsg): Boolean {
+        val accountGeneration = meshAccountGeneration
+        val storageEpoch = MessageStore.storageEpoch()
+        hydrateMeshTranscriptFromDisk(peerId, accountGeneration, storageEpoch)
+        if (accountGeneration != meshAccountGeneration || storageEpoch != MessageStore.storageEpoch()) return false
         val existing = meshChats[peerId].orEmpty()
         if (existing.any { it.id == msg.id }) return false
         meshChats[peerId] = (existing + msg).sortedBy { it.tsSecs }
-        persistMesh(peerId)
+        if (!persistMesh(peerId)) {
+            if (meshChats[peerId]?.any { it.id == msg.id } == true) meshChats[peerId] = existing
+            return false
+        }
         refreshMeshDmRows()
         return true
     }
@@ -6359,6 +6904,9 @@ class SonarAppState(private val scope: CoroutineScope) {
     // available, messages are queued here instead of being dropped. Flushed
     // automatically when the peer reconnects over BLE or their npub is learned.
     private val outbox = SonarOutbox()
+    private val outboxStorageMutex = Mutex()
+    /** peer -> (account generation, in-flight durable admission count). */
+    private val pendingOutboxAdmissions = mutableMapOf<String, Pair<Long, Int>>()
     private val flushingOutboxPeers = mutableSetOf<String>()
 
     /** Continue a Sonar-peer conversation over White Noise (Marmot) when out of
@@ -6452,14 +7000,49 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     // ── Outbox queue (mirrors iOS MessageRouter outbox) ──
 
-    /** Queue a message for [peerId] when no transport is available. Enforces
-     *  per-peer size limit (FIFO eviction) matching iOS behaviour. */
-    private fun enqueueOutbox(peerId: String, text: String) {
-        val result = outbox.enqueue(peerId, text, randomMeshId(), SonarClock.nowSecs())
-        result.evicted?.let { evicted ->
-            sonarLog("SonarOutbox", "overflow for ${peerId.take(10)}… — evicted oldest id=${evicted.messageId.take(8)}…")
+    /** Queue only after the route-agnostic obligation is fsynced. Admissions are
+     * serialized so taps in the same clock tick retain a total FIFO order. */
+    private fun enqueueOutbox(peerId: String, text: String, flushAfterAdmission: Boolean = false) {
+        val accountGeneration = meshAccountGeneration
+        val conversationGeneration = meshGeneration(peerId)
+        val storageEpoch = MessageStore.storageEpoch()
+        val candidate = QueuedMessage(
+            content = text,
+            peerId = peerId,
+            messageId = randomMeshId(),
+            timestampSecs = SonarClock.nowSecs(),
+        )
+        val currentAdmission = pendingOutboxAdmissions[peerId]
+        val admissionCount = if (currentAdmission?.first == accountGeneration) currentAdmission.second + 1 else 1
+        pendingOutboxAdmissions[peerId] = accountGeneration to admissionCount
+        scope.launch {
+            try {
+                val admitted = outboxStorageMutex.withLock {
+                    if (accountGeneration != meshAccountGeneration) return@withLock null
+                    val saved = MessageStore.saveRoutePending(candidate, storageEpoch) ?: return@withLock null
+                    if (accountGeneration != meshAccountGeneration || conversationGeneration != meshGeneration(peerId)) {
+                        MessageStore.deleteRoutePending(peerId, candidate.messageId, storageEpoch)
+                        return@withLock null
+                    }
+                    outbox.enqueue(saved)
+                    saved
+                }
+                if (admitted == null) {
+                    toast = "Message queue is full or local storage is unavailable."
+                    sonarLog("SonarOutbox", "durable admission failed for ${peerId.take(10)}…")
+                    return@launch
+                }
+                sonarLog("SonarOutbox", "queued for ${peerId.take(10)}… id=${admitted.messageId.take(8)}… queue=${outbox.snapshot(peerId).size}")
+                if (flushAfterAdmission) flushOutbox(peerId)
+            } finally {
+                val active = pendingOutboxAdmissions[peerId]
+                if (active?.first == accountGeneration) {
+                    val remaining = active.second - 1
+                    if (remaining <= 0) pendingOutboxAdmissions.remove(peerId)
+                    else pendingOutboxAdmissions[peerId] = accountGeneration to remaining
+                }
+            }
         }
-        sonarLog("SonarOutbox", "queued for ${peerId.take(10)}… id=${result.message.messageId.take(8)}… queue=${result.depth}")
     }
 
     /** Try to deliver all queued messages for [peerId]. Expired messages (>24h)
@@ -6476,6 +7059,8 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private suspend fun flushOutboxNow(peerId: String) {
+        val accountGeneration = meshAccountGeneration
+        val storageEpoch = MessageStore.storageEpoch()
         val queue = outbox.snapshot(peerId)
         if (queue.isEmpty()) { outbox.finishFlush(peerId, 0, emptyList()); return }
         if (isMeshContactBlocked(peerId)) {
@@ -6489,15 +7074,24 @@ class SonarAppState(private val scope: CoroutineScope) {
         sonarLog("SonarOutbox", "flushing ${queue.size} message(s) for ${peerId.take(10)}…")
 
         for ((index, msg) in queue.withIndex()) {
+            if (accountGeneration != meshAccountGeneration || storageEpoch != MessageStore.storageEpoch()) {
+                remaining.addAll(outbox.remainingAfterFailure(queue, index, now))
+                break
+            }
             // TTL check: drop messages older than 24 hours.
             if (outbox.isExpired(msg, now)) {
                 sonarLog("SonarOutbox", "expired id=${msg.messageId.take(8)}… age=${now - msg.timestampSecs}s")
+                if (!MessageStore.deleteRoutePending(peerId, msg.messageId, storageEpoch)) {
+                    remaining.addAll(outbox.remainingAfterFailure(queue, index, now))
+                    sonarLog("SonarOutbox", "couldn't delete expired durable record id=${msg.messageId.take(8)}…")
+                    break
+                }
                 continue
             }
             // Try to send via the best available transport.
             val routePeerId = liveMeshRoutePeerId(peerId)
             val delivered = if (routePeerId != null) {
-                sendMesh(routePeerId, msg.content)
+                sendMesh(routePeerId, msg.content, msg.messageId, msg.timestampSecs)
             } else {
                 val raw = npubRawFor(peerId)
                 if (raw != null) {
@@ -6517,6 +7111,11 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (!delivered) {
                 remaining.addAll(outbox.remainingAfterFailure(queue, index, now))
                 sonarLog("SonarOutbox", "kept ${remaining.size} message(s) queued for ${peerId.take(10)}…")
+                break
+            }
+            if (!MessageStore.deleteRoutePending(peerId, msg.messageId, storageEpoch)) {
+                remaining.addAll(outbox.remainingAfterFailure(queue, index, now))
+                sonarLog("SonarOutbox", "delivery accepted but durable cleanup failed id=${msg.messageId.take(8)}…")
                 break
             }
             sonarLog("SonarOutbox", "delivered id=${msg.messageId.take(8)}… to ${peerId.take(10)}…")
@@ -7338,65 +7937,212 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (length % 2 != 0) ByteArray(0)
         else runCatching { chunked(2).map { it.toInt(16).toByte() }.toByteArray() }.getOrDefault(ByteArray(0))
 
-    private fun handleFavoriteControl(peerId: String, text: String): Boolean {
+    private suspend fun handleFavoriteControl(peerId: String, text: String): Boolean {
         val favorite = when {
             text.startsWith(FAVORITED_CONTROL) -> true
             text.startsWith(UNFAVORITED_CONTROL) -> false
             else -> return false
         }
         val payloadNpub = text.substringAfter(':', missingDelimiterValue = "").trim()
+        val candidateLinks = linkByFp.toMutableMap()
         canonicalNpubHex(payloadNpub)?.let { npubHex ->
-            if (!linkByFp[peerId].equals(npubHex, ignoreCase = true)) {
-                linkByFp[peerId] = npubHex
-                persistLinks()
-                refreshKnownContactDescriptors()
+            if (!candidateLinks[peerId].equals(npubHex, ignoreCase = true)) {
+                candidateLinks[peerId] = npubHex
             }
         }
-        socialState = meshPeerAliases(peerId).fold(socialState) { state, alias ->
+        val candidateSocialState = meshPeerAliases(peerId).fold(socialState) { state, alias ->
             state.withRemoteFavoritePeer(alias, favorite)
         }
-        persistSocialState()
+        SonarCore.saveBlobDurable(
+            FAVORITE_ROUTE_STATE_BLOB_KEY,
+            encodeFavoriteRouteState(candidateSocialState, candidateLinks),
+        )
+        val linksChanged = candidateLinks != linkByFp
+        linkByFp.clear()
+        linkByFp.putAll(candidateLinks)
+        socialState = candidateSocialState
+        // Best-effort legacy mirrors; the combined record above is authoritative.
+        SonarCore.saveBlob("sonar.links", linkByFp.entries.joinToString("\n") { "${it.key}=${it.value}" })
+        SonarCore.saveBlob(SOCIAL_STATE_BLOB_KEY, encodeSonarSocialState(socialState))
+        if (linksChanged) refreshKnownContactDescriptors()
         recomputeSociallyFilteredRows()
         if (favorite) flushOutbox(peerId)
         return true
     }
 
+    /** Project idempotent local receive effects, then durably clear the marker.
+     * A crash before the second write replays with the same notification ID;
+     * ACK is withheld until this method succeeds. */
+    private suspend fun completeMeshReceiveEffects(
+        peerId: String,
+        message: SonarMsg,
+        preview: String,
+        accountGeneration: Long,
+        storageEpoch: Long,
+        conversationGeneration: Long = meshGeneration(peerId),
+    ): Boolean {
+        if (!message.receiveEffectsPending) return true
+        hydrateMeshTranscriptFromDisk(peerId, accountGeneration, storageEpoch)
+        if (accountGeneration != meshAccountGeneration || storageEpoch != MessageStore.storageEpoch() ||
+            conversationGeneration != meshGeneration(peerId)
+        ) return false
+        val chatId = meshChatId(peerId)
+        processPayLines(chatId, listOf(message))
+        notifyIncoming(
+            idKey = "$chatId:${message.id}",
+            conversationTitle = meshPeerName(peerId),
+            content = preview,
+            senderName = meshPeerName(peerId),
+            sound = SonarNotificationSound.Ble,
+        )
+        val existing = meshChats[peerId].orEmpty()
+        val index = existing.indexOfFirst { it.id == message.id }
+        if (index < 0) return false
+        val completed = existing.toMutableList().also {
+            it[index] = it[index].copy(receiveEffectsPending = false)
+        }
+        meshChats[peerId] = completed
+        val persisted = MessageStore.saveMeshDm(
+            peerId,
+            completed,
+            nextMeshPersistRevision(),
+            storageEpoch,
+        )
+        if (!persisted || accountGeneration != meshAccountGeneration || storageEpoch != MessageStore.storageEpoch() ||
+            conversationGeneration != meshGeneration(peerId)
+        ) {
+            if (meshChats[peerId] == completed) meshChats[peerId] = existing
+            return false
+        }
+        return true
+    }
+
+    private suspend fun replayDurableMeshReceiveEffects() {
+        val accountGeneration = meshAccountGeneration
+        val storageEpoch = MessageStore.storageEpoch()
+        for (peerId in meshChats.keys.toList()) {
+            hydrateMeshTranscriptFromDisk(peerId, accountGeneration, storageEpoch)
+            val transcript = meshChats[peerId].orEmpty()
+            for (message in transcript.filter { !it.mine && it.receiveEffectsPending }) {
+                if (accountGeneration != meshAccountGeneration || storageEpoch != MessageStore.storageEpoch()) return
+                val preview = if (message.stickerRef != null) "Sticker" else message.content
+                completeMeshReceiveEffects(peerId, message, preview, accountGeneration, storageEpoch)
+            }
+        }
+        refreshMeshDmRows()
+    }
+
     /** Drain mesh DMs received since last poll into the per-peer transcripts,
      *  surface them as Messages rows, and notify for ones we're not looking at. */
-    private fun drainMeshDms(): Boolean {
+    private suspend fun drainMeshDms(): Boolean {
+        val accountGeneration = meshAccountGeneration
+        val storageEpoch = MessageStore.storageEpoch()
         val incoming = MeshRadio.drainMeshDm()
         if (incoming.isEmpty()) return false
+        incoming.asSequence().map { it.peerId }.distinct().forEach { peerId ->
+            hydrateMeshTranscriptFromDisk(peerId, accountGeneration, storageEpoch)
+        }
+        if (accountGeneration != meshAccountGeneration || storageEpoch != MessageStore.storageEpoch()) return false
         val touched = mutableSetOf<String>()
+        val originalByPeer = mutableMapOf<String, List<SonarMsg>>()
+        val newRowsByPeer = mutableMapOf<String, MutableList<Triple<SonarMsg, String, String>>>()
+        val conversationGenerationByPeer = mutableMapOf<String, Long>()
+        val ackAfterProcessing = mutableListOf<Pair<String, String>>()
         for (m in incoming) {
-            if (isMeshContactBlocked(m.peerId)) continue
-            if (handleFavoriteControl(m.peerId, m.text)) continue
+            if (isMeshContactBlocked(m.peerId)) {
+                // Policy-handled is terminal delivery. ACK the stable id so a
+                // blocked sender cannot pin its FIFO head and retry forever;
+                // no content is surfaced or persisted in the transcript.
+                ackAfterProcessing += m.peerId to m.messageId
+                continue
+            }
+            val conversationGeneration = conversationGenerationByPeer.getOrPut(m.peerId) { meshGeneration(m.peerId) }
+            if (conversationGeneration != meshGeneration(m.peerId)) continue
+            if (handleFavoriteControl(m.peerId, m.text)) {
+                ackAfterProcessing += m.peerId to m.messageId
+                continue
+            }
             val stickerRef = meshParseStickerContent(m.text)?.let {
                 SonarStickerRef(it.packCoordinate, it.shortcode, it.plaintextSha256)
             }
-            val msg = SonarMsg(
-                m.messageId.ifBlank { randomMeshId() }, m.peerId,
-                if (stickerRef != null) "" else m.text,
-                mine = false, m.tsSecs, stickerRef = stickerRef,
-            )
-            val chatId = meshChatId(m.peerId)
-            if (stickerRef == null && SonarCore.callParseControl(m.text) != null) {
-                processCallLines(chatId, listOf(msg))
+            val stableId = m.messageId.ifBlank { randomMeshId() }
+            if (!isNewMeshMessage(stableId, meshChats[m.peerId].orEmpty().map { it.id })) {
+                val existing = meshChats[m.peerId].orEmpty().firstOrNull { it.id == stableId }
+                val preview = if (existing?.stickerRef != null) "Sticker" else m.text
+                if (existing == null || completeMeshReceiveEffects(
+                        m.peerId, existing, preview, accountGeneration, storageEpoch, conversationGeneration
+                    )) {
+                    ackAfterProcessing += m.peerId to m.messageId
+                }
                 continue
             }
+            val msg = SonarMsg(
+                stableId, m.peerId,
+                if (stickerRef != null) "" else m.text,
+                mine = false, m.tsSecs, receiveEffectsPending = true, stickerRef = stickerRef,
+            )
+            val chatId = meshChatId(m.peerId)
+            val callControl = if (stickerRef == null) SonarCore.callParseControl(m.text) else null
+            if (callControl != null) {
+                // Mesh ACK means the control reached the application engine, not
+                // merely that a detached coroutine was scheduled. This also
+                // preserves ordering across OFFER/ANSWER/END on the BLE FIFO.
+                if (scannedCall.add(msg.id) && !msg.mine) {
+                    try {
+                        onCallControl(chatId, msg, callControl)
+                    } catch (error: Throwable) {
+                        scannedCall.remove(msg.id)
+                        throw error
+                    }
+                    // Descriptor deferral deliberately removes the scan mark so
+                    // the stable-id retry is processed later. Do not ACK/drop it.
+                    if (msg.id !in scannedCall) continue
+                }
+                ackAfterProcessing += m.peerId to m.messageId
+                continue
+            }
+            originalByPeer.putIfAbsent(m.peerId, meshChats[m.peerId].orEmpty())
             meshChats[m.peerId] = meshChats[m.peerId].orEmpty() + msg
-            processPayLines(chatId, listOf(msg))
             touched += m.peerId
             val preview = if (stickerRef != null) "Sticker" else m.text
-            val sender = meshPeerName(m.peerId)
-            notifyIncoming(
-                idKey = chatId,
-                conversationTitle = sender,
-                content = preview,
-                senderName = sender,
-                sound = SonarNotificationSound.Ble,
-            )
+            newRowsByPeer.getOrPut(m.peerId) { mutableListOf() } += Triple(msg, preview, m.messageId)
         }
-        touched.forEach { persistMesh(it) } // write-through so received DMs survive restart
+        val persistedPeers = mutableSetOf<String>()
+        for (peerId in touched) {
+            val persisted = accountGeneration == meshAccountGeneration &&
+                storageEpoch == MessageStore.storageEpoch() &&
+                conversationGenerationByPeer[peerId] == meshGeneration(peerId) &&
+                MessageStore.saveMeshDm(
+                peerId,
+                meshChats[peerId].orEmpty(),
+                nextMeshPersistRevision(),
+                storageEpoch,
+            )
+            if (persisted && accountGeneration == meshAccountGeneration &&
+                conversationGenerationByPeer[peerId] == meshGeneration(peerId)
+            ) {
+                persistedPeers += peerId
+            } else {
+                meshChats[peerId] = originalByPeer[peerId].orEmpty()
+            }
+        }
+        for (peerId in persistedPeers) {
+            for ((msg, preview, wireMessageId) in newRowsByPeer[peerId].orEmpty()) {
+                if (completeMeshReceiveEffects(
+                        peerId, msg, preview, accountGeneration, storageEpoch,
+                        conversationGenerationByPeer.getValue(peerId)
+                    )) {
+                    ackAfterProcessing += peerId to wireMessageId
+                }
+            }
+        }
+        updateBleDiscoveryPolicy()
+        ackAfterProcessing.forEach { (peerId, messageId) ->
+            val captured = conversationGenerationByPeer[peerId]
+            if (messageId.isNotBlank() && (captured == null || captured == meshGeneration(peerId))) {
+                MeshRadio.acknowledgeMeshDm(peerId, messageId)
+            }
+        }
         refreshMeshDmRows()
         // Refresh the open conversation (merged mesh + White Noise) if it's one we
         // just appended to.
@@ -7409,22 +8155,36 @@ class SonarAppState(private val scope: CoroutineScope) {
         return true
     }
 
-    private suspend fun drainDirectDms() {
+    private suspend fun drainDirectDms() = directDmDrainMutex.withLock {
+        val accountGeneration = meshAccountGeneration
+        val storageEpoch = MessageStore.storageEpoch()
         val incoming = runCatching { SonarCore.drainDirectDms() }.getOrDefault(emptyList())
-        if (incoming.isEmpty()) return
+        if (incoming.isEmpty() || accountGeneration != meshAccountGeneration || storageEpoch != MessageStore.storageEpoch()) {
+            return@withLock
+        }
         val touched = mutableSetOf<String>()
+        val rowsByPeer = mutableMapOf<String, MutableList<Pair<SonarDirectDm, SonarMsg>>>()
+        val conversationGenerationByPeer = mutableMapOf<String, Long>()
+        val eventPeerGeneration = mutableMapOf<String, Pair<String, Long>>()
         val ackEventIds = linkedSetOf<String>()
         for (m in incoming) {
+            if (accountGeneration != meshAccountGeneration || storageEpoch != MessageStore.storageEpoch()) return@withLock
             val peerId = peerIdForNpubHex(m.senderPubkeyHex)
             if (peerId == null) {
                 ackEventIds += m.eventId
                 continue
             }
+            hydrateMeshTranscriptFromDisk(peerId, accountGeneration, storageEpoch)
+            if (accountGeneration != meshAccountGeneration || storageEpoch != MessageStore.storageEpoch()) return@withLock
+            val conversationGeneration = conversationGenerationByPeer.getOrPut(peerId) { meshGeneration(peerId) }
+            eventPeerGeneration[m.eventId] = peerId to conversationGeneration
+            if (conversationGeneration != meshGeneration(peerId)) continue
             if (isMeshContactBlocked(peerId) || socialState.isBlockedNostr(m.senderPubkeyHex)) {
                 ackEventIds += m.eventId
                 continue
             }
             if (handleFavoriteControl(peerId, m.content)) {
+                if (accountGeneration != meshAccountGeneration || storageEpoch != MessageStore.storageEpoch()) return@withLock
                 ackEventIds += m.eventId
                 continue
             }
@@ -7436,8 +8196,14 @@ class SonarAppState(private val scope: CoroutineScope) {
                 continue
             }
             val id = m.id.ifBlank { randomMeshId() }
-            if (meshChats[peerId].orEmpty().any { it.id == id }) {
-                ackEventIds += m.eventId
+            val existing = meshChats[peerId].orEmpty().firstOrNull { it.id == id }
+            if (existing != null) {
+                val preview = if (existing.stickerRef != null) "Sticker" else m.content
+                if (completeMeshReceiveEffects(
+                        peerId, existing, preview, accountGeneration, storageEpoch, conversationGeneration
+                    )) {
+                    ackEventIds += m.eventId
+                }
                 continue
             }
             val msg = privateDmMessage(
@@ -7447,55 +8213,253 @@ class SonarAppState(private val scope: CoroutineScope) {
                 mine = false,
                 tsSecs = m.tsSecs,
                 viaInternet = true,
-            )
+            ).copy(receiveEffectsPending = true)
             val chatId = meshChatId(peerId)
-            if (msg.stickerRef == null && SonarCore.callParseControl(m.content) != null) {
-                processCallLines(chatId, listOf(msg))
-                ackEventIds += m.eventId
+            val callControl = if (msg.stickerRef == null) SonarCore.callParseControl(m.content) else null
+            if (callControl != null) {
+                if (scannedCall.add(msg.id) && !msg.mine) {
+                    try {
+                        onCallControl(chatId, msg, callControl)
+                    } catch (error: Throwable) {
+                        scannedCall.remove(msg.id)
+                        throw error
+                    }
+                    if (msg.id !in scannedCall) continue
+                }
+                if (accountGeneration == meshAccountGeneration &&
+                    storageEpoch == MessageStore.storageEpoch() &&
+                    conversationGeneration == meshGeneration(peerId)
+                ) ackEventIds += m.eventId
                 continue
             }
             meshChats[peerId] = meshChats[peerId].orEmpty() + msg
-            processPayLines(chatId, listOf(msg))
             touched += peerId
-            ackEventIds += m.eventId
-            val preview = if (msg.stickerRef != null) "Sticker" else m.content
-            notifyIncoming(chatId, meshPeerName(peerId), preview)
+            rowsByPeer.getOrPut(peerId) { mutableListOf() } += m to msg
         }
+        val persistedPeers = mutableSetOf<String>()
         for (peerId in touched) {
-            MessageStore.saveMeshDm(peerId, meshChats[peerId].orEmpty())
+            val persisted = accountGeneration == meshAccountGeneration &&
+                storageEpoch == MessageStore.storageEpoch() &&
+                conversationGenerationByPeer[peerId] == meshGeneration(peerId) &&
+                MessageStore.saveMeshDm(
+                peerId,
+                meshChats[peerId].orEmpty(),
+                nextMeshPersistRevision(),
+                storageEpoch,
+            )
+            if (persisted && accountGeneration == meshAccountGeneration && storageEpoch == MessageStore.storageEpoch() &&
+                conversationGenerationByPeer[peerId] == meshGeneration(peerId)
+            ) {
+                persistedPeers += peerId
+            } else {
+                val stagedIds = rowsByPeer[peerId].orEmpty().mapTo(hashSetOf()) { it.second.id }
+                meshChats[peerId] = meshChats[peerId].orEmpty().filterNot { it.id in stagedIds }
+            }
         }
-        if (ackEventIds.isNotEmpty()) {
-            SonarCore.acknowledgeDirectDms(ackEventIds.toList())
+        for (peerId in persistedPeers) {
+            for ((event, msg) in rowsByPeer[peerId].orEmpty()) {
+                val preview = if (msg.stickerRef != null) "Sticker" else event.content
+                if (completeMeshReceiveEffects(
+                        peerId, msg, preview, accountGeneration, storageEpoch,
+                        conversationGenerationByPeer.getValue(peerId)
+                    )) {
+                    ackEventIds += event.eventId
+                }
+            }
         }
-        if (touched.isNotEmpty()) {
+        if (ackEventIds.isNotEmpty() && accountGeneration == meshAccountGeneration && storageEpoch == MessageStore.storageEpoch()) {
+            val fencedAckIds = ackEventIds.filter { eventId ->
+                eventPeerGeneration[eventId]?.let { (peerId, generation) ->
+                    generation == meshGeneration(peerId)
+                } ?: true
+            }
+            if (fencedAckIds.isNotEmpty()) SonarCore.acknowledgeDirectDms(fencedAckIds)
+        }
+        if (persistedPeers.isNotEmpty()) {
             refreshMeshDmRows()
             recomputeConversations()
             (screen as? Screen.Chat)?.let { sc ->
                 if (isMeshChat(sc.id)) {
                     val pid = meshPeerId(sc.id)
-                    if (meshAliasGroupWasTouched(meshPeerAliases(pid), touched)) refreshOpenDm(pid)
+                    if (meshAliasGroupWasTouched(meshPeerAliases(pid), persistedPeers)) refreshOpenDm(pid)
                 }
             }
         }
     }
 
+    /** Persist the delivery projection before retiring its durable retry record.
+     * A crash between these operations may resend a stable id, but can never
+     * leave a locally "sent" bubble whose retry obligation was lost. */
+    private suspend fun persistMeshDeliveryState(
+        record: MeshPendingDeliveryRecord,
+        state: String,
+        accountGeneration: Long,
+        storageEpoch: Long,
+    ): Boolean {
+        if (!record.surfaceInTranscript) return true
+        if (accountGeneration != meshAccountGeneration || storageEpoch != MessageStore.storageEpoch()) return false
+        hydrateMeshTranscriptFromDisk(record.peerId, accountGeneration, storageEpoch)
+        if (accountGeneration != meshAccountGeneration || storageEpoch != MessageStore.storageEpoch()) return false
+        val existing = meshChats[record.peerId].orEmpty()
+        val index = existing.indexOfFirst { it.id == record.messageId }
+        val next = if (index >= 0) {
+            existing.toMutableList().also { it[index] = it[index].copy(state = state) }
+        } else {
+            val stickerRef = meshParseStickerContent(record.text)?.let {
+                SonarStickerRef(it.packCoordinate, it.shortcode, it.plaintextSha256)
+            }
+            existing + SonarMsg(
+                id = record.messageId,
+                senderNpub = npub,
+                content = if (stickerRef != null) "" else record.text,
+                mine = true,
+                tsSecs = record.timestampSecs,
+                state = state,
+                stickerRef = stickerRef,
+            )
+        }
+        meshChats[record.peerId] = next
+        val persisted = MessageStore.saveMeshDm(
+            record.peerId,
+            next,
+            nextMeshPersistRevision(),
+            storageEpoch,
+        )
+        if (!persisted || accountGeneration != meshAccountGeneration || storageEpoch != MessageStore.storageEpoch()) {
+            // Do not advertise a terminal state in RAM when its exact durable
+            // snapshot was rejected. Preserve a concurrent newer mutation.
+            if (meshChats[record.peerId] == next) {
+                meshChats[record.peerId] = existing
+                refreshMeshDmRows()
+            }
+            return false
+        }
+        refreshMeshDmRows()
+        (screen as? Screen.Chat)?.takeIf { isMeshChat(it.id) }?.let { open ->
+            val openPeer = meshPeerId(open.id)
+            if (meshAliasGroupWasTouched(meshPeerAliases(openPeer), setOf(record.peerId))) {
+                refreshOpenDm(openPeer)
+            }
+        }
+        return true
+    }
+
+    private suspend fun expireDurableMeshDeliveries(
+        accountGeneration: Long = meshAccountGeneration,
+        storageEpoch: Long = MessageStore.storageEpoch(),
+    ): Boolean {
+        if (accountGeneration != meshAccountGeneration || storageEpoch != MessageStore.storageEpoch()) return false
+        val nowSecs = MeshRadio.nowSecs()
+        val acknowledged = pendingMeshAckDeletes.toSet()
+        val expired = MessageStore.loadMeshPending().filter {
+            meshDeliveryTerminalState(it, nowSecs, acknowledged) == "Couldn't send"
+        }
+        var retiredAny = false
+        for (record in expired) {
+            if (accountGeneration != meshAccountGeneration || storageEpoch != MessageStore.storageEpoch()) break
+            // ACK admission and TTL retirement arbitrate on the transport lock.
+            // If an ACK already owns this stable id, leave it for the ACK drain
+            // instead of painting a delivered message as failed.
+            if (!MeshRadio.claimPendingDeliveryExpiry(record.peerId, record.messageId)) continue
+            var committed = false
+            try {
+                val projected = persistMeshDeliveryState(record, "Couldn't send", accountGeneration, storageEpoch)
+                if (projected && MessageStore.deleteMeshPending(record.peerId, record.messageId, storageEpoch)) {
+                    MeshRadio.discardPendingDelivery(record.peerId, record.messageId)
+                    pendingMeshAckDeletes.remove(MeshDeliveryAck(record.peerId, record.messageId))
+                    retiredAny = true
+                    committed = true
+                }
+            } finally {
+                if (!committed) {
+                    MeshRadio.releasePendingDeliveryExpiry(record.peerId, record.messageId)
+                }
+            }
+        }
+        return retiredAny
+    }
+
+    private suspend fun drainMeshDeliveryAcks(): Boolean {
+        val accountGeneration = meshAccountGeneration
+        val storageEpoch = MessageStore.storageEpoch()
+        val fresh = MeshRadio.drainMeshDeliveryAcks()
+        if (accountGeneration != meshAccountGeneration) return false
+        if (fresh.isNotEmpty()) pendingMeshAckDeletes.addAll(fresh)
+        if (pendingMeshAckDeletes.isEmpty()) return false
+        val durableById = MessageStore.loadMeshPending().associateBy { it.peerId to it.messageId }
+        var deletedAny = false
+        val iterator = pendingMeshAckDeletes.iterator()
+        while (iterator.hasNext()) {
+            val ack = iterator.next()
+            val record = durableById[ack.peerId to ack.messageId]
+            if (record == null) {
+                iterator.remove()
+                MeshRadio.finishMeshDeliveryAck(ack.peerId, ack.messageId)
+                continue
+            }
+            val terminalState = meshDeliveryTerminalState(
+                record,
+                MeshRadio.nowSecs(),
+                setOf(ack),
+            ) ?: continue
+            val projected = persistMeshDeliveryState(record, terminalState, accountGeneration, storageEpoch)
+            if (projected && MessageStore.deleteMeshPending(ack.peerId, ack.messageId, storageEpoch)) {
+                iterator.remove()
+                MeshRadio.finishMeshDeliveryAck(ack.peerId, ack.messageId)
+                deletedAny = true
+            } else {
+                // Retain both the host ACK and the transport fence. A disk
+                // failure needs another local commit attempt, not a redundant
+                // wire send. Process death naturally rehydrates the stable id.
+            }
+        }
+        if (deletedAny) {
+            // Admit the next durable records if the bounded transport window was
+            // full at boot/send time. Stable-id enqueue makes this idempotent.
+            MeshRadio.restorePendingDeliveries(MessageStore.loadMeshPending().filter {
+                MeshRadio.nowSecs() - it.timestampSecs <= OUTBOX_TTL_SECS
+            })
+        }
+        return fresh.isNotEmpty() || deletedAny
+    }
+
     /** Drain private BLE file transfers into the same mesh transcript model as
      * text DMs. The raw bytes are stored in MessageStore and referenced by a
      * local `mesh-media:` URL so bubbles survive an app restart. */
-    private fun drainMeshMedia(): Boolean {
+    private suspend fun drainMeshMedia(): Boolean {
+        val accountGeneration = meshAccountGeneration
+        val storageEpoch = MessageStore.storageEpoch()
         val incoming = MeshRadio.drainMeshMedia()
         if (incoming.isEmpty()) return false
+        incoming.asSequence().map { it.peerId }.distinct().forEach { peerId ->
+            hydrateMeshTranscriptFromDisk(peerId, accountGeneration, storageEpoch)
+        }
+        if (accountGeneration != meshAccountGeneration || storageEpoch != MessageStore.storageEpoch()) return false
         val touched = mutableSetOf<String>()
         for (m in incoming) {
+            if (accountGeneration != meshAccountGeneration || storageEpoch != MessageStore.storageEpoch()) break
             if (isMeshContactBlocked(m.peerId)) continue
             val id = m.messageId.ifBlank { randomMeshId() }
             if (meshChats[m.peerId].orEmpty().any { it.id == id }) continue
             val mediaUrl = meshMediaUrl(m.peerId, id, m.filename)
             val media = SonarMedia(mediaUrl, m.mimeType, m.filename, null, null, null)
-            mediaCache[mediaUrl] = m.bytes
-            scope.launch { MessageStore.saveMeshMedia(mediaUrl, m.bytes) }
+            // File receipt is not delivery. Persist both the bytes and their
+            // transcript reference before surfacing a bubble or notification;
+            // otherwise a process kill could notify for media that disappears.
+            if (!MessageStore.saveMeshMedia(mediaUrl, m.bytes, storageEpoch)) continue
             val msg = SonarMsg(id, m.peerId, "", mine = false, tsSecs = m.tsSecs, media = listOf(media))
             meshChats[m.peerId] = meshChats[m.peerId].orEmpty() + msg
+            val committed = MessageStore.saveMeshDm(
+                m.peerId,
+                meshChats[m.peerId].orEmpty(),
+                nextMeshPersistRevision(),
+                storageEpoch,
+            )
+            if (!committed) {
+                meshChats[m.peerId] = meshChats[m.peerId].orEmpty().filterNot { it.id == id }
+                continue
+            }
+            mediaCache[mediaUrl] = m.bytes
             touched += m.peerId
             notifyIncoming(
                 meshChatId(m.peerId),
@@ -7505,7 +8469,6 @@ class SonarAppState(private val scope: CoroutineScope) {
             )
         }
         if (touched.isEmpty()) return false
-        touched.forEach { persistMesh(it) }
         refreshMeshDmRows()
         (screen as? Screen.Chat)?.let { sc ->
             if (isMeshChat(sc.id)) {
@@ -8125,20 +9088,37 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (meshRealtimeLoopRunning) return
         meshRealtimeLoopRunning = true
         scope.launch {
-            // Adaptive cadence (Signal-grade idle cost): the 150ms realtime
-            // tick only earns its keep while BLE traffic is actually possible
-            // — a peer in range or a recent drain hit. Otherwise 20 FFI
-            // calls/sec burn CPU draining empty queues forever. Idle backs
-            // off to 1s; any drain hit or in-range peer snaps back to 150ms.
-            var lastActivityMs = 0L
-            while (true) {
-                val drained = drainMeshDms() or drainMeshMedia() or drainMeshBroadcasts()
-                val nowMs = SonarClock.nowMillis()
-                // hasActivePeer() is a cheap link/announce probe — unlike
-                // peers() it doesn't build+sort the whole list every tick.
-                if (drained || MeshRadio.hasActivePeer()) lastActivityMs = nowMs
-                val fast = nowMs - lastActivityMs < MESH_REALTIME_HOT_WINDOW_MS
-                delay(if (fast) 150 else 1000)
+            try {
+                // Adaptive cadence (Signal-grade idle cost): the 150ms realtime
+                // tick only earns its keep while BLE traffic is actually possible
+                // — a peer in range or a recent drain hit. Otherwise 20 FFI
+                // calls/sec burn CPU draining empty queues forever. Idle backs
+                // off to 1s; any drain hit or in-range peer snaps back to 150ms.
+                var lastActivityMs = 0L
+                while (true) {
+                    fun report(label: String): (Throwable) -> Unit = { failure ->
+                        sonarLog("MeshRealtime", "$label drain failed; retrying: ${failure.message}")
+                    }
+                    val nowMs = SonarClock.nowMillis()
+                    // Drain peer truth first. [expireDurableMeshDeliveries] also
+                    // excludes any ACK whose durable projection must be retried.
+                    val acknowledged = safeMeshDrain(report("ack")) { drainMeshDeliveryAcks() }
+                    val expired = if (nowMs >= nextMeshPendingExpiryCheckMs) {
+                        nextMeshPendingExpiryCheckMs = nowMs + 60_000L
+                        safeMeshDrain(report("expiry")) { expireDurableMeshDeliveries() }
+                    } else false
+                    val drained = acknowledged or expired or
+                        safeMeshDrain(report("dm")) { drainMeshDms() } or
+                        safeMeshDrain(report("media")) { drainMeshMedia() } or
+                        safeMeshDrain(report("broadcast")) { drainMeshBroadcasts() }
+                    // hasActivePeer() is a cheap link/announce probe — unlike
+                    // peers() it doesn't build+sort the whole list every tick.
+                    if (drained || MeshRadio.hasActivePeer()) lastActivityMs = nowMs
+                    val fast = nowMs - lastActivityMs < MESH_REALTIME_HOT_WINDOW_MS
+                    delay(if (fast) 150 else 1000)
+                }
+            } finally {
+                meshRealtimeLoopRunning = false
             }
         }
     }

@@ -79,9 +79,11 @@ actual object MeshRadio {
     @Volatile private var lastNewDiscoveryMs = 0L
     @Volatile private var lastScanStartMs = 0L
     @Volatile private var scanResultCount = 0L
+    @Volatile private var consecutiveWatchdogRestarts = 0
     private const val WATCHDOG_TICK_MS = 4_000L
     private const val WATCHDOG_STALE_MS = 7_000L
     private const val WATCHDOG_GAP_MS = 8_000L
+    private const val WATCHDOG_MAX_GAP_MS = 120_000L
     /** Head start the SMALLER node id gets before the larger node also dials, in
      *  the soft election (see [scanCallback]). */
     private const val FALLBACK_DIAL_MS = 5_000L
@@ -102,11 +104,13 @@ actual object MeshRadio {
     private const val ANNOUNCE_STALE_MS = 300_000L
 
     /** Incoming decrypted mesh DMs, buffered until the app drains them. */
-    private val meshDmInbox = java.util.concurrent.ConcurrentLinkedQueue<MeshDmIn>()
+    private val meshDmInbox = java.util.concurrent.ArrayBlockingQueue<MeshDmIn>(512)
     /** Incoming private mesh file transfers, buffered until the app drains them. */
-    private val meshMediaInbox = java.util.concurrent.ConcurrentLinkedQueue<MeshMediaIn>()
+    private val meshMediaInbox = java.util.concurrent.ArrayBlockingQueue<MeshMediaIn>(64)
     /** Incoming public Mesh-channel broadcasts, buffered until drained. */
-    private val meshBroadcastInbox = java.util.concurrent.ConcurrentLinkedQueue<MeshBroadcastIn>()
+    private val meshBroadcastInbox = java.util.concurrent.ArrayBlockingQueue<MeshBroadcastIn>(512)
+    /** Peer-confirmed stable ids whose durable outbox files may now be removed. */
+    private val meshDeliveryAckInbox = java.util.concurrent.ArrayBlockingQueue<MeshDeliveryAck>(512)
 
     init {
         // The String identity from MeshGatt is the peer's STABLE fingerprint
@@ -115,16 +119,18 @@ actual object MeshRadio {
         // Buffer incoming Noise DMs (the listener fires on a BLE callback thread).
         MeshGatt.addMessageListener { fingerprint, messageId, text ->
             if (!isKnownPeer(fingerprint)) return@addMessageListener
-            meshDmInbox.add(MeshDmIn(fingerprint, messageId, text, System.currentTimeMillis() / 1000))
+            // When full, do not ACK: the sender's stable-id retry will deliver
+            // again after the host drains this bounded callback queue.
+            meshDmInbox.offer(MeshDmIn(fingerprint, messageId, text, System.currentTimeMillis() / 1000))
         }
         MeshGatt.addFileListener { fingerprint, messageId, filename, mime, bytes ->
             if (!isKnownPeer(fingerprint)) return@addFileListener
-            meshMediaInbox.add(MeshMediaIn(fingerprint, messageId, filename, mime, bytes, System.currentTimeMillis() / 1000))
+            meshMediaInbox.offer(MeshMediaIn(fingerprint, messageId, filename, mime, bytes, System.currentTimeMillis() / 1000))
         }
         // Buffer incoming public broadcasts (the BLE "Mesh" channel).
         MeshGatt.addBroadcastListener { senderFingerprint, pm ->
             if (!isKnownPeer(senderFingerprint)) return@addBroadcastListener
-            meshBroadcastInbox.add(MeshBroadcastIn(senderFingerprint, pm.content, (pm.timestampMs / 1000u).toLong()))
+            meshBroadcastInbox.offer(MeshBroadcastIn(senderFingerprint, pm.content, (pm.timestampMs / 1000u).toLong()))
         }
         // Stash peers' 0x53 payloads + register named, verified announce peers,
         // keyed by stable fingerprint.
@@ -142,7 +148,13 @@ actual object MeshRadio {
             announcedSeen[fingerprint] = System.currentTimeMillis()
         }
         // Keep a peer fresh while its encrypted link is (re)established.
-        MeshGatt.addLinkListener { fingerprint -> announcedSeen[fingerprint] = System.currentTimeMillis() }
+        MeshGatt.addLinkListener { fingerprint ->
+            announcedSeen[fingerprint] = System.currentTimeMillis()
+            consecutiveWatchdogRestarts = 0
+        }
+        MeshGatt.addDeliveryAckListener { fingerprint, messageId ->
+            meshDeliveryAckInbox.offer(MeshDeliveryAck(fingerprint, messageId))
+        }
     }
 
     private val ctx: Context get() = AppContextHolder.ctx
@@ -198,6 +210,10 @@ actual object MeshRadio {
     }
 
     actual fun start() {
+        if (PanicWipeIntent.isPending()) {
+            android.util.Log.i(TAG, "start skipped: panic wipe recovery is pending")
+            return
+        }
         if (!AndroidMeshLifecycleGate.allowed) {
             android.util.Log.i(TAG, "start skipped: visible Activity lifecycle is not active")
             return
@@ -213,6 +229,7 @@ actual object MeshRadio {
         }
         applyMeshGattPolicy()
         val a = adapter() ?: return
+        consecutiveWatchdogRestarts = 0
         scanning = true
         try {
             // Bring the GATT callback owner up before scan results can dial.
@@ -234,6 +251,7 @@ actual object MeshRadio {
 
     actual fun stop() {
         scanning = false
+        consecutiveWatchdogRestarts = 0
         // This handler also owns delayed soft-election dials, so cancelling only
         // the watchdog can reconnect GATT after onStop.
         handler.removeCallbacksAndMessages(null)
@@ -246,7 +264,9 @@ actual object MeshRadio {
     }
 
     actual fun resetAccountState() {
-        AndroidMeshLifecycleGate.allowed = false
+        // Account identity and Activity visibility are independent lifecycles.
+        // Preserve the visible-Activity gate so an in-foreground erase/restore
+        // can safely reinitialize the fresh account without an Activity bounce.
         stop()
         MeshGatt.resetAccountState()
         discoveryMode = BleDiscoveryMode.Normal
@@ -255,6 +275,7 @@ actual object MeshRadio {
         meshDmInbox.clear()
         meshMediaInbox.clear()
         meshBroadcastInbox.clear()
+        meshDeliveryAckInbox.clear()
     }
 
     private fun restartRadioForPolicy() {
@@ -335,7 +356,11 @@ actual object MeshRadio {
                 lastScanStartMs = lastScanStartMs,
                 hasUsableLink = hasUsableLink,
                 staleMs = WATCHDOG_STALE_MS,
-                gapMs = WATCHDOG_GAP_MS,
+                gapMs = bleWatchdogGapMs(
+                    WATCHDOG_GAP_MS,
+                    consecutiveWatchdogRestarts,
+                    WATCHDOG_MAX_GAP_MS,
+                ),
             )
             if (restartReason != null) {
                 sonarLog(
@@ -347,6 +372,7 @@ actual object MeshRadio {
                 )
                 runCatching { scanner?.stopScan(scanCallback) }
                 runCatching { startScanInternal() }
+                consecutiveWatchdogRestarts = (consecutiveWatchdogRestarts + 1).coerceAtMost(16)
             }
             if (shouldRunAndroidMeshWatchdog(scanning, AndroidMeshLifecycleGate.allowed)) {
                 handler.postDelayed(this, WATCHDOG_TICK_MS)
@@ -407,8 +433,40 @@ actual object MeshRadio {
         return out
     }
 
+    actual fun restorePendingDeliveries(records: List<MeshPendingDeliveryRecord>) {
+        MeshGatt.restorePendingDeliveries(records)
+    }
+
+    actual fun discardPendingDeliveries(peerIds: Set<String>) {
+        MeshGatt.discardPendingDeliveries(peerIds)
+    }
+
+    actual fun discardPendingDelivery(peerId: String, messageId: String) {
+        MeshGatt.discardPendingDelivery(peerId, messageId)
+    }
+
+    actual fun claimPendingDeliveryExpiry(peerId: String, messageId: String): Boolean =
+        MeshGatt.claimPendingDeliveryExpiry(peerId, messageId)
+
+    actual fun releasePendingDeliveryExpiry(peerId: String, messageId: String) {
+        MeshGatt.releasePendingDeliveryExpiry(peerId, messageId)
+    }
+
+    actual fun finishMeshDeliveryAck(peerId: String, messageId: String) {
+        MeshGatt.finishDeliveryAck(peerId, messageId)
+    }
+
+    actual fun drainMeshDeliveryAcks(): List<MeshDeliveryAck> {
+        val out = ArrayList<MeshDeliveryAck>()
+        while (true) out.add(meshDeliveryAckInbox.poll() ?: break)
+        return out
+    }
+
+    actual fun acknowledgeMeshDm(peerId: String, messageId: String): Boolean =
+        MeshGatt.acknowledgeText(peerId, messageId)
+
     actual fun sendMeshMedia(peerId: String, messageId: String, bytes: ByteArray, filename: String, mimeType: String): Boolean =
-        MeshGatt.sendFileToPeer(peerId, messageId, bytes, filename, mimeType)
+        false
 
     actual fun drainMeshMedia(): List<MeshMediaIn> {
         val out = ArrayList<MeshMediaIn>()
@@ -444,6 +502,11 @@ actual object MeshRadio {
             val name = runCatching { result.scanRecord?.deviceName }.getOrNull()
                 ?: ("mesh·" + id.takeLast(5).replace(":", ""))
             val isNew = !seen.containsKey(id)
+            consecutiveWatchdogRestarts = bleWatchdogBackoffAfterScanResult(
+                consecutiveRestarts = consecutiveWatchdogRestarts,
+                newAddress = isNew,
+                hasUsableLink = announcedPeers.keys.any { MeshGatt.hasLink(it) },
+            )
             seen[id] = MeshPeer(id = id, name = name, rssi = result.rssi)
             lastSeen[id] = System.currentTimeMillis()
             val peerNodeId = runCatching {

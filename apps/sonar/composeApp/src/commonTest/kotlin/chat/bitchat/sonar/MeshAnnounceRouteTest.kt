@@ -32,4 +32,16 @@ class MeshAnnounceRouteTest {
         assertTrue(meshSigningKeyMatches("AABB", "aabb"))
         assertFalse(meshSigningKeyMatches("aabb", "ccdd"))
     }
+
+    @Test
+    fun noiseSessionMustAuthenticateTheKeyFromTheVerifiedAnnounce() {
+        val victim = "11".repeat(32)
+        val attacker = "22".repeat(32)
+
+        assertTrue(meshNoiseStaticMatches(victim.uppercase(), victim))
+        assertFalse(meshNoiseStaticMatches(victim, attacker))
+        assertFalse(meshNoiseStaticMatches(victim, null))
+        assertFalse(meshNoiseStaticMatches(null, victim))
+        assertFalse(meshNoiseStaticMatches("not-hex", "not-hex"))
+    }
 }

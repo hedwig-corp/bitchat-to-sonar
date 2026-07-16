@@ -40,6 +40,16 @@ class WalletSeedTest {
     }
 }
 
+class WalletCallbackFenceTest {
+    @Test
+    fun staleOrPanicFencedCallbacksCannotMutateTheNewAccount() {
+        assertTrue(acceptsWalletCallback(4, 4, ownsSdkNode = true, panicWipePending = false))
+        assertFalse(acceptsWalletCallback(3, 4, ownsSdkNode = true, panicWipePending = false))
+        assertFalse(acceptsWalletCallback(4, 4, ownsSdkNode = false, panicWipePending = false))
+        assertFalse(acceptsWalletCallback(4, 4, ownsSdkNode = true, panicWipePending = true))
+    }
+}
+
 private fun ByteArray.toHex(): String =
     joinToString("") { ((it.toInt() and 0xFF) + 0x100).toString(16).substring(1) }
 

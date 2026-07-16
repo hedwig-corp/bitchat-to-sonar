@@ -1,12 +1,39 @@
 package chat.bitchat.sonar
 
 import uniffi.sonar_ffi.SonarNoise
+import uniffi.sonar_ffi.MeshReassembler
 import uniffi.sonar_ffi.meshDecodePacket
 import uniffi.sonar_ffi.meshDecodePrivateMessage
 import uniffi.sonar_ffi.meshEncodePrivateMessage
 import uniffi.sonar_ffi.meshParseAnnounce
+import uniffi.sonar_ffi.meshParseVerifiedSonarAnnounce
+import uniffi.sonar_ffi.meshFragment
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.ArrayBlockingQueue
+import java.security.SecureRandom
+import java.util.concurrent.atomic.AtomicLong
+
+/** One detached latest packet per sender, with deterministic FIFO eviction. */
+internal class PendingSonarPacketQueue(private val limit: Int) {
+    private val packets = LinkedHashMap<String, ByteArray>()
+    init { require(limit > 0) }
+
+    fun offer(senderKey: String, packet: ByteArray) {
+        if (!packets.containsKey(senderKey) && packets.size >= limit) {
+            val oldest = packets.keys.iterator()
+            if (oldest.hasNext()) {
+                oldest.next()
+                oldest.remove()
+            }
+        }
+        packets.remove(senderKey)
+        packets[senderKey] = packet.copyOf()
+    }
+
+    fun remove(senderKey: String): ByteArray? = packets.remove(senderKey)
+    fun clear() = packets.clear()
+    fun size(): Int = packets.size
+}
 
 /**
  * Desktop BLE mesh protocol engine — the Noise-over-GATT transport, the desktop
@@ -29,8 +56,16 @@ object MeshLink {
     private const val TYPE_ANNOUNCE = 0x01
     private const val TYPE_NOISE_HANDSHAKE = 0x10
     private const val TYPE_NOISE_ENCRYPTED = 0x11
+    private const val TYPE_FRAGMENT = 0x20
+    private const val TYPE_REQUEST_SYNC = 0x21
     private const val TYPE_SONAR = 0x53
+    private const val NOISE_PRIVATE_MESSAGE = 0x01
+    private const val NOISE_DELIVERED = 0x03
     private const val PEER_TTL_MS = 90_000L
+    private const val DELIVERY_ACK_TIMEOUT_MS = 10_000L
+    private const val MAX_SINGLE_GATT_PACKET_BYTES = 480
+    private const val FRAGMENT_CHUNK_SIZE: UInt = 350u
+    private const val MAX_PENDING_SONAR_PROFILES = 128
 
     private class Session(val noise: SonarNoise) {
         @Volatile var established = false
@@ -43,8 +78,17 @@ object MeshLink {
     private val seenByFp = ConcurrentHashMap<String, Long>()           // fp -> last-activity ms
     private val sonarByPeerId = ConcurrentHashMap<String, ByteArray>() // peerId -> 0x53 payload
     private val sonarSeenAt = ConcurrentHashMap<String, Long>()        // peerId -> last 0x53 ms (for TTL)
-    private val rxDms = ConcurrentLinkedQueue<MeshDmIn>()
-    private val pending = ConcurrentHashMap<String, ConcurrentLinkedQueue<Pair<String, String>>>()
+    private val signingKeyByPeerId = ConcurrentHashMap<String, String>()
+    private val announcedNoiseKeyByPeerId = ConcurrentHashMap<String, String>()
+    /** Signed 0x53 can precede its verified 0x01. Retain only one detached
+     * packet per sender in a bounded FIFO until the signing key arrives. */
+    private val pendingSonarByPeerId = PendingSonarPacketQueue(MAX_PENDING_SONAR_PROFILES)
+    private val rxDms = ArrayBlockingQueue<MeshDmIn>(512)
+    private val deliveryAcks = ArrayBlockingQueue<MeshDeliveryAck>(512)
+    private val pendingDeliveries = PendingMeshDeliveryTracker()
+    private data class AwaitingAck(val messageId: String, val sentAtMs: Long)
+    private val awaitingAck = mutableMapOf<String, AwaitingAck>()
+    private var reassembler = MeshReassembler()
 
     /** Our encoded SonarAnnounce (npub + caps) to broadcast as a signed 0x53, so
      *  phones treat us as a full Sonar peer and continue our chat over White Noise
@@ -53,6 +97,7 @@ object MeshLink {
     @Volatile private var lastSonarSendMs = 0L
 
     @Volatile private var running = false
+    private val loopGeneration = AtomicLong()
     private val lifecycleLock = Any()
 
     /** Set/clear the SonarAnnounce payload broadcast as our 0x53 (from the app). */
@@ -60,48 +105,59 @@ object MeshLink {
 
     fun start() {
         if (running) return
+        val generation = loopGeneration.incrementAndGet()
         running = true
-        Thread({ loop() }, "sonar-mesh-link").apply { isDaemon = true }.start()
+        Thread({ loop(generation) }, "sonar-mesh-link").apply { isDaemon = true }.start()
     }
 
-    fun stop() { running = false }
+    fun stop() {
+        running = false
+        loopGeneration.incrementAndGet()
+        synchronized(lifecycleLock) {
+            // Native advertising/GATT is torn down by MeshRadio.stop(); Noise
+            // nonces cannot be resumed across that raw-link generation.
+            sessions.clear()
+            // A Noise handshake is admitted only after a verified announce in
+            // this raw BLE generation. Never reuse an old lifecycle's binding.
+            announcedNoiseKeyByPeerId.clear()
+            reassembler = MeshReassembler()
+            pendingDeliveries.cancelInFlight()
+            awaitingAck.clear()
+        }
+    }
 
-    private fun loop() {
-        while (running) {
-            runCatching { synchronized(lifecycleLock) { if (running) pump() } }
+    private fun loop(generation: Long) {
+        while (running && loopGeneration.get() == generation) {
+            runCatching {
+                synchronized(lifecycleLock) {
+                    if (running && loopGeneration.get() == generation) pump()
+                }
+            }
             try { Thread.sleep(120) } catch (_: InterruptedException) { break }
         }
     }
 
     private fun pump() {
-        for (pkt in BleBridge.drainRx()) {
-            val info = runCatching { meshDecodePacket(pkt) }.getOrNull() ?: continue
-            val sender = info.senderIdHex
-            when (info.packetType.toInt()) {
-                TYPE_ANNOUNCE -> {
-                    val ann = runCatching { meshParseAnnounce(pkt) }.getOrNull() ?: continue
-                    val fp = MeshIdentity.fingerprintOf(ann.noisePublicKeyHex)
-                    if (fp.isNotEmpty()) {
-                        fpByPeerId[sender] = fp; peerIdByFp[fp] = sender
-                        nameByFp[fp] = ann.nickname; touch(fp)
-                    }
-                }
-                TYPE_NOISE_HANDSHAKE -> handleHandshake(sender, info.payload)
-                TYPE_NOISE_ENCRYPTED -> handleEncrypted(sender, info.payload)
-                TYPE_SONAR -> {
-                    sonarSeenAt[sender] = System.currentTimeMillis()
-                    if (sonarByPeerId.put(sender, info.payload) == null) {
-                        sonarLog("MeshLink", "RX 0x53 Sonar announce from ${nameByFp[fpByPeerId[sender]] ?: sender} → peer is a full Sonar user (npub for WN fallback)")
-                    }
-                }
-            }
-        }
+        for (pkt in BleBridge.drainRx()) handlePacket(pkt)
         val now = System.currentTimeMillis()
         seenByFp.entries.removeIf { now - it.value > PEER_TTL_MS }
         // Expire stale 0x53 payloads too (parity with seenByFp) so a peer that left
         // range stops being reported as a live Sonar user by [sonarPeers].
         sonarSeenAt.entries.removeIf { now - it.value > PEER_TTL_MS }
         sonarByPeerId.keys.retainAll(sonarSeenAt.keys)
+        awaitingAck.toMap().forEach { (fp, waiting) ->
+            if (now - waiting.sentAtMs >= DELIVERY_ACK_TIMEOUT_MS &&
+                pendingDeliveries.retryIfAwaiting(fp, waiting.messageId)
+            ) {
+                awaitingAck.remove(fp)
+                // A lost native notify advanced our Noise send nonce but not the
+                // peer's receive nonce. Never retry on that session; retain the
+                // logical head for the next fresh phone handshake.
+                sessions.remove(fp)
+                BleBridge.restartAdvertising()
+                sonarLog("MeshLink", "peer delivery ACK timed out ${waiting.messageId.take(12)}…; awaiting fresh handshake")
+            }
+        }
 
         // Broadcast our signed 0x53 Sonar announce every ~3s so connected phones
         // learn our npub and can continue the chat over White Noise out of range.
@@ -110,11 +166,83 @@ object MeshLink {
         val payload = sonarPayload
         if (payload != null && seenByFp.isNotEmpty() && now - lastSonarSendMs >= 3_000L) {
             lastSonarSendMs = now
-            runCatching { BleBridge.notify(MeshIdentity.buildSonarPacket(payload)) }
+            runCatching { notifyPacket(MeshIdentity.buildSonarPacket(payload), TYPE_SONAR, "") }
+        }
+    }
+
+    private fun handlePacket(packet: ByteArray) {
+        val info = runCatching { meshDecodePacket(packet) }.getOrNull() ?: return
+        val sender = info.senderIdHex
+        if (info.packetType.toInt() == TYPE_FRAGMENT) {
+            val full = runCatching { reassembler.add(sender, info.payload) }.getOrNull() ?: return
+            handlePacket(full)
+            return
+        }
+        when (info.packetType.toInt()) {
+            TYPE_ANNOUNCE -> {
+                val ann = runCatching { meshParseAnnounce(packet) }.getOrNull() ?: return
+                val senderKey = ann.senderIdHex.lowercase()
+                if (ann.senderIdHex.equals(MeshIdentity.peerIdHex, ignoreCase = true)) return
+                val existingSigningKey = signingKeyByPeerId.putIfAbsent(senderKey, ann.signingPublicKeyHex)
+                if (!meshSigningKeyMatches(existingSigningKey, ann.signingPublicKeyHex)) {
+                    sonarLog("MeshLink", "announce signing-key change rejected for ${ann.senderIdHex}")
+                    return
+                }
+                val fp = MeshIdentity.fingerprintOf(ann.noisePublicKeyHex)
+                if (fp.isNotEmpty()) {
+                    announcedNoiseKeyByPeerId[senderKey] = ann.noisePublicKeyHex
+                    fpByPeerId[senderKey] = fp; peerIdByFp[fp] = senderKey
+                    nameByFp[fp] = ann.nickname; touch(fp)
+                    pendingSonarByPeerId.remove(senderKey)?.let { pending ->
+                        acceptVerifiedSonar(senderKey, pending, ann.signingPublicKeyHex)
+                    }
+                }
+            }
+            TYPE_NOISE_HANDSHAKE -> handleHandshake(sender, info.payload)
+            TYPE_NOISE_ENCRYPTED -> handleEncrypted(sender, info.payload)
+            // Safe tracked gap: do not fabricate a lossy sync response until the
+            // Bounded GCS index + RSR flags are tracked in parity issue #284:
+            // https://github.com/hedwig-corp/bitchat-to-sonar/issues/284
+            TYPE_REQUEST_SYNC -> sonarLog(
+                "MeshLink",
+                "requestSync requires a bounded local GCS packet index and RSR flag support; refusing an incomplete response",
+            )
+            TYPE_SONAR -> {
+                if (sender.equals(MeshIdentity.peerIdHex, ignoreCase = true)) return
+                val senderKey = sender.lowercase()
+                val signingKey = signingKeyByPeerId[senderKey]
+                val fp = fpByPeerId[senderKey]
+                if (signingKey == null || fp == null) {
+                    queuePendingSonar(senderKey, packet)
+                } else {
+                    acceptVerifiedSonar(senderKey, packet, signingKey)
+                }
+            }
         }
     }
 
     private fun touch(fp: String) { seenByFp[fp] = System.currentTimeMillis() }
+
+    private fun queuePendingSonar(senderKey: String, packet: ByteArray) {
+        pendingSonarByPeerId.offer(senderKey, packet)
+    }
+
+    private fun acceptVerifiedSonar(senderKey: String, packet: ByteArray, signingKey: String) {
+        val payload = runCatching {
+            meshParseVerifiedSonarAnnounce(packet, signingKey)
+        }.getOrNull()
+        if (payload == null) {
+            sonarLog("MeshLink", "Sonar announce signature rejected for $senderKey")
+            return
+        }
+        sonarSeenAt[senderKey] = System.currentTimeMillis()
+        if (sonarByPeerId.put(senderKey, payload) == null) {
+            sonarLog(
+                "MeshLink",
+                "RX verified 0x53 Sonar announce from ${nameByFp[fpByPeerId[senderKey]] ?: senderKey}",
+            )
+        }
+    }
 
     /** Noise XX responder: read m1 → reply m2 → read m3 → established.
      *
@@ -126,18 +254,22 @@ object MeshLink {
      *  range"). So tear down + start fresh whenever a handshake doesn't fit the
      *  current state. */
     private fun handleHandshake(senderPeerId: String, m: ByteArray) {
-        val fp = fpByPeerId[senderPeerId] ?: senderPeerId
+        val senderKey = senderPeerId.lowercase()
+        val fp = fpByPeerId[senderKey] ?: return
+        if (announcedNoiseKeyByPeerId[senderKey] == null) return
+        pendingDeliveries.cancelInFlight(fp)
+        awaitingAck.remove(fp)
         if (sessions[fp]?.established == true) {
             sonarLog("MeshLink", "re-handshake from ${nameByFp[fp] ?: fp.take(8)} → resetting session")
             sessions.remove(fp)
         }
         val s = sessions.getOrPut(fp) { Session(SonarNoise.responder(MeshIdentity.noisePrivHex())) }
         synchronized(s) {
-            if (!feedHandshake(fp, senderPeerId, s, m)) {
+            if (!feedHandshake(fp, senderKey, s, m)) {
                 // Wrong message for this state (a fresh m1 mid-handshake) — restart.
                 val fresh = Session(SonarNoise.responder(MeshIdentity.noisePrivHex()))
                 sessions[fp] = fresh
-                synchronized(fresh) { feedHandshake(fp, senderPeerId, fresh, m) }
+                synchronized(fresh) { feedHandshake(fp, senderKey, fresh, m) }
             }
         }
         touch(fp)
@@ -148,12 +280,22 @@ object MeshLink {
         runCatching {
             s.noise.readMessage(m) // m1, then m3
             if (s.noise.isFinished()) {
+                val announced = announcedNoiseKeyByPeerId[senderPeerId]
+                val authenticated = s.noise.remoteStaticHex()
+                check(meshNoiseStaticMatches(announced, authenticated)) {
+                    "Noise static key does not match verified announce"
+                }
+                check(MeshIdentity.fingerprintOf(authenticated!!) == fp) {
+                    "Noise fingerprint does not match verified announce"
+                }
                 s.noise.intoSession(); s.established = true
                 sonarLog("MeshLink", "Noise link ESTABLISHED with ${nameByFp[fp] ?: fp.take(8)}")
                 flushPending(fp)
             } else {
                 val m2 = s.noise.writeMessage()
-                BleBridge.notify(MeshIdentity.buildPacket(TYPE_NOISE_HANDSHAKE.toUByte(), senderPeerId, m2))
+                check(notifyPacket(MeshIdentity.buildPacket(TYPE_NOISE_HANDSHAKE.toUByte(), senderPeerId, m2), TYPE_NOISE_HANDSHAKE, senderPeerId)) {
+                    "native BLE bridge rejected handshake reply"
+                }
             }
             true
         }.getOrElse { sessions.remove(fp); false }
@@ -164,9 +306,25 @@ object MeshLink {
         synchronized(s) {
             runCatching {
                 val plain = s.noise.decrypt(ciphertext)
-                meshDecodePrivateMessage(plain)?.let { pm ->
-                    sonarLog("MeshLink", "RX DM from ${nameByFp[fp] ?: fp.take(8)} (${pm.content.length} chars)")
-                    rxDms.add(MeshDmIn(fp, pm.messageId, pm.content, System.currentTimeMillis() / 1000))
+                when (plain.firstOrNull()?.toInt()?.and(0xFF)) {
+                    NOISE_PRIVATE_MESSAGE -> meshDecodePrivateMessage(plain)?.let { pm ->
+                        sonarLog("MeshLink", "RX DM from ${nameByFp[fp] ?: fp.take(8)} (${pm.content.length} chars)")
+                        // Full means no host ACK; the peer retries this stable id.
+                        rxDms.offer(MeshDmIn(fp, pm.messageId, pm.content, System.currentTimeMillis() / 1000))
+                    }
+                    NOISE_DELIVERED -> {
+                        val messageId = meshDeliveryAckMessageId(plain)
+                        if (messageId != null && pendingDeliveries.acknowledgeIf(fp, messageId) {
+                                deliveryAcks.offer(MeshDeliveryAck(fp, messageId))
+                            }
+                        ) {
+                            awaitingAck.remove(fp)
+                            sonarLog("MeshLink", "peer delivery ACK ${messageId.take(12)}…")
+                            flushPending(fp)
+                        } else if (messageId != null && pendingDeliveries.awaitingAck(fp, messageId)) {
+                            sonarLog("MeshLink", "retaining delivery ACK ${messageId.take(12)}…: host queue is full")
+                        }
+                    }
                 }
             }
         }
@@ -176,46 +334,130 @@ object MeshLink {
     fun hasLink(fp: String): Boolean = sessions[fp]?.established == true
 
     fun sendDm(fp: String, messageId: String, text: String): Boolean {
-        val s = sessions[fp]?.takeIf { it.established }
-        if (s == null) {
-            // No live link yet — the phone initiates the handshake, so queue and
-            // deliver on establish (mirrors Android's pending-send behavior).
-            pending.getOrPut(fp) { ConcurrentLinkedQueue() }.add(messageId to text)
+        synchronized(lifecycleLock) {
+            if (!pendingDeliveries.enqueue(fp, messageId, text)) return false
+            flushPending(fp)
             return true
         }
-        return encryptAndSend(fp, s, messageId, text)
     }
 
-    fun sendDmNow(fp: String, messageId: String, text: String): Boolean {
+    fun restorePendingDeliveries(records: List<MeshPendingDeliveryRecord>) = synchronized(lifecycleLock) {
+        records.sortedWith(compareBy<MeshPendingDeliveryRecord> { it.peerId }.thenBy { it.sequence }).forEach { record ->
+            pendingDeliveries.enqueue(record.peerId, record.messageId, record.text)
+        }
+        records.mapTo(linkedSetOf()) { it.peerId }.forEach(::flushPending)
+    }
+
+    fun discardPendingDeliveries(peerIds: Set<String>) = synchronized(lifecycleLock) {
+        peerIds.forEach { peerId ->
+            pendingDeliveries.clear(peerId)
+            awaitingAck.remove(peerId)
+        }
+    }
+
+    fun discardPendingDelivery(peerId: String, messageId: String) = synchronized(lifecycleLock) {
+        if (pendingDeliveries.discard(peerId, messageId)) {
+            if (awaitingAck[peerId]?.messageId == messageId) awaitingAck.remove(peerId)
+            flushPending(peerId)
+        }
+    }
+
+    fun claimPendingDeliveryExpiry(peerId: String, messageId: String): Boolean = synchronized(lifecycleLock) {
+        pendingDeliveries.claimExpiry(peerId, messageId).also { claimed ->
+            if (claimed && awaitingAck[peerId]?.messageId == messageId) awaitingAck.remove(peerId)
+        }
+    }
+
+    fun releasePendingDeliveryExpiry(peerId: String, messageId: String) = synchronized(lifecycleLock) {
+        pendingDeliveries.releaseExpiry(peerId, messageId)
+        flushPending(peerId)
+    }
+
+    fun finishDeliveryAck(peerId: String, messageId: String) = synchronized(lifecycleLock) {
+        pendingDeliveries.finishAcknowledgement(peerId, messageId)
+    }
+
+    fun sendDmNow(fp: String, messageId: String, text: String): Boolean = synchronized(lifecycleLock) {
+        if (!running) return@synchronized false
         val s = sessions[fp]?.takeIf { it.established } ?: return false
-        return encryptAndSend(fp, s, messageId, text)
+        encryptAndSend(fp, s, messageId, text)
     }
 
     private fun encryptAndSend(fp: String, s: Session, messageId: String, text: String): Boolean {
         val peerId = peerIdByFp[fp] ?: return false
-        return synchronized(s) {
+        val accepted = synchronized(s) {
             runCatching {
                 val plain = meshEncodePrivateMessage(messageId, text)
                 val ct = s.noise.encrypt(plain)
-                BleBridge.notify(MeshIdentity.buildPacket(TYPE_NOISE_ENCRYPTED.toUByte(), peerId, ct))
+                if (!notifyPacket(MeshIdentity.buildPacket(TYPE_NOISE_ENCRYPTED.toUByte(), peerId, ct), TYPE_NOISE_ENCRYPTED, peerId)) {
+                    return@runCatching false
+                }
                 sonarLog("MeshLink", "TX DM to ${nameByFp[fp] ?: fp.take(8)} (${text.length} chars)")
                 true
             }.getOrDefault(false)
         }
+        if (!accepted) {
+            sessions.remove(fp, s)
+            BleBridge.restartAdvertising()
+        }
+        return accepted
     }
 
     private fun flushPending(fp: String) {
-        val q = pending[fp] ?: return
         val s = sessions[fp]?.takeIf { it.established } ?: return
-        while (true) {
-            val (mid, text) = q.poll() ?: break
-            encryptAndSend(fp, s, mid, text)
+        val delivery = pendingDeliveries.beginNext(fp) ?: return
+        val accepted = encryptAndSend(fp, s, delivery.messageId, delivery.text)
+        pendingDeliveries.finishTransport(fp, delivery.messageId, accepted)
+        if (accepted) {
+            awaitingAck[fp] = AwaitingAck(delivery.messageId, System.currentTimeMillis())
+        }
+    }
+
+    /** Apple/Android-compatible [0x03][UTF-8 stable message id] ACK. */
+    fun acknowledgeDm(fp: String, messageId: String): Boolean = synchronized(lifecycleLock) {
+        if (!running) return@synchronized false
+        if (messageId.isBlank()) return@synchronized false
+        val s = sessions[fp]?.takeIf { it.established } ?: return@synchronized false
+        val peerId = peerIdByFp[fp] ?: return@synchronized false
+        val accepted = synchronized(s) {
+            runCatching {
+                val plain = meshDeliveryAckPayload(messageId)
+                val ct = s.noise.encrypt(plain)
+                notifyPacket(MeshIdentity.buildPacket(TYPE_NOISE_ENCRYPTED.toUByte(), peerId, ct), TYPE_NOISE_ENCRYPTED, peerId)
+            }.getOrDefault(false)
+        }
+        if (!accepted) {
+            sessions.remove(fp, s)
+            BleBridge.restartAdvertising()
+        }
+        accepted
+    }
+
+    /** Desktop uses the exact phone fragmentation envelope for logical packets
+     * larger than the conservative cross-platform GATT payload. */
+    private fun notifyPacket(packet: ByteArray, originalType: Int, recipientPeerId: String): Boolean {
+        if (packet.size <= MAX_SINGLE_GATT_PACKET_BYTES) return BleBridge.notify(packet)
+        val fragmentId = ByteArray(8).also { SecureRandom().nextBytes(it) }
+            .joinToString("") { "%02x".format(it.toInt() and 0xff) }
+        val fragments = runCatching {
+            meshFragment(packet, fragmentId, originalType.toUByte(), FRAGMENT_CHUNK_SIZE)
+        }.getOrNull() ?: return false
+        return fragments.all { payload ->
+            BleBridge.notify(
+                MeshIdentity.buildPacket(TYPE_FRAGMENT.toUByte(), recipientPeerId, payload),
+            )
         }
     }
 
     fun drainDms(): List<MeshDmIn> {
         val out = ArrayList<MeshDmIn>()
         while (true) out.add(rxDms.poll() ?: break)
+        return out
+    }
+
+    fun drainDeliveryAcks(): List<MeshDeliveryAck> {
+        val out = ArrayList<MeshDeliveryAck>()
+        while (true) out.add(deliveryAcks.poll() ?: break)
         return out
     }
 
@@ -236,7 +478,10 @@ object MeshLink {
 
     fun wipe() = synchronized(lifecycleLock) {
         sessions.clear(); fpByPeerId.clear(); peerIdByFp.clear()
-        nameByFp.clear(); seenByFp.clear(); sonarByPeerId.clear(); sonarSeenAt.clear(); rxDms.clear(); pending.clear()
+        nameByFp.clear(); seenByFp.clear(); sonarByPeerId.clear(); sonarSeenAt.clear(); rxDms.clear(); deliveryAcks.clear()
+        signingKeyByPeerId.clear(); pendingSonarByPeerId.clear()
+        pendingDeliveries.clear(); awaitingAck.clear()
+        reassembler = MeshReassembler()
         sonarPayload = null
         lastSonarSendMs = 0L
     }

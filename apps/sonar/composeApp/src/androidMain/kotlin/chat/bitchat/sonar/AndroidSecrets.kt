@@ -49,8 +49,19 @@ internal object AndroidSecrets {
         legacyPrefs().edit().remove(key).apply()
     }
 
+    /** Durable panic barrier: identity ciphertexts must be gone before the UI
+     *  can advertise a logged-out/new-account state. */
+    fun clearDurable(): Boolean = secretsPrefs().edit().clear().commit()
+
+    fun removeDurable(vararg keys: String): Boolean {
+        val secure = secretsPrefs().edit()
+        val legacy = legacyPrefs().edit()
+        keys.forEach { key -> secure.remove(key); legacy.remove(key) }
+        return secure.commit() && legacy.commit()
+    }
+
     fun clear() {
-        secretsPrefs().edit().clear().apply()
+        clearDurable()
     }
 
     private fun encrypt(value: String): String {

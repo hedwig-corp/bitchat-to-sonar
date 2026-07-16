@@ -173,14 +173,25 @@ fun App(
         SonarLifecycle.installInviteLinkHandler { state.requestJoinViaLink(it) }
         SonarLifecycle.installSharedTextHandler { state.handleSharedText(it) }
     }
-    LaunchedEffect(state.onboarded) {
-        onOnboardingStateChanged(state.onboarded)
-        if (state.onboarded) state.boot()
+    LaunchedEffect(state.onboarded, state.panicWipeRecoveryPending) {
+        // Close the Android Activity's independent radio gate immediately while
+        // recovery is pending. The onboarding UI itself stays behind the launch
+        // surface until the durable marker has been removed.
+        onOnboardingStateChanged(
+            if (state.panicWipeRecoveryPending) false else state.onboarded,
+        )
+        runAccountColdStart(
+            panicWipePending = state.panicWipeRecoveryPending,
+            onboarded = state.onboarded,
+            recoverPendingWipe = state::recoverPendingPanicWipeOnLaunch,
+            activateAccount = state::boot,
+        )
     }
     LaunchedEffect(state, stickerBenchmarkRequest) {
         stickerBenchmarkRequest?.let { state.runStickerBenchmark(it) }
     }
     val firstLocalStateReady = isFirstLocalStateReady(
+        panicWipeRecoveryPending = state.panicWipeRecoveryPending,
         onboarded = state.onboarded,
         locked = state.locked,
         homeMessagesHydrated = state.homeMessagesHydrated,
@@ -192,7 +203,9 @@ fun App(
         val s = sonar
 
         Surface(Modifier.fillMaxSize(), color = s.bg) {
-            if (state.locked) {
+            if (state.panicWipeRecoveryPending) {
+                LocalStateLaunchSurface()
+            } else if (state.locked) {
                 LockScreen(onUnlock = { state.unlock() })
             } else if (!state.onboarded) {
                 Box(Modifier.statusBarsPadding().navigationBarsPadding().imePadding()) {
@@ -218,13 +231,14 @@ fun App(
  * relay connectivity is deliberately not part of this boundary.
  */
 internal fun isFirstLocalStateReady(
+    panicWipeRecoveryPending: Boolean,
     onboarded: Boolean,
     locked: Boolean,
     homeMessagesHydrated: Boolean,
-): Boolean = !onboarded || locked || homeMessagesHydrated
+): Boolean = !panicWipeRecoveryPending && (!onboarded || locked || homeMessagesHydrated)
 
 @Composable
-private fun LocalStateLaunchSurface() {
+internal fun LocalStateLaunchSurface() {
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Image(
             painter = painterResource(Res.drawable.sonar_icon),

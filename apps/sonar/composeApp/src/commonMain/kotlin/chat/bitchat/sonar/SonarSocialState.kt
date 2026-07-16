@@ -1,6 +1,7 @@
 package chat.bitchat.sonar
 
 internal const val SOCIAL_STATE_BLOB_KEY = "sonar.social.v1"
+internal const val FAVORITE_ROUTE_STATE_BLOB_KEY = "sonar.favoriteRoute.v1"
 
 internal data class SonarSocialState(
     val favoritePeers: Set<String> = emptySet(),
@@ -98,6 +99,33 @@ internal fun decodeSonarSocialState(blob: String): SonarSocialState {
         }
     }
     return state
+}
+
+internal fun encodeFavoriteRouteState(
+    state: SonarSocialState,
+    links: Map<String, String>,
+): String = buildString {
+    append(encodeSonarSocialState(state).lineSequence().joinToString("\n") { "social\t$it" })
+    links.toSortedMap().forEach { (peerId, npubHex) ->
+        if (isNotEmpty()) append('\n')
+        append("link\t").append(peerId).append('\t').append(npubHex)
+    }
+}
+
+internal fun decodeFavoriteRouteState(blob: String): Pair<SonarSocialState, Map<String, String>>? {
+    if (blob.isBlank()) return null
+    val socialLines = mutableListOf<String>()
+    val links = mutableMapOf<String, String>()
+    blob.lineSequence().forEach { line ->
+        when {
+            line.startsWith("social\t") -> socialLines += line.removePrefix("social\t")
+            line.startsWith("link\t") -> {
+                val parts = line.split('\t', limit = 3)
+                if (parts.size == 3 && parts[1].isNotBlank()) links[parts[1]] = parts[2]
+            }
+        }
+    }
+    return decodeSonarSocialState(socialLines.joinToString("\n")) to links
 }
 
 private fun ByteArray.toHexLower(): String =

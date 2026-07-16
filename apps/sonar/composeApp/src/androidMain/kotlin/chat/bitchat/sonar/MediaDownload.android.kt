@@ -60,8 +60,7 @@ actual object MediaCache {
         Unit
     }
 
-    actual suspend fun wipe(): Unit = withContext(Dispatchers.IO) {
-        runCatching { root().deleteRecursively() }
-        Unit
+    actual suspend fun wipe(): Boolean = withContext(Dispatchers.IO) {
+        durablyRetireAndroidDirectory(root(), ".media-cache-wipe-")
     }
 }

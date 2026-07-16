@@ -3,11 +3,13 @@ package chat.bitchat.sonar
 internal const val OUTBOX_MAX_PER_PEER = 100
 internal const val OUTBOX_TTL_SECS = 24 * 60 * 60L
 
-internal data class QueuedMessage(
+data class QueuedMessage(
     val content: String,
     val peerId: String,
     val messageId: String,
     val timestampSecs: Long,
+    /** Per-peer durable FIFO order. Zero means "assign atomically". */
+    val sequence: Long = 0L,
 )
 
 internal data class OutboxEnqueueResult(
@@ -26,6 +28,10 @@ internal class SonarOutbox(
         queues.clear()
     }
 
+    fun remove(peerId: String) {
+        queues.remove(peerId)
+    }
+
     fun isEmpty(): Boolean = queues.isEmpty()
 
     fun contains(peerId: String): Boolean = queues.containsKey(peerId)
@@ -33,6 +39,26 @@ internal class SonarOutbox(
     fun peerIds(): List<String> = queues.keys.toList()
 
     fun snapshot(peerId: String): List<QueuedMessage> = queues[peerId]?.toList().orEmpty()
+
+    fun restore(messages: Iterable<QueuedMessage>) {
+        messages.groupBy { it.peerId }.forEach { (peerId, restored) ->
+            queues[peerId] = restored
+                .distinctBy { it.messageId }
+                .sortedWith(compareBy<QueuedMessage> { it.sequence }.thenBy { it.messageId })
+                .take(maxPerPeer)
+                .toMutableList()
+        }
+    }
+
+    fun enqueue(message: QueuedMessage): OutboxEnqueueResult {
+        val queue = queues.getOrPut(message.peerId) { mutableListOf() }
+        val existing = queue.firstOrNull { it.messageId == message.messageId }
+        if (existing != null) return OutboxEnqueueResult(existing, null, queue.size)
+        queue.add(message)
+        queue.sortWith(compareBy<QueuedMessage> { it.sequence }.thenBy { it.messageId })
+        val evicted = if (queue.size > maxPerPeer) queue.removeAt(0) else null
+        return OutboxEnqueueResult(message, evicted, queue.size)
+    }
 
     fun enqueue(peerId: String, content: String, messageId: String, timestampSecs: Long): OutboxEnqueueResult {
         val queue = queues.getOrPut(peerId) { mutableListOf() }
@@ -42,9 +68,7 @@ internal class SonarOutbox(
             messageId = messageId,
             timestampSecs = timestampSecs,
         )
-        queue.add(message)
-        val evicted = if (queue.size > maxPerPeer) queue.removeAt(0) else null
-        return OutboxEnqueueResult(message, evicted, queue.size)
+        return enqueue(message)
     }
 
     fun isExpired(message: QueuedMessage, nowSecs: Long): Boolean =

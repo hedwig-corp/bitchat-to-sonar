@@ -43,7 +43,7 @@ actual object Notifier {
         }
     }
 
-    actual fun canNotify(): Boolean = SystemTray.isSupported()
+    actual fun canNotify(): Boolean = !PanicWipeIntent.isPending() && SystemTray.isSupported()
 
     actual fun onWalletReady() { /* no push webhooks on desktop */ }
 
@@ -53,7 +53,9 @@ actual object Notifier {
 
     actual fun setPushEnabled(enabled: Boolean) { /* no push on desktop */ }
 
+    @Synchronized
     actual fun notify(id: Int, title: String, body: String, sound: SonarNotificationSound) {
+        if (PanicWipeIntent.isPending()) return
         val icon = trayIcon ?: run { ensureChannel(); trayIcon } ?: return
         runCatching { icon.displayMessage(title, body, TrayIcon.MessageType.INFO) }
             .onFailure { sonarLog("Notifier", "Failed to display desktop notification: ${it.message}") }
@@ -99,5 +101,14 @@ actual object Notifier {
                 sonarLog("Notifier", "Failed to play desktop notification sound $resource: ${it.message}")
             }
         }
+    }
+
+    @Synchronized
+    actual fun suspendAndCancelAll() {
+        // Invalidate queued and currently playing account-bound sounds at the
+        // same serialized boundary as tray notification removal.
+        soundGeneration.incrementAndGet()
+        trayIcon?.let { icon -> runCatching { SystemTray.getSystemTray().remove(icon) } }
+        trayIcon = null
     }
 }

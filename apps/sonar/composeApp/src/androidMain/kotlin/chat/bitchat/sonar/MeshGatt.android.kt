@@ -73,14 +73,18 @@ object MeshGatt {
     private const val TYPE_NOISE_HANDSHAKE: UByte = 0x10u
     private const val TYPE_NOISE_ENCRYPTED: UByte = 0x11u
     private const val TYPE_FRAGMENT: UByte = 0x20u
+    private const val TYPE_REQUEST_SYNC: UByte = 0x21u
     private const val TYPE_FILE_TRANSFER: UByte = 0x22u
     private const val TYPE_SONAR_0X53: UByte = 0x53u
+    private const val NOISE_PRIVATE_MESSAGE = 0x01
+    private const val NOISE_DELIVERED = 0x03
     private const val DEFAULT_TTL: UByte = 7u
     private const val MAX_SINGLE_GATT_PACKET_BYTES = 480
     private const val FRAGMENT_CHUNK_SIZE: UInt = 350u
     private const val MAX_FILE_TRANSFER_BYTES = 1024 * 1024
     private const val MAX_V1_FILE_PAYLOAD_BYTES = 0xFFFF
     private const val MAX_PENDING_SONAR_PROFILES = 128
+    private const val DELIVERY_ACK_TIMEOUT_MS = 10_000L
 
     private val ctx: Context get() = AppContextHolder.ctx
     private fun manager() = ctx.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
@@ -90,27 +94,75 @@ object MeshGatt {
     // so the mesh peerID is stable without leaving private material in plaintext
     // prefs. Deriving these from the Nostr identity is tracked separately.
 
-    /** Noise static keypair (X25519), loaded from secure storage or generated + saved once. */
-    private val keypair by lazy {
-        val priv = AndroidSecrets.getMigrating("mesh.noise.priv")
-        val pub = AndroidSecrets.getMigrating("mesh.noise.pub")
-        if (priv != null && pub != null) {
-            NoiseKeypairHex(priv, pub)
-        } else {
-            noiseGenerateKeypair().also {
-                AndroidSecrets.put("mesh.noise.priv", it.privateHex)
-                AndroidSecrets.put("mesh.noise.pub", it.publicHex)
+    private data class AccountIdentity(
+        val generation: Long,
+        val keypair: NoiseKeypairHex,
+        val ed25519SeedHex: String,
+        val peerIdHex: String,
+    )
+
+    /**
+     * Replaceable account-generation holder. Unlike Kotlin `lazy`, reset drops
+     * every reference to the old private material immediately. Provisioning is
+     * fail-closed while the durable panic journal exists, and the three secrets
+     * are committed as one encrypted bundle so a crash cannot mix generations.
+     */
+    private object AccountIdentityHolder {
+        private const val BUNDLE_KEY = "mesh.identity.bundle.v1"
+        private var generation = 0L
+        private var current: AccountIdentity? = null
+
+        @Synchronized
+        fun require(): AccountIdentity {
+            current?.let { return it }
+            check(!PanicWipeIntent.isPending()) { "mesh identity fenced by pending panic wipe" }
+            val stored = AndroidSecrets.getMigrating(BUNDLE_KEY, durable = true)
+                ?.split(':')
+                ?.takeIf { it.size == 3 }
+            val keypair: NoiseKeypairHex
+            val seed: String
+            if (stored != null) {
+                keypair = NoiseKeypairHex(stored[0], stored[1])
+                seed = stored[2]
+            } else {
+                val legacyPriv = AndroidSecrets.getMigrating("mesh.noise.priv", durable = true)
+                val legacyPub = AndroidSecrets.getMigrating("mesh.noise.pub", durable = true)
+                val legacySeed = AndroidSecrets.getMigrating("mesh.ed25519.seed", durable = true)
+                keypair = if (legacyPriv != null && legacyPub != null) {
+                    NoiseKeypairHex(legacyPriv, legacyPub)
+                } else {
+                    noiseGenerateKeypair()
+                }
+                seed = legacySeed ?: ByteArray(32).also { SecureRandom().nextBytes(it) }.toHex()
+                AndroidSecrets.put(
+                    BUNDLE_KEY,
+                    "${keypair.privateHex}:${keypair.publicHex}:$seed",
+                    durable = true,
+                )
+                check(AndroidSecrets.removeDurable("mesh.noise.priv", "mesh.noise.pub", "mesh.ed25519.seed")) {
+                    "failed to remove legacy mesh identity fragments"
+                }
             }
+            val identity = AccountIdentity(
+                generation = generation,
+                keypair = keypair,
+                ed25519SeedHex = seed,
+                peerIdHex = Sha256.hash(keypair.publicHex.hexToBytes()).copyOf(8).toHex(),
+            )
+            current = identity
+            return identity
+        }
+
+        @Synchronized
+        fun drop() {
+            generation += 1
+            current = null
         }
     }
-    /** Ed25519 announce-signing seed (32 bytes, hex), loaded securely or made once. */
-    private val ed25519SeedHex by lazy {
-        AndroidSecrets.getMigrating("mesh.ed25519.seed") ?: ByteArray(32)
-            .also { SecureRandom().nextBytes(it) }.toHex()
-            .also { AndroidSecrets.put("mesh.ed25519.seed", it) }
-    }
-    /** bitchat peerID = SHA256(noise static pubkey)[:8], hex. */
-    private val myPeerIdHex by lazy { Sha256.hash(keypair.publicHex.hexToBytes()).copyOf(8).toHex() }
+
+    private val keypair: NoiseKeypairHex get() = AccountIdentityHolder.require().keypair
+    private val ed25519SeedHex: String get() = AccountIdentityHolder.require().ed25519SeedHex
+    private val myPeerIdHex: String get() = AccountIdentityHolder.require().peerIdHex
     /** Display nickname carried in our announce (set by the host). */
     @Volatile private var nickname: String = ""
     /** Our latest Sonar Discovery (0x53) payload, broadcast alongside the announce. */
@@ -148,7 +200,13 @@ object MeshGatt {
      *  is when the current handshake attempt began, so a half-open handshake (m1
      *  sent but m2/m3 lost to an intermittent BLE link) can be retried instead of
      *  blocking forever. */
-    private class Link(val noise: SonarNoise, var established: Boolean = false, var startedMs: Long = 0L)
+    private val nextLinkGeneration = java.util.concurrent.atomic.AtomicLong()
+    private class Link(
+        val noise: SonarNoise,
+        var established: Boolean = false,
+        var startedMs: Long = 0L,
+        val generation: Long,
+    )
     private val serverLinks = ConcurrentHashMap<String, Link>()
     private val serverDevices = ConcurrentHashMap<String, BluetoothDevice>()
     private val clientLinks = ConcurrentHashMap<String, Link>()
@@ -160,6 +218,9 @@ object MeshGatt {
      *  stays one identity across peerID + MAC rotation (issue #12). */
     private val fingerprintByAddr = ConcurrentHashMap<String, String>()
     private val fingerprintByPeerId = ConcurrentHashMap<String, String>()
+    /** Noise static key from the verified DIRECT 0x01 announce for this raw link.
+     * A relayed announce must never populate address-scoped authentication state. */
+    private val announcedNoiseKeyByAddr = ConcurrentHashMap<String, String>()
     /** Ed25519 keys learned from verified 0x01 announces, keyed by sender ID.
      *  A 0x53 is accepted only after it verifies against this exact key. */
     private val signingKeyByPeerId = ConcurrentHashMap<String, String>()
@@ -180,6 +241,7 @@ object MeshGatt {
     private val onLink = java.util.concurrent.CopyOnWriteArrayList<(String) -> Unit>()
     private val onBroadcast = java.util.concurrent.CopyOnWriteArrayList<(String, MeshPublicMessage) -> Unit>()
     private val onFile = java.util.concurrent.CopyOnWriteArrayList<(String, String, String, String, ByteArray) -> Unit>()
+    private val onDeliveryAck = java.util.concurrent.CopyOnWriteArrayList<(String, String) -> Boolean>()
     /** Dedup public broadcasts by message id (we receive from multiple links). */
     private val seenBroadcastIds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     /** Dedup file transfers by packet sender + packet timestamp. */
@@ -191,6 +253,9 @@ object MeshGatt {
      *  is the peer's stable fingerprint (SHA256 of its noise static pubkey). */
     fun addAnnounceListener(cb: (bleAddr: String, info: MeshAnnounceInfo, fingerprint: String) -> Unit) { onAnnounce.add(cb) }
     fun addLinkListener(cb: (fingerprint: String) -> Unit) { onLink.add(cb) }
+    fun addDeliveryAckListener(cb: (fingerprint: String, messageId: String) -> Boolean) {
+        onDeliveryAck.add(cb)
+    }
 
     /** Stable fingerprint for a peer = SHA256(noise static pubkey), full hex. */
     private fun fingerprintOf(noisePublicKeyHex: String): String =
@@ -398,6 +463,7 @@ object MeshGatt {
         clientGatt.values.forEach { runCatching { it.disconnect(); it.close() } }
         clientGatt.clear(); clientChar.clear(); clientLinks.clear(); clientPending.clear(); clientConnected.clear(); clientAttempts.clear()
         serverLinks.clear(); serverDevices.clear(); peerIdByAddr.clear(); fingerprintByAddr.clear()
+        announcedNoiseKeyByAddr.clear()
         fingerprintByPeerId.clear(); signingKeyByPeerId.clear(); recentDials.clear()
         clearPendingSonar()
         // Partial packets belong to the closed raw link generation and must not
@@ -413,6 +479,7 @@ object MeshGatt {
     @Synchronized
     fun resetAccountState() {
         stop()
+        AccountIdentityHolder.drop()
         pendingDeliveries.clear()
         nickname = ""
         sonarPayload = null
@@ -453,16 +520,36 @@ object MeshGatt {
         cleanupClient(addr)
     }
 
-    private fun cleanupServer(addr: String) {
-        val device = serverDevices.remove(addr)
-        if (device != null) runCatching { server?.cancelConnection(device) }
-        serverLinks.remove(addr)
+    private fun clientRouteId(addr: String, generation: Long) = "client:$addr:$generation"
+    private fun serverRouteId(addr: String, generation: Long) = "server:$addr:$generation"
+
+    private fun disconnectRoute(routeId: String, addr: String) {
+        if (routeId.startsWith("client:")) cleanupClient(addr) else cleanupServer(addr)
+    }
+
+    private fun releaseAddrIdentityIfUnused(addr: String) {
+        if (clientGatt.containsKey(addr) || clientLinks.containsKey(addr) ||
+            serverDevices.containsKey(addr) || serverLinks.containsKey(addr)
+        ) return
         peerIdByAddr.remove(addr)
         fingerprintByAddr.remove(addr)
+        announcedNoiseKeyByAddr.remove(addr)
+    }
+
+    private fun cleanupServer(addr: String) {
+        val fp = fingerprintByAddr[addr]
+        val device = serverDevices.remove(addr)
+        if (device != null) runCatching { server?.cancelConnection(device) }
+        val removedLink = serverLinks.remove(addr)
+        releaseAddrIdentityIfUnused(addr)
         val queued = serverNotifyQueue.remove(addr)
         val failed = serverNotifyInFlight.remove(addr)?.onComplete
             ?: queued?.firstOrNull { it.onComplete != null }?.onComplete
         if (active) failed?.invoke(false)
+        val routeId = removedLink?.let { serverRouteId(addr, it.generation) }
+        if (active && fp != null && routeId != null && pendingDeliveries.cancelInFlightForRoute(fp, routeId)) {
+            flushPending(fp)
+        }
     }
 
     private fun serverCallback(generation: Long) = object : BluetoothGattServerCallback() {
@@ -751,14 +838,21 @@ object MeshGatt {
             runCatching { expectedGatt.close() }
             return
         }
-        clientLinks.remove(addr); clientChar.remove(addr); peerIdByAddr.remove(addr); fingerprintByAddr.remove(addr)
+        val fp = fingerprintByAddr[addr]
+        val removedLink = clientLinks.remove(addr)
+        clientChar.remove(addr)
         clientPending.remove(addr); clientConnected.remove(addr)
         clientAttempts.remove(addr)
         val queued = clientWriteQueue.remove(addr)
         val failed = clientWriteInFlight.remove(addr)?.onComplete
             ?: queued?.firstOrNull { it.onComplete != null }?.onComplete
         clientGatt.remove(addr)?.let { runCatching { it.disconnect(); it.close() } }
+        releaseAddrIdentityIfUnused(addr)
         if (active) failed?.invoke(false)
+        val routeId = removedLink?.let { clientRouteId(addr, it.generation) }
+        if (active && fp != null && routeId != null && pendingDeliveries.cancelInFlightForRoute(fp, routeId)) {
+            flushPending(fp)
+        }
     }
 
     // ── Receive: route every characteristic value (one padded packet) by type ──
@@ -803,6 +897,7 @@ object MeshGatt {
                     // state. A relayed announce still belongs in the radar, but
                     // must never replace the neighbour used for Noise routing.
                     peerIdByAddr[addr] = ann.senderIdHex
+                    announcedNoiseKeyByAddr[addr] = ann.noisePublicKeyHex
                     if (fp.isNotEmpty()) fingerprintByAddr[addr] = fp
                     clientPending.remove(addr) // a real peer answered — keep this link
                 }
@@ -857,6 +952,13 @@ object MeshGatt {
             TYPE_NOISE_HANDSHAKE -> handleHandshake(addr, info.payload, fromServer, device, gatt)
             TYPE_NOISE_ENCRYPTED -> handleEncrypted(addr, info.payload, fromServer)
             TYPE_FRAGMENT -> handleFragment(addr, info.senderIdHex, info.payload, fromServer, device, gatt)
+            // Safe tracked gap: do not fabricate a lossy sync response until the
+            // Bounded GCS index + RSR flags are tracked in parity issue #284:
+            // https://github.com/hedwig-corp/bitchat-to-sonar/issues/284
+            TYPE_REQUEST_SYNC -> android.util.Log.w(
+                TAG,
+                "requestSync requires a bounded local GCS packet index and RSR flag support; refusing an incomplete response",
+            )
             TYPE_FILE_TRANSFER -> handleFileTransfer(addr, value, info)
             TYPE_SONAR_0X53 -> {
                 // Tag the 0x53 with the peer's STABLE fingerprint (from its 0x01
@@ -905,7 +1007,11 @@ object MeshGatt {
         val ch = clientChar[addr] ?: run {
             android.util.Log.w(TAG, "startHandshake $addr: no clientChar"); return
         }
-        val link = Link(SonarNoise.initiator(keypair.privateHex), startedMs = System.currentTimeMillis())
+        val link = Link(
+            SonarNoise.initiator(keypair.privateHex),
+            startedMs = System.currentTimeMillis(),
+            generation = nextLinkGeneration.incrementAndGet(),
+        )
         clientLinks[addr] = link
         runCatching {
             val m1 = link.noise.writeMessage()
@@ -920,10 +1026,16 @@ object MeshGatt {
     ) {
         try {
             if (fromServer) {
-                val link = serverLinks.getOrPut(addr) { Link(SonarNoise.responder(keypair.privateHex)) }
+                val link = serverLinks.getOrPut(addr) {
+                    Link(
+                        SonarNoise.responder(keypair.privateHex),
+                        generation = nextLinkGeneration.incrementAndGet(),
+                    )
+                }
                 if (link.established) return
                 link.noise.readMessage(noiseMsg) // m1 (then m3)
                 if (link.noise.isFinished()) {
+                    check(bindAuthenticatedNoiseIdentity(addr, link)) { "Noise static key does not match direct announce" }
                     link.noise.intoSession(); link.established = true; linkEstablished(addr)
                 } else {
                     device?.let { notify(it, handshakePacket(peerIdByAddr[addr] ?: "", link.noise.writeMessage())) } // m2
@@ -937,12 +1049,31 @@ object MeshGatt {
                     gatt?.let { writePacket(it, ch, handshakePacket(peerIdByAddr[addr] ?: "", link.noise.writeMessage())) } // m3
                 }
                 if (link.noise.isFinished()) {
+                    check(bindAuthenticatedNoiseIdentity(addr, link)) { "Noise static key does not match direct announce" }
                     link.noise.intoSession(); link.established = true; linkEstablished(addr)
                 }
             }
         } catch (_: Throwable) {
             if (fromServer) serverLinks.remove(addr) else cleanupClient(addr)
         }
+    }
+
+    /** Bind the cryptographically authenticated XX remote static to the signed
+     * direct announce before any queued DM can use this route. */
+    private fun bindAuthenticatedNoiseIdentity(addr: String, link: Link): Boolean {
+        val announced = announcedNoiseKeyByAddr[addr]
+        val authenticated = link.noise.remoteStaticHex()
+        if (!meshNoiseStaticMatches(announced, authenticated)) {
+            android.util.Log.w(TAG, "Noise identity mismatch on $addr; rejecting route")
+            return false
+        }
+        val fingerprint = authenticated?.let(::fingerprintOf).orEmpty()
+        if (fingerprint.isEmpty()) return false
+        val peerId = peerIdByAddr[addr]?.lowercase()
+        val announcedFingerprint = peerId?.let(fingerprintByPeerId::get)
+        if (announcedFingerprint != null && announcedFingerprint != fingerprint) return false
+        fingerprintByAddr[addr] = fingerprint
+        return true
     }
 
     /** The established Noise session for a peer identity, across connections.
@@ -974,42 +1105,43 @@ object MeshGatt {
             ?: fp?.let { establishedLinkForFp(it) }
             ?: return
         runCatching {
-            val plain = link.noise.decrypt(ciphertext)
-            // inner NoisePayloadType: 0x01 privateMessage, 0x02 readReceipt,
-            // 0x03 delivered ack. We currently surface only 0x01; the others are
-            // logged (a 0x03 confirms the peer received + stored our DM).
-            android.util.Log.i(TAG, "rx 0x11 inner type=0x${(plain.firstOrNull()?.toInt()?.and(0xFF) ?: -1).toString(16)} (${plain.size}B) from $addr")
+            // The Snow session owns a single nonce stream. Serialize decrypts
+            // with the synchronized send/ACK paths so callback threads cannot
+            // advance it concurrently.
+            val plain = synchronized(MeshGatt) { link.noise.decrypt(ciphertext) }
+            val innerType = plain.firstOrNull()?.toInt()?.and(0xFF) ?: return@runCatching
+            android.util.Log.i(TAG, "rx 0x11 inner type=0x${innerType.toString(16)} (${plain.size}B) from $addr")
             // Surface the STABLE fingerprint so the app keys the conversation by
             // peer identity across peerID + BLE-address rotation (issue #12).
             val idFp = fp ?: peerIdByAddr[addr] ?: addr
-            meshDecodePrivateMessage(plain)?.let { pm -> onText.forEach { it(idFp, pm.messageId, pm.content) } }
+            when (innerType) {
+                NOISE_PRIVATE_MESSAGE -> meshDecodePrivateMessage(plain)?.let { pm ->
+                    // The host persists/dedupes this before calling
+                    // acknowledgeText; receiving bytes alone is not delivery.
+                    onText.forEach { it(idFp, pm.messageId, pm.content) }
+                }
+                NOISE_DELIVERED -> {
+                    val messageId = meshDeliveryAckMessageId(plain) ?: return@runCatching
+                    synchronized(MeshGatt) {
+                        if (pendingDeliveries.acknowledgeIf(idFp, messageId) {
+                                onDeliveryAck.isNotEmpty() && onDeliveryAck.all { it(idFp, messageId) }
+                            }
+                        ) {
+                            android.util.Log.i(TAG, "peer delivery ACK ${messageId.take(12)}… from ${idFp.take(8)}…")
+                            flushPending(idFp)
+                        } else if (pendingDeliveries.awaitingAck(idFp, messageId)) {
+                            android.util.Log.w(TAG, "retaining delivery ACK ${messageId.take(12)}…: host queue is full")
+                        }
+                    }
+                }
+            }
         }
     }
 
-    private fun handleFileTransfer(addr: String, packetBytes: ByteArray, info: MeshPacketInfo) {
-        val recipient = info.recipientIdHex.lowercase()
-        if (recipient != myPeerIdHex) return
-
-        val fp = fingerprintByAddr[addr] ?: peerIdByAddr[addr] ?: return
-        val tsMs = packetTimestampMs(packetBytes) ?: System.currentTimeMillis()
-        val payloadHash = Sha256.hash(info.payload).copyOf(8).toHex()
-        val transferKey = "${info.senderIdHex}-$tsMs-$payloadHash"
-        if (!seenFileIds.add(transferKey)) return
-        if (seenFileIds.size > 1024) seenFileIds.clear()
-
-        val file = runCatching { meshDecodeFilePacket(info.payload) }.getOrNull() ?: return
-        val bytes = file.content
-        if (bytes.isEmpty() || bytes.size > MAX_FILE_TRANSFER_BYTES) {
-            android.util.Log.w(TAG, "dropping file transfer size=${bytes.size} from $addr")
-            return
-        }
-        val mime = normalizedMime(file.mimeType, bytes) ?: run {
-            android.util.Log.w(TAG, "dropping file transfer mime=${file.mimeType} size=${bytes.size} from $addr")
-            return
-        }
-        val filename = safeFileName(file.fileName, mime, tsMs)
-        val messageId = "$transferKey-file"
-        onFile.forEach { it(fp, messageId, filename, mime, bytes) }
+    private fun handleFileTransfer(addr: String, _packetBytes: ByteArray, _info: MeshPacketInfo) {
+        // Directed type-0x22 payloads are signed plaintext, not Noise-encrypted.
+        // Refuse them until cross-platform encrypted chunks + durable ACK exist.
+        android.util.Log.w(TAG, "dropping legacy plaintext private file transfer from $addr")
     }
 
     private fun handshakePacket(peerIdHex: String, noiseMsg: ByteArray): ByteArray =
@@ -1028,12 +1160,21 @@ object MeshGatt {
         flushPending(fp)
     }
 
-    private fun encryptedPrivatePacket(peerAddress: String, link: Link, messageId: String, text: String): ByteArray {
-        val plain = meshEncodePrivateMessage(messageId, text)
+    private fun encryptedNoisePacket(peerAddress: String, link: Link, plain: ByteArray): ByteArray {
         val ciphertext = link.noise.encrypt(plain)
         val peerId = peerIdByAddr[peerAddress] ?: ""
         return meshBuildPacket(TYPE_NOISE_ENCRYPTED, myPeerIdHex, peerId, DEFAULT_TTL, System.currentTimeMillis().toULong(), ciphertext)
     }
+
+    private fun encryptedPrivatePacket(peerAddress: String, link: Link, messageId: String, text: String): ByteArray =
+        encryptedNoisePacket(peerAddress, link, meshEncodePrivateMessage(messageId, text))
+
+    private fun encryptedDeliveryAckPacket(peerAddress: String, link: Link, messageId: String): ByteArray =
+        encryptedNoisePacket(
+            peerAddress,
+            link,
+            meshDeliveryAckPayload(messageId),
+        )
 
     private fun fileTransferPacket(peerAddress: String, bytes: ByteArray, filename: String, mimeType: String): ByteArray? {
         if (bytes.isEmpty() || bytes.size > MAX_FILE_TRANSFER_BYTES) return null
@@ -1131,6 +1272,46 @@ object MeshGatt {
         false
     }
 
+    /** ACK only after the host has durably accepted the inbound stable id. */
+    @Synchronized
+    fun acknowledgeText(fingerprint: String, messageId: String): Boolean = runCatching {
+        if (!active || messageId.isBlank()) return@runCatching false
+        val addr = sendableAddrFor(fingerprint) ?: return@runCatching false
+        val client = clientLinks[addr]?.takeIf { it.established }
+        val gatt = clientGatt[addr]
+        val ch = clientChar[addr]
+        val completion: (Boolean) -> Unit = { success ->
+            if (!success) synchronized(MeshGatt) { disconnectAddr(addr) }
+        }
+        val sent = if (client != null && gatt != null && ch != null) {
+            writePacketMaybeFragmented(
+                addr,
+                encryptedDeliveryAckPacket(addr, client, messageId),
+                onComplete = completion,
+            ) { packet, completion -> writePacket(gatt, ch, packet, completion) }
+        } else {
+            val serverLink = serverLinks[addr]?.takeIf { it.established }
+            val device = serverDevices[addr]
+            if (serverLink != null && device != null) {
+                writePacketMaybeFragmented(
+                    addr,
+                    encryptedDeliveryAckPacket(addr, serverLink, messageId),
+                    onComplete = completion,
+                ) { packet, completion -> notify(device, packet, completion) }
+            } else {
+                false
+            }
+        }
+        // Encryption advances the Noise sending nonce before Binder accepts the
+        // packet. A rejected write therefore requires a fresh handshake; keeping
+        // this session would make the peer unable to decrypt our next ACK.
+        if (!sent) disconnectAddr(addr)
+        sent
+    }.getOrElse {
+        android.util.Log.w(TAG, "delivery ACK failed for ${fingerprint.take(8)}…: ${it.message}")
+        false
+    }
+
     private fun canSendOnAddr(addr: String): Boolean =
         (clientLinks[addr]?.established == true && clientGatt[addr] != null && clientChar[addr] != null) ||
             (serverLinks[addr]?.established == true && serverDevices[addr] != null)
@@ -1154,9 +1335,44 @@ object MeshGatt {
     @Synchronized
     fun sendTextToPeer(fingerprint: String, messageId: String, text: String): Boolean {
         if (!active || !peerAllowedByPolicy(fingerprint)) return false
-        pendingDeliveries.enqueue(fingerprint, messageId, text)
+        if (!pendingDeliveries.enqueue(fingerprint, messageId, text)) return false
         flushPending(fingerprint)
         return true
+    }
+
+    /** Rehydrate process-independent logical sends without requiring a current
+     * Activity/BLE lifecycle. A later link establishment calls flushPending. */
+    @Synchronized
+    fun restorePendingDeliveries(records: List<MeshPendingDeliveryRecord>) {
+        records.sortedWith(compareBy<MeshPendingDeliveryRecord> { it.peerId }.thenBy { it.sequence }).forEach { record ->
+            pendingDeliveries.enqueue(record.peerId, record.messageId, record.text)
+        }
+        if (active) records.mapTo(linkedSetOf()) { it.peerId }.forEach(::flushPending)
+    }
+
+    @Synchronized
+    fun discardPendingDeliveries(peerIds: Set<String>) {
+        peerIds.forEach(pendingDeliveries::clear)
+    }
+
+    @Synchronized
+    fun discardPendingDelivery(peerId: String, messageId: String) {
+        if (pendingDeliveries.discard(peerId, messageId) && active) flushPending(peerId)
+    }
+
+    @Synchronized
+    fun claimPendingDeliveryExpiry(peerId: String, messageId: String): Boolean =
+        pendingDeliveries.claimExpiry(peerId, messageId)
+
+    @Synchronized
+    fun releasePendingDeliveryExpiry(peerId: String, messageId: String) {
+        pendingDeliveries.releaseExpiry(peerId, messageId)
+        if (active) flushPending(peerId)
+    }
+
+    @Synchronized
+    fun finishDeliveryAck(peerId: String, messageId: String) {
+        pendingDeliveries.finishAcknowledgement(peerId, messageId)
     }
 
     /** Immediate send for real-time controls. Never queues. */
@@ -1203,21 +1419,63 @@ object MeshGatt {
     private fun flushPending(fingerprint: String) {
         if (!active) return
         val addr = sendableAddrFor(fingerprint) ?: return
-        val delivery = pendingDeliveries.beginNext(fingerprint) ?: return
-        val accepted = sendText(addr, delivery.messageId, delivery.text) { delivered ->
+        val clientLink = clientLinks[addr]?.takeIf {
+            it.established && clientGatt[addr] != null && clientChar[addr] != null
+        }
+        val serverLink = serverLinks[addr]?.takeIf {
+            it.established && serverDevices[addr] != null
+        }
+        val routeId = when {
+            clientLink != null -> clientRouteId(addr, clientLink.generation)
+            serverLink != null -> serverRouteId(addr, serverLink.generation)
+            else -> return
+        }
+        val delivery = pendingDeliveries.beginNext(fingerprint, routeId) ?: return
+        val accepted = sendText(addr, delivery.messageId, delivery.text) { transportAccepted ->
             synchronized(MeshGatt) {
-                pendingDeliveries.finish(fingerprint, delivery.messageId, delivered)
-                if (delivered) {
-                    flushPending(fingerprint)
-                } else if (active) {
+                pendingDeliveries.finishTransport(
+                    fingerprint,
+                    delivery.messageId,
+                    transportAccepted,
+                    routeId,
+                )
+                if (!transportAccepted && active) {
                     // A failed reliable operation invalidates this Noise route;
                     // retain the logical message and retry only after re-handshake.
-                    disconnectAddr(addr)
+                    disconnectRoute(routeId, addr)
+                    flushPending(fingerprint)
                 }
             }
         }
-        if (!accepted) {
-            pendingDeliveries.finish(fingerprint, delivery.messageId, delivered = false)
+        if (accepted) {
+            // Start at queue admission, not at the controller callback: some
+            // Android stacks never invoke onCharacteristicWrite/onNotificationSent
+            // after accepting a Binder operation. One watchdog therefore covers
+            // both a missing local callback and a missing peer ACK.
+            handler.postDelayed({
+                synchronized(MeshGatt) {
+                    if (!active || !pendingDeliveries.retryIfAwaiting(fingerprint, delivery.messageId, routeId)) {
+                        return@synchronized
+                    }
+                    android.util.Log.w(
+                        TAG,
+                        "peer delivery ACK timed out ${delivery.messageId.take(12)}…; retrying after re-handshake",
+                    )
+                    disconnectRoute(routeId, addr)
+                    flushPending(fingerprint)
+                }
+            }, DELIVERY_ACK_TIMEOUT_MS)
+        } else {
+            pendingDeliveries.finishTransport(
+                fingerprint,
+                delivery.messageId,
+                accepted = false,
+                routeId = routeId,
+            )
+            if (active) {
+                disconnectRoute(routeId, addr)
+                flushPending(fingerprint)
+            }
         }
     }
 

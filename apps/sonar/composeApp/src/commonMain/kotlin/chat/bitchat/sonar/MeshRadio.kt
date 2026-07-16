@@ -12,6 +12,18 @@ data class MeshPeer(val id: String, val name: String, val rssi: Int, val sonar: 
  *  fingerprint (not the rotating bitchat peerID), so messages stay in one
  *  conversation across rotation. Drained by the app into the mesh-chat store. */
 data class MeshDmIn(val peerId: String, val messageId: String, val text: String, val tsSecs: Long)
+data class MeshDeliveryAck(val peerId: String, val messageId: String)
+data class MeshPendingDeliveryRecord(
+    val peerId: String,
+    val messageId: String,
+    val text: String,
+    val timestampSecs: Long,
+    /** False for idempotent protocol controls that must be retried durably but
+     * never rendered as user-authored transcript bubbles. */
+    val surfaceInTranscript: Boolean = true,
+    /** Per-peer durable admission order. Zero means "assign atomically". */
+    val sequence: Long = 0L,
+)
 
 /** An incoming PUBLIC broadcast (the BLE "Mesh" channel) from another peer. The
  *  wire carries only content + sender peerID + timestamp; the display nickname is
@@ -101,36 +113,144 @@ internal data class PendingMeshDelivery(
     val text: String,
 )
 
+internal const val MESH_PENDING_PER_PEER_LIMIT = 100
+
+/** Retransmissions carry the same stable id. They still need another ACK, but
+ * only the first copy may be appended/notified. */
+internal fun isNewMeshMessage(messageId: String, storedMessageIds: Iterable<String>): Boolean =
+    storedMessageIds.none { it == messageId }
+
+/** Wire-compatible with Apple's `NoisePayloadType.delivered`: one 0x03 byte
+ * followed by the UTF-8 stable message id. */
+internal fun meshDeliveryAckPayload(messageId: String): ByteArray =
+    byteArrayOf(0x03) + messageId.encodeToByteArray()
+
+internal fun meshDeliveryAckMessageId(payload: ByteArray): String? {
+    if (payload.size < 2 || payload[0] != 0x03.toByte()) return null
+    return payload.copyOfRange(1, payload.size).decodeToString().takeIf { it.isNotBlank() }
+}
+
 /**
  * Logical mesh sends survive a foreground lifecycle stop, while byte-level GATT
- * work does not. The head remains pending until the final reliable GATT write is
- * acknowledged; an account reset is the only operation that discards it.
+ * work does not. The head remains pending until the peer returns its encrypted
+ * stable-id delivery ACK; an account reset is the only operation that discards it.
  *
  * Android serializes access with the MeshGatt monitor, so this deliberately
  * stays platform-neutral and allocation-light rather than adding another lock.
  */
 internal class PendingMeshDeliveryTracker {
+    private data class InFlight(val messageId: String, val routeId: String?)
     private val queues = mutableMapOf<String, MutableList<PendingMeshDelivery>>()
-    private val inFlight = mutableMapOf<String, String>()
+    private val inFlight = mutableMapOf<String, InFlight>()
+    /** Stable ids whose ACK is admitted to the host queue but whose durable
+     * transcript/outbox retirement has not completed yet. */
+    private val acknowledged = mutableSetOf<Pair<String, String>>()
+    /** Two-phase TTL claims fence a late ACK while durable projection/deletion
+     * is in progress. Keep the logical queue so a failed disk transition can
+     * release the claim and resume delivery without reconstructing state. */
+    private val expiryClaims = mutableSetOf<Pair<String, String>>()
 
-    fun enqueue(peerId: String, messageId: String, text: String) {
-        queues.getOrPut(peerId) { mutableListOf() }.add(PendingMeshDelivery(messageId, text))
+    /** False only when a new logical message exceeds the bounded per-peer
+     * in-memory window. Its durable file remains authoritative and can be
+     * admitted after an earlier ACK frees a slot. */
+    fun enqueue(peerId: String, messageId: String, text: String): Boolean {
+        val key = peerId to messageId
+        // A generic durable-window restore must not resurrect a stable id whose
+        // ACK or terminal TTL transition already owns completion in this process.
+        if (key in acknowledged || key in expiryClaims) return true
+        val queue = queues.getOrPut(peerId) { mutableListOf() }
+        if (queue.any { it.messageId == messageId }) return true
+        if (queue.size >= MESH_PENDING_PER_PEER_LIMIT) return false
+        queue.add(PendingMeshDelivery(messageId, text))
+        return true
     }
 
-    fun beginNext(peerId: String): PendingMeshDelivery? {
+    fun beginNext(peerId: String, routeId: String? = null): PendingMeshDelivery? {
         if (inFlight.containsKey(peerId)) return null
         val next = queues[peerId]?.firstOrNull() ?: return null
-        inFlight[peerId] = next.messageId
+        if ((peerId to next.messageId) in expiryClaims) return null
+        inFlight[peerId] = InFlight(next.messageId, routeId)
         return next
     }
 
-    fun finish(peerId: String, messageId: String, delivered: Boolean) {
-        if (inFlight[peerId] != messageId) return
-        inFlight.remove(peerId)
-        if (!delivered) return
-        val queue = queues[peerId] ?: return
-        if (queue.firstOrNull()?.messageId == messageId) queue.removeAt(0)
+    /** Finish only the local transport operation. A successful controller
+     * callback leaves the logical message in flight until the peer returns its
+     * encrypted, message-id-scoped delivery acknowledgement. */
+    fun finishTransport(
+        peerId: String,
+        messageId: String,
+        accepted: Boolean,
+        routeId: String? = null,
+    ) {
+        val current = inFlight[peerId] ?: return
+        if (current.messageId != messageId || (routeId != null && current.routeId != routeId)) return
+        if (!accepted) inFlight.remove(peerId)
+    }
+
+    /** Remove the head only when the same peer acknowledges the same stable id. */
+    fun acknowledge(peerId: String, messageId: String): Boolean {
+        return acknowledgeIf(peerId, messageId) { true }
+    }
+
+    /** Commit completion only if the host completion queue admits it. This keeps
+     * the logical head/in-flight state retryable when a bounded UI queue is full. */
+    fun acknowledgeIf(peerId: String, messageId: String, admitCompletion: () -> Boolean): Boolean {
+        val key = peerId to messageId
+        if (key in expiryClaims || key in acknowledged) return false
+        val queue = queues[peerId] ?: return false
+        if (queue.firstOrNull()?.messageId != messageId) return false
+        if (!admitCompletion()) return false
+        queue.removeAt(0)
+        if (inFlight[peerId]?.messageId == messageId) inFlight.remove(peerId)
         if (queue.isEmpty()) queues.remove(peerId)
+        acknowledged += key
+        return true
+    }
+
+    /** Atomically arbitrate terminal TTL retirement against ACK admission. */
+    fun claimExpiry(peerId: String, messageId: String): Boolean {
+        val key = peerId to messageId
+        if (key in acknowledged || key in expiryClaims) return false
+        expiryClaims += key
+        if (inFlight[peerId]?.messageId == messageId) inFlight.remove(peerId)
+        return true
+    }
+
+    /** Roll back a failed durable TTL transition and make its head sendable. */
+    fun releaseExpiry(peerId: String, messageId: String) {
+        expiryClaims.remove(peerId to messageId)
+    }
+
+    /** Release the ACK fence after durable host processing is complete. */
+    fun finishAcknowledgement(peerId: String, messageId: String) {
+        acknowledged.remove(peerId to messageId)
+    }
+
+    /** Retire one exact durable obligation after its terminal projection and
+     * on-disk deletion commit. Unlike [clear], this is safe for expiry while
+     * newer messages for the same peer remain queued. */
+    fun discard(peerId: String, messageId: String): Boolean {
+        val queue = queues[peerId]
+        val removed = queue?.removeAll { it.messageId == messageId } == true
+        if (inFlight[peerId]?.messageId == messageId) inFlight.remove(peerId)
+        if (queue?.isEmpty() == true) queues.remove(peerId)
+        val claimed = expiryClaims.remove(peerId to messageId)
+        val wasAcknowledged = acknowledged.remove(peerId to messageId)
+        return removed || claimed || wasAcknowledged
+    }
+
+    /** Make an unacknowledged transport eligible for retransmission. */
+    fun retryIfAwaiting(peerId: String, messageId: String, routeId: String? = null): Boolean {
+        val current = inFlight[peerId] ?: return false
+        if (current.messageId != messageId || (routeId != null && current.routeId != routeId)) return false
+        inFlight.remove(peerId)
+        return true
+    }
+
+    fun cancelInFlightForRoute(peerId: String, routeId: String): Boolean {
+        if (inFlight[peerId]?.routeId != routeId) return false
+        inFlight.remove(peerId)
+        return true
     }
 
     /** A lifecycle stop cancels raw I/O but retains every logical delivery. */
@@ -138,13 +258,32 @@ internal class PendingMeshDeliveryTracker {
         inFlight.clear()
     }
 
+    fun cancelInFlight(peerId: String) {
+        inFlight.remove(peerId)
+    }
+
     /** Account teardown must not carry messages into the next identity. */
     fun clear() {
         queues.clear()
         inFlight.clear()
+        acknowledged.clear()
+        expiryClaims.clear()
+    }
+
+    fun clear(peerId: String) {
+        queues.remove(peerId)
+        inFlight.remove(peerId)
+        acknowledged.removeAll { it.first == peerId }
+        expiryClaims.removeAll { it.first == peerId }
     }
 
     fun pendingCount(peerId: String): Int = queues[peerId]?.size ?: 0
+
+    fun awaitingAck(peerId: String, messageId: String): Boolean =
+        inFlight[peerId]?.messageId == messageId
+
+    internal fun acknowledgementPending(peerId: String, messageId: String): Boolean =
+        (peerId to messageId) in acknowledged
 }
 
 internal enum class BleScanRestartReason(val logValue: String) {
@@ -183,6 +322,23 @@ internal fun meshAnnounceRoute(
 internal fun meshSigningKeyMatches(existingKeyHex: String?, announcedKeyHex: String): Boolean =
     existingKeyHex == null || existingKeyHex.equals(announcedKeyHex, ignoreCase = true)
 
+/** A Noise XX handshake authenticates its remote static key, but that key only
+ * belongs to the advertised Sonar identity after it matches the key carried by
+ * the verified direct 0x01 announce. Missing/malformed keys fail closed. */
+internal fun meshNoiseStaticMatches(
+    announcedKeyHex: String?,
+    authenticatedKeyHex: String?,
+): Boolean {
+    val announced = announcedKeyHex?.trim()?.takeIf { it.length == 64 && it.all(Char::isHexDigit) }
+        ?: return false
+    val authenticated = authenticatedKeyHex?.trim()?.takeIf { it.length == 64 && it.all(Char::isHexDigit) }
+        ?: return false
+    return announced.equals(authenticated, ignoreCase = true)
+}
+
+private fun Char.isHexDigit(): Boolean =
+    this in '0'..'9' || this in 'a'..'f' || this in 'A'..'F'
+
 /**
  * Decide whether Android's BLE scan needs recovery without confusing repeated
  * advertisements from a connected peer with scanner starvation.
@@ -203,6 +359,26 @@ internal fun bleScanRestartReason(
     }
     return null
 }
+
+/** Exponential recovery avoids an 8-second restart loop in legitimately empty
+ * rooms while still repairing the first Pixel scanner starvation quickly. */
+internal fun bleWatchdogGapMs(baseMs: Long, consecutiveRestarts: Int, maxMs: Long): Long {
+    var gap = baseMs
+    repeat(consecutiveRestarts.coerceIn(0, 16)) {
+        gap = (gap * 2).coerceAtMost(maxMs)
+    }
+    return gap
+}
+
+/** Repeated callbacks for an already-known address are not scanner recovery:
+ * the Pixel can keep reporting that one address while remaining blind to every
+ * other advertiser. Preserve exponential backoff until discovery progresses or
+ * an encrypted route is actually usable. */
+internal fun bleWatchdogBackoffAfterScanResult(
+    consecutiveRestarts: Int,
+    newAddress: Boolean,
+    hasUsableLink: Boolean,
+): Int = if (newAddress || hasUsableLink) 0 else consecutiveRestarts
 
 /**
  * The BLE mesh radio: scans for and advertises the bitchat mesh service so
@@ -256,6 +432,24 @@ expect object MeshRadio {
     fun localPeerIdHex(): String
     /** Pull (and clear) all mesh DMs received since the last call. */
     fun drainMeshDm(): List<MeshDmIn>
+    /** Rehydrate durable logical sends before radio startup/process recovery. */
+    fun restorePendingDeliveries(records: List<MeshPendingDeliveryRecord>)
+    /** Explicit chat deletion cancels this account's queued logical sends. */
+    fun discardPendingDeliveries(peerIds: Set<String>)
+    /** Retire one terminal stable id without dropping later sends to the peer. */
+    fun discardPendingDelivery(peerId: String, messageId: String)
+    /** Atomically arbitrate TTL retirement against an ACK awaiting host drain. */
+    fun claimPendingDeliveryExpiry(peerId: String, messageId: String): Boolean
+    /** Re-enable a logical send when its durable TTL retirement did not commit. */
+    fun releasePendingDeliveryExpiry(peerId: String, messageId: String)
+    /** Release the ACK fence after durable host processing is complete. */
+    fun finishMeshDeliveryAck(peerId: String, messageId: String)
+    /** Stable ids peer-ACKed since the last drain; the host removes their
+     * per-message durable outbox files only after receiving these records. */
+    fun drainMeshDeliveryAcks(): List<MeshDeliveryAck>
+    /** Send the encrypted stable-id delivery acknowledgement only after the
+     * inbound DM has been accepted and written through to local storage. */
+    fun acknowledgeMeshDm(peerId: String, messageId: String): Boolean
     /** Send a private BLE file transfer to a live mesh peer. This does not queue:
      * callers should fall back to White Noise or show a route error when false. */
     fun sendMeshMedia(peerId: String, messageId: String, bytes: ByteArray, filename: String, mimeType: String): Boolean

@@ -59,4 +59,17 @@ class SonarOutboxTest {
 
         assertEquals(listOf("three"), outbox.snapshot("peer-1").map { it.content })
     }
+
+    @Test
+    fun durableRestoreUsesSequenceForSameSecondMessages() {
+        val outbox = SonarOutbox(maxPerPeer = 10, ttlSecs = 100)
+        outbox.restore(
+            listOf(
+                QueuedMessage("second", "peer-1", "random-a", 100, sequence = 2),
+                QueuedMessage("first", "peer-1", "random-z", 100, sequence = 1),
+            ),
+        )
+
+        assertEquals(listOf("first", "second"), outbox.snapshot("peer-1").map { it.content })
+    }
 }

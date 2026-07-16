@@ -60,5 +60,6 @@ expect object MediaCache {
     suspend fun write(path: String, bytes: ByteArray): Boolean
     suspend fun promote(partialPath: String, finalPath: String): Boolean
     suspend fun remove(path: String)
-    suspend fun wipe()
+    /** True only after no decrypted cache tree remains. */
+    suspend fun wipe(): Boolean
 }

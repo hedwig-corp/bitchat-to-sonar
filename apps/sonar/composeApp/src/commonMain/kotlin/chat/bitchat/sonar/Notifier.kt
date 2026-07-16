@@ -19,6 +19,9 @@ expect object Notifier {
         body: String,
         sound: SonarNotificationSound = SonarNotificationSound.Default,
     )
+    /** Synchronous panic boundary: serialize with notification publication and
+     * cancel every platform notification owned by this app/account. */
+    fun suspendAndCancelAll()
     /** Called after the wallet reaches Ready — retries push webhook registration
      *  that was deferred because the wallet was not connected at startup. */
     fun onWalletReady()

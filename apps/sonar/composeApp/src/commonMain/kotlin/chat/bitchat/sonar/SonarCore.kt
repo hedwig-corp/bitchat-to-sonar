@@ -42,6 +42,8 @@ data class SonarMsg(
     val media: List<SonarMedia> = emptyList(),
     /// Local send state projected from core delivery metadata.
     val state: String? = null,
+    /// Durable receive row whose unread/notification effects still need replay.
+    val receiveEffectsPending: Boolean = false,
     /// Sticker reference if this message is a sticker send.
     val stickerRef: SonarStickerRef? = null,
 )
@@ -709,6 +711,8 @@ expect object SonarCore {
     /** Generic persisted key/value blobs (⚡PAY ledger, BIP-353 address, …). */
     fun loadBlob(key: String): String
     fun saveBlob(key: String, value: String)
+    /** Commit a control-plane mutation before acknowledging it to a peer. */
+    suspend fun saveBlobDurable(key: String, value: String)
 
     /** Wipe all on-device data (identity, chats, prefs). */
     suspend fun wipe()

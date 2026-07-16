@@ -39,6 +39,15 @@ data class WalletPaymentEvent(
     val preimage: String? = null,
 )
 
+/** A native wallet callback may mutate account state only while it still owns
+ * the exact SDK/account generation and no crash-durable panic fence is active. */
+internal fun acceptsWalletCallback(
+    listenerEpoch: Int,
+    currentEpoch: Int,
+    ownsSdkNode: Boolean,
+    panicWipePending: Boolean,
+): Boolean = listenerEpoch == currentEpoch && ownsSdkNode && !panicWipePending
+
 /**
  * Thin Kotlin façade over the on-device Breez SDK Liquid wallet, the Android
  * twin of iOS `WalletBridgeService`. Seed is derived deterministically from the
@@ -122,4 +131,9 @@ expect object WalletBridge {
      * success while retaining a previous identity's database.
      */
     suspend fun wipeLocalStorage()
+
+    /** Panic barrier twin of [wipeLocalStorage]: disconnect, durably retire all
+     * account-derived SDK state, and return false while any setup/native handle
+     * prevents the complete wallet root from becoming absent. */
+    suspend fun wipeLocalData(): Boolean
 }

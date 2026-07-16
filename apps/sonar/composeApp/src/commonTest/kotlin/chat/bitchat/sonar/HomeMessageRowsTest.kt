@@ -1,5 +1,8 @@
 package chat.bitchat.sonar
 
+import chat.bitchat.sonar.wallet.ExchangeRate
+import chat.bitchat.sonar.wallet.FiatCurrency
+import chat.bitchat.sonar.wallet.WalletState
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -9,11 +12,118 @@ import kotlin.test.assertTrue
 class HomeMessageRowsTest {
 
     @Test
+    fun pendingPanicWipeSkipsOldAccountLoadsAndKeepsFirstFrameRedacted() {
+        val reads = mutableListOf<String>()
+        val oldChat = loadInitialAccountState(
+            panicWipePending = true,
+            redacted = "",
+        ) {
+            reads += "chat"
+            "old transcript"
+        }
+        val onboarded = recoverInitialOnboardingState(
+            panicWipePending = true,
+            readStored = { reads += "onboarding"; true },
+            hasIdentity = { reads += "identity"; true },
+            persistRecovered = { reads += "migration" },
+        )
+
+        assertEquals("", oldChat)
+        assertFalse(onboarded)
+        assertTrue(reads.isEmpty())
+        assertFalse(isFirstLocalStateReady(
+            panicWipeRecoveryPending = true,
+            onboarded = onboarded,
+            locked = false,
+            homeMessagesHydrated = false,
+        ))
+    }
+
+    @Test
+    fun pendingPanicMarkerRunsRecoveryWithoutStartingIdentityOrMesh() {
+        val events = mutableListOf<String>()
+
+        runAccountColdStart(
+            panicWipePending = true,
+            onboarded = false,
+            recoverPendingWipe = { events += "recover" },
+            activateAccount = {
+                events += "identity"
+                events += "mesh"
+            },
+        )
+
+        assertEquals(listOf("recover"), events)
+        assertFalse(canStartAccountServices(
+            panicWipePending = true,
+            onboarded = true,
+            accountStarted = true,
+        ))
+    }
+
+    @Test
+    fun accountAndMeshActivationWaitForSuccessfulRecoveryAndAccountBoot() {
+        val events = mutableListOf<String>()
+
+        runAccountColdStart(
+            panicWipePending = false,
+            onboarded = true,
+            recoverPendingWipe = { events += "recover" },
+            activateAccount = { events += "boot" },
+        )
+
+        assertEquals(listOf("boot"), events)
+        assertFalse(canStartAccountServices(false, onboarded = true, accountStarted = false))
+        assertTrue(canStartAccountServices(false, onboarded = true, accountStarted = true))
+    }
+
+    @Test
+    fun pendingPanicMarkerSkipsEveryWalletConstructionRead() {
+        val reads = mutableListOf<String>()
+
+        val wallet = loadInitialWalletAccountState(
+            panicWipePending = true,
+            loadState = { reads += "state"; WalletState.Ready(42) },
+            loadShowFiat = { reads += "showFiat"; true },
+            loadCurrency = { reads += "currency"; FiatCurrency.CHF },
+            loadRate = { reads += "rate"; ExchangeRate(it.code, 1.0) },
+        )
+
+        assertEquals(WalletState.NotConfigured, wallet.state)
+        assertFalse(wallet.showFiat)
+        assertEquals(FiatCurrency.USD, wallet.currency)
+        assertEquals(null, wallet.rate)
+        assertTrue(reads.isEmpty())
+    }
+
+    @Test
+    fun normalColdStartLoadsAccountStateAndRecoversOnboarding() {
+        val reads = mutableListOf<String>()
+        val oldChat = loadInitialAccountState(
+            panicWipePending = false,
+            redacted = "",
+        ) {
+            reads += "chat"
+            "old transcript"
+        }
+        val onboarded = recoverInitialOnboardingState(
+            panicWipePending = false,
+            readStored = { reads += "onboarding"; false },
+            hasIdentity = { reads += "identity"; true },
+            persistRecovered = { reads += "migration" },
+        )
+
+        assertEquals("old transcript", oldChat)
+        assertTrue(onboarded)
+        assertEquals(listOf("chat", "onboarding", "identity", "migration"), reads)
+    }
+
+    @Test
     fun unlockedAccountWaitsForCoherentLocalHomeBeforeFirstPaint() {
-        assertFalse(isFirstLocalStateReady(onboarded = true, locked = false, homeMessagesHydrated = false))
-        assertTrue(isFirstLocalStateReady(onboarded = true, locked = false, homeMessagesHydrated = true))
-        assertTrue(isFirstLocalStateReady(onboarded = true, locked = true, homeMessagesHydrated = false))
-        assertTrue(isFirstLocalStateReady(onboarded = false, locked = false, homeMessagesHydrated = false))
+        assertFalse(isFirstLocalStateReady(false, onboarded = true, locked = false, homeMessagesHydrated = false))
+        assertTrue(isFirstLocalStateReady(false, onboarded = true, locked = false, homeMessagesHydrated = true))
+        assertTrue(isFirstLocalStateReady(false, onboarded = true, locked = true, homeMessagesHydrated = false))
+        assertTrue(isFirstLocalStateReady(false, onboarded = false, locked = false, homeMessagesHydrated = false))
     }
 
     private fun mesh(peerId: String, ts: Long) =

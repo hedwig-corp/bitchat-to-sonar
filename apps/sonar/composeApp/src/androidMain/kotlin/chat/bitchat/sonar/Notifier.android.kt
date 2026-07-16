@@ -90,7 +90,9 @@ actual object Notifier {
         )
     }
 
+    @Synchronized
     actual fun canNotify(): Boolean {
+        if (PanicWipeIntent.isPending()) return false
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             return ctx.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) ==
                 PackageManager.PERMISSION_GRANTED
@@ -118,7 +120,9 @@ actual object Notifier {
         }
     }
 
+    @Synchronized
     actual fun notify(id: Int, title: String, body: String, sound: SonarNotificationSound) {
+        if (PanicWipeIntent.isPending()) return
         if (!canNotify()) return
         val open = ctx.packageManager.getLaunchIntentForPackage(ctx.packageName)
             ?.apply { flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP }
@@ -142,5 +146,10 @@ actual object Notifier {
             .apply { if (pi != null) setContentIntent(pi) }
             .build()
         manager().notify(id, n)
+    }
+
+    @Synchronized
+    actual fun suspendAndCancelAll() {
+        runCatching { manager().cancelAll() }
     }
 }
