@@ -128,6 +128,21 @@ iOS has the same staging (`openedDM` → `loadLocalWhenConnected` →
 refresh). Open-time captures must fall back to reading
 `service.conversationSummaries()` directly.
 
+### Media dimensions differ by transport
+
+Marmot attachments carry **width/height as MIP-04 metadata** (Signal's
+`AttachmentPointer` pattern), so their bubbles reserve the final box before the
+bytes decode and the transcript never reflows. **BLE mesh media carries no
+metadata** — the dimensions must be derived at *ingestion*, where the bytes
+live (`meshMediaFor`/`decodeImageBounds` on Compose at mesh send/receive plus a
+one-time startup backfill for legacy rows; `meshMediaItem` → `CGImageSource`
+header read on iOS). A media path that skips this reserves the fixed skeleton
+box and visibly grows the bubble on decode — a 394px shift per image on a
+Pixel 10, and another bug that splits by transport: internet photos looked
+fixed while photos from a nearby BLE peer kept jumping (`f6936bd02`). Signal's
+rule, adopted on both apps: dimensions are derived when the attachment is
+written, never at render, and cells measure only from stored values.
+
 ### The snapshot is not uniformly real (synthetic chat-list rows)
 
 `chatSnapshotMessagesByChat` is **not** all transcript rows. Only the newest
