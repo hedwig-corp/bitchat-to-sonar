@@ -108,6 +108,15 @@ pub fn max_media_plaintext_bytes() -> u64 {
     sonar_core::client::MAX_MEDIA_PLAINTEXT_BYTES as u64
 }
 
+/// Aggregate plaintext ceiling for one album send (every attachment is
+/// memory-resident at once during `send_media_multi`). Hosts should bound the
+/// combined size of picked videos against this; the core also rejects
+/// over-aggregate albums.
+#[uniffi::export]
+pub fn max_media_total_plaintext_bytes() -> u64 {
+    sonar_core::client::MAX_MEDIA_TOTAL_PLAINTEXT_BYTES as u64
+}
+
 /// Erase the persistent Marmot database at `db_path`, its SQLite sidecars
 /// (`-wal`, `-shm`, `-journal`), and the conversation-index sidecar database.
 ///

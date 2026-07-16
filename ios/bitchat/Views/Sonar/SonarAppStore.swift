@@ -767,13 +767,40 @@ final class SonarAppStore: ObservableObject {
         #endif
     }
 
-    /// Receivers hard-cap media downloads at 25 MiB plaintext (core
-    /// `MAX_MEDIA_PLAINTEXT_BYTES`) — anything larger publishes a message no
-    /// client can fetch, so the sender must fit under it or not send at all.
-    private nonisolated static let maxMediaPlaintextBytes = 25 * 1024 * 1024
+    /// Receivers hard-cap media downloads at this plaintext size (core
+    /// `MAX_MEDIA_PLAINTEXT_BYTES`, read through the FFI so the sender can
+    /// never drift from receiver enforcement) — anything larger publishes a
+    /// message no client can fetch.
+    private nonisolated static let maxMediaPlaintextBytes = Int(SonarCore.maxMediaPlaintextBytes())
+
+    /// Aggregate plaintext ceiling for one album send (core
+    /// `MAX_MEDIA_TOTAL_PLAINTEXT_BYTES`): every attachment is memory-resident
+    /// at once during `send_media_multi`.
+    private nonisolated static let maxMediaTotalPlaintextBytes = Int(SonarCore.maxMediaTotalPlaintextBytes())
 
     private nonisolated static func fileSize(_ url: URL) -> Int? {
         (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? Int
+    }
+
+    /// Delete picker/preview temp files older than a day. Normal flows clean
+    /// up via `defer`s; this sweep catches files stranded by a crash or kill.
+    private nonisolated static func sweepStaleMediaTempFiles() {
+        let fm = FileManager.default
+        let cutoff = Date().addingTimeInterval(-24 * 60 * 60)
+        for name in ["sonar-preview", "sonar-picked"] {
+            let dir = fm.temporaryDirectory.appendingPathComponent(name)
+            guard let files = try? fm.contentsOfDirectory(
+                at: dir,
+                includingPropertiesForKeys: [.contentModificationDateKey]
+            ) else { continue }
+            for file in files {
+                let modified = (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?
+                    .contentModificationDate ?? .distantPast
+                if modified < cutoff {
+                    try? fm.removeItem(at: file)
+                }
+            }
+        }
     }
 
     /// Outcome of finalizing a staged video: distinguishes "cannot fit under
@@ -928,6 +955,9 @@ final class SonarAppStore: ObservableObject {
             var encodeFailed = false
             var videoTooLarge = false
             var videoFailed = false
+            // Every album item is memory-resident at once through the send —
+            // bound the batch's video total like the core aggregate cap does.
+            var remainingVideoBudget = Self.maxMediaTotalPlaintextBytes
             for preview in items {
                 if preview.mime.hasPrefix("video/") {
                     // Pass through when under the receiver download cap; else
@@ -941,7 +971,12 @@ final class SonarAppStore: ObservableObject {
                     }).value
                     switch finalized {
                     case .ready(let data, let filename, let mime):
-                        prepared.append((preview.peerId, data, filename, mime))
+                        if data.count > remainingVideoBudget {
+                            videoTooLarge = true
+                        } else {
+                            remainingVideoBudget -= data.count
+                            prepared.append((preview.peerId, data, filename, mime))
+                        }
                     case .tooLarge:
                         videoTooLarge = true
                     case .failed:
@@ -986,7 +1021,13 @@ final class SonarAppStore: ObservableObject {
                     if only.mime == "image/gif" || only.mime.hasPrefix("video/") {
                         // The attachment path preserves the source MIME (GIF
                         // animation, video container) instead of forcing JPEG.
-                        _ = sendAttachment(only.peerId, data: only.data, filename: only.filename, mime: only.mime)
+                        // A false return means NO route took the payload —
+                        // never dismiss the preview into silence.
+                        if !sendAttachment(only.peerId, data: only.data, filename: only.filename, mime: only.mime) {
+                            showToast(only.mime.hasPrefix("video/")
+                                ? "Couldn't send video — start the secure chat first."
+                                : "Couldn't send attachment — start the secure chat first.")
+                        }
                     } else {
                         sendImage(only.peerId, data: only.data, filename: only.filename, mime: only.mime)
                     }
@@ -1380,6 +1421,13 @@ final class SonarAppStore: ObservableObject {
             }
         }
         #endif
+
+        // A crash or kill mid pick/preview/export bypasses every `defer`, so
+        // stale picker/preview temp files (multi-MB for videos) are swept by
+        // age on launch.
+        Task.detached(priority: .utility) {
+            Self.sweepStaleMediaTempFiles()
+        }
     }
 
     /// Identity publication happens before the encrypted DB opens so BLE can
@@ -5285,12 +5333,20 @@ final class SonarAppStore: ObservableObject {
             // Per-item over mesh (no album packet), preserving each MIME:
             // sendImageOverMesh forces JPEG, so route GIFs through the file
             // path to keep the animation instead of flattening it.
+            var failed = 0
             for item in items {
                 if item.mime == "image/gif" || item.mime.hasPrefix("video/") {
-                    _ = sendAttachment(id, data: item.data, filename: item.filename, mime: item.mime)
+                    if !sendAttachment(id, data: item.data, filename: item.filename, mime: item.mime) {
+                        failed += 1
+                    }
                 } else {
                     sendImageOverMesh(PeerID(str: id), data: item.data)
                 }
+            }
+            if failed > 0 {
+                showToast(failed == 1
+                    ? "1 attachment couldn't be sent — start the secure chat first."
+                    : "\(failed) attachments couldn't be sent — start the secure chat first.")
             }
             return
         }
@@ -5362,11 +5418,15 @@ final class SonarAppStore: ObservableObject {
         let safeName = snEncryptedAttachmentFilename(filename)
         let safeMime = snEncryptedAttachmentMime(mime)
         if meshReachable(id) {
-            guard FileTransferLimits.isValidPayload(data.count) else { return false }
-            chatViewModel.selectedPrivateChatPeer = PeerID(str: id)
-            let meshMime = MimeType(safeMime)?.mimeString ?? "application/octet-stream"
-            chatViewModel.sendFile(data: data, filename: safeName, mime: meshMime)
-            return true
+            if FileTransferLimits.isValidPayload(data.count) {
+                chatViewModel.selectedPrivateChatPeer = PeerID(str: id)
+                let meshMime = MimeType(safeMime)?.mimeString ?? "application/octet-stream"
+                chatViewModel.sendFile(data: data, filename: safeName, mime: meshMime)
+                return true
+            }
+            // Payload exceeds the mesh file-packet limit (videos usually do) —
+            // fall through to the White Noise route below instead of silently
+            // refusing while a perfectly good encrypted route exists.
         }
 
         let groupId: String?

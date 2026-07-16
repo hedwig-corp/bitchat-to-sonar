@@ -48,15 +48,19 @@ actual fun rememberPhotoPicker(
             val picked = pickImageFiles()
             if (picked.isEmpty()) return@launch
             var rejectedTooLarge = 0
+            // Same aggregate video budget as the Android picker — every album
+            // item is memory-resident at once through the send.
+            var remainingVideoBudget = MAX_ALBUM_TOTAL_VIDEO_BYTES
             val items = withContext(Dispatchers.IO) {
                 picked.mapNotNull { file ->
                     val videoMime = videoMimeForExtension(file.extension)
-                    if (videoMime != null && file.length() > MAX_INTERNET_ATTACHMENT_BYTES) {
+                    if (videoMime != null && file.length() > minOf(MAX_INTERNET_ATTACHMENT_BYTES, remainingVideoBudget)) {
                         rejectedTooLarge += 1
                         return@mapNotNull null
                     }
                     val raw = runCatching { file.readBytes() }.getOrNull() ?: return@mapNotNull null
                     if (videoMime != null) {
+                        remainingVideoBudget -= raw.size.toLong()
                         return@mapNotNull PickedPhoto(raw, file.name.ifBlank { "video.mp4" }, videoMime)
                     }
                     // Raw bytes — JPEG re-encoding happens lazily on send confirmation.
@@ -72,16 +76,6 @@ actual fun rememberPhotoPicker(
             if (items.isNotEmpty() || rejectedTooLarge > 0) onPicked(items, rejectedTooLarge)
         }
     }
-}
-
-/** Video container MIME by filename extension, or null when not a video. */
-private fun videoMimeForExtension(extension: String): String? = when (extension.lowercase()) {
-    "mp4", "m4v" -> "video/mp4"
-    "mov" -> "video/quicktime"
-    "webm" -> "video/webm"
-    "mkv" -> "video/x-matroska"
-    "avi" -> "video/x-msvideo"
-    else -> null
 }
 
 @Composable

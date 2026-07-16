@@ -17,6 +17,36 @@ const val MAX_ALBUM_PHOTOS = 10
 /** True when the attachment is a video container (sent as-is, never re-encoded). */
 fun isVideoMime(mime: String): Boolean = mime.startsWith("video/")
 
+/** Aggregate cap for the videos in ONE picked album — mirrors the core
+ *  `MAX_MEDIA_TOTAL_PLAINTEXT_BYTES` backstop (every album item is memory-
+ *  resident at once during the send). */
+const val MAX_ALBUM_TOTAL_VIDEO_BYTES = 100L * 1024L * 1024L
+
+/** Video container MIME by filename extension, or null when not a video. */
+internal fun videoMimeForExtension(extension: String): String? = when (extension.lowercase()) {
+    "mp4", "m4v" -> "video/mp4"
+    "mov" -> "video/quicktime"
+    "webm" -> "video/webm"
+    "mkv" -> "video/x-matroska"
+    "avi" -> "video/x-msvideo"
+    "3gp" -> "video/3gpp"
+    else -> null
+}
+
+/** Resolve a picked item's video MIME from provider metadata + filename.
+ *  Providers can report null, mixed case, parameters, or `application/mp4`;
+ *  missing that here would route a huge video into the unbounded image path. */
+internal fun pickedVideoMime(declaredMime: String, filename: String): String? {
+    val normalized = declaredMime.substringBefore(';').trim().lowercase()
+    if (isVideoMime(normalized)) return normalized
+    if (normalized == "application/mp4") return "video/mp4"
+    val fromExtension = videoMimeForExtension(filename.substringAfterLast('.', ""))
+    if (fromExtension != null && (normalized.isBlank() || normalized == "application/octet-stream")) {
+        return fromExtension
+    }
+    return null
+}
+
 /**
  * Platform photo/video picker (multi-select up to [MAX_ALBUM_PHOTOS]). Raw
  * bytes are delivered with the source MIME type so the preview shows

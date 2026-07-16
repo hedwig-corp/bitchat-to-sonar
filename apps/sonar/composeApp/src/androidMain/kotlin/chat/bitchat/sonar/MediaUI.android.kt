@@ -54,30 +54,42 @@ actual fun rememberPhotoPicker(
         scope.launch(Dispatchers.IO) {
             // Load every pick in selection order; 2+ stage as one album.
             var rejectedTooLarge = 0
+            // Every album item is memory-resident at once through the send, so
+            // the videos in one pick share an aggregate budget on top of the
+            // per-item receiver download cap.
+            var remainingVideoBudget = MAX_ALBUM_TOTAL_VIDEO_BYTES
             val items = uris.mapNotNull { uri ->
-                val sourceMime = ctx.contentResolver.getType(uri).orEmpty()
-                if (isVideoMime(sourceMime)) {
+                val declaredMime = ctx.contentResolver.getType(uri).orEmpty()
+                val sourceName = ctx.displayNameForUri(uri)
+                val videoMime = pickedVideoMime(declaredMime, sourceName.orEmpty())
+                if (videoMime != null) {
                     // Videos can far exceed the receiver download cap — check
                     // the provider-reported size BEFORE buffering anything.
-                    val read = ctx.readVideoBounded(uri, MAX_INTERNET_ATTACHMENT_BYTES)
+                    val read = ctx.readBounded(uri, minOf(MAX_INTERNET_ATTACHMENT_BYTES, remainingVideoBudget))
                     if (read.tooLarge) {
                         rejectedTooLarge += 1
                         return@mapNotNull null
                     }
                     val raw = read.bytes ?: return@mapNotNull null
-                    val sourceName = ctx.displayNameForUri(uri) ?: "video.mp4"
-                    return@mapNotNull PickedPhoto(raw, sourceName, sourceMime)
+                    remainingVideoBudget -= raw.size.toLong()
+                    return@mapNotNull PickedPhoto(raw, sourceName ?: "video.mp4", videoMime)
                 }
-                val raw = ctx.contentResolver.openInputStream(uri)?.use { it.readBytes() }
-                    ?: return@mapNotNull null
-                val sourceName = ctx.displayNameForUri(uri) ?: "photo"
-                if (sourceMime.equals("image/gif", ignoreCase = true) || raw.isGifBytes()) {
-                    val filename = sourceName.takeIf { it.endsWith(".gif", ignoreCase = true) }
+                // Images stay bounded too: a provider that misreports the MIME
+                // of a huge file must never trigger an unbounded readBytes().
+                val read = ctx.readBounded(uri, IMAGE_READ_SANITY_BYTES)
+                if (read.tooLarge) {
+                    rejectedTooLarge += 1
+                    return@mapNotNull null
+                }
+                val raw = read.bytes ?: return@mapNotNull null
+                val name = sourceName ?: "photo"
+                if (declaredMime.equals("image/gif", ignoreCase = true) || raw.isGifBytes()) {
+                    val filename = name.takeIf { it.endsWith(".gif", ignoreCase = true) }
                         ?: "animation.gif"
                     PickedPhoto(raw, filename, "image/gif")
                 } else {
                     // Raw bytes — JPEG re-encoding happens lazily on send confirmation.
-                    PickedPhoto(raw, sourceName.ifBlank { "photo" }, sourceMime.ifBlank { "image/jpeg" })
+                    PickedPhoto(raw, name.ifBlank { "photo" }, declaredMime.ifBlank { "image/jpeg" })
                 }
             }
             if (items.isNotEmpty() || rejectedTooLarge > 0) {
@@ -92,12 +104,17 @@ actual fun rememberPhotoPicker(
     }
 }
 
+/** Sanity ceiling for a picked image read. Real photos re-encode to JPEG on
+ *  send, so this only guards the pathological case: a provider misreporting a
+ *  multi-GB file as an image and OOMing the unbounded read. */
+private const val IMAGE_READ_SANITY_BYTES = 128L * 1024L * 1024L
+
 private class BoundedVideoRead(val bytes: ByteArray?, val tooLarge: Boolean)
 
-/** Read a picked video fully, refusing to buffer anything over [maxBytes].
+/** Read a picked item fully, refusing to buffer anything over [maxBytes].
  *  Provider-reported size rejects cheaply; an unreported size is enforced
- *  while streaming so an over-cap video never materializes in memory. */
-private fun Context.readVideoBounded(uri: Uri, maxBytes: Long): BoundedVideoRead {
+ *  while streaming so an over-cap file never materializes in memory. */
+private fun Context.readBounded(uri: Uri, maxBytes: Long): BoundedVideoRead {
     val metadata = pickedFileMetadata(uri)
     if (metadata.size != null && metadata.size > maxBytes) {
         return BoundedVideoRead(null, tooLarge = true)

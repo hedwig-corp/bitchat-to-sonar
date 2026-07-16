@@ -4829,15 +4829,28 @@ class SonarAppState(private val scope: CoroutineScope) {
         pendingMediaPreviews = emptyList()
         deletePreviewTempFilesAsync(previous)
         scope.launch {
+            // A temp write can throw mid-batch (disk full): never leak the
+            // files already written, and tell the user instead of dying quietly.
             val written = withContext(Dispatchers.IO) {
-                items.map { item ->
+                val done = mutableListOf<PendingMediaPreview>()
+                for (item in items) {
                     val suffix = when {
                         item.mime == "image/gif" -> ".gif"
                         isVideoMime(item.mime) -> ".vid"
                         else -> ".img"
                     }
-                    PendingMediaPreview(chatId, writeTempMediaFile(item.bytes, suffix), item.filename, item.mime)
+                    val path = runCatching { writeTempMediaFile(item.bytes, suffix) }.getOrNull()
+                    if (path == null) {
+                        for (p in done) deleteTempMediaFile(p.tempPath)
+                        return@withContext null
+                    }
+                    done += PendingMediaPreview(chatId, path, item.filename, item.mime)
                 }
+                done
+            }
+            if (written == null) {
+                toast = "Couldn't prepare media."
+                return@launch
             }
             if (mediaPreviewGeneration != generation || (screen as? Screen.Chat)?.id != chatId) {
                 withContext(Dispatchers.IO) { for (p in written) deleteTempMediaFile(p.tempPath) }
@@ -5174,8 +5187,17 @@ class SonarAppState(private val scope: CoroutineScope) {
     ) {
         if (isContactBlocked(chatId)) { toast = "Unblock this contact before sending."; return }
         if (isMeshChat(chatId) && liveMeshRoutePeerId(meshPeerId(chatId)) != null) {
-            if (sendMeshMedia(meshPeerId(chatId), data, filename, mime)) return
-            if (resolveMarmotGroupId(chatId) == null) return
+            // Only attempt the BLE route for payloads the file packet can
+            // carry — a doomed attempt surfaces the misleading "Not connected
+            // over Bluetooth" toast before the White Noise fallback runs.
+            val fitsMesh = data.size.toLong() <= MAX_MESH_ATTACHMENT_BYTES
+            if (fitsMesh && sendMeshMedia(meshPeerId(chatId), data, filename, mime)) return
+            if (resolveMarmotGroupId(chatId) == null) {
+                if (!fitsMesh) {
+                    toast = "Too large to send over Bluetooth — start the secure chat to send it."
+                }
+                return
+            }
         }
         scope.launch {
             val groupId = resolveMarmotGroupId(chatId)
@@ -5252,11 +5274,32 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         if (isContactBlocked(chatId)) { toast = "Unblock this contact before sending."; return }
         if (isMeshChat(chatId) && liveMeshRoutePeerId(meshPeerId(chatId)) != null) {
-            // Mesh has no album packet — send each over mesh and return. Sending
-            // per-item (not `all {}`, which short-circuits mid-batch) avoids a
-            // partial mesh send that then double-sends via the Marmot album path.
-            for (item in items) sendMeshMedia(meshPeerId(chatId), item.bytes, item.filename, item.mime)
-            return
+            // Mesh has no album packet and its file packets cap at
+            // MAX_MESH_ATTACHMENT_BYTES. When an item (e.g. a video) exceeds
+            // that and a White Noise route exists, prefer the Marmot album
+            // path below instead of dropping items on the floor.
+            val oversize = items.count { it.bytes.size.toLong() > MAX_MESH_ATTACHMENT_BYTES }
+            if (oversize == 0 || resolveMarmotGroupId(chatId) == null) {
+                // Send each over mesh and return. Sending per-item (not
+                // `all {}`, which short-circuits mid-batch) avoids a partial
+                // mesh send that then double-sends via the Marmot album path.
+                var skipped = 0
+                for (item in items) {
+                    if (item.bytes.size.toLong() > MAX_MESH_ATTACHMENT_BYTES) {
+                        skipped += 1
+                        continue
+                    }
+                    sendMeshMedia(meshPeerId(chatId), item.bytes, item.filename, item.mime)
+                }
+                if (skipped > 0) {
+                    toast = if (skipped == 1) {
+                        "1 attachment is too large to send over Bluetooth."
+                    } else {
+                        "$skipped attachments are too large to send over Bluetooth."
+                    }
+                }
+                return
+            }
         }
         scope.launch {
             val groupId = resolveMarmotGroupId(chatId)

@@ -309,12 +309,18 @@ struct SonarDMScreenContent: View {
                 // Videos land as picker-owned temp FILES (never buffered
                 // through memory here); photos load as Data like before.
                 var staged: [(payload: SonarAppStore.PendingMediaPayload, filename: String, mime: String)] = []
+                // An iCloud download/export can fail per item — count it so a
+                // partially imported album never sends in silence.
+                var failedImports = 0
                 for item in items {
                     let isVideo = item.supportedContentTypes.contains {
                         $0.conforms(to: .movie) || $0.conforms(to: .audiovisualContent)
                     }
                     if isVideo {
-                        guard let picked = try? await item.loadTransferable(type: PickedVideoFile.self) else { continue }
+                        guard let picked = try? await item.loadTransferable(type: PickedVideoFile.self) else {
+                            failedImports += 1
+                            continue
+                        }
                         staged.append((
                             payload: .file(picked.url),
                             filename: picked.suggestedFilename,
@@ -322,7 +328,10 @@ struct SonarDMScreenContent: View {
                         ))
                         continue
                     }
-                    guard let data = try? await item.loadTransferable(type: Data.self) else { continue }
+                    guard let data = try? await item.loadTransferable(type: Data.self) else {
+                        failedImports += 1
+                        continue
+                    }
                     if data.snIsGif {
                         staged.append((payload: .data(data), filename: "animation.gif", mime: "image/gif"))
                     } else {
@@ -330,7 +339,13 @@ struct SonarDMScreenContent: View {
                     }
                 }
                 let toStage = staged
+                let failed = failedImports
                 await MainActor.run {
+                    if failed > 0 {
+                        showToast(failed == 1
+                            ? "Couldn't load 1 item from your library."
+                            : "Couldn't load \(failed) items from your library.")
+                    }
                     if !toStage.isEmpty {
                         store.stageMediaPreviews(peerId, items: toStage)
                     }

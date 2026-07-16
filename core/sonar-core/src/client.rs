@@ -78,6 +78,11 @@ pub struct MediaUpload {
 /// Hosts accept 25 MiB of plaintext; MIP-04 ChaCha20-Poly1305 appends its
 /// 16-byte authentication tag to the uploaded ciphertext.
 pub const MAX_MEDIA_PLAINTEXT_BYTES: usize = 25 * 1024 * 1024;
+/// Aggregate plaintext ceiling for ONE album send. Every item is resident in
+/// memory at once on both sides of the FFI (plus the ciphertext of the item
+/// being uploaded), so a full 10 x 25 MiB selection could exhaust a low-RAM
+/// phone. Interim backstop until the file-backed/streaming send API lands.
+pub const MAX_MEDIA_TOTAL_PLAINTEXT_BYTES: usize = 100 * 1024 * 1024;
 const MIP04_AEAD_TAG_BYTES: usize = 16;
 const MAX_MEDIA_DOWNLOAD_BYTES: usize = MAX_MEDIA_PLAINTEXT_BYTES + MIP04_AEAD_TAG_BYTES;
 const BLOSSOM_UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
@@ -3161,7 +3166,9 @@ impl SonarClient {
         }
         // Receivers hard-cap downloads at MAX_MEDIA_PLAINTEXT_BYTES, so an
         // over-limit upload would publish a message NO client can ever fetch.
-        // Reject before any encrypt/upload work.
+        // Reject before any encrypt/upload work. The aggregate cap bounds the
+        // whole album's resident plaintext (every item is in memory at once).
+        let mut total_bytes: u64 = 0;
         for item in &items {
             if item.data.len() > MAX_MEDIA_PLAINTEXT_BYTES {
                 return Err(Error::MediaTooLarge {
@@ -3169,6 +3176,13 @@ impl SonarClient {
                     max: MAX_MEDIA_PLAINTEXT_BYTES as u64,
                 });
             }
+            total_bytes += item.data.len() as u64;
+        }
+        if total_bytes > MAX_MEDIA_TOTAL_PLAINTEXT_BYTES as u64 {
+            return Err(Error::MediaTooLarge {
+                bytes: total_bytes,
+                max: MAX_MEDIA_TOTAL_PLAINTEXT_BYTES as u64,
+            });
         }
         // Encrypt + upload every attachment first; only then build + publish the
         // single message. Any failure aborts the whole album with nothing sent.
@@ -5660,6 +5674,35 @@ mod tests {
             matches!(err, Error::MediaTooLarge { bytes, max }
                 if bytes == (MAX_MEDIA_PLAINTEXT_BYTES + 1) as u64
                     && max == MAX_MEDIA_PLAINTEXT_BYTES as u64),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_media_multi_rejects_album_over_aggregate_cap() {
+        // Every item fits individually, but the album total would hold more
+        // resident plaintext than a low-RAM phone can afford.
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client without relays");
+        let group_id = GroupId::from_slice(&[7u8; 32]);
+        let per_item = MAX_MEDIA_PLAINTEXT_BYTES;
+        let count = MAX_MEDIA_TOTAL_PLAINTEXT_BYTES / per_item + 1;
+        let items: Vec<_> = (0..count)
+            .map(|i| MediaUpload {
+                data: vec![0u8; per_item],
+                filename: format!("clip-{i}.mp4"),
+                mime: "video/mp4".to_string(),
+            })
+            .collect();
+        let err = client
+            .send_media_multi(&group_id, items, "", "")
+            .await
+            .expect_err("over-aggregate album must be rejected");
+        assert!(
+            matches!(err, Error::MediaTooLarge { bytes, max }
+                if bytes == (count * per_item) as u64
+                    && max == MAX_MEDIA_TOTAL_PLAINTEXT_BYTES as u64),
             "unexpected error: {err:?}"
         );
     }
