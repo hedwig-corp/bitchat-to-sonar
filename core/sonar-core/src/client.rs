@@ -98,6 +98,8 @@ const MEDIA_DOWNLOAD_CANCEL_POLL: Duration = Duration::from_millis(100);
 const MEDIA_DOWNLOAD_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 const STICKER_PREFETCH_CONCURRENCY: usize = 4;
 const STICKER_PREFETCH_DOWNLOAD_BYTES: usize = MAX_STICKER_CACHE_BYTES;
+/// Upper bound on receive-time sticker prefetch work per processed event batch.
+const STICKER_REF_PREFETCH_BATCH_LIMIT: usize = 16;
 const SONAR_DIRECT_DM_DESCRIPTION: &str = "sonar.direct-dm.v1";
 
 /// Shared HTTP client for Blossom media downloads. Built once so every blob
@@ -587,6 +589,29 @@ fn log_sticker_prefetch_result(outcome: Option<StickerPrefetchJoinResult>) -> (u
         Some(Ok((_, Ok(_)))) => (1, 0),
         None => (0, 0),
     }
+}
+
+/// Dedup receive-time sticker refs by full reference (coordinate + shortcode +
+/// plaintext hash, case-insensitive) preserving first-seen order, capped at
+/// `limit` so one large drain cannot schedule unbounded downloads.
+fn sticker_prefetch_batch(refs: Vec<StickerRef>, limit: usize) -> Vec<StickerRef> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut batch = Vec::new();
+    for sticker_ref in refs {
+        if batch.len() >= limit {
+            break;
+        }
+        let key = format!(
+            "{}|{}|{}",
+            sticker_ref.pack.coordinate(),
+            sticker_ref.shortcode,
+            sticker_ref.plaintext_sha256.to_ascii_lowercase()
+        );
+        if seen.insert(key) {
+            batch.push(sticker_ref);
+        }
+    }
+    batch
 }
 
 async fn http_get_with_retries(
@@ -2854,6 +2879,83 @@ impl SonarClient {
         });
     }
 
+    /// Warm the disk cache for sticker references carried by freshly received
+    /// messages. Best-effort and bounded: each ref costs at most one pack fetch
+    /// (singleflight, with validated-local fallback) plus one image download,
+    /// and refs already authorized by the validated pack cache are skipped.
+    fn spawn_sticker_refs_prefetch(&self, refs: Vec<StickerRef>) {
+        if refs.is_empty() {
+            return;
+        }
+        let nostr = self.nostr.clone();
+        let relays = self.relays.clone();
+        let sticker_cache = self.sticker_cache.clone();
+        let pack_gates = self.sticker_pack_fetch_gates.clone();
+        let image_gates = self.sticker_image_fetch_gates.clone();
+        let _prefetch = tokio::spawn(async move {
+            for sticker_ref in refs {
+                if !matches!(sticker_cache.session_is_current(), Ok(true)) {
+                    return;
+                }
+                let coordinate = sticker_ref.pack.coordinate();
+                match sticker_cache.read_validated_image(
+                    &coordinate,
+                    &sticker_ref.shortcode,
+                    &sticker_ref.plaintext_sha256,
+                ) {
+                    Ok(Some(_)) => continue,
+                    Ok(None) => {}
+                    Err(err) => {
+                        tracing::debug!(%err, coordinate, "sticker ref prefetch: cache read failed");
+                    }
+                }
+                let pack = match fetch_sticker_pack_singleflight(
+                    &pack_gates,
+                    &sticker_cache,
+                    &nostr,
+                    &relays,
+                    &sticker_ref.pack.author_pubkey_hex,
+                    &sticker_ref.pack.identifier,
+                    &[],
+                    &coordinate,
+                )
+                .await
+                {
+                    Ok((outcome, _)) => outcome.pack.clone(),
+                    Err(err) => {
+                        tracing::debug!(%err, coordinate, "sticker ref prefetch: pack fetch failed");
+                        continue;
+                    }
+                };
+                let Some(sticker) = pack.stickers.iter().find(|sticker| {
+                    sticker.shortcode == sticker_ref.shortcode
+                        && sticker
+                            .sha256
+                            .eq_ignore_ascii_case(&sticker_ref.plaintext_sha256)
+                }) else {
+                    tracing::debug!(
+                        coordinate,
+                        shortcode = %sticker_ref.shortcode,
+                        "sticker ref prefetch: ref not in latest pack"
+                    );
+                    continue;
+                };
+                if let Err(err) = fetch_sticker_image_singleflight(
+                    &image_gates,
+                    &sticker_cache,
+                    &sticker.url,
+                    &sticker.sha256,
+                    STICKER_PREFETCH_DOWNLOAD_BYTES,
+                    "prefetch",
+                )
+                .await
+                {
+                    tracing::debug!(%err, coordinate, "sticker ref prefetch: image fetch failed");
+                }
+            }
+        });
+    }
+
     pub async fn fetch_installed_packs(&self) -> Result<Vec<PackAddress>> {
         let filter = Filter::new()
             .kind(Kind::Custom(USER_STICKER_PACKS_KIND))
@@ -4106,6 +4208,7 @@ impl SonarClient {
         let mut report = MarmotProcessReport::default();
         let mut notifications: Vec<DrainNotification> = Vec::new();
         let mut changed_groups: HashSet<String> = HashSet::new();
+        let mut sticker_refs: Vec<StickerRef> = Vec::new();
         let group_names: HashMap<Vec<u8>, String> = self
             .engine
             .groups()
@@ -4235,6 +4338,9 @@ impl SonarClient {
                 }
                 Ok(ref incoming @ Incoming::Message(ref message)) => {
                     self.record_delivery_for_incoming(incoming);
+                    if let Some(sticker_ref) = &message.sticker_ref {
+                        sticker_refs.push(sticker_ref.clone());
+                    }
                     let cached_name = group_names
                         .get(message.group_id.as_slice())
                         .map(|s| s.as_str());
@@ -4299,6 +4405,14 @@ impl SonarClient {
             }
         }
         self.notify_conversations_changed(&changed_groups);
+        // Signal-style receive-time warming: sticker attachments referenced by
+        // freshly processed messages download in the background now, so opening
+        // the chat later paints them from the local disk cache instead of doing
+        // relay + Blossom round-trips at render time.
+        self.spawn_sticker_refs_prefetch(sticker_prefetch_batch(
+            sticker_refs,
+            STICKER_REF_PREFETCH_BATCH_LIMIT,
+        ));
         (report, notifications)
     }
 
@@ -5721,6 +5835,48 @@ mod tests {
         let prefetch_limit = std::hint::black_box(STICKER_PREFETCH_DOWNLOAD_BYTES);
         assert_eq!(prefetch_limit, MAX_STICKER_CACHE_BYTES);
         assert!(prefetch_limit < MAX_MEDIA_DOWNLOAD_BYTES);
+    }
+
+    fn prefetch_ref(identifier: &str, shortcode: &str, sha_seed: u8) -> StickerRef {
+        StickerRef::new(
+            PackAddress::new("11".repeat(32), identifier).unwrap(),
+            shortcode,
+            format!("{:02x}", sha_seed).repeat(32),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn sticker_prefetch_batch_dedups_full_reference_case_insensitively() {
+        let duplicate_upper = StickerRef::new(
+            PackAddress::new("11".repeat(32), "pack").unwrap(),
+            "wave",
+            "AA".repeat(32),
+        )
+        .unwrap();
+        let batch = sticker_prefetch_batch(
+            vec![
+                prefetch_ref("pack", "wave", 0xaa),
+                duplicate_upper,
+                prefetch_ref("pack", "wave", 0xbb),
+                prefetch_ref("other", "wave", 0xaa),
+            ],
+            16,
+        );
+        assert_eq!(batch.len(), 3);
+        assert_eq!(batch[0].plaintext_sha256, "aa".repeat(32));
+        assert_eq!(batch[1].plaintext_sha256, "bb".repeat(32));
+        assert_eq!(batch[2].pack.identifier, "other");
+    }
+
+    #[test]
+    fn sticker_prefetch_batch_caps_scheduled_work() {
+        let refs: Vec<StickerRef> = (0..64)
+            .map(|i| prefetch_ref("pack", &format!("s{i}"), i as u8))
+            .collect();
+        let batch = sticker_prefetch_batch(refs, STICKER_REF_PREFETCH_BATCH_LIMIT);
+        assert_eq!(batch.len(), STICKER_REF_PREFETCH_BATCH_LIMIT);
+        assert_eq!(batch[0].shortcode, "s0");
     }
 
     #[tokio::test]

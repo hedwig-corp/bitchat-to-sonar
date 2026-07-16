@@ -28,6 +28,30 @@ class StickerSendEchoTest {
         )
     }
 
+    @Test fun stickerRefMemoryKeyNormalizesAuthorCaseAndHashCase() {
+        val key = stickerRefMemoryKey(
+            packCoordinate = "30031:ABCDEF1234:MyPack",
+            shortcode = "wave",
+            plaintextSha256 = "AA".repeat(32),
+        )
+        assertEquals("30031:abcdef1234:MyPack|wave|${"aa".repeat(32)}", key)
+        // Identifier and shortcode stay case-sensitive: they are distinct
+        // stickers per the pack model, so they must not collapse to one key.
+        assertFalse(
+            key == stickerRefMemoryKey("30031:abcdef1234:mypack", "wave", "aa".repeat(32)),
+        )
+        assertFalse(
+            key == stickerRefMemoryKey("30031:abcdef1234:MyPack", "Wave", "aa".repeat(32)),
+        )
+    }
+
+    @Test fun stickerLoadRetryScheduleIsShortAndBounded() {
+        assertEquals(2_000L, stickerLoadRetryDelayMs(0))
+        assertEquals(8_000L, stickerLoadRetryDelayMs(1))
+        assertEquals(null, stickerLoadRetryDelayMs(2))
+        assertEquals(null, stickerLoadRetryDelayMs(100))
+    }
+
     @Test fun failedInstalledRefreshPreservesCachedPacks() {
         assertTrue(shouldPreserveCachedStickerPacks(hadCachedPacks = true, installedCoordinates = null))
         assertFalse(shouldPreserveCachedStickerPacks(hadCachedPacks = false, installedCoordinates = null))

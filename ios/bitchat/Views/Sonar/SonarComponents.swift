@@ -1244,8 +1244,13 @@ struct SNStickerBubble: View {
 
     @State private var image: PlatformImage?
     @State private var failed = false
+    @State private var retryToken = 0
 
     private var mine: Bool { m.mine }
+
+    private var loadTaskID: String {
+        "\(m.stickerRef?.plaintextSha256 ?? "")#\(retryToken)"
+    }
 
     var body: some View {
         VStack(alignment: mine ? .trailing : .leading, spacing: 3) {
@@ -1288,7 +1293,11 @@ struct SNStickerBubble: View {
                 }
             }
             .onTapGesture {
-                if let coord = m.stickerRef?.packCoordinate {
+                if failed, image == nil {
+                    // A failed load retries on tap instead of opening the pack
+                    // preview: the placeholder is the only recovery affordance.
+                    retryToken += 1
+                } else if let coord = m.stickerRef?.packCoordinate {
                     onTapPack?(coord)
                 }
             }
@@ -1299,17 +1308,26 @@ struct SNStickerBubble: View {
         }
         .frame(maxWidth: .infinity, alignment: mine ? .trailing : .leading)
         .padding(.vertical, 3)
-        .task(id: m.stickerRef?.plaintextSha256) {
+        .task(id: loadTaskID) {
             guard let ref = m.stickerRef else { return }
             image = nil
             failed = false
-            guard let data = await load?(ref),
-                  let decoded = PlatformImage(data: data)
-            else {
+            // The failed placeholder shows after the first miss, but keep
+            // retrying on a short bounded schedule: cold opens race the relay
+            // connection and receive-time prefetch may land moments later.
+            var attempt = 0
+            while !Task.isCancelled {
+                if let data = await load?(ref), let decoded = PlatformImage(data: data) {
+                    image = decoded
+                    failed = false
+                    return
+                }
                 failed = true
-                return
+                guard let delay = MarmotChatModel.stickerLoadRetryDelaySeconds(attempt: attempt)
+                else { return }
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                attempt += 1
             }
-            image = decoded
         }
     }
 }

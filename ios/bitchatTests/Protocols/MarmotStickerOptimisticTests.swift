@@ -32,6 +32,34 @@ final class MarmotStickerOptimisticTests: XCTestCase {
         ), .hit)
     }
 
+    func testStickerRefMemoryKeyNormalizesAuthorCaseAndHashCase() {
+        let key = MarmotChatModel.stickerRefMemoryKey(
+            packCoordinate: "30031:ABCDEF1234:MyPack",
+            shortcode: "wave",
+            plaintextSha256: String(repeating: "AA", count: 32)
+        )
+        XCTAssertEqual(key, "30031:abcdef1234:MyPack|wave|\(String(repeating: "aa", count: 32))")
+        // Identifier and shortcode stay case-sensitive: they are distinct
+        // stickers per the pack model, so they must not collapse to one key.
+        XCTAssertNotEqual(key, MarmotChatModel.stickerRefMemoryKey(
+            packCoordinate: "30031:abcdef1234:mypack",
+            shortcode: "wave",
+            plaintextSha256: String(repeating: "aa", count: 32)
+        ))
+        XCTAssertNotEqual(key, MarmotChatModel.stickerRefMemoryKey(
+            packCoordinate: "30031:abcdef1234:MyPack",
+            shortcode: "Wave",
+            plaintextSha256: String(repeating: "aa", count: 32)
+        ))
+    }
+
+    func testStickerLoadRetryScheduleIsShortAndBounded() {
+        XCTAssertEqual(MarmotChatModel.stickerLoadRetryDelaySeconds(attempt: 0), 2)
+        XCTAssertEqual(MarmotChatModel.stickerLoadRetryDelaySeconds(attempt: 1), 8)
+        XCTAssertNil(MarmotChatModel.stickerLoadRetryDelaySeconds(attempt: 2))
+        XCTAssertNil(MarmotChatModel.stickerLoadRetryDelaySeconds(attempt: 100))
+    }
+
     func testIdentityReplacementClearsPickerAuthorityBeforeDatabaseWipe() async throws {
         let suiteName = "MarmotStickerOptimisticTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!

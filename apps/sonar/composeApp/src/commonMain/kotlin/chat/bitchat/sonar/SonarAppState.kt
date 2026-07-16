@@ -517,6 +517,31 @@ internal enum class StickerCacheLookupState { HIT, MISS, INVALIDATED }
 private const val STICKER_IMAGE_MEMORY_BUDGET_BYTES = 25 * 1024 * 1024
 private const val STICKER_IMAGE_MEMORY_ENTRY_LIMIT = 100
 
+/** Bounded wait for the relay before a sticker pack lookup. Mirrors the iOS
+ *  `ensureRelayConnected(timeoutSeconds: 10)` guard: chats open local-first, so
+ *  the first sticker render often races the relay connection on cold start. */
+private const val STICKER_PACK_RELAY_WAIT_MS = 10_000L
+
+/** Session key under which a sticker reference was authorized against the
+ *  validated pack (core disk cache or a fresh relay pack match). Memory-first
+ *  lookups are gated on this so the sha-keyed byte LRU never serves a ref that
+ *  was not verified this session. */
+internal fun stickerRefMemoryKey(
+    packCoordinate: String,
+    shortcode: String,
+    plaintextSha256: String,
+): String =
+    "${normalizeStickerPackCoordinate(packCoordinate)}|$shortcode|${plaintextSha256.lowercase()}"
+
+/** Delay before retry [attempt] (0-based) of a failed transcript sticker load,
+ *  or null when attempts are exhausted. Bubbles keep the failed placeholder
+ *  visible while these run, so the schedule stays short and bounded. */
+internal fun stickerLoadRetryDelayMs(attempt: Int): Long? = when (attempt) {
+    0 -> 2_000L
+    1 -> 8_000L
+    else -> null
+}
+
 internal fun stickerCacheLookupState(
     hasBytes: Boolean,
     startedGeneration: Long,
@@ -5215,6 +5240,9 @@ class SonarAppState(private val scope: CoroutineScope) {
     private var nextMediaDownloadGeneration = 0L
     private val stickerPackCache = linkedMapOf<String, SonarStickerPack>()
     private val stickerImageCache = linkedMapOf<String, ByteArray>()
+    /** Sticker references already authorized against validated pack metadata
+     *  this session; only these may be served memory-first by full reference. */
+    private val authorizedStickerRefKeys = mutableSetOf<String>()
     private var stickerImageMemoryBytes = 0
     private var stickerBenchmarkRecording = false
     /** Last locally-authoritative installed set. Generic pack metadata also
@@ -5812,6 +5840,13 @@ class SonarAppState(private val scope: CoroutineScope) {
         val cacheKey = "30031:${authorPubkeyHex.lowercase()}:$identifier"
         stickerPackCache.remove(cacheKey)?.let { stickerPackCache[cacheKey] = it; return it }
         return try {
+            // Cold-start race: chats paint before the relay connects, so give
+            // the connection a bounded head start instead of failing the
+            // kind-30031 lookup instantly (mirrors iOS ensureRelayConnected).
+            if (!SonarCore.isRelayConnected()) {
+                withTimeoutOrNull(STICKER_PACK_RELAY_WAIT_MS) { awaitRelayConnection() }
+            }
+            if (stickerCacheGeneration != generation) return null
             val pack = SonarCore.fetchStickerPack(authorPubkeyHex, identifier, relayUrls)
             if (stickerCacheGeneration != generation) return null
             if (stickerPackCache.size >= 20) stickerPackCache.remove(stickerPackCache.keys.first())
@@ -5856,8 +5891,17 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     suspend fun stickerImage(ref: SonarStickerRef): ByteArray? {
         val generation = stickerCacheGeneration
+        val refKey = stickerRefMemoryKey(ref.packCoordinate, ref.shortcode, ref.plaintextSha256)
+        // Memory-first for refs this session already authorized: skips the
+        // FFI disk read + validated-pack parse on every transcript recompose.
+        if (refKey in authorizedStickerRefKeys) {
+            stickerImageFromMemory(ref.plaintextSha256)?.let { return it }
+        }
         when (val cached = cachedStickerImage(ref, generation)) {
-            is CachedStickerImageResult.Hit -> return cached.bytes
+            is CachedStickerImageResult.Hit -> {
+                authorizedStickerRefKeys += refKey
+                return cached.bytes
+            }
             CachedStickerImageResult.Invalidated -> return null
             CachedStickerImageResult.Miss -> Unit
         }
@@ -5869,11 +5913,15 @@ class SonarAppState(private val scope: CoroutineScope) {
             expectedGeneration = generation,
         ) ?: return null
         val sticker = pack.stickerMatching(ref) ?: return null
-        return stickerImage(
+        val bytes = stickerImage(
             url = sticker.url,
             expectedSha256 = ref.plaintextSha256,
             expectedGeneration = generation,
         )
+        if (bytes != null && stickerCacheGeneration == generation) {
+            authorizedStickerRefKeys += refKey
+        }
+        return bytes
     }
 
     /** Run one representative device cache ladder through the production host
@@ -6043,6 +6091,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun clearStickerCaches() {
         stickerCacheGeneration++
         stickerPackCache.clear()
+        authorizedStickerRefKeys.clear()
         clearStickerImageMemoryCache()
         installedPackCoordinates.clear()
     }

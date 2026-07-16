@@ -306,6 +306,9 @@ final class MarmotChatModel: ObservableObject {
     private var stickerPackLRU: [String] = []
     private var stickerImagesBySHA256: [String: Data] = [:]
     private var stickerImageLRU: [String] = []
+    /// Sticker references already authorized against validated pack metadata
+    /// this session; only these may be served memory-first by full reference.
+    private var authorizedStickerRefKeys: Set<String> = []
     private var stickerImageMemoryBytes = 0
     private var stickerCacheGeneration: UInt64 = 0
     /// Last desired payment offer metadata for our public descriptor. Reused
@@ -362,6 +365,27 @@ final class MarmotChatModel: ObservableObject {
     ) -> StickerCacheLookupState {
         guard startedGeneration == currentGeneration else { return .invalidated }
         return hasData ? .hit : .miss
+    }
+
+    /// Session key under which a sticker reference was authorized against the
+    /// validated pack. Memory-first lookups are gated on this so the sha-keyed
+    /// byte LRU never serves a ref that was not verified this session.
+    static func stickerRefMemoryKey(
+        packCoordinate: String,
+        shortcode: String,
+        plaintextSha256: String
+    ) -> String {
+        "\(snNormalizeStickerPackCoordinate(packCoordinate))|\(shortcode)|\(plaintextSha256.lowercased())"
+    }
+
+    /// Delay before retry `attempt` (0-based) of a failed transcript sticker
+    /// load, or nil when attempts are exhausted. Mirrors the Compose schedule.
+    static func stickerLoadRetryDelaySeconds(attempt: Int) -> Double? {
+        switch attempt {
+        case 0: return 2
+        case 1: return 8
+        default: return nil
+        }
     }
 
     private enum CachedStickerImageResult {
@@ -2256,8 +2280,20 @@ final class MarmotChatModel: ObservableObject {
 
     func stickerData(for ref: MarmotService.MarmotStickerRef) async -> Data? {
         let generation = stickerCacheGeneration
+        let refKey = Self.stickerRefMemoryKey(
+            packCoordinate: ref.packCoordinate,
+            shortcode: ref.shortcode,
+            plaintextSha256: ref.plaintextSha256
+        )
+        // Memory-first for refs this session already authorized: skips the
+        // FFI disk read + validated-pack parse on every transcript render.
+        if authorizedStickerRefKeys.contains(refKey),
+           let cached = stickerImageFromMemory(expectedSha256: ref.plaintextSha256) {
+            return cached
+        }
         switch await cachedStickerImage(for: ref, generation: generation) {
         case .hit(let data):
+            authorizedStickerRefKeys.insert(refKey)
             return data
         case .invalidated:
             return nil
@@ -2277,11 +2313,15 @@ final class MarmotChatModel: ObservableObject {
                       $0.sha256.caseInsensitiveCompare(ref.plaintextSha256) == .orderedSame
               })
         else { return nil }
-        return await fetchStickerImage(
+        let data = await fetchStickerImage(
             url: sticker.url,
             expectedSha256: ref.plaintextSha256,
             expectedGeneration: generation
         )
+        if data != nil, stickerCacheGeneration == generation {
+            authorizedStickerRefKeys.insert(refKey)
+        }
+        return data
     }
 
     private func cachedStickerImage(
@@ -2356,6 +2396,7 @@ final class MarmotChatModel: ObservableObject {
         stickerCacheGeneration = stickerCacheGeneration &+ 1
         stickerPacksByCoordinate = [:]
         stickerPackLRU = []
+        authorizedStickerRefKeys = []
         clearStickerImageMemoryCache()
         installedPackCoordinates = []
     }
