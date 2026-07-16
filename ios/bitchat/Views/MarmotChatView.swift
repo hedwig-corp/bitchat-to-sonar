@@ -317,6 +317,13 @@ final class MarmotChatModel: ObservableObject {
     /// first has already reopened SQLCipher (Compose joins jobs before FFI).
     private var accountBackupInFlight = false
     @Published var errorText: String?
+    /// Blocking account/storage failure after onboarding: the identity or the
+    /// encrypted local database could not be opened (missing account key, wrong
+    /// DB encryption key, corrupt store). While set, transcripts cannot load
+    /// and sends cannot commit, so the UI must show a persistent restore/error
+    /// surface instead of a normal-looking blank chat (Account Key Durability
+    /// Rule: never fail into a silent fresh-looking state).
+    @Published private(set) var localStoreFailure: String?
     /// Resolved kind-0 profiles, keyed by npub — fills in human names/avatars
     /// for Marmot members instead of raw npubs.
     @Published var profilesByNpub: [String: MarmotService.Profile] = [:]
@@ -674,6 +681,7 @@ final class MarmotChatModel: ObservableObject {
                 guard allowCreateIdentity else {
                     SecureLogger.warning("⚠️ marmot-nsec missing after onboarding — refusing to create a replacement identity", category: .session)
                     self.errorText = "Account key missing. Restore from your backup key."
+                    self.localStoreFailure = self.errorText
                     return false
                 }
                 storedNsec = nil
@@ -708,6 +716,7 @@ final class MarmotChatModel: ObservableObject {
             let desc = Self.describe(error)
             SecureLogger.warning("⚠️ Marmot identity load failed: \(desc)", category: .session)
             self.errorText = desc
+            self.localStoreFailure = desc
             return false
         }
         // 2) Open the encrypted DB with no relays first → load LOCAL chats right
@@ -725,12 +734,17 @@ final class MarmotChatModel: ObservableObject {
             SecureLogger.info("SONAR_BENCH t1_local_paint groups=\(groups.count)", category: .session)
             #endif
             self.errorText = nil
+            self.localStoreFailure = nil
             scheduleRelayConnect(delaySeconds: 0.25)
             return true
         } catch {
             let desc = Self.describe(error)
             SecureLogger.warning("⚠️ Marmot local open failed: \(desc)", category: .session)
             self.errorText = desc
+            // The chat-list snapshot cache still paints rows at this point, so
+            // without a persistent surface this failure looks like "chats are
+            // blank and my sends vanish". Flag it for the UI.
+            self.localStoreFailure = desc
             return false
         }
     }
@@ -2656,7 +2670,25 @@ final class MarmotChatModel: ObservableObject {
                 try await self.service.sendText(groupId: groupId, text: trimmed)
             } catch {
                 self.discardOptimistic(id: echo.id, from: groupId)
-                onFailure?()
+                if let onFailure {
+                    // Setup-stage callers keep their own failed pending row.
+                    onFailure()
+                } else {
+                    // A vanished bubble reads as "the app ate my message" — and
+                    // when the local store failed to open, the whole chat is
+                    // already blank around it. Keep the send visible as a
+                    // retryable failed row, exactly like media and stickers.
+                    let failed = MarmotService.MarmotMessage(
+                        id: Self.failedOptimisticIDPrefix + UUID().uuidString,
+                        senderNpub: echo.senderNpub,
+                        content: echo.content,
+                        createdAt: echo.createdAt,
+                        isMine: true,
+                        media: []
+                    )
+                    self.pendingOptimistic[groupId, default: []].append(failed)
+                    self.messagesByGroup[groupId, default: []].append(failed)
+                }
                 self.errorText = Self.describe(error)
                 return
             }
@@ -3718,6 +3750,7 @@ final class MarmotChatModel: ObservableObject {
     private func clearIdentityScopedState() {
         relayConnected = false
         npub = nil
+        localStoreFailure = nil
         groups = []
         pendingGroupInvites = []
         messagesByGroup = [:]

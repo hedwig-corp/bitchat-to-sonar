@@ -265,6 +265,11 @@ private struct SonarMacSidebar: View {
 
             ScrollView {
                 VStack(spacing: 0) {
+                    if let failure = store.marmot.localStoreFailure {
+                        SNLocalStoreFailureBanner(detail: failure) {
+                            store.marmot.connectIfNeeded()
+                        }
+                    }
                     MacSidebarDiscoverRow(
                         selected: selection == .radar,
                         meshCount: store.meshCount
@@ -814,7 +819,14 @@ private struct MacConversationPane: View {
     }
 
     @ViewBuilder private var banner: some View {
-        if isChannel {
+        if let failure = store.marmot.localStoreFailure, !isChannel {
+            // Blocking storage/account failure: the transcript below cannot
+            // load and sends cannot commit — say so instead of implying a
+            // healthy encrypted chat.
+            SNLocalStoreFailureBanner(detail: failure) {
+                store.marmot.connectIfNeeded()
+            }
+        } else if isChannel {
             SNBanner(icon: .people, tone: .publicRoom, bold: "Public channel", rest: " - anyone nearby can read")
         } else if verified {
             SNBanner(icon: .shieldCheck, tone: .enc, bold: "Verified", rest: " - you confirmed \(peer.name)'s safety number")
@@ -3833,7 +3845,16 @@ private struct MacDMTranscript: View {
 
     var body: some View {
         let msgs = convo.messages
-        if msgs.isEmpty {
+        if msgs.isEmpty, store.marmot.localStoreFailure != nil {
+            // The transcript is empty because the encrypted store cannot be
+            // opened — "Say hi" would misread as a fresh empty chat.
+            SNEmptyState(
+                icon: .lock,
+                iconSize: 24,
+                title: "Can't unlock this chat",
+                desc: "Your messages are still stored on this device, but the encrypted database can't be opened right now."
+            )
+        } else if msgs.isEmpty {
             SNEmptyState(
                 icon: .lock,
                 iconSize: 24,

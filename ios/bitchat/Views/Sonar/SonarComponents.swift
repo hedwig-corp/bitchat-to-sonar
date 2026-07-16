@@ -439,7 +439,7 @@ struct SNDot: View {
 // MARK: - Banner (bc-banner)
 
 enum SNBannerTone {
-    case neutral, publicRoom, enc, net
+    case neutral, publicRoom, enc, net, danger
 
     var background: Color {
         switch self {
@@ -447,6 +447,7 @@ enum SNBannerTone {
         case .publicRoom: return SonarTheme.accentSoft
         case .enc: return SonarTheme.greenSoft
         case .net: return SonarTheme.netSoft
+        case .danger: return SonarTheme.dangerSoft
         }
     }
 
@@ -456,6 +457,7 @@ enum SNBannerTone {
         case .publicRoom: return SonarTheme.accentDeep
         case .enc: return SonarTheme.greenDeep
         case .net: return SonarTheme.netDeep
+        case .danger: return SonarTheme.dangerDeep
         }
     }
 }
@@ -494,6 +496,28 @@ struct SNBanner<Action: View>: View {
 extension SNBanner where Action == EmptyView {
     init(icon: SNIconName, tone: SNBannerTone, bold: String, rest: String) {
         self.init(icon: icon, tone: tone, bold: bold, rest: rest, action: { EmptyView() })
+    }
+}
+
+/// Persistent restore/error surface shown while the Marmot local store cannot
+/// be opened (missing account key, wrong DB encryption key, corrupt store).
+/// Without it the app looks healthy — the chat list paints from the snapshot
+/// cache — while every transcript is blank and every send silently dies.
+struct SNLocalStoreFailureBanner: View {
+    let detail: String
+    var onRetry: (() -> Void)? = nil
+
+    var body: some View {
+        SNBanner(
+            icon: .lock,
+            tone: .danger,
+            bold: "Can't unlock your chats",
+            rest: " - \(detail)"
+        ) {
+            if let onRetry {
+                SNBannerButton(label: "Retry", action: onRetry)
+            }
+        }
     }
 }
 

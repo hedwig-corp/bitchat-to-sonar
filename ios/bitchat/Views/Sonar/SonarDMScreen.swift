@@ -190,6 +190,15 @@ struct SonarDMScreenContent: View {
                 ProgressView()
                     .tint(SonarTheme.accent)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if msgs.isEmpty, store.marmot.localStoreFailure != nil {
+                // The transcript is empty because the encrypted store cannot be
+                // opened — "Say hi" would misread as a fresh empty chat.
+                SNEmptyState(
+                    icon: .lock,
+                    iconSize: 24,
+                    title: "Can't unlock this chat",
+                    desc: "Your messages are still stored on this device, but the encrypted database can't be opened right now."
+                )
             } else if msgs.isEmpty {
                 SNEmptyState(
                     icon: .lock,
@@ -618,7 +627,14 @@ struct SonarDMScreenContent: View {
 
     @ViewBuilder
     private var banner: some View {
-        if !isMarmot && !peer.inRange {
+        if let failure = store.marmot.localStoreFailure {
+            // Blocking storage/account failure: the transcript below cannot
+            // load and sends cannot commit — say so instead of implying a
+            // healthy encrypted chat.
+            SNLocalStoreFailureBanner(detail: failure) {
+                store.marmot.connectIfNeeded()
+            }
+        } else if !isMarmot && !peer.inRange {
             outOfRangeBanner
         } else if verified {
             SNBanner(

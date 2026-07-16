@@ -5304,6 +5304,21 @@ final class SonarAppStore: ObservableObject {
             return
         }
 
+        // Platform-local failed TEXT echo (send failed before reaching the
+        // core outbox, e.g. node not connected). The id does not exist in the
+        // durable database, so core retryMessage cannot find it — re-send the
+        // retained content and drop the failed row once the new echo shows.
+        if let groupId, MarmotChatModel.isFailedOptimisticMessageId(message.id) {
+            guard let content = snRetryContent(message) else {
+                showToast("This message is no longer available to retry.")
+                return
+            }
+            marmot.send(content, to: groupId, onEchoVisible: { [weak self] in
+                self?.marmot.removeFailedOptimisticMessage(groupId: groupId, messageId: message.id)
+            })
+            return
+        }
+
         if message.id.hasPrefix("echo-") {
             retryFailedPendingText(id, message: message, groupId: groupId)
             return
