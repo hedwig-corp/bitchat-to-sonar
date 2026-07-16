@@ -2,9 +2,29 @@ package chat.bitchat.sonar
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertTrue
 
 class MeshLinkLivenessTest {
     private val staleMs = 90_000L
+    private val resumeGapMs = 45_000L
+
+    @Test
+    fun ticksOnScheduleAreNotTreatedAsAFreeze() {
+        assertFalse(meshSweepResumedFromGap(115_000L, lastSweepMs = 100_000L, gapMs = resumeGapMs))
+    }
+
+    @Test
+    fun sweepThatMissedItsTicksIsTreatedAsAResume() {
+        // Process frozen (Android caches a backgrounded app) or device dozed: the
+        // monotonic clock ran on while our handler did not.
+        assertTrue(meshSweepResumedFromGap(400_000L, lastSweepMs = 100_000L, gapMs = resumeGapMs))
+    }
+
+    @Test
+    fun firstTickIsNeverAResume() {
+        assertFalse(meshSweepResumedFromGap(999_000L, lastSweepMs = 0L, gapMs = resumeGapMs))
+    }
 
     @Test
     fun cullsLinkSilentPastTheStaleWindow() {

@@ -356,6 +356,15 @@ object MeshGatt {
     private fun nowMonotonic(): Long = SystemClock.elapsedRealtime()
     @Volatile private var lastHeartbeatMs = 0L
     @Volatile private var livenessArmed = false
+    /** Tick time of the previous sweep, to spot a frozen/dozed process (below). */
+    @Volatile private var lastSweepMs = 0L
+    /** A scheduling gap longer than this means our own process was frozen (Android
+     *  caches a backgrounded app: `cch/LAST`, handler callbacks stop) or the device
+     *  dozed. elapsedRealtime keeps running through it, so every link would look
+     *  stale and get culled for OUR downtime rather than the peer's. On such a tick
+     *  we re-seed and skip the cull, letting peers prove themselves over a normal
+     *  window first. */
+    private const val SWEEP_RESUME_GAP_MS = LIVENESS_TICK_MS * 3
 
     /** Cull zombie links the stack never reported as disconnected (seen on
      *  Pixel 10: rx stops mid-conversation with no callback; the stale map
@@ -369,6 +378,9 @@ object MeshGatt {
         override fun run() {
             if (!livenessArmed) return
             val now = nowMonotonic()
+            val sweepGapMs = if (lastSweepMs == 0L) 0L else now - lastSweepMs
+            val resumedFromGap = meshSweepResumedFromGap(now, lastSweepMs, SWEEP_RESUME_GAP_MS)
+            lastSweepMs = now
             val clients = clientGatt.keys.toSet()
             val servers = serverDevices.keys.toSet()
             if ((clients.isNotEmpty() || servers.isNotEmpty()) && now - lastHeartbeatMs >= HEARTBEAT_MS) {
@@ -382,6 +394,16 @@ object MeshGatt {
             // grows without bound across a long session of rotating addresses.
             lastClientRxMs.keys.removeAll { it !in clients && it !in clientPending }
             lastServerRxMs.keys.removeAll { it !in servers }
+            if (resumedFromGap) {
+                // Our process was frozen/dozed: silence measured across that gap is
+                // our downtime, not the peer's. Re-arm every window and judge on the
+                // next tick, once peers have had a fair chance to talk.
+                android.util.Log.i(TAG, "liveness sweep resumed after ${sweepGapMs}ms gap — re-seeding, no cull this tick")
+                clients.forEach { lastClientRxMs[it] = now }
+                servers.forEach { lastServerRxMs[it] = now }
+                if (livenessArmed) handler.postDelayed(this, LIVENESS_TICK_MS)
+                return
+            }
             for (addr in meshStaleLinkAddrs(now, clients, lastClientRxMs, LINK_STALE_MS)) {
                 if (!stillStale(lastClientRxMs[addr])) continue
                 android.util.Log.i(TAG, "client link $addr zombie (no rx in ${LINK_STALE_MS}ms) — closing so scan can re-dial")
@@ -442,6 +464,7 @@ object MeshGatt {
         handler.removeCallbacks(linkLivenessSweep)
         lastClientRxMs.clear()
         lastServerRxMs.clear()
+        lastSweepMs = 0L // next start() must not read a stop-to-start gap as a freeze
         try { server?.close() } catch (_: Throwable) {}
         server = null; characteristic = null
         clientGatt.values.forEach { runCatching { it.disconnect(); it.close() } }

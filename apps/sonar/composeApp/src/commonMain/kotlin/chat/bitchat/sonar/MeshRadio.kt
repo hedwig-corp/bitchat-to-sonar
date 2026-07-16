@@ -120,6 +120,22 @@ internal fun meshStaleLinkAddrs(
 }
 
 /**
+ * True when the liveness sweep did not run for [gapMs], i.e. our own process was
+ * frozen (Android caches a backgrounded app and stops its handler callbacks) or
+ * the device dozed.
+ *
+ * The monotonic clock keeps advancing through that downtime, so every link would
+ * look silent and be culled for OUR outage rather than the peer's. On such a tick
+ * the caller re-seeds and skips the cull. [lastSweepMs] of 0 means "first tick" —
+ * never a gap.
+ */
+internal fun meshSweepResumedFromGap(
+    nowMs: Long,
+    lastSweepMs: Long,
+    gapMs: Long,
+): Boolean = lastSweepMs != 0L && nowMs - lastSweepMs >= gapMs
+
+/**
  * Decide whether Android's BLE scan needs recovery without confusing repeated
  * advertisements from a connected peer with scanner starvation.
  */
