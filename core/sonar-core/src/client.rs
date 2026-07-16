@@ -2146,7 +2146,11 @@ impl SonarClient {
             .identifier()
             .ok_or_else(|| Error::InvalidInput("key package event missing d tag".into()))?
             .to_string();
-        self.nostr.send_event(&event).await?;
+        // Require a relay to accept it: the old device is about to look this
+        // KeyPackage up by its `d` tag, so a code for an event that reached no
+        // relay is unusable. Fail loudly instead of showing a dead code.
+        let output = self.nostr.send_event(&event).await?;
+        require_relay_success(&output, "device link key package publish")?;
         Ok(d_tag)
     }
 
@@ -2178,10 +2182,17 @@ impl SonarClient {
             )));
         }
         // Refresh local group state so admin flags and epochs reflect the
-        // latest commits before staging on top of them. Best-effort: hosts run
-        // live sync anyway, and if relays are unreachable the per-group
-        // publishes below fail with honest `Failed` outcomes.
-        if let Err(err) = self.sync().await {
+        // latest commits before staging on top of them. First drain any events
+        // the live subscription already buffered (a peer commit sitting in
+        // `pending_marmot` would otherwise leave us staging on a superseded
+        // epoch), then `sync_force` — plain `sync()` short-circuits under live
+        // subscriptions, exactly the mode where this refresh matters. Both are
+        // best-effort: on relay failure the per-group publishes below still
+        // produce honest `Failed` outcomes rather than a false `Linked`.
+        if let Err(err) = self.drain_pending_marmot().await {
+            tracing::debug!(%err, "pre-link drain failed; linking from local state");
+        }
+        if let Err(err) = self.sync_force().await {
             tracing::debug!(%err, "pre-link sync failed; linking from local state");
         }
         let own = self.identity().public_key();

@@ -215,21 +215,33 @@ Affected code:
 
 ## Recommendation
 
-**A now, C next, B as the tracked protocol goal.** Ship device-to-device transfer
-first: it is the only option that is *correct* on day one (MLS state moves intact,
-no peer cooperation, no new Nostr kind, no interop negotiation), it matches what
-Signal actually ships for "I got a new phone", and it's an M-sized change. Layer
-C on top so a *lost* phone still recovers its transcript, and be brutally explicit
-in the UI that a C-only restore cannot send or receive in existing groups until B
-exists. Do **not** ship C alone — restoring history onto a leafless install looks
-like it worked and isn't.
+**Shipped: Approach B in PR #195.** The review corrections above overturned the
+original draft's reasons for preferring A first — the account fork it feared
+does not exist (fresh random `d` tag per KeyPackage), no send fan-out is needed,
+and no MIP change is required — which makes B correct on day one, not just the
+long-term goal. So B is what shipped: link a new device as a second MLS leaf,
+old device commits it into every admin group, new device auto-accepts its own
+sealed welcome.
 
-Before any of this, land the safety fix that is independent of the chosen path:
-**a fresh install with an imported nsec must not blind-publish a KeyPackage that
-replaces the existing one.** Today `publish_key_package_background()` on relay
-connect silently forks the account. It should publish under a device-scoped `d`
-tag, or not publish at all until the user picks "this is my new phone (transfer)"
-vs "this is an additional device".
+C (encrypted transcript backup to Blossom) remains the next follow-up so a
+*lost* phone still recovers its history; B does not move history (MLS joins at
+the current epoch), and the UI states this. A (device-to-device transfer) is no
+longer on the critical path but is still a reasonable future addition for the
+lost-nothing "both phones in hand" case.
+
+The original draft's KeyPackage-fork safety concern turned out to be moot: MDK
+already mints a fresh random `d` tag per KeyPackage, so an imported-nsec install
+coexists with the old device's slot rather than replacing it. `existing_d_tag`
+reuse to curb slot proliferation on relay-connect republish remains an open
+cleanup (tracked below).
+
+### Historical note (original draft recommendation)
+
+The pre-review draft recommended "A now, C next, B as the tracked protocol
+goal," on the belief that B required a MIP change and risked a silent account
+fork. Both premises were disproven while grounding the plan in the vendored
+`mdk-core` — see "Review corrections" at the top. Kept here only so the
+decision trail is legible.
 
 ## Open questions
 

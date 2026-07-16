@@ -810,6 +810,12 @@ private fun LinkedDevicesSheet(state: SonarAppState, onClose: () -> Unit) {
     var error by remember { mutableStateOf<String?>(null) }
 
     Sheet("Linked devices", onClose) {
+      // Scroll + cap the height: the code block, entry field, and a per-chat
+      // result list can exceed a small screen, and the shared Sheet does not
+      // scroll. heightIn(max) keeps it fit-to-content until it would overflow.
+      Column(
+          Modifier.heightIn(max = 520.dp).verticalScroll(rememberScrollState())
+      ) {
         // This device: show a link code (use on the NEW device).
         Text("THIS DEVICE", color = s.text3, fontSize = 11.sp, fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(8.dp))
@@ -950,6 +956,7 @@ private fun LinkedDevicesSheet(state: SonarAppState, onClose: () -> Unit) {
             "Linking adds your other device to every chat where you are an admin. New messages appear on both devices; older history stays on this one.",
             color = s.text3, fontSize = 12.5.sp, lineHeight = 17.sp,
         )
+      }
     }
 }
 

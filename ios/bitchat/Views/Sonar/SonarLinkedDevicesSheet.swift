@@ -28,20 +28,27 @@ struct SNLinkedDevicesSheetContent: View {
     @State private var errorText: String?
 
     var body: some View {
-        VStack(spacing: 0) {
-            showCodeCard
-            linkDeviceCard
-            if let report {
-                reportCard(report)
+        // Scroll + cap the height: the QR, both cards, and a per-chat result
+        // list (one row per skipped/failed chat) can exceed a small screen,
+        // and the shared sheet scaffold does not scroll. The frame stays fit
+        // to content until it would overflow, then scrolls.
+        ScrollView {
+            VStack(spacing: 0) {
+                showCodeCard
+                linkDeviceCard
+                if let report {
+                    reportCard(report)
+                }
+                Text("Linking adds your other device to every chat where you are an admin. New messages appear on both devices; older history stays on this one.")
+                    .font(SonarTheme.uiFont(size: 13))
+                    .lineSpacing(13 * 0.5)
+                    .foregroundColor(SonarTheme.text3)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity)
+                    .padding(EdgeInsets(top: 12, leading: 18, bottom: 4, trailing: 18))
             }
-            Text("Linking adds your other device to every chat where you are an admin. New messages appear on both devices; older history stays on this one.")
-                .font(SonarTheme.uiFont(size: 13))
-                .lineSpacing(13 * 0.5)
-                .foregroundColor(SonarTheme.text3)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: .infinity)
-                .padding(EdgeInsets(top: 12, leading: 18, bottom: 4, trailing: 18))
         }
+        .frame(maxHeight: 520)
     }
 
     // MARK: - New device: show a link code
