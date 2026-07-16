@@ -11,6 +11,7 @@ import android.os.IBinder
 import android.util.Log
 import chat.bitchat.sonar.Notifier
 import chat.bitchat.sonar.PROFILE_CACHE_BLOB_KEY
+import chat.bitchat.sonar.SonarConversationSummary
 import chat.bitchat.sonar.SonarCore
 import chat.bitchat.sonar.SonarNotificationKind
 import chat.bitchat.sonar.SonarNotificationPrefs
@@ -24,6 +25,7 @@ import chat.bitchat.sonar.wallet.WalletState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
@@ -114,8 +116,12 @@ class SonarPushProcessingService : Service() {
             // same way the foreground path does: persisted kind-0 cache first,
             // then a bounded relay fetch (relays are already connected here).
             // Never title a notification with the raw npub when a name exists.
+            // Skip the network entirely when names are hidden -- the router
+            // discards senderName in that case, so the fetches would be wasted.
             val cachedProfiles = decodeProfileCache(SonarCore.loadBlob(PROFILE_CACHE_BLOB_KEY))
-            val fetchedProfiles = HashMap<String, SonarProfile?>()
+            val fetchedProfiles =
+                if (prefs.showNames) prefetchSenderProfiles(unread, cachedProfiles)
+                else emptyMap()
 
             for (summary in unread) {
                 val kind = SonarNotificationRouter.classifyContent(
@@ -128,11 +134,13 @@ class SonarPushProcessingService : Service() {
                     idKey = summary.groupIdHex,
                     kind = kind,
                     conversationTitle = summary.name.ifBlank { null },
-                    senderName = summary.latestSenderNpub
+                    senderName = if (!prefs.showNames) null else summary.latestSenderNpub
                         .takeIf { it.isNotBlank() }
                         ?.let { npub ->
+                            // Everything is prefetched above under one budget, so
+                            // the fetch lambda is a pure map read (no network).
                             resolvePushSenderName(npub, cachedProfiles) { missing ->
-                                fetchProfileOnce(missing, fetchedProfiles)
+                                fetchedProfiles[canonicalProfileKey(missing)]
                             }
                         },
                     preview = summary.latestContent,
@@ -150,19 +158,48 @@ class SonarPushProcessingService : Service() {
         }
     }
 
-    /** One bounded profile fetch per sender per wakeup (a miss is memoized too,
-     *  so an unknown sender across several chats costs a single relay fetch). */
-    private suspend fun fetchProfileOnce(
-        npub: String,
-        fetched: MutableMap<String, SonarProfile?>,
-    ): SonarProfile? {
-        val key = canonicalProfileKey(npub)
-        if (!fetched.containsKey(key)) {
-            fetched[key] = withTimeoutOrNull(PROFILE_FETCH_TIMEOUT_MS) {
-                SonarCore.fetchProfile(npub)
+    /**
+     * Resolve every uncached sender's kind-0 profile for this wakeup under ONE
+     * total budget, keyed by [canonicalProfileKey].
+     *
+     * Fetches run in parallel and, crucially, are launched on the service's own
+     * [scope] rather than as children of the timeout block: [SonarCore.fetchProfile]
+     * hops to `Dispatchers.IO` and makes a blocking UniFFI call (with its own
+     * ~10s core-internal timeout), so a `withTimeoutOrNull` wrapped directly
+     * around it could not actually cancel the blocking child and would wait the
+     * full core timeout anyway. By awaiting orphaned [scope] jobs inside the
+     * budget, the await is genuinely cancellable -- when the budget expires we
+     * fall back to the npub label immediately while the stragglers finish
+     * harmlessly in the background. A single budget also bounds total wall time
+     * regardless of how many distinct uncached senders are unread (otherwise it
+     * would grow as senderCount x timeout, delaying later notifications and
+     * stopSelf).
+     */
+    private suspend fun prefetchSenderProfiles(
+        unread: List<SonarConversationSummary>,
+        cachedProfiles: Map<String, SonarProfile>,
+    ): Map<String, SonarProfile?> {
+        // canonicalKey -> npub, de-duplicated and skipping cache hits.
+        val missing = LinkedHashMap<String, String>()
+        for (summary in unread) {
+            val npub = summary.latestSenderNpub.takeIf { it.isNotBlank() } ?: continue
+            val key = canonicalProfileKey(npub)
+            if (cachedProfiles[key]?.bestName != null) continue
+            missing.putIfAbsent(key, npub)
+        }
+        if (missing.isEmpty()) return emptyMap()
+
+        val jobs = missing.map { (key, npub) ->
+            scope.async { key to runCatching { SonarCore.fetchProfile(npub) }.getOrNull() }
+        }
+        val resolved = HashMap<String, SonarProfile?>()
+        withTimeoutOrNull(PROFILE_FETCH_BUDGET_MS) {
+            jobs.forEach { job ->
+                val (key, profile) = job.await()
+                resolved[key] = profile
             }
         }
-        return fetched[key]
+        return resolved
     }
 
     private fun notificationPrefs(): SonarNotificationPrefs =
@@ -223,9 +260,11 @@ class SonarPushProcessingService : Service() {
         // must also fit inside this budget.)
         private const val MARMOT_PUSH_SYNC_TIMEOUT_MS = 25_000L
 
-        // Per-sender kind-0 lookup budget when the persisted profile cache
-        // misses. Runs after the sync above, so the relay pool is already
-        // connected; on expiry the notification falls back to the npub label.
-        private const val PROFILE_FETCH_TIMEOUT_MS = 5_000L
+        // Total kind-0 lookup budget for the WHOLE wakeup (not per sender) when
+        // the persisted profile cache misses. All uncached senders are fetched
+        // in parallel under this single budget after the sync above, so the
+        // relay pool is already connected; whatever has not resolved when it
+        // expires falls back to the npub label.
+        private const val PROFILE_FETCH_BUDGET_MS = 5_000L
     }
 }
