@@ -137,7 +137,34 @@ connect to**, not an arbitrary marketing list:
 | `wss://relay.kaleidoswap.com` | iOS + Android/JVM |
 | `wss://nostr.relay.hedwig.sh` | Android/JVM (+ Hedwig) |
 
-**Out of scope for this table:** geohash / location-channel relays from
+### White Noise interop relays
+
+Sonar talks Marmot to the official White Noise clients, so the relays those
+clients bootstrap against are monitored **as part of the same `relays` row**:
+
+| Relay | Source |
+| --- | --- |
+| `wss://relay.us.whitenoise.chat` | `MarmotClient.bootstrapRelays` (whitenoise-android) |
+| `wss://relay.eu.whitenoise.chat` | `MarmotClient.bootstrapRelays` (whitenoise-android) |
+
+Keep these in sync with `MarmotClient.kt` in
+[marmot-protocol/whitenoise-android](https://github.com/marmot-protocol/whitenoise-android);
+override at runtime with `--whitenoise-relays` / `SONAR_STATUS_WHITENOISE_RELAYS`.
+
+Sonar's own traffic does not use these relays, but they are deliberately treated
+like relays we do use: they count toward the reachable ratio and median RTT, so a
+White Noise outage degrades the relay row and opens an incident. Marmot interop
+with the official clients is broken at that point, and that is worth saying out
+loud on the status page.
+
+One property is deliberate and should survive refactors: **they are
+reachability-probed only.** `--chat-probe` / `--sticker-probe` *publish* events,
+and those writes stay on `DEFAULT_RELAYS` — `WHITENOISE_RELAYS` is never written
+to. We monitor third-party infrastructure; we do not write to it to fill in a
+status page. `build_payload` keeps the two lists separate for exactly this
+reason: the monitored set is the union, the write set is `DEFAULT_RELAYS` alone.
+
+**Out of scope for both tables:** geohash / location-channel relays from
 `relays/online_relays_gps.csv` / `GeoRelayDirectory` — those are chosen
 per-geohash at runtime and change with the user.
 
@@ -146,6 +173,9 @@ Keep these three places in sync when the app defaults change:
 1. `ios/bitchat/Nostr/NostrRelayManager.swift` `defaultRelays`
 2. `apps/sonar/.../SonarCore.android.kt` / `SonarCore.jvm.kt`
 3. `web/src/lib/status-data.js` + `core/sonar-status` `DEFAULT_RELAYS`
+
+The interop set has one upstream instead: `MarmotClient.bootstrapRelays` in
+whitenoise-android → `core/sonar-status` `WHITENOISE_RELAYS`.
 
 ## Seed vs live services
 
@@ -181,7 +211,7 @@ Goal: every row on `/status` should eventually mean "we ran a check", not
 
 | Service id | Check (v1 target) | How `sonar-status` implements it | Auth / secrets |
 | --- | --- | --- | --- |
-| `relays` | WebSocket open RTT to client default relays | **Done** — `probe_relay_ws` | None |
+| `relays` | WebSocket open RTT to client default + White Noise interop relays | **Done** — `probe_relay_ws` | None |
 | `dm` | KeyPackage publish + fetch own package from bootstrap relays via `sonar-core` | **Done** — `chat::probe_marmot_keypackage` (`--chat-probe`) | **Dedicated probe nsec** (`SONAR_STATUS_PROBE_NSEC`) — not the publisher key |
 | `groups` | 5-agent MLS group via Hermes task (A→B or multi-member) | **Done** (Hermes `groups-probe.sh`) | Probe nsec(s) |
 | `media` | Blossom reachability: HTTP HEAD `DEFAULT_BLOSSOM_SERVER` | **Done** | None |

@@ -39,12 +39,23 @@ export SONAR_STATUS_CHAT_PROBE=1
 
 On non-zero exit: notify ops (Hermes DM / gateway alert).
 
+## Shipping a probe change to the bot
+
+`publish.sh` rebuilds `sonar-status` from the checkout on every run, so deploying
+a probe change is just `git pull` on the Hermes host — the next scheduled run
+picks it up. Cargo is a fast no-op when the tree is unchanged.
+
+The one exception is `SONAR_STATUS_BIN`: setting it opts out of the rebuild, and
+the bot will keep running whatever binary it points at. That is a silent
+staleness trap — probe changes land in git, every publish still reports healthy,
+and the document never changes. If you set it, rebuild it yourself on deploy.
+
 Optional post-step: parse `~/.local/state/sonar-status/last.json` and alert if any
 `services[].state` is `degraded` or `down`.
 
 ## What gets measured
 
-- `relays` — always
+- `relays` — always (Sonar bootstrap + White Noise interop relays)
 - `dm` — when `SONAR_STATUS_CHAT_PROBE=1` + probe nsec (KeyPackage publish/fetch)
 - `http-*` — when `SONAR_STATUS_HTTP` is set
 

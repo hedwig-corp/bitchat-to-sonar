@@ -381,8 +381,9 @@
 			{pingNote}
 		</div>
 		<p class="relay-disclaimer">
-			These are Sonar’s client bootstrap relays (iOS + Android defaults). RTT is WebSocket open
-			latency from <em>your</em> browser. Geohash channels use a separate GPS relay directory.
+			These are Sonar’s client bootstrap relays (iOS + Android defaults), plus the official White
+			Noise relays Sonar interoperates with over Marmot. RTT is WebSocket open latency from
+			<em>your</em> browser. Geohash channels use a separate GPS relay directory.
 		</p>
 
 		<h2>Past incidents</h2>
