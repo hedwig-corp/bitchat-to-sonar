@@ -18,6 +18,46 @@ import XCTest
 
 final class SonarMoneyDisplayTests: XCTestCase {
 
+    func testPendingPanicColdStartDoesNotReadWalletOrRunAccountStartup() {
+        var walletStateReads = 0
+        var accountStartupRuns = 0
+
+        let state = SonarAccountStartupGate.initialWalletState(
+            recoveringPanicWipe: true,
+            read: {
+                walletStateReads += 1
+                return .ready(balanceSats: 21)
+            }
+        )
+        SonarAccountStartupGate.performIfActive(recoveringPanicWipe: true) {
+            accountStartupRuns += 1
+        }
+
+        XCTAssertEqual(state, .notConfigured)
+        XCTAssertEqual(walletStateReads, 0)
+        XCTAssertEqual(accountStartupRuns, 0)
+    }
+
+    func testClearedPanicMarkerReopensWalletAndAccountStartup() {
+        var walletStateReads = 0
+        var accountStartupRuns = 0
+
+        let state = SonarAccountStartupGate.initialWalletState(
+            recoveringPanicWipe: false,
+            read: {
+                walletStateReads += 1
+                return .ready(balanceSats: 21)
+            }
+        )
+        SonarAccountStartupGate.performIfActive(recoveringPanicWipe: false) {
+            accountStartupRuns += 1
+        }
+
+        XCTAssertEqual(state, .ready(balanceSats: 21))
+        XCTAssertEqual(walletStateReads, 1)
+        XCTAssertEqual(accountStartupRuns, 1)
+    }
+
     /// Test double for `SonarWalletProviding` with toggleable mode/rate, so we
     /// can assert the effective-display matrix without the Breez SDK. The fiat
     /// formatter here is a stand-in for the SDK's converter — the test asserts

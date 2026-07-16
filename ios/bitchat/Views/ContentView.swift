@@ -1221,7 +1221,7 @@ struct ContentView: View {
                 .foregroundColor(textColor)
                 .onTapGesture(count: 3) {
                     // PANIC: Triple-tap to clear all data
-                    viewModel.panicClearAllData()
+                    viewModel.requestPanicClearAllData()
                 }
                 .onTapGesture(count: 1) {
                     // Single tap for app info

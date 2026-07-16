@@ -16,6 +16,9 @@ final class MockKeychain: KeychainManagerProtocol {
     // BCH-01-009: Configurable error simulation for testing
     var simulatedReadError: KeychainReadResult?
     var simulatedSaveError: KeychainSaveResult?
+    var simulatedGenericSaveFailure = false
+    var simulatedGenericDeleteFailure = false
+    var simulatedDeleteAllFailure = false
 
     func saveIdentityKey(_ keyData: Data, forKey key: String) -> Bool {
         storage[key] = keyData
@@ -32,6 +35,7 @@ final class MockKeychain: KeychainManagerProtocol {
     }
 
     func deleteAllKeychainData() -> Bool {
+        guard !simulatedDeleteAllFailure else { return false }
         storage.removeAll()
         serviceStorage.removeAll()
         return true
@@ -71,6 +75,7 @@ final class MockKeychain: KeychainManagerProtocol {
     // MARK: - Generic Data Storage (consolidated from KeychainHelper)
 
     func save(key: String, data: Data, service: String, accessible: CFString?) {
+        guard !simulatedGenericSaveFailure else { return }
         if serviceStorage[service] == nil {
             serviceStorage[service] = [:]
         }
@@ -81,8 +86,11 @@ final class MockKeychain: KeychainManagerProtocol {
         serviceStorage[service]?[key]
     }
 
-    func delete(key: String, service: String) {
+    @discardableResult
+    func delete(key: String, service: String) -> Bool {
+        guard !simulatedGenericDeleteFailure else { return false }
         serviceStorage[service]?.removeValue(forKey: key)
+        return serviceStorage[service]?[key] == nil
     }
 }
 
@@ -194,7 +202,9 @@ final class TrackingMockKeychain: KeychainManagerProtocol {
         serviceStorage[service]?[key]
     }
 
-    func delete(key: String, service: String) {
+    @discardableResult
+    func delete(key: String, service: String) -> Bool {
         serviceStorage[service]?.removeValue(forKey: key)
+        return serviceStorage[service]?[key] == nil
     }
 }

@@ -26,19 +26,42 @@ struct MessageRouterTests {
     }
 
     @Test @MainActor
-    func sendPrivate_queuesThenFlushesWhenReachable() async {
+    func sendPrivate_unavailableTransportDoesNotKeepVolatileRouterQueue() async {
         let peerID = PeerID(str: "0000000000000002")
         let transport = MockTransport()
 
         let router = MessageRouter(transports: [transport])
-        router.sendPrivate("Queued", to: peerID, recipientNickname: "Peer", messageID: "m2")
+        let disposition = router.sendPrivate("Queued", to: peerID, recipientNickname: "Peer", messageID: "m2")
 
+        if case .unavailable = disposition {} else {
+            Issue.record("Expected unavailable disposition")
+        }
         #expect(transport.sentPrivateMessages.isEmpty)
 
         transport.reachablePeers.insert(peerID)
         router.flushOutbox(for: peerID)
 
-        #expect(transport.sentPrivateMessages.count == 1)
+        #expect(transport.sentPrivateMessages.isEmpty)
+    }
+
+    @Test @MainActor
+    func sendPrivate_unreachableAcknowledgedTransportOwnsDurableSubmission() async {
+        let peerID = PeerID(str: "0000000000000005")
+        let transport = MockTransport()
+        transport.usesAcknowledgedPrivateDelivery = true
+
+        let router = MessageRouter(transports: [transport])
+        let disposition = router.sendPrivate(
+            "Durable",
+            to: peerID,
+            recipientNickname: "Peer",
+            messageID: "m5"
+        )
+
+        if case .awaitingDeliveryAck = disposition {} else {
+            Issue.record("Expected ACK-backed disposition")
+        }
+        #expect(transport.sentPrivateMessages.map(\.messageID) == ["m5"])
     }
 
     @Test @MainActor

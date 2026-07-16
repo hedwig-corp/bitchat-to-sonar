@@ -14,8 +14,11 @@ import Foundation
 
 /// Creates a ChatViewModel with mock dependencies for testing
 @MainActor
-private func makeTestableViewModel() -> (viewModel: ChatViewModel, transport: MockTransport) {
-    let keychain = MockKeychain()
+private func makeTestableViewModel(
+    keychain: MockKeychain = MockKeychain(),
+    messageStore: MessageStore = .shared,
+    favoritesPersistenceService: FavoritesPersistenceService = .shared
+) -> (viewModel: ChatViewModel, transport: MockTransport) {
     let keychainHelper = MockKeychainHelper()
     let idBridge = NostrIdentityBridge(keychain: keychainHelper)
     let identityManager = MockIdentityManager(keychain)
@@ -25,7 +28,9 @@ private func makeTestableViewModel() -> (viewModel: ChatViewModel, transport: Mo
         keychain: keychain,
         idBridge: idBridge,
         identityManager: identityManager,
-        transport: transport
+        transport: transport,
+        messageStore: messageStore,
+        favoritesPersistenceService: favoritesPersistenceService
     )
 
     return (viewModel, transport)
@@ -463,11 +468,80 @@ struct ChatViewModelBluetoothTests {
 
 // MARK: - Panic Clear Tests
 
+@Suite(.serialized)
 struct ChatViewModelPanicTests {
 
     @Test @MainActor
+    func panicClearAllData_withoutJournalLeavesLiveStateUntouched() async {
+        _ = PanicWipeIntent.clear()
+        defer { _ = PanicWipeIntent.clear() }
+        let store = MessageStore(directoryName: "PanicUnarmed-\(UUID().uuidString)")
+        defer { store.wipeAll() }
+        let (viewModel, transport) = makeTestableViewModel(messageStore: store)
+        viewModel.messages = [
+            BitchatMessage(
+                id: "panic-unarmed",
+                sender: "Tester",
+                content: "Before",
+                timestamp: Date(),
+                isRelay: false
+            )
+        ]
+
+        let committed = await viewModel.panicClearAllData()
+
+        #expect(!committed)
+        #expect(transport.emergencyDisconnectCallCount == 0)
+        #expect(viewModel.messages.count == 1)
+    }
+
+    @Test @MainActor
+    func panicClearAllData_keychainFailureStaysFailClosed() async {
+        defer { _ = PanicWipeIntent.clear() }
+        #expect(PanicWipeIntent.begin())
+        let keychain = MockKeychain()
+        keychain.simulatedDeleteAllFailure = true
+        let store = MessageStore(directoryName: "PanicKeychainFailure-\(UUID().uuidString)")
+        let favorites = FavoritesPersistenceService(keychain: keychain)
+        defer { store.wipeAll() }
+        let (viewModel, transport) = makeTestableViewModel(
+            keychain: keychain,
+            messageStore: store,
+            favoritesPersistenceService: favorites
+        )
+        viewModel.messages = [
+            BitchatMessage(
+                id: "panic-failure",
+                sender: "Tester",
+                content: "Before",
+                timestamp: Date(),
+                isRelay: false
+            )
+        ]
+
+        let committed = await viewModel.panicClearAllData()
+
+        #expect(!committed)
+        #expect(transport.emergencyDisconnectCallCount == 1)
+        #expect(viewModel.messages.isEmpty)
+        // The old account is fenced instead of being reactivated on top of a
+        // keychain item that failed deletion.
+        #expect(viewModel.nostrRelayManager == nil)
+    }
+
+    @Test @MainActor
     func panicClearAllData_delegatesToTransport() async {
-        let (viewModel, transport) = makeTestableViewModel()
+        defer { _ = PanicWipeIntent.clear() }
+        #expect(PanicWipeIntent.begin())
+        let keychain = MockKeychain()
+        let store = MessageStore(directoryName: "PanicSuccess-\(UUID().uuidString)")
+        let favorites = FavoritesPersistenceService(keychain: keychain)
+        defer { store.wipeAll() }
+        let (viewModel, transport) = makeTestableViewModel(
+            keychain: keychain,
+            messageStore: store,
+            favoritesPersistenceService: favorites
+        )
 
         // Set up some state
         transport.connectedPeers.insert(PeerID(str: "PEER1"))
@@ -494,9 +568,10 @@ struct ChatViewModelPanicTests {
         ]
         viewModel.unreadPrivateMessages.insert(PeerID(str: "PEER1"))
 
-        viewModel.panicClearAllData()
+        let committed = await viewModel.panicClearAllData()
 
         // After panic, emergency disconnect should be called
+        #expect(committed)
         #expect(transport.emergencyDisconnectCallCount == 1)
         #expect(viewModel.messages.isEmpty)
         #expect(viewModel.privateChats.isEmpty)

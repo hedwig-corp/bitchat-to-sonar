@@ -331,6 +331,7 @@ final class MarmotService: @unchecked Sendable {
     /// Returns the identity's npub. Safe to call again to reconnect.
     @discardableResult
     func connect(nsec: String? = nil) async throws -> String {
+        guard !PanicWipeIntent.isPending else { throw ServiceError.cancelled }
         let relayUrls = self.relayUrls
         let (identity, generation) = try await run { service in
             guard !service.nodeClosing else { throw ServiceError.cancelled }
@@ -383,7 +384,8 @@ final class MarmotService: @unchecked Sendable {
     /// before network setup has a chance to block them.
     @discardableResult
     func connectLocal(nsec: String? = nil) async throws -> String {
-        try await run { service in
+        guard !PanicWipeIntent.isPending else { throw ServiceError.cancelled }
+        return try await run { service in
             guard !service.nodeClosing else { throw ServiceError.cancelled }
             let identity: SonarIdentity
             if let nsec {

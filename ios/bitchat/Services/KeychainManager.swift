@@ -74,13 +74,48 @@ protocol KeychainManagerProtocol {
     /// Load data from a custom service
     func load(key: String, service: String) -> Data?
     /// Delete data from a custom service
-    func delete(key: String, service: String)
+    /// Delete one generic-password item and verify that no matching item
+    /// remains. Panic cleanup must never treat a fire-and-forget delete as a
+    /// durable account boundary.
+    @discardableResult
+    func delete(key: String, service: String) -> Bool
 }
 
 final class KeychainManager: KeychainManagerProtocol {
     // Use consistent service name for all keychain items
     private let service = BitchatApp.bundleID
     private let appGroup = "group.\(BitchatApp.bundleID)"
+    /// `com.apple.security.application-groups` does not grant Keychain access.
+    /// Add an entry here only together with a matching
+    /// `keychain-access-groups` entitlement. The current targets have none, so
+    /// deletion must query only the app's default Keychain access group.
+    private let configuredKeychainAccessGroups: [String] = []
+
+    /// A delete is complete only when Security.framework accepted the delete
+    /// operation and an explicit follow-up query proves the item is absent.
+    /// In particular, `errSecMissingEntitlement` is an access failure, not
+    /// evidence that the protected item does not exist.
+    static func deletionProvedAbsent(
+        deleteStatus: OSStatus,
+        verificationStatus: OSStatus
+    ) -> Bool {
+        guard deleteStatus == errSecSuccess || deleteStatus == errSecItemNotFound else {
+            return false
+        }
+        return verificationStatus == errSecItemNotFound
+    }
+
+    static func deletionScopeAccessGroups(
+        configuredAccessGroups: [String]
+    ) -> [String?] {
+        [nil] + configuredAccessGroups.map(Optional.some)
+    }
+
+    private func verifyKeychainQueryIsAbsent(_ base: [String: Any]) -> OSStatus {
+        var query = base
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        return SecItemCopyMatching(query as CFDictionary, nil)
+    }
     
     // MARK: - Identity Keys
     
@@ -403,22 +438,52 @@ final class KeychainManager: KeychainManagerProtocol {
             kSecAttrService as String: service
         ]
 
-        func attempt(withAccessGroup: Bool) -> OSStatus {
+        func query(accessGroup: String?) -> [String: Any] {
             var q = base
-            if withAccessGroup { q[kSecAttrAccessGroup as String] = appGroup }
-            return SecItemDelete(q as CFDictionary)
+            if let accessGroup { q[kSecAttrAccessGroup as String] = accessGroup }
+            return q
         }
 
-        #if os(iOS)
-        let groupedStatus = attempt(withAccessGroup: true)
-        let plainStatus = attempt(withAccessGroup: false)
-        let groupedOK = groupedStatus == errSecSuccess || groupedStatus == errSecItemNotFound || groupedStatus == -34018
-        let plainOK = plainStatus == errSecSuccess || plainStatus == errSecItemNotFound
-        return groupedOK && plainOK
-        #else
-        let status = attempt(withAccessGroup: false)
-        return status == errSecSuccess || status == errSecItemNotFound
-        #endif
+        func deleteAndVerify(accessGroup: String?) -> Bool {
+            let q = query(accessGroup: accessGroup)
+            let deleteStatus = SecItemDelete(q as CFDictionary)
+            let verificationStatus = verifyKeychainQueryIsAbsent(q)
+            return Self.deletionProvedAbsent(
+                deleteStatus: deleteStatus,
+                verificationStatus: verificationStatus
+            )
+        }
+
+        return Self.deletionScopeAccessGroups(
+            configuredAccessGroups: configuredKeychainAccessGroups
+        ).map(deleteAndVerify).allSatisfy { $0 }
+    }
+
+    @discardableResult
+    func delete(key: String, service customService: String) -> Bool {
+        let base: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrAccount as String: key,
+            kSecAttrService as String: customService
+        ]
+
+        func query(accessGroup: String?) -> [String: Any] {
+            var query = base
+            if let accessGroup { query[kSecAttrAccessGroup as String] = accessGroup }
+            return query
+        }
+
+        func deleteAndVerify(accessGroup: String?) -> Bool {
+            let q = query(accessGroup: accessGroup)
+            return Self.deletionProvedAbsent(
+                deleteStatus: SecItemDelete(q as CFDictionary),
+                verificationStatus: verifyKeychainQueryIsAbsent(q)
+            )
+        }
+
+        return Self.deletionScopeAccessGroups(
+            configuredAccessGroups: configuredKeychainAccessGroups
+        ).map(deleteAndVerify).allSatisfy { $0 }
     }
     
     // MARK: - Cleanup
@@ -433,8 +498,10 @@ final class KeychainManager: KeychainManagerProtocol {
             query[kSecAttrService as String] = service
         }
         
-        let status = SecItemDelete(query as CFDictionary)
-        return status == errSecSuccess || status == errSecItemNotFound
+        return Self.deletionProvedAbsent(
+            deleteStatus: SecItemDelete(query as CFDictionary),
+            verificationStatus: verifyKeychainQueryIsAbsent(query)
+        )
     }
     
     
@@ -443,6 +510,15 @@ final class KeychainManager: KeychainManagerProtocol {
         SecureLogger.warning("Panic mode - deleting all keychain data", category: .security)
         
         var totalDeleted = 0
+        var cleanupSucceeded = true
+        func deleteAndVerify(_ query: [String: Any]) -> (provedAbsent: Bool, deleted: Bool) {
+            let deleteStatus = SecItemDelete(query as CFDictionary)
+            let provedAbsent = Self.deletionProvedAbsent(
+                deleteStatus: deleteStatus,
+                verificationStatus: verifyKeychainQueryIsAbsent(query)
+            )
+            return (provedAbsent, deleteStatus == errSecSuccess)
+        }
         
         // Search without service restriction to catch all items
         let searchQuery: [String: Any] = [
@@ -453,6 +529,10 @@ final class KeychainManager: KeychainManagerProtocol {
         
         var result: AnyObject?
         let searchStatus = SecItemCopyMatching(searchQuery as CFDictionary, &result)
+        if searchStatus != errSecSuccess && searchStatus != errSecItemNotFound {
+            cleanupSucceeded = false
+            SecureLogger.error("Panic keychain enumeration failed with status \(searchStatus)", category: .keychain)
+        }
         
         if searchStatus == errSecSuccess, let items = result as? [[String: Any]] {
             for item in items {
@@ -474,6 +554,7 @@ final class KeychainManager: KeychainManagerProtocol {
                     "com.bitchat.deviceidentity",
                     "com.bitchat.noise.identity",
                     "chat.bitchat.passwords",
+                    "chat.bitchat.favorites",
                     "bitchat.keychain",
                     "bitchat",
                     "com.bitchat"
@@ -500,17 +581,20 @@ final class KeychainManager: KeychainManagerProtocol {
                         deleteQuery[kSecAttrAccessGroup as String] = accessGroup
                     }
                     
-                    let deleteStatus = SecItemDelete(deleteQuery as CFDictionary)
-                    if deleteStatus == errSecSuccess {
-                        totalDeleted += 1
+                    let deletion = deleteAndVerify(deleteQuery)
+                    if deletion.provedAbsent {
+                        if deletion.deleted { totalDeleted += 1 }
                         SecureLogger.info("Deleted keychain item: \(account) from \(service)", category: .keychain)
+                    } else {
+                        cleanupSucceeded = false
+                        SecureLogger.error("Panic keychain item deletion or verification failed", category: .keychain)
                     }
                 }
             }
         }
         
-        // Also try to delete by known service names and app group
-        // This catches any items that might have been missed above
+        // Also delete by known service names. This catches any items that may
+        // not have appeared in the initial enumeration.
         let knownServices = [
             self.service,  // Current service name
             "com.bitchat.passwords",
@@ -518,6 +602,7 @@ final class KeychainManager: KeychainManagerProtocol {
             "com.bitchat.noise.identity",
             "chat.bitchat.passwords",
             "chat.bitchat.nostr",
+            "chat.bitchat.favorites",
             "bitchat.keychain",
             "bitchat",
             "com.bitchat"
@@ -529,26 +614,37 @@ final class KeychainManager: KeychainManagerProtocol {
                 kSecAttrService as String: serviceName
             ]
             
-            let status = SecItemDelete(query as CFDictionary)
-            if status == errSecSuccess {
-                totalDeleted += 1
+            let deletion = deleteAndVerify(query)
+            if deletion.provedAbsent {
+                if deletion.deleted { totalDeleted += 1 }
+            } else {
+                cleanupSucceeded = false
+                SecureLogger.error("Panic keychain service deletion or verification failed", category: .keychain)
             }
         }
         
-        // Also delete by app group to ensure complete cleanup
-        let groupQuery: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrAccessGroup as String: appGroup
-        ]
-        
-        let groupStatus = SecItemDelete(groupQuery as CFDictionary)
-        if groupStatus == errSecSuccess {
-            totalDeleted += 1
+        // Delete only explicitly entitled Keychain access groups. Application
+        // groups are a different entitlement and querying one here would return
+        // errSecMissingEntitlement, permanently wedging a legitimate wipe.
+        for accessGroup in configuredKeychainAccessGroups {
+            let groupQuery: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrAccessGroup as String: accessGroup
+            ]
+            let groupDeletion = deleteAndVerify(groupQuery)
+            if groupDeletion.provedAbsent {
+                if groupDeletion.deleted { totalDeleted += 1 }
+            } else {
+                cleanupSucceeded = false
+                SecureLogger.error("Panic keychain access-group deletion or verification failed", category: .keychain)
+            }
         }
         
         SecureLogger.warning("Panic mode cleanup completed. Total items deleted: \(totalDeleted)", category: .keychain)
         
-        return totalDeleted > 0
+        // Idempotent panic retry: an already-empty keychain is success. Only
+        // an actual Security.framework error keeps account deletion fenced.
+        return cleanupSucceeded
     }
     
     // MARK: - Security Utilities
@@ -582,18 +678,42 @@ final class KeychainManager: KeychainManagerProtocol {
 
     /// Save data with a custom service name
     func save(key: String, data: Data, service customService: String, accessible: CFString?) {
-        var query: [String: Any] = [
+        let matchQuery: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: customService,
-            kSecAttrAccount as String: key,
-            kSecValueData as String: data
+            kSecAttrAccount as String: key
         ]
+        var updateAttributes: [String: Any] = [kSecValueData as String: data]
         if let accessible = accessible {
-            query[kSecAttrAccessible as String] = accessible
+            updateAttributes[kSecAttrAccessible as String] = accessible
         }
 
-        SecItemDelete(query as CFDictionary)
-        SecItemAdd(query as CFDictionary, nil)
+        let updateStatus = SecItemUpdate(matchQuery as CFDictionary, updateAttributes as CFDictionary)
+        if updateStatus == errSecSuccess {
+            return
+        }
+
+        guard updateStatus == errSecItemNotFound else {
+            // SecItemUpdate is atomic: on failure the previous value remains
+            // intact, which lets callers safely verify and retry.
+            SecureLogger.error(
+                "Generic Keychain update failed for service \(customService): \(updateStatus)",
+                category: .session
+            )
+            return
+        }
+
+        var addQuery = matchQuery
+        for (key, value) in updateAttributes {
+            addQuery[key] = value
+        }
+        let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
+        if addStatus != errSecSuccess {
+            SecureLogger.error(
+                "Generic Keychain insert failed for service \(customService): \(addStatus)",
+                category: .session
+            )
+        }
     }
 
     /// Load data from a custom service
@@ -612,14 +732,4 @@ final class KeychainManager: KeychainManagerProtocol {
         return result as? Data
     }
 
-    /// Delete data from a custom service
-    func delete(key: String, service customService: String) {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: customService,
-            kSecAttrAccount as String: key
-        ]
-
-        SecItemDelete(query as CFDictionary)
-    }
 }

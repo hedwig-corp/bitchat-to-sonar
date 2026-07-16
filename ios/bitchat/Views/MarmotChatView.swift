@@ -2598,19 +2598,25 @@ final class MarmotChatModel: ObservableObject {
     /// Panic-wipe the encrypted Marmot database + its Keychain key and reset
     /// in-memory state. Called from the emergency-wipe path.
     func wipeDatabase() {
-        stopPolling()
-        conversationRefreshTask?.cancel()
-        conversationRefreshTask = nil
-        pendingConversationRefreshGroups = []
-        let service = self.service
-        clearIdentityScopedState()
         Task {
             do {
-                try await service.wipeDatabase()
+                try await wipeDatabaseAndWait()
             } catch {
                 SecureLogger.error(error, context: "Marmot panic wipe failed", category: .session)
             }
         }
+    }
+
+    /// Awaitable panic barrier used by the app-wide wipe coordinator. Account
+    /// identity/radios must not restart until the encrypted DB and its key have
+    /// both been removed (or the operation has explicitly failed).
+    func wipeDatabaseAndWait() async throws {
+        stopPolling()
+        conversationRefreshTask?.cancel()
+        conversationRefreshTask = nil
+        pendingConversationRefreshGroups = []
+        clearIdentityScopedState()
+        try await service.wipeDatabase()
     }
 
     /// Reset every account-bound in-memory/cache value through the same path as

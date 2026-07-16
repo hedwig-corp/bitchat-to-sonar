@@ -67,7 +67,9 @@ final class PreviewKeychainManager: KeychainManagerProtocol {
         serviceStorage[service]?[key]
     }
 
-    func delete(key: String, service: String) {
+    @discardableResult
+    func delete(key: String, service: String) -> Bool {
         serviceStorage[service]?.removeValue(forKey: key)
+        return serviceStorage[service]?[key] == nil
     }
 }

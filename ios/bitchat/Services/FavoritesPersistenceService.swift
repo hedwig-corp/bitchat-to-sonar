@@ -117,12 +117,14 @@ final class FavoritesPersistenceService: ObservableObject {
     }
     
     /// Update when we learn a peer favorited/unfavorited us
+    @discardableResult
     func updatePeerFavoritedUs(
         peerNoisePublicKey: Data,
         favorited: Bool,
         peerNickname: String? = nil,
         peerNostrPublicKey: String? = nil
-    ) {
+    ) -> Bool {
+        let previousFavorites = favorites
         let existing = favorites[peerNoisePublicKey]
         let displayName = peerNickname ?? existing?.peerNickname ?? "Unknown"
         
@@ -151,7 +153,16 @@ final class FavoritesPersistenceService: ObservableObject {
             }
         }
         
-        saveFavorites()
+        guard saveFavorites() else {
+            // Do not let callers acknowledge a control whose state was only
+            // updated in memory. Roll back so a sender retry can apply it again.
+            favorites = previousFavorites
+            SecureLogger.error(
+                "Failed to durably save favorite notification for \(displayName)",
+                category: .session
+            )
+            return false
+        }
         
         // Notify observers
         NotificationCenter.default.post(
@@ -159,6 +170,7 @@ final class FavoritesPersistenceService: ObservableObject {
             object: nil,
             userInfo: ["peerPublicKey": peerNoisePublicKey]
         )
+        return true
     }
     
     /// Check if a peer is favorited by us
@@ -188,25 +200,30 @@ final class FavoritesPersistenceService: ObservableObject {
     }
     
     /// Clear all favorites - used for panic mode
-    func clearAllFavorites() {
+    @discardableResult
+    func clearAllFavorites() -> Bool {
         SecureLogger.warning("🧹 Clearing all favorites (panic mode)", category: .session)
-        
+
+        // Redact process memory immediately, but do not report the account
+        // boundary complete until the injected Keychain owner proves absence.
         favorites.removeAll()
-        saveFavorites()
-        
-        // Delete from keychain directly
-        keychain.delete(
+        let deleted = keychain.delete(
             key: Self.storageKey,
             service: Self.keychainService
         )
-        
+
         // Post notification for UI update
         NotificationCenter.default.post(name: .favoriteStatusChanged, object: nil)
+        if !deleted {
+            SecureLogger.error("Panic favorite deletion could not be verified", category: .security)
+        }
+        return deleted
     }
     
     // MARK: - Persistence
     
-    private func saveFavorites() {
+    @discardableResult
+    private func saveFavorites() -> Bool {
         let relationships = Array(favorites.values)
         // Saving favorite relationships to keychain
         
@@ -221,10 +238,12 @@ final class FavoritesPersistenceService: ObservableObject {
                 service: Self.keychainService,
                 accessible: nil
             )
-            
-            // Successfully saved favorites
+            // The generic keychain API is fire-and-forget, so verify the value
+            // before a mesh control is considered durably accepted.
+            return keychain.load(key: Self.storageKey, service: Self.keychainService) == data
         } catch {
             SecureLogger.error("Failed to save favorites: \(error)", category: .session)
+            return false
         }
     }
     

@@ -13,7 +13,10 @@ import Combine
 // MARK: - Test Helpers
 
 @MainActor
-private func makeTestableViewModel() -> (viewModel: ChatViewModel, transport: MockTransport) {
+private func makeTestableViewModel(
+    messageStore: MessageStore = .shared,
+    favoritesPersistenceService: FavoritesPersistenceService = .shared
+) -> (viewModel: ChatViewModel, transport: MockTransport) {
     let keychain = MockKeychain()
     let keychainHelper = MockKeychainHelper()
     let idBridge = NostrIdentityBridge(keychain: keychainHelper)
@@ -24,7 +27,9 @@ private func makeTestableViewModel() -> (viewModel: ChatViewModel, transport: Mo
         keychain: keychain,
         idBridge: idBridge,
         identityManager: identityManager,
-        transport: transport
+        transport: transport,
+        messageStore: messageStore,
+        favoritesPersistenceService: favoritesPersistenceService
     )
 
     return (viewModel, transport)
@@ -44,6 +49,351 @@ private func nonFavoriteNoiseKeyHex() -> String {
 // MARK: - Private Chat Extension Tests
 
 struct ChatViewModelPrivateChatExtensionTests {
+
+    private enum SimulatedPersistenceFailure: Error {
+        case beforeRename
+    }
+
+    @MainActor
+    private func receiveMeshPrivateMessage(
+        _ content: String,
+        messageID: String,
+        from peerID: PeerID,
+        viewModel: ChatViewModel
+    ) throws {
+        let packet = PrivateMessagePacket(messageID: messageID, content: content)
+        let payload = try #require(packet.encode(), "Failed to encode private message")
+        viewModel.didReceiveNoisePayload(
+            from: peerID,
+            type: .privateMessage,
+            payload: payload,
+            timestamp: Date()
+        )
+    }
+
+    @MainActor
+    private func waitForDeliveryAcks(
+        _ count: Int,
+        transport: MockTransport
+    ) async {
+        for _ in 0..<100 where transport.sentDeliveryAcks.count < count {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
+
+    @Test @MainActor
+    func meshPrivateMessage_ackFollowsDurableCommit() async throws {
+        let dirName = "MeshAckTest-\(UUID().uuidString)"
+        let store = MessageStore(directoryName: dirName)
+        defer { store.wipeAll() }
+        let (viewModel, transport) = makeTestableViewModel(messageStore: store)
+        let peerID = PeerID(str: "sender-durable-ack")
+        let messageID = "durable-ack-\(UUID().uuidString)"
+
+        try receiveMeshPrivateMessage(
+            "persist before ack",
+            messageID: messageID,
+            from: peerID,
+            viewModel: viewModel
+        )
+        await waitForDeliveryAcks(1, transport: transport)
+
+        #expect(transport.sentDeliveryAcks.map(\.messageID) == [messageID])
+        let reopened = MessageStore(directoryName: dirName)
+        #expect(reopened.load(peerID: peerID).contains(where: { $0.id == messageID }))
+    }
+
+    @Test @MainActor
+    func meshPrivateMessage_failedCommitWithholdsAck() async throws {
+        let dirName = "MeshAckFailureTest-\(UUID().uuidString)"
+        let cleanupStore = MessageStore(directoryName: dirName)
+        defer { cleanupStore.wipeAll() }
+        let failingStore = MessageStore(
+            directoryName: dirName,
+            beforeAtomicReplace: { throw SimulatedPersistenceFailure.beforeRename }
+        )
+        let (viewModel, transport) = makeTestableViewModel(messageStore: failingStore)
+        let peerID = PeerID(str: "sender-failed-ack")
+
+        try receiveMeshPrivateMessage(
+            "do not ack",
+            messageID: "failed-ack-\(UUID().uuidString)",
+            from: peerID,
+            viewModel: viewModel
+        )
+        try? await Task.sleep(nanoseconds: 200_000_000)
+
+        #expect(transport.sentDeliveryAcks.isEmpty)
+        #expect(viewModel.privateChats[peerID]?.isEmpty != false)
+        #expect(!viewModel.unreadPrivateMessages.contains(peerID))
+    }
+
+    @Test @MainActor
+    func meshPrivateMedia_failedTranscriptCommitRollsBackStagedFileAndEffects() async throws {
+        let dirName = "MeshMediaCommitFailureTest-\(UUID().uuidString)"
+        let cleanupStore = MessageStore(directoryName: dirName)
+        defer { cleanupStore.wipeAll() }
+        let failingStore = MessageStore(
+            directoryName: dirName,
+            beforeAtomicReplace: { throw SimulatedPersistenceFailure.beforeRename }
+        )
+        let (viewModel, _) = makeTestableViewModel(messageStore: failingStore)
+        let peerID = PeerID(str: "sender-media-failed-commit")
+        let fileName = "staged-\(UUID().uuidString).jpg"
+        let directory = try viewModel.applicationFilesDirectory()
+            .appendingPathComponent("images/incoming", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let fileURL = directory.appendingPathComponent(fileName)
+        try Data([0xff, 0xd8, 0xff, 0xd9]).write(to: fileURL)
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+
+        let message = BitchatMessage(
+            id: "media-failed-\(UUID().uuidString)",
+            sender: "Media Sender",
+            content: "[image] \(fileName)",
+            timestamp: Date(),
+            isRelay: false,
+            isPrivate: true,
+            recipientNickname: "me",
+            senderPeerID: peerID
+        )
+        viewModel.didReceiveMessage(message)
+
+        for _ in 0..<100 where FileManager.default.fileExists(atPath: fileURL.path) {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        #expect(!FileManager.default.fileExists(atPath: fileURL.path))
+        #expect(viewModel.privateChats[peerID]?.contains(where: { $0.id == message.id }) != true)
+        #expect(!viewModel.unreadPrivateMessages.contains(peerID))
+    }
+
+    @Test @MainActor
+    func meshPrivateMedia_replayKeepsCommittedFileAndRemovesReplayFile() async throws {
+        let dirName = "MeshMediaReplayTest-\(UUID().uuidString)"
+        let store = MessageStore(directoryName: dirName)
+        defer { store.wipeAll() }
+        let (viewModel, _) = makeTestableViewModel(messageStore: store)
+        let peerID = PeerID(str: "sender-media-replay")
+        let messageID = "stable-media-\(UUID().uuidString)"
+        let directory = try viewModel.applicationFilesDirectory()
+            .appendingPathComponent("images/incoming", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let originalName = "original-\(UUID().uuidString).jpg"
+        let replayName = "replay-\(UUID().uuidString).jpg"
+        let originalURL = directory.appendingPathComponent(originalName)
+        let replayURL = directory.appendingPathComponent(replayName)
+        try Data([0xff, 0xd8, 0xff, 0xd9]).write(to: originalURL)
+        try Data([0xff, 0xd8, 0xff, 0xd9]).write(to: replayURL)
+        defer {
+            try? FileManager.default.removeItem(at: originalURL)
+            try? FileManager.default.removeItem(at: replayURL)
+        }
+
+        let original = BitchatMessage(
+            id: messageID,
+            sender: "Media Sender",
+            content: "[image] \(originalName)",
+            timestamp: Date(),
+            isRelay: false,
+            isPrivate: true,
+            recipientNickname: "me",
+            senderPeerID: peerID
+        )
+        viewModel.didReceiveMessage(original)
+        let didCommit = await TestHelpers.waitUntil(
+            { viewModel.privateChats[peerID]?.contains(where: { $0.id == messageID }) == true },
+            timeout: TestConstants.defaultTimeout
+        )
+        #expect(didCommit)
+
+        let replay = BitchatMessage(
+            id: messageID,
+            sender: "Media Sender",
+            content: "[image] \(replayName)",
+            timestamp: original.timestamp,
+            isRelay: false,
+            isPrivate: true,
+            recipientNickname: "me",
+            senderPeerID: peerID
+        )
+        viewModel.didReceiveMessage(replay)
+        for _ in 0..<100 where FileManager.default.fileExists(atPath: replayURL.path) {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        #expect(FileManager.default.fileExists(atPath: originalURL.path))
+        #expect(!FileManager.default.fileExists(atPath: replayURL.path))
+        #expect(viewModel.privateChats[peerID]?.filter { $0.id == messageID }.count == 1)
+        #expect(store.load(peerID: peerID).filter { $0.id == messageID }.count == 1)
+    }
+
+    @Test @MainActor
+    func meshPrivateMessage_duplicateIsStoredOnceAndReAcked() async throws {
+        let dirName = "MeshDuplicateAckTest-\(UUID().uuidString)"
+        let store = MessageStore(directoryName: dirName)
+        defer { store.wipeAll() }
+        let (viewModel, transport) = makeTestableViewModel(messageStore: store)
+        let peerID = PeerID(str: "sender-duplicate-ack")
+        let messageID = "duplicate-ack-\(UUID().uuidString)"
+
+        try receiveMeshPrivateMessage("once", messageID: messageID, from: peerID, viewModel: viewModel)
+        await waitForDeliveryAcks(1, transport: transport)
+        try receiveMeshPrivateMessage("once", messageID: messageID, from: peerID, viewModel: viewModel)
+        await waitForDeliveryAcks(2, transport: transport)
+
+        #expect(transport.sentDeliveryAcks.filter { $0.messageID == messageID }.count == 2)
+        #expect(viewModel.privateChats[peerID]?.filter { $0.id == messageID }.count == 1)
+        #expect(store.load(peerID: peerID).filter { $0.id == messageID }.count == 1)
+    }
+
+    @Test @MainActor
+    func meshPrivateMessage_concurrentBurstCommitsAndAcksEveryMessage() async throws {
+        let dirName = "MeshBurstAckTest-\(UUID().uuidString)"
+        let store = MessageStore(directoryName: dirName)
+        defer { store.wipeAll() }
+        let (viewModel, transport) = makeTestableViewModel(messageStore: store)
+        let peerID = PeerID(str: "sender-burst-ack")
+        let ids = (0..<8).map { "burst-\($0)-\(UUID().uuidString)" }
+
+        for (index, messageID) in ids.enumerated() {
+            try receiveMeshPrivateMessage(
+                "burst \(index)",
+                messageID: messageID,
+                from: peerID,
+                viewModel: viewModel
+            )
+        }
+        await waitForDeliveryAcks(ids.count, transport: transport)
+
+        #expect(Set(transport.sentDeliveryAcks.map(\.messageID)) == Set(ids))
+        #expect(Set(viewModel.privateChats[peerID]?.map(\.id) ?? []) == Set(ids))
+        let reopened = MessageStore(directoryName: dirName)
+        #expect(Set(reopened.load(peerID: peerID).map(\.id)) == Set(ids))
+    }
+
+    @Test @MainActor
+    func meshPrivateMessage_blockedPeerIsDroppedAndAcked() async throws {
+        let dirName = "MeshBlockedAckTest-\(UUID().uuidString)"
+        let store = MessageStore(directoryName: dirName)
+        defer { store.wipeAll() }
+        let (viewModel, transport) = makeTestableViewModel(messageStore: store)
+        let peerID = PeerID(str: "sender-blocked-ack")
+        let fingerprint = "blocked-fingerprint-\(UUID().uuidString)"
+        transport.peerFingerprints[peerID] = fingerprint
+        viewModel.identityManager.setBlocked(fingerprint, isBlocked: true)
+        #expect(viewModel.isPeerBlocked(peerID))
+
+        let messageID = "blocked-ack-\(UUID().uuidString)"
+        try receiveMeshPrivateMessage("drop me", messageID: messageID, from: peerID, viewModel: viewModel)
+        await waitForDeliveryAcks(1, transport: transport)
+
+        #expect(transport.sentDeliveryAcks.map(\.messageID) == [messageID])
+        #expect(viewModel.privateChats[peerID]?.contains(where: { $0.id == messageID }) != true)
+        #expect(store.load(peerID: peerID).isEmpty)
+    }
+
+    @Test @MainActor
+    func meshFavoriteControl_ackFollowsDurableReceipt() async throws {
+        let dirName = "MeshControlAckTest-\(UUID().uuidString)"
+        let store = MessageStore(directoryName: dirName)
+        defer { store.wipeAll() }
+        let favoriteKeychain = MockKeychain()
+        let favoriteService = FavoritesPersistenceService(keychain: favoriteKeychain)
+        let (viewModel, transport) = makeTestableViewModel(
+            messageStore: store,
+            favoritesPersistenceService: favoriteService
+        )
+        let noiseKey = Data((1...32).map { UInt8($0) })
+        let peerID = PeerID(hexData: noiseKey)
+        let messageID = "favorite-control-\(UUID().uuidString)"
+
+        try receiveMeshPrivateMessage(
+            "[FAVORITED]:npub-test",
+            messageID: messageID,
+            from: peerID,
+            viewModel: viewModel
+        )
+        await waitForDeliveryAcks(1, transport: transport)
+
+        #expect(transport.sentDeliveryAcks.map(\.messageID) == [messageID])
+        #expect(store.hasControlReceipt(peerID: peerID, messageID: messageID))
+        #expect(store.load(peerID: peerID).isEmpty)
+        let reopenedFavorites = FavoritesPersistenceService(keychain: favoriteKeychain)
+        #expect(reopenedFavorites.getFavoriteStatus(for: noiseKey)?.theyFavoritedUs == true)
+    }
+
+    @Test @MainActor
+    func meshFavoriteControl_failedMessageCommitHasZeroSideEffects() async throws {
+        let dirName = "MeshControlFailureTest-\(UUID().uuidString)"
+        let cleanupStore = MessageStore(directoryName: dirName)
+        defer { cleanupStore.wipeAll() }
+        let failingStore = MessageStore(
+            directoryName: dirName,
+            beforeAtomicReplace: { throw SimulatedPersistenceFailure.beforeRename }
+        )
+        let favoriteKeychain = MockKeychain()
+        let favoriteService = FavoritesPersistenceService(keychain: favoriteKeychain)
+        let (viewModel, transport) = makeTestableViewModel(
+            messageStore: failingStore,
+            favoritesPersistenceService: favoriteService
+        )
+        let noiseKey = Data((33...64).map { UInt8($0) })
+        let peerID = PeerID(hexData: noiseKey)
+
+        try receiveMeshPrivateMessage(
+            "[FAVORITED]:npub-test",
+            messageID: "favorite-fail-\(UUID().uuidString)",
+            from: peerID,
+            viewModel: viewModel
+        )
+        try? await Task.sleep(nanoseconds: 200_000_000)
+
+        #expect(transport.sentDeliveryAcks.isEmpty)
+        #expect(favoriteService.getFavoriteStatus(for: noiseKey) == nil)
+    }
+
+    @Test @MainActor
+    func favoriteKeychainFailurePreservesPreviousDurableValue() {
+        let keychain = MockKeychain()
+        let service = FavoritesPersistenceService(keychain: keychain)
+        let noiseKey = Data((65...96).map { UInt8($0) })
+        #expect(service.updatePeerFavoritedUs(
+            peerNoisePublicKey: noiseKey,
+            favorited: true,
+            peerNickname: "alice"
+        ))
+
+        keychain.simulatedGenericSaveFailure = true
+        #expect(!service.updatePeerFavoritedUs(
+            peerNoisePublicKey: noiseKey,
+            favorited: false,
+            peerNickname: "alice"
+        ))
+
+        let reopened = FavoritesPersistenceService(keychain: keychain)
+        #expect(reopened.getFavoriteStatus(for: noiseKey)?.theyFavoritedUs == true)
+        #expect(service.getFavoriteStatus(for: noiseKey)?.theyFavoritedUs == true)
+    }
+
+    @Test @MainActor
+    func clearAllFavoritesReportsVerifiedDeleteFailure() {
+        let keychain = MockKeychain()
+        let service = FavoritesPersistenceService(keychain: keychain)
+        let noiseKey = Data((97...128).map { UInt8($0) })
+        #expect(service.updatePeerFavoritedUs(
+            peerNoisePublicKey: noiseKey,
+            favorited: true,
+            peerNickname: "alice"
+        ))
+
+        keychain.simulatedGenericDeleteFailure = true
+        #expect(!service.clearAllFavorites())
+        #expect(service.getFavoriteStatus(for: noiseKey) == nil)
+
+        let reopened = FavoritesPersistenceService(keychain: keychain)
+        #expect(reopened.getFavoriteStatus(for: noiseKey)?.theyFavoritedUs == true)
+    }
 
     @Test @MainActor
     func sendPrivateMessage_mesh_storesAndSends() async {
@@ -75,6 +425,85 @@ struct ChatViewModelPrivateChatExtensionTests {
         // Verify message sent to transport (MockTransport captures sendPrivateMessage)
         // MockTransport.sendPrivateMessage is what MessageRouter calls for connected peers
         // Check MockTransport implementation... it might need update or verification
+    }
+
+    @Test @MainActor
+    func deleteConversationOutboxFailureKeepsTranscriptAndUIForRetry() async {
+        let dirName = "ConversationDeleteFailure-\(UUID().uuidString)"
+        let store = MessageStore(directoryName: dirName)
+        defer { store.wipeAll() }
+        let (viewModel, transport) = makeTestableViewModel(messageStore: store)
+        let peer = PeerID(str: "a1b2c3d4e5f60718")
+        let message = BitchatMessage(
+            id: "unsent-delete",
+            sender: "me",
+            content: "still pending",
+            timestamp: Date(),
+            isRelay: false,
+            isPrivate: true,
+            senderPeerID: transport.myPeerID
+        )
+        viewModel.privateChats[peer] = [message]
+        let committed = await store.commitPrivate(peerID: peer, messages: [message])
+        #expect(committed)
+        transport.pruneDurablePrivateOutboxResult = false
+
+        #expect(!viewModel.deleteConversation(with: peer))
+
+        #expect(viewModel.privateChats[peer]?.map(\.id) == [message.id])
+        #expect(store.load(peerID: peer).map(\.id) == [message.id])
+        #expect(transport.prunedDurablePrivatePeers == [[peer]])
+    }
+
+    @Test @MainActor
+    func sendPrivateMessage_acknowledgedMeshStaysSendingUntilPeerAck() async {
+        let (viewModel, transport) = makeTestableViewModel()
+        let validHex = nonFavoriteNoiseKeyHex()
+        let peerID = PeerID(str: validHex)
+        transport.connectedPeers.insert(peerID)
+        transport.peerNicknames[peerID] = "MeshUser"
+        transport.usesAcknowledgedPrivateDelivery = true
+
+        viewModel.sendPrivateMessage("Wait for ACK", to: peerID)
+
+        #expect(transport.sentPrivateMessages.count == 1)
+        let status = viewModel.privateChats[peerID]?.last?.deliveryStatus
+        if case .sending = status {} else {
+            Issue.record("ACK-backed BLE message was marked sent before delivery ACK")
+        }
+    }
+
+    @Test @MainActor
+    func privateDeliveryStatusUpdatePersistsAcrossReopen() async {
+        let dirName = "MeshDeliveryStatusTest-\(UUID().uuidString)"
+        let store = MessageStore(directoryName: dirName)
+        defer { store.wipeAll() }
+        let (viewModel, _) = makeTestableViewModel(messageStore: store)
+        let peerID = PeerID(str: "delivery-status-peer")
+        let messageID = "delivery-status-\(UUID().uuidString)"
+        viewModel.privateChats[peerID] = [BitchatMessage(
+            id: messageID,
+            sender: viewModel.nickname,
+            content: "persist my ACK",
+            timestamp: Date(),
+            isRelay: false,
+            isPrivate: true,
+            recipientNickname: "alice",
+            senderPeerID: viewModel.meshService.myPeerID,
+            deliveryStatus: .sending
+        )]
+
+        viewModel.updateMessageDeliveryStatus(
+            messageID,
+            status: .delivered(to: "alice", at: Date())
+        )
+        _ = store.load(peerID: peerID) // serial queue barrier
+
+        let reopened = MessageStore(directoryName: dirName)
+        let status = reopened.load(peerID: peerID).first?.deliveryStatus
+        if case .delivered = status {} else {
+            Issue.record("Delivery status did not survive MessageStore reopen")
+        }
     }
 
     @Test @MainActor
@@ -137,6 +566,24 @@ struct ChatViewModelPrivateChatExtensionTests {
         try FileManager.default.removeItem(at: sourceURL)
         #expect(FileManager.default.fileExists(atPath: storedURL.path))
     }
+
+    @Test @MainActor
+    func sendFile_privateMeshChat_blocksLegacyPlaintextTransfer() async {
+        let (viewModel, transport) = makeTestableViewModel()
+        let peerID = PeerID(str: nonFavoriteNoiseKeyHex())
+        viewModel.selectedPrivateChatPeer = peerID
+
+        #expect(!viewModel.canSendMediaInCurrentContext)
+
+        viewModel.sendFile(
+            data: Data(repeating: 0x2a, count: 32),
+            filename: "private.jpg",
+            mime: "image/jpeg"
+        )
+
+        #expect(transport.sentFilePrivates.isEmpty)
+        #expect(transport.sentFileBroadcasts.isEmpty)
+    }
     
     @Test @MainActor
     func handlePrivateMessage_storesMessage() async {
@@ -166,7 +613,12 @@ struct ChatViewModelPrivateChatExtensionTests {
         #expect(viewModel.privateChats[peerID]?.count == 1)
         #expect(viewModel.privateChats[peerID]?.first?.content == "Private Content")
         
-        // Verify notification trigger (unread count should increase if not viewing)
+        // Receive-side notification work is asynchronous so a platform
+        // submission cannot block local transcript insertion. Wait only for
+        // the immediate unread projection, not for notification-center I/O.
+        for _ in 0..<100 where !viewModel.unreadPrivateMessages.contains(peerID) {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
         #expect(viewModel.unreadPrivateMessages.contains(peerID))
     }
     

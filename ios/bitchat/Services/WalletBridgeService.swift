@@ -184,6 +184,7 @@ final class WalletBridgeService: ObservableObject {
     /// Safe to call repeatedly (e.g. on every foreground): concurrent and
     /// repeat calls await/reuse the first successful setup.
     func setupIfNeeded() async throws {
+        guard !PanicWipeIntent.isPending else { return }
         if case .ready = state { return }
         if let running = setupTask {
             return try await running.value

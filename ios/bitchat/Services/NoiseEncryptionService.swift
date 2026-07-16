@@ -197,14 +197,16 @@ final class NoiseEncryptionService {
         }
     }
     
-    init(keychain: KeychainManagerProtocol) {
+    init(keychain: KeychainManagerProtocol, allowPersistentIdentity: Bool = true) {
         self.keychain = keychain
 
         // BCH-01-009: Load or create static identity key with proper error handling
         let loadedKey: Curve25519.KeyAgreement.PrivateKey
 
         // Try to load from keychain with proper error classification
-        let noiseKeyResult = keychain.getIdentityKeyWithResult(forKey: "noiseStaticKey")
+        let noiseKeyResult: KeychainReadResult = allowPersistentIdentity
+            ? keychain.getIdentityKeyWithResult(forKey: "noiseStaticKey")
+            : .accessDenied
 
         switch noiseKeyResult {
         case .success(let identityData):
@@ -250,7 +252,9 @@ final class NoiseEncryptionService {
         // BCH-01-009: Load or create signing key pair with proper error handling
         let loadedSigningKey: Curve25519.Signing.PrivateKey
 
-        let signingKeyResult = keychain.getIdentityKeyWithResult(forKey: "ed25519SigningKey")
+        let signingKeyResult: KeychainReadResult = allowPersistentIdentity
+            ? keychain.getIdentityKeyWithResult(forKey: "ed25519SigningKey")
+            : .accessDenied
 
         switch signingKeyResult {
         case .success(let signingData):

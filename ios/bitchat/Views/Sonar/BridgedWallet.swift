@@ -87,7 +87,9 @@ final class BridgedWallet: SonarWalletProviding {
         }
 
         // With no BREEZ_API_KEY this settles to .notConfigured immediately.
-        Task { [weak self] in try? await self?.setupAfterPendingCleanupIfNeeded() }
+        if !PanicWipeIntent.isPending {
+            Task { [weak self] in try? await self?.setupAfterPendingCleanupIfNeeded() }
+        }
         // NOTE: incoming-payment observation must NOT be started here. The
         // receive flow should subscribe only after the wallet is ready.
     }
@@ -95,12 +97,14 @@ final class BridgedWallet: SonarWalletProviding {
     /// Re-attempt setup once the chat identity exists (the entropy provider
     /// started returning non-nil). Called by the store when the npub lands.
     func retrySetup() {
+        guard !PanicWipeIntent.isPending else { return }
         Task { [weak self] in try? await self?.setupAfterPendingCleanupIfNeeded() }
     }
 
     /// A crash or native disconnect failure may interrupt a destructive wipe.
     /// Finish it before deriving/opening any wallet for the current identity.
     private func setupAfterPendingCleanupIfNeeded() async throws {
+        guard !PanicWipeIntent.isPending else { return }
         if UserDefaults.standard.bool(forKey: Self.cleanupPendingKey) {
             try await bridge.shutdownForStorageMutation()
             try Self.wipeWalletStorage()
@@ -234,6 +238,13 @@ final class BridgedWallet: SonarWalletProviding {
         guard status == errSecSuccess || status == errSecItemNotFound else {
             throw WalletStorageWipeError.keychain(status)
         }
+        let absenceStatus = SecItemCopyMatching(query as CFDictionary, nil)
+        guard absenceStatus == errSecItemNotFound else {
+            if absenceStatus == errSecSuccess {
+                throw WalletStorageWipeError.storageStillPresent
+            }
+            throw WalletStorageWipeError.keychain(absenceStatus)
+        }
 
         let fm = FileManager.default
         try wipeWalletFilesAndDefaults(
@@ -289,7 +300,9 @@ final class BridgedWallet: SonarWalletProviding {
             sharedDefaults.removeObject(forKey: "breez_api_key")
             sharedDefaults.removeObject(forKey: "breez_seed_hex")
             sharedDefaults.removeObject(forKey: "breez_mainnet")
-            _ = sharedDefaults.synchronize()
+            guard sharedDefaults.synchronize() else {
+                throw WalletStorageWipeError.cleanupMarker
+            }
         }
     }
 }

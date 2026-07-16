@@ -22,6 +22,7 @@ final class MockTransport: Transport {
 
     var myPeerID: PeerID = PeerID(str: "TESTPEER")
     var myNickname: String = "TestUser"
+    var usesAcknowledgedPrivateDelivery = false
 
     private let peerSnapshotSubject = CurrentValueSubject<[TransportPeerSnapshot], Never>([])
     var peerSnapshotPublisher: AnyPublisher<[TransportPeerSnapshot], Never> {
@@ -32,6 +33,7 @@ final class MockTransport: Transport {
 
     private(set) var sentMessages: [(content: String, mentions: [String], messageID: String?, timestamp: Date?)] = []
     private(set) var sentPrivateMessages: [(content: String, peerID: PeerID, recipientNickname: String, messageID: String)] = []
+    private(set) var sentImmediatePrivateMessages: [(content: String, peerID: PeerID, messageID: String)] = []
     private(set) var sentReadReceipts: [(receipt: ReadReceipt, peerID: PeerID)] = []
     private(set) var sentDeliveryAcks: [(messageID: String, peerID: PeerID)] = []
     private(set) var sentFavoriteNotifications: [(peerID: PeerID, isFavorite: Bool)] = []
@@ -44,6 +46,7 @@ final class MockTransport: Transport {
     private(set) var emergencyDisconnectCallCount = 0
     private(set) var broadcastAnnounceCallCount = 0
     private(set) var triggeredHandshakes: [PeerID] = []
+    private(set) var prunedDurablePrivatePeers: [[PeerID]] = []
 
     // MARK: - Configurable Mock State
 
@@ -52,6 +55,8 @@ final class MockTransport: Transport {
     var peerNicknames: [PeerID: String] = [:]
     var peerFingerprints: [PeerID: String] = [:]
     var peerNoiseStates: [PeerID: LazyHandshakeState] = [:]
+    var acceptsImmediatePrivateMessages = false
+    var pruneDurablePrivateOutboxResult = true
     private let mockKeychain = MockKeychain()
 
     // MARK: - Transport Protocol Implementation
@@ -76,6 +81,11 @@ final class MockTransport: Transport {
         emergencyDisconnectCallCount += 1
         connectedPeers.removeAll()
         reachablePeers.removeAll()
+    }
+
+    func pruneDurablePrivateOutbox(for peerIDs: [PeerID]) -> Bool {
+        prunedDurablePrivatePeers.append(peerIDs)
+        return pruneDurablePrivateOutboxResult
     }
 
     func isPeerConnected(_ peerID: PeerID) -> Bool {
@@ -122,6 +132,14 @@ final class MockTransport: Transport {
 
     func sendPrivateMessage(_ content: String, to peerID: PeerID, recipientNickname: String, messageID: String) {
         sentPrivateMessages.append((content, peerID, recipientNickname, messageID))
+    }
+
+    func sendPrivateMessageNow(_ content: String, to peerID: PeerID, messageID: String) -> Bool {
+        guard acceptsImmediatePrivateMessages,
+              connectedPeers.contains(peerID) else { return false }
+        guard case .established = peerNoiseStates[peerID] else { return false }
+        sentImmediatePrivateMessages.append((content, peerID, messageID))
+        return true
     }
 
     func sendReadReceipt(_ receipt: ReadReceipt, to peerID: PeerID) {

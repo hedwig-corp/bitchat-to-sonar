@@ -12,6 +12,9 @@ import SwiftUI
 
 /// Manages all private chat functionality
 final class PrivateChatManager: ObservableObject {
+    /// First paint reads a fixed number of local transcript files. Remaining
+    /// pages hydrate on the MessageStore queue after the UI can render.
+    static let startupChatPageSize = 24
     /// Encrypted on-disk store backing the in-memory transcripts: hydrated on
     /// launch, written through on every change so chats survive a restart.
     /// Mesh DMs stay LOCAL-ONLY — this store is private to the device.
@@ -35,6 +38,12 @@ final class PrivateChatManager: ObservableObject {
     /// Set while we are hydrating from disk on launch, so the write-through
     /// `didSet` doesn't echo the loaded data straight back to disk.
     private var isHydrating = false
+    /// A receive transaction publishes its canonical in-memory snapshot before
+    /// awaiting the durable barrier. Suppress the ordinary detached didSet
+    /// writer for that one mutation; the awaited commit owns its ordering.
+    private var isDurableReceiveStaging = false
+    private var nextStoredChatCursor: PrivateConversationCursor?
+    private var hasMoreStoredChats = false
 
     init(meshService: Transport? = nil, store: MessageStore = .shared) {
         self.meshService = meshService
@@ -47,26 +56,210 @@ final class PrivateChatManager: ObservableObject {
 
     // MARK: - Persistence (write-through to MessageStore)
 
-    /// Load persisted transcripts on launch so private chats survive a restart.
+    /// Load only the newest bounded local page synchronously for first paint.
     private func hydrateFromStore() {
-        let persisted = store.loadAllPrivate()
+        let snapshot = store.loadPrivateSnapshot(chatLimit: Self.startupChatPageSize)
+        let persisted = snapshot.chats
+        nextStoredChatCursor = snapshot.nextCursor
+        hasMoreStoredChats = snapshot.hasMore
         guard !persisted.isEmpty else { return }
         isHydrating = true
         privateChats = persisted
         isHydrating = false
     }
 
+    /// Page the rest of local storage without blocking first paint. Merging is
+    /// idempotent so a message received while a page is in flight wins over the
+    /// older on-disk row with the same stable ID.
+    @MainActor
+    func hydrateRemainingChatPages() async {
+        while hasMoreStoredChats {
+            let page = await store.loadPrivateSnapshotPage(
+                after: nextStoredChatCursor,
+                chatLimit: Self.startupChatPageSize
+            )
+            guard page.scannedFileCount > 0 else {
+                hasMoreStoredChats = false
+                break
+            }
+            mergeHydratedPage(page)
+            nextStoredChatCursor = page.nextCursor
+            hasMoreStoredChats = page.hasMore
+            objectWillChange.send()
+            await Task.yield()
+        }
+
+        // Existing installs may not have bounded window sidecars yet. Rebuild
+        // them in very small background pages; never parse legacy full bodies
+        // on the synchronous first-paint path.
+        while true {
+            let page = await store.rebuildLegacyPrivateWindowPage(chatLimit: 4)
+            guard page.scannedFileCount > 0 else { break }
+            mergeHydratedPage(page)
+            objectWillChange.send()
+            guard page.hasMore else { break }
+            await Task.yield()
+        }
+    }
+
+    @MainActor
+    private func mergeHydratedPage(_ page: PrivateStoreSnapshot) {
+        isHydrating = true
+        for (peerID, persisted) in page.chats {
+            let current = privateChats[peerID] ?? []
+            var byID: [String: BitchatMessage] = [:]
+            for message in persisted { byID[message.id] = message }
+            for message in current { byID[message.id] = message }
+            privateChats[peerID] = Array(byID.values)
+                .sorted { $0.timestamp < $1.timestamp }
+        }
+        isHydrating = false
+    }
+
+    func pendingReceiveEffectsForStartupReplay() async -> [(peerID: PeerID, message: BitchatMessage)] {
+        await store.loadPendingReceiveEffects()
+    }
+
     /// Write through only the peers whose transcript actually changed.
     private func persistChanges(old: [PeerID: [BitchatMessage]], new: [PeerID: [BitchatMessage]]) {
-        guard !isHydrating else { return }
+        guard !isHydrating, !isDurableReceiveStaging else { return }
         // Peers added or modified: re-save their (deduped, capped) transcript.
         for (peerID, messages) in new where old[peerID] != messages {
-            store.savePrivate(peerID: peerID, messages: messages)
+            store.savePrivateWindow(peerID: peerID, messages: messages)
         }
         // Peers removed (e.g. consolidation merged them away): drop their file.
         for peerID in old.keys where new[peerID] == nil {
-            store.savePrivate(peerID: peerID, messages: [])
+            let removedIDs = Set((old[peerID] ?? []).map(\.id))
+            let migrationTarget = new.first { _, messages in
+                !removedIDs.isEmpty && removedIDs.isSubset(of: Set(messages.map(\.id)))
+            }?.key
+            if let migrationTarget {
+                store.migratePrivateTranscript(from: peerID, to: migrationTarget)
+            } else {
+                store.savePrivate(peerID: peerID, messages: [])
+            }
         }
+    }
+
+    /// Force write-through after mutating a property on a BitchatMessage class
+    /// instance. Dictionary `oldValue` and `newValue` can share that reference,
+    /// so equality-based didSet detection alone cannot observe status changes.
+    @MainActor
+    func persistCurrentTranscript(for peerID: PeerID) {
+        guard let messages = privateChats[peerID] else { return }
+        store.savePrivateWindow(peerID: peerID, messages: messages)
+    }
+
+    func currentStorageGeneration() -> String {
+        store.currentStorageGeneration()
+    }
+
+    /// Flush the transcript that contains an accepted mesh message. The
+    /// preferred peer covers the normal path; scanning aliases preserves
+    /// correctness after Noise/Nostr chat migration or mirroring.
+    @MainActor
+    func commitIncomingMessage(
+        _ messageID: String,
+        preferredPeerID: PeerID,
+        expectedGeneration: String
+    ) async -> Bool {
+        if let messages = privateChats[preferredPeerID],
+           messages.contains(where: { $0.id == messageID }) {
+            return await store.commitPrivate(
+                peerID: preferredPeerID,
+                messages: messages,
+                expectedGeneration: expectedGeneration,
+                mergeExistingTranscript: true
+            )
+        }
+
+        guard let (peerID, messages) = privateChats.first(where: { _, messages in
+            messages.contains(where: { $0.id == messageID })
+        }) else {
+            return false
+        }
+        return await store.commitPrivate(
+            peerID: peerID,
+            messages: messages,
+            expectedGeneration: expectedGeneration,
+            mergeExistingTranscript: true
+        )
+    }
+
+    /// Install the received message in the canonical snapshot before awaiting
+    /// its durable commit. Any same-peer mutation queued while this suspends is
+    /// therefore based on a snapshot that already contains the received row;
+    /// it cannot overwrite an ACKed message with an older transcript.
+    @MainActor
+    func commitStagedIncomingMessage(
+        _ message: BitchatMessage,
+        preferredPeerID: PeerID,
+        expectedGeneration: String
+    ) async -> Bool {
+        var staged = privateChats[preferredPeerID] ?? []
+        guard !staged.contains(where: { $0.id == message.id }) else {
+            return await store.commitPrivate(
+                peerID: preferredPeerID,
+                messages: staged,
+                expectedGeneration: expectedGeneration,
+                mergeExistingTranscript: true
+            )
+        }
+        staged.append(message)
+        isDurableReceiveStaging = true
+        privateChats[preferredPeerID] = staged
+        isDurableReceiveStaging = false
+        let committed = await store.commitPrivate(
+            peerID: preferredPeerID,
+            messages: staged,
+            expectedGeneration: expectedGeneration,
+            pendingReceiveEffectMessageID: message.id,
+            mergeExistingTranscript: true
+        )
+        guard committed else {
+            // Keep later same-peer changes, but withdraw this unpublished row.
+            isDurableReceiveStaging = true
+            privateChats[preferredPeerID]?.removeAll { $0.id == message.id }
+            isDurableReceiveStaging = false
+            return false
+        }
+        return true
+    }
+
+    func hasPendingReceiveEffects(_ messageID: String, preferredPeerID: PeerID) -> Bool {
+        if store.hasPendingReceiveEffects(peerID: preferredPeerID, messageID: messageID) {
+            return true
+        }
+        return privateChats.keys.contains {
+            $0 != preferredPeerID && store.hasPendingReceiveEffects(peerID: $0, messageID: messageID)
+        }
+    }
+
+    @MainActor
+    func commitReceiveEffectsProcessed(
+        _ messageID: String,
+        preferredPeerID: PeerID,
+        expectedGeneration: String
+    ) async -> Bool {
+        let owner = privateChats.keys.first {
+            store.hasPendingReceiveEffects(peerID: $0, messageID: messageID)
+        } ?? preferredPeerID
+        return await store.commitReceiveEffectsProcessed(
+            peerID: owner,
+            messageID: messageID,
+            expectedGeneration: expectedGeneration
+        )
+    }
+
+    /// Favorite/unfavorite controls intentionally do not enter the transcript,
+    /// so persist a bounded acceptance receipt before acknowledging them.
+    @MainActor
+    func commitIncomingControl(
+        _ messageID: String,
+        from peerID: PeerID,
+        expectedGeneration: String
+    ) async -> Bool {
+        await store.commitControlReceipt(peerID: peerID, messageID: messageID, expectedGeneration: expectedGeneration)
     }
 
     // MARK: - Message Consolidation
@@ -232,13 +425,20 @@ final class PrivateChatManager: ObservableObject {
             selectedPeerFingerprint = fingerprint
         }
         
-        // Mark messages as read
-        markAsRead(from: peerID)
-        
         // Initialize chat if needed
         if privateChats[peerID] == nil {
-            privateChats[peerID] = []
+            // A chat outside the first list page paints from its one bounded
+            // local transcript file and never waits for relay/network sync.
+            let persisted = store.loadRecent(peerID: peerID)
+            isHydrating = true
+            privateChats[peerID] = persisted
+            isHydrating = false
         }
+
+        // Mark the bounded local window as read only after it is present; this
+        // keeps chat opening local-first and does not require a full history
+        // parse before read receipts can be projected.
+        markAsRead(from: peerID)
     }
     
     /// End the current private chat
