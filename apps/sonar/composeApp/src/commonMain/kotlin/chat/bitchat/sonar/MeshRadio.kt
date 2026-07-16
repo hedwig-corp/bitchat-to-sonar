@@ -94,6 +94,27 @@ internal fun meshSigningKeyMatches(existingKeyHex: String?, announcedKeyHex: Str
     existingKeyHex == null || existingKeyHex.equals(announcedKeyHex, ignoreCase = true)
 
 /**
+ * Mesh links whose receive side has gone silent for [staleMs].
+ *
+ * The Pixel 10 BLE stack can silently stop delivering a link's data without
+ * ever firing a disconnect callback. The stale address then stays in the
+ * client/server link maps, `isLinkedAddr` keeps gating off every re-dial, and a
+ * static-address peer (e.g. a Mac) becomes permanently undetectable while the
+ * scanner still reports it. Culling such zombies lets the next scan result
+ * re-dial and recover the link. Addresses with no recorded receive time are
+ * left alone — the caller seeds them first so a fresh link gets a full window.
+ */
+internal fun meshStaleLinkAddrs(
+    nowMs: Long,
+    linkedAddrs: Set<String>,
+    lastRxMsByAddr: Map<String, Long>,
+    staleMs: Long,
+): List<String> = linkedAddrs.filter { addr ->
+    val lastRx = lastRxMsByAddr[addr] ?: return@filter false
+    nowMs - lastRx >= staleMs
+}
+
+/**
  * Decide whether Android's BLE scan needs recovery without confusing repeated
  * advertisements from a connected peer with scanner starvation.
  */
