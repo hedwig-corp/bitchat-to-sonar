@@ -48,6 +48,9 @@ pub enum Error {
     #[error("encrypted media error: {0}")]
     Media(String),
 
+    #[error("media too large: {bytes} bytes (max {max})")]
+    MediaTooLarge { bytes: u64, max: u64 },
+
     #[error("blossom storage error: {0}")]
     Blossom(String),
 

@@ -29,13 +29,15 @@ import javax.swing.JLabel
 import javax.swing.SwingConstants
 
 /**
- * Desktop (JVM) `actual` photo picker: a native AWT [FileDialog] filtered to
- * images, multi-select up to [MAX_ALBUM_PHOTOS]. Raw bytes are passed through —
- * JPEG re-encoding is deferred to send confirmation via [reencodeToJpeg].
+ * Desktop (JVM) `actual` photo/video picker: a native AWT [FileDialog] filtered
+ * to images + video containers, multi-select up to [MAX_ALBUM_PHOTOS]. Raw
+ * bytes are passed through — JPEG re-encoding is deferred to send confirmation
+ * via [reencodeToJpeg]; videos are never re-encoded and are rejected at pick
+ * time when they exceed the receiver download cap.
  */
 @Composable
 actual fun rememberPhotoPicker(
-    onPicked: (items: List<PickedPhoto>) -> Unit
+    onPicked: (items: List<PickedPhoto>, rejectedTooLarge: Int) -> Unit
 ): () -> Unit {
     val scope = rememberCoroutineScope()
     return {
@@ -45,9 +47,18 @@ actual fun rememberPhotoPicker(
             // thread). Decoding/re-encoding then hops to a background thread.
             val picked = pickImageFiles()
             if (picked.isEmpty()) return@launch
+            var rejectedTooLarge = 0
             val items = withContext(Dispatchers.IO) {
                 picked.mapNotNull { file ->
+                    val videoMime = videoMimeForExtension(file.extension)
+                    if (videoMime != null && file.length() > MAX_INTERNET_ATTACHMENT_BYTES) {
+                        rejectedTooLarge += 1
+                        return@mapNotNull null
+                    }
                     val raw = runCatching { file.readBytes() }.getOrNull() ?: return@mapNotNull null
+                    if (videoMime != null) {
+                        return@mapNotNull PickedPhoto(raw, file.name.ifBlank { "video.mp4" }, videoMime)
+                    }
                     // Raw bytes — JPEG re-encoding happens lazily on send confirmation.
                     val name = file.name.ifBlank { "photo" }
                     val mime = if (file.extension.equals("gif", ignoreCase = true) || raw.isGifBytes()) {
@@ -58,9 +69,19 @@ actual fun rememberPhotoPicker(
                     PickedPhoto(raw, name, mime)
                 }
             }
-            if (items.isNotEmpty()) onPicked(items)
+            if (items.isNotEmpty() || rejectedTooLarge > 0) onPicked(items, rejectedTooLarge)
         }
     }
+}
+
+/** Video container MIME by filename extension, or null when not a video. */
+private fun videoMimeForExtension(extension: String): String? = when (extension.lowercase()) {
+    "mp4", "m4v" -> "video/mp4"
+    "mov" -> "video/quicktime"
+    "webm" -> "video/webm"
+    "mkv" -> "video/x-matroska"
+    "avi" -> "video/x-msvideo"
+    else -> null
 }
 
 @Composable
@@ -85,14 +106,17 @@ internal actual fun rememberFilePicker(
 }
 
 private fun pickImageFiles(): List<File> {
-    // Limit to formats the stock JDK ImageIO can actually decode (no WebP reader),
-    // so a picked file always re-encodes rather than silently failing.
-    val dialog = FileDialog(null as Frame?, "Choose images", FileDialog.LOAD).apply {
+    // Images: limit to formats the stock JDK ImageIO can actually decode (no
+    // WebP reader), so a picked file always re-encodes rather than silently
+    // failing. Videos: containers on the encrypted-attachment MIME whitelist.
+    val dialog = FileDialog(null as Frame?, "Choose photos or videos", FileDialog.LOAD).apply {
         isMultipleMode = true
         setFilenameFilter { _, name ->
             name.lowercase().let {
                 it.endsWith(".jpg") || it.endsWith(".jpeg") || it.endsWith(".png") ||
-                    it.endsWith(".gif") || it.endsWith(".bmp")
+                    it.endsWith(".gif") || it.endsWith(".bmp") ||
+                    it.endsWith(".mp4") || it.endsWith(".m4v") || it.endsWith(".mov") ||
+                    it.endsWith(".webm") || it.endsWith(".mkv") || it.endsWith(".avi")
             }
         }
         isVisible = true
@@ -157,6 +181,10 @@ actual fun MediaImage(
 
 actual fun decodeImageBitmap(bytes: ByteArray): ImageBitmap? =
     runCatching { SkiaImage.makeFromEncoded(bytes).toComposeImageBitmap() }.getOrNull()
+
+// The stock JVM has no video decoder — the preview falls back to a generic
+// video tile (filename + play glyph) instead of a poster frame.
+actual fun decodeVideoPosterFrame(path: String): ImageBitmap? = null
 
 @Composable
 actual fun rememberMediaActions(): MediaActions =

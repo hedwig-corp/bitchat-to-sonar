@@ -963,8 +963,15 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     var mediaGallery by remember { mutableStateOf<Pair<List<SonarMedia>, Int>?>(null) }
     var previewPackCoordinate by remember { mutableStateOf<String?>(null) }
     val mediaActions = rememberMediaActions()
-    val pickPhoto = rememberPhotoPicker { items ->
-        state.stageMediaPreviews(screen.id, items)
+    val pickPhoto = rememberPhotoPicker { items, rejectedTooLarge ->
+        if (rejectedTooLarge > 0) {
+            state.toast = if (rejectedTooLarge == 1) {
+                "Video is too large to send (max 25 MB)."
+            } else {
+                "$rejectedTooLarge videos are too large to send (max 25 MB)."
+            }
+        }
+        if (items.isNotEmpty()) state.stageMediaPreviews(screen.id, items)
     }
     // Voice-note recorder (hold the mic to record; drag left to cancel).
     val recorder = remember { VoiceRecorder() }
@@ -1475,10 +1482,23 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     val chatPreviews = state.pendingMediaPreviews.filter { it.chatId == screen.id }
     if (chatPreviews.isNotEmpty()) {
         val previewKey = chatPreviews.joinToString("|") { it.tempPath }
-        val loaded by androidx.compose.runtime.produceState<List<Pair<ByteArray, Boolean>>?>(null, previewKey) {
+        val loaded by androidx.compose.runtime.produceState<List<SendPreviewItem>?>(null, previewKey) {
             value = withContext(Dispatchers.IO) {
                 chatPreviews.mapNotNull { p ->
-                    readTempMediaFile(p.tempPath)?.let { it to (p.mime == "image/gif") }
+                    if (isVideoMime(p.mime)) {
+                        // Poster frame only — never buffer the full video for preview.
+                        SendPreviewItem(
+                            bytes = null,
+                            isGif = false,
+                            isVideo = true,
+                            poster = decodeVideoPosterFrame(p.tempPath),
+                            filename = p.filename,
+                        )
+                    } else {
+                        readTempMediaFile(p.tempPath)?.let {
+                            SendPreviewItem(it, p.mime == "image/gif", false, null, p.filename)
+                        }
+                    }
                 }
             }
         }
@@ -1577,7 +1597,7 @@ private fun AddToMessageSheet(
                 Text("Add to your message", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(8.dp))
                 if (canSendPhoto) {
-                    ActionRow(SNIconName.Lock, "Send photo or GIF", "Encrypted end-to-end over White Noise", onPhoto)
+                    ActionRow(SNIconName.Lock, "Send photo or video", "Encrypted end-to-end over White Noise", onPhoto)
                 }
                 if (canSendFile) {
                     ActionRow(SNIconName.Data, "Send file", "PDFs, documents, and other files", onFile)
@@ -2872,9 +2892,19 @@ private fun MediaViewer(
     }
 }
 
+/** One staged attachment in the pre-send preview pager. Images/GIFs carry
+ *  their bytes; videos carry only a poster frame (never the full payload). */
+private class SendPreviewItem(
+    val bytes: ByteArray?,
+    val isGif: Boolean,
+    val isVideo: Boolean,
+    val poster: androidx.compose.ui.graphics.ImageBitmap?,
+    val filename: String,
+)
+
 @Composable
 private fun MediaSendPreview(
-    items: List<Pair<ByteArray, Boolean>>,
+    items: List<SendPreviewItem>,
     onSend: () -> Unit,
     onCancel: () -> Unit,
     modifier: Modifier = Modifier,
@@ -2886,12 +2916,41 @@ private fun MediaSendPreview(
             state = pagerState,
             modifier = Modifier.fillMaxSize(),
         ) { page ->
-            val (data, isGif) = items[page]
-            val image = remember(data) { if (!isGif) decodeImageBitmap(data) else null }
+            val item = items[page]
+            val data = item.bytes
+            val image = remember(data) {
+                if (data != null && !item.isGif && !item.isVideo) decodeImageBitmap(data) else null
+            }
             when {
-                isGif || image != null -> MediaImage(
+                item.isVideo -> Box(
+                    Modifier.fillMaxSize().padding(bottom = 80.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    item.poster?.let { poster ->
+                        androidx.compose.foundation.Image(
+                            bitmap = poster,
+                            contentDescription = item.filename,
+                            contentScale = ContentScale.Fit,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    }
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text("▶", color = Color.White, fontSize = 44.sp)
+                        if (item.poster == null) {
+                            Spacer(Modifier.height(8.dp))
+                            Text(
+                                item.filename,
+                                color = Color.White.copy(alpha = 0.75f),
+                                fontSize = 14.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+                }
+                data != null && (item.isGif || image != null) -> MediaImage(
                     bytes = data,
-                    isGif = isGif,
+                    isGif = item.isGif,
                     modifier = Modifier.fillMaxSize().padding(bottom = 80.dp)
                 )
                 else -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {

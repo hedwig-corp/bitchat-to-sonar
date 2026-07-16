@@ -4831,7 +4831,11 @@ class SonarAppState(private val scope: CoroutineScope) {
         scope.launch {
             val written = withContext(Dispatchers.IO) {
                 items.map { item ->
-                    val suffix = if (item.mime == "image/gif") ".gif" else ".img"
+                    val suffix = when {
+                        item.mime == "image/gif" -> ".gif"
+                        isVideoMime(item.mime) -> ".vid"
+                        else -> ".img"
+                    }
                     PendingMediaPreview(chatId, writeTempMediaFile(item.bytes, suffix), item.filename, item.mime)
                 }
             }
@@ -4858,7 +4862,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         scope.launch {
             // Finalize every staged item IN ORDER (lazy jpeg re-encode happens
-            // here, on send confirmation — Signal-style).
+            // here, on send confirmation — Signal-style). GIFs and videos pass
+            // through untouched: `reencodeToJpeg` cannot decode them, and a
+            // video is already bounded by the pick-time size cap.
             val prepared = mutableListOf<Triple<String, PickedPhoto, Boolean>>()
             var encodeFailed = false
             for (preview in items) {
@@ -4867,6 +4873,12 @@ class SonarAppState(private val scope: CoroutineScope) {
                 } ?: continue
                 if (preview.mime == "image/gif") {
                     prepared += Triple(preview.chatId, PickedPhoto(raw, preview.filename, preview.mime), true)
+                } else if (isVideoMime(preview.mime)) {
+                    // Normalize to the MDK-accepted MIME/filename set so an
+                    // exotic container degrades to a file send, never an error.
+                    val safeMime = encryptedAttachmentMime(preview.mime)
+                    val safeFilename = encryptedAttachmentFilename(preview.filename)
+                    prepared += Triple(preview.chatId, PickedPhoto(raw, safeFilename, safeMime), true)
                 } else {
                     val jpeg = withContext(Dispatchers.Default) { reencodeToJpeg(raw) }
                     if (jpeg == null) {

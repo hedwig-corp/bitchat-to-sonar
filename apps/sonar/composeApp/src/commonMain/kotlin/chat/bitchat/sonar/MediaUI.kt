@@ -4,25 +4,31 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.ImageBitmap
 
-/** One picked photo delivered by [rememberPhotoPicker], in selection order. */
+/** One picked photo or video delivered by [rememberPhotoPicker], in selection order. */
 class PickedPhoto(
     val bytes: ByteArray,
     val filename: String,
     val mime: String,
 )
 
-/** Max photos per pick — 2+ send as ONE album message (card deck). */
+/** Max photos/videos per pick — 2+ send as ONE album message (card deck). */
 const val MAX_ALBUM_PHOTOS = 10
 
+/** True when the attachment is a video container (sent as-is, never re-encoded). */
+fun isVideoMime(mime: String): Boolean = mime.startsWith("video/")
+
 /**
- * Platform photo picker (multi-select up to [MAX_ALBUM_PHOTOS]). Raw bytes are
- * delivered with the source MIME type so the preview shows full-quality data.
- * JPEG re-encoding is deferred to send confirmation via [reencodeToJpeg]. GIFs
- * are passed through unmodified.
+ * Platform photo/video picker (multi-select up to [MAX_ALBUM_PHOTOS]). Raw
+ * bytes are delivered with the source MIME type so the preview shows
+ * full-quality data. JPEG re-encoding is deferred to send confirmation via
+ * [reencodeToJpeg]; GIFs and videos are passed through unmodified. Videos over
+ * the receiver download cap ([MAX_INTERNET_ATTACHMENT_BYTES]) are rejected at
+ * pick time and reported via `rejectedTooLarge` — receivers can never fetch
+ * them, so staging one would only fail later at send.
  */
 @Composable
 expect fun rememberPhotoPicker(
-    onPicked: (items: List<PickedPhoto>) -> Unit
+    onPicked: (items: List<PickedPhoto>, rejectedTooLarge: Int) -> Unit
 ): () -> Unit
 
 /**
@@ -45,6 +51,13 @@ expect fun MediaImage(
 
 /** Decode decrypted image bytes into a Compose [ImageBitmap] (null on failure). */
 expect fun decodeImageBitmap(bytes: ByteArray): ImageBitmap?
+
+/**
+ * Extract a poster frame from a local video file for the pre-send preview
+ * (null when the platform has no video decoder — callers show a generic video
+ * tile instead). Runs a media decode: call from a background dispatcher only.
+ */
+expect fun decodeVideoPosterFrame(path: String): ImageBitmap?
 
 /** Native actions for an already-decrypted private local file. */
 class MediaActions(

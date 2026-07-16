@@ -913,7 +913,7 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * or HTTP; `None` is an ordinary cache or validation miss.
      */
     func cachedStickerImageForRef(packCoordinate: String, shortcode: String, plaintextSha256: String) throws  -> Data?
-
+    
     /**
      * The user accepted an incoming call: we are the dialer. Dials the offerer
      * and starts media. Blocks on the QUIC connect.
@@ -1181,7 +1181,7 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * plaintext transcript row or mutate MLS state a second time.
      */
     func retryMessage(messageIdHex: String) throws  -> String
-
+    
     /**
      * Reload the durable outbox sidecar and retry pending sends. Hosts call this
      * after replacing a local-only node with a relay-backed node so sends created
@@ -1358,7 +1358,7 @@ public static func connect(identity: SonarIdentity, relayUrls: [String], dbPath:
     )
 })
 }
-
+    
 
     
     /**
@@ -1432,7 +1432,7 @@ open func cachedStickerImageForRef(packCoordinate: String, shortcode: String, pl
     )
 })
 }
-
+    
     /**
      * The user accepted an incoming call: we are the dialer. Dials the offerer
      * and starts media. Blocks on the QUIC connect.
@@ -2038,7 +2038,7 @@ open func retryMessage(messageIdHex: String)throws  -> String  {
     )
 })
 }
-
+    
     /**
      * Reload the durable outbox sidecar and retry pending sends. Hosts call this
      * after replacing a local-only node with a relay-backed node so sends created
@@ -6036,6 +6036,18 @@ public func callParseControl(content: String) -> CallControlInfo?  {
 })
 }
 /**
+ * Largest media attachment (plaintext bytes) a receiver will download.
+ * Hosts must pre-check picked files against this before staging/sending;
+ * the core also rejects over-cap sends so an unfetchable blob is never
+ * published.
+ */
+public func maxMediaPlaintextBytes() -> UInt64  {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_func_max_media_plaintext_bytes($0
+    )
+})
+}
+/**
  * Build a signed identity announce as wire bytes (padded 0x01 packet).
  */
 public func meshBuildAnnounce(seedHex: String, senderIdHex: String, nickname: String, noisePublicKeyHex: String, ttl: UInt8, timestampMs: UInt64)throws  -> Data  {
@@ -6352,6 +6364,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_func_call_parse_control() != 41480) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_max_media_plaintext_bytes() != 26928) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_func_mesh_build_announce() != 52908) {
