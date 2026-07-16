@@ -2307,12 +2307,33 @@ final class MarmotChatModel: ObservableObject {
                   identifier: parts.identifier,
                   relayUrls: [],
                   expectedGeneration: generation
-              ),
-              let sticker = pack.stickers.first(where: {
-                  $0.shortcode == ref.shortcode &&
-                      $0.sha256.caseInsensitiveCompare(ref.plaintextSha256) == .orderedSame
-              })
+              )
         else { return nil }
+        func matching(_ pack: StickerPackInfo) -> StickerInfo? {
+            pack.stickers.first(where: {
+                $0.shortcode == ref.shortcode &&
+                    $0.sha256.caseInsensitiveCompare(ref.plaintextSha256) == .orderedSame
+            })
+        }
+        var sticker = matching(pack)
+        if sticker == nil {
+            // Session pack metadata can be stale: a sticker published to the
+            // pack after this session cached its metadata — or a copy served
+            // by the offline validated-local fallback — is missing from the
+            // cached copy while every older sticker still renders. Evict and
+            // refetch once so one early failed relay fetch cannot pin a stale
+            // pack for the session.
+            guard stickerCacheGeneration == generation else { return nil }
+            evictStickerPack(coordinate: ref.packCoordinate)
+            guard let refreshed = await fetchStickerPack(
+                authorPubkeyHex: parts.author,
+                identifier: parts.identifier,
+                relayUrls: [],
+                expectedGeneration: generation
+            ) else { return nil }
+            sticker = matching(refreshed)
+        }
+        guard let sticker else { return nil }
         let data = await fetchStickerImage(
             url: sticker.url,
             expectedSha256: ref.plaintextSha256,
@@ -2418,6 +2439,14 @@ final class MarmotChatModel: ObservableObject {
     private func touchStickerPack(_ cacheKey: String) {
         stickerPackLRU.removeAll { $0 == cacheKey }
         stickerPackLRU.append(cacheKey)
+    }
+
+    /// Drop one pack's session metadata so the next fetch consults the relay
+    /// again. Used when a transcript ref is missing from the cached copy.
+    private func evictStickerPack(coordinate: String) {
+        let normalized = snNormalizeStickerPackCoordinate(coordinate)
+        stickerPacksByCoordinate.removeValue(forKey: normalized)
+        stickerPackLRU.removeAll { $0 == normalized }
     }
 
     func replaceInstalledPackCoordinates(_ coordinates: [String]) {

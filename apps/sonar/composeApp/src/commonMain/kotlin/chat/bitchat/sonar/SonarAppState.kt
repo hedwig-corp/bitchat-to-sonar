@@ -5912,7 +5912,21 @@ class SonarAppState(private val scope: CoroutineScope) {
             identifier = identifier,
             expectedGeneration = generation,
         ) ?: return null
-        val sticker = pack.stickerMatching(ref) ?: return null
+        // Session pack metadata can be stale: a sticker published to the pack
+        // after this session cached its metadata — or a copy served by the
+        // offline validated-local fallback — is missing from the cached copy
+        // while every older sticker still renders. Evict and refetch once so
+        // one early failed relay fetch cannot pin a stale pack for the session.
+        val sticker = pack.stickerMatching(ref) ?: run {
+            if (stickerCacheGeneration != generation) return null
+            stickerPackCache.remove("30031:${author.lowercase()}:$identifier")
+            val refreshed = stickerPack(
+                authorPubkeyHex = author,
+                identifier = identifier,
+                expectedGeneration = generation,
+            ) ?: return null
+            refreshed.stickerMatching(ref) ?: return null
+        }
         val bytes = stickerImage(
             url = sticker.url,
             expectedSha256 = ref.plaintextSha256,
