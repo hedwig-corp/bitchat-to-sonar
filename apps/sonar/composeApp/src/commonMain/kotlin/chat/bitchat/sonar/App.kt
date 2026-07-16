@@ -999,17 +999,22 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         if (screen.pay) openPaySheetOrRetry()
     }
     // Transcript feed = chat messages (pay control lines collapsed) + mocked
-    // call-log records, merged chronologically.
-    val visible = state.messages.filter {
-        val p = PayLine.decode(it.content)
-        // Hide ⚡PAY control lines (Claim/Done) and ☎CALL signaling lines. The
-        // cheap ☎CALL prefix check avoids an FFI call for ordinary chat.
-        val isCall = it.content.trimStart().startsWith("☎CALL") &&
-            SonarCore.callParseControl(it.content) != null
-        (p == null || p is PayLine.Pay) && !isCall
-    }
+    // call-log records, merged chronologically. Memoized on its inputs: the
+    // filter runs PayLine.decode per row (and an FFI call for ☎CALL rows) and
+    // the merge sorts — per-recomposition work the render path must not repeat
+    // when unrelated state (media decode, presence) invalidates the screen.
     val calls = run { state.callVersion; state.callRecords(screen.id) }
-    val feed: List<Any> = (visible + calls).sortedBy { if (it is CallRecord) it.tsSecs else (it as SonarMsg).tsSecs }
+    val feed: List<Any> = remember(state.messages, calls) {
+        val visible = state.messages.filter {
+            val p = PayLine.decode(it.content)
+            // Hide ⚡PAY control lines (Claim/Done) and ☎CALL signaling lines. The
+            // cheap ☎CALL prefix check avoids an FFI call for ordinary chat.
+            val isCall = it.content.trimStart().startsWith("☎CALL") &&
+                SonarCore.callParseControl(it.content) != null
+            (p == null || p is PayLine.Pay) && !isCall
+        }
+        (visible + calls).sortedBy { if (it is CallRecord) it.tsSecs else (it as SonarMsg).tsSecs }
+    }
     val newestFeedKey = feed.lastOrNull()?.let(::transcriptFeedKey)
     val currentFeed by rememberUpdatedState(feed)
     // Signal-style unread anchoring: opening a chat with unread messages lands
