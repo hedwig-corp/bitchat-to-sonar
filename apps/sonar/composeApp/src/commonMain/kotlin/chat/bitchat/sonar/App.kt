@@ -892,7 +892,7 @@ internal fun transcriptTailOverflowPx(
  *  alone top-aligns the row; when the row is taller than the (keyboard-shrunk)
  *  viewport that leaves the newest content hidden below the fold, so any
  *  remaining overflow is corrected with a follow-up scroll. */
-private suspend fun LazyListState.anchorTranscriptTail(index: Int, animate: Boolean) {
+internal suspend fun LazyListState.anchorTranscriptTail(index: Int, animate: Boolean) {
     if (index < 0) return
     if (animate) animateScrollToItem(index) else scrollToItem(index)
     val info = layoutInfo
@@ -911,7 +911,7 @@ private suspend fun LazyListState.anchorTranscriptTail(index: Int, animate: Bool
  *  whenever layout (IME shrink, media growth) — not the user's scroll and not
  *  a history prepend — steals a fully visible tail. */
 @Composable
-private fun TranscriptTailPinning(
+internal fun TranscriptTailPinning(
     listState: LazyListState,
     key: Any? = null,
     isPrepending: () -> Boolean = { false },
@@ -930,11 +930,18 @@ private fun TranscriptTailPinning(
                 prepending = isPrepending(),
             )
         }.distinctUntilChanged().collect { frame ->
-            when (pinner.onFrame(frame)) {
-                TranscriptTailPin.Snap -> listState.anchorTranscriptTail(frame.itemCount - 1, animate = false)
-                TranscriptTailPin.Animate -> listState.anchorTranscriptTail(frame.itemCount - 1, animate = true)
-                TranscriptTailPin.None -> Unit
-            }
+            val pin = pinner.onFrame(frame)
+            if (pin == TranscriptTailPin.None) return@collect
+            // These frames are produced *during* layout, so scrolling straight
+            // from here can re-enter measure ("performMeasureAndLayout called
+            // during measure layout"). Land on the next frame boundary first,
+            // the way the history-prepend path does. The IME emits a frame per
+            // animation step, so the tail still tracks the keyboard.
+            withFrameNanos { }
+            listState.anchorTranscriptTail(
+                frame.itemCount - 1,
+                animate = pin == TranscriptTailPin.Animate,
+            )
         }
     }
 }

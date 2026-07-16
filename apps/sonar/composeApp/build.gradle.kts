@@ -163,6 +163,15 @@ kotlin {
             implementation(kotlin("test"))
             implementation(libs.coroutines.test)
         }
+        // Compose UI tests live in jvmTest, not commonTest: they need a real
+        // composition + layout pass, which the Android *unit* test target
+        // cannot provide without Robolectric. The code under test is
+        // commonMain, so the desktop target exercises the shared behavior.
+        jvmTest.dependencies {
+            @OptIn(org.jetbrains.compose.ExperimentalComposeLibrary::class)
+            implementation(compose.uiTest)
+            implementation(compose.desktop.currentOs)
+        }
         androidMain.dependencies {
             implementation(libs.androidx.activity.compose)
             implementation(libs.coroutines.android)
