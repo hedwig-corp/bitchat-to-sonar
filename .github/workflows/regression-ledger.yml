@@ -1,0 +1,41 @@
+name: Regression ledger
+
+# docs/REGRESSIONS.md links each recurring-bug invariant to the test that pins
+# it. That link is what rots first: a test gets renamed and the entry quietly
+# becomes a lie. This asserts every cited test still exists.
+#
+# Deliberately separate from compose-tests.yml: this is pure shell (seconds, no
+# JDK/Rust), and it must also run when a *test* is renamed, not only when the
+# ledger itself changes.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'docs/REGRESSIONS.md'
+      - 'scripts/check-regression-ledger.sh'
+      - '.github/workflows/regression-ledger.yml'
+      - 'apps/sonar/composeApp/src/**Test*/**'
+      - 'ios/bitchatTests/**'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'docs/REGRESSIONS.md'
+      - 'scripts/check-regression-ledger.sh'
+      - '.github/workflows/regression-ledger.yml'
+      - 'apps/sonar/composeApp/src/**Test*/**'
+      - 'ios/bitchatTests/**'
+
+jobs:
+  check:
+    name: Regression ledger references
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check every cited regression test exists
+        run: ./scripts/check-regression-ledger.sh

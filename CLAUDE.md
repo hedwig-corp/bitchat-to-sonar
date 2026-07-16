@@ -142,6 +142,31 @@ The value must never be empty, `https:`, `http:`, or anything without a host.
 If this check fails, fix the build setting before archiving; otherwise the app
 can launch successfully while silently disabling Breez offline payment wakeups.
 
+## Regression Invariant Rule
+
+Some bugs in this repo have been fixed more than once. [`docs/REGRESSIONS.md`](docs/REGRESSIONS.md)
+records their invariants, the test that pins each one, both platforms' call
+sites, and the approaches already tried and reverted.
+
+Read it **before** changing conversation, transcript, send/echo, dedup, or
+notification behaviour — and especially before editing the mirror pair
+`apps/sonar/.../SonarAppState.kt` (32 `fix:` commits) and
+`ios/bitchat/Views/Sonar/SonarAppStore.swift` (30), or
+`ios/bitchat/Views/MarmotChatView.swift` and `core/sonar-core/src/client.rs` (21
+each). These four files carry most of this project's repeat regressions. If a
+change there looks like an obvious simplification, check the `Rejected` notes
+first: it has often already been tried.
+
+When fixing a bug that has now happened twice, add an entry. Rules:
+
+1. Every entry names a `Guarded by:` test that **fails without the fix**. No test, no entry — put it under `## Unguarded` instead, which is the backlog.
+2. Every entry carries **both** platform call sites (`ios/` and `apps/sonar/`), or states why one does not apply. A fix landing on one platform and not its mirror is the most common way these bugs return — see the Cross-Platform Feature Rule.
+3. Record what you rejected and why, not just what you shipped.
+
+`scripts/check-regression-ledger.sh` runs in CI and fails if a cited test no
+longer exists. It cannot tell whether a test is still meaningful — that is a
+review question.
+
 ## Fix What We Break Rule
 
 When a change breaks existing behavior, fix the broken behavior directly before considering the work complete. Do not leave regressions for users to route around, and do not hide them with UI-only workarounds.
