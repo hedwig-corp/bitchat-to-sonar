@@ -139,20 +139,30 @@ internal suspend fun runMarmotSendWithBestEffortReconciliation(
 internal data class SendEchoDisplayPlan(
     val visibleEchoes: List<SonarMsg>,
     val terminalAcceptedEchoIds: Set<String>,
+    /** Fulfilling rows the render window excluded; re-add them or the send vanishes. */
+    val admittedCanonical: List<SonarMsg> = emptyList(),
 )
 
 internal fun planSendEchoDisplay(
     echoes: List<SonarMsg>,
     published: List<SonarMsg>,
     excludedPublishedIdsByEcho: Map<String, Set<String>> = emptyMap(),
+    freshCanonical: List<SonarMsg> = emptyList(),
 ): SendEchoDisplayPlan {
-    val fulfilled = fulfilledSendEchoIds(echoes, published, excludedPublishedIdsByEcho)
+    val reconciliation = reconcileSendEchoes(
+        echoes,
+        published,
+        excludedPublishedIdsByEcho,
+        freshCanonical,
+    )
+    val fulfilled = reconciliation.fulfilledEchoIds
     return SendEchoDisplayPlan(
         visibleEchoes = echoes.filterNot { it.id in fulfilled },
         terminalAcceptedEchoIds = echoes
             .asSequence()
             .filter { it.state == "Accepted" && it.id in fulfilled }
             .mapTo(mutableSetOf()) { it.id },
+        admittedCanonical = reconciliation.admittedCanonical,
     )
 }
 
@@ -855,6 +865,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         // Reopening starts from a viewport-sized local page. Older pages are a
         // property of the live view, not an account-wide plaintext cache.
         transcriptWindows.clear()
+        freshCanonicalByGroup.clear()
         meshTranscriptRows = emptyList()
         meshTranscriptHasMore = false
         meshTranscriptPinnedToOlderEdge = false
@@ -868,6 +879,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         transcriptGeneration += 1
         activeTranscriptChatId = null
         transcriptWindows.clear()
+        freshCanonicalByGroup.clear()
         meshTranscriptRows = emptyList()
         meshTranscriptHasMore = false
         meshTranscriptPinnedToOlderEdge = false
@@ -4673,7 +4685,10 @@ class SonarAppState(private val scope: CoroutineScope) {
     // Matching uses whole-second timestamps. Remember already visible canonical
     // rows so an earlier identical send in that second cannot consume a new echo.
     private val previouslyPublishedMessageIdsByEcho = mutableMapOf<String, Set<String>>()
-    private val echoIdPrefix = "echo-"
+    private val echoIdPrefix = SEND_ECHO_ID_PREFIX
+    // Newest rows read from local storage per group, kept before the render
+    // window bounds them so echo reconciliation can still see an outgoing row.
+    private val freshCanonicalByGroup = mutableMapOf<String, List<SonarMsg>>()
 
     private fun createSendEcho(chatId: String, text: String, viaInternet: Boolean = true): SonarMsg {
         val echo = privateDmMessage(
@@ -4765,7 +4780,12 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private fun withSendEchoes(chatId: String, published: List<SonarMsg>): List<SonarMsg> {
         val echoes = pendingSendEchoes[chatId] ?: return published
-        val plan = planSendEchoDisplay(echoes, published, previouslyPublishedMessageIdsByEcho)
+        val plan = planSendEchoDisplay(
+            echoes,
+            published,
+            previouslyPublishedMessageIdsByEcho,
+            freshCanonicalForChat(chatId),
+        )
         if (plan.terminalAcceptedEchoIds.isNotEmpty()) {
             echoes.removeAll { it.id in plan.terminalAcceptedEchoIds }
             plan.terminalAcceptedEchoIds.forEach(previouslyPublishedMessageIdsByEcho::remove)
@@ -4775,9 +4795,26 @@ class SonarAppState(private val scope: CoroutineScope) {
         // coroutine reports its exact outcome. Keep the echo pending until
         // clearSendEcho/failSendEcho receives that outcome so a late failure
         // still renders "Couldn't send" instead of disappearing.
-        return (published.filterNot { it.id.startsWith(echoIdPrefix) } + plan.visibleEchoes)
+        return (
+            published.filterNot { it.id.startsWith(echoIdPrefix) } +
+                plan.admittedCanonical +
+                plan.visibleEchoes
+            )
             .distinctBy { it.id }
             .sortedBy { it.tsSecs }
+    }
+
+    /** Newest locally stored rows for every source folded into [chatId]. */
+    private fun freshCanonicalForChat(chatId: String): List<SonarMsg> {
+        val groupIds = transcriptGroupIds(chatId)
+        if (groupIds.isEmpty()) return freshCanonicalByGroup[chatId].orEmpty()
+        val fresh = ArrayList<SonarMsg>()
+        for (groupId in groupIds) {
+            val rows = freshCanonicalByGroup[groupId] ?: continue
+            // A mesh-folded conversation reads its Marmot legs as internet rows.
+            fresh += if (isMeshChat(chatId)) rows.map { it.copy(viaInternet = true) } else rows
+        }
+        return fresh
     }
 
     // ── Media preview (confirmation before send) ──
@@ -6852,6 +6889,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
 
         val newest = visibleTranscriptPage(fetched)
+        // Remember the freshly read page before any pinned/bounded filtering can
+        // drop it: send-echo reconciliation must still see an outgoing row that
+        // the render window refuses to admit.
+        freshCanonicalByGroup[groupId] = newest
         val unboundedCount = (current?.rows.orEmpty() + newest).distinctBy { it.id }.size
         val merged = refreshTranscriptRows(
             existing = current?.rows.orEmpty(),
